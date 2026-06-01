@@ -1217,6 +1217,27 @@ pub enum ReportingParty {
     Admin,
 }
 
+/// Which work class an attempt row belongs to (substitution-replacement
+/// campaign, design §2.5). The fold partitions on this and ONLY this
+/// (never on outcome class — the partition must be total over every
+/// channel that can produce a row): [`decide`] skips
+/// materialization-kind rows entirely, and [`materialization_decide`]
+/// folds only them.
+///
+/// The kernel-side mirror of `drv_executions.attempt_kind` (migration
+/// 078): the scheduler's fold-input assembly joins the column onto each
+/// ledger row; rows without an execution are `Build`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AttemptKind {
+    /// A from-source build attempt (the as-built work class; the
+    /// default for every row that predates the kind column).
+    #[default]
+    Build,
+    /// A store-executed materialization attempt (fetch + verify of a
+    /// derivation's wanted outputs from upstream caches).
+    Materialization,
+}
+
 /// The decision-relevant projection of one `drv_attempts` row, in ledger
 /// order. [`decide`] folds a suffix of these; the scheduler's
 /// `retry_policy::decide()` shim builds them from `AttemptRecord`s
@@ -1244,6 +1265,11 @@ pub struct LedgerRow<Id> {
     pub resubmit_cycle: i32,
     /// When the event occurred, on the abstract clock (epoch seconds).
     pub at: AbsTime,
+    /// Work class (joined from `drv_executions.attempt_kind` at
+    /// fold-input assembly; rows without an execution are `Build`).
+    /// The kind partition keys on this and only this — see [`decide`]'s
+    /// skip arm and [`materialization_decide`].
+    pub kind: AttemptKind,
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,21 +1357,29 @@ fn decide_verdict_partition_consistent<Id: Ord>(
 /// budget cap — the per-cycle/infra/timeout caps hold over every
 /// history, and the exempt cap holds over every history whose last
 /// event is exempt-charging.
+///
+/// "Last event" means the last BUILD-kind row: the kind partition
+/// (design §2.5) makes materialization-kind rows invisible to the build
+/// fold, so the contract is stated over the build-kind view of history.
 #[cfg(kani)]
 fn decide_requeue_within_caps<Id: Ord>(
     d: &Decision<Id>,
     history: &[LedgerRow<Id>],
     budget: &Budget,
 ) -> bool {
-    let last_is_exempt_charge = history.last().is_some_and(|r| {
-        r.event_kind == AttemptEventKind::Attempt
-            && ((r.reporting_party == ReportingParty::Worker
-                && r.outcome_class == OutcomeClass::ExemptInfra)
-                || (r.reporting_party != ReportingParty::Worker
-                    && !r.floor_at_cap
-                    && (r.outcome_class == OutcomeClass::ExemptInfra
-                        || (r.outcome_class == OutcomeClass::Infra && r.floor_promoted))))
-    });
+    let last_is_exempt_charge = history
+        .iter()
+        .rev()
+        .find(|r| r.kind == AttemptKind::Build)
+        .is_some_and(|r| {
+            r.event_kind == AttemptEventKind::Attempt
+                && ((r.reporting_party == ReportingParty::Worker
+                    && r.outcome_class == OutcomeClass::ExemptInfra)
+                    || (r.reporting_party != ReportingParty::Worker
+                        && !r.floor_at_cap
+                        && (r.outcome_class == OutcomeClass::ExemptInfra
+                            || (r.outcome_class == OutcomeClass::Infra && r.floor_promoted))))
+        });
     d.counters.count <= budget.max_retries
         && d.counters.infra_count <= budget.max_infra_retries
         && d.counters.timeout_count <= budget.max_timeout_retries
@@ -1356,6 +1390,11 @@ fn decide_requeue_within_caps<Id: Ord>(
 
 /// Clause 3 of [`decide`]'s contract: the exclusion set contains the
 /// executor of every charged threshold attempt after the last reset row.
+///
+/// Both "reset row" and "charged attempt" range over BUILD-kind rows
+/// only: the kind partition (design §2.5) keeps materialization-kind
+/// rows out of the build fold, so a materialization row neither cuts
+/// the window nor demands exclusion coverage.
 #[cfg(kani)]
 fn decide_exclusion_covers_charged_attempts<Id: Ord>(
     d: &Decision<Id>,
@@ -1363,19 +1402,22 @@ fn decide_exclusion_covers_charged_attempts<Id: Ord>(
 ) -> bool {
     let last_reset = history
         .iter()
-        .rposition(|r| r.event_kind == AttemptEventKind::Reset);
+        .rposition(|r| r.kind == AttemptKind::Build && r.event_kind == AttemptEventKind::Reset);
     let start = last_reset.map_or(0, |i| i + 1);
-    history[start..].iter().all(|r| {
-        let charges_threshold = r.event_kind == AttemptEventKind::Attempt
-            && matches!(
-                r.outcome_class,
-                OutcomeClass::Transient
-                    | OutcomeClass::Permanent
-                    | OutcomeClass::Backstop
-                    | OutcomeClass::ExecutorCrash
-            );
-        !charges_threshold || r.executor.as_ref().is_none_or(|e| d.exclusion.contains(e))
-    })
+    history[start..]
+        .iter()
+        .filter(|r| r.kind == AttemptKind::Build)
+        .all(|r| {
+            let charges_threshold = r.event_kind == AttemptEventKind::Attempt
+                && matches!(
+                    r.outcome_class,
+                    OutcomeClass::Transient
+                        | OutcomeClass::Permanent
+                        | OutcomeClass::Backstop
+                        | OutcomeClass::ExecutorCrash
+                );
+            !charges_threshold || r.executor.as_ref().is_none_or(|e| d.exclusion.contains(e))
+        })
 }
 
 /// Phase-1b decision function: fold a derivation's attempt-ledger suffix
@@ -1392,6 +1434,17 @@ fn decide_exclusion_covers_charged_attempts<Id: Ord>(
 /// eligible fleet is not history, so the in-history check is evaluated
 /// against an empty fleet (never exhausted) and the call sites consume
 /// [`Decision::exclusion`] through [`placeable`] instead.
+///
+/// **The kind partition (substitution-replacement, design §2.5):**
+/// materialization-kind rows are invisible to this fold — every part of
+/// it, including the resubmit-cycle seed read. They never charge a
+/// build budget, never enter the poison thresholds, never contribute an
+/// exclusion key, and never reset anything. Their own budget is
+/// [`materialization_decide`]'s job. The
+/// `materialization_rows_invisible_to_build_decision` unit test and the
+/// `check_materialization_rows_invisible_to_build_decision` CBMC
+/// harness pin this as an algebraic property: for any history,
+/// `decide(history) == decide(build-kind rows of history)`.
 ///
 /// This is the design's frozen §5a-2 three-argument decision surface.
 /// (A fourth, transitional `legacy_seed` argument — the decision-P5
@@ -1447,7 +1500,10 @@ pub fn decide<Id: Ord + Clone>(
     // index on the row itself; seed the pre-fold counter so the reset
     // arm's `prior + 1` reproduces it (the loader cuts the suffix at the
     // most recent reset, so prior cycles are not otherwise visible).
-    if let Some(first) = history.first()
+    // "Starts at" means the first BUILD-kind row: the kind partition
+    // makes materialization rows invisible to every part of this fold,
+    // including this seed read.
+    if let Some(first) = history.iter().find(|r| r.kind == AttemptKind::Build)
         && first.event_kind == AttemptEventKind::Reset
         && first.outcome_class == OutcomeClass::ResubmitReset
     {
@@ -1464,6 +1520,15 @@ pub fn decide<Id: Ord + Clone>(
     let mut counters = initial;
     let mut verdict = Verdict::Requeue;
     for row in history {
+        // The kind partition (design §2.5): materialization-kind rows
+        // are invisible to every build budget — they never charge
+        // transient/infra/timeout caps, never enter the poison
+        // thresholds, never contribute an exclusion key, and never
+        // reset anything. They are folded by `materialization_decide`
+        // instead.
+        if row.kind == AttemptKind::Materialization {
+            continue;
+        }
         if let Some(ev) = row_to_event(row) {
             verdict = apply(&mut counters, &ev, budget, &fleet);
         }
@@ -1566,6 +1631,69 @@ fn row_to_event<Id: Clone>(row: &LedgerRow<Id>) -> Option<AttemptEvent<Id>> {
         // these classes yet (dormant until the materialization flags
         // enable the consumption/establishment writers).
         OutcomeClass::MaterializationUnobtainable | OutcomeClass::MaterializationInfra => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The materialization budget (substitution-replacement Phase A, design §2.5)
+//
+// The other half of the kind partition: `decide()` skips
+// materialization-kind rows; this fold sees ONLY them. Dormant in Phase A
+// (no scheduler call site constructs materialization rows until the
+// flag-gated Wave-3 wiring); the function ships now so the partition is a
+// complete, provable algebra rather than half of one.
+// ---------------------------------------------------------------------------
+
+/// The materialization-budget verdict (design §2.5): the disposition of
+/// one derivation's materialization-kind ledger suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterializationVerdict {
+    /// Under budget: the job may be (re-)claimed.
+    Claimable,
+    /// Budget exhausted: park with backoff (never a fail-fast, never a
+    /// poison — B3 "unknown never demotes"; the park is re-evaluated by
+    /// housekeeping).
+    Park,
+}
+
+/// Fold the materialization-kind rows of one derivation's ledger suffix
+/// into the materialization-budget verdict.
+///
+/// Counts `MaterializationInfra` rows — worker-reported AND
+/// establishment-written (OQ1 amendment 1: both channels charge the
+/// same budget) — since the last materialization-kind reset row.
+/// `MaterializationUnobtainable` rows are routing verdicts, not
+/// retries: they are never counted. Build-kind rows are invisible here
+/// (the partition is two-sided): they neither charge this budget nor
+/// cut its reset window — pinned by the
+/// `build_rows_invisible_to_materialization_decision` test.
+///
+/// `Park` at `count >= max_materialization_attempts`; never a poison,
+/// never a fail-fast (the InfraFailure park-not-fail posture,
+/// sched.materialize.routing).
+pub fn materialization_decide<Id: Ord + Clone>(
+    rows: &[LedgerRow<Id>],
+    max_materialization_attempts: u32,
+) -> MaterializationVerdict {
+    let infra_since_reset = rows
+        .iter()
+        // Same reset-cut discipline as the build fold, applied to the
+        // materialization-kind view: count after the last
+        // materialization-kind reset row. Build-kind rows (reset or
+        // not) never cut this window.
+        .rev()
+        .take_while(|r| {
+            !(r.kind == AttemptKind::Materialization && r.event_kind == AttemptEventKind::Reset)
+        })
+        .filter(|r| {
+            r.kind == AttemptKind::Materialization
+                && r.outcome_class == OutcomeClass::MaterializationInfra
+        })
+        .count();
+    if infra_since_reset >= max_materialization_attempts as usize {
+        MaterializationVerdict::Park
+    } else {
+        MaterializationVerdict::Claimable
     }
 }
 
@@ -1944,6 +2072,221 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // The kind partition (substitution-replacement Phase A, design §2.5)
+    // -----------------------------------------------------------------
+
+    /// A build-kind ledger row for the partition battery.
+    fn build_row(class: OutcomeClass, executor: Option<&str>, at: AbsTime) -> LedgerRow<String> {
+        LedgerRow {
+            event_kind: AttemptEventKind::Attempt,
+            outcome_class: class,
+            executor: executor.map(str::to_string),
+            reporting_party: ReportingParty::Worker,
+            floor_promoted: false,
+            floor_at_cap: false,
+            resubmit_cycle: 0,
+            at,
+            kind: AttemptKind::Build,
+        }
+    }
+
+    /// A build-kind reset row (`event_kind = Reset`).
+    fn reset_build_row(class: OutcomeClass, resubmit_cycle: i32, at: AbsTime) -> LedgerRow<String> {
+        LedgerRow {
+            event_kind: AttemptEventKind::Reset,
+            reporting_party: ReportingParty::Scheduler,
+            resubmit_cycle,
+            ..build_row(class, None, at)
+        }
+    }
+
+    /// A materialization-kind ledger row.
+    fn mat_row(class: OutcomeClass, executor: Option<&str>, at: AbsTime) -> LedgerRow<String> {
+        LedgerRow {
+            kind: AttemptKind::Materialization,
+            ..build_row(class, executor, at)
+        }
+    }
+
+    /// materializationInvisibleToBuildBudgets, kernel half (design §2.5,
+    /// review findings PP-4/BC-2): for ANY history, interleaving ANY
+    /// number of materialization-kind rows anywhere in it never changes
+    /// the build-budget decision (verdict, exclusion set, backoff,
+    /// counters).
+    #[test]
+    fn materialization_rows_invisible_to_build_decision() {
+        let budget = Budget::default();
+        // Representative build history: same-worker transients, a worker
+        // infra, an established crash, a resubmit reset, a fresh-cycle
+        // transient.
+        let build_history = vec![
+            build_row(OutcomeClass::Transient, Some("w1"), 100),
+            build_row(OutcomeClass::Transient, Some("w1"), 200),
+            build_row(OutcomeClass::Infra, Some("w2"), 300),
+            build_row(OutcomeClass::ExecutorCrash, Some("w3"), 400),
+            reset_build_row(OutcomeClass::ResubmitReset, 1, 500),
+            build_row(OutcomeClass::Transient, Some("w1"), 600),
+        ];
+        let baseline = decide(&build_history, &budget, 600);
+
+        // Materialization rows of both classes, with/without identity.
+        let mat_rows = [
+            mat_row(OutcomeClass::MaterializationInfra, Some("store-0"), 50),
+            mat_row(OutcomeClass::MaterializationUnobtainable, None, 250),
+            mat_row(OutcomeClass::MaterializationInfra, Some("store-1"), 450),
+            mat_row(OutcomeClass::MaterializationInfra, None, 700),
+        ];
+
+        // All four interleaved at spread positions.
+        let mut interleaved = build_history.clone();
+        interleaved.insert(0, mat_rows[0].clone());
+        interleaved.insert(3, mat_rows[1].clone());
+        interleaved.insert(6, mat_rows[2].clone());
+        interleaved.push(mat_rows[3].clone());
+        assert_eq!(
+            decide(&interleaved, &budget, 600),
+            baseline,
+            "interleaved materialization rows must be invisible to the build fold"
+        );
+
+        // Every single-insertion position × every materialization row.
+        for pos in 0..=build_history.len() {
+            for m in &mat_rows {
+                let mut h = build_history.clone();
+                h.insert(pos, m.clone());
+                assert_eq!(
+                    decide(&h, &budget, 600),
+                    baseline,
+                    "a materialization row at position {pos} changed the build decision"
+                );
+            }
+        }
+
+        // The seed corner: a history whose FIRST build row is a
+        // resubmit-reset (the cycle-seed read) — a materialization row
+        // inserted ahead of it must not break the seed.
+        let reset_first = vec![
+            reset_build_row(OutcomeClass::ResubmitReset, 2, 100),
+            build_row(OutcomeClass::Transient, Some("w1"), 200),
+        ];
+        let seed_baseline = decide(&reset_first, &budget, 300);
+        let mut with_prefix = reset_first.clone();
+        with_prefix.insert(0, mat_row(OutcomeClass::MaterializationInfra, None, 50));
+        assert_eq!(
+            decide(&with_prefix, &budget, 300),
+            seed_baseline,
+            "a materialization row ahead of the resubmit-reset seed row must not change the seed"
+        );
+    }
+
+    /// The materialization budget: N materialization_infra rows since
+    /// the last (materialization) reset → Park verdict at
+    /// N >= max_attempts; unobtainable rows are NOT counted (they are
+    /// routing verdicts, not retries).
+    #[test]
+    fn materialization_budget_counts_infra_only() {
+        // 2 infra + 2 unobtainable, budget 3: claimable.
+        let h = vec![
+            mat_row(OutcomeClass::MaterializationInfra, Some("store-0"), 100),
+            mat_row(
+                OutcomeClass::MaterializationUnobtainable,
+                Some("store-0"),
+                200,
+            ),
+            mat_row(OutcomeClass::MaterializationInfra, Some("store-1"), 300),
+            mat_row(
+                OutcomeClass::MaterializationUnobtainable,
+                Some("store-1"),
+                400,
+            ),
+        ];
+        assert_eq!(
+            materialization_decide(&h, 3),
+            MaterializationVerdict::Claimable,
+            "unobtainable rows must not charge the materialization budget"
+        );
+
+        // A third infra row exhausts the budget: park.
+        let mut h3 = h.clone();
+        h3.push(mat_row(
+            OutcomeClass::MaterializationInfra,
+            Some("store-2"),
+            500,
+        ));
+        assert_eq!(materialization_decide(&h3, 3), MaterializationVerdict::Park);
+
+        // Empty history: claimable.
+        assert_eq!(
+            materialization_decide::<String>(&[], 3),
+            MaterializationVerdict::Claimable
+        );
+
+        // Zero budget: parked immediately (never claimable).
+        assert_eq!(materialization_decide(&h, 0), MaterializationVerdict::Park);
+    }
+
+    /// Crash-establishment rows (kind=Materialization,
+    /// class=MaterializationInfra, party=Scheduler) count toward the
+    /// materialization budget — OQ1 amendment 1's channel: the
+    /// establishment sweep and the worker report charge the same budget.
+    #[test]
+    fn establishment_written_infra_rows_count_toward_materialization_budget() {
+        // One worker-reported infra row.
+        let worker = mat_row(OutcomeClass::MaterializationInfra, Some("store-0"), 100);
+        // Two establishment-written rows: party=Scheduler, no identity
+        // (the executing replica crashed without reporting).
+        let mut crash_a = mat_row(OutcomeClass::MaterializationInfra, None, 200);
+        crash_a.reporting_party = ReportingParty::Scheduler;
+        let mut crash_b = crash_a.clone();
+        crash_b.at = 300;
+
+        let h = vec![worker, crash_a, crash_b];
+        assert_eq!(
+            materialization_decide(&h[..2], 3),
+            MaterializationVerdict::Claimable,
+            "two of three: still claimable"
+        );
+        assert_eq!(
+            materialization_decide(&h, 3),
+            MaterializationVerdict::Park,
+            "establishment-written rows charge the same budget as worker-reported ones"
+        );
+    }
+
+    /// Build-kind rows are invisible to the materialization budget (the
+    /// partition is two-sided): they neither charge it nor cut its
+    /// reset window — including build RESET rows.
+    #[test]
+    fn build_rows_invisible_to_materialization_decision() {
+        let mat_history = vec![
+            mat_row(OutcomeClass::MaterializationInfra, Some("store-0"), 100),
+            mat_row(OutcomeClass::MaterializationInfra, Some("store-1"), 300),
+        ];
+        let baseline = materialization_decide(&mat_history, 2);
+        assert_eq!(baseline, MaterializationVerdict::Park);
+
+        // Build rows of every flavor — including reset rows, which must
+        // NOT cut the materialization count.
+        let build_rows = [
+            build_row(OutcomeClass::Transient, Some("w1"), 150),
+            build_row(OutcomeClass::Infra, Some("w2"), 250),
+            reset_build_row(OutcomeClass::ResubmitReset, 1, 200),
+            reset_build_row(OutcomeClass::PoisonCleared, 0, 350),
+        ];
+        for pos in 0..=mat_history.len() {
+            for b in &build_rows {
+                let mut h = mat_history.clone();
+                h.insert(pos, b.clone());
+                assert_eq!(
+                    materialization_decide(&h, 2),
+                    baseline,
+                    "a build row at position {pos} changed the materialization decision"
+                );
+            }
+        }
+    }
+
     /// The kernel's dependency-free substring predicate agrees with
     /// `str::contains` for the CONCURRENT_PUTPATH marker over messages
     /// covering the interesting shapes: empty, shorter than the marker,
@@ -2048,9 +2391,15 @@ mod proofs {
         AbsTime::from(v)
     }
 
+    /// Every outcome class, including the two materialization classes
+    /// (the full 15-literal alphabet): the row domain stays a strict
+    /// superset of what any appending site can write, so kind/class
+    /// combinations that are malformed by writer discipline (e.g. a
+    /// build-kind row carrying a materialization class) are inside the
+    /// proven domain and covered by the fold's no-op arms.
     fn any_outcome_class() -> OutcomeClass {
         let i: u8 = kani::any();
-        kani::assume(i < 13);
+        kani::assume(i < 15);
         match i {
             0 => OutcomeClass::Transient,
             1 => OutcomeClass::Infra,
@@ -2064,7 +2413,9 @@ mod proofs {
             9 => OutcomeClass::FleetExhaust,
             10 => OutcomeClass::ResubmitReset,
             11 => OutcomeClass::CacheHitClear,
-            _ => OutcomeClass::PoisonCleared,
+            12 => OutcomeClass::PoisonCleared,
+            13 => OutcomeClass::MaterializationUnobtainable,
+            _ => OutcomeClass::MaterializationInfra,
         }
     }
 
@@ -2080,7 +2431,7 @@ mod proofs {
     }
 
     /// One arbitrary ledger row: every decision-relevant field free
-    /// (class, kind, flags, party, executor, cycle, timestamp). The
+    /// (class, work kind, flags, party, executor, cycle, timestamp). The
     /// fields `decide()` ignores (UUIDs, error messages, the recorded-at
     /// timestamp) are not part of [`LedgerRow`] at all — the scheduler's
     /// projection shim drops them before the kernel ever sees a row.
@@ -2104,6 +2455,14 @@ mod proofs {
             floor_at_cap: kani::any(),
             resubmit_cycle: i32::from(cycle),
             at: small_time(max_at),
+            // Symbolic work kind: the kind-partition harnesses need
+            // both kinds in the domain, and every other harness must
+            // hold over rows of either kind.
+            kind: if kani::any() {
+                AttemptKind::Build
+            } else {
+                AttemptKind::Materialization
+            },
         }
     }
 
@@ -2371,6 +2730,75 @@ mod proofs {
         }
         if fleet.eligible.is_empty() {
             assert!(verdict != Verdict::Poison(PoisonReason::FleetExhausted));
+        }
+    }
+
+    /// The build-kind-only view of a bounded history: clone-initialised
+    /// fixed array + compacted prefix length (no heap, no Vec growth —
+    /// the same array discipline as [`any_history`]). Shared by the two
+    /// kind-partition harnesses below.
+    fn build_only_view<const MAX: usize>(
+        rows: &[LedgerRow<u8>; MAX],
+        n: usize,
+    ) -> ([LedgerRow<u8>; MAX], usize) {
+        let mut filtered: [LedgerRow<u8>; MAX] = rows.clone();
+        let mut m = 0;
+        for row in rows.iter().take(n) {
+            if row.kind == AttemptKind::Build {
+                filtered[m] = row.clone();
+                m += 1;
+            }
+        }
+        (filtered, m)
+    }
+
+    /// materializationInvisibleToBuildBudgets, kernel half
+    /// (substitution-replacement design §2.5, review findings PP-4/BC-2):
+    /// for ANY row set over the full symbolic domain — both work kinds,
+    /// all 15 outcome classes, all parties/flags/identities — the build
+    /// decision over the full set equals the build decision over its
+    /// build-kind-only subset. Verdict, exclusion set, backoff deadline,
+    /// and every counter: materialization rows are invisible to all of
+    /// them, wherever they sit in the history (including ahead of the
+    /// resubmit-cycle seed row).
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn check_materialization_rows_invisible_to_build_decision() {
+        let (rows, n) = any_history::<4>();
+        let history = &rows[..n];
+        let budget = any_small_budget();
+        let now = small_time(16);
+
+        let full = decide(history, &budget, now);
+
+        let (filtered, m) = build_only_view(&rows, n);
+        let build_only = decide(&filtered[..m], &budget, now);
+
+        assert_eq!(full, build_only);
+    }
+
+    /// materializationNeverPoisons, kernel half: no row set produces a
+    /// Poison verdict attributable to its materialization-kind rows —
+    /// if the build-kind subset alone does not poison, the full set
+    /// (with any number of materialization rows, any classes) does not
+    /// poison either. A corollary of the invisibility property, stated
+    /// separately because it is the clause the park-not-fail posture
+    /// (sched.materialize.routing, B3 "unknown never demotes") rests on.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn check_materialization_never_poisons() {
+        let (rows, n) = any_history::<4>();
+        let history = &rows[..n];
+        let budget = any_small_budget();
+        let now = small_time(16);
+
+        let full = decide(history, &budget, now);
+
+        let (filtered, m) = build_only_view(&rows, n);
+        let build_only = decide(&filtered[..m], &budget, now);
+
+        if !matches!(build_only.verdict, Verdict::Poison(_)) {
+            assert!(!matches!(full.verdict, Verdict::Poison(_)));
         }
     }
 }

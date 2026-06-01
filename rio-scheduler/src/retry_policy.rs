@@ -151,6 +151,13 @@ fn record_to_row(record: &AttemptRecord) -> rio_retry_kernel::LedgerRow<String> 
         floor_at_cap: record.floor_at_cap,
         resubmit_cycle: record.resubmit_cycle,
         at: record.occurred_at_epoch_secs as AbsTime,
+        // Every in-memory record is a build attempt until the
+        // suffix-load JOIN populates the real kind from
+        // drv_executions.attempt_kind (the fold-input plumbing that
+        // lands with AttemptRecord.attempt_kind). Build is the identity
+        // value: the kind partition treats it exactly as the
+        // pre-partition fold treated every row.
+        kind: rio_retry_kernel::AttemptKind::Build,
     }
 }
 

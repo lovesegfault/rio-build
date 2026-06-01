@@ -216,7 +216,7 @@ in
   # each other by the kernel's differential unit tests plus the
   # set-semantics harness below.
   #
-  # Six harnesses (in rio-retry-kernel/src/lib.rs `mod proofs`):
+  # Eight harnesses (in rio-retry-kernel/src/lib.rs `mod proofs`):
   #   - check_bounded_set_models_set_semantics: the proof-time bounded
   #     set obeys set semantics over symbolic values (insert newness,
   #     precise membership, distinct-count len, order-insensitivity,
@@ -249,6 +249,14 @@ in
   #   - check_fold_fleet_exhaust_arm: the fold-side fleet-exhaust arm
   #     (E1) needs a non-empty fully-failed fleet; an empty fleet never
   #     poisons.
+  #   - check_materialization_rows_invisible_to_build_decision: the kind
+  #     partition (substitution-replacement design §2.5) — for any row
+  #     set over both work kinds and all 15 outcome classes, the build
+  #     decision over the full set equals the build decision over its
+  #     build-kind-only subset (verdict, exclusion, backoff, counters).
+  #   - check_materialization_never_poisons: the park-not-fail corollary
+  #     — if the build-kind subset alone does not poison, no amount of
+  #     interleaved materialization rows makes the full set poison.
   # r[verify sched.retry.transient-budget]
   # r[verify sched.retry.attempts-bounded+2]
   # r[verify sched.retry.exempt-infra-cap]
@@ -258,7 +266,7 @@ in
   kani-rio-retry-kernel = mkKaniCheck {
     name = "rio-retry-kernel";
     crate = crateBuildKani.members.rio-retry-kernel;
-    expectedHarnesses = 6;
+    expectedHarnesses = 8;
   };
 
   # rio-evidence-kernel: the scheduler's closure-evidence decision kernel
