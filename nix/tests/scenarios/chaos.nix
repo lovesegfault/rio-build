@@ -73,15 +73,59 @@ let
       ''${busybox}/bin/busybox dd if=/dev/urandom of=$out bs=1048576 count=2
     '';
   };
+
+  # Subtest 5: chatty ~90s build. 850 iterations x 0.1s sleep, 130 fat
+  # lines per iteration (~1300 lines/s — far under the 250k lines/s
+  # rate limit): size-driven batching (64-line batches, ~20/s) fills
+  # the full absorption chain — 256-slot sink + 256-slot gRPC outbound
+  # + frozen h2/TCP windows (~540 batches) — about 27s into the 60s
+  # scheduler stall, so the shed counter is decisively nonzero at the
+  # in-stall scrape rather than racing the pipeline depth.
+  stallSurvivorDrv = drvs.mkCustom {
+    name = "rio-test-chaos5stallmark";
+    script = ''
+      i=0
+      while [ $i -lt 850 ]; do
+        j=0
+        while [ $j -lt 130 ]; do
+          echo "chaos5stallmark-line-$i-$j-................................................................................................................................"
+          j=$((j+1))
+        done
+        # CPU-positive busywork: the survives-the-stall assertion reads
+        # cgroup cpu.stat deltas, and a purely sleep-paced script runs
+        # too close to the frozen baseline to discriminate.
+        k=0
+        while [ $k -lt 400 ]; do
+          k=$((k+1))
+        done
+        ''${busybox}/bin/busybox sleep 0.1
+        i=$((i+1))
+      done
+      echo chaos-stall-done > $out
+    '';
+  };
+
+  # Subtest 6: endlessly chatty build (chaos6forevermark in argv); only
+  # the executor's timeout kill ever ends it.
+  stallForeverDrv = drvs.mkCustom {
+    name = "rio-test-chaos6forevermark";
+    script = ''
+      while true; do
+        echo "chaos6forevermark-line-............................................................"
+        ''${busybox}/bin/busybox sleep 0.05
+      done
+    '';
+  };
 in
 pkgs.testers.runNixOSTest {
   name = "rio-chaos";
   skipTypeCheck = true;
   # Boot ~60s + subtest 1 ~10s + subtest 2 ~30s (journal-poll + retry
   # backoff) + subtest 3 ~15s (5s toxic-close + build) + subtest 4 ~30s
-  # (dd + 16s throttled upload) + margin. 600s is generous; the dominant
-  # term is subtest 2's wait_until_succeeds poll loop under VM jitter.
-  globalTimeout = 600 + common.covTimeoutHeadroom;
+  # (dd + 16s throttled upload) + subtest 5 ~130s (85s build spanning a
+  # 60s scheduler stall + post-resume waits) + subtest 6 ~135s (worker
+  # restart + 75s stall with the kill assert inside it) + margin.
+  globalTimeout = 840 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 
@@ -380,6 +424,168 @@ pkgs.testers.runNixOSTest {
             )
         finally:
             control.succeed("toxiproxy-cli toxic remove -n bw worker_store")
+
+    # ══════════════════════════════════════════════════════════════════
+    # Subtest 5: scheduler SIGSTOP 60s — running build survives
+    # ══════════════════════════════════════════════════════════════════
+    # The control/data-plane separation pin at system level: with the
+    # sole scheduler frozen (TCP up, process dead-silent), the worker's
+    # display stream sheds instead of backing up into the executor, the
+    # build keeps consuming CPU mid-stall, and the client gets its store
+    # path after recovery. Flake discipline: structural signals only —
+    # cgroup cpu.stat, process existence, worker metrics; no scheduler
+    # health probes during the stall (its PG lease may lapse and
+    # re-acquire after SIGCONT; heartbeats time out and retry).
+    with subtest("sched-stall-build-survives: CPU advances and build completes"):
+        # Detached launch, the in-scenario proven shape (subtest 2):
+        # the redirections apply to the WHOLE backgrounded group, so no
+        # copy of the test backdoor's fds survives in the job and
+        # `succeed` returns immediately. (A transient systemd unit
+        # would detach too, but loses the login env the ssh-ng store
+        # client needs; a `( ... ) &` with inner-only redirections
+        # blocks `succeed` for the build's whole runtime.)
+        client.succeed(
+            "rm -f /tmp/chaos5.log; "
+            f"{{ timeout 400 nix-build --no-out-link --store '{store_url}' "
+            f"{busybox_arg} ${stallSurvivorDrv}; echo rc=$?; }} "
+            "> /tmp/chaos5.log 2>&1 < /dev/null &"
+        )
+        # Dispatch confirmed structurally: rio-builder creates the
+        # per-build cgroup (named from the sanitized drv path) on the
+        # HOST when the build starts — host pgrep cannot see the
+        # PID-namespaced build script, so the cgroup is the worker-side
+        # dispatch signal. Generous budget: the worker slot is busy
+        # with the previous subtest's teardown for a few seconds.
+        worker.wait_until_succeeds(
+            "find /sys/fs/cgroup -type d -name '*chaos5stallmark*' "
+            "| grep -q .",
+            timeout=180,
+        )
+        cg = worker.succeed(
+            "find /sys/fs/cgroup -type d -name '*chaos5stallmark*' "
+            "| head -1"
+        ).strip()
+        worker.succeed(f"test -r {cg}/cpu.stat")
+
+        control.succeed("systemctl kill --signal=SIGSTOP rio-scheduler")
+        try:
+            time.sleep(30)
+            cpu1 = int(worker.succeed(
+                f"awk '/^usage_usec/ {{print $2}}' {cg}/cpu.stat"
+            ).strip())
+            time.sleep(20)
+            cpu2 = int(worker.succeed(
+                f"awk '/^usage_usec/ {{print $2}}' {cg}/cpu.stat"
+            ).strip())
+            # Pre-isolation: sink(256) + event channel + chunk channel +
+            # pipe fill → the build write-blocks → flatline (<5ms of
+            # residual kernel accounting over 20s). Running, the
+            # sleep-paced-but-busyworked script burns ≥300ms per 20s
+            # window; 100ms sits >20x above frozen and >3x below
+            # running.
+            assert cpu2 - cpu1 > 100_000, (
+                f"build CPU flatlined during the scheduler stall "
+                f"(delta {cpu2 - cpu1} usec over 20s) — the worker froze "
+                "with the link"
+            )
+            time.sleep(10)  # complete the 60s stall window
+            # The display stream shed during the stall (counted,
+            # structural) — scraped INSIDE the stall window because the
+            # per-build worker process (and its metric registry) exits
+            # after completion; a post-recovery scrape would read a
+            # fresh, empty process.
+            worker.succeed(
+                "curl -sf localhost:9093/metrics | "
+                "grep -E 'rio_builder_log_messages_shed_total.+ [1-9][0-9]*$'"
+            )
+        finally:
+            control.succeed("systemctl kill --signal=SIGCONT rio-scheduler")
+
+        # Post-recovery: generous window (lease re-acquire, heartbeat
+        # retries, completion delivery are all allowed to take time).
+        client.wait_until_succeeds(
+            "grep -q '^/nix/store/.*chaos5stallmark' /tmp/chaos5.log "
+            "&& grep -qx 'rc=0' /tmp/chaos5.log",
+            timeout=180,
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # Subtest 6: scheduler SIGSTOP 75s — the timeout kill fires INSIDE it
+    # ══════════════════════════════════════════════════════════════════
+    # 45s build timeout via worker config (drop-in + restart: the env is
+    # worker-wide, and subtest 5's build needed the 2h default). 75s
+    # stall with the kill due at 45s: at stall+55s the build tree must
+    # be GONE while the scheduler is still frozen — the discriminator
+    # between "killed on time" and "frozen by backpressure" (both
+    # flatline CPU). 45s timeout + 75s stall stays under the scheduler's
+    # 45+90=135s worker deadline: no reassignment race.
+    with subtest("sched-stall-timeout-still-fires: kill lands mid-stall"):
+        worker.succeed(
+            "mkdir -p /run/systemd/system/rio-builder.service.d && "
+            "printf '[Service]\nEnvironment=RIO_BUILD_TIMEOUT_SECS=45\n' "
+            "> /run/systemd/system/rio-builder.service.d/chaos-timeout.conf && "
+            "systemctl daemon-reload && systemctl restart rio-builder"
+        )
+        control.wait_until_succeeds(
+            "curl -sf http://localhost:9091/metrics | "
+            "grep -x 'rio_scheduler_workers_active 1'",
+            timeout=60,
+        )
+
+        client.succeed(
+            "rm -f /tmp/chaos6.log; "
+            f"{{ timeout 400 nix-build --no-out-link --store '{store_url}' "
+            f"{busybox_arg} ${stallForeverDrv}; echo rc=$?; }} "
+            "> /tmp/chaos6.log 2>&1 < /dev/null &"
+        )
+        worker.wait_until_succeeds(
+            "find /sys/fs/cgroup -type d -name '*chaos6forevermark*' "
+            "| grep -q .",
+            timeout=180,
+        )
+
+        control.succeed("systemctl kill --signal=SIGSTOP rio-scheduler")
+        try:
+            # Kill due ~45s after build start (the cgroup-creation
+            # instant, moments before this stall began); assert at
+            # stall+55s, still 20s inside the stall: the build cgroup
+            # must hold no processes (or be torn down entirely) — the
+            # discriminator between "killed on time" and "frozen".
+            time.sleep(55)
+            worker.fail(
+                "for d in $(find /sys/fs/cgroup -type d "
+                "-name '*chaos6forevermark*'); do cat $d/cgroup.procs; "
+                "done | grep -q ."
+            )
+        finally:
+            time.sleep(20)  # complete the 75s stall
+            control.succeed("systemctl kill --signal=SIGCONT rio-scheduler")
+
+        # The buffered TimedOut completion reaches the scheduler after
+        # recovery. The structural receipt is the timeout handler's
+        # signature action: it bumps and PERSISTS the derivation's
+        # deadline floor before re-queueing. We deliberately do NOT
+        # wait for the client-visible failure — the scheduler retries
+        # TimedOut builds with a promoted deadline (up to its retry
+        # max) by design, so nix-build only exits nonzero after that
+        # ladder exhausts (~4 x 50s, beyond any sane window here); the
+        # ladder itself is lifecycle-suite territory. This subtest's
+        # property ends at "the kill's outcome crossed the recovered
+        # link and was durably processed".
+        control.wait_until_succeeds(
+            "sudo -u postgres psql rio -qtAc "
+            "\"SELECT 1 FROM derivations WHERE drv_path "
+            "LIKE '%chaos6forevermark%' AND floor_deadline_secs > 0\" "
+            "| grep -q 1",
+            timeout=120,
+        )
+        # Tear down the retry ladder's in-flight client build and
+        # restore the default-timeout worker.
+        client.succeed("pkill -f 'chaos6forevermar[k]' || true")
+        worker.succeed(
+            "rm -f /run/systemd/system/rio-builder.service.d/chaos-timeout.conf && "
+            "systemctl daemon-reload && systemctl restart rio-builder"
+        )
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';

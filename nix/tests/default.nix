@@ -666,6 +666,18 @@ in
   # is standalone + a proxy systemd unit on control; see fixtures/
   # toxiproxy.nix for why not a separate VM (scheduler connect_store
   # boot race). ~4-5min.
+  # r[verify builder.exec.limits-isolated]
+  #   sched-stall-timeout-still-fires: the build-timeout kill lands
+  #   DURING a 75s scheduler SIGSTOP — no process in the build cgroup
+  #   10s past the deadline, while the scheduler link is still frozen —
+  #   proving enforcement owns no channel path a stalled consumer could
+  #   park.
+  # r[verify builder.relay.log-shed]
+  #   sched-stall-build-survives: a chatty build keeps consuming CPU
+  #   through a 60s scheduler SIGSTOP (cgroup cpu.stat advances
+  #   mid-stall), completes after recovery, and the worker's
+  #   rio_builder_log_messages_shed_total shows the display stream shed
+  #   instead of freezing the build.
   vm-chaos-standalone = chaos {
     inherit pkgs common;
     fixture = toxiproxy { };

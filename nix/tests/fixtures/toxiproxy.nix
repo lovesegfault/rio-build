@@ -54,6 +54,10 @@
   rio-workspace,
   rioModules,
   coverage ? false,
+  # Merged into the worker's rio-builder service environment
+  # (mkWorkerNode extraServiceEnv) — chaos scenarios use it for
+  # worker-config knobs that have no per-build channel.
+  extraWorkerEnv ? { },
   ...
 }:
 let
@@ -154,6 +158,7 @@ _: {
       imports = [
         (common.mkWorkerNode {
           hostName = "worker";
+          extraServiceEnv = extraWorkerEnv;
         })
       ];
       # mkWorkerNode hardcodes storeAddr = "control:9002" with no override
