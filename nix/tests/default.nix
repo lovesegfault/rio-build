@@ -423,6 +423,14 @@ in
   #   and per-aid done is monotone non-decreasing. The store-side
   #   indeterminate→hits unit tests cover the probe; this proves the
   #   full scheduler→gateway→client wire path.
+  # r[verify sched.materialize.job]
+  # r[verify sched.materialize.pinning]
+  #   materialization-dormant: after the six substitution subtests, the
+  #   five-table zero-count proves flag-off dormancy at deployment level
+  #   (jobs/wanted tables non-vacuously — substitution traffic is exactly
+  #   what would create jobs flag-on; the attempt/execution/pin clauses
+  #   are covered by the lifecycle-core fragment, which has real builder
+  #   traffic). Plus the systemd-unit env guard on scheduler + store.
   vm-substitute-standalone =
     let
       jwtKeys = import ./lib/jwt-keys.nix;
@@ -746,6 +754,14 @@ in
       #   with the subtests above), so it folds into core rather than
       #   paying a separate k3s boot.
       "pool-lifecycle"
+      # r[verify sched.materialize.job]      (traffic half: builds mint only build-kind rows)
+      # r[verify sched.materialize.pinning]  (traffic half: builds write only build_input pins)
+      #   materialization-dormant: the five-table zero-count against a
+      #   deployment whose builder traffic (cancel-cgroup-kill,
+      #   build-timeout above) HAS minted executions — proving the
+      #   attempt/execution/pin dormancy clauses non-vacuously. Placed
+      #   LAST: it audits the residue of everything before it.
+      "materialization-dormant"
     ];
   };
 

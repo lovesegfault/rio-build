@@ -698,6 +698,45 @@ pkgs.testers.runNixOSTest {
             f"{n_progress} resProgress events all done≤expected and monotone"
         )
 
+    # ══════════════════════════════════════════════════════════════════
+    # materialization-dormant — Phase A dormancy criterion 2 (flag-off)
+    # ══════════════════════════════════════════════════════════════════
+    # Substitution-replacement campaign: after the six substitution
+    # subtests above (cold-fetch, sig-mode-add, cross-tenant-gate,
+    # built-path-cross-tenant-gate, ssh-ng, progress-e2e) have driven
+    # the full merge → probe → walk → completion path — exactly the
+    # path that would create materialization jobs flag-on — the
+    # materialization tables must be EMPTY and no ledger/execution row
+    # may carry a materialization kind/class. Asserted against a real
+    # deployment doing real substitution work with the flags at their
+    # default (false). The attempt/execution/pin clauses are vacuously
+    # zero here (this fixture has zero workers); the lifecycle-core
+    # fragment proves those against real builder traffic.
+    with subtest("materialization-dormant: flag-off deployment creates no materialization state"):
+        rows = psql(
+            ${gatewayHost},
+            "SELECT (SELECT count(*) FROM materialization_jobs)"
+            " + (SELECT count(*) FROM build_wanted_outputs)"
+            " + (SELECT count(*) FROM drv_attempts WHERE outcome_class LIKE 'materialization%')"
+            " + (SELECT count(*) FROM drv_executions WHERE attempt_kind = 'materialization')"
+            " + (SELECT count(*) FROM scheduler_live_pins WHERE pin_kind = 'materialization')",
+        )
+        assert rows == "0", (
+            f"flag-off deployment created materialization state: {rows} row(s) "
+            f"across the five dormancy tables/clauses (Phase A criterion 2 violation)"
+        )
+
+        # And the flags really are off in the SERVICES' environment (not
+        # the test driver's shell — printenv in a fresh succeed() shell
+        # can never see the unit's env, so that guard could never fail).
+        # Assert against the units' real environment via systemd.
+        for unit in ["rio-scheduler", "rio-store"]:
+            env = ${gatewayHost}.succeed(f"systemctl show {unit} --property=Environment")
+            assert "RIO_MATERIALIZATION__ENABLED=true" not in env, (
+                f"scenario unexpectedly enables materialization on {unit}: {env}"
+            )
+        print("materialization-dormant PASS: zero rows in all five clauses, flags off")
+
     client.execute("systemctl stop test-cache 2>/dev/null || true")
 
     ${common.collectCoverage fixture.pyNodeVars}
