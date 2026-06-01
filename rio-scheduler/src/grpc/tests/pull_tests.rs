@@ -413,6 +413,77 @@ async fn materialization_pull_instance_validated_as_dns_label() -> anyhow::Resul
     Ok(())
 }
 
+// r[verify sched.executor.input-bounds+2]
+/// Identity hygiene (security review, separator confusion): `intent_id`
+/// is the whole pulling identity for build pulls and the left half of
+/// the composite materialization ExecutorId (`{intent}@{instance}`). A
+/// literal `@` inside it lets two distinct work items collide on one
+/// identity string — a build pull for intent `a@b` and a
+/// materialization pull for intent `a` on replica `b` are
+/// indistinguishable to the kernel's same-identity re-delivery arm.
+/// Intent ids are scheduler-generated (drv hashes), so a `@` is never
+/// legitimate; the gRPC layer rejects it closed on every carrier and
+/// kind, before any actor state is touched.
+#[tokio::test]
+async fn pull_intent_id_with_separator_rejected() -> anyhow::Result<()> {
+    use rio_auth::hmac::{ExecutorClaims, HmacKey};
+    use rio_proto::ExecutorService;
+
+    // 1. The finding's exact shape: a VERIFIED executor token whose
+    //    claims carry an `@` intent. The attestation match forces the
+    //    request to repeat the claims' intent, so the ambiguous string
+    //    is exactly what would become the pulling identity.
+    let (_db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    let key = std::sync::Arc::new(HmacKey::from_key(
+        b"test-key-32-bytes-long-here!!!!!".to_vec(),
+    ));
+    grpc.hmac_key = Some(std::sync::Arc::clone(&key));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let ambiguous = "drv-a@store-replica-0";
+    let token = key.sign(&ExecutorClaims {
+        intent_id: ambiguous.into(),
+        kind: rio_proto::types::ExecutorKind::Builder as i32,
+        expiry_unix: now + 600,
+    });
+    let err = grpc
+        .pull_assignment(Request::new(rio_proto::types::PullAssignmentRequest {
+            executor_token: token,
+            intent_id: ambiguous.into(),
+            kind: rio_proto::types::AttemptKind::Build.into(),
+            executor_instance: String::new(),
+        }))
+        .await
+        .expect_err("a build pull whose attested intent contains '@' must be rejected");
+    assert_eq!(
+        err.code(),
+        tonic::Code::InvalidArgument,
+        "expected InvalidArgument for '@' in intent_id, got {err:?}"
+    );
+
+    // 2. Dev mode, materialization kind: the same string in the raw
+    //    request field would be interpolated as the composite's left
+    //    half — `a@b` + `c` collides with `a` + `b@c`-style splits.
+    //    The hygiene does not depend on a token existing.
+    let (_db2, grpc2, _handle2, _actor_task2) = setup_grpc().await;
+    let err = grpc2
+        .pull_assignment(Request::new(rio_proto::types::PullAssignmentRequest {
+            executor_token: String::new(),
+            intent_id: ambiguous.into(),
+            kind: rio_proto::types::AttemptKind::Materialization.into(),
+            executor_instance: "store-replica-0".into(),
+        }))
+        .await
+        .expect_err("a materialization pull whose intent contains '@' must be rejected");
+    assert_eq!(
+        err.code(),
+        tonic::Code::InvalidArgument,
+        "expected InvalidArgument for '@' in intent_id, got {err:?}"
+    );
+    Ok(())
+}
+
 // ── The store-service credential (Wave-4 security obligation:
 //    the kind-attested materialization credential) ──
 

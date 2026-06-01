@@ -31,7 +31,11 @@ use super::SchedulerGrpc;
 //              the actor — a lost completion strands the derivation in
 //              Running).
 // PullAssignment RPC (pull-mode dispatch):
-//   intent_id                         → DAG lookup, assignments/executions rows → reject RPC > MAX_IDENT_LEN
+//   intent_id                         → DAG lookup, assignments/executions rows; the build-pull identity
+//                                       and the left half of the composite materialization ExecutorId →
+//                                       reject RPC > MAX_IDENT_LEN; reject RPC if it contains '@' (the
+//                                       composite separator — keeps build identities and materialization
+//                                       composites disjoint)
 //   executor_token                    → HMAC-verified then dropped        → reject RPC > MAX_EXECUTOR_TOKEN_LEN
 //                                       (verification fails on any tamper; the bound only caps the hash work)
 //   kind                              → enum/i32 (UNSPECIFIED|BUILD → Build; MATERIALIZATION →
@@ -369,6 +373,20 @@ impl ExecutorService for SchedulerGrpc {
         }
         // r[impl sched.executor.input-bounds+2]
         rio_common::grpc::check_bound("intent_id bytes", req.intent_id.len(), MAX_IDENT_LEN)?;
+        // Identity hygiene (security review, separator confusion): `@`
+        // is the composite-identity separator (`{intent}@{instance}`).
+        // An intent carrying it would let a build identity collide with
+        // a materialization composite (intent `a@b` vs intent `a` on
+        // replica `b`), confusing the kernel's same-identity
+        // re-delivery arm. Intent ids are scheduler-generated drv
+        // hashes and never contain `@` — reject closed (defense in
+        // depth), every kind, every carrier.
+        // r[impl sched.executor.input-bounds+2]
+        if req.intent_id.contains('@') {
+            return Err(Status::invalid_argument(
+                "intent_id must not contain '@' (the composite-identity separator)",
+            ));
+        }
         // BC-1: the per-replica identity is mandatory for the
         // materialization kind (it is what makes the kernel's
         // one-winner arbitration per-replica); for build pulls the
