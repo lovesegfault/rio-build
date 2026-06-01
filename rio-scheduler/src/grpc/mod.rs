@@ -65,6 +65,16 @@ pub struct SchedulerGrpc {
     /// [`Self::require_executor`] rejects `BuildExecution` /
     /// `Heartbeat` without a valid `x-rio-executor-token`.
     pub(super) hmac_key: Option<Arc<HmacKey>>,
+    /// Service-HMAC verifier (the `x-rio-service-token` family — the
+    /// SEPARATE key the admin surfaces verify). Verifies the store's
+    /// kind-attested materialization credential
+    /// (`ServiceClaims { caller: "rio-store" }`) on the
+    /// materialization-only ExecutorService operations
+    /// (ListMaterializationJobs, kind=MATERIALIZATION PullAssignment,
+    /// materialization ReportOutcome). `None` + `hmac_key: None` = full
+    /// dev mode (open); `None` + `hmac_key: Some` = closed for
+    /// materialization operations (no acceptable credential exists).
+    pub(super) service_verifier: Option<Arc<HmacKey>>,
 }
 
 impl SchedulerGrpc {
@@ -77,6 +87,7 @@ impl SchedulerGrpc {
             is_leader: Arc::new(AtomicBool::new(true)),
             jwt_mode: false,
             hmac_key: None,
+            service_verifier: None,
         }
     }
 
@@ -90,6 +101,7 @@ impl SchedulerGrpc {
             is_leader: Arc::new(AtomicBool::new(true)),
             jwt_mode: false,
             hmac_key: None,
+            service_verifier: None,
         }
     }
 
@@ -101,12 +113,15 @@ impl SchedulerGrpc {
     /// `jwt_mode`: whether a JWT pubkey is configured (drives
     /// `require_tenant`). `hmac_key`: assignment-HMAC key, reused as
     /// the executor-identity verifier (drives `require_executor`).
+    /// `service_verifier`: service-HMAC verifier for the store's
+    /// materialization credential (drives `require_store_service`).
     pub fn new(
         actor: ActorHandle,
         db: SchedulerDb,
         is_leader: Arc<AtomicBool>,
         jwt_mode: bool,
         hmac_key: Option<Arc<HmacKey>>,
+        service_verifier: Option<Arc<HmacKey>>,
     ) -> Self {
         Self {
             actor,
@@ -114,6 +129,7 @@ impl SchedulerGrpc {
             is_leader,
             jwt_mode,
             hmac_key,
+            service_verifier,
         }
     }
 

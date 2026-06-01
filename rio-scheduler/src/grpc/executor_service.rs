@@ -37,8 +37,10 @@ use super::SchedulerGrpc;
 //   kind                              → enum/i32 (UNSPECIFIED|BUILD → Build; MATERIALIZATION →
 //                                       Materialization); decides identity binding + attempt_kind column.
 //                                       AUTHZ: MATERIALIZATION + any verified executor token → reject RPC
-//                                       PermissionDenied (no executor credential authorizes the kind;
-//                                       the store-service credential is the Wave-4 obligation)
+//                                       PermissionDenied (no executor credential authorizes the kind);
+//                                       the kind-attested store-service credential
+//                                       (ServiceClaims caller="rio-store", x-rio-service-token) is what
+//                                       authorizes it — verified then dropped → reject RPC > MAX_EXECUTOR_TOKEN_LEN
 //   executor_instance                 → BC-1 per-replica identity, interpolated into the composite
 //                                       ExecutorId and assignments/executions rows → reject RPC unless a
 //                                       DNS-1123 label (lowercase alnum + interior hyphens, ≤63; excludes
@@ -54,12 +56,15 @@ use super::SchedulerGrpc;
 //   materialization_outcome.*         → routed to the materialization consumption transaction for
 //                                       materialization-kind attempts; acknowledged-and-ignored for
 //                                       build attempts (kindMatchesWorker). Mutually exclusive with
-//                                       report (reject RPC when both set). Path/cause strings land in
-//                                       ledger error_msg / routing inputs → reject RPC if report also set;
+//                                       report (reject RPC when both set). AUTHZ: requires the
+//                                       store-service credential; an executor-authenticated report
+//                                       carrying it → reject RPC PermissionDenied. Path/cause strings land
+//                                       in ledger error_msg / routing inputs → reject RPC if report also set;
 //                                       per-field truncation rides MAX_ERROR_MSG_LEN at the ledger append
 // ListMaterializationJobs RPC (leader-served store poll):
-//   service_token                     → HMAC-verified then dropped (the body fallback carrier;
-//                                       same family as executor tokens)   → reject RPC > MAX_EXECUTOR_TOKEN_LEN
+//   service_token                     → HMAC-verified then dropped (the body fallback carrier for the
+//                                       store-service credential; an executor token here is rejected) →
+//                                       reject RPC > MAX_EXECUTOR_TOKEN_LEN
 //   limit                             → numeric; clamped to 256 actor-side → n/a
 // ReportMaterializationProgress RPC (Phase A: validate + acknowledge-and-drop, per the wire contract):
 //   exec_id                           → UUID-parsed for validation, then dropped → reject RPC if not a
@@ -109,6 +114,131 @@ pub(super) fn is_dns1123_label(s: &str) -> bool {
         && !s.ends_with('-')
 }
 
+/// `ServiceClaims.caller` values whose service token authorizes
+/// materialization operations (the Wave-4 kind-attested store
+/// credential). Exactly the store service: the credential attests the
+/// caller IS a store replica — the work class materialization belongs
+/// to — not merely "some control-plane service".
+const MATERIALIZATION_SERVICE_CALLERS: &[&str] = &["rio-store"];
+
+/// Outcome of the store-service credential gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StoreServiceAuth {
+    /// A valid `ServiceClaims{caller="rio-store"}` token was presented.
+    Authorized,
+    /// Full dev mode (no executor HMAC key AND no service verifier):
+    /// open, the flag gate decides — the same posture every other
+    /// ExecutorService unary has in dev mode.
+    DevMode,
+}
+
+impl SchedulerGrpc {
+    /// The store-service credential gate for materialization operations
+    /// (the Wave-4 kind-attested credential — security-review findings
+    /// 2/3 from the Wave-3 hardening).
+    ///
+    /// Materialization pulls / job listing / outcome reports are
+    /// fleet-level STORE operations, not per-intent executor
+    /// operations: the authorizing credential is
+    /// `ServiceClaims { caller: "rio-store" }` signed with the SEPARATE
+    /// service-HMAC key (the same `x-rio-service-token` family the
+    /// admin surfaces verify) — never an executor token.
+    ///
+    /// Carriers: the `x-rio-service-token` metadata header (what
+    /// `rio_auth::hmac::ServiceTokenInterceptor` attaches), with
+    /// `body_token` as the body fallback for requests whose proto
+    /// carries one (`ListMaterializationJobsRequest.service_token`).
+    ///
+    /// Closed-by-default: the only open outcome is full dev mode
+    /// (neither key family configured). A configured deployment with a
+    /// missing/invalid/wrong-caller/wrong-key token is rejected.
+    // r[impl sched.materialize.job]
+    pub(super) fn require_store_service<T>(
+        &self,
+        req: &tonic::Request<T>,
+        body_token: &str,
+    ) -> Result<StoreServiceAuth, Status> {
+        // Full dev mode → open (the flag gate answers; flag-off that is
+        // the empty list / NotYetReady / ack-and-ignore).
+        if self.hmac_key.is_none() && self.service_verifier.is_none() {
+            return Ok(StoreServiceAuth::DevMode);
+        }
+        // Locate a presented token: metadata carrier first, body
+        // fallback second.
+        let token = req
+            .metadata()
+            .get(rio_common::grpc::SERVICE_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .or_else(|| (!body_token.is_empty()).then(|| body_token.to_owned()));
+        let Some(token) = token else {
+            // No service credential presented in an authenticated
+            // deployment → the same closed answer the executor-token
+            // unaries give credential-less calls.
+            return Err(Status::unauthenticated(
+                "materialization operations require x-rio-service-token \
+                 (the store-service credential)",
+            ));
+        };
+        // r[impl sched.executor.input-bounds+2]
+        rio_common::grpc::check_bound("service token bytes", token.len(), MAX_EXECUTOR_TOKEN_LEN)?;
+        let Some(verifier) = &self.service_verifier else {
+            // Half-configured deployment (executor HMAC without a
+            // service key): the presented credential cannot be
+            // verified → closed.
+            return Err(Status::permission_denied(
+                "a store-service credential was presented but the scheduler has \
+                 no service-HMAC verifier configured",
+            ));
+        };
+        let claims: rio_auth::hmac::ServiceClaims = verifier.verify(&token).map_err(|e| {
+            Status::permission_denied(format!("store-service token verification failed: {e}"))
+        })?;
+        if !MATERIALIZATION_SERVICE_CALLERS.contains(&claims.caller.as_str()) {
+            return Err(Status::permission_denied(format!(
+                "service-token caller {:?} does not authorize materialization \
+                 operations (allowed: {MATERIALIZATION_SERVICE_CALLERS:?})",
+                claims.caller
+            )));
+        }
+        Ok(StoreServiceAuth::Authorized)
+    }
+
+    /// Whether the request presents a token that VERIFIES as an
+    /// executor credential, on either carrier (`x-rio-executor-token`
+    /// metadata or the given body field). Used by the materialization
+    /// authorization arms: a verified executor credential never
+    /// authorizes the materialization kind regardless of carrier
+    /// (the Wave-3 rejection, kept verbatim).
+    ///
+    /// `None` when no executor HMAC key is configured, when no token is
+    /// present, or when what is present does not verify — the caller
+    /// then consults the store-service gate, which gives the precise
+    /// closed/open answer.
+    pub(super) fn verified_executor_claims<T>(
+        &self,
+        req: &tonic::Request<T>,
+        body_token: &str,
+    ) -> Option<rio_auth::hmac::ExecutorClaims> {
+        let key = self.hmac_key.as_ref()?;
+        if let Some(tok) = req
+            .metadata()
+            .get(rio_proto::EXECUTOR_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok())
+            && let Ok(claims) = key.verify::<rio_auth::hmac::ExecutorClaims>(tok)
+        {
+            return Some(claims);
+        }
+        if !body_token.is_empty()
+            && body_token.len() <= MAX_EXECUTOR_TOKEN_LEN
+            && let Ok(claims) = key.verify::<rio_auth::hmac::ExecutorClaims>(body_token)
+        {
+            return Some(claims);
+        }
+        None
+    }
+}
+
 #[tonic::async_trait]
 impl ExecutorService for SchedulerGrpc {
     // Pull-mode dispatch surface — the only work-delivery path.
@@ -126,66 +256,13 @@ impl ExecutorService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
-        // r[impl sec.executor.identity-token+2]
-        // The same token↔intent binding the stream/heartbeat path
-        // enforces, applied per-unary. The token may arrive in metadata
-        // (x-rio-executor-token) or in the request body (the unary is
-        // self-contained for clients that cannot set per-call
-        // metadata); either carrier is verified by the same key. The
-        // FULL claims are kept (not just the intent) so the kind
-        // authorization below can consult them.
-        let auth_claims: Option<rio_auth::hmac::ExecutorClaims> = match self
-            .require_executor(&request)
-        {
-            Ok(claims) => claims,
-            Err(metadata_err) => {
-                let body_token = request.get_ref().executor_token.as_str();
-                if body_token.is_empty() {
-                    metrics::counter!(
-                        "rio_scheduler_pull_rejected_total",
-                        "rpc" => "pull_assignment",
-                        "reason" => "unauthenticated"
-                    )
-                    .increment(1);
-                    return Err(metadata_err);
-                }
-                // r[impl sched.executor.input-bounds+2]
-                rio_common::grpc::check_bound(
-                    "executor_token bytes",
-                    body_token.len(),
-                    MAX_EXECUTOR_TOKEN_LEN,
-                )?;
-                let Some(key) = &self.hmac_key else {
-                    // require_executor only fails when a key is
-                    // configured; unreachable, but stay closed.
-                    return Err(metadata_err);
-                };
-                let claims: rio_auth::hmac::ExecutorClaims =
-                    key.verify(body_token).map_err(|e| {
-                        metrics::counter!(
-                            "rio_scheduler_pull_rejected_total",
-                            "rpc" => "pull_assignment",
-                            "reason" => "unauthenticated"
-                        )
-                        .increment(1);
-                        Status::unauthenticated(format!("executor_token verification failed: {e}"))
-                    })?;
-                Some(claims)
-            }
-        };
-        let auth_intent = auth_claims.as_ref().map(|c| c.intent_id.clone());
-        let req = request.into_inner();
-        if req.intent_id.is_empty() {
-            return Err(Status::invalid_argument("intent_id is required"));
-        }
-        // r[impl sched.executor.input-bounds+2]
-        rio_common::grpc::check_bound("intent_id bytes", req.intent_id.len(), MAX_IDENT_LEN)?;
-
-        // Substitution-replacement: the claimed work class. Proto3 zero
-        // value (UNSPECIFIED) and BUILD both map to Build — deployed
-        // builder pods that predate the field send nothing and behave
-        // bit-for-bit as before (the frozen pull-contract addendum).
-        let kind = match req.kind() {
+        // Substitution-replacement: the claimed work class, read before
+        // the identity gate because it selects WHICH credential family
+        // applies. Proto3 zero value (UNSPECIFIED) and BUILD both map to
+        // Build — deployed builder pods that predate the field send
+        // nothing and behave bit-for-bit as before (the frozen
+        // pull-contract addendum).
+        let kind = match request.get_ref().kind() {
             rio_proto::types::AttemptKind::Materialization => {
                 rio_evidence_kernel::pull::PullKind::Materialization
             }
@@ -193,28 +270,105 @@ impl ExecutorService for SchedulerGrpc {
                 rio_evidence_kernel::pull::PullKind::Build
             }
         };
-        // Kind authorization (security review): an executor token is the
-        // per-intent BUILDER/FETCHER credential — its `kind` claim
-        // attests the pod class for the FOD airgap, not the
-        // materialization work class. No token kind that authorizes a
-        // materialization claim exists in Phase A (the kind-attested
-        // store credential is the Wave-4 store-executor obligation), so
-        // every authenticated materialization pull is rejected closed.
-        // Dev mode (no HMAC key, no claims) falls through to the flag
-        // gate, which parks/dismisses while materialization dispatch is
-        // disabled.
-        if kind == rio_evidence_kernel::pull::PullKind::Materialization && auth_claims.is_some() {
-            metrics::counter!(
-                "rio_scheduler_pull_rejected_total",
-                "rpc" => "pull_assignment",
-                "reason" => "kind_unauthorized"
-            )
-            .increment(1);
-            return Err(Status::permission_denied(
-                "executor tokens do not authorize materialization pulls \
-                 (a store-service credential is required)",
-            ));
+        // r[impl sec.executor.identity-token+2]
+        // Identity gates, per work class:
+        //
+        // BUILD pulls (the as-built path, byte-identical): the executor
+        // token↔intent binding the stream/heartbeat path enforces,
+        // applied per-unary. The token may arrive in metadata
+        // (x-rio-executor-token) or in the request body (the unary is
+        // self-contained for clients that cannot set per-call metadata);
+        // either carrier is verified by the same key.
+        //
+        // MATERIALIZATION pulls (the Wave-3/Wave-4 authorization): an
+        // executor token is the per-intent BUILDER/FETCHER credential —
+        // its `kind` claim attests the pod class for the FOD airgap, not
+        // the materialization work class — so it never authorizes the
+        // kind, on either carrier. The kind-attested store-service
+        // credential (ServiceClaims caller="rio-store", the separate
+        // x-rio-service-token key family) is what does. Full dev mode
+        // (neither key family configured) falls through to the flag
+        // gate, which parks while materialization dispatch is disabled.
+        let auth_claims: Option<rio_auth::hmac::ExecutorClaims> =
+            if kind == rio_evidence_kernel::pull::PullKind::Materialization {
+                let body_token = request.get_ref().executor_token.as_str();
+                if self
+                    .verified_executor_claims(&request, body_token)
+                    .is_some()
+                {
+                    metrics::counter!(
+                        "rio_scheduler_pull_rejected_total",
+                        "rpc" => "pull_assignment",
+                        "reason" => "kind_unauthorized"
+                    )
+                    .increment(1);
+                    return Err(Status::permission_denied(
+                        "executor tokens do not authorize materialization pulls \
+                     (a store-service credential is required)",
+                    ));
+                }
+                // r[impl sched.materialize.job]
+                if let Err(e) = self.require_store_service(&request, "") {
+                    metrics::counter!(
+                        "rio_scheduler_pull_rejected_total",
+                        "rpc" => "pull_assignment",
+                        "reason" => "kind_unauthorized"
+                    )
+                    .increment(1);
+                    return Err(e);
+                }
+                // The store credential is fleet-level, not per-intent: the
+                // pulling identity is the composite (intent, replica) pair
+                // the kernel arbitrates on, so there is no auth_intent.
+                None
+            } else {
+                match self.require_executor(&request) {
+                    Ok(claims) => claims,
+                    Err(metadata_err) => {
+                        let body_token = request.get_ref().executor_token.as_str();
+                        if body_token.is_empty() {
+                            metrics::counter!(
+                                "rio_scheduler_pull_rejected_total",
+                                "rpc" => "pull_assignment",
+                                "reason" => "unauthenticated"
+                            )
+                            .increment(1);
+                            return Err(metadata_err);
+                        }
+                        // r[impl sched.executor.input-bounds+2]
+                        rio_common::grpc::check_bound(
+                            "executor_token bytes",
+                            body_token.len(),
+                            MAX_EXECUTOR_TOKEN_LEN,
+                        )?;
+                        let Some(key) = &self.hmac_key else {
+                            // require_executor only fails when a key is
+                            // configured; unreachable, but stay closed.
+                            return Err(metadata_err);
+                        };
+                        let claims: rio_auth::hmac::ExecutorClaims =
+                            key.verify(body_token).map_err(|e| {
+                                metrics::counter!(
+                                    "rio_scheduler_pull_rejected_total",
+                                    "rpc" => "pull_assignment",
+                                    "reason" => "unauthenticated"
+                                )
+                                .increment(1);
+                                Status::unauthenticated(format!(
+                                    "executor_token verification failed: {e}"
+                                ))
+                            })?;
+                        Some(claims)
+                    }
+                }
+            };
+        let auth_intent = auth_claims.as_ref().map(|c| c.intent_id.clone());
+        let req = request.into_inner();
+        if req.intent_id.is_empty() {
+            return Err(Status::invalid_argument("intent_id is required"));
         }
+        // r[impl sched.executor.input-bounds+2]
+        rio_common::grpc::check_bound("intent_id bytes", req.intent_id.len(), MAX_IDENT_LEN)?;
         // BC-1: the per-replica identity is mandatory for the
         // materialization kind (it is what makes the kernel's
         // one-winner arbitration per-replica); for build pulls the
@@ -311,20 +465,50 @@ impl ExecutorService for SchedulerGrpc {
         self.ensure_leader()?;
         self.check_actor_alive()?;
         // r[impl sec.executor.identity-token+2]
-        // The metadata header is the report's only identity carrier
-        // (the frozen signature has no body token field), so a missing
-        // or invalid token under the enforced HMAC posture is counted
-        // for alertability — the rejected pod's own logs are ephemeral.
+        // Identity, per payload class:
+        //
+        // BUILD reports (the as-built path, byte-identical): the
+        // metadata header is the report's only identity carrier (the
+        // frozen signature has no body token field), so a missing or
+        // invalid token under the enforced HMAC posture is counted for
+        // alertability — the rejected pod's own logs are ephemeral.
+        //
+        // MATERIALIZATION reports (`materialization_outcome` set): the
+        // reporter is a store replica, whose identity is the
+        // kind-attested store-service credential — not a per-intent
+        // executor token (the store holds none). The exec_id names the
+        // attempt; the actor's kind dispatch guarantees a
+        // store-credential report can only ever consume
+        // materialization-kind attempts (a build attempt
+        // acknowledges-and-ignores the payload).
         let auth_intent = match self.require_executor(&request) {
             Ok(claims) => claims.map(|c| c.intent_id),
-            Err(e) => {
-                metrics::counter!(
-                    "rio_scheduler_pull_rejected_total",
-                    "rpc" => "report_outcome",
-                    "reason" => "unauthenticated"
-                )
-                .increment(1);
-                return Err(e);
+            Err(metadata_err) => {
+                if request.get_ref().materialization_outcome.is_some() {
+                    // r[impl sched.materialize.job]
+                    match self.require_store_service(&request, "") {
+                        // Authorized store replica (or full dev mode):
+                        // fleet-level credential, no per-intent binding.
+                        Ok(_) => None,
+                        Err(e) => {
+                            metrics::counter!(
+                                "rio_scheduler_pull_rejected_total",
+                                "rpc" => "report_outcome",
+                                "reason" => "kind_unauthorized"
+                            )
+                            .increment(1);
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    metrics::counter!(
+                        "rio_scheduler_pull_rejected_total",
+                        "rpc" => "report_outcome",
+                        "reason" => "unauthenticated"
+                    )
+                    .increment(1);
+                    return Err(metadata_err);
+                }
             }
         };
         let req = request.into_inner();
@@ -333,6 +517,25 @@ impl ExecutorService for SchedulerGrpc {
             .exec_id
             .parse()
             .map_err(|_| Status::invalid_argument("exec_id must be a UUID"))?;
+        // Substitution-replacement (defense in depth, symmetric with the
+        // pull-side rejection): an EXECUTOR-authenticated report never
+        // carries a materialization outcome — a builder pod that somehow
+        // learned a materialization attempt's exec_id must not be able to
+        // consume it. Store-credential reports have `auth_intent == None`
+        // (fleet-level identity), so this arm never fires for them; full
+        // dev mode also has `None` and stays open.
+        if auth_intent.is_some() && req.materialization_outcome.is_some() {
+            metrics::counter!(
+                "rio_scheduler_pull_rejected_total",
+                "rpc" => "report_outcome",
+                "reason" => "kind_unauthorized"
+            )
+            .increment(1);
+            return Err(Status::permission_denied(
+                "executor tokens do not authorize materialization outcome reports \
+                 (a store-service credential is required)",
+            ));
+        }
         let has_report = req.report.is_some();
         let report = req.report.unwrap_or_default();
         // The exec_id names the attempt; the report's drv_path is not
@@ -417,11 +620,11 @@ impl ExecutorService for SchedulerGrpc {
     /// descriptors carry cross-tenant drv hashes and tenant ids, so the
     /// listing is NOT a per-intent executor surface. An executor token
     /// (the per-intent builder/fetcher credential) on either carrier is
-    /// rejected `PermissionDenied`; the store-service credential that
-    /// will authorize this listing is the Wave-4 store-executor
-    /// obligation. Until it exists, the listing is reachable only in
-    /// dev mode (no HMAC key — same open posture as every other unary
-    /// there), where it answers the flag-off empty list.
+    /// rejected `PermissionDenied`; the kind-attested store-service
+    /// credential (`ServiceClaims{caller="rio-store"}`, the Wave-4
+    /// obligation discharged here) is what authorizes it. Full dev mode
+    /// (neither key family configured) stays open and answers the
+    /// flag-off empty list.
     // r[impl sched.materialize.job]
     #[instrument(skip(self, request), fields(rpc = "ListMaterializationJobs"))]
     async fn list_materialization_jobs(
@@ -432,46 +635,26 @@ impl ExecutorService for SchedulerGrpc {
         self.ensure_leader()?;
         self.check_actor_alive()?;
         // r[impl sec.executor.identity-token+2]
-        // Metadata carrier first (the shared interceptor), body
-        // service_token as the fallback — both verified by the same
-        // key. A token that VERIFIES is an executor credential, which
-        // does not authorize fleet-wide listing: reject closed.
-        match self.require_executor(&request) {
-            Ok(Some(_claims)) => {
-                return Err(Status::permission_denied(
-                    "executor tokens do not authorize materialization-job listing \
-                     (a store-service credential is required)",
-                ));
-            }
-            // Dev mode (no HMAC key configured): open, like every
-            // other unary.
-            Ok(None) => {}
-            Err(metadata_err) => {
-                let body_token = request.get_ref().service_token.as_str();
-                if body_token.is_empty() {
-                    return Err(metadata_err);
-                }
-                // r[impl sched.executor.input-bounds+2]
-                rio_common::grpc::check_bound(
-                    "service_token bytes",
-                    body_token.len(),
-                    MAX_EXECUTOR_TOKEN_LEN,
-                )?;
-                let Some(key) = &self.hmac_key else {
-                    return Err(metadata_err);
-                };
-                let _claims: rio_auth::hmac::ExecutorClaims =
-                    key.verify(body_token).map_err(|e| {
-                        Status::unauthenticated(format!("service_token verification failed: {e}"))
-                    })?;
-                // Verified — but as an executor credential, which does
-                // not authorize the listing (see above).
-                return Err(Status::permission_denied(
-                    "executor tokens do not authorize materialization-job listing \
-                     (a store-service credential is required)",
-                ));
-            }
+        // A token that verifies as an EXECUTOR credential (on either
+        // carrier — the x-rio-executor-token header or the body
+        // service_token field) never authorizes fleet-wide listing:
+        // reject closed (the Wave-3 rejection, kept verbatim).
+        let body_token = request.get_ref().service_token.as_str();
+        if self
+            .verified_executor_claims(&request, body_token)
+            .is_some()
+        {
+            return Err(Status::permission_denied(
+                "executor tokens do not authorize materialization-job listing \
+                 (a store-service credential is required)",
+            ));
         }
+        // The store-service credential gate: x-rio-service-token
+        // metadata (the ServiceTokenInterceptor carrier) or the body
+        // service_token field, verified as ServiceClaims by the
+        // service-HMAC key with caller="rio-store". Full dev mode
+        // passes through to the flag gate (empty list).
+        self.require_store_service(&request, body_token)?;
         let req = request.into_inner();
 
         // send_unchecked: the store polls on an interval; a dropped

@@ -398,6 +398,11 @@ async fn main() -> anyhow::Result<()> {
         // wiring; the path being set is what determines mode).
         cfg.jwt.key_path.is_some(),
         hmac_for_grpc,
+        // Substitution-replacement: the same service-HMAC verifier the
+        // AdminService uses, here verifying the store's kind-attested
+        // materialization credential (ServiceClaims caller="rio-store")
+        // on the materialization-only ExecutorService operations.
+        service_verifier.clone(),
     );
 
     // Background refresh for ClusterStatus.store_size_bytes — 60s PG poll

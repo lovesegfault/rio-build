@@ -412,3 +412,286 @@ async fn materialization_pull_instance_validated_as_dns_label() -> anyhow::Resul
     );
     Ok(())
 }
+
+// ── The store-service credential (Wave-4 security obligation:
+//    the kind-attested materialization credential) ──
+
+/// Sign a `ServiceClaims` store credential with `key`.
+fn store_service_token(key: &rio_auth::hmac::HmacKey, caller: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs();
+    key.sign(&rio_auth::hmac::ServiceClaims {
+        caller: caller.to_string(),
+        expiry_unix: now + 60,
+    })
+}
+
+/// An empty materialization Success outcome payload.
+fn mat_success_outcome() -> rio_proto::types::MaterializationOutcome {
+    rio_proto::types::MaterializationOutcome {
+        outcome: Some(rio_proto::types::materialization_outcome::Outcome::Success(
+            rio_proto::types::materialization_outcome::Success {
+                ingested_paths: vec![],
+                verified_paths: vec![],
+            },
+        )),
+    }
+}
+
+// r[verify sched.materialize.job]
+/// Wave-4 kind-attested credential: `ServiceClaims{caller="rio-store"}`
+/// signed with the SERVICE HMAC key (the separate x-rio-service-token
+/// family) authorizes exactly the materialization operations —
+/// ListMaterializationJobs (both carriers), kind=MATERIALIZATION
+/// PullAssignment, and materialization ReportOutcome — while the
+/// executor HMAC posture stays fully enforced. The flag-off answers
+/// stay dormant: empty list, NotYetReady, acknowledged-and-ignored.
+#[tokio::test]
+async fn materialization_ops_accept_store_service_credential() -> anyhow::Result<()> {
+    use rio_auth::hmac::HmacKey;
+    use rio_proto::ExecutorService;
+    let (_db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    // The production posture: BOTH key families configured, distinct keys.
+    let executor_key = std::sync::Arc::new(HmacKey::from_key(
+        b"executor-key-32-bytes-long!!!!!!".to_vec(),
+    ));
+    let service_key = std::sync::Arc::new(HmacKey::from_key(
+        b"service-key-32-bytes-long-here!!".to_vec(),
+    ));
+    grpc.hmac_key = Some(executor_key);
+    grpc.service_verifier = Some(std::sync::Arc::clone(&service_key));
+    let store_token = store_service_token(&service_key, "rio-store");
+
+    // 1. ListMaterializationJobs, metadata carrier → flag-off empty list.
+    let mut req = Request::new(rio_proto::types::ListMaterializationJobsRequest {
+        service_token: String::new(),
+        limit: 16,
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
+    let resp = grpc
+        .list_materialization_jobs(req)
+        .await
+        .expect("the store-service credential authorizes the listing (metadata carrier)")
+        .into_inner();
+    assert!(resp.jobs.is_empty(), "flag-off listing stays empty");
+
+    // 2. ListMaterializationJobs, body carrier → same.
+    let resp = grpc
+        .list_materialization_jobs(Request::new(
+            rio_proto::types::ListMaterializationJobsRequest {
+                service_token: store_token.clone(),
+                limit: 16,
+            },
+        ))
+        .await
+        .expect("the store-service credential authorizes the listing (body carrier)")
+        .into_inner();
+    assert!(resp.jobs.is_empty());
+
+    // 3. kind=MATERIALIZATION PullAssignment with the credential →
+    //    flag-off NotYetReady (the AS-6 posture), never a rejection.
+    let mut req = Request::new(rio_proto::types::PullAssignmentRequest {
+        executor_token: String::new(),
+        intent_id: "drv-store-credential".into(),
+        kind: rio_proto::types::AttemptKind::Materialization.into(),
+        executor_instance: "store-replica-0".into(),
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
+    let resp = grpc
+        .pull_assignment(req)
+        .await
+        .expect("the store-service credential authorizes the materialization pull")
+        .into_inner();
+    assert!(
+        matches!(
+            resp.outcome,
+            Some(rio_proto::types::pull_assignment_response::Outcome::NotYetReady(_))
+        ),
+        "flag-off materialization pull parks NotYetReady, got {resp:?}"
+    );
+
+    // 4. Materialization ReportOutcome with the credential → reaches the
+    //    actor (unknown exec → acknowledged-and-ignored), never rejected.
+    let mut req = Request::new(rio_proto::types::ReportOutcomeRequest {
+        exec_id: uuid::Uuid::now_v7().to_string(),
+        report: None,
+        materialization_outcome: Some(mat_success_outcome()),
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
+    grpc.report_outcome(req)
+        .await
+        .expect("the store-service credential authorizes the materialization report");
+    Ok(())
+}
+
+// r[verify sched.materialize.job]
+/// The credential is exactly `caller="rio-store"`: another control-plane
+/// caller's service token (e.g. the gateway's) does NOT authorize
+/// materialization operations; executor tokens stay rejected (the Wave-3
+/// pins, unchanged); a build report presenting only the store credential
+/// is still rejected (build reports require the per-intent executor
+/// token).
+#[tokio::test]
+async fn store_service_credential_scoping_is_exact() -> anyhow::Result<()> {
+    use rio_auth::hmac::HmacKey;
+    use rio_proto::ExecutorService;
+    let (_db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    let executor_key = std::sync::Arc::new(HmacKey::from_key(
+        b"executor-key-32-bytes-long!!!!!!".to_vec(),
+    ));
+    let service_key = std::sync::Arc::new(HmacKey::from_key(
+        b"service-key-32-bytes-long-here!!".to_vec(),
+    ));
+    grpc.hmac_key = Some(executor_key);
+    grpc.service_verifier = Some(std::sync::Arc::clone(&service_key));
+
+    // (a) Wrong caller (a real, validly-signed gateway token) → rejected.
+    let gateway_token = store_service_token(&service_key, "rio-gateway");
+    let mut req = Request::new(rio_proto::types::ListMaterializationJobsRequest {
+        service_token: String::new(),
+        limit: 16,
+    });
+    req.metadata_mut().insert(
+        rio_common::grpc::SERVICE_TOKEN_HEADER,
+        gateway_token.parse()?,
+    );
+    let err = grpc
+        .list_materialization_jobs(req)
+        .await
+        .expect_err("a non-store service caller must not authorize the listing");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // (b) Wrong caller on the materialization pull → rejected.
+    let mut req = Request::new(rio_proto::types::PullAssignmentRequest {
+        executor_token: String::new(),
+        intent_id: "drv-wrong-caller".into(),
+        kind: rio_proto::types::AttemptKind::Materialization.into(),
+        executor_instance: "store-replica-0".into(),
+    });
+    req.metadata_mut().insert(
+        rio_common::grpc::SERVICE_TOKEN_HEADER,
+        gateway_token.parse()?,
+    );
+    let err = grpc
+        .pull_assignment(req)
+        .await
+        .expect_err("a non-store service caller must not authorize a materialization pull");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // (c) A token signed with the WRONG key (the executor key) in the
+    //     service-token header → rejected (the key families are not
+    //     interchangeable).
+    let executor_signed =
+        store_service_token(grpc.hmac_key.as_ref().expect("set above"), "rio-store");
+    let mut req = Request::new(rio_proto::types::ListMaterializationJobsRequest {
+        service_token: String::new(),
+        limit: 16,
+    });
+    req.metadata_mut().insert(
+        rio_common::grpc::SERVICE_TOKEN_HEADER,
+        executor_signed.parse()?,
+    );
+    let err = grpc
+        .list_materialization_jobs(req)
+        .await
+        .expect_err("a store token signed with the executor key must not verify");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // (d) A BUILD report carrying only the store credential (no executor
+    //     token) → still Unauthenticated: build reports require the
+    //     per-intent executor identity, the store credential is not a
+    //     substitute for it.
+    let store_token = store_service_token(&service_key, "rio-store");
+    let mut req = Request::new(rio_proto::types::ReportOutcomeRequest {
+        exec_id: uuid::Uuid::now_v7().to_string(),
+        report: Some(rio_proto::types::CompletionReport::default()),
+        materialization_outcome: None,
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
+    let err = grpc
+        .report_outcome(req)
+        .await
+        .expect_err("a build report must still require the executor token");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // (e) Half-configured deployment (executor HMAC, no service
+    //     verifier): the store credential cannot be verified → closed,
+    //     and credential-less stays Unauthenticated (the Wave-3 pin).
+    grpc.service_verifier = None;
+    let mut req = Request::new(rio_proto::types::ListMaterializationJobsRequest {
+        service_token: String::new(),
+        limit: 16,
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
+    let err = grpc
+        .list_materialization_jobs(req)
+        .await
+        .expect_err("a store token without a configured service verifier must not authorize");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    Ok(())
+}
+
+// r[verify sched.materialize.job]
+/// Defense in depth, symmetric with the pull-side kind rejection: an
+/// EXECUTOR-authenticated ReportOutcome carrying a materialization
+/// outcome is rejected PermissionDenied — a builder pod that somehow
+/// learned a materialization attempt's exec_id cannot consume it. The
+/// same payload under the store-service credential is accepted.
+#[tokio::test]
+async fn executor_token_report_with_materialization_outcome_rejected() -> anyhow::Result<()> {
+    use rio_auth::hmac::{ExecutorClaims, HmacKey};
+    use rio_proto::ExecutorService;
+    let (_db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    let executor_key = std::sync::Arc::new(HmacKey::from_key(
+        b"executor-key-32-bytes-long!!!!!!".to_vec(),
+    ));
+    let service_key = std::sync::Arc::new(HmacKey::from_key(
+        b"service-key-32-bytes-long-here!!".to_vec(),
+    ));
+    grpc.hmac_key = Some(std::sync::Arc::clone(&executor_key));
+    grpc.service_verifier = Some(std::sync::Arc::clone(&service_key));
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let executor_token = executor_key.sign(&ExecutorClaims {
+        intent_id: "drv-cross-kind".into(),
+        kind: rio_proto::types::ExecutorKind::Builder as i32,
+        expiry_unix: now + 600,
+    });
+
+    // Executor-authenticated materialization report → PermissionDenied.
+    let mut req = Request::new(rio_proto::types::ReportOutcomeRequest {
+        exec_id: uuid::Uuid::now_v7().to_string(),
+        report: None,
+        materialization_outcome: Some(mat_success_outcome()),
+    });
+    req.metadata_mut()
+        .insert(rio_proto::EXECUTOR_TOKEN_HEADER, executor_token.parse()?);
+    let err = grpc
+        .report_outcome(req)
+        .await
+        .expect_err("an executor token must not authorize a materialization outcome report");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // The same executor token reporting a BUILD outcome still works
+    // (unknown exec → acknowledged): the build path is untouched.
+    let mut req = Request::new(rio_proto::types::ReportOutcomeRequest {
+        exec_id: uuid::Uuid::now_v7().to_string(),
+        report: Some(rio_proto::types::CompletionReport::default()),
+        materialization_outcome: None,
+    });
+    req.metadata_mut()
+        .insert(rio_proto::EXECUTOR_TOKEN_HEADER, executor_token.parse()?);
+    grpc.report_outcome(req)
+        .await
+        .expect("build reports with executor tokens are unaffected");
+    Ok(())
+}
