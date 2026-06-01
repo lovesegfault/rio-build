@@ -551,10 +551,25 @@ fn intermediate_main(
 /// cancellation) cannot leak a running build. With a cgroup the kill is
 /// `cgroup.kill` (atomic over every descendant); without one it is a
 /// SIGKILL of the intermediate process, whose death cascades to the
-/// sandbox child via `PR_SET_PDEATHSIG` and from pid 1 to the rest of
-/// the PID namespace. The `armed` flag is shared with the waitpid task,
-/// which disarms it at reap time so a late kill cannot hit a recycled
-/// pid.
+/// sandbox child via `PR_SET_PDEATHSIG` — armed as the sandbox child's
+/// *first* setup statement and re-armed after the credential drop — and
+/// from pid 1 to the rest of the PID namespace. The no-cgroup cascade
+/// is therefore valid from the first setup instruction on; the residual
+/// no-cgroup exposures are exactly two instruction-scale windows where
+/// the death signal is not armed: [fork, the early arm] and [setuid,
+/// the re-arm]. The `armed` flag is shared with the waitpid task, which
+/// disarms it at reap time so a late kill cannot hit a recycled pid.
+///
+/// TODO: CppNix closes the [fork, first arm] window differently — it
+/// forks the sandbox child with `CLONE_PARENT`
+/// (`linux-derivation-builder.cc`, the `sendPid` protocol) so the
+/// daemon itself is the child's parent and can kill it by pid from the
+/// moment fork returns. A naive port of that protocol here is a
+/// recycled-pid kill hazard: in this executor the *intermediate* reaps
+/// the sandbox child, so a pid the parent learned through sendPid may
+/// already have been reaped (and recycled) by the time the parent
+/// kills it. Deferred until the supervision loop owns reaping for the
+/// whole tree.
 struct KillGuard {
     cgroup: Option<PathBuf>,
     pid: nix::unistd::Pid,
@@ -585,8 +600,9 @@ impl Drop for KillGuard {
 /// that can fail, and its abort path runs through here — and a cgroup
 /// the executor cannot write to must not leak the tree either. The
 /// intermediate's death SIGKILLs the sandbox child through
-/// `PR_SET_PDEATHSIG`, and the sandbox child is pid 1 of the PID
-/// namespace, so the kernel then kills everything else in it.
+/// `PR_SET_PDEATHSIG` (armed from the sandbox child's first setup
+/// instruction; see `child::setup`), and the sandbox child is pid 1 of
+/// the PID namespace, so the kernel then kills everything else in it.
 fn kill_tree(cgroup: Option<&Path>, pid: nix::unistd::Pid, armed: &AtomicBool) {
     // swap(false): only the first caller acts, and never after the
     // waitpid task has reaped the pid (it clears the flag).

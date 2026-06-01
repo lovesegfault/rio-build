@@ -586,6 +586,24 @@ process (rio-builder, a test harness) happens to have open --- a future fd
 added to the worker cannot silently leak into the sandbox or re-break the
 EOF protocols.
 
+#r("builder.exec.pdeathsig-first")[
+  The sandbox child MUST arm its parent-death signal (`PR_SET_PDEATHSIG`
+  delivering `SIGKILL`) as the *first* statement of its setup sequence ---
+  before the session, stdio, mount, pivot, and hardening steps --- and MUST
+  re-arm it immediately after the credential drop, because the kernel clears
+  the death signal on `setuid`. Intermediate death therefore cascades to the
+  sandbox child throughout setup, not only after the privilege drop.
+]
+
+This is oracle parity: CppNix's `runChild` arms `dieWithParent` as its first
+action (`processes.cc`), and the post-`setuid` re-arm mirrors its
+`preserveDeathSignal` handling. Without a per-build cgroup, two residual
+windows remain where intermediate death does not cascade --- the handful of
+instructions in [fork, first arm] and [`setuid`, re-arm]; with a cgroup the
+executor's cgroup kill covers both. The windows and the deferred
+`CLONE_PARENT`/`sendPid` alternative (a recycled-pid kill hazard under this
+executor's reaping topology) are documented at the executor's kill guard.
+
 #r("builder.retry.infra-transient")[
   The build-spawn loop retries `execute_build` locally when the failure is a
   transient worker-local infrastructure failure --- sandbox setup

@@ -159,7 +159,7 @@ pub enum SetupPhase {
     /// The post-drop verification that the real and effective ids
     /// actually changed.
     VerifyIds = 24,
-    /// `prctl(PR_SET_PDEATHSIG)`.
+    /// `prctl(PR_SET_PDEATHSIG)` — the post-credential-drop re-arm.
     Pdeathsig = 25,
     /// `execve(2)` returned.
     Exec = 26,
@@ -168,6 +168,12 @@ pub enum SetupPhase {
     /// module) so that a fork failure is distinguishable from a build
     /// that merely exited with an unusual status code.
     ForkSandboxChild = 27,
+    /// `prctl(PR_SET_PDEATHSIG)` — the arm that runs as the sandbox
+    /// child's *first* setup statement, before any other step, so
+    /// intermediate death cascades during setup too. Declared in
+    /// execution order (right after the fork); the wire discriminant
+    /// is append-only (29).
+    PdeathsigEarly = 29,
 }
 
 impl SetupPhase {
@@ -179,6 +185,8 @@ impl SetupPhase {
         SetupPhase::FdSweep,
         SetupPhase::GoPipe,
         SetupPhase::Unshare,
+        SetupPhase::ForkSandboxChild,
+        SetupPhase::PdeathsigEarly,
         SetupPhase::Setsid,
         SetupPhase::DupStdio,
         SetupPhase::CloseRange,
@@ -204,7 +212,6 @@ impl SetupPhase {
         SetupPhase::VerifyIds,
         SetupPhase::Pdeathsig,
         SetupPhase::Exec,
-        SetupPhase::ForkSandboxChild,
     ];
 
     /// Decode a wire discriminant. Exhaustive over every variant so a
@@ -243,7 +250,8 @@ impl SetupPhase {
             SetupPhase::Setgid => "dropping group privileges",
             SetupPhase::Setuid => "dropping user privileges",
             SetupPhase::VerifyIds => "verifying the privilege drop",
-            SetupPhase::Pdeathsig => "arming the parent-death signal",
+            SetupPhase::Pdeathsig => "re-arming the parent-death signal",
+            SetupPhase::PdeathsigEarly => "arming the parent-death signal",
             SetupPhase::Exec => "executing the program",
             SetupPhase::ForkSandboxChild => "forking the sandbox child",
         }
@@ -502,10 +510,35 @@ pub(crate) fn setup_and_exec(
     SetupError::new(SetupPhase::Exec, Errno::last())
 }
 
+/// Arm `PR_SET_PDEATHSIG` so this process is `SIGKILL`ed when its
+/// parent dies. `phase` attributes a failure to the early arm or the
+/// post-credential-drop re-arm.
+///
+/// Async-signal-safe: a single `prctl(2)`.
+// r[impl builder.exec.pdeathsig-first]
+fn arm_pdeathsig(phase: SetupPhase) -> Result<(), SetupError> {
+    // SAFETY: prctl with integer arguments has no memory preconditions.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
+        return Err(SetupError::new(phase, Errno::last()));
+    }
+    Ok(())
+}
+
 /// The fallible body of [`setup_and_exec`], split out so `?` can be
 /// used over the per-step helpers.
 fn setup(plan: &SandboxPlan, fds: &ChildFds) -> Result<(), SetupError> {
     let c = &plan.child;
+
+    // --- Parent-death cascade, armed FIRST ---------------------------------
+    // If the intermediate dies at any point during the long setup
+    // sequence below — mounts, pivot_root, hardening, the privilege
+    // drop — this process must die with it instead of continuing to
+    // build a sandbox nobody supervises. CppNix arms the death signal
+    // as its child's first statement too (processes.cc, dieWithParent).
+    // The arm is repeated after setuid because the kernel clears
+    // pdeath_signal on credential changes.
+    // r[impl builder.exec.pdeathsig-first]
+    arm_pdeathsig(SetupPhase::PdeathsigEarly)?;
 
     // --- Session and stdio -------------------------------------------------
     // A fresh session so the pty the parent allocated can become the
@@ -735,18 +768,20 @@ fn setup(plan: &SandboxPlan, fds: &ChildFds) -> Result<(), SetupError> {
                 detail: 0,
             });
         }
-        // setuid clears the parent-death signal; re-arm it so the
-        // sandboxed process tree dies with the executor instead of
-        // leaking. The traditional getppid()-changed race check is
-        // meaningless here: this process is pid 1 of its PID
-        // namespace, so getppid() always returns 0 regardless of
-        // whether the real parent is alive. The race window (parent
-        // dying between fork and this prctl) is closed by the
-        // executor's cgroup kill on its own teardown path instead.
-        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-            return Err(SetupError::new(SetupPhase::Pdeathsig, Errno::last()));
-        }
     }
+
+    // setuid cleared the parent-death signal (the kernel does this on
+    // any credential change); re-arm it so intermediate death keeps
+    // cascading here. The traditional getppid()-changed race check is
+    // meaningless in this topology: this process is pid 1 of its PID
+    // namespace, so getppid() always returns 0 whether or not the real
+    // parent is alive. Without a cgroup, two residual windows remain
+    // where intermediate death does NOT cascade — the handful of
+    // instructions in [fork, the early arm] and in [setuid, this
+    // re-arm]; with a per-build cgroup the executor's cgroup kill
+    // covers both. Documented at the executor's kill guard.
+    // r[impl builder.exec.pdeathsig-first]
+    arm_pdeathsig(SetupPhase::Pdeathsig)?;
 
     Ok(())
 }
@@ -1165,6 +1200,99 @@ mod tests {
                 nix::unistd::write(&go_w, &[1u8]).expect("write the go byte");
                 let code = wait_with_deadline(pid, Duration::from_secs(10));
                 assert_eq!(code, 0, "the go byte must still arrive after the sweep");
+            }
+        }
+    }
+
+    // -- parent-death signal (fork-based, unprivileged) ----------------------
+
+    /// The early arm: a sandbox child whose intermediate dies during
+    /// setup must die with it. Exact production topology — the test
+    /// plays the executor and forks A (the intermediate), which forks B
+    /// (the sandbox child). B arms the death signal as its FIRST
+    /// statement (the property under test), reports readiness, and
+    /// parks; the test then lets A exit and asserts B is SIGKILLed by
+    /// the kernel (its liveness-pipe write end closes). No wall-clock
+    /// race assertions — the deadline only bounds the failure case.
+    // r[verify builder.exec.pdeathsig-first]
+    #[test]
+    fn pdeathsig_armed_child_dies_with_its_parent() {
+        let (ready_r, ready_w) = plain_pipe(); // B → test: "armed and parked"
+        let (exit_r, exit_w) = plain_pipe(); // test → A: "you may exit"
+        let (live_r, live_w) = plain_pipe(); // B holds live_w; EOF = B died
+
+        // SAFETY: child branches only call async-signal-safe code.
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork failed: {}", std::io::Error::last_os_error()),
+            0 => {
+                // A: the intermediate.
+                match unsafe { libc::fork() } {
+                    -1 => unsafe { libc::_exit(20) },
+                    0 => {
+                        // B: the sandbox child. Arm FIRST, then report,
+                        // then park until the parent-death SIGKILL.
+                        if arm_pdeathsig(SetupPhase::PdeathsigEarly).is_err() {
+                            unsafe { libc::_exit(21) };
+                        }
+                        // SAFETY: write/pause are async-signal-safe;
+                        // live_w stays open in B for the test to observe.
+                        unsafe {
+                            let byte = [1u8];
+                            libc::write(ready_w.as_raw_fd(), byte.as_ptr().cast(), 1);
+                            loop {
+                                libc::pause();
+                            }
+                        }
+                    }
+                    _b_pid => {
+                        // A: hold until the test says B's arm was
+                        // observed, then exit — which must SIGKILL B.
+                        let mut buf = [0u8; 1];
+                        // SAFETY: blocking read into a stack buffer,
+                        // then _exit.
+                        unsafe {
+                            libc::read(exit_r.as_raw_fd(), buf.as_mut_ptr().cast(), 1);
+                            libc::_exit(0);
+                        }
+                    }
+                }
+            }
+            a_pid => {
+                // The test (executor side): drop our copies of the ends
+                // whose EOF we must observe.
+                drop(live_w);
+                drop(ready_w);
+                // B reports it has armed.
+                let mut buf = [0u8; 1];
+                nix::unistd::read(&ready_r, &mut buf).expect("readiness byte from B");
+                // Let A exit; it must exit cleanly.
+                nix::unistd::write(&exit_w, &[1u8]).expect("exit permission to A");
+                let code = wait_with_deadline(a_pid, Duration::from_secs(10));
+                assert_eq!(code, 0, "the intermediate must exit when told");
+                // B must now die from the parent-death signal: its
+                // liveness pipe EOFs. Poll nonblocking with a deadline
+                // (the deadline only bounds the failure case).
+                // SAFETY: fcntl F_SETFL on an fd this test owns.
+                unsafe {
+                    libc::fcntl(live_r.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+                }
+                let start = Instant::now();
+                loop {
+                    let mut b = [0u8; 1];
+                    match nix::unistd::read(&live_r, &mut b) {
+                        Ok(0) => break, // EOF: B is gone.
+                        Ok(_) => panic!("unexpected bytes on the liveness pipe"),
+                        Err(Errno::EAGAIN) => {
+                            assert!(
+                                start.elapsed() < Duration::from_secs(10),
+                                "sandbox child survived its parent's death — \
+                                 the early pdeathsig arm did not take effect"
+                            );
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(e) => panic!("liveness-pipe read failed: {e}"),
+                    }
+                }
             }
         }
     }
