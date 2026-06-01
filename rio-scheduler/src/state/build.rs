@@ -1,10 +1,10 @@
-//! Build request state machine: [`BuildState`] transitions and
-//! [`BuildInfo`] (per-SubmitBuild tracking).
+//! Build request state machine: [`BuildState`] transitions, [`BuildInfo`]
+//! (per-SubmitBuild tracking), and [`Builds`] (the liveness-aware map).
 //!
 //! State machine: pending → active → succeeded|failed|cancelled.
 //! Pending can also go straight to cancelled (client abort before start).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use uuid::Uuid;
@@ -200,6 +200,100 @@ impl BuildInfo {
         from.validate_transition(to)?;
         self.state = to;
         Ok(from)
+    }
+}
+
+/// The actor's per-build state map with a liveness-aware policy surface.
+///
+/// Terminal builds linger in the map until the delayed terminal cleanup
+/// (`TERMINAL_CLEANUP_DELAY`, and the cleanup command is droppable under
+/// mailbox backpressure), so MAP PRESENCE IS NOT LIVENESS. Policy
+/// decisions over live builds — the force-build substitution gates, the
+/// live effective wanted set, substitute-auth tenant selection, the
+/// interactive priority boost — each used to re-derive "present AND
+/// `!state().is_terminal()`" by hand, and one forgotten terminal check
+/// is exactly the bug shape where a finished build keeps steering
+/// scheduling for up to a minute (or until restart).
+///
+/// This wrapper makes the safe form the DEFAULT: [`Builds::get`]
+/// returns only LIVE builds. Bookkeeping that must see lingering
+/// terminal entries — terminal cleanup itself, build-state transitions
+/// and count updates, sweeps that filter on `state()` explicitly,
+/// metrics/tenant attribution that deliberately includes finished
+/// builds — goes through the `*_including_terminal*` accessors, whose
+/// names make the inclusion a greppable, review-visible decision
+/// instead of a per-call-site discipline.
+#[derive(Debug, Default)]
+pub struct Builds {
+    inner: HashMap<Uuid, BuildInfo>,
+}
+
+impl Builds {
+    pub fn new() -> Self {
+        Self {
+            inner: HashMap::new(),
+        }
+    }
+
+    /// LIVE-build lookup — the policy default. Returns `None` for
+    /// missing AND terminal entries: a missing entry counts as terminal
+    /// (cleanup removes the `BuildInfo` and the DAG interest in the
+    /// same handler), and a lingering terminal entry counts as gone.
+    pub fn get(&self, build_id: &Uuid) -> Option<&BuildInfo> {
+        self.inner
+            .get(build_id)
+            .filter(|b| !b.state().is_terminal())
+    }
+
+    /// Raw lookup including lingering terminal entries. For bookkeeping
+    /// that must see a finished build (terminal-event re-send to late
+    /// watchers, cleanup, transition validation, count updates) — NOT
+    /// for policy decisions, which take [`Builds::get`].
+    pub fn get_including_terminal_for_bookkeeping(&self, build_id: &Uuid) -> Option<&BuildInfo> {
+        self.inner.get(build_id)
+    }
+
+    /// Mutable raw lookup including lingering terminal entries — same
+    /// contract as
+    /// [`get_including_terminal_for_bookkeeping`](Self::get_including_terminal_for_bookkeeping).
+    pub fn get_mut_including_terminal_for_bookkeeping(
+        &mut self,
+        build_id: &Uuid,
+    ) -> Option<&mut BuildInfo> {
+        self.inner.get_mut(build_id)
+    }
+
+    pub fn insert(&mut self, build_id: Uuid, info: BuildInfo) -> Option<BuildInfo> {
+        self.inner.insert(build_id, info)
+    }
+
+    pub fn remove(&mut self, build_id: &Uuid) -> Option<BuildInfo> {
+        self.inner.remove(build_id)
+    }
+
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    /// Entry count including lingering terminal builds (diagnostics).
+    pub fn len_including_terminal(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn keys_including_terminal(&self) -> impl Iterator<Item = &Uuid> {
+        self.inner.keys()
+    }
+
+    pub fn values_including_terminal(&self) -> impl Iterator<Item = &BuildInfo> {
+        self.inner.values()
+    }
+
+    pub fn iter_including_terminal(&self) -> impl Iterator<Item = (&Uuid, &BuildInfo)> {
+        self.inner.iter()
+    }
+
+    pub fn iter_mut_including_terminal(&mut self) -> impl Iterator<Item = (&Uuid, &mut BuildInfo)> {
+        self.inner.iter_mut()
     }
 }
 

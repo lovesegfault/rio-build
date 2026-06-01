@@ -794,9 +794,13 @@ impl DagActor {
 
     /// Resolve auth for dispatch-time store calls. `Jwt(vec![])`
     /// (no-auth) when no `service_signer` (dev mode) or no candidate
-    /// has a known tenant (single-tenant mode / recovered orphan);
-    /// otherwise `Service{signer, tenant_id}` so the detached
-    /// closure-walk task can re-mint tokens past the original 60s.
+    /// has a known tenant (single-tenant mode / recovered orphan / all
+    /// interested builds already terminal); otherwise
+    /// `Service{signer, tenant_id}` so the detached closure-walk task
+    /// can re-mint tokens past the original 60s. Tenant selection is a
+    /// policy decision over LIVE builds (`Builds::get`): a lingering
+    /// terminal build must not authorize a new fetch it no longer
+    /// wants.
     #[allow(clippy::extra_unused_lifetimes)] // 'a only in impl-Trait arg
     fn probe_substitute_auth<'a>(
         &self,
@@ -817,27 +821,26 @@ impl DagActor {
     /// spawn arm (it may still complete from a locally-present output).
     /// `pub(super)` so the merge-time gates (merge.rs) share it.
     ///
-    /// Live = present in `builds` AND `!state().is_terminal()` — the
-    /// same definition `effective_wanted` uses. Terminal builds linger
-    /// in `builds` until the delayed terminal cleanup
-    /// (`TERMINAL_CLEANUP_DELAY`, and the cleanup command is droppable
-    /// under mailbox backpressure), so map presence alone is NOT
-    /// liveness: counting a finished force-build submission here would
-    /// keep its roots substitution-blocked for every later tenant
-    /// sharing them — a from-source rebuild (or, for a still-poisoned
-    /// root, a spurious fail-fast where the documented behavior is the
+    /// Live = [`Builds::get`](crate::state::Builds::get)'s contract:
+    /// present in `builds` AND `!state().is_terminal()` — the same
+    /// definition `effective_wanted` uses, enforced by the accessor
+    /// rather than re-derived here. Terminal builds linger in `builds`
+    /// until the delayed terminal cleanup (`TERMINAL_CLEANUP_DELAY`,
+    /// and the cleanup command is droppable under mailbox
+    /// backpressure), so map presence alone is NOT liveness: counting a
+    /// finished force-build submission here would keep its roots
+    /// substitution-blocked for every later tenant sharing them — a
+    /// from-source rebuild (or, for a still-poisoned root, a spurious
+    /// fail-fast where the documented behavior is the
     /// reprobe-substitutable lane) for up to the cleanup delay, or
     /// until restart if the cleanup was dropped. The gate must die with
     /// the build, not with the map entry.
     pub(super) fn is_force_build_root(&self, drv_hash: &DrvHash) -> bool {
-        use super::BuildStateExt as _;
         self.dag.node(drv_hash).is_some_and(|s| {
             s.interested_builds.iter().any(|bid| {
-                self.builds.get(bid).is_some_and(|b| {
-                    !b.state().is_terminal()
-                        && b.force_build_roots
-                        && b.root_hashes.contains(drv_hash)
-                })
+                self.builds
+                    .get(bid)
+                    .is_some_and(|b| b.force_build_roots && b.root_hashes.contains(drv_hash))
             })
         })
     }
@@ -1699,7 +1702,10 @@ impl DagActor {
             }
         }
         for build_id in self.get_interested_builds(drv_hash) {
-            if let Some(build) = self.builds.get_mut(&build_id) {
+            if let Some(build) = self
+                .builds
+                .get_mut_including_terminal_for_bookkeeping(&build_id)
+            {
                 build.error_summary.get_or_insert_with(|| msg.clone());
                 build
                     .failed_derivation
@@ -2041,7 +2047,10 @@ impl DagActor {
             }
         }
         for (build_id, n) in cached_per_build {
-            if let Some(b) = self.builds.get_mut(&build_id) {
+            if let Some(b) = self
+                .builds
+                .get_mut_including_terminal_for_bookkeeping(&build_id)
+            {
                 b.cached_count += n;
             }
             // I-140: one build_summary scan shared, not two.
@@ -3070,8 +3079,11 @@ impl DagActor {
             .node(drv_hash)
             .map(|n| n.sched.priority)
             .unwrap_or(0.0);
-        // Any interested build is interactive (IFD) → priority boost
-        // dwarfing any critical-path value.
+        // Any LIVE interested build is interactive (IFD) → priority
+        // boost dwarfing any critical-path value. `Builds::get` is the
+        // live-only policy accessor: a finished interactive build's
+        // lingering entry must not keep boosting shared nodes it no
+        // longer waits on.
         let interactive = self.get_interested_builds(drv_hash).iter().any(|id| {
             self.builds
                 .get(id)

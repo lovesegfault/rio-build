@@ -250,9 +250,12 @@ impl DagActor {
         caller_tenant: Option<Uuid>,
         reason: &str,
     ) -> Result<bool, ActorError> {
+        // Bookkeeping lookup: a terminal build must resolve here so the
+        // is_terminal guard below can return Ok(false) (idempotent
+        // cancel), not BuildNotFound.
         let build = self
             .builds
-            .get(&build_id)
+            .get_including_terminal_for_bookkeeping(&build_id)
             .ok_or(ActorError::BuildNotFound(build_id))?;
         // r[impl sched.tenant.authz+2]
         if caller_tenant.is_some() && build.tenant_id != caller_tenant {
@@ -307,9 +310,11 @@ impl DagActor {
         build_id: Uuid,
         caller_tenant: Option<Uuid>,
     ) -> Result<rio_proto::types::BuildStatus, ActorError> {
+        // Bookkeeping lookup: clients poll status after the build went
+        // terminal (until the delayed cleanup removes it).
         let build = self
             .builds
-            .get(&build_id)
+            .get_including_terminal_for_bookkeeping(&build_id)
             .ok_or(ActorError::BuildNotFound(build_id))?;
         // r[impl sched.tenant.authz+2]
         if caller_tenant.is_some() && build.tenant_id != caller_tenant {
@@ -343,9 +348,11 @@ impl DagActor {
         build_id: Uuid,
         caller_tenant: Option<Uuid>,
     ) -> Result<(super::BuildEventReceivers, u64), ActorError> {
+        // Bookkeeping lookup: late watchers of a just-finished build
+        // still attach (and get the terminal event re-send below).
         let build = self
             .builds
-            .get(&build_id)
+            .get_including_terminal_for_bookkeeping(&build_id)
             .ok_or(ActorError::BuildNotFound(build_id))?;
         // r[impl sched.tenant.authz+2]
         if caller_tenant.is_some() && build.tenant_id != caller_tenant {
@@ -374,7 +381,9 @@ impl DagActor {
         // event was already sent (possibly to zero receivers). A late subscriber
         // would never see it and would hang forever. Re-send a terminal event
         // so the new subscriber gets it.
-        if let Some(build) = self.builds.get(&build_id)
+        if let Some(build) = self
+            .builds
+            .get_including_terminal_for_bookkeeping(&build_id)
             && build.state().is_terminal()
         {
             let terminal_event = match build.state() {
@@ -460,7 +469,10 @@ impl DagActor {
         build_id: Uuid,
         summary: &crate::dag::BuildSummary,
     ) {
-        let Some(build) = self.builds.get_mut(&build_id) else {
+        let Some(build) = self
+            .builds
+            .get_mut_including_terminal_for_bookkeeping(&build_id)
+        else {
             return;
         };
         build.completed_count = summary.completed;
@@ -573,7 +585,7 @@ impl DagActor {
     ) -> Result<(), ActorError> {
         let (error_summary, failed_derivation) = self
             .builds
-            .get(&build_id)
+            .get_including_terminal_for_bookkeeping(&build_id)
             .map(|b| {
                 (
                     b.error_summary.clone().unwrap_or_default(),
@@ -634,7 +646,9 @@ impl DagActor {
         // Dry-run validate without mutating. validate_transition is the
         // exact predicate transition() uses, so the post-DB transition()
         // below cannot fail.
-        if let Some(b) = self.builds.get(&build_id)
+        if let Some(b) = self
+            .builds
+            .get_including_terminal_for_bookkeeping(&build_id)
             && let Err(e) = b.state().validate_transition(new_state)
         {
             debug!(
@@ -649,7 +663,7 @@ impl DagActor {
 
         let error_summary = self
             .builds
-            .get(&build_id)
+            .get_including_terminal_for_bookkeeping(&build_id)
             .and_then(|b| b.error_summary.as_deref());
 
         // DB first — if this fails, in-memory is unchanged and retry
@@ -658,7 +672,10 @@ impl DagActor {
             .update_build_status(build_id, new_state, error_summary)
             .await?;
 
-        if let Some(build) = self.builds.get_mut(&build_id) {
+        if let Some(build) = self
+            .builds
+            .get_mut_including_terminal_for_bookkeeping(&build_id)
+        {
             // Validated above; the actor is single-threaded and there is
             // no `.await` between the dry-run and here that could observe
             // a state change.
@@ -713,7 +730,7 @@ impl DagActor {
         // cleanup, e.g., if build_id was reused, though UUIDs make this unlikely).
         let is_terminal = self
             .builds
-            .get(&build_id)
+            .get_including_terminal_for_bookkeeping(&build_id)
             .map(|b| b.state().is_terminal())
             .unwrap_or(true); // already removed = fine
         if !is_terminal {
@@ -957,7 +974,7 @@ impl DagActor {
         }
 
         for build_id in &interested {
-            if let Some(build) = self.builds.get(build_id) {
+            if let Some(build) = self.builds.get_including_terminal_for_bookkeeping(build_id) {
                 max_silent_time = min_nonzero(max_silent_time, build.options.max_silent_time);
                 build_timeout = min_nonzero(build_timeout, build.options.build_timeout);
                 // 0 = "all cores" (proto:307) — most permissive, sticky

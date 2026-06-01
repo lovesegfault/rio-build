@@ -311,7 +311,11 @@ impl DagActor {
             let tenant_ids: Vec<Uuid> = state
                 .interested_builds
                 .iter()
-                .filter_map(|id| self.builds.get(id)?.tenant_id)
+                .filter_map(|id| {
+                    self.builds
+                        .get_including_terminal_for_bookkeeping(id)?
+                        .tenant_id
+                })
                 .collect();
             if tenant_ids.is_empty() {
                 continue;
@@ -1521,7 +1525,10 @@ impl DagActor {
                 );
                 for build_id in interested {
                     self.events.emit(build_id, event.clone());
-                    if let Some(b) = self.builds.get_mut(&build_id) {
+                    if let Some(b) = self
+                        .builds
+                        .get_mut_including_terminal_for_bookkeeping(&build_id)
+                    {
                         b.cached_count += 1;
                     }
                 }
@@ -2083,7 +2090,9 @@ impl DagActor {
     /// a no-op for them — but filtering keeps the intent explicit.
     pub(super) fn prune_interested_keep_going(&mut self, drv_hash: &DrvHash) {
         for build_id in self.get_interested_builds(drv_hash) {
-            if let Some(build) = self.builds.get_mut(&build_id)
+            if let Some(build) = self
+                .builds
+                .get_mut_including_terminal_for_bookkeeping(&build_id)
                 && build.keep_going
             {
                 build.derivation_hashes.remove(drv_hash);
@@ -2748,7 +2757,10 @@ impl DagActor {
         // additional parents to DependencyFailed; those must be counted here.
         self.update_build_counts(build_id).await;
 
-        let Some(build) = self.builds.get_mut(&build_id) else {
+        let Some(build) = self
+            .builds
+            .get_mut_including_terminal_for_bookkeeping(&build_id)
+        else {
             return;
         };
 

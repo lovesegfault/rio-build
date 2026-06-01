@@ -195,7 +195,10 @@ impl DagActor {
         } = self.reconcile_merged_state(&ingest).await;
 
         // Update build's cached count + persist initial denorm columns.
-        if let Some(build) = self.builds.get_mut(&build_id) {
+        if let Some(build) = self
+            .builds
+            .get_mut_including_terminal_for_bookkeeping(&build_id)
+        {
             build.cached_count = cached_count;
         }
         // I-103: sets completed_count from DAG ground truth + persists
@@ -345,7 +348,7 @@ impl DagActor {
             // Failed. If so, don't dispatch.
             if self
                 .builds
-                .get(&build_id)
+                .get_including_terminal_for_bookkeeping(&build_id)
                 .is_some_and(|b| b.state().is_terminal())
             {
                 return Ok(ingest.event_rx);
@@ -897,7 +900,7 @@ impl DagActor {
         // via the pool) — only the merge path is transactional.
         let applied = self
             .builds
-            .get_mut(&build_id)
+            .get_mut_including_terminal_for_bookkeeping(&build_id)
             .is_some_and(|b| b.transition(BuildState::Active).is_ok());
         debug_assert!(
             applied,

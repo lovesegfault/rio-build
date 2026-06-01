@@ -490,7 +490,7 @@ impl DagActor {
     // r[impl sched.timeout.per-build]
     async fn tick_check_build_timeouts(&mut self) {
         let mut timed_out_builds: Vec<(Uuid, u64)> = Vec::new();
-        for (build_id, build) in &self.builds {
+        for (build_id, build) in self.builds.iter_including_terminal() {
             if build.state() == BuildState::Active
                 && build.options.build_timeout > 0
                 && build.submitted_at.elapsed().as_secs() > build.options.build_timeout
@@ -505,7 +505,10 @@ impl DagActor {
 
             // Set error_summary FIRST so transition_build_to_failed picks it
             // up for the BuildFailed event + DB error_summary column.
-            if let Some(build) = self.builds.get_mut(&build_id) {
+            if let Some(build) = self
+                .builds
+                .get_mut_including_terminal_for_bookkeeping(&build_id)
+            {
                 build.error_summary = Some(reason.clone());
             }
             // Reuse the CancelBuild derivation-cancellation path (sends
@@ -537,7 +540,7 @@ impl DagActor {
     async fn tick_recheck_stuck_completions(&mut self) {
         let candidates: Vec<Uuid> = self
             .builds
-            .iter()
+            .iter_including_terminal()
             .filter(|(_, b)| {
                 b.state() == BuildState::Active
                     && (b.completed_count + b.failed_count) >= b.derivation_hashes.len() as u32
@@ -581,7 +584,7 @@ impl DagActor {
     async fn tick_check_orphaned_builds(&mut self) {
         let now = Instant::now();
         let mut to_cancel: Vec<Uuid> = Vec::new();
-        for (build_id, build) in self.builds.iter_mut() {
+        for (build_id, build) in self.builds.iter_mut_including_terminal() {
             if build.state() != BuildState::Active {
                 // Pending: hasn't started dispatching — the SubmitBuild
                 // handler is still running and holds a receiver (or the
@@ -803,7 +806,7 @@ impl DagActor {
         );
         metrics::gauge!("rio_scheduler_builds_active").set(
             self.builds
-                .values()
+                .values_including_terminal()
                 .filter(|b| b.state() == BuildState::Active)
                 .count() as f64,
         );

@@ -30,14 +30,12 @@
 //! invariant — "incremental updates and the periodic full sweep
 //! converge on the same priorities" — holds by construction.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-
-use uuid::Uuid;
+use std::collections::{HashSet, VecDeque};
 
 use crate::dag::DerivationDag;
 use crate::sla::SlaEstimator;
 use crate::sla::types::ModelKey;
-use crate::state::{BuildInfo, DerivationState, DrvHash};
+use crate::state::{Builds, DerivationState, DrvHash};
 
 /// Fallback duration when the SLA cache has no fit for a key (cold
 /// start, or `pname` absent so no key can be built). 60s sits between
@@ -51,7 +49,7 @@ pub const DEFAULT_DURATION_SECS: f64 = 60.0;
 /// [`DerivationState::attributed_tenant`] (shared with
 /// `solve_intent_for` / `write_build_sample`). `None` when `pname` is
 /// absent (raw/FOD derivation) — nothing to key on.
-fn model_key_for(state: &DerivationState, builds: &HashMap<Uuid, BuildInfo>) -> Option<ModelKey> {
+fn model_key_for(state: &DerivationState, builds: &Builds) -> Option<ModelKey> {
     Some(ModelKey {
         pname: state.pname.as_ref()?.clone(),
         system: state.system.clone(),
@@ -86,7 +84,7 @@ fn model_key_for(state: &DerivationState, builds: &HashMap<Uuid, BuildInfo>) -> 
 pub fn compute_initial(
     dag: &mut DerivationDag,
     sla: &SlaEstimator,
-    builds: &HashMap<Uuid, BuildInfo>,
+    builds: &Builds,
     newly_inserted: &HashSet<DrvHash>,
 ) {
     if newly_inserted.is_empty() {
@@ -194,7 +192,7 @@ pub fn update_ancestors(dag: &mut DerivationDag, from: &str) {
 ///
 /// Cost: O(V + E) for the topo-sort + one pass. For a 10k-node DAG,
 /// ~1ms. Every 60s is negligible.
-pub fn full_sweep(dag: &mut DerivationDag, sla: &SlaEstimator, builds: &HashMap<Uuid, BuildInfo>) {
+pub fn full_sweep(dag: &mut DerivationDag, sla: &SlaEstimator, builds: &Builds) {
     // Collect all non-terminal hashes. Terminal nodes don't need
     // priority (they won't be dispatched).
     let non_terminal: HashSet<DrvHash> = dag
@@ -220,6 +218,7 @@ mod tests {
     };
     use crate::state::DerivationStatus;
     use rio_test_support::fixtures::{make_derivation_node, make_edge};
+    use std::collections::HashMap;
     use uuid::Uuid;
 
     /// Build a domain `DerivationNode` for test DAG construction.
@@ -292,8 +291,8 @@ mod tests {
         SlaEstimator::new(&crate::sla::config::SlaConfig::test_default())
     }
 
-    fn no_builds() -> HashMap<Uuid, BuildInfo> {
-        HashMap::new()
+    fn no_builds() -> Builds {
+        Builds::new()
     }
 
     #[test]

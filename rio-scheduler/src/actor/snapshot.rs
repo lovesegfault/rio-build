@@ -325,7 +325,7 @@ impl DagActor {
 
         let mut pending_builds = 0u32;
         let mut active_builds = 0u32;
-        for b in self.builds.values() {
+        for b in self.builds.values_including_terminal() {
             match b.state() {
                 BuildState::Pending => pending_builds += 1,
                 BuildState::Active => active_builds += 1,

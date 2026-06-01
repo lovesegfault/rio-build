@@ -1418,11 +1418,16 @@ impl DerivationState {
     /// `None`).
     pub fn attributed_tenants<'a>(
         &'a self,
-        builds: &'a std::collections::HashMap<Uuid, super::BuildInfo>,
+        builds: &'a super::Builds,
     ) -> impl Iterator<Item = Uuid> + 'a {
+        // Deliberately includes lingering terminal builds: attribution
+        // (SLA model keys, metrics, path-tenant rows) is bookkeeping
+        // about who asked for the work, not a liveness-gated policy
+        // decision — a build that finished a moment ago still owns its
+        // attribution until cleanup.
         self.interested_builds
             .iter()
-            .filter_map(|id| builds.get(id)?.tenant_id)
+            .filter_map(|id| builds.get_including_terminal_for_bookkeeping(id)?.tenant_id)
     }
 
     /// Minimum-UUID tenant among interested builds — the SLA model-key
@@ -1438,10 +1443,7 @@ impl DerivationState {
     /// for a given set; cross-tenant dedup is rare enough that
     /// "smallest UUID wins" is fine — per-tenant key is a grouping
     /// dimension, not an accounting ledger.
-    pub fn attributed_tenant(
-        &self,
-        builds: &std::collections::HashMap<Uuid, super::BuildInfo>,
-    ) -> Option<Uuid> {
+    pub fn attributed_tenant(&self, builds: &super::Builds) -> Option<Uuid> {
         self.attributed_tenants(builds).min()
     }
 
@@ -1576,10 +1578,10 @@ pub use rio_common::wanted_outputs::{
 
 /// Effective wanted set for classification: the saturating union of the
 /// wanted contributions ([`DerivationState::wanted_by_build`]) of LIVE
-/// interested builds. A build is live iff its [`BuildInfo`](super::BuildInfo)
-/// is present in `builds` and `!state().is_terminal()` — a missing entry
-/// counts as terminal (terminal cleanup removes the `BuildInfo` and the
-/// DAG interest in the same handler).
+/// interested builds. Liveness is [`Builds::get`](super::Builds::get)'s
+/// contract — present in the map and `!state().is_terminal()`; a
+/// missing entry counts as terminal (terminal cleanup removes the
+/// `BuildInfo` and the DAG interest in the same handler).
 ///
 /// Returns `None` when the caller MUST fall back to the stored
 /// node-level union ([`DerivationState::wanted_output_names`]):
@@ -1600,22 +1602,16 @@ pub use rio_common::wanted_outputs::{
 /// Free function (not a `DerivationState` method) because liveness needs
 /// the actor's `builds` map, which the node cannot see; it lives here
 /// (not rio-common) because it needs [`BuildInfo`](super::BuildInfo).
-pub fn effective_wanted(
-    state: &DerivationState,
-    builds: &HashMap<Uuid, super::BuildInfo>,
-) -> Option<Vec<String>> {
-    use super::BuildStateExt as _;
-
+pub fn effective_wanted(state: &DerivationState, builds: &super::Builds) -> Option<Vec<String>> {
     // None = no live contribution folded yet. Folding starts from the
     // first live contribution (cloned) rather than an empty accumulator:
     // an empty Vec is the "all wanted" sentinel and would saturate the
     // union from the start.
     let mut effective: Option<Vec<String>> = None;
     for build_id in &state.interested_builds {
-        let live = builds
-            .get(build_id)
-            .is_some_and(|b| !b.state().is_terminal());
-        if !live {
+        // `Builds::get` is the live-only policy accessor — the terminal
+        // filter is structural, not re-derived here.
+        if builds.get(build_id).is_none() {
             continue;
         }
         // A live interested build with an unknown contribution: a partial
@@ -1839,7 +1835,7 @@ mod tests {
         let live_unknown = Uuid::new_v4();
         let done = Uuid::new_v4();
 
-        let mut builds: HashMap<Uuid, BuildInfo> = HashMap::new();
+        let mut builds = crate::state::Builds::new();
         for bid in [live_out, live_dev, live_all, live_unknown] {
             builds.insert(bid, mk_build(bid));
         }
@@ -2489,8 +2485,9 @@ mod tests {
                 HashSet::new(),
             )
         };
-        let builds: std::collections::HashMap<_, _> =
-            [(b_hi, mk(b_hi, t_hi)), (b_lo, mk(b_lo, t_lo))].into();
+        let mut builds = crate::state::Builds::new();
+        builds.insert(b_hi, mk(b_hi, t_hi));
+        builds.insert(b_lo, mk(b_lo, t_lo));
 
         let mut s = DerivationState::try_from_node(&dummy_node())?;
         // Insert hi-tenant build first, lo second.

@@ -1393,7 +1393,7 @@ fn test_large_dag_hot_ops_perf_bound() -> anyhow::Result<()> {
     }
 
     let sla = crate::sla::SlaEstimator::new(&crate::sla::config::SlaConfig::test_default());
-    let builds = std::collections::HashMap::new();
+    let builds = crate::state::Builds::new();
 
     macro_rules! time {
         ($name:literal, $bound_ms:literal, $body:expr) => {{

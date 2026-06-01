@@ -180,7 +180,7 @@ impl DagActor {
         self.finalize_recovered_builds(&bd_rows).await;
 
         info!(
-            builds = self.builds.len(),
+            builds = self.builds.len_including_terminal(),
             derivations = self.dag.iter_nodes().count(),
             ready_queue = self.ready_queue.len(),
             "state recovery complete"
@@ -986,7 +986,8 @@ impl DagActor {
             *bd_counts.entry(*build_id).or_insert(0) += 1;
         }
 
-        let build_ids_to_check: Vec<Uuid> = self.builds.keys().copied().collect();
+        let build_ids_to_check: Vec<Uuid> =
+            self.builds.keys_including_terminal().copied().collect();
         for build_id in build_ids_to_check {
             // Zero PG links → orphan. Skip completion check.
             // TransitionOutcome::Rejected also guards against
@@ -1008,7 +1009,9 @@ impl DagActor {
             // a later ClearPoison/TTL removes the node →
             // failed_count=0 → keep_going build spuriously Succeeds.
             // error_summary is the sticky; failed_count is not.
-            if let Some(b) = self.builds.get_mut(&build_id)
+            if let Some(b) = self
+                .builds
+                .get_mut_including_terminal_for_bookkeeping(&build_id)
                 && b.failed_count > 0
                 && b.error_summary.is_none()
             {

@@ -30,8 +30,8 @@ use crate::lease::LeaderState;
 use crate::queue::ReadyQueue;
 #[allow(unused_imports)]
 use crate::state::{
-    BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, ExecutorId, ExecutorState,
-    HEARTBEAT_TIMEOUT_SECS, POISON_TTL, PoisonConfig, RetryPolicy,
+    BuildInfo, BuildState, BuildStateExt, Builds, DerivationStatus, DrvHash, ExecutorId,
+    ExecutorState, HEARTBEAT_TIMEOUT_SECS, POISON_TTL, PoisonConfig, RetryPolicy,
 };
 
 // `impl DagActor` is sharded across these submodules by concern.
@@ -259,7 +259,7 @@ pub struct DagActor {
     /// FIFO queue of ready derivation hashes.
     ready_queue: ReadyQueue,
     /// Active builds indexed by build_id.
-    builds: HashMap<Uuid, BuildInfo>,
+    builds: Builds,
     /// Per-build event broadcast channels + sequence/debounce state +
     /// persister/flusher wires. See [`BuildEventBus`].
     events: BuildEventBus,
@@ -717,7 +717,7 @@ impl DagActor {
         Self {
             dag,
             ready_queue: ReadyQueue::new(),
-            builds: HashMap::new(),
+            builds: Builds::new(),
             events: BuildEventBus::new(plumbing.event_persist_tx, plumbing.log_flush_tx),
             log_buffers: plumbing.log_buffers,
             executors: HashMap::new(),

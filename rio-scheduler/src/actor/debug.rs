@@ -270,7 +270,10 @@ impl DagActor {
         build_id: Uuid,
         secs_ago: u64,
     ) -> bool {
-        let Some(build) = self.builds.get_mut(&build_id) else {
+        let Some(build) = self
+            .builds
+            .get_mut_including_terminal_for_bookkeeping(&build_id)
+        else {
             return false;
         };
         build.submitted_at = backdate(secs_ago);
