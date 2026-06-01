@@ -17,7 +17,16 @@ use serde::{Deserialize, Serialize};
 /// "neither error nor drvPath" error instead of a serde panic).
 #[derive(Debug, Clone, Deserialize)]
 struct RawEvalLine {
+    /// Human-display rendering of the attribute path. nix-eval-jobs
+    /// quotes any path component that is not a bare Nix identifier, so
+    /// for the scoped selection's flat dotted attribute names this
+    /// arrives wrapped in literal `"` characters — never use it as a
+    /// join key; it is only a fallback when `attrPath` is absent.
     attr: Option<String>,
+    /// Machine-readable attribute path, one element per component, free
+    /// of display escaping.
+    #[serde(default, rename = "attrPath")]
+    attr_path: Vec<String>,
     #[serde(rename = "drvPath")]
     drv_path: Option<String>,
     #[serde(default)]
@@ -26,6 +35,23 @@ struct RawEvalLine {
     error: Option<String>,
     #[serde(default)]
     constituents: Vec<String>,
+}
+
+impl RawEvalLine {
+    /// Canonical attribute/job name for this line: the dot-join of the
+    /// structured `attrPath` — which is exactly Hydra's job-name
+    /// convention, so a scoped selection's flat `"a.b.c"` attribute and
+    /// a full evaluation's nested `a.b.c` path both derive the name the
+    /// recorder's ground truth, buildstatus truth, and unit labels are
+    /// keyed by. Falls back to the display `attr` rendering only when
+    /// `attrPath` is missing entirely.
+    fn canonical_attr(&self) -> String {
+        if self.attr_path.is_empty() {
+            self.attr.clone().unwrap_or_default()
+        } else {
+            self.attr_path.join(".")
+        }
+    }
 }
 
 /// One in-scope job as the evaluator produced it:
@@ -92,7 +118,7 @@ fn line_snippet(line: &str) -> String {
 pub fn parse_eval_jobs_line(line: &str) -> anyhow::Result<ParsedEvalLine> {
     let raw: RawEvalLine = serde_json::from_str(line)
         .with_context(|| format!("parse nix-eval-jobs output line: {}", line_snippet(line)))?;
-    let attr = raw.attr.clone().unwrap_or_default();
+    let attr = raw.canonical_attr();
     if let Some(error) = raw.error {
         return Ok(ParsedEvalLine::Error(EvalErrorRecord { attr, error }));
     }
@@ -177,15 +203,36 @@ pub async fn run_evaluator(
 mod tests {
     use super::*;
 
-    const HELLO_LINE: &str = r#"{"attr":"nixpkgs.hello.x86_64-linux","attrPath":["nixpkgs.hello.x86_64-linux"],"drvPath":"/nix/store/7mdg60drrnh0wq1j8hmmbhll47czm107-hello-2.12.3.drv","name":"hello-2.12.3","outputs":{"out":"/nix/store/10s5j3mfdg22k1597x580qrhprnzcjwb-hello-2.12.3"},"system":"x86_64-linux","meta":{"available":true}}"#;
-    const ERROR_LINE: &str = r#"{"attr":"nixpkgs.broken.x86_64-linux","attrPath":["nixpkgs.broken.x86_64-linux"],"error":"attribute 'broken' missing"}"#;
-    const AGGREGATE_LINE: &str = r#"{"attr":"tested","attrPath":["tested"],"drvPath":"/nix/store/nfxb7045aaaaaaaaaaaaaaaaaaaaaaaa-nixos-26.05pre975402.68d8aa3d661f.drv","name":"nixos-26.05pre975402.68d8aa3d661f","outputs":{"out":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nixos-26.05pre975402.68d8aa3d661f"},"system":"x86_64-linux","constituents":["/nix/store/bvzyd5iyaaaaaaaaaaaaaaaaaaaaaaaa-nixos-minimal.iso.drv"]}"#;
+    // Golden captures from the pinned nix-eval-jobs (2.34.1) — shape
+    // verbatim, store paths substituted with the recorded eval-1824219
+    // values other fixtures pin. The scoped selection exposes each job
+    // as a single flat attribute named by its dotted Hydra job name, and
+    // nix-eval-jobs renders such names in `attr` wrapped in literal `"`
+    // characters (`attrPath` carries the clean name):
+    //
+    //   nix-eval-jobs --workers 1 --meta <selection.nix>
+    //
+    // Hand-editing these shapes (e.g. unquoting `attr`) would re-pin the
+    // parser to output the real binary never produces.
+    const HELLO_LINE: &str = r#"{"attr":"\"nixpkgs.hello.x86_64-linux\"","attrPath":["nixpkgs.hello.x86_64-linux"],"constituents":[],"drvPath":"/nix/store/7mdg60drrnh0wq1j8hmmbhll47czm107-hello-2.12.3.drv","globConstituents":false,"meta":{"available":true},"name":"hello-2.12.3","namedConstituents":[],"outputs":{"out":"/nix/store/10s5j3mfdg22k1597x580qrhprnzcjwb-hello-2.12.3"},"requiredSystemFeatures":[],"storeDir":"/nix/store","system":"x86_64-linux"}"#;
+    const ERROR_LINE: &str = r#"{"attr":"\"nixpkgs.broken.x86_64-linux\"","attrPath":["nixpkgs.broken.x86_64-linux"],"error":"attribute 'broken' missing","fatal":false}"#;
+    const AGGREGATE_LINE: &str = r#"{"attr":"\"nixos.tested\"","attrPath":["nixos.tested"],"constituents":["/nix/store/bvzyd5iyaaaaaaaaaaaaaaaaaaaaaaaa-nixos-minimal.iso.drv"],"drvPath":"/nix/store/nfxb7045aaaaaaaaaaaaaaaaaaaaaaaa-nixos-26.05pre975402.68d8aa3d661f.drv","globConstituents":false,"name":"nixos-26.05pre975402.68d8aa3d661f","namedConstituents":[],"outputs":{"out":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nixos-26.05pre975402.68d8aa3d661f"},"requiredSystemFeatures":[],"storeDir":"/nix/store","system":"x86_64-linux"}"#;
+    // A full-evaluation line (`--force-recurse`): the attr path is
+    // nested, so `attr` is the clean dot-join and `attrPath` has one
+    // element per nesting level. Both shapes must derive the same job
+    // name.
+    const NESTED_LINE: &str = r#"{"attr":"nixos.tests.login.x86_64-linux","attrPath":["nixos","tests","login","x86_64-linux"],"constituents":[],"drvPath":"/nix/store/lwi798n9vczdqf7a51yfhl70kjp5b3b5-vm-test-run-login.drv","globConstituents":false,"name":"vm-test-run-login","namedConstituents":[],"outputs":{"out":"/nix/store/j94lvxv7sn2129q61km8pi5qvyxphb4j-vm-test-run-login"},"requiredSystemFeatures":[],"storeDir":"/nix/store","system":"x86_64-linux"}"#;
 
     #[test]
     fn parses_a_job_line_into_a_manifest_record() {
         let parsed = parse_eval_jobs_line(HELLO_LINE).unwrap();
         match parsed {
             ParsedEvalLine::Job(rec) => {
+                // The job name comes from the structured `attrPath`, not
+                // the quote-wrapped `attr` rendering, so it is exactly
+                // the Hydra job name the selection was generated from —
+                // the join key for the fidelity gate, the buildstatus
+                // truth, and the units.jsonl label.
                 assert_eq!(rec.job, "nixpkgs.hello.x86_64-linux");
                 assert_eq!(rec.attr, "nixpkgs.hello.x86_64-linux");
                 assert_eq!(rec.system, "x86_64-linux");
@@ -203,10 +250,71 @@ mod tests {
         }
     }
 
+    /// Round-trip: every job-name shape [`super::super::recipe::selection_expr`]
+    /// accepts (dots as separators; `-`, `_`, `+` inside components)
+    /// comes back from the evaluator output as exactly the requested
+    /// name. The lines are golden captures of the pinned nix-eval-jobs
+    /// evaluating a flat selection over these names — each `attr` is
+    /// quote-wrapped, so deriving names from `attr` instead of
+    /// `attrPath` fails this test.
+    #[test]
+    fn scoped_job_names_round_trip_through_evaluator_output() {
+        const ODD_NAME_LINES: [(&str, &str); 3] = [
+            (
+                "nixos.tests.systemd-networkd.x86_64-linux",
+                r#"{"attr":"\"nixos.tests.systemd-networkd.x86_64-linux\"","attrPath":["nixos.tests.systemd-networkd.x86_64-linux"],"constituents":[],"drvPath":"/nix/store/ik8aihdqgmp671k66rjphs4nyxv50f77-vm-test-run-systemd-networkd.drv","globConstituents":false,"name":"vm-test-run-systemd-networkd","namedConstituents":[],"outputs":{"out":"/nix/store/p3khaykm4r1z4i75py1bc96rz06j50h8-vm-test-run-systemd-networkd"},"requiredSystemFeatures":[],"storeDir":"/nix/store","system":"x86_64-linux"}"#,
+            ),
+            (
+                "nixpkgs.gnupg24+libusb.x86_64-linux",
+                r#"{"attr":"\"nixpkgs.gnupg24+libusb.x86_64-linux\"","attrPath":["nixpkgs.gnupg24+libusb.x86_64-linux"],"constituents":[],"drvPath":"/nix/store/wra3s69mm29an6srfnbg7f2q9dgnj8b1-gnupg-2.4.5.drv","globConstituents":false,"name":"gnupg-2.4.5","namedConstituents":[],"outputs":{"out":"/nix/store/7vgq5iqr5kbpbzx664a1mi76znv1pr75-gnupg-2.4.5"},"requiredSystemFeatures":[],"storeDir":"/nix/store","system":"x86_64-linux"}"#,
+            ),
+            (
+                "nixpkgs.haskellPackages.aeson_2_2_3_0.x86_64-linux",
+                r#"{"attr":"\"nixpkgs.haskellPackages.aeson_2_2_3_0.x86_64-linux\"","attrPath":["nixpkgs.haskellPackages.aeson_2_2_3_0.x86_64-linux"],"constituents":[],"drvPath":"/nix/store/j8s55vwhljra6kq7q19ykq0pcb6a5g8f-aeson-2.2.3.0.drv","globConstituents":false,"name":"aeson-2.2.3.0","namedConstituents":[],"outputs":{"out":"/nix/store/zf5nl55j6zpb3w4gpcrczhr2y9a1sglj-aeson-2.2.3.0"},"requiredSystemFeatures":[],"storeDir":"/nix/store","system":"x86_64-linux"}"#,
+            ),
+        ];
+        for (requested, line) in ODD_NAME_LINES {
+            match parse_eval_jobs_line(line).unwrap() {
+                ParsedEvalLine::Job(rec) => {
+                    assert_eq!(rec.job, requested, "job name must round-trip");
+                    assert_eq!(rec.attr, requested);
+                }
+                other => panic!("expected Job for {requested}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn nested_attr_paths_join_to_the_hydra_job_name() {
+        // Full evaluations expose nested attrsets; the dot-join of
+        // `attrPath` is Hydra's job-name convention, so nested and flat
+        // shapes both derive the canonical name.
+        match parse_eval_jobs_line(NESTED_LINE).unwrap() {
+            ParsedEvalLine::Job(rec) => {
+                assert_eq!(rec.job, "nixos.tests.login.x86_64-linux");
+                assert_eq!(rec.attr, "nixos.tests.login.x86_64-linux");
+            }
+            other => panic!("expected Job, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_attr_path_falls_back_to_the_attr_field() {
+        // Defensive fallback for producers that omit `attrPath`: the
+        // display string is better than no name at all.
+        let line = r#"{"attr":"hello","drvPath":"/nix/store/7mdg60drrnh0wq1j8hmmbhll47czm107-hello-2.12.3.drv","outputs":{},"system":"x86_64-linux"}"#;
+        match parse_eval_jobs_line(line).unwrap() {
+            ParsedEvalLine::Job(rec) => assert_eq!(rec.job, "hello"),
+            other => panic!("expected Job, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parses_an_error_line() {
         match parse_eval_jobs_line(ERROR_LINE).unwrap() {
             ParsedEvalLine::Error(e) => {
+                // Eval-error attrs become exclusions.jsonl labels, so
+                // they need the same clean name as job records.
                 assert_eq!(e.attr, "nixpkgs.broken.x86_64-linux");
                 assert!(e.error.contains("missing"));
             }
@@ -217,7 +325,7 @@ mod tests {
     #[test]
     fn aggregate_lines_are_classified_not_manifested() {
         match parse_eval_jobs_line(AGGREGATE_LINE).unwrap() {
-            ParsedEvalLine::Aggregate { attr, .. } => assert_eq!(attr, "tested"),
+            ParsedEvalLine::Aggregate { attr, .. } => assert_eq!(attr, "nixos.tested"),
             other => panic!("expected Aggregate, got {other:?}"),
         }
     }
