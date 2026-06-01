@@ -799,6 +799,26 @@ producer satisfies both: the gateway emits each edge together with its parent
 node and includes every child as a node of the same request, and the hook
 fallback submits a single node with no edges.
 
+#r("sched.merge.ingress-output-path-shape")[
+  `SubmitBuild` ingress MUST reject any node carrying an
+  `expected_output_paths` entry that is neither empty nor a valid non-`.drv`
+  store path.
+]
+
+Declared output paths flow into `FindMissingPaths` cache-hit probing, the
+HMAC assignment-claims output allowlist that authorizes worker uploads, and
+the merge gate's fixed-output path-agreement evidence. Empty entries are the
+legitimate floating-CA / deferred shape (the real path is computed at
+resolution time); anything else that is not a store path is either hostile or
+garbage, and rejecting it at ingress keeps tenant-controlled non-store-path
+strings out of every downstream consumer — the same trusted-plane line the
+gateway draws for its own clients (#rref("gw.reject.output-path-mismatch+2")).
+The shape check is deliberately weaker than the gateway's binding check (the
+scheduler has no derivation bytes for store-backed nodes to re-derive paths
+from); content-binding for inline submissions is the authoritative-content
+validation, and full evidence-ranked binding for store-backed claims is a
+documented follow-up.
+
 #r("sched.merge.edge-creation-scoped")[
   The merge MUST attach a submitted dependency edge to its parent node only
   when this submission (re)creates that parent (a newly inserted node, a

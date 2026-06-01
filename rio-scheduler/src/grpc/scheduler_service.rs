@@ -167,6 +167,39 @@ impl SchedulerService for SchedulerGrpc {
                     node.drv_hash
                 )));
             }
+            // r[impl sched.merge.ingress-output-path-shape]
+            // expected_output_paths feed FindMissingPaths cache-hit
+            // probing, the assignment-claims output allowlist that
+            // authorizes worker uploads, and the merge gate's FOD
+            // path-agreement evidence. Each entry must be empty
+            // (floating-CA / deferred — the path is computed at
+            // resolution) or parse as a non-.drv store path. Backstop
+            // for direct submitters: the gateway re-derives and
+            // validates every declared path before submitting
+            // (gw.reject.output-path-mismatch+2), so nothing it
+            // produces is rejected here.
+            for (i, path) in node.expected_output_paths.iter().enumerate() {
+                if path.is_empty() {
+                    continue;
+                }
+                match rio_nix::store_path::StorePath::parse(path) {
+                    Ok(sp) if !sp.is_derivation() => {}
+                    Ok(_) => {
+                        return Err(Status::invalid_argument(format!(
+                            "node {} expected_output_paths[{i}] {path:?} is a .drv path — \
+                             outputs cannot be derivations",
+                            node.drv_hash
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(Status::invalid_argument(format!(
+                            "node {} expected_output_paths[{i}] {path:?} is not a valid store \
+                             path: {e}",
+                            node.drv_hash
+                        )));
+                    }
+                }
+            }
             if node.system.is_empty() {
                 return Err(Status::invalid_argument(format!(
                     "node {} system must be non-empty",

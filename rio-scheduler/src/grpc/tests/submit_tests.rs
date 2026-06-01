@@ -150,6 +150,65 @@ async fn test_submit_build_rejects_fod_without_ca_flag() {
     );
 }
 
+// r[verify sched.merge.ingress-output-path-shape]
+/// expected_output_paths entries must be empty (floating-CA/deferred) or
+/// real non-.drv store paths — they feed FindMissingPaths, the
+/// assignment-claims allowlist, and the merge gate's FOD path evidence.
+#[rstest]
+#[case::short_hash("/nix/store/zzz-evil")]
+#[case::not_store_path("/build/exfil")]
+#[case::drv_path("/nix/store/cccccccccccccccccccccccccccccccc-evil.drv")]
+#[tokio::test]
+async fn test_submit_build_rejects_malformed_expected_output_path(#[case] bad_path: &str) {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    let mut node = make_node("bad-expected-out");
+    node.expected_output_paths = vec![bad_path.to_owned()];
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("expected_output_paths"),
+        "error should name the field: {}",
+        status.message()
+    );
+}
+
+// r[verify sched.merge.ingress-output-path-shape]
+/// Empty entries are the legitimate floating-CA / deferred shape and stay
+/// accepted; valid store paths likewise.
+#[tokio::test]
+async fn test_submit_build_accepts_empty_expected_output_paths() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    let mut node = make_node("empty-expected-out");
+    node.is_content_addressed = true;
+    node.expected_output_paths = vec![
+        String::new(),
+        "/nix/store/ffffffffffffffffffffffffffffffff-real-out".to_owned(),
+    ];
+    let result = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await;
+    // Reaches the actor (or fails for a non-ingress reason); the shape gate
+    // must not reject the empty/valid mix.
+    if let Err(status) = &result {
+        assert!(
+            !status.message().contains("expected_output_paths"),
+            "shape gate must not fire on empty/valid entries: {}",
+            status.message()
+        );
+    }
+}
+
 // r[verify sched.merge.ingress-edge-endpoints]
 /// An edge whose parent is not a node of this request would attach a
 /// dependency to ANOTHER submitter's resident node via the global path
