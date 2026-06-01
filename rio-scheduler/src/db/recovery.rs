@@ -473,33 +473,6 @@ impl SchedulerDb {
         .await
     }
 
-    /// Max sequence number per build_id from build_event_log.
-    /// recover_from_pg() seeds `build_sequences` from this so new
-    /// events continue from where the old leader left off — a
-    /// reconnecting WatchBuild client with `since_sequence=N` would
-    /// miss events if we reset to 0 and emitted new events with
-    /// seq=1 (<N → filtered by the client).
-    ///
-    /// Only for builds that are still active (caller filters by
-    /// build_ids from load_nonterminal_builds).
-    pub async fn max_sequence_per_build(
-        &self,
-        build_ids: &[Uuid],
-    ) -> Result<Vec<(Uuid, i64)>, sqlx::Error> {
-        if build_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        sqlx::query_as(
-            r#"
-            SELECT build_id, MAX(sequence) FROM build_event_log
-            WHERE build_id = ANY($1) GROUP BY build_id
-            "#,
-        )
-        .bind(build_ids)
-        .fetch_all(&self.pool)
-        .await
-    }
-
     /// Load the build's derivation subgraph for dashboard DAG viz
     /// (`AdminService.GetBuildGraph`). PG-backed, not actor-snapshot —
     /// completed builds have no actor state, but PG persists the full graph.

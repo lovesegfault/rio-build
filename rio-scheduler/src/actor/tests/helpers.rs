@@ -155,8 +155,7 @@ pub(crate) async fn setup_ca_fixture_configured(
 
 /// Set up an actor with a configurator closure that mutates
 /// `DagActorConfig`/`DagActorPlumbing` before spawn. For tests that
-/// need custom `retry_policy`, `event_persist_tx`,
-/// `leader`, etc.
+/// need custom `retry_policy`, `leader`, etc.
 pub(crate) fn setup_actor_configured(
     pool: sqlx::PgPool,
     store_client: Option<StoreServiceClient<Channel>>,

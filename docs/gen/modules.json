@@ -869,7 +869,7 @@
     {
       "path": "actor/event.rs",
       "depth": 1,
-      "doc": "Build-event emission: per-build broadcast channel + PG persist"
+      "doc": "Build-event emission: per-build broadcast channels."
     },
     {
       "path": "actor/executor.rs",
@@ -1045,11 +1045,6 @@
       "path": "domain.rs",
       "depth": 0,
       "doc": "Scheduler-internal domain types decoupled from `rio_proto` wire types."
-    },
-    {
-      "path": "event_log.rs",
-      "depth": 0,
-      "doc": "Persistent build event log for since_sequence resumption."
     },
     {
       "path": "grpc/",

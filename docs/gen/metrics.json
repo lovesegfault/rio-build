@@ -95,7 +95,6 @@
     "rio_scheduler_derivations_gc_deleted_total",
     "rio_scheduler_derivations_queued",
     "rio_scheduler_derivations_running",
-    "rio_scheduler_event_persist_dropped_total",
     "rio_scheduler_evidence_write_fenced_total",
     "rio_scheduler_features_stripped_total",
     "rio_scheduler_generation_claim_failed_total",
@@ -689,11 +688,6 @@
         "name": "rio_scheduler_derivations_running",
         "kind": "gauge",
         "help": "Derivations currently building"
-      },
-      {
-        "name": "rio_scheduler_event_persist_dropped_total",
-        "kind": "counter",
-        "help": "BuildEvents dropped from PG persister (channel backpressure). Broadcast still live; only mid-backlog reconnect loses it. Alert if rate > 0 sustained."
       },
       {
         "name": "rio_scheduler_evidence_write_fenced_total",

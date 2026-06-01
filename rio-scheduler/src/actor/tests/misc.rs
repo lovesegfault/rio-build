@@ -107,9 +107,9 @@ async fn test_not_leader_does_not_set_gauges() -> TestResult {
     merge_single_node(&handle, Uuid::new_v4(), "sg-drv", PriorityClass::Scheduled).await?;
 
     // Tick on a fresh actor: tick_count 0→1, maybe_refresh_estimator
-    // early-returns (1%6≠0), event_persist_tx is None → sweep gated
-    // out. No workers, nothing running → heartbeat/backstop/poison
-    // scans no-op. Gauge block is the only gauge path reachable.
+    // early-returns (1%6≠0). No workers, nothing running →
+    // heartbeat/backstop/poison scans no-op. Gauge block is the only
+    // gauge path reachable.
     handle.send_unchecked(ActorCommand::Tick).await?;
     barrier(&handle).await;
 
@@ -1884,45 +1884,46 @@ async fn clear_persisted_state_clears_per_generation_maps() {
 }
 
 // ---------------------------------------------------------------------------
-// BuildEventBus: display-only seq reuse
+// BuildEventBus: display-only ring routing
 // ---------------------------------------------------------------------------
 
-/// `Event::SubstituteProgress` is not persisted, so it MUST NOT consume
-/// a sequence number — otherwise the in-memory counter diverges from PG
-/// `MAX(sequence)` and the `since_sequence < last_seq` replay guard
-/// misfires after failover.
+/// `Event::SubstituteProgress` is display-only: it MUST be routed to the
+/// log ring, never the state ring, so display volume cannot evict
+/// state-transition events (`r[gw.activity.stop-parity]`).
 #[tokio::test]
-async fn display_only_events_do_not_consume_sequence() {
+async fn display_only_events_route_to_log_ring() {
     use crate::actor::event::BuildEventBus;
     use rio_proto::types::build_event::Event;
-    let mut bus = BuildEventBus::new(None);
+    let mut bus = BuildEventBus::new();
     let build_id = Uuid::new_v4();
-    let _rx = bus.register(build_id);
+    let mut rx = bus.register(build_id);
 
     bus.emit(
         build_id,
-        Event::Started(rio_proto::types::BuildStarted::default()),
-    );
-    assert_eq!(bus.last_seq(build_id), 1);
-    for _ in 0..50 {
-        bus.emit(
-            build_id,
-            Event::SubstituteProgress(rio_proto::types::SubstituteProgress::default()),
-        );
-    }
-    assert_eq!(
-        bus.last_seq(build_id),
-        1,
-        "SubstituteProgress must not consume seq"
+        Event::SubstituteProgress(rio_proto::types::SubstituteProgress::default()),
     );
     bus.emit(
         build_id,
         Event::Derivation(rio_proto::types::DerivationEvent::default()),
     );
-    assert_eq!(
-        bus.last_seq(build_id),
-        2,
-        "next persisted event gets seq=2, not 52"
+
+    // State ring sees ONLY the Derivation event.
+    let state_ev = rx.state.try_recv().expect("state event");
+    assert!(
+        matches!(state_ev.event, Some(Event::Derivation(_))),
+        "state ring must carry the Derivation event, got {:?}",
+        state_ev.event
+    );
+    assert!(
+        rx.state.try_recv().is_err(),
+        "SubstituteProgress must NOT be on the state ring"
+    );
+    // Log ring sees ONLY the SubstituteProgress.
+    let log_ev = rx.log.try_recv().expect("log event");
+    assert!(
+        matches!(log_ev.event, Some(Event::SubstituteProgress(_))),
+        "log ring must carry the SubstituteProgress event, got {:?}",
+        log_ev.event
     );
 }
 

@@ -125,7 +125,6 @@ impl DagActor {
         self.tick_check_orphaned_builds().await;
         self.tick_process_expired_poisons(expired_poisons).await;
 
-        self.tick_sweep_event_log();
         self.tick_gc_orphan_derivations().await;
         self.tick_sweep_dispatched_cells();
         self.tick_publish_gauges();
@@ -456,44 +455,6 @@ impl DagActor {
                 .node(k)
                 .is_some_and(|s| matches!(s.status(), Ready | Assigned | Running))
         });
-    }
-
-    /// `build_event_log` time-based sweep. Every 360 ticks (~1h at
-    /// 10s interval). Safety net for terminal-cleanup delete —
-    /// if that failed (PG blip), rows would leak. Also catches
-    /// rows from builds that never hit terminal-cleanup (actor
-    /// restart mid-build, PG restored before recovery).
-    ///
-    /// `spawn_monitored` (not bare spawn): a PG panic in the sweep
-    /// logs with task=event-log-sweep + component=scheduler instead
-    /// of vanishing. Still fire-and-forget — `handle_tick` doesn't block.
-    /// 24h retention is plenty for WatchBuild replay (gateway
-    /// reconnects are within minutes of disconnect).
-    fn tick_sweep_event_log(&self) {
-        const EVENT_LOG_SWEEP_EVERY: u64 = 360;
-        if self.tick_count.is_multiple_of(EVENT_LOG_SWEEP_EVERY) && self.events.has_persister() {
-            let pool = self.db.pool().clone();
-            rio_common::task::spawn_monitored("event-log-sweep", async move {
-                match sqlx::query(
-                    "DELETE FROM build_event_log WHERE created_at < now() - interval '24 hours'",
-                )
-                .execute(&pool)
-                .await
-                {
-                    Ok(r) => {
-                        if r.rows_affected() > 0 {
-                            debug!(
-                                rows = r.rows_affected(),
-                                "event-log sweep: deleted rows older than 24h"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "event-log sweep failed (will retry next hour)");
-                    }
-                }
-            });
-        }
     }
 
     // r[impl sched.db.derivations-gc+3]

@@ -39,8 +39,13 @@ message BuildEvent {
   // Removed by the build-log data-plane cutover: the gateway sources the
   // live tail from rio-store's LogService.TailLog instead.
   reserved 6;
+  // 2 was `uint64 sequence` — the per-build monotonic counter that keyed
+  // the build_event_log replay. Removed with the WatchBuild resumability
+  // layer: reconnection is snapshot-first (the snapshot arm below), so
+  // events carry no ordering metadata beyond stream order.
+  reserved 2;
+  reserved "sequence";
   string build_id = 1;
-  uint64 sequence = 2;                      // Monotonic, for stream resumption
   google.protobuf.Timestamp timestamp = 3;
   oneof event {
     BuildStarted started = 4;
@@ -522,8 +527,12 @@ message SubmitBuildRequest {
 }
 
 message WatchBuildRequest {
+  // 2 was `uint64 since_sequence` — the replay resume point. Removed with
+  // the WatchBuild resumability layer: the response stream is snapshot-
+  // first (BuildEvent.snapshot), so there is nothing to resume from.
+  reserved 2;
+  reserved "since_sequence";
   string build_id = 1;
-  uint64 since_sequence = 2;             // Resume from this sequence (0 = from start)
 }
 
 message QueryBuildRequest {

@@ -4300,10 +4300,10 @@ async fn compute_spawn_intents_carries_ice_masked_cells() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.build.terminal-status-settled]
+// r[verify sched.build.terminal-status-settled+2]
 /// A dispatch-time store hit that fans out to a resident terminal build
-/// must not mutate its served accounting and must not persist a
-/// post-terminal `BuildProgress` to the event log.
+/// must not mutate its served accounting and must not emit a
+/// post-terminal `BuildProgress` to its watchers.
 ///
 /// Staging: B1 builds X and succeeds (terminal, resident for the cleanup
 /// window, interest retained on X). B2 re-merges X while X's output is
@@ -4311,24 +4311,21 @@ async fn compute_spawn_intents_carries_ice_masked_cells() -> TestResult {
 /// Ready. The output then appears in the store and the next dispatch
 /// sweep's batched Ready probe completes X as cached, fanning out to
 /// every interested build — including terminal B1. B1's served
-/// accounting (cached_derivations) and its persisted event stream must
-/// both stay settled; a post-`BuildCompleted` `BuildProgress` row in
-/// `build_event_log` would be replayed to re-subscribers with totals
-/// recomputed from a DAG the finished build no longer describes.
+/// accounting (cached_derivations), its live event stream, and its
+/// WatchBuild snapshot must all stay settled: a post-`BuildCompleted`
+/// `BuildProgress` recomputed from the still-mutating DAG would reach
+/// watchers with totals the finished build no longer describes.
 #[tokio::test]
 async fn test_terminal_build_frozen_on_dispatch_store_hit() -> TestResult {
-    use prost::Message;
     use rio_proto::types::build_event::Event;
 
-    // Setup: mock store + a captured event-log persister channel.
+    // Setup: mock store. B1's broadcast receiver is held for the whole
+    // test so every event B1's watchers would see is observable.
     let db = TestDb::new(&MIGRATOR).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
-    let (persist_tx, mut persist_rx) = mpsc::channel::<crate::event_log::EventLogEntry>(256);
     let (handle, _actor_task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), |_, plumbing| {
-            plumbing.event_persist_tx = Some(persist_tx);
-        });
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_, _| {});
 
     let x_out = test_store_path("tfz-x-out");
 
@@ -4336,7 +4333,7 @@ async fn test_terminal_build_frozen_on_dispatch_store_hit() -> TestResult {
     let b1 = Uuid::new_v4();
     let mut x = make_node("tfz-x");
     x.expected_output_paths = vec![x_out.clone()];
-    merge_dag(&handle, b1, vec![x.clone()], vec![], false).await?;
+    let mut b1_events = merge_dag(&handle, b1, vec![x.clone()], vec![], false).await?;
     barrier(&handle).await;
 
     // Build X via the pull surface → B1 Succeeded.
@@ -4352,6 +4349,16 @@ async fn test_terminal_build_frozen_on_dispatch_store_hit() -> TestResult {
         settled.cached_derivations, 0,
         "precondition: B1 built X from source — no cache hits"
     );
+
+    // Drain B1's stream up to (and including) its BuildCompleted. From
+    // here on, no BuildProgress may follow for B1.
+    let mut saw_completed = false;
+    while let Ok(ev) = b1_events.try_recv() {
+        if matches!(ev.event, Some(Event::Completed(_))) {
+            saw_completed = true;
+        }
+    }
+    assert!(saw_completed, "precondition: B1's BuildCompleted observed");
 
     // B2 re-merges X (+ a sibling root Z so B2 stays live). x_out is NOT
     // in the mock store → the stale-Completed verify resets X to Ready.
@@ -4371,10 +4378,6 @@ async fn test_terminal_build_frozen_on_dispatch_store_hit() -> TestResult {
          missing from the store); got {:?}",
         xs.status
     );
-
-    // Drain everything persisted so far. From here on, nothing for B1
-    // may be a BuildProgress.
-    while persist_rx.try_recv().is_ok() {}
 
     // The output appears in the store → the next dispatch sweep's
     // batched Ready probe completes X as cached and fans out to ALL
@@ -4404,23 +4407,48 @@ async fn test_terminal_build_frozen_on_dispatch_store_hit() -> TestResult {
          terminal transition"
     );
 
-    // 2. No post-terminal BuildProgress was persisted to the event log.
-    let mut post_terminal_progress: Vec<u64> = Vec::new();
-    while let Ok((build_id, seq, bytes)) = persist_rx.try_recv() {
-        if build_id != b1 {
-            continue;
-        }
-        let ev = rio_proto::types::BuildEvent::decode(&bytes[..])?;
+    // 2. No post-terminal BuildProgress reached B1's live stream. The
+    //    per-drv DerivationCached fan-out event is allowed (it is a fact
+    //    about the derivation, not aggregate progress of the finished
+    //    build); aggregate Progress is not.
+    let mut post_terminal_progress = 0usize;
+    while let Ok(ev) = b1_events.try_recv() {
         if matches!(ev.event, Some(Event::Progress(_))) {
-            post_terminal_progress.push(seq);
+            post_terminal_progress += 1;
         }
     }
-    assert!(
-        post_terminal_progress.is_empty(),
-        "no BuildProgress after BuildCompleted may be persisted to \
-         build_event_log (it would be replayed to re-subscribers with \
-         shrunk totals); got post-terminal Progress at seqs \
-         {post_terminal_progress:?}"
+    assert_eq!(
+        post_terminal_progress, 0,
+        "no BuildProgress after BuildCompleted may be emitted to a \
+         terminal build's watchers (it would show totals shrunk by DAG \
+         mutations the finished build no longer describes)"
+    );
+
+    // 3. The WatchBuild snapshot — what a re-attaching watcher would see
+    //    — also reports the settled accounting, not the mutated DAG's.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::WatchBuild {
+            build_id: b1,
+            caller_tenant: None,
+            reply: reply_tx,
+        })
+        .await?;
+    let (_rx, snapshot) = reply_rx.await??;
+    let Some(Event::Snapshot(snap)) = snapshot.event else {
+        panic!(
+            "WatchBuild reply must carry a Snapshot, got {:?}",
+            snapshot.event
+        );
+    };
+    assert_eq!(
+        snap.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "snapshot reports the settled terminal state"
+    );
+    assert_eq!(
+        snap.cached_derivations, 0,
+        "snapshot serves the settled accounting, not the mutated DAG's"
     );
     Ok(())
 }

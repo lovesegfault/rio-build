@@ -1952,25 +1952,25 @@ is emitted, so there is no missed state to summarize.
     or API call).
 ]
 
-#r("sched.build.terminal-status-settled")[
+#r("sched.build.terminal-status-settled+2")[
   Once a build reaches a terminal state, its externally served progress and
-  outcome are settled: no further `BuildProgress` event may be emitted or
-  persisted to `build_event_log` for it, its served progress accounting
-  (`cached_derivations`) MUST NOT be mutated, and a later failure of a
-  shared derivation MUST NOT rewrite its settled error summary or re-run
-  its per-build failure handling --- aggregate fan-outs (dispatch-time
-  store hits, completion release, failure cascades) MUST skip interested
-  builds that are already terminal.
+  outcome are settled: no further `BuildProgress` event may be emitted for
+  it, its served progress accounting (`cached_derivations`) MUST NOT be
+  mutated, and a later failure of a shared derivation MUST NOT rewrite its
+  settled error summary or re-run its per-build failure handling ---
+  aggregate fan-outs (dispatch-time store hits, completion release, failure
+  cascades) MUST skip interested builds that are already terminal.
 ]
 Terminal builds stay resident --- and re-subscribable via `WatchBuild` ---
 for the terminal-cleanup window while the global DAG keeps evolving for
 other builds that share their nodes (a stale-Completed reset, a re-dispatch,
 a dispatch-time store hit). A `BuildProgress` recomputed from that
-still-mutating DAG and sequenced after `BuildCompleted` would be persisted
-to the event log and replayed to re-subscribers with totals shrunk by
-whatever mutated the DAG since; a late shared-node failure routed through
-the per-build failure handler would overwrite the settled error summary of
-a build that already succeeded. Per-derivation events (`DerivationCached`,
+still-mutating DAG and emitted after `BuildCompleted` would reach live
+watchers --- and a re-attaching watcher's snapshot
+(#rref("sched.watch.snapshot-first")) --- with totals shrunk by whatever
+mutated the DAG since; a late shared-node failure routed through the
+per-build failure handler would overwrite the settled error summary of a
+build that already succeeded. Per-derivation events (`DerivationCached`,
 `DerivationFailed`) still flow to a resident terminal build's channel ---
 they are facts about the derivation, not aggregate progress of the finished
 build.
@@ -2739,10 +2739,6 @@ backoff. This prevents unbounded request queueing at the gateway layer.
     `final_line_count`) --- written by the scheduler at dispatch and terminal,
     read by rio-store's log completeness predicate and latest-exec resolution],
 
-  [`build_event_log`],
-  [Prost-encoded `BuildEvent` per (`build_id`, `sequence`) for gateway
-    `since_sequence` replay across failover],
-
   [`scheduler_live_pins`],
   [Auto-pinned live-build input closures (`store_path_hash`, `drv_hash`).
     Written by `pin_live_inputs` at dispatch; unpinned on completion. Used by
@@ -2908,9 +2904,8 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
 
 #info[
   Auxiliary tables omitted from pseudo-DDL above: `drv_executions`
-  (per-execution lifecycle, `exec_id` PK; the log subsystem's anchor row) and
-  `build_event_log` (Prost-encoded BuildEvent per sequence for gateway
-  replay). See `rio-migrations/migrations/` for full schema.
+  (per-execution lifecycle, `exec_id` PK; the log subsystem's anchor row).
+  See `rio-migrations/migrations/` for full schema.
 ]
 
 = Leader Election
@@ -3041,9 +3036,9 @@ condition, and the response-anchoring premise (the renew attempt deadline
 keeps the response-anchored fence within the commit-anchored bound the
 model assumes) so no constant moves without the others.
 
-#r("sched.lease.standby-drops-writes+2")[
+#r("sched.lease.standby-drops-writes+3")[
   A replica that has lost the lease MUST NOT write scheduler-owned PG state
-  (`derivations`, `realisations`, `build_samples`, `build_event_log`). The
+  (`derivations`, `realisations`, `build_samples`). The
   pull-mode work surfaces are leader-gated at the gRPC layer and the fenced
   transactions re-check the durable floor
   (#rref("sched.lease.generation-fence")). `ProcessCompletion`, `CancelBuild`,
@@ -3055,19 +3050,12 @@ model assumes) so no constant moves without the others.
   own chokepoint (the stream-era `ExecutorConnected`/`Disconnected`/
   `DrainExecutor`/`Heartbeat`/`ReportExecutorTermination`/`ForwardPhase` arms
   it used to ride behind are deleted with their commands).
-  Two narrow `build_event_log` write paths are deliberate, accepted
-  exceptions to the table list above, because that table is the
-  lossy-by-design display-event stream and both writes are idempotent: the
-  event-log persister task drains its bounded in-flight backlog without a
-  leader gate (a deposed replica's queued events still INSERT, colliding
-  with the new leader's rows first-writer-wins via
-  `ON CONFLICT (build_id, sequence) DO NOTHING`), and the per-build
-  event-log GC DELETE on the ungated `CleanupTerminalBuild` arm may delete
-  a terminal build's replay rows from a replica that has lost the lease
-  (acknowledge-without-persist on a standby is permitted for this stream
-  --- the rows it removes belong to that terminal build alone and the
-  DELETE is idempotent).
 ]
+The build-event stream itself has no PG write path to gate: build events
+are broadcast-only (the `build_event_log` mirror, its persister, and its
+GC --- the carve-outs earlier revisions of this rule had to acknowledge ---
+were deleted with the WatchBuild resumability layer in favor of
+#rref("sched.watch.snapshot-first")).
 
 - *Terminal-build cleanup:* the `CleanupTerminalBuild` arm also stays ungated
   (in-memory build/event-map removal and the DAG reap run on standby); its
@@ -3702,8 +3690,6 @@ entirely: a `requirements` edit takes effect on the next rollout.
   (generation counter, `is_leader` flag, `recovery_complete` gate)
 - #src("rio-scheduler/src/actor/recovery.rs") --- State recovery: reload
   non-terminal builds/derivations from PG on LeaderAcquired
-- #src("rio-scheduler/src/event_log.rs") --- PostgreSQL-backed
-  `build_event_log` writes for gateway `since_sequence` replay
 - #src("rio-scheduler/src/admin/") --- AdminService gRPC (ClusterStatus,
   ListExecutors/ListOpenAttempts, TriggerGC)
 

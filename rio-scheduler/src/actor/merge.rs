@@ -463,7 +463,7 @@ impl DagActor {
         // If merge fails (cycle), nothing is in the actor's maps; only the
         // DB build row exists, which we best-effort delete. This ordering
         // prevents the leak where a cyclic submission left permanent entries
-        // in build_events/build_sequences/builds with no cleanup scheduled.
+        // in build_events/builds with no cleanup scheduled.
         let merge_result = match self.dag.merge(build_id, &nodes, &edges, &traceparent) {
             Ok(r) => r,
             Err(e) => {

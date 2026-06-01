@@ -363,7 +363,7 @@ Build progress is streamed to clients (gateways and dashboard) via
 ```protobuf
 message BuildEvent {
   string build_id = 1;
-  uint64 sequence = 2;                     // Vestigial; snapshot-first attach replaced resumption
+  // 2 was `uint64 sequence` — removed with the WatchBuild resumability layer
   google.protobuf.Timestamp timestamp = 3;
   oneof event {
     BuildStarted started = 4;
@@ -492,7 +492,7 @@ use this to subscribe to an existing build's event stream:
 ```protobuf
 message WatchBuildRequest {
   string build_id = 1;
-  uint64 since_sequence = 2;  // Vestigial; ignored (snapshot-first attach)
+  // 2 was `uint64 since_sequence` — removed with the WatchBuild resumability layer
 }
 ```
 

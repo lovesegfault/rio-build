@@ -126,5 +126,3 @@ uint64 first_line_number = 3;
 uint64 max_silent_time = 1;
 uint64 max_silent_time = 5;
 uint64 peak_memory_bytes = 4;
-uint64 sequence = 2;
-uint64 since_sequence = 2;

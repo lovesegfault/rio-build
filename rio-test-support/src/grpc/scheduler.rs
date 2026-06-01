@@ -22,8 +22,8 @@ use super::spawn::spawn_grpc_server;
 pub enum SubmitOutcome {
     /// Immediately return `Err(Status::new(code, ...))`.
     Error(tonic::Code),
-    /// Send these events verbatim, auto-filling empty `build_id` / zero
-    /// `sequence`, then close the stream.
+    /// Send these events verbatim, auto-filling empty `build_id`, then
+    /// close the stream.
     Scripted {
         events: Vec<types::BuildEvent>,
         /// Inject `Err(Status)` after sending N events. For gateway
@@ -88,10 +88,10 @@ impl SubmitOutcome {
 /// What `WatchBuild` does on the next call. Orthogonal to [`SubmitOutcome`].
 #[derive(Clone, Default)]
 pub struct WatchOutcome {
-    /// If Some, return a stream of these events (same `build_id`/`sequence`
-    /// auto-fill as scripted submit), honoring `since_sequence`. For gateway
-    /// reconnect tests: SubmitBuild stream errors → gateway calls WatchBuild
-    /// → this stream delivers the remainder.
+    /// If Some, return a stream of these events (same `build_id` auto-fill
+    /// as scripted submit). For gateway reconnect tests: SubmitBuild stream
+    /// errors → gateway calls WatchBuild → this stream delivers the
+    /// snapshot + remainder.
     pub scripted_events: Option<Vec<types::BuildEvent>>,
     /// How many times `watch_build` fails with `Unavailable` before
     /// succeeding (or returning `not_found` if `scripted_events` is `None`).
@@ -109,10 +109,9 @@ pub struct MockScheduler {
     pub submit_calls: Arc<RwLock<Vec<types::SubmitBuildRequest>>>,
     /// CancelBuild calls received: (build_id, reason).
     pub cancel_calls: Arc<RwLock<Vec<(String, String)>>>,
-    /// WatchBuild calls received: (build_id, since_sequence). For asserting
-    /// the gateway's reconnect sent the correct resume point (see
-    /// `r[gw.reconnect.since-seq]`).
-    pub watch_calls: Arc<RwLock<Vec<(String, u64)>>>,
+    /// WatchBuild calls received: build_id per call. For asserting the
+    /// gateway's reconnect targeted the right build.
+    pub watch_calls: Arc<RwLock<Vec<String>>>,
     /// `x-rio-tenant-token` value on each WatchBuild call (`None` = absent).
     /// For `r[gw.jwt.propagate]` — catches bare-struct call sites that
     /// bypass `with_jwt` on the reconnect path.
@@ -194,7 +193,7 @@ impl SchedulerService for MockScheduler {
             } => {
                 let n_events = events.len();
                 tokio::spawn(async move {
-                    for (seq, mut ev) in events.into_iter().enumerate() {
+                    for (idx, mut ev) in events.into_iter().enumerate() {
                         if let Some(d) = interval {
                             tokio::time::sleep(d).await;
                         }
@@ -202,7 +201,7 @@ impl SchedulerService for MockScheduler {
                         // into the stream. Gateway's process_build_events maps this
                         // to StreamProcessError::Transport → triggers the reconnect loop.
                         if let Some((n, code)) = error_after_n
-                            && seq == n
+                            && idx == n
                         {
                             let _ = tx
                                 .send(Err(Status::new(code, "mock: injected stream error")))
@@ -211,9 +210,6 @@ impl SchedulerService for MockScheduler {
                         }
                         if ev.build_id.is_empty() {
                             ev.build_id = build_id.clone();
-                        }
-                        if ev.sequence == 0 {
-                            ev.sequence = (seq as u64) + 1;
                         }
                         if tx.send(Ok(ev)).await.is_err() {
                             return;
@@ -238,7 +234,6 @@ impl SchedulerService for MockScheduler {
                     let _ = tx
                         .send(Ok(types::BuildEvent {
                             build_id: build_id.clone(),
-                            sequence: 1,
                             timestamp: None,
                             event: Some(types::build_event::Event::Started(types::BuildStarted {
                                 total_derivations: 1,
@@ -251,7 +246,6 @@ impl SchedulerService for MockScheduler {
                         let _ = tx
                             .send(Ok(types::BuildEvent {
                                 build_id: build_id.clone(),
-                                sequence: 2,
                                 timestamp: None,
                                 event: Some(types::build_event::Event::Completed(
                                     types::BuildCompleted {
@@ -291,11 +285,7 @@ impl SchedulerService for MockScheduler {
             .unwrap()
             .push(tenant_token(&request));
         let req = request.into_inner();
-        let since = req.since_sequence;
-        self.watch_calls
-            .write()
-            .unwrap()
-            .push((req.build_id, since));
+        self.watch_calls.write().unwrap().push(req.build_id);
 
         let watch = self.watch.read().unwrap().clone();
 
@@ -312,26 +302,18 @@ impl SchedulerService for MockScheduler {
             return Err(Status::unavailable("mock: injected watch_build failure"));
         }
 
-        // Scripted WatchBuild stream — same auto-fill pattern as SubmitBuild.
-        // HONORS since_sequence: events with sequence ≤ `since` are skipped,
-        // mirroring rio-scheduler's build_event_log replay. Auto-fill runs
-        // FIRST (so `sequence: 0` in a scripted event becomes `(idx+1)`
-        // before the filter checks it), then the filter compares the
-        // FINAL sequence value against `since`.
+        // Scripted WatchBuild stream — same auto-fill pattern as
+        // SubmitBuild. Events are delivered verbatim and in order: the
+        // real scheduler's WatchBuild is snapshot-first + live broadcast,
+        // so reconnect tests script a Snapshot event first, then the
+        // live remainder.
         if let Some(events) = watch.scripted_events {
             let (tx, rx) = tokio::sync::mpsc::channel(32);
             let build_id = TEST_BUILD_ID.to_string();
             tokio::spawn(async move {
-                for (seq, mut ev) in events.into_iter().enumerate() {
+                for mut ev in events {
                     if ev.build_id.is_empty() {
                         ev.build_id = build_id.clone();
-                    }
-                    if ev.sequence == 0 {
-                        ev.sequence = (seq as u64) + 1;
-                    }
-                    // Real scheduler: strictly-greater-than filter.
-                    if ev.sequence <= since {
-                        continue;
                     }
                     if tx.send(Ok(ev)).await.is_err() {
                         return;

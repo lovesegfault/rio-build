@@ -237,7 +237,6 @@ async fn test_cancel_watch_cross_tenant_denied() {
     // Watch as B → PermissionDenied.
     let mut watch = Request::new(rio_proto::types::WatchBuildRequest {
         build_id: build_id.clone(),
-        since_sequence: 0,
     });
     watch.extensions_mut().insert(claims_b);
     let status = grpc.watch_build(watch).await.unwrap_err();
@@ -732,7 +731,6 @@ async fn revoked_jti_rejected_by_cancel_watch_query() {
     // WatchBuild — leaks build progress + log output.
     let mut watch = Request::new(rio_proto::types::WatchBuildRequest {
         build_id: build_id.clone(),
-        since_sequence: 0,
     });
     watch.extensions_mut().insert(claims_with_jti(jti));
     let s = grpc

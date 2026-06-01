@@ -1,15 +1,13 @@
-//! Build-event emission: per-build broadcast channel + PG persist
-//! sidechannel + log/phase forwarding from worker streams.
+//! Build-event emission: per-build broadcast channels.
 //!
-//! [`BuildEventBus`] owns the per-build channel/sequence/debounce maps
-//! and the persister wire. `DagActor` methods that need DAG
-//! lookups (`emit_progress`, `handle_forward_*`)
+//! [`BuildEventBus`] owns the per-build channel/debounce maps. `DagActor`
+//! methods that need DAG lookups (`emit_progress`, `handle_forward_*`)
 //! stay on `DagActor` and call into the bus.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -39,11 +37,11 @@ pub struct BuildEventReceivers {
 /// `emit_progress_with` directly (bypasses debounce — scan cost paid).
 const PROGRESS_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Per-build event broadcast + sequencing state. Sub-struct of
-/// [`DagActor`] — single-owner actor, so no locking. Fields are
-/// `pub(super)` for the handful of callers that need raw map access
-/// (recovery seq seed, watch_build terminal-resend); everything else
-/// goes through the methods below.
+/// Per-build event broadcast state. Sub-struct of [`DagActor`] —
+/// single-owner actor, so no locking. Fields are `pub(super)` for the
+/// handful of callers that need raw map access (watch_build subscribe,
+/// orphan-watcher receiver counts); everything else goes through the
+/// methods below.
 pub(super) struct BuildEventBus {
     /// State-event broadcast channels (everything but the display-only
     /// kinds). Orphan-watcher checks `receiver_count()` on this sender.
@@ -52,41 +50,31 @@ pub(super) struct BuildEventBus {
     /// separate so display volume cannot lag the state ring and drop
     /// completions. See [`LOG_EVENT_BUFFER_SIZE`].
     pub(super) log_channels: HashMap<Uuid, broadcast::Sender<rio_proto::types::BuildEvent>>,
-    /// Per-build sequence counters.
-    pub(super) sequences: HashMap<Uuid, u64>,
     /// Per-build last-BuildProgress emit time. `emit_progress` debounces
     /// against this — Progress is dashboard-only and `build_summary` is
     /// O(dag_nodes), so emitting on every assign/complete/disconnect at
     /// large-DAG × ephemeral-churn scale head-of-line blocks the actor
     /// (I-140). Cleared on build terminal/cleanup with the other maps.
     progress_at: HashMap<Uuid, Instant>,
-    /// Channel to the event-log persister task. [`emit`](Self::emit)
-    /// try_sends (build_id, seq, prost-encoded BuildEvent) here AFTER
-    /// the broadcast. Display-only events are filtered out — those
-    /// would flood PG. None in tests without PG.
-    persist_tx: Option<mpsc::Sender<crate::event_log::EventLogEntry>>,
 }
 
 impl BuildEventBus {
-    pub(super) fn new(persist_tx: Option<mpsc::Sender<crate::event_log::EventLogEntry>>) -> Self {
+    pub(super) fn new() -> Self {
         Self {
             channels: HashMap::new(),
             log_channels: HashMap::new(),
-            sequences: HashMap::new(),
             progress_at: HashMap::new(),
-            persist_tx,
         }
     }
 
-    /// Create fresh state + log broadcast channels for `build_id` and
-    /// seed `sequences[build_id] = 0`. Returns both receivers (merge
-    /// step 3 hands them to the SubmitBuild bridge; recovery drops them).
+    /// Create fresh state + log broadcast channels for `build_id`.
+    /// Returns both receivers (merge step 3 hands them to the
+    /// SubmitBuild bridge; recovery drops them).
     pub(super) fn register(&mut self, build_id: Uuid) -> BuildEventReceivers {
         let (tx, state) = broadcast::channel(BUILD_EVENT_BUFFER_SIZE);
         let (log_tx, log) = broadcast::channel(LOG_EVENT_BUFFER_SIZE);
         self.channels.insert(build_id, tx);
         self.log_channels.insert(build_id, log_tx);
-        self.sequences.insert(build_id, 0);
         BuildEventReceivers { state, log }
     }
 
@@ -102,39 +90,20 @@ impl BuildEventBus {
         Some(BuildEventReceivers { state, log })
     }
 
-    /// Drop all per-build state for `build_id` (channels + seq +
-    /// debounce). Called from terminal-cleanup and merge-rollback.
+    /// Drop all per-build state for `build_id` (channels + debounce).
+    /// Called from terminal-cleanup and merge-rollback.
     pub(super) fn remove(&mut self, build_id: Uuid) {
         self.channels.remove(&build_id);
         self.log_channels.remove(&build_id);
-        self.sequences.remove(&build_id);
         self.progress_at.remove(&build_id);
     }
 
     /// Reset to empty. Called from `clear_persisted_state` on leader
-    /// transitions. The `persist_tx` wire survives — it's a task
-    /// channel, not per-build state.
+    /// transitions.
     pub(super) fn clear(&mut self) {
         self.channels.clear();
         self.log_channels.clear();
-        self.sequences.clear();
         self.progress_at.clear();
-    }
-
-    /// Last-emitted sequence for `build_id`, or 0 if unknown. Test-only
-    /// observable for the display-only seq-reuse rule — production's
-    /// last reader (the since_sequence replay watermark) was replaced
-    /// by snapshot-first WatchBuild attach.
-    #[cfg(test)]
-    pub(super) fn last_seq(&self, build_id: Uuid) -> u64 {
-        self.sequences.get(&build_id).copied().unwrap_or(0)
-    }
-
-    /// Whether a PG event-log persister is wired. Gates the
-    /// per-build/periodic event-log GC sweeps (no persister → no rows
-    /// to sweep).
-    pub(super) fn has_persister(&self) -> bool {
-        self.persist_tx.is_some()
     }
 
     /// `true` if a Progress event for `build_id` was emitted within
@@ -146,71 +115,22 @@ impl BuildEventBus {
             .is_some_and(|t| t.elapsed() < PROGRESS_DEBOUNCE)
     }
 
-    /// Core emit: bump sequence, persist (if wired + non-Log), broadcast.
+    /// Core emit: route to the right broadcast ring.
+    ///
+    /// Events carry no sequence numbers and are not persisted anywhere:
+    /// the live broadcast is the only delivery channel, and a watcher
+    /// that attaches later learns the net effect of missed events from
+    /// the WatchBuild snapshot (`r[sched.watch.snapshot-first]`), not
+    /// from history.
     pub(super) fn emit(&mut self, build_id: Uuid, event: rio_proto::types::build_event::Event) {
         use rio_proto::types::build_event::Event;
 
-        // SubstituteProgress isn't persisted (see below) — assigning a
-        // fresh seq would diverge the in-memory counter from PG
-        // `MAX(sequence)`, breaking the `since_sequence <
-        // last_seq` replay guard after failover (gateway saw seq=100
-        // via broadcast, recovery seeds last_seq=41 from PG → no
-        // replay → events 42..100 lost). Reuse the last persisted seq
-        // for these; the gateway tracker (build.rs) overwrites, so
-        // monotonicity is preserved.
-        //
-        // TODO: if you are changing this seq-reuse rule (or the persist
-        // filter / replay / dedup machinery around it) to fix a replay
-        // bug, consult the build-event-sourcing rescope memo (C4,
-        // 2026-05-31) first. The WatchBuild resumability layer — this
-        // sequencing rule, the event-log persister, and the
-        // since_sequence replay — is retired-pending-trigger: a
-        // recurrence of a resumability-layer defect is that memo's
-        // re-open trigger #1, and the recorded disposition is to DELETE
-        // the layer in favor of snapshot-on-reconnect (the memo's §4.5
-        // work item) rather than repair it in place.
         let display_only = matches!(event, Event::SubstituteProgress(_));
-        let seq = if display_only {
-            self.sequences.get(&build_id).copied().unwrap_or(0)
-        } else {
-            let s = self.sequences.entry(build_id).or_insert(0);
-            *s += 1;
-            *s
-        };
-
         let build_event = rio_proto::types::BuildEvent {
             build_id: build_id.to_string(),
-            sequence: seq,
             timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
             event: Some(event),
         };
-
-        // Persist to PG for since_sequence replay. BEFORE the
-        // broadcast: the prost encode borrows build_event, and the
-        // broadcast consumes it. Ordering doesn't matter for
-        // correctness (the persister is a separate FIFO task; a
-        // watcher that subscribes between try_send and tx.send below
-        // still sees this event via broadcast).
-        //
-        // Display-only events filtered: they are high-volume,
-        // re-derivable presentation state. Gateway reconnect cares
-        // about state-machine events (Started/Completed/Derivation*).
-        if let Some(tx) = &self.persist_tx
-            && !display_only
-        {
-            use prost::Message;
-            let bytes = build_event.encode_to_vec();
-            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send((build_id, seq, bytes)) {
-                // Persister backed up (PG slow/down). The broadcast
-                // below still carries the event to live watchers;
-                // only a mid-backlog reconnect loses it. 1000 events
-                // of backlog = ~200s at steady-state — if we're
-                // here, PG is probably unreachable anyway.
-                metrics::counter!("rio_scheduler_event_persist_dropped_total").increment(1);
-            }
-            // Closed variant: persister task died. Don't spam the
-            // metric — spawn_monitored already logged the panic.
-        }
 
         // r[impl gw.activity.stop-parity]
         // Display-only events (SubstituteProgress) → log ring;
@@ -266,9 +186,9 @@ impl DagActor {
     /// (one O(nodes) pass). Call after state changes that affect the
     /// aggregate view — dispatch (running count + worker set changed)
     /// and completion (completed count changed + critpath dropped via
-    /// `update_ancestors`). NOT called from recovery (recovery
-    /// rebuilds state but watchers replay from PG event log; emitting
-    /// here would inject a spurious event into the sequence).
+    /// `update_ancestors`). NOT called from recovery (recovery rebuilds
+    /// state with no watchers attached; a reattaching watcher gets its
+    /// counts from the WatchBuild snapshot).
     ///
     /// Why a separate event (not folding into DerivationEvent): the
     /// dashboard wants a single ETA number it can display without
@@ -276,14 +196,14 @@ impl DagActor {
     /// dumb — no stateful reconstruction from the DerivationEvent
     /// stream.
     pub(super) fn emit_progress(&mut self, build_id: Uuid) {
-        // r[impl sched.build.terminal-status-settled]
+        // r[impl sched.build.terminal-status-settled+2]
         // A terminal build's served progress is settled at its terminal
         // transition: shared-node fan-outs (release_downstream,
         // dispatch-time store hits, failure cascades) can still reach a
         // resident terminal build during the cleanup window, and a
         // post-`BuildCompleted` Progress recomputed from the mutating
-        // DAG would be sequenced, persisted to the event log, and
-        // replayed after the terminal event with shrunk totals.
+        // DAG would reach live watchers (and the WatchBuild snapshot's
+        // counts) with totals shrunk by whatever mutated the DAG since.
         if self.build_progress_frozen(build_id) {
             return;
         }
@@ -319,10 +239,10 @@ impl DagActor {
     /// [`BuildEventBus::emit_progress_with`] behind the terminal-build
     /// freeze: the caller paid for the `build_summary` scan, but a
     /// resident terminal build's progress must not be re-emitted from
-    /// the still-mutating DAG — it would be persisted to the event log
-    /// after the build's terminal event and replayed to re-subscribers
-    /// with shrunk totals.
-    // r[impl sched.build.terminal-status-settled]
+    /// the still-mutating DAG — live watchers (and any later WatchBuild
+    /// snapshot) would see totals shrunk by mutations the finished build
+    /// no longer describes.
+    // r[impl sched.build.terminal-status-settled+2]
     pub(super) fn emit_progress_with(
         &mut self,
         build_id: Uuid,

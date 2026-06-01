@@ -101,14 +101,11 @@ async fn test_build_paths_eof_triggers_reconnect_not_error() -> anyhow::Result<(
     h.scheduler.set_submit_outcome(SubmitOutcome::close_early());
     // WatchBuild: deliver Completed on the retry.
     h.scheduler.set_watch_outcome(WatchOutcome {
-        scripted_events: Some(vec![types::BuildEvent {
-            build_id: String::new(),
-            sequence: 2,
-            timestamp: None,
-            event: Some(build_event::Event::Completed(types::BuildCompleted {
+        scripted_events: Some(vec![ev(build_event::Event::Completed(
+            types::BuildCompleted {
                 output_paths: vec!["/nix/store/zzz-out".into()],
-            })),
-        }]),
+            },
+        ))]),
         ..Default::default()
     });
 
@@ -667,11 +664,10 @@ use rio_nix::protocol::client::{StderrMessage, read_stderr_message};
 use rio_proto::types::{self, build_event};
 
 /// Build a BuildEvent wrapping just the oneof; MockScheduler auto-fills
-/// build_id and sequence.
+/// build_id.
 fn ev(e: build_event::Event) -> types::BuildEvent {
     types::BuildEvent {
         build_id: String::new(),
-        sequence: 0,
         timestamp: None,
         event: Some(e),
     }
@@ -1772,14 +1768,11 @@ async fn test_build_paths_reconnect_on_transport_error() -> anyhow::Result<()> {
     // WatchBuild: deliver Completed. Gateway's process_build_events
     // reads from this fresh stream after the reconnect.
     h.scheduler.set_watch_outcome(WatchOutcome {
-        scripted_events: Some(vec![types::BuildEvent {
-            build_id: String::new(),
-            sequence: 2,
-            timestamp: None,
-            event: Some(build_event::Event::Completed(types::BuildCompleted {
+        scripted_events: Some(vec![ev(build_event::Event::Completed(
+            types::BuildCompleted {
                 output_paths: vec!["/nix/store/zzz-output".into()],
-            })),
-        }]),
+            },
+        ))]),
         ..Default::default()
     });
     let drv_path = seed_minimal_drv(&h);

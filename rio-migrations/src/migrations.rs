@@ -1611,6 +1611,33 @@ pub const M_075: () = ();
 /// live deployment observes.
 pub const M_076: () = ();
 
+/// `migrations/077_drop_build_event_log.sql`
+///
+/// WatchBuild resumability-layer deletion (the build-event-sourcing
+/// rescope memo's §4.5 work item, executed by owner decision): drops
+/// `build_event_log`, the prost-encoded per-(build_id, sequence) event
+/// mirror that existed solely so a reconnecting gateway could replay
+/// events it missed across scheduler failover.
+///
+/// **Why the table is dead:** reconnection is snapshot-first
+/// (`sched.watch.snapshot-first`): a `WatchBuild` stream's first message
+/// describes the build's current state, so missed events are never
+/// re-delivered — their net effect is what the snapshot reports. The
+/// table's only writer (the event-log persister task), its only readers
+/// (the `since_sequence` replay query and the recovery sequence seeding),
+/// both GC paths (per-build DELETE on terminal cleanup, the 24h Tick
+/// sweep), and the per-build sequence counters are deleted in the same
+/// change set this migration ships in.
+///
+/// **Why a new migration rather than editing 003:** `003_event_log.sql`
+/// is frozen and PINNED (the checksum-freeze rule); the M_055/042
+/// precedent applies — a shipped migration's content never changes, so
+/// the drop takes the next free number. 003 remains as history: a fresh
+/// database creates the table at 003 and drops it at 077, which is just
+/// chain replay (the fresh-deployments-only directive recorded at M_072 /
+/// M_075 / M_076 means no live database carries rows to migrate).
+pub const M_077: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

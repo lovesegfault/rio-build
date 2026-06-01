@@ -119,7 +119,6 @@ const CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// bd_row UUIDs to hashes) and doesn't cross.
 struct RecoveryLoad {
     build_rows: Vec<RecoveryBuildRow>,
-    build_ids: Vec<Uuid>,
     /// Flat (build_id, derivation_id) link rows. `restore_builds` only
     /// needs the per-build hash sets (`build_drv_hashes` below);
     /// `finalize_recovered_builds` needs the raw rows again to count
@@ -178,14 +177,12 @@ impl DagActor {
 
         let RecoveryLoad {
             build_rows,
-            build_ids,
             bd_rows,
             build_drv_hashes,
             failed_dep_parents,
         } = self.load_dag_from_rows().await?;
 
-        self.restore_builds(build_rows, &build_ids, build_drv_hashes)
-            .await?;
+        self.restore_builds(build_rows, build_drv_hashes).await?;
 
         self.seed_ready_queue(&failed_dep_parents).await;
 
@@ -634,22 +631,20 @@ impl DagActor {
 
         Ok(RecoveryLoad {
             build_rows,
-            build_ids,
             bd_rows,
             build_drv_hashes,
             failed_dep_parents,
         })
     }
 
-    /// Reconstruct `BuildInfo` + broadcast channels + `build_sequences`
-    /// from the loaded rows. `submitted_at` is reconstructed from PG's
+    /// Reconstruct `BuildInfo` + broadcast channels from the loaded
+    /// rows. `submitted_at` is reconstructed from PG's
     /// `now() - submitted_at` (so `r[sched.timeout.per-build]` survives
     /// failover); total/completed/cached counts are seeded from PG
     /// denorm columns (I-111).
     async fn restore_builds(
         &mut self,
         build_rows: Vec<RecoveryBuildRow>,
-        build_ids: &[Uuid],
         mut build_drv_hashes: HashMap<Uuid, HashSet<DrvHash>>,
     ) -> Result<(), ActorError> {
         // --- Build BuildInfo + broadcast channels ---
@@ -714,23 +709,16 @@ impl DagActor {
                       "recovered build transition failed");
             }
 
-            // Fresh broadcast channel. Late WatchBuild subscribers
-            // get new events from here; events before recovery are
-            // served from build_event_log replay (WatchBuild with
-            // since_sequence reads from PG). The returned
-            // `broadcast::Receiver` is intentionally dropped:
+            // Fresh broadcast channel. Late WatchBuild subscribers get
+            // new events from here; the state they missed while the old
+            // leader was down is summarized by their attach snapshot
+            // (`r[sched.watch.snapshot-first]`), not replayed. The
+            // returned `broadcast::Receiver` is intentionally dropped:
             // recovery itself doesn't subscribe, it only needs the
             // channel to EXIST so emit_build_event has a sender and
             // late WatchBuild calls can `events.subscribe(id)`.
             drop(self.events.register(row.build_id));
             self.builds.insert(row.build_id, info);
-        }
-
-        // --- Seed event-bus sequences from event_log high-water marks ---
-        let seq_rows = self.db.max_sequence_per_build(build_ids).await?;
-        for (build_id, max_seq) in seq_rows {
-            // i64 → u64: sequences are always positive.
-            self.events.sequences.insert(build_id, max_seq as u64);
         }
 
         Ok(())

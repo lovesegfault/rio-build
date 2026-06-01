@@ -104,7 +104,7 @@ async fn test_scheduler_cache_check_skipped_without_store() -> TestResult {
 /// A cyclic DAG submission must not leak into the actor's in-memory maps.
 /// Regression test for the reorder fix: merge() now runs BEFORE the map
 /// inserts, so a CycleDetected error leaves no trace in
-/// build_events/build_sequences/builds.
+/// build_events/builds.
 #[tokio::test]
 async fn test_cyclic_merge_does_not_leak_in_memory_state() -> TestResult {
     let (_db, handle, _task) = setup().await;

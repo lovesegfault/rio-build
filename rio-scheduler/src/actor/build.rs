@@ -416,7 +416,6 @@ impl DagActor {
 
         rio_proto::types::BuildEvent {
             build_id: build_id.to_string(),
-            sequence: 0,
             timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
             event: Some(types::build_event::Event::Snapshot(snapshot)),
         }
@@ -649,11 +648,11 @@ impl DagActor {
     }
 
     /// Schedule delayed cleanup of terminal build state. After
-    /// TERMINAL_CLEANUP_DELAY, the build's entries in builds/build_events/
-    /// build_sequences are removed and orphaned+terminal DAG nodes are reaped.
+    /// TERMINAL_CLEANUP_DELAY, the build's entries in builds/build_events
+    /// are removed and orphaned+terminal DAG nodes are reaped.
     ///
-    /// The delay allows late WatchBuild subscribers to receive the terminal
-    /// event before the broadcast sender is dropped.
+    /// The delay keeps the build resident so late WatchBuild subscribers
+    /// can still attach and learn the outcome from their snapshot.
     ///
     /// No-op if `self_tx` is None (tests that use bare `run()`).
     fn schedule_terminal_cleanup(&self, build_id: Uuid) {
@@ -718,12 +717,11 @@ impl DagActor {
         // that child's removal is its only wake-up edge
         // (`sched.poison.clear-survivor-reevaluation`).
         //
-        // r[impl sched.lease.standby-drops-writes+2]
+        // r[impl sched.lease.standby-drops-writes+3]
         // Leader-gated like the `drain_phantoms` slice of the Heartbeat
         // arm: the rest of this handler stays ungated (in-memory build/
-        // event-map removal and the DAG reap run on standby as before;
-        // the event-log GC below is its own
-        // fire-and-forget), but this block performs leader-class writes —
+        // event-map removal and the DAG reap run on standby as before),
+        // but this block performs leader-class writes —
         // the closure-hole stamp, `persist_status`, the fail-fast's PG
         // mark clear, and terminal build failure — and
         // `CleanupTerminalBuild` can be drained by an ex-leader (the
@@ -767,30 +765,6 @@ impl DagActor {
                 "deps reaped while the closure was never produced",
             )
             .await;
-        }
-
-        // GC the persisted event log. Fire-and-forget: this is
-        // cleanup of replay state for a build that's already
-        // terminal — if PG is down the rows just age out via
-        // created_at (handle_tick runs a 24h sweep every 360 ticks).
-        // Spawned (not awaited in the actor loop): a slow PG
-        // doesn't stall the next command. Unlike emit_build_event's
-        // persister (which needs FIFO ordering), DELETE ordering
-        // doesn't matter — there are no writes for this build_id
-        // anymore (build_sequences just removed above).
-        //
-        // Skip if no persister configured (tests without PG).
-        if self.events.has_persister() {
-            let pool = self.db.pool().clone();
-            rio_common::task::spawn_monitored("event-log-gc", async move {
-                if let Err(e) = sqlx::query("DELETE FROM build_event_log WHERE build_id = $1")
-                    .bind(build_id)
-                    .execute(&pool)
-                    .await
-                {
-                    debug!(build_id = %build_id, error = %e, "event-log GC failed (rows will age out)");
-                }
-            });
         }
     }
 

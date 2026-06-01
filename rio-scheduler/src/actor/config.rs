@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
 use tonic::transport::Channel;
 
 use rio_proto::StoreServiceClient;
@@ -73,14 +72,12 @@ impl Default for DagActorConfig {
 /// that connect the actor to other tasks. Unlike [`DagActorConfig`],
 /// these are not "settings" — they are wires.
 ///
-/// `Default` gives the test/bench shape: no store, no flusher/persister,
+/// `Default` gives the test/bench shape: no store, no flusher,
 /// always-leader, fresh never-cancelled shutdown token.
 pub struct DagActorPlumbing {
     /// Store service client for scheduler-side cache checks. `None` in
     /// tests that don't need the store (cache check is then skipped).
     pub store_client: Option<StoreServiceClient<Channel>>,
-    /// Channel to the event-log persister task.
-    pub event_persist_tx: Option<mpsc::Sender<crate::event_log::EventLogEntry>>,
     /// HMAC signer for assignment tokens. `None` = legacy unsigned
     /// format-string (dev mode).
     pub hmac_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
@@ -156,7 +153,6 @@ impl Default for DagActorPlumbing {
     fn default() -> Self {
         Self {
             store_client: None,
-            event_persist_tx: None,
             hmac_signer: None,
             service_signer: None,
             leader: LeaderState::default(),

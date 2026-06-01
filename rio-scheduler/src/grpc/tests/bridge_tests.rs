@@ -34,28 +34,25 @@ fn state_only(state: broadcast::Receiver<rio_proto::types::BuildEvent>) -> Build
 // r[verify sched.backstop.orphan-watcher]
 #[tokio::test]
 async fn test_bridge_build_events_lagged_keeps_receiver_alive() {
+    let build_id = Uuid::new_v4();
     // Capacity 1 + send 3 → rx (subscribed at channel creation) lags by 2.
     let (tx, rx) = broadcast::channel(1);
     for i in 1..=3u64 {
-        let _ = tx.send(rio_proto::types::BuildEvent {
-            build_id: "b".into(),
-            sequence: i,
-            timestamp: None,
-            event: None,
-        });
+        let _ = tx.send(mk_event(build_id, i));
     }
 
     let mut stream = bridge_build_events("test-bridge", state_only(rx), None);
 
     // First poll: bridge's first recv() hits Lagged(2), continues, next
-    // recv() returns seq=3 (oldest still in the cap-1 ring). NOT an Err.
+    // recv() returns event 3 (oldest still in the cap-1 ring). NOT an Err.
     let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
         .await
         .expect("bridge should not hang post-lag")
         .expect("stream should yield, not end");
     let ev = first.expect("post-lag event must be Ok, not DATA_LOSS");
     assert_eq!(
-        ev.sequence, 3,
+        event_tag(&ev),
+        "seq-3",
         "oldest in-ring event after Lagged reposition"
     );
 
@@ -69,18 +66,13 @@ async fn test_bridge_build_events_lagged_keeps_receiver_alive() {
     );
 
     // Subsequent events flow normally (bridge loop didn't break).
-    let _ = tx.send(rio_proto::types::BuildEvent {
-        build_id: "b".into(),
-        sequence: 4,
-        timestamp: None,
-        event: None,
-    });
+    let _ = tx.send(mk_event(build_id, 4));
     let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
         .await
         .expect("post-lag stream should keep yielding")
         .expect("stream open")
         .expect("Ok event");
-    assert_eq!(next.sequence, 4);
+    assert_eq!(event_tag(&next), "seq-4");
     assert_eq!(tx.receiver_count(), 1, "still subscribed after second send");
 }
 
@@ -124,7 +116,6 @@ async fn test_completed_event_survives_display_flood() {
     // The state event under test: a per-derivation Completed.
     let _ = state_tx.send(rio_proto::types::BuildEvent {
         build_id: build_id.to_string(),
-        sequence: 1,
         timestamp: None,
         event: Some(Event::Derivation(rio_proto::types::DerivationEvent {
             derivation_path: "/nix/store/x.drv".into(),
@@ -244,25 +235,34 @@ async fn test_build_ids_are_time_ordered_v7() -> anyhow::Result<()> {
 // Snapshot-first attach + bridge helpers
 // ===========================================================================
 
-/// Minimal BuildEvent for bridge tests.
-fn mk_event(build_id: Uuid, seq: u64) -> rio_proto::types::BuildEvent {
+/// Minimal BuildEvent for bridge tests. The `n` lands in the Cancelled
+/// reason (`"seq-{n}"`) so tests can identify which event came through —
+/// see [`event_tag`].
+fn mk_event(build_id: Uuid, n: u64) -> rio_proto::types::BuildEvent {
     use rio_proto::types::build_event::Event;
     rio_proto::types::BuildEvent {
         build_id: build_id.to_string(),
-        sequence: seq,
         timestamp: None,
         event: Some(Event::Cancelled(rio_proto::types::BuildCancelled {
-            reason: format!("seq-{seq}"),
+            reason: format!("seq-{n}"),
         })),
     }
 }
 
+/// The identifying tag [`mk_event`] embedded in this event.
+fn event_tag(ev: &rio_proto::types::BuildEvent) -> &str {
+    use rio_proto::types::build_event::Event;
+    match &ev.event {
+        Some(Event::Cancelled(c)) => &c.reason,
+        other => panic!("expected a mk_event Cancelled, got {other:?}"),
+    }
+}
+
 /// `Event::SubstituteProgress` — display-only, routed via the log ring.
-fn mk_display_event(build_id: Uuid, seq: u64) -> rio_proto::types::BuildEvent {
+fn mk_display_event(build_id: Uuid, _n: u64) -> rio_proto::types::BuildEvent {
     use rio_proto::types::build_event::Event;
     rio_proto::types::BuildEvent {
         build_id: build_id.to_string(),
-        sequence: seq,
         timestamp: None,
         event: Some(Event::SubstituteProgress(
             rio_proto::types::SubstituteProgress {
@@ -279,7 +279,6 @@ fn mk_snapshot(build_id: Uuid) -> rio_proto::types::BuildEvent {
     use rio_proto::types::build_event::Event;
     rio_proto::types::BuildEvent {
         build_id: build_id.to_string(),
-        sequence: 0,
         timestamp: None,
         event: Some(Event::Snapshot(rio_proto::types::BuildSnapshot {
             state: rio_proto::types::BuildState::Active as i32,

@@ -192,7 +192,7 @@ Notable edges:
 
     #r(
       "ts.mock.scheduler-outcome+2",
-    )[`MockScheduler` is configured via two orthogonal knobs. `SubmitOutcome` is an enum of mutually-exclusive `SubmitBuild` modes: `Error(code)` (immediate failure), `Simple { send_completed, close_early }` (Started then optionally Completed/close/hang), or `Scripted { events, error_after_n, interval }` (verbatim event list with auto-filled `build_id`/`sequence`, optional mid-stream `Err(Status)` injection, optional per-event sleep for disconnect-race tests). `WatchOutcome` carries `scripted_events` (WatchBuild replay honoring `since_sequence`) and `fail_count` (decrement-and-Unavailable). `SubmitBuild` sets `BUILD_ID_HEADER` in initial metadata; `WatchBuild` does NOT (the gateway already has the build_id when it calls WatchBuild).]
+    )[`MockScheduler` is configured via two orthogonal knobs. `SubmitOutcome` is an enum of mutually-exclusive `SubmitBuild` modes: `Error(code)` (immediate failure), `Simple { send_completed, close_early }` (Started then optionally Completed/close/hang), or `Scripted { events, error_after_n, interval }` (verbatim event list with auto-filled `build_id`, optional mid-stream `Err(Status)` injection, optional per-event sleep for disconnect-race tests). `WatchOutcome` carries `scripted_events` (the WatchBuild stream, delivered verbatim --- reconnect tests script a snapshot first, then the live remainder) and `fail_count` (decrement-and-Unavailable). `SubmitBuild` sets `BUILD_ID_HEADER` in initial metadata; `WatchBuild` does NOT (the gateway already has the build_id when it calls WatchBuild).]
 
     #r(
       "ts.spawn.layered",

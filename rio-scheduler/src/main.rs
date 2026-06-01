@@ -43,8 +43,7 @@ async fn main() -> anyhow::Result<()> {
     // returns → SchedulerGrpc + AdminService drop their ActorHandle
     // clones → tick-loop + lease-loop also break and drop theirs →
     // all mpsc::Sender clones drop → actor's rx.recv() returns None
-    // → actor exits → drops event_persist_tx → event-persister also
-    // exits (channel-close). event_log::spawn doesn't need a token.
+    // → actor exits.
 
     let (pool, db) = init_db_pool(&cfg.database_url, &shutdown).await?;
     // M_058: reference_hw_class change guard. Runs before any
@@ -120,13 +119,6 @@ async fn main() -> anyhow::Result<()> {
     let is_leader_for_health = leader.is_leader_arc();
     let is_leader_for_grpc = leader.is_leader_arc();
     let leader_for_admin = leader.clone();
-
-    // Spawn the event-log persister. Bounded mpsc + single drain
-    // task → FIFO write ordering (fire-and-forget spawns would
-    // race on the PG pool). emit_build_event try_sends here; if
-    // backed up, the broadcast still carries the event — only a
-    // mid-backlog gateway reconnect loses it.
-    let event_persist_tx = rio_scheduler::event_log::spawn(pool.clone());
 
     // Load HMAC signer for assignment tokens. None path = disabled
     // (unsigned tokens, dev mode). Bad path / empty file = startup
@@ -296,7 +288,6 @@ async fn main() -> anyhow::Result<()> {
         },
         rio_scheduler::actor::DagActorPlumbing {
             store_client,
-            event_persist_tx: Some(event_persist_tx),
             hmac_signer,
             service_signer: service_signer.map(Arc::new),
             leader: leader.clone(),

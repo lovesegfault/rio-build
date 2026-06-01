@@ -1219,7 +1219,6 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                 let watch_req = with_jwt(
                     types::WatchBuildRequest {
                         build_id: build_id.clone(),
-                        since_sequence: 0,
                     },
                     jwt_token,
                 )?;

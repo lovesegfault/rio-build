@@ -232,9 +232,10 @@ pub(super) const FORECAST_DROPPED_WARNED_CAP: usize = 4096;
 /// `DISPATCH_PROBE_BATCH_CAP`).
 pub const MERGE_FMP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// Delay before cleaning up terminal build state. Allows late WatchBuild
-/// subscribers to receive the terminal event before the broadcast sender
-/// is dropped.
+/// Delay before cleaning up terminal build state. Keeps the build
+/// resident (and its broadcast channels alive) so late WatchBuild
+/// subscribers can still attach and learn the outcome from their
+/// snapshot (`r[sched.watch.snapshot-first]`).
 const TERMINAL_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Max Ready candidates per `FindMissingPaths` batch in the ready-set
@@ -265,8 +266,8 @@ pub struct DagActor {
     ready_queue: ReadyQueue,
     /// Active builds indexed by build_id.
     builds: HashMap<Uuid, BuildInfo>,
-    /// Per-build event broadcast channels + sequence/debounce state +
-    /// persister wire. See [`BuildEventBus`].
+    /// Per-build event broadcast channels + progress-debounce state.
+    /// See [`BuildEventBus`].
     events: BuildEventBus,
     /// Kube-authoritative `drv_hash → (spec.nodeName, tenant)` from
     /// the controller's pod informer (`AckSpawnedIntents.bound_intents`).
@@ -718,7 +719,7 @@ impl DagActor {
             dag,
             ready_queue: ReadyQueue::new(),
             builds: HashMap::new(),
-            events: BuildEventBus::new(plumbing.event_persist_tx),
+            events: BuildEventBus::new(),
             authoritative_binding: HashMap::new(),
             attempt_record_retries: HashMap::new(),
             retry_policy: cfg.retry_policy,
@@ -1114,7 +1115,7 @@ impl DagActor {
                     final_resources,
                     final_line_count,
                 } => {
-                    // r[impl sched.lease.standby-drops-writes+2]
+                    // r[impl sched.lease.standby-drops-writes+3]
                     // Defense-in-depth under the stream-reader's
                     // generation fence (executor_service.rs): an
                     // ex-leader MUST NOT write terminal PG state
@@ -1143,7 +1144,7 @@ impl DagActor {
                     reason,
                     reply,
                 } => {
-                    // r[impl sched.lease.standby-drops-writes+2]
+                    // r[impl sched.lease.standby-drops-writes+3]
                     // Defense-in-depth like ProcessCompletion: an
                     // ex-leader's cancel writes terminal PG state from
                     // a stale DAG, and its terminal_log_epilogue pins
@@ -1167,7 +1168,7 @@ impl DagActor {
                     auth_intent,
                     reply,
                 } => {
-                    // r[sched.lease.standby-drops-writes+2]: the handler
+                    // r[sched.lease.standby-drops-writes+3]: the handler
                     // self-gates on is_leader() and the mint transaction
                     // carries the durable generation fence.
                     self.handle_pull_assignment(intent_id, auth_intent, reply)
@@ -1179,7 +1180,7 @@ impl DagActor {
                     payload,
                     reply,
                 } => {
-                    // r[sched.lease.standby-drops-writes+2]: the handler
+                    // r[sched.lease.standby-drops-writes+3]: the handler
                     // self-gates on is_leader(); the classification
                     // path it funnels into carries the same appending
                     // discipline as the stream Completion arm.
@@ -1192,7 +1193,7 @@ impl DagActor {
                     node_name,
                     reply,
                 } => {
-                    // r[sched.lease.standby-drops-writes+2]: the handler
+                    // r[sched.lease.standby-drops-writes+3]: the handler
                     // self-gates on is_leader(); its only write is the
                     // first-writer-wins reason fill.
                     self.handle_report_attempt_outcome(identity, reason, node_name, reply)
@@ -1205,7 +1206,7 @@ impl DagActor {
                     observed_instance_types,
                     bound_intents,
                 } => {
-                    // r[impl sched.lease.standby-drops-writes+2] —
+                    // r[impl sched.lease.standby-drops-writes+3] —
                     // ICE state is lease-holder only.
                     if self.leader.is_leader() {
                         self.handle_ack_spawned_intents(
@@ -1262,7 +1263,7 @@ impl DagActor {
                     ok,
                     forgiven,
                 } => {
-                    // r[impl sched.lease.standby-drops-writes+2]
+                    // r[impl sched.lease.standby-drops-writes+3]
                     if self.leader.is_leader() {
                         self.handle_substitute_complete(&drv_hash, ok, &forgiven)
                             .await;

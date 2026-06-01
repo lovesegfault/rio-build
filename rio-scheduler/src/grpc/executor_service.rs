@@ -36,7 +36,7 @@ use super::SchedulerGrpc;
 //                                       (verification fails on any tamper; the bound only caps the hash work)
 // ReportOutcome RPC (pull-mode dispatch):
 //   exec_id                           → UUID parse → attempt lookup       → reject RPC if not a valid UUID
-//   report.result.error_msg           → build_event_log × N, ring, term   → truncate to MAX_ERROR_MSG_LEN
+//   report.result.error_msg           → event ring, terminal payload      → truncate to MAX_ERROR_MSG_LEN
 //   report.node_name / report.hw_class → build_samples row                → None if > MAX_IDENT_LEN
 //   report.drv_path                   → never read (exec_id names the attempt) → dropped before the actor
 //   report numerics (peak_*, final_resources.*) → build_samples row       → validated actor-side (completion.rs
@@ -53,8 +53,8 @@ pub(super) const MAX_IDENT_LEN: usize = 256;
 /// (not rejected — a dropped `CompletionReport` strands the derivation in
 /// `Running`). A legitimate daemon/executor error is well under 16 KiB;
 /// the field is fanned out as `DerivationEvent::failed.error_message` to
-/// `(1 + cascaded_ancestors) × interested_builds` `build_event_log` rows,
-/// state-ring slots, and `nix build -L` terminals.
+/// `(1 + cascaded_ancestors) × interested_builds` state-ring slots and
+/// `nix build -L` terminals.
 ///
 /// Head-truncation cannot break the scheduler's semantic dispatch on this
 /// field: `handle_infrastructure_failure` greps for `CGROUP_OOM_MSG` and
