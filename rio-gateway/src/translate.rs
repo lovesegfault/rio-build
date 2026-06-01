@@ -1221,6 +1221,26 @@ pub fn build_fallback_node(
     drv_path: &str,
     basic: &rio_nix::derivation::BasicDerivation,
 ) -> Result<types::DerivationNode, String> {
+    // Producer contract: the single-node fallback exists ONLY for
+    // content-bound derivations (fixed-output / floating-CA), whose
+    // output paths are governed by content-hash rules. The scheduler
+    // unconditionally rejects authoritative inline content with
+    // input-addressed outputs (nothing binds declared IA paths to
+    // derivation text), so minting such a node here would manufacture a
+    // guaranteed scheduler rejection — one that, before this guard, was
+    // misreported to the client as a transient failure. The handler's
+    // inline IA gate rejects these earlier with client remediation
+    // (gw.reject.output-path-mismatch+2); this guard makes the
+    // producer's contract self-enforcing.
+    // r[impl gw.build.scheduler-rejection-permanent]
+    if !basic.is_content_addressed() {
+        return Err(format!(
+            "cannot build '{drv_path}': the full derivation is not in the store and inline \
+             input-addressed derivations cannot be validated — upload the .drv first with \
+             `nix copy --derivation` or use --store ssh-ng:// so the worker can fetch it \
+             from the store"
+        ));
+    }
     let aterm = basic.to_aterm();
     if aterm.len() > MAX_FALLBACK_INLINE_DRV_BYTES {
         return Err(format!(
@@ -1244,25 +1264,22 @@ pub fn build_fallback_node(
     // received BasicDerivation = hashDerivationModulo with empty
     // inputDrvs) so the scheduler registers the realisation under the
     // exact id the client will register and look up, and merge-time
-    // cache hits apply to resubmissions. Deferred-IA-shaped inline
-    // submissions (algo and path both empty) keep no hash — there is
-    // no CppNix flow to mirror for them. Degrade like
+    // cache hits apply to resubmissions. The producer guard above means
+    // every node reaching this point is content-addressed. Degrade like
     // populate_ca_modular_hashes: never reject on hash failure.
-    if basic.is_content_addressed() {
-        let lifted = rio_nix::derivation::Derivation::from_basic(basic);
-        match rio_nix::derivation::hash_derivation_modulo(
-            &lifted,
-            drv_path,
-            &|_| None,
-            &mut HashMap::new(),
-        ) {
-            Ok(hash) => node.ca_modular_hash = hash.to_vec(),
-            Err(e) => warn!(
-                drv_path = %drv_path,
-                error = %e,
-                "failed to hash inline fallback derivation; builtOutputs enrichment degraded"
-            ),
-        }
+    let lifted = rio_nix::derivation::Derivation::from_basic(basic);
+    match rio_nix::derivation::hash_derivation_modulo(
+        &lifted,
+        drv_path,
+        &|_| None,
+        &mut HashMap::new(),
+    ) {
+        Ok(hash) => node.ca_modular_hash = hash.to_vec(),
+        Err(e) => warn!(
+            drv_path = %drv_path,
+            error = %e,
+            "failed to hash inline fallback derivation; builtOutputs enrichment degraded"
+        ),
     }
     Ok(node)
 }
@@ -2241,8 +2258,13 @@ mod tests {
             "FOD fallback node carries the modular hash of the inline derivation"
         );
 
-        // A deferred-IA-shaped inline derivation (no hash algo, empty
-        // path) is not content-bound: no hash is invented for it.
+        // A non-content-bound (input-addressed / deferred-IA) inline
+        // derivation is REFUSED by the producer: the scheduler
+        // unconditionally rejects authoritative inline IA content, so
+        // minting the node would only manufacture a guaranteed rejection
+        // misreported as transient. The handler's inline IA gate rejects
+        // these earlier; this is the producer's own contract.
+        // r[verify gw.build.scheduler-rejection-permanent]
         let ia_basic = BasicDerivation::new(
             vec![rio_nix::derivation::DerivationOutput::new("out", "", "", "").unwrap()],
             Default::default(),
@@ -2252,14 +2274,14 @@ mod tests {
             [("out".to_string(), String::new())].into_iter().collect(),
         )
         .expect("IA-shaped BasicDerivation constructs");
-        let ia_node = build_fallback_node(
+        let ia_err = build_fallback_node(
             "/nix/store/cccccccccccccccccccccccccccccccc-plain.drv",
             &ia_basic,
         )
-        .expect("under the cap");
+        .expect_err("non-content-bound fallback nodes are refused");
         assert!(
-            ia_node.ca_modular_hash.is_empty(),
-            "non-content-bound fallback nodes carry no modular hash"
+            ia_err.contains("input-addressed") && ia_err.contains("upload the .drv"),
+            "refusal names the cause and the remediation: {ia_err}"
         );
         assert_eq!(
             node.drv_content,

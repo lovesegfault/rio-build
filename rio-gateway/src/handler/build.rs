@@ -803,6 +803,46 @@ enum BuildEventOutcome {
     },
 }
 
+/// Classify a failed `SubmitBuild` call: a scheduler `INVALID_ARGUMENT` /
+/// `FAILED_PRECONDITION` means the scheduler validated the submission and
+/// REFUSED it — retrying the identical submission can never succeed —
+/// while every other failure (timeout, `UNAVAILABLE`, transport) is
+/// infrastructure trouble.
+///
+/// `with_timeout` wraps the tonic error into `anyhow::Error`, which
+/// preserves the concrete `tonic::Status` for downcasting (verified by
+/// the wire test: a mock InvalidArgument surfaces as `SchedulerRejected`).
+// r[impl gw.build.scheduler-rejection-permanent]
+fn classify_scheduler_error(e: anyhow::Error) -> GatewayError {
+    if let Some(status) = e.downcast_ref::<tonic::Status>()
+        && matches!(
+            status.code(),
+            tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition
+        )
+    {
+        return GatewayError::SchedulerRejected(status.message().to_owned());
+    }
+    GatewayError::Scheduler(format!("SubmitBuild failed: {e}"))
+}
+
+/// Convert a build-submission error into the `BuildResult` failure the
+/// client sees: scheduler rejections are permanent (`InputRejected`),
+/// everything else is retryable (`TransientFailure`).
+// r[impl gw.build.scheduler-rejection-permanent]
+fn submit_failure_result(e: &anyhow::Error) -> BuildResult {
+    if let Some(GatewayError::SchedulerRejected(reason)) = e.downcast_ref::<GatewayError>() {
+        BuildResult::failure(
+            BuildStatus::InputRejected,
+            format!("scheduler rejected the submission: {reason}"),
+        )
+    } else {
+        BuildResult::failure(
+            BuildStatus::TransientFailure,
+            format!("scheduler error: {e}"),
+        )
+    }
+}
+
 /// Issue the `SubmitBuild` RPC and read its initial response metadata
 /// (`x-rio-build-id`, `x-rio-trace-id`). Records `build_id` in
 /// `active_build_ids` at seq=0 so a stream error before event 0 is
@@ -841,7 +881,7 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
             // Sending STDERR_ERROR here would produce the exact
             // ERROR→LAST desync remediation 07 fixes.
             let _ = stderr.log(&format!("SubmitBuild RPC failed: {e}\n")).await;
-            return Err(GatewayError::Scheduler(format!("SubmitBuild failed: {e}")).into());
+            return Err(classify_scheduler_error(e).into());
         }
     };
 
@@ -1545,10 +1585,8 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "build submission failed");
-            BuildResult::failure(
-                BuildStatus::TransientFailure,
-                format!("scheduler error: {e}"),
-            )
+            // r[impl gw.build.scheduler-rejection-permanent]
+            submit_failure_result(&e)
         }
     };
 
@@ -2310,10 +2348,8 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                 warn!(error = %e, "wopBuildPathsWithResults: build submission failed");
                 metrics::counter!("rio_gateway_errors_total", "type" => "scheduler_submit")
                     .increment(1);
-                BuildResult::failure(
-                    BuildStatus::TransientFailure,
-                    format!("scheduler error: {e}"),
-                )
+                // r[impl gw.build.scheduler-rejection-permanent]
+                submit_failure_result(&e)
             }
         };
 

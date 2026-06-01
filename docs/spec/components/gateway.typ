@@ -693,6 +693,24 @@ which the inline `BasicDerivation` lacks — so in the single-node fallback
 pre-verification behavior: empty `builtOutputs`, scheduler outcome passed
 through.
 
+#r("gw.build.scheduler-rejection-permanent")[
+  When `SubmitBuild` fails with `INVALID_ARGUMENT` or `FAILED_PRECONDITION`,
+  the gateway MUST report the failure to the client as a permanent rejection
+  (`BuildResult` status `InputRejected`), never as `TransientFailure`; all
+  other submission failures (timeout, `UNAVAILABLE`, transport errors) remain
+  transient. The gateway MUST NOT mint fallback nodes it knows the scheduler
+  will reject: `build_fallback_node` refuses non-content-bound derivations.
+]
+
+A scheduler `INVALID_ARGUMENT` / `FAILED_PRECONDITION` means the scheduler
+validated the submission's content and refused it --- resubmitting the
+identical request can never succeed, so reporting it as transient sends
+clients (and CI retry wrappers) into a retry loop against a deterministic
+rejection. The producer half closes the one known way the gateway itself
+could manufacture such a rejection: an inline fallback node for a
+non-content-bound derivation, which the scheduler's authoritative-content
+validation always refuses.
+
 === BuildResult Wire Format
 
 All fields below are present for 1.35+ except `cpu_user`/`cpu_system`, which

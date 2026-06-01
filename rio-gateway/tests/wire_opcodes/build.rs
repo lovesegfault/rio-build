@@ -870,6 +870,85 @@ async fn test_build_derivation_inline_fod_unresolvable_accepted() -> anyhow::Res
     Ok(())
 }
 
+/// wopBuildDerivation (36): a scheduler INVALID_ARGUMENT on SubmitBuild is
+/// reported to the client as a PERMANENT rejection (InputRejected), never
+/// TransientFailure — the scheduler validated the submission and refused
+/// it, so retrying the identical request can never succeed. UNAVAILABLE
+/// (infrastructure trouble) stays transient.
+// r[verify gw.build.scheduler-rejection-permanent]
+#[tokio::test]
+async fn test_build_derivation_scheduler_invalid_argument_reported_input_rejected()
+-> anyhow::Result<()> {
+    // Helper: drive a content-bound (FOD) inline fallback — which passes
+    // every gateway gate — into a scheduler whose submit outcome is `code`,
+    // and return the BuildResult status the client reads back.
+    async fn submit_with_scheduler_code(code: tonic::Code, tag: &str) -> anyhow::Result<u64> {
+        let mut h = GatewaySession::new_with_handshake().await?;
+        h.scheduler.set_submit_outcome(SubmitOutcome::Error(code));
+
+        let drv_path = format!("/nix/store/00000000000000000000000000000055-sched-rej-{tag}.drv");
+        let digest =
+            hex::decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")?;
+        let nix_hash = rio_nix::hash::NixHash::new("sha256".parse().unwrap(), digest)?;
+        let honest_path = rio_nix::store_path::StorePath::make_fixed_output(
+            &format!("sched-rej-{tag}"),
+            &nix_hash,
+            false,
+            &[],
+        )?
+        .as_str()
+        .to_owned();
+
+        wire_send!(&mut h.stream;
+            u64: 36,                                 // wopBuildDerivation
+            string: &drv_path,
+            u64: 1,                                  // 1 output
+            string: "out",
+            string: &honest_path,
+            string: "sha256",                        // hash_algo → fixed-output
+            string: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            strings: wire::NO_STRINGS,               // input_srcs
+            string: "x86_64-linux",
+            string: "/bin/sh",
+            strings: &["-c", "echo hi"],
+            u64: 1,                                  // 1 env pair
+            string: "out",
+            string: &honest_path,
+            u64: 0,                                  // build_mode
+        );
+
+        drain_stderr_until_last(&mut h.stream).await?;
+        let status = wire::read_u64(&mut h.stream).await?;
+        let _error_msg = wire::read_string(&mut h.stream).await?;
+        drain_build_result_tail(&mut h.stream).await?;
+        h.finish().await;
+        Ok(status)
+    }
+
+    // Scheduler validated and refused → InputRejected (4), permanent.
+    let rejected = submit_with_scheduler_code(tonic::Code::InvalidArgument, "inv").await?;
+    assert_eq!(
+        rejected, 4,
+        "scheduler INVALID_ARGUMENT must surface as InputRejected (4), got {rejected}"
+    );
+
+    // FAILED_PRECONDITION (merge-gate conflict) → also permanent.
+    let precondition = submit_with_scheduler_code(tonic::Code::FailedPrecondition, "pre").await?;
+    assert_eq!(
+        precondition, 4,
+        "scheduler FAILED_PRECONDITION must surface as InputRejected (4), got {precondition}"
+    );
+
+    // Infrastructure trouble → TransientFailure (6), retryable.
+    let transient = submit_with_scheduler_code(tonic::Code::Unavailable, "unav").await?;
+    assert_eq!(
+        transient, 6,
+        "scheduler UNAVAILABLE must stay TransientFailure (6), got {transient}"
+    );
+
+    Ok(())
+}
+
 /// wopBuildDerivation (36): an inline floating-CA derivation (algo set,
 /// hash and path empty) with no uploaded .drv is accepted, and the
 /// submitted node carries parseable drv_content with needs_resolve set.

@@ -180,6 +180,15 @@ pub enum GatewayError {
     #[error("scheduler gRPC: {0}")]
     Scheduler(String),
 
+    /// The scheduler VALIDATED the submission and refused it
+    /// (`INVALID_ARGUMENT` / `FAILED_PRECONDITION`). Unlike
+    /// [`GatewayError::Scheduler`] this is not infrastructure trouble:
+    /// retrying the identical submission can never succeed, so callers
+    /// that convert errors into `BuildResult`s must report
+    /// `InputRejected`, never `TransientFailure`.
+    #[error("scheduler rejected the submission: {0}")]
+    SchedulerRejected(String),
+
     /// gRPC stream/channel error (channel closed, task panicked).
     #[error("gRPC stream: {0}")]
     GrpcStream(String),
