@@ -4342,3 +4342,128 @@ async fn flag_on_success_coverage_ignores_unwanted_outputs() -> TestResult {
     assert_eq!(job_state, "resolved_success");
     Ok(())
 }
+// r[verify sched.materialize.job]
+/// FP-4(b) absorption — the flag-transition scenario's second product
+/// gap (red-first): a build submitted FLAG-OFF has no
+/// `build_wanted_outputs` rows (flag-off merges never write the
+/// relation). When the flip enables materialization and the dispatch
+/// probe creates a job for that build's node, the probe MUST backfill
+/// the wanted relation for the flag-off-era interest. Without the
+/// backfill the §6 join is empty for these jobs: the store executor's
+/// tenant resolution and wanted-set resolution (both join through
+/// build_wanted_outputs) return nothing, and every execution of the job
+/// fails instantly as InfraFailure("no tenant context") — observed at
+/// deployment level as claims that charge materialization_infra within
+/// milliseconds and a build that never completes.
+#[tokio::test]
+async fn flag_on_probe_job_backfills_wanted_relation_for_flag_off_era_builds() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "fp4b-tenant").await;
+
+    let out = test_store_path("fp4b-out");
+
+    // ── Phase 1: a FLAG-OFF leader merges the build (tenant attached) ──
+    {
+        let (handle, task) = setup_actor_with_store(db.pool.clone(), Some(store_client.clone()));
+        let mut n = make_node("fp4b-node");
+        n.expected_output_paths = vec![out.clone()];
+        n.wanted_output_names = vec!["out".into()];
+        let build_id = Uuid::new_v4();
+        merge_dag_req(
+            &handle,
+            MergeDagRequest {
+                build_id,
+                tenant_id: Some(tenant),
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![n],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+                traceparent: String::new(),
+                jti: None,
+                jwt_token: None,
+            },
+        )
+        .await?;
+        barrier(&handle).await;
+        // Flag-off dormancy: zero jobs, zero wanted-relation rows.
+        let (jobs, wanted) = sdb(&db.pool).count_materialization_rows().await?;
+        assert_eq!(
+            (jobs, wanted),
+            (0, 0),
+            "flag-off: the merge writes no materialization rows"
+        );
+        // The flip begins: the flag-off leader goes away.
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // ── Phase 2: the flag-ON leader recovers; its dispatch probe creates
+    //    the job for the flag-off-era build's node ──
+    let leader = crate::lease::LeaderState::always_leader(std::sync::Arc::new(
+        std::sync::atomic::AtomicU64::new(1),
+    ));
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let phase2_leader = leader.clone();
+    let (handle, _task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), move |cfg, p| {
+            cfg.materialization.enabled = true;
+            p.leader = phase2_leader;
+        });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // The walk-era node's output is substitutable → the probe partition
+    // creates a cache_opportunity job for it.
+    store.state.substitutable.write().unwrap().push(out.clone());
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    let (jobs, wanted) = sdb(&db.pool).count_materialization_rows().await?;
+    assert_eq!(jobs, 1, "the probe created the flag-off-era build's job");
+    // THE BACKFILL ASSERTION: the wanted relation now reflects the
+    // flag-off-era build's interest.
+    assert_eq!(
+        wanted, 1,
+        "the probe-partition job creation must backfill the wanted relation for \
+         flag-off-era interested builds (the FP-4(b) absorption gap: without it \
+         the executor's §6 joins are empty and every execution fails as \
+         InfraFailure('no tenant context'))"
+    );
+
+    // The exact executor-side joins (rio-store executor.rs
+    // resolve_tenant / live_wanted_paths) now answer.
+    let resolved_tenant: Option<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT b.tenant_id \
+           FROM materialization_jobs j \
+           JOIN build_wanted_outputs w USING (derivation_id) \
+           JOIN builds b ON b.build_id = w.build_id \
+          WHERE j.drv_hash = 'fp4b-node' \
+            AND b.status IN ('pending', 'active') \
+            AND b.tenant_id IS NOT NULL",
+    )
+    .fetch_optional(&db.pool)
+    .await?;
+    assert_eq!(
+        resolved_tenant,
+        Some(tenant),
+        "the executor's tenant resolution must find the flag-off-era build's tenant"
+    );
+    let wanted_names: Option<Vec<String>> = sqlx::query_scalar(
+        "SELECT w.wanted_output_names \
+           FROM derivations d \
+           JOIN build_wanted_outputs w USING (derivation_id) \
+           JOIN builds b ON b.build_id = w.build_id \
+          WHERE d.drv_hash = 'fp4b-node' AND b.status IN ('pending', 'active')",
+    )
+    .fetch_optional(&db.pool)
+    .await?;
+    assert_eq!(
+        wanted_names,
+        Some(vec!["out".to_string()]),
+        "the executor's wanted-set resolution must find the build's wanted names"
+    );
+    Ok(())
+}

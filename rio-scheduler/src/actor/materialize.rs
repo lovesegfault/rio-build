@@ -181,13 +181,44 @@ impl DagActor {
                     )
                     .increment(1);
                 }
-                // Interest: the creating build's wanted-relation row
-                // (merge-tx callers write the relation for ALL nodes in
-                // the tx instead — this arm covers the probe-partition
-                // path where no merge tx is open).
-                if let Some(build_id) = creating_build {
+                // Interest: ensure the durable wanted relation reflects
+                // EVERY live interested build of this node — not just a
+                // named creating build. Builds that merged flag-on
+                // already have their rows (their merge wrote them; the
+                // record is an idempotent fenced upsert), but builds
+                // that merged FLAG-OFF have none, and the §6 joins the
+                // store executor runs (tenant resolution + wanted-set
+                // resolution, both through build_wanted_outputs) come up
+                // empty for them: every execution of the job then fails
+                // instantly as InfraFailure("no tenant context") and the
+                // build never completes — the FP-4(b) absorption gap
+                // observed by the flag-transition scenario (a flag-off
+                // era build's nodes get jobs after the flip that can
+                // never execute).
+                let live_interested: Vec<Uuid> = {
+                    use crate::state::BuildStateExt;
+                    self.dag
+                        .node(drv_hash)
+                        .map(|s| {
+                            s.interested_builds
+                                .iter()
+                                .filter(|bid| {
+                                    self.builds
+                                        .get(bid)
+                                        .is_some_and(|b| !b.state().is_terminal())
+                                })
+                                .copied()
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                for build_id in live_interested {
                     self.record_wanted_for_build_node(build_id, drv_hash).await;
                 }
+                // The named creating build (the reprobe lane's re-merging
+                // build) is covered by the loop above — it is among the
+                // node's live interested builds by the time this runs.
+                let _ = creating_build;
                 true
             }
             Ok(FencedJobCreate::Fenced) => {
