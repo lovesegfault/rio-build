@@ -221,6 +221,7 @@ fn migration_checksums_frozen() {
         (75, "59adad7c2e33bec0ae77bf525f32d133a4821b560cfb65779adc0a285dddf677607d470303692dfa068690043781c57b"),
         (76, "6122899143cc4f340a4a59d2f450e859b4ffc41339bb8c455e6520c4a7b92b3c4b95fadd577d8fb4537a53e3a032f64f"),
         (77, "6516c066cd4643aa5aea0154ab6cae62ec8944f3db2c073f0276500bf297171efbab08d1489b5cee7f5eaf3ff6fb42cd"),
+        (78, "da278b2ad23df8c9621186db1b83999940bdd783b35e642355e3e52eb2bba6171f709287393337779ca0bee8d0a20fc5"),
     ];
 
     let pinned: std::collections::HashMap<i64, &str> = PINNED.iter().copied().collect();
@@ -416,4 +417,322 @@ async fn migration_048_recounts_skipped_as_completed() {
     // b2 active → guard skipped it: seeded undercount preserved (live
     // path owns active builds; 048 must not race it).
     assert_eq!(row(b2).fetch_one(&db.pool).await.unwrap(), (2, 2));
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Migration 078 schema contract (substitution-replacement Phase A).
+//
+// Pins the structural properties the materialization-job machinery
+// depends on: the partial-unique dedup index, the state CHECK alphabet,
+// wanted-relation PK isolation, the derived interest view's liveness
+// filter, and — the dormancy half — the DEFAULT values that keep every
+// existing writer (the build pull mint, pin_live_inputs) untouched.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// 078: at most one unresolved (state='pending') job per derivation,
+/// enforced by the `materialization_jobs_unresolved` partial-unique
+/// index. Resolved jobs leave the index, so a new pending job for the
+/// same derivation inserts cleanly afterwards.
+#[tokio::test]
+async fn materialization_jobs_unresolved_dedup() {
+    let db = rio_test_support::TestDb::new(&MIGRATOR).await;
+
+    let drv = uuid::Uuid::now_v7();
+    let job1 = uuid::Uuid::now_v7();
+    let insert = "INSERT INTO materialization_jobs \
+                  (job_id, derivation_id, drv_hash, origin, created_generation) \
+                  VALUES ($1, $2, 'h-dedup', 'cache_opportunity', 1)";
+
+    sqlx::query(insert)
+        .bind(job1)
+        .bind(drv)
+        .execute(&db.pool)
+        .await
+        .expect("first pending job inserts");
+
+    // Second pending job for the same derivation: rejected by the
+    // partial-unique index (the database-enforced C3-class dedup).
+    let err = sqlx::query(insert)
+        .bind(uuid::Uuid::now_v7())
+        .bind(drv)
+        .execute(&db.pool)
+        .await
+        .expect_err("second pending job for one derivation must violate the dedup index");
+    assert!(
+        err.to_string().contains("materialization_jobs_unresolved"),
+        "expected materialization_jobs_unresolved violation, got: {err}"
+    );
+
+    // Resolve the first job: it leaves the partial index.
+    sqlx::query(
+        "UPDATE materialization_jobs \
+         SET state = 'resolved_success', resolved_at = now() WHERE job_id = $1",
+    )
+    .bind(job1)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // A new pending job for the same derivation now inserts cleanly.
+    sqlx::query(insert)
+        .bind(uuid::Uuid::now_v7())
+        .bind(drv)
+        .execute(&db.pool)
+        .await
+        .expect("pending job after resolution must insert (the index covers pending only)");
+}
+
+/// 078: the `state` CHECK rejects literals outside the job state-machine
+/// alphabet ("claimed" is deliberately NOT a job state — a claim is an
+/// open attempt, not a job-row mutation).
+#[tokio::test]
+async fn materialization_jobs_state_alphabet() {
+    let db = rio_test_support::TestDb::new(&MIGRATOR).await;
+
+    let err = sqlx::query(
+        "INSERT INTO materialization_jobs \
+         (job_id, derivation_id, drv_hash, origin, state, created_generation) \
+         VALUES ($1, $2, 'h-alpha', 'pruned', 'claimed', 1)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(uuid::Uuid::now_v7())
+    .execute(&db.pool)
+    .await
+    .expect_err("unknown state literal must fail the CHECK");
+    assert!(
+        err.to_string().contains("materialization_jobs_state_check"),
+        "expected materialization_jobs_state_check violation, got: {err}"
+    );
+
+    // Positive control: a valid non-default state inserts cleanly.
+    sqlx::query(
+        "INSERT INTO materialization_jobs \
+         (job_id, derivation_id, drv_hash, origin, state, created_generation) \
+         VALUES ($1, $2, 'h-alpha2', 'pruned', 'cancelled', 1)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(uuid::Uuid::now_v7())
+    .execute(&db.pool)
+    .await
+    .expect("valid state literal must pass the CHECK");
+}
+
+/// 078: two builds' wanted rows for one derivation coexist (PK is
+/// (build_id, derivation_id)); upserting one build's contribution
+/// replaces only that build's row, never another's.
+#[tokio::test]
+async fn build_wanted_outputs_pk_isolation() {
+    let db = rio_test_support::TestDb::new(&MIGRATOR).await;
+
+    let drv = uuid::Uuid::now_v7();
+    let (b1, b2): (sqlx::types::Uuid, sqlx::types::Uuid) = sqlx::query_as(
+        "WITH b AS (
+            INSERT INTO builds (status) VALUES ('active'), ('active') RETURNING build_id
+         ), ids AS (SELECT array_agg(build_id) AS a FROM b)
+         SELECT a[1], a[2] FROM ids",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let upsert = "INSERT INTO build_wanted_outputs \
+                  (build_id, derivation_id, wanted_output_names) VALUES ($1, $2, $3) \
+                  ON CONFLICT (build_id, derivation_id) DO UPDATE \
+                  SET wanted_output_names = EXCLUDED.wanted_output_names, recorded_at = now()";
+
+    // Both builds contribute a row for the same derivation.
+    sqlx::query(upsert)
+        .bind(b1)
+        .bind(drv)
+        .bind(vec!["out".to_string()])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(upsert)
+        .bind(b2)
+        .bind(drv)
+        .bind(vec!["dev".to_string()])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // Re-record b1 with a different wanted set: replaces b1's row only.
+    sqlx::query(upsert)
+        .bind(b1)
+        .bind(drv)
+        .bind(vec!["out".to_string(), "lib".to_string()])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let rows: Vec<(sqlx::types::Uuid, Vec<String>)> = sqlx::query_as(
+        "SELECT build_id, wanted_output_names FROM build_wanted_outputs \
+         WHERE derivation_id = $1",
+    )
+    .bind(drv)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 2, "both builds' rows coexist");
+    let names_of = |b: sqlx::types::Uuid| {
+        rows.iter()
+            .find(|(rb, _)| *rb == b)
+            .map(|(_, n)| n.clone())
+            .expect("row present")
+    };
+    assert_eq!(
+        names_of(b1),
+        vec!["out".to_string(), "lib".to_string()],
+        "b1's upsert replaced b1's row"
+    );
+    assert_eq!(
+        names_of(b2),
+        vec!["dev".to_string()],
+        "b2's row untouched by b1's upsert (PK isolation)"
+    );
+}
+
+/// 078: the `materialization_interest` view derives interest from the
+/// live-build join — rows appear only for builds with status
+/// pending/active, and flipping a build terminal drops its row without
+/// touching any wanted/job row.
+#[tokio::test]
+async fn materialization_interest_view_liveness() {
+    let db = rio_test_support::TestDb::new(&MIGRATOR).await;
+
+    let drv = uuid::Uuid::now_v7();
+    let job = uuid::Uuid::now_v7();
+
+    sqlx::query(
+        "INSERT INTO materialization_jobs \
+         (job_id, derivation_id, drv_hash, origin, created_generation) \
+         VALUES ($1, $2, 'h-interest', 'pruned', 1)",
+    )
+    .bind(job)
+    .bind(drv)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // Three builds — active, pending, succeeded — each with a wanted row.
+    let (b_active, b_pending, b_done): (sqlx::types::Uuid, sqlx::types::Uuid, sqlx::types::Uuid) =
+        sqlx::query_as(
+            "WITH b AS (
+            INSERT INTO builds (status)
+            VALUES ('active'), ('pending'), ('succeeded') RETURNING build_id
+         ), ids AS (SELECT array_agg(build_id) AS a FROM b)
+         SELECT a[1], a[2], a[3] FROM ids",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    for b in [b_active, b_pending, b_done] {
+        sqlx::query("INSERT INTO build_wanted_outputs (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(b)
+            .bind(drv)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+
+    let interested = sqlx::query_as::<_, (sqlx::types::Uuid,)>(
+        "SELECT build_id FROM materialization_interest WHERE job_id = $1",
+    );
+    let got: std::collections::HashSet<_> = interested
+        .bind(job)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(b,)| b)
+        .collect();
+    assert!(
+        got.contains(&b_active) && got.contains(&b_pending),
+        "live (active/pending) builds are interested"
+    );
+    assert!(
+        !got.contains(&b_done),
+        "terminal build must not appear in the interest view"
+    );
+
+    // Flip the active build terminal: its interest row disappears.
+    sqlx::query("UPDATE builds SET status = 'succeeded' WHERE build_id = $1")
+        .bind(b_active)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let after: std::collections::HashSet<_> = sqlx::query_as::<_, (sqlx::types::Uuid,)>(
+        "SELECT build_id FROM materialization_interest WHERE job_id = $1",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(b,)| b)
+    .collect();
+    assert_eq!(
+        after,
+        std::collections::HashSet::from([b_pending]),
+        "only the still-live build remains interested after the flip"
+    );
+}
+
+/// 078 dormancy guarantee: an INSERT into `drv_executions` that does not
+/// mention `attempt_kind` — i.e. every existing writer, the fenced pull
+/// mint — gets 'build'.
+#[tokio::test]
+async fn attempt_kind_default_is_build() {
+    let db = rio_test_support::TestDb::new(&MIGRATOR).await;
+
+    let exec = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO drv_executions (exec_id, drv_hash, executor_id, started_at) \
+         VALUES ($1, $2, 'builder-0', now())",
+    )
+    .bind(exec)
+    .bind("a".repeat(32))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let kind: String =
+        sqlx::query_scalar("SELECT attempt_kind FROM drv_executions WHERE exec_id = $1")
+            .bind(exec)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(kind, "build", "kind-less INSERT must default to 'build'");
+}
+
+/// 078 dormancy guarantee: an INSERT into `scheduler_live_pins` that does
+/// not mention `pin_kind` — i.e. the as-built `pin_live_inputs` writer —
+/// gets 'build_input' and a NULL job_id.
+#[tokio::test]
+async fn live_pins_kind_default_is_build_input() {
+    let db = rio_test_support::TestDb::new(&MIGRATOR).await;
+
+    sqlx::query(
+        "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash) \
+         VALUES ($1, 'h-pin-default')",
+    )
+    .bind(vec![0xabu8; 20])
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let (kind, job): (String, Option<sqlx::types::Uuid>) = sqlx::query_as(
+        "SELECT pin_kind, job_id FROM scheduler_live_pins WHERE drv_hash = 'h-pin-default'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        kind, "build_input",
+        "kind-less pin INSERT must default to 'build_input'"
+    );
+    assert_eq!(job, None, "job_id defaults to NULL for build-input pins");
 }

@@ -1638,6 +1638,38 @@ pub const M_076: () = ();
 /// M_075 / M_076 means no live database carries rows to migrate).
 pub const M_077: () = ();
 
+/// `migrations/078_materialization_jobs.sql`
+///
+/// Substitution-replacement campaign Phase A (additive, dormant): the
+/// durable wanted relation (`build_wanted_outputs`), the
+/// materialization-job table + `materialization_interest` view, the
+/// `drv_executions.attempt_kind` work-class discriminator, and
+/// pin-kind discrimination on `scheduler_live_pins`.
+///
+/// **Dormancy:** no code path writes any of this while
+/// `scheduler.materialization.enabled` / `store.materialization.enabled`
+/// are false (the Phase A defaults). Every ALTER carries a DEFAULT so
+/// existing writers (`mint_pull_attempt_fenced`, `pin_live_inputs`)
+/// are untouched.
+///
+/// **Why `attempt_kind` exists when M_076 just dropped `dispatch_mode`:**
+/// 076 dropped a *transport* discriminator whose value space had
+/// collapsed to a constant ('pull') — it discriminated nothing. This
+/// column is a *work-class* discriminator (build vs materialization)
+/// whose value space becomes non-constant the moment the
+/// materialization executor ships. The retry fold's kind partition
+/// (materialization rows invisible to build budgets), the
+/// establishment sweep's no-adopt branch, and the report intake's
+/// kind check all read it. Kind is never derived from an executor-id
+/// prefix (the newtypes.rs convention).
+///
+/// **Forward reference:** `build_wanted_outputs` is the
+/// PG-authoritative successor of the 062 stored union + the in-memory
+/// per-build contributions (AW4). 062 is NOT touched here; its
+/// retirement is a Phase D' migration gated on the campaign's
+/// verify-then-simplify gate (design §4).
+pub const M_078: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
