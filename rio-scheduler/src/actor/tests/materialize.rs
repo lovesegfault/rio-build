@@ -631,3 +631,151 @@ async fn flag_on_infra_failure_charges_and_rearms() -> TestResult {
     assert_eq!(drv.status, DerivationStatus::Ready, "the node requeued");
     Ok(())
 }
+
+// ── Establishment + cancellation (T-3.6) ───────────────────────────────
+
+// r[verify sched.materialize.routing]
+/// A dead store replica's open materialization attempt is established
+/// as materialization_infra — never executor_crash, never adopted —
+/// and the job returns to pending (claimable again). BC-2/BC-3: no
+/// adopt arm for the materialization kind (the outputs ARE present in
+/// the store here — the adopt-arm bait — and the establishment still
+/// charges instead of completing); the charge is invisible to build
+/// budgets by the kernel kind partition.
+#[tokio::test]
+async fn establishment_writes_materialization_infra_never_adopts() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    // Job via the merge new_sub lane + a store-replica claim.
+    let out = test_store_path("maton-est-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("maton-est");
+    n.expected_output_paths = vec![out.clone()];
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+    let outcome = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "maton-est".into(),
+            auth_intent: Some("maton-est".into()),
+            kind: rio_evidence_kernel::pull::PullKind::Materialization,
+            executor_instance: Some("store-replica-0".into()),
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    let assignment = match outcome {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("flag-on materialization claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+
+    // The adopt-arm bait: the wanted output IS present in the store.
+    store
+        .state
+        .paths
+        .write()
+        .unwrap()
+        .insert(out.clone(), Default::default());
+
+    // Age the attempt past any deadline + slack, then sweep.
+    sqlx::query(
+        "UPDATE assignments SET assigned_at = now() - interval '100 days' WHERE exec_id = $1",
+    )
+    .bind(exec_id)
+    .execute(&db.pool)
+    .await?;
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    // Exactly one charge row: materialization_infra (never
+    // executor_crash — BC-2) with the materialization kind. The adopt
+    // arm would have written NO row at all (and completed the node);
+    // the as-built C2 arm would have written executor_crash.
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT t.outcome_class, COALESCE(e.attempt_kind, 'build') \
+           FROM drv_attempts t \
+           LEFT JOIN drv_executions e ON e.exec_id = t.exec_id",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(rows.len(), 1, "exactly one establishment row, got {rows:?}");
+    assert_eq!(
+        rows[0].0, "materialization_infra",
+        "the charge class is materialization_infra, never executor_crash (BC-2)"
+    );
+    assert_eq!(rows[0].1, "materialization");
+
+    // The job returned to pending (claimable again): never resolved by
+    // the establishment, never adopted-as-success.
+    let job_state: String = sqlx::query_scalar("SELECT state FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(job_state, "pending", "the job stays pending (claimable)");
+    Ok(())
+}
+
+// r[verify sched.materialize.job]
+/// Cancellation: when the last live interested build goes terminal, the
+/// housekeeping backstop (flag-gated) cancels the job and closes any
+/// open materialization attempt CHARGE-FREE — no charge row of any
+/// class is appended (BC-2's no-controller closer).
+#[tokio::test]
+async fn cancellation_closes_open_attempt_charge_free() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    let out = test_store_path("maton-cancel-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("maton-cancel");
+    n.expected_output_paths = vec![out.clone()];
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+    let outcome = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "maton-cancel".into(),
+            auth_intent: Some("maton-cancel".into()),
+            kind: rio_evidence_kernel::pull::PullKind::Materialization,
+            executor_instance: Some("store-replica-0".into()),
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    assert!(
+        matches!(outcome, Ok(PullOutcome::Deliver(_))),
+        "claim delivered, got {outcome:?}"
+    );
+
+    // The last (only) live interested build goes terminal.
+    cancel_build(&handle, build_id).await?;
+    barrier(&handle).await;
+    // The flag-gated housekeeping backstop runs the closer.
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    // Charge-free: no charge row of ANY class for the closed attempt
+    // (cancellation is not a failure; the budget is untouched).
+    let charges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM drv_attempts \
+          WHERE outcome_class IN ('materialization_infra', 'materialization_unobtainable', \
+                                  'executor_crash', 'infra', 'transient')",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(charges, 0, "the cancellation close is charge-free (BC-2)");
+
+    // The job is cancelled (terminal, never claimable again).
+    let job_state: String = sqlx::query_scalar("SELECT state FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(job_state, "cancelled");
+
+    // The assignment row is closed (no open attempt remains).
+    let open: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM assignments WHERE status IN ('pending', 'acknowledged')",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(open, 0, "the open attempt was closed");
+    Ok(())
+}

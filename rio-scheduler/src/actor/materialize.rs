@@ -52,10 +52,6 @@ impl JobDescriptor {
 #[derive(Debug, Clone)]
 pub(crate) struct JobViewEntry {
     /// `materialization_jobs.job_id`.
-    // Read by the consumption transaction and the establishment/
-    // cancellation closers (the next commits of this campaign wave);
-    // the allow is removed with the first reader.
-    #[allow(dead_code)]
     pub job_id: Uuid,
     /// Backoff expiry while parked; `None` = not parked.
     pub parked_until: Option<std::time::Instant>,
@@ -885,5 +881,120 @@ impl DagActor {
         } else {
             ReprobeAnswer::ConfirmedMissing
         })
+    }
+}
+
+impl DagActor {
+    /// Establish one expired open materialization attempt (the
+    /// dead-store-replica case): append the `materialization_infra`
+    /// charge (kind=materialization, party=Scheduler, "unreported"),
+    /// close the assignment row in the same fenced transaction, clear
+    /// the in-memory claim, and leave the job pending (claimable
+    /// again). NO adopt arm (BC-3: a mid-walk crash leaves outputs
+    /// present but the closure incomplete) and never `executor_crash`
+    /// (BC-2: the charge feeds the materialization budget and nothing
+    /// else). Mirrors `close_pull_attempt_uncharged`'s transaction
+    /// shape WITH the charge row.
+    // r[impl sched.materialize.routing]
+    pub(super) async fn establish_materialization_attempt(
+        &mut self,
+        attempt: &crate::db::open_attempts::OpenAttemptRow,
+    ) {
+        let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
+        let executor = ExecutorId::from(attempt.executor_id.as_str());
+        let serving_generation = self.serving_generation();
+        let mut row = crate::db::attempts::AttemptRow::new(
+            attempt.derivation_id,
+            crate::state::OutcomeClass::MaterializationInfra,
+            crate::state::ReportingParty::Scheduler,
+        );
+        row.exec_id = Some(attempt.exec_id);
+        row.executor_id = Some(executor.clone());
+        row.attempt_kind = crate::state::AttemptKind::Materialization;
+        row.source_node = attempt.source_node.clone();
+        row.termination_reason = Some("unreported".into());
+        self.close_materialization_attempt(
+            attempt.exec_id,
+            &drv_hash,
+            Some(row),
+            serving_generation,
+        )
+        .await;
+        // The claim is gone; the job stays pending (claimable again).
+        self.rearm_materialization_job(&drv_hash, &executor).await;
+        // The node returns to its dispatchable status.
+        self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
+            .await;
+        tracing::info!(
+            drv_hash = %drv_hash,
+            exec_id = %attempt.exec_id,
+            executor_id = %executor,
+            age_secs = attempt.age_secs,
+            "establishment sweep: open materialization attempt established as \
+             materialization_infra (no adopt arm; the job stays pending)"
+        );
+    }
+
+    /// The flag-gated housekeeping backstop: cancel jobs for
+    /// derivations whose live interest dropped to zero (node gone,
+    /// node terminal, or every interested build terminal), closing any
+    /// open materialization attempt charge-free. Phase B's
+    /// build-terminal hooks will call the closer directly; in Phase A
+    /// this tick backstop and the tests are the only callers.
+    pub(super) async fn tick_cancel_zero_interest_materialization(&mut self) {
+        use crate::state::BuildStateExt;
+        let zero_interest: Vec<DrvHash> = self
+            .materialization_jobs
+            .keys()
+            .filter(|h| match self.dag.node(h.as_str()) {
+                None => true,
+                Some(state) => {
+                    state.status().is_terminal()
+                        || !state.interested_builds.iter().any(|bid| {
+                            self.builds
+                                .get(bid)
+                                .is_some_and(|b| !b.state().is_terminal())
+                        })
+                }
+            })
+            .cloned()
+            .collect();
+        for drv_hash in zero_interest {
+            self.cancel_materialization_for_zero_interest(&drv_hash)
+                .await;
+        }
+    }
+
+    // r[impl sched.materialize.job]
+    /// Cancel the job for a derivation whose live interest dropped to
+    /// zero, closing any open materialization attempt CHARGE-FREE (no
+    /// drv_attempts row at all) — BC-2's no-controller closer. The job
+    /// resolution is fenced and pending-only (terminal-row-wins).
+    pub(super) async fn cancel_materialization_for_zero_interest(&mut self, drv_hash: &DrvHash) {
+        let Some(entry) = self.materialization_jobs.get(drv_hash) else {
+            return;
+        };
+        let job_id = entry.job_id;
+        let serving_generation = self.serving_generation();
+        // Close any open attempt charge-free (no charge row — a
+        // cancellation is not a failure; the budget is untouched).
+        if let Some(exec_id) = self.dag.node(drv_hash).and_then(|s| s.exec_id) {
+            self.close_materialization_attempt(exec_id, drv_hash, None, serving_generation)
+                .await;
+        }
+        // Cancel the job (fenced, pending-only).
+        self.resolve_materialization_job(
+            job_id,
+            None,
+            crate::state::JobState::Cancelled,
+            serving_generation,
+        )
+        .await;
+        self.materialization_jobs.remove(drv_hash);
+        tracing::info!(
+            drv_hash = %drv_hash,
+            %job_id,
+            "materialization job cancelled: no live interested build remains"
+        );
     }
 }

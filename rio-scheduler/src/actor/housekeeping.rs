@@ -129,6 +129,14 @@ impl DagActor {
         self.tick_sweep_dispatched_cells();
         self.tick_publish_gauges();
         self.tick_sweep_open_pull_attempts().await;
+        // Substitution-replacement (flag-gated — review finding
+        // dormancy-7: an unconditional call would issue PG queries
+        // against the materialization tables on every flag-off
+        // housekeeping cycle): cancel jobs whose derivation has no live
+        // interest left, closing open attempts charge-free.
+        if self.materialization_cfg.enabled {
+            self.tick_cancel_zero_interest_materialization().await;
+        }
 
         // Advance probe_generation here (1/s) — NOT per
         // `sweep_ready_cached` call — so a Ready node is FMP-probed at
@@ -611,6 +619,19 @@ impl DagActor {
         // Standby replicas must neither write attempt rows nor decide
         // from them (the same gate every establishment vehicle carries).
         if !self.leader.is_leader() {
+            return;
+        }
+        // Substitution-replacement (design §2.4 / findings BC-2, BC-3):
+        // the materialization kind has NO adopt arm (a mid-walk crash
+        // leaves outputs present but the closure incomplete — adopting
+        // would fabricate a closure-incomplete completion), and its
+        // charge class is materialization_infra (counts toward the
+        // materialization budget and toward NOTHING else), never
+        // executor_crash. The branch is an early return for a kind no
+        // build attempt carries — the as-built arms below are untouched.
+        // r[impl sched.materialize.routing]
+        if attempt.attempt_kind == crate::state::AttemptKind::Materialization.as_str() {
+            self.establish_materialization_attempt(attempt).await;
             return;
         }
         let drv_hash = DrvHash::from(attempt.drv_hash.as_str());

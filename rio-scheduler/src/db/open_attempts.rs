@@ -96,6 +96,11 @@ pub(crate) struct OpenAttemptRow {
     /// window anchor: the window may widen via the sweep-time re-solve
     /// but never shrink below this. `None` for rows minted before 072.
     pub deadline_secs: Option<f64>,
+    /// Work class of the execution (`drv_executions.attempt_kind`,
+    /// COALESCE'd to 'build' — substitution-replacement). The
+    /// establishment sweep branches on it: materialization attempts
+    /// get the no-adopt materialization_infra arm.
+    pub attempt_kind: String,
 }
 
 impl SchedulerDb {
@@ -297,6 +302,7 @@ impl SchedulerDb {
             "SELECT d.derivation_id, d.drv_hash, d.drv_path, d.system, d.is_fixed_output, \
                     a.exec_id, a.builder_id AS executor_id, a.generation, \
                     e.source_node, e.deadline_secs, \
+                    COALESCE(e.attempt_kind, 'build') AS attempt_kind, \
                     EXTRACT(EPOCH FROM a.assigned_at)::float8 AS assigned_at_epoch_secs, \
                     GREATEST(EXTRACT(EPOCH FROM (now() - a.assigned_at))::float8, 0.0) \
                         AS age_secs \
