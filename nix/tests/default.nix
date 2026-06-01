@@ -61,6 +61,7 @@ let
   log-service = import ./scenarios/log-service.nix;
   substitute-scale = import ./scenarios/substitute-scale.nix;
   materialize = import ./scenarios/materialize.nix;
+  materialize-transition = import ./scenarios/materialize-transition.nix;
   materialize-failover = import ./scenarios/materialize-failover.nix;
   sla-sizing = import ./scenarios/sla-sizing.nix;
   forecast-provisioning = import ./scenarios/forecast-provisioning.nix;
@@ -1319,6 +1320,53 @@ in
   #   deep-chain (byte-original): one merge burst spawns all 49 walks —
   #   rio_scheduler_substitute_spawned_total delta ≥45.
   vm-substitute-scale-walk-k3s = mkSubstituteScale false;
+
+  # ── materialization flag-transition rollouts (T-3.2 / FP-4) ─────────
+  # The deployment-level revertability proof (RFB-4): the chart deploys
+  # flag-OFF, the scenario flips ON at runtime over in-flight walk-era
+  # state (kubectl set env + rollouts, the AS-6 store-first order), then
+  # flips back OFF over live job-era state — both directions leave no
+  # orphaned state, no stuck node, and no wrongful failure. Inherently
+  # both-state (it flips at runtime), so it needs no -walk oracle twin.
+  #
+  # k3s (NOT the standalone fixture) because recovery — the §4 mechanism
+  # that absorbs the other era's in-flight state — runs only on
+  # LeaderAcquired, which only fires in lease-based deployments. A
+  # standalone scheduler restart never reloads PG state, so FP-4
+  # transitions are k8s-only operations by construction.
+  #
+  # r[verify sched.materialize.job]
+  #   flip-on: walk-era nodes (Substituting / unresolved) at flip time
+  #   are absorbed — the new leader's recovery resets them, the flag-on
+  #   dispatch probe creates jobs for them, and the build completes
+  #   through the job path. Zero wrongful failures.
+  # r[verify sched.materialize.routing+2]
+  #   flag-on-marks + flip-off-marks: the topdown-pruned mark is
+  #   dual-written at merge, the consumption transaction's clear-mirror
+  #   clears it when the pruned job resolves successfully, and the clear
+  #   is durable across the ON->OFF flip (a re-submission of the node
+  #   never wrongfully fail-fasts).
+  #   flip-off: parked flag-on-era jobs survive the flip as inert rows
+  #   (still pending, never claimed again, never cancelled) while the
+  #   as-built walk completes their build around them.
+  # r[verify sched.materialize.pinning]
+  #   flag-on-pins + flip-off-pins: pin-at-ingest rows survive the
+  #   ON->OFF flip while their interested build is live; the always-on
+  #   release fires FLAG-OFF when that interest goes terminal, and the
+  #   path becomes GC-collectable.
+  vm-materialization-transition-k3s = materialize-transition {
+    inherit pkgs common;
+    fixture = k3sFull {
+      jwtEnabled = true;
+      # The chart deploys flag-OFF (both components — the AS-6 pairing);
+      # the scenario's kubectl-set-env flips are the runtime cutover and
+      # the rollback rendering.
+      extraValuesTyped = {
+        "scheduler.materialization.enabled" = false;
+        "store.materialization.enabled" = false;
+      };
+    };
+  };
 
   # ── materialization under leader failover + AS-6 mixed-flag (T-3.3) ─
   # What the standalone scenarios cannot prove: materialization jobs are
