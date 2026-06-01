@@ -122,7 +122,7 @@
         }
       },
       "materialization": {
-        "description": "Substitution-replacement campaign (design §8): store-owned\nmaterialization jobs. `[materialization]` table in\nscheduler.toml. Env: `RIO_MATERIALIZATION__*` (nested keys —\ndouble underscore). Phase A lands every mechanism dormant behind\n`enabled = false`; Phase B turns it on.",
+        "description": "Substitution-replacement campaign (design §8): store-owned\nmaterialization jobs. `[materialization]` table in\nscheduler.toml. Env: `RIO_MATERIALIZATION__*` (nested keys —\ndouble underscore). Phase B activated the mechanism at the\ndeployment layer: the helm values default the flag ON (the\ncutover switch), while this struct's default stays `false` —\na bare binary without deployment config runs the as-built walk.",
         "$ref": "#/$defs/MaterializationConfig",
         "default": {
           "enabled": false,
@@ -281,7 +281,7 @@
         }
       },
       "MaterializationConfig": {
-        "description": "Substitution-replacement campaign (design §8): store-owned\nmaterialization jobs. Phase A lands every mechanism dormant behind\n`enabled = false`; Phase B turns it on. The deployment-ordering\nconstraint (store executor flag first ON, last OFF — design §4/AS-6)\nis enforced by helm value structure, not here.",
+        "description": "Substitution-replacement campaign (design §8): store-owned\nmaterialization jobs. Phase B activated the mechanism: the helm\nvalues default `enabled: true` for both components (the deployment\nlayer is the cutover switch — PD-B1), while this struct's default\nstays `false` so a bare binary runs the as-built walk. The\ndeployment-ordering constraint (store executor flag first ON, last\nOFF — design §4/AS-6) is enforced by the chart's AND-guard\n(templates/scheduler.yaml), not here.",
         "type": "object",
         "properties": {
           "enabled": {

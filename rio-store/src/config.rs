@@ -215,7 +215,10 @@ pub struct Config {
     pub log_peer_url_template: String,
     /// Substitution-replacement campaign (design §8): the store-side
     /// materialization-job executor. `[materialization]` table in
-    /// store.toml. Env: `RIO_MATERIALIZATION__*`.
+    /// store.toml. Env: `RIO_MATERIALIZATION__*`. Phase B activated the
+    /// executor at the deployment layer (helm values default ON); this
+    /// struct's default stays `false` — a bare binary spawns no
+    /// executor task set.
     pub materialization: MaterializationConfig,
     /// Build-log retention, in days since the execution *started*
     /// (`drv_executions.started_at` — the only timestamp every
@@ -266,10 +269,13 @@ impl Default for Config {
 }
 
 /// Substitution-replacement campaign (design §8): store-owned
-/// materialization jobs. Phase A lands the per-replica executor task
-/// set dormant behind `enabled = false`; Phase B turns it on. The
-/// deployment-ordering constraint (store executor flag first ON, last
-/// OFF — design §4/AS-6) is enforced by helm value structure, not here.
+/// materialization jobs. Phase B activated the per-replica executor
+/// task set: the helm values default `enabled: true` (the deployment
+/// layer is the cutover switch — PD-B1), while this struct's default
+/// stays `false` so a bare binary spawns no executor (and needs no
+/// scheduler address). The deployment-ordering constraint (store
+/// executor flag first ON, last OFF — design §4/AS-6) is enforced by
+/// the chart's AND-guard (templates/scheduler.yaml), not here.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct MaterializationConfig {

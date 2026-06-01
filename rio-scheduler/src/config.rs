@@ -88,8 +88,10 @@ pub struct Config {
     /// Substitution-replacement campaign (design §8): store-owned
     /// materialization jobs. `[materialization]` table in
     /// scheduler.toml. Env: `RIO_MATERIALIZATION__*` (nested keys —
-    /// double underscore). Phase A lands every mechanism dormant behind
-    /// `enabled = false`; Phase B turns it on.
+    /// double underscore). Phase B activated the mechanism at the
+    /// deployment layer: the helm values default the flag ON (the
+    /// cutover switch), while this struct's default stays `false` —
+    /// a bare binary without deployment config runs the as-built walk.
     pub materialization: MaterializationConfig,
     /// In-flight detached substitute-fetch task bound
     /// (r[sched.substitute.detached+5]) — memory-safety only; per-replica
@@ -152,10 +154,13 @@ impl Default for DashboardConfig {
 }
 
 /// Substitution-replacement campaign (design §8): store-owned
-/// materialization jobs. Phase A lands every mechanism dormant behind
-/// `enabled = false`; Phase B turns it on. The deployment-ordering
-/// constraint (store executor flag first ON, last OFF — design §4/AS-6)
-/// is enforced by helm value structure, not here.
+/// materialization jobs. Phase B activated the mechanism: the helm
+/// values default `enabled: true` for both components (the deployment
+/// layer is the cutover switch — PD-B1), while this struct's default
+/// stays `false` so a bare binary runs the as-built walk. The
+/// deployment-ordering constraint (store executor flag first ON, last
+/// OFF — design §4/AS-6) is enforced by the chart's AND-guard
+/// (templates/scheduler.yaml), not here.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct MaterializationConfig {

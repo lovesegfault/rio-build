@@ -199,7 +199,7 @@
         "default": "http://{pod}.rio-store-headless.rio-store.svc:9002"
       },
       "materialization": {
-        "description": "Substitution-replacement campaign (design §8): the store-side\nmaterialization-job executor. `[materialization]` table in\nstore.toml. Env: `RIO_MATERIALIZATION__*`.",
+        "description": "Substitution-replacement campaign (design §8): the store-side\nmaterialization-job executor. `[materialization]` table in\nstore.toml. Env: `RIO_MATERIALIZATION__*`. Phase B activated the\nexecutor at the deployment layer (helm values default ON); this\nstruct's default stays `false` — a bare binary spawns no\nexecutor task set.",
         "$ref": "#/$defs/MaterializationConfig",
         "default": {
           "enabled": false,
@@ -293,7 +293,7 @@
         }
       },
       "MaterializationConfig": {
-        "description": "Substitution-replacement campaign (design §8): store-owned\nmaterialization jobs. Phase A lands the per-replica executor task\nset dormant behind `enabled = false`; Phase B turns it on. The\ndeployment-ordering constraint (store executor flag first ON, last\nOFF — design §4/AS-6) is enforced by helm value structure, not here.",
+        "description": "Substitution-replacement campaign (design §8): store-owned\nmaterialization jobs. Phase B activated the per-replica executor\ntask set: the helm values default `enabled: true` (the deployment\nlayer is the cutover switch — PD-B1), while this struct's default\nstays `false` so a bare binary spawns no executor (and needs no\nscheduler address). The deployment-ordering constraint (store\nexecutor flag first ON, last OFF — design §4/AS-6) is enforced by\nthe chart's AND-guard (templates/scheduler.yaml), not here.",
         "type": "object",
         "properties": {
           "enabled": {

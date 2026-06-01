@@ -1405,8 +1405,11 @@ interested builds of the node (the verdict is per-node, not per-build).
   DAG-interested build remains.
 ]
 This is the substitution-replacement campaign's job lifecycle (design §2.1/§6,
-adjudications OQ3/OQ6). Phase A lands the mechanism dormant behind
-`scheduler.materialization.enabled = false`; Phase B activates it. The
+adjudications OQ3/OQ6). Phase A landed the mechanism dormant behind
+`scheduler.materialization.enabled = false`; Phase B activated it at the
+deployment layer: the helm values default the flag ON for both components (the
+cutover switch), while the Rust struct defaults stay `false` --- a bare binary
+without deployment configuration runs the as-built walk. The
 per-(build, derivation) wanted relation (`build_wanted_outputs`) is written by
 every merge for every pair when the flag is on, and materialization interest is
 always DERIVED from it by a live-build join --- never registered separately
