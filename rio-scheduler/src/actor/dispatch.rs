@@ -744,6 +744,15 @@ impl DagActor {
                     locally_present.push(drv_hash);
                 }
             } else if !substitute_tried
+                // Liveness reviewed for this site: `is_force_build_root`
+                // counts only LIVE (non-terminal) interested builds, so
+                // a force submission that already finished — its
+                // BuildInfo still lingering through the delayed terminal
+                // cleanup — no longer pins this node to the from-source
+                // path here; the batch probe routes it to the substitute
+                // lane like any other Ready node. While the force build
+                // IS live, the gate holds regardless of who triggered
+                // the probe.
                 && !self.is_force_build_root(&drv_hash)
                 && wanted.iter().all(|p| {
                     !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
@@ -802,17 +811,33 @@ impl DagActor {
     }
 
     // r[impl sched.merge.force-build-roots]
-    /// Sticky-OR over interested builds: true iff any live interested
+    /// Sticky-OR over interested builds: true iff any LIVE interested
     /// build has `force_build_roots` and names this node as one of its
     /// submission roots. Such a node must never enter the substitute-
     /// spawn arm (it may still complete from a locally-present output).
     /// `pub(super)` so the merge-time gates (merge.rs) share it.
+    ///
+    /// Live = present in `builds` AND `!state().is_terminal()` — the
+    /// same definition `effective_wanted` uses. Terminal builds linger
+    /// in `builds` until the delayed terminal cleanup
+    /// (`TERMINAL_CLEANUP_DELAY`, and the cleanup command is droppable
+    /// under mailbox backpressure), so map presence alone is NOT
+    /// liveness: counting a finished force-build submission here would
+    /// keep its roots substitution-blocked for every later tenant
+    /// sharing them — a from-source rebuild (or, for a still-poisoned
+    /// root, a spurious fail-fast where the documented behavior is the
+    /// reprobe-substitutable lane) for up to the cleanup delay, or
+    /// until restart if the cleanup was dropped. The gate must die with
+    /// the build, not with the map entry.
     pub(super) fn is_force_build_root(&self, drv_hash: &DrvHash) -> bool {
+        use super::BuildStateExt as _;
         self.dag.node(drv_hash).is_some_and(|s| {
             s.interested_builds.iter().any(|bid| {
-                self.builds
-                    .get(bid)
-                    .is_some_and(|b| b.force_build_roots && b.root_hashes.contains(drv_hash))
+                self.builds.get(bid).is_some_and(|b| {
+                    !b.state().is_terminal()
+                        && b.force_build_roots
+                        && b.root_hashes.contains(drv_hash)
+                })
             })
         })
     }
@@ -1749,6 +1774,13 @@ impl DagActor {
                 let sub: HashSet<String> = resp.substitutable_paths.into_iter().collect();
                 let ind: HashSet<String> = resp.indeterminate_paths.into_iter().collect();
                 if !substitute_tried
+                    // Liveness reviewed for this site: same predicate as
+                    // the batch pre-pass — only LIVE force builds block
+                    // the per-drv fallback's substitute-spawn arm. A
+                    // terminal force build's lingering BuildInfo must
+                    // not force this node to `find_executor` (or, when
+                    // Broken-evidence-marked, to the fail-fast below)
+                    // when the upstream can provide it.
                     && !self.is_force_build_root(drv_hash)
                     && wanted
                         .iter()

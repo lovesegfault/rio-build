@@ -443,6 +443,19 @@ impl DagActor {
         // fail-fast; a doomed from-source dispatch cannot happen, so
         // widening this gate would only trade the prune away for
         // closure-pinning the other build already provides.
+        //
+        // Liveness reviewed for this site: `is_force_build_root` counts
+        // only LIVE force builds, so a force submission that already
+        // went terminal — BuildInfo lingering until the delayed cleanup
+        // — no longer blocks a later submission's top-down prune. That
+        // is required, not merely allowed: the prune-skip exists to
+        // protect a from-source dispatch the force build still wants;
+        // once that build is terminal there is nothing left to protect,
+        // and keeping the block would force a full merge + from-source
+        // path onto an unrelated tenant. The "force gate dies with its
+        // build" argument above is exactly this — the gate dies at the
+        // terminal transition, not at the (delayed, droppable) map
+        // cleanup.
         let topdown_blocked =
             force_build_roots || submission_roots.iter().any(|h| self.is_force_build_root(h));
         let (nodes, edges, topdown_fired, pruned_closure_parents) = if topdown_blocked {
@@ -610,6 +623,16 @@ impl DagActor {
         // request-local arm (a) keeps the gate independent of that step
         // ordering. Locally-present roots still short-circuit to
         // Completed via cached_hits.
+        //
+        // Liveness reviewed for this site: arm (b) counts only LIVE
+        // force builds, so a re-submission probing the root of a force
+        // build that already finished is released to the substitute
+        // lane (including the reprobe-substitutable lane for a root the
+        // failed force build left Poisoned — blocking that lane is what
+        // turned one tenant's finished replay build into another
+        // tenant's spurious fail-fast). Arm (a) is request-local and
+        // deliberately liveness-free: THIS build was inserted Pending/
+        // Active a step ago and is live by construction.
         let pending_substitute: Vec<(DrvHash, Vec<String>)> = pending_substitute
             .into_iter()
             .filter(|(h, _)| {
@@ -1842,6 +1865,15 @@ impl DagActor {
             // ready queue and let the dispatch-time probes
             // (`batch_probe_cached_ready` / `ready_check_or_spawn`)
             // route them to a builder.
+            //
+            // Liveness reviewed for this site: only roots of LIVE force
+            // builds take the from-source (push_ready) leg. A root that
+            // Completed for a force build whose submission has since
+            // gone terminal — the lingering-BuildInfo window — is
+            // released to the detached re-substitution lane when its
+            // output vanishes: there is no live force contract left to
+            // honor, and the push_ready leg would spend a builder
+            // re-building an output the upstream can re-provide.
             if !self.is_force_build_root(&drv_hash_k)
                 && output_paths.iter().all(|p| {
                     !missing.contains(p.as_str())

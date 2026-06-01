@@ -1489,6 +1489,102 @@ async fn dispatch_time_force_build_root_dispatches_not_substitutes() -> TestResu
     Ok(())
 }
 
+/// Sticky-OR liveness at the dispatch-time batch probe: build A
+/// (force_build_roots) roots drv X (aarch64, so the x86 prober worker
+/// can never take it — only the probe's verdict moves it). A non-force
+/// build B re-merges X, then X's output becomes upstream-substitutable.
+///
+/// While A is LIVE the probe must leave X Ready (from-source path).
+/// Once A is TERMINAL — Succeeded here, with interest + BuildInfo
+/// lingering until the delayed cleanup (a cancel would strip the DAG
+/// interest immediately and never exercise the gate) — the probe must
+/// release X to the substitute lane.
+// r[verify sched.merge.force-build-roots]
+#[rstest::rstest]
+#[case::force_build_live(false)]
+#[case::force_build_terminal(true)]
+#[tokio::test]
+async fn dispatch_probe_substitution_follows_force_build_liveness(
+    #[case] a_terminal: bool,
+) -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let out = test_store_path("fdl-x-out");
+
+    // Build A: force-build root X on aarch64.
+    let mut node_a = make_node("fdl-x");
+    node_a.system = "aarch64-linux".into();
+    node_a.expected_output_paths = vec![out.clone()];
+    let build_a = Uuid::new_v4();
+
+    if a_terminal {
+        // Build X from source on a transient aarch64 worker: X →
+        // Completed, A → Succeeded (terminal; interest + BuildInfo
+        // linger). The output is never uploaded to the mock store, so
+        // B's later re-merge stale-resets X back to Ready.
+        let mut w1 = connect_executor(&handle, "fdl-w1", "aarch64-linux").await?;
+        merge_dag_force_roots(&handle, build_a, vec![node_a], vec![]).await?;
+        let assn = recv_assignment(&mut w1).await;
+        complete_success(&handle, "fdl-w1", &assn.drv_path, &out).await?;
+        barrier(&handle).await;
+        assert_eq!(
+            query_status(&handle, build_a).await?.state,
+            rio_proto::types::BuildState::Succeeded as i32,
+            "precondition: A is terminal, interest retained"
+        );
+        disconnect(&handle, "fdl-w1").await?;
+    } else {
+        // No aarch64 worker → X stays Ready and A stays Active.
+        merge_dag_force_roots(&handle, build_a, vec![node_a], vec![]).await?;
+        barrier(&handle).await;
+    }
+
+    // Build B (non-force) re-merges X while nothing is substitutable —
+    // the merge classifies nothing (in the terminal case the
+    // stale-Completed verify resets X to Ready, vanished-output path);
+    // the decision under test happens at dispatch time.
+    let mut node_b = make_node("fdl-x");
+    node_b.system = "aarch64-linux".into();
+    node_b.expected_output_paths = vec![out.clone()];
+    let build_b = Uuid::new_v4();
+    merge_dag(&handle, build_b, vec![node_b], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "fdl-x").await.status,
+        DerivationStatus::Ready,
+        "precondition: nothing substitutable at merge time → Ready"
+    );
+
+    // The output appears upstream AFTER B's merge; an x86 worker's
+    // heartbeat triggers the batch probe over Ready nodes.
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let _rx = connect_executor(&handle, "fdl-w", "x86_64-linux").await?;
+    send_heartbeat(&handle, "fdl-w", "x86_64-linux").await?;
+    barrier(&handle).await;
+
+    if a_terminal {
+        wait_for_status(&handle, "fdl-x", DerivationStatus::Completed).await;
+        assert!(
+            store.calls.qpi_calls.read().unwrap().contains(&out),
+            "a terminal force build must release X to the dispatch-time substitute lane"
+        );
+        assert_eq!(
+            query_status(&handle, build_b).await?.state,
+            rio_proto::types::BuildState::Succeeded as i32,
+        );
+    } else {
+        assert_eq!(
+            expect_drv(&handle, "fdl-x").await.status,
+            DerivationStatus::Ready,
+            "the probe must leave a live force-build root on the from-source path"
+        );
+        assert!(
+            !store.calls.qpi_calls.read().unwrap().contains(&out),
+            "no substitute fetch for a live force-build root at dispatch time"
+        );
+    }
+    Ok(())
+}
+
 /// I-163 Fix 3: `cluster_snapshot_cached()` reads the watch-channel
 /// value the actor publishes on `Tick` — no mailbox round-trip. The
 /// `fn` (not `async fn`) signature is the structural proof; this test

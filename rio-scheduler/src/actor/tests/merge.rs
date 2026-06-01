@@ -8885,40 +8885,319 @@ async fn test_force_build_root_not_substituted_at_merge() -> TestResult {
     Ok(())
 }
 
-/// Cross-build stickiness at merge time: build A (force_build_roots)
-/// roots drv X and is still live; a SECOND, non-force submission of the
-/// same X must NOT route X to the substitute lane at its own merge-time
-/// cache check, even though X's output is now upstream-substitutable.
+/// Cross-build stickiness vs RELEASE at the merge-time cache check
+/// (the step-4 `pending_substitute` filter): build A (force_build_roots)
+/// roots drv X.
+///
+/// While A is LIVE, a second non-force submission of the same X must
+/// NOT route X to the substitute lane, even though X's output became
+/// upstream-substitutable after A merged.
+///
+/// Once A is TERMINAL — failed here via the keep_going completion path,
+/// so its DAG interest and terminal `BuildInfo` linger until the
+/// delayed terminal cleanup — the same re-submission MUST be released:
+/// the force gate dies with the build, and the root the failed force
+/// build left Poisoned takes the reprobe-substitutable lane instead of
+/// fail-fasting B against the stale poison.
 // r[verify sched.merge.force-build-roots]
+#[rstest::rstest]
+#[case::force_build_live(false)]
+#[case::force_build_terminal(true)]
 #[tokio::test]
-async fn test_non_force_merge_does_not_substitute_live_force_build_root() -> TestResult {
+async fn non_force_merge_substitution_follows_force_build_liveness(
+    #[case] a_terminal: bool,
+) -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
     let out = test_store_path("force-cross-out");
 
     // Build A: force-build, single root "force-cross". Output not yet
-    // substitutable, so A's merge leaves it Ready (no builder connected).
+    // substitutable, so A's merge classifies nothing.
     let mut node_a = make_node("force-cross");
     node_a.expected_output_paths = vec![out.clone()];
-    merge_dag_force_roots(&handle, Uuid::new_v4(), vec![node_a], vec![]).await?;
-    barrier(&handle).await;
+    let build_a = Uuid::new_v4();
 
-    // The output appears upstream AFTER A merged.
+    if a_terminal {
+        // Drive A terminal WITHOUT losing its DAG interest or its
+        // BuildInfo: dispatch X on a worker and fail it permanently.
+        // keep_going (set by merge_dag_force_roots) routes the build
+        // through check_build_completion → Failed — no cancel sweep, so
+        // interest + terminal BuildInfo stay behind exactly as in the
+        // post-failure cleanup-delay window. X is left Poisoned.
+        let mut w1 = connect_executor(&handle, "fcl-w1", "x86_64-linux").await?;
+        merge_dag_force_roots(&handle, build_a, vec![node_a], vec![]).await?;
+        let assn = recv_assignment(&mut w1).await;
+        complete_failure(
+            &handle,
+            "fcl-w1",
+            &assn.drv_path,
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "permanent",
+        )
+        .await?;
+        barrier(&handle).await;
+        assert_eq!(
+            query_status(&handle, build_a).await?.state,
+            rio_proto::types::BuildState::Failed as i32,
+            "precondition: A is terminal, interest retained"
+        );
+        disconnect(&handle, "fcl-w1").await?;
+    } else {
+        merge_dag_force_roots(&handle, build_a, vec![node_a], vec![]).await?;
+        barrier(&handle).await;
+    }
+
+    // The output appears upstream AFTER A merged (and, in the terminal
+    // case, after A failed).
     store.state.substitutable.write().unwrap().push(out.clone());
 
     // Build B: plain submission (force_build_roots=false) of the SAME
     // node — it lands in existing_reprobe → check_cached_outputs finds
-    // it substitutable → only the sticky-OR keeps it out of the lane.
+    // it substitutable → only the LIVE sticky-OR may keep it out of
+    // the lane.
     let mut node_b = make_node("force-cross");
     node_b.expected_output_paths = vec![out.clone()];
-    merge_dag(&handle, Uuid::new_v4(), vec![node_b], vec![], false).await?;
+    let build_b = Uuid::new_v4();
+    merge_dag(&handle, build_b, vec![node_b], vec![], false).await?;
     barrier(&handle).await;
 
-    let st = expect_drv(&handle, "force-cross").await;
-    assert_ne!(st.status, crate::state::DerivationStatus::Substituting);
-    assert_ne!(st.status, crate::state::DerivationStatus::Completed);
-    assert!(
-        !store.calls.qpi_calls.read().unwrap().contains(&out),
-        "a non-force re-submission must not eager-fetch a live force-build root"
+    if a_terminal {
+        // Released: the reprobe-substitutable lane fetches X upstream
+        // (Poisoned → Substituting → Completed via the detached walk).
+        wait_for_status(
+            &handle,
+            "force-cross",
+            crate::state::DerivationStatus::Completed,
+        )
+        .await;
+        assert!(
+            store.calls.qpi_calls.read().unwrap().contains(&out),
+            "a terminal force build must release X to the substitute lane"
+        );
+        assert_eq!(
+            query_status(&handle, build_b).await?.state,
+            rio_proto::types::BuildState::Succeeded as i32,
+            "B must complete via substitution, not fail-fast on A's stale poison"
+        );
+    } else {
+        let st = expect_drv(&handle, "force-cross").await;
+        assert_ne!(st.status, crate::state::DerivationStatus::Substituting);
+        assert_ne!(st.status, crate::state::DerivationStatus::Completed);
+        assert!(
+            !store.calls.qpi_calls.read().unwrap().contains(&out),
+            "a non-force re-submission must not eager-fetch a live force-build root"
+        );
+    }
+    Ok(())
+}
+
+/// Sticky-OR liveness at the merge-time TOP-DOWN gate: a non-force
+/// multi-node submission (X → D) whose structural root X is a force
+/// build A's root.
+///
+/// While A is LIVE the top-down prune must stay blocked — the full DAG
+/// (including dep D) merges, and X stays out of the substitute lane.
+///
+/// Once A is TERMINAL — failed via the keep_going completion path, so
+/// (unlike a cancel, whose sweep strips the build's DAG interest
+/// immediately) interest + BuildInfo linger until the delayed cleanup
+/// — the prune must fire: B's demand set {X} is substitutable, D never
+/// enters the DAG, and X completes via the detached fetch.
+// r[verify sched.merge.force-build-roots]
+#[rstest::rstest]
+#[case::force_build_live(false)]
+#[case::force_build_terminal(true)]
+#[tokio::test]
+async fn topdown_prune_block_follows_force_build_liveness(#[case] a_terminal: bool) -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let x_out = test_store_path("ftd-x-out");
+
+    // Build A: force-build, single root X.
+    let mut node_xa = make_node("ftd-x");
+    node_xa.expected_output_paths = vec![x_out.clone()];
+    let build_a = Uuid::new_v4();
+
+    if a_terminal {
+        // Fail X permanently on a worker: X → Poisoned, A → Failed via
+        // the keep_going completion path. Interest and the terminal
+        // BuildInfo linger until the delayed terminal cleanup — the
+        // window under test.
+        let mut w1 = connect_executor(&handle, "ftd-w1", "x86_64-linux").await?;
+        merge_dag_force_roots(&handle, build_a, vec![node_xa], vec![]).await?;
+        let assn = recv_assignment(&mut w1).await;
+        complete_failure(
+            &handle,
+            "ftd-w1",
+            &assn.drv_path,
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "permanent",
+        )
+        .await?;
+        barrier(&handle).await;
+        assert_eq!(
+            query_status(&handle, build_a).await?.state,
+            rio_proto::types::BuildState::Failed as i32,
+            "precondition: A is terminal, interest retained"
+        );
+        disconnect(&handle, "ftd-w1").await?;
+    } else {
+        // No worker → X stays Ready and A stays Active.
+        merge_dag_force_roots(&handle, build_a, vec![node_xa], vec![]).await?;
+        barrier(&handle).await;
+    }
+
+    // X's output is upstream-substitutable by the time B submits.
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(x_out.clone());
+
+    // Build B: non-force X → D. Demand set = {X} (D is an unrequested
+    // dep), all of it substitutable → the top-down prune fires unless
+    // a live force build pins X.
+    let mut node_xb = make_node("ftd-x");
+    node_xb.expected_output_paths = vec![x_out.clone()];
+    let mut node_d = make_node("ftd-d");
+    node_d.expected_output_paths = vec![test_store_path("ftd-d-out")];
+    let build_b = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_b,
+        vec![node_xb, node_d],
+        vec![make_test_edge("ftd-x", "ftd-d")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let d_in_dag = handle.debug_query_derivation("ftd-d").await?.is_some();
+    if a_terminal {
+        assert!(
+            !d_in_dag,
+            "a terminal force build must unblock the top-down prune \
+             (B's dep D must never enter the DAG)"
+        );
+        wait_for_status(&handle, "ftd-x", crate::state::DerivationStatus::Completed).await;
+        assert_eq!(
+            query_status(&handle, build_b).await?.state,
+            rio_proto::types::BuildState::Succeeded as i32,
+            "B completes via the pruned demand set's substitution"
+        );
+    } else {
+        assert!(
+            d_in_dag,
+            "a live force-build root must block the top-down prune (full merge)"
+        );
+        let st = expect_drv(&handle, "ftd-x").await;
+        assert_ne!(st.status, crate::state::DerivationStatus::Substituting);
+        assert_ne!(st.status, crate::state::DerivationStatus::Completed);
+    }
+    Ok(())
+}
+
+/// Sticky-OR liveness at the stale-output re-substitution arm: R1 is a
+/// root of multi-root force build A (roots R1 + R2) that Completed
+/// from source; its output later vanishes from the store but is
+/// upstream-substitutable, and a non-force submission of R1 triggers
+/// the stale-Completed verify + reset.
+///
+/// While A is LIVE (R2 still building), the reset must route R1 to the
+/// ready queue — the from-source path — never the re-fetch lane.
+///
+/// Once A is TERMINAL (Succeeded after R2 lands; BuildInfo lingering),
+/// the same reset must release R1 to the detached re-substitution lane.
+// r[verify sched.merge.force-build-roots]
+// r[verify sched.merge.stale-substitutable+2]
+#[rstest::rstest]
+#[case::force_build_live(false)]
+#[case::force_build_terminal(true)]
+#[tokio::test]
+async fn stale_substitutable_reset_follows_force_build_liveness(
+    #[case] a_terminal: bool,
+) -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let r1_out = test_store_path("fsr-r1-out");
+    let r2_out = test_store_path("fsr-r2-out");
+
+    // Build A: force-build, TWO roots (multi-target submission). R2 is
+    // aarch64 so it can only dispatch once (and if) an aarch64 worker
+    // connects — that knob stages A's liveness deterministically.
+    let mut w = connect_executor(&handle, "fsr-w", "x86_64-linux").await?;
+    let mut r1 = make_node("fsr-r1");
+    r1.expected_output_paths = vec![r1_out.clone()];
+    let mut r2 = make_node("fsr-r2");
+    r2.system = "aarch64-linux".into();
+    r2.expected_output_paths = vec![r2_out.clone()];
+    let build_a = Uuid::new_v4();
+    merge_dag_force_roots(&handle, build_a, vec![r1, r2], vec![]).await?;
+
+    // R1 dispatches from source on the x86 worker and completes.
+    let assn = recv_assignment(&mut w).await;
+    assert_eq!(assn.drv_path, test_drv_path("fsr-r1"));
+    complete_success(&handle, "fsr-w", &assn.drv_path, &r1_out).await?;
+
+    if a_terminal {
+        // Land R2 too: A → Succeeded, with its BuildInfo + interest
+        // lingering until the delayed terminal cleanup.
+        let mut w2 = connect_executor(&handle, "fsr-w2", "aarch64-linux").await?;
+        let assn2 = recv_assignment(&mut w2).await;
+        assert_eq!(assn2.drv_path, test_drv_path("fsr-r2"));
+        complete_success(&handle, "fsr-w2", &assn2.drv_path, &r2_out).await?;
+    }
+    barrier(&handle).await;
+    let expected_a = if a_terminal {
+        rio_proto::types::BuildState::Succeeded
+    } else {
+        rio_proto::types::BuildState::Active
+    };
+    assert_eq!(
+        query_status(&handle, build_a).await?.state,
+        expected_a as i32,
+        "precondition: A liveness staged (terminal={a_terminal})"
     );
+
+    // R1's output was never uploaded to the (mock) store — to the
+    // stale-Completed verify it reads as vanished — but the upstream
+    // can re-provide it.
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r1_out.clone());
+
+    // Build B: plain re-submission of R1 → verify_preexisting_completed
+    // resets it and routes the reset by force-build liveness.
+    let mut r1b = make_node("fsr-r1");
+    r1b.expected_output_paths = vec![r1_out.clone()];
+    let build_b = Uuid::new_v4();
+    merge_dag(&handle, build_b, vec![r1b], vec![], false).await?;
+    barrier(&handle).await;
+
+    if a_terminal {
+        wait_for_status(&handle, "fsr-r1", crate::state::DerivationStatus::Completed).await;
+        assert!(
+            store.calls.qpi_calls.read().unwrap().contains(&r1_out),
+            "a terminal force build's stale root must be released to the re-fetch lane"
+        );
+        assert_eq!(
+            query_status(&handle, build_b).await?.state,
+            rio_proto::types::BuildState::Succeeded as i32,
+        );
+    } else {
+        // Live force build: the reset must route R1 to the ready queue
+        // (from-source). The still-connected worker may pick it up —
+        // Ready or Assigned both prove the from-source path; the
+        // forbidden outcomes are the substitute lane and a substitution
+        // completion.
+        let st = expect_drv(&handle, "fsr-r1").await;
+        assert_ne!(st.status, crate::state::DerivationStatus::Substituting);
+        assert_ne!(st.status, crate::state::DerivationStatus::Completed);
+        assert!(
+            !store.calls.qpi_calls.read().unwrap().contains(&r1_out),
+            "a live force build's stale root must not be re-fetched from upstream"
+        );
+    }
     Ok(())
 }
