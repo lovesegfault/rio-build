@@ -17,14 +17,17 @@ store executor, scheduler job machinery, dormancy proof — THIS record),
 the go/no-go gate), **D′** (replacement: walk deletion, spec re-pointing,
 migration retirement).
 
-**Status: Phase A complete (this map's stage record). Every mechanism the
-design's §8-A scopes — plus the scheduler-side dormant wiring PD-19 records —
-is landed, dormant, behind `materialization.enabled = false` on both the
-scheduler and the store. The dormancy criteria (1–7) all hold with named
-artifacts; the flag-on smoke battery proves the machinery composes end-to-end
-in-process (dormant ≠ vestigial); the full CI gate is green at the Phase A
-tip. Phase B owns activation; nothing in this phase changes deployed
-behavior.**
+**Status: Phase A complete; Phase B complete (this map carries both stage
+records). Phase A landed every §8-A mechanism dormant behind
+`materialization.enabled = false`; its dormancy criteria (1–7) hold with
+named artifacts. Phase B (the flag-on cutover) is landed: the deployment
+layer defaults to materialization ENABLED (helm values + VM fixtures, with
+the AS-6 AND-guard; Rust struct defaults stay `false` per PD-B1), the six
+equivalence criteria hold with named artifacts (the Phase B stage record
+below), the full VM matrix runs in BOTH flag states (every `-walk` attr is
+the byte-original as-built oracle), and the full CI gate is green at the
+Phase B tip with flipped defaults. Phase C′ owns the model completion and
+the §9.3 calibration transfer (the go/no-go); Phase D′ owns deletion.**
 
 The spec rules this campaign added (Phase A, T-1.1):
 `sched.materialize.job`, `sched.materialize.routing`,
@@ -50,19 +53,19 @@ a wired quint check proves it (none in Phase A — C′'s gate).
 |---|---|---|
 | `noFromSourceWhileJobUnresolved` | A node with an unresolved job never gets a from-source build attempt. | encoded; prod-tested (kernel `check_kinded_no_build_delivery_while_job_unresolved` CBMC harness + kinded battery) |
 | `jobResolutionSound` | A job resolves only by consumption of one of its own attempts' outcomes (exec_id-keyed). | encoded; prod-tested (consumption battery, T-3.5) |
-| `routingRequiresDurableVouchOrFailFast` | The Unobtainable routing lands From-Source only on durable Vouched/Pending evidence, FailFast only on the three-conjunct corner. | encoded; prod-tested (`routing_fail_fast_requires_all_three_conjuncts`) |
-| `unresolvedJobAlwaysArmed` | An unresolved unparked job is always claimable or claimed (never stranded). | encoded; prod-tested (re-arm paths in T-3.5/T-3.6 batteries) |
+| `routingRequiresDurableVouchOrFailFast` | The Unobtainable routing lands From-Source on durable Vouched/Pending evidence OR on the unmarked re-probe dispositions; FailFast only on the **four-conjunct** corner (Broken evidence ∧ `topdown_pruned` mark ∧ confirmed-missing-or-spent-one-shot — the finding-11 mark discriminator, `sched.materialize.routing+2`). | encoded **STALE vs as-built** (the draft predates finding 11 — its arm 3 fail-fasts unmarked nodes and its property forbids the unmarked from-source disposition; C′ delta 1 re-encodes both); prod-tested (`routing_fail_fast_requires_all_four_conjuncts` exhaustive + the T-4.4 matrix, Phase B `c952e5a51`) |
+| `unresolvedJobAlwaysArmed` | An unresolved unparked job is always claimable or claimed (never stranded). | encoded; prod-tested (re-arm paths in T-3.5/T-3.6 batteries; **Phase B**: `flag_on_every_job_state_has_armed_action` — settlement totality over every job state incl. the 5b Vouched-parked arm, T-4.2/T-6.1) |
 | `noWrongfulTerminalFailure` | No build terminally fails while its wanted set is obtainable. | encoded; prod-tested (moot-arm C3 replay, T-6.2) |
 | `noWrongfulFromSourceRouting` | No from-source routing while upstream still offers the wanted set. | encoded |
 | `successConsumptionCoversLiveWanted` | Success consumption completes a node only when ingested+verified ⊇ live wanted. | encoded; prod-tested (`success_consumption_coverage_check`, keystone stage 6) |
 | `interestUnionLiveOnly` | The effective wanted union ranges over LIVE builds only. | encoded; prod-tested (moot-arm replay: cancelled build's wants leave the join) |
 | `pinCoversIngestUntilAllInterestTerminal` | Materialization pins survive until job resolved AND no live interest (PD-10/DF-3 upward re-kind). | encoded; prod-tested (pin-kind db battery, T-4.2) |
-| `failoverPreservesJobs` | Jobs survive leader failover (PG-authoritative). | placeholder in draft (recovery rebuild is Phase B) |
-| `fencedJobWritesOnly` | Every job write carries the claims-floor fence. | placeholder in draft; prod-tested (fenced db batteries T-1.3/T-1.4: below-floor → Fenced) |
+| `failoverPreservesJobs` | Jobs survive leader failover (PG-authoritative). | placeholder in draft; **prod-tested (Phase B)**: T-4.3 recovery view-rebuild battery (pending → DeliverNew, claimed → DeliverExisting same-holder, parked → NotYetReady until backoff lapses) + `vm-materialization-failover-k3s` (10 jobs survive leader force-delete, ids identical) — C′ encodes the pre/post ghost |
+| `fencedJobWritesOnly` | Every job write carries the claims-floor fence. | placeholder in draft; **prod-tested (Phase A db batteries; Phase B)**: the T-5.2 five-site posture audit (3 in-tx + 2 standalone-fenced — every creation site fenced) — C′ encodes via the leaseGen/staleWriteDiscarded ghosts |
 | `kindMatchesWorker` | Materialization attempts execute only on store replicas; build attempts only on builders. | encoded; prod-tested (grpc authorization battery: executor tokens never authorize the kind) |
 | `materializationNeverPoisons` | No materialization charge ever produces a Poison verdict. | encoded; **checked** (`quint-retry-policy-pull-materialization`, T-5.1/T-5.2) + CBMC `check_materialization_never_poisons` |
 | `materializationInvisibleToBuildBudgets` | Materialization charges feed exactly one budget (their own). | encoded; **checked** (`quint-retry-policy-pull-materialization`) + CBMC `check_materialization_rows_invisible_to_build_decision` + keystone stage 7 |
-| `atMostOneUnresolvedJobPerDrv` | The partial-unique-index dedup. | placeholder in draft; prod-tested (`flag_on_concurrent_interest_creates_one_job`, db contract tests) |
+| `atMostOneUnresolvedJobPerDrv` | The partial-unique-index dedup. | placeholder in draft; **prod-tested (Phase A + Phase B)**: `flag_on_concurrent_interest_creates_one_job` + the cross-creation-layer race `flag_on_concurrent_probe_and_merge_create_one_job` (T-5.2) + the T-4.1 two-build C3 trace — C′ widens the job slot to a multiset and re-checks |
 | `atMostOneClaimWinner` | One-winner claim arbitration per job (BC-1 composite identity). | encoded; prod-tested (CBMC `check_kinded_one_winner_arbitration` + keystone one-winner stage) |
 | `wrongfulFailFastBoundedPerJob` | At most one wrongful fail-fast per job (the one-shot). | encoded |
 
@@ -71,8 +74,17 @@ Draft witnesses (non-vacuity probes, wired at C′): `noSuccessResolution`,
 
 Three of the seventeen draft properties violate in pre-wiring simulation for
 a documented draft-encoding reason (current-state reads where at-decision-time
-ghosts are needed) — recorded in the T-5.3 commit (`420e7c1c7`) as C′
-completion work, not as design findings.
+ghosts are needed): `routingRequiresDurableVouchOrFailFast`,
+`noWrongfulTerminalFailure`, `noWrongfulFromSourceRouting` — recorded in the
+T-5.3 commit (`420e7c1c7`) as C′ completion work, not as design findings.
+
+**The draft is now also BEHIND the as-built system**: Phase B landed six
+behavior deltas the draft predates (the finding-11 mark discriminator, the
+finding-18 channel/backfill behaviors, the park re-evaluation split, the
+five-origin/posture set, and the always-on §4 clear-mirror + §5.3 pin
+release). The complete delta list C′ must encode is in the Phase B stage
+record's "C′ handoff" section below — wiring the draft without those deltas
+would verify the wrong system.
 
 ---
 
@@ -495,6 +507,313 @@ are unchanged.
 | MD-D2 | **Flag rollback procedure (ON → OFF)** | Set both helm values false (`scheduler.materialization.enabled`, `store.materialization.enabled`) and roll. The walk serves all new work immediately. Flag-on-era state drains, never strands: pending job rows are inert (nothing claims them); claimed jobs' reports drain through the always-on consumption transaction; flag-on-era marks were cleared at resolution (the §4 clear-mirror), so no wrongful fail-fast can fire on stale marks; flag-on-era pins release through the always-on §5.3 wiring once jobs resolve and interest goes terminal. The chart's AND-guard makes the hazardous persistent state (scheduler on / store off) unrenderable in either direction. | vm-materialization-transition-k3s (both directions, 8/8 subtests incl. flip-off marks + pins); T-1.7 revert-with-state test; T-1.8 always-on release tests |
 | MD-D3 | **Mixed-flag window guidance** | During a rollout where the scheduler is flag-on before the store (the transient AS-6 race the AND-guard cannot eliminate): jobs are created but not claimed — a visible wait (`substituting_derivations` > 0 via rio-cli status, builds Active), bounded by the store rollout completing, never a strand (the store's first poll drains the backlog). The reverse window (store on / scheduler off) is a no-op: the store polls empty lists harmlessly. | T-3.3 mixed-flag subtest (45 s observation window, drains on store rollout) |
 | MD-D4 | **Mixed-version (rolling upgrade) posture of the instance-bound credential** | The T-5.1 instance binding is FAIL-CLOSED across version skew: a pre-Phase-B scheduler that receives an instance-bound store token REJECTS it (`deny_unknown_fields` — `unknown field 'instance'`), so no mixed-version window exists in which an instance-bound token is authenticated while the binding check is skipped. The failure mode of that (unsupported, unreachable pre-D′) skew direction is store claim retries against the rolling scheduler — self-healing within the rollout window — never unenforced binding and never a wrongful build outcome. No deployment-ordering step is required for security: the store's instance-bound minting is flag-gated and the flag rolls atomically with the pod template (a pod is either old-binary+flag-off or new-binary+flag-on, never a cross). | `service_claims_instance_forward_skew` (the fail-closed pin); T-5.1 wire-compat battery; PD-B8/PDB-8 adjudication record |
+
+---
+
+## Phase B stage record (flag-on cutover; landed 2026-06-01)
+
+### Identity
+
+- Branch: `a4-phaseB`, **31 commits** ahead of baseline `21955a450` (the
+  post-Phase-A integration tip + the ReportMaterializationProgress auth fix):
+  26 plan task commits (two of which also carry bug fixes B1/B5) + 3
+  standalone product-bug-fix commits (B2/B3/B4) + 1 flake-hardening commit +
+  this record. All signed, all crate-scoped semantic subjects
+  (`/tmp/rio-dev/phaseB-commits.txt`).
+- **The cutover posture (PD-B1):** helm `values.yaml` defaults
+  `materialization.enabled: true` for BOTH components, with the AS-6
+  AND-guard (scheduler env renders `scheduler.enabled ∧ store.enabled`);
+  every VM fixture flag-on by default; **Rust struct defaults stay `false`**
+  in both crates (the unit battery's regression posture). Rollback is a
+  values flip (MD-D2).
+- Diff vs baseline: 67 files, +11,473/−624 (net +10,849).
+- Full CI gate (`.claude/bin/nixbuild --checks`) green at this tip with the
+  flipped defaults (Wave 7; the gate record below).
+
+### What landed (the deliverables table, with commits)
+
+| # | Deliverable (plan #) | Commits |
+|---|---|---|
+| 1 | §2.6 consumer re-sourcing flag-on: substituting bucket ← pending unclaimed jobs, queued-bucket exclusion, build_summary union, scaler signal (1) | `435987dad` |
+| 2 | BC-4 gateway events flag-on: SUBSTITUTING at claim intake, terminal stop at consumption, byte-progress relay (2) | `ef706db31` |
+| 3 | PD-6 Queued materialization claims: kinded `Queued→Assigned` mint edge + 144-case exhaustive + the 3 pre-authorized pin flips (3) | `8d5caee2d` |
+| 4 | PD-7 GetSpawnIntents unresolved-job filter (4) | `bbb607447` |
+| 5 | PD-17 reprobe-lane job creation (origin=`reprobe`, in-tx, AS-5 6d reset + poison_cleared) (5) | `1fc41ff71` |
+| 6 | PD-18 stale-Completed-verify creation (origin=`stale_reset`, standalone-fenced) (6) | `09bc947ba` |
+| 7 | The §4 consumption-transaction clear-mirror (T-1.7/PD-B16) + the Phase A admission-gap fix (bug B1) (21) | `7c9b9f949` |
+| 8 | The §5.3 pin-release wiring, ALWAYS-ON, three sites (T-1.8/PD-B17) (22) | `97f2d4553` |
+| 9 | Materialization-surface auth sweep (T-1.9/PD-B18: 4 surfaces × {no token, executor token}) (23) | `bee3c1155` |
+| 10 | `vm-substitute-standalone{,-walk}`: parametrized both-state + dormant→`materialization-active` inversion + the PD-B21 store end-state blocks + `substitute-scheduler-owned` (the PD-B2 basic-path proof) (8, 9) | `ee03bf1a9` |
+| 11 | `vm-substitute-scale-k3s{,-walk}`: both-state + the CF-1 deep-chain re-key (jobs_created ≥ 45 + walk-metric == 0) (9) | `a04119f79` |
+| 12 | THE FLIP: helm defaults + AND-guard + VM fixtures + lifecycle `materialization-boundary` inversion + helm-lint guard fragment (7, 8) | `03b27b109` |
+| 13 | Config-docs cutover posture record (BLESS + regen) (7) | `fcf4b518e` |
+| 14 | `vm-materialization-standalone{,-walk}`: routing arms + park + gc-pin + no-walks guard, with the flag-off walk oracle (OQ7 sequences 2–4) (10) | `e043d5bcd` |
+| 15 | `vm-materialization-failover{,-walk}-k3s`: failover + mixed-flag + store-only-noop, with the walk failover oracle (OQ7 sequence 5) (12) | `4282476e9` |
+| 16 | `vm-materialization-transition-k3s`: FP-4 both directions + marks + pins (8/8 subtests) (11) | `ccd62c48f` |
+| 17 | C3/D16/L3 flag-on equivalents: two-build dedup trace, settlement totality, recovery job-view rebuild + reap gate, routing matrix (13, 14) | `ec1874d5f`, `64639ba50`, `4e57180fd`, `aa0efe231` |
+| 18 | Obligation 1: `executor_instance` bound INTO ServiceClaims (fail-closed skew, three legs pinned) (15) | `520fc26fb` |
+| 19 | Obligation 2: PDQ-9 posture revisit + cross-site dedup pin (16) | `5bf827475` |
+| 20 | OQ7 close-out: the six-site zero-walk audit + `flag_on_fresh_work_never_walks` (17) | `69ee2263f` |
+| 21 | PD-20: stalled gauge + park re-evaluation arm (18) | `642fe9fb7` |
+| 22 | Lifecycle metrics + alerts + dashboards (18) | `034e91c1a` |
+| 23 | Deployment checklist (CE-D re-verification + MD-D rows) (19) | `223e05c27` |
+| — | Bug fixes B2/B3/B4 (the harvest below) | `c952e5a51`, `ce17c6445`, `056bfc9b6` |
+| — | infra-park flake hardening (multi-charge claim waves) | `01e405c6c` |
+| — | This stage record (20) | this commit |
+
+### Wave-by-wave commit record
+
+| Wave | Commits (in order) |
+|---|---|
+| 1 — flag-on mechanisms + missing mechanisms + auth audit | `435987dad`, `ef706db31`, `8d5caee2d`, `bbb607447`, `1fc41ff71`, `09bc947ba`, `7c9b9f949`*, `97f2d4553`, `bee3c1155` |
+| 2 — both-state adaptation, then the flip | `ee03bf1a9`, `a04119f79`, `03b27b109`, `fcf4b518e` |
+| 3 — new-path VM scenarios | `e043d5bcd`, `4282476e9` (T-3.2 deferred to Wave 4 behind finding 18) |
+| 4 — findings resolution + unit/actor battery | `01e405c6c`, `c952e5a51`*, `ce17c6445`*, `ec1874d5f`, `64639ba50`, `4e57180fd`*, `aa0efe231`, `056bfc9b6`*, `ccd62c48f` |
+| 5 — obligations | `520fc26fb`, `5bf827475`, `69ee2263f` |
+| 6 — observability + checklist | `642fe9fb7`, `034e91c1a`, `223e05c27` |
+| 7 — exit gate + this record | this commit |
+
+\* carries a product-bug fix (the harvest below).
+
+### Equivalence evidence (criteria 1–6, the named artifacts)
+
+| # | Criterion | Verdict | Artifact |
+|---|---|---|---|
+| 1 | Outcome equivalence (OQ7), all five sequences, both runs | **HOLDS** | Cache-hit: `vm-substitute-standalone` vs `-walk` (~61 s each) and `vm-substitute-scale-k3s` vs `-walk` (163–177 s) — same verdicts, statuses, store end-state; the §8-B pair-rendering assertion in progress-e2e, `substituting_derivations > 0` in the scale sub_peak poll (PD-B2 split). Unobtainable-from-source / unobtainable-fail-fast / infra-retry: `vm-materialization-standalone` (21.5 s / 13.3 s / 38.4 s) vs `-walk` (37.3 s / 72.4 s / 35.8 s) — same outcome triple per pair (verdict + error class, final statuses, store rows). Failover: `vm-materialization-failover-k3s` (15.4 s) vs `-walk` (14.8 s) — succeeded, 10 paths, no stuck nodes, both mechanisms. Store end-state: IDENTICAL psql/NAR assertion blocks in both branches of every parametrized scenario (PD-B21). The one authoring-time divergence found (unmarked-childless fail-fast) was a real product bug — fixed as B2, not papered over. |
+| 2 | Flag-off invariance (revertability) | **HOLDS** | T-4.5 byte-identity audit: ZERO deleted/modified lines in `tests/{dispatch,merge,build,recovery}.rs` vs baseline; tree-wide ZERO deleted test functions (Wave 7 grep); the only existing-test edits are the three pre-authorized PD-6 pin flips, the B2 routing-core conjunct extension (orchestrator-sanctioned), and the three T-5.1 mint updates — each enumerated in its commit body. The `-walk` oracle attrs carry the byte-original Phase A assertions (incl. the relocated five-table dormancy zero-count) and are GREEN at the final tree (Wave 7 matrix). Walk machinery production code: `dispatch.rs` +21/−0 (the T-4.3 reap gate, flag-gated); `spawn_substitute_fetches`/`handle_substitute_complete`/`walk_substitute_closure`/`settle_broken_marked_root` untouched. As-built `admit_pull` + battery + 5 harnesses: byte-identical (all pull.rs deltas are in the Phase A kinded-wrapper region, line ≥715). |
+| 3 | Walk unreachability for fresh flag-on work (PD-B19 scope) | **HOLDS** | The T-5.3 six-site audit table (above) — merge lanes closed by T-1.5/T-1.6, dispatch lanes reachable only via flag-off-era state; `flag_on_fresh_work_never_walks` (all 5 origins + consumption arms → `substitute_spawned_total == 0`, zero `QueryPathInfo`; the legacy-state arm walks → metric capture non-vacuous, sanctioned absorption); deployment level: `materialize-no-walks` guard, progress-e2e `spawned_total == 0`, deep-chain walk-metric delta == 0 with `jobs_created` delta ≥ 45. |
+| 4 | Settlement totality flag-on | **HOLDS** | `flag_on_every_job_state_has_armed_action` (T-4.2 + the T-6.1 5b Vouched-parked arm): pending⇒claimable, claimed⇒report-or-establishment, parked⇒re-evaluation+backoff expiry, zero-interest⇒cancellation; the D16 limbo cell (marks+tried+refusing probe) is unconstructible flag-on; T-4.3: the armed action survives failover (view rebuild). |
+| 5 | Wire and schema freeze | **HOLDS** | `git diff 4ef5be222 -- rio-proto/` → empty (0 lines); `ls rio-migrations/migrations/ | tail -1` → `079_materialization_outcome_classes.sql` (zero new migrations; `migrations/` diff vs baseline = 0 lines); zero config-schema deletions (T-2.4 is description-only + fixture bless). |
+| 6 | Formal-check invariance | **HOLDS** | `retryPolicy.qnt`, `materializationJob.qnt`, `spawnCoherence.qnt`, `nix/kani.nix`: ZERO diff vs baseline. `nix/quint.nix`: the only delta is `c952e5a51`'s tracey marker re-point (`r[verify sched.materialize.routing]` → `+2`), a comment line in the MATERIALIZATION-regime check's wiring — zero check-logic change; the build-only `quint-retry-policy-pull` definition is byte-untouched, so its derivation is the same one green at the Phase A tip (14 invariants, 39,711,022 distinct states — bit-identity by drv identity). Coexistence regime + witness green in the Wave 7 gate; kani 17+8 harnesses green (re-built — the kinded wrapper changed — and re-verified at T-1.3, T-1.7, and the gate). |
+
+**The auth-surface record (PD-B18):** all four materialization RPC surfaces
+(kind=MATERIALIZATION PullAssignment, materialization ReportOutcome,
+ListMaterializationJobs, ReportMaterializationProgress) carry the
+store-service credential gate; the T-1.9 table-driven sweep (every surface ×
+{no token, executor token} → rejected; dev-mode open) is a permanent test;
+T-5.1 narrowed the WORK surfaces further to instance-bound credentials
+(progress stays fleet-level, display-only). The motivating class:
+`21955a450` (the third Phase A RPC that shipped ungated). No fifth surface
+exists at this tip.
+
+### The bug harvest (five product bugs + the finding-11 design correction)
+
+Every fix red-first, with the failing transcript in the commit body; zero
+walk-machinery changes.
+
+| # | Bug (where it lived) | Found by | Fix | Spec/design impact |
+|---|---|---|---|---|
+| B1 | **Phase A admission gap**: the kinded wrapper's materialization Pending arm ran the as-built A11 `must_substitute` refusal, which also refused MATERIALIZATION claims of topdown-pruned roots — parking exactly the jobs that most need claiming, forever | T-1.7's pruned-origin red fixture | `7c9b9f949` — Ready/Queued + must_substitute upgrades to DeliverNew for unparked pending jobs (the claim IS the substitution); build pulls of marked nodes stay refused | none (kernel arm; kani 17/17 unchanged) |
+| B2 | **Arm-3 routing fail-fasted unmarked nodes** (finding 11, the stop-condition-2 candidate): flag-on, ANY Broken-evidence node with a confirmed-missing wanted output fail-fasted — including genuine leaves the walk builds from source. Reachable client-visible divergence (probe-blip + 404 + childless ⇒ flag-on FAILS, flag-off builds) | T-3.1 scenario authoring (the `-walk` oracle disagreed) | `c952e5a51` — the topdown-pruned mark discriminator: FailFast requires the four-conjunct corner (marked ∧ Broken ∧ confirmed-missing-or-spent); unmarked → ResolveFromSource (the walk-equivalent disposition); 6-row behavior table in the commit | **THE design correction**: `sched.materialize.routing+2` (22 annotation sites re-pointed in-commit). Implemented per the orchestrator ruling — **flagged for owner counter-signature** |
+| B3 | **Executor transport pinned to a standby** (finding 18 gap 1): the store's lazy ClusterIP channel pins per kube-proxy connection; after a scheduler rollout it can pin to the STANDBY, whose UNAVAILABLE answers never break the connection — claims/reports dead-end forever (deployment-level settlement-totality hole) | T-3.2 transition scenario (5-iteration diagnosis; the failover scenario masked it — one pod dying re-dials naturally) | `ce17c6445` — abandon-and-redial on UNAVAILABLE | `store.materialize.executor+2` |
+| B4 | **Wanted relation absent for flag-off-era builds** (finding 18 gap 2): builds submitted flag-off have no `build_wanted_outputs` rows; post-flip jobs for their nodes resolve no tenant/wanted (§6 joins empty) → instant InfraFailure("no tenant context") — the OFF→ON transition strands | T-3.2 flip-on direction | `056bfc9b6` — the probe-partition creation backfills the relation for every live interested build | none (the §6 join contract honored at every creation site) |
+| B5 | **Job-view armament-state defects at recovery** (two in one commit): (a) the dispatch-probe dedup re-feed OVERWROTE existing view entries with `parked_until = None` — one probe pass wiped a parked job's in-memory park state (premature re-claim eligibility); (b) the reap hook routed marked-Broken survivors CARRYING an unresolved job through the walk settlement — spending the verification one-shot and spawning a flag-on walk for job-armed nodes (a criterion-3 cell) | T-4.3 red-first | `4e57180fd` — `entry().or_insert()` preserves armament state; the reap hook gates on job presence (survivors with an unresolved job need nothing — the job is armed) | none |
+
+**Finding-11 ruling status:** the divergence was reported as a
+stop-condition-2 candidate (notes finding 11); the orchestrator ruled the
+mark discriminator IS the §2.4 intent (the stricter flag-on behavior was a
+plan-text artifact, not a design decision); implemented + spec-bumped in
+`c952e5a51`; T-3.1 re-verified green in both branches post-fix. The ruling
+record rides this map **pending owner counter-signature** (the design
+§10/§2.4 text is owner-controlled).
+
+### The findings/deviations ledger (all 21, with dispositions)
+
+Full prose in `/tmp/rio-dev/subst-phaseB-notes.md`; this table is the
+durable record.
+
+| # | Finding / deviation | Disposition |
+|---|---|---|
+| 1 | `gw.activity.subst-progress` NOT bumped (T-1.2): normative text is emitter-agnostic; a bump would conflict with PD-B15 zero-gateway-changes | Deviation recorded for plan review; events wire-identical |
+| 2 | Phase A admission gap (B1) | Fixed `7c9b9f949` |
+| 3 | T-1.3 crash test re-scoped to Wave-1-honest assertions (post-recovery re-claim needs the T-4.3 view rebuild) | Closed by `4e57180fd` (T-4.3) |
+| 4 | progress-e2e flag-on creates 1 `pruned` + 4 `cache_opportunity` jobs (5, not the plan's 4) — the prune fires for the substitutable root, the exact 1:1 twin of the flag-off pruned-root walk | Enumeration-A row corrected (mechanical gap, triage path 2) |
+| 5 | The as-built substitute scenario never reaches the scheduler's substitution machinery for multi-node work (gateway pre-substitutes via wopQueryMissing) | `substitute-scheduler-owned` subtest added, both branches — the PD-B2 `vm-materialization-basic` deployment proof |
+| 6 | Both-state realization is Python-level `MATERIALIZATION_ENABLED` branching, not nix `optionalString` (nixfmt re-indents nested splices out of subtest scope) | Realization deviation; both texts live in the file, the parameter selects |
+| 7 | `rio_scheduler_materialization_jobs_created_total` carries an `origin` label — bare-name lookups miss it | Scenarios sum across labeled series |
+| 8 | T-2.2's first commit had a tracey ImplInTestFile (prose `r[...]` in a comment) | Amended in place pre-merge (`a04119f79`); boundary stayed green |
+| 9 | PD-B4 AND-guard/default/rollback rendering proofs made a permanent helm-lint fragment (`26-materialization-and-guard.sh`) | Hardening beyond plan; keeps the guard tested forever |
+| 10 | `check_roots_topdown` forwards ONLY the client JWT — gRPC-direct submissions can never fire the prune without a tenant token | All Wave 3+ scenarios mint tenant JWTs and attach to SubmitBuild |
+| 11 | OQ7 divergence, unmarked-childless shape (B2) | STOP-AND-REPORT raised → orchestrator ruling → fixed `c952e5a51`; counter-signature pending |
+| 12 | Determinism mechanism: store `poll_interval_secs=3600` + restart-per-wave = exactly one claim wave per restart (also clears the 1 h HEAD-probe cache) | Adopted by all standalone materialization scenarios |
+| 13 | ARCHITECTURAL: `recover_from_pg` runs only on LeaderAcquired (k8s lease deployments); a standalone scheduler restart starts empty — ANY in-flight build is orphaned, flag flip or not | T-3.2 rewritten as `vm-materialization-transition-k3s` (the FP-4 story is k8s-only by construction); pre-existing as-built behavior, documented, NOT changed |
+| 14 | FP-4(a) establishment-drain not VM-testable (the establishment window anchors to SLA deadlines) | §4 inertness covered by the PARKED-jobs form (pending rows inert across the flip); establishment-drain stays unit-level (Phase A battery) |
+| 15 | Schema lessons: `drv_attempts` has no kind column (kind implied by outcome class); `drv_executions` keys on the executor-facing CHAR(32) hash | Baked into scenario assertions (deployment-wide zero-build-executions form) |
+| 16 | Mixed-flag window: pending-job backlog visible via the re-sourced `substituting_derivations` (≥2 across the 45 s window), drains on store rollout | Asserted in T-3.3 mixed-flag; MD-D3 guidance |
+| 17 | Post-failover completion initially via the dispatch-probe dedup re-feed (~1 tick lazy heal) | Closed by T-4.3's eager rebuild; failover scenario re-verified |
+| 18 | STOP-AND-REPORT: transition claim stall after OFF→ON flip | Diagnosed over 5 iterations → B3 + B4 + two scenario races fixed (claim-wave/heal race via finding 12; orphan-watcher re-attach); `ccd62c48f` green 8/8 both directions |
+| 19 | Alert named `RioSchedulerEvidenceWriteFenced` (generic), not the plan's `RioSchedulerMaterializationFenced` — the fence counter is shared across all evidence writes | Honest-name deviation recorded for plan review |
+| 20 | T-5.2 audit corrects the plan's posture table: the stale-verify site is standalone-fenced (post-tx, reconcile 6c), NOT in-tx batch 5 — split is 3 in-tx + 2 standalone-fenced | PD-B9 verdict (split kept) unchanged; table above is authoritative |
+| 21 | Park re-evaluation resolves Vouched AND Pending evidence from-source; only Broken-evidence jobs ever appear in the stalled gauge | Makes the alert's "no from-source fallback" description exact (MD-D1) |
+| — | Wave 7: `vm-materialization-standalone-walk` `walk-infra-retry` timed out (180 s) under ~30-VM builder contention; green at Wave 3 in 35.8 s | Triage path 1: solo discriminating re-run GREEN (38.6 s subtest, 172 s attr) — contention flake, recorded, criterion 2 intact |
+
+### Test accounting (baseline `21955a450` → Phase B tip)
+
+Wave 7 full-workspace battery: **3442 tests run, 3442 passed, 28 skipped,
+zero failures** (124.2 s). Tree-wide added-test-function count (+43) equals
+the run-count delta exactly; **zero test functions deleted** (diff grep).
+
+| Battery | Baseline | Phase B tip | Delta |
+|---|---|---|---|
+| rio-scheduler | 1146 + 1 skipped | 1182 + 1 skipped | +36 |
+| rio-store | 537 + 13 skipped | 541 + 13 skipped | +4 |
+| rio-auth | 38 | 41 | +3 (instance binding + skew legs) |
+| rio-evidence-kernel / rio-retry-kernel / rio-proto / rio-migrations | 17 / 14 / 56 / 11 | unchanged | 0 (kernel deltas live in the existing kinded battery files) |
+| **Workspace** | **3399 + 28 skipped** | **3442 + 28 skipped** | **+43** |
+| CBMC harnesses | 17 + 8 | 17 + 8 | 0 (kinded-arm changes re-verified under the existing harnesses) |
+| Wired quint checks | 12 | 12 | 0 |
+| VM check attrs | 30 | **37** | +7 (2 substitution `-walk` oracles + materialization-standalone{,-walk} + transition + failover{,-walk}) |
+| codecov `after_n_builds` | 44 | **51** | +7 (= 17 unit + 34 vm coverage entries; gen-matrix verified) |
+
+### The VM matrix at the exit (Wave 7, final tree)
+
+All 37 attrs green (`.#ci.vm-test` aggregate exit 0). 30 pre-Phase-B attrs
+run flag-ON — 27 with byte-zero assertion changes (their green-ness is the
+criterion 1 zero-delta statement) + lifecycle-core (boundary fragment) + the
+2 adapted substitution scenarios; 4 `-walk` attrs run flag-OFF with the
+as-built oracle assertions; `vm-materialization-transition-k3s` exercises
+both flips in one run (8/8 subtests, ~191 s green run). One contention
+flake this wave (ledger row above), green on the discriminating re-run.
+
+### The Wave 7 exit gate
+
+`.claude/bin/nixbuild --checks` (nix-fast-build over the full
+`checks.x86_64-linux` — **380 attrs**: per-member clippy/clippy-test/doc/
+nextest for every workspace crate, all 37 VM attrs, the quint family
+(build-only + coexistence regime + 11 witnesses), 4 kani check families
+(17+8 harness counts among them), cov-smoke, fuzz, pre-commit,
+tracey-validate, helm-lint incl. the AND-guard fragment, docs-lint, drift/
+policy checks): **OK, exit 0**, zero red checks, zero failure events on the
+streamed log (`/tmp/rio-dev/rio-a4-phaseB-92.log`).
+
+Wall-clock, stated honestly against stop condition 7(a): the `--checks`
+invocation itself ran **542 s** because the 37-attr VM matrix was built
+earlier in the same wave (T-7.1) at the same tree and served as cache hits;
+the combined Wave 7 verification wall — matrix run (513 s) + the flake's
+discriminating solo re-run (172 s) + aggregate certification (684 s) + the
+gate (542 s) — is **≈ 32 min**, inside the plan's expected band (~50–65
+min) and far under the ~70 min ceiling. The T-1.9 auth sweep and the full
+flag-off battery ride `nextest-rio-scheduler`/`nextest-rio-store` inside
+the gate; the workspace dev-shell battery (3442/3442) ran separately at
+T-7.1.
+
+### Plan-decision log final state (PD-B1..PD-B21)
+
+All 21 entries **exercised as written**; none struck. Entries with
+in-execution detail beyond the plan text: PD-B2 (extended by finding 5 —
+`substitute-scheduler-owned` realizes the basic-path deployment proof),
+PD-B3 (finding 6's Python-level branching realization), PD-B4 (finding 9's
+permanent helm fragment), PD-B6 (stop sites build.rs:441/:521 per CF-4),
+PD-B9 (finding 20's posture correction — split kept, table corrected),
+PD-B19 (the legacy-state absorption arm exercised non-vacuously by T-5.3).
+In-execution deviations needing plan-review ratification: findings 1, 6, 19
+(all recorded above); the T-3.2 standalone→k3s rewrite (finding 13 — the
+plan's standalone+systemd form was unimplementable against the as-built
+recovery trigger).
+
+### What Phase B does NOT claim
+
+- **No soak/production evidence** (house no-soak rule; deployment is
+  post-D′ operations — MD-D rows are the operator handoff).
+- **No model verdicts**: `materializationJob.qnt` remains a draft, NOT
+  wired; nothing is model-checked beyond the Phase A
+  `retryPolicyPullMat` regime. C′ owns the model and the §9.3 transfer.
+- **The walk machinery is intact** and serves flag-off deployments
+  bit-identically; the §4 dual-write stamps are still WRITTEN flag-on
+  (removal is D′.1); the evidence-bit absorption arms stay documented, not
+  deleted.
+- **CE-D6's seven-conjunction manual re-run** has not been executed (C′
+  go/no-go scope).
+- **The §9.3 calibration transfer has not been executed** — the protocol
+  below is the handoff, not a result.
+- **The finding-11 ruling awaits owner counter-signature** (the harvest
+  table); if the owner overrules, B2's discriminator and
+  `sched.materialize.routing+2` re-open.
+
+---
+
+## Phase C′ entry criteria and handoff
+
+### Entry criteria
+
+1. This record integrated into `formal-sprint` behind a green full gate.
+2. The finding-11 owner counter-signature obtained (or the overrule
+   processed) — the model's arm-3 encoding depends on it.
+3. The C′ plan absorbs the model-completion deltas below (the as-built
+   system moved during Phase B; the draft did not).
+
+### The model-completion delta list (what `materializationJob.qnt` must encode to match the AS-BUILT system)
+
+The draft (1,221 lines, 20 actions, 17 properties, 5 regimes — Phase A
+T-5.3, deliberately unwired) describes the Phase A design. Phase B changed
+the system in six places the draft predates. **Wiring the draft without
+encoding these deltas would verify the wrong system.**
+
+| Δ | As-built behavior (Phase B) | What the draft has | What C′ must encode |
+|---|---|---|---|
+| 1 | **The finding-11 mark discriminator** (`c952e5a51`, `sched.materialize.routing+2`): arm-3 FailFast requires the four-conjunct corner (Broken ∧ `topdown_pruned` mark ∧ confirmed-missing-or-spent-one-shot); unmarked nodes → ResolveFromSource. Plus the §4 clear-mirror (`7c9b9f949`): the mark CLEARS at `resolved_success`/`resolved_from_source` | No mark state at all; `consumeUnobtainable`'s `arm3fail` fail-fasts ANY node on confirmed-missing/spent; `routingRequiresDurableVouchOrFailFast` forbids the unmarked from-source disposition (it would VIOLATE against the as-built system) | A per-drv `topdownPruned` ghost: set by `createJob(OPruned)`, cleared on both resolution arms (the clear-mirror); arm selection split marked/unmarked per the 6-row B2 table; `lastFailFastJustified` gains the mark conjunct; the property re-encoded to admit the unmarked arm-3 from-source; a pruned-origin trace keeps `noFailFast` non-vacuous |
+| 2a | **Finding-18 transport** (`ce17c6445`, `store.materialize.executor+2`): the executor abandons-and-redials its scheduler channel on UNAVAILABLE (standby-pinned ClusterIP after rollouts); without it, claims/reports dead-end forever — a deployment-level settlement-totality hole | `claimJob`/report actions are atomic direct actions against THE scheduler; no channel/leader-target state exists | Either a per-replica channel-target state (leader/standby; standby-targeted claim/report actions blocked until a redial action) with `unresolvedJobAlwaysArmed` re-proven under it, or an explicit recorded abstraction ("transport liveness assumed") citing the two transport unit pins + the transition VM scenario — C′ adjudicates which; the as-built behavior is the redial |
+| 2b | **Finding-18 wanted backfill** (`056bfc9b6`): flag-off-era builds have NO `build_wanted_outputs` rows; the probe-partition creation BACKFILLS the relation for every live interested build (else: InfraFailure "no tenant context") | `createJob` precondition `liveWanted(d) != Set()` makes the no-wanted-rows state unrepresentable — the bug class cannot even be expressed | Model the transition-window build (interest without wanted rows) + creation-establishes-wanted at the probe origin; the new invariant: every unresolved job has ≥1 live interested build with wanted rows (tenant-resolvability) |
+| 3 | **The park re-evaluation split** (`642fe9fb7`, T-6.1/PD-20): per-tick re-evaluation resolves Vouched AND Pending evidence from-source; **Broken-evidence jobs STAY parked** until the durable backoff lapses (exactly the stalled-gauge/alert population); backoff-expiry re-claim is a separate arm | `housekeepingReevaluatePark` conflates both arms: Vouched/Pending → from-source, ELSE unconditional unpark + `matInfraCount` reset | Two actions: evidence re-evaluation (Vouched/Pending → `JResolvedFromSource`; Broken → no-op, stays parked) and backoff expiry (unpark Broken-evidence jobs for re-claim); decide the budget-reset semantics against the as-built park cycle; optionally a stalled ghost = parked ∧ Broken (the alert population) |
+| 4 | **Five origins, split posture** (T-1.5/T-1.6/T-5.2, finding 20): `cache_opportunity` (merge new_sub IN-tx + dispatch probe standalone-fenced), `pruned` (in-tx), `reprobe` (in-tx, AS-5 6d reset + `poison_cleared`), `stale_reset` (standalone-fenced POST-tx, resets FROM Completed) | Four origins (`OProbe`/`OMerge`/`OPruned`/`OStaleReset`), no `OReprobe`; the AS-5 reset is attached to `OStaleReset`; `createJob` precondition `nodeStatus != NCompleted` BLOCKS the as-built stale-verify shape (a Completed node with vanished outputs is exactly what creates `stale_reset` jobs) | Add `OReprobe` (carries the AS-5 reset; `poison_cleared` ghost if poison enters the model); relax the NCompleted precondition for the `stale_reset` origin (reset-from-Completed in the same action); if C′ models merge-tx atomicity, group the three in-tx origins with the wanted-row writes (one fenced commit) vs the two standalone-fenced sites |
+| 5 | **Recovery rebuilds the job view** (`4e57180fd`, T-4.3): post-failover, pending → DeliverNew immediately, claimed → DeliverExisting to the SAME holder / NotYetReady to others, parked → NotYetReady until the durable backoff lapses; the view feed preserves armament state (`or_insert`) | `failoverPreservesJobs = true` (placeholder); no in-memory-view state — failover is droppable-view by assumption, not by proof | The pre/post ghost form (jobs identical across `failover`); if C′ adds a view layer, the rebuild action + the or_insert-class property (a re-feed never weakens armament state: park survives, holder survives) |
+| 6 | **Queued claims + the must_substitute upgrade** (`8d5caee2d` + `7c9b9f949`/B1): materialization claims legal from Ready AND Queued; `must_substitute` (the A11 mark refusal) upgrades to DeliverNew for unparked pending jobs — the claim IS the substitution | `claimJob` already admits NQueued|NReady (the draft anticipated PD-6) but has no must_substitute concept at all | NO structural change needed for the happy path (record the anticipation); if C′ imports the mark (Δ1), assert the marked-node claim is ENABLED (the B1 regression guard: a marked Ready/Queued node with an unparked pending job is claimable) |
+
+Out-of-model surfaces (recorded, deliberately NOT deltas): BC-4 events,
+§2.6 buckets, metrics (display-only — the draft's exclusion list);
+the T-5.1 instance binding (auth layer; wire-level pins own it); the
+chart-level AND-guard (deployment config, covered by helm-lint + the
+mixed-flag scenario).
+
+### The calibration-transfer protocol (§9.3, executable form)
+
+1. **Which rows transfer:** the closure-evidence calibration families
+   F1–F14 and C1–C5 (the model header's completion-contract item 3, the
+   `closure-evidence-invariant-map.md` vocabulary) plus the
+   executor-campaign rows that touch the pull protocol; target table = the
+   §9.1 skeleton above (17 properties + 5 witnesses).
+2. **Falsification first:** every transferred row must FALSIFY against a
+   deliberately broken encoding (the planted-violation discipline) before
+   its correct form is trusted — a transferred row that cannot falsify is
+   recalibrated or rejected, never waved through.
+3. **Then exhaustive:** every §9.1 property holds exhaustively (TLC) in
+   every regime it names (base / failover / adversarialStore / staleTenure
+   / crashLoop), with the six deltas above encoded; every property keeps an
+   expect-violation witness (`mkQuintWitnessCheck` non-vacuity).
+4. **The three draft-violating properties** re-encoded with at-decision-time
+   ghosts (`routingRequiresDurableVouchOrFailFast` — restructured by Δ1
+   anyway —, `noWrongfulTerminalFailure`, `noWrongfulFromSourceRouting`).
+5. **The dormancy oracle holds throughout:** `quint-retry-policy-pull`
+   (build-only regime) stays bit-identical through all C′ wiring (the
+   regime-split rule from Phase A PD-21).
+6. **Budget:** minutes-class per check (the 2-build × 2-drv space); the
+   spawnCoherence job-filter conjunct (T-1.4's deferral) joins
+   `spawnCoherence.qnt` in the same wave.
+
+### The C′ go/no-go criteria (the design §8/§9.3 gate)
+
+GO requires ALL of:
+
+1. Every transferred calibration row falsifies (protocol step 2) and then
+   holds (step 3) — the §9.3 row-by-row verdict table complete, one verdict
+   per family.
+2. Every NEW invariant (the §9.1 successor table incl. the three
+   re-encodes and the Δ-derived properties) holds exhaustively in every
+   named regime; witnesses all violate as expected.
+3. **The model matches the as-built system per the six deltas above** —
+   reviewed against `c952e5a51`, `ce17c6445`, `056bfc9b6`, `7c9b9f949`,
+   `4e57180fd`, `642fe9fb7`, `1fc41ff71`, `09bc947ba` (the behavior-bearing
+   commits), not against the Phase A draft or the original design text.
+4. CE-D6's seven closureEvidence conjunctions re-run green (the deferred
+   manual-target runbook).
+5. `quint-retry-policy-pull` bit-identical; kani counts unchanged; the full
+   CI gate green with the new checks wired in `nix/quint.nix`.
+6. The finding-11 counter-signature resolved (entry criterion 2).
+
+NO-GO (any of): a transferred row that holds without ever falsifying
+(calibration failure); a §9.1 property that needs a system change to hold
+(that is a D′-blocking design finding, not a model bug); the model
+verifying a behavior the six-delta review shows the system does not have.
 
 ---
 
