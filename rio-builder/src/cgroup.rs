@@ -524,11 +524,28 @@ fn read_single_u64(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// Host logical-CPU count. `available_parallelism()` is std (no
-/// `num_cpus` dep) and reads `/proc` directly — NOT cgroup-aware on
-/// Linux, so it returns the node's full core count even under a
-/// `cpu.max` quota. That's exactly what we want as the "no quota"
-/// fallback for [`parse_cpu_max`]; the quota clamp is applied on top.
+/// Effective CPU count for this process.
+///
+/// `available_parallelism()` IS cgroup-aware on Linux (std clamps the
+/// affinity count to the cgroup v1/v2 CPU quota, rounded *down*, min 1
+/// — `library/std/src/sys/thread/unix.rs`, `cgroups::quota()`), so
+/// inside a pod this returns the **quota-limited** core count, not the
+/// node's. Two consequences this module and the executor rely on:
+///
+/// * In [`parse_cpu_max`]'s `"max"` arm and its parse-failure fallback,
+///   the value returned here is already the pod-appropriate `-jN`: with
+///   no quota of its own the pod sees its affinity/ancestor-quota limit,
+///   and on a malformed `cpu.max` the std-side clamp still applies. (The
+///   quota arm never calls this — it computes `ceil(quota/period)`
+///   itself, which intentionally rounds *up* where std rounds down.)
+///
+/// * tokio sizes its default worker pool from this same value, so a
+///   1-CPU pod runs a **single-worker** async runtime. Any blocking call
+///   on that worker suspends every other task — limit watchdogs,
+///   heartbeats, cancellation. This is why every FUSE/merged-store
+///   filesystem operation in the executor must go through
+///   `spawn_blocking` or stay async (see the request-glue call in
+///   `executor::run_native_lifecycle`).
 fn nproc() -> u32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)
@@ -545,10 +562,11 @@ fn nproc() -> u32 {
 /// Returns `ceil(quota/period)` clamped to ≥1. Ceiling because a
 /// fractional limit (0.5 cores) still means ONE concurrent job is
 /// the right `-jN` — `make -j0` is meaningless and `-j` ≥2 just
-/// thrashes the throttle. `"max"` → host nproc.
+/// thrashes the throttle. `"max"` → [`nproc`] (the effective,
+/// quota-clamped count — see its doc).
 ///
 /// On parse failure (malformed file — shouldn't happen on a v2
-/// mount), falls back to host nproc rather than erroring: `cpu.max`
+/// mount), falls back to [`nproc`] rather than erroring: `cpu.max`
 /// is advisory for `-jN`, not a hard gate, and the cgroup throttle
 /// still applies regardless of what we pass to make.
 pub(crate) fn parse_cpu_max(content: &str) -> u32 {
@@ -570,7 +588,7 @@ pub(crate) fn parse_cpu_max(content: &str) -> u32 {
 ///
 /// Same input format as [`parse_cpu_max`] but returns the un-ceilinged
 /// f64 ratio for ADR-023 SLA telemetry (`ResourceUsage.cpu_limit_cores`).
-/// `"max"` → `None` (caller substitutes host nproc); the integer
+/// `"max"` → `None` (caller substitutes the effective nproc); the integer
 /// [`parse_cpu_max`] keeps its nproc-fallback for the `-jN` clamp path
 /// where a definite whole number is required.
 pub(crate) fn parse_cpu_max_cores(content: &str) -> Option<f64> {
@@ -813,7 +831,7 @@ pub async fn utilization_reporter_loop_with_shutdown(
 
     // cpu.max is static for the pod's lifetime (k8s sets it once from
     // resources.limits.cpu). Read once. None = "max" (unbounded) → report
-    // host nproc as the effective limit so the SLA model has a denominator.
+    // the effective (quota-clamped) nproc so the SLA model has a denominator.
     let cpu_limit_cores = fs::read_to_string(root.join("cpu.max"))
         .ok()
         .and_then(|s| parse_cpu_max_cores(&s))
@@ -1130,7 +1148,7 @@ mod tests {
 
     // r[verify builder.cores.cgroup-clamp+3]
     /// I-196: cpu.max → effective whole-core count for `make -jN`.
-    /// Ceiling division, min 1, "max" → host nproc.
+    /// Ceiling division, min 1, "max" → effective nproc.
     #[test]
     fn parse_cpu_max_quota_to_cores() {
         // 0.5 cores: 50ms/100ms. -j1 (ceil, never 0).
