@@ -61,6 +61,7 @@ let
   log-service = import ./scenarios/log-service.nix;
   substitute-scale = import ./scenarios/substitute-scale.nix;
   materialize = import ./scenarios/materialize.nix;
+  materialize-failover = import ./scenarios/materialize-failover.nix;
   sla-sizing = import ./scenarios/sla-sizing.nix;
   forecast-provisioning = import ./scenarios/forecast-provisioning.nix;
   kwok = import ./fixtures/kwok.nix { inherit pkgs; };
@@ -397,6 +398,29 @@ let
         # (criterion 2's revertability posture).
         // pkgs.lib.optionalAttrs (!materializationEnabled) {
           materializationEnabled = false;
+        }
+      );
+    };
+
+  # ── materialize-failover scenario builder (both flag states — T-3.3) ─
+  # Failover + AS-6 mixed-flag windows on the k3s fixture (2 scheduler
+  # replicas per vmtest-full.yaml — the failover needs a standby). Same
+  # one-builder-two-attrs pattern as mkSubstituteScale: the flag-on attr
+  # inherits the chart's flipped values.yaml default; the -walk oracle
+  # pins both chart flags off explicitly.
+  mkMaterializeFailover =
+    materializationEnabled:
+    materialize-failover {
+      inherit pkgs common materializationEnabled;
+      fixture = k3sFull (
+        {
+          jwtEnabled = true;
+        }
+        // pkgs.lib.optionalAttrs (!materializationEnabled) {
+          extraValuesTyped = {
+            "scheduler.materialization.enabled" = false;
+            "store.materialization.enabled" = false;
+          };
         }
       );
     };
@@ -1295,6 +1319,48 @@ in
   #   deep-chain (byte-original): one merge burst spawns all 49 walks —
   #   rio_scheduler_substitute_spawned_total delta ≥45.
   vm-substitute-scale-walk-k3s = mkSubstituteScale false;
+
+  # ── materialization under leader failover + AS-6 mixed-flag (T-3.3) ─
+  # What the standalone scenarios cannot prove: materialization jobs are
+  # PG-authoritative state that survives the scheduler leader's death,
+  # and the AS-6 mixed-flag windows are visible waits / no-ops, never
+  # strands. Both flag states (review eq-1: the OQ7
+  # failover-during-substitution comparison): the flag-on attr inherits
+  # the chart's flipped default; the -walk oracle pins both chart flags
+  # off and runs the same failover sequence through the as-built walk.
+  #
+  # Wave-3-honest assertions (the acknowledged recovery limitation): the
+  # new leader's in-memory job view is rebuilt indirectly (the dispatch
+  # probe's create-job dedup re-feeds it from the surviving PG rows);
+  # Wave 4's T-4.3 adds the direct recovery rebuild and only makes these
+  # assertions pass sooner. The scenario asserts end states, not view
+  # internals, precisely so T-4.3 extends rather than rewrites it.
+  #
+  # ── Flag-ON ──────────────────────────────────────────────────────────
+  # r[verify sched.materialize.job]
+  #   failover: 10 jobs created in the merge tx; the leader is
+  #   force-deleted while >=1 is still unresolved; the standby acquires;
+  #   the job rows survive byte-identically (count + job_ids); all 10
+  #   resolve and the build succeeds. PG is the authority — no job is
+  #   lost with the leader.
+  # r[verify sched.materialize.routing]
+  #   mixed-flag: scheduler-on/store-off (the rollout-race window the
+  #   chart AND-guard cannot close) is a visible wait — jobs pending,
+  #   build active, backlog reported via substituting_derivations — and
+  #   drains the moment the store executor returns.
+  #   store-only-noop: scheduler-off/store-on serves builds via the
+  #   as-built walk; the executor's polls return empty; zero jobs.
+  vm-materialization-failover-k3s = mkMaterializeFailover true;
+
+  # ── Flag-OFF oracle: the as-built walk path under the same failover ─
+  # r[verify sched.merge.substitute-probe-indeterminate]
+  #   failover: the same 10-leaf submission runs as walks; the leader is
+  #   force-deleted mid-walk; the standby's recovery resets Substituting
+  #   nodes and the re-probe re-spawns the walks; the build completes
+  #   with the same client-visible outcome the flag-on attr asserts
+  #   (succeeded, all paths present, no stuck nodes) and zero
+  #   materialization jobs.
+  vm-materialization-failover-walk-k3s = mkMaterializeFailover false;
 
   # ── leader-election splits (2 tests, k3s-full fixture) ───────────────
   # ~0 wall-clock savings (4min bootstrap dominates both) but failures
