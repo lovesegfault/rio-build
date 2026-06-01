@@ -911,6 +911,24 @@ impl DagActor {
         }
         let mut spawned: Vec<Spawned> = Vec::with_capacity(candidates.len());
         for (drv_hash, paths) in candidates {
+            // r[impl sched.merge.force-build-roots]
+            // Chokepoint enforcement of the force-build gate at the one
+            // spawn site, so every caller — including the forgiven-now-
+            // wanted downgrade re-spawn in `handle_substitute_complete`
+            // and any future caller — inherits it. The merge-time and
+            // dispatch-time callers also gate (cheaper early-outs that
+            // pick a different lane for the node before it gets here);
+            // this filter is the backstop that makes "a force-build
+            // root never enters the substitute-spawn arm" hold at the
+            // arm itself rather than per caller. A skipped candidate
+            // keeps its current status and falls through to normal
+            // from-source scheduling.
+            if self.is_force_build_root(&drv_hash) {
+                debug!(%drv_hash,
+                       "spawn_substitute: live force-build root; skipping \
+                        (dispatches as a build)");
+                continue;
+            }
             // Live effective wanted set for the forgivable complement
             // below (terminal builds' contributions excluded; stored-
             // union fallback on None) — computed before the `node_mut`
@@ -1145,6 +1163,71 @@ impl DagActor {
         if state.status() != DerivationStatus::Substituting {
             debug!(%drv_hash, status = ?state.status(),
                    "SubstituteComplete: not Substituting (cancelled/re-merged); dropping");
+            return;
+        }
+        // r[impl sched.merge.force-build-roots]
+        // Completion-time re-derivation of the force-build gate. The
+        // spawn-time gates only stop NEW fetches; a `force_build_roots`
+        // build that merged DURING the (potentially minutes-long)
+        // detached fetch has named this node a root the walk's verdict
+        // must not settle: an ok=true completion would hand that build
+        // an upstream substitution — the outcome the gate exists to
+        // prevent — and an ok=false one would burn the one-shot
+        // `substitute_tried` flag against it. Mirror the
+        // `forgiven_now_wanted` re-check below: an eligibility
+        // predicate over mutable live state is re-derived when the
+        // result is APPLIED, never trusted from spawn time. Discard the
+        // verdict and revert (3-way, like the failure path): the next
+        // dispatch pass routes the node by the live gates — from-source
+        // for the still-missing-locally case, while a root whose
+        // outputs DID land in the local store mid-race completes via
+        // the sanctioned locally-present short-circuit instead of the
+        // substitution arm. The chain ends here, so the spent-
+        // forgiveness bookkeeping is dropped; `substitute_tried` is
+        // deliberately NOT set — the force gates (not the one-shot
+        // flag) keep the substitution lane closed while protection
+        // holds, and a later legitimate substitution after the force
+        // build retires must stay possible.
+        if self.is_force_build_root(drv_hash) {
+            let to = self.dag.revert_target_for(drv_hash);
+            info!(%drv_hash, ok, revert_target = ?to,
+                  "substitute fetch completed for a node that became a live \
+                   force-build root mid-fetch; discarding the verdict and \
+                   reverting for from-source dispatch");
+            let Some(state) = self.dag.node_mut(drv_hash) else {
+                return;
+            };
+            state.never_forgive_paths.clear();
+            if let Err(e) = state.transition(to) {
+                warn!(%drv_hash, %e, "force-build root re-check: revert rejected");
+                return;
+            }
+            self.persist_status(drv_hash, to, None).await;
+            match to {
+                DerivationStatus::Ready => {
+                    self.push_ready(drv_hash.clone());
+                    self.dispatch_dirty = true;
+                }
+                DerivationStatus::DependencyFailed => {
+                    // Same epilogue as the failure revert below: cascade
+                    // + per-build completion check so interested builds
+                    // terminate instead of hanging Active on a node
+                    // whose dep is terminally failed.
+                    self.terminal_failure_epilogue(
+                        drv_hash,
+                        "substitution discarded for a force-build root and a \
+                         dependency is terminally failed",
+                        rio_proto::types::BuildResultStatus::DependencyFailed,
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+            // build_summary counts Substituting as running; the revert
+            // flips running→queued — surface it like the failure path.
+            for build_id in self.get_interested_builds(drv_hash) {
+                self.emit_progress(build_id);
+            }
             return;
         }
         let topdown_pruned = state.topdown_pruned;

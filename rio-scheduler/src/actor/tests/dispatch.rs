@@ -1585,6 +1585,92 @@ async fn dispatch_probe_substitution_follows_force_build_liveness(
     Ok(())
 }
 
+/// Completion-time re-derivation of the force-build gate: a node
+/// spawned into Substituting by a NON-force submission, then merged as
+/// a root by a `force_build_roots` build while the detached fetch is in
+/// flight, must NOT complete via substitution when the fetch posts
+/// ok=true. The handler re-derives the gate, discards the verdict
+/// (without burning the one-shot `substitute_tried` flag), and the node
+/// dispatches from source.
+// r[verify sched.merge.force-build-roots]
+// r[verify sched.substitute.detached+5]
+#[tokio::test]
+async fn force_merge_mid_fetch_discards_substitute_completion() -> TestResult {
+    use std::sync::atomic::Ordering;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let out = test_store_path("fmf-x-out");
+
+    // X is upstream-substitutable; arm the QPI gate so the detached
+    // fetch PARKS — the force merge happens mid-fetch.
+    store.state.substitutable.write().unwrap().push(out.clone());
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, Ordering::SeqCst);
+
+    // Non-force build S: its merge routes X into the substitute lane.
+    let mut node_s = make_node("fmf-x");
+    node_s.expected_output_paths = vec![out.clone()];
+    let build_s = Uuid::new_v4();
+    merge_dag(&handle, build_s, vec![node_s], vec![], false).await?;
+    wait_for_status(&handle, "fmf-x", DerivationStatus::Substituting).await;
+
+    // Force build A merges the SAME node as its root mid-fetch. A
+    // Substituting node matches no merge-time reset/reprobe arm — the
+    // in-flight fetch is untouched.
+    let mut node_a = make_node("fmf-x");
+    node_a.expected_output_paths = vec![out.clone()];
+    let build_a = Uuid::new_v4();
+    merge_dag_force_roots(&handle, build_a, vec![node_a], vec![]).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "fmf-x").await.status,
+        DerivationStatus::Substituting,
+        "precondition: the fetch is still in flight after the force merge"
+    );
+
+    // The fetch completes ok=true — post the completion explicitly (the
+    // parked real task posts a duplicate later that the
+    // status!=Substituting guard drops).
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "fmf-x".into(),
+            ok: true,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let st = expect_drv(&handle, "fmf-x").await;
+    assert_ne!(
+        st.status,
+        DerivationStatus::Completed,
+        "a mid-fetch force merge must void the substitution verdict"
+    );
+    assert!(
+        !st.substitute_tried,
+        "the discarded verdict must not burn the one-shot substitution flag"
+    );
+
+    // The reverted node dispatches FROM SOURCE once a builder shows up
+    // (the dispatch-time probe's spawn arm stays closed — A is live).
+    let mut w = connect_executor(&handle, "fmf-w", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut w).await;
+    assert_eq!(
+        assn.drv_path,
+        test_drv_path("fmf-x"),
+        "force-build root must route to a builder after the discarded fetch"
+    );
+
+    // Release the parked walk so test teardown doesn't wait on it.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(false, Ordering::SeqCst);
+    store.faults.query_path_info_gate.notify_waiters();
+    Ok(())
+}
+
 /// I-163 Fix 3: `cluster_snapshot_cached()` reads the watch-channel
 /// value the actor publishes on `Tick` — no mailbox round-trip. The
 /// `fn` (not `async fn`) signature is the structural proof; this test
