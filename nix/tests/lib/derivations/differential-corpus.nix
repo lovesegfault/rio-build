@@ -574,6 +574,44 @@ rec {
         outputHash = flatPayloadSha256;
       };
 
+  # ── Boundary-value discipline ────────────────────────────────────────
+  # Entries below this header exist because a porter once read the C++
+  # and got a corner wrong. They feed the oracle the BOUNDARY inputs the
+  # friendly entries above never sample — env-precedence collisions,
+  # numeric edge values, wrong-typed structured attrs — so a parity
+  # claim is pinned by executing the oracle, not by re-reading it.
+  # Add the discriminating input HERE in the same commit as any future
+  # "matches CppNix" code comment.
+
+  # Env-precedence probe: the output bytes ARE the final values of the
+  # contested env vars, and the declared FOD hash is computed at eval
+  # time from the values the ORACLE's initEnv statement order produces
+  # ("1|2|xterm-256color"). The drv attrs adversarially set all three
+  # (drv attrs must lose to the forced layers), and impureEnvVars lists
+  # NIX_LOG_FD/TERM (impure assignment must lose to initEnv's final
+  # NIX_LOG_FD/TERM writes; both unset in the VM environment, so the
+  # oracle's getEnv fallback contributes "" either way). Any precedence
+  # drift on either side changes the output bytes → FOD hash mismatch →
+  # red gate. NIX_OUTPUT_CHECKED is deliberately NOT in impureEnvVars:
+  # the forced "1" (set after the drv env) must survive.
+  fod-env-precedence =
+    mkDrv "rio-diff-fod-env-precedence"
+      ''
+        printf '%s|%s|%s\n' "$NIX_OUTPUT_CHECKED" "$NIX_LOG_FD" "$TERM" > $out
+      ''
+      {
+        outputHashMode = "flat";
+        outputHashAlgo = "sha256";
+        outputHash = builtins.hashString "sha256" "1|2|xterm-256color\n";
+        NIX_OUTPUT_CHECKED = "0";
+        NIX_LOG_FD = "7";
+        TERM = "dumb";
+        impureEnvVars = [
+          "NIX_LOG_FD"
+          "TERM"
+        ];
+      };
+
   # ── Floating content-addressed derivations ───────────────────────────
   # Native-side CA finalization lands with the M6b milestone; until then
   # these entries are recorded as known divergences (the native side

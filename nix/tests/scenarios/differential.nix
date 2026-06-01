@@ -198,6 +198,12 @@ let
       expect = "both-fail";
       rio_status = "TransientFailure";
     };
+    # The output bytes are the contested env values; the declared hash
+    # is the oracle-order answer, so success on both sides IS the
+    # precedence proof (any drift = FOD hash mismatch on that side).
+    fod-env-precedence = {
+      expect = "parity";
+    };
     ca-multi-output = {
       # M6b floating-CA finalization is merged: the native side must
       # now realize the same content-addressed paths as the oracle.

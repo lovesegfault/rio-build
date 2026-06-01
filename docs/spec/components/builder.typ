@@ -523,6 +523,28 @@ fetcher component (#rref("fetcher.fetchurl.sandboxed")).
   `NIX_ATTRS_JSON_FILE`/`NIX_ATTRS_SH_FILE` alongside the base environment.
 ]
 
+#r("builder.exec.env-precedence")[
+  The builder environment MUST be assembled in CppNix `initEnv`'s statement
+  order — base values, then the derivation's (desugared) env, then the
+  build-directory variables, then `NIX_OUTPUT_CHECKED=1` for fixed-output
+  derivations, then `impureEnvVars`, and finally `NIX_LOG_FD=2` and
+  `TERM=xterm-256color` — with a later layer overwriting an earlier one on
+  key collision. In particular: a derivation attribute MUST NOT override
+  `NIX_OUTPUT_CHECKED`, a listed `impureEnvVars` name MAY (oracle parity),
+  and `NIX_LOG_FD`/`TERM` always win over everything including
+  `impureEnvVars`.
+]
+
+The layer order is encoded once (`EnvLayer`/`LAYER_ORDER` in the request
+glue) and each layer cites its statement range in the pinned oracle source.
+The value source for `impureEnvVars` remains the operator-configured map
+only — never the worker process's environment — which is a deliberate,
+documented divergence in value *source*, not in layer *position*. The
+`fod-env-precedence` differential entry executes both sides with adversarial
+attribute collisions and a declared FOD hash equal to the oracle-order
+answer, so any future precedence drift turns the merge gate red instead of
+surviving as a misread of the C++.
+
 #r("builder.exec.refs-graph-acyclic")[
   `exportReferencesGraph` materialization MUST terminate with auxiliary
   memory linear in the closure size, and MUST reject cyclic reference

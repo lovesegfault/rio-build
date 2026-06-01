@@ -6,21 +6,27 @@
 //! receives the COMPLETE environment in the `ExecutionRequest` and adds
 //! nothing, so every rule lives here where it is unit-testable.
 //!
-//! Ordering/precedence (later wins on key collision):
-//! 1. base env (`PATH`, `HOME`, `NIX_STORE`, `NIX_BUILD_CORES`, plus
-//!    `NIX_OUTPUT_CHECKED` for fixed-output derivations);
+//! Precedence is the fold over [`LAYER_ORDER`] (later layers win on key
+//! collision; the order mirrors the oracle `initEnv`'s statement order
+//! — see [`EnvLayer`]'s per-variant citations):
+//! 1. base env (`PATH`, `HOME`, `NIX_STORE`, `NIX_BUILD_CORES`);
 //! 2. the derivation's own env — unless `__structuredAttrs`, in which
 //!    case only `NIX_ATTRS_JSON_FILE` / `NIX_ATTRS_SH_FILE`;
-//! 3. forced values that always win over derivation attrs:
-//!    `NIX_BUILD_TOP`, `TMPDIR`, `TEMPDIR`, `TMP`, `TEMP`, `PWD`,
-//!    `NIX_LOG_FD=2`, `TERM=xterm-256color`;
-//! 4. fixed-output only: each name in `impureEnvVars`, copied **from the
+//! 3. build-directory vars (`NIX_BUILD_TOP`, `TMPDIR`, `TEMPDIR`,
+//!    `TMP`, `TEMP`, `PWD`) — derivation attrs cannot relocate them;
+//! 4. fixed-output only: `NIX_OUTPUT_CHECKED=1` — after the drv env
+//!    (an attr cannot override it) but before `impureEnvVars` (a
+//!    listed impure var still can; oracle parity);
+//! 5. fixed-output only: each name in `impureEnvVars`, copied **from the
 //!    operator-configured impure-env map only** — never from the worker
 //!    process's environment. (CppNix falls back to the daemon's own
 //!    environment; rio deliberately does not, because the builder pod's
 //!    environment carries credentials such as `RIO_EXECUTOR_TOKEN` that
 //!    a tenant-supplied `impureEnvVars` list must not be able to read.
-//!    Documented divergence — DESIGN.md §4.3.)
+//!    Value-source divergence only — the LAYER position matches the
+//!    oracle. Documented divergence — DESIGN.md §4.3.)
+//! 6. `NIX_LOG_FD=2`, `TERM=xterm-256color` — `initEnv`'s final
+//!    assignments; they win over everything, including `impureEnvVars`.
 //!
 //! Every derivation-supplied value (env values, argv, `passAsFile`
 //! contents) is passed through [`rewrite`] with the build's
@@ -85,11 +91,69 @@ pub(crate) struct EnvOptions<'a> {
     pub impure_env: &'a BTreeMap<String, String>,
 }
 
+/// One precedence layer of the builder environment.
+///
+/// [`LAYER_ORDER`]'s declaration order IS the precedence contract:
+/// [`build_env`] folds the layers top to bottom into one map, and a
+/// later layer's insert overwrites an earlier layer's value for the
+/// same key — exactly how the oracle's
+/// `DerivationBuilderImpl::initEnv` assigns into `env[...]` in
+/// statement order. Each variant cites its statement range in the
+/// pinned CppNix 2.34.7 source
+/// (`src/libstore/unix/build/derivation-builder.cc`).
+// r[impl builder.exec.env-precedence]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvLayer {
+    /// `PATH=/path-not-set`, `HOME=/homeless-shelter`, `NIX_STORE`,
+    /// `NIX_BUILD_CORES` — derivation-builder.cc:1068–1087.
+    Base,
+    /// The derivation's own (desugared) env — or, for structured-attrs
+    /// builds, only `NIX_ATTRS_JSON_FILE`/`NIX_ATTRS_SH_FILE` —
+    /// derivation-builder.cc:1092–1100. `passAsFile` materialization
+    /// happens here (part of the oracle's desugaring).
+    DrvEnv,
+    /// `NIX_BUILD_TOP`, `TMPDIR`/`TEMPDIR`/`TMP`/`TEMP`, `PWD` —
+    /// derivation-builder.cc:1103–1112. After [`EnvLayer::DrvEnv`]: a
+    /// derivation attr cannot relocate the build directory (but a
+    /// fixed-output derivation's `impureEnvVars` listing still can —
+    /// the oracle assigns impure vars later).
+    BuildDir,
+    /// `NIX_OUTPUT_CHECKED=1` for fixed-output derivations —
+    /// derivation-builder.cc:1118–1119. After [`EnvLayer::DrvEnv`]: a
+    /// derivation attr cannot override it (the pre-fix code set it in
+    /// the base layer, where any drv env entry silently won). Before
+    /// [`EnvLayer::ImpureEnv`]: a listed impure var still can — oracle
+    /// parity, pinned by the `fod-env-precedence` differential entry.
+    OutputChecked,
+    /// `impureEnvVars` for fixed-output derivations —
+    /// derivation-builder.cc:1130–1142. Layer position matches the
+    /// oracle; the VALUE source deliberately diverges (operator map
+    /// only — module doc, DESIGN.md §4.3).
+    ImpureEnv,
+    /// `NIX_LOG_FD=2`, `TERM=xterm-256color` —
+    /// derivation-builder.cc:1148–1151, `initEnv`'s final assignments.
+    /// They win over everything, including `impureEnvVars`.
+    ForcedLast,
+}
+
+/// The oracle `initEnv`'s statement order. Reorder ⇒ different builder
+/// environment ⇒ FOD hash drift; the differential corpus
+/// (`fod-env-precedence`) turns that into a red merge gate.
+const LAYER_ORDER: [EnvLayer; 6] = [
+    EnvLayer::Base,
+    EnvLayer::DrvEnv,
+    EnvLayer::BuildDir,
+    EnvLayer::OutputChecked,
+    EnvLayer::ImpureEnv,
+    EnvLayer::ForcedLast,
+];
+
 /// Build the complete builder environment for `drv`.
 ///
 /// `structured` callers (`__structuredAttrs`) get the minimal env; the
 /// `.attrs.json` / `.attrs.sh` files themselves are produced by
 /// [`super::attrs`].
+// r[impl builder.exec.env-precedence]
 pub(crate) fn build_env(
     drv: &BasicDerivation,
     rewrites: &BTreeMap<String, String>,
@@ -102,65 +166,76 @@ pub(crate) fn build_env(
     let mut env: BTreeMap<String, String> = BTreeMap::new();
     let mut passed_files = Vec::new();
 
-    // 1. Base environment.
-    env.insert("PATH".into(), "/path-not-set".into());
-    env.insert("HOME".into(), "/homeless-shelter".into());
-    env.insert("NIX_STORE".into(), SANDBOX_STORE_DIR.into());
-    env.insert("NIX_BUILD_CORES".into(), opts.build_cores.to_string());
-    if is_fod {
-        // Tells nixpkgs' fetcher framework the output hash is checked by
-        // the builder (so it can skip its own re-hash).
-        env.insert("NIX_OUTPUT_CHECKED".into(), "1".into());
-    }
-
-    // 2. The derivation env (or the structured-attrs minimal env).
-    if structured {
-        env.insert(
-            "NIX_ATTRS_JSON_FILE".into(),
-            format!("{SANDBOX_BUILD_DIR}/.attrs.json"),
-        );
-        env.insert(
-            "NIX_ATTRS_SH_FILE".into(),
-            format!("{SANDBOX_BUILD_DIR}/.attrs.sh"),
-        );
-    } else {
-        // passAsFile: the listed attrs become files instead of env vars.
-        // (Ignored under structuredAttrs, matching CppNix's desugaring.)
-        let pass_as_file: std::collections::BTreeSet<String> = senv
-            .strings("passAsFile")
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-
-        for (k, v) in drv.env() {
-            if pass_as_file.contains(k) {
-                let file_name = format!(".attr-{}", attr_file_hash(k));
-                env.insert(
-                    format!("{k}Path"),
-                    format!("{SANDBOX_BUILD_DIR}/{file_name}"),
-                );
-                passed_files.push(PassedFile {
-                    file_name,
-                    contents: rewrite(v, rewrites).into_bytes(),
-                });
-            } else {
-                env.insert(k.clone(), rewrite(v, rewrites));
+    for layer in LAYER_ORDER {
+        match layer {
+            EnvLayer::Base => {
+                env.insert("PATH".into(), "/path-not-set".into());
+                env.insert("HOME".into(), "/homeless-shelter".into());
+                env.insert("NIX_STORE".into(), SANDBOX_STORE_DIR.into());
+                env.insert("NIX_BUILD_CORES".into(), opts.build_cores.to_string());
             }
-        }
-    }
+            EnvLayer::DrvEnv => {
+                if structured {
+                    env.insert(
+                        "NIX_ATTRS_JSON_FILE".into(),
+                        format!("{SANDBOX_BUILD_DIR}/.attrs.json"),
+                    );
+                    env.insert(
+                        "NIX_ATTRS_SH_FILE".into(),
+                        format!("{SANDBOX_BUILD_DIR}/.attrs.sh"),
+                    );
+                } else {
+                    // passAsFile: the listed attrs become files instead of
+                    // env vars. (Ignored under structuredAttrs, matching
+                    // CppNix's desugaring.)
+                    let pass_as_file: std::collections::BTreeSet<String> = senv
+                        .strings("passAsFile")
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect();
 
-    // 3. Forced values — always win over derivation attrs.
-    for k in ["NIX_BUILD_TOP", "TMPDIR", "TEMPDIR", "TMP", "TEMP", "PWD"] {
-        env.insert(k.into(), SANDBOX_BUILD_DIR.into());
-    }
-    env.insert("NIX_LOG_FD".into(), "2".into());
-    env.insert("TERM".into(), "xterm-256color".into());
-
-    // 4. Fixed-output: impureEnvVars from the operator map ONLY.
-    if is_fod {
-        for name in senv.strings("impureEnvVars").unwrap_or_default() {
-            let value = opts.impure_env.get(&name).cloned().unwrap_or_default();
-            env.insert(name, value);
+                    for (k, v) in drv.env() {
+                        if pass_as_file.contains(k) {
+                            let file_name = format!(".attr-{}", attr_file_hash(k));
+                            env.insert(
+                                format!("{k}Path"),
+                                format!("{SANDBOX_BUILD_DIR}/{file_name}"),
+                            );
+                            passed_files.push(PassedFile {
+                                file_name,
+                                contents: rewrite(v, rewrites).into_bytes(),
+                            });
+                        } else {
+                            env.insert(k.clone(), rewrite(v, rewrites));
+                        }
+                    }
+                }
+            }
+            EnvLayer::BuildDir => {
+                for k in ["NIX_BUILD_TOP", "TMPDIR", "TEMPDIR", "TMP", "TEMP", "PWD"] {
+                    env.insert(k.into(), SANDBOX_BUILD_DIR.into());
+                }
+            }
+            EnvLayer::OutputChecked => {
+                if is_fod {
+                    // Tells nixpkgs' fetcher framework the output hash is
+                    // checked by the builder (so it can skip its own
+                    // re-hash).
+                    env.insert("NIX_OUTPUT_CHECKED".into(), "1".into());
+                }
+            }
+            EnvLayer::ImpureEnv => {
+                if is_fod {
+                    for name in senv.strings("impureEnvVars").unwrap_or_default() {
+                        let value = opts.impure_env.get(&name).cloned().unwrap_or_default();
+                        env.insert(name, value);
+                    }
+                }
+            }
+            EnvLayer::ForcedLast => {
+                env.insert("NIX_LOG_FD".into(), "2".into());
+                env.insert("TERM".into(), "xterm-256color".into());
+            }
         }
     }
 
@@ -398,5 +473,105 @@ mod tests {
             "/nix/store/x-a:/nix/store/y-b:/nix/store/x-a"
         );
         assert_eq!(rewrite("untouched", &rw), "untouched");
+    }
+
+    /// The bug_036 regression pin: a fixed-output derivation's own env
+    /// attr must NOT be able to override `NIX_OUTPUT_CHECKED` (oracle
+    /// sets it AFTER the drv env, derivation-builder.cc:1118-1119).
+    // r[verify builder.exec.env-precedence]
+    #[test]
+    fn fod_drv_attr_cannot_override_output_checked() {
+        let impure = BTreeMap::new();
+        let drv = fod_with_env(&[("NIX_OUTPUT_CHECKED", "0")]);
+        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure)).env;
+        assert_eq!(env["NIX_OUTPUT_CHECKED"], "1");
+    }
+
+    /// `NIX_LOG_FD` / `TERM` are `initEnv`'s final assignments
+    /// (derivation-builder.cc:1148-1151): they win even over a listed
+    /// `impureEnvVars` entry.
+    // r[verify builder.exec.env-precedence]
+    #[test]
+    fn forced_log_fd_and_term_beat_impure_env() {
+        let mut impure = BTreeMap::new();
+        impure.insert("NIX_LOG_FD".to_string(), "9".to_string());
+        impure.insert("TERM".to_string(), "vt100".to_string());
+        let drv = fod_with_env(&[("impureEnvVars", "NIX_LOG_FD TERM")]);
+        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure)).env;
+        assert_eq!(env["NIX_LOG_FD"], "2");
+        assert_eq!(env["TERM"], "xterm-256color");
+    }
+
+    /// No over-correction: `impureEnvVars` is assigned AFTER the
+    /// build-directory vars (oracle order), so a listed `TMPDIR` IS
+    /// overridable by the operator map.
+    // r[verify builder.exec.env-precedence]
+    #[test]
+    fn impure_env_can_override_build_dir_vars() {
+        let mut impure = BTreeMap::new();
+        impure.insert("TMPDIR".to_string(), "/var/big-scratch".to_string());
+        let drv = fod_with_env(&[("impureEnvVars", "TMPDIR")]);
+        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure)).env;
+        assert_eq!(env["TMPDIR"], "/var/big-scratch");
+        // The unlisted siblings stay forced.
+        assert_eq!(env["TEMPDIR"], "/build");
+        assert_eq!(env["PWD"], "/build");
+    }
+
+    /// `impureEnvVars` listing `NIX_OUTPUT_CHECKED` overrides the
+    /// forced "1" (oracle: impure assignment happens later); the drv
+    /// attr still cannot. Full precedence chain in one matrix:
+    /// base < drv < builddir < output-checked < impure < forced-last.
+    // r[verify builder.exec.env-precedence]
+    #[test]
+    fn fod_env_precedence_matrix() {
+        let mut impure = BTreeMap::new();
+        impure.insert("NIX_OUTPUT_CHECKED".to_string(), "from-impure".to_string());
+        impure.insert("TMPDIR".to_string(), "/impure-tmp".to_string());
+        let drv = fod_with_env(&[
+            // drv beats base:
+            ("PATH", "/nix/store/dddddddddddddddddddddddddddddddd-sd/bin"),
+            // builddir beats drv:
+            ("TMPDIR", "/drv-tmp"),
+            // output-checked beats drv:
+            ("NIX_OUTPUT_CHECKED", "0"),
+            // forced-last beats drv:
+            ("TERM", "dumb"),
+            ("NIX_LOG_FD", "7"),
+            // impure beats output-checked AND builddir; forced-last
+            // beats impure:
+            ("impureEnvVars", "NIX_OUTPUT_CHECKED TMPDIR NIX_LOG_FD TERM"),
+        ]);
+        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure)).env;
+        assert_eq!(
+            env["PATH"], "/nix/store/dddddddddddddddddddddddddddddddd-sd/bin",
+            "drv env beats the /path-not-set base"
+        );
+        assert_eq!(
+            env["NIX_OUTPUT_CHECKED"], "from-impure",
+            "a listed impure var beats the forced FOD marker"
+        );
+        assert_eq!(
+            env["TMPDIR"], "/impure-tmp",
+            "a listed impure var beats the build-dir layer"
+        );
+        assert_eq!(env["NIX_LOG_FD"], "2", "forced-last beats impure");
+        assert_eq!(env["TERM"], "xterm-256color", "forced-last beats impure");
+    }
+
+    /// A structured-attrs FOD cannot smuggle `NIX_OUTPUT_CHECKED`
+    /// through `__json`: the structured branch exports only the two
+    /// `NIX_ATTRS_*` paths, so the forced "1" survives.
+    // r[verify builder.exec.env-precedence]
+    #[test]
+    fn structured_fod_cannot_inject_output_checked() {
+        let impure = BTreeMap::new();
+        let drv = fod_with_env(&[
+            ("__structuredAttrs", "1"),
+            ("__json", r#"{"NIX_OUTPUT_CHECKED":"0"}"#),
+        ]);
+        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure)).env;
+        assert_eq!(env["NIX_OUTPUT_CHECKED"], "1");
+        assert!(!env.contains_key("__json"));
     }
 }

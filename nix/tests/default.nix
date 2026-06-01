@@ -270,6 +270,10 @@ in
   #   the declared fixed-output hash is verified fail-closed by the
   #   native result path (mismatch and unverifiable algorithms are
   #   rejections, never skips).
+  # r[verify builder.exec.env-precedence]
+  #   fod-env-precedence entry: the output bytes are the contested env
+  #   values and the declared FOD hash is the oracle-order answer, so
+  #   any initEnv layer-order drift on either side is a hash mismatch.
   vm-differential-standalone = import ./scenarios/differential.nix {
     inherit pkgs rio-workspace;
   };
