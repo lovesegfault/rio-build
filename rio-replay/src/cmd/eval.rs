@@ -10,6 +10,14 @@
 //! `--dry-run` stops after the fidelity gate: no closure pass, no truth
 //! sweep, no archive, no upload (fidelity.json and a dry-run-marked
 //! provenance.json are still written locally, so the run is auditable).
+//!
+//! The fidelity gate fails closed on zero coverage: when jobs are in
+//! scope but the gate compared none of them, nothing was verified, so
+//! the run aborts right after writing fidelity.json — no truth sweep,
+//! no archive, no upload. (A divergent recording, by contrast, is real
+//! information: it is still packed and published with its mismatched
+//! units flagged `identity_divergent`, and the CLI exits non-zero at
+//! the end.)
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -202,6 +210,46 @@ pub struct EvalArgs {
 /// attempts with the sweep's exponential backoff stays well under a
 /// minute per path worst-case.
 const NARINFO_SWEEP_MAX_ATTEMPTS: u32 = 5;
+
+/// Error for a vacuous fidelity gate: jobs were in scope but the
+/// comparison joined none of them, so the recording verified nothing
+/// and must not proceed. The message names both sides of the empty join
+/// — counts plus one example name each — because the classic cause is a
+/// job-name format skew (one side's names carrying decoration the other
+/// side's lack), which is immediately visible from a sample pair.
+fn vacuous_gate_error(
+    report: &crate::evalset::fidelity::FidelityReport,
+    fidelity_path: &std::path::Path,
+) -> anyhow::Error {
+    use std::fmt::Write as _;
+
+    // With zero comparisons, every job on either side sits in a
+    // coverage-gap list, so the gap lists are the per-side universes.
+    let mut msg = String::from("fidelity gate is vacuous: 0 in-scope jobs were compared. ");
+    let _ = write!(
+        msg,
+        "Hydra ground truth carries {} job name(s)",
+        report.missing_locally.len()
+    );
+    if let Some(example) = report.missing_locally.first() {
+        let _ = write!(msg, " (e.g. {example:?})");
+    }
+    let _ = write!(
+        msg,
+        " and the local evaluation produced {} manifest record(s)",
+        report.missing_on_hydra.len()
+    );
+    if let Some(example) = report.missing_on_hydra.first() {
+        let _ = write!(msg, " (e.g. {example:?})");
+    }
+    let _ = write!(
+        msg,
+        ", but the job-name join matched none of them, so nothing was verified. \
+         Refusing to record unverified truth; compare the two name lists in {}",
+        fidelity_path.display()
+    );
+    anyhow::anyhow!(msg)
+}
 
 /// Derive the per-job Hydra buildstatus map from the builds fetched
 /// during scope resolution. Only finished builds carry a meaningful
@@ -529,17 +577,44 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
     // ── Phase 4: fidelity gate (exhaustive — scoped recordings compare every job) ──
     let report = fidelity::compare_drv_paths(&manifest, &ground_truth, fidelity::MODE_EXHAUSTIVE);
     dir.write_json(FIDELITY_FILE, &report)?;
-    if report.divergent {
-        tracing::error!(
-            mismatches = report.mismatches.len(),
-            "fidelity gate FAILED: locally produced drvPaths diverge from Hydra's; the archive will be marked divergent"
-        );
-    } else {
-        tracing::info!(
-            checked = report.checked,
-            matched = report.matched,
-            "fidelity gate passed"
-        );
+    // The verdict, not the divergent flag, decides the gate: "passed"
+    // structurally requires a nonzero coverage witness, so a comparison
+    // that joined zero jobs cannot slip through as success.
+    let verdict = report.verdict();
+    match verdict {
+        fidelity::FidelityVerdict::Divergent { mismatches } => {
+            // Real, verified counter-evidence: keep recording so the
+            // divergence is published flagged (units carry
+            // identity_divergent), and exit non-zero at the end.
+            tracing::error!(
+                mismatches = mismatches.get(),
+                "fidelity gate FAILED: locally produced drvPaths diverge from Hydra's; the archive will be marked divergent"
+            );
+        }
+        fidelity::FidelityVerdict::Passed { checked } => {
+            tracing::info!(
+                checked = checked.get(),
+                matched = report.matched,
+                "fidelity gate passed"
+            );
+        }
+        fidelity::FidelityVerdict::Vacuous { .. } => {
+            // Zero coverage with jobs in scope: nothing was verified, so
+            // nothing may be recorded. Abort before the truth sweep and
+            // the archive staging; fidelity.json (already written) holds
+            // both job-name lists for the post-mortem.
+            return Err(vacuous_gate_error(&report, &dir.path(FIDELITY_FILE)));
+        }
+        fidelity::FidelityVerdict::NothingInScope => {
+            // Unreachable here: scope resolution guarantees at least one
+            // in-scope job and each contributes ground truth. Refuse
+            // rather than stage an empty archive if a future change
+            // breaks that guarantee.
+            anyhow::bail!(
+                "fidelity gate compared an empty universe (no Hydra ground truth and no \
+                 manifest records) — the recorder requires a non-empty scope"
+            );
+        }
     }
 
     // The provenance block carried verbatim in the archive manifest (and,
@@ -811,10 +886,10 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
         }
     }
 
-    if report.divergent {
+    if let fidelity::FidelityVerdict::Divergent { mismatches } = verdict {
         anyhow::bail!(
             "evaluation DIVERGENT: {} drvPath mismatches (see {})",
-            report.mismatches.len(),
+            mismatches,
             dir.path(FIDELITY_FILE).display()
         );
     }
@@ -956,6 +1031,55 @@ mod tests {
             releasename: None,
             jobsetevals: Vec::new(),
         }
+    }
+
+    #[test]
+    fn vacuous_gate_error_names_both_sides_of_the_empty_join() {
+        use crate::evalset::evaluator::ManifestRecord;
+        use crate::evalset::fidelity::{self, FidelityVerdict};
+
+        // The historical failure shape: the local job names carry
+        // decoration (here the evaluator's display quoting) that the
+        // Hydra names lack, so the join matches nothing.
+        let manifest = vec![ManifestRecord {
+            job: "\"nixpkgs.hello.x86_64-linux\"".into(),
+            system: "x86_64-linux".into(),
+            attr: "\"nixpkgs.hello.x86_64-linux\"".into(),
+            drv_path: "/nix/store/7mdg60drrnh0wq1j8hmmbhll47czm107-hello-2.12.3.drv".into(),
+            outputs: BTreeMap::new(),
+            required_features: None,
+        }];
+        let truth = BTreeMap::from([(
+            "nixpkgs.hello.x86_64-linux".to_string(),
+            "/nix/store/7mdg60drrnh0wq1j8hmmbhll47czm107-hello-2.12.3.drv".to_string(),
+        )]);
+        let report = fidelity::compare_drv_paths(&manifest, &truth, fidelity::MODE_EXHAUSTIVE);
+        assert!(matches!(report.verdict(), FidelityVerdict::Vacuous { .. }));
+
+        let err = vacuous_gate_error(&report, std::path::Path::new("/out/fidelity.json"));
+        let msg = format!("{err:#}");
+        // Actionable: says what failed, shows one example name from each
+        // side (making the format skew visible), and points at the full
+        // lists.
+        assert!(msg.contains("vacuous"), "got: {msg}");
+        assert!(msg.contains("0 in-scope jobs were compared"), "got: {msg}");
+        assert!(msg.contains("\"nixpkgs.hello.x86_64-linux\""), "got: {msg}");
+        assert!(
+            msg.contains("\"\\\"nixpkgs.hello.x86_64-linux\\\"\""),
+            "the quote-polluted local name must be shown escaped, got: {msg}"
+        );
+        assert!(msg.contains("/out/fidelity.json"), "got: {msg}");
+
+        // A side can be empty (e.g. every in-scope job failed local
+        // eval): the message still reports both counts without panicking
+        // on a missing example.
+        let report = fidelity::compare_drv_paths(&[], &truth, fidelity::MODE_EXHAUSTIVE);
+        let msg = format!(
+            "{:#}",
+            vacuous_gate_error(&report, std::path::Path::new("/out/fidelity.json"))
+        );
+        assert!(msg.contains("1 job name(s)"), "got: {msg}");
+        assert!(msg.contains("0 manifest record(s)"), "got: {msg}");
     }
 
     #[test]

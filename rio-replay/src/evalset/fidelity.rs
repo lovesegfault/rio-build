@@ -6,10 +6,16 @@
 //! sets compare every in-scope job (exhaustive mode); full-evaluation
 //! sets compare a bounded sample of jobs (sampled mode). Only a drvPath
 //! mismatch marks the set divergent; jobs present on one side but not
-//! the other are reported as coverage gaps and do not gate. The
-//! resulting report is written verbatim as `fidelity.json`.
+//! the other are reported as coverage gaps and do not gate
+//! individually. Zero coverage is different: a comparison that joined
+//! no jobs at all verified nothing, so [`FidelityReport::verdict`]
+//! reduces the counters to a [`FidelityVerdict`] whose passing arm
+//! structurally requires a nonzero number of compared jobs — absence of
+//! counter-evidence alone can never read as success. The resulting
+//! report is written verbatim as `fidelity.json`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use serde::Serialize;
 
@@ -44,8 +50,71 @@ pub struct FidelityReport {
     pub missing_locally: Vec<String>,
     /// Local manifest jobs with no Hydra ground truth (coverage flag).
     pub missing_on_hydra: Vec<String>,
-    /// True iff any drvPath mismatch was found — the only gating condition.
+    /// True iff any drvPath mismatch was found. Gate callers must branch
+    /// on [`FidelityReport::verdict`] — which also fails a zero-coverage
+    /// comparison closed — never on this flag alone: an empty join has
+    /// no mismatches yet verified nothing.
     pub divergent: bool,
+}
+
+/// Gate verdict of one fidelity comparison: [`FidelityReport`]'s
+/// counters reduced to the states a gate must distinguish.
+///
+/// `Passed` carries its coverage witness — the nonzero number of jobs
+/// actually compared — so the type cannot express "passed having
+/// verified nothing". A comparison that joined zero jobs while jobs
+/// existed on either side is its own [`FidelityVerdict::Vacuous`] state,
+/// and gates must fail closed on it: an empty join means the trust
+/// mechanism never ran (the classic cause being a job-name format skew
+/// between the two sides), not that the eval set is faithful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FidelityVerdict {
+    /// At least one compared job's local drvPath differs from ground
+    /// truth.
+    Divergent { mismatches: NonZeroUsize },
+    /// Every compared job matched, witnessed by `checked` actual
+    /// comparisons.
+    Passed { checked: NonZeroUsize },
+    /// Jobs existed on at least one side but zero were compared:
+    /// nothing was verified, which must read as failure, not success.
+    Vacuous {
+        /// Ground-truth jobs, none of which were compared.
+        hydra_jobs: usize,
+        /// Locally evaluated jobs, none of which were compared.
+        local_jobs: usize,
+    },
+    /// Both sides were empty: there was genuinely nothing to verify, so
+    /// the empty comparison is clean rather than vacuous.
+    NothingInScope,
+}
+
+impl FidelityReport {
+    /// Reduce the report to its [`FidelityVerdict`].
+    ///
+    /// Mismatches always dominate (a mismatch is a real comparison, so
+    /// `Divergent` and `Vacuous` are mutually exclusive); a clean report
+    /// passes only with `checked > 0`; with zero comparisons the gap
+    /// lists are the per-side universes, distinguishing "jobs existed
+    /// but the join missed all of them" (vacuous) from "nothing was in
+    /// scope at all".
+    pub fn verdict(&self) -> FidelityVerdict {
+        if let Some(mismatches) = NonZeroUsize::new(self.mismatches.len()) {
+            return FidelityVerdict::Divergent { mismatches };
+        }
+        if let Some(checked) = NonZeroUsize::new(self.checked) {
+            return FidelityVerdict::Passed { checked };
+        }
+        let hydra_jobs = self.missing_locally.len();
+        let local_jobs = self.missing_on_hydra.len();
+        if hydra_jobs == 0 && local_jobs == 0 {
+            FidelityVerdict::NothingInScope
+        } else {
+            FidelityVerdict::Vacuous {
+                hydra_jobs,
+                local_jobs,
+            }
+        }
+    }
 }
 
 /// Compare manifest drvPaths against Hydra ground truth (job → drvpath).
@@ -142,6 +211,13 @@ mod tests {
         assert_eq!(report.matched, 1);
         assert!(report.mismatches.is_empty());
         assert!(!report.divergent);
+        // The pass carries its coverage witness.
+        assert_eq!(
+            report.verdict(),
+            FidelityVerdict::Passed {
+                checked: NonZeroUsize::new(1).unwrap()
+            }
+        );
     }
 
     #[test]
@@ -159,27 +235,103 @@ mod tests {
             "/nix/store/7mdg60drrnh0wq1j8hmmbhll47czm107-hello-2.12.3.drv"
         );
         assert!(report.divergent);
+        assert_eq!(
+            report.verdict(),
+            FidelityVerdict::Divergent {
+                mismatches: NonZeroUsize::new(1).unwrap()
+            }
+        );
     }
 
     #[test]
     fn coverage_gaps_flag_but_do_not_gate() {
-        // Local job Hydra doesn't know + Hydra job we didn't evaluate:
-        // both recorded, neither marks divergence — only a drvPath
-        // mismatch gates.
-        let manifest = vec![rec(
-            "nixpkgs.onlylocal.x86_64-linux",
-            "/nix/store/aaa-x.drv",
-        )];
+        // A local job Hydra doesn't know plus a Hydra job we didn't
+        // evaluate: both recorded as gaps, neither marks divergence nor
+        // spoils the pass — as long as at least one job WAS compared,
+        // only a drvPath mismatch gates.
+        let manifest = vec![
+            rec(
+                "nixpkgs.hello.x86_64-linux",
+                "/nix/store/7mdg60drrnh0wq1j8hmmbhll47czm107-hello-2.12.3.drv",
+            ),
+            rec("nixpkgs.onlylocal.x86_64-linux", "/nix/store/aaa-x.drv"),
+        ];
         let mut truth = hydra_truth();
-        truth.remove("nixpkgs.onlylocal.x86_64-linux");
+        truth.insert(
+            "nixpkgs.onlyhydra.x86_64-linux".into(),
+            "/nix/store/bbb-y.drv".into(),
+        );
         let report = compare_drv_paths(&manifest, &truth, MODE_EXHAUSTIVE);
-        assert_eq!(report.checked, 0);
+        assert_eq!(report.checked, 1);
         assert_eq!(
             report.missing_on_hydra,
             vec!["nixpkgs.onlylocal.x86_64-linux"]
         );
-        assert_eq!(report.missing_locally, vec!["nixpkgs.hello.x86_64-linux"]);
+        assert_eq!(
+            report.missing_locally,
+            vec!["nixpkgs.onlyhydra.x86_64-linux"]
+        );
         assert!(!report.divergent);
+        assert_eq!(
+            report.verdict(),
+            FidelityVerdict::Passed {
+                checked: NonZeroUsize::new(1).unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn zero_coverage_with_jobs_in_scope_is_vacuous_not_passed() {
+        // The two sides share no job name at all (the historical cause:
+        // one side's names carry display quoting). No mismatch can ever
+        // accumulate, so a mismatch-only gate would read this as a pass
+        // — the verdict instead fails it closed as vacuous.
+        let manifest = vec![rec(
+            "nixpkgs.onlylocal.x86_64-linux",
+            "/nix/store/aaa-x.drv",
+        )];
+        let report = compare_drv_paths(&manifest, &hydra_truth(), MODE_EXHAUSTIVE);
+        assert_eq!(report.checked, 0);
+        assert!(
+            !report.divergent,
+            "a coverage gap is not drvPath divergence"
+        );
+        assert_eq!(
+            report.verdict(),
+            FidelityVerdict::Vacuous {
+                hydra_jobs: 1,
+                local_jobs: 1
+            }
+        );
+
+        // One-sided emptiness is vacuous too: jobs existed to verify.
+        let report = compare_drv_paths(&[], &hydra_truth(), MODE_EXHAUSTIVE);
+        assert_eq!(
+            report.verdict(),
+            FidelityVerdict::Vacuous {
+                hydra_jobs: 1,
+                local_jobs: 0
+            }
+        );
+        let report = compare_drv_paths(&manifest, &BTreeMap::new(), MODE_EXHAUSTIVE);
+        assert_eq!(
+            report.verdict(),
+            FidelityVerdict::Vacuous {
+                hydra_jobs: 0,
+                local_jobs: 1
+            }
+        );
+    }
+
+    #[test]
+    fn genuinely_empty_scope_is_nothing_in_scope_not_vacuous() {
+        // Nothing on either side: there was nothing to verify, so the
+        // empty comparison is clean — vacuity requires that jobs existed
+        // and were missed.
+        let report = compare_drv_paths(&[], &BTreeMap::new(), MODE_EXHAUSTIVE);
+        assert_eq!(report.checked, 0);
+        assert!(!report.divergent);
+        assert_eq!(report.verdict(), FidelityVerdict::NothingInScope);
     }
 
     #[test]
