@@ -2016,20 +2016,23 @@ impl DagActor {
             && self.dag.closure_evidence(drv_hash) == ClosureEvidence::Broken
     }
 
-    /// Prior interested builds of a displaced node that must lose the
-    /// displaced hash from their accounting: every build captured on the
-    /// displaced node's prior state EXCEPT the displacing build and
-    /// builds already terminal at displacement time — a terminal build's
-    /// completion accounting and its build_derivations links are settled
-    /// history (sched.merge.authoritative-conflict). Also reports whether
-    /// the displaced node had already delivered its result
+    /// Prior interested builds of a destructively-removed node
+    /// (displacement, same-definition resubmit-reset, or authority
+    /// takeover): every build captured on the removed node's prior state
+    /// EXCEPT the removing build and builds already terminal at removal
+    /// time — a terminal build's completion accounting and its
+    /// build_derivations links are settled history
+    /// (sched.merge.authoritative-conflict). Also reports whether the
+    /// removed node had already delivered its result
     /// (`Completed`/`Skipped`) to those builds, which decides between
     /// keeping the credit and shrinking the total. One helper feeds
-    /// BOTH the durable link DELETE + total adjustment inside the persist
-    /// transaction and the in-memory prune/fan-out in
-    /// reconcile_merged_state, so the two prune sets (and the
-    /// credit-vs-total decision) are congruent by construction (the actor
-    /// is single-threaded, so build states cannot change between the two
+    /// the durable link DELETE + total adjustment inside the persist
+    /// transaction (displacement only), the in-memory prune/fan-out in
+    /// reconcile_merged_state (displacement only), AND the
+    /// failure-evidence backstops for all three removal kinds (Batches
+    /// 2b and 2b'), so the prune sets, the credit-vs-total decision,
+    /// and the evidence scope are congruent by construction (the actor
+    /// is single-threaded, so build states cannot change between the
     /// call sites within one merge).
     fn displaced_prior_interest(
         &self,
@@ -2292,6 +2295,49 @@ impl DagActor {
             // observed failure (e.g. the displaced node had Completed
             // for them) are left untouched — joining a later-displaced
             // node is not a failure.
+            for prior_build in &interest.prior_builds {
+                if !evidence_persisted.insert(*prior_build) {
+                    continue;
+                }
+                let Some(summary) = self
+                    .builds
+                    .get(prior_build)
+                    .and_then(|b| b.error_summary.as_deref())
+                else {
+                    continue;
+                };
+                crate::db::SchedulerDb::persist_build_error_summary_tx(
+                    &mut tx,
+                    *prior_build,
+                    summary,
+                )
+                .await?;
+            }
+        }
+
+        // Batch 2b': the same failure-evidence backstop for the
+        // NON-displacement destructive removals — same-definition
+        // resubmit-resets and authority takeovers (removed_retriable
+        // minus displaced). Unlike displacement these do not prune prior
+        // interest (the carried interested_builds ride the re-created
+        // node), but the recreate-refresh upsert in Batch 1 just reset
+        // the row's failure state (status, poison fields), so a
+        // still-running keep_going build whose only reconstructible
+        // failure evidence was that row would lose it at failover. The
+        // at-source persist (sched.build.failure-evidence-at-source)
+        // normally already covered it; this in-tx write is the same
+        // defense-in-depth backstop as the displacement loop above —
+        // flag-agnostic, idempotent (COALESCE), and fail-closed (a
+        // persist error fails the merge, which cleanup_failed_merge
+        // rolls back).
+        // r[impl sched.build.failure-evidence-at-source]
+        let displaced_set: HashSet<&str> =
+            merge_result.displaced.iter().map(|h| h.as_str()).collect();
+        for (hash, _prior) in &merge_result.removed_retriable {
+            if displaced_set.contains(hash.as_str()) {
+                continue; // handled by Batch 2b above
+            }
+            let interest = self.displaced_prior_interest(merge_result, hash, build_id);
             for prior_build in &interest.prior_builds {
                 if !evidence_persisted.insert(*prior_build) {
                     continue;

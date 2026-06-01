@@ -10363,3 +10363,125 @@ async fn test_displacement_persists_prior_build_failure_evidence() -> TestResult
     );
     Ok(())
 }
+
+// r[verify sched.build.failure-evidence-at-source]
+/// The in-tx evidence backstop covers BOTH non-displacement destructive
+/// removals: the same-definition resubmit-reset and the authority
+/// takeover. Staging simulates a lost at-source write (NULL out the
+/// persisted evidence after the failure), then lets the resubmitting
+/// merge run — its transaction must independently re-persist the prior
+/// build's evidence while resetting the row, the resubmitter must not
+/// inherit any false evidence, and the prior build stays Active.
+#[rstest::rstest]
+#[case::same_definition(false)]
+#[case::authority_takeover(true)]
+#[tokio::test]
+async fn test_resubmit_reset_persists_prior_build_failure_evidence(
+    #[case] takeover: bool,
+) -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let tag = if takeover { "rrpA" } else { "rrpB" };
+    let out = test_store_path(&format!("{tag}-out"));
+
+    // The prior build (keep_going): the node that will fail + a filler
+    // on another arch so the build stays Active throughout.
+    let watcher = Uuid::new_v4();
+    let mut node = make_node(tag);
+    node.expected_output_paths = vec![out.clone()];
+    if takeover {
+        // Authoritative content-bound claim → the store-backed
+        // resubmission below takes the authority-takeover arm.
+        node.drv_content = format!("Derive-{tag}").into_bytes();
+        node.drv_content_authoritative = true;
+    }
+    merge_dag(
+        &handle,
+        watcher,
+        vec![
+            node,
+            make_test_node(&format!("{tag}-fill"), "aarch64-linux"),
+        ],
+        vec![],
+        true,
+    )
+    .await?;
+
+    // Real failure on a worker → at-source evidence + Poisoned (under
+    // budget → retriable on resubmit).
+    let mut rx = connect_executor(&handle, "w-rrp", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, test_drv_path(tag));
+    complete_failure(
+        &handle,
+        "w-rrp",
+        &test_drv_path(tag),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "builder exploded",
+    )
+    .await?;
+    wait_for_status(&handle, tag, DerivationStatus::Poisoned).await;
+    drop(rx);
+
+    // Simulate a lost at-source write so the in-tx backstop is verified
+    // independently.
+    sqlx::query("UPDATE builds SET error_summary = NULL WHERE build_id = $1")
+        .bind(watcher)
+        .execute(&db.pool)
+        .await?;
+
+    // The resubmitter: store-backed submission of the same definition
+    // (same expected output path = the verifiable identity). For the
+    // takeover case the prior node was authoritative, so this is an
+    // authority takeover; for the plain case it is a same-definition
+    // resubmit-reset. Both reset the row's failure state in the same
+    // transaction that must re-persist the watcher's evidence.
+    let resubmitter = Uuid::new_v4();
+    let mut renode = make_node(tag);
+    renode.expected_output_paths = vec![out.clone()];
+    merge_dag(&handle, resubmitter, vec![renode], vec![], false).await?;
+    barrier(&handle).await;
+
+    // The eraser ran: the row no longer carries the failure state.
+    let (status, poisoned): (String, bool) = sqlx::query_as(
+        "SELECT status, poisoned_at IS NOT NULL FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(tag)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_ne!(
+        status, "poisoned",
+        "fixture premise: the reset erased the row's status"
+    );
+    assert!(!poisoned, "fixture premise: the reset cleared poisoned_at");
+
+    // The backstop fired: the watcher's evidence was re-persisted INSIDE
+    // the resetting merge's transaction.
+    let (evidence,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(watcher)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        evidence.as_deref(),
+        Some(format!("derivation {tag} failed").as_str()),
+        "in-tx backstop re-persisted the prior build's evidence on the \
+         resubmit-reset/takeover path"
+    );
+
+    // The resubmitter has no false evidence and the watcher stays Active.
+    let (resub_evidence,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(resubmitter)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        resub_evidence, None,
+        "the resubmitting build must not inherit the prior build's evidence"
+    );
+    assert_eq!(
+        query_status(&handle, watcher).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "the prior keep_going build stays Active (its filler is still pending)"
+    );
+    Ok(())
+}

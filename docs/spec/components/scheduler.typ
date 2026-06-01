@@ -2001,7 +2001,12 @@ retained as its defense-in-depth backstop. With evidence persisted at the
 source, the deleted `build_derivations` link is normally no longer the only
 failover-recoverable trace of the failure --- the in-transaction persist
 matters only when the at-source write failed (PG unavailable at the
-observation moment) and no tick retry has succeeded since. It rides an
+observation moment) and no tick retry has succeeded since. The same in-tx
+backstop also runs for the non-displacement destructive removals --- the
+same-definition resubmit-reset and the authority takeover, whose
+recreate-refresh resets the row's failure state without pruning interest
+--- so every eraser inside the merge transaction carries its own evidence
+persist regardless of which removal arm fired. It rides an
 existing transaction (atomicity is free), keeps the displacement path's
 evidence contract self-contained rather than dependent on another
 component's earlier success, and the COALESCE first-write-wins makes the
