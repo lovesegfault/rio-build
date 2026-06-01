@@ -401,13 +401,18 @@ let
             f"flag-on deployment spawned walks for fresh work: {walks}"
         )
         # And the flag-on twin metric DID move: one creation per matjob
-        # node (plus the progress-e2e build's pruned-origin job).
+        # node (plus the progress-e2e build's pruned-origin job). The
+        # counter carries an `origin` label, so the grep matches one
+        # line per origin — sum the values across every labeled series.
         created = ${gatewayHost}.succeed(
             "curl -s localhost:9091/metrics"
             " | grep '^rio_scheduler_materialization_jobs_created_total'"
             " || echo 'rio_scheduler_materialization_jobs_created_total 0'"
         )
-        created_n = float(created.strip().rsplit(" ", 1)[1])
+        created_n = sum(
+            float(line.rsplit(" ", 1)[1])
+            for line in created.strip().splitlines()
+        )
         assert created_n >= 4, (
             f"rio_scheduler_materialization_jobs_created_total should be >=4 "
             f"(one per matjob node), got {created_n}"

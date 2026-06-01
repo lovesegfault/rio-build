@@ -308,6 +308,33 @@ let
         ];
       };
     };
+
+  # ── substitute-scale scenario builder (both flag states) ────────────
+  # Same one-builder-two-attrs pattern as mkSubstituteStandalone, on the
+  # k3s fixture: the materialization flag is threaded to the scenario
+  # (selects the mechanism-assertion branch) AND pinned on both chart
+  # components via extraValuesTyped (sets the deployed posture), so the
+  # two can never flip independently across a commit boundary.
+  mkSubstituteScale =
+    materializationEnabled:
+    substitute-scale {
+      inherit pkgs common materializationEnabled;
+      fixture = k3sFull {
+        jwtEnabled = true;
+        extraValuesTyped = {
+          "componentScaler.store.enabled" = true;
+          "componentScaler.store.min" = 1;
+          "componentScaler.store.max" = 4;
+          "componentScaler.store.seedRatio" = 10;
+          "store.substituteAdmissionPermits" = 1;
+          # Substitution-replacement Phase B: the per-attr flag pins
+          # (PD-B13 — assertions and posture flip together; the AS-6
+          # pairing keeps creation and execution flags equal).
+          "scheduler.materialization.enabled" = materializationEnabled;
+          "store.materialization.enabled" = materializationEnabled;
+        };
+      };
+    };
 in
 {
   # ── nixos-node AMI bootstrap (mocked IMDS, no AWS) ────────────────────
@@ -1046,19 +1073,18 @@ in
     };
   };
 
-  # r[verify ctrl.scaler.signal-substituting+2]
-  # r[verify store.substitute.admission]
-  # r[verify store.admin.get-load+2]
+  # ── substitute-scale (both flag states — PD-B3/PD-B13) ──────────────
   #   Substitution → ComponentScaler closed loop. 30-leaf substitutable
   #   fanout against a 1-permit store admission gate: scheduler reports
   #   substituting_derivations → ComponentScaler counts it (P1) →
   #   desiredReplicas RISES (never drops mid-cascade) → GetLoad's
   #   substitute_admission_utilization reaches CR.status (P2). Zero
-  #   builder pods for the leaves. ~7min (k3s + cache-seed + 90s poll).
+  #   builder pods for the leaves. Plus the depth-50 deep-chain
+  #   eager-burst proof. ~7min (k3s + cache-seed + 90s poll) per attr.
   #
-  # Distinct runNixOSTest name (rio-substitute-scale) — NOT a variant
-  # of rio-componentscaler / rio-substitute, so the derivation name
-  # doesn't collide.
+  # Distinct runNixOSTest names (rio-substitute-scale[-walk]) — NOT
+  # variants of rio-componentscaler / rio-substitute, so the derivation
+  # names don't collide.
   #
   # jwtEnabled: substitution is tenant-scoped (try_substitute_on_miss
   # short-circuits without x-rio-tenant-token); the gateway must mint
@@ -1069,20 +1095,44 @@ in
   # derived default (pg_max×3≥64), tiny NARs drain in <1s and
   # desiredReplicas never moves. Set via the chart key (not extraEnv)
   # so the values.yaml → store.yaml templating is exercised.
+  #
+  # The materialization flag is pinned per attr via extraValuesTyped on
+  # BOTH chart components (the scenario's Python branch selects the
+  # matching mechanism assertions): assertions and deployment posture
+  # flip together (commit rule 3 / PD-B13). The flag-on attr's explicit
+  # `true` pins are scaffolding T-2.3 removes when the chart default
+  # catches up; the -walk attr's `false` pins then OVERRIDE the flipped
+  # default.
+
+  # ── Flag-ON: substitution routes through materialization jobs ───────
+  # r[verify ctrl.scaler.signal-substituting+2]
+  #   cascade: the §2.6 re-sourced substituting bucket (pending unclaimed
+  #   jobs) drives the P1 closed loop — desiredReplicas rises and never
+  #   drops mid-cascade while the job backlog drains.
+  # r[verify store.substitute.admission]
+  # r[verify store.admin.get-load+2]
+  #   cascade: the store executors' fetches go through the SAME
+  #   per-replica admission gate as the walk; GetLoad's admission
+  #   utilization reaches CR.status (P2) unchanged.
   # r[verify sched.substitute.eager-probe]
-  vm-substitute-scale-k3s = substitute-scale {
-    inherit pkgs common;
-    fixture = k3sFull {
-      jwtEnabled = true;
-      extraValuesTyped = {
-        "componentScaler.store.enabled" = true;
-        "componentScaler.store.min" = 1;
-        "componentScaler.store.max" = 4;
-        "componentScaler.store.seedRatio" = 10;
-        "store.substituteAdmissionPermits" = 1;
-      };
-    };
-  };
+  # r[verify sched.materialize.job]
+  #   deep-chain (re-keyed): one merge burst classifies all 49 seeded
+  #   links — rio_scheduler_materialization_jobs_created_total delta
+  #   ≥45 + ≥49 cache_opportunity job rows, while the walk-spawn
+  #   counter stays at 0 (criterion 3). Same eager-vs-lazy property,
+  #   flag-on twin counter.
+  vm-substitute-scale-k3s = mkSubstituteScale true;
+
+  # ── Flag-OFF oracle: the as-built walk path, byte-original ──────────
+  # r[verify ctrl.scaler.signal-substituting+2]
+  #   cascade: the status-sourced substituting bucket (Substituting
+  #   nodes) drives the same P1 closed loop — the as-built signal half.
+  # r[verify store.substitute.admission]
+  # r[verify store.admin.get-load+2]
+  # r[verify sched.substitute.eager-probe]
+  #   deep-chain (byte-original): one merge burst spawns all 49 walks —
+  #   rio_scheduler_substitute_spawned_total delta ≥45.
+  vm-substitute-scale-walk-k3s = mkSubstituteScale false;
 
   # ── leader-election splits (2 tests, k3s-full fixture) ───────────────
   # ~0 wall-clock savings (4min bootstrap dominates both) but failures
