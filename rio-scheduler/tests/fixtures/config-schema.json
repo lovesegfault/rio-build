@@ -121,6 +121,16 @@
           "jitter_fraction": 0.2
         }
       },
+      "materialization": {
+        "description": "Substitution-replacement campaign (design §8): store-owned\nmaterialization jobs. `[materialization]` table in\nscheduler.toml. Env: `RIO_MATERIALIZATION__*` (nested keys —\ndouble underscore). Phase A lands every mechanism dormant behind\n`enabled = false`; Phase B turns it on.",
+        "$ref": "#/$defs/MaterializationConfig",
+        "default": {
+          "enabled": false,
+          "max_attempts": 3,
+          "park_backoff_base_secs": 30,
+          "park_backoff_cap_secs": 900
+        }
+      },
       "substitute_max_concurrent": {
         "description": "In-flight detached substitute-fetch task bound\n(r[sched.substitute.detached+5]) — memory-safety only; per-replica\nthrottling is `r[store.substitute.admission]`. Sizes\n`DagActor.substitute_sem`. Env: `RIO_SUBSTITUTE_MAX_CONCURRENT`\n(operator escape hatch — not chart-set). Default 256.",
         "type": "integer",
@@ -270,6 +280,38 @@
           }
         }
       },
+      "MaterializationConfig": {
+        "description": "Substitution-replacement campaign (design §8): store-owned\nmaterialization jobs. Phase A lands every mechanism dormant behind\n`enabled = false`; Phase B turns it on. The deployment-ordering\nconstraint (store executor flag first ON, last OFF — design §4/AS-6)\nis enforced by helm value structure, not here.",
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "description": "Master switch for scheduler-side job creation, the kind-aware\npull-admission table, and materialization-outcome consumption.\nfalse = the as-built substitution walk path runs unchanged.",
+            "type": "boolean",
+            "default": false
+          },
+          "max_attempts": {
+            "description": "Budget: `materialization_infra` rows (worker-reported AND\nestablishment-written — OQ1 amendment 1) per job before the job\nparks (design §2.5). Never causes a fail-fast.",
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0,
+            "default": 3
+          },
+          "park_backoff_base_secs": {
+            "description": "Park backoff base (seconds) after budget exhaustion.",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "default": 30
+          },
+          "park_backoff_cap_secs": {
+            "description": "Park backoff cap (seconds).",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "default": 900
+          }
+        }
+      },
       "DashboardConfig": {
         "description": "Dashboard browser-facing settings. The scheduler serves gRPC-Web\nnatively on its main port (D3) so the ingress is a plain HTTP\nrouter — CORS therefore lives here, not in a proxy CRD.",
         "type": "object",
@@ -318,6 +360,12 @@
       "backoff_multiplier": 2.0,
       "backoff_max_secs": 300.0,
       "jitter_fraction": 0.2
+    },
+    "materialization": {
+      "enabled": false,
+      "max_attempts": 3,
+      "park_backoff_base_secs": 30,
+      "park_backoff_cap_secs": 900
     },
     "substitute_max_concurrent": 256,
     "dashboard": {

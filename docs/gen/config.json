@@ -298,6 +298,30 @@
         "description": "Jitter fraction (0.0 to 1.0)."
       },
       {
+        "key": "materialization.enabled",
+        "type": "boolean",
+        "default": "false",
+        "description": "Master switch for scheduler-side job creation, the kind-aware pull-admission table, and materialization-outcome consumption. false = the as-built substitution walk path runs unchanged."
+      },
+      {
+        "key": "materialization.max_attempts",
+        "type": "uint32",
+        "default": "3",
+        "description": "Budget: `materialization_infra` rows (worker-reported AND establishment-written — OQ1 amendment 1) per job before the job parks (design §2.5)."
+      },
+      {
+        "key": "materialization.park_backoff_base_secs",
+        "type": "uint64",
+        "default": "30",
+        "description": "Park backoff base (seconds) after budget exhaustion."
+      },
+      {
+        "key": "materialization.park_backoff_cap_secs",
+        "type": "uint64",
+        "default": "900",
+        "description": "Park backoff cap (seconds)."
+      },
+      {
         "key": "substitute_max_concurrent",
         "type": "uint",
         "default": "256",

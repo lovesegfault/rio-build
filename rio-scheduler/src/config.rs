@@ -85,6 +85,12 @@ pub struct Config {
     /// Default: 2 retries, 5s→300s exponential with 20% jitter. No CLI
     /// override for the same reason as `poison`.
     pub retry: crate::RetryPolicy,
+    /// Substitution-replacement campaign (design §8): store-owned
+    /// materialization jobs. `[materialization]` table in
+    /// scheduler.toml. Env: `RIO_MATERIALIZATION__*` (nested keys —
+    /// double underscore). Phase A lands every mechanism dormant behind
+    /// `enabled = false`; Phase B turns it on.
+    pub materialization: MaterializationConfig,
     /// In-flight detached substitute-fetch task bound
     /// (r[sched.substitute.detached+5]) — memory-safety only; per-replica
     /// throttling is `r[store.substitute.admission]`. Sizes
@@ -145,6 +151,39 @@ impl Default for DashboardConfig {
     }
 }
 
+/// Substitution-replacement campaign (design §8): store-owned
+/// materialization jobs. Phase A lands every mechanism dormant behind
+/// `enabled = false`; Phase B turns it on. The deployment-ordering
+/// constraint (store executor flag first ON, last OFF — design §4/AS-6)
+/// is enforced by helm value structure, not here.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct MaterializationConfig {
+    /// Master switch for scheduler-side job creation, the kind-aware
+    /// pull-admission table, and materialization-outcome consumption.
+    /// false = the as-built substitution walk path runs unchanged.
+    pub enabled: bool,
+    /// Budget: `materialization_infra` rows (worker-reported AND
+    /// establishment-written — OQ1 amendment 1) per job before the job
+    /// parks (design §2.5). Never causes a fail-fast.
+    pub max_attempts: u32,
+    /// Park backoff base (seconds) after budget exhaustion.
+    pub park_backoff_base_secs: u64,
+    /// Park backoff cap (seconds).
+    pub park_backoff_cap_secs: u64,
+}
+
+impl Default for MaterializationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_attempts: 3,
+            park_backoff_base_secs: 30,
+            park_backoff_cap_secs: 900,
+        }
+    }
+}
+
 fn default_substitute_concurrency() -> usize {
     crate::DEFAULT_SUBSTITUTE_CONCURRENCY
 }
@@ -166,6 +205,7 @@ impl Default for Config {
             lease_namespace: None,
             poison: crate::PoisonConfig::default(),
             retry: crate::RetryPolicy::default(),
+            materialization: MaterializationConfig::default(),
             substitute_max_concurrent: default_substitute_concurrency(),
             dashboard: DashboardConfig::default(),
             sla: crate::sla::config::SlaConfig::defaults_baseline(),
@@ -314,6 +354,34 @@ impl rio_common::config::ValidateConfig for Config {
          (threshold=0 means is_poisoned() is always true — \
          every derivation poisons immediately)",
             cfg.poison.threshold
+        );
+        // Substitution-replacement materialization budget/backoff
+        // bounds. `max_attempts = 0` would park every job before its
+        // first attempt (the budget check is `count >= max`), and a
+        // zero backoff base makes a parked job instantly re-claimable
+        // (park becomes a hot-loop). The cap must not sit below the
+        // base — backoff_duration-style curves degenerate otherwise.
+        // All three checked even while `enabled = false` (Phase A's
+        // deployed state) so a bad value fails at config load, not at
+        // the Phase B flag flip.
+        anyhow::ensure!(
+            cfg.materialization.max_attempts >= 1,
+            "materialization.max_attempts must be >= 1, got {} \
+         (0 would park every job before its first attempt)",
+            cfg.materialization.max_attempts
+        );
+        anyhow::ensure!(
+            cfg.materialization.park_backoff_base_secs >= 1,
+            "materialization.park_backoff_base_secs must be >= 1, got {} \
+         (0 makes a parked job instantly re-claimable — park becomes a hot-loop)",
+            cfg.materialization.park_backoff_base_secs
+        );
+        anyhow::ensure!(
+            cfg.materialization.park_backoff_cap_secs >= cfg.materialization.park_backoff_base_secs,
+            "materialization.park_backoff_cap_secs must be >= park_backoff_base_secs \
+         (got cap={}, base={})",
+            cfg.materialization.park_backoff_cap_secs,
+            cfg.materialization.park_backoff_base_secs
         );
         // §13c-3: pass-1 only — the catalog is fetched in main.rs
         // AFTER config load; `validate_resolved()` runs there.

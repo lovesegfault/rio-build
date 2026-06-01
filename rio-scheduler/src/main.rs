@@ -284,6 +284,7 @@ async fn main() -> anyhow::Result<()> {
             substitute_max_concurrent: cfg.substitute_max_concurrent,
             sla: cfg.sla,
             establishment_report_slack: cfg.establishment_report_slack,
+            materialization: cfg.materialization,
             ..Default::default()
         },
         rio_scheduler::actor::DagActorPlumbing {
