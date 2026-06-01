@@ -13,9 +13,13 @@
 //! `--filter` exists for debugging a single check; a filtered run
 //! cannot distinguish cold from warm reads.
 
+pub mod dir_locks;
 pub mod errno_battery;
+pub mod io_paths;
 pub mod meta;
 pub mod read;
+pub mod write_attack;
+pub mod xattr_statx;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -24,7 +28,7 @@ use anyhow::Context as _;
 use nix::errno::Errno;
 use nix::unistd::{Gid, Uid, setegid, seteuid};
 
-use crate::manifest::Manifest;
+use crate::manifest::{FileSpec, Manifest};
 
 /// Everything a check needs: the mount under test, the oracle, and the
 /// probe identities.
@@ -45,6 +49,11 @@ pub struct Ctx {
     /// uid class a real build's processes map to on the host side).
     pub probe_uid: u32,
     pub probe_gid: u32,
+    /// A SECOND unprivileged uid/gid, distinct from `probe_uid`, for the
+    /// generic/088 DAC check — proves `default_permissions` enforcement
+    /// is not special-cased to the mount-owner uid.
+    pub second_uid: u32,
+    pub second_gid: u32,
 }
 
 impl Ctx {
@@ -71,7 +80,8 @@ pub struct Check {
 
 /// All checks, in execution order (cold-read sequencing, then
 /// privilege-dropping batteries, then the root-probe batteries, with
-/// the state-restoring write-through probe last).
+/// the state-restoring write-through and dirty-pipe page-cache probes
+/// last — they need the big blob warm in the passthrough page cache).
 pub fn registry() -> Vec<Check> {
     vec![
         Check {
@@ -101,7 +111,7 @@ pub fn registry() -> Vec<Check> {
         },
         Check {
             name: "generic_002_nlink_walk",
-            origin: "xfstests generic/002 (adapted)",
+            origin: "xfstests generic/002 (inverted: castore has no hardlinks, asserts nlink==1 — F-B)",
             run: meta::generic_002_nlink_walk,
         },
         Check {
@@ -126,8 +136,66 @@ pub fn registry() -> Vec<Check> {
         },
         Check {
             name: "generic_095_113_310_concurrency",
-            origin: "xfstests generic/095 + generic/113 + generic/310",
+            origin: "xfstests generic/095 + generic/310 + generic/113 (sync open/close legs only; no AIO)",
             run: read::generic_095_113_310_concurrency,
+        },
+        // mmap/splice/copy_file_range run after the big blob is warm
+        // (promoted to passthrough by the read-integrity check) so they
+        // exercise the passthrough backing fd, the production read path.
+        Check {
+            name: "generic_074_127_mmap_reads",
+            origin: "xfstests generic/074 + generic/127",
+            run: io_paths::generic_074_127_mmap_reads,
+        },
+        Check {
+            name: "generic_249_splice_read",
+            origin: "xfstests generic/249",
+            run: io_paths::generic_249_splice_read,
+        },
+        Check {
+            name: "generic_430_553_copy_file_range",
+            origin: "xfstests generic/430 + generic/553",
+            run: io_paths::generic_430_553_copy_file_range,
+        },
+        Check {
+            name: "generic_285_448_706_seek_hole_data",
+            origin: "xfstests generic/285 + generic/448 + generic/706",
+            run: io_paths::generic_285_448_706_seek_hole_data,
+        },
+        Check {
+            name: "generic_020_062_097_xattr_read_legs",
+            origin: "xfstests generic/020 + generic/062 + generic/097 (xattr read legs)",
+            run: xattr_statx::generic_020_062_097_xattr_read_legs,
+        },
+        Check {
+            name: "generic_423_statx_field_correctness",
+            origin: "xfstests generic/423",
+            run: xattr_statx::generic_423_statx_field_correctness,
+        },
+        Check {
+            name: "generic_532_statx_attributes_mask_sanity",
+            origin: "xfstests generic/532",
+            run: xattr_statx::generic_532_statx_attributes_mask_sanity,
+        },
+        Check {
+            name: "generic_471_rewinddir",
+            origin: "xfstests generic/471",
+            run: dir_locks::generic_471_rewinddir,
+        },
+        Check {
+            name: "generic_676_seekdir",
+            origin: "xfstests generic/676",
+            run: dir_locks::generic_676_seekdir,
+        },
+        Check {
+            name: "generic_088_second_uid_dac",
+            origin: "xfstests generic/088",
+            run: dir_locks::generic_088_second_uid_dac,
+        },
+        Check {
+            name: "generic_131_read_locks",
+            origin: "xfstests generic/131",
+            run: dir_locks::generic_131_read_locks,
         },
         Check {
             name: "generic_126_exec_access",
@@ -136,7 +204,7 @@ pub fn registry() -> Vec<Check> {
         },
         Check {
             name: "generic_050_write_protection_unprivileged",
-            origin: "xfstests generic/050 (adapted)",
+            origin: "xfstests generic/050 + generic/123 (adapted: unprivileged overwrite/append/delete/move all denied)",
             run: errno_battery::generic_050_write_protection_unprivileged,
         },
         Check {
@@ -156,8 +224,13 @@ pub fn registry() -> Vec<Check> {
         },
         Check {
             name: "statfs_zero_totals",
-            origin: "xfstests generic/361-adjacent (statfs sanity)",
+            origin: "castore-specific (statfs F-A pin; no upstream statfs-totals analogue)",
             run: errno_battery::statfs_zero_totals,
+        },
+        Check {
+            name: "generic_680_dirty_pipe",
+            origin: "xfstests generic/680 (CVE-2022-0847, Dirty Pipe)",
+            run: write_attack::generic_680_dirty_pipe,
         },
         Check {
             name: "write_through_passthrough_root",
@@ -197,6 +270,24 @@ pub fn resolve_dep_root(mount: &Path, manifest: &Manifest) -> anyhow::Result<Pat
 /// The errno of an `io::Error`, or `UnknownErrno` for non-OS errors.
 pub fn errno_of(e: &std::io::Error) -> Errno {
     Errno::from_raw(e.raw_os_error().unwrap_or(0))
+}
+
+/// First byte offset at which `actual` differs from `expected` (or the
+/// length difference if one is a prefix of the other).
+pub fn first_divergence(expected: &[u8], actual: &[u8]) -> Option<usize> {
+    let prefix_mismatch = expected.iter().zip(actual.iter()).position(|(a, b)| a != b);
+    let len_mismatch = (expected.len() != actual.len()).then_some(expected.len().min(actual.len()));
+    prefix_mismatch.or(len_mismatch)
+}
+
+/// A non-empty, non-executable input file (served 0444): the default
+/// probe target for read, lock, and xattr checks.
+pub fn readable_plain_file(ctx: &Ctx) -> anyhow::Result<&FileSpec> {
+    ctx.manifest
+        .files
+        .iter()
+        .find(|f| !f.executable && !f.content.is_empty())
+        .context("manifest has no non-empty plain file")
 }
 
 /// Assert `res` failed with one of `accepted`'s errnos; return which.

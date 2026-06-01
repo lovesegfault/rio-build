@@ -288,7 +288,8 @@ in
                 " --manifest ${manifest}"
                 " --cache-dir /var/rio/cache"
                 " --consumer-output /tmp/xfs-consumer.txt"
-                " --probe-uid 1000 --probe-gid 990",
+                " --probe-uid 1000 --probe-gid 990"
+                " --second-uid 1001 --second-gid 991",
                 timeout=None,
             )
             print(out)

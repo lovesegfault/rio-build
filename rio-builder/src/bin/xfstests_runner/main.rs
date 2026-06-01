@@ -68,6 +68,13 @@ struct Args {
     /// Unprivileged gid for the permission-enforcement probes.
     #[arg(long, default_value_t = 990)]
     probe_gid: u32,
+    /// A second unprivileged uid (distinct from `--probe-uid`) for the
+    /// generic/088 DAC check.
+    #[arg(long, default_value_t = 1001)]
+    second_uid: u32,
+    /// Gid paired with `--second-uid`.
+    #[arg(long, default_value_t = 991)]
+    second_gid: u32,
     /// Only run checks whose name contains this substring. Note that
     /// the full suite's order is load-bearing for cold-vs-warm read
     /// distinctions; filtered runs are for debugging.
@@ -102,6 +109,8 @@ fn main() -> anyhow::Result<ExitCode> {
         consumer_output: args.consumer_output,
         probe_uid: args.probe_uid,
         probe_gid: args.probe_gid,
+        second_uid: args.second_uid,
+        second_gid: args.second_gid,
     };
 
     let selected: Vec<_> = registry
