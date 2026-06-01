@@ -1148,3 +1148,171 @@ async fn flag_on_progress_relay_reaches_build_events() -> anyhow::Result<()> {
     assert_eq!(progress.upstream_uri, "https://cache.example.org");
     Ok(())
 }
+
+// ── T-1.9 (Phase B): the materialization-surface authentication sweep ──────
+
+/// The complete materialization RPC surface (PD-B18's four-row table).
+/// A future fifth surface is one variant + one match arm here — the
+/// sweep below then covers it automatically.
+#[derive(Debug, Clone, Copy)]
+enum MatSurface {
+    /// `PullAssignment` with kind=MATERIALIZATION (the claim arm).
+    PullAssignment,
+    /// `ReportOutcome` carrying a materialization_outcome payload.
+    ReportOutcome,
+    /// `ListMaterializationJobs` (the store poll).
+    ListJobs,
+    /// `ReportMaterializationProgress` (the BC-4 relay).
+    ReportProgress,
+}
+
+const ALL_MAT_SURFACES: [MatSurface; 4] = [
+    MatSurface::PullAssignment,
+    MatSurface::ReportOutcome,
+    MatSurface::ListJobs,
+    MatSurface::ReportProgress,
+];
+
+/// Issue one call against `surface`, optionally decorated with an
+/// executor token on the metadata carrier. Returns the call result
+/// (Ok = the surface answered; the answer's content is irrelevant to
+/// the authentication sweep).
+async fn call_mat_surface(
+    grpc: &SchedulerGrpc,
+    surface: MatSurface,
+    executor_token: Option<&str>,
+) -> Result<(), tonic::Status> {
+    use rio_proto::ExecutorService;
+    macro_rules! decorated {
+        ($inner:expr) => {{
+            let mut req = Request::new($inner);
+            if let Some(tok) = executor_token {
+                req.metadata_mut()
+                    .insert(rio_proto::EXECUTOR_TOKEN_HEADER, tok.parse().unwrap());
+            }
+            req
+        }};
+    }
+    match surface {
+        MatSurface::PullAssignment => grpc
+            .pull_assignment(decorated!(rio_proto::types::PullAssignmentRequest {
+                executor_token: String::new(),
+                intent_id: "sweep-drv".into(),
+                kind: rio_proto::types::AttemptKind::Materialization.into(),
+                executor_instance: "store-replica-0".into(),
+            }))
+            .await
+            .map(|_| ()),
+        MatSurface::ReportOutcome => grpc
+            .report_outcome(decorated!(rio_proto::types::ReportOutcomeRequest {
+                exec_id: uuid::Uuid::now_v7().to_string(),
+                report: None,
+                materialization_outcome: Some(mat_success_outcome()),
+            }))
+            .await
+            .map(|_| ()),
+        MatSurface::ListJobs => grpc
+            .list_materialization_jobs(decorated!(
+                rio_proto::types::ListMaterializationJobsRequest {
+                    service_token: String::new(),
+                    limit: 16,
+                }
+            ))
+            .await
+            .map(|_| ()),
+        MatSurface::ReportProgress => grpc
+            .report_materialization_progress(decorated!(
+                rio_proto::types::ReportMaterializationProgressRequest {
+                    exec_id: uuid::Uuid::now_v7().to_string(),
+                    bytes_done: 1,
+                    bytes_expected: 2,
+                    upstream_uri: String::new(),
+                }
+            ))
+            .await
+            .map(|_| ()),
+    }
+}
+
+// r[verify sched.materialize.job]
+// r[verify sec.executor.identity-token+2]
+/// T-1.9 / PD-B18: the materialization-surface authentication sweep —
+/// the cross-surface structural pin that catches the NEXT handler
+/// added or completed without the store-credential gate (the
+/// `21955a450` class: ReportMaterializationProgress shipped its Phase A
+/// stub without the gate and was closed by a post-integration fix
+/// instead of CI).
+///
+/// Enforced posture (both key families configured): every surface ×
+///   {no credential}    → Unauthenticated  (closed by default)
+///   {executor token}   → PermissionDenied (the per-intent builder
+///                         credential never authorizes the
+///                         materialization work class)
+/// Dev mode (neither key family): every surface stays open — the
+/// documented uniform exception.
+#[tokio::test]
+async fn materialization_surface_rejects_unauthenticated_and_executor_credentials()
+-> anyhow::Result<()> {
+    use rio_auth::hmac::{ExecutorClaims, HmacKey};
+
+    // ── The enforced posture: BOTH key families, distinct keys. ──
+    let (_db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    let executor_key = std::sync::Arc::new(HmacKey::from_key(
+        b"executor-key-32-bytes-long!!!!!!".to_vec(),
+    ));
+    let service_key = std::sync::Arc::new(HmacKey::from_key(
+        b"service-key-32-bytes-long-here!!".to_vec(),
+    ));
+    grpc.hmac_key = Some(std::sync::Arc::clone(&executor_key));
+    grpc.service_verifier = Some(service_key);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let executor_token = executor_key.sign(&ExecutorClaims {
+        intent_id: "sweep-drv".into(),
+        kind: rio_proto::types::ExecutorKind::Builder as i32,
+        expiry_unix: now + 600,
+    });
+
+    for surface in ALL_MAT_SURFACES {
+        // (a) Credential-less → Unauthenticated (closed).
+        let err = call_mat_surface(&grpc, surface, None)
+            .await
+            .expect_err(&format!(
+                "{surface:?}: a credential-less call must be rejected in the enforced posture"
+            ));
+        assert_eq!(
+            err.code(),
+            tonic::Code::Unauthenticated,
+            "{surface:?}: credential-less → Unauthenticated, got {err:?}"
+        );
+
+        // (b) A valid EXECUTOR token (the per-intent builder credential)
+        //     → PermissionDenied (never authorizes the materialization
+        //     work class, on any surface).
+        let err = call_mat_surface(&grpc, surface, Some(&executor_token))
+            .await
+            .expect_err(&format!(
+                "{surface:?}: an executor token must never authorize materialization operations"
+            ));
+        assert_eq!(
+            err.code(),
+            tonic::Code::PermissionDenied,
+            "{surface:?}: executor token → PermissionDenied, got {err:?}"
+        );
+    }
+
+    // ── Dev mode (neither key family): every surface stays open. ──
+    let (_db2, grpc2, _handle2, _actor_task2) = setup_grpc().await;
+    for surface in ALL_MAT_SURFACES {
+        call_mat_surface(&grpc2, surface, None)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{surface:?}: full dev mode must stay open (the uniform exception), got {e:?}"
+                )
+            });
+    }
+    Ok(())
+}
