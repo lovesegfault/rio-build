@@ -555,6 +555,23 @@ hand-rolled walk can reintroduce the hang.
   scheduler and uploaded to the store with their content-address descriptor.
 ]
 
+#r("builder.exec.declared-path-validated")[
+  The request glue MUST reject any non-empty declared output path that does
+  not parse as a store path, and every host-side filesystem join over an
+  output location MUST use the basename computed from the parsed store path
+  at planning time — never a re-derivation from the raw declared string.
+]
+
+Defense in depth under #rref("sec.trust.workers-untrusted"): the
+authoritative rejection is the gateway's binding gate
+(#rref("gw.reject.output-path-mismatch+2")) and the scheduler's ingress shape
+check (#rref("sched.merge.ingress-output-path-shape")); a malformed
+declaration reaching the worker means both were bypassed. The planning-time
+invariant matters because the joins run in the builder's root context against
+the overlay upper store — with a raw-string fallback, a declared "path" like
+`/build/exfil` would strip to itself and the join would escape the upper
+store entirely (an absolute path replaces the join target).
+
 == Sandbox process-tree lifecycle
 
 The executor forks twice (parent → intermediate → sandbox child) and

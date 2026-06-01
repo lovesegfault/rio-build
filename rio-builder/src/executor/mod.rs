@@ -1327,14 +1327,16 @@ async fn run_native_lifecycle(
                     let to_process: Vec<native_result::OutputToProcess> = prepared
                         .outputs
                         .iter()
-                        .map(|po| {
-                            let basename =
-                                rio_nix::store_path::basename(&po.path).unwrap_or(po.path.as_str());
-                            native_result::OutputToProcess {
-                                name: po.name.clone(),
-                                store_path: po.path.clone(),
-                                host_path: overlay_mount.upper_store().join(basename),
-                            }
+                        .map(|po| native_result::OutputToProcess {
+                            name: po.name.clone(),
+                            store_path: po.path.clone(),
+                            // po.basename was computed from the PARSED
+                            // store path at planning time (plan_outputs
+                            // rejects non-store-path declarations), so
+                            // this join can never receive a
+                            // tenant-controlled arbitrary string.
+                            // r[impl builder.exec.declared-path-validated]
+                            host_path: overlay_mount.upper_store().join(&po.basename),
                         })
                         .collect();
                     let drv_owned = drv.clone();

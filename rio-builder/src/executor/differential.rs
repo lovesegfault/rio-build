@@ -189,7 +189,13 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
             .with_context(|| format!("chowning {} to the sandbox user", d.display()))?;
     }
     for p in &closure_paths {
-        let dest = store_dir.join(basename(p).unwrap_or(p.as_str()));
+        // Closure paths come from validated input metadata, but the join
+        // still requires a real store basename — a path that fails to
+        // strip the store prefix would otherwise be joined as-is (an
+        // absolute path replaces the join target entirely).
+        let dest = store_dir.join(
+            basename(p).with_context(|| format!("input closure path {p} is not a store path"))?,
+        );
         if !dest.exists() {
             let st = Command::new("cp")
                 .arg("-a")
@@ -322,7 +328,10 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
         .map(|po| OutputToProcess {
             name: po.name.clone(),
             store_path: po.path.clone(),
-            host_path: store_dir.join(basename(&po.path).unwrap_or(po.path.as_str())),
+            // Planning-time validated basename — same invariant as the
+            // production executor path.
+            // r[impl builder.exec.declared-path-validated]
+            host_path: store_dir.join(&po.basename),
         })
         .collect();
 

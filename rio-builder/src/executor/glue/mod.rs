@@ -149,6 +149,20 @@ pub(crate) enum GlueError {
     #[error("derivation path {path} is not a valid store path: {message}")]
     BadDerivationPath { path: String, message: String },
 
+    /// A non-empty declared output path that does not parse as a store
+    /// path. Defense-in-depth under `sec.trust.workers-untrusted`: the
+    /// gateway's binding gate (`gw.reject.output-path-mismatch+2`) is the
+    /// authoritative rejection, and the scheduler shape-checks
+    /// `expected_output_paths` too — a malformed path reaching the worker
+    /// means both were bypassed. Rejecting it here keeps tenant-controlled
+    /// non-store-path strings out of every host-side filesystem join.
+    #[error("output `{output}` declares path {path:?}, which is not a valid store path: {message}")]
+    MalformedOutputPath {
+        output: String,
+        path: String,
+        message: String,
+    },
+
     #[error("builtin:fetchurl derivation has no (non-empty) `url` attribute")]
     FetchurlMissingUrl,
 
@@ -309,6 +323,12 @@ pub(crate) struct PlannedOutput {
     /// the deterministic scratch path for floating-CA outputs (which
     /// the result glue rewrites to the final content-addressed path).
     pub path: String,
+    /// Store basename of `path` (`{hash}-{name}`), computed exactly once
+    /// from the PARSED store path at planning time. Every host-side
+    /// filesystem join uses this field — never a re-derivation from the
+    /// raw string — so a non-store-path declaration can never reach a
+    /// `Path::join` (it is rejected before a `PlannedOutput` exists).
+    pub basename: String,
     pub floating_ca: bool,
 }
 
@@ -665,8 +685,25 @@ fn plan_outputs(
     let mut rewrites = BTreeMap::new();
     let mut outputs = Vec::with_capacity(drv.outputs().len());
     for o in drv.outputs() {
-        let (path, floating) = if !o.path().is_empty() {
-            (o.path().to_owned(), false)
+        let (path, basename, floating) = if !o.path().is_empty() {
+            // Declared (input-addressed / fixed-output) path: must parse
+            // as a store path. Defense-in-depth under
+            // sec.trust.workers-untrusted — the gateway rejects these at
+            // submission (gw.reject.output-path-mismatch+2) and the
+            // scheduler shape-checks expected_output_paths; a malformed
+            // declaration reaching this point means both gates were
+            // bypassed. The basename it yields feeds host-side
+            // filesystem joins, so it is computed from the PARSED path
+            // only.
+            // r[impl builder.exec.declared-path-validated]
+            let sp = store_path::StorePath::parse(o.path()).map_err(|e| {
+                GlueError::MalformedOutputPath {
+                    output: o.name().to_owned(),
+                    path: o.path().to_owned(),
+                    message: e.to_string(),
+                }
+            })?;
+            (o.path().to_owned(), sp.basename().to_owned(), false)
         } else if o.has_hash_algo() {
             let drv_sp = match &parsed_drv_path {
                 Some(p) => p,
@@ -689,7 +726,8 @@ fn plan_outputs(
                     path: drv_path.to_owned(),
                     message: e.to_string(),
                 })?;
-            (scratch.as_str().to_owned(), true)
+            let scratch_basename = scratch.basename().to_owned();
+            (scratch.as_str().to_owned(), scratch_basename, true)
         } else {
             return Err(GlueError::MissingOutputPath {
                 output: o.name().to_owned(),
@@ -699,6 +737,7 @@ fn plan_outputs(
         outputs.push(PlannedOutput {
             name: o.name().to_owned(),
             path,
+            basename,
             floating_ca: floating,
         });
     }
@@ -1116,6 +1155,64 @@ mod tests {
         // Deterministic.
         let again = prepare(&ca);
         assert_eq!(again.outputs[0].path, out.path);
+    }
+
+    /// Non-store-path declared output paths are rejected at planning time —
+    /// these are exactly the shapes that would survive rio-exec's
+    /// writable-mount validation but escape the overlay upper store via a
+    /// raw-string `Path::join` (an absolute path replaces the join target).
+    /// Defense-in-depth; the gateway and scheduler gates are authoritative.
+    // r[verify builder.exec.declared-path-validated]
+    #[test]
+    fn plan_outputs_rejects_malformed_declared_path() {
+        for bad in ["/build/exfil", "/nix/store", "/nix/store/zzz-evil"] {
+            let drv = mk_drv(
+                vec![DerivationOutput::new("out", bad, "", "").unwrap()],
+                &[("name", "demo"), ("out", bad)],
+            );
+            let (input_paths, input_meta) = closure();
+            let err =
+                derivation_into_request(DRV, &drv, &input_paths, &input_meta, &paths(), &opts())
+                    .unwrap_err();
+            assert!(
+                matches!(err, GlueError::MalformedOutputPath { .. }),
+                "path {bad:?} must be rejected as malformed, got: {err}"
+            );
+        }
+    }
+
+    /// Every PlannedOutput's basename comes from the PARSED store path —
+    /// declared (IA) and scratch (floating-CA) alike — so host-side joins
+    /// never re-derive it from the raw string.
+    // r[verify builder.exec.declared-path-validated]
+    #[test]
+    fn planned_outputs_carry_store_basenames() {
+        // Input-addressed: basename of the declared path.
+        let prepared = prepare(&ia_drv());
+        let out = &prepared.outputs[0];
+        assert_eq!(out.basename, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-demo");
+        assert_eq!(format!("/nix/store/{}", out.basename), out.path);
+
+        // Floating-CA: basename of the scratch path.
+        let ca = mk_drv(
+            vec![DerivationOutput::new("out", "", "r:sha256", "").unwrap()],
+            &[("name", "demo"), ("out", &hash_placeholder("out"))],
+        );
+        let prepared_ca = prepare(&ca);
+        let ca_out = &prepared_ca.outputs[0];
+        assert_eq!(format!("/nix/store/{}", ca_out.basename), ca_out.path);
+        assert!(ca_out.basename.ends_with("-demo"));
+
+        // Fixed-output: basename of the declared (hash-derived) path.
+        let zeros = "00".repeat(32);
+        let fod_out = fod_path("sha256", &zeros);
+        let fod = mk_drv(
+            vec![DerivationOutput::new("out", fod_out.as_str(), "sha256", zeros.as_str()).unwrap()],
+            &[("name", "demo"), ("out", fod_out.as_str())],
+        );
+        let prepared_fod = prepare(&fod);
+        let f_out = &prepared_fod.outputs[0];
+        assert_eq!(format!("/nix/store/{}", f_out.basename), f_out.path);
     }
 
     #[test]
