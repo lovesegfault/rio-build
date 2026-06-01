@@ -605,7 +605,8 @@ mod tests {
                 err.to_string().contains("impureEnvVars"),
                 "error names the attribute: {err}"
             );
-            assert!(!err.is_transient_io(), "wrong types are permanent");
+            // Permanence is structural: GlueError carries no transient
+            // class at all (builder.glue.pure).
         }
         // Malformed __json on a FOD errors too (the read is
         // fail-closed, not best-effort).

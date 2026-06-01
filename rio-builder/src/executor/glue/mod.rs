@@ -85,18 +85,6 @@ pub(crate) enum GlueError {
     #[error("exportReferencesGraph: cannot read derivation {path} for closure expansion: {reason}")]
     ExportRefsDrvUnreadable { path: String, reason: String },
 
-    /// Transient I/O failure reading a `.drv` from the materialized
-    /// input store (FUSE/JIT-fetch hiccup, EIO, missing materialization).
-    /// Unlike [`GlueError::ExportRefsDrvUnreadable`] — which covers
-    /// structural problems with the derivation itself (unparseable text,
-    /// no store available to the caller) — this is a property of the
-    /// worker's input materialization, so the executor classifies it as
-    /// infra-transient and the build is retried instead of being
-    /// rejected (the same bucket as a bind-mount materialization
-    /// failure).
-    #[error("exportReferencesGraph: I/O error reading derivation {path}: {reason}")]
-    ExportRefsDrvIo { path: String, reason: String },
-
     #[error(
         "exportReferencesGraph: cannot expand {drv}: output `{output}` has no statically-known \
          store path (content-addressed derivations are not supported here, matching Nix)"
@@ -276,22 +264,7 @@ pub(crate) enum GlueError {
     InvalidRequest(String),
 }
 
-impl GlueError {
-    /// `true` for failures that are properties of this worker's input
-    /// materialization (transient I/O while reading materialized inputs)
-    /// rather than of the derivation. The executor maps these to its
-    /// infra-transient bucket so the build is retried elsewhere instead
-    /// of being permanently rejected.
-    ///
-    /// This set MUST NOT be widened to cover structural metadata problems
-    /// — in particular [`GlueError::ExportRefsCyclicMetadata`]: cyclic
-    /// metadata is identical on every worker, so transient classification
-    /// would turn one hostile registration into an unbounded retry storm
-    /// (the exact failure mode the cycle rejection exists to prevent).
-    pub(crate) fn is_transient_io(&self) -> bool {
-        matches!(self, GlueError::ExportRefsDrvIo { .. })
-    }
-}
+impl GlueError {}
 
 /// Host-side directories backing the sandbox's writable mounts.
 pub(crate) struct SandboxPaths {
@@ -402,6 +375,7 @@ pub(crate) fn derivation_into_request(
     drv: &BasicDerivation,
     input_paths: &[String],
     input_metadata: &[ValidatedPathInfo],
+    graph_drvs: &std::collections::BTreeMap<String, String>,
     paths: &SandboxPaths,
     opts: &SandboxOptions,
 ) -> Result<GluePlan, GlueError> {
@@ -441,8 +415,7 @@ pub(crate) fn derivation_into_request(
     let env::BuilderEnv { env, passed_files } = env::build_env(drv, &input_rewrites, &env_opts)?;
 
     // ---- inline files ---------------------------------------------------
-    let closure =
-        ClosureIndex::new(input_metadata, input_paths).with_store_dir(&paths.merged_store);
+    let closure = ClosureIndex::new(input_metadata, input_paths).with_drv_table(graph_drvs);
     let mut inline_files: Vec<InlineFile> = Vec::new();
 
     for pf in passed_files {
@@ -918,6 +891,10 @@ mod tests {
         }
     }
 
+    fn drv_table() -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::new()
+    }
+
     fn paths() -> SandboxPaths {
         SandboxPaths {
             build_dir: PathBuf::from("/host/builds/b1/build"),
@@ -957,8 +934,16 @@ mod tests {
 
     fn prepare(drv: &BasicDerivation) -> PreparedBuild {
         let (input_paths, input_meta) = closure();
-        match derivation_into_request(DRV, drv, &input_paths, &input_meta, &paths(), &opts())
-            .expect("glue should succeed")
+        match derivation_into_request(
+            DRV,
+            drv,
+            &input_paths,
+            &input_meta,
+            &drv_table(),
+            &paths(),
+            &opts(),
+        )
+        .expect("glue should succeed")
         {
             GluePlan::Sandbox(p) => *p,
             GluePlan::BuiltinFetchurl(_) => panic!("not a builtin"),
@@ -1134,9 +1119,16 @@ mod tests {
                 &[("name", "demo"), ("out", OUT)],
             );
             let (input_paths, input_meta) = closure();
-            let err =
-                derivation_into_request(DRV, &drv, &input_paths, &input_meta, &paths(), &opts())
-                    .unwrap_err();
+            let err = derivation_into_request(
+                DRV,
+                &drv,
+                &input_paths,
+                &input_meta,
+                &drv_table(),
+                &paths(),
+                &opts(),
+            )
+            .unwrap_err();
             match err {
                 GlueError::FixedOutputPathMismatch {
                     declared, expected, ..
@@ -1193,8 +1185,16 @@ mod tests {
             &[("name", "demo"), ("out", OUT)],
         );
         let (input_paths, input_meta) = closure();
-        let err = derivation_into_request(DRV, &drv, &input_paths, &input_meta, &paths(), &opts())
-            .unwrap_err();
+        let err = derivation_into_request(
+            DRV,
+            &drv,
+            &input_paths,
+            &input_meta,
+            &drv_table(),
+            &paths(),
+            &opts(),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, GlueError::FixedOutputHashInvalid { .. }),
             "got: {err}"
@@ -1214,8 +1214,16 @@ mod tests {
             &[("name", "demo")],
         );
         let (input_paths, input_meta) = closure();
-        let err = derivation_into_request(DRV, &drv, &input_paths, &input_meta, &paths(), &opts())
-            .unwrap_err();
+        let err = derivation_into_request(
+            DRV,
+            &drv,
+            &input_paths,
+            &input_meta,
+            &drv_table(),
+            &paths(),
+            &opts(),
+        )
+        .unwrap_err();
         match err {
             GlueError::FixedOutputBadShape { reason } => {
                 assert!(reason.contains("cannot be mixed"), "{reason}")
@@ -1245,9 +1253,16 @@ mod tests {
                 ("lib", OUT),
             ],
         );
-        let err =
-            derivation_into_request(DRV, &mixed, &input_paths, &input_meta, &paths(), &opts())
-                .unwrap_err();
+        let err = derivation_into_request(
+            DRV,
+            &mixed,
+            &input_paths,
+            &input_meta,
+            &drv_table(),
+            &paths(),
+            &opts(),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, GlueError::MixedOutputTypes { .. }),
             "mixed floating-CA + IA must be rejected, got: {err}"
@@ -1276,6 +1291,7 @@ mod tests {
                 &all_floating,
                 &input_paths,
                 &input_meta,
+                &drv_table(),
                 &paths(),
                 &opts()
             )
@@ -1291,8 +1307,16 @@ mod tests {
             &[("name", "demo"), ("out", fod_out.as_str())],
         );
         assert!(
-            derivation_into_request(DRV, &fod, &input_paths, &input_meta, &paths(), &opts())
-                .is_ok(),
+            derivation_into_request(
+                DRV,
+                &fod,
+                &input_paths,
+                &input_meta,
+                &drv_table(),
+                &paths(),
+                &opts()
+            )
+            .is_ok(),
             "single fixed-output derivations keep planning"
         );
     }
@@ -1322,8 +1346,16 @@ mod tests {
             &[("name", "demo")],
         );
         let (input_paths, input_meta) = closure();
-        let err = derivation_into_request(DRV, &drv, &input_paths, &input_meta, &paths(), &opts())
-            .unwrap_err();
+        let err = derivation_into_request(
+            DRV,
+            &drv,
+            &input_paths,
+            &input_meta,
+            &drv_table(),
+            &paths(),
+            &opts(),
+        )
+        .unwrap_err();
         match err {
             GlueError::FixedOutputBadShape { reason } => {
                 assert!(reason.contains("only one fixed output"), "{reason}")
@@ -1341,8 +1373,16 @@ mod tests {
             &[("name", "demo")],
         );
         let (input_paths, input_meta) = closure();
-        let err = derivation_into_request(DRV, &drv, &input_paths, &input_meta, &paths(), &opts())
-            .unwrap_err();
+        let err = derivation_into_request(
+            DRV,
+            &drv,
+            &input_paths,
+            &input_meta,
+            &drv_table(),
+            &paths(),
+            &opts(),
+        )
+        .unwrap_err();
         match err {
             GlueError::FixedOutputBadShape { reason } => {
                 assert!(reason.contains("named \"out\""), "{reason}")
@@ -1395,9 +1435,16 @@ mod tests {
                 &[("name", "demo"), ("out", bad)],
             );
             let (input_paths, input_meta) = closure();
-            let err =
-                derivation_into_request(DRV, &drv, &input_paths, &input_meta, &paths(), &opts())
-                    .unwrap_err();
+            let err = derivation_into_request(
+                DRV,
+                &drv,
+                &input_paths,
+                &input_meta,
+                &drv_table(),
+                &paths(),
+                &opts(),
+            )
+            .unwrap_err();
             assert!(
                 matches!(err, GlueError::MalformedOutputPath { .. }),
                 "path {bad:?} must be rejected as malformed, got: {err}"
@@ -1456,8 +1503,16 @@ mod tests {
         )
         .unwrap();
         let (input_paths, input_meta) = closure();
-        let plan = derivation_into_request(DRV, &drv, &input_paths, &input_meta, &paths(), &opts())
-            .unwrap();
+        let plan = derivation_into_request(
+            DRV,
+            &drv,
+            &input_paths,
+            &input_meta,
+            &drv_table(),
+            &paths(),
+            &opts(),
+        )
+        .unwrap();
         let GluePlan::BuiltinFetchurl(prepared) = plan else {
             panic!("builtin:fetchurl must dispatch to the re-exec path");
         };
@@ -1480,9 +1535,16 @@ mod tests {
             BTreeMap::new(),
         )
         .unwrap();
-        let err =
-            derivation_into_request(DRV, &other, &input_paths, &input_meta, &paths(), &opts())
-                .unwrap_err();
+        let err = derivation_into_request(
+            DRV,
+            &other,
+            &input_paths,
+            &input_meta,
+            &drv_table(),
+            &paths(),
+            &opts(),
+        )
+        .unwrap_err();
         assert!(matches!(err, GlueError::UnsupportedBuiltin { .. }));
     }
 
@@ -1505,8 +1567,16 @@ mod tests {
         )
         .unwrap();
         let (input_paths, input_meta) = closure();
-        let err = derivation_into_request(DRV, &drv, &input_paths, &input_meta, &paths(), &opts())
-            .unwrap_err();
+        let err = derivation_into_request(
+            DRV,
+            &drv,
+            &input_paths,
+            &input_meta,
+            &drv_table(),
+            &paths(),
+            &opts(),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, GlueError::BuiltinFetchurlNotFixedOutput),
             "expected the fixed-output gate, got: {err}"

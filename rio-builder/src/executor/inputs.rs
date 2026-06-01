@@ -317,10 +317,15 @@ pub(super) async fn prefetch_manifests(
 pub(super) async fn fetch_drv_from_store(
     store_client: &mut StoreServiceClient<Channel>,
     drv_path: &str,
-) -> Result<Derivation, ExecutorError> {
+) -> Result<(Derivation, String), ExecutorError> {
     // .drv files are small (KB range), but wrap in stream timeout: this is
     // the first gRPC call after setup_overlay, so a stalled store would hang
     // the build with an overlay mount held indefinitely.
+    //
+    // Returns the parsed derivation AND its ATerm text: the text feeds
+    // the request glue's graph-derivation table (the glue itself holds
+    // no filesystem capability — every input byte arrives as a
+    // parameter resolved here, at the resolve step).
     let result = rio_proto::client::get_path_nar(
         store_client,
         drv_path,
@@ -345,9 +350,68 @@ pub(super) async fn fetch_drv_from_store(
         });
     };
 
-    Derivation::parse_from_nar(&nar_data).map_err(|e| {
-        ExecutorError::InvalidDerivation(format!("failed to parse .drv from NAR: {e}"))
-    })
+    let bytes = rio_nix::nar::extract_single_file(&nar_data).map_err(|e| {
+        ExecutorError::InvalidDerivation(format!("failed to extract .drv from NAR: {e}"))
+    })?;
+    let text = String::from_utf8(bytes).map_err(|e| {
+        ExecutorError::InvalidDerivation(format!(".drv content is not valid UTF-8: {e}"))
+    })?;
+    let drv = Derivation::parse(&text)
+        .map_err(|e| ExecutorError::InvalidDerivation(format!("failed to parse .drv: {e}")))?;
+    Ok((drv, text))
+}
+
+/// Assemble the request glue's graph-derivation table: ATerm text for
+/// every `.drv` in the build's input closure, keyed by store path.
+///
+/// Zero double-fetch by construction: the main derivation's text and
+/// every input `.drv`'s text are retained from fetches that already
+/// happened (`execute_build` step 1, the `resolve_inputs` input-drv
+/// loop); only RESIDUAL closure members ending in `.drv` covered by
+/// neither — typically none — are fetched here, deadline-bounded and
+/// cancellable through the same `get_path_nar` machinery.
+///
+/// Failures are worker-local input-materialization faults
+/// (`MetadataFetch` → `InfrastructureFailure` → scheduler re-dispatch),
+/// never glue rejections: by the time the glue runs, every byte it can
+/// ask for is already in this table.
+// r[impl builder.result.input-materialization-is-infra+4]
+pub(super) async fn prefetch_graph_drvs(
+    store_client: &StoreServiceClient<Channel>,
+    main_drv_path: &str,
+    main_drv_text: &str,
+    mut table: std::collections::BTreeMap<String, String>,
+    input_paths: &[String],
+) -> Result<std::collections::BTreeMap<String, String>, ExecutorError> {
+    use futures_util::stream::{StreamExt as _, TryStreamExt as _};
+
+    table.insert(main_drv_path.to_owned(), main_drv_text.to_owned());
+
+    let residual: Vec<String> = input_paths
+        .iter()
+        .filter(|p| p.ends_with(".drv") && !table.contains_key(p.as_str()))
+        .cloned()
+        .collect();
+    if residual.is_empty() {
+        return Ok(table);
+    }
+    tracing::debug!(
+        n_residual = residual.len(),
+        "prefetching residual closure .drv texts for the request glue"
+    );
+    let fetched: Vec<(String, String)> = futures_util::stream::iter(residual)
+        .map(|path| {
+            let mut client = store_client.clone();
+            async move {
+                let (_, text) = fetch_drv_from_store(&mut client, &path).await?;
+                Ok::<_, ExecutorError>((path, text))
+            }
+        })
+        .buffer_unordered(super::MAX_PARALLEL_FETCHES)
+        .try_collect()
+        .await?;
+    table.extend(fetched);
+    Ok(table)
 }
 
 /// Compute the input closure for a derivation by querying the store.
@@ -1168,7 +1232,7 @@ mod tests {
         let drv_path = tp("test.drv");
         store.seed(make_path_info(&drv_path, &nar, hash), nar);
 
-        let drv = fetch_drv_from_store(&mut client, &drv_path)
+        let (drv, _text) = fetch_drv_from_store(&mut client, &drv_path)
             .await
             .expect("fetch + parse should succeed");
 
@@ -1195,6 +1259,72 @@ mod tests {
         Ok(())
     }
 
+    /// No double-fetch by construction: a table that already covers
+    /// every closure `.drv` (retained from the input-drv loop + the
+    /// main text) makes prefetch_graph_drvs a pure merge — proven by
+    /// running it against a store where any fetch would 404.
+    #[tokio::test]
+    async fn prefetch_graph_drvs_skips_already_fetched() -> anyhow::Result<()> {
+        let (_store, client) = spawn_and_connect().await?; // EMPTY store
+        let main_drv = tp("main.drv");
+        let dep_drv = tp("dep.drv");
+        let mut table = std::collections::BTreeMap::new();
+        table.insert(dep_drv.clone(), "Derive-dep".to_owned());
+
+        let input_paths = vec![main_drv.clone(), dep_drv.clone(), tp("plain-src")];
+        let table =
+            prefetch_graph_drvs(&client, &main_drv, "Derive-main", table, &input_paths).await?;
+        assert_eq!(
+            table.get(&main_drv).map(String::as_str),
+            Some("Derive-main")
+        );
+        assert_eq!(table.get(&dep_drv).map(String::as_str), Some("Derive-dep"));
+        assert_eq!(table.len(), 2, "non-.drv closure members are not fetched");
+        Ok(())
+    }
+
+    /// A residual closure `.drv` the table does not cover is fetched;
+    /// a store failure there is a MetadataFetch infrastructure fault
+    /// (the resolve-step classification — never a glue rejection).
+    // r[verify builder.result.input-materialization-is-infra+4]
+    #[tokio::test]
+    async fn prefetch_graph_drvs_residual_fetch_and_error_classification() -> anyhow::Result<()> {
+        let (store, client) = spawn_and_connect().await?;
+        let main_drv = tp("main.drv");
+        let residual = tp("residual.drv");
+        let aterm = r#"Derive([("out","/nix/store/llllllllllllllllllllllllllllllll-r","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
+        let (nar, hash) = make_nar(aterm.as_bytes());
+        store.seed(make_path_info(&residual, &nar, hash), nar);
+
+        // Covered residual: fetched into the table.
+        let table = prefetch_graph_drvs(
+            &client,
+            &main_drv,
+            "Derive-main",
+            std::collections::BTreeMap::new(),
+            std::slice::from_ref(&residual),
+        )
+        .await?;
+        assert_eq!(table.get(&residual).map(String::as_str), Some(aterm));
+
+        // Missing residual: MetadataFetch (infra), not InvalidDerivation.
+        let missing = tp("missing.drv");
+        let err = prefetch_graph_drvs(
+            &client,
+            &main_drv,
+            "Derive-main",
+            std::collections::BTreeMap::new(),
+            std::slice::from_ref(&missing),
+        )
+        .await
+        .expect_err("missing residual .drv must fail the resolve step");
+        assert!(
+            matches!(err, ExecutorError::MetadataFetch { ref path, .. } if *path == missing),
+            "got: {err}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_fetch_drv_from_store_bad_nar() -> anyhow::Result<()> {
         let (store, mut client) = spawn_and_connect().await?;
@@ -1209,7 +1339,7 @@ mod tests {
 
         assert!(matches!(err, ExecutorError::InvalidDerivation(_)));
         assert!(
-            err.to_string().contains("failed to parse .drv from NAR"),
+            err.to_string().contains("failed to extract .drv from NAR"),
             "got: {err}"
         );
         Ok(())

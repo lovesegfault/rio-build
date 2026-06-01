@@ -225,6 +225,23 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
     }
 
     // ---- Glue: derivation → ExecutionRequest -----------------------------
+    // The glue holds no filesystem capability (`builder.glue.pure`):
+    // the harness assembles the derivation-text table itself from the
+    // inputs it just materialized (driver-side std::fs is fine — this
+    // IS the resolve step here), mirroring what the executor's input
+    // resolution does in production.
+    let mut graph_drvs: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    graph_drvs.insert(drv_path_str.clone(), drv_text.clone());
+    for p in &closure_paths {
+        if !p.ends_with(".drv") || graph_drvs.contains_key(p) {
+            continue;
+        }
+        let host = store_dir.join(basename(p).context("closure .drv basename")?);
+        let text = std::fs::read_to_string(&host)
+            .with_context(|| format!("reading materialized input drv {}", host.display()))?;
+        graph_drvs.insert(p.clone(), text);
+    }
     let basic = BasicDerivation::from_resolved(&drv, resolved_inputs.iter().cloned());
     let paths = SandboxPaths {
         build_dir: build_dir.clone(),
@@ -270,6 +287,7 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
         &basic,
         &closure_paths,
         &input_metadata,
+        &graph_drvs,
         &paths,
         &opts,
     ) {

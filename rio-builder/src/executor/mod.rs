@@ -509,7 +509,7 @@ pub async fn execute_build(
     // 1. Parse the derivation. Scheduler inlines drv_content for
     // missing-output nodes; empty means cache-hit or
     // inline-budget exceeded, so fall back to store fetch.
-    let drv = if assignment.drv_content.is_empty() {
+    let (drv, drv_text) = if assignment.drv_content.is_empty() {
         match fetch_drv_from_store(store_client, drv_path).await {
             Ok(d) => d,
             Err(e) => return ExecuteOutcome::pre_cgroup(e, first_line),
@@ -526,9 +526,11 @@ pub async fn execute_build(
                 ExecutorError::InvalidDerivation(format!("drv content is not valid UTF-8: {e}"))
             })
             .and_then(|t| {
-                Derivation::parse(t).map_err(|e| {
-                    ExecutorError::InvalidDerivation(format!("failed to parse derivation: {e}"))
-                })
+                Derivation::parse(t)
+                    .map(|d| (d, t.to_owned()))
+                    .map_err(|e| {
+                        ExecutorError::InvalidDerivation(format!("failed to parse derivation: {e}"))
+                    })
             });
         match parsed {
             Ok(d) => d,
@@ -677,7 +679,8 @@ pub async fn execute_build(
                 input_paths,
                 input_sized,
                 input_metadata,
-            } = resolve_inputs(&*store_client, &drv, drv_path).await?;
+                graph_drvs,
+            } = resolve_inputs(&*store_client, &drv, drv_path, &drv_text).await?;
 
             // r[impl builder.cores.cgroup-clamp+3]
             // Compute once: feeds the assignment-clamped `build_cores`
@@ -777,6 +780,7 @@ pub async fn execute_build(
                 opts,
                 is_fod,
                 log_tx,
+                graph_drvs: &graph_drvs,
             })
             .await?;
 
@@ -1043,6 +1047,7 @@ struct NativeLifecycleArgs<'a> {
     opts: BuildOpts,
     is_fod: bool,
     log_tx: &'a crate::log_stream::SheddingLogSender,
+    graph_drvs: &'a std::collections::BTreeMap<String, String>,
 }
 
 /// What the native pipeline produced for one build attempt.
@@ -1103,6 +1108,7 @@ async fn run_native_lifecycle(
         opts,
         is_fod,
         log_tx,
+        graph_drvs,
     } = args;
 
     // ── Per-build cgroup (same name the cancel registry predicts). ──────
@@ -1197,12 +1203,14 @@ async fn run_native_lifecycle(
     let basic_drv_owned = basic_drv.clone();
     let input_paths_owned = input_paths.to_vec();
     let input_metadata_owned = input_metadata.to_vec();
+    let graph_drvs_owned = graph_drvs.clone();
     let glue_join = tokio::task::spawn_blocking(move || {
         glue::derivation_into_request(
             &drv_path_owned,
             &basic_drv_owned,
             &input_paths_owned,
             &input_metadata_owned,
+            &graph_drvs_owned,
             &paths,
             &glue_opts,
         )
@@ -1214,25 +1222,18 @@ async fn run_native_lifecycle(
         Ok(Err(e)) => {
             // Input-shaped rejection: report through the normal result
             // channel (the caller maps Glue → InputRejected) after the
-            // cgroup has been drained below. The one exception is a
-            // transient I/O failure reading materialized inputs (e.g. a
-            // FUSE hiccup while expanding an exportReferencesGraph .drv):
-            // that is the same class of fault as a bind-mount
-            // materialization failure, so it maps to the infra-transient
-            // bucket and the build is retried instead of rejected.
-            // r[impl builder.result.input-materialization-is-infra+3]
+            // cgroup has been drained below. Every GlueError is a
+            // permanent property of the inputs now — the glue holds no
+            // filesystem capability (`builder.glue.pure`), so there is
+            // no transient-I/O class left in it; resolution I/O faults
+            // were classified infra-transient at the resolve step
+            // (`builder.result.input-materialization-is-infra+4`)
+            // before the glue ever ran.
             monitors.stop();
             drain_build_cgroup(build_cgroup).await;
             scopeguard::ScopeGuard::into_inner(cgroup_kill_guard);
-            let build_result = Err(if e.is_transient_io() {
-                ExecutorError::SandboxSetup(format!(
-                    "reading materialized inputs for the request glue: {e}"
-                ))
-            } else {
-                ExecutorError::Glue(e.to_string())
-            });
             return Ok(NativeOutcome {
-                build_result,
+                build_result: Err(ExecutorError::Glue(e.to_string())),
                 peak_memory_bytes: 0,
                 peak_cpu_cores: 0.0,
                 final_line_count: opts.batcher_seed,
@@ -1373,7 +1374,7 @@ async fn run_native_lifecycle(
         // and the daemon-era path report it as a permanent build failure
         // in the build log, not as something to retry. Materialization
         // faults stay infra-transient: they surface earlier as bind-mount
-        // failures (r[builder.result.input-materialization-is-infra+3]) or
+        // failures (r[builder.result.input-materialization-is-infra+4]) or
         // as EIO, never as these errnos at exec time — every input bind
         // already succeeded by the time the child execs.
         Err(rio_exec::ExecError::Setup(se))
@@ -1751,6 +1752,12 @@ struct ResolvedInputs {
     /// glue's closure planning and the output policy checks don't need
     /// a second QueryPathInfo pass (I-106).
     input_metadata: Vec<ValidatedPathInfo>,
+    /// ATerm text for every `.drv` in the closure, keyed by store path:
+    /// the request glue's only source of derivation bytes
+    /// (`builder.glue.pure` — the glue holds no filesystem capability).
+    /// Assembled from the texts the fetches above already produced;
+    /// see `inputs::prefetch_graph_drvs`.
+    graph_drvs: std::collections::BTreeMap<String, String>,
 }
 
 /// Resolve inputDrvs → BasicDerivation + compute full input closure.
@@ -1777,6 +1784,7 @@ async fn resolve_inputs(
     store_client: &StoreServiceClient<Channel>,
     drv: &Derivation,
     drv_path: &str,
+    drv_text: &str,
 ) -> Result<ResolvedInputs, ExecutorError> {
     let mut resolved_input_srcs = drv.input_srcs().clone();
     // Collect owned (path, names) pairs up-front so the async closures
@@ -1788,11 +1796,11 @@ async fn resolve_inputs(
         .collect();
     let n_input_drvs = input_drv_specs.len();
     let fetch_drvs_start = std::time::Instant::now();
-    let fetched: Vec<Vec<String>> = stream::iter(input_drv_specs)
+    let fetched: Vec<(String, String, Vec<String>)> = stream::iter(input_drv_specs)
         .map(|(path, names)| {
             let mut client = store_client.clone();
             async move {
-                let input_drv = fetch_drv_from_store(&mut client, &path).await?;
+                let (input_drv, text) = fetch_drv_from_store(&mut client, &path).await?;
                 let matching: Vec<String> = input_drv
                     .outputs()
                     .iter()
@@ -1825,7 +1833,7 @@ async fn resolve_inputs(
                     })
                     .map(|out| out.path().to_string())
                     .collect();
-                Ok::<_, ExecutorError>(matching)
+                Ok::<_, ExecutorError>((path, text, matching))
             }
         })
         .buffer_unordered(MAX_PARALLEL_FETCHES)
@@ -1850,7 +1858,10 @@ async fn resolve_inputs(
     // steady-state; any warn here means investigate the scheduler's
     // `maybe_resolve_ca` path.
     let mut dropped_empty = 0usize;
-    for paths in fetched {
+    let mut graph_drvs: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for (path, text, paths) in fetched {
+        graph_drvs.insert(path, text);
         for p in paths {
             if p.is_empty() {
                 dropped_empty += 1;
@@ -1904,11 +1915,18 @@ async fn resolve_inputs(
         .map(|m| (m.store_path.to_string(), m.nar_size))
         .collect();
 
+    // Complete the glue's derivation table: main drv text + any
+    // residual closure .drvs not covered by the input-drv fetches.
+    let graph_drvs =
+        inputs::prefetch_graph_drvs(store_client, drv_path, drv_text, graph_drvs, &input_paths)
+            .await?;
+
     Ok(ResolvedInputs {
         basic_drv,
         input_paths,
         input_sized,
         input_metadata,
+        graph_drvs,
     })
 }
 
@@ -2185,7 +2203,7 @@ mod tests {
         );
 
         // === Resolve ===
-        let resolved = resolve_inputs(&client, &drv, &main_drv_path).await?;
+        let resolved = resolve_inputs(&client, &drv, &main_drv_path, &main_aterm).await?;
 
         // The dep's concrete output path is now in input_srcs.
         assert!(

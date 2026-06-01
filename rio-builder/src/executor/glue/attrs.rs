@@ -391,7 +391,8 @@ mod tests {
                     .contains("'exportReferencesGraph' value is not an array or a string"),
                 "{err}"
             );
-            assert!(!err.is_transient_io(), "wrong types are permanent");
+            // Permanence is structural: GlueError carries no transient
+            // class at all (builder.glue.pure).
         }
     }
 

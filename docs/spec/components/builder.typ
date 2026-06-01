@@ -609,6 +609,25 @@ build over a bad `pname` would reject derivations the oracle accepts;
 widening the enum is the only way to add a lenient read, so every new
 exemption is a one-line reviewable diff.
 
+#r("builder.glue.pure")[
+  The request glue MUST hold no filesystem capability: every input byte it
+  consumes --- derivation text for `exportReferencesGraph` expansion
+  included --- arrives as a parameter resolved upstream at input
+  resolution. Resolution I/O failures MUST be classified
+  infrastructure-transient at the resolve step, never inside the glue: a
+  `GlueError` is always a permanent property of the inputs.
+]
+
+The capability deletion is what closes the blocking-in-async family: the
+glue runs on the blocking pool as pure CPU (parse + closure walk +
+serialization), and a future glue change *cannot* reintroduce a FUSE-backed
+read because there is no store directory, no path join, and no `std::fs`
+call to reach for --- the `ClosureIndex` consumes a caller-supplied
+derivation-text table. The table costs no extra fetches: input resolution
+already fetched the main `.drv` and every input `.drv`; their texts are
+retained, and only residual closure `.drv`s (typically none) are fetched
+through the same deadline-bounded machinery.
+
 #r("builder.exec.refs-graph-acyclic")[
   `exportReferencesGraph` materialization MUST terminate with auxiliary
   memory linear in the closure size, and MUST reject cyclic reference
@@ -1572,7 +1591,7 @@ shape the scheduler ring buffer already accepts); the marker itself is
 best-effort --- a shed final flush leaves a bounded display gap with no
 later carrier.
 
-#r("builder.result.input-materialization-is-infra+3")[
+#r("builder.result.input-materialization-is-infra+4")[
   A build failure caused by an input path that was verified present in
   rio-store during input resolution but could not be materialized on the
   worker (FUSE JIT-fetch error, overlay race) MUST be reported as
@@ -1580,7 +1599,11 @@ later carrier.
   worker-local fault, not a build defect. The native executor detects this
   structurally --- the input bind-mount fails during sandbox setup, which is
   an infrastructure-transient error (#rref("builder.retry.infra-transient"))
-  --- rather than by parsing error text.
+  --- rather than by parsing error text. The same classification applies at
+  the resolve step itself: a store fetch that fails while assembling the
+  request glue's derivation-text table is a `MetadataFetch` infrastructure
+  failure, surfaced BEFORE the glue runs --- the glue holds no I/O capability
+  (#rref("builder.glue.pure")), so no transient-I/O class exists inside it.
 ]
 = Shutdown
 

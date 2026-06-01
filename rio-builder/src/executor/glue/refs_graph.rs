@@ -27,9 +27,9 @@
 //!
 //! The closure data comes from the input metadata that accompanies the
 //! build's input manifest (`ValidatedPathInfo`: references, NAR hash
-//! and size) — no store round-trips; the only file access is reading
-//! `.drv` text from the already-materialized input store during the
-//! expansion above.
+//! and size) — no store round-trips and zero file access of any kind:
+//! `.drv` text for the expansion above arrives in a caller-supplied
+//! table assembled at input resolution (`builder.glue.pure`).
 //!
 //! All graph traversal (closure expansion, cycle detection, closure
 //! sizing) is delegated to [`rio_nix::closure`] — this module contains
@@ -39,11 +39,10 @@
 //! `closure_of`'s cycle gate.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
 
 use rio_nix::derivation::Derivation;
 use rio_nix::hash::{HashAlgo, NixHash};
-use rio_nix::store_path::{STORE_DIR, StorePath, basename};
+use rio_nix::store_path::{STORE_DIR, StorePath};
 use rio_proto::validated::ValidatedPathInfo;
 use serde_json::Value;
 
@@ -78,11 +77,13 @@ pub(crate) struct ClosureIndex<'a> {
     /// The full input closure (every store path the build may read).
     /// Membership here is the "is it in the input closure" gate.
     input_closure: BTreeSet<&'a str>,
-    /// Host directory holding the materialized inputs (the merged-store
-    /// bind source), used to read `.drv` contents when a graph closure
-    /// needs derivation-output expansion. `None` only in callers whose
-    /// graphs cannot contain `.drv` paths (unit fixtures).
-    store_dir: Option<&'a Path>,
+    /// ATerm text per `.drv` store path, supplied by the caller (the
+    /// executor's input resolution, or the differential harness), used
+    /// when a graph closure needs derivation-output expansion. `None`
+    /// only in callers whose graphs cannot contain `.drv` paths (unit
+    /// fixtures). The glue performs no file access of any kind
+    /// (`builder.glue.pure`): every derivation byte arrives here.
+    drv_table: Option<&'a std::collections::BTreeMap<String, String>>,
 }
 
 impl<'a> ClosureIndex<'a> {
@@ -93,15 +94,19 @@ impl<'a> ClosureIndex<'a> {
                 .map(|i| (i.store_path.as_str(), i))
                 .collect(),
             input_closure: input_paths.iter().map(String::as_str).collect(),
-            store_dir: None,
+            drv_table: None,
         }
     }
 
-    /// Provide the host directory the input closure is materialized in,
-    /// enabling `.drv` closure expansion (reading the drv text is the
-    /// only file access this module performs).
-    pub(crate) fn with_store_dir(mut self, dir: &'a Path) -> Self {
-        self.store_dir = Some(dir);
+    /// Provide the derivation-text table, enabling `.drv` closure
+    /// expansion. The table is assembled upstream (input resolution
+    /// retains every fetched ATerm text); this module never touches
+    /// the filesystem.
+    pub(crate) fn with_drv_table(
+        mut self,
+        table: &'a std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.drv_table = Some(table);
         self
     }
 
@@ -226,26 +231,22 @@ impl<'a> ClosureIndex<'a> {
             path: drv_store_path.to_owned(),
             reason,
         };
-        let Some(dir) = self.store_dir else {
+        let Some(table) = self.drv_table else {
             return Err(unreadable(
-                "no materialized input store is available to this caller".to_owned(),
+                "no derivation table is available to this caller".to_owned(),
             ));
         };
-        let Some(base) = basename(drv_store_path) else {
-            return Err(unreadable("not a valid store path".to_owned()));
+        // A miss is defensively unreachable in production: the table is
+        // assembled from the SAME closure this index walks (every .drv
+        // member's text is retained or prefetched at input resolution),
+        // so a missing entry means the caller's table and closure
+        // diverged — a structural fault of the inputs, never transient.
+        let Some(text) = table.get(drv_store_path) else {
+            return Err(unreadable(
+                "derivation text missing from the resolved input table".to_owned(),
+            ));
         };
-        let host_path = dir.join(base);
-        // I/O failures reading the materialized .drv (FUSE/JIT-fetch EIO,
-        // a file the materialization should have produced but didn't) are
-        // a property of this worker's input materialization, not of the
-        // derivation — keep them distinct from the structural
-        // `ExportRefsDrvUnreadable` cases so the executor can classify
-        // them as infra-transient and retry.
-        let text = std::fs::read_to_string(&host_path).map_err(|e| GlueError::ExportRefsDrvIo {
-            path: drv_store_path.to_owned(),
-            reason: format!("reading {}: {e}", host_path.display()),
-        })?;
-        let drv = Derivation::parse(&text).map_err(|e| unreadable(format!("parsing: {e}")))?;
+        let drv = Derivation::parse(text).map_err(|e| unreadable(format!("parsing: {e}")))?;
         Ok(drv
             .outputs()
             .iter()
@@ -566,13 +567,12 @@ mod tests {
     const FDRV: &str = "/nix/store/jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj-fetch.drv";
     const FOUT: &str = "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-fetched";
 
-    /// Write a minimal input-addressed `.drv` (ATerm) into `dir` under
-    /// the store-path basename, declaring the given
-    /// `(name, path, hashAlgo, hash)` outputs: empty hash fields =
-    /// input-addressed, empty path + hashAlgo = floating CA, path +
-    /// hash fields = fixed-output.
-    fn write_drv(
-        dir: &std::path::Path,
+    /// Build a minimal input-addressed `.drv` (ATerm) table entry,
+    /// declaring the given `(name, path, hashAlgo, hash)` outputs:
+    /// empty hash fields = input-addressed, empty path + hashAlgo =
+    /// floating CA, path + hash fields = fixed-output.
+    fn drv_entry(
+        table: &mut std::collections::BTreeMap<String, String>,
         drv_store_path: &str,
         outputs: &[(&str, &str, &str, &str)],
     ) {
@@ -589,7 +589,7 @@ mod tests {
             outs.join(","),
             env.join(",")
         );
-        std::fs::write(dir.join(basename(drv_store_path).unwrap()), aterm).unwrap();
+        table.insert(drv_store_path.to_owned(), aterm);
     }
 
     #[test]
@@ -607,9 +607,9 @@ mod tests {
             info(C, 40, &[]),
         ];
         let paths = vec![A.to_string(), DRV.to_string()];
-        let tmp = tempfile::tempdir().unwrap();
-        write_drv(tmp.path(), DRV, &[("out", DOUT, "", "")]);
-        let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
+        let mut table = std::collections::BTreeMap::new();
+        drv_entry(&mut table, DRV, &[("out", DOUT, "", "")]);
+        let index = ClosureIndex::new(&infos, &paths).with_drv_table(&table);
 
         let text = String::from_utf8(index.registration_text(&[A.to_string()]).unwrap()).unwrap();
         for p in [A, DRV, DOUT, C] {
@@ -629,10 +629,10 @@ mod tests {
     fn drv_floating_output_is_rejected() {
         let infos = vec![info(A, 10, &[DRV]), info(DRV, 5, &[])];
         let paths = vec![A.to_string(), DRV.to_string()];
-        let tmp = tempfile::tempdir().unwrap();
+        let mut table = std::collections::BTreeMap::new();
         // Floating-CA output: empty declared path, hash algo set.
-        write_drv(tmp.path(), DRV, &[("out", "", "r:sha256", "")]);
-        let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
+        drv_entry(&mut table, DRV, &[("out", "", "r:sha256", "")]);
+        let index = ClosureIndex::new(&infos, &paths).with_drv_table(&table);
         let err = index.registration_text(&[A.to_string()]).unwrap_err();
         assert!(
             matches!(err, GlueError::ExportRefsDrvFloatingOutput { ref output, .. } if output == "out"),
@@ -656,10 +656,10 @@ mod tests {
             info(DRV2, 5, &[]),
         ];
         let paths = vec![A.to_string(), DRV.to_string()];
-        let tmp = tempfile::tempdir().unwrap();
-        write_drv(tmp.path(), DRV, &[("out", DOUT, "", "")]);
-        write_drv(tmp.path(), DRV2, &[("out", OUT2, "", "")]);
-        let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
+        let mut table = std::collections::BTreeMap::new();
+        drv_entry(&mut table, DRV, &[("out", DOUT, "", "")]);
+        drv_entry(&mut table, DRV2, &[("out", OUT2, "", "")]);
+        let index = ClosureIndex::new(&infos, &paths).with_drv_table(&table);
 
         let text = String::from_utf8(index.registration_text(&[A.to_string()]).unwrap()).unwrap();
         assert!(
@@ -683,9 +683,9 @@ mod tests {
             info(FOUT, 30, &[]),
         ];
         let paths = vec![A.to_string(), FDRV.to_string()];
-        let tmp = tempfile::tempdir().unwrap();
-        write_drv(
-            tmp.path(),
+        let mut table = std::collections::BTreeMap::new();
+        drv_entry(
+            &mut table,
             FDRV,
             &[(
                 "out",
@@ -694,7 +694,7 @@ mod tests {
                 "1111111111111111111111111111111111111111111111111111111111111111",
             )],
         );
-        let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
+        let index = ClosureIndex::new(&infos, &paths).with_drv_table(&table);
 
         let text = String::from_utf8(index.registration_text(&[A.to_string()]).unwrap()).unwrap();
         assert!(text.contains(FOUT), "{text}");
@@ -705,9 +705,9 @@ mod tests {
         // DRV declares DOUT but the index has no metadata for it.
         let infos = vec![info(A, 10, &[DRV]), info(DRV, 5, &[])];
         let paths = vec![A.to_string(), DRV.to_string()];
-        let tmp = tempfile::tempdir().unwrap();
-        write_drv(tmp.path(), DRV, &[("out", DOUT, "", "")]);
-        let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
+        let mut table = std::collections::BTreeMap::new();
+        drv_entry(&mut table, DRV, &[("out", DOUT, "", "")]);
+        let index = ClosureIndex::new(&infos, &paths).with_drv_table(&table);
         let err = index.registration_text(&[A.to_string()]).unwrap_err();
         assert!(
             matches!(err, GlueError::ExportRefsDrvOutputMissing { ref path, .. } if path == DOUT),
@@ -720,43 +720,44 @@ mod tests {
         let infos = vec![info(A, 10, &[DRV]), info(DRV, 5, &[])];
         let paths = vec![A.to_string(), DRV.to_string()];
 
-        // No store dir at all: structural — the caller cannot expand
-        // .drvs here at all. Permanent.
+        // No derivation table at all: structural — the caller cannot
+        // expand .drvs here. Permanent.
         let index = ClosureIndex::new(&infos, &paths);
         let err = index.registration_text(&[A.to_string()]).unwrap_err();
         assert!(
             matches!(err, GlueError::ExportRefsDrvUnreadable { .. }),
             "{err}"
         );
-        assert!(!err.is_transient_io());
 
-        // Store dir present but the .drv text is unparseable: a property
+        // Table present but the .drv text is unparseable: a property
         // of the derivation, not of this worker. Permanent.
-        let tmp = tempfile::tempdir().unwrap();
-        let drv_base = DRV.strip_prefix("/nix/store/").unwrap();
-        std::fs::write(tmp.path().join(drv_base), b"not an aterm derivation").unwrap();
-        let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
+        let mut table = std::collections::BTreeMap::new();
+        table.insert(DRV.to_owned(), "not an aterm derivation".to_owned());
+        let index = ClosureIndex::new(&infos, &paths).with_drv_table(&table);
         let err = index.registration_text(&[A.to_string()]).unwrap_err();
         assert!(
             matches!(err, GlueError::ExportRefsDrvUnreadable { .. }),
             "{err}"
         );
-        assert!(!err.is_transient_io());
     }
 
     #[test]
-    fn io_failure_reading_drv_is_transient() {
-        // Store dir present but the .drv file is missing from it: the
-        // materialization should have produced it, so this is an
-        // infra/materialization fault — surfaced as the transient-I/O
-        // variant so the executor retries instead of rejecting.
+    fn drv_text_missing_from_table_is_rejected() {
+        // The closure names DRV but the supplied table has no entry for
+        // it. Defensively unreachable in production (the table is
+        // assembled from the same closure) — and structurally permanent:
+        // by glue time every byte the glue could ask for has already
+        // been resolved, so a miss is a fault of the inputs, never a
+        // transient I/O condition (the glue performs no I/O at all).
         let infos = vec![info(A, 10, &[DRV]), info(DRV, 5, &[])];
         let paths = vec![A.to_string(), DRV.to_string()];
-        let tmp = tempfile::tempdir().unwrap();
-        let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
+        let table = std::collections::BTreeMap::new();
+        let index = ClosureIndex::new(&infos, &paths).with_drv_table(&table);
         let err = index.registration_text(&[A.to_string()]).unwrap_err();
-        assert!(matches!(err, GlueError::ExportRefsDrvIo { .. }), "{err}");
-        assert!(err.is_transient_io());
+        assert!(
+            matches!(err, GlueError::ExportRefsDrvUnreadable { .. }),
+            "{err}"
+        );
     }
 
     #[test]
@@ -813,11 +814,11 @@ mod tests {
         let paths = vec![A.to_string(), B.to_string()];
         let index = ClosureIndex::new(&infos, &paths);
         let err = index.registration_text(&[A.to_string()]).unwrap_err();
+        // Permanence is structural now: GlueError carries no transient
+        // class at all (`builder.glue.pure` deleted the transient query with
+        // the glue's last I/O capability), so the cyclic rejection can
+        // only ever map to InputRejected.
         assert!(matches!(err, GlueError::ExportRefsCyclicMetadata { .. }));
-        assert!(
-            !err.is_transient_io(),
-            "cyclic metadata must never be classified infra-transient"
-        );
     }
 
     /// A cycle that is only reachable through a `.drv` output-closure
@@ -835,9 +836,9 @@ mod tests {
             info(OUT2, 15, &[C]),
         ];
         let paths = vec![A.to_string(), DRV.to_string()];
-        let tmp = tempfile::tempdir().unwrap();
-        write_drv(tmp.path(), DRV, &[("out", DOUT, "", "")]);
-        let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
+        let mut table = std::collections::BTreeMap::new();
+        drv_entry(&mut table, DRV, &[("out", DOUT, "", "")]);
+        let index = ClosureIndex::new(&infos, &paths).with_drv_table(&table);
 
         let err = index.registration_text(&[A.to_string()]).unwrap_err();
         assert!(
