@@ -1968,6 +1968,7 @@ async fn collect_pass_with(
             build_id: batch.build_id.clone(),
             results: batch.results.clone(),
             reasons: batch.reasons.clone(),
+            stderr_tail: batch.stderr_tail.clone(),
             engine_cancelled: batch.engine_cancelled,
             interruption_drvs: batch.interruption_drvs.clone(),
             submitted_at: Some(batch.started_at.clone()),

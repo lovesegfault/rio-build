@@ -31,10 +31,11 @@ use super::classify::{
 use super::grpc::{AdminApi, StoreApi};
 use super::model::{
     BATCH_KIND_TIMED, ExpectedOutcome, ExpectedSide, FailureKind, JobRecord, PathOutcome,
-    RioOutcome, RioSide, RootCauseKind, UnifiedClass, Verdict, build_status_from_name, now_rfc3339,
+    RioOutcome, RioSide, RootCauseKind, UnifiedClass, Verdict, build_status_from_name,
+    is_terminal_class, now_rfc3339,
 };
 use super::spec::Knobs;
-use super::state::{StateDir, StateFile};
+use super::state::{StateDir, StateFile, latest_per_job};
 use super::stderrparse::{ReasonClass, classify_reason, signature_for};
 use super::submitter::repro_command;
 
@@ -152,6 +153,12 @@ pub struct BatchView {
     pub results: Vec<PathOutcome>,
     /// drv → relayed reason line (the Signal-1 fallback).
     pub reasons: BTreeMap<String, String>,
+    /// Raw stderr evidence captured at submission time — for an engine-side
+    /// submission failure this is the recorded `engine submission error: …`
+    /// text, the only evidence the failure left behind. It becomes the
+    /// terminal record's evidence when such a failure exhausts the retry
+    /// budget.
+    pub stderr_tail: Option<String>,
     pub engine_cancelled: bool,
     /// Root drvs for which the timed dispatcher armed a recorded
     /// interruption (empty for every non-timed batch).
@@ -550,23 +557,100 @@ pub async fn process_settled_batch(
     if batch.results.is_empty() && batch.build_id.is_none() && !(timed && batch.engine_cancelled) {
         // Neither in-band results nor a build id: an engine-side submission
         // failure (channel open, drv import, the build op erroring before
-        // any result arrived). Every member job is re-offered to the submit
-        // loop — except for a timed batch, whose members are simply left to
-        // the timed dispatcher. (A timed batch the engine cancelled with no
-        // results falls through instead, so its armed interruptions are
-        // still recorded below.)
-        tracing::info!(
-            jobs = batch_jobs.len(),
-            engine_cancelled = batch.engine_cancelled,
-            timed,
-            "batch has no in-band results and no build id (engine-side submission failure); \
-             re-offering its jobs unless the batch is timed"
-        );
-        return Ok(if timed {
-            Vec::new()
-        } else {
-            batch_jobs.to_vec()
-        });
+        // any result arrived). Members of a timed batch are simply left to
+        // the timed dispatcher, which owns its own retries. (A timed batch
+        // the engine cancelled with no results falls through instead, so
+        // its armed interruptions are still recorded below.)
+        if timed {
+            tracing::info!(
+                jobs = batch_jobs.len(),
+                "timed batch has no in-band results and no build id (engine-side submission \
+                 failure); leaving its members to the timed dispatcher"
+            );
+            return Ok(Vec::new());
+        }
+        // An engine-cancelled submission (batch deadline, abort) is the
+        // engine's own act, not a transport defect: every member is
+        // re-offered without consuming budget — the engine-cancelled rule
+        // in [`decide`].
+        if batch.engine_cancelled {
+            tracing::info!(
+                jobs = batch_jobs.len(),
+                "engine-cancelled batch settled with no in-band results and no build id; \
+                 re-offering its jobs"
+            );
+            return Ok(batch_jobs.to_vec());
+        }
+        // Otherwise the failure consumes the same bounded auto-retry budget
+        // as a missing in-band result ([`decide`] with no target): re-offer
+        // while budget remains, then terminalize as an infrastructure
+        // failure carrying the recorded submission error as evidence.
+        // Without the bound, a deterministic submission failure (gateway
+        // unreachable, host-key mismatch, drv import error) would re-offer
+        // its members on every wave and the campaign would never drain.
+        // No poison snapshot or log tail is fetched: the failure pre-dates
+        // any build, so the scheduler holds no evidence for it.
+        let evidence = batch
+            .stderr_tail
+            .clone()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "engine-submission-failure".to_string());
+        // Duplicate-batch belt: the submit loop can re-submit a job whose
+        // terminal record landed between settle and collect (the cool-down
+        // damper narrows that window but does not close it). Such a
+        // duplicate must never overwrite the job's real verdict under
+        // latest-record-per-job semantics, so members already terminal in
+        // results.jsonl are dropped here — neither re-offered nor recorded.
+        let already_terminal: HashSet<String> =
+            latest_per_job(state.load_jsonl(StateFile::Results)?)
+                .into_iter()
+                .filter(|(_, r)| is_terminal_class(&r.verdict, &r.disposition))
+                .map(|(job, _)| job)
+                .collect();
+        for job in batch_jobs {
+            let Some(ctx) = contexts.get(job) else {
+                tracing::warn!(job, "batch member has no job context; skipping");
+                continue;
+            };
+            if already_terminal.contains(job) {
+                tracing::info!(
+                    job,
+                    "member of a failed submission already has a terminal record; dropping"
+                );
+                continue;
+            }
+            let prior = prior_requeues.get(job).copied().unwrap_or(0);
+            if prior < knobs.max_auto_retries {
+                tracing::info!(job, why = "engine-submission-failure", "re-queueing");
+                requeue.push(job.clone());
+                continue;
+            }
+            tracing::info!(
+                job,
+                prior_requeues = prior,
+                "engine-side submission failure with no retry budget left; recording an \
+                 infrastructure failure"
+            );
+            let record = build_record(
+                ctx,
+                &RioOutcome::TargetFailed {
+                    kind: FailureKind::Infra,
+                },
+                Some(evidence.clone()),
+                None,
+                batch,
+                &HashMap::new(),
+                &HashMap::new(),
+                mode,
+                campaign_id,
+                prior + 1,
+                None,
+                first_active.get(job).cloned(),
+                None,
+            );
+            state.append_jsonl(StateFile::Results, &record)?;
+        }
+        return Ok(requeue);
     }
     let results_by_drv: HashMap<&str, &PathOutcome> = batch
         .results
@@ -1645,6 +1729,170 @@ mod tests {
         }
     }
 
+    /// An engine-side submission failure (no in-band results, no build id)
+    /// consumes the same bounded auto-retry budget as a missing in-band
+    /// result: a member with budget left is re-offered, a member whose
+    /// budget is spent gets a terminal infra-indeterminate record carrying
+    /// the recorded submission error as evidence — so a deterministic
+    /// transport failure (unreachable gateway, host-key mismatch) drains
+    /// the campaign instead of re-offering forever. No scheduler evidence
+    /// RPCs fire: the failure happened before any build existed.
+    #[tokio::test]
+    async fn engine_submission_failure_consumes_budget_then_terminalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let admin = LogAdmin::default();
+        let contexts: HashMap<String, JobContext> = [
+            (
+                "fresh.x86_64-linux".to_string(),
+                ctx("fresh.x86_64-linux", T, &[], ExpectedOutcome::Built),
+            ),
+            (
+                "spent.x86_64-linux".to_string(),
+                ctx("spent.x86_64-linux", DEP, &[], ExpectedOutcome::Built),
+            ),
+        ]
+        .into();
+        let batch = BatchView {
+            kind: BATCH_KIND_SUBMIT.to_string(),
+            stderr_tail: Some("engine submission error: ssh handshake: host key mismatch".into()),
+            ..BatchView::default()
+        };
+        // Knobs::default() grants one auto-retry: "spent" already burned it.
+        let prior: HashMap<String, u32> = [("spent.x86_64-linux".to_string(), 1)].into();
+        let requeue = process_settled_batch(
+            &state,
+            &admin,
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &["fresh.x86_64-linux".into(), "spent.x86_64-linux".into()],
+            &batch,
+            &prior,
+            &Knobs::default(),
+            "leaf",
+            "c1",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(requeue, vec!["fresh.x86_64-linux".to_string()]);
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1, "{records:?}");
+        let rec = &records[0];
+        assert_eq!(rec.job, "spent.x86_64-linux");
+        assert_eq!(
+            rec.verdict.as_deref(),
+            Some(Verdict::InfraIndeterminate.as_str())
+        );
+        assert_eq!(rec.failure_cause.as_deref(), Some("infra"));
+        assert_eq!(rec.rio.outcome, "target-failed");
+        assert_eq!(
+            rec.evidence.as_deref(),
+            Some("engine submission error: ssh handshake: host key mismatch")
+        );
+        assert_eq!(rec.attempts, 2);
+        assert!(rec.build_ids.is_empty());
+        // The failure pre-dates any build: nothing to fetch poison evidence
+        // or a log tail for.
+        assert_eq!(admin.poisoned_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(admin.log_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A duplicate engine-side submission failure for a job that already
+    /// settled terminally (the submit loop can re-submit inside the
+    /// settle-to-collect window) is dropped: it must neither overwrite the
+    /// real verdict under latest-record-per-job semantics nor re-offer the
+    /// finished job.
+    #[tokio::test]
+    async fn duplicate_submission_failure_never_clobbers_a_terminal_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let contexts: HashMap<String, JobContext> = [(
+            "ok.x86_64-linux".to_string(),
+            ctx("ok.x86_64-linux", T, &[], ExpectedOutcome::Built),
+        )]
+        .into();
+        // First batch settles the job successfully (match-built record).
+        let settled = BatchView {
+            kind: BATCH_KIND_SUBMIT.to_string(),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+            results: vec![po(T, BuildStatus::Built, "")],
+            ..BatchView::default()
+        };
+        // Duplicate submission of the same job then fails engine-side with
+        // the job's whole retry budget already spent.
+        let duplicate = BatchView {
+            kind: BATCH_KIND_SUBMIT.to_string(),
+            stderr_tail: Some("engine submission error: channel open failed".into()),
+            ..BatchView::default()
+        };
+        let prior: HashMap<String, u32> = [("ok.x86_64-linux".to_string(), 5)].into();
+        for (batch, prior) in [(&settled, &HashMap::new()), (&duplicate, &prior)] {
+            let requeue = process_settled_batch(
+                &state,
+                &LogAdmin::default(),
+                &FakeStoreApi::default(),
+                None,
+                &contexts,
+                &["ok.x86_64-linux".into()],
+                batch,
+                prior,
+                &Knobs::default(),
+                "leaf",
+                "c1",
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+            assert!(requeue.is_empty(), "{requeue:?}");
+        }
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].verdict.as_deref(), Some("match-built"));
+    }
+
+    /// The engine-cancelled carve-out survives the submission-failure
+    /// budget: a non-timed batch the engine itself cancelled (deadline,
+    /// abort) that settled with no results and no build id re-offers every
+    /// member regardless of spent budget — cancellation is the engine's own
+    /// act, mirroring the engine-cancelled rule in [`decide`].
+    #[tokio::test]
+    async fn engine_cancelled_submission_failure_requeues_without_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let contexts: HashMap<String, JobContext> = [(
+            "spent.x86_64-linux".to_string(),
+            ctx("spent.x86_64-linux", T, &[], ExpectedOutcome::Built),
+        )]
+        .into();
+        let batch = BatchView {
+            kind: BATCH_KIND_SUBMIT.to_string(),
+            engine_cancelled: true,
+            ..BatchView::default()
+        };
+        let prior: HashMap<String, u32> = [("spent.x86_64-linux".to_string(), 5)].into();
+        let requeue = process_settled_batch(
+            &state,
+            &LogAdmin::default(),
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &["spent.x86_64-linux".into()],
+            &batch,
+            &prior,
+            &Knobs::default(),
+            "leaf",
+            "c1",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(requeue, vec!["spent.x86_64-linux".to_string()]);
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert!(records.is_empty(), "{records:?}");
+    }
+
     /// End-to-end through process_settled_batch with fakes: one success (NAR
     /// hash captured), one genuine failure (log tail uploaded), one batch-mate
     /// requeued — all driven by the batch's in-band per-root results.
@@ -1705,6 +1953,7 @@ mod tests {
                     format!("dependency '{T}' failed: failed on every eligible worker"),
                 ),
             ]),
+            stderr_tail: None,
             engine_cancelled: false,
             interruption_drvs: Vec::new(),
             submitted_at: Some("2026-05-26T01:00:00Z".into()),
@@ -1771,14 +2020,15 @@ mod tests {
                 .exists()
         );
         // Neither in-band results nor a build id → engine-side submission
-        // failure → whole batch re-offered.
+        // failure → the still-unsettled member is re-offered (its retry
+        // budget is untouched).
         let r = process_settled_batch(
             &state,
             &LogAdmin::default(),
             &store,
             None,
             &contexts,
-            &["ok.x86_64-linux".into()],
+            &["mate.x86_64-linux".into()],
             &BatchView::default(),
             &HashMap::new(),
             &Knobs::default(),
@@ -1788,7 +2038,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(r, vec!["ok.x86_64-linux".to_string()]);
+        assert_eq!(r, vec!["mate.x86_64-linux".to_string()]);
     }
 
     /// A batch whose in-band results are all successes never fetches the

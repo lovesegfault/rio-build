@@ -1619,6 +1619,7 @@ mod tests {
             build_id: record.build_id.clone(),
             results: record.results.clone(),
             reasons: record.reasons.clone(),
+            stderr_tail: record.stderr_tail.clone(),
             engine_cancelled: record.engine_cancelled,
             interruption_drvs: record.interruption_drvs.clone(),
             submitted_at: Some(record.started_at.clone()),
