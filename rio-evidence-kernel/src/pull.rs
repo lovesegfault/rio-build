@@ -715,7 +715,11 @@ pub struct MaterializationInputs {
 ///   kind=Materialization:
 ///     job None              → Gone (nothing to materialize)
 ///     job Pending{parked:f} → as-built admission gates (token/fence/
-///                             status) then: node Ready → DeliverNew;
+///                             status) then: node Ready → DeliverNew
+///                             (including Ready+must_substitute — the
+///                             A11 refusal blocks from-source BUILD
+///                             dispatch, never the materialization
+///                             claim, which IS the substitution);
 ///                             node Queued → DeliverNew (PD-6, Phase B:
 ///                             materialization does not wait for deps —
 ///                             the dep-racing claim is legal; the mint's
@@ -777,16 +781,33 @@ where
                 // Ready; materialization claims need an unparked job.
                 PullAdmission::DeliverNew if !parked => PullAdmission::DeliverNew,
                 // r[impl sched.state.machine+2]
-                // PD-6 (Phase B, design §2.3 "one new transition edge"):
-                // a QUEUED node with an unparked pending job is also
-                // claimable — materialization does not wait for deps
-                // (the store fetches from upstream; dep state is
-                // irrelevant to the claim). The as-built kernel answers
-                // NotYetReady for Queued; this arm upgrades exactly that
-                // cell. The token/fence/Gone dominance above is
-                // untouched (a mis-bound token or terminal node never
-                // reaches here).
-                PullAdmission::NotYetReady if !parked && status == Some(PullNodeStatus::Queued) => {
+                // The two NotYetReady cells the materialization claim
+                // upgrades to DeliverNew (both Phase B, design §2.3):
+                //
+                //  - QUEUED + unparked pending job (PD-6, "one new
+                //    transition edge"): materialization does not wait
+                //    for deps — the store fetches from upstream, so dep
+                //    state is irrelevant to the claim.
+                //
+                //  - READY + must_substitute + unparked pending job: the
+                //    as-built kernel's A11 refusal exists to block
+                //    FROM-SOURCE dispatch of a marked node with Broken
+                //    closure evidence. A MATERIALIZATION claim is the
+                //    substitution mechanism itself — refusing it would
+                //    park exactly the nodes (pruned roots) whose jobs
+                //    most need claiming; the job's §2.4 routing (success
+                //    coverage / from-source / fail-fast) is the marked
+                //    node's flag-on settlement authority, not the mark.
+                //
+                // The token/fence/Gone dominance above is untouched (a
+                // mis-bound token or terminal node never reaches here).
+                PullAdmission::NotYetReady
+                    if !parked
+                        && matches!(
+                            status,
+                            Some(PullNodeStatus::Queued | PullNodeStatus::Ready)
+                        ) =>
+                {
                     PullAdmission::DeliverNew
                 }
                 _ => PullAdmission::NotYetReady,
@@ -1039,6 +1060,34 @@ mod kinded_tests {
             ),
             PullAdmission::NotYetReady,
             "Created (deps not yet evaluated) is not claimable — only Ready/Queued are"
+        );
+        // A MARKED node (must_substitute=true: topdown-pruned with
+        // Broken closure evidence) with an unparked pending job IS
+        // claimable: the A11 refusal blocks from-source BUILD dispatch
+        // of marked nodes, never the materialization claim — which is
+        // the substitution mechanism the mark demands. Refusing here
+        // would park exactly the pruned-root jobs forever.
+        assert_eq!(
+            admit_pull_kinded(
+                request(Some(S::Ready), true, None, &me),
+                mat(JobView::Pending { parked: false })
+            ),
+            PullAdmission::DeliverNew,
+            "a marked node's materialization claim must deliver (the claim IS the substitution)"
+        );
+        // ...but a marked node's BUILD pull stays refused (the as-built
+        // A11 arm, untouched — flag-on it is doubly refused by the
+        // job-unresolved rule).
+        assert_eq!(
+            admit_pull_kinded(
+                request(Some(S::Ready), true, None, &me),
+                MaterializationInputs {
+                    enabled: true,
+                    kind: PullKind::Build,
+                    job: JobView::Pending { parked: false },
+                }
+            ),
+            PullAdmission::NotYetReady
         );
         // Pending unparked + node terminal → Gone.
         assert_eq!(

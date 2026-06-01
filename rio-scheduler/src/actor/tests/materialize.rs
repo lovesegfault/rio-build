@@ -2057,3 +2057,328 @@ async fn flag_on_stale_completed_demote_creates_stale_reset_job() -> TestResult 
     );
     Ok(())
 }
+
+// ── T-1.7 (Phase B): the §4 consumption-transaction topdown_pruned clear-mirror ──
+
+// r[verify sched.materialize.routing]
+/// PD-B16 / design §4 ("Which writers stay live — normative"): when a
+/// PRUNED-origin materialization job resolves ResolvedSuccess, the
+/// consumption clears the node's own topdown_pruned mark — in-memory
+/// and durably — mirroring the success-clear the flag-off walk path
+/// owns. Without the clear, the mark survives the successful
+/// materialization and a later flag-off rollback can wrongly fail-fast
+/// the node (the FP-4(a) revert-with-state hazard, pinned by the
+/// revert test below).
+#[tokio::test]
+async fn flag_on_resolved_job_clears_pruned_mark() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    // The canonical real-prune fixture: root output substitutable BEFORE
+    // merge, root → dep edge → the prune fires, keeps the root only
+    // (marked + job origin=pruned), drops the dep.
+    let root_out = test_store_path("clr-root-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(root_out.clone());
+    let mut root = make_node("clr-root");
+    root.expected_output_paths = vec![root_out.clone()];
+    root.wanted_output_names = vec!["out".into()];
+    let dep = make_node("clr-dep");
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(
+        &handle,
+        build_id,
+        vec![root, dep],
+        vec![make_test_edge("clr-root", "clr-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Preconditions: marked root, pruned-origin job.
+    let drv = expect_drv(&handle, "clr-root").await;
+    assert!(drv.topdown_pruned, "the prune stamped the kept root");
+    let origin: String = sqlx::query_scalar("SELECT origin FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(origin, "pruned");
+
+    // Claim → Success → consumption.
+    let assignment = match claim_materialization(&handle, "clr-root", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the pruned root's job must be claimable, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    store.seed_with_content(&root_out, b"materialized");
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "clr-root",
+        mat_success_outcome(vec![root_out.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // The node completed and the job resolved.
+    assert_eq!(
+        expect_drv(&handle, "clr-root").await.status,
+        DerivationStatus::Completed
+    );
+    let job_state: String = sqlx::query_scalar("SELECT state FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(job_state, "resolved_success");
+
+    // THE clear-mirror (§4): the mark is cleared in-memory AND durably.
+    assert!(
+        !expect_drv(&handle, "clr-root").await.topdown_pruned,
+        "resolved_success must clear the node's own topdown_pruned mark (in-memory)"
+    );
+    let pg_mark: bool =
+        sqlx::query_scalar("SELECT topdown_pruned FROM derivations WHERE drv_hash = $1")
+            .bind("clr-root")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        !pg_mark,
+        "resolved_success must clear the node's own topdown_pruned mark (durable)"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.routing]
+/// The §4 clear-mirror's resolved_from_source half: a pruned root whose
+/// re-declared child is NOT yet produced (durable evidence Pending) gets
+/// an Unobtainable report → the routing resolves from-source → the mark
+/// is cleared (in-memory + durable) so the from-source dispatch is not
+/// poisoned by the stale prune verdict.
+#[tokio::test]
+async fn flag_on_from_source_resolution_clears_pruned_mark() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    // Build #1: the prune fixture (root marked + job origin=pruned).
+    let root_out = test_store_path("clrfs-root-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(root_out.clone());
+    let mut root = make_node("clrfs-root");
+    root.expected_output_paths = vec![root_out.clone()];
+    root.wanted_output_names = vec!["out".into()];
+    let dep = make_node("clrfs-dep");
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(
+        &handle,
+        b1,
+        vec![root.clone(), dep.clone()],
+        vec![make_test_edge("clrfs-root", "clrfs-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert!(expect_drv(&handle, "clrfs-root").await.topdown_pruned);
+
+    // The upstream loses the root's output (so build #2 does not
+    // re-prune), then build #2 re-declares root → dep: the dep inserts
+    // un-produced, so the root's durable evidence becomes Pending.
+    store.state.substitutable.write().unwrap().clear();
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        b2,
+        vec![root, dep],
+        vec![make_test_edge("clrfs-root", "clrfs-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Claim the (still pending, pruned-origin) job and report
+    // Unobtainable for the live-wanted root output.
+    let assignment = match claim_materialization(&handle, "clrfs-root", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the pruned root's job must be claimable, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "clrfs-root",
+        mat_unobtainable_outcome(vec![root_out.clone()], vec![], "upstream 404"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // The routing resolved from-source (durable evidence Pending — the
+    // re-declared child gates it; never a fail-fast).
+    let job_state: String = sqlx::query_scalar(
+        "SELECT state FROM materialization_jobs ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        job_state, "resolved_from_source",
+        "Pending durable evidence routes from-source"
+    );
+
+    // THE clear-mirror: the mark is gone (in-memory + durable) so the
+    // from-source path is not poisoned by the stale prune verdict.
+    assert!(
+        !expect_drv(&handle, "clrfs-root").await.topdown_pruned,
+        "resolved_from_source must clear the node's own topdown_pruned mark (in-memory)"
+    );
+    let pg_mark: bool =
+        sqlx::query_scalar("SELECT topdown_pruned FROM derivations WHERE drv_hash = $1")
+            .bind("clrfs-root")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        !pg_mark,
+        "resolved_from_source must clear the node's own topdown_pruned mark (durable)"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.routing]
+/// THE FP-4(a) revert-with-state test (PD-B16's reason to exist): a
+/// node materialized successfully under flag-ON, then the deployment
+/// reverts to flag-OFF (actor re-created flag-off against the same PG).
+/// When the node's outputs are later GC'd and a flag-off build re-merges
+/// it, the node must dispatch from source normally — it must NOT be
+/// wrongly fail-fasted on a stale topdown_pruned mark left over from the
+/// flag-on era. The §4 clear-mirror (resolved_success clears the mark
+/// durably) is what closes this hazard.
+#[tokio::test]
+async fn flag_on_job_success_then_flag_off_revert_no_wrongful_fail_fast() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+
+    let root_out = test_store_path("revert-root-out");
+
+    // ── Phase 1 (flag-ON): prune → job → claim → Success → consume. ──
+    {
+        let (handle, task) =
+            setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |cfg, _| {
+                cfg.materialization.enabled = true;
+            });
+        store
+            .state
+            .substitutable
+            .write()
+            .unwrap()
+            .push(root_out.clone());
+        let mut root = make_node("revert-root");
+        root.expected_output_paths = vec![root_out.clone()];
+        root.wanted_output_names = vec!["out".into()];
+        let dep = make_node("revert-dep");
+        let b1 = Uuid::new_v4();
+        let _ev = merge_dag(
+            &handle,
+            b1,
+            vec![root, dep],
+            vec![make_test_edge("revert-root", "revert-dep")],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        assert!(
+            expect_drv(&handle, "revert-root").await.topdown_pruned,
+            "phase 1 precondition: the prune stamped the root (dual-written per §4)"
+        );
+
+        let assignment = match claim_materialization(&handle, "revert-root", "store-test-0").await {
+            Ok(PullOutcome::Deliver(a)) => *a,
+            other => panic!("the job must be claimable, got {other:?}"),
+        };
+        let exec_id: Uuid = assignment.exec_id.parse()?;
+        store.seed_with_content(&root_out, b"materialized-flag-on");
+        report_materialization_outcome(
+            &handle,
+            exec_id,
+            "revert-root",
+            mat_success_outcome(vec![root_out.clone()], vec![]),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+        barrier(&handle).await;
+        assert_eq!(
+            expect_drv(&handle, "revert-root").await.status,
+            DerivationStatus::Completed,
+            "phase 1: the node completed via materialization"
+        );
+        assert_eq!(
+            query_status(&handle, b1).await?.state,
+            rio_proto::types::BuildState::Succeeded as i32
+        );
+
+        // The flag flips OFF: the deployment reverts (actor torn down).
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // ── Phase 2 (flag-OFF, same PG): recovery, GC, re-merge, dispatch. ──
+    let leader = crate::lease::LeaderState::always_leader(std::sync::Arc::new(
+        std::sync::atomic::AtomicU64::new(1),
+    ));
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let phase2_leader = leader.clone();
+    // Flag-off: the DEFAULT MaterializationConfig (enabled = false).
+    let (handle, _task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), move |_cfg, p| {
+            p.leader = phase2_leader;
+        });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // GC: the output is gone from the store AND no longer substitutable
+    // upstream (definitively missing — the worst case for a marked node).
+    store.state.paths.write().unwrap().remove(&root_out);
+    store.state.substitutable.write().unwrap().clear();
+
+    // A flag-off build re-merges the root (the resubmit shape).
+    let mut root = make_node("revert-root");
+    root.expected_output_paths = vec![root_out.clone()];
+    root.wanted_output_names = vec!["out".into()];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(&handle, b2, vec![root], vec![], false).await?;
+    barrier(&handle).await;
+
+    // The stale-Completed verify demoted the node; the dispatch probe
+    // now evaluates it.
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    // THE FP-4(a) property: no wrongful fail-fast. The node dispatches
+    // from source (Ready — waiting for a builder) and the build stays
+    // Active. Without the §4 clear-mirror, the stale flag-on-era mark +
+    // childless (Broken) evidence + the confirmed-missing probe answer
+    // would take the fail-fast arm and FAIL the build.
+    let st = query_status(&handle, b2).await?;
+    assert_ne!(
+        st.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "the flag-off build must NOT be wrongly fail-fasted on a stale flag-on-era mark \
+         (FP-4(a)); error: {:?}",
+        st.error_summary
+    );
+    assert_eq!(
+        st.state,
+        rio_proto::types::BuildState::Active as i32,
+        "the build proceeds: the node is from-source dispatchable"
+    );
+    let drv = expect_drv(&handle, "revert-root").await;
+    assert_eq!(
+        drv.status,
+        DerivationStatus::Ready,
+        "the node sits Ready for a from-source builder — never terminal, never fail-fasted"
+    );
+    Ok(())
+}

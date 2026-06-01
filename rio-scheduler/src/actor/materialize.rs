@@ -534,6 +534,9 @@ impl DagActor {
                         .await;
                     }
                     self.materialization_jobs.remove(&drv_hash);
+                    // The §4 clear-mirror: a successful resolution
+                    // clears the node's own topdown_pruned mark (PD-B16).
+                    self.clear_pruned_mark_on_job_resolution(&drv_hash).await;
                     // The build-success path: outputs are present and
                     // verified in the store; complete the node for live
                     // interest through the same chokepoint the
@@ -620,6 +623,9 @@ impl DagActor {
                             .await;
                         }
                         self.materialization_jobs.remove(&drv_hash);
+                        // The §4 clear-mirror: the moot arm is a
+                        // resolved_success too (PD-B16).
+                        self.clear_pruned_mark_on_job_resolution(&drv_hash).await;
                         self.complete_ready_from_store_batch(std::slice::from_ref(&drv_hash))
                             .await;
                     }
@@ -637,6 +643,11 @@ impl DagActor {
                             .await;
                         }
                         self.materialization_jobs.remove(&drv_hash);
+                        // The §4 clear-mirror: from-source resolution
+                        // clears the mark so the dispatch that follows is
+                        // not poisoned by the stale prune verdict
+                        // (PD-B16; the from-source-clear half).
+                        self.clear_pruned_mark_on_job_resolution(&drv_hash).await;
                         // The node returns to its dep-derived status
                         // (the normal Ready path) — requeue it.
                         self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
@@ -821,6 +832,48 @@ impl DagActor {
                 warn!(drv_hash = %drv_hash, %exec_id, error = %e,
                       "materialization attempt close failed; the establishment sweep remains \
                        the backstop");
+            }
+        }
+    }
+
+    // r[impl sched.materialize.routing]
+    /// The §4 clear-mirror (Phase B / PD-B16): when a materialization
+    /// job resolves successfully (`resolved_success` — the
+    /// covered-success and moot arms) or from-source
+    /// (`resolved_from_source`), clear the node's OWN `topdown_pruned`
+    /// mark — in-memory plus the durable fenced helper — mirroring the
+    /// success-clear / from-source-clear design §4 makes normative for
+    /// the flag-on consumption transaction. Without this, the mark
+    /// outlives the successful materialization and a flag-off rollback
+    /// can wrongly fail-fast the node on the stale flag-on-era mark
+    /// (the FP-4(a) revert-with-state hazard).
+    ///
+    /// Same posture as the walk's lazy/fail-fast clears (warn and
+    /// continue, never fail the consumption); the recovery
+    /// produced-children gate stays the cross-restart backstop for a
+    /// lost durable write. Materialization-only path — unreachable
+    /// flag-off, so flag-off behavior is byte-identical by construction.
+    async fn clear_pruned_mark_on_job_resolution(&mut self, drv_hash: &DrvHash) {
+        let marked = self.dag.node(drv_hash).is_some_and(|s| s.topdown_pruned);
+        if !marked {
+            return;
+        }
+        if let Some(state) = self.dag.node_mut(drv_hash) {
+            state.topdown_pruned = false;
+        }
+        match self
+            .db
+            .clear_topdown_pruned_by_hash(drv_hash, self.serving_generation())
+            .await
+        {
+            Ok(crate::db::FencedWrite::Fenced) => {
+                self.note_fenced_evidence_write("materialization-resolution topdown_pruned clear");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(drv_hash = %drv_hash, error = %e,
+                      "failed to clear persisted topdown_pruned after job resolution \
+                       (continuing; the recovery produced-children gate is the backstop)");
             }
         }
     }
