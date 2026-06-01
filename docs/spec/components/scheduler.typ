@@ -1436,10 +1436,12 @@ recorded contract ("every fail-fast decision point re-probes live obtainability
 first") at the single surviving fail-fast site. The Success coverage re-check
 closes the CE-17 class (interest grew between execution and consumption). The
 park-not-fail posture preserves B3 ("unknown never demotes"): infra evidence is
-never confirmation. Parking becomes *visible and alertable* (the
-`rio_scheduler_materialization_stalled` metric, design §2.5) and re-evaluable
-(the housekeeping Vouched/Pending → from-source arm) in Phase B --- PD-20
-records that deferral; Phase A's park is a durable `park_until` row only.
+never confirmation. Parking becomes *visible and alertable* (a dedicated
+stalled-jobs metric, design §2.5 --- the name lands with the metric itself; a
+metric that does not exist yet cannot be a validated reference) and
+re-evaluable (the housekeeping Vouched/Pending → from-source arm) in Phase
+B --- PD-20 records that deferral; Phase A's park is a durable `park_until`
+row only.
 
 #r("sched.materialize.pinning")[
   Every store path a materialization job ingests or verifies present MUST be
