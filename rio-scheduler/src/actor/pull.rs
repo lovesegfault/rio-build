@@ -437,14 +437,21 @@ impl DagActor {
         // Durable mint committed — now the in-memory bookkeeping, the
         // same shape the stream path's record phase keeps (transition,
         // exec_id, assigned executor, status persist, GC pins).
+        // r[impl sched.state.machine+2]
+        // The transition uses the KINDED validation (PD-6): build mints
+        // take the as-built Ready→Assigned edge byte-identically;
+        // materialization mints may additionally take Queued→Assigned
+        // (the kernel's Queued admission and this edge are two halves of
+        // one decision — a rejection here for an admitted claim would
+        // re-open the PDQ-6 stranded-mint window).
         if let Some(state) = self.dag.node_mut(drv_hash) {
-            if let Err(e) = state.transition(DerivationStatus::Assigned) {
+            if let Err(e) = state.transition_for_mint(DerivationStatus::Assigned, attempt_kind) {
                 // TOCTOU vs a concurrent cancel between the admit and
                 // the commit: the durable rows exist but the node left
-                // Ready. The attempt resolves via the normal terminal
-                // paths (report or establishment); never deliver.
+                // Ready/Queued. The attempt resolves via the normal
+                // terminal paths (report or establishment); never deliver.
                 warn!(drv_hash = %drv_hash, error = %e,
-                      "pull minted but Ready→Assigned rejected; answering NotYetReady");
+                      "pull minted but the mint transition was rejected; answering NotYetReady");
                 return Ok(PullOutcome::NotYetReady {
                     retry_after_secs: NOT_YET_READY_RETRY_AFTER_SECS,
                 });

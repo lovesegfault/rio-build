@@ -165,7 +165,7 @@ impl EffectiveFeatures {
 }
 
 db_str_enum! {
-    // r[impl sched.state.machine]
+    // r[impl sched.state.machine+2]
     /// State of a single derivation in the global DAG.
     ///
     /// The macro-generated [`ALL`](Self::ALL) const lists variants in
@@ -432,6 +432,33 @@ impl DerivationStatus {
                 reason: "transition not in state machine",
             })
         }
+    }
+
+    // r[impl sched.state.machine+2]
+    /// Kind-aware transition validation for the PULL-MINT path only
+    /// (PD-6, design §2.3: "one new transition edge `Queued → Assigned`
+    /// is legal for materialization mints only").
+    ///
+    /// Build mints — and every (from, to) pair other than the single
+    /// delta cell — delegate to the kind-blind [`Self::validate_transition`]
+    /// table unchanged, so the as-built table (and its exhaustive test)
+    /// stays byte-identical. Materialization mints additionally accept
+    /// `Queued → Assigned`: materialization does not wait for deps (the
+    /// store fetches from upstream; dep state is irrelevant to the
+    /// claim), so the kernel's PD-6 Queued admission and this edge are
+    /// the two halves of one decision — the kernel admits, the mint's
+    /// in-memory transition must then accept (a rejection here would
+    /// re-open the PDQ-6 stranded-mint window: durable rows committed
+    /// for an attempt the actor refuses to track).
+    pub fn validate_transition_for_mint(
+        self,
+        to: Self,
+        kind: AttemptKind,
+    ) -> Result<(), TransitionError> {
+        if kind == AttemptKind::Materialization && self == Self::Queued && to == Self::Assigned {
+            return Ok(());
+        }
+        self.validate_transition(to)
     }
 }
 
@@ -1700,10 +1727,37 @@ impl DerivationState {
     ) -> Result<DerivationStatus, TransitionError> {
         let from = self.status;
         from.validate_transition(to)?;
+        Ok(self.apply_validated_transition(from, to))
+    }
 
+    // r[impl sched.state.machine+2]
+    /// [`Self::transition`] for the pull-mint path: kind-aware
+    /// validation ([`DerivationStatus::validate_transition_for_mint`] —
+    /// the PD-6 `Queued → Assigned` materialization edge is the only
+    /// delta), identical post-validation bookkeeping. Build-kind mints
+    /// behave byte-identically to [`Self::transition`].
+    pub fn transition_for_mint(
+        &mut self,
+        to: DerivationStatus,
+        kind: AttemptKind,
+    ) -> Result<DerivationStatus, TransitionError> {
+        let from = self.status;
+        from.validate_transition_for_mint(to, kind)?;
+        Ok(self.apply_validated_transition(from, to))
+    }
+
+    /// The post-validation bookkeeping shared by [`Self::transition`]
+    /// and [`Self::transition_for_mint`]. The caller has already
+    /// validated `from → to`; this applies the status write and the
+    /// derived-field maintenance, returning the old status.
+    fn apply_validated_transition(
+        &mut self,
+        from: DerivationStatus,
+        to: DerivationStatus,
+    ) -> DerivationStatus {
         // Idempotent no-ops: don't change anything
         if from == to {
-            return Ok(from);
+            return from;
         }
 
         self.status = to;
@@ -1734,7 +1788,7 @@ impl DerivationState {
             self.exec_id = None;
         }
 
-        Ok(from)
+        from
     }
 
     /// Worker-lost recovery. Transitions Assigned -> Ready, or Running -> Failed -> Ready.
@@ -2514,6 +2568,21 @@ mod tests {
         assert!(Created.validate_transition(Ready).is_err());
         assert!(Created.validate_transition(Assigned).is_err());
         assert!(Queued.validate_transition(Assigned).is_err());
+        // PD-6 (Phase B): the kind-blind table keeps rejecting
+        // Queued→Assigned (the line above is the as-built pin); the
+        // MATERIALIZATION-MINT kinded form accepts exactly that edge —
+        // and only for the materialization kind (build mints stay
+        // byte-identical to the kind-blind table).
+        assert!(
+            Queued
+                .validate_transition_for_mint(Assigned, AttemptKind::Materialization)
+                .is_ok()
+        );
+        assert!(
+            Queued
+                .validate_transition_for_mint(Assigned, AttemptKind::Build)
+                .is_err()
+        );
         assert!(Queued.validate_transition(Running).is_err());
         assert!(Ready.validate_transition(Running).is_err());
         // ready -> completed IS valid (FOD output already in store; I-067)
@@ -2740,7 +2809,7 @@ mod tests {
         );
     }
 
-    // r[verify sched.state.machine]
+    // r[verify sched.state.machine+2]
     /// Exhaustive (from, to) cartesian product over all 11 states.
     /// Every pair is explicitly Ok or Err — a mutant that flips ONE
     /// arm's outcome breaks exactly one assertion. Complements
@@ -2839,6 +2908,48 @@ mod tests {
                         result.is_err(),
                         "expected {from} -> {to} to be INVALID (not in state machine)"
                     );
+                }
+            }
+        }
+    }
+
+    // r[verify sched.state.machine+2]
+    /// Exhaustive (from, to, kind) product over all 12 statuses × 2
+    /// attempt kinds for the KINDED mint validation (PD-6, Phase B):
+    /// the kinded form agrees with the kind-blind table on EVERY cell
+    /// except exactly one — (Queued, Assigned, Materialization), the
+    /// dep-racing materialization claim edge. The as-built exhaustive
+    /// test above stays untouched (it pins the kind-blind table, which
+    /// is byte-identical); this test pins the wrapper's delta to that
+    /// single cell so a future edit that widens the kinded form breaks
+    /// here, not in production.
+    #[test]
+    fn validate_transition_for_mint_exhaustive() {
+        use DerivationStatus as S;
+        for &from in S::ALL {
+            for &to in S::ALL {
+                let blind = from.validate_transition(to).is_ok();
+                for kind in [AttemptKind::Build, AttemptKind::Materialization] {
+                    let kinded = from.validate_transition_for_mint(to, kind).is_ok();
+                    let is_delta_cell = from == S::Queued
+                        && to == S::Assigned
+                        && kind == AttemptKind::Materialization;
+                    if is_delta_cell {
+                        assert!(
+                            kinded,
+                            "(Queued, Assigned, Materialization) is the ONE legal kinded delta"
+                        );
+                        assert!(
+                            !blind,
+                            "the kind-blind table must keep rejecting Queued -> Assigned"
+                        );
+                    } else {
+                        assert_eq!(
+                            kinded, blind,
+                            "kinded({from} -> {to}, {kind:?}) must agree with the kind-blind \
+                             table everywhere except the single delta cell"
+                        );
+                    }
                 }
             }
         }

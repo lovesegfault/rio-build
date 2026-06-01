@@ -1476,16 +1476,20 @@ async fn flag_off_walk_substituting_events_unchanged() -> TestResult {
 }
 
 // r[verify sched.materialize.job]
-/// The PD-6 boundary pin (adjudication PDQ-6): a Queued node (a parent
-/// behind an unproduced dep) with a pending job REFUSES a flag-on
-/// materialization claim — NotYetReady, ZERO drv_executions rows
-/// minted, node still Queued. Never a stranded mint (the as-built mint
-/// commits durable rows BEFORE the in-memory transition; refusing at
-/// admission is what prevents the strand). Phase B's Queued work item
-/// (the Queued→Assigned edge + the mint-ordering rework + the
-/// `sched.state.machine` test updates) flips this pin red-first.
+// r[verify sched.state.machine+2]
+/// PD-6 (Phase B, the PDQ-6 amendment's prescribed flip): a Queued node
+/// (a parent behind an unproduced dep) with a pending job ACCEPTS a
+/// flag-on materialization claim — DeliverNew, one drv_executions row
+/// with attempt_kind='materialization', node transitions Queued →
+/// Assigned → Running through the kinded mint edge. Materialization
+/// does not wait for deps: the store fetches from upstream, so dep
+/// state is irrelevant to the claim.
+///
+/// (Phase A pinned the opposite — Ready-only claims — as
+/// `flag_on_queued_node_refuses_materialization_claim`; this is that
+/// pin flipped red-first per the PDQ-6 amendment.)
 #[tokio::test]
-async fn flag_on_queued_node_refuses_materialization_claim() -> TestResult {
+async fn flag_on_queued_node_accepts_materialization_claim() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
 
     // 3-node chain root → mid → leaf where only MID's output is
@@ -1512,7 +1516,7 @@ async fn flag_on_queued_node_refuses_materialization_claim() -> TestResult {
         make_test_edge("mat-queued-mid", "mat-queued-leaf"),
     ];
     let build_id = Uuid::new_v4();
-    merge_dag(&handle, build_id, nodes, edges, false).await?;
+    let _ev = merge_dag(&handle, build_id, nodes, edges, false).await?;
     barrier(&handle).await;
 
     // The job exists for mid (created by the merge new_sub lane) and
@@ -1525,24 +1529,191 @@ async fn flag_on_queued_node_refuses_materialization_claim() -> TestResult {
         "mid is Queued behind the unproduced leaf"
     );
 
-    // The boundary pin: a flag-on materialization claim against the
-    // Queued node refuses NotYetReady.
+    // PD-6: the flag-on materialization claim against the Queued node
+    // DELIVERS (the dep race is the point — materialization does not
+    // wait for the leaf to build).
     let claim = claim_materialization(&handle, "mat-queued-mid", "store-test-0").await;
-    assert!(
-        matches!(claim, Ok(PullOutcome::NotYetReady { .. })),
-        "PDQ-6: materialization claims are Ready-only in Phase A, got {claim:?}"
-    );
+    let assignment = match claim {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("PD-6: a Queued node's materialization claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
 
-    // ZERO drv_executions rows were minted (never a stranded mint) and
-    // the node is still Queued.
+    // The fenced mint persisted exactly one materialization-kind
+    // execution row.
+    let kind: String =
+        sqlx::query_scalar("SELECT attempt_kind FROM drv_executions WHERE exec_id = $1")
+            .bind(exec_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(kind, "materialization", "the mint persists the work class");
     let execs: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_executions")
         .fetch_one(&db.pool)
         .await?;
-    assert_eq!(execs, 0, "a refused claim must never mint durable rows");
+    assert_eq!(execs, 1, "exactly one execution row minted");
+
+    // The kinded mint edge: the node transitioned Queued → Assigned →
+    // Running (never a stranded mint — the in-memory transition accepts
+    // what the kernel admitted).
     assert_eq!(
         expect_drv(&handle, "mat-queued-mid").await.status,
-        DerivationStatus::Queued,
-        "the refusal leaves the node untouched"
+        DerivationStatus::Running,
+        "the Queued claim's mint transitions the node through the kinded edge"
     );
+    Ok(())
+}
+
+// r[verify sched.materialize.job]
+// r[verify sched.state.machine+2]
+/// PD-6 mint-ordering / no-strand proof: the durable mint commits
+/// BEFORE the in-memory transition (the as-built ordering, unchanged).
+/// If the actor crashes in that window for a QUEUED claim, the
+/// crashed mint's durable rows are absorbed — recovery loads the node,
+/// the establishment sweep closes the orphaned open attempt
+/// (materialization_infra, job re-armed), and a fresh claim DELIVERS
+/// from Queued (the kinded edge). Nothing strands.
+#[tokio::test]
+async fn flag_on_queued_mint_crash_between_commit_and_transition_recovers() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+
+    // ── Phase 1: flag-on actor; merge the chain; simulate the crashed
+    //    mint window with direct SQL (the exact rows
+    //    mint_pull_attempt_fenced commits, with derivations.status left
+    //    at 'queued' — the in-memory transition never ran). ──
+    let mid_out = test_store_path("mat-crash-mid-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(mid_out.clone());
+    {
+        let (handle, task) =
+            setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |cfg, _| {
+                cfg.materialization.enabled = true;
+            });
+        let root = make_node("mat-crash-root");
+        let mut mid = make_node("mat-crash-mid");
+        mid.expected_output_paths = vec![mid_out.clone()];
+        let leaf = make_node("mat-crash-leaf");
+        let nodes = vec![root, mid, leaf];
+        let edges = vec![
+            make_test_edge("mat-crash-root", "mat-crash-mid"),
+            make_test_edge("mat-crash-mid", "mat-crash-leaf"),
+        ];
+        let build_id = Uuid::new_v4();
+        let _ev = merge_dag(&handle, build_id, nodes, edges, false).await?;
+        barrier(&handle).await;
+        assert_eq!(
+            expect_drv(&handle, "mat-crash-mid").await.status,
+            DerivationStatus::Queued
+        );
+        // The crashed-mint window, reproduced durably.
+        let derivation_id: Uuid =
+            sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+                .bind("mat-crash-mid")
+                .fetch_one(&db.pool)
+                .await?;
+        let exec_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id) \
+             VALUES ($1, $2, 1, 'pending', $3)",
+        )
+        .bind(derivation_id)
+        .bind("mat-crash-mid@store-test-0")
+        .bind(exec_id)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO drv_executions (exec_id, drv_hash, executor_id, started_at, \
+                                         attempt_kind) \
+             VALUES ($1, $2, $3, now() - interval '1 hour', 'materialization')",
+        )
+        .bind(exec_id)
+        .bind("mat-crash-mid")
+        .bind("mat-crash-mid@store-test-0")
+        .execute(&db.pool)
+        .await?;
+        // Backdate the assignment so the establishment window has
+        // expired by the time phase 2 sweeps.
+        sqlx::query("UPDATE assignments SET assigned_at = now() - interval '100 days'")
+            .execute(&db.pool)
+            .await?;
+        // Crash: drop the actor.
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // ── Phase 2: fresh flag-on actor on the same PG; recovery; the
+    //    establishment sweep absorbs the orphan; a fresh claim delivers
+    //    from Queued. ──
+    let leader = crate::lease::LeaderState::always_leader(std::sync::Arc::new(
+        std::sync::atomic::AtomicU64::new(1),
+    ));
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let phase2_leader = leader.clone();
+    let (handle, _task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), move |cfg, p| {
+            cfg.materialization.enabled = true;
+            p.leader = phase2_leader;
+        });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // The node recovered (Queued — its dep is still unproduced).
+    assert_eq!(
+        expect_drv(&handle, "mat-crash-mid").await.status,
+        DerivationStatus::Queued,
+        "the crashed-mint node recovers at its durable status"
+    );
+
+    // The establishment sweep (PG-driven: kind read from the durable
+    // drv_executions row, never from the in-memory view) closes the
+    // orphaned open attempt: assignment row completed, charge class
+    // materialization_infra (the kind partition — never executor_crash),
+    // job stays pending.
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let open: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM assignments WHERE status IN ('pending', 'acknowledged')",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        open, 0,
+        "the establishment sweep closed the orphaned attempt"
+    );
+    let charges: Vec<String> = sqlx::query_scalar("SELECT outcome_class FROM drv_attempts")
+        .fetch_all(&db.pool)
+        .await?;
+    assert_eq!(
+        charges,
+        vec!["materialization_infra".to_string()],
+        "the orphaned materialization attempt is established as materialization_infra \
+         (never executor_crash — the kind partition holds across the crash)"
+    );
+    let job_state: String = sqlx::query_scalar("SELECT state FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        job_state, "pending",
+        "the job survived the crash, still claimable"
+    );
+
+    // The job is listed claimable to any store replica (the durable
+    // listing is PG-driven). The end-to-end re-claim from a RECOVERED
+    // Queued node additionally needs the in-memory job view rebuilt at
+    // recovery — that is T-4.3's obligation (Wave 4); the non-crash
+    // Queued claim path is proven by
+    // flag_on_queued_node_accepts_materialization_claim above.
+    let listed = list_materialization_jobs(&handle, 16).await;
+    assert_eq!(
+        listed.len(),
+        1,
+        "the surviving job is listed claimable after recovery, got {listed:?}"
+    );
+    assert_eq!(listed[0].drv_hash, "mat-crash-mid");
     Ok(())
 }

@@ -716,9 +716,12 @@ pub struct MaterializationInputs {
 ///     job None              → Gone (nothing to materialize)
 ///     job Pending{parked:f} → as-built admission gates (token/fence/
 ///                             status) then: node Ready → DeliverNew;
+///                             node Queued → DeliverNew (PD-6, Phase B:
+///                             materialization does not wait for deps —
+///                             the dep-racing claim is legal; the mint's
+///                             Queued→Assigned edge is the kinded
+///                             transition pair of this arm);
 ///                             node terminal → Gone; else NotYetReady
-///                             (Phase A claims from Ready only — the
-///                             Queued extension is Phase B, plan Delta D6)
 ///     job Pending{parked:t} → NotYetReady (backoff unexpired)
 ///     job Claimed{held:t}   → DeliverExisting (re-delivery to the same
 ///                             replica — needs the open attempt's exec id,
@@ -763,17 +766,29 @@ where
             }
         }
         (PullKind::Materialization, JobView::Pending { parked }) => {
-            // PHASE B: a dedicated Queued-status check lands here when
-            // the Queued→Assigned transition edge + mint-ordering rework
-            // make dep-racing claims legal (plan Delta D6 / PDQ-6).
+            // The node's status, captured before `request` moves into the
+            // as-built kernel: the PD-6 Queued arm below keys on it.
+            let status = request.status;
             match admit_pull(request) {
                 PullAdmission::RejectToken => PullAdmission::RejectToken,
                 PullAdmission::RejectStaleGeneration => PullAdmission::RejectStaleGeneration,
                 PullAdmission::Gone => PullAdmission::Gone,
                 // The as-built kernel said the node is deliverable from
-                // Ready; materialization claims need Ready (Phase A)
-                // and an unparked job.
+                // Ready; materialization claims need an unparked job.
                 PullAdmission::DeliverNew if !parked => PullAdmission::DeliverNew,
+                // r[impl sched.state.machine+2]
+                // PD-6 (Phase B, design §2.3 "one new transition edge"):
+                // a QUEUED node with an unparked pending job is also
+                // claimable — materialization does not wait for deps
+                // (the store fetches from upstream; dep state is
+                // irrelevant to the claim). The as-built kernel answers
+                // NotYetReady for Queued; this arm upgrades exactly that
+                // cell. The token/fence/Gone dominance above is
+                // untouched (a mis-bound token or terminal node never
+                // reaches here).
+                PullAdmission::NotYetReady if !parked && status == Some(PullNodeStatus::Queued) => {
+                    PullAdmission::DeliverNew
+                }
                 _ => PullAdmission::NotYetReady,
             }
         }
@@ -965,11 +980,12 @@ mod kinded_tests {
         }
     }
 
-    /// Flag-on: the materialization claim table (design §2.3), including the
-    /// PD-6/Delta-D6 Phase A boundary pin per adjudication PDQ-6:
-    /// materialization claims are Ready-only — a Queued node refuses the
-    /// claim NotYetReady (Phase B flips this case to DeliverNew when the
-    /// Queued→Assigned edge + mint-ordering rework land).
+    /// Flag-on: the materialization claim table (design §2.3), including
+    /// PD-6 (Phase B, the PDQ-6 amendment's prescribed flip):
+    /// materialization claims deliver from Ready AND from Queued — a
+    /// pending unparked job's node is claimable regardless of dep state
+    /// (materialization does not wait for deps; the store fetches from
+    /// upstream).
     #[test]
     fn kinded_flag_on_materialization_claim_table() {
         use PullNodeStatus as S;
@@ -996,14 +1012,33 @@ mod kinded_tests {
             ),
             PullAdmission::DeliverNew
         );
-        // PDQ-6 boundary pin: Pending unparked + node Queued → NotYetReady
-        // (Ready-only claims in Phase A; Phase B flips this to DeliverNew).
+        // PD-6 (Phase B): Pending unparked + node Queued → DeliverNew —
+        // the dep-racing claim is legal (was the Phase A Ready-only
+        // NotYetReady pin, flipped red-first per the PDQ-6 amendment).
         assert_eq!(
             admit_pull_kinded(
                 request(Some(S::Queued), false, None, &me),
                 mat(JobView::Pending { parked: false })
             ),
+            PullAdmission::DeliverNew
+        );
+        // The Queued delivery still requires an unparked pending job:
+        // Queued + parked → NotYetReady; Queued + Created (pre-dep
+        // statuses other than Queued) stay NotYetReady.
+        assert_eq!(
+            admit_pull_kinded(
+                request(Some(S::Queued), false, None, &me),
+                mat(JobView::Pending { parked: true })
+            ),
             PullAdmission::NotYetReady
+        );
+        assert_eq!(
+            admit_pull_kinded(
+                request(Some(S::Created), false, None, &me),
+                mat(JobView::Pending { parked: false })
+            ),
+            PullAdmission::NotYetReady,
+            "Created (deps not yet evaluated) is not claimable — only Ready/Queued are"
         );
         // Pending unparked + node terminal → Gone.
         assert_eq!(
@@ -1332,8 +1367,9 @@ mod kinded_proofs {
     /// One-winner: a materialization pull is delivered only when no open
     /// attempt is held by a different identity (atMostOneClaimWinner's
     /// admission half, AS-3/BC-1). A fresh claim (DeliverNew) requires an
-    /// unparked Pending job on a Ready node with no open attempt held by
-    /// anyone else; a re-delivery (DeliverExisting) requires the open
+    /// unparked Pending job on a Ready or Queued node (PD-6, Phase B:
+    /// the dep-racing Queued claim is legal) with no open attempt held
+    /// by anyone else; a re-delivery (DeliverExisting) requires the open
     /// attempt to be the puller's own and carries exactly its exec id.
     #[kani::proof]
     fn check_kinded_one_winner_arbitration() {
@@ -1352,12 +1388,18 @@ mod kinded_proofs {
         match decision {
             PullAdmission::DeliverNew => {
                 // Fresh claims happen only through the Pending-unparked
-                // arm, on a Ready node, via the as-built gates (which
-                // require no open attempt by another identity:
-                // DeliverNew is only produced for Ready, and Ready
-                // nodes carry no open attempt in the as-built table).
+                // arm, on a Ready or Queued node (PD-6: the kinded
+                // Queued→Assigned mint edge is the transition pair of
+                // the Queued admission), via the as-built gates — which
+                // require no open attempt by another identity: neither
+                // Ready nor Queued nodes carry an open attempt in the
+                // as-built table (open attempts exist only for
+                // Assigned/Running).
                 assert!(matches!(job, JobView::Pending { parked: false }));
-                assert_eq!(inputs.status, Some(PullNodeStatus::Ready));
+                assert!(matches!(
+                    inputs.status,
+                    Some(PullNodeStatus::Ready | PullNodeStatus::Queued)
+                ));
             }
             PullAdmission::DeliverExisting { exec_id } => {
                 // Re-deliveries happen only to the identity already

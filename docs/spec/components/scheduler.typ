@@ -1721,9 +1721,14 @@ Queue-level preemption is fully supported:
 
 = Derivation State Machine
 
-#r("sched.state.machine")[
+#r("sched.state.machine+2")[
   Each derivation node in the global DAG follows a strict state machine. All
   transitions are performed inside the DAG actor to ensure serialized access.
+  The transition table is kind-blind with exactly one kinded exception:
+  materialization-kind pull mints may additionally take `Queued → Assigned`
+  (materialization does not wait for dependencies --- the store fetches from
+  upstream, so dependency state is irrelevant to the claim). Build-kind mints
+  and every non-mint transition use the kind-blind table unchanged.
 ]
 
 // Mermaid's `note right of` annotations are dropped here — the transition-
