@@ -565,6 +565,33 @@ differential entry (the one that byte-compares `.attrs.sh`), so the gate
 executes the oracle on the wrap and rounding edges rather than trusting
 this paragraph.
 
+#r("builder.exec.structured-attrs-typed")[
+  Every read of a *behavioral* structured attribute — output policy
+  (`outputChecks`, `unsafeDiscardReferences`), graph expansion
+  (`exportReferencesGraph`), env semantics (`impureEnvVars`, `passAsFile`),
+  and sandbox shape (`__noChroot`) — MUST go through the fail-closed typed
+  accessors mirroring the oracle's `json-utils.cc` getters: a wrong-typed
+  value or an unparseable `__json` blob is an error, never a silent skip,
+  coercion, element drop, or fallback to a default. Lenient
+  (degrade-to-absent) reads are permitted ONLY for the scheduling-hint
+  attributes enumerated by the `SizingHint` type.
+]
+
+The pre-fix readers were fail-open three ways: unparseable `__json`
+neutralized every behavioral attribute at once (`outputChecks` simply
+vanished), wrong-typed values fell through to defaults (`maxSize: "1024"`
+meant *no* size limit), and `filter_map` silently shrank lists
+(`allowedReferences: ["ok", 42]` dropped the 42 — and with it the error the
+oracle raises). The oracle throws on all three (`getBoolean`/`getString`/
+`getStringList`/`getObject`, plus nlohmann's implicit `uint64` conversion
+for `maxSize`, whose float-truncation and signed-wrap acceptance is
+mirrored, not "fixed" — divergence here would reject derivations the
+oracle builds). The `SizingHint` enum is the compile-time bound on the
+lenient tier: pod-sizing hints read at submission time, where failing a
+build over a bad `pname` would reject derivations the oracle accepts;
+widening the enum is the only way to add a lenient read, so every new
+exemption is a one-line reviewable diff.
+
 #r("builder.exec.refs-graph-acyclic")[
   `exportReferencesGraph` materialization MUST terminate with auxiliary
   memory linear in the closure size, and MUST reject cyclic reference
