@@ -176,15 +176,16 @@ pub const DEFAULT_BUILD_TIMEOUT: Duration = Duration::from_secs(7200);
 /// Hard ceiling on how long a sandbox execution may outlive its build
 /// timeout before the worker forcibly reclaims it.
 ///
-/// rio-exec enforces the build's own `timeout`/`max_silent`/log-cap
-/// limits from inside its supervision loop, but those kills are issued
-/// by the same loop that forwards log events to the consumer: a consumer
-/// that stops reading (scheduler-link backpressure filling the event
-/// channel) suspends enforcement with it. This backstop bounds that
-/// suspension: `build timeout + EXEC_BACKSTOP_SLACK` after spawn, the
-/// `execute()` future is dropped, which fires the executor's
-/// process-tree guard — kill *and* reap, the designed-for cancellation
-/// path proven by `rio-exec/tests/drop_cancel.rs`.
+/// Primary enforcement is rio-exec's `LimitWatchdog`: timeout, silence,
+/// and log-cap kills run in a dedicated task that performs no channel
+/// sends and is fed at raw-read time, so no consumer behavior — this
+/// worker's log loop, scheduler-link backpressure behind it — can
+/// stall a kill. This backstop is the *second* line, against
+/// worker-internal defects (a watchdog bug, a wedged blocking pool):
+/// `build timeout + EXEC_BACKSTOP_SLACK` after spawn, the `execute()`
+/// future is dropped, which fires the executor's process-tree guard —
+/// kill *and* reap, the designed-for cancellation path proven by
+/// `rio-exec/tests/drop_cancel.rs`.
 ///
 /// MUST stay below rio-controller's `WORKER_DEADLINE_SLACK_SECS` (90s,
 /// `reconcilers/pool/jobs.rs`): the pod's `activeDeadlineSeconds` is
@@ -1284,14 +1285,18 @@ async fn run_native_lifecycle(
         .unwrap_or(0);
     // r[impl builder.exec.sandbox+3]
     // r[impl builder.timeout.no-reassign]
-    // Backstop: rio-exec's own timeout/silence/log-cap kills are issued by
-    // its supervision loop, whose event sends stall when the consumer
-    // stalls. If that enforcement is suspended past the build's deadline
-    // plus slack, drop the execute() future: the executor's process-tree
-    // guard kills and reaps the sandbox tree on drop (the designed-for
-    // cancellation path — rio-exec/tests/drop_cancel.rs), so the worker
-    // reclaims the build instead of waiting for k8s to kill the pod. The
-    // result is a build outcome (TimedOut), never an executor fault.
+    // Backstop, second line: primary limit enforcement is rio-exec's
+    // LimitWatchdog, which owns the kill handle in a task that performs
+    // no channel sends — no consumer behavior (this worker's log loop,
+    // scheduler-link backpressure behind it) can delay its kills. This
+    // outer timeout exists for worker-internal defects only: a watchdog
+    // bug, a wedged blocking pool, anything that breaks the executor's
+    // own machinery. On expiry, drop the execute() future: the
+    // executor's process-tree guard kills and reaps the sandbox tree on
+    // drop (the designed-for cancellation path —
+    // rio-exec/tests/drop_cancel.rs), so the worker reclaims the build
+    // instead of waiting for k8s to kill the pod. The result is a build
+    // outcome (TimedOut), never an executor fault.
     let exec_result = match tokio::time::timeout(
         opts.timeout.saturating_add(EXEC_BACKSTOP_SLACK),
         rio_exec::execute(&prepared.request, &host, event_tx),
@@ -1300,9 +1305,11 @@ async fn run_native_lifecycle(
     {
         Ok(result) => result,
         Err(_elapsed) => {
-            // The log loop's consumer side may be the stalled party —
-            // abort it rather than draining it, then collect the abort
-            // before tearing the cgroup down.
+            // Reaching this arm means the executor's own watchdog
+            // failed to fire — a worker-internal defect, not consumer
+            // backpressure. Abort the log loop rather than draining
+            // it, then collect the abort before tearing the cgroup
+            // down.
             log_task.abort();
             let _ = log_task.await;
             let (peak_cpu_cores, _oom) = monitors.stop();
@@ -1314,9 +1321,9 @@ async fn run_native_lifecycle(
                     status: rio_proto::types::BuildResultStatus::TimedOut,
                     error_msg: format!(
                         "build exceeded its timeout ({}s) plus the worker's enforcement \
-                         backstop ({}s); the in-sandbox limit enforcement never fired, which \
-                         usually means the worker's log/event pipeline was stalled (e.g. \
-                         scheduler-link backpressure)",
+                         backstop ({}s); the executor's limit watchdog never fired, which \
+                         indicates a worker-internal fault (the watchdog is isolated from \
+                         log and scheduler-link backpressure by design)",
                         opts.timeout.as_secs(),
                         EXEC_BACKSTOP_SLACK.as_secs(),
                     ),
