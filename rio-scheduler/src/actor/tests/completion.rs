@@ -4798,6 +4798,55 @@ async fn test_terminal_build_outcome_not_mutated_by_late_shared_failure() -> Tes
     Ok(())
 }
 
+/// Consumer-side guard for gw.dag.modulo-hash-all-nodes: a PLAIN IA node
+/// (is_ca=false, needs_resolve=false, statically-known path) that carries
+/// a populated ca_modular_hash must NOT be treated as CA anywhere — its
+/// completion registers no realisation row, because the realisation gate
+/// keys on is_ca/needs_resolve, never on hash presence.
+// r[verify gw.dag.modulo-hash-all-nodes]
+#[tokio::test]
+async fn plain_ia_modular_hash_does_not_trigger_ca_paths() -> TestResult {
+    let (db, handle, _task, mut wrx) = setup_with_worker("ia-guard-w", "x86_64-linux").await?;
+    let build_id = Uuid::new_v4();
+    let modular_hash = [0x42u8; 32];
+    let static_out = test_store_path("ia-guard-out");
+    let mut node = make_node("ia-guard");
+    node.is_content_addressed = false;
+    node.needs_resolve = false;
+    node.is_fixed_output = false;
+    node.expected_output_paths = vec![static_out.clone()];
+    // The gateway now populates this for plain IA nodes too.
+    node.ca_modular_hash = modular_hash.to_vec();
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    let assn = recv_assignment(&mut wrx).await;
+    assert_eq!(assn.drv_path, test_drv_path("ia-guard"));
+    complete_success(
+        &handle,
+        "ia-guard-w",
+        &test_drv_path("ia-guard"),
+        &static_out,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Build succeeded normally…
+    assert_eq!(
+        query_status(&handle, build_id).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+    );
+    // …and NO realisation row was registered for the hash.
+    let (n_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM realisations WHERE drv_hash = $1")
+        .bind(modular_hash.as_slice())
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        n_rows, 0,
+        "plain IA completion must not register a realisation (gate is is_ca/needs_resolve, not hash presence)"
+    );
+    Ok(())
+}
+
 /// Live-path pin for the deferred-IA realisation contract: a
 /// non-recovered deferred-IA completion (is_ca=false, needs_resolve set
 /// on the submitted node, gateway-provided modular hash) writes the

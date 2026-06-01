@@ -53,12 +53,16 @@ message DerivationNode {
   // same value Nix sends as the `sha256:<hex>` prefix of
   // wopRegisterDrvOutput's `id` field. Populated by the gateway after
   // DAG BFS from the same drv_cache that resolves inputDrvs (so the full
-  // transitive closure is available) for content-addressed nodes AND for
-  // deferred input-addressed nodes (is_content_addressed=false but the
-  // output path is unknown until a floating-CA input resolves — the
-  // realisation row keyed by this hash is how the scheduler answers
-  // wopQueryDerivationOutputMap for them). Empty (zero-length) for
-  // input-addressed derivations with statically-known output paths. For
+  // transitive closure is available) for EVERY node with a cached full
+  // derivation: content-addressed nodes (realisation key for CA-on-CA
+  // resolve), deferred input-addressed nodes (realisation row keyed by
+  // this hash is how the scheduler answers wopQueryDerivationOutputMap
+  // for them), AND plain input-addressed nodes with statically-known
+  // output paths (identity evidence — the scheduler's ingress
+  // inline-content binding seeds input_addressed_output_paths' hash
+  // cache with children's hashes to verify declared IA paths without
+  // store access). May be empty when the gateway's best-effort hash
+  // computation failed (consumers degrade per their own rules). For
   // the single-node BasicDerivation fallback, build_fallback_node
   // populates it when the inline derivation is content-addressed
   // (CppNix staticOutputHashes: hashDerivationModulo over the lifted

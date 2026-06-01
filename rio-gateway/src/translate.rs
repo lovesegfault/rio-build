@@ -236,31 +236,42 @@ pub(crate) fn compute_modular_hash_cached(
     }
 }
 
-/// Fill `ca_modular_hash` on each CA node via `hash_derivation_modulo`.
+/// Fill `ca_modular_hash` on EVERY node with a cached full derivation
+/// via `hash_derivation_modulo`.
 ///
-/// The scheduler's CA-on-CA resolve queries `realisations` keyed on
-/// `(modular_hash, output_name)`. The modular hash needs the full
-/// transitive closure of parsed derivations (what BFS put in
-/// `drv_cache`). Memoised via one shared `hash_cache` — for N CA
-/// nodes sharing a common CA input, the common sub-hash is computed
-/// once.
+/// Three consumers, three node populations:
+///   - CA nodes: the scheduler's CA-on-CA resolve queries `realisations`
+///     keyed on `(modular_hash, output_name)`;
+///   - deferred-IA nodes (empty output path): the scheduler writes a
+///     realisation on completion keyed by this hash so the gateway's
+///     `wopQueryDerivationOutputMap` can answer the client;
+///   - plain IA nodes with statically-known paths: the hash is the
+///     identity evidence the scheduler's ingress inline-content binding
+///     and Follow-up store-evidence displacement consume — it lets the
+///     scheduler verify a declared IA output path against inline bytes
+///     by seeding `input_addressed_output_paths`' hash cache with the
+///     children's hashes, no store access needed. (Previously these
+///     nodes carried no hash — "dead bytes on the wire" — which made
+///     every IA declared path unverifiable at ingress.)
+///
+/// The modular hash needs the full transitive closure of parsed
+/// derivations (what BFS put in `drv_cache`). Memoised via one shared
+/// `hash_cache` — for N nodes sharing a common input, the common
+/// sub-hash is computed once.
 ///
 /// Best-effort: hash failure → warn, leave empty. Scheduler's
 /// `collect_ca_inputs` skips empty; resolve degrades to worker-fail
-/// + retry-with-backoff.
+/// and retry-with-backoff; ingress treats a missing hash as no-evidence
+/// (fail-closed for authoritative claims, declaration-only for
+/// store-backed ones).
+// r[impl gw.dag.modulo-hash-all-nodes]
 fn populate_ca_modular_hashes(
     nodes: &mut [types::DerivationNode],
     drv_cache: &HashMap<StorePath, Derivation>,
 ) {
     let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
-    // IA nodes with statically-known paths: ca_modular_hash stays
-    // empty — dead bytes on the wire. Deferred-IA (empty output
-    // path) DOES need it: the scheduler writes a realisation on
-    // completion keyed by this hash so the gateway's
-    // wopQueryDerivationOutputMap can answer the client.
     let hashes: Vec<(usize, Vec<u8>)> =
         iter_cached_drvs(nodes, drv_cache, "populate_ca_modular_hashes")
-            .filter(|(_, node, drv)| node.is_content_addressed || drv.has_unknown_output_paths())
             .filter_map(|(idx, node, drv)| {
                 compute_modular_hash_cached(drv, &node.drv_path, drv_cache, &mut hash_cache)
                     .map(|h| (idx, h.to_vec()))
@@ -2982,6 +2993,81 @@ mod tests {
             nodes.iter().map(|n| n.drv_path.clone()).collect();
         assert!(paths.contains(&root_path.to_string()));
         assert!(paths.contains(&child_path.to_string()));
+    }
+
+    /// Plain IA nodes (statically-known output paths) now carry the
+    /// modular hash too — they are no longer "dead bytes on the wire":
+    /// the scheduler's ingress inline-content binding seeds
+    /// `input_addressed_output_paths`' hash cache from sibling nodes'
+    /// hashes to verify declared IA paths without store access.
+    // r[verify gw.dag.modulo-hash-all-nodes]
+    #[tokio::test]
+    async fn populate_modular_hashes_covers_plain_ia_nodes() {
+        let root_path = sp(&test_drv_path("ia-root"));
+        let child_path = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-ia-child.drv");
+
+        // Plain IA: non-empty declared output paths, no hash algo.
+        let child_aterm = format!(
+            r#"Derive([("out","/nix/store/{}-ia-child","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo c"],[("out","/nix/store/{}-ia-child")])"#,
+            "c".repeat(32),
+            "c".repeat(32),
+        );
+        let child_drv = Derivation::parse(&child_aterm).expect("child ATerm");
+        let root_aterm = format!(
+            r#"Derive([("out","/nix/store/{}-ia-root","","")],[("{}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo r"],[("out","/nix/store/{}-ia-root")])"#,
+            "d".repeat(32),
+            child_path.as_str(),
+            "d".repeat(32),
+        );
+        let root_drv = Derivation::parse(&root_aterm).expect("root ATerm");
+
+        let mut store = unreachable_store();
+        let mut cache = HashMap::new();
+        // Production parity: the root .drv is in the session drv_cache
+        // (the client uploaded it before requesting the build).
+        cache.insert(root_path.clone(), root_drv.clone());
+        cache.insert(child_path.clone(), child_drv.clone());
+
+        let (nodes, _edges) = reconstruct_dag(&root_path, &root_drv, None, &mut store, &mut cache)
+            .await
+            .expect("reconstruct should succeed");
+
+        assert_eq!(nodes.len(), 2);
+        for node in &nodes {
+            assert!(
+                !node.is_content_addressed,
+                "fixture nodes are plain IA: {}",
+                node.drv_path
+            );
+            assert!(
+                !node.ca_modular_hash.is_empty(),
+                "plain IA node {} must carry the modular hash",
+                node.drv_path
+            );
+            assert_eq!(node.ca_modular_hash.len(), 32);
+        }
+
+        // The child's populated hash equals a direct hash_derivation_modulo
+        // computation — i.e. it IS the value a consumer can seed a hash
+        // cache with.
+        let child_node = nodes
+            .iter()
+            .find(|n| n.drv_path == child_path.as_str())
+            .expect("child node present");
+        let mut direct_cache = HashMap::new();
+        let no_resolve = |_: &str| -> Option<&Derivation> { None };
+        let direct = rio_nix::derivation::hash_derivation_modulo(
+            &child_drv,
+            child_path.as_str(),
+            &no_resolve,
+            &mut direct_cache,
+        )
+        .expect("leaf IA hash");
+        assert_eq!(
+            child_node.ca_modular_hash,
+            direct.to_vec(),
+            "populated hash equals the direct computation"
+        );
     }
 
     #[tokio::test]

@@ -1067,6 +1067,28 @@ one submission), so the scheduler's top-down prune
 (#rref("sched.merge.substitute-topdown")) retains and verifies a requested
 target even when another target's closure swallows it as a non-root.
 
+#r("gw.dag.modulo-hash-all-nodes")[
+  After DAG reconstruction, the gateway MUST populate `ca_modular_hash`
+  (the `hashDerivationModulo` SHA-256) on every submitted node whose full
+  derivation is in the BFS cache --- content-addressed, deferred
+  input-addressed, and plain input-addressed nodes alike. Hash-computation
+  failure for a node degrades that node only (empty hash, warning logged);
+  it MUST NOT fail the submission.
+]
+Plain IA nodes previously carried no hash ("dead bytes on the wire"),
+which made every declared IA output path unverifiable at scheduler
+ingress: verifying `path == input_addressed_output_paths(bytes)` requires
+the modulo hashes of the node's inputs, and those inputs' own nodes are
+the only place the scheduler can get them without store access. With
+every node carrying its hash, the scheduler can seed the derivation-hash
+cache from sibling nodes and bind declared IA paths to inline bytes
+(#rref("sched.merge.ingress-inline-drv-binding")), and the follow-up
+store-evidence displacement can compare a store-fetched `.drv` against
+the persisted hash. The per-node degrade keeps the prior availability
+semantics: a node whose closure the gateway could not fully parse
+submits without evidence, and the scheduler's fail-closed rules decide
+what that node may then claim.
+
 #r("gw.reject.nochroot")[
   The gateway MUST reject any derivation (at SubmitBuild time) whose env
   contains `__noChroot = "1"`. This is a sandbox-escape request that rio-build
