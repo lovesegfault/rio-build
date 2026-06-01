@@ -287,20 +287,9 @@ pub async fn run(
                         cfg,
                         &opts.load_target,
                         opts.load_parallel,
-                        // base_port: each parallel build binds
-                        // localhost:{base_port + i} for its ssh-ng tunnel,
-                        // so the caller must know the port up-front (the
-                        // store URL embeds it). 2250 is the default the
-                        // original `xtask k8s stress run` CLI shipped with;
-                        // `e7707afa1`'s smoke/stress→qa migration dropped
-                        // it to a literal 0, which `gateway_port_forward`
-                        // can't represent (it discards `port_forward`'s
-                        // ephemeral pick and reads the SSH banner from
-                        // 127.0.0.1:0 — a 75s silent timeout). Never hit
-                        // until 2026-05-13 because the QA suite always
-                        // FAILed at least one scenario and aborted before
-                        // reaching `load`.
-                        2250,
+                        // base_port 0: each parallel tunnel binds its own
+                        // ephemeral local port — no bind races.
+                        0,
                         None,
                         false,
                     )

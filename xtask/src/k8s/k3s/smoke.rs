@@ -13,22 +13,11 @@ use crate::ui;
 
 use crate::k8s::shared::port_forward;
 
-const LOCAL_PORT: u16 = 2222;
-const SCHED_PORT: u16 = 19001;
-const STORE_PORT: u16 = 19002;
-
 pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     let client = kube::client().await?;
-    let store_url = format!(
-        "ssh-ng://rio@localhost:{LOCAL_PORT}?ssh-key={}",
-        chaos::SSH_KEY
-    );
 
     ui::step("smoke", || async {
-        let cli = ui::step("open cli tunnel", || {
-            chaos::CliCtx::open(&client, SCHED_PORT, STORE_PORT)
-        })
-        .await?;
+        let cli = ui::step("open cli tunnel", || chaos::CliCtx::open(&client, 0, 0)).await?;
         ui::step("bootstrap tenant", || {
             chaos::step_tenant(&cli, chaos::TENANT)
         })
@@ -40,7 +29,11 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         ui::step("install ssh key", || chaos::step_install_key(&client)).await?;
         ui::step("restart gateway", || chaos::step_restart_gateway(&client)).await?;
         // Port-forward to the gateway Service (instead of SSM→NLB).
-        let _tunnel = ui::step("establish tunnel", || tunnel(LOCAL_PORT)).await?;
+        let (gw_port, _tunnel) = ui::step("establish tunnel", || tunnel(0)).await?;
+        let store_url = format!(
+            "ssh-ng://rio@localhost:{gw_port}?ssh-key={}",
+            chaos::SSH_KEY
+        );
         ui::step("builder pool reconcile", || {
             chaos::step_pool_reconciled(&client, crate::k8s::NS_BUILDERS, "x86-64")
         })
@@ -63,16 +56,18 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     Ok(())
 }
 
-pub async fn tunnel(local_port: u16) -> Result<ProcessGuard> {
-    let (_, guard) = port_forward(NS, "svc/rio-gateway", local_port, 22).await?;
+/// `local_port = 0` binds an ephemeral local port; the returned port
+/// is the one actually bound — build store URLs from that.
+pub async fn tunnel(local_port: u16) -> Result<(u16, ProcessGuard)> {
+    let (port, guard) = port_forward(NS, "svc/rio-gateway", local_port, 22).await?;
     ui::poll_debug("reading SSH banner", Duration::from_secs(2), 10, || async {
         Ok(
-            tokio::time::timeout(Duration::from_secs(3), chaos::ssh_banner(local_port))
+            tokio::time::timeout(Duration::from_secs(3), chaos::ssh_banner(port))
                 .await
                 .ok()
                 .flatten(),
         )
     })
     .await?;
-    Ok(guard)
+    Ok((port, guard))
 }

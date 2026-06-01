@@ -419,8 +419,8 @@ pub enum AmiCmd {
 
 #[derive(Args)]
 pub struct RemoteStoreArgs {
-    /// Local port for the tunnel.
-    #[arg(long, default_value_t = 2222)]
+    /// Local port for the tunnel; 0 (default) picks an ephemeral port.
+    #[arg(long, default_value_t = 0)]
     port: u16,
     /// Passed through to the nix command.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -773,8 +773,10 @@ where
     // only fires if xtask exited cleanly; SIGKILL/panic leaks it).
     // The new tunnel would then bind fine but route to the OLD NLB —
     // surfacing as the "type 80" SSH error 30s later. Reap first.
-    shared::kill_port_listeners(port);
-    let _guard = ui::step("establish tunnel", || p.tunnel(port)).await?;
+    if port != 0 {
+        shared::kill_port_listeners(port);
+    }
+    let (port, _guard) = ui::step("establish tunnel", || p.tunnel(port)).await?;
 
     let store = format!(
         "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",

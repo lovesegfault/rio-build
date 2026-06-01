@@ -115,7 +115,7 @@ impl Provider for K3s {
         smoke::run(cfg).await
     }
 
-    async fn tunnel(&self, local_port: u16) -> Result<shared::ProcessGuard> {
+    async fn tunnel(&self, local_port: u16) -> Result<(u16, shared::ProcessGuard)> {
         smoke::tunnel(local_port).await
     }
 

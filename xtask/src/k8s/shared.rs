@@ -541,9 +541,10 @@ impl Drop for ProcessGuard {
 /// one's kubectl failed `address already in use`, surfacing later as a
 /// bare `transport error` from rio-cli.
 ///
-/// With `local != 0`, returns `(local, guard)` without waiting for the
-/// bind line — callers layer their own readiness poll (SSH banner,
-/// TCP-accept) as before.
+/// Fixed ports (`local != 0`) parse the same bind line, so a failed
+/// bind (port already taken) errors here instead of leaving the
+/// caller's readiness probe talking to whatever foreign listener owns
+/// the port.
 pub async fn port_forward(
     ns: &str,
     target: &str,
@@ -554,10 +555,6 @@ pub async fn port_forward(
     cmd.args(["-n", ns, "port-forward", target])
         .arg(format!("{local}:{remote}"))
         .stderr(std::process::Stdio::null());
-    if local != 0 {
-        cmd.stdout(std::process::Stdio::null());
-        return Ok((local, ProcessGuard::spawn(cmd)?));
-    }
     cmd.stdout(std::process::Stdio::piped());
     let mut guard = ProcessGuard::spawn(cmd)?;
     let stdout = guard.child.stdout.take().expect("piped above");
