@@ -246,7 +246,10 @@ pub async fn sync_state(
 /// Resume support: if the local state dir has no campaign.json but the
 /// store does, download the synced state files so resume can proceed
 /// after a pod reschedule wiped the local volume. Returns true when a
-/// campaign was restored from the store. `buckets/*.jsonl` and
+/// campaign was restored from the store. The local campaign.json doubles
+/// as the restore-complete sentinel and is written last, so a restore
+/// that fails partway leaves no sentinel and is retried in full on the
+/// next start. `buckets/*.jsonl` and
 /// `logs/*.log.zst` are uploaded by [`sync_state`] but not restored here —
 /// the report stage regenerates the bucket files from results.jsonl, and
 /// the job records already carry their log keys (the local log copies are
@@ -266,7 +269,6 @@ pub async fn download_state_if_missing(
     else {
         return Ok(false);
     };
-    state.write_bytes("campaign.json", &campaign)?;
     for rel in SYNCED_FILES.iter().filter(|r| **r != "campaign.json") {
         if let Some(bytes) = store
             .get_bytes(&format!("{prefix}/{campaign_id}/{rel}"))
@@ -275,6 +277,16 @@ pub async fn download_state_if_missing(
             state.write_bytes(rel, &bytes)?;
         }
     }
+    // Written last: the local campaign.json is the already-restored sentinel
+    // checked at the top of this function, so it must only become visible
+    // after every other state file landed. A failure mid-restore then leaves
+    // no sentinel and the next start retries the full restore (the downloads
+    // are idempotent overwrites); a sentinel written first would make a
+    // partial restore look complete, resume the campaign on near-empty state,
+    // and let the periodic sync overwrite the durable store copies with that
+    // empty state. Mirrors the data-before-markers ordering [`sync_state`]
+    // enforces in the upload direction.
+    state.write_bytes("campaign.json", &campaign)?;
     Ok(true)
 }
 
@@ -527,6 +539,88 @@ mod tests {
                 .unwrap(),
             b"{\"job\":\"a\"}\n"
         );
+    }
+
+    /// [`ArtifactStore`] wrapper that fails `get_bytes` for keys with a
+    /// given suffix while failures remain, then delegates (simulates a
+    /// transient store error mid-restore).
+    struct FailingGetStore {
+        inner: LocalDirArtifactStore,
+        fail_key_suffix: &'static str,
+        failures_left: std::sync::Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl ArtifactStore for FailingGetStore {
+        async fn put_bytes(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
+            self.inner.put_bytes(key, bytes).await
+        }
+
+        async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            if key.ends_with(self.fail_key_suffix) {
+                let mut left = self.failures_left.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    anyhow::bail!("injected transient store failure for {key}");
+                }
+            }
+            self.inner.get_bytes(key).await
+        }
+
+        async fn exists(&self, key: &str) -> Result<bool> {
+            self.inner.exists(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_restore_leaves_no_sentinel_and_is_retried() {
+        let adir = tempfile::tempdir().unwrap();
+        let store = FailingGetStore {
+            inner: LocalDirArtifactStore::new(adir.path()),
+            fail_key_suffix: "/results.jsonl",
+            failures_left: std::sync::Mutex::new(1),
+        };
+        store
+            .put_bytes(
+                "replay/campaigns/c1/campaign.json",
+                b"{\"campaignId\":\"c1\"}".to_vec(),
+            )
+            .await
+            .unwrap();
+        let mut results = serde_json::to_vec(&rec("a")).unwrap();
+        results.push(b'\n');
+        store
+            .put_bytes("replay/campaigns/c1/results.jsonl", results.clone())
+            .await
+            .unwrap();
+        store
+            .put_bytes("replay/campaigns/c1/markers/plan.done", b"done".to_vec())
+            .await
+            .unwrap();
+
+        let sdir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(sdir.path()).unwrap();
+
+        // First attempt: the results.jsonl download fails mid-restore.
+        let err = download_state_if_missing(&state, &store, "replay/campaigns", "c1").await;
+        assert!(err.is_err());
+        // The local campaign.json is the restore-complete sentinel: if a
+        // failed restore left it behind, every later start would skip the
+        // restore, resume on near-empty state, and the periodic sync would
+        // overwrite the durable store copies with that empty state.
+        assert!(
+            !state.path("campaign.json").exists(),
+            "a failed restore must not leave the restore-complete sentinel behind"
+        );
+
+        // Second attempt (store healthy again): the full restore runs.
+        let restored = download_state_if_missing(&state, &store, "replay/campaigns", "c1")
+            .await
+            .unwrap();
+        assert!(restored);
+        assert!(state.path("campaign.json").exists());
+        assert_eq!(std::fs::read(state.path("results.jsonl")).unwrap(), results);
+        assert!(state.path("markers/plan.done").exists());
     }
 
     #[tokio::test]
