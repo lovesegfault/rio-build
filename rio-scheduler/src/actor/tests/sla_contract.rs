@@ -3570,7 +3570,13 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
     // not taken work.
     let (tx, rx) = tokio::sync::oneshot::channel();
     actor
-        .handle_pull_assignment("ice-pull-b".into(), Some("ice-pull-b".into()), tx)
+        .handle_pull_assignment(
+            "ice-pull-b".into(),
+            Some("ice-pull-b".into()),
+            rio_evidence_kernel::pull::PullKind::Build,
+            None,
+            tx,
+        )
         .await;
     assert!(
         matches!(
@@ -3591,7 +3597,13 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
     // The first successful pull of the Ready drv IS the success edge.
     let (tx, rx) = tokio::sync::oneshot::channel();
     actor
-        .handle_pull_assignment("ice-pull-a".into(), Some("ice-pull-a".into()), tx)
+        .handle_pull_assignment(
+            "ice-pull-a".into(),
+            Some("ice-pull-a".into()),
+            rio_evidence_kernel::pull::PullKind::Build,
+            None,
+            tx,
+        )
         .await;
     assert!(
         matches!(rx.await.expect("reply"), Ok(PullOutcome::Deliver(_))),

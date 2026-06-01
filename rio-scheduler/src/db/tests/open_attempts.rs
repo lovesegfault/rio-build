@@ -191,6 +191,8 @@ async fn mint_persists_dispatched_deadline_and_view_returns_it() -> anyhow::Resu
             &log_hash("oadeadline"),
             Some("node-1"),
             Some(1234.0),
+            // Mechanical flag-off default (carve-out 1c): build kind.
+            crate::state::AttemptKind::Build,
         )
         .await?;
     assert!(committed, "the fenced mint commits on a fresh cluster");

@@ -12,6 +12,9 @@ async fn pull_deliver(handle: &ActorHandle, intent: &str) -> rio_proto::types::W
         .query_unchecked(|reply| ActorCommand::PullAssignment {
             intent_id: intent.into(),
             auth_intent: Some(intent.into()),
+            // Mechanical flag-off defaults (carve-out 1c).
+            kind: rio_evidence_kernel::pull::PullKind::Build,
+            executor_instance: None,
             reply,
         })
         .await

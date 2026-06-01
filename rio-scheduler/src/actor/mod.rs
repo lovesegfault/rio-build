@@ -52,6 +52,7 @@ mod executor;
 pub(crate) mod floor;
 mod handle;
 mod housekeeping;
+pub(crate) mod materialize;
 mod merge;
 pub(crate) mod pull;
 mod recovery;
@@ -1177,13 +1178,27 @@ impl DagActor {
                 ActorCommand::PullAssignment {
                     intent_id,
                     auth_intent,
+                    kind,
+                    executor_instance,
                     reply,
                 } => {
                     // r[sched.lease.standby-drops-writes+3]: the handler
                     // self-gates on is_leader() and the mint transaction
                     // carries the durable generation fence.
-                    self.handle_pull_assignment(intent_id, auth_intent, reply)
-                        .await;
+                    self.handle_pull_assignment(
+                        intent_id,
+                        auth_intent,
+                        kind,
+                        executor_instance,
+                        reply,
+                    )
+                    .await;
+                }
+                ActorCommand::ListMaterializationJobs { limit, reply } => {
+                    // r[sched.lease.standby-drops-writes+3]: the handler
+                    // self-gates on is_leader() (standby answers empty)
+                    // and is read-only either way.
+                    self.handle_list_materialization_jobs(limit, reply).await;
                 }
                 ActorCommand::ReportPullOutcome {
                     exec_id,

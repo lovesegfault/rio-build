@@ -184,10 +184,17 @@ impl DagActor {
         &mut self,
         intent_id: String,
         auth_intent: Option<String>,
+        kind: rio_evidence_kernel::pull::PullKind,
+        executor_instance: Option<String>,
         reply: oneshot::Sender<Result<PullOutcome, PullRejection>>,
     ) {
         let result = self
-            .pull_assignment_inner(&intent_id, auth_intent.as_deref())
+            .pull_assignment_inner(
+                &intent_id,
+                auth_intent.as_deref(),
+                kind,
+                executor_instance.as_deref(),
+            )
             .await;
         let _ = reply.send(result);
     }
@@ -197,6 +204,8 @@ impl DagActor {
         &mut self,
         intent_id: &str,
         auth_intent: Option<&str>,
+        kind: rio_evidence_kernel::pull::PullKind,
+        executor_instance: Option<&str>,
     ) -> Result<PullOutcome, PullRejection> {
         // Standby replicas answer nothing (the gRPC layer already
         // gates; this closes the in-flight-deposed window).
@@ -211,9 +220,25 @@ impl DagActor {
             .map_err(|e| PullRejection::Internal(format!("claims-floor read failed: {e}")))?;
 
         let drv_hash = DrvHash::from(intent_id);
-        // The attempt's executor identity is the attested intent (see
-        // the module doc) — not a pod name the request cannot carry.
-        let pulling_identity = ExecutorId::from(intent_id);
+        // The attempt's executor identity (substitution-replacement
+        // BC-1): build pulls bind to the attested intent itself,
+        // exactly as-built (the request carries no pod name the token
+        // could attest). Materialization pulls bind to the
+        // `(intent, replica)` pair — distinct per store replica, so the
+        // kernel's open-attempt arm (same-identity re-delivery,
+        // different-identity NotYetReady) is the one-winner arbiter.
+        // The kind is NEVER parsed back out of this string: it is
+        // carried by the request and persisted as
+        // `drv_executions.attempt_kind`.
+        let pulling_identity = match (kind, executor_instance) {
+            (rio_evidence_kernel::pull::PullKind::Materialization, Some(instance))
+                if !instance.is_empty() =>
+            {
+                ExecutorId::from(format!("{intent_id}@{instance}"))
+            }
+            // Build pulls: the attested intent, exactly as-built.
+            _ => ExecutorId::from(intent_id),
+        };
 
         let (status, open_attempt) = match self.dag.node(&drv_hash) {
             None => (None, None),
@@ -240,12 +265,12 @@ impl DagActor {
             serving_generation,
             generation_floor,
             materialization_enabled: self.materialization_cfg.enabled,
-            // The kind/job-view intake: the gRPC layer's proto `kind`
-            // field and the in-memory job view land with the
-            // materialization listing/creation handlers; until then
-            // every pull is a build pull of a job-less node — exactly
-            // the as-built admission domain.
-            pull_kind: rio_evidence_kernel::pull::PullKind::Build,
+            pull_kind: kind,
+            // The job view: projected from the actor's in-memory job
+            // map, which is populated only by the flag-gated creation
+            // paths (none exist yet — the creation gate lands with the
+            // job-creation handlers). Until then every node is job-less,
+            // which flag-off is also the only correct answer.
             job_view: rio_evidence_kernel::pull::JobView::None,
         });
 
@@ -295,7 +320,7 @@ impl DagActor {
                 Ok(PullOutcome::Deliver(Box::new(assignment)))
             }
             PullDecision::DeliverNew => {
-                self.mint_and_deliver(&drv_hash, &pulling_identity, serving_generation)
+                self.mint_and_deliver(&drv_hash, &pulling_identity, serving_generation, kind)
                     .await
             }
         }
@@ -312,6 +337,7 @@ impl DagActor {
         drv_hash: &DrvHash,
         pulling_identity: &ExecutorId,
         serving_generation: u64,
+        kind: rio_evidence_kernel::pull::PullKind,
     ) -> Result<PullOutcome, PullRejection> {
         let Some(db_id) = self.dag.node(drv_hash).and_then(|s| s.db_id) else {
             // Merged but not yet persisted — deliverable on a later
@@ -350,6 +376,17 @@ impl DagActor {
             })
         };
 
+        // Substitution-replacement: the work class is persisted on the
+        // execution row (`drv_executions.attempt_kind`) — keyed on the
+        // request's claimed kind, never derived from an identity prefix.
+        // Build pulls write 'build' (the column default — value-identical
+        // to the as-built rows).
+        let attempt_kind = match kind {
+            rio_evidence_kernel::pull::PullKind::Build => crate::state::AttemptKind::Build,
+            rio_evidence_kernel::pull::PullKind::Materialization => {
+                crate::state::AttemptKind::Materialization
+            }
+        };
         let committed = self
             .db
             .mint_pull_attempt_fenced(
@@ -360,6 +397,7 @@ impl DagActor {
                 &log_hash,
                 source_node.as_deref(),
                 deadline_secs,
+                attempt_kind,
             )
             .await
             .map_err(|e| PullRejection::Internal(format!("pull mint transaction failed: {e}")))?;
@@ -421,13 +459,18 @@ impl DagActor {
             .await;
 
         // GC live-input pins — same best-effort discipline as the
-        // stream path's record phase.
-        let input_paths = crate::assignment::approx_input_closure(&self.dag, drv_hash);
-        if !input_paths.is_empty()
-            && let Err(e) = self.db.pin_live_inputs(drv_hash, &input_paths).await
-        {
-            debug!(drv_hash = %drv_hash, error = %e,
-                   "failed to pin live inputs for pull attempt (best-effort)");
+        // stream path's record phase. Materialization mints skip this:
+        // build-input pins are not materialization's lifecycle (design
+        // §5 — pin-at-ingest is store-side, and a materialization
+        // attempt never reads build inputs).
+        if attempt_kind == crate::state::AttemptKind::Build {
+            let input_paths = crate::assignment::approx_input_closure(&self.dag, drv_hash);
+            if !input_paths.is_empty()
+                && let Err(e) = self.db.pin_live_inputs(drv_hash, &input_paths).await
+            {
+                debug!(drv_hash = %drv_hash, error = %e,
+                       "failed to pin live inputs for pull attempt (best-effort)");
+            }
         }
 
         let assignment = self

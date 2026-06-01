@@ -116,6 +116,7 @@ impl SchedulerDb {
         log_hash: &str,
         source_node: Option<&str>,
         deadline_secs: Option<f64>,
+        attempt_kind: crate::state::AttemptKind,
     ) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         // The floor read runs on the transaction's connection so the
@@ -153,12 +154,17 @@ impl SchedulerDb {
         .execute(&mut *tx)
         .await?;
         // The execution lifecycle row carries the controller-
-        // authoritative source attribution (071) and the dispatched-
-        // deadline anchor for the establishment window (072).
+        // authoritative source attribution (071), the dispatched-
+        // deadline anchor for the establishment window (072), and the
+        // work class (078, substitution-replacement: 'build' for build
+        // pulls — value-identical to the column default — and
+        // 'materialization' for store-replica claims; the kind
+        // partition's durable key).
         sqlx::query(
             "INSERT INTO drv_executions \
-                 (exec_id, drv_hash, executor_id, started_at, source_node, deadline_secs) \
-             VALUES ($1, $2, $3, now(), $4, $5) \
+                 (exec_id, drv_hash, executor_id, started_at, source_node, deadline_secs, \
+                  attempt_kind) \
+             VALUES ($1, $2, $3, now(), $4, $5, $6) \
              ON CONFLICT (exec_id) DO NOTHING",
         )
         .bind(exec_id)
@@ -166,6 +172,7 @@ impl SchedulerDb {
         .bind(executor_id.as_str())
         .bind(source_node)
         .bind(deadline_secs)
+        .bind(attempt_kind.as_str())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

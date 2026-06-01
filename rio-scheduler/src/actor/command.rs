@@ -154,7 +154,29 @@ pub enum ActorCommand {
         intent_id: String,
         /// HMAC-attested intent binding (None = dev mode, no key).
         auth_intent: Option<String>,
+        /// The attempt class this pull claims (substitution-replacement
+        /// Phase A). The gRPC layer maps proto UNSPECIFIED|BUILD →
+        /// Build; materialization claims arrive only from store
+        /// replicas, and only deliver flag-on.
+        kind: rio_evidence_kernel::pull::PullKind,
+        /// Per-replica executor identity for materialization pulls (the
+        /// store replica's pod name; BC-1). `None` for build pulls —
+        /// build-pull identity remains the attested intent (as-built).
+        executor_instance: Option<String>,
         reply: oneshot::Sender<Result<super::pull::PullOutcome, super::pull::PullRejection>>,
+    },
+
+    /// Store-replica poll for claimable materialization jobs
+    /// (`ExecutorService.ListMaterializationJobs`, substitution-
+    /// replacement Phase A). Leader-served and read-only; flag-off,
+    /// standby, or no claimable jobs all answer an empty list (the
+    /// AS-6 mixed-flag posture — never an error).
+    /// `send_unchecked`: the store polls on an interval, so a dropped
+    /// command is just a delayed listing.
+    ListMaterializationJobs {
+        /// Cap on returned descriptors (server clamps to 256).
+        limit: u32,
+        reply: oneshot::Sender<Vec<super::materialize::JobDescriptor>>,
     },
 
     /// Pull-mode dispatch: a pod reports the terminal outcome of its
@@ -572,6 +594,7 @@ impl ActorCommand {
             Self::SubstituteProgress { .. } => "SubstituteProgress",
             Self::CancelBuild { .. } => "CancelBuild",
             Self::PullAssignment { .. } => "PullAssignment",
+            Self::ListMaterializationJobs { .. } => "ListMaterializationJobs",
             Self::ReportPullOutcome { .. } => "ReportPullOutcome",
             Self::ReportAttemptOutcome { .. } => "ReportAttemptOutcome",
             Self::AckSpawnedIntents { .. } => "AckSpawnedIntents",

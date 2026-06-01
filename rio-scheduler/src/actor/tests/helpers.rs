@@ -1036,6 +1036,9 @@ pub(crate) async fn try_pull_attempt(
         .query_unchecked(|reply| ActorCommand::PullAssignment {
             intent_id: drv_hash.into(),
             auth_intent: Some(drv_hash.into()),
+            // Mechanical flag-off defaults (carve-out 1c).
+            kind: rio_evidence_kernel::pull::PullKind::Build,
+            executor_instance: None,
             reply,
         })
         .await

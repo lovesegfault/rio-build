@@ -15,6 +15,10 @@ async fn pull(
         .query_unchecked(|reply| ActorCommand::PullAssignment {
             intent_id: intent_id.into(),
             auth_intent: auth_intent.map(Into::into),
+            // Mechanical flag-off defaults (carve-out 1c): build kind,
+            // no per-replica instance — the as-built pull shape.
+            kind: rio_evidence_kernel::pull::PullKind::Build,
+            executor_instance: None,
             reply,
         })
         .await

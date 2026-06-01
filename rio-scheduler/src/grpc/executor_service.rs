@@ -34,10 +34,12 @@ use super::SchedulerGrpc;
 //   intent_id                         → DAG lookup, assignments/executions rows → reject RPC > MAX_IDENT_LEN
 //   executor_token                    → HMAC-verified then dropped        → reject RPC > MAX_EXECUTOR_TOKEN_LEN
 //                                       (verification fails on any tamper; the bound only caps the hash work)
-//   kind                              → n/a (enum/i32; never read in Phase A — the
-//                                       materialization claim intake is Wave-3/T-3.3 work)
-//   executor_instance                 → never read in Phase A (dormant)   → bound lands with the T-3.3
-//                                       identity intake (per-replica ExecutorId binding)
+//   kind                              → enum/i32 (UNSPECIFIED|BUILD → Build; MATERIALIZATION →
+//                                       Materialization); decides identity binding + attempt_kind column
+//   executor_instance                 → BC-1 per-replica identity, interpolated into ExecutorId and
+//                                       assignments/executions rows       → reject RPC > MAX_IDENT_LEN;
+//                                       reject RPC empty for kind=MATERIALIZATION (mandatory);
+//                                       ignored/dropped for kind=BUILD
 // ReportOutcome RPC (pull-mode dispatch):
 //   exec_id                           → UUID parse → attempt lookup       → reject RPC if not a valid UUID
 //   report.result.error_msg           → event ring, terminal payload      → truncate to MAX_ERROR_MSG_LEN
@@ -48,11 +50,15 @@ use super::SchedulerGrpc;
 //   materialization_outcome.*         → never read in Phase A (dormant: the intake treats the
 //                                       request exactly as one without it) → bounds land with the
 //                                       Wave-3 consumption transaction (T-3.5)
-// ListMaterializationJobs RPC (Phase A dormant stub — always the disabled-state empty list):
-//   service_token / limit             → never read in Phase A             → bounds land with T-3.3
-// ReportMaterializationProgress RPC (Phase A: acknowledge-and-drop, per the wire contract):
-//   exec_id / upstream_uri / bytes_*  → never read in Phase A             → bounds land with the
-//                                       Phase-B progress relay
+// ListMaterializationJobs RPC (leader-served store poll):
+//   service_token                     → HMAC-verified then dropped (the body fallback carrier;
+//                                       same family as executor tokens)   → reject RPC > MAX_EXECUTOR_TOKEN_LEN
+//   limit                             → numeric; clamped to 256 actor-side → n/a
+// ReportMaterializationProgress RPC (Phase A: validate + acknowledge-and-drop, per the wire contract):
+//   exec_id                           → UUID-parsed for validation, then dropped → reject RPC if not a
+//                                       valid UUID
+//   upstream_uri / bytes_*            → never read in Phase A (droppable display payload) → dropped
+//                                       before any state; bounds land with the Phase-B relay
 
 /// Upper bound on worker-supplied identifier/label fields: `intent_id`,
 /// `node_name`, and `hw_class`. All are either k8s object names (≤253
@@ -149,6 +155,40 @@ impl ExecutorService for SchedulerGrpc {
         // r[impl sched.executor.input-bounds+2]
         rio_common::grpc::check_bound("intent_id bytes", req.intent_id.len(), MAX_IDENT_LEN)?;
 
+        // Substitution-replacement: the claimed work class. Proto3 zero
+        // value (UNSPECIFIED) and BUILD both map to Build — deployed
+        // builder pods that predate the field send nothing and behave
+        // bit-for-bit as before (the frozen pull-contract addendum).
+        let kind = match req.kind() {
+            rio_proto::types::AttemptKind::Materialization => {
+                rio_evidence_kernel::pull::PullKind::Materialization
+            }
+            rio_proto::types::AttemptKind::Unspecified | rio_proto::types::AttemptKind::Build => {
+                rio_evidence_kernel::pull::PullKind::Build
+            }
+        };
+        // BC-1: the per-replica identity is mandatory for the
+        // materialization kind (it is what makes the kernel's
+        // one-winner arbitration per-replica); for build pulls the
+        // field is ignored — build identity stays the attested intent.
+        let executor_instance = match kind {
+            rio_evidence_kernel::pull::PullKind::Materialization => {
+                if req.executor_instance.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "executor_instance is required for materialization pulls",
+                    ));
+                }
+                // r[impl sched.executor.input-bounds+2]
+                rio_common::grpc::check_bound(
+                    "executor_instance bytes",
+                    req.executor_instance.len(),
+                    MAX_IDENT_LEN,
+                )?;
+                Some(req.executor_instance)
+            }
+            rio_evidence_kernel::pull::PullKind::Build => None,
+        };
+
         // send_unchecked: a dropped pull would park the pod for a full
         // backoff interval; the pod retries anyway, so backpressure
         // surfaces as retried pulls, never lost work.
@@ -157,6 +197,8 @@ impl ExecutorService for SchedulerGrpc {
             .send_unchecked(ActorCommand::PullAssignment {
                 intent_id: req.intent_id,
                 auth_intent,
+                kind,
+                executor_instance,
                 reply: reply_tx,
             })
             .await
@@ -298,36 +340,107 @@ impl ExecutorService for SchedulerGrpc {
     }
 
     /// Store-replica poll for claimable materialization jobs
-    /// (substitution-replacement Phase A).
+    /// (substitution-replacement Phase A, design §2.2 item 1).
     ///
-    /// Phase A dormant stub: materialization dispatch is never enabled,
-    /// so this always answers the wire contract's documented
-    /// disabled-state response — an empty list, read-only, no state
-    /// change, request fields never read. Wave 3 (T-3.3) replaces this
-    /// with the leader-served, service-token-verified handler backed by
-    /// the actor's claimable-job query.
-    #[instrument(skip(self, _request), fields(rpc = "ListMaterializationJobs"))]
+    /// Leader-served and read-only. The actor answers the empty list
+    /// whenever materialization dispatch is disabled (the Phase A
+    /// deployed state), the replica is standby, or no job is claimable
+    /// — never an error (the AS-6 mixed-flag posture: a flag-on store
+    /// polling a flag-off scheduler hangs harmlessly on empty lists).
+    ///
+    /// Identity: the same gate as the other ExecutorService unaries
+    /// (`require_executor`'s metadata carrier) with the body
+    /// `service_token` accepted as the self-contained fallback — the
+    /// same HMAC family/key as executor tokens. Dev mode (no key):
+    /// credential-less calls are accepted, like every other unary.
+    // r[impl sched.materialize.job]
+    #[instrument(skip(self, request), fields(rpc = "ListMaterializationJobs"))]
     async fn list_materialization_jobs(
         &self,
-        _request: Request<rio_proto::types::ListMaterializationJobsRequest>,
+        request: Request<rio_proto::types::ListMaterializationJobsRequest>,
     ) -> Result<Response<rio_proto::types::ListMaterializationJobsResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        // r[impl sec.executor.identity-token+2]
+        // Metadata carrier first (the shared interceptor), body
+        // service_token as the fallback — both verified by the same key.
+        if let Err(metadata_err) = self.require_executor(&request) {
+            let body_token = request.get_ref().service_token.as_str();
+            if body_token.is_empty() {
+                return Err(metadata_err);
+            }
+            // r[impl sched.executor.input-bounds+2]
+            rio_common::grpc::check_bound(
+                "service_token bytes",
+                body_token.len(),
+                MAX_EXECUTOR_TOKEN_LEN,
+            )?;
+            let Some(key) = &self.hmac_key else {
+                return Err(metadata_err);
+            };
+            let _claims: rio_auth::hmac::ExecutorClaims = key.verify(body_token).map_err(|e| {
+                Status::unauthenticated(format!("service_token verification failed: {e}"))
+            })?;
+        }
+        let req = request.into_inner();
+
+        // send_unchecked: the store polls on an interval; a dropped
+        // command is a delayed listing, never lost state.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.actor
+            .send_unchecked(ActorCommand::ListMaterializationJobs {
+                limit: req.limit,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(Self::actor_error_to_status)?;
+        let jobs = reply_rx
+            .await
+            .map_err(|_| Status::internal("actor dropped ListMaterializationJobs reply"))?;
+
         Ok(Response::new(
-            rio_proto::types::ListMaterializationJobsResponse { jobs: Vec::new() },
+            rio_proto::types::ListMaterializationJobsResponse {
+                jobs: jobs
+                    .into_iter()
+                    .map(|j| rio_proto::types::MaterializationJobDescriptor {
+                        job_id: j.job_id.to_string(),
+                        drv_hash: j.drv_hash,
+                        tenant_id: j.tenant_id.map(|t| t.to_string()).unwrap_or_default(),
+                        origin: j.origin.as_str().to_string(),
+                    })
+                    .collect(),
+            },
         ))
     }
 
     /// Fire-and-forget byte progress for a running materialization
     /// attempt. Display-only, droppable.
     ///
-    /// Phase A: acknowledges and drops, exactly as the wire contract
-    /// documents — no materialization attempt can exist while the
-    /// flags are off, and progress is droppable by contract even when
-    /// one does. Phase B wires the relay to build events.
-    #[instrument(skip(self, _request), fields(rpc = "ReportMaterializationProgress"))]
+    /// Phase A: validates the exec_id format, acknowledges, and drops —
+    /// exactly as the wire contract documents (no materialization
+    /// attempt can exist while the flags are off, and progress is
+    /// droppable by contract even when one does). Phase B wires the
+    /// relay to build events (BC-4).
+    #[instrument(skip(self, request), fields(rpc = "ReportMaterializationProgress"))]
     async fn report_materialization_progress(
         &self,
-        _request: Request<rio_proto::types::ReportMaterializationProgressRequest>,
+        request: Request<rio_proto::types::ReportMaterializationProgressRequest>,
     ) -> Result<Response<rio_proto::types::ReportMaterializationProgressResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let req = request.into_inner();
+        // Validate-then-drop: a malformed exec_id is a caller bug worth
+        // surfacing even though the payload itself is droppable.
+        let exec_id: uuid::Uuid = req
+            .exec_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("exec_id must be a UUID"))?;
+        tracing::debug!(
+            %exec_id,
+            bytes_done = req.bytes_done,
+            bytes_expected = req.bytes_expected,
+            "materialization progress acknowledged and dropped (Phase A: relay is dormant)"
+        );
         Ok(Response::new(
             rio_proto::types::ReportMaterializationProgressResponse {},
         ))
