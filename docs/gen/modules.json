@@ -1414,6 +1414,21 @@
       "doc": "Chunk manifest serialization."
     },
     {
+      "path": "materialize/",
+      "depth": 0,
+      "doc": "Store-side materialization executor (substitution-replacement"
+    },
+    {
+      "path": "materialize/client.rs",
+      "depth": 1,
+      "doc": "The materialization executor's scheduler client: poll → fenced"
+    },
+    {
+      "path": "materialize/executor.rs",
+      "depth": 1,
+      "doc": "Per-job materialization execution: tenant re-resolution → live"
+    },
+    {
       "path": "metadata/",
       "depth": 0,
       "doc": "Store path metadata persistence in PostgreSQL."
