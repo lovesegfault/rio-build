@@ -33,6 +33,15 @@ pub enum ExecEvent {
         stream: LogStream,
         /// The raw line bytes (not necessarily UTF-8).
         line: Vec<u8>,
+        /// Whether this event ends a logical line: `true` for a line
+        /// emitted at its `\n` terminator; `false` for a fragment the
+        /// splitter force-emitted (pending-buffer cap reached) or an
+        /// EOF flush of a trailing unterminated line. Pure framing
+        /// metadata --- the executor attaches no meaning to the
+        /// contents, but a caller-side classifier needs the boundary
+        /// to treat a split logical line as one unit (the head
+        /// classifies, continuations inherit).
+        terminated: bool,
     },
     /// Sandbox setup completed and the program is about to exec.
     Started {

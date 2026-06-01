@@ -296,7 +296,7 @@ async fn separate_pipes_tag_streams() {
     assert_exited(&result, 0);
     let find = |needle: &str| {
         events.iter().find_map(|e| match e {
-            ExecEvent::Log { stream, line }
+            ExecEvent::Log { stream, line, .. }
                 if std::str::from_utf8(line).is_ok_and(|l| l.contains(needle)) =>
             {
                 Some(*stream)

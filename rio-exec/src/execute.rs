@@ -1164,19 +1164,22 @@ fn read_status_pipe(fd: OwnedFd) -> StatusReport {
 /// -w0`, a binary dumped to stdout, a deliberate flood) would otherwise
 /// grow the pending buffer without bound — memory charged to the
 /// executor process, outside the build cgroup's accounting. When the
-/// cap is reached the accumulated bytes are emitted as a (partial) line
-/// so they flow through the normal event pipeline and whatever
-/// log-volume limits the caller enforces there.
+/// cap is reached the accumulated bytes are emitted as a (partial,
+/// `terminated: false`) fragment so they flow through the normal event
+/// pipeline and whatever log-volume limits the caller enforces there;
+/// the fragment boundary travels on the event, so callers can treat
+/// the split logical line as one unit.
 const MAX_PENDING_LINE_BYTES: usize = 1 << 20;
 
 /// Accumulates raw chunks per stream and emits complete lines as
 /// [`ExecEvent::Log`]s. Lines are split on `\n`; a trailing `\r` (pty
 /// raw mode passes through the `\r\n` the line discipline would have
 /// produced) is stripped. A line that reaches [`MAX_PENDING_LINE_BYTES`]
-/// without a terminator is emitted in chunks of that size; a single
-/// control frame longer than that (e.g. a >1 MiB `@nix` line) is
-/// therefore split and dropped as malformed by the downstream filter —
-/// pathological input, accepted trade-off.
+/// without a terminator is emitted in fragments of that size, each
+/// marked `terminated: false`; the event at the eventual `\n` (or the
+/// EOF flush) closes the logical line. Callers that classify lines by
+/// their head bytes use the flag to extend the head's classification
+/// over its continuations.
 #[derive(Default)]
 struct LineSplitter {
     pending: Vec<(LogStream, Vec<u8>)>,
@@ -1200,13 +1203,17 @@ impl LineSplitter {
                 events.push(ExecEvent::Log {
                     stream,
                     line: std::mem::take(buf),
+                    terminated: true,
                 });
             } else {
                 buf.push(*byte);
                 if buf.len() >= MAX_PENDING_LINE_BYTES {
+                    // Cap-forced fragment: the logical line continues in
+                    // the next event, so it is not terminated.
                     events.push(ExecEvent::Log {
                         stream,
                         line: std::mem::take(buf),
+                        terminated: false,
                     });
                 }
             }
@@ -1226,6 +1233,9 @@ impl LineSplitter {
             .map(|(stream, buf)| ExecEvent::Log {
                 stream: *stream,
                 line: std::mem::take(buf),
+                // EOF flush of an unterminated trailing line: the
+                // logical line never saw its `\n`.
+                terminated: false,
             })
             .collect()
     }
@@ -1532,7 +1542,7 @@ mod tests {
         events
             .into_iter()
             .map(|e| match e {
-                ExecEvent::Log { stream, line } => (stream, line),
+                ExecEvent::Log { stream, line, .. } => (stream, line),
                 ExecEvent::Started { .. } => panic!("unexpected Started"),
             })
             .collect()
@@ -1558,8 +1568,62 @@ mod tests {
             .find(|(stream, _)| *stream == LogStream::Merged)
             .expect("pending entry");
         assert_eq!(pending.len(), MAX_PENDING_LINE_BYTES / 2);
-        // The remainder still flushes at EOF.
-        assert!(!s.flush().is_empty());
+        // The remainder still flushes at EOF — also unterminated.
+        let flushed = s.flush();
+        assert!(!flushed.is_empty());
+        assert!(
+            flushed.iter().all(|e| matches!(
+                e,
+                ExecEvent::Log {
+                    terminated: false,
+                    ..
+                }
+            )),
+            "EOF flush of a capped line's remainder is not a logical line end"
+        );
+    }
+
+    /// The framing flag: newline-emitted lines are terminated, both
+    /// fragment producers (cap force-emit, EOF flush) are not, and a
+    /// CRLF terminator counts as a normal line end.
+    #[test]
+    fn line_splitter_marks_fragments_unterminated() {
+        let mut s = LineSplitter::default();
+        // Cap-forced fragment: false; the eventual newline closes the
+        // logical line with true.
+        let mut blob = vec![b'x'; MAX_PENDING_LINE_BYTES];
+        blob.extend_from_slice(b"tail\n");
+        let events = s.push(LogStream::Merged, &blob);
+        let flags: Vec<bool> = events
+            .iter()
+            .map(|e| match e {
+                ExecEvent::Log { terminated, .. } => *terminated,
+                ExecEvent::Started { .. } => panic!("unexpected Started"),
+            })
+            .collect();
+        assert_eq!(flags, vec![false, true], "cap fragment then newline end");
+
+        // Plain newline and CRLF: terminated.
+        let events = s.push(LogStream::Merged, b"a\nb\r\n");
+        assert!(events.iter().all(|e| matches!(
+            e,
+            ExecEvent::Log {
+                terminated: true,
+                ..
+            }
+        )));
+
+        // EOF flush of a trailing partial: unterminated.
+        assert!(s.push(LogStream::Merged, b"partial").is_empty());
+        let flushed = s.flush();
+        assert_eq!(flushed.len(), 1);
+        assert!(matches!(
+            flushed[0],
+            ExecEvent::Log {
+                terminated: false,
+                ..
+            }
+        ));
     }
 
     #[test]
