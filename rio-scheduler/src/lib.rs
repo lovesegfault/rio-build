@@ -160,8 +160,18 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_merge_foreign_edge_skipped_total",
         "Submitted dependency edges skipped at merge because their parent is a resident \
-         node not (re)created by the submission (sched.merge.edge-creation-scoped). \
-         Sustained nonzero rate → hostile direct submitter or gateway DAG-construction bug."
+         node not (re)created by the submission (sched.merge.edge-creation-scoped) and \
+         not carrying the closure_hole breadcrumb (rejoin-shaped skips are counted \
+         separately). Sustained nonzero rate → hostile direct submitter or gateway \
+         DAG-construction bug."
+    );
+    describe_counter!(
+        "rio_scheduler_merge_rejoin_edge_skipped_total",
+        "Submitted dependency edges skipped at merge whose parent is a resident \
+         closure-holed node not (re)created by the submission — the legitimate \
+         full-closure rejoin signature after a reap truncated the parent's children \
+         (sched.merge.heal-accepted-edges). The parent's hole stays set until a \
+         submission re-creates the node."
     );
     describe_counter!(
         "rio_scheduler_cache_hits_total",

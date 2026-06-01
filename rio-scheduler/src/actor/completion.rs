@@ -187,7 +187,7 @@ impl DagActor {
             .await;
     }
 
-    // r[impl sched.merge.substitute-topdown+10]
+    // r[impl sched.merge.substitute-topdown+11]
     /// Completion-time `topdown_pruned` clear: walk the (deduped) DAG
     /// parents of every hash in `completed` and drop the mark from any
     /// flagged parent whose closure is now vouched for
@@ -208,7 +208,8 @@ impl DagActor {
     /// breadcrumb are never Vouched and so are skipped: an un-produced
     /// child was reaped out from under them, so their produced children
     /// are a truncated view of the pruned closure — the fail-fast or a
-    /// later full merge re-declaring their edges resolves them instead.
+    /// later full merge whose re-declared edges are all accepted
+    /// (sched.merge.heal-accepted-edges) resolves them instead.
     /// Per-parent work is flag-gated (one node lookup) before the
     /// children scan; the PG write is one batched best-effort statement
     /// (warn-and-continue, same posture as the lazy and fail-fast
@@ -2202,7 +2203,7 @@ impl DagActor {
         // `builds.error_summary` above, before the row reset erased the
         // only other durable trace of the failure.
         //
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+11]
         // Capture the parents BEFORE `remove_node` scrubs the edge maps:
         // a Poisoned child is by definition un-produced, so removing it
         // truncates each surviving parent's child set relative to the

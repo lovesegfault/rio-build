@@ -32,6 +32,14 @@ use super::{ActorError, DagActor, MergeDagRequest};
 /// `node_index` is NOT carried (it borrows from `nodes`, which would
 /// make this self-referential) — `reconcile_merged_state` rebuilds it
 /// in one pass over `nodes`.
+/// INVARIANT (sched.merge.heal-accepted-edges): no field of this struct
+/// may derive from the raw request edge list. Everything downstream of
+/// the merge — the closure-hole heal, the `topdown_pruned`
+/// clear-candidate seeding, the PG edge persist, metrics — must read
+/// `merge_result` (computed by the same loop that enforces edge
+/// admission). `validate_and_ingest` drops the request edges immediately
+/// after `dag.merge` returns precisely so that re-deriving state from
+/// them is a compile error, not a code-review catch.
 pub(super) struct MergeIngest {
     pub build_id: Uuid,
     /// Post-topdown-prune node set (may be smaller than the request's).
@@ -39,12 +47,6 @@ pub(super) struct MergeIngest {
     /// Only `edges.len()` survives past step 5 (for the total-time log);
     /// the edges themselves are consumed by `dag.merge` + persist.
     pub edges_len: usize,
-    /// Deduped parent hashes of the post-prune submission `edges`,
-    /// resolved while the edges were still alive in
-    /// `validate_and_ingest`. Candidate set for the caller's
-    /// post-reconciliation `topdown_pruned` clear pass — empty for a
-    /// pruned merge (its edges were dropped with the closure).
-    pub edge_parent_hashes: Vec<DrvHash>,
     pub merge_result: crate::dag::MergeResult,
     pub event_rx: super::BuildEventReceivers,
     /// Pre-existing not-done nodes that were re-probed in step 4.
@@ -139,7 +141,7 @@ impl DagActor {
         // (total, completed, cached) to PG so list_builds is O(LIMIT).
         self.update_build_counts(build_id).await;
 
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+11]
         // Post-reconciliation `topdown_pruned` clear pass. A node may
         // only lose the mark once its children (in the post-merge DAG)
         // are all already produced — its closure is then in the store,
@@ -170,19 +172,27 @@ impl DagActor {
         // drops it (with the lazy clear in `handle_substitute_complete`
         // as the walk-failure backstop).
         //
+        // r[impl sched.merge.heal-accepted-edges]
         // Closure-hole healing comes FIRST: a full merge that
-        // re-declares a node's edges re-supplies its inputDrvs, so its
-        // child set is representative of its closure again — drop the
-        // `closure_hole` breadcrumb for every edge parent of this
-        // submission before judging the clear. A pruned merge has
-        // no edges (`edge_parent_hashes` is empty), so it never heals a
-        // hole. Candidates that are NOT edge parents of this submission
-        // (e.g. pre-existing DAG parents of a cache hit) keep their
-        // breadcrumb and are skipped below: the classifier judges their
-        // reap-truncated child set Broken, never Vouched.
+        // re-declares a node's edges AND has every one of them accepted
+        // re-supplies its inputDrvs, so its child set is representative
+        // of its closure again — drop the `closure_hole` breadcrumb for
+        // every HEALED parent (`merge_result.healed_parents`: declared
+        // minus vetoed, computed by the admission loop itself) before
+        // judging the clear. This is deliberately NOT the raw request
+        // edge list: a parent with even one gate-skipped or unresolvable
+        // declared edge keeps its breadcrumb, so reap-truncation
+        // evidence can never be laundered into Vouched closure evidence
+        // by a join the gate refused (the Broken→Vouched flip that
+        // re-arms the doomed from-source dispatch is unconstructible).
+        // A pruned merge has no edges (`healed_parents` is empty), so it
+        // never heals a hole. Candidates that are NOT healed parents of
+        // this submission (e.g. pre-existing DAG parents of a cache hit)
+        // keep their breadcrumb and are skipped below: the classifier
+        // judges their reap-truncated child set Broken, never Vouched.
         //
         // The persisted breadcrumb (`migrations/064`) is cleared here
-        // too, best-effort, for EVERY edge parent of this submission:
+        // too, best-effort, for every healed parent:
         // the upsert above never clears the column (OR-on-conflict,
         // merge binds false), and the heal must also fire when the
         // `topdown_pruned` mark stays (unbuilt children), so it cannot
@@ -196,13 +206,14 @@ impl DagActor {
         // earlier heal's best-effort write may simply have failed. The
         // helper's `AND closure_hole` WHERE keeps the statement a
         // no-op for rows that never carried the hole.
-        for hash in &ingest.edge_parent_hashes {
+        for hash in &ingest.merge_result.healed_parents {
             if let Some(s) = self.dag.node_mut(hash) {
                 s.closure_hole = false;
             }
         }
         let heal_parents: Vec<String> = ingest
-            .edge_parent_hashes
+            .merge_result
+            .healed_parents
             .iter()
             .map(|h| h.to_string())
             .collect();
@@ -213,7 +224,7 @@ impl DagActor {
                   "failed to clear persisted closure_hole after merge heal (continuing)");
         }
         let mut clear_candidates: HashSet<DrvHash> =
-            ingest.edge_parent_hashes.iter().cloned().collect();
+            ingest.merge_result.healed_parents.iter().cloned().collect();
         for child in ingest.cached_hits.keys() {
             clear_candidates.extend(self.dag.get_parents(child));
         }
@@ -369,7 +380,7 @@ impl DagActor {
         }
 
         // === Step 0: Top-down demand-set substitution check =========
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+11]
         // Before merging the full DAG, check if the DEMANDED
         // derivations' outputs are already available. The demand set is
         // the structural roots ∪ every node the gateway marked
@@ -459,6 +470,7 @@ impl DagActor {
         // DB build row exists, which we best-effort delete. This ordering
         // prevents the leak where a cyclic submission left permanent entries
         // in build_events/build_sequences/builds with no cleanup scheduled.
+        let edges_len = edges.len();
         let merge_result = match self.dag.merge(build_id, &nodes, &edges, &traceparent) {
             Ok(r) => r,
             Err(e) => {
@@ -470,12 +482,22 @@ impl DagActor {
                 return Err(ActorError::Dag(e));
             }
         };
+        // r[impl sched.merge.heal-accepted-edges]
+        // The raw request edge list is dead from here on: every consumer
+        // of "what this submission's edges did" must read `merge_result`
+        // (computed by the same loop that enforces edge admission), so an
+        // edge the gate skipped can never influence post-merge state.
+        // Deriving anything from the declared list after this point is a
+        // compile error by construction.
+        drop(edges);
         // r[impl sched.merge.edge-creation-scoped]
-        // Surface foreign-parent edge skips: a submission tried to extend
-        // the dependency set of a resident node it did not (re)create.
-        // Legitimate full-closure joins only re-declare existing edges
-        // (silent no-ops), so a sustained nonzero rate is either a
-        // hostile direct submitter or a gateway DAG-construction bug.
+        // Surface creation-scope edge skips, split by signature.
+        // Hostile/bug shape: parent is a resident node with no
+        // closure_hole — a submission tried to extend the dependency set
+        // of a node it did not (re)create. Legitimate full-closure joins
+        // only re-declare existing edges (silent no-ops), so a sustained
+        // nonzero rate is either a hostile direct submitter or a gateway
+        // DAG-construction bug.
         if !merge_result.foreign_parent_edges_skipped.is_empty() {
             let count = merge_result.foreign_parent_edges_skipped.len() as u64;
             metrics::counter!("rio_scheduler_merge_foreign_edge_skipped_total").increment(count);
@@ -484,6 +506,22 @@ impl DagActor {
                 count,
                 "skipped foreign-parent dependency edges at merge \
                  (parents are resident nodes this submission did not (re)create)"
+            );
+        }
+        // Rejoin shape: parent is a resident node CARRYING the
+        // closure_hole breadcrumb — the expected signature of a
+        // full-closure rejoin after a reap truncated the parent's
+        // children. Not hostile; counted separately (debug-level) and
+        // the parent's hole deliberately stays set until a submission
+        // re-creates the node (sched.merge.heal-accepted-edges).
+        if !merge_result.rejoin_parent_edges_skipped.is_empty() {
+            let count = merge_result.rejoin_parent_edges_skipped.len() as u64;
+            metrics::counter!("rio_scheduler_merge_rejoin_edge_skipped_total").increment(count);
+            debug!(
+                build_id = %build_id,
+                count,
+                "skipped rejoin dependency edges at merge \
+                 (closure-holed parents not (re)created by this submission keep their hole)"
             );
         }
         let newly_inserted = &merge_result.newly_inserted;
@@ -587,7 +625,7 @@ impl DagActor {
         phase!("5-persist-and-activate");
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+11]
         // Stamp topdown_pruned on the kept (demanded) nodes only now
         // that the merge is committed (steps 4–5 can no longer fail).
         // The stamp is a cross-build-visible mutation of possibly
@@ -630,27 +668,9 @@ impl DagActor {
                 }
             }
         }
-        // Parents of this submission's (post-prune) edges, deduped and
-        // resolved while `edges` is still alive — only `edges_len`
-        // otherwise survives into MergeIngest. These are the candidate
-        // set for the caller's post-reconciliation `topdown_pruned`
-        // clear pass. The clear DECISION is deliberately NOT taken
-        // here: `verify_preexisting_completed` (reconcile phase 6c) has
-        // not run yet, so a stale pre-existing Completed child that 6c
-        // is about to demote would launder a clear computed against the
-        // pre-verification view. A pruned merge has no edges, so this
-        // is empty there.
-        let edge_parent_hashes: Vec<DrvHash> = edges
-            .iter()
-            .filter_map(|e| self.dag.hash_for_path(&e.parent_drv_path).cloned())
-            .collect::<HashSet<DrvHash>>()
-            .into_iter()
-            .collect();
-
         Ok(MergeIngest {
             build_id,
-            edges_len: edges.len(),
-            edge_parent_hashes,
+            edges_len,
             nodes,
             merge_result,
             event_rx,
@@ -1975,7 +1995,7 @@ impl DagActor {
         self.dag.closure_evidence(drv_hash) == ClosureEvidence::Vouched
     }
 
-    // r[impl sched.merge.substitute-topdown+10]
+    // r[impl sched.merge.substitute-topdown+11]
     /// True when `drv_hash` carries the `topdown_pruned` mark AND its
     /// closure evidence is [`ClosureEvidence::Broken`] (childless or
     /// closure-holed): its dependency closure was dropped from the
@@ -2950,7 +2970,7 @@ impl DagActor {
         Ok(Some(resp))
     }
 
-    // r[impl sched.merge.substitute-topdown+10]
+    // r[impl sched.merge.substitute-topdown+11]
     /// Top-down demand-set substitution pre-check (step 0 of
     /// `handle_merge_dag`).
     ///

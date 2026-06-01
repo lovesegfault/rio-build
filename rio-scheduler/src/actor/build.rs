@@ -839,7 +839,7 @@ impl DagActor {
             debug!(build_id = %build_id, reaped = reap.reaped_paths.len(), "reaped orphaned terminal DAG nodes");
         }
 
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+11]
         // Re-evaluate the surviving parents that just lost children to this
         // reap. The hook lives HERE (the terminal-build reap) and not in
         // `dag::remove_node` because the poison-TTL sweep and admin
@@ -905,7 +905,8 @@ impl DagActor {
             // the fail-fast's PG clear is mark-only — so the stamp's
             // position relative to the loop no longer changes the
             // outcome: the persisted hole stays set either way until a
-            // later full merge re-declares the parent's edges. That
+            // later full merge re-declares the parent's edges and has
+            // every one of them accepted (healed_parents). That
             // persistence is intended — the directed resubmit the
             // fail-fast solicits re-prunes, and its stamp gates need the
             // breadcrumb so the produced survivors cannot pass for

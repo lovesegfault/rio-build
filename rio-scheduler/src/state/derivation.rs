@@ -944,7 +944,7 @@ pub struct DerivationState {
     /// hook, the walk-failure gate, and all clear sites) judges the
     /// same `ClosureEvidence`, treating a closure-holed survivor as
     /// childless-equivalent.
-    /// r[sched.merge.substitute-topdown+10]. Persisted (`migrations/063`,
+    /// r[sched.merge.substitute-topdown+11]. Persisted (`migrations/063`,
     /// stamped in the pruned merge's own transaction, OR-on-conflict,
     /// cleared only on a `Vouched` verdict — ≥1 child, all produced,
     /// no closure hole, and at recovery additionally a still-live
@@ -1011,9 +1011,11 @@ pub struct DerivationState {
     /// breadcrumb rides along with the other carried fields); a
     /// `rollback_merge` restores the prior state wholesale. Cleared
     /// explicitly (memory + PG) only when a later full merge
-    /// re-declares the node's edges (its child set is representative
-    /// again; the heal pushes the PG clear for every re-declared edge
-    /// parent) and when a Vouched-keyed clear pass consumes the
+    /// re-declares the node's edges AND the merge ACCEPTS every one of
+    /// them (`MergeResult::healed_parents` — its child set is
+    /// representative again; a gate-skipped declared edge vetoes the
+    /// heal, sched.merge.heal-accepted-edges) and when a Vouched-keyed
+    /// clear pass consumes the
     /// `topdown_pruned` mark it qualifies (the batched
     /// `clear_topdown_pruned_by_hashes` drops both bits; the singular
     /// `clear_topdown_pruned_by_hash` — the lazy walk-failure clear and

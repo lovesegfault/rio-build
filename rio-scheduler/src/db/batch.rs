@@ -175,8 +175,9 @@ impl SchedulerDb {
         // edges, so it must not launder the persisted truncation
         // evidence through the upsert. The only merge-side clear is
         // the explicit heal in `handle_merge_dag`
-        // (`clear_closure_hole_by_hashes`, edge parents of a full
-        // merge); the batched mark-clear helper below drops it
+        // (`clear_closure_hole_by_hashes`, keyed on
+        // `MergeResult::healed_parents` — parents whose every declared
+        // edge the merge ACCEPTED); the batched mark-clear helper below drops it
         // together with `topdown_pruned`, while the single-row
         // `clear_topdown_pruned_by_hash` is mark-only (the fail-fast
         // retains the breadcrumb for the directed resubmit).

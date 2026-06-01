@@ -122,6 +122,7 @@
     "rio_scheduler_malformed_built_output_total",
     "rio_scheduler_merge_foreign_edge_skipped_total",
     "rio_scheduler_merge_phase_seconds",
+    "rio_scheduler_merge_rejoin_edge_skipped_total",
     "rio_scheduler_orphan_builds_cancelled_total",
     "rio_scheduler_phantom_assignments_drained_total",
     "rio_scheduler_phases_rejected_total",
@@ -821,12 +822,17 @@
       {
         "name": "rio_scheduler_merge_foreign_edge_skipped_total",
         "kind": "counter",
-        "help": "Submitted dependency edges skipped at merge because their parent is a resident node not (re)created by the submission (sched.merge.edge-creation-scoped). Sustained nonzero rate → hostile direct submitter or gateway DAG-construction bug."
+        "help": "Submitted dependency edges skipped at merge because their parent is a resident node not (re)created by the submission (sched.merge.edge-creation-scoped) and not carrying the closure_hole breadcrumb (rejoin-shaped skips are counted separately). Sustained nonzero rate → hostile direct submitter or gateway DAG-construction bug."
       },
       {
         "name": "rio_scheduler_merge_phase_seconds",
         "kind": "histogram",
         "help": "Per-phase MergeDag latency (labeled by phase: 0-topdown-roots..6f). Decomposes rio_scheduler_actor_cmd_seconds{cmd=MergeDag}. A single phase >1s is the I-139 signal — N sequential PG awaits in the actor."
+      },
+      {
+        "name": "rio_scheduler_merge_rejoin_edge_skipped_total",
+        "kind": "counter",
+        "help": "Submitted dependency edges skipped at merge whose parent is a resident closure-holed node not (re)created by the submission — the legitimate full-closure rejoin signature after a reap truncated the parent's children (sched.merge.heal-accepted-edges). The parent's hole stays set until a submission re-creates the node."
       },
       {
         "name": "rio_scheduler_orphan_builds_cancelled_total",

@@ -2120,7 +2120,7 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+11]
 /// Completion-time clear, worker path: a topdown-pruned parent whose
 /// only child is produced by a normal worker completion must lose the
 /// mark right then — in memory AND in PG — not only at the next merge
@@ -2189,7 +2189,7 @@ async fn test_topdown_pruned_cleared_when_children_complete_normally() -> TestRe
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+11]
 /// Same worker-path clear as above, but with the parent NOT Queued
 /// (forced Substituting — the realistic mid-fetch shape for a flagged
 /// node): the child's completion promotes nothing to Ready, so this
@@ -2257,7 +2257,7 @@ async fn test_topdown_pruned_cleared_when_child_completes_while_parent_not_queue
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+11]
 /// Same clear, substitution/store path: the child completes via
 /// `complete_ready_from_store` (`SubstituteComplete{ok: true}`), which
 /// promotes dependents through its own inline loop rather than

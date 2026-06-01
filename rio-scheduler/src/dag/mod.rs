@@ -238,14 +238,42 @@ pub struct MergeResult {
     /// in the same transaction.
     pub displaced_scrubbed_edges: Vec<(DrvHash, HashSet<DrvHash>)>,
     /// Submitted edges skipped by the creation-scoped edge gate
-    /// (`sched.merge.edge-creation-scoped`): their parent is a resident
-    /// node this submission did NOT (re)create and that is not a
+    /// (`sched.merge.edge-creation-scoped`) whose parent does NOT carry
+    /// the `closure_hole` breadcrumb: their parent is a resident node
+    /// this submission did NOT (re)create and that is not a
     /// topdown-pruned root awaiting its dependency top-up, and the edge
     /// did not already exist. They never enter the in-memory DAG, are
     /// never persisted (Batch 3 sources `derivation_edges` rows from
     /// `new_edges`), and are not part of rollback. Surfaced so the
-    /// actor can count them (`rio_scheduler_merge_foreign_edge_skipped_total`).
+    /// actor can count them (`rio_scheduler_merge_foreign_edge_skipped_total`)
+    /// — this hostile-or-bug shape is disjoint from
+    /// `rejoin_parent_edges_skipped`.
     pub foreign_parent_edges_skipped: Vec<(DrvHash, DrvHash)>,
+    /// Submitted edges skipped by the creation-scoped edge gate whose
+    /// parent DOES carry the `closure_hole` breadcrumb: the signature of
+    /// a legitimate full-closure rejoin of a node whose children were
+    /// reaped out from under it (the submitter re-declares the full
+    /// inputDrvs set, but the gate cannot attach edges to a resident
+    /// node it did not re-create). Surfaced separately
+    /// (`rio_scheduler_merge_rejoin_edge_skipped_total`, debug-level)
+    /// because this shape is expected traffic, not hostility — and the
+    /// vetoed parent deliberately stays OUT of `healed_parents`.
+    pub rejoin_parent_edges_skipped: Vec<(DrvHash, DrvHash)>,
+    // r[impl sched.merge.heal-accepted-edges]
+    /// Parents whose ENTIRE declared edge set was accepted by this
+    /// merge: every declared edge with this parent was either attached
+    /// (`new_edges`) or already present (silent re-declaration). Any
+    /// gate-skipped edge (foreign or rejoin) and any edge whose child
+    /// endpoint did not resolve vetoes its parent. This — not the raw
+    /// request edge list — is the only legitimate key for the
+    /// closure-hole heal and the `topdown_pruned` clear-candidate
+    /// seeding: a parent whose declared set was only PARTIALLY accepted
+    /// has a child set that is not representative of its closure, so
+    /// healing it would launder reap-truncation evidence into Vouched
+    /// closure evidence. Computed by the same loop that enforces edge
+    /// admission, so any future tightening of the gate automatically
+    /// propagates here.
+    pub healed_parents: Vec<DrvHash>,
     /// Hashes of pre-existing nodes whose empty `traceparent` was
     /// upgraded to `submitter_traceparent` by this merge. Rollback
     /// clears it back to `""` so a rejected build's trace ID does not
@@ -544,8 +572,18 @@ impl DerivationDag {
         // Track newly-inserted edges for rollback (pairs of hashes)
         let mut new_edges: Vec<(DrvHash, DrvHash)> = Vec::new();
         // Submitted edges skipped because their parent is a resident node
-        // this submission did not (re)create (sched.merge.edge-creation-scoped).
+        // this submission did not (re)create (sched.merge.edge-creation-scoped),
+        // split by whether the parent carries the closure_hole breadcrumb
+        // (rejoin signature) or not (hostile / gateway-bug signature).
         let mut foreign_parent_edges_skipped: Vec<(DrvHash, DrvHash)> = Vec::new();
+        let mut rejoin_parent_edges_skipped: Vec<(DrvHash, DrvHash)> = Vec::new();
+        // Per-parent edge-admission bookkeeping for healed_parents
+        // (sched.merge.heal-accepted-edges): a parent is healed iff every
+        // declared edge naming it was accepted (attached or already
+        // present). Vetoes: gate-skipped edge (either kind) or an edge
+        // whose child endpoint did not resolve.
+        let mut edge_parents_declared: HashSet<DrvHash> = HashSet::new();
+        let mut edge_parents_vetoed: HashSet<DrvHash> = HashSet::new();
         // Track pre-existing nodes that gained interest in this merge, so
         // rollback only removes interest from these (not from nodes where
         // build_id was already present from a prior successful merge).
@@ -1047,12 +1085,21 @@ impl DerivationDag {
                 );
                 continue;
             };
+            // Every edge whose parent resolves declares that parent's
+            // (partial or full) dependency set — track it for the
+            // healed_parents computation regardless of what happens to
+            // the edge below.
+            edge_parents_declared.insert(parent_hash.clone());
             let Some(child_hash) = self.path_to_hash.get(edge.child_drv_path.as_str()).cloned()
             else {
                 tracing::warn!(
                     child_path = %edge.child_drv_path,
                     "edge references unknown child drv_path, skipping"
                 );
+                // An unresolvable child means this parent's declared set
+                // could not be fully attached → its child set is not
+                // representative of its closure → veto the heal.
+                edge_parents_vetoed.insert(parent_hash);
                 continue;
             };
 
@@ -1075,14 +1122,35 @@ impl DerivationDag {
                     .get(&parent_hash)
                     .is_some_and(|s| s.topdown_pruned);
             if !parent_creation_scoped && !already_present {
-                tracing::warn!(
-                    parent_path = %edge.parent_drv_path,
-                    child_path = %edge.child_drv_path,
-                    %build_id,
-                    "edge parent is a resident node not (re)created by this \
-                     submission; skipping foreign dependency edge"
-                );
-                foreign_parent_edges_skipped.push((parent_hash, child_hash));
+                // r[impl sched.merge.heal-accepted-edges]
+                // A gate-skipped edge vetoes its parent's heal either way;
+                // the split below only decides observability. A parent
+                // carrying the closure_hole breadcrumb is the legitimate
+                // post-reap rejoin signature (full-closure re-declaration
+                // of a node whose children were reaped); anything else is
+                // a hostile direct submitter or a gateway bug.
+                edge_parents_vetoed.insert(parent_hash.clone());
+                let parent_holed = self.nodes.get(&parent_hash).is_some_and(|s| s.closure_hole);
+                if parent_holed {
+                    tracing::debug!(
+                        parent_path = %edge.parent_drv_path,
+                        child_path = %edge.child_drv_path,
+                        %build_id,
+                        "edge parent is a closure-holed resident node not (re)created \
+                         by this submission; skipping rejoin dependency edge \
+                         (hole stays until the node is re-created)"
+                    );
+                    rejoin_parent_edges_skipped.push((parent_hash, child_hash));
+                } else {
+                    tracing::warn!(
+                        parent_path = %edge.parent_drv_path,
+                        child_path = %edge.child_drv_path,
+                        %build_id,
+                        "edge parent is a resident node not (re)created by this \
+                         submission; skipping foreign dependency edge"
+                    );
+                    foreign_parent_edges_skipped.push((parent_hash, child_hash));
+                }
                 continue;
             }
 
@@ -1100,6 +1168,18 @@ impl DerivationDag {
                 new_edges.push((parent_hash, child_hash));
             }
         }
+
+        // r[impl sched.merge.heal-accepted-edges]
+        // healed_parents = declared − vetoed: parents whose every declared
+        // edge was accepted (attached or already present). Computed here —
+        // by the same loop that enforces admission — and never from the
+        // raw request edge list, so edge-gate tightening can never diverge
+        // from the heal. merge() only COMPUTES this set; the closure_hole
+        // mutation itself happens actor-side (no new rollback obligation).
+        let healed_parents: Vec<DrvHash> = edge_parents_declared
+            .into_iter()
+            .filter(|p| !edge_parents_vetoed.contains(p))
+            .collect();
 
         // Cycle check: DFS from each newly-inserted node AND from each parent
         // endpoint of new edges. The latter catches cycles formed by new edges
@@ -1144,6 +1224,8 @@ impl DerivationDag {
             removed_retriable,
             displaced_scrubbed_edges,
             foreign_parent_edges_skipped,
+            rejoin_parent_edges_skipped,
+            healed_parents,
             traceparent_upgraded,
             wanted_grown,
             contributions_recorded,

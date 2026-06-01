@@ -3916,6 +3916,11 @@ fn test_foreign_parent_edge_skipped_on_resident_join() -> anyhow::Result<()> {
     );
     assert_eq!(res.foreign_parent_edges_skipped[0].0.as_str(), "fps-x");
     assert_eq!(res.foreign_parent_edges_skipped[0].1.as_str(), "fps-y");
+    // r[verify sched.merge.heal-accepted-edges]
+    assert!(
+        !res.healed_parents.iter().any(|h| h.as_str() == "fps-x"),
+        "a parent with a gate-skipped declared edge must not be healed"
+    );
     assert!(
         res.newly_inserted.contains("fps-y"),
         "the junk node itself is admitted (it is b2's own node)"
@@ -3977,6 +3982,13 @@ fn test_topdown_pruned_resident_parent_accepts_dep_topup() -> anyhow::Result<()>
         "pruned-root top-up must not be treated as a foreign edge"
     );
     assert_eq!(res.new_edges.len(), 2, "both edges accepted");
+    // r[verify sched.merge.heal-accepted-edges]
+    assert!(
+        res.healed_parents.iter().any(|h| h.as_str() == "tdp-r")
+            && res.healed_parents.iter().any(|h| h.as_str() == "tdp-app"),
+        "every parent whose declared edges were all accepted is healed \
+         (topdown carve-out and newly-inserted alike)"
+    );
     assert!(
         dag.get_children("tdp-r")
             .iter()
@@ -4030,6 +4042,11 @@ fn test_displacing_submission_attaches_own_edges() -> anyhow::Result<()> {
         res.foreign_parent_edges_skipped.is_empty(),
         "displacement is a re-creation: its own edges are not foreign"
     );
+    // r[verify sched.merge.heal-accepted-edges]
+    assert!(
+        res.healed_parents.iter().any(|h| h.as_str() == "ecs-h"),
+        "a displacing re-creation whose edges were all accepted is healed"
+    );
     assert!(
         res.new_edges
             .iter()
@@ -4041,6 +4058,281 @@ fn test_displacing_submission_attaches_own_edges() -> anyhow::Result<()> {
             .iter()
             .any(|h| h.as_str() == "ecs-d2"),
         "fresh node's dependency set is the displacing submission's"
+    );
+    Ok(())
+}
+
+// ── sched.merge.heal-accepted-edges ─────────────────────────────────────
+
+// r[verify sched.merge.heal-accepted-edges]
+/// A joining submission with one accepted re-declaration AND one
+/// gate-skipped extension is NOT healed: the partial acceptance means its
+/// declared set is not what the DAG holds, so reap-truncation evidence
+/// must not be cleared on its strength.
+#[test]
+fn test_healed_parents_excludes_gate_skipped_parent() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    // b1 creates X→D (X's true dependency set).
+    dag.merge(
+        b1,
+        &[
+            make_node("hgs-x", "x86_64-linux"),
+            make_node("hgs-d", "x86_64-linux"),
+        ],
+        &[make_edge("hgs-x", "hgs-d")],
+        "",
+    )?;
+
+    // b2 joins X, re-declares X→D (accepted no-op) and tries to extend
+    // X→J (gate-skipped). One veto → X is not healed.
+    let res = dag.merge(
+        b2,
+        &[
+            make_node("hgs-x", "x86_64-linux"),
+            make_node("hgs-d", "x86_64-linux"),
+            make_node("hgs-j", "x86_64-linux"),
+        ],
+        &[make_edge("hgs-x", "hgs-d"), make_edge("hgs-x", "hgs-j")],
+        "",
+    )?;
+
+    assert_eq!(
+        res.foreign_parent_edges_skipped.len(),
+        1,
+        "the extension edge is gate-skipped"
+    );
+    assert!(
+        !res.healed_parents.iter().any(|h| h.as_str() == "hgs-x"),
+        "one gate-skipped declared edge vetoes the parent's heal even \
+         though another declared edge was accepted"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.heal-accepted-edges]
+/// A joining submission whose declared edges are ALL exact
+/// re-declarations of existing edges IS healed: its declared set and the
+/// DAG's child set agree, which is exactly the "child set is
+/// representative again" condition the heal exists for.
+#[test]
+fn test_healed_parents_includes_already_present_redeclaration() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    dag.merge(
+        b1,
+        &[
+            make_node("hrd-x", "x86_64-linux"),
+            make_node("hrd-d", "x86_64-linux"),
+        ],
+        &[make_edge("hrd-x", "hrd-d")],
+        "",
+    )?;
+
+    // b2 joins and re-declares the full existing edge set, extending
+    // nothing.
+    let res = dag.merge(
+        b2,
+        &[
+            make_node("hrd-x", "x86_64-linux"),
+            make_node("hrd-d", "x86_64-linux"),
+        ],
+        &[make_edge("hrd-x", "hrd-d")],
+        "",
+    )?;
+
+    assert!(res.new_edges.is_empty(), "re-declaration adds nothing");
+    assert!(res.foreign_parent_edges_skipped.is_empty());
+    assert!(
+        res.healed_parents.iter().any(|h| h.as_str() == "hrd-x"),
+        "a parent whose every declared edge is an accepted re-declaration is healed"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.heal-accepted-edges]
+/// All three creation-scope admission arms produce healed parents: a
+/// newly-inserted parent, a topdown-pruned resident parent taking its
+/// dependency top-up, and a resubmit-reset re-creation.
+#[test]
+fn test_healed_parents_creation_scoped_parents_included() -> anyhow::Result<()> {
+    // Arm 1: newly-inserted parent.
+    {
+        let mut dag = DerivationDag::new();
+        let res = dag.merge(
+            Uuid::new_v4(),
+            &[
+                make_node("hcs-new", "x86_64-linux"),
+                make_node("hcs-dep", "x86_64-linux"),
+            ],
+            &[make_edge("hcs-new", "hcs-dep")],
+            "",
+        )?;
+        assert!(
+            res.healed_parents.iter().any(|h| h.as_str() == "hcs-new"),
+            "newly-inserted parent with accepted edges is healed"
+        );
+    }
+
+    // Arm 2: topdown-pruned resident parent accepting its top-up.
+    {
+        let mut dag = DerivationDag::new();
+        dag.merge(
+            Uuid::new_v4(),
+            &[make_node("hcs-r", "x86_64-linux")],
+            &[],
+            "",
+        )?;
+        dag.nodes.get_mut("hcs-r").unwrap().topdown_pruned = true;
+        // Simulate the truncation breadcrumb the top-up is healing.
+        dag.nodes.get_mut("hcs-r").unwrap().closure_hole = true;
+        let res = dag.merge(
+            Uuid::new_v4(),
+            &[
+                make_node("hcs-r", "x86_64-linux"),
+                make_node("hcs-glibc", "x86_64-linux"),
+            ],
+            &[make_edge("hcs-r", "hcs-glibc")],
+            "",
+        )?;
+        assert!(
+            res.healed_parents.iter().any(|h| h.as_str() == "hcs-r"),
+            "topdown-pruned resident parent taking its top-up is healed"
+        );
+        assert!(
+            dag.nodes.get("hcs-r").unwrap().closure_hole,
+            "merge() only COMPUTES healed_parents; the closure_hole \
+             mutation itself is actor-side"
+        );
+    }
+
+    // Arm 3: resubmit-reset re-creation of a retriable node.
+    {
+        let mut dag = DerivationDag::new();
+        let b1 = Uuid::new_v4();
+        dag.merge(
+            b1,
+            &[
+                make_node("hcs-f", "x86_64-linux"),
+                make_node("hcs-d2", "x86_64-linux"),
+            ],
+            &[make_edge("hcs-f", "hcs-d2")],
+            "",
+        )?;
+        dag.nodes
+            .get_mut("hcs-f")
+            .unwrap()
+            .set_status_for_test(DerivationStatus::Failed);
+        // Resubmit re-creates the failed node with the same edges.
+        let res = dag.merge(
+            Uuid::new_v4(),
+            &[
+                make_node("hcs-f", "x86_64-linux"),
+                make_node("hcs-d2", "x86_64-linux"),
+            ],
+            &[make_edge("hcs-f", "hcs-d2")],
+            "",
+        )?;
+        assert!(
+            res.reset_on_resubmit.iter().any(|h| h.as_str() == "hcs-f"),
+            "fixture premise: the resubmit reset fired"
+        );
+        assert!(
+            res.healed_parents.iter().any(|h| h.as_str() == "hcs-f"),
+            "a resubmit-reset re-creation with accepted edges is healed"
+        );
+    }
+    Ok(())
+}
+
+// r[verify sched.merge.heal-accepted-edges]
+/// An edge whose child endpoint does not resolve vetoes its parent's
+/// heal: the parent's declared set could not be fully attached, so its
+/// child set is not representative of its closure.
+#[test]
+fn test_healed_parents_unresolvable_child_endpoint_vetoes_parent() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+
+    // One submission declaring P→missing (the child node is not part of
+    // the submission and not resident — e.g. a non-gRPC driver bug).
+    let res = dag.merge(
+        Uuid::new_v4(),
+        &[make_node("huc-p", "x86_64-linux")],
+        &[make_edge("huc-p", "huc-missing")],
+        "",
+    )?;
+
+    assert!(res.new_edges.is_empty(), "unresolvable edge is skipped");
+    assert!(
+        !res.healed_parents.iter().any(|h| h.as_str() == "huc-p"),
+        "an unresolvable child endpoint vetoes the parent's heal"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.heal-accepted-edges]
+/// Gate-skips are classified by the parent's closure_hole breadcrumb:
+/// holed parent → rejoin signature (separate vec/metric, debug-level);
+/// un-holed parent → hostile/bug signature (existing vec/metric, warn).
+/// Both shapes veto the heal.
+#[test]
+fn test_foreign_skip_classified_by_parent_hole() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+
+    // Two resident nodes created without children; one carries the
+    // truncation breadcrumb.
+    dag.merge(
+        b1,
+        &[
+            make_node("cls-holed", "x86_64-linux"),
+            make_node("cls-clean", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    )?;
+    dag.nodes.get_mut("cls-holed").unwrap().closure_hole = true;
+
+    // A later join tries to attach a child to each.
+    let res = dag.merge(
+        Uuid::new_v4(),
+        &[
+            make_node("cls-holed", "x86_64-linux"),
+            make_node("cls-clean", "x86_64-linux"),
+            make_node("cls-dep", "x86_64-linux"),
+        ],
+        &[
+            make_edge("cls-holed", "cls-dep"),
+            make_edge("cls-clean", "cls-dep"),
+        ],
+        "",
+    )?;
+
+    assert_eq!(
+        res.rejoin_parent_edges_skipped.len(),
+        1,
+        "the holed parent's skip is classified as a rejoin"
+    );
+    assert_eq!(res.rejoin_parent_edges_skipped[0].0.as_str(), "cls-holed");
+    assert_eq!(
+        res.foreign_parent_edges_skipped.len(),
+        1,
+        "the clean parent's skip is classified as hostile/bug"
+    );
+    assert_eq!(res.foreign_parent_edges_skipped[0].0.as_str(), "cls-clean");
+    assert!(
+        !res.healed_parents.iter().any(|h| h.as_str() == "cls-holed")
+            && !res.healed_parents.iter().any(|h| h.as_str() == "cls-clean"),
+        "both skip shapes veto the heal"
+    );
+    assert!(
+        dag.nodes.get("cls-holed").unwrap().closure_hole,
+        "the rejoin-shaped skip does not clear the hole (only a \
+         re-creation can)"
     );
     Ok(())
 }

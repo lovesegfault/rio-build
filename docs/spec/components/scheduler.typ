@@ -831,6 +831,37 @@ future gateway-consistency cross-check for nodes that carry inline content),
 and a topdown-pruned root accepts dependency top-ups from any submitter
 while the flag is set.
 
+#r("sched.merge.heal-accepted-edges")[
+  Every post-merge consumer of "what this submission's edges did" --- the
+  closure-hole heal, the `topdown_pruned` clear-candidate seeding, the
+  persisted edge rows, and the edge-skip metrics --- MUST be derived from the
+  merge's *accepted*-edge bookkeeping (`MergeResult`), never from the
+  submitter's raw declared edge list. The closure-hole breadcrumb of a
+  resident node MUST be cleared by a merge only when that node's *entire*
+  declared edge set was accepted (each declared edge either attached or an
+  exact re-declaration of an existing edge); a declared edge skipped by the
+  creation-scoped gate or naming an unresolvable child MUST veto the heal
+  for its parent.
+]
+
+The closure-hole breadcrumb is reap-truncation *evidence*: it records that a
+node's child set is no longer representative of its `.drv` closure. Healing
+it on the strength of edges the merge refused to attach would launder that
+evidence — a joining submission whose top-up edges are gate-skipped (the
+node was not re-created, so the creation-scoped rule rejects them) would
+flip the node's closure evidence from Broken to Vouched while its child set
+is still truncated, re-arming exactly the doomed from-source dispatch the
+breadcrumb exists to prevent. Deriving every consumer from `MergeResult`
+(computed by the same loop that enforces admission) makes this structural:
+any future tightening of edge admission automatically propagates to the
+heal, the clear pass, the persist, and the metrics. Skips whose parent
+carries the breadcrumb are the expected rejoin signature and are counted
+separately (#(refs.metric)("rio_scheduler_merge_rejoin_edge_skipped_total"))
+from hostile-shaped skips
+(#(refs.metric)("rio_scheduler_merge_foreign_edge_skipped_total")); the
+rejoined node's hole stays set until a submission re-creates the node with
+its full dependency set.
+
 #r("sched.merge.dep-failed-transitive")[
   When a newly-merged node transitively depends on a node already in a
   failure-terminal state (`Poisoned`/`DependencyFailed`/`Cancelled`), it is
@@ -938,7 +969,7 @@ submitted after the failover record contributions as usual).
   origin URL.
 ]
 
-#r("sched.merge.substitute-topdown+10")[
+#r("sched.merge.substitute-topdown+11")[
   Before merging a submission's full DAG, the scheduler MUST first check
   whether the submission's *demand set* --- its structural roots (nodes with
   no parent edge in the submission) ∪ every node the client explicitly
@@ -964,7 +995,10 @@ submitted after the failover record contributions as usual).
   DAG and no un-produced child has been reaped out from under it since
   (the closure-hole breadcrumb is recorded in memory and persisted
   alongside the mark, is carried across a resubmit retry of the node, and is
-  dropped when a later full merge re-declares its edges), or
+  dropped only when a later full merge re-declares its edges *and the merge
+  accepts every one of them* --- a declared edge skipped by the
+  creation-scoped gate or naming an unresolvable child vetoes the heal,
+  #rref("sched.merge.heal-accepted-edges")), or
   when the fail-fast below consumes it --- a merge that gives it only
   unbuilt children leaves the mark in place. The scheduler MUST
   fall through to the full merge and the bottom-up `check_cached_outputs`
