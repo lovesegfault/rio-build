@@ -93,11 +93,22 @@ pub struct BatchOutcome {
     /// Last ~200 stderr lines, kept verbatim as raw evidence for
     /// batches.jsonl.
     pub stderr_tail: String,
-    /// True when the engine itself cancelled the submission (batch deadline,
-    /// abort, or an evidence-stream failure that cut the capture short)
-    /// rather than the submission settling on its own. A cancelled outcome's
-    /// captured evidence may be incomplete and its `results` are empty —
-    /// collect re-offers the members instead of charging them.
+    /// True when the [`BatchDeadline`] handed to
+    /// [`Submitter::submit_batch`] cancelled the submission, rather than
+    /// the submission settling on its own. A cancelled outcome's captured
+    /// evidence may be incomplete and its `results` are empty — collect
+    /// re-offers the members instead of charging them.
+    ///
+    /// CONTRACT: the handed deadline is the ONLY cause an impl may set
+    /// this bit for. `submit_one_batch` derives the fidelity-critical
+    /// `disconnect_deadline_fired` as `engine_cancelled` AND
+    /// "the deadline was a [`BatchDeadline::DisconnectReplay`]" — an impl
+    /// that sets the bit for any other cause (an abort, a failed evidence
+    /// stream) under a disconnect-replay deadline would fabricate
+    /// "interruption replayed" fidelity records for interruptions that
+    /// never replayed. Other failures are an `Err` from
+    /// [`Submitter::submit_batch`]: recorded as engine-side submission
+    /// failures and re-offered, never classified against the deadline.
     pub engine_cancelled: bool,
 }
 
