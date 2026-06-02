@@ -171,10 +171,13 @@ pub struct Knobs {
     pub no_truth_threshold_pct: f64,
     pub report_top_n: usize,
     /// SSH connections the gateway transport pool dials. `None` derives the
-    /// count from the in-flight channel budget as
-    /// ceil(`submit_concurrency` / `CHANNELS_PER_CONNECTION`), minimum 1.
-    /// The divisor is the transport's own per-connection fan-out — a
-    /// client-side blast-radius choice, not a gateway limit.
+    /// count from the scheduling mode's peak channel demand — timed: the
+    /// larger of `submit_concurrency` and `max_sessions`; timeless:
+    /// `submit_concurrency` — as ceil(demand / `CHANNELS_PER_CONNECTION`),
+    /// minimum 1. The divisor is the transport's own per-connection fan-out
+    /// — a client-side blast-radius choice, not a gateway limit. An
+    /// explicit value must cover that demand in timed mode; spec validation
+    /// rejects one that cannot.
     pub connections: Option<usize>,
     /// Deadline in seconds for each probe / upload / path-info client op on
     /// a gateway channel (build submissions use the batch timeout instead).
@@ -342,6 +345,17 @@ pub enum SupplyDelivery {
     /// Client uploads happen per submission as gaps are discovered; allowed
     /// only for timeless runs.
     Inline,
+}
+
+impl SupplyDelivery {
+    /// The wire string (matches the serde kebab-case form); used wherever
+    /// the policy is named as data, e.g. in validation errors.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SupplyDelivery::Prewarm => "prewarm",
+            SupplyDelivery::Inline => "inline",
+        }
+    }
 }
 
 /// Supply policy block of the campaign spec; part of the campaign's
@@ -646,12 +660,46 @@ impl CampaignSpec {
                 );
             }
         }
-        // Timed runs deliver all planned supply before the clock starts;
-        // inline top-up during execution would corrupt the recorded timing.
-        if self.scheduling.mode == ScheduleMode::Timed {
+        // Legality of the (scheduling.mode × supply.delivery) combination
+        // is defined by the engine's mode-wiring table — the same source
+        // that sizes the gateway transport pool and wires the
+        // pre-submission supply hook — so a combination cannot pass
+        // validation while having no execution path.
+        let Some(wiring) =
+            super::mode_wiring(self.scheduling.mode, self.supply.delivery, &self.knobs)
+        else {
+            anyhow::bail!(
+                "campaign spec field supply.delivery = \"{}\" has no engine wiring when \
+                 scheduling.mode is \"{}\" (timed runs deliver all planned supply before the \
+                 execution clock starts; a per-submission top-up would corrupt the recorded \
+                 cadence)",
+                self.supply.delivery.as_str(),
+                self.scheduling.mode.as_str(),
+            );
+        };
+        // An explicitly pinned knobs.connections must still cover the
+        // scheduling mode's peak channel demand in timed mode: the pool's
+        // channel capacity is a hard ceiling on concurrently held build
+        // channels, and dispatch lateness is stamped at admission — before
+        // the channel wait — so an undersized pool would silently
+        // serialize the recorded cadence with no trace in the timing
+        // statistics. Timeless campaigns have no cadence contract: there an
+        // explicit undersized pool merely throttles throughput, which can
+        // be a deliberate choice.
+        if self.scheduling.mode == ScheduleMode::Timed
+            && let Some(connections) = self.knobs.connections
+        {
+            let capacity = connections.saturating_mul(super::transport::CHANNELS_PER_CONNECTION);
             anyhow::ensure!(
-                self.supply.delivery == SupplyDelivery::Prewarm,
-                "campaign spec field supply.delivery must be \"prewarm\" when scheduling.mode is \"timed\""
+                capacity >= wiring.channel_demand,
+                "campaign spec field knobs.connections = {} yields {} concurrent channels \
+                 ({} per connection), below the timed scheduling mode's channel demand of {} \
+                 (the larger of knobs.submit_concurrency and knobs.max_sessions); raise \
+                 knobs.connections or lower knobs.max_sessions",
+                connections,
+                capacity,
+                super::transport::CHANNELS_PER_CONNECTION,
+                wiring.channel_demand,
             );
         }
         // The dependency policy must not contradict what the campaign mode
@@ -1258,11 +1306,11 @@ mod tests {
         assert_eq!(re.scheduling.mode, ScheduleMode::Timed);
     }
 
-    #[test]
-    fn timed_knob_validation() {
-        // Base valid spec: an archive pin (any 64-char lowercase-hex digest)
-        // plus the required cluster and tenant blocks.
-        let base = r#"{
+    /// Base valid spec for validation tests: an archive pin (any 64-char
+    /// lowercase-hex digest) plus the required cluster and tenant blocks.
+    /// Unterminated — append `, ...}` overrides (or just `}`) to close it.
+    fn spec_base() -> &'static str {
+        r#"{
             "mode": "leaf",
             "archive": {"digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
             "cluster": {"gateway_store_url": "ssh-ng://rio@rio-gateway.rio-system.svc:22?ssh-key=/k",
@@ -1270,7 +1318,12 @@ mod tests {
                         "store_addr": "rio-store.rio-store.svc:9002",
                         "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"},
             "tenants": {"build_tenant": "replay-leaf", "warm_tenant": "replay-warm",
-                        "upstreams_verified": true}"#;
+                        "upstreams_verified": true}"#
+    }
+
+    #[test]
+    fn timed_knob_validation() {
+        let base = spec_base();
         // Non-positive speedup rejected outright.
         let spec: CampaignSpec =
             serde_json::from_str(&format!("{base}, \"knobs\": {{\"speedup\": 0.0}}}}")).unwrap();
@@ -1300,16 +1353,16 @@ mod tests {
         ))
         .unwrap();
         spec.validate().unwrap();
-        // Inline delivery is rejected in timed mode.
+        // Inline delivery is rejected in timed mode (no entry in the
+        // mode-wiring table), naming both offending fields.
         let spec: CampaignSpec = serde_json::from_str(&format!(
             "{base}, \"scheduling\": {{\"mode\": \"timed\"}}, \"supply\": {{\"delivery\": \"inline\"}}}}"
         ))
         .unwrap();
+        let err = spec.validate().unwrap_err().to_string();
         assert!(
-            spec.validate()
-                .unwrap_err()
-                .to_string()
-                .contains("delivery")
+            err.contains("supply.delivery") && err.contains("inline") && err.contains("timed"),
+            "{err}"
         );
         // Self-hosted + explicit substituters dependencies contradiction is rejected.
         let json = r#"{
@@ -1327,6 +1380,55 @@ mod tests {
                 .to_string()
                 .contains("dependencies")
         );
+    }
+
+    /// A timed spec that pins `knobs.connections` must still cover the
+    /// dispatcher's admission bound (the mode-wiring table's channel
+    /// demand): the pool's channel capacity is the hard ceiling on
+    /// concurrently held build channels, and an undersized pool would
+    /// silently serialize the recorded cadence.
+    #[test]
+    fn timed_explicit_connections_must_cover_the_admission_bound() {
+        // 3 connections × 4 channels = 12 < max_sessions 16 → rejected,
+        // naming the knob, the capacity, and the demand.
+        let spec: CampaignSpec = serde_json::from_str(&format!(
+            "{}, \"scheduling\": {{\"mode\": \"timed\"}}, \
+             \"knobs\": {{\"max_sessions\": 16, \"connections\": 3}}}}",
+            spec_base()
+        ))
+        .unwrap();
+        let err = spec.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("knobs.connections") && err.contains("12") && err.contains("16"),
+            "{err}"
+        );
+        // 4 connections × 4 channels = 16 ≥ max_sessions 16 → accepted.
+        let spec: CampaignSpec = serde_json::from_str(&format!(
+            "{}, \"scheduling\": {{\"mode\": \"timed\"}}, \
+             \"knobs\": {{\"max_sessions\": 16, \"connections\": 4}}}}",
+            spec_base()
+        ))
+        .unwrap();
+        spec.validate().unwrap();
+        // The demand is the larger of submit_concurrency and max_sessions:
+        // submit_concurrency 24 demands 24 channels even with max_sessions
+        // at 16, so 4 connections (16 channels) no longer cover it.
+        let spec: CampaignSpec = serde_json::from_str(&format!(
+            "{}, \"scheduling\": {{\"mode\": \"timed\"}}, \
+             \"knobs\": {{\"max_sessions\": 16, \"connections\": 4, \"submit_concurrency\": 24}}}}",
+            spec_base()
+        ))
+        .unwrap();
+        let err = spec.validate().unwrap_err().to_string();
+        assert!(err.contains("24"), "{err}");
+        // Timeless campaigns have no cadence contract: an explicitly
+        // undersized pool merely throttles throughput and stays accepted.
+        let spec: CampaignSpec = serde_json::from_str(&format!(
+            "{}, \"knobs\": {{\"connections\": 1, \"submit_concurrency\": 8}}}}",
+            spec_base()
+        ))
+        .unwrap();
+        spec.validate().unwrap();
     }
 
     #[test]

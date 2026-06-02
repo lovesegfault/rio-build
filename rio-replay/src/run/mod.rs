@@ -247,21 +247,26 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // Gateway worker-protocol transport for build-path submissions. The
     // host-key pin is required by spec validation and re-required here: an
     // absent pin is an explicit error at this call site, never an empty
-    // value passed downstream. Channel budget: a burst of channel-open or
-    // exec refusals against this configuration is a capacity or
-    // configuration problem (the gateway shedding load at its global
-    // session cap, or the connections knob is wrong), not per-unit infra
-    // noise.
+    // value passed downstream. Channel budget: a derived connection count
+    // covers the scheduling mode's peak channel demand from the mode-wiring
+    // table — the timed dispatcher holds up to max_sessions channels at
+    // once, the timeless loop submit_concurrency — so admission can never
+    // outrun transport capacity, and a burst of channel-open or exec
+    // refusals against this configuration is a capacity or configuration
+    // problem (the gateway shedding load at its global session cap, or the
+    // connections knob is wrong), not per-unit infra noise.
     let endpoint = transport::GatewayEndpoint::parse(&spec.cluster.gateway_store_url)?;
     let policy = pinned_host_key_policy(&spec)?;
+    let wiring = require_mode_wiring(&spec)?;
     let connections = spec
         .knobs
         .connections
-        .unwrap_or_else(|| transport::default_connections(spec.knobs.submit_concurrency));
+        .unwrap_or_else(|| transport::default_connections(wiring.channel_demand));
     let pool = Arc::new(transport::GatewayPool::new(endpoint, policy, connections)?);
     tracing::info!(
         connections,
         channels_per_connection = transport::CHANNELS_PER_CONNECTION,
+        channel_demand = wiring.channel_demand,
         "gateway transport configured"
     );
     // The supply stage's absent-upstream coverage probe is pointed at the
@@ -307,6 +312,88 @@ pub async fn run(args: RunArgs) -> Result<()> {
         artifacts,
     };
     run_with_backends(args, spec, state, archive, backends).await
+}
+
+/// What one legal (scheduling mode × supply delivery) combination requires
+/// of the engine. Produced by [`mode_wiring`] — the single source from which
+/// spec validation derives legality, [`run`] sizes the gateway transport
+/// pool, and [`run_with_backends`] wires the pre-submission supply hook, so
+/// the three can never disagree about what a combination needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModeWiring {
+    /// Peak concurrently held daemon channels the execute stage can demand
+    /// from the gateway pool: the timed dispatcher admits up to
+    /// `max_sessions` requests, each holding one build channel until it
+    /// fully settles, while the timeless submit loop runs
+    /// `submit_concurrency` workers, each holding one channel per batch.
+    channel_demand: usize,
+    /// The pre-submission supply top-up hook's role in this combination.
+    topup: TopupRole,
+}
+
+/// Role of the pre-submission supply top-up hook ([`PreSubmitSupply`]) in a
+/// (scheduling mode × supply delivery) combination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopupRole {
+    /// Inline delivery: the supply stage deliberately defers every planned
+    /// upload to the per-submission top-up, so the hook IS the delivery
+    /// mechanism — wired whenever the stage produced a ladder context,
+    /// regardless of the dependency policy (embedded input sources are
+    /// deferred too).
+    Primary,
+    /// Prewarm delivery: planned supply is delivered before execution and
+    /// the hook only backstops prewarm misses, so it is wired only when the
+    /// dependency policy delivers anything per submission (skipped under
+    /// `dependencies = "none"`).
+    MissFallback,
+}
+
+/// The mode-wiring table: what each (scheduling mode × supply delivery)
+/// combination requires of the engine, or `None` for a combination that has
+/// no execution path. [`CampaignSpec::validate`] rejects exactly the `None`
+/// combinations, [`run`] sizes the gateway pool from `channel_demand`, and
+/// [`run_with_backends`] constructs the supply hook from `topup` — adding a
+/// scheduling or delivery variant fails to compile until its arm (and with
+/// it the legality, hook wiring, and capacity bound) is written here.
+fn mode_wiring(mode: ScheduleMode, delivery: SupplyDelivery, knobs: &Knobs) -> Option<ModeWiring> {
+    match (mode, delivery) {
+        (ScheduleMode::Timeless, SupplyDelivery::Prewarm) => Some(ModeWiring {
+            channel_demand: knobs.submit_concurrency,
+            topup: TopupRole::MissFallback,
+        }),
+        (ScheduleMode::Timeless, SupplyDelivery::Inline) => Some(ModeWiring {
+            channel_demand: knobs.submit_concurrency,
+            topup: TopupRole::Primary,
+        }),
+        (ScheduleMode::Timed, SupplyDelivery::Prewarm) => Some(ModeWiring {
+            // The dispatcher admits up to max_sessions concurrent requests
+            // and each holds one build channel until it settles; the pool
+            // must cover that bound, or admitted requests would block in
+            // open_channel after their lateness was already stamped,
+            // silently serializing the recorded cadence.
+            channel_demand: knobs.submit_concurrency.max(knobs.max_sessions),
+            topup: TopupRole::MissFallback,
+        }),
+        // Timed runs deliver all planned supply before the execution clock
+        // starts: a per-submission inline top-up would spend schedule time
+        // on uploads and corrupt the recorded cadence, so the combination
+        // has no wiring and spec validation rejects it.
+        (ScheduleMode::Timed, SupplyDelivery::Inline) => None,
+    }
+}
+
+/// [`mode_wiring`] as a hard requirement: an absent wiring here means the
+/// spec bypassed [`CampaignSpec::validate`], which rejects exactly the
+/// combinations the table declines.
+fn require_mode_wiring(spec: &CampaignSpec) -> Result<ModeWiring> {
+    mode_wiring(spec.scheduling.mode, spec.supply.delivery, &spec.knobs).with_context(|| {
+        format!(
+            "scheduling.mode \"{}\" with supply.delivery \"{}\" has no engine wiring \
+             (the campaign spec was not validated)",
+            spec.scheduling.mode.as_str(),
+            spec.supply.delivery.as_str(),
+        )
+    })
 }
 
 /// Resolve the SSH host-key policy every gateway pool the engine dials uses:
@@ -1014,6 +1101,11 @@ pub async fn run_with_backends(
             );
         }
     }
+    // The execute-stage wiring this (scheduling × delivery) combination
+    // requires. Spec validation reads the same table for legality, so an
+    // absent wiring can only mean the spec bypassed validation — refused
+    // here, before any stage marker or campaign record is written.
+    let wiring = require_mode_wiring(&spec)?;
 
     // The CLI deadline wins over the spec's; a supplied-but-unparsable value
     // is a startup error rather than a silently unbounded campaign.
@@ -1151,9 +1243,11 @@ pub async fn run_with_backends(
             .max()
             .unwrap_or(1),
     ));
-    // Pre-submission supply hook for the timed dispatcher: built below only
-    // when the supply stage runs in this process under a policy that has
-    // something to top up; `None` keeps the dispatcher running without one.
+    // Pre-submission supply hook for the execute stage (the timed
+    // dispatcher's per-request call, the timeless submit loop's per-batch
+    // call): built below only when the supply stage runs in this process
+    // under a wiring that has something to top up; `None` keeps the execute
+    // stage running without one.
     let mut supply_topup: Option<Arc<dyn PreSubmitSupply>> = None;
     if !state.marker_done("supply") {
         let effective_dependencies = spec.supply.effective_dependencies(spec.mode);
@@ -1241,20 +1335,32 @@ pub async fn run_with_backends(
         .await?;
         state.write_json_atomic("supply-report.json", &supply_output.report)?;
         state.set_marker("supply")?;
-        // Timed campaigns keep the stage's transport and ladder context alive
-        // past the supply stage: the dispatcher calls the inline top-up for
-        // each request's roots right before submission, so a path the prewarm
-        // pass missed (refused, failed, or skipped) gets one more delivery
-        // attempt without re-admitting substituters or re-probing what is
-        // already known valid. Self-hosted / dependencies-none campaigns have
-        // nothing to top up, and a resumed campaign whose supply marker is
-        // already set ran the stage in an earlier process — no context exists,
-        // so the dispatcher runs without the hook exactly as before.
-        if spec.scheduling.mode == ScheduleMode::Timed
-            && spec.supply.delivery == SupplyDelivery::Prewarm
-            && effective_dependencies != SupplyDependencies::None
-            && let Some(ladder) = supply_output.ladder
-        {
+        // The mode-wiring table decides whether the stage's transport and
+        // ladder context outlive the stage as the pre-submission top-up
+        // hook. Under inline delivery the hook IS the delivery mechanism:
+        // the stage deferred every planned upload to it, whatever the
+        // dependency policy. Under prewarm it only backstops prewarm misses
+        // (a path the prewarm pass refused, failed, or skipped gets one
+        // more delivery attempt), so dependencies-none campaigns — whose
+        // ladder delivers nothing per submission — run without it. Either
+        // way the hook reuses the stage's admitted substituters and probe
+        // results instead of re-admitting or re-probing what is already
+        // known valid.
+        //
+        // TODO: rebuild the ladder context when resuming an inline-delivery
+        // campaign. A resumed campaign whose supply marker is already set
+        // ran the stage in an earlier process, so no context exists here
+        // and the execute stage runs without the hook: under prewarm that
+        // only loses the miss-fallback, but under inline the deferred
+        // uploads of jobs the earlier process never submitted are not
+        // delivered, and those jobs fail on missing inputs. Re-running the
+        // stage's planning and probing on resume (resume costs re-probing,
+        // never correctness) would restore delivery.
+        let wire_topup = match wiring.topup {
+            TopupRole::Primary => true,
+            TopupRole::MissFallback => effective_dependencies != SupplyDependencies::None,
+        };
+        if wire_topup && let Some(ladder) = supply_output.ladder {
             let topup: Arc<dyn PreSubmitSupply> = Arc::new(LadderTopup::new(
                 transport,
                 archive.clone(),
@@ -1728,6 +1834,10 @@ pub async fn run_with_backends(
             }
             match &timed_inputs {
                 None => {
+                    // The supply stage's top-up hook (when one was built
+                    // above) gives every batch a pre-submission gap top-up:
+                    // the delivery mechanism itself under inline delivery,
+                    // the miss-fallback under prewarm.
                     let terminal_seed = terminal_set(&*results.lock().await);
                     run_submit_loop(
                         state.clone(),
@@ -1740,6 +1850,7 @@ pub async fn run_with_backends(
                         spec.cluster.gateway_store_url.clone(),
                         spec.knobs.clone(),
                         batch_seq.clone(),
+                        supply_topup.clone(),
                     )
                     .await?;
                 }
@@ -2206,6 +2317,55 @@ mod tests {
             evidence: None,
             updated_at: now_rfc3339(),
         }
+    }
+
+    /// The mode-wiring table is the single source for mode legality, hook
+    /// role, and transport demand: every legal (scheduling × delivery)
+    /// combination produces a wiring, the one unsupported combination
+    /// (timed × inline) produces none, and the timed channel demand covers
+    /// the dispatcher's admission bound so a derived pool can never admit
+    /// more concurrent requests than it can carry.
+    #[test]
+    fn mode_wiring_is_the_single_source_for_legality_hooks_and_demand() {
+        // Defaults: submit_concurrency 8, max_sessions 32.
+        let knobs = Knobs::default();
+        let timeless_prewarm =
+            mode_wiring(ScheduleMode::Timeless, SupplyDelivery::Prewarm, &knobs).unwrap();
+        assert_eq!(timeless_prewarm.channel_demand, 8);
+        assert_eq!(timeless_prewarm.topup, TopupRole::MissFallback);
+        let timeless_inline =
+            mode_wiring(ScheduleMode::Timeless, SupplyDelivery::Inline, &knobs).unwrap();
+        assert_eq!(timeless_inline.channel_demand, 8);
+        assert_eq!(timeless_inline.topup, TopupRole::Primary);
+        let timed_prewarm =
+            mode_wiring(ScheduleMode::Timed, SupplyDelivery::Prewarm, &knobs).unwrap();
+        assert_eq!(
+            timed_prewarm.channel_demand, 32,
+            "the timed demand must cover max_sessions, not just submit_concurrency"
+        );
+        assert_eq!(timed_prewarm.topup, TopupRole::MissFallback);
+        assert!(
+            mode_wiring(ScheduleMode::Timed, SupplyDelivery::Inline, &knobs).is_none(),
+            "timed × inline has no execution path and must produce no wiring"
+        );
+        // With default knobs the derived timed pool covers the admission
+        // bound: 32 demanded channels → 8 connections × 4 channels each.
+        assert_eq!(
+            transport::default_connections(timed_prewarm.channel_demand),
+            8
+        );
+        // The timed demand is the larger of the two knobs, so an operator
+        // who raises submit_concurrency above max_sessions is covered too.
+        let knobs = Knobs {
+            submit_concurrency: 64,
+            ..Knobs::default()
+        };
+        assert_eq!(
+            mode_wiring(ScheduleMode::Timed, SupplyDelivery::Prewarm, &knobs)
+                .unwrap()
+                .channel_demand,
+            64
+        );
     }
 
     #[test]

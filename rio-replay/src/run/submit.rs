@@ -21,6 +21,7 @@ use super::model::{BATCH_KIND_SUBMIT, BatchRecord, PauseState, now_rfc3339};
 use super::spec::Knobs;
 use super::state::{StateDir, StateFile};
 use super::submitter::Submitter;
+use super::supply::exec::PreSubmitSupply;
 
 /// How long the loop sleeps between re-checks while submission is paused
 /// (manual pause or backpressure). Short enough that an operator unpause
@@ -213,6 +214,14 @@ pub async fn submit_one_batch(
 /// never killed by a pause — pausing only stops new submissions. Either
 /// exit still drains the batches already in flight before returning, which
 /// can take up to the batch timeout.
+///
+/// When `supply_topup` is present (the campaign's
+/// [`LadderTopup`](super::supply::exec::LadderTopup) under inline delivery,
+/// or as the prewarm-miss fallback), each batch gets a pre-submission supply
+/// top-up over its root drvs — mirroring the timed dispatcher's per-request
+/// call. A top-up failure degrades to a warning and the batch is submitted
+/// regardless: a genuinely undelivered input then surfaces as that unit's
+/// build failure, never as a silently skipped batch.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_submit_loop(
     state: Arc<StateDir>,
@@ -225,6 +234,7 @@ pub async fn run_submit_loop(
     store_url: String,
     knobs: Knobs,
     batch_seq: Arc<AtomicU64>,
+    supply_topup: Option<Arc<dyn PreSubmitSupply>>,
 ) -> Result<()> {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(knobs.submit_concurrency.max(1)));
     // Floor the child deadline at one second: a zero/NaN batch_timeout_hours
@@ -335,8 +345,24 @@ pub async fn run_submit_loop(
         let submitter = submitter.clone();
         let tracker = tracker.clone();
         let store_url = store_url.clone();
+        let supply_topup = supply_topup.clone();
         join_set.spawn(async move {
             let _permit = permit;
+            // Pre-submission gap top-up (inline delivery / prewarm-miss
+            // fallback) over this batch's roots, exactly like the timed
+            // dispatcher's per-request call: a failure degrades to a
+            // warning so a supply hiccup can never wedge the batch — a
+            // truly undelivered input surfaces as the unit's build failure
+            // instead.
+            if let Some(topup) = &supply_topup
+                && let Err(e) = topup.topup(&batch.root_drvs).await
+            {
+                tracing::warn!(
+                    batch_id,
+                    error = %format!("{e:#}"),
+                    "pre-submission supply top-up failed; submitting the batch anyway"
+                );
+            }
             submit_one_batch(
                 &state,
                 submitter.as_ref(),
@@ -554,6 +580,7 @@ mod tests {
             "ssh-ng://test".into(),
             knobs,
             Arc::new(AtomicU64::new(1)),
+            None,
         )
         .await
         .unwrap();
@@ -569,6 +596,93 @@ mod tests {
         assert_eq!(total_jobs, 3);
         // Dual cap respected: no batch carries more than 2 jobs.
         assert!(records.iter().all(|r| r.jobs.len() <= 2));
+    }
+
+    /// Scripted pre-submission supply hook: records each call's root drvs
+    /// together with how many submissions the fake submitter had already
+    /// received, then fails — proving both the before-submission ordering
+    /// and that a top-up failure never blocks the batch.
+    struct RecordingTopup {
+        submitter: Arc<FakeSubmitter>,
+        /// `(roots, submissions already made)` per call, in call order.
+        calls: std::sync::Mutex<Vec<(Vec<String>, usize)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PreSubmitSupply for RecordingTopup {
+        async fn topup(&self, roots: &[String]) -> anyhow::Result<()> {
+            let submitted = self.submitter.submitted.lock().unwrap().len();
+            self.calls.lock().unwrap().push((roots.to_vec(), submitted));
+            anyhow::bail!("scripted top-up failure")
+        }
+    }
+
+    /// The pre-submission top-up runs once per batch with that batch's root
+    /// drvs, before the batch's own submission — the timeless leg of inline
+    /// delivery and of the prewarm-miss fallback; a failing top-up degrades
+    /// to a warning and the batch is submitted anyway.
+    #[tokio::test]
+    async fn submit_loop_runs_the_topup_before_each_batch_and_failures_never_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        let tracker = Arc::new(SubmitTracker::default());
+        let pause = Arc::new(PauseState::default());
+        let submitter = Arc::new(FakeSubmitter::default());
+        for _ in 0..2 {
+            submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
+                build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into()),
+                ..BatchOutcome::default()
+            }));
+        }
+        let topup = Arc::new(RecordingTopup {
+            submitter: submitter.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        // Serial submission (concurrency 1) makes the top-up/submission
+        // interleaving deterministic; two jobs per batch over three jobs
+        // yields two batches.
+        let knobs = Knobs {
+            batch_max_jobs: 2,
+            submit_concurrency: 1,
+            ..Knobs::default()
+        };
+        let submitted_view = submitter.clone();
+        run_submit_loop(
+            state,
+            submitter.clone(),
+            tracker,
+            pause,
+            vec![pj("a", 0), pj("b", 0), pj("c", 0)],
+            move || {
+                submitted_view
+                    .submitted
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|(_, b, _)| b.jobs.clone())
+                    .collect()
+            },
+            || false,
+            "ssh-ng://test".into(),
+            knobs,
+            Arc::new(AtomicU64::new(1)),
+            Some(topup.clone() as Arc<dyn PreSubmitSupply>),
+        )
+        .await
+        .unwrap();
+        let calls = topup.calls.lock().unwrap().clone();
+        let submitted = submitter.submitted.lock().unwrap();
+        assert_eq!(calls.len(), 2, "one top-up call per batch");
+        assert_eq!(submitted.len(), 2, "failing top-ups never block submission");
+        // Each call carried exactly its batch's root drvs and happened
+        // before that batch's own submission: the first call saw zero prior
+        // submissions, the second exactly one.
+        for (index, ((roots, prior), (_, batch, _))) in
+            calls.iter().zip(submitted.iter()).enumerate()
+        {
+            assert_eq!(roots, &batch.root_drvs);
+            assert_eq!(*prior, index);
+        }
     }
 
     /// A deadline that is already reached exits cleanly before starting any
@@ -589,6 +703,7 @@ mod tests {
             "ssh-ng://test".into(),
             Knobs::default(),
             Arc::new(AtomicU64::new(1)),
+            None,
         )
         .await
         .unwrap();
@@ -654,6 +769,7 @@ mod tests {
             "ssh-ng://test".into(),
             knobs,
             Arc::new(AtomicU64::new(1)),
+            None,
         ));
         // Wait (in virtual time) until the same job has been submitted twice.
         for _ in 0..600 {
@@ -695,6 +811,7 @@ mod tests {
             "ssh-ng://test".into(),
             Knobs::default(),
             Arc::new(AtomicU64::new(1)),
+            None,
         ));
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(

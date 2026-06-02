@@ -26,7 +26,8 @@
 //!   fallback and the inline-delivery path): probe, plan, and upload only
 //!   what the given roots' closure still misses. [`LadderTopup`] packages it
 //!   with the stage's ladder context as the [`PreSubmitSupply`] hook the
-//!   timed dispatcher calls before each request's submission.
+//!   execute stage calls before each submission — per request in the timed
+//!   dispatcher, per batch in the timeless submit loop.
 //!
 //! Every per-path outcome is appended to `supply.jsonl` as a
 //! [`SupplyEntry`] using the shared vocabulary constants. Per-path and
@@ -139,10 +140,12 @@ pub trait PreSubmitSupply: Send + Sync {
 }
 
 /// Production [`PreSubmitSupply`]: the supply stage's ladder context and
-/// transport packaged for the timed dispatcher, so every request gets a
-/// [`topup_for_roots`] pass over its root derivations immediately before
-/// submission — the inline top-up that backstops a prewarm miss (a path the
-/// prewarm pass refused, failed, or never planned).
+/// transport packaged for the execute stage (the timed dispatcher's
+/// per-request call, the timeless submit loop's per-batch call), so every
+/// submission gets a [`topup_for_roots`] pass over its root derivations
+/// immediately beforehand — the delivery mechanism itself under inline
+/// delivery, and under prewarm the top-up that backstops a prewarm miss (a
+/// path the prewarm pass refused, failed, or never planned).
 ///
 /// Cheap when there is nothing to do: the held [`SupplyContext`] is the one
 /// the supply stage probed and uploaded with, so paths already delivered (by
@@ -1990,8 +1993,8 @@ async fn run_upload_ladder(
 
 /// What [`run_supply_stage`] hands back to the campaign orchestrator: the
 /// stage report plus the ladder context the upload ladder built, kept alive
-/// so the timed dispatcher's pre-submission top-up ([`LadderTopup`]) can
-/// reuse the already-admitted substituters and probe results instead of
+/// so the execute stage's pre-submission top-up ([`LadderTopup`]) can reuse
+/// the already-admitted substituters and probe results instead of
 /// re-admitting or re-probing them.
 pub struct SupplyStageOutput {
     /// Aggregated stage accounting (persisted as `supply-report.json`).
