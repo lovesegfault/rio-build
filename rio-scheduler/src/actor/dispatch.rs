@@ -334,9 +334,10 @@ impl DagActor {
         // and PG that no reap collects and every recovery reloads.
         // Equally nothing to do when the node vanished or no build is
         // interested any more — the verdicts are already settled. (The
-        // SubstituteComplete{ok=false} caller never trips this: it only
-        // reaches the helper for a node it just observed Substituting
-        // with live interest.)
+        // walk-era SubstituteComplete{ok=false} caller never tripped
+        // this either: it only reached the helper for a node it had
+        // just observed in the walk's in-flight status with live
+        // interest.)
         let actionable = self
             .dag
             .node(drv_hash)

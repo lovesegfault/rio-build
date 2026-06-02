@@ -750,12 +750,13 @@ mod kinded_tests {
             PullAdmission::NotYetReady,
             "Created (deps not yet evaluated) is not claimable — only Ready/Queued are"
         );
-        // A MARKED node (must_substitute=true: topdown-pruned with
-        // Broken closure evidence) with an unparked pending job IS
-        // claimable: the A11 refusal blocks from-source BUILD dispatch
-        // of marked nodes, never the materialization claim — which is
-        // the substitution mechanism the mark demands. Refusing here
-        // would park exactly the pruned-root jobs forever.
+        // A pruned-origin node (the walk era called this marked /
+        // must_substitute=true) with an unparked pending job IS
+        // claimable: the claim IS the substitution the pruned
+        // classification demands — refusing here would park exactly
+        // the pruned-root jobs forever. (The walk-era A11 refusal arm
+        // for from-source BUILD dispatch died with Phase D'; the
+        // JobView::None requirement subsumes it.)
         assert_eq!(
             admit_pull(
                 request(Some(S::Ready), None, &me),

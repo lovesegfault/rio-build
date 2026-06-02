@@ -137,7 +137,7 @@ impl DagActor {
         // Defense-in-depth: re-read the node's CURRENT status before
         // fail-fasting. reconcile_merged_state's phase ordering
         // guarantees all dep-state corrections (cache-hit, stale-reset,
-        // reprobe-Poisoned→Substituting) ran before any verdict was
+        // the reprobe-Poisoned reset) ran before any verdict was
         // computed, but a future reordering could regress this; the
         // re-check is cheap and also suppresses the phantom
         // error_summary side-effect under keep_going=true if the node
@@ -640,7 +640,7 @@ impl DagActor {
 
         // r[sched.merge.reconcile-order+2]: split pending_substitute by
         // lane. Reprobe-substitutable (pre-existing Poisoned/Failed/
-        // DependencyFailed) MUST transition →Substituting BEFORE
+        // DependencyFailed) MUST take the 6d reset out of Poisoned BEFORE
         // seed_initial_states reads `any_co_owned_dep_terminally_failed`
         // (6d); newly-inserted substitutable nodes need seed to put them
         // at Created/Queued/Ready first (6g). Partition keys on
@@ -653,11 +653,12 @@ impl DagActor {
 
         // === Phase ordering invariant ==============================
         // All dep-state CORRECTIONS (6a cache-hit→Completed, 6c stale-
-        // Completed reset, 6d reprobe-Poisoned→Substituting) MUST
+        // Completed reset, 6d reprobe-Poisoned reset) MUST
         // complete before any dependent VERDICT that reads dep status
         // (6e seed_initial_states, 6f reprobe_unlocked Queued→Ready).
         // Violations: bug_089 (6a's advance fired before 6c reset),
-        // bug_132 (6e seed fired before 6d Poisoned→Substituting).
+        // bug_132 (6e seed fired before the 6d Poisoned reset --- the
+        // walk-era form of which was the Substituting transition).
 
         let (mut cached_count, deferred_hits, other_builds, reprobe_unlocked) =
             self.apply_cached_hits(ingest, &node_index).await;

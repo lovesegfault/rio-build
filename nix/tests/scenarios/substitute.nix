@@ -69,8 +69,8 @@ let
   # produces 4 input-addressed store paths (busybox is static, closure
   # of 1); copying that closure to /srv/cache and submitting the SAME
   # expr via ssh-ng makes the scheduler see all 4 outputs as
-  # substitutable → walk_substitute_closure walks the references →
-  # actCopyPath + resProgress events on the wire.
+  # substitutable → materialization jobs; the store executor walks the
+  # references → actCopyPath + resProgress events on the wire.
   #
   # Function `{ busybox }:` so Nix tracks busybox as a build input
   # (a literal string path has no context → "No such file" in sandbox).
@@ -1039,7 +1039,7 @@ pkgs.testers.runNixOSTest {
         # Submit via ssh-ng with internal-json on stderr → cap.json. The
         # tee preserves the capture even if nom/nix exits oddly. The
         # build SUCCEEDS without any worker — all 4 drvs' outputs are
-        # in upstream → walk_substitute_closure → Cached.
+        # in upstream → materialization jobs fetch them → Cached.
         client.succeed(
             "nix build --impure --no-link "
             "${bbArg} -f ${progressClosure} "

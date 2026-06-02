@@ -347,12 +347,12 @@ impl DagActor {
     // r[impl sched.materialize.job+2]
     /// BC-4 (Phase B): emit the SUBSTITUTING DerivationEvent at
     /// materialization-claim intake. The event KIND is wire-retained;
-    /// only its emission site moves — from walk-spawn (which never runs
-    /// for fresh flag-on work) to the claim. The gateway's
+    /// its emission site moved here from the walk spawn (deleted with
+    /// Phase D'). The gateway's
     /// actSubstitute/actCopyPath pair creation keys on this kind
     /// (rio-gateway handler/build.rs `relay_derivation_status`,
-    /// Substituting arm) and is untouched (BC-4's contract). Mirrors the
-    /// walk-spawn emission shape (`spawn_substitute_fetches`): one event
+    /// the SUBSTITUTING arm) and is untouched (BC-4's contract). Keeps
+    /// the walk-era emission shape on the wire: one event
     /// per interested build + a progress snapshot so the queued/running
     /// flip is visible.
     ///
