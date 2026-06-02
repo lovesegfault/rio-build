@@ -2819,6 +2819,185 @@ async fn test_build_paths_with_results_failure_rescues_verified_target_as_substi
     Ok(())
 }
 
+/// __noChroot derivation with a PARSEABLE output path, so the store check
+/// can positively confirm presence — the no-rescue-on-rejection test needs
+/// `confirmed_present` to be true while the batch is refused.
+const NOCHROOT_PRESENT_OUT: &str = "/nix/store/cccccccccccccccccccccccccccccccc-nochroot-out";
+const NOCHROOT_PRESENT_DRV: &str = "/nix/store/00000000000000000000000000000555-nochroot-p.drv";
+const NOCHROOT_PRESENT_ATERM: &str = r#"Derive([("out","/nix/store/cccccccccccccccccccccccccccccccc-nochroot-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("__noChroot","1"),("out","/nix/store/cccccccccccccccccccccccccccccccc-nochroot-out")])"#;
+
+// r[verify gw.opcode.build-results-honest+2]
+/// Event-loss shape: the scheduler completes the DAG but THIS root's
+/// terminal event never arrives (state-channel Lagged, a leader-failover
+/// reconnect gap, dispatch-vs-completion path-key mismatch — all
+/// documented loss modes). The DAG-level `Completed` is an execution
+/// claim about the batch, not about this root: with its outputs present
+/// the root must report `Substituted`/`timesBuilt = 0` (presence under a
+/// completed DAG), never inherit the DAG's executed `Built`/
+/// `timesBuilt = 1`. Replay tooling maps `Built` → executed, so the
+/// inherited claim would inflate execution metrics for builds that were
+/// substituted or cache-hit.
+#[tokio::test]
+async fn test_build_paths_with_results_eventless_completed_reports_substituted()
+-> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    // Completed DAG with NO per-derivation events: the real scheduler
+    // emits a terminal per derivation, so this stream models exactly the
+    // event-loss window.
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        })),
+        ev(build_event::Event::Completed(types::BuildCompleted {
+            output_paths: vec![HONEST_A_OUT.into()],
+        })),
+    ]));
+
+    h.store
+        .seed_with_content(HONEST_A_DRV, HONEST_A_ATERM.as_bytes());
+    h.store.seed_with_content(HONEST_A_OUT, b"a-out");
+
+    let path_a = format!("{HONEST_A_DRV}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: std::slice::from_ref(&path_a),
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+
+    let (echoed, result) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(echoed, path_a);
+    assert_eq!(
+        result.status,
+        BuildStatus::Substituted,
+        "a root with no terminal of its own in a Completed DAG must report \
+         presence (Substituted), never the DAG-level executed Built: {result:?}"
+    );
+    assert_eq!(
+        result.times_built, 0,
+        "no per-root execution evidence ⇒ no execution claim: {result:?}"
+    );
+    assert!(
+        result.status.is_success(),
+        "Substituted stays a success to stock clients: {result:?}"
+    );
+    assert_eq!(
+        result.built_outputs.len(),
+        1,
+        "presence-derived success still carries builtOutputs: {result:?}"
+    );
+    assert_eq!(result.built_outputs[0].out_path, HONEST_A_OUT);
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.build-results-honest+2]
+/// A batch the gateway itself refused (validate_dag rejection) was never
+/// seen by the scheduler — there is no scheduler evidence for ANY root,
+/// so store presence must NOT rescue targets to `Substituted`. The
+/// refusal is reported verbatim per path; anything else converts a policy
+/// rejection into a success observation (and opcode 9 hard-errors the
+/// identical input).
+#[tokio::test]
+async fn test_build_paths_with_results_rejected_batch_not_rescued_by_presence() -> anyhow::Result<()>
+{
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    h.store
+        .seed_with_content(NOCHROOT_PRESENT_DRV, NOCHROOT_PRESENT_ATERM.as_bytes());
+    // The wanted output IS present (an earlier substitution or another
+    // tenant's build landed it) — presence is the trigger under test.
+    h.store
+        .seed_with_content(NOCHROOT_PRESENT_OUT, b"nochroot out");
+
+    let derived_path = format!("{NOCHROOT_PRESENT_DRV}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: std::slice::from_ref(&derived_path),
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+
+    let (echoed, result) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(echoed, derived_path);
+    assert!(
+        !result.status.is_success(),
+        "a rejected batch must not be store-rescued into a success: {result:?}"
+    );
+    assert!(
+        result.error_msg.contains("noChroot") || result.error_msg.contains("sandbox"),
+        "the rejection reason must reach the client verbatim, got: {:?}",
+        result.error_msg
+    );
+    assert!(
+        result.built_outputs.is_empty(),
+        "no fabricated builtOutputs for a refused batch: {result:?}"
+    );
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "rejection happens before SubmitBuild — nothing was submitted"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.build-results-honest+2]
+/// A batch whose SubmitBuild RPC failed before acknowledgment was never
+/// accepted by the scheduler: same rule as the validation rejection —
+/// presence must not rescue, the synthesized transport failure is
+/// reported verbatim, and a scheduler outage stays visible instead of
+/// reading as a (substituted) success.
+#[tokio::test]
+async fn test_build_paths_with_results_submit_error_not_rescued_by_presence() -> anyhow::Result<()>
+{
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler
+        .set_submit_outcome(SubmitOutcome::Error(tonic::Code::Unavailable));
+
+    h.store
+        .seed_with_content(HONEST_A_DRV, HONEST_A_ATERM.as_bytes());
+    h.store.seed_with_content(HONEST_A_OUT, b"a-out");
+
+    let path_a = format!("{HONEST_A_DRV}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: std::slice::from_ref(&path_a),
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+
+    let (echoed, result) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(echoed, path_a);
+    assert_eq!(
+        result.status,
+        BuildStatus::TransientFailure,
+        "an unacknowledged submission reports the transport failure, not a \
+         store-presence success: {result:?}"
+    );
+    assert!(
+        result.error_msg.contains("scheduler error"),
+        "the synthesized failure must reach the client verbatim, got: {:?}",
+        result.error_msg
+    );
+    assert!(result.built_outputs.is_empty(), "{result:?}");
+
+    h.finish().await;
+    Ok(())
+}
+
 // r[verify gw.opcode.build-results-honest+2]
 /// wopBuildPaths (9): the bare success word is gated on the same store
 /// verification. Aggregate success but the wanted output path is missing

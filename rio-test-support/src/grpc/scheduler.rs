@@ -38,8 +38,11 @@ pub enum SubmitOutcome {
         /// is nondeterministic.
         interval: Option<std::time::Duration>,
     },
-    /// Send `BuildStarted`, then either `BuildCompleted`, close the stream
-    /// without a terminal event, or hang for 3600s (default).
+    /// Send `BuildStarted`, then either `BuildCompleted` (preceded by one
+    /// `DerivationEvent::Completed` per submitted DAG node — the real
+    /// scheduler emits a terminal per derivation, and per-root consumers
+    /// must see that shape), close the stream without a terminal event,
+    /// or hang for 3600s (default).
     Simple {
         send_completed: bool,
         close_early: bool,
@@ -58,7 +61,10 @@ impl Default for SubmitOutcome {
 }
 
 impl SubmitOutcome {
-    /// `BuildStarted` → `BuildCompleted`.
+    /// `BuildStarted` → one `DerivationEvent::Completed` per submitted
+    /// DAG node → `BuildCompleted`, mirroring the real scheduler's
+    /// terminal-per-derivation guarantee. Use `scripted` to model event
+    /// loss (a Completed stream missing a root's terminal).
     pub fn completed() -> Self {
         Self::Simple {
             send_completed: true,
@@ -177,6 +183,14 @@ impl SchedulerService for MockScheduler {
         request: Request<types::SubmitBuildRequest>,
     ) -> Result<Response<Self::SubmitBuildStream>, Status> {
         let req = request.into_inner();
+        // Captured before the request moves into `submit_calls`: the
+        // Simple-completed arm derives its per-derivation terminal events
+        // from the submitted DAG, like the real scheduler.
+        let submitted_nodes: Vec<(String, Vec<String>)> = req
+            .nodes
+            .iter()
+            .map(|node| (node.drv_path.clone(), node.expected_output_paths.clone()))
+            .collect();
         self.submit_calls.write().unwrap().push(req);
 
         let outcome = self.submit.read().unwrap().clone();
@@ -235,23 +249,49 @@ impl SchedulerService for MockScheduler {
                 close_early,
             } => {
                 tokio::spawn(async move {
+                    let mut sequence = 1u64;
                     let _ = tx
                         .send(Ok(types::BuildEvent {
                             build_id: build_id.clone(),
-                            sequence: 1,
+                            sequence,
                             timestamp: None,
                             event: Some(types::build_event::Event::Started(types::BuildStarted {
-                                total_derivations: 1,
+                                total_derivations: submitted_nodes.len().max(1) as u32,
                                 cached_derivations: 0,
                             })),
                         }))
                         .await;
 
                     if send_completed {
+                        // Real-scheduler fidelity: the scheduler emits a
+                        // terminal DerivationEvent for EVERY derivation in
+                        // the DAG (one per node, including merge-time and
+                        // pre-existing cache hits) before the DAG-level
+                        // terminal. A Completed stream with no per-drv
+                        // terminals is a shape production cannot emit; a
+                        // mock without them silently exercises — and
+                        // fixtures then enshrine — the gateway's
+                        // no-evidence fallback paths instead of the
+                        // per-root reporting under test. Tests that NEED
+                        // the event-loss shape script it explicitly.
+                        for (drv_path, output_paths) in submitted_nodes {
+                            sequence += 1;
+                            let _ = tx
+                                .send(Ok(types::BuildEvent {
+                                    build_id: build_id.clone(),
+                                    sequence,
+                                    timestamp: None,
+                                    event: Some(types::build_event::Event::Derivation(
+                                        types::DerivationEvent::completed(drv_path, output_paths),
+                                    )),
+                                }))
+                                .await;
+                        }
+                        sequence += 1;
                         let _ = tx
                             .send(Ok(types::BuildEvent {
                                 build_id: build_id.clone(),
-                                sequence: 2,
+                                sequence,
                                 timestamp: None,
                                 event: Some(types::build_event::Event::Completed(
                                     types::BuildCompleted {

@@ -976,6 +976,187 @@ struct ProcessedBuild {
     /// roots without an entry fall back to `result`. Empty for the
     /// opcodes that pass no roots (9, 36).
     per_drv: HashMap<String, BuildResult>,
+    /// Whether this value came from the scheduler's event substrate for
+    /// an acknowledged submission. `submit_and_process_build` always
+    /// produces `true`: once the scheduler acknowledges the build, the
+    /// DAG-level result and the terminal map are scheduler state — the
+    /// event stream replays from the (possibly recovered) leader's
+    /// authoritative DAG across reconnects, and even a post-
+    /// acknowledgment stream failure (reconnects exhausted) reports a
+    /// synthesized failure ALONGSIDE whatever terminals were collected.
+    /// `false` only for [`Self::unsubmitted`] stand-ins: the scheduler
+    /// never accepted the batch, so no scheduler evidence exists for ANY
+    /// root and the per-root loop must not treat the stand-in result or
+    /// the (vacuously empty) terminal map as evidence to refine.
+    submitted: bool,
+}
+
+impl ProcessedBuild {
+    /// Stand-in for a batch the scheduler never accepted: a DAG
+    /// validation rejection, or a submit error before acknowledgment.
+    /// Carries the synthesized blanket failure and no terminals; the
+    /// per-root verdict reports it verbatim — store presence must not
+    /// upgrade it (see [`per_root_verdict`]).
+    fn unsubmitted(result: BuildResult) -> Self {
+        Self {
+            result,
+            per_drv: HashMap::new(),
+            submitted: false,
+        }
+    }
+
+    /// The verdict basis for one requested root: its own recorded
+    /// terminal when the event relay captured one, otherwise the
+    /// DAG-level result tagged with whether the scheduler ever
+    /// acknowledged this batch. The single derivation site — every root
+    /// of the multi-root result loop goes through here, so "which
+    /// evidence backs this verdict?" is decided in one place.
+    fn root_evidence(&self, drv_path: &str) -> RootEvidence {
+        match self.per_drv.get(drv_path) {
+            Some(own) => RootEvidence::OwnTerminal(own.clone()),
+            None => RootEvidence::DagFallback {
+                dag: self.result.clone(),
+                submitted: self.submitted,
+            },
+        }
+    }
+}
+
+/// What the scheduler's event substrate provides for ONE requested root
+/// of a multi-root build opcode.
+enum RootEvidence {
+    /// The relay recorded this exact root's terminal event
+    /// (Completed → executed success, Cached → substituted, Failed →
+    /// failure with the scheduler's message).
+    OwnTerminal(BuildResult),
+    /// No terminal for this root: the DAG-level result is the only
+    /// evidence. `submitted` distinguishes "the scheduler processed the
+    /// batch but this root's terminal was not captured" (event lost in a
+    /// state-channel Lagged window, dropped across a leader-failover
+    /// reconnect, path-key mismatch) from "the scheduler never saw the
+    /// batch at all" (validation rejection, pre-acknowledgment submit
+    /// error) — the latter has no scheduler evidence to refine.
+    DagFallback { dag: BuildResult, submitted: bool },
+}
+
+/// Decide ONE requested root's reported result from its evidence and the
+/// store check — the single chokepoint where per-root claims are minted,
+/// total over (evidence × store state).
+///
+/// The honesty invariants (r[gw.opcode.build-results-honest]):
+///
+/// - An executed `Built` (`timesBuilt` ≥ 1) is reported only from the
+///   root's OWN success terminal — the DAG-level Completed is an
+///   execution claim about the batch, never about a root whose terminal
+///   was not captured. Such a root reports `Substituted` (presence
+///   under a completed DAG), so a lost `Cached`/`Completed` event can
+///   inflate nothing.
+/// - A root's own recorded failure stands verbatim; store presence
+///   proves the outputs exist somehow, never that THIS build succeeded.
+/// - Any success-shaped basis is demoted when the store is missing
+///   wanted outputs (wrong-success).
+/// - The presence rescue (blanket DAG failure refined to `Substituted`
+///   by positive store evidence) requires an ACKNOWLEDGED batch: for an
+///   unsubmitted stand-in the synthesized refusal/transport failure is
+///   reported verbatim, whatever the store holds — rescuing would
+///   convert the gateway's own refusal or a scheduler outage into a
+///   success observation.
+fn per_root_verdict(
+    evidence: RootEvidence,
+    check: &TargetOutputsCheck,
+    drv_path: &str,
+) -> RootVerdict {
+    let demoted = |missing: &[String]| {
+        warn!(
+            drv = %drv_path,
+            missing = ?missing,
+            "demoting successful wopBuildPathsWithResults entry: outputs not in store"
+        );
+        RootVerdict::Verbatim(BuildResult::failure(
+            BuildStatus::MiscFailure,
+            format!(
+                "build completed but requested outputs are not in the store: {}",
+                missing.join("; ")
+            ),
+        ))
+    };
+    match evidence {
+        RootEvidence::OwnTerminal(own) => {
+            if !own.status.is_success() {
+                // The root's own recorded failure — status and error
+                // message — is the result the client is owed. Store
+                // presence never overrides it.
+                RootVerdict::Verbatim(own)
+            } else if check.missing.is_empty() {
+                // Verified (or unverifiable — defer to the scheduler's
+                // own per-root terminal): success in the terminal's own
+                // shape (Built / Substituted), enriched with the wanted
+                // builtOutputs.
+                RootVerdict::Success(own)
+            } else {
+                demoted(&check.missing)
+            }
+        }
+        RootEvidence::DagFallback {
+            dag,
+            submitted: false,
+        } => {
+            // Never acknowledged: the stand-in is a synthesized failure
+            // by construction, and no store state may upgrade it. The
+            // success-shaped guard is defense in depth — reporting an
+            // unsubmitted "success" would fabricate an outcome for a
+            // batch no scheduler processed.
+            if dag.status.is_success() {
+                RootVerdict::Verbatim(BuildResult::failure(
+                    BuildStatus::MiscFailure,
+                    "internal: success result for a batch the scheduler never accepted".to_string(),
+                ))
+            } else {
+                RootVerdict::Verbatim(dag)
+            }
+        }
+        RootEvidence::DagFallback {
+            dag,
+            submitted: true,
+        } => {
+            if dag.status.is_success() {
+                // Completed DAG, no terminal for THIS root (event lost,
+                // Lagged window, leader-failover reconnect gap, path-key
+                // mismatch): the scheduler settled every node, but which
+                // terminal this root reached is unknown. Report presence
+                // honestly — Substituted, timesBuilt = 0 — never the
+                // DAG-level executed Built.
+                if check.missing.is_empty() {
+                    RootVerdict::Success(BuildResult::substituted())
+                } else {
+                    demoted(&check.missing)
+                }
+            } else if check.confirmed_present {
+                // Partial outcome: this root was blanket-failed by the
+                // DAG-level result, but every output it asked for is
+                // present in the store — rescue it from the unrelated
+                // failure, reporting presence honestly: Substituted,
+                // timesBuilt = 0. Presence proves the outputs exist
+                // somehow (a concurrent batch, another tenant, an
+                // earlier substitution), not that this submission
+                // executed the build.
+                RootVerdict::Success(BuildResult::substituted())
+            } else {
+                // Unverified blanket failure stands.
+                RootVerdict::Verbatim(dag)
+            }
+        }
+    }
+}
+
+/// [`per_root_verdict`]'s decision: how one root's result reaches the
+/// wire.
+enum RootVerdict {
+    /// Report this success enriched with `builtOutputs` covering the
+    /// wanted outputs (`result_with_wanted_outputs`).
+    Success(BuildResult),
+    /// Report this result verbatim (failures are never enriched).
+    Verbatim(BuildResult),
 }
 
 /// Submit a build to the scheduler and process events, returning the
@@ -1224,6 +1405,11 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     Ok(ProcessedBuild {
         result,
         per_drv: act.terminal,
+        // Reaching here means the scheduler acknowledged the submission:
+        // result and terminals are scheduler-substrate state (including
+        // the reconnect-exhausted synthesized failure above, which still
+        // carries every terminal collected before the stream died).
+        submitted: true,
     })
 }
 
@@ -2086,22 +2272,18 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
             .collect();
         let processed = match submit_dag(stderr, ctx, all_nodes, all_edges, result_roots).await {
             Ok(DagSubmitOutcome::Gated) => return Ok(()),
-            Ok(DagSubmitOutcome::Rejected(reason)) => ProcessedBuild {
-                result: BuildResult::failure(BuildStatus::InputRejected, reason),
-                per_drv: HashMap::new(),
-            },
+            Ok(DagSubmitOutcome::Rejected(reason)) => ProcessedBuild::unsubmitted(
+                BuildResult::failure(BuildStatus::InputRejected, reason),
+            ),
             Ok(DagSubmitOutcome::Built(p)) => p,
             Err(e) => {
                 warn!(error = %e, "wopBuildPathsWithResults: build submission failed");
                 metrics::counter!("rio_gateway_errors_total", "type" => "scheduler_submit")
                     .increment(1);
-                ProcessedBuild {
-                    result: BuildResult::failure(
-                        BuildStatus::TransientFailure,
-                        format!("scheduler error: {e}"),
-                    ),
-                    per_drv: HashMap::new(),
-                }
+                ProcessedBuild::unsubmitted(BuildResult::failure(
+                    BuildStatus::TransientFailure,
+                    format!("scheduler error: {e}"),
+                ))
             }
         };
 
@@ -2114,20 +2296,15 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         // FindMissingPaths; store errors abort the opcode (stderr_err!
         // inside, before stderr.finish()).
         //
-        // Each target's verdict starts from its own recorded terminal
-        // (per-drv status + error message captured from the event stream —
-        // see `ProcessedBuild`); targets with no recorded terminal (event
-        // lost, build cancelled mid-flight, never attempted) fall back to
-        // the DAG-level result. The store check then refines the verdict —
-        // but only where the scheduler left no per-root evidence: a
-        // success is demoted when the store is missing what the client is
-        // owed (any root), while the failure-side rescue applies solely to
-        // the DAG-level fallback. A root's OWN recorded failure always
-        // stands — store presence proves the outputs exist (a concurrent
-        // batch, another tenant, or an earlier substitution may have
-        // landed them), not that THIS root's build succeeded — and the
-        // rescue reports presence for what it is: Substituted with
-        // timesBuilt = 0, never an executed Built.
+        // Each target's verdict is decided by [`per_root_verdict`] — the
+        // single chokepoint over (evidence × store state) — from the
+        // evidence [`ProcessedBuild::root_evidence`] derives: the root's
+        // own recorded terminal when the relay captured one, otherwise
+        // the DAG-level result tagged with whether the scheduler ever
+        // acknowledged the batch. See the chokepoint's doc for the
+        // honesty invariants (own failures stand; execution claims need
+        // own terminals; the presence rescue needs an acknowledged
+        // batch).
         let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
         let mut checks =
             check_targets_against_store(stderr, ctx, &drv_for_idx, &mut hash_cache).await?;
@@ -2138,67 +2315,34 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                 continue;
             }
             let (Some(demand), Some(check)) = (drv_for_idx.get(&idx), checks.remove(&idx)) else {
-                results.push(processed.result.clone());
+                // Unreachable: every non-opaque idx has a demand, and the
+                // store check returns one entry per demand. Defensive arm
+                // only — and it must not relay a success word it never
+                // verified against the store.
+                let dag = processed.result.clone();
+                results.push(if dag.status.is_success() {
+                    BuildResult::failure(
+                        BuildStatus::MiscFailure,
+                        "internal: no store verification for this target".to_string(),
+                    )
+                } else {
+                    dag
+                });
                 continue;
             };
-            // This target's own recorded terminal; DAG-level result when
-            // none was recorded.
-            let own_terminal = processed.per_drv.get(&demand.drv_path).cloned();
-            let has_own_terminal = own_terminal.is_some();
-            let per_root = own_terminal.unwrap_or_else(|| processed.result.clone());
-            if per_root.status.is_success() {
-                if check.missing.is_empty() {
-                    // Verified (or unverifiable — defer to the scheduler):
-                    // success, with builtOutputs covering exactly the
-                    // wanted outputs.
-                    results.push(result_with_wanted_outputs(
-                        per_root,
-                        demand,
-                        &check,
-                        &ctx.drv_cache,
-                        &mut hash_cache,
-                    ));
-                } else {
-                    // Wrong-success: this target's terminal says built but
-                    // its requested outputs are not in the store.
-                    warn!(
-                        drv = %demand.drv_path,
-                        missing = ?check.missing,
-                        "demoting successful wopBuildPathsWithResults entry: outputs not in store"
-                    );
-                    results.push(BuildResult::failure(
-                        BuildStatus::MiscFailure,
-                        format!(
-                            "build completed but requested outputs are not in the store: {}",
-                            check.missing.join("; ")
-                        ),
-                    ));
-                }
-            } else if !has_own_terminal && check.confirmed_present {
-                // Partial outcome: this target was blanket-failed by the
-                // DAG-level result (the scheduler recorded no terminal for
-                // it), but every output THIS target asked for is present
-                // in the store — rescue it from the unrelated failure,
-                // reporting presence honestly: Substituted, timesBuilt = 0.
-                // Presence proves the outputs exist somehow (a concurrent
-                // batch, another tenant, an earlier substitution), not
-                // that this submission executed the build, so the rescue
-                // must never claim an executed Built.
-                results.push(result_with_wanted_outputs(
-                    BuildResult::substituted(),
+            match per_root_verdict(
+                processed.root_evidence(&demand.drv_path),
+                &check,
+                &demand.drv_path,
+            ) {
+                RootVerdict::Success(base) => results.push(result_with_wanted_outputs(
+                    base,
                     demand,
                     &check,
                     &ctx.drv_cache,
                     &mut hash_cache,
-                ));
-            } else {
-                // The root's own recorded failure — or an unverified
-                // blanket failure — stands: keep the per-root status +
-                // error message. Store presence never overrides a root's
-                // OWN failed terminal: the scheduler said this exact
-                // derivation's build failed, and that verdict (with its
-                // error message) is the result the client is owed.
-                results.push(per_root);
+                )),
+                RootVerdict::Verbatim(result) => results.push(result),
             }
         }
     } else {
@@ -2225,6 +2369,293 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
 mod tests {
     use super::*;
     use rio_nix::protocol::stderr::{STDERR_RESULT, STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY};
+
+    // r[verify gw.opcode.build-results-honest+2]
+    /// Lattice totality for [`per_root_verdict`]: every (evidence ×
+    /// store-state) cell, with the honesty invariants asserted
+    /// machine-checked per cell instead of sampling scenarios.
+    ///
+    /// Quantification domain: evidence enumerates every constructor shape
+    /// of [`RootEvidence`] reachable from the handler — own terminals in
+    /// all three terminal-event shapes the relay records (Completed →
+    /// `success()`, Cached → `substituted()`, Failed → failure), the
+    /// DAG fallback for an acknowledged batch with both DAG outcomes
+    /// (Completed with this root's terminal lost — the state-channel
+    /// Lagged / leader-failover-reconnect / path-key-mismatch shapes —
+    /// and the blanket failure, including the post-acknowledgment
+    /// reconnect-exhausted synthesis), and the unsubmitted stand-ins
+    /// (validation rejection, pre-acknowledgment submit error, plus the
+    /// defensively-handled success-shaped stand-in no call site can
+    /// construct). Store state enumerates the three
+    /// [`TargetOutputsCheck`] verdict classes: confirmed-present,
+    /// missing, unverifiable.
+    ///
+    /// Invariants, checked at every cell:
+    ///  1. execution honesty — `timesBuilt ≥ 1` is reported only from the
+    ///     root's own executed-success terminal;
+    ///  2. success provenance — any success requires either an own
+    ///     success terminal or an acknowledged batch with presence/
+    ///     completed-DAG evidence;
+    ///  3. unsubmitted batches report their synthesized failure verbatim
+    ///     (no store state upgrades them, success-shaped stand-ins are
+    ///     demoted);
+    ///  4. an own failure is verbatim under every store state;
+    ///  5. wrong-success demotion — a success basis with missing outputs
+    ///     is demoted to a failure naming them;
+    ///  6. rescue shape — a rescued or evidence-less success is always
+    ///     `Substituted`/`timesBuilt = 0`, never an executed `Built`.
+    #[test]
+    fn per_root_verdict_lattice_totality() {
+        const CONFIRMED: usize = 0;
+        const MISSING: usize = 1;
+        const UNVERIFIABLE: usize = 2;
+        let check = |state: usize| -> TargetOutputsCheck {
+            match state {
+                CONFIRMED => TargetOutputsCheck {
+                    missing: vec![],
+                    confirmed_present: true,
+                    realized: HashMap::new(),
+                    wanted_names: vec!["out".into()],
+                    checkable: vec![],
+                    unverifiable: false,
+                },
+                MISSING => TargetOutputsCheck {
+                    missing: vec!["output 'out' (/nix/store/x-out) is not valid".into()],
+                    confirmed_present: false,
+                    realized: HashMap::new(),
+                    wanted_names: vec!["out".into()],
+                    checkable: vec![],
+                    unverifiable: false,
+                },
+                UNVERIFIABLE => TargetOutputsCheck {
+                    missing: vec![],
+                    confirmed_present: false,
+                    realized: HashMap::new(),
+                    wanted_names: vec!["out".into()],
+                    checkable: vec![],
+                    unverifiable: true,
+                },
+                _ => unreachable!(),
+            }
+        };
+
+        struct Cell {
+            label: &'static str,
+            own_success: bool,
+            own_failure: Option<(BuildStatus, &'static str)>,
+            dag_success: bool,
+            submitted: Option<bool>,
+        }
+        let evidence_shapes: Vec<(Cell, fn() -> RootEvidence)> = vec![
+            (
+                Cell {
+                    label: "own Completed terminal",
+                    own_success: true,
+                    own_failure: None,
+                    dag_success: false,
+                    submitted: None,
+                },
+                || RootEvidence::OwnTerminal(BuildResult::success()),
+            ),
+            (
+                Cell {
+                    label: "own Cached terminal",
+                    own_success: true,
+                    own_failure: None,
+                    dag_success: false,
+                    submitted: None,
+                },
+                || RootEvidence::OwnTerminal(BuildResult::substituted()),
+            ),
+            (
+                Cell {
+                    label: "own Failed terminal",
+                    own_success: false,
+                    own_failure: Some((BuildStatus::PermanentFailure, "builder exit 1")),
+                    dag_success: false,
+                    submitted: None,
+                },
+                || {
+                    RootEvidence::OwnTerminal(BuildResult::failure(
+                        BuildStatus::PermanentFailure,
+                        "builder exit 1",
+                    ))
+                },
+            ),
+            (
+                Cell {
+                    label: "Completed DAG, terminal lost",
+                    own_success: false,
+                    own_failure: None,
+                    dag_success: true,
+                    submitted: Some(true),
+                },
+                || RootEvidence::DagFallback {
+                    dag: BuildResult::success(),
+                    submitted: true,
+                },
+            ),
+            (
+                Cell {
+                    label: "blanket DAG failure",
+                    own_success: false,
+                    own_failure: None,
+                    dag_success: false,
+                    submitted: Some(true),
+                },
+                || RootEvidence::DagFallback {
+                    dag: BuildResult::failure(
+                        BuildStatus::PermanentFailure,
+                        "derivation '/nix/store/x.drv' failed: boom",
+                    ),
+                    submitted: true,
+                },
+            ),
+            (
+                Cell {
+                    label: "post-ack stream death (reconnect exhausted)",
+                    own_success: false,
+                    own_failure: None,
+                    dag_success: false,
+                    submitted: Some(true),
+                },
+                || RootEvidence::DagFallback {
+                    dag: BuildResult::failure(
+                        BuildStatus::TransientFailure,
+                        "build stream error (reconnect exhausted): transport",
+                    ),
+                    submitted: true,
+                },
+            ),
+            (
+                Cell {
+                    label: "validation rejection (never submitted)",
+                    own_success: false,
+                    own_failure: None,
+                    dag_success: false,
+                    submitted: Some(false),
+                },
+                || RootEvidence::DagFallback {
+                    dag: BuildResult::failure(
+                        BuildStatus::InputRejected,
+                        "DAG validation failed: __noChroot",
+                    ),
+                    submitted: false,
+                },
+            ),
+            (
+                Cell {
+                    label: "pre-ack submit error (never submitted)",
+                    own_success: false,
+                    own_failure: None,
+                    dag_success: false,
+                    submitted: Some(false),
+                },
+                || RootEvidence::DagFallback {
+                    dag: BuildResult::failure(
+                        BuildStatus::TransientFailure,
+                        "scheduler error: connect refused",
+                    ),
+                    submitted: false,
+                },
+            ),
+            (
+                Cell {
+                    label: "success-shaped unsubmitted stand-in (defensive)",
+                    own_success: false,
+                    own_failure: None,
+                    dag_success: true,
+                    submitted: Some(false),
+                },
+                || RootEvidence::DagFallback {
+                    dag: BuildResult::success(),
+                    submitted: false,
+                },
+            ),
+        ];
+
+        for (cell, make) in &evidence_shapes {
+            for state in [CONFIRMED, MISSING, UNVERIFIABLE] {
+                let chk = check(state);
+                let verdict = per_root_verdict(make(), &chk, "/nix/store/under-test.drv");
+                let (result, enriched) = match verdict {
+                    RootVerdict::Success(r) => (r, true),
+                    RootVerdict::Verbatim(r) => (r, false),
+                };
+                let ctx = format!("evidence: {}, store state: {state}", cell.label);
+
+                // 1. Execution honesty: timesBuilt ≥ 1 only from an own
+                //    executed-success terminal.
+                if result.times_built >= 1 {
+                    assert!(
+                        cell.own_success && result.status == BuildStatus::Built,
+                        "{ctx}: execution claim without an own executed terminal: {result:?}"
+                    );
+                }
+                // 2. Success provenance.
+                if result.status.is_success() {
+                    let own_ok = cell.own_success && chk.missing.is_empty();
+                    let dag_ok = cell.submitted == Some(true)
+                        && ((cell.dag_success && chk.missing.is_empty()) || chk.confirmed_present);
+                    assert!(
+                        own_ok || dag_ok,
+                        "{ctx}: success without per-root or acknowledged-batch evidence: \
+                         {result:?}"
+                    );
+                    assert!(
+                        enriched,
+                        "{ctx}: success must carry builtOutputs enrichment"
+                    );
+                } else {
+                    assert!(!enriched, "{ctx}: failures are never enriched");
+                }
+                // 3. Unsubmitted stand-ins are verbatim failures.
+                if cell.submitted == Some(false) {
+                    assert!(
+                        !result.status.is_success(),
+                        "{ctx}: a batch the scheduler never accepted reported success: \
+                         {result:?}"
+                    );
+                    if !cell.dag_success {
+                        let RootEvidence::DagFallback { dag, .. } = make() else {
+                            unreachable!()
+                        };
+                        assert_eq!(result.status, dag.status, "{ctx}: stand-in not verbatim");
+                        assert_eq!(
+                            result.error_msg, dag.error_msg,
+                            "{ctx}: stand-in message not verbatim"
+                        );
+                    }
+                }
+                // 4. Own failures stand verbatim under every store state.
+                if let Some((status, msg)) = cell.own_failure {
+                    assert_eq!(result.status, status, "{ctx}: own failure overridden");
+                    assert_eq!(result.error_msg, msg, "{ctx}: own failure message changed");
+                }
+                // 5. Wrong-success demotion names the missing outputs.
+                let success_basis =
+                    cell.own_success || (cell.submitted == Some(true) && cell.dag_success);
+                if success_basis && state == MISSING {
+                    assert_eq!(result.status, BuildStatus::MiscFailure, "{ctx}");
+                    assert!(
+                        result.error_msg.contains("not in the store")
+                            && result.error_msg.contains("output 'out'"),
+                        "{ctx}: demotion must name the missing output: {}",
+                        result.error_msg
+                    );
+                }
+                // 6. Evidence-less successes are presence claims.
+                if result.status.is_success() && !cell.own_success {
+                    assert_eq!(
+                        result.status,
+                        BuildStatus::Substituted,
+                        "{ctx}: evidence-less success must be a presence claim"
+                    );
+                    assert_eq!(result.times_built, 0, "{ctx}");
+                }
+            }
+        }
+    }
 
     fn ev(kind: types::DerivationEventKind, drv: &str, outs: &[&str]) -> types::DerivationEvent {
         types::DerivationEvent {
