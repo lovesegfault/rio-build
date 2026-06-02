@@ -381,8 +381,11 @@ pub async fn download_state_if_missing(
     // partial restore look complete, resume the campaign on near-empty state,
     // and let the periodic sync overwrite the durable store copies with that
     // empty state. Mirrors the data-before-markers ordering [`sync_state`]
-    // enforces in the upload direction.
-    state.write_bytes("campaign.json", &campaign)?;
+    // enforces in the upload direction. The write itself is atomic (tmp +
+    // fsync + rename, the state dir's JSON-document discipline): a torn
+    // sentinel would exist-but-not-parse, skipping the retry that heals it
+    // and crash-looping resume on an unreadable campaign.json instead.
+    state.write_bytes_atomic("campaign.json", &campaign)?;
     Ok(true)
 }
 
@@ -833,6 +836,9 @@ mod tests {
         assert!(restored);
         assert!(state.path("campaign.json").exists());
         assert!(state.path("results.jsonl").exists());
+        // The sentinel is written via tmp + rename; its scratch sibling
+        // must not survive the restore.
+        assert!(!state.path("campaign.tmp").exists());
 
         // Second call is a no-op (campaign.json now present locally).
         let again = download_state_if_missing(&state, &store, "replay/campaigns", "c1")

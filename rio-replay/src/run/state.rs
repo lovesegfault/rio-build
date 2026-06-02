@@ -193,12 +193,39 @@ impl StateDir {
     }
 
     /// Write raw bytes (log tails, rendered report) under the state dir.
+    /// Plain `fs::write` — a crash mid-write can leave a torn file, which
+    /// is fine for files whose presence carries no meaning (they are
+    /// re-written or re-uploaded wholesale). Files whose PRESENCE is a
+    /// signal (e.g. the restore-complete sentinel) must use
+    /// [`Self::write_bytes_atomic`] instead.
     pub fn write_bytes(&self, rel: &str, bytes: &[u8]) -> Result<()> {
         let path = self.path(rel);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).ok();
         }
         fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))
+    }
+
+    /// Atomic raw-byte rewrite — the same tmp + fsync + rename discipline
+    /// as [`Self::write_json_atomic`], for callers that already hold the
+    /// serialized bytes of a JSON document. For files whose existence is
+    /// itself a signal (the restore path's campaign.json sentinel): a
+    /// crash mid-write must leave either the old state or the new one,
+    /// never a torn file that exists but cannot be parsed.
+    pub fn write_bytes_atomic(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        let path = self.path(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        let tmp = path.with_extension("tmp");
+        {
+            let mut f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+            f.write_all(bytes)
+                .with_context(|| format!("write {}", tmp.display()))?;
+            f.sync_all().ok();
+        }
+        fs::rename(&tmp, &path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
     }
 
     pub fn marker_done(&self, stage: &str) -> bool {
@@ -564,5 +591,43 @@ mod tests {
         // Missing document reads as None.
         let missing: Option<serde_json::Value> = state.read_json("nope.json").unwrap();
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn raw_bytes_atomic_rewrite() {
+        // write_bytes_atomic follows the same tmp + rename discipline as
+        // write_json_atomic: the target is replaced wholesale and no .tmp
+        // sibling survives — required for files whose presence is itself a
+        // signal (the restore path's campaign.json sentinel).
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        state
+            .write_bytes_atomic("campaign.json", b"{\"campaignId\":\"c1\"}")
+            .unwrap();
+        assert_eq!(
+            std::fs::read(state.path("campaign.json")).unwrap(),
+            b"{\"campaignId\":\"c1\"}"
+        );
+        assert!(!state.path("campaign.tmp").exists());
+
+        // Overwrite replaces the previous content in full.
+        state
+            .write_bytes_atomic("campaign.json", b"{\"campaignId\":\"c2\"}")
+            .unwrap();
+        assert_eq!(
+            std::fs::read(state.path("campaign.json")).unwrap(),
+            b"{\"campaignId\":\"c2\"}"
+        );
+        assert!(!state.path("campaign.tmp").exists());
+
+        // Parent directories are created as needed (parity with
+        // write_bytes).
+        state
+            .write_bytes_atomic("nested/dir/doc.json", b"{}")
+            .unwrap();
+        assert_eq!(
+            std::fs::read(state.path("nested/dir/doc.json")).unwrap(),
+            b"{}"
+        );
     }
 }
