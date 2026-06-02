@@ -522,6 +522,49 @@ spec:
               serving_generation log lines, and the
               leader_generation_claims table.
 
+        # Item T (harden-store reconciliation memo §6.2 / §3 row 32):
+        # conversion visibility for the Vouched/Pending evidence class.
+        # rio_scheduler_materialization_converted_total counts PD-20 park
+        # re-evaluations that resolved a job from_source — TIME-driven
+        # conversions (infra budget exhausted while from-source stayed
+        # viable), not evidence-driven consumption routing. For
+        # origin=cache_opportunity that is upstream-available content
+        # converting to a from-source build: recorded and bounded, but
+        # exactly the incident's outcome class re-entering through
+        # exhaustion. A single conversion during a cold-start wave is
+        # expected noise (the placeholder-race absorption); the
+        # churn-loop signature — a wedged-but-heartbeating ingest owner
+        # converting a competing job roughly once a minute per re-created
+        # job cycle — is SUSTAINED conversions. Hence the shape: a
+        # conversion in every sliding 5m window for 15 consecutive
+        # minutes (≈3+ spread conversions), not one blip held for 15m.
+        # warning, not page: conversions are walk-equivalent recorded
+        # behavior; the strictness knob (whether to refuse them) is a
+        # separate owner decision. Counter is pre-registered at 0
+        # flag-on, so the expr has series from boot; sum() collapses
+        # leader/old-leader series across failovers.
+        - alert: RioSchedulerMaterializationConversions
+          expr: sum(increase(rio_scheduler_materialization_converted_total{origin="cache_opportunity"}[5m])) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: sustained from-source conversions of upstream-available jobs (>15m)
+            description: >-
+              Parked materialization jobs with cache_opportunity origin have
+              been converting to from-source builds continuously for over 15
+              minutes ({{`{{ $value | humanize }}`}} in the last 5m window).
+              Each conversion is a derivation whose content the upstream
+              cache advertises, built from source anyway because its
+              materialization attempts kept failing (the park budget
+              exhausted). Sustained conversions usually mean a wedged or
+              overloaded store ingest path (check
+              rio_store_substitute_stale_reclaimed_total{reason=~"stall_.*"}
+              and rio_store_materialization_executions_total{outcome="infra"})
+              or a flapping upstream — fix the ingest/upstream side; the
+              conversions themselves are recorded, bounded fallbacks, not
+              failures.
+
         # Forward-compat: rio_store_putpath_retries_total lands in P0539d.
         # Until then this expr evaluates empty (no series) → never fires.
         # >10/s sustained means S3/PG backpressure or the chunk-dedup

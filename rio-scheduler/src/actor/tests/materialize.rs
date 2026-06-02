@@ -4441,14 +4441,58 @@ async fn parked_job_stalled_gauge_and_reevaluation() -> TestResult {
         "a Broken-evidence (childless) parked job stays parked (never force-resolved)"
     );
 
+    // One snapshot serves both reads (debugging snapshots are
+    // DESTRUCTIVE — swap(0) — so the gauge and the conversion counter
+    // must come from the same drain).
+    let (stalled, converted) = {
+        use metrics_util::debugging::DebugValue;
+        let mut stalled = None;
+        let mut converted: std::collections::BTreeMap<String, u64> = Default::default();
+        for (ck, _, _, v) in snap.snapshot().into_vec() {
+            match (ck.key().name(), v) {
+                ("rio_scheduler_materialization_stalled", DebugValue::Gauge(g)) => {
+                    stalled = Some(g.into_inner());
+                }
+                ("rio_scheduler_materialization_converted_total", DebugValue::Counter(c)) => {
+                    let origin = ck
+                        .key()
+                        .labels()
+                        .find(|l| l.key() == "origin")
+                        .map(|l| l.value().to_owned())
+                        .unwrap_or_default();
+                    *converted.entry(origin).or_default() += c;
+                }
+                _ => {}
+            }
+        }
+        (stalled, converted)
+    };
+
     // The gauge: exactly one job still stalled (X), set from ground
     // truth at the tick.
-    let stalled = gauge_value(&snap, "rio_scheduler_materialization_stalled");
     assert_eq!(
         stalled,
         Some(1.0),
         "the stalled gauge counts jobs still parked after the re-evaluation pass \
          (X only; Y resolved), got {stalled:?}"
+    );
+
+    // Item T conversion visibility: the PD-20 time-driven conversion of
+    // an upstream-available-class job (Y, origin=cache_opportunity) is
+    // counted, discriminated by origin — the alertable churn-loop
+    // signal (every `{outcome="from_source"}` resolution that came from
+    // park exhaustion rather than evidence-driven consumption routing).
+    assert_eq!(
+        converted.get("cache_opportunity").copied(),
+        Some(1),
+        "the PD-20 conversion increments \
+         rio_scheduler_materialization_converted_total{{origin=\"cache_opportunity\"}}; \
+         got {converted:?}"
+    );
+    assert_eq!(
+        converted.get("pruned").copied().unwrap_or(0),
+        0,
+        "no pruned-origin conversion happened; got {converted:?}"
     );
 
     // The gauge is self-healing across ticks (stays 1 while X is parked).

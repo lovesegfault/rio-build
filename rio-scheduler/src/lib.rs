@@ -313,6 +313,18 @@ pub fn describe_metrics() {
          cancelled = zero live interest remained. A high infra-failure or \
          unobtainable rate is the upstream-health signal."
     );
+    describe_counter!(
+        "rio_scheduler_materialization_converted_total",
+        "PD-20 park re-evaluation conversions: parked materialization jobs \
+         resolved from_source because their infra budget exhausted while \
+         from-source stayed viable — the TIME-driven subset of \
+         jobs_resolved_total{outcome=from_source}, labeled by job origin \
+         (pruned|cache_opportunity|stale_reset|reprobe). origin=cache_opportunity \
+         means upstream-available content converted to a build: expected as \
+         bounded noise during cold-start waves, alertable when sustained \
+         (RioSchedulerMaterializationConversions — the wedged-ingest churn-loop \
+         signature). At-most-once per applied resolution."
+    );
     describe_histogram!(
         "rio_scheduler_critical_path_accuracy",
         "Predicted vs actual completion ratio (actual/estimated; 1.0=perfect, >1.0=underestimate)"

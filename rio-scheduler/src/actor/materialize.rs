@@ -971,7 +971,9 @@ impl DagActor {
     }
 
     /// Resolve the job terminally (fenced, exec_id-keyed, at-most-once)
-    /// and note a fence refusal.
+    /// and note a fence refusal. Returns whether the resolution was
+    /// APPLIED (rows > 0) — the at-most-once edge callers may hang
+    /// further accounting on (the PD-20 conversion counter).
     // r[impl obs.metric.scheduler]
     async fn resolve_materialization_job(
         &mut self,
@@ -979,7 +981,7 @@ impl DagActor {
         exec_id: Option<Uuid>,
         to_state: crate::state::JobState,
         serving_generation: i64,
-    ) {
+    ) -> bool {
         match self
             .db
             .resolve_materialization_job_fenced(job_id, exec_id, to_state, serving_generation)
@@ -1006,12 +1008,15 @@ impl DagActor {
                 // resolution is a no-op when interest is still live.
                 self.release_materialization_pins_best_effort("job resolution")
                     .await;
+                rows > 0
             }
             Ok(crate::db::FencedWrite::Fenced) => {
                 self.note_fenced_evidence_write("materialization job resolve");
+                false
             }
             Err(e) => {
                 warn!(%job_id, error = %e, "materialization job resolve failed");
+                false
             }
         }
     }
@@ -1287,19 +1292,51 @@ impl DagActor {
             if !from_source_viable {
                 continue;
             }
+            // Item T conversion visibility: read the (still-pending)
+            // job's origin BEFORE resolving — PG is the origin
+            // authority (the dedup may have upgraded it after the view
+            // entry was created). `unknown` only on a query/decode
+            // failure, never silently dropped.
+            let origin_label = match self.db.unresolved_job_for_derivation(db_id).await {
+                Ok(Some((_, origin))) => origin.as_str(),
+                Ok(None) => "unknown",
+                Err(e) => {
+                    warn!(drv_hash = %drv_hash, error = %e,
+                          "conversion-origin read failed; counting origin=unknown");
+                    "unknown"
+                }
+            };
             // From-source is viable: resolve the job (no exec_id — the
             // re-evaluation, not an execution, resolved it) and requeue
             // the node. The spawn-intent filter and the admission table
             // stop excluding the node the moment the job row is
             // terminal.
             let serving_generation = self.serving_generation();
-            self.resolve_materialization_job(
-                job_id,
-                None,
-                crate::state::JobState::ResolvedFromSource,
-                serving_generation,
-            )
-            .await;
+            let applied = self
+                .resolve_materialization_job(
+                    job_id,
+                    None,
+                    crate::state::JobState::ResolvedFromSource,
+                    serving_generation,
+                )
+                .await;
+            // Item T (harden-store reconciliation memo §6.2): every
+            // PD-20 conversion — a TIME-driven from-source disposition
+            // of a job whose park budget exhausted while from-source
+            // stayed viable — is counted, discriminated by origin.
+            // `origin="cache_opportunity"` conversions are upstream-
+            // available content converting to builds (the incident's
+            // outcome class re-entering through exhaustion): the
+            // RioSchedulerMaterializationConversions alert watches
+            // their sustained rate. Applied-only (the at-most-once
+            // edge), so a deposed leader's fenced resolve never counts.
+            if applied {
+                metrics::counter!(
+                    "rio_scheduler_materialization_converted_total",
+                    "origin" => origin_label
+                )
+                .increment(1);
+            }
             self.materialization_jobs.remove(&drv_hash);
             self.reassign_derivations(std::slice::from_ref(&drv_hash), None)
                 .await;
@@ -1308,6 +1345,7 @@ impl DagActor {
                 drv_hash = %drv_hash,
                 %job_id,
                 ?evidence,
+                origin = origin_label,
                 "parked materialization job re-evaluated: from-source is viable; \
                  resolved from_source and requeued (PD-20)"
             );

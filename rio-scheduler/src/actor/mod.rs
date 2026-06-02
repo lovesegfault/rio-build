@@ -698,6 +698,18 @@ impl DagActor {
                 )
                 .absolute(0);
             }
+            // Item T: the PD-20 conversion counter — pre-registered per
+            // origin so the RioSchedulerMaterializationConversions
+            // alert has a series to evaluate from boot (a never-firing
+            // increase() over an absent series is indistinguishable
+            // from a broken scrape).
+            for origin in ["pruned", "cache_opportunity", "stale_reset", "reprobe"] {
+                metrics::counter!(
+                    "rio_scheduler_materialization_converted_total",
+                    "origin" => origin
+                )
+                .absolute(0);
+            }
         }
 
         Self {

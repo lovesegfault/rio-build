@@ -103,6 +103,7 @@
     "rio_scheduler_lease_lost_total",
     "rio_scheduler_malformed_built_output_total",
     "rio_scheduler_materialization_claims_total",
+    "rio_scheduler_materialization_converted_total",
     "rio_scheduler_materialization_jobs_created_total",
     "rio_scheduler_materialization_jobs_origin_upgraded_total",
     "rio_scheduler_materialization_jobs_resolved_total",
@@ -732,6 +733,11 @@
         "name": "rio_scheduler_materialization_claims_total",
         "kind": "counter",
         "help": "Materialization claims delivered to store replicas (one per minted open attempt). Pairs with jobs_created_total (supply) and jobs_resolved_total (drain) for the lifecycle rates: created-vs-claimed divergence means store executors are not keeping up (or are partitioned from the leader); claimed-vs-resolved divergence means executions are failing or reports are not landing."
+      },
+      {
+        "name": "rio_scheduler_materialization_converted_total",
+        "kind": "counter",
+        "help": "PD-20 park re-evaluation conversions: parked materialization jobs resolved from_source because their infra budget exhausted while from-source stayed viable — the TIME-driven subset of jobs_resolved_total{outcome=from_source}, labeled by job origin (pruned|cache_opportunity|stale_reset|reprobe). origin=cache_opportunity means upstream-available content converted to a build: expected as bounded noise during cold-start waves, alertable when sustained (RioSchedulerMaterializationConversions — the wedged-ingest churn-loop signature). At-most-once per applied resolution."
       },
       {
         "name": "rio_scheduler_materialization_jobs_created_total",
