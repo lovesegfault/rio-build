@@ -123,10 +123,11 @@ pub async fn run(a: SetupArgs, cfg: &XtaskConfig) -> Result<()> {
 
     // -- Enable replay on the existing release -----------------------------
     let current_values = helm::get_values(RELEASE, NS)?;
-    if replay_currently_enabled(current_values.as_ref()) {
+    if replay_values_current(current_values.as_ref()) {
         ui::step_skip(
             "enable replay on the helm release",
-            "replay.enabled is already true on the current release",
+            "replay.enabled=true with replay.namespace at its required value on the current \
+             release",
         );
     } else {
         // Flipping replay.enabled re-renders the gateway config (campaign
@@ -211,16 +212,30 @@ pub async fn run(a: SetupArgs, cfg: &XtaskConfig) -> Result<()> {
     Ok(())
 }
 
-/// Whether the release's user-supplied values already carry
-/// `replay.enabled: true`. Pure (values JSON in → bool out) so the
+/// Whether the release's user-supplied values already carry exactly the
+/// replay enablement setup writes: `replay.enabled: true` AND
+/// `replay.namespace` equal to [`NS_REPLAY`]. Checking the namespace too
+/// is what makes "re-run `cargo xtask replay setup`" a real remediation
+/// for a drifted override (e.g. a raw `helm upgrade --set
+/// replay.namespace=…`): on the skip path setup would only re-DETECT the
+/// drift in its CNP read-back, while this predicate routes it through
+/// the corrective upgrade that writes the value back. A missing
+/// namespace key also re-upgrades — the chart default happens to match,
+/// but converging the release to the explicitly written pair keeps the
+/// skip decision trivial. Pure (values JSON in → bool out) so the
 /// idempotency decision is unit-testable; `None` (release installed with
 /// no user values — cannot happen for a real deploy, but helm prints
 /// `null` for it) reads as not-enabled.
-fn replay_currently_enabled(values: Option<&serde_json::Value>) -> bool {
-    values
+fn replay_values_current(values: Option<&serde_json::Value>) -> bool {
+    let enabled = values
         .and_then(|v| v.pointer("/replay/enabled"))
         .and_then(|v| v.as_bool())
-        == Some(true)
+        == Some(true);
+    let namespace_current = values
+        .and_then(|v| v.pointer("/replay/namespace"))
+        .and_then(|v| v.as_str())
+        == Some(NS_REPLAY);
+    enabled && namespace_current
 }
 
 /// Read back the deployed gateway build-policy and assert every campaign
@@ -244,21 +259,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn replay_enabled_detection() {
-        // Not enabled: no release values, null values, no replay block,
-        // explicitly false, or a non-boolean value.
-        assert!(!replay_currently_enabled(None));
-        assert!(!replay_currently_enabled(Some(&json!(null))));
-        assert!(!replay_currently_enabled(Some(&json!({"global": {}}))));
-        assert!(!replay_currently_enabled(Some(
-            &json!({"replay": {"enabled": false}})
+    fn replay_values_current_detection() {
+        // Upgrade required: no release values, null values, no replay
+        // block, explicitly disabled, or a non-boolean enabled value.
+        assert!(!replay_values_current(None));
+        assert!(!replay_values_current(Some(&json!(null))));
+        assert!(!replay_values_current(Some(&json!({"global": {}}))));
+        assert!(!replay_values_current(Some(
+            &json!({"replay": {"enabled": false, "namespace": "rio-replay"}})
         )));
-        assert!(!replay_currently_enabled(Some(
-            &json!({"replay": {"enabled": "true"}})
+        assert!(!replay_values_current(Some(
+            &json!({"replay": {"enabled": "true", "namespace": "rio-replay"}})
         )));
-        // Enabled — what setup itself writes.
-        assert!(replay_currently_enabled(Some(
-            &json!({"replay": {"enabled": true, "namespace": "rio-replay"}})
+        // Upgrade required even though enabled: a drifted or missing
+        // replay.namespace must route through the corrective upgrade,
+        // not the skip path — skipping would leave CNPs admitting a
+        // namespace the engine never runs in, with only the read-back
+        // left to (repeatedly) detect it.
+        assert!(!replay_values_current(Some(
+            &json!({"replay": {"enabled": true, "namespace": "my-replay"}})
+        )));
+        assert!(!replay_values_current(Some(
+            &json!({"replay": {"enabled": true}})
+        )));
+        // Current — exactly the pair setup itself writes.
+        assert!(replay_values_current(Some(
+            &json!({"replay": {"enabled": true, "namespace": NS_REPLAY}})
         )));
     }
 }
