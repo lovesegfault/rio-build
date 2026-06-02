@@ -664,7 +664,24 @@ async fn download_to(
 }
 
 /// Turn the downloaded temp file into the final output per the params.
+// r[impl fetcher.fetchurl.attempt-atomic]
 async fn finalize_output(tmp: &Path, params: &FetchurlParams) -> anyhow::Result<()> {
+    // Attempt atomicity is the FUNCTION's property, not each step's:
+    // the guard arms over the output path for the whole fallible scope
+    // and is disarmed only after every step — including the trailing
+    // chmod — succeeded. Any early `?` (either materialization branch
+    // OR the chmod after them) drops the guard and removes whatever
+    // was materialized, so a failed attempt can never strand an output
+    // that poisons the next candidate's attempt or reaches the FOD
+    // hash gate half-finalized. (The previous shape hand-cleaned
+    // inside `restore_unpacked` only — a chmod failure AFTER a
+    // successful restore left the fully-restored tree in place.)
+    //
+    // Oracle note: CppNix's builtinFetchurl has no in-builtin retry
+    // after materialization (a chmod failure fails the whole builtin),
+    // so it never needs this invariant; rio retries the next candidate
+    // inside the process, which makes attempt-atomicity rio-owned.
+    let guard = FreshOutput::arm(&params.output);
     if params.unpack {
         restore_unpacked(tmp, params).await?;
     } else {
@@ -685,7 +702,43 @@ async fn finalize_output(tmp: &Path, params: &FetchurlParams) -> anyhow::Result<
             .await
             .context("chmod 0755 on executable output")?;
     }
+    guard.disarm();
     Ok(())
+}
+
+/// RAII cleanup guard for one finalize attempt: on drop, removes
+/// whatever exists at the output path. [`FreshOutput::disarm`] is the
+/// ONLY way to keep the output, and it is reachable only at the end of
+/// the fully-successful path — failure scope = cleanup scope by
+/// construction, so a new fallible step added to the finalize cannot
+/// fall outside the cleanup (the gap the previous hand-rolled,
+/// branch-local cleanup left for the chmod).
+struct FreshOutput<'a> {
+    path: Option<&'a Path>,
+}
+
+impl<'a> FreshOutput<'a> {
+    fn arm(path: &'a Path) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for FreshOutput<'_> {
+    fn drop(&mut self) {
+        if let Some(p) = self.path {
+            // Both forms: the output may be a tree (unpack) or a file/
+            // symlink (plain or single-file NAR). remove_file unlinks
+            // symlinks themselves (never follows), so a dangling
+            // symlink output — invisible to `Path::exists`, which
+            // stats THROUGH the link — is still cleaned.
+            let _ = std::fs::remove_dir_all(p);
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 use std::os::unix::fs::PermissionsExt as _;
@@ -728,16 +781,12 @@ async fn restore_unpacked(tmp: &Path, params: &FetchurlParams) -> anyhow::Result
             inner: bridge,
             meter,
         };
-        let restore = rio_nix::nar::restore_path_streaming(&mut metered, &dest)
-            .with_context(|| format!("restoring NAR to {}", dest.display()));
-        if restore.is_err() {
-            // A half-restored tree at the output path would be scanned
-            // (and rejected) as a stray on the next attempt, and a
-            // retried fetch would fail on the existing destination.
-            let _ = std::fs::remove_dir_all(&dest);
-            let _ = std::fs::remove_file(&dest);
-        }
-        restore
+        // No branch-local cleanup here: half-restored trees (and every
+        // other failure shape, including ones in steps AFTER this one)
+        // are removed by `finalize_output`'s FreshOutput guard — the
+        // cleanup scope is the whole finalize attempt.
+        rio_nix::nar::restore_path_streaming(&mut metered, &dest)
+            .with_context(|| format!("restoring NAR to {}", dest.display()))
     })
     .await
     .context("NAR restore task panicked")??;
@@ -1082,6 +1131,127 @@ mod tests {
         p.output = out_dir.path().join("mirror-out");
         fetch(&p).await.expect("mirror fetch");
         assert_eq!(std::fs::read(&p.output).unwrap(), b"from-mirror");
+    }
+
+    /// bug_100 regression — the failure-path test the parent fix
+    /// omitted: a chmod that fails AFTER a fully-successful unpack
+    /// must leave NO output. Staged with a NAR whose root is a
+    /// dangling symlink: the restore succeeds (symlinks restore
+    /// without following), then `set_permissions` follows the link to
+    /// a nonexistent target and fails. Asserted via symlink_metadata —
+    /// `Path::exists()` stats THROUGH the dangling link and reports
+    /// false even when the stranded symlink is right there.
+    // r[verify fetcher.fetchurl.attempt-atomic]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_chmod_after_unpack_leaves_no_output() {
+        use axum::{Router, routing::get};
+
+        // NAR of a symlink pointing at a target that does not exist.
+        let inner = tempfile::tempdir().unwrap();
+        let link = inner.path().join("link");
+        std::os::unix::fs::symlink("/nonexistent-target-for-rio-test", &link).unwrap();
+        let nar = rio_nix::nar::dump_path(&link).unwrap();
+
+        let app = Router::new().route(
+            "/dangling.nar",
+            get(move || {
+                let body = nar.clone();
+                async move { body }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let mut p = params(&format!("http://{addr}/dangling.nar"), &[]);
+        p.mirrors.clear();
+        p.output = out_dir.path().join("dangling-out");
+        p.unpack = true;
+        p.executable = true; // chmod follows the dangling link → fails
+        let err = fetch(&p)
+            .await
+            .expect_err("chmod through dangling link fails");
+        assert!(format!("{err:#}").contains("chmod"), "{err:#}");
+        assert!(
+            std::fs::symlink_metadata(&p.output).is_err(),
+            "the stranded symlink output must be cleaned (symlink_metadata, \
+             not exists(): exists() follows the dangling link and lies)"
+        );
+    }
+
+    /// Attempt-atomicity across candidates: a first candidate whose
+    /// finalize fails must not poison the second candidate's attempt
+    /// (a stranded output makes the next restore fail on the existing
+    /// path). Mirror serves the poisoned payload, origin serves the
+    /// good one.
+    // r[verify fetcher.fetchurl.attempt-atomic]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_finalize_does_not_poison_next_candidate() {
+        use axum::{Router, routing::get};
+
+        // Bad payload: dangling-symlink NAR (finalize fails at chmod).
+        let inner = tempfile::tempdir().unwrap();
+        let link = inner.path().join("link");
+        std::os::unix::fs::symlink("/nonexistent-target-for-rio-test", &link).unwrap();
+        let bad_nar = rio_nix::nar::dump_path(&link).unwrap();
+        // Good payload: regular-file NAR.
+        std::fs::write(inner.path().join("file"), b"good\n").unwrap();
+        let good_nar = rio_nix::nar::dump_path(&inner.path().join("file")).unwrap();
+
+        // The mirror candidate URL is {mirror}/{algo}/{hex}; serve the
+        // bad payload there. The origin serves the good payload.
+        let app = Router::new()
+            .route(
+                "/sha256/{hash}",
+                get(move || {
+                    let body = bad_nar.clone();
+                    async move { body }
+                }),
+            )
+            .route(
+                "/good.nar",
+                get(move || {
+                    let body = good_nar.clone();
+                    async move { body }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let mut p = params(&format!("http://{addr}/good.nar"), &[]);
+        p.mirrors = vec![format!("http://{addr}/")];
+        p.output = out_dir.path().join("retry-out");
+        p.unpack = true;
+        p.executable = true;
+        fetch(&p)
+            .await
+            .expect("the origin attempt must succeed on a clean path");
+        assert_eq!(std::fs::read(&p.output).unwrap(), b"good\n");
+        let mode = std::fs::metadata(&p.output).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "good candidate fully finalized");
+    }
+
+    /// Happy-path disarm pin: success keeps the output (the guard must
+    /// not clean up what it was guarding).
+    // r[verify fetcher.fetchurl.attempt-atomic]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_finalize_keeps_output() {
+        use axum::{Router, routing::get};
+        let app = Router::new().route("/f", get(|| async { "kept" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let mut p = params(&format!("http://{addr}/f"), &[]);
+        p.mirrors.clear();
+        p.output = out_dir.path().join("kept-out");
+        p.executable = true;
+        fetch(&p).await.expect("fetch");
+        assert_eq!(std::fs::read(&p.output).unwrap(), b"kept");
     }
 
     /// Progress cadence with an injected writer: marks at every 16 MiB

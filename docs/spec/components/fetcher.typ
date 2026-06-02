@@ -166,6 +166,25 @@ than the cadence floor are deliberately treated as silent: at that
 rate a 100 MiB source takes over an hour, and the operator's
 max-silent policy --- not the fetcher --- owns that call.
 
+#r("fetcher.fetchurl.attempt-atomic")[
+  A failed fetch attempt MUST leave nothing at the output path: the
+  cleanup scope is the WHOLE fallible finalize (both materialization
+  branches and every step after them, including the executable chmod),
+  enforced by an RAII guard armed at finalize entry and disarmed only
+  on the fully-successful path. A stranded output would poison the
+  next candidate's attempt (restore onto an existing path fails) or
+  reach the FOD hash gate half-finalized.
+]
+
+CppNix's builtinFetchurl never retries within the builtin after
+materialization --- a post-restore failure fails the whole build ---
+so the oracle has no need for this invariant; rio retries the next
+candidate in-process, which makes attempt-atomicity rio-owned. The
+guard form (failure scope = cleanup scope) exists because the
+previous, branch-local hand cleanup was exactly one fallible step too
+narrow: a chmod failure after a successful unpack stranded the
+fully-restored tree.
+
 The cadence and the cap are pinned at the unit level (injected-writer
 cadence, over-cap permanence on both paths, bomb no-retry,
 truncated-transient). The end-to-end composition --- progress line →
