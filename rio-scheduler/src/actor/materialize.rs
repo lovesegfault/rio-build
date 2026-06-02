@@ -54,6 +54,11 @@ pub(crate) struct JobViewEntry {
     pub parked_until: Option<std::time::Instant>,
     /// `Some(identity)` while an open materialization attempt exists.
     pub claimed_by: Option<ExecutorId>,
+    /// Realized-path carrier (migration 082, the floating-CA
+    /// stale-reset lane) — display copy for the claim-intake
+    /// SUBSTITUTING event; the executor and the consumption coverage
+    /// read the durable column directly.
+    pub carried_realized_paths: Option<Vec<String>>,
 }
 
 /// One job the merge transaction created (or found via the dedup) —
@@ -116,6 +121,7 @@ impl DagActor {
         drv_hash: &DrvHash,
         origin: JobOrigin,
         creating_build: Option<Uuid>,
+        carried_realized_paths: Option<Vec<String>>,
     ) -> bool {
         if !self.leader.is_leader() {
             return false;
@@ -145,6 +151,7 @@ impl DagActor {
                 drv_hash.as_str(),
                 tenant,
                 origin,
+                carried_realized_paths.as_deref(),
                 serving_generation,
             )
             .await
@@ -164,13 +171,24 @@ impl DagActor {
                 // (created == true) cannot have a view entry (the
                 // partial-unique index guarantees no unresolved job
                 // existed), so or_insert inserts it.
-                self.materialization_jobs
-                    .entry(drv_hash.clone())
-                    .or_insert(JobViewEntry {
-                        job_id,
-                        parked_until: None,
-                        claimed_by: None,
-                    });
+                let entry =
+                    self.materialization_jobs
+                        .entry(drv_hash.clone())
+                        .or_insert(JobViewEntry {
+                            job_id,
+                            parked_until: None,
+                            claimed_by: None,
+                            carried_realized_paths: None,
+                        });
+                // Mirror the durable set-if-null carrier semantics on
+                // the view copy (display only).
+                if entry.carried_realized_paths.is_none()
+                    && carried_realized_paths
+                        .as_ref()
+                        .is_some_and(|c| !c.is_empty())
+                {
+                    entry.carried_realized_paths = carried_realized_paths;
+                }
                 if created {
                     metrics::counter!(
                         "rio_scheduler_materialization_jobs_created_total",
@@ -291,6 +309,10 @@ impl DagActor {
                     job_id: job.job_id,
                     parked_until: None,
                     claimed_by: None,
+                    // The merge in-tx creation lanes never carry
+                    // realized paths (only the stale_reset post-tx
+                    // site does); recovery rebuilds from the column.
+                    carried_realized_paths: None,
                 });
             if job.created {
                 metrics::counter!(
@@ -371,8 +393,20 @@ impl DagActor {
         let drv_path = state.drv_path().to_string();
         // The same payload the walk-spawn site sends: the paths the
         // store will fetch. `output_paths` is set by completion only;
-        // pre-completion the expected paths are the fetch targets.
-        let output_paths = state.expected_output_paths.clone();
+        // pre-completion the expected paths are the fetch targets —
+        // except the floating-CA stale-reset lane, where the expected
+        // slots are [""] placeholders and the job's carried realized
+        // paths (migration 082) ARE the fetch targets (the walk-era
+        // emission carried them too; display copy of the carrier).
+        let carried = self
+            .materialization_jobs
+            .get(drv_hash)
+            .and_then(|e| e.carried_realized_paths.clone())
+            .filter(|c| !c.is_empty());
+        let output_paths = match carried {
+            Some(c) if state.expected_output_paths.iter().all(|p| p.is_empty()) => c,
+            _ => state.expected_output_paths.clone(),
+        };
         let event = rio_proto::types::build_event::Event::Derivation(
             rio_proto::types::DerivationEvent::substituting(drv_path, output_paths),
         );
@@ -444,6 +478,7 @@ impl DagActor {
                             std::time::Instant::now() + std::time::Duration::from_secs_f64(secs)
                         }),
                     claimed_by: row.claimed_by.map(ExecutorId::from),
+                    carried_realized_paths: row.carried_realized_paths,
                 },
             );
         }
@@ -622,15 +657,33 @@ impl DagActor {
             .map_err(|e| {
                 super::pull::PullRejection::Internal(format!("materialization job lookup: {e}"))
             })?;
-        let job_id = job.map(|(id, _)| id);
-        let pruned_origin = job.is_some_and(|(_, origin)| matches!(origin, JobOrigin::Pruned));
+        let job_id = job.as_ref().map(|(id, _, _)| *id);
+        let pruned_origin = job
+            .as_ref()
+            .is_some_and(|(_, origin, _)| matches!(origin, JobOrigin::Pruned));
+        // Realized-path carrier (migration 082): the floating-CA
+        // stale-reset lane's fetch targets. Unioned into the wanted
+        // set below, so coverage is non-vacuous exactly when a carrier
+        // is present (the conservative-absent saturation arm and every
+        // non-carried shape are untouched — the scope the records'
+        // collision analysis settled).
+        let carried_paths: Vec<String> = job
+            .as_ref()
+            .and_then(|(_, _, carried)| carried.clone())
+            .unwrap_or_default();
 
         // 1. The live effective wanted set (the §6 join), resolved to
         //    store paths — the presence-re-check half of D7's closure.
-        let live_wanted_paths = self
+        let mut live_wanted_paths = self
             .live_wanted_paths_for(attempt.derivation_id, &drv_hash)
             .await
             .map_err(|e| super::pull::PullRejection::Internal(format!("wanted-union read: {e}")))?;
+        // r[impl sched.merge.stale-substitutable+3]
+        for p in &carried_paths {
+            if !p.is_empty() && !live_wanted_paths.contains(p) {
+                live_wanted_paths.push(p.clone());
+            }
+        }
 
         match outcome.outcome {
             Some(Outcome::Success(s)) => {
@@ -654,6 +707,18 @@ impl DagActor {
                         .await;
                     }
                     self.materialization_jobs.remove(&drv_hash);
+                    // Stamp the carried realized path(s) BEFORE the
+                    // completion chokepoint: its non-destructive guard
+                    // keeps a known path, so the floating-CA node
+                    // re-completes with the realized path instead of
+                    // the [""] placeholder (GC retention + the
+                    // client-visible path restored).
+                    if !carried_paths.is_empty()
+                        && let Some(state) = self.dag.node_mut(&drv_hash)
+                        && state.output_paths.is_empty()
+                    {
+                        state.output_paths = carried_paths.clone();
+                    }
                     // The build-success path: outputs are present and
                     // verified in the store; complete the node for live
                     // interest through the same chokepoint the
@@ -661,9 +726,20 @@ impl DagActor {
                     self.complete_ready_from_store_batch(std::slice::from_ref(&drv_hash))
                         .await;
                 } else {
-                    // Interest grew between execution and consumption:
-                    // the job stays pending; the next claim covers it.
+                    // Coverage failed — interest grew between execution
+                    // and consumption, or the report did not cover the
+                    // carried realized paths (the floating-CA stale-
+                    // reset shape): the job stays pending; the next
+                    // claim covers it. The node must leave the mint's
+                    // Running state too (the InfraFailure arm's
+                    // posture) — without the reassign the admission
+                    // table answers NotYetReady to EVERY identity (the
+                    // job is pending-unclaimed but the node is held
+                    // Running by closed-attempt bookkeeping) and the
+                    // re-arm is a wedge, not an armed action.
                     self.rearm_materialization_job(&drv_hash, &executor).await;
+                    self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
+                        .await;
                 }
                 Ok(())
             }
@@ -1298,7 +1374,7 @@ impl DagActor {
             // entry was created). `unknown` only on a query/decode
             // failure, never silently dropped.
             let origin_label = match self.db.unresolved_job_for_derivation(db_id).await {
-                Ok(Some((_, origin))) => origin.as_str(),
+                Ok(Some((_, origin, _))) => origin.as_str(),
                 Ok(None) => "unknown",
                 Err(e) => {
                     warn!(drv_hash = %drv_hash, error = %e,

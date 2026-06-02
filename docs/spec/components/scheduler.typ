@@ -1858,18 +1858,32 @@ the Phase-1b cutover froze the column.
   merge on store availability would be a worse regression).
 ]
 
-#r("sched.merge.stale-substitutable+2")[
+#r("sched.merge.stale-substitutable+3")[
   The stale-completed `FindMissingPaths` is sent with the build's tenant token
   so the store reports `substitutable_paths`. A Completed node with a
   missing-but-substitutable live-wanted output MUST be reset and given a
   `stale_reset`-origin materialization job in the same verify (the node
   re-enters Queued; the executor re-fetches); only outputs that are missing
   AND not obtainable leave the node on the from-source reset
-  (#rref("sched.merge.stale-completed-verify")). Without this, post-GC
-  re-submissions re-dispatch the entire subtree ---
-  including FOD sources whose origin URLs may be dead --- for paths
-  cache.nixos.org already has.
+  (#rref("sched.merge.stale-completed-verify")). When the reset destroys
+  realized floating-CA output paths (the node's `expected_output_paths`
+  slots are the `""` placeholder), the job MUST carry them
+  (`materialization_jobs.carried_realized_paths` --- a creation-time
+  snapshot of the immutable realized paths, written only by the
+  `stale_reset` origin; the wanted NAME set stays live), the executor's
+  wanted resolution MUST union the carried paths into its seed set, and
+  the success-consumption coverage MUST include them --- scoped to
+  carried-path presence, never a general "empty coverage never
+  completes" rule, which would collide with the conservative-absent
+  all-declared saturation (for floating-CA that saturates back to the
+  placeholder and re-opens the same hole).
 ]
+
+The carrier scope is deliberate: without it, post-GC re-submissions
+re-dispatch the entire subtree --- including FOD sources whose origin URLs
+may be dead --- for paths cache.nixos.org already has, and a floating-CA
+stale reset "re-completes" vacuously with the `""` placeholder, never
+re-fetching the realized path (GC retention dropped, clients handed `""`).
 
 = Build State Machine
 

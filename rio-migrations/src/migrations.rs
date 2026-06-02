@@ -1799,6 +1799,38 @@ pub const M_080: () = ();
 /// the pre-081 heartbeat-death-only reclaim, never misbehaves.
 pub const M_081: () = ();
 
+/// `migrations/082_materialization_job_carried_paths.sql`
+///
+/// Realized-path carrier for the floating-CA stale-reset lane
+/// (substitution-replacement follow-up ledger row 1; spec rule
+/// `sched.merge.stale-substitutable+3`). One nullable column on
+/// `materialization_jobs`:
+///
+/// - `carried_realized_paths TEXT[]`: written ONLY by the
+///   `stale_reset` origin at job creation — a snapshot of the realized
+///   floating-CA output paths the stale-Completed verify destroys in
+///   memory (`state.output_paths.clear()`). The paths are immutable
+///   content-addressed data, so the creation-time snapshot does not
+///   violate the "live wanted reads" rule (which governs the wanted
+///   NAME set — that stays live). Set-if-null on the creation dedup
+///   arm: an existing pending job gains the carrier, a present
+///   carrier is never overwritten.
+///
+/// Consumers: the store executor's wanted resolution unions the
+/// carried paths into its walk seed set (the empty-path placeholder
+/// slots produce nothing); the scheduler's success-consumption
+/// coverage unions the same column, so seed set and coverage agree by
+/// construction and a vacuous `Success{[],[]}` no longer
+/// "re-completes" the node with the `[""]` placeholder.
+///
+/// Nullable, no backfill, no index. Mixed-version window: an old
+/// scheduler never writes the column (stale-reset jobs degrade to the
+/// pre-082 vacuous shape — today's behavior, not a regression); an
+/// old store executor ignores it (the scheduler-side coverage union
+/// then refuses the vacuous success and the job re-arms until an
+/// upgraded executor claims it — additive-only, never a crash).
+pub const M_082: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

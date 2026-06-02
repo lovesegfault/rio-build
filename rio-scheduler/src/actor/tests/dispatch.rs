@@ -678,6 +678,7 @@ async fn spawn_intents_excludes_job_pending_nodes() -> TestResult {
             job_id: Uuid::new_v4(),
             parked_until: None,
             claimed_by: None,
+            carried_realized_paths: None,
         },
     );
 

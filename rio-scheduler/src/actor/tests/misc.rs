@@ -1350,6 +1350,7 @@ async fn snapshot_counts_substituting() {
                 job_id: Uuid::new_v4(),
                 parked_until: None,
                 claimed_by: None,
+                carried_realized_paths: None,
             },
         );
     }

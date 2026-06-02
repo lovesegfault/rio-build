@@ -2381,6 +2381,153 @@ async fn flag_on_stale_completed_demote_creates_stale_reset_job() -> TestResult 
     Ok(())
 }
 
+// r[verify sched.merge.stale-substitutable+3]
+/// Floating-CA stale-reset carrier (follow-up ledger row 1): the
+/// stale-Completed verify destroys the realized output path in memory
+/// (`state.output_paths.clear()`), and pre-fix the `stale_reset` job
+/// carried nothing — the executor's wanted set resolved through
+/// `expected_output_paths == [""]` to `[]`, a vacuous
+/// `Success{[],[]}` covered the empty wanted set, and the node
+/// "re-completed" with `[""]` (GC retention dropped; clients got
+/// `""`). The carrier (migration 082's
+/// `materialization_jobs.carried_realized_paths`, written only by the
+/// stale_reset origin) makes the coverage check non-vacuous and
+/// restores the realized path on re-completion.
+///
+/// Red pre-fix: (a) the vacuous outcome RE-COMPLETED the node, and
+/// (b) the honest re-fetch left `output_paths == [""]`.
+#[tokio::test]
+async fn flag_on_stale_reset_floating_ca_carries_realized_path() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let tag = "fca-stale";
+    let real = test_store_path("fca-stale-realized");
+
+    // Floating-CA shape: path unknown until built.
+    let mut node = make_node(tag);
+    node.is_content_addressed = true;
+    node.ca_modular_hash = [0x66u8; 32].to_vec();
+    node.expected_output_paths = vec![String::new()];
+    node.wanted_output_names = vec!["out".into()];
+
+    // Build #1 holds the node in DAG; complete it with realized path R
+    // (the retired walk-era staging: debug-force + debug-set).
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(&handle, b1, vec![node.clone()], vec![], false).await?;
+    handle
+        .debug_force_status(tag, DerivationStatus::Completed)
+        .await?;
+    handle
+        .debug_set_output_paths(tag, vec![real.clone()])
+        .await?;
+    barrier(&handle).await;
+
+    // R is gone from the store but substitutable upstream.
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(real.clone());
+
+    // Build #2 re-merges the node: the verify resets it and creates the
+    // stale_reset job (the IA twin pins this half).
+    let b2 = Uuid::new_v4();
+    let mut ev2 = merge_dag(&handle, b2, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, tag).await.status,
+        DerivationStatus::Ready,
+        "stale verify demotes the floating-CA node"
+    );
+    let (origin, job_state): (String, String) = sqlx::query_as(
+        "SELECT origin, state FROM materialization_jobs \
+          WHERE drv_hash = $1 AND state = 'pending'",
+    )
+    .bind(tag)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(origin, "stale_reset");
+    assert_eq!(job_state, "pending");
+
+    // Claim #1. The SUBSTITUTING claim-intake event must carry the
+    // CARRIED realized path, not the [""] placeholder (display half of
+    // the same carrier; the walk-era emission carried the real fetch
+    // targets).
+    let assignment = match claim_materialization(&handle, tag, "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the stale_reset job must be claimable, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    let substituting_paths = loop {
+        let e = ev2.recv().await?;
+        if let Some(rio_proto::types::build_event::Event::Derivation(d)) = e.event
+            && d.kind() == rio_proto::types::DerivationEventKind::Substituting
+        {
+            break d.output_paths;
+        }
+    };
+    assert_eq!(
+        substituting_paths,
+        vec![real.clone()],
+        "the claim-intake SUBSTITUTING event must carry the carried \
+         realized path, not the [\"\"] placeholder"
+    );
+
+    // (a) RED: the vacuous outcome a pre-fix executor produces (empty
+    // wanted set → Success{[],[]}) must NOT re-complete the node — the
+    // carried path makes coverage non-vacuous, so the job re-arms.
+    report_materialization_outcome(&handle, exec_id, tag, mat_success_outcome(vec![], vec![]))
+        .await
+        .map_err(|e| anyhow::anyhow!("vacuous report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    assert_ne!(
+        expect_drv(&handle, tag).await.status,
+        DerivationStatus::Completed,
+        "a vacuous Success must not complete a floating-CA stale-reset \
+         node (the carried realized path is uncovered)"
+    );
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM materialization_jobs \
+          WHERE drv_hash = $1 AND state = 'pending'",
+    )
+    .bind(tag)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(pending, 1, "the uncovered job re-arms (stays pending)");
+
+    // (b) Honest re-fetch: the executor reports R covered; the node
+    // re-completes WITH the realized path (not [""]).
+    let assignment = match claim_materialization(&handle, tag, "store-test-1").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the re-armed job must be claimable, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    store.seed_with_content(&real, b"fca-materialized");
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        tag,
+        mat_success_outcome(vec![real.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("honest report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    let post = expect_drv(&handle, tag).await;
+    assert_eq!(post.status, DerivationStatus::Completed);
+    assert_eq!(
+        post.output_paths,
+        vec![real],
+        "re-completion must stamp the carried realized path, not \
+         expected_output_paths == [\"\"]"
+    );
+    assert_eq!(
+        query_status(&handle, b2).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "build #2 succeeds through the carried stale_reset job"
+    );
+    Ok(())
+}
+
 // ── Pruned-origin consumption shapes (T-D5.1 re-frames of the walk-era
 // clear-mirror block: the mark died with the evidence columns; the
 // origin row is the only durable pruned fact and resolution itself is

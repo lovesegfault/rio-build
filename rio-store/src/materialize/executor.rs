@@ -374,12 +374,38 @@ async fn live_wanted_paths(
         }
     }
 
-    Ok(output_names
+    let mut paths: Vec<String> = output_names
         .iter()
         .zip(expected_paths.iter())
         .filter(|(name, path)| (all || union.contains(&name.as_str())) && !path.is_empty())
         .map(|(_, path)| path.clone())
-        .collect())
+        .collect();
+
+    // r[impl sched.merge.stale-substitutable+3]
+    // Realized-path carrier (migration 082, the floating-CA
+    // stale-reset lane): the empty-path slots filtered above are the
+    // floating-CA placeholders — for a carried job the realized paths
+    // ride the job row, written at creation by the stale_reset origin
+    // (an immutable content-addressed snapshot; the wanted NAME set
+    // above stays live). The scheduler-side consumption coverage reads
+    // the same column, so seed set and coverage agree by construction.
+    if let Some(job_id) = claimed.job_id {
+        let carried: Option<Vec<String>> = sqlx::query_scalar(
+            "SELECT carried_realized_paths FROM materialization_jobs \
+              WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_optional(&ctx.pool)
+        .await?
+        .flatten();
+        for p in carried.unwrap_or_default() {
+            if !p.is_empty() && !paths.contains(&p) {
+                paths.push(p);
+            }
+        }
+    }
+
+    Ok(paths)
 }
 
 /// The store-side pin-at-ingest INSERT (design §5.1).
@@ -837,6 +863,69 @@ mod tests {
 
     // r[verify store.materialize.executor+3]
     /// (2) The wanted set is read at execution time and RE-READ at the
+    // r[verify sched.merge.stale-substitutable+3]
+    /// Floating-CA stale-reset carrier (migration 082): a job whose
+    /// derivation row has the empty-path placeholder (`("out", "")`)
+    /// resolves its wanted set through the job row's
+    /// `carried_realized_paths` — the executor fetches the realized
+    /// path instead of producing the vacuous `Success{[],[]}` the
+    /// empty-filtered map yields pre-fix (zero fetches, zero pins; the
+    /// scheduler then "re-completed" the node with `[""]`).
+    #[tokio::test]
+    async fn floating_ca_carried_paths_seed_the_walk() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-fca").await;
+
+        let real = store_path(7, "mat-fca-realized");
+        let (nar, _) = rio_test_support::fixtures::make_nar(b"fca contents");
+        let upstream = spawn_multi_upstream(vec![(real.clone(), nar, vec![])], "cache.fca").await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+
+        // Floating-CA shape: the expected slot is the "" placeholder.
+        let seeded = seed_job(
+            &db.pool,
+            "mat-fca-drv",
+            &[("out", "")],
+            Some(tenant),
+            Some(tenant),
+            &[], // '{}' = all outputs wanted
+        )
+        .await;
+        // The stale_reset origin wrote the carrier at creation.
+        sqlx::query(
+            "UPDATE materialization_jobs                 SET origin = 'stale_reset', carried_realized_paths = $2               WHERE job_id = $1",
+        )
+        .bind(seeded.job_id)
+        .bind(vec![real.clone()])
+        .execute(&db.pool)
+        .await
+        .expect("carrier seeded");
+
+        let ctx = make_ctx(db.pool.clone());
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+
+        let success = outcome_success(&outcome)
+            .unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
+        let covered: Vec<&str> = success
+            .ingested_paths
+            .iter()
+            .chain(success.verified_paths.iter())
+            .map(String::as_str)
+            .collect();
+        assert!(
+            covered.contains(&real.as_str()),
+            "the carried realized path must seed the walk (pre-fix: \
+             vacuous Success {{ingested: [], verified: []}}, zero \
+             fetches); covered={covered:?}"
+        );
+        // Pin-at-ingest applies to the carried path like any other.
+        assert_eq!(
+            pin_count(&db.pool, "mat-fca-drv", "materialization").await,
+            1,
+            "the carried fetch pins at ingest"
+        );
+    }
+
     /// final verification pass — never snapshotted at creation. The
     /// job is created while only `out` is wanted; by execution time a
     /// second live build wants `dev` too; the executor fetches BOTH.

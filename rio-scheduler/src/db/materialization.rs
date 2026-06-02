@@ -96,6 +96,14 @@ pub(crate) struct NewJobRow<'a> {
     pub drv_hash: &'a str,
     pub tenant_id: Option<Uuid>,
     pub origin: JobOrigin,
+    /// Realized-path carrier (migration 082) — the floating-CA paths
+    /// the stale-Completed reset destroyed in memory. `Some` ONLY for
+    /// the `stale_reset` origin (a creation-time snapshot of immutable
+    /// content-addressed paths; the wanted NAME set stays live).
+    /// Set-if-null on the dedup arm: an existing pending row gains the
+    /// carrier (it executes post-reset and hits the same empty-wanted
+    /// hole), but a present carrier is never overwritten.
+    pub carried_realized_paths: Option<&'a [String]>,
 }
 
 /// Per-input outcome of the in-tx batch creation.
@@ -222,6 +230,33 @@ impl SchedulerDb {
             rows.into_iter().map(|(id,)| id).collect()
         };
 
+        // Realized-path carrier (migration 082, the floating-CA
+        // stale-reset lane): set-if-null so the dedup arm gains the
+        // carrier when the found pending row has none, while a present
+        // carrier is never overwritten (the snapshot is immutable
+        // content-addressed data; first writer wins).
+        for r in rows {
+            let Some(carried) = r.carried_realized_paths else {
+                continue;
+            };
+            if carried.is_empty() {
+                continue;
+            }
+            let Some(job_id) = by_drv.get(&r.derivation_id) else {
+                continue;
+            };
+            sqlx::query(
+                "UPDATE materialization_jobs \
+                    SET carried_realized_paths = $2 \
+                  WHERE job_id = $1 AND state = 'pending' \
+                    AND carried_realized_paths IS NULL",
+            )
+            .bind(job_id)
+            .bind(carried)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         rows.iter()
             .map(|r| {
                 let job_id = by_drv.get(&r.derivation_id).copied().ok_or_else(|| {
@@ -250,6 +285,7 @@ impl SchedulerDb {
         drv_hash: &str,
         tenant_id: Option<Uuid>,
         origin: JobOrigin,
+        carried_realized_paths: Option<&[String]>,
         serving_generation: i64,
     ) -> Result<FencedJobCreate, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
@@ -265,6 +301,7 @@ impl SchedulerDb {
                 drv_hash,
                 tenant_id,
                 origin,
+                carried_realized_paths,
             }],
             serving_generation,
         )
@@ -410,16 +447,16 @@ impl SchedulerDb {
     pub(crate) async fn unresolved_job_for_derivation(
         &self,
         derivation_id: Uuid,
-    ) -> Result<Option<(Uuid, JobOrigin)>, sqlx::Error> {
-        let row: Option<(Uuid, String)> = sqlx::query_as(
-            "SELECT job_id, origin FROM materialization_jobs \
+    ) -> Result<Option<(Uuid, JobOrigin, Option<Vec<String>>)>, sqlx::Error> {
+        let row: Option<(Uuid, String, Option<Vec<String>>)> = sqlx::query_as(
+            "SELECT job_id, origin, carried_realized_paths FROM materialization_jobs \
               WHERE derivation_id = $1 AND state = 'pending' \
               LIMIT 1",
         )
         .bind(derivation_id)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|(job_id, origin)| {
+        row.map(|(job_id, origin, carried)| {
             let origin = origin.parse().map_err(|_| {
                 sqlx::Error::Decode(
                     format!(
@@ -429,7 +466,7 @@ impl SchedulerDb {
                     .into(),
                 )
             })?;
-            Ok((job_id, origin))
+            Ok((job_id, origin, carried))
         })
         .transpose()
     }
@@ -458,7 +495,7 @@ impl SchedulerDb {
         &self,
     ) -> Result<Vec<RecoveredJobRow>, sqlx::Error> {
         sqlx::query_as(
-            "SELECT j.job_id, j.drv_hash, \
+            "SELECT j.job_id, j.drv_hash, j.carried_realized_paths, \
                     EXTRACT(EPOCH FROM (j.park_until - now()))::float8 AS park_remaining_secs, \
                     a.builder_id AS claimed_by \
                FROM materialization_jobs j \
@@ -476,6 +513,8 @@ impl SchedulerDb {
 pub(crate) struct RecoveredJobRow {
     pub job_id: Uuid,
     pub drv_hash: String,
+    /// Realized-path carrier (migration 082); `None` = no carrier.
+    pub carried_realized_paths: Option<Vec<String>>,
     /// Seconds until the park expires; `None` or non-positive = not
     /// parked (or the park already lapsed).
     pub park_remaining_secs: Option<f64>,

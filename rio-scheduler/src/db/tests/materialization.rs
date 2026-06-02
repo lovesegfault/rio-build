@@ -39,7 +39,7 @@ async fn job_creation_is_dedup_idempotent() -> anyhow::Result<()> {
     let (test_db, db, drv) = setup("job-dedup-hash").await?;
 
     let first = db
-        .create_materialization_job_fenced(drv, "job-dedup-hash", None, JobOrigin::Pruned, 1)
+        .create_materialization_job_fenced(drv, "job-dedup-hash", None, JobOrigin::Pruned, None, 1)
         .await?;
     let FencedJobCreate::Applied {
         job_id: first_id,
@@ -58,6 +58,7 @@ async fn job_creation_is_dedup_idempotent() -> anyhow::Result<()> {
             "job-dedup-hash",
             None,
             JobOrigin::CacheOpportunity,
+            None,
             1,
         )
         .await?;
@@ -91,7 +92,7 @@ async fn job_creation_is_dedup_idempotent() -> anyhow::Result<()> {
         .await?;
     assert_eq!(resolved, FencedWrite::Applied(1));
     let third = db
-        .create_materialization_job_fenced(drv, "job-dedup-hash", None, JobOrigin::Pruned, 1)
+        .create_materialization_job_fenced(drv, "job-dedup-hash", None, JobOrigin::Pruned, None, 1)
         .await?;
     let FencedJobCreate::Applied {
         job_id: third_id,
@@ -124,7 +125,7 @@ async fn job_creation_below_floor_is_fenced() -> anyhow::Result<()> {
 
     // The deposed tenure's late create (serving generation 1).
     let outcome = db
-        .create_materialization_job_fenced(drv, "job-fence-hash", None, JobOrigin::Pruned, 1)
+        .create_materialization_job_fenced(drv, "job-fence-hash", None, JobOrigin::Pruned, None, 1)
         .await?;
     assert_eq!(
         outcome,
@@ -139,7 +140,7 @@ async fn job_creation_below_floor_is_fenced() -> anyhow::Result<()> {
 
     // Positive control: the current tenure (at the floor) creates.
     let outcome = db
-        .create_materialization_job_fenced(drv, "job-fence-hash", None, JobOrigin::Pruned, 2)
+        .create_materialization_job_fenced(drv, "job-fence-hash", None, JobOrigin::Pruned, None, 2)
         .await?;
     assert!(
         matches!(outcome, FencedJobCreate::Applied { created: true, .. }),
@@ -165,7 +166,14 @@ async fn list_claimable_excludes_claimed_and_parked() -> anyhow::Result<()> {
     for (i, hash) in ["claim-a", "claim-b", "claim-c"].iter().enumerate() {
         let drv = insert_test_derivation(&db, hash).await?;
         let created = db
-            .create_materialization_job_fenced(drv, hash, None, JobOrigin::CacheOpportunity, 1)
+            .create_materialization_job_fenced(
+                drv,
+                hash,
+                None,
+                JobOrigin::CacheOpportunity,
+                None,
+                1,
+            )
             .await?;
         let FencedJobCreate::Applied { job_id, .. } = created else {
             anyhow::bail!("create must apply");
@@ -243,7 +251,14 @@ async fn job_resolution_is_fenced_and_at_most_once() -> anyhow::Result<()> {
     let (test_db, db, drv) = setup("job-resolve-hash").await?;
 
     let created = db
-        .create_materialization_job_fenced(drv, "job-resolve-hash", None, JobOrigin::Pruned, 1)
+        .create_materialization_job_fenced(
+            drv,
+            "job-resolve-hash",
+            None,
+            JobOrigin::Pruned,
+            None,
+            1,
+        )
         .await?;
     let FencedJobCreate::Applied { job_id, .. } = created else {
         anyhow::bail!("create must apply");
@@ -297,7 +312,14 @@ async fn job_resolution_is_fenced_and_at_most_once() -> anyhow::Result<()> {
     // Below-floor resolution of a fresh pending job: fenced, unchanged.
     let drv2 = insert_test_derivation(&db, "job-resolve-hash-2").await?;
     let created = db
-        .create_materialization_job_fenced(drv2, "job-resolve-hash-2", None, JobOrigin::Pruned, 1)
+        .create_materialization_job_fenced(
+            drv2,
+            "job-resolve-hash-2",
+            None,
+            JobOrigin::Pruned,
+            None,
+            1,
+        )
         .await?;
     let FencedJobCreate::Applied { job_id: job2, .. } = created else {
         anyhow::bail!("create must apply");
@@ -334,7 +356,7 @@ async fn parked_job_excluded_until_backoff_expires() -> anyhow::Result<()> {
     let (test_db, db, drv) = setup("job-park-hash").await?;
 
     let created = db
-        .create_materialization_job_fenced(drv, "job-park-hash", None, JobOrigin::Pruned, 1)
+        .create_materialization_job_fenced(drv, "job-park-hash", None, JobOrigin::Pruned, None, 1)
         .await?;
     let FencedJobCreate::Applied { job_id, .. } = created else {
         anyhow::bail!("create must apply");
@@ -385,7 +407,7 @@ async fn job_cancellation_marks_cancelled() -> anyhow::Result<()> {
     let (test_db, db, drv) = setup("job-cancel-hash").await?;
 
     let created = db
-        .create_materialization_job_fenced(drv, "job-cancel-hash", None, JobOrigin::Pruned, 1)
+        .create_materialization_job_fenced(drv, "job-cancel-hash", None, JobOrigin::Pruned, None, 1)
         .await?;
     let FencedJobCreate::Applied { job_id, .. } = created else {
         anyhow::bail!("create must apply");
@@ -435,6 +457,7 @@ async fn job_create_in_rolled_back_tx_leaves_no_row() -> anyhow::Result<()> {
             drv_hash: "job-rollback-hash",
             tenant_id: None,
             origin: JobOrigin::CacheOpportunity,
+            carried_realized_paths: None,
         }],
         1,
     )
@@ -462,6 +485,7 @@ async fn job_create_in_rolled_back_tx_leaves_no_row() -> anyhow::Result<()> {
             drv_hash: "job-rollback-hash",
             tenant_id: None,
             origin: JobOrigin::CacheOpportunity,
+            carried_realized_paths: None,
         }],
         1,
     )
@@ -505,6 +529,7 @@ async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<(
             drv_hash: "job-cross-site-hash",
             tenant_id: None,
             origin: JobOrigin::CacheOpportunity,
+            carried_realized_paths: None,
         }],
         1,
     )
@@ -524,6 +549,7 @@ async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<(
                 "job-cross-site-hash",
                 None,
                 JobOrigin::CacheOpportunity,
+                None,
                 1,
             )
             .await
@@ -574,6 +600,7 @@ async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<(
             "job-cross-site-hash-2",
             None,
             JobOrigin::CacheOpportunity,
+            None,
             1,
         )
         .await?;
@@ -593,6 +620,7 @@ async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<(
             drv_hash: "job-cross-site-hash-2",
             tenant_id: None,
             origin: JobOrigin::Pruned,
+            carried_realized_paths: None,
         }],
         1,
     )
@@ -718,6 +746,7 @@ async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
             "job-upgrade-hash",
             None,
             JobOrigin::CacheOpportunity,
+            None,
             1,
         )
         .await?;
@@ -733,7 +762,14 @@ async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
     // ... then a pruned merge dedups onto it: created=false AND the
     // existing row's origin upgrades to 'pruned' (the durable mark).
     let second = db
-        .create_materialization_job_fenced(drv, "job-upgrade-hash", None, JobOrigin::Pruned, 1)
+        .create_materialization_job_fenced(
+            drv,
+            "job-upgrade-hash",
+            None,
+            JobOrigin::Pruned,
+            None,
+            1,
+        )
         .await?;
     let FencedJobCreate::Applied {
         job_id: second_id,
@@ -758,6 +794,7 @@ async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
             "job-upgrade-hash",
             None,
             JobOrigin::CacheOpportunity,
+            None,
             1,
         )
         .await?;
@@ -778,12 +815,13 @@ async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
         "job-upgrade-hash-2",
         None,
         JobOrigin::CacheOpportunity,
+        None,
         1,
     )
     .await?;
     for origin in [JobOrigin::Reprobe, JobOrigin::StaleReset] {
         let r = db
-            .create_materialization_job_fenced(drv2, "job-upgrade-hash-2", None, origin, 1)
+            .create_materialization_job_fenced(drv2, "job-upgrade-hash-2", None, origin, None, 1)
             .await?;
         assert!(
             matches!(r, FencedJobCreate::Applied { created: false, .. }),

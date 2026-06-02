@@ -1599,7 +1599,7 @@ impl DagActor {
             return HashSet::new();
         }
 
-        // r[impl sched.merge.stale-substitutable+2]
+        // r[impl sched.merge.stale-substitutable+3]
         // Missing-but-substitutable: reset the stale Completed node and
         // give it a stale_reset-origin materialization job (the store
         // executor re-fetches; the success consumption re-completes the
@@ -1753,7 +1753,16 @@ impl DagActor {
                     || unwanted.contains(p.as_str())
             }) {
                 metrics::counter!("rio_scheduler_stale_completed_substituted_total").increment(1);
-                to_spawn.push((drv_hash_k, output_paths));
+                // Carrier (migration 082): the realized paths this
+                // reset just destroyed in memory, minus unwanted and
+                // placeholder-empty entries — the stale_reset job's
+                // fetch targets and coverage obligation.
+                let carried: Vec<String> = output_paths
+                    .iter()
+                    .filter(|p| !p.is_empty() && !unwanted.contains(p.as_str()))
+                    .cloned()
+                    .collect();
+                to_spawn.push((drv_hash_k, carried));
             } else {
                 self.push_ready(drv_hash_k);
             }
@@ -1825,11 +1834,19 @@ impl DagActor {
             // probe-origin posture), not batch 5. The wanted
             // relation for this (build, node) pair already rode the
             // merge transaction.
-            for (drv_hash, _) in to_spawn {
+            for (drv_hash, carried) in to_spawn {
+                // r[impl sched.merge.stale-substitutable+3]
+                // The carried realized paths ride the job row
+                // (migration 082): the executor's wanted resolution
+                // and the consumption coverage read the same column,
+                // so the floating-CA empty-expected shape fetches the
+                // realized path instead of vacuously succeeding.
+                let carried = (!carried.is_empty()).then_some(carried);
                 self.create_materialization_job(
                     &drv_hash,
                     crate::state::JobOrigin::StaleReset,
                     None,
+                    carried,
                 )
                 .await;
             }
@@ -2052,6 +2069,7 @@ impl DagActor {
                         drv_hash: node.drv_hash.as_str(),
                         tenant_id,
                         origin: crate::state::JobOrigin::Pruned,
+                        carried_realized_paths: None,
                     });
                 }
             }
@@ -2066,6 +2084,7 @@ impl DagActor {
                         drv_hash: drv_hash.as_str(),
                         tenant_id,
                         origin: crate::state::JobOrigin::CacheOpportunity,
+                        carried_realized_paths: None,
                     });
                 }
             }
@@ -2099,6 +2118,7 @@ impl DagActor {
                         drv_hash: drv_hash.as_str(),
                         tenant_id,
                         origin: crate::state::JobOrigin::Reprobe,
+                        carried_realized_paths: None,
                     });
                 }
                 if self.dag.node(drv_hash).is_some_and(|s| {

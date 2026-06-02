@@ -247,6 +247,7 @@ impl DagActor {
                 drv_hash,
                 crate::state::JobOrigin::CacheOpportunity,
                 None,
+                None,
             )
             .await;
         }

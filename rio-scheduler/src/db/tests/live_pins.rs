@@ -157,7 +157,14 @@ async fn materialization_pins_released_only_after_all_interest_terminal() -> any
 
     // The materialization job + the pins its execution ingested.
     let FencedJobCreate::Applied { job_id, .. } = db
-        .create_materialization_job_fenced(drv_id, "pin-release-drv", None, JobOrigin::Pruned, 1)
+        .create_materialization_job_fenced(
+            drv_id,
+            "pin-release-drv",
+            None,
+            JobOrigin::Pruned,
+            None,
+            1,
+        )
         .await?
     else {
         anyhow::bail!("job create must apply");
