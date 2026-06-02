@@ -2355,6 +2355,29 @@ collection; this is harmless because realisations are keyed by
 the genuine derivation's, so stale realisations cannot poison the
 victim's resolution.
 
+#r("sched.merge.input-form-seed")[
+  Modular-hash seeds consumed by store-evidence verification MUST be
+  built only through a constructor that owns the input-form predicate:
+  a node or resident child contributes its recorded modular hash only
+  when it is not floating-content-addressed
+  (`is_fixed_output || !is_content_addressed`). A floating derivation's
+  published hash is the masked-subject form and MUST NOT be used as an
+  input-position digest.
+]
+A floating-CA derivation's own `hashDerivationModulo` masks its output
+slots (oracle parity), so the value the gateway publishes for the node is
+NOT the digest its consumers fold over in input position --- those come
+from the unmasked recursion. Seeding a masked form silently steers every
+derived input-addressed path away from the honest paths: against an
+honest submission that is a wrongful contradiction (poison), and against
+a crafted one it is a wrongful verification. The predicate was originally
+enforced by call-site discipline at three sites; the fourth (dispatch's
+DAG-children seed, added hours before the sweep) shipped without it ---
+the constructor is the chokepoint that makes a fifth unfiltered site
+unwritable rather than merely unlikely. Floating inputs that genuinely
+matter to a verification resolve to store-silence (unseedable input)
+instead, which is the fail-closed direction under the trust model.
+
 #r("sched.persist.atomic-activation+2")[
   The merge-time persistence of (re)created derivation rows --- including
   the definition-change accumulator reset of

@@ -1355,3 +1355,50 @@ pub(crate) fn mint_text_ca_leaf(tag: &str) -> (rio_proto::types::DerivationNode,
     };
     (node, aterm, out_path)
 }
+
+/// Mint a canonical floating-CA LEAF derivation as a bare store-backed
+/// submission node (gateway warm shape: declared 32-byte modular hash,
+/// no inline content). Returns `(node, aterm, published_hash)` where
+/// `published_hash` is the MASKED-subject form `hashDerivationModulo`
+/// publishes for a floating drv — deliberately NOT an input-position
+/// digest (`sched.merge.input-form-seed`).
+pub(crate) fn mint_floating_ca_leaf(
+    tag: &str,
+) -> (rio_proto::types::DerivationNode, String, [u8; 32]) {
+    use rio_nix::derivation::{Derivation, hash_derivation_modulo};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    let aterm = format!(
+        r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","{tag}"),("out","")])"#
+    );
+    let drv = Derivation::parse(&aterm).expect("floating leaf parses");
+    assert_eq!(drv.to_aterm(), aterm, "fixture must be canonical");
+
+    let content_hash =
+        NixHash::new(HashAlgo::SHA256, Sha256::digest(aterm.as_bytes()).to_vec()).unwrap();
+    let drv_path = StorePath::make_text(&format!("{tag}.drv"), &content_hash, &[])
+        .unwrap()
+        .as_str()
+        .to_owned();
+
+    let resolve_none = |_: &str| -> Option<&Derivation> { None };
+    let published = hash_derivation_modulo(&drv, &drv_path, &resolve_none, &mut HashMap::new())
+        .expect("floating leaf modulo hash");
+
+    let node = rio_proto::types::DerivationNode {
+        drv_path: drv_path.clone(),
+        drv_hash: drv_path,
+        pname: tag.to_owned(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: true,
+        expected_output_paths: vec![String::new()],
+        ca_modular_hash: published.to_vec(),
+        ..Default::default()
+    };
+    (node, aterm, published)
+}

@@ -2725,3 +2725,164 @@ async fn test_dispatch_unparseable_verified_bytes_poison() -> TestResult {
     wait_for_status(&handle, &garbage_path, DerivationStatus::Poisoned).await;
     Ok(())
 }
+
+// r[verify sched.merge.input-form-seed]
+/// The seed constructors own the not-floating predicate: a floating-CA
+/// node's declared (published, masked) hash never enters the seed map;
+/// IA and FOD nodes' hashes do.
+#[test]
+fn input_form_seed_constructor_excludes_floating_published_hashes() {
+    let mk = |path: &str, is_ca: bool, fod: bool| crate::domain::DerivationNode {
+        drv_hash: path.to_owned(),
+        drv_path: path.to_owned(),
+        pname: String::new(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        expected_output_paths: vec![String::new()],
+        is_fixed_output: fod,
+        is_content_addressed: is_ca,
+        ca_modular_hash: Some([7u8; 32]),
+        drv_content: Vec::new(),
+        drv_content_authoritative: false,
+        required_features: Vec::new(),
+        wanted_output_names: Vec::new(),
+        explicitly_requested: false,
+        needs_resolve: false,
+        version: None,
+        enable_parallel_building: None,
+        enable_parallel_checking: None,
+        prefer_local_build: None,
+    };
+    let nodes = vec![
+        mk("/nix/store/ia.drv", false, false),
+        mk("/nix/store/fod.drv", true, true),
+        mk("/nix/store/floating.drv", true, false),
+    ];
+    let seed = crate::actor::merge::InputFormSeed::from_submission_nodes(&nodes);
+    assert!(
+        seed.get("/nix/store/ia.drv").is_some(),
+        "IA hash is an input-form digest"
+    );
+    assert!(
+        seed.get("/nix/store/fod.drv").is_some(),
+        "FOD hash is an input-form digest (mask never applies)"
+    );
+    assert!(
+        seed.get("/nix/store/floating.drv").is_none(),
+        "a floating node's published hash is the masked form and must \
+         never seed input position"
+    );
+}
+
+// r[verify sched.merge.input-form-seed]
+/// merged_bug_003 e2e (the dispatch-time 4th site, fix-child of
+/// e2c2dbfc2 / pattern R2): a bare IA parent whose Completed
+/// floating-CA child carries its published (masked) hash must NOT have
+/// that hash seeded into the dispatch-time claims verification. Pre-fix
+/// the raw children loop seeded it, the validator derived the parent's
+/// IA paths from a masked digest, the honest declared paths "differed",
+/// and the node was wrongfully POISONED as forged. Post-fix the child
+/// is excluded, the input is unseedable, and the verdict is the
+/// fail-closed transient one: rolled back to Ready with backoff, no
+/// forgery counter, no poison.
+#[tokio::test]
+async fn test_dispatch_floating_child_masked_hash_backs_off_not_forged() -> TestResult {
+    use rio_nix::derivation::{Derivation, input_addressed_output_paths};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (_db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    // Floating child, resident + Completed, carrying its PUBLISHED
+    // (masked) modular hash — the gateway warm shape.
+    let (child_node, child_aterm, _published) = mint_floating_ca_leaf("ifs-child");
+    let child_path = child_node.drv_path.clone();
+    let child_drv = Derivation::parse(&child_aterm).expect("child parses");
+    merge_dag(&handle, Uuid::new_v4(), vec![child_node], vec![], false).await?;
+    assert!(
+        handle
+            .debug_force_status(&child_path, DerivationStatus::Completed)
+            .await?,
+        "child forced Completed"
+    );
+
+    // Honest IA parent over the floating child: declared output paths
+    // derived through the real input-form recursion (the resolver
+    // computes the child's UNMASKED input digest internally).
+    let build_parent = |out: &str| {
+        format!(
+            r#"Derive([("out","{out}","","")],[("{child_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","ifs-parent"),("out","{out}")])"#
+        )
+    };
+    let masked_parent = Derivation::parse(&build_parent("")).expect("masked parent parses");
+    let name_only = format!("/nix/store/{}-ifs-parent.drv", "a".repeat(32));
+    let resolver = |p: &str| -> Option<&Derivation> { (p == child_path).then_some(&child_drv) };
+    let paths =
+        input_addressed_output_paths(&masked_parent, &name_only, &resolver, &mut HashMap::new())
+            .expect("derive honest parent paths");
+    let parent_out = paths["out"].as_str().to_owned();
+    let parent_aterm = build_parent(&parent_out);
+    let parent_drv = Derivation::parse(&parent_aterm).expect("parent parses");
+    assert_eq!(parent_drv.to_aterm(), parent_aterm, "parent canonical");
+    let content_hash = NixHash::new(
+        HashAlgo::SHA256,
+        Sha256::digest(parent_aterm.as_bytes()).to_vec(),
+    )
+    .unwrap();
+    let parent_drv_path = StorePath::make_text(
+        "ifs-parent.drv",
+        &content_hash,
+        &[StorePath::parse(&child_path).unwrap()],
+    )
+    .unwrap()
+    .as_str()
+    .to_owned();
+    store.seed_with_content(&parent_drv_path, parent_aterm.as_bytes());
+
+    let parent_node = rio_proto::types::DerivationNode {
+        drv_path: parent_drv_path.clone(),
+        drv_hash: parent_drv_path.clone(),
+        pname: "ifs-parent".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: false,
+        expected_output_paths: vec![parent_out],
+        ..Default::default()
+    };
+    let edge = rio_proto::types::DerivationEdge {
+        parent_drv_path: parent_drv_path.clone(),
+        child_drv_path: child_path.clone(),
+    };
+
+    let mut worker_rx = connect_executor(&handle, "ifs-w", "x86_64-linux").await?;
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![parent_node],
+        vec![edge],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    assert!(
+        try_recv_assignment(&mut worker_rx, 300).await.is_none(),
+        "the masked child hash must not be signed against"
+    );
+    let info = handle
+        .debug_query_derivation(&parent_drv_path)
+        .await?
+        .expect("parent resident");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Ready,
+        "unseedable floating input is the fail-closed TRANSIENT verdict \
+         (rolled back with backoff) — pre-fix this was Poisoned via a \
+         wrongful Contradicts against the masked digest"
+    );
+    Ok(())
+}

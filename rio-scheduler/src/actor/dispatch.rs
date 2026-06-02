@@ -2481,15 +2481,16 @@ impl DagActor {
                         enable_parallel_checking: None,
                         prefer_local_build: None,
                     };
-                    let mut seed: std::collections::HashMap<String, [u8; 32]> =
-                        std::collections::HashMap::new();
-                    for child in self.dag.get_children(drv_hash) {
-                        if let Some(cs) = self.dag.node(&child)
-                            && let Some(h) = cs.ca.modular_hash
-                        {
-                            seed.insert(cs.drv_path().to_string(), h);
-                        }
-                    }
+                    // Input-form seeds only: the constructor owns the
+                    // not-floating predicate (sched.merge.input-form-seed)
+                    // — a Completed floating child's recorded hash is
+                    // the masked published form and would steer the
+                    // verification onto wrong derived paths (wrongful
+                    // Forged for honest parents, wrongful Verified for
+                    // crafted ones). Excluded children make the input
+                    // unseedable instead, which is the fail-closed
+                    // direction.
+                    let seed = super::merge::InputFormSeed::from_dag_children(&self.dag, drv_hash);
                     Some(self.check_store_evidence(&node, &seed).await)
                 }
             };

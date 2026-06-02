@@ -171,6 +171,64 @@ fn settled_row_identity_matches(
 /// earlier ones resolve.
 const MERGE_STORE_EVIDENCE_BUDGET: u32 = 8;
 
+/// Input-form modular-hash seeds for store-evidence verification.
+///
+/// r[impl sched.merge.input-form-seed]
+/// The not-floating predicate (`is_fixed_output || !is_ca`) lives INSIDE
+/// this type's two constructors — the only ways to build a seed map —
+/// so a future call site cannot forget it: a floating-CA node's
+/// published hash is the masked-subject form (oracle parity:
+/// `hashDerivationModulo` masks its own outputs) and can never stand in
+/// for its input-position digest. Seeding one re-creates the
+/// masked-form false-rejection/false-verification class fixed at
+/// ingress (`ingress-inline-drv-binding+1`) and at the three merge-time
+/// sites (e2c2dbfc2) — whose hand-sweep missed the dispatch-time
+/// fourth site, which is exactly why the predicate now has a single
+/// owner (fix-discipline R2: chokepoints over call-site discipline).
+///
+/// Consumers read through [`Self::get`]; `check_store_evidence` accepts
+/// only this type, never a raw map.
+pub(super) struct InputFormSeed(HashMap<String, [u8; 32]>);
+
+impl InputFormSeed {
+    /// Seed from a submission's nodes (merge Steps 0.5/0.6): every
+    /// non-floating node's declared 32-byte modular hash, keyed by its
+    /// declared `drv_path`.
+    pub(super) fn from_submission_nodes(nodes: &[crate::domain::DerivationNode]) -> Self {
+        Self(
+            nodes
+                .iter()
+                .filter(|n| n.is_fixed_output || !n.is_content_addressed)
+                .filter_map(|n| n.ca_modular_hash.map(|h| (n.drv_path.clone(), h)))
+                .collect(),
+        )
+    }
+
+    /// Seed from a dispatched node's resident DAG children (the
+    /// dispatch-time claims derivation): a child's recorded modular
+    /// hash qualifies only when the child is not floating-CA — for a
+    /// dispatched parent its children are resident and Completed, but
+    /// a Completed floating child's recorded hash is still the masked
+    /// published form, not an input digest.
+    pub(super) fn from_dag_children(dag: &crate::dag::DerivationDag, drv_hash: &DrvHash) -> Self {
+        let mut map = HashMap::new();
+        for child in dag.get_children(drv_hash) {
+            if let Some(cs) = dag.node(&child)
+                && (cs.is_fixed_output || !cs.ca.is_ca)
+                && let Some(h) = cs.ca.modular_hash
+            {
+                map.insert(cs.drv_path().to_string(), h);
+            }
+        }
+        Self(map)
+    }
+
+    /// Look up the input-form digest recorded for `drv_path`.
+    pub(super) fn get(&self, drv_path: &str) -> Option<[u8; 32]> {
+        self.0.get(drv_path).copied()
+    }
+}
+
 /// Outcome of [`DagActor::check_store_evidence`].
 pub(super) enum StoreEvidenceOutcome {
     /// The store's text-CA-bound bytes derive exactly the submission's
@@ -218,7 +276,7 @@ impl DagActor {
     pub(super) async fn check_store_evidence(
         &self,
         node: &crate::domain::DerivationNode,
-        submission_seed: &HashMap<String, [u8; 32]>,
+        submission_seed: &InputFormSeed,
     ) -> StoreEvidenceOutcome {
         use rio_nix::derivation::Derivation;
         use rio_nix::hash::{HashAlgo, NixHash};
@@ -300,7 +358,7 @@ impl DagActor {
         let mut input_seed: Vec<rio_proto::types::DerivationNode> = Vec::new();
         if needs_ia {
             for input in drv.input_drvs().keys() {
-                let hash = submission_seed.get(input.as_str()).copied().or_else(|| {
+                let hash = submission_seed.get(input.as_str()).or_else(|| {
                     self.dag
                         .hash_for_path(input)
                         .and_then(|h| self.dag.node(h))
@@ -750,17 +808,11 @@ impl DagActor {
             std::collections::HashSet::new();
         let mut settled_evidence_displaced: Vec<String> = Vec::new();
         let mut evidence_budget: u32 = MERGE_STORE_EVIDENCE_BUDGET;
-        // Input-form seeds only: a floating-CA sibling's published
-        // hash is the masked-subject form (oracle parity) and cannot
-        // stand in for its input-position digest — seeding it would
-        // re-create the masked-form false-rejection class fixed at
-        // ingress (ingress-inline-drv-binding+1). Floating inputs that
-        // matter resolve to Unverifiable in check_store_evidence.
-        let submission_seed: HashMap<String, [u8; 32]> = nodes
-            .iter()
-            .filter(|n| n.is_fixed_output || !n.is_content_addressed)
-            .filter_map(|n| n.ca_modular_hash.map(|h| (n.drv_path.clone(), h)))
-            .collect();
+        // Input-form seeds only — the not-floating predicate lives in
+        // the InputFormSeed constructors (sched.merge.input-form-seed);
+        // floating inputs that matter resolve to Unverifiable in
+        // check_store_evidence.
+        let submission_seed = InputFormSeed::from_submission_nodes(&nodes);
         let non_resident: Vec<String> = nodes
             .iter()
             .filter(|n| self.dag.node(&n.drv_hash).is_none())
