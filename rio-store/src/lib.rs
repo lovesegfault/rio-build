@@ -59,7 +59,7 @@ pub mod logs;
 pub mod manifest;
 // Substitution-replacement campaign (design §2.2/§5): the store-side
 // materialization-job executor. Dormant in Phase A — nothing spawns it
-// unless `materialization.enabled = true` (default false).
+// unless a `materialization.scheduler_addr` is configured (PD-D2).
 #[cfg(feature = "server")]
 pub mod materialize;
 #[cfg(feature = "server")]
@@ -386,8 +386,7 @@ pub fn describe_metrics() {
          scheduler's rio_scheduler_materialization_{claims,jobs_resolved}_total. \
          A rising infra share means upstream/network trouble (executions are \
          retried within the scheduler's materialization budget); a rising \
-         unobtainable share means requested paths genuinely left the upstreams. \
-         Absent while store materialization.enabled = false."
+         unobtainable share means requested paths genuinely left the upstreams."
     );
     describe_counter!(
         "rio_store_materialization_pinned_paths_total",
@@ -395,8 +394,7 @@ pub fn describe_metrics() {
          design §5.1 pin-at-ingest). Pairs with the scheduler's §5.3 release \
          lifecycle: a sustained pinned-paths rate with no matching pin releases \
          after jobs resolve and interest goes terminal means materialization \
-         pins are accumulating (GC pressure). Absent while store \
-         materialization.enabled = false."
+         pins are accumulating (GC pressure)."
     );
     describe_counter!(
         "rio_store_substitute_integrity_failures_total",

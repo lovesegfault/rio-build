@@ -498,12 +498,6 @@
         "description": "URL template the cross-replica `TailLog` proxy uses to dial the store replica holding an execution's live ingest stream."
       },
       {
-        "key": "materialization.enabled",
-        "type": "boolean",
-        "default": "false",
-        "description": "Master switch for the per-replica materialization-job executor task set. false = the executor never polls; the store is byte-for-byte the as-built store."
-      },
-      {
         "key": "materialization.executor_concurrency",
         "type": "uint",
         "default": "8",

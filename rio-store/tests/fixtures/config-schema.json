@@ -202,7 +202,6 @@
         "description": "Substitution-replacement campaign (design §8): the store-side\nmaterialization-job executor. `[materialization]` table in\nstore.toml. Env: `RIO_MATERIALIZATION__*`. Phase B activated the\nexecutor at the deployment layer (helm values default ON); this\nstruct's default stays `false` — a bare binary spawns no\nexecutor task set.",
         "$ref": "#/$defs/MaterializationConfig",
         "default": {
-          "enabled": false,
           "executor_concurrency": 8,
           "poll_interval_secs": 1,
           "scheduler_addr": ""
@@ -293,14 +292,9 @@
         }
       },
       "MaterializationConfig": {
-        "description": "Substitution-replacement campaign (design §8): store-owned\nmaterialization jobs. Phase B activated the per-replica executor\ntask set: the helm values default `enabled: true` (the deployment\nlayer is the cutover switch — PD-B1), while this struct's default\nstays `false` so a bare binary spawns no executor (and needs no\nscheduler address). The deployment-ordering constraint (store\nexecutor flag first ON, last OFF — design §4/AS-6) is enforced by\nthe chart's AND-guard (templates/scheduler.yaml), not here.",
+        "description": "Store-owned materialization jobs (design §8) — THE substitution\nmechanism. The executor spawns whenever a scheduler address is\nconfigured (PD-D2) — a bare binary with no address spawns nothing\nand needs no scheduler.",
         "type": "object",
         "properties": {
-          "enabled": {
-            "description": "Master switch for the per-replica materialization-job executor\ntask set. false = the executor never polls; the store is\nbyte-for-byte the as-built store.",
-            "type": "boolean",
-            "default": false
-          },
           "executor_concurrency": {
             "description": "Concurrent jobs per replica (design §2.2 item 1: default 8).",
             "type": "integer",
@@ -316,7 +310,7 @@
             "default": 1
           },
           "scheduler_addr": {
-            "description": "Scheduler ExecutorService address (the store→scheduler edge:\nListMaterializationJobs / PullAssignment / ReportOutcome).\nEmpty = executor cannot run (`enabled = true` requires it);\nPhase A's VM/helm wiring sets it explicitly.",
+            "description": "Scheduler ExecutorService address (the store→scheduler edge:\nListMaterializationJobs / PullAssignment / ReportOutcome).\nTHE executor spawn condition (PD-D2): non-empty spawns the\nclaim loops; empty disables the executor (the schedulerless\npure-store deployment stays valid). The VM/helm wiring sets it\nexplicitly.",
             "type": "string",
             "default": ""
           }
@@ -361,7 +355,6 @@
     "log_cors_allow_origins": "",
     "log_peer_url_template": "http://{pod}.rio-store-headless.rio-store.svc:9002",
     "materialization": {
-      "enabled": false,
       "executor_concurrency": 8,
       "poll_interval_secs": 1,
       "scheduler_addr": ""

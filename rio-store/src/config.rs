@@ -268,36 +268,29 @@ impl Default for Config {
     }
 }
 
-/// Substitution-replacement campaign (design §8): store-owned
-/// materialization jobs. Phase B activated the per-replica executor
-/// task set: the helm values default `enabled: true` (the deployment
-/// layer is the cutover switch — PD-B1), while this struct's default
-/// stays `false` so a bare binary spawns no executor (and needs no
-/// scheduler address). The deployment-ordering constraint (store
-/// executor flag first ON, last OFF — design §4/AS-6) is enforced by
-/// the chart's AND-guard (templates/scheduler.yaml), not here.
+/// Store-owned materialization jobs (design §8) — THE substitution
+/// mechanism. The executor spawns whenever a scheduler address is
+/// configured (PD-D2) — a bare binary with no address spawns nothing
+/// and needs no scheduler.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct MaterializationConfig {
-    /// Master switch for the per-replica materialization-job executor
-    /// task set. false = the executor never polls; the store is
-    /// byte-for-byte the as-built store.
-    pub enabled: bool,
     /// Concurrent jobs per replica (design §2.2 item 1: default 8).
     pub executor_concurrency: usize,
     /// Poll interval for ListMaterializationJobs (seconds; jitter added).
     pub poll_interval_secs: u64,
     /// Scheduler ExecutorService address (the store→scheduler edge:
     /// ListMaterializationJobs / PullAssignment / ReportOutcome).
-    /// Empty = executor cannot run (`enabled = true` requires it);
-    /// Phase A's VM/helm wiring sets it explicitly.
+    /// THE executor spawn condition (PD-D2): non-empty spawns the
+    /// claim loops; empty disables the executor (the schedulerless
+    /// pure-store deployment stays valid). The VM/helm wiring sets it
+    /// explicitly.
     pub scheduler_addr: String,
 }
 
 impl Default for MaterializationConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             executor_concurrency: 8,
             poll_interval_secs: 1,
             scheduler_addr: String::new(),
@@ -482,15 +475,6 @@ impl rio_common::config::ValidateConfig for Config {
             "materialization.poll_interval_secs must be >= 1, got {} \
              (0 busy-polls the scheduler); set RIO_MATERIALIZATION__POLL_INTERVAL_SECS",
             self.materialization.poll_interval_secs
-        );
-        // The executor cannot poll without a scheduler address; failing
-        // at startup beats a task set that logs connection errors
-        // forever against an empty URI.
-        anyhow::ensure!(
-            !self.materialization.enabled || !self.materialization.scheduler_addr.is_empty(),
-            "materialization.enabled = true requires a non-empty \
-             materialization.scheduler_addr (the scheduler ExecutorService \
-             address); set RIO_MATERIALIZATION__SCHEDULER_ADDR"
         );
         Ok(())
     }

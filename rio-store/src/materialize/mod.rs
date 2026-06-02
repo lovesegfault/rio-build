@@ -10,11 +10,10 @@
 //! machinery, pin every ingested/verified path at ingest, and report
 //! the outcome through `ReportOutcome` retried until acknowledged.
 //!
-//! **Phase A dormancy:** everything here is reachable ONLY when
-//! `materialization.enabled = true` (default `false`). Flag-off,
-//! `main.rs` never spawns the executor task set and the store is
-//! byte-for-byte the as-built store — the dormancy proof is the
-//! unchanged store battery plus the Wave-6 VM assertion.
+//! **Spawn condition:** everything here runs ONLY when a
+//! `scheduler_addr` is configured (PD-D2). Without one, the executor
+//! task set never spawns and the store serves its data plane alone
+//! (the schedulerless pure-store deployment).
 //!
 //! **Identity** (BC-1 + the Wave-3/4 security obligations):
 //! - The *credential* is the kind-attested store-service token —
@@ -62,16 +61,16 @@ const POLL_JITTER: rio_common::backoff::Jitter = rio_common::backoff::Jitter::Pr
 /// poll → claim → execute → report against the scheduler's
 /// ExecutorService until shutdown.
 ///
-/// **The dormancy gate lives HERE and is unit-testable:** flag-off
-/// (`cfg.enabled == false`, the Phase A deployed state) this function
-/// spawns NOTHING and returns 0 — the store process is byte-for-byte
-/// the as-built store. main.rs calls this unconditionally; the flag
-/// check is not duplicated at the call site so there is exactly one
-/// tested gate.
+/// **The spawn gate lives HERE and is unit-testable:** with no
+/// `scheduler_addr` configured this function spawns NOTHING and
+/// returns 0 (PD-D2 — the schedulerless pure-store deployment).
+/// main.rs calls this unconditionally; the gate is not duplicated at
+/// the call site so there is exactly one tested gate.
 ///
-/// Returns the number of claim loops spawned (0 flag-off; also 0 when
-/// the scheduler address is malformed — logged, never fatal: a broken
-/// materialization executor must not take down the store data plane).
+/// Returns the number of claim loops spawned (0 without an address;
+/// also 0 when the scheduler address is malformed — logged, never
+/// fatal: a broken materialization executor must not take down the
+/// store data plane).
 // r[impl store.materialize.executor+2]
 pub fn spawn_materialization_executor(
     cfg: crate::config::MaterializationConfig,
@@ -80,7 +79,8 @@ pub fn spawn_materialization_executor(
     service_signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
     shutdown: rio_common::signal::Token,
 ) -> usize {
-    if !cfg.enabled {
+    if cfg.scheduler_addr.is_empty() {
+        info!("materialization executor disabled: no scheduler_addr configured");
         return 0;
     }
     let instance = executor_instance();
@@ -94,8 +94,8 @@ pub fn spawn_materialization_executor(
     // T-6.2 (Phase B): pre-register the executor lifecycle counters at 0
     // (the gc-collect pre-registration pattern) so dashboards/alerts have
     // series from boot and the metrics-registered VM assertion sees them
-    // before the first job executes. Flag-off this whole function returns
-    // above — the flag-off /metrics surface stays byte-identical.
+    // before the first job executes. (Without a scheduler_addr this
+    // whole function returned above — no executor, no series.)
     for outcome in ["success", "unobtainable", "infra"] {
         metrics::counter!(
             "rio_store_materialization_executions_total",
@@ -280,6 +280,44 @@ fn sanitize_dns1123_label(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // r[verify store.materialize.executor+2]
+    /// PD-D2 spawn condition: no `scheduler_addr` → zero claim loops
+    /// (the schedulerless pure-store deployment); a configured address
+    /// spawns exactly `executor_concurrency` loops (connect_lazy — no
+    /// scheduler needs to be listening).
+    #[tokio::test]
+    async fn executor_spawns_iff_scheduler_addr_configured() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let substituter =
+            std::sync::Arc::new(crate::substitute::Substituter::new(db.pool.clone(), None));
+        let shutdown = rio_common::signal::Token::new();
+
+        let mut cfg = crate::config::MaterializationConfig::default();
+        assert!(cfg.scheduler_addr.is_empty(), "default: no address");
+        let spawned = spawn_materialization_executor(
+            cfg.clone(),
+            db.pool.clone(),
+            std::sync::Arc::clone(&substituter),
+            None,
+            shutdown.clone(),
+        );
+        assert_eq!(spawned, 0, "no scheduler_addr => no executor (PD-D2)");
+
+        // Positive control: an address spawns the configured loops
+        // (connect_lazy — no scheduler needs to be listening).
+        cfg.scheduler_addr = "http://127.0.0.1:1".into();
+        cfg.executor_concurrency = 3;
+        let spawned = spawn_materialization_executor(
+            cfg,
+            db.pool.clone(),
+            substituter,
+            None,
+            shutdown.clone(),
+        );
+        assert_eq!(spawned, 3, "an address spawns the configured loops");
+        shutdown.cancel();
+    }
 
     /// The instance derivation produces a scheduler-acceptable DNS-1123
     /// label from every input shape: a real pod name passes through
