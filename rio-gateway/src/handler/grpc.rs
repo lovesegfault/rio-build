@@ -44,10 +44,11 @@ const STORE_TRANSIENT_BACKOFF: rio_common::backoff::Backoff = rio_common::backof
 /// STORE_TRANSIENT_MAX_ATTEMPTS`; `None` if the caller should surface
 /// the error. Logs the retry/surface decision. Shared by
 /// [`grpc_query_path_info`] and [`grpc_get_path`] — both traverse
-/// `r[store.substitute.admission]` server-side, which returns
+/// `r[store.substitute.admission+2]` server-side, which returns
 /// `ResourceExhausted` after its bounded wait under saturation. The
-/// scheduler already retries this (`r[sched.substitute.detached+5]`);
-/// without it the gateway surfaced a hard `STDERR_ERROR` → client sees
+/// in-process materialization executor re-arms through its job budget
+/// (`r[store.materialize.executor+3]`); without this retry the gateway
+/// surfaced a hard `STDERR_ERROR` → client sees
 /// "store error: ResourceExhausted" on a momentary overload.
 ///
 /// NOT a closure-taking `retry(op)` wrapper: `impl AsyncFnMut`
@@ -82,7 +83,7 @@ fn transient_retry_after(
 ///
 /// Retries transient status per [`transient_retry_after`] — store-side
 /// `QueryPathInfo` traverses `try_substitute_on_miss`
-/// (`r[store.substitute.admission]`).
+/// (`r[store.substitute.admission+2]`).
 pub(crate) async fn grpc_query_path_info(
     store_client: &mut StoreServiceClient<Channel>,
     jwt_token: Option<&str>,

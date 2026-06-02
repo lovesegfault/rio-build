@@ -364,7 +364,7 @@ async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
 // classification survives; the routed mechanism is now a materialization
 // job — the store replica executes the fetch and the consumption path
 // completes the node.
-// r[verify sched.dispatch.fod-substitute+2]
+// r[verify sched.dispatch.fod-substitute+3]
 /// Dispatch-time substitution routing: a Ready IA derivation (FOD or
 /// non-FOD) whose output becomes substitutable AFTER merge (so
 /// merge-time `check_cached_outputs` missed it) is routed to a
@@ -426,7 +426,7 @@ async fn dispatch_time_substitutable_routes_to_job(#[case] is_fod: bool) -> Test
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs+2]
+// r[verify sched.merge.wanted-outputs+3]
 /// `batch_probe_cached_ready` × wanted outputs: a Ready node whose only
 /// missing output is one nothing wants must be completed inline by the
 /// dispatch-time batch probe instead of staying Ready forever / being
@@ -599,7 +599,7 @@ async fn cgroup_oom_doubles_mem_floor(
 ///
 /// `queued_by_system` is intentionally NOT gated — it must match
 /// `ClusterSnapshot.queued_by_system` (snapshot.rs).
-// r[verify sched.admin.spawn-intents.probed-gate+2]
+// r[verify sched.admin.spawn-intents.probed-gate+3]
 #[tokio::test]
 async fn spawn_intents_excludes_unprobed_ready() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -649,7 +649,7 @@ async fn spawn_intents_excludes_unprobed_ready() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// PD-7 (Phase B, design §2.3): a node with an unresolved
 /// materialization job is never a spawn-intent candidate — the
 /// controller must not spawn builder pods for work that will be
@@ -1656,7 +1656,7 @@ async fn batch_probe_locally_present_batches_pg() -> TestResult {
 // I-139/I-140: batch-probe truncated tail must NOT hit per-drv FMP fallback
 // ---------------------------------------------------------------------------
 
-// r[verify sched.dispatch.fod-substitute+2]
+// r[verify sched.dispatch.fod-substitute+3]
 /// With > `DISPATCH_PROBE_BATCH_CAP` Ready leaves and the batch RPC
 /// failing-open, the truncated tail must NOT fall through to the
 /// per-drv `ready_check_or_spawn` (one inline-awaited FMP each =

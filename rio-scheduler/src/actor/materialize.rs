@@ -2,7 +2,7 @@
 //! (unconditional since the substitution-replacement cutover).
 //! Design: substitution-replacement-design.md §2; spec:
 //! sched.materialize.{job,routing,pinning}.
-// r[impl sched.materialize.job]
+// r[impl sched.materialize.job+2]
 
 use tokio::sync::oneshot;
 use tracing::warn;
@@ -76,7 +76,7 @@ pub(crate) struct CreatedJob {
 impl DagActor {
     /// Leader-served job listing (the store's poll). Standby or no
     /// jobs → empty vec (never an error).
-    // r[impl sched.materialize.job]
+    // r[impl sched.materialize.job+2]
     pub(super) async fn handle_list_materialization_jobs(
         &mut self,
         limit: u32,
@@ -110,7 +110,7 @@ impl DagActor {
     ///
     /// Returns whether an unresolved job exists for the node after the
     /// call (created now or found by the dedup).
-    // r[impl sched.materialize.job]
+    // r[impl sched.materialize.job+2]
     pub(super) async fn create_materialization_job(
         &mut self,
         drv_hash: &DrvHash,
@@ -344,7 +344,7 @@ impl DagActor {
         metrics::counter!("rio_scheduler_materialization_claims_total").increment(1);
     }
 
-    // r[impl sched.materialize.job]
+    // r[impl sched.materialize.job+2]
     /// BC-4 (Phase B): emit the SUBSTITUTING DerivationEvent at
     /// materialization-claim intake. The event KIND is wire-retained;
     /// only its emission site moves — from walk-spawn (which never runs
@@ -414,7 +414,7 @@ impl DagActor {
         self.materialization_jobs.contains_key(drv_hash)
     }
 
-    // r[impl sched.materialize.job]
+    // r[impl sched.materialize.job+2]
     /// T-4.3 (Phase B): rebuild the in-memory job view from PG at
     /// recovery. Without this, a failed-over leader's empty view
     /// answers `JobView::None` to every materialization claim → the
@@ -522,7 +522,7 @@ pub(crate) struct RoutingInputs<'a> {
     pub pruned_origin: bool,
 }
 
-// r[impl sched.materialize.routing+2]
+// r[impl sched.materialize.routing+3]
 /// The four-arm routing core. PURE (no IO, no clocks) — kani-liftable
 /// per design §9.4; the FMP re-probe answer is an input.
 ///
@@ -581,7 +581,7 @@ pub(crate) fn route_unobtainable(inputs: &RoutingInputs<'_>) -> UnobtainableRout
 
 /// Success-consumption coverage check (the CE-17 closer): the live
 /// wanted set is covered by what the execution ingested or verified.
-// r[impl sched.materialize.routing+2]
+// r[impl sched.materialize.routing+3]
 pub(crate) fn success_covers_live_wanted(
     ingested: &[String],
     verified: &[String],
@@ -593,7 +593,7 @@ pub(crate) fn success_covers_live_wanted(
 }
 
 impl DagActor {
-    // r[impl sched.materialize.routing+2]
+    // r[impl sched.materialize.routing+3]
     /// Consume one materialization outcome (the §2.4 consumption
     /// transaction). Reachable only flag-on in practice (no
     /// materialization attempt can exist otherwise) — but ALWAYS wired
@@ -1180,7 +1180,7 @@ impl DagActor {
     /// (BC-2: the charge feeds the materialization budget and nothing
     /// else). Mirrors `close_pull_attempt_uncharged`'s transaction
     /// shape WITH the charge row.
-    // r[impl sched.materialize.routing+2]
+    // r[impl sched.materialize.routing+3]
     pub(super) async fn establish_materialization_attempt(
         &mut self,
         attempt: &crate::db::open_attempts::OpenAttemptRow,
@@ -1221,7 +1221,7 @@ impl DagActor {
     }
 
     // r[impl obs.metric.materialization-stalled]
-    // r[impl sched.materialize.routing+2]
+    // r[impl sched.materialize.routing+3]
     /// PD-20 (design §2.5, Phase B T-6.1): the parked-job housekeeping
     /// arm. Every tick, flag-on, leader-only:
     ///
@@ -1244,9 +1244,8 @@ impl DagActor {
     ///      cancellations are never missed decrements.
     ///
     /// Leader-only by construction (`handle_tick` returns early on
-    /// standby) and flag-gated at the call site, so flag-off
-    /// deployments never publish the gauge (the flag-off /metrics
-    /// surface stays byte-identical to as-built — criterion 2).
+    /// standby).
+    // r[impl sched.materialize.settlement]
     pub(super) async fn tick_reevaluate_parked_materialization_jobs(&mut self) {
         let now = std::time::Instant::now();
         let parked: Vec<(DrvHash, Uuid)> = self
@@ -1323,6 +1322,7 @@ impl DagActor {
     /// open materialization attempt charge-free. Phase B's
     /// build-terminal hooks will call the closer directly; in Phase A
     /// this tick backstop and the tests are the only callers.
+    // r[impl sched.materialize.settlement]
     pub(super) async fn tick_cancel_zero_interest_materialization(&mut self) {
         use crate::state::BuildStateExt;
         let zero_interest: Vec<DrvHash> = self
@@ -1347,7 +1347,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.materialize.job]
+    // r[impl sched.materialize.job+2]
     /// Cancel the job for a derivation whose live interest dropped to
     /// zero, closing any open materialization attempt CHARGE-FREE (no
     /// drv_attempts row at all) — BC-2's no-controller closer. The job

@@ -338,7 +338,7 @@ impl DagActor {
     /// finished build is still in `interested_builds`) does not revise
     /// it.
     ///
-    /// r[impl sched.merge.exec-correlation+7]
+    /// r[impl sched.merge.exec-correlation+8]
     pub(super) fn record_exec_correlation(
         &self,
         drv_hash: &DrvHash,
@@ -455,7 +455,7 @@ impl DagActor {
     /// on a write whose correct outcome is "zero rows changed", which
     /// no row poll can observe.
     ///
-    /// r[impl sched.merge.exec-correlation+7]
+    /// r[impl sched.merge.exec-correlation+8]
     pub(super) fn terminal_log_epilogue(
         &self,
         drv_hash: &DrvHash,

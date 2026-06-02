@@ -12,7 +12,7 @@
 //! The effective-wanted union is computed by ONE query helper here and
 //! nowhere else — the '{}'-means-all saturation convention (the 062
 //! convention) lives in exactly one place.
-// r[impl sched.materialize.job]
+// r[impl sched.materialize.job+2]
 
 use sqlx::PgConnection;
 use uuid::Uuid;

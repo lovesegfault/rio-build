@@ -171,7 +171,7 @@ impl SchedulerGrpc {
     /// Closed-by-default: the only open outcome is full dev mode
     /// (neither key family configured). A configured deployment with a
     /// missing/invalid/wrong-caller/wrong-key token is rejected.
-    // r[impl sched.materialize.job]
+    // r[impl sched.materialize.job+2]
     pub(super) fn require_store_service<T>(
         &self,
         req: &tonic::Request<T>,
@@ -245,7 +245,7 @@ impl SchedulerGrpc {
     /// suffices there).
     ///
     /// Dev mode passes through unchanged (no claims exist to bind).
-    // r[impl sched.materialize.job]
+    // r[impl sched.materialize.job+2]
     pub(super) fn require_store_service_instance_bound<T>(
         &self,
         req: &tonic::Request<T>,
@@ -380,7 +380,7 @@ impl ExecutorService for SchedulerGrpc {
                      (a store-service credential is required)",
                 ));
             }
-            // r[impl sched.materialize.job]
+            // r[impl sched.materialize.job+2]
             // T-5.1 (Phase B security obligation 1): the credential
             // must be INSTANCE-BOUND, and the instance bound inside
             // the signed claims must equal the request's
@@ -586,7 +586,7 @@ impl ExecutorService for SchedulerGrpc {
             Ok(claims) => claims.map(|c| c.intent_id),
             Err(metadata_err) => {
                 if request.get_ref().materialization_outcome.is_some() {
-                    // r[impl sched.materialize.job]
+                    // r[impl sched.materialize.job+2]
                     // T-5.1: outcome reports consume attempts (a state
                     // effect), so they require the instance-bound store
                     // credential. The report has no executor_instance
@@ -731,7 +731,7 @@ impl ExecutorService for SchedulerGrpc {
     /// obligation discharged here) is what authorizes it. Full dev mode
     /// (neither key family configured) stays open and answers the
     /// flag-off empty list.
-    // r[impl sched.materialize.job]
+    // r[impl sched.materialize.job+2]
     #[instrument(skip(self, request), fields(rpc = "ListMaterializationJobs"))]
     async fn list_materialization_jobs(
         &self,
@@ -837,7 +837,7 @@ impl ExecutorService for SchedulerGrpc {
         // metadata (the ServiceTokenInterceptor carrier), verified as
         // ServiceClaims by the service-HMAC key with caller="rio-store".
         // Full dev mode passes through to the relay below.
-        // r[impl sched.materialize.job]
+        // r[impl sched.materialize.job+2]
         self.require_store_service(&request, "")?;
         let req = request.into_inner();
         // A malformed exec_id is a caller bug worth surfacing even

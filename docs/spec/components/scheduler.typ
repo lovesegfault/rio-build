@@ -224,7 +224,7 @@ still self-reported telemetry. The remaining `final_resources` counters are
 decoded and dropped without being folded into the row and are enumerated as
 `n/a` in the bounds table.
 
-#r("sched.merge.exec-correlation+7")[
+#r("sched.merge.exec-correlation+8")[
   The scheduler MUST set `build_derivations.exec_id` for every interested
   build that has not already recorded an observation for that derivation
   when a derivation that has been dispatched (and therefore has an
@@ -233,8 +233,7 @@ decoded and dropped without being folded into the row and are enumerated as
   orphan adoption), `Poisoned` (permanent failure), `Cancelled` reached
   from `Assigned`/`Running`, and any terminal reached by a derivation
   whose prior, reset execution left a stamped log buffer (the
-  build-cancel sweep's `Cancelled`/`DependencyFailed` arms, the
-  failed-substitute revert to `DependencyFailed`, and the
+  build-cancel sweep's `Cancelled`/`DependencyFailed` arms and the
   dependency-failure cascade's `DependencyFailed` ancestors). The column
   MUST stay `NULL` for cache-hit `Completed`, cascade-swept
   `DependencyFailed` ancestors that never left a stamped log buffer,
@@ -250,17 +249,17 @@ decoded and dropped without being folded into the row and are enumerated as
 (`is_terminal()`); it is the transient retry intermediate
 (`Running → Failed → Ready`). The shared chokepoint is `terminal_log_epilogue`, called from
 `handle_success_completion` (`Completed`), `terminal_failure_epilogue`
-(`Poisoned`, timeout-exhausted `Cancelled`, and the failed-substitute
-revert to `DependencyFailed`), and
+(`Poisoned` and timeout-exhausted `Cancelled`), and
 `cancel_build_derivations` (any path that cancels in-flight derivations:
-user cancel, per-build wall-clock timeout, fail-fast, top-down substitute
-fail), and recovery's `adopt_orphan_completion` (an orphaned assignment
+user cancel, per-build wall-clock timeout, fail-fast --- including the
+materialization settlement's resubmit-directing fail-fast), and
+recovery's `adopt_orphan_completion` (an orphaned assignment
 whose outputs are found in the store --- the execution completed while the
 scheduler was down, and an ex-leader re-acquiring the lease may still hold
 its unflushed log tail) --- each of which implies the worker ran the build.
 The
 not-yet-dispatched arms of the same cancel sweep (`Queued`/`Ready`/`Created` →
-`DependencyFailed`, `Substituting` → `Cancelled`) and the dependency-failure
+`DependencyFailed`) and the dependency-failure
 cascade's swept ancestors call the chokepoint only
 when a prior execution was reset and left a stamped log buffer
 (`has_buffered_exec_log`, via the shared gated form
@@ -700,17 +699,17 @@ parents whose cascade was interrupted by a crash. All three exist because a
 keep-going build with a poisoned leaf otherwise hangs Active forever ---
 `completed + failed` never reaches `total`.
 
-#r("sched.poison.clear-survivor-reevaluation")[
+#r("sched.poison.clear-survivor-reevaluation+2")[
   Both poison-removal paths --- admin `ClearPoison` and the poison-TTL
   sweep --- MUST re-evaluate every surviving parent of the removed child
-  after the removal and the closure-hole stamp: a `Queued` survivor whose
+  after the removal: a `Queued` survivor whose
   remaining dependencies are all satisfied (vacuously so when the removed
   child was its last incomplete dependency) MUST be promoted to `Ready`,
-  pushed for dispatch and persisted; a topdown-pruned survivor whose
-  closure evidence is Broken and that has no walk or attempt in flight and
-  is not `Queued` MUST be routed through the broken-marked-root settlement
-  (#rref("sched.evidence.settlement")). Vanished, terminal, and
-  interest-free survivors are skipped.
+  pushed for dispatch and persisted. A survivor carrying an unresolved
+  materialization job needs no extra settling route --- the job's armed
+  action covers it (#rref("sched.materialize.settlement")) and the next
+  dispatch sweep's probe partition re-classifies the rest. Vanished,
+  terminal, and interest-free survivors are skipped.
 ]
 The re-evaluation is what makes the recovery condemnation's co-ownership
 scoping (#rref("sched.recovery.failed-dep-cascade")) sound as a pair: a
@@ -768,15 +767,17 @@ registration, draining, degraded, or connecting state left to report.
   path since the controller polls it every reconcile tick.
 ]
 
-#r("sched.admin.clear-poison+2")[
+#r("sched.admin.clear-poison+3")[
   `AdminService.ClearPoison` resets both PostgreSQL (`db.clear_poison()`:
   status and `poisoned_at`, joined by the `poison_cleared` ledger reset row
   --- migration 075 dropped the retry-mirror columns, so the attempt ledger
   is the only failure history) and in-memory state (the node is removed
   from the DAG so the next submit re-inserts it fresh); removing the Poisoned
-  (by definition un-produced) child MUST stamp the `closure_hole` breadcrumb
-  on each surviving parent, in memory and best-effort in PG
-  (#rref("sched.evidence.closure-hole")). Returns `cleared=true`
+  (by definition un-produced) child MUST run the surviving-parent
+  re-evaluation (#rref("sched.poison.clear-survivor-reevaluation")) --- the
+  truncation needs no durable breadcrumb, because closure evidence is
+  classified from the durable relation at decision time
+  (#rref("sched.materialize.routing")). Returns `cleared=true`
   only if both succeed. PG is cleared FIRST: if the PG clear fails, the
   in-memory state is left untouched (still Poisoned) and `false` is returned,
   so the operator's retry finds the derivation still poisoned and can proceed
@@ -998,27 +999,26 @@ than in a scheduler-side stream count.
   in the priority queue is updated.
 ]
 
-#r("sched.merge.wanted-outputs+2")[
+#r("sched.merge.wanted-outputs+3")[
   The cache-hit and substitutability classification of a derivation MUST be
-  evaluated over its *wanted* outputs only. Each submission contributes, per
-  node, the union of the output names referenced by any consumer's `inputDrvs`
-  entry for it and the root request's output selection, with an empty
-  contribution meaning every declared output. Two derived sets MUST be kept
-  distinct. The *stored* per-node union MUST only ever grow --- unioned across
-  consumers within one submission, across roots of a multi-root submission,
-  across concurrent builds merging the same derivation, and across rows in the
-  persistence upsert --- and serves as the persistence/recovery fallback. The
-  *effective* wanted set used for classification is the saturating union of
-  the wanted contributions of LIVE (non-terminal) interested builds: a
-  terminal build's contribution stops counting, and classification MUST fall
-  back to the stored union when live contributions are unavailable
-  (post-failover, pre-feature rows, or no live interested builds). The
-  assignment-token output allowlist, the GC pin set, and the client-facing
-  output report MUST continue to cover every declared output. A wanted set
-  that resolves to no verifiable concrete path MUST take a conservative
-  branch --- fall back to the all-declared criterion, or treat the derivation
-  as unavailable/unclassifiable --- rather than vacuously classifying it as
-  available.
+  evaluated over its *wanted* outputs only. Every merge MUST durably record,
+  per (build, derivation), the union of the output names referenced by any
+  consumer's `inputDrvs` entry and the root request's output selection
+  (empty = every declared output) in the per-build wanted relation
+  (`build_wanted_outputs`), inside the merge transaction; a build's
+  re-submission replaces that build's own row and MUST NOT modify any other
+  build's row. The *effective* wanted set used for classification is the
+  saturating union of the wanted rows of LIVE (non-terminal) interested
+  builds, with a live interested build that has no row contributing every
+  declared output (the conservative branch); a terminal build's row stops
+  counting. The assignment-token output allowlist, the GC pin set, and the
+  client-facing output report MUST continue to cover every declared output.
+  A wanted set that resolves to no verifiable concrete path MUST take a
+  conservative branch --- fall back to the all-declared criterion, or treat
+  the derivation as unavailable/unclassifiable --- rather than vacuously
+  classifying it as available. The in-memory contribution view is a
+  droppable cache of the relation: rebuilt from it at recovery, never
+  reconciled, never written back.
 ]
 A missing output that nothing consumes (the `-debug` output of a multi-output
 derivation) must not condemn the derivation --- and, through dependency
@@ -1031,13 +1031,17 @@ builds because a terminal or cancelled build's wants must not keep pinning a
 shared node: under a never-shrinking classification union, one wide
 submission that has long since failed or been cancelled forces every later
 narrow re-merge to keep resetting, re-fetching, or rebuilding outputs nothing
-live asks for --- the incident class that motivated live-scoping. Per-build
-contributions are in-memory only on this branch (nothing per-build is
-persisted): after a leader failover the effective set degrades conservatively
-to the stored union until the recovered pre-failover builds go terminal ---
-recovery rebuilds their interest but not their contributions, and they never
-re-merge, so only their terminal cleanup ends the degradation (builds
-submitted after the failover record contributions as usual).
+live asks for --- the incident class that motivated live-scoping. The
+same-build replace semantics is the B5 supersession (counter-signed per the
+F5/PP-5 calibration record): the durable relation makes the post-failover
+effective union exact --- recovery rebuilds the contribution cache from
+`build_wanted_outputs`, so a recovered build's width survives the failover.
+The conservative no-row branch covers only the pre-relation residue (builds
+merged before the relation existed): their width saturates to all-declared
+--- wider-or-equal, never narrower --- until they go terminal, observable via
+the saturation counter and warn (the recorded D-prime wanted-width
+transition residual). The walk-era stored per-node union column (migration
+062) and its only-grows fallback semantics were retired with migration 080.
 
 #r("sched.merge.substitute-probe")[
   The merge-time cache check (`check_cached_outputs`) MUST forward the
@@ -1048,34 +1052,33 @@ submitted after the failover record contributions as usual).
   builds for paths the store could fetch.
 ]
 
-#r("sched.merge.substitute-probe-indeterminate")[
+#r("sched.merge.substitute-probe-indeterminate+2")[
   The store's upstream HEAD probe MUST report paths it could not classify
   (every upstream returned 429 / 5xx / timed out, or the per-call deadline cut
   the pass short) in `FindMissingPathsResponse.indeterminate_paths`, distinct
   from confirmed-miss. The scheduler --- at BOTH the merge-time check and the
   dispatch-time `batch_probe_cached_ready` re-check --- MUST treat
-  indeterminate the same as substitutable: route to the detached substitute
-  fetch and let its failure path (`SubstituteComplete{ok=false}` →
-  `substitute_tried`) fall through to build. Treating indeterminate as
+  indeterminate the same as substitutable: create the materialization job
+  (the optimistic creation --- indeterminate is never confirmation of a miss)
+  and let the job's consumption routing own the outcome
+  (#rref("sched.materialize.routing") --- a genuinely missing path resolves
+  from-source there). Treating indeterminate as
   confirmed-miss dispatches builders for paths that ARE in cache.nixos.org
   whenever a fresh-wipe burst trips Fastly's edge rate-limit.
 ]
 
-#r("sched.merge.substitute-fetch")[
-  Before marking a substitutable-probed derivation as completed, the scheduler
-  MUST eagerly trigger the store's NAR fetch for each substitutable path by
-  issuing `QueryPathInfo` with the session JWT. `FindMissingPaths`'s probe is
-  HEAD-only; the builder's later FUSE `GetPath` calls carry no JWT (`&[]`
-  metadata) so the store's `try_substitute_on_miss` short-circuits and the
-  build fails with ENOENT on inputs the scheduler claimed were cached. Fetches
-  MUST be issued concurrently with a bounded in-flight cap (a DAG can have
-  hundreds of substitutable paths; unbounded fan-out saturates the store's S3
-  connection pool and causes false demotes), and each fetch bounded by the
-  actor's gRPC timeout, since the call blocks the single-threaded actor event
-  loop. A fetch that fails or returns NotFound demotes that path from the
-  substitutable set --- the derivation falls through to normal dispatch instead
-  of being marked completed against a phantom cache hit.
-]
+*Retired (Phase D-prime --- the eager walk-seed fetch):*
+`sched.merge.substitute-fetch` required the scheduler to eagerly issue
+`QueryPathInfo` for each substitutable-probed path (the walk-seed fetch) so a
+derivation was never marked completed against a phantom HEAD hit. The eager
+fetch and its caller died with the walk (Wave D3). The obligation's surviving
+carrier: a substitutable-probed node is never completed against a HEAD
+verdict at all --- it gets a materialization job, the store executor performs
+the actual fetch-and-ingest, and only the Success consumption's coverage
+re-check completes the node (#rref("sched.materialize.routing"); creation and
+the at-most-one-unresolved dedup are #rref("sched.materialize.job")). The
+builder-FUSE tenant-context gap the rule documented is likewise owned by the
+executor's tenant re-resolution (#rref("store.materialize.executor")).
 
 #r("sched.merge.ca-fod-substitute")[
   The path-based lane of `check_cached_outputs` MUST cover every probe-set node
@@ -1089,7 +1092,7 @@ submitted after the failover record contributions as usual).
   origin URL.
 ]
 
-#r("sched.merge.substitute-topdown+12")[
+#r("sched.merge.substitute-topdown+13")[
   Before merging a submission's full DAG, the scheduler MUST first check
   whether the submission's *demand set* --- its structural roots (nodes with
   no parent edge in the submission) ∪ every node the client explicitly
@@ -1104,57 +1107,21 @@ submitted after the failover record contributions as usual).
   DAG. The prune is all-or-nothing over the demand set; when it fires, the
   kept submission is the demand set: kept nodes are merged dep-less,
   completed inline when their wanted outputs are already present in the
-  store and otherwise routed to the deferred upstream fetch
-  (#rref("sched.substitute.detached"), no inline `QueryPathInfo`); kept
-  nodes whose dependency closure the prune dropped (a kept node whose
+  store, and otherwise given a materialization job created inside the merge
+  transaction (#rref("sched.materialize.job")), with `origin = 'pruned'` for
+  kept nodes whose dependency closure the prune dropped (a kept node whose
   dependencies are already produced in the DAG, or one with no closure to
-  drop, is not marked) are marked `topdown_pruned` --- a mark that MUST
-  be applied only after the merge has committed, MUST be persisted and
-  restored at leader-failover recovery, and MUST be cleared (in PG and in
-  memory) only once the node's children are all already produced in the
-  DAG and no un-produced child has been reaped out from under it since
-  (the closure-hole breadcrumb is recorded in memory and persisted
-  alongside the mark, is carried across a resubmit retry of the node, and is
-  dropped when a later full merge re-declares its edges), or
-  when the fail-fast below consumes it --- a merge that gives it only
-  unbuilt children leaves the mark in place. The scheduler MUST
-  fall through to the full merge and the bottom-up `check_cached_outputs`
-  when any demanded node's criterion set contains a wanted output that is
-  missing and not substitutable, when a demanded node's own selector
-  resolves to no declared output, when a criterion set resolves to no
-  verifiable path, or on any other uncertainty (store unreachable,
-  floating-CA demanded node). A `topdown_pruned` node whose current DAG
-  children no longer cover its pruned input closure --- childless, or left
-  with a closure hole because an un-produced child was removed out from
-  under it (reaped by a terminal interested build's cleanup, removed by a
-  poison clear, or dropped at recovery as a lost edge) --- MUST NOT be
-  dispatched as a from-source build, and MUST NOT take the
-  resubmit-directing fail-fast while its live effective wanted outputs are
-  obtainable: every fail-fast decision point --- the substitute-completion
-  routing (`SubstituteComplete{ok=false}`), the dispatch-probe partition
-  (wanted outputs that can neither be completed inline nor routed to
-  substitution), and the terminal-build reap's survivor pass --- MUST first
-  re-probe the live effective wanted set and route an obtainable node
-  (every live-wanted output present, substitutable, or indeterminate) to a
-  closure-re-verifying substitution walk
-  (#rref("sched.evidence.settlement")), at most one such verification walk
-  per `substitute_tried` arming; only a
-  confirmed-missing-and-unsubstitutable answer, or a failed verification
-  walk (the spent one-shot), takes the fail-fast: the scheduler MUST then
-  fail every interested build with a resubmit-directing error --- the
-  dependency subgraph was dropped, so the worker cannot resolve `inputDrvs`
-  --- and this MUST hold across leader failover. Pull admission MUST refuse
-  to mint a from-source attempt for a Ready node in this state ---
-  `NotYetReady`, no attempt row, no status change, and deliberately not a
-  fail-fast (the pull carries no store verdict) --- leaving settlement to the
-  dispatch sweep's probe/walk/fail-fast arms; and the reap-time
-  re-evaluation of surviving parents MUST skip survivors that are
-  `Substituting`/`Assigned`/`Running` --- an in-flight walk or open attempt
-  keeps its chance to settle the node, and the pull-admission refusal is
-  what keeps new from-source attempts from opening on it meanwhile --- and
-  MUST route `Queued` survivors through the promotion arm (vacuously
-  all-deps-completed after the reap) so the next dispatch sweep's
-  settlement covers them.
+  drop, is not pruned-origin) --- the durable record that from-source
+  dispatch of this node is doomed, consumed by the settlement arm of
+  #rref("sched.materialize.routing"). A later creation that dedups onto this
+  node's unresolved job MUST NOT lose the pruned classification (the
+  pruned-wins in-place origin upgrade, armament preserved). The scheduler
+  MUST fall through to the full merge and the bottom-up
+  `check_cached_outputs` when any demanded node's criterion set contains a
+  wanted output that is missing and not substitutable, when a demanded
+  node's own selector resolves to no declared output, when a criterion set
+  resolves to no verifiable path, or on any other uncertainty (store
+  unreachable, floating-CA demanded node).
 ]
 The prune short-circuits the common case where a requested package is already
 cached upstream: instead of eager-fetching hundreds of dependency NARs (the
@@ -1172,253 +1139,185 @@ dependency closure while another live build's wants keep the node on the
 from-source path, leaving this build hostage to that interest staying alive.
 The own-selector resolvability guard covers the fallback corner where no
 prior interested build is live and post-merge classification degrades to
-exactly this submission's (possibly bogus) selector. The `topdown_pruned`
-stamp waits for the committed merge because merge rollback does not revert
-it: stamping before the fallible cache-check and persist steps would leak a
-rejected build's prune verdict onto a shared pre-existing childless node, and
-a later routine fetch failure would terminally fail innocent builds through
-the fail-fast arm. The flag is persisted (migration 063, OR-on-conflict on
-upsert, cleared --- by the post-reconciliation clear pass at merge time when
-those children are already produced and verified, by the completion-time
-clear when children become produced, by the recovery-time gate that
-drops a restored mark whose persisted children are all produced and vouched
-for by a still-live build that also owns the parent, or by the
-lazy walk-failure clear when a failed detached fetch finds the node's
-children already produced ---
-otherwise the mark stays until they produce or the fail-fast consumes it)
-because the post-failover shape
-is exactly where the from-source hazard bites: the recovered node is
-childless and re-probed against the stored wanted union (migration 062,
-empty = all declared) ---
-routinely wider than the prune-time criterion --- so an output the prune
-never vouched for can be definitively missing at dispatch time; without the
-restored flag the node would be left Ready and handed a doomed from-source
-dispatch whose `inputDrvs` were never merged. The closure-hole breadcrumb is
-persisted alongside the mark (migration 064, OR-on-conflict, written
-best-effort by the leader's terminal-build reap hook, by the poison-clear
-paths --- the admin clear and the poison-TTL sweep, whose removal of a
-Poisoned child is the same truncation --- and by recovery itself when it
-drops an edge to an un-produced terminal child of a restored parent, the
-recovery-side analogue of that reap; restored at recovery, and cleared
-alongside a produced-children mark clear or by the merge-time heal --- the
-fail-fast consumes only the mark and leaves the breadcrumb for the resubmit
-it directs) so the recovery-time
-gate keeps refusing to treat a reap-truncated persisted child set as
-produced-closure evidence: the reaped un-produced child's own row and edge
-can be GC'd before the failover, and without the durable breadcrumb the
-surviving produced siblings would launder the clear and re-arm exactly that
-doomed dispatch.
+exactly this submission's (possibly bogus) selector. The pruned
+classification rides the job row inside the merge transaction, so a rolled
+back merge leaves neither a job nor a pruned verdict (in-tx atomicity ---
+the predecessor mark needed an explicit stamp-after-commit rule for exactly
+this; the job row gets it structurally), it survives leader failover with
+the row, and it ends with the row's resolution (success, from-source, the
+fail-fast, cancellation, obsolescence) --- there is no clear lifecycle. The
+fail-fast obligation itself --- a pruned-origin node whose live-wanted
+outputs prove unobtainable MUST fail with the resubmit-directing error
+rather than a doomed from-source dispatch, across failover --- moved to (and
+is normed by) #rref("sched.materialize.routing"): the routing's settlement
+arm reads the durable child relation and the job's origin at decision time,
+which replaced the predecessor's persisted mark/closure-hole breadcrumb pair
+(migrations 063/064, retired by migration 080) and the recovery-time
+clear/restore gates that policed them. HISTORY: through Phase D-prime the
+walk-era form of this rule additionally normed the `topdown_pruned` stamp
+lifecycle, the closure-hole breadcrumb, the verification-walk settlement,
+the `substitute_tried` one-shot and the pull-admission refusal; those
+mechanisms were deleted (Waves D3-D6) --- admission refusal is the
+unresolved-job arm of #rref("sched.materialize.job"), and reap-survivor
+re-evaluation is #rref("sched.poison.clear-survivor-reevaluation")'s loop at
+the reap site with jobs as the armed action.
 
-#r("sched.evidence.closure-hole")[
-  The `closure_hole` breadcrumb records that an un-produced child was removed
-  out from under a surviving parent, leaving that parent's remaining child set
-  a truncated view of its pruned input closure. Every production removal of an
-  un-produced child from a surviving parent MUST set the breadcrumb on that
-  parent --- in memory at the removal site and best-effort in PG: the
-  terminal-build reap, the admin poison clear, the poison-TTL sweep, and the
-  recovery-time drop of an edge to an un-produced terminal child. A node
-  carrying the breadcrumb MUST classify as Broken closure evidence
-  (#rref("sched.merge.substitute-topdown")): its child set MUST NOT vouch for
-  a from-source dispatch, exempt it from the `topdown_pruned` stamp, or
-  launder a mark clear, however many of its surviving children are produced.
-  The breadcrumb MUST be persisted OR-on-conflict alongside the mark
-  (migration 064), restored at leader-failover recovery, carried across a
-  resubmit-reset of the node, and retained across the node's own completion.
-  It MUST be cleared only by the merge-time heal --- a full merge that
-  re-declares the node's edges, applied to every edge parent of that
-  submission regardless of the in-memory bit --- or together with the mark by
-  the Vouched-keyed both-bits clear, whose statement also mops up a markless
-  leftover persisted hole; the mark-only clears (the fail-fast consume and the
-  lazy walk-failure clear) MUST retain it. The removal sites do not filter on
-  `topdown_pruned`: the breadcrumb MAY be set on unmarked parents, where it
-  MUST stay inert for dispatch decisions (every consumer also requires the
-  mark) and only withholds the stamp-time Vouched exemption from a later
-  pruned merge of that node.
+*Retired (Phase D-prime --- the closure-hole breadcrumb):*
+`sched.evidence.closure-hole` normed the durable breadcrumb (migration 064)
+that recorded "an un-produced child was removed out from under a surviving
+parent", so a truncated child set could not launder a from-source dispatch
+through the produced survivors. The breadcrumb, its four stamping sites, the
+recovery restore, the merge-time heal and the Vouched-keyed clears were
+deleted (Wave D5; column dropped by migration 080). The hazard it guarded is
+owned by durable-relation classification at decision time
+(#rref("sched.materialize.routing")): the settlement arm classifies closure
+evidence from the persisted edges, the children's persisted statuses AND the
+live co-owning build links --- produced children vouched only by terminal
+builds classify Broken, so a reap-truncated or stale child set cannot read
+as Vouched and no breadcrumb is needed (the relation read is never a
+truncated in-memory view).
+
+#r("sched.evidence.durability+3")[
+  A durable scheduler write whose loss would leave PG missing state the
+  in-memory view relies on MUST be transactional with the state it
+  describes: materialization-job creation rides the merge transaction for
+  merge-originated classifications --- the row upsert, the edge and
+  `build_derivations` inserts, the per-build wanted rows
+  (#rref("sched.merge.wanted-outputs")) and the job rows
+  (#rref("sched.materialize.job")), with the Pending→Active build activation
+  as the final statement --- so a rejected merge leaves no durable trace and
+  a committed merge cannot lose one.
+
+  Every durable scheduler write --- the merge transaction (links, edges,
+  wanted rows, job rows, activation), every job-table write (creation,
+  claim, resolution, park, the pruned-origin upgrade), every wanted-relation
+  write, and every derivation-status / poison persistence (the pool-variant
+  writers and every transaction that carries their `_in_tx` bodies) --- MUST
+  carry the serving generation of the tenure that built the in-memory state
+  issuing the write (claimed by #rref("sched.lease.generation-claim") before
+  that tenure's recovery writes run) and MUST be applied only if that
+  generation is at or above the durable claims floor (`GREATEST` over
+  `assignments.generation` and `leader_generation_claims.generation`), read
+  on the same connection inside the same transaction as the write; a
+  below-floor write MUST roll back having written nothing. A best-effort
+  fenced write's ERROR failure is logged and MUST NOT fail the surrounding
+  operation --- a Fenced outcome is the fence working on a deposed replica,
+  not an error. For the multi-statement merge transaction the floor is
+  re-read immediately before commit; the residual window for every fenced
+  write is one floor-read-to-commit round trip (a window-narrowing fence,
+  not a serializability proof). The comparison is at-or-above (`>=`): a
+  write carrying a generation equal to the floor is the same-epoch
+  re-acquire keep that #rref("sched.lease.generation-claim") requires, and
+  MUST apply.
 ]
-The breadcrumb exists because the produced survivors of a truncated child set
-look exactly like a vouched closure to every children-keyed judgment; the
-fail-fast retains it so the directed resubmit it solicits re-stamps the node
-instead of reading those survivors as Vouched (the resubmit-reset keeps the
-truncated edges and carries the breadcrumb with them), and the heal is total
---- not keyed on the in-memory bit --- because the persisted copy can be stale
-relative to a reaped-and-reinserted or recovered-as-stub in-memory node whose
-field sits at its `false` default.
+The in-tx-or-fenced split is the load-bearing durability decision, carried
+over from the predecessor evidence design: state whose loss would make the
+scheduler PERMISSIVE (a job row or wanted row missing while the in-memory
+view dispatches against it) rides the transaction that creates the demand;
+state whose staleness only makes it CONSERVATIVE may be best-effort fenced.
+HISTORY: through Phase D-prime this rule additionally normed the
+`topdown_pruned` stamp's in-tx placement, the OR-on-conflict monotonicity of
+both evidence columns, and the best-effort clear/heal/hole-stamp statements;
+those columns and statements were deleted (Wave D5, migration 080) --- the
+pruned verdict now rides the job row in the same transaction, which is the
+identical guarantee with no separate stamp to police.
 
-#r("sched.evidence.durability+2")[
-  The `topdown_pruned` stamp MUST be written inside the same transaction that
-  persists the pruned merge --- the row upsert, the edge and
-  `build_derivations` inserts, and the Pending→Active build activation as the
-  final statement --- so a rejected merge leaves no durable stamp and a
-  committed merge cannot lose it; the in-memory stamp MUST be applied only
-  after that transaction commits. Every other durable evidence write --- the
-  Vouched-keyed both-bits clear, the mark-only clear, the closure-hole stamp,
-  and the heal --- is best-effort: a generation-fenced single-statement
-  transaction (claims-floor read + the write, rolled back having written
-  nothing when the serving generation is below the floor), issued after the
-  corresponding in-memory mutation, whose ERROR failure is logged and MUST
-  NOT fail the surrounding operation --- a Fenced outcome is the fence
-  working on a deposed replica, not an error. The merge
-  upsert MUST be monotone for both evidence columns (OR-on-conflict): no
-  merge --- pruned or not --- may clear `topdown_pruned` or `closure_hole`
-  through the upsert, and the persisted wanted-output union MUST only grow
-  (empty-saturating, #rref("sched.merge.wanted-outputs")). Best-effort loss
-  is acceptable only in the stale-true direction (PG retains a mark or hole
-  the in-memory state already cleared): a write whose loss would leave PG
-  missing evidence the in-memory state relies on MUST either be transactional
-  with the state it describes (the stamp) or be re-derivable at the next
-  recovery (the closure-hole stamp, re-derived from the un-produced child's
-  persisted row and edges).
-
-  Every durable evidence write --- the merge transaction (stamp, links,
-  edges, activation), the Vouched-keyed both-bits clear, the mark-only
-  clear, the closure-hole stamp, the heal, and every derivation-status /
-  poison persistence (the pool-variant writers and every transaction that
-  carries their `_in_tx` bodies) --- MUST carry the serving generation of
-  the tenure that built the in-memory state issuing the write (claimed by
-  #rref("sched.lease.generation-claim") before that tenure's evidence writes
-  run) and MUST be applied only if that generation is at or above the
-  durable claims floor (`GREATEST` over `assignments.generation` and
-  `leader_generation_claims.generation`), read on the same connection inside
-  the same transaction as the write; a below-floor write MUST roll back
-  having written nothing. For the multi-statement merge transaction the
-  floor is re-read immediately before commit; the residual window for every
-  fenced write is one floor-read-to-commit round trip (a window-narrowing
-  fence, not a serializability proof). The comparison is at-or-above
-  (`>=`): a write carrying a generation equal to the floor is the
-  same-epoch re-acquire keep that #rref("sched.lease.generation-claim")
-  requires, and MUST apply.
-]
-A lost clear is absorbed by the next recovery's produced-children gate or
-costs at most one bounded resubmit-directing fail-fast after a failover ---
-never a doomed from-source dispatch --- which is why the clears may be
-best-effort while the stamp may not. The asymmetry is the load-bearing
-durability decision of the evidence design: stale-true evidence makes the
-scheduler conservative (refuse from-source work, at worst fail a build with
-the resubmit-directing error), stale-false evidence would make it permissive
-(dispatch a node whose closure was never merged), so only the former is
-tolerated outside the merge transaction.
-
-Fencing posture for evidence writes: the uniform claims-floor fence above is
-normative as of Phase 1 of the closure-evidence campaign (the 2026-05-30
-owner decision, "fence everything" / design option D15(b)), replacing the
-original entry-time-leader-checks-only posture. The deciding evidence was
-the campaign's stale-tenure model results (the A17 stale-override and A18
-deposed-writer probes,
+Fencing posture: the uniform claims-floor fence above is normative as of
+Phase 1 of the closure-evidence campaign (the 2026-05-30 owner decision,
+"fence everything" / design option D15(b)), replacing the original
+entry-time-leader-checks-only posture, and Phase D-prime kept it
+column-agnostic: job-table and wanted-relation writes feed the same fence
+and the same `rio_scheduler_evidence_write_fenced_total` counter. The
+deciding evidence was the campaign's stale-tenure model results (the A17
+stale-override and A18 deposed-writer probes,
 `docs/spec/models/closure-evidence-invariant-map.md`): entry-time gates
 cannot close the deposed-believer window --- a replica deposed after a
 handler's entry check (or after the SubmitBuild enqueue check, for the
-otherwise-ungated MergeDag handler) keeps issuing evidence writes for up to
+otherwise-ungated MergeDag handler) keeps issuing durable writes for up to
 the lease self-fence interval plus in-flight handler work
-(#rref("sched.lease.self-fence")), racing the successor's recovery gate and
-recovery hole stamp. What the fence guarantees: a deposed tenure's evidence
-write never lands once a successor's claim is durable (narrowed to the one
-floor-read-to-commit round trip stated in the rule). What it does not
-guarantee: serializability across the residual window, and it does not
-cover work that is not a PG evidence write at all --- same-epoch in-flight
-work (required to survive, per the `>=` comparison), walk-completion
-consumption (in-memory; covered by the model's walk-identity abstraction,
-whose cross-tenure witness stays reachable), and the documented
-Lease-deletion-plus-PG-fault conjunction
-(#rref("sched.lease.generation-claim") residuals). The serving-generation
-capture is tenure-tracking, not per-command: the value is stamped at the
-generation claim that precedes the tenure's recovery writes and is never
-re-read from the lease atomic mid-tenure, so a new leader's own recovery
-writes always pass (the claim made them the floor) while commands queued
-under a deposed tenure keep carrying the deposed generation and are
+(#rref("sched.lease.self-fence")), racing the successor's recovery. What the
+fence guarantees: a deposed tenure's durable write never lands once a
+successor's claim is durable (narrowed to the one floor-read-to-commit round
+trip stated in the rule). What it does not guarantee: serializability across
+the residual window, and it does not cover work that is not a PG write at
+all --- same-epoch in-flight work (required to survive, per the `>=`
+comparison) and the documented Lease-deletion-plus-PG-fault conjunction
+(#rref("sched.lease.generation-claim") residuals); the model-level oracle is
+`fencedJobWritesOnly` (the materialization stale-tenure regime). The
+serving-generation capture is tenure-tracking, not per-command: the value is
+stamped at the generation claim that precedes the tenure's recovery writes
+and is never re-read from the lease atomic mid-tenure, so a new leader's own
+recovery writes always pass (the claim made them the floor) while commands
+queued under a deposed tenure keep carrying the deposed generation and are
 refused.
 
-Accepted residuals of the evidence lifecycle, recorded so operators have the
-recovery answer (in every shape it is: resubmit the build --- the
-resubmitting merge re-probes, re-prunes, or full-merges as appropriate).
-(a) Expired-at-load poison: a Poisoned row already past its 24 h TTL when a
-recovery loads it is reset to `created` before the recovery hole-stamp query
-runs, so a parent whose only truncation evidence was that row recovers
-without the breadcrumb; reachable only when no leader ran for longer than
-the TTL. (b) Lost hole stamp: losing the best-effort closure-hole write alone
-is self-healing --- the next recovery re-derives the hole from the
-un-produced child's still-linked row --- and erasing that re-derivable
-evidence requires, in addition, every linking builds row to be removed (an
-external builds-row purge; no in-tree path deletes a terminal build's builds
-row) and the row GC to run before the next recovery
-(#rref("sched.db.derivations-gc")). (c) GC after vouch: outputs that
-justified a clear, a heal, or a successful walk are not pinned at that
-moment, so the store GC may remove them later. A walk-completed node whose
-outputs are lost is re-detected by the stale-completed verify at the next
-merge that touches it (#rref("sched.merge.stale-completed-verify")) or by a
-dependent's builder ENOENT and retry; a mark or hole cleared on
-children-produced evidence whose children outputs are later GC'd has no
-probe-time re-detection (the dispatch probe checks only the node's own
-wanted outputs), and surfaces as a generic builder ENOENT/retry/poison
-failure rather than the resubmit-directing error.
+Accepted residuals, recorded so operators have the recovery answer (in
+every shape it is: resubmit the build --- the resubmitting merge re-probes,
+re-prunes, or full-merges as appropriate). (a) GC after vouch: outputs that
+justified a from-source routing (durable Vouched evidence) are not pinned at
+that moment, so the store GC may remove them later; a materialized node's
+own outputs ARE pinned at ingest (#rref("sched.materialize.pinning")), and a
+completed node whose outputs are lost is re-detected by the stale-completed
+verify at the next merge that touches it
+(#rref("sched.merge.stale-completed-verify")) or by a dependent's builder
+ENOENT and retry. (b) The D-prime transition residuals: a pre-deletion-era
+pruned mark without a job row lost its routing effect when the columns
+retired --- such a node re-enters via the probe partition and, if its
+upstream later vanished, fails as a normal build failure rather than with
+the resubmit-directing error (bounded, self-identifying in logs, recovered
+by resubmission); and pre-relation builds' effective wanted width saturates
+to all-declared post-failover (wider-only; the saturation counter + warn).
 
-#r("sched.evidence.settlement")[
-  Every derivation that carries the `topdown_pruned` mark with Broken closure
-  evidence and at least one live interested build MUST settle within the
-  current tenure: the scheduler MUST keep a settling step armed for it ---
-  complete it inline from the store, route it to a substitution walk, or take
-  the resubmit-directing fail-fast --- rather than leaving it parked Ready
-  while pull admission refuses to mint for it. In particular, a marked Broken
-  node whose walk has already been tried (`substitute_tried`) and whose
-  wanted outputs the store probe reports present MUST NOT be left with no
-  action by the dispatch sweep: it MUST either be completed (with its closure
-  re-verified) or fail-fasted with the resubmit-directing error.
-]
-This is the settlement obligation adopted for the closure-evidence campaign
-(its D16 finding). Pre-settlement, the dispatch probe's present-but-tried
-cell violated it: such a node took the probe partition's all-present branch
-and got no action --- not completed inline (already tried), not routed to a
-walk (already tried), not fail-fasted (that arm is the else of the missing
-branch) --- while `admit_pull` kept refusing it `NotYetReady`, and when its
-hole came from a poison-clear path there was no reap-hook survivor pass to
-re-evaluate it; it sat Ready until a new merge, completion, or failover
-changed its state. The settling arm is the model-adjudicated one (the
-campaign's OQ1 adjudication, recorded in
-`docs/spec/models/closure-evidence-invariant-map.md`): an obtainable node is
-routed to a *closure-re-verifying substitution walk* --- never completed
-inline directly --- because FMP presence covers output paths only and a
-tried node's earlier walk may have ingested the seed then failed on a
-reference, so "present" can hide a closure hole that only the walk's own
-reference traversal re-verifies; the walk's `ok=true` completion is what
-satisfies "completed (with its closure re-verified)", and its genuine
-failure lands back at the Broken arm with the one-shot spent and takes the
-fail-fast there. Direct inline completion would re-open the closure-hole
-hazard, and an unconditional fail-fast is wrongful for outputs that became
-obtainable during the walk (the C3 defect class). The settlement bounds
-wrongful terminal failures to at most one per `substitute_tried` arming (the
-campaign's C1 bound) and eliminates them entirely only in the
-no-failover / no-store-fault / no-upstream-withdrawal envelope (C3's scope);
-a co-build with genuinely unobtainable wanted outputs still fails all
-interested builds of the node (the verdict is per-node, not per-build).
+*Retired with transfer (Phase D-prime --- the settlement obligation moved):*
+`sched.evidence.settlement` required every `topdown_pruned`-marked
+Broken-evidence node with live interest to keep a settling step armed
+(inline completion, walk, or fail-fast) instead of parking Ready behind the
+pull-admission refusal --- the closure-evidence campaign's D16 finding, in
+the armed-state form. The mark, the walk, the `substitute_tried` one-shot
+and the refusal arm were all deleted (Waves D3-D5), and with them the
+present-but-tried limbo cell the rule existed to close (unconstructible
+post-deletion). The obligation TRANSFERS to
+#rref("sched.materialize.settlement"): every unresolved materialization job
+must have an armed action, which subsumes the old rule's subject --- a
+pruned-origin node's settlement is its job's claim/consumption/park
+lifecycle, and the wrongful-fail-fast bound is carried by the routing's
+same-transaction re-probe (#rref("sched.materialize.routing")).
 
-#r("sched.materialize.job")[
-  When materialization dispatch is enabled, the scheduler MUST express "make
-  this derivation's live-wanted outputs present in rio-store" as a durable
-  materialization-job row created atomically with the classification that
-  demanded it --- inside the merge transaction for merge-originated
-  classifications (merge classification, prune, stale-Completed verify),
-  through its own claims-floor-fenced transaction for the dispatch-probe
-  partition --- with at most one unresolved job per derivation
-  (database-enforced), with the creating build's tenant recorded, and with
-  every job-table write fenced by the durable claims floor. A job MUST
+#r("sched.materialize.job+2")[
+  The scheduler MUST express "make this derivation's live-wanted outputs
+  present in rio-store" as a durable materialization-job row created
+  atomically with the classification that demanded it --- inside the merge
+  transaction for merge-originated classifications (merge classification,
+  prune, stale-Completed verify), through its own claims-floor-fenced
+  transaction for the dispatch-probe partition --- with at most one
+  unresolved job per derivation (database-enforced), with the creating
+  build's tenant recorded, and with every job-table write fenced by the
+  durable claims floor. While a derivation carries an unresolved job, pull
+  admission MUST NOT mint a from-source build attempt for it (the JobView
+  arm: NotYetReady, no attempt row, no status change). A job MUST
   resolve only through: an exec_id-keyed consumption outcome, obsolescence
   on the node producing by other means, or cancellation when no live
   DAG-interested build remains.
 ]
 This is the substitution-replacement campaign's job lifecycle (design §2.1/§6,
-adjudications OQ3/OQ6). Phase A landed the mechanism dormant behind
-`scheduler.materialization.enabled = false`; Phase B activated it at the
-deployment layer: the helm values default the flag ON for both components (the
-cutover switch), while the Rust struct defaults stay `false` --- a bare binary
-without deployment configuration runs the as-built walk. The
+adjudications OQ3/OQ6). HISTORY: Phase A landed the mechanism dormant behind a
+coexistence flag, Phase B activated it at the deployment layer, and Phase
+D-prime deleted the flag and the predecessor walk --- the job is the only
+substitution mechanism and creation is unconditional. The
 per-(build, derivation) wanted relation (`build_wanted_outputs`) is written by
-every merge for every pair when the flag is on, and materialization interest is
+every merge for every pair, and materialization interest is
 always DERIVED from it by a live-build join --- never registered separately
 (review finding AS-1). The dedup mirrors the C3 protection: N builds requesting
 the same derivation concurrently produce one job, enforced by the
 `materialization_jobs_unresolved` partial-unique index instead of by in-memory
-status checks.
+status checks; a pruned merge deduping onto the existing unresolved job
+upgrades its origin in place (pruned-wins,
+#rref("sched.merge.substitute-topdown")). The unresolved-job admission refusal
+is the successor of the walk-era must-substitute pull interlock (kind-aware:
+materialization-kind claims are the one exception,
+#rref("sched.state.machine")).
 
-#r("sched.materialize.routing+2")[
+#r("sched.materialize.routing+3")[
   A materialization outcome MUST be consumed in exactly one fenced transaction
   keyed by its exec_id, and that transaction MUST re-read live interest and the
   live effective wanted set before acting: a Success outcome completes the node
@@ -1430,27 +1329,38 @@ status checks.
   and only then --- after a same-transaction store re-probe of the live wanted
   set confirms a live-wanted path missing-and-unsubstitutable, or after the
   per-job re-probe one-shot is spent --- the settlement arm, which MUST
-  discriminate on the topdown-pruned mark: a MARKED node fail-fasts every live
+  discriminate on the job's pruned origin (`origin = 'pruned'`, set at pruned
+  creation or by the pruned-wins dedup upgrade and read from the job row at
+  decision time): a PRUNED-origin job fail-fasts every live
   DAG-interested build with the resubmit-directing error (the prune
-  deliberately dropped its closure --- from-source is doomed); an UNMARKED node
-  MUST instead resolve from-source (the as-built walk never fail-fasts unmarked
-  nodes, whatever their evidence --- flag-state outcome equivalence requires
-  the same verdict from the materialization settlement). An InfraFailure
+  deliberately dropped its closure --- from-source is doomed); a non-pruned
+  job MUST instead resolve from-source (the predecessor walk never
+  fail-fasted unmarked nodes, whatever their evidence --- the recorded
+  equivalence, Phase B finding 11, preserved through the deletion). The
+  durable closure evidence consulted by the Vouched/Pending arms MUST be
+  classified from the persisted relation at decision time --- the declared
+  edges, the children's persisted statuses AND a live co-owning build link
+  for every produced child (produced children vouched only by terminal
+  builds classify Broken --- stale evidence never launders a from-source
+  dispatch). An InfraFailure
   outcome MUST never fail-fast and never route from-source; it re-arms the job
   within the materialization budget and parks it on exhaustion.
 ]
 The four-arm routing is the C3-settlement successor (design §2.4; review
 findings AS-2/PP-1/PP-3/BC-5). The same-transaction re-probe preserves CE-D4's
 recorded contract ("every fail-fast decision point re-probes live obtainability
-first") at the single surviving fail-fast site. The mark discriminator is the
-flag-state reachability mirror of that site: as-built, `must_substitute`
-(marked AND Broken closure evidence) is the only gate to
-`fail_fast_topdown_pruned_root`, so a node that was never pruned can never
-receive the resubmit-directing terminal error flag-off --- the settlement arm
-reserves the same verdict for marked nodes flag-on (the C3-class equivalence
-divergence; Phase B finding 11). Genuine leaves whose evidence is Broken by
-structure (childless) release to from-source dispatch and the build attempt
-proceeds. The Success coverage re-check
+first") at the single surviving fail-fast site. The pruned-origin
+discriminator preserves the predecessor reachability fact: in the walk era
+only a marked (pruned) node could reach the resubmit-directing fail-fast, so
+the settlement arm reserves the same verdict for pruned-origin jobs (the
+C3-class equivalence divergence; Phase B finding 11) --- the origin is the
+durable carrier the deleted mark column used to be (Wave D2.1). The
+three-part live-links criterion is the F9-class guard (Wave D2.2): PG retains
+a terminal build's completed children indefinitely, so without live-build
+scoping a previous-generation child set would classify Vouched and launder a
+stale closure into a doomed dispatch. Genuine leaves whose evidence is Broken
+by structure (childless) release to from-source dispatch and the build
+attempt proceeds. The Success coverage re-check
 closes the CE-17 class (interest grew between execution and consumption). The
 park-not-fail posture preserves B3 ("unknown never demotes"): infra evidence is
 never confirmation. Parking is *visible and alertable* --- the
@@ -1462,6 +1372,35 @@ durable closure evidence reads Vouched or Pending (the arm-1/arm-2 disposition
 applied outside a consumption), so a dead upstream can only ever stall nodes
 with no buildable dependency closure; those stay parked, alertable, and
 re-claimable at backoff expiry. (PD-20, discharged in Phase B.)
+
+#r("sched.materialize.settlement")[
+  Every unresolved materialization job MUST have an armed action: a pending
+  unparked job is claimable by any store replica; a claimed job settles
+  through outcome report or, on executor crash, the establishment sweep
+  (materialization-infra charged, never adopted, never parked at
+  establishment); a parked job is covered by the per-tick re-evaluation (a
+  Vouched/Pending-evidence park resolves from-source the moment its durable
+  closure evidence allows) and by backoff expiry (a Broken-evidence park ---
+  the stalled population --- un-parks for another claim cycle without
+  resetting the budget counter); and a job whose derivation has no live
+  DAG-interested build left is cancelled charge-free. This MUST hold across
+  leader failover: recovery rebuilds the job view faithfully (claim holders
+  and park expiries mirrored), so no unresolved job is left with no armed
+  action by a failover.
+]
+The armed-action totality is the transferred settlement obligation
+(predecessor: the walk-era `sched.evidence.settlement`, retired above ---
+its present-but-tried limbo cell is unconstructible post-deletion, and the
+job lifecycle's totality is the form the obligation takes when every
+substitution is a durable job). The stalled population is deliberately NOT
+an exception: parked Broken-evidence jobs stay visible
+(#(refs.metric)("rio_scheduler_materialization_stalled"), the MD-D1 alert)
+and re-claimable at expiry, so "armed" includes "alertably waiting with a
+wake-up edge" --- never "parked Ready with no action", which was the D16
+defect class. Model-level verification: `unresolvedJobAlwaysArmed` (view
+faithfulness, all five materialization regimes) with the F10/B5(a)
+calibration pins as its falsifiability pair; production verification: the
+armed-action totality test and the failover VM scenario.
 
 #r("sched.materialize.pinning")[
   Every store path a materialization job ingests or verifies present MUST be
@@ -1479,7 +1418,7 @@ fires at exactly the wrong time for materialization output pins --- its premise
 "terminal drv ⇒ inputs no longer in use" is true for build-input pins and false
 for materialization output pins.
 
-#r("sched.dispatch.fod-substitute+2")[
+#r("sched.dispatch.fod-substitute+3")[
   The dispatch-time store-check (`batch_probe_cached_ready` and the
   per-derivation `ready_check_or_spawn` fallback) MUST probe upstream
   substitutability for every Ready input-addressed derivation, not just FODs
@@ -1496,10 +1435,13 @@ for materialization output pins.
   to any interested build's tenant; the store MUST honour
   `x-rio-probe-tenant-id` only when the request carries a valid allowlisted
   service-token (an unauthenticated request cannot self-select a tenant).
-  Substitutable paths MUST be fetched (`QueryPathInfo` with the same metadata)
-  before the derivation is marked Completed --- builders' subsequent `GetPath`
-  calls have no tenant context, so the lazy `try_substitute_on_miss` cannot
-  fire there.
+  A missing-but-obtainable (substitutable or indeterminate) node MUST get a
+  materialization job (#rref("sched.materialize.job")) --- never an inline
+  completion against the HEAD verdict; only locally-present outputs complete
+  inline. The store executor performs the actual fetch with the tenant
+  context it re-resolves itself (#rref("store.materialize.executor")) ---
+  builders' subsequent `GetPath` calls have no tenant context, so the lazy
+  `try_substitute_on_miss` cannot fire there.
 ]
 
 #r("sched.substitute.eager-probe")[
@@ -1515,86 +1457,43 @@ for materialization output pins.
   whether 90s needs revisiting.
 ]
 
-#r("sched.merge.reconcile-order")[
+#r("sched.merge.reconcile-order+2")[
   In `reconcile_merged_state`, all dep-state corrections (cache-hit→Completed,
-  stale-Completed reset, reprobe-Poisoned→Substituting) MUST complete before
-  any dependent-verdict computation (reprobe-unlocked Queued→Ready,
-  `seed_initial_states`). A pending-substitute reprobe node MUST transition
-  →Substituting before `seed_initial_states` reads
+  stale-Completed reset, the reprobe-Poisoned reset --- `poison_cleared`
+  ledger row plus the dep-derived status, the AS-5 6d slot) MUST complete
+  before any dependent-verdict computation (reprobe-unlocked Queued→Ready,
+  `seed_initial_states`). A reprobed previously-Poisoned node MUST be reset
+  out of Poisoned before `seed_initial_states` reads
   `any_co_owned_dep_terminally_failed` for its dependents.
 ]
 
-#r("sched.admin.snapshot-substituting+2")[
-  `ClusterStatus` MUST report `substituting_derivations`. The snapshot match
-  over `DerivationStatus` MUST be exhaustive so future status additions are
-  compile-time caught, not silently-zero. When materialization dispatch is
-  enabled, the substituting bucket MUST additionally count derivations carrying
-  an unresolved, unclaimed materialization job (whatever their status), and
-  those derivations MUST be excluded from `queued_derivations` and
-  `queued_by_system` --- the three buckets stay disjoint, and their sum never
-  reads zero mid-cascade.
+#r("sched.admin.snapshot-substituting+3")[
+  `ClusterStatus` MUST report `substituting_derivations` (wire-stable field
+  name): the count of derivations carrying an unresolved, unclaimed
+  materialization job, whatever their status. The snapshot match over
+  `DerivationStatus` MUST be exhaustive so future status additions are
+  compile-time caught, not silently-zero. Job-counted derivations MUST be
+  excluded from `queued_derivations` and `queued_by_system` --- the buckets
+  stay disjoint, and their sum never reads zero mid-cascade.
 ]
 
-#r("sched.substitute.detached+5")[
-  The upstream-substitute fetch MUST run outside the actor event loop. Awaiting
-  it inline blocks `MergeDag`/dispatch for the duration of the slowest closure
-  walk --- a single ghc-sized NAR (1.9 GB) exceeds the 30s `grpc_timeout` and
-  the 16-way concurrent fan-out blocked the actor for >100s in production.
-  Instead: at each merge-time and dispatch-time substitution call site the
-  scheduler MUST transition the derivation to `DerivationStatus::Substituting`,
-  spawn a background task that walks the transitive reference closure (BFS over
-  `info.references` from the output paths, each node a `QueryPathInfo`
-  triggering store-side `try_substitute`) with a separate
-  `SUBSTITUTE_FETCH_TIMEOUT` (minutes, not seconds), and post
-  `ActorCommand::SubstituteComplete{drv_hash, ok}` back into the mailbox. The
-  task posts `ok=true` ONLY if every *wanted* seed and every node discovered
-  by the reference BFS was found or substituted. Per-path failure handling
-  retries a `NotFound` or transient error up to the attempt budget before
-  recording the failure (every path in the walk was either probed as
-  available or named in a narinfo the upstream just served, so a `NotFound`
-  inside the walk contradicts an earlier observation); a non-transient error,
-  a path whose retries exhaust, or the `MAX_SUBSTITUTE_CLOSURE` cap,
-  → `ok=false`. A seed that is declared-but-unwanted
-  (#rref("sched.merge.wanted-outputs")) is still attempted --- opportunistic
-  completeness --- but it is forgiven on its first failure of any kind,
-  without consuming the retry budget: logged, not counted as a fetch
-  failure. A path recorded in the node's never-forgive set --- one whose
-  forgiveness already triggered a forgiven-now-wanted downgrade of a
-  completed walk --- MUST NOT be forgiven in later walks of the
-  substitution chain that recorded it; the set is cleared when that chain
-  ends in any way (success, the genuine-failure demotion to a from-source
-  build, or completion through a non-substitution path), so a walk of a
-  later chain MAY forgive the path again once no live build wants it.
-  The store substitutes ONE path per
-  call (no recursion), so this BFS is the only place the runtime closure can be
-  completed. `Substituting` is NOT terminal (`all_deps_completed` returns false
-  → dependents stay gated); on `ok=true` the handler transitions `Substituting
-  → Completed` (safe even if inputDrvs aren't yet Completed in the DAG --- the
-  BFS fetched every wanted seed and the reachable reference closure of
-  everything it successfully fetched; a forgiven unwanted seed can leave its
-  own path absent, including when a wanted sibling's references name it ---
-  see the residual-hole caveat at the implementation site); on `ok=false` it
-  reverts to
-  `Ready`/`Queued` for normal scheduling and sets `substitute_tried` so
-  subsequent dispatch passes skip substitution and route to a worker (one-shot
-  fall-through --- a `FindMissingPaths` HEAD probe that disagrees with
-  `QueryPathInfo` GET would otherwise loop at Tick cadence and never reach
-  `find_executor`). On scheduler restart, recovery MUST reset `Substituting`
-  nodes via the same dep-walk as `Created`/`Queued` (the spawned task is gone).
-  A cancelled build's orphan task is benign: its fetch still populates the
-  store, the `SubstituteComplete` is dropped by the not-Substituting guard.
-]
-The recovery reset above is an in-memory re-derivation, not a durable one:
-seed-time status writes cover only the DependencyFailed short-circuit
-targets, so a node re-derived to Ready/Queued keeps PG
-`status='substituting'` (or `'queued'`) until some later status write ---
-durable status therefore cannot be read as "a walk is in flight", and no
-durable reset is required because the next status-bearing transition
-overwrites it. "The spawned task is gone" holds for the new leader's process;
-on a failover with the old replica still alive, the old tenure's walk keeps
-running and ingesting into the store (benign --- the store is content
-addressed) and its late `SubstituteComplete` is dropped by that replica's own
-leader gate (#rref("sched.substitute.leader-gate")).
+*Retired (Phase D-prime --- the detached substitution walk):*
+`sched.substitute.detached+5` normed the walk: the `Substituting` status, the
+detached BFS over the reference closure (per-path `QueryPathInfo` against the
+store), the per-path retry ladder, the unwanted-seed forgiveness and its
+chain-scoped never-forgive set, the `SubstituteComplete{ok}` completion
+protocol with the `substitute_tried` one-shot fall-through, and the
+recovery-time Substituting reset. The entire mechanism was deleted (Waves
+D3-D6; the status left the persisted alphabet with migration 080). The job
+IS the successor (#rref("sched.materialize.job")): the closure walk runs
+inside the store executor against its own substitution machinery
+(#rref("store.materialize.executor")), completion is the exec_id-keyed
+consumption with its coverage re-check, the one-shot's role is the routing's
+per-job re-probe one-shot, and "never Completed against a phantom HEAD hit"
+is owned by the Success coverage arm (#rref("sched.materialize.routing")).
+Forgiveness has no successor --- the executor ingests the live wanted set
+path by path and coverage is re-read at consumption, so there is no
+forgiven-set state to police (the C-prime F6 by-construction record).
 
 *Retired (Phase D-prime --- the walk fan-out bound):*
 `sched.substitute.fanout-bound` bounded the scheduler's in-flight detached
@@ -1606,34 +1505,29 @@ store protection is per-replica admission
 the real bound; the materialization executor's fetch concurrency is
 store-side configuration (#rref("store.materialize.executor")).
 
-#r("sched.admin.spawn-intents.probed-gate+2")[
+#r("sched.admin.spawn-intents.probed-gate+3")[
   `compute_spawn_intents` MUST NOT emit a SpawnIntent for a Ready derivation
   whose `probed_generation == 0`, when a store client is configured AND the
   derivation's `expected_output_paths` are all known
   (`DerivationState::output_paths_probeable`).
-  `handle_substitute_complete{ok=true}` promotes dependents Queued→Ready and
-  (past the inline cap) defers their dispatch-time substitute probe to the next
-  Tick; a `GetSpawnIntents` poll landing in that ≤1s window would otherwise
+  A materialization success's consumption promotes dependents Queued→Ready
+  with their dispatch-time substitute probe deferred to the next Tick; a
+  `GetSpawnIntents` poll landing in that ≤1s window would otherwise
   spawn pods for derivations that the next probe finds substitutable, which
   `reap_stale_for_intents` then deletes 10s later. With
   #rref("sched.substitute.eager-probe") the merge-time probe covers the whole
   submission, so the layer-by-layer cascade is no longer the primary case; the
-  gate still covers dependents promoted by a substituted intermediate that was
-  NOT in the original probe_set. `queued_by_system` is intentionally NOT gated
-  (it must match `ClusterSnapshot.queued_by_system`). With no store client
-  (test-only), `batch_probe_cached_ready` early-returns without stamping; the
-  gate is moot and disabled.
+  gate still covers dependents promoted by a materialized intermediate that
+  was NOT in the original probe_set. `queued_by_system` is intentionally NOT
+  gated (it must match `ClusterSnapshot.queued_by_system`). With no store
+  client (test-only), `batch_probe_cached_ready` early-returns without
+  stamping; the gate is moot and disabled.
 ]
-The spawn-intent producer does not consult `must_substitute`: a Ready
-topdown-pruned node with Broken closure evidence still yields a SpawnIntent
-once probed, the controller spawns a pod for it, and that pod's pull is then
-refused `NotYetReady` (#rref("sched.merge.substitute-topdown")). This
-refusal/spawn churn is accepted as-built: it is bounded by the probed-gate
-above and reaped by `reap_stale_for_intents`, and settlement of the refused
-node is owned by the dispatch sweep's probe/walk/fail-fast arms
-(#rref("sched.evidence.settlement")), not by the spawn path --- filtering
-intents on `must_substitute` is a possible future refinement, not a current
-requirement.
+The spawn-intent producer additionally filters intents whose node carries an
+unresolved materialization job (the PD-7 job filter, model-verified by the
+spawn-coherence mat-jobs regime): a spawned pod's pull would be refused while
+the job is unresolved (#rref("sched.materialize.job")), so the filter removes
+the refusal/spawn churn the walk-era gate accepted.
 
 *Retired (Phase D-prime --- the inline completion cascade):*
 `sched.dispatch.substitute-complete-inline+2` required
@@ -1650,15 +1544,16 @@ existed to bound is owned by the merge-time eager probe
 (#rref("sched.substitute.eager-probe")), which probes the whole submission up
 front.
 
-#r("sched.substitute.leader-gate")[
-  `SubstituteComplete` MUST be dropped on a standby replica (`!is_leader()`).
-  The detached `substitute-fetch` task survives lease loss (`on_lose` only
-  flips atomics) and posts to the now-standby's mailbox; the `ok=true` branch
-  writes PG (`persist_status(Completed)`, `upsert_path_tenants`) and would
-  split-brain `derivations.status` with the new leader's recovery. The new
-  leader's `recover_from_pg` resets `Substituting` via the dep-walk and
-  re-probes from there.
-]
+*Retired (Phase D-prime --- the walk completion's leader gate):*
+`sched.substitute.leader-gate` dropped `SubstituteComplete` on standby
+replicas so a deposed tenure's surviving walk task could not split-brain
+`derivations.status` against the new leader's recovery. The command and the
+walk died (Wave D3.2). Cross-tenure staleness for the surviving mechanism is
+owned by exec_id identity plus fenced consumption: a materialization outcome
+is consumed in exactly one claims-floor-fenced transaction keyed by its
+exec_id (#rref("sched.materialize.routing")), so a deposed tenure's report
+is refused by the fence rather than by a mailbox gate (the model's
+fencedJobWritesOnly oracle and the F11 calibration pin).
 
 #r("sched.dag.build-scoped-roots")[
   `find_roots(build_id)` MUST treat a derivation as a root for a given build if
@@ -1884,7 +1779,7 @@ Queue-level preemption is fully supported:
   )
 ]
 
-#r("sched.state.terminal-idempotent")[
+#r("sched.state.terminal-idempotent+2")[
   *Idempotency rules:*
   - `completed → completed`: No-op (duplicate completion reports are accepted
     and ignored)
@@ -1896,19 +1791,21 @@ Queue-level preemption is fully supported:
     when a merge-time output-existence check finds the output GC'd
     (#rref("sched.merge.stale-completed-verify"));
     `poisoned`/`dependency_failed`/`failed` →
-    `queued`/`completed`/`substituting` when a merge-time re-probe finds the
-    output present or substitutable (I-094; `failed` is non-terminal so
-    technically not a carve-out --- listed for symmetry with the reprobe lane)
+    `queued`/`completed` when a merge-time re-probe finds the
+    output present or substitutable (I-094: present completes via the
+    cache-hit lane; substitutable resets to `queued` with a reprobe-origin
+    materialization job --- the AS-5 reset; `failed` is non-terminal so
+    technically not a carve-out --- listed for symmetry with the reprobe
+    lane)
 ]
 
 #r("sched.state.poisoned-ttl")[
   The `poisoned → created` transition is gated by a 24h TTL.
 ]
 The poison-TTL sweep that performs the expiry removes the expired node from
-the DAG the same way the admin clear does, and is therefore one of the
-closure-hole stamping sites: the surviving parents are breadcrumbed in memory
-and best-effort in PG (#rref("sched.evidence.closure-hole")), exactly as for
-#rref("sched.admin.clear-poison").
+the DAG the same way the admin clear does, and runs the same surviving-parent
+re-evaluation (#rref("sched.poison.clear-survivor-reevaluation")), exactly as
+for #rref("sched.admin.clear-poison").
 
 #r("sched.merge.poisoned-resubmit-bounded+4")[
   When a build merges and finds a pre-existing `poisoned` node in the global
@@ -1960,13 +1857,15 @@ the Phase-1b cutover froze the column.
   merge on store availability would be a worse regression).
 ]
 
-#r("sched.merge.stale-substitutable")[
+#r("sched.merge.stale-substitutable+2")[
   The stale-completed `FindMissingPaths` is sent with the build's tenant token
-  so the store reports `substitutable_paths`. Outputs that are
-  missing-but-substitutable are eagerly fetched (per
-  #rref("sched.merge.substitute-fetch")) and the node stays `completed`; only
-  outputs that are missing AND not successfully substituted reset to `ready`.
-  Without this, post-GC re-submissions re-dispatch the entire subtree ---
+  so the store reports `substitutable_paths`. A Completed node with a
+  missing-but-substitutable live-wanted output MUST be reset and given a
+  `stale_reset`-origin materialization job in the same verify (the node
+  re-enters Queued; the executor re-fetches); only outputs that are missing
+  AND not obtainable leave the node on the from-source reset
+  (#rref("sched.merge.stale-completed-verify")). Without this, post-GC
+  re-submissions re-dispatch the entire subtree ---
   including FOD sources whose origin URLs may be dead --- for paths
   cache.nixos.org already has.
 ]
@@ -2876,7 +2775,7 @@ backoff. This prevents unbounded request queueing at the gateway layer.
   `DerivationStatus::is_terminal()` MUST stay in sync (drift-tested).
 ]
 
-#r("sched.db.derivations-gc+3")[
+#r("sched.db.derivations-gc+4")[
   Terminal `derivations` rows with no `build_derivations` link and no ACTIVE
   (`pending`/`acknowledged`) `assignments` row are deleted by a periodic
   Tick-driven sweep (batched `LIMIT 1000` per pass). The same statement deletes
@@ -2889,17 +2788,16 @@ backoff. This prevents unbounded request queueing at the gateway layer.
   do not block: migration 034 made the FK `ON DELETE CASCADE`. Without the
   sweep, `dependency_failed` rows from large failed closures accumulate
   unboundedly --- I-169.2 observed 1.16M rows. The sweep is coupled to the
-  closure-evidence lifecycle: deleting an un-produced terminal child row (and
-  its edges) removes the persisted child-set evidence that the recovery-time
-  closure-hole stamp re-derives a parent's truncation from, leaving the
-  surviving parent's persisted `closure_hole` breadcrumb (migration 064,
-  #rref("sched.evidence.closure-hole")) as the only durable record of it ---
+  closure-evidence lifecycle: the durable-relation classifier
+  (#rref("sched.materialize.routing")) reads the persisted edges, child
+  statuses and live co-owning `build_derivations` links at decision time ---
   the no-`build_derivations`-link victim filter MUST be retained, because the
-  link is what keeps a reaped un-produced child's row re-derivable until its
+  link is what keeps a child row readable by that classifier until its
   builds rows are deleted, which no in-tree path does for a build that merely
   ran to terminal (the failed-merge rollback is the only production deleter
-  of `builds` rows), so erasing the re-derivable evidence requires an
-  external builds-row purge in addition to this sweep.
+  of `builds` rows); erasing classification evidence therefore requires an
+  external builds-row purge in addition to this sweep, and a truncated row
+  set classifies Broken (conservative), never Vouched.
 ]
 
 #r("sched.db.assignment-terminal-on-status+2")[

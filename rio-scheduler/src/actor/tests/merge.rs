@@ -372,7 +372,7 @@ async fn test_ca_cache_miss(#[case] seed_stale: bool) -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs+2]
+// r[verify sched.merge.wanted-outputs+3]
 /// THE incident scenario: a multi-output derivation whose only missing
 /// output is one nothing wants (glibc-debug) must classify as a cache
 /// hit, not fall through to a from-source build dispatch. Three cases:
@@ -491,11 +491,12 @@ async fn missing_unwanted_output_is_still_a_cache_hit() -> TestResult {
 }
 
 // r[verify sched.merge.substitute-probe]
-// r[verify sched.merge.substitute-fetch]
+// r[verify sched.materialize.job+2]
 /// Substitutable-probe matrix at merge time. A path NOT in the store
-/// but reported as `substitutable_paths` by FindMissingPaths should
-/// cache-hit (eager-fetch via QueryPathInfo, no dispatch). If QPI
-/// fails, demote to miss. Missing-and-not-substitutable stays missing.
+/// but reported as `substitutable_paths` by FindMissingPaths is routed
+/// to a materialization job (the walk-era eager QueryPathInfo fetch
+/// retired with sched.merge.substitute-fetch).
+/// Missing-and-not-substitutable stays missing.
 ///
 /// Before P0472: scheduler ignored `substitutable_paths` → dispatched
 /// builds cache.nixos.org already had. Before P0473: marked
@@ -569,7 +570,7 @@ async fn test_substitutable_probe_matrix(
 /// (the store-side fetch decides), never straight to a from-source
 /// build dispatch. Without this, indeterminate was treated as
 /// confirmed-miss and dispatched as a build.
-// r[verify sched.merge.substitute-probe-indeterminate]
+// r[verify sched.merge.substitute-probe-indeterminate+2]
 #[tokio::test]
 async fn test_indeterminate_probe_tries_substitute_not_build() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
@@ -612,7 +613,7 @@ async fn test_indeterminate_probe_tries_substitute_not_build() -> TestResult {
 
 // D3-retarget: prune-decision pin (B10 kept-guard unit half) — the prune
 // survives D'; stamp/walk arms re-target to origin='pruned' job rows.
-// r[verify sched.merge.substitute-topdown+12]
+// r[verify sched.merge.substitute-topdown+13]
 /// Top-down short-circuit: when the root is substitutable, deps are
 /// pruned from the merge — only the root's NAR is fetched, build
 /// completes immediately.
@@ -694,7 +695,7 @@ async fn test_topdown_root_substitutable_prunes_deps() -> TestResult {
 }
 
 // D3-retarget: prune-decision pin (B10 kept-guard unit half).
-// r[verify sched.merge.substitute-topdown+12]
+// r[verify sched.merge.substitute-topdown+13]
 /// Top-down negative: an `explicitly_requested` NON-root (a client
 /// target folded inside another target's closure by the gateway's
 /// multi-target dedup) whose wanted output is NOT available must block
@@ -774,7 +775,7 @@ async fn test_topdown_explicit_target_unavailable_blocks_prune() -> TestResult {
 }
 
 // D3-retarget: prune-decision pin (B10 kept-guard unit half).
-// r[verify sched.merge.substitute-topdown+12]
+// r[verify sched.merge.substitute-topdown+13]
 /// Top-down positive: when every demanded node — structural roots AND
 /// `explicitly_requested` non-roots — is available upstream, the prune
 /// fires and keeps the whole demand set, not just the roots.
@@ -862,7 +863,7 @@ async fn test_topdown_explicit_target_substitutable_kept_in_prune() -> TestResul
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+12]
+// r[verify sched.merge.substitute-topdown+13]
 /// A kept (demanded) node whose existing DAG children are ALL already
 /// produced (Completed/Skipped) must NOT get the `origin = 'pruned'`
 /// classification (T-D5.1 re-target of the walk-era stamp pin: the
@@ -951,7 +952,7 @@ async fn test_topdown_stamp_skips_kept_node_whose_children_are_already_produced(
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+12]
+// r[verify sched.merge.substitute-topdown+13]
 /// A kept (demanded) node whose existing DAG children are still UNBUILT
 /// must get the `origin = 'pruned'` classification (T-D5.1 re-target of
 /// the walk-era stamp pin). Those children can belong to a different
@@ -1032,7 +1033,7 @@ async fn test_topdown_stamp_kept_when_existing_children_unbuilt() -> TestResult 
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+12]
+// r[verify sched.merge.substitute-topdown+13]
 /// The `origin = 'pruned'` classification must land only on kept nodes
 /// whose dependency closure the prune actually dropped (T-D5.1
 /// re-target of the walk-era stamp pin: the selection predicate IS the
@@ -1111,7 +1112,7 @@ async fn test_topdown_stamp_only_nodes_whose_closure_was_dropped() -> TestResult
 }
 
 // D3-retarget: prune-decision pin (B10 kept-guard unit half).
-// r[verify sched.merge.substitute-topdown+12]
+// r[verify sched.merge.substitute-topdown+13]
 /// Top-down negative: root NOT substitutable → fall through to
 /// full bottom-up check. All nodes merged, deps processed normally.
 #[tokio::test]
@@ -1171,7 +1172,7 @@ async fn test_topdown_root_missing_falls_through() -> TestResult {
 }
 
 // D3-retarget: prune-decision pin (B10 kept-guard unit half).
-// r[verify sched.merge.wanted-outputs+2]
+// r[verify sched.merge.wanted-outputs+3]
 /// Top-down negative: a root whose `wanted_output_names` matches NO
 /// declared output (a client sending `drv^bogus` — the gateway does
 /// not validate the root OutputsSpec against the drv's declared
@@ -1226,8 +1227,8 @@ async fn test_topdown_unresolvable_wanted_set_falls_through() -> TestResult {
 }
 
 // D3-retarget: prune-decision pin (B10 kept-guard unit half).
-// r[verify sched.merge.substitute-topdown+12]
-// r[verify sched.merge.wanted-outputs+2]
+// r[verify sched.merge.substitute-topdown+13]
+// r[verify sched.merge.wanted-outputs+3]
 /// Top-down negative: a PRE-EXISTING root shared with a live build whose
 /// effective wanted set is NOT satisfiable must refuse the prune, even
 /// when the submitting build's own (narrower) wanted set is.
@@ -1342,7 +1343,7 @@ async fn test_topdown_prune_gated_on_live_effective_wanted_of_preexisting_root()
 }
 
 // D3-retarget: prune-decision pin (B10 kept-guard unit half).
-// r[verify sched.merge.substitute-topdown+12]
+// r[verify sched.merge.substitute-topdown+13]
 /// Top-down positive companion: a PRE-EXISTING root whose live
 /// effective wanted set IS satisfiable keeps the prune. Same shape as
 /// the negative test above, but build A wants only `out` too — the
@@ -1430,8 +1431,8 @@ async fn test_topdown_prune_fires_when_preexisting_roots_live_wanted_satisfiable
 }
 
 // D3-retarget: prune-decision pin (B10 kept-guard unit half).
-// r[verify sched.merge.substitute-topdown+12]
-// r[verify sched.merge.wanted-outputs+2]
+// r[verify sched.merge.substitute-topdown+13]
+// r[verify sched.merge.wanted-outputs+3]
 /// Top-down negative: the submission's OWN root selector resolving to
 /// no declared output (`drv^bogus`) blocks the prune even when the
 /// root pre-exists and its STORED wanted union is fully available.
@@ -1515,7 +1516,7 @@ async fn test_topdown_unresolvable_wanted_set_falls_through_on_preexisting_root(
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs+2]
+// r[verify sched.merge.wanted-outputs+3]
 // r[verify sched.merge.stale-completed-verify+5]
 /// `verify_preexisting_completed` × an UNAVAILABLE effective wanted set:
 /// when a live interested build's contribution is unknown — the
@@ -1998,7 +1999,7 @@ async fn test_reprobe_completion_fans_out_to_earlier_build() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.reconcile-order]
+// r[verify sched.merge.reconcile-order+2]
 // r[verify sched.merge.stale-completed-verify+5]
 /// bug_089: `apply_cached_hits`' `reprobe_unlocked` advance fired
 /// BEFORE `verify_preexisting_completed` reset stale-Completed deps.
@@ -2095,7 +2096,7 @@ async fn test_reprobe_unlocked_deferred_past_stale_reset() -> TestResult {
     assert_eq!(
         ds.status,
         DerivationStatus::Queued,
-        "r[sched.merge.reconcile-order]: reprobe_unlocked advance must \
+        "r[sched.merge.reconcile-order+2]: reprobe_unlocked advance must \
          re-check all_deps_completed AFTER stale-reset; D's dep Y was \
          reset → D stays Queued (was: Ready against Y's stale Completed)"
     );
@@ -2249,7 +2250,7 @@ async fn suffix_classes(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<&'static str
 }
 
 // D3-retarget: prune-decision pin (B10 kept-guard unit half).
-// r[verify sched.merge.substitute-topdown+12]
+// r[verify sched.merge.substitute-topdown+13]
 /// Top-down: deps pruned from this build are NOT in the global DAG,
 /// so a later build that needs them triggers its own cache-check.
 ///
@@ -2373,7 +2374,7 @@ enum GcState {
 /// so a replica deposed after the enqueue still executes its merge
 /// transaction — racing the new leader's recovery — unless the
 /// transaction itself is fenced.
-// r[verify sched.evidence.durability+2]
+// r[verify sched.evidence.durability+3]
 #[tokio::test]
 async fn merge_from_deposed_generation_is_fenced() -> TestResult {
     let (db, handle, _task) = setup().await;

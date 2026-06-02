@@ -97,7 +97,7 @@ async fn test_query_path_info_exists() -> anyhow::Result<()> {
 
 // r[verify gw.store.transient-retry]
 /// Store returns `ResourceExhausted` for the first attempt (modelling
-/// `r[store.substitute.admission]` saturation), then succeeds. Gateway's
+/// `r[store.substitute.admission+2]` saturation), then succeeds. Gateway's
 /// `grpc_query_path_info` single retry absorbs it → client sees a normal
 /// `valid=true` response, not `STDERR_ERROR`.
 #[tokio::test(start_paused = true)]

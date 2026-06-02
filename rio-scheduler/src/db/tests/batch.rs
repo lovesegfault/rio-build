@@ -300,7 +300,7 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
 /// no newer tenure's evidence exists, so this is the same-epoch
 /// re-acquire keep, not a hazard. The fence comparison is `>=` and must
 /// never be tightened to `>`: this test pins that.
-// r[verify sched.evidence.durability+2]
+// r[verify sched.evidence.durability+3]
 #[tokio::test]
 async fn same_generation_write_at_floor_applies() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -342,7 +342,7 @@ async fn same_generation_write_at_floor_applies() -> anyhow::Result<()> {
 /// The fence is not over-eager on a fresh cluster: with no claims and
 /// no assignments the floor is empty, and any serving generation
 /// applies.
-// r[verify sched.evidence.durability+2]
+// r[verify sched.evidence.durability+3]
 #[tokio::test]
 async fn empty_floor_write_applies() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;

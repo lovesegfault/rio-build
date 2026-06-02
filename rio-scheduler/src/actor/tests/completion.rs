@@ -1,7 +1,7 @@
 //! Completion handling: retry/poison thresholds, dep-chain release, duplicate idempotence.
 // r[verify sched.completion.idempotent]
 // r[verify sched.state.transitions]
-// r[verify sched.state.terminal-idempotent]
+// r[verify sched.state.terminal-idempotent+2]
 
 use super::*;
 use rstest::rstest;
@@ -2866,7 +2866,7 @@ async fn test_infra_retry_cap_uniform_across_reasons(
 /// PG with the established 10ms × 100 pattern rather than asserting
 /// immediately after `barrier()` (which only drains the actor loop, not
 /// background tasks).
-// r[verify sched.merge.exec-correlation+7]
+// r[verify sched.merge.exec-correlation+8]
 #[tokio::test]
 async fn completion_records_build_exec_correlation() -> TestResult {
     let (db, handle, _task) = setup().await;
@@ -2950,7 +2950,7 @@ async fn completion_records_build_exec_correlation() -> TestResult {
 /// as the exact log B1 observed (the "approximate" banner gates on
 /// `execId === ''`, not on correctness).
 ///
-/// r[verify sched.merge.exec-correlation+7]
+/// r[verify sched.merge.exec-correlation+8]
 #[tokio::test]
 async fn exec_correlation_skips_terminal_builds() -> TestResult {
     use crate::state::{BuildInfo, BuildState};

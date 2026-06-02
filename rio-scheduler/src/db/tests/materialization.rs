@@ -33,7 +33,7 @@ async fn job_count(pool: &sqlx::PgPool, derivation_id: Uuid) -> anyhow::Result<i
 /// second create for the same derivation is idempotent — it returns
 /// the existing job_id with `created: false` and writes no second row
 /// (the database-enforced C3-class dedup).
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 #[tokio::test]
 async fn job_creation_is_dedup_idempotent() -> anyhow::Result<()> {
     let (test_db, db, drv) = setup("job-dedup-hash").await?;
@@ -108,7 +108,7 @@ async fn job_creation_is_dedup_idempotent() -> anyhow::Result<()> {
 
 /// (b) Creation below the durable claims floor → `Fenced`, no row
 /// written (the A17/A18 fence extension to the job table).
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 #[tokio::test]
 async fn job_creation_below_floor_is_fenced() -> anyhow::Result<()> {
     let (test_db, db, drv) = setup("job-fence-hash").await?;
@@ -152,7 +152,7 @@ async fn job_creation_below_floor_is_fenced() -> anyhow::Result<()> {
 /// (c) `list_claimable_materialization_jobs`: pending jobs with NO
 /// active assignment row for their derivation (the anti-join), not
 /// parked, capped by limit, oldest first.
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 #[tokio::test]
 async fn list_claimable_excludes_claimed_and_parked() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -237,7 +237,7 @@ async fn list_claimable_excludes_claimed_and_parked() -> anyhow::Result<()> {
 /// first resolve stamps `resolution_exec_id`/`resolved_at`; resolving
 /// an already-resolved job is a no-op (`Applied(0)` — terminal-row-
 /// wins); resolving below the floor is `Fenced` and changes nothing.
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 #[tokio::test]
 async fn job_resolution_is_fenced_and_at_most_once() -> anyhow::Result<()> {
     let (test_db, db, drv) = setup("job-resolve-hash").await?;
@@ -328,7 +328,7 @@ async fn job_resolution_is_fenced_and_at_most_once() -> anyhow::Result<()> {
 /// (e) Parking: `park_materialization_job_fenced` sets `park_until`
 /// (the job stays `pending`); the claimable list excludes it until the
 /// backoff expires.
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 #[tokio::test]
 async fn parked_job_excluded_until_backoff_expires() -> anyhow::Result<()> {
     let (test_db, db, drv) = setup("job-park-hash").await?;
@@ -379,7 +379,7 @@ async fn parked_job_excluded_until_backoff_expires() -> anyhow::Result<()> {
 
 /// (f) `cancel_materialization_jobs_for_derivation_fenced`: pending →
 /// cancelled (the zero-live-interest closer; Phase A: tests only).
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 #[tokio::test]
 async fn job_cancellation_marks_cancelled() -> anyhow::Result<()> {
     let (test_db, db, drv) = setup("job-cancel-hash").await?;
@@ -422,7 +422,7 @@ async fn job_cancellation_marks_cancelled() -> anyhow::Result<()> {
 /// that is then ROLLED BACK leaves zero job rows — a rolled-back merge
 /// creates no jobs (design B6: rollbackRestoresWantedAndEvidence;
 /// A13: stampAtomicWithActivation).
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 #[tokio::test]
 async fn job_create_in_rolled_back_tx_leaves_no_row() -> anyhow::Result<()> {
     let (test_db, db, drv) = setup("job-rollback-hash").await?;
@@ -490,7 +490,7 @@ async fn job_create_in_rolled_back_tx_leaves_no_row() -> anyhow::Result<()> {
 /// posture split (in-tx for merge origins, standalone fenced for the
 /// probe origin — the kept PDQ-9 verdict, PD-B9) could break; pinning it
 /// is what makes keeping the split safe.
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 #[tokio::test]
 async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<()> {
     let (test_db, db, drv) = setup("job-cross-site-hash").await?;
@@ -698,7 +698,7 @@ async fn materialization_job_alphabets_match_check_constraints() -> anyhow::Resu
 /// reserved to the pruned origin (reprobe/stale_reset never upgrade).
 /// `created` stays false for the dedup arm — an upgrade is NOT a
 /// creation (jobs_created_total counts creations only).
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 #[tokio::test]
 async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
     let (test_db, db, drv) = setup("job-upgrade-hash").await?;

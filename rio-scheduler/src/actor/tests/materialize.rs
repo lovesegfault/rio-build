@@ -13,7 +13,7 @@ fn sdb(pool: &sqlx::PgPool) -> crate::db::SchedulerDb {
     crate::db::SchedulerDb::new(pool.clone())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// FLAG ON: the same merge + dispatch cycle creates exactly ONE job
 /// (origin=cache_opportunity) at the dispatch-probe partition, writes
 /// the wanted relation for the (build, node) pair, does NOT spawn the
@@ -71,7 +71,7 @@ async fn flag_on_probe_partition_creates_job_instead_of_walk() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// FLAG ON: two builds merging the same substitutable node produce ONE
 /// job (the dedup — the C3-class protection, now database-enforced),
 /// while both builds' wanted relations are recorded.
@@ -114,7 +114,7 @@ async fn flag_on_concurrent_interest_creates_one_job() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// FLAG ON: the prune origin — a topdown-pruned kept root creates a job
 /// with origin=pruned IN the merge transaction (adjudication PDQ-9 /
 /// design A13/B6).
@@ -195,7 +195,7 @@ fn paths(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| (*s).to_string()).collect()
 }
 
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// Arm 0 (moot-failure / the C3 arm): missing ∩ live-wanted = ∅ and
 /// verified ⊇ live-wanted → CompleteForLiveInterest. The design's
 /// §2.4 confirmed-C3-trace replay, steps 4–5: b2 cancelled in the
@@ -293,7 +293,7 @@ fn routing_broken_with_obtainable_reprobe_rearms_once() {
     );
 }
 
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// FINDING 11 (the C3-class equivalence divergence, orchestrator
 /// ruling): the arm-3 settlement MUST discriminate on the
 /// topdown-pruned mark. An UNMARKED node — a genuine leaf whose
@@ -477,7 +477,7 @@ fn infra_failure_never_failfasts_never_routes_from_source() {
 
 // ── The consumption transaction (handler level, PG-backed) ─────────────
 
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// A BUILD attempt receiving a payload with materialization_outcome set
 /// is acknowledged-and-ignored: no ledger row appended, no status
 /// change, no job state touched. Reachable FLAG-OFF (any builder could
@@ -546,7 +546,7 @@ async fn build_attempt_with_materialization_payload_acked_and_ignored() -> TestR
     Ok(())
 }
 
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// FLAG ON: an InfraFailure consumption charges materialization_infra
 /// (kind=materialization — invisible to every build budget), the job
 /// stays pending and claimable (under budget — never a fail-fast, B3),
@@ -652,7 +652,7 @@ async fn flag_on_infra_failure_charges_and_rearms() -> TestResult {
 
 // ── Establishment + cancellation (T-3.6) ───────────────────────────────
 
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// A dead store replica's open materialization attempt is established
 /// as materialization_infra — never executor_crash, never adopted —
 /// and the job returns to pending (claimable again). BC-2/BC-3: no
@@ -733,7 +733,7 @@ async fn establishment_writes_materialization_infra_never_adopts() -> TestResult
     Ok(())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// Cancellation: when the last live interested build goes terminal, the
 /// housekeeping backstop (flag-gated) cancels the job and closes any
 /// open materialization attempt CHARGE-FREE — no charge row of any
@@ -900,8 +900,8 @@ async fn list_materialization_jobs(
         .expect("actor alive")
 }
 
-// r[verify sched.materialize.job]
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.job+2]
+// r[verify sched.materialize.routing+3]
 // r[verify sched.materialize.pinning]
 /// THE Phase A keystone: one materialization job, end-to-end, flag-on,
 /// exercising every dormant mechanism this campaign added in one
@@ -1090,7 +1090,7 @@ async fn flag_on_materialization_job_end_to_end() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// The Unobtainable moot arm (the C3 trace), flag-on, end-to-end through
 /// the actor: report Unobtainable for a path no LIVE build wants → the
 /// node completes for live interest, NEVER fail-fasts. The design §2.4
@@ -1218,8 +1218,8 @@ async fn flag_on_moot_unobtainable_never_fail_fasts() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+2]
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.routing+3]
+// r[verify sched.materialize.job+2]
 /// T-4.1 (Phase B): the FULL §2.4 C3 two-build dedup trace, flag-on —
 /// the materialization-path twin of
 /// `stale_walk_failure_does_not_fail_build_with_present_outputs`
@@ -1399,7 +1399,7 @@ async fn flag_on_stale_unobtainable_two_build_dedup_never_fails() -> TestResult 
     Ok(())
 }
 
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// FINDING 11 (the C3-class equivalence divergence; orchestrator ruling,
 /// red-first), actor level: an UNMARKED genuine leaf — childless, so its
 /// closure evidence is structurally `Broken` — whose wanted output the
@@ -1554,8 +1554,8 @@ async fn flag_on_unmarked_leaf_confirmed_missing_releases_to_from_source() -> Te
 
 // ── T-1.1 (Phase B): §2.6 consumer re-sourcing — the snapshot buckets ──
 
-// r[verify sched.admin.snapshot-substituting+2]
-// r[verify ctrl.scaler.signal-substituting+2]
+// r[verify sched.admin.snapshot-substituting+3]
+// r[verify ctrl.scaler.signal-substituting+3]
 /// §2.6 re-sourcing: pending (unclaimed) materialization jobs ARE the
 /// substituting bucket flag-on. A Ready or Queued node carrying an
 /// unresolved unclaimed job counts in `substituting_derivations` and is
@@ -1662,7 +1662,7 @@ fn drain_derivation_kinds(
     kinds
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// BC-4 (design §2.4 "Progress and gateway events"): flag-on, the
 /// SUBSTITUTING DerivationEvent — the wire-retained kind the gateway's
 /// actSubstitute/actCopyPath pair creation keys on — is emitted at
@@ -1738,7 +1738,7 @@ async fn flag_on_claim_emits_substituting_event_and_consumption_stops_it() -> Te
     Ok(())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 // r[verify sched.state.machine+2]
 /// PD-6 (Phase B, the PDQ-6 amendment's prescribed flip): a Queued node
 /// (a parent behind an unproduced dep) with a pending job ACCEPTS a
@@ -1826,7 +1826,7 @@ async fn flag_on_queued_node_accepts_materialization_claim() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 // r[verify sched.state.machine+2]
 /// PD-6 mint-ordering / no-strand proof: the durable mint commits
 /// BEFORE the in-memory transition (the as-built ordering, unchanged).
@@ -1980,7 +1980,7 @@ async fn flag_on_queued_mint_crash_between_commit_and_transition_recovers() -> T
 
 // ── T-1.5 (Phase B): PD-17 — reprobe-lane job creation + the AS-5 reset ──
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// PD-17 + AS-5 (design §2.1 reprobe row): flag-on, a previously-failed
 /// (Poisoned) pre-existing node whose output is upstream-substitutable
 /// again gets, at the re-merging build's 6d slot:
@@ -2098,7 +2098,7 @@ async fn flag_on_reprobe_poisoned_node_creates_job_with_reset() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// PD-17, the Phase A T-6.2 observed-orphan trace replayed: a second
 /// build merging an existing READY node that already carries a pending
 /// job routes through the I-099 reprobe lane. As-built (flag-on, Phase
@@ -2189,7 +2189,7 @@ async fn flag_on_reprobe_job_orphan_no_longer_forms() -> TestResult {
 
 // ── T-1.6 (Phase B): PD-18 — stale-Completed-verify job creation ──
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// PD-18 (design §2.1 row 4): flag-on, the stale-Completed verify (6c)
 /// routes the substitutable subset of demoted nodes to materialization
 /// jobs (origin='stale_reset') instead of spawning its OWN walks (the
@@ -2323,7 +2323,7 @@ async fn flag_on_stale_completed_demote_creates_stale_reset_job() -> TestResult 
 // origin row is the only durable pruned fact and resolution itself is
 // the settlement) ──
 
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// Arm 2 at the actor level: a PRUNED-origin job whose node's
 /// re-declared child is NOT yet produced (durable evidence Pending)
 /// gets an Unobtainable report → the routing resolves from-source —
@@ -2406,7 +2406,7 @@ async fn pruned_origin_pending_evidence_resolves_from_source() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// Resolution is terminal (the FP-4(a) class, re-framed for the
 /// origin-only world): a node whose pruned-origin job resolved
 /// SUCCESSFULLY, then lost its outputs to GC, must dispatch from source
@@ -2878,8 +2878,8 @@ async fn recovery_sweep_releases_orphaned_materialization_pins() -> TestResult {
 // ── T-4.2 (Phase B): settlement totality — the D16-class limbo is
 //    structurally impossible flag-on ─────────────────────────────────────
 
-// r[verify sched.materialize.routing+2]
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.routing+3]
+// r[verify sched.materialize.job+2]
 /// T-4.2: every non-terminal materialization-job state has an armed
 /// action, and that action FIRES. The D16 limbo (flag-off: a
 /// marked+tried+present node refused by every decision cell, hanging
@@ -2906,6 +2906,7 @@ async fn recovery_sweep_releases_orphaned_materialization_pins() -> TestResult {
 /// (listing, Queued claims, establishment, park, cancellation closer)
 /// all exist by this task — first-try pass recorded as a pin under
 /// commit rule 1's pure-addition clause.
+// r[verify sched.materialize.settlement]
 #[tokio::test]
 async fn flag_on_every_job_state_has_armed_action() -> TestResult {
     // Tight budget/backoff so the park arm is provable in-test:
@@ -3241,7 +3242,7 @@ async fn flag_on_every_job_state_has_armed_action() -> TestResult {
 
 // ── T-4.3 (Phase B): recovery job-view rebuild + reap-survivor armament ──
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// T-4.3 step 2 (red-first): materialization jobs survive leader
 /// failover AS ARMED ACTIONS — the new leader's recovery rebuilds the
 /// in-memory job view from PG, so pull admission answers correctly from
@@ -3426,7 +3427,7 @@ async fn flag_on_recovery_rebuilds_job_view_and_jobs_survive() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// T-4.3 step 3 (red-first): a terminal build's reap leaves a survivor
 /// node with an unresolved materialization job → the reap hook does
 /// NOTHING to it (design §2.1: "survivors with an unresolved job need
@@ -3604,7 +3605,7 @@ async fn flag_on_reap_survivor_with_unresolved_job_stays_armed() -> TestResult {
 // ── T-4.4 (Phase B): the probe-matrix, no-from-source, and fail-fast
 //    routing variants ────────────────────────────────────────────────────
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// T-4.4 test 1: the dispatch-probe partition matrix flag-on — the
 /// merge.rs probe-matrix walk twin (test_substitutable_probe_matrix),
 /// asserting job-vs-no-job per cell instead of walk-vs-build:
@@ -3716,8 +3717,8 @@ async fn flag_on_probe_matrix_routes_to_jobs() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.job]
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.job+2]
+// r[verify sched.materialize.routing+3]
 /// T-4.4 test 2: noFromSourceWhileJobUnresolved at the actor level (the
 /// F8/F13 anchor's production half), both mark states:
 ///
@@ -3936,7 +3937,7 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// T-4.4 test 3: arm 3's genuine fail-fast — a PRUNED-ORIGIN
 /// root whose live-wanted output the consumption re-probe confirms
 /// missing-and-unsubstitutable fails every live DAG-interested build
@@ -4068,7 +4069,7 @@ async fn flag_on_genuine_unobtainable_fail_fasts_with_resubmit_error() -> TestRe
     Ok(())
 }
 
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// T-4.4 test 4: Success coverage is over the LIVE WANTED set, not the
 /// declared output set — the batch_probe_completes_on_missing_unwanted_
 /// output walk twin. A Success report covering the wanted output but
@@ -4132,7 +4133,7 @@ async fn flag_on_success_coverage_ignores_unwanted_outputs() -> TestResult {
     assert_eq!(job_state, "resolved_success");
     Ok(())
 }
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// FP-4(b) absorption — the flag-transition scenario's second product
 /// gap (red-first): a build submitted FLAG-OFF has no
 /// `build_wanted_outputs` rows (flag-off merges never write the
@@ -4283,7 +4284,7 @@ fn gauge_value(snap: &metrics_util::debugging::Snapshotter, name: &str) -> Optio
 }
 
 // r[verify obs.metric.materialization-stalled]
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// PD-20 (design §2.5, red-first): parked materialization jobs are
 /// VISIBLE (the `rio_scheduler_materialization_stalled` gauge, set from
 /// ground truth every housekeeping tick) and RE-EVALUABLE (a parked job
@@ -4465,7 +4466,7 @@ async fn parked_job_stalled_gauge_and_reevaluation() -> TestResult {
 // ── T-6.2 (Phase B): the job-lifecycle metrics ──────────────────────────────
 
 // r[verify obs.metric.scheduler]
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// T-6.2 (red-first): the job-lifecycle counters the dashboards and
 /// alerts consume —
 ///
@@ -4603,7 +4604,7 @@ async fn job_lifecycle_metrics_count_claims_and_resolutions() -> TestResult {
 // materialization_jobs.origin (+ pruned-wins dedup upgrade)
 // ════════════════════════════════════════════════════════════════════
 
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// The arm-3 settlement discriminator reads the consumed job's ORIGIN
 /// (the durable successor of the walk-era pruned mark — design §4/A2/
 /// A13) and nothing else. Both directions:
@@ -4776,8 +4777,8 @@ async fn routing_reads_origin_not_column() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+2]
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.routing+3]
+// r[verify sched.materialize.job+2]
 /// The dedup-then-prune corner end-to-end (PD-D1): a node gets a
 /// cache_opportunity job from an earlier merge; a LATER pruned merge
 /// dedups onto it. The dedup must upgrade the job's origin to 'pruned'
@@ -4927,7 +4928,7 @@ async fn unobtainable_on_upgraded_dedup_job_fail_fasts() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// DQ-1 armament preservation: the merge post-commit feed must NOT
 /// clobber a dedup-found job's armament state (park backoff, claim
 /// holder) — the `entry().or_insert()` discipline of the probe path,
@@ -5082,7 +5083,7 @@ async fn pg_edge(pool: &sqlx::PgPool, parent: Uuid, child: Uuid) -> anyhow::Resu
     Ok(())
 }
 
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// The routing classification must survive in-memory truncation: the
 /// consumption transaction classifies over the DURABLE relation
 /// (pg.edges + pg.status + live co-owning build links), not the
@@ -5182,7 +5183,7 @@ async fn routing_evidence_survives_inmemory_truncation() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// The park re-evaluation classifies over the durable relation too: a
 /// parked job whose node's PG closure is fully produced AND vouched by
 /// a live co-owning build resolves from-source at the next tick, even
@@ -5251,7 +5252,7 @@ async fn park_reevaluation_resolves_on_durable_vouch() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// The THIRD conjunct's own pin (the stale-evidence direction, RS-1):
 /// produced children whose only voucher is a TERMINAL build — the
 /// previous-generation shape — must classify Broken, NOT Vouched. PG
@@ -5454,7 +5455,7 @@ where
     Ok((db, handle, confirmations, task))
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// The recovery wanted-cache rebuild (the AW4/D8 headline): two builds
 /// merge with distinct narrow wants flag-on; one cancels; after
 /// failover the effective wanted set must be the EXACT narrow union of
@@ -5524,7 +5525,7 @@ async fn recovery_rebuilds_wanted_contributions() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// The conservative-absent arm (DQ-2: absent = MAXIMAL width): a live
 /// interested build with NO cache entry and NO relation row (the
 /// legacy/pre-relation shape) contributes `{}` = ALL DECLARED outputs
@@ -5601,7 +5602,7 @@ async fn unknown_contribution_saturates_conservatively() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.routing+3]
 /// The consumption None-arm (step 4's red test, RS-2): a job's
 /// consumption where `effective_wanted_union` returns None (zero live
 /// relation rows — the legacy shape) must saturate `live_wanted_paths`

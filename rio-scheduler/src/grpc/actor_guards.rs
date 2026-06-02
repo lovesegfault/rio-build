@@ -79,7 +79,7 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         // Same string as `ensure_leader` above so operators grep for
         // one signature.
         ActorError::NotLeader => Status::unavailable("not leader (standby replica)"),
-        // r[impl sched.evidence.durability+2]
+        // r[impl sched.evidence.durability+3]
         // FAILED_PRECONDITION (not UNAVAILABLE): the request itself is
         // fine, this replica just is not entitled to commit it any
         // more. Health-aware balanced-channel clients have already

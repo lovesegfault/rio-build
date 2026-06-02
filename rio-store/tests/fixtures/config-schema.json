@@ -95,7 +95,7 @@
         ]
       },
       "chunk_upload_max_concurrent": {
-        "description": "Max concurrent S3 chunk uploads per `put_chunked` call.\nDefault 8. Per-replica `r[store.substitute.admission]` bounds\nconcurrent `put_chunked` calls; `substitute_admission_permits\n× this` is the per-replica in-flight PutObject ceiling. Raise\nif the store runs with a larger aws-sdk pool; lower (min 1)\nif you see `DispatchFailure` in store logs during large-NAR\ningest. Set via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT`.",
+        "description": "Max concurrent S3 chunk uploads per `put_chunked` call.\nDefault 8. Per-replica `r[store.substitute.admission+2]` bounds\nconcurrent `put_chunked` calls; `substitute_admission_permits\n× this` is the per-replica in-flight PutObject ceiling. Raise\nif the store runs with a larger aws-sdk pool; lower (min 1)\nif you see `DispatchFailure` in store logs during large-NAR\ningest. Set via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT`.",
         "type": "integer",
         "format": "uint",
         "minimum": 0,

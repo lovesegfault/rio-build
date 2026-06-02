@@ -505,7 +505,7 @@ pub struct MaterializationInputs {
     pub job: JobView,
 }
 
-// r[impl sched.materialize.job]
+// r[impl sched.materialize.job+2]
 // r[impl sched.executor.pull-gone]
 // r[impl sched.executor.pull-not-ready+2]
 /// The kinded admission (design §2.3's table). Pure, total.

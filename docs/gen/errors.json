@@ -1097,7 +1097,7 @@
       "name": "Saturated",
       "crate": "rio-store",
       "msg": "substitute admission saturated; retry (transient)",
-      "doc": "Queued for [`SUBSTITUTE_ADMISSION_WAIT`] without acquiring. Transient — caller retries per `r[sched.substitute.detached+5]`."
+      "doc": "Queued for [`SUBSTITUTE_ADMISSION_WAIT`] without acquiring. Transient — the gateway caller retries (`r[gw.store.transient-retry]`); the in-process materialization executor re-arms through its job budget."
     },
     {
       "enum": "ChunkError",
@@ -1363,7 +1363,7 @@
       "name": "RateLimited",
       "crate": "rio-store",
       "msg": "transient: upstream rate-limited (retry after {retry_after:?})",
-      "doc": "Transient upstream-429 (`r[store.substitute.probe-429-retry+2]`). `retry_after` is the parsed `Retry-After` header (delta-seconds or HTTP-date), `None` if absent or unparseable. Returned as `Err` so moka does NOT cache it; the admission permit is dropped on return so the wait happens caller-side without holding per-replica capacity. gRPC maps to `Unavailable` so the scheduler's 8-attempt backoff retries — a bare 429 (no `Retry-After`) is still a real rate-limit, NOT a miss."
+      "doc": "Transient upstream-429 (`r[store.substitute.probe-429-retry+3]`). `retry_after` is the parsed `Retry-After` header (delta-seconds or HTTP-date), `None` if absent or unparseable. Returned as `Err` so moka does NOT cache it; the admission permit is dropped on return so the wait happens caller-side without holding per-replica capacity. gRPC maps to `Unavailable` so the scheduler's 8-attempt backoff retries — a bare 429 (no `Retry-After`) is still a real rate-limit, NOT a miss."
     },
     {
       "enum": "SubstituteError",

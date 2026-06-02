@@ -120,7 +120,7 @@ impl DagActor {
             // status=NULL until the TTL sweep and bd.exec_id NULL
             // (dashboard shows the "approximate" banner for a log that
             // was streamed).
-            // r[impl sched.merge.exec-correlation+7]
+            // r[impl sched.merge.exec-correlation+8]
             // No CompletionReport on the cancel path → final_line_count
             // stays NULL → the row reads as incomplete (correct: a
             // cancelled execution's log is truncated).
@@ -705,7 +705,7 @@ impl DagActor {
             debug!(build_id = %build_id, reaped = reap.reaped_paths.len(), "reaped orphaned terminal DAG nodes");
         }
 
-        // r[impl sched.merge.substitute-topdown+12]
+        // r[impl sched.merge.substitute-topdown+13]
         // Re-evaluate the surviving parents that just lost children to this
         // reap, via the shared removal-survivor loop
         // (`reevaluate_removal_survivors` — promotion for

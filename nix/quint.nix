@@ -3209,7 +3209,7 @@ in
     # partition invariants: the pre-existing invariants are re-proven
     # over materialization interleavings (a materialization action
     # between any two build events must not perturb any of them).
-    # r[verify sched.materialize.routing+2]
+    # r[verify sched.materialize.routing+3]
     quint-retry-policy-pull-materialization = mkQuintCheck {
       name = "retry-policy-pull-materialization";
       spec = "retryPolicy";
@@ -3316,8 +3316,8 @@ in
     # below): quint-materialization-calib-* (19 expect-violation pins)
     # + the marked-claim / post-failover-claim witnesses (the B1/B3
     # liveness flips).
-    # r[verify sched.materialize.job]
-    # r[verify sched.materialize.routing+2]
+    # r[verify sched.materialize.job+2]
+    # r[verify sched.materialize.routing+3]
     quint-materialization-holds-base = mkQuintSimHoldsCheck {
       name = "materialization-holds-base";
       spec = "materializationJob";
@@ -3326,7 +3326,8 @@ in
       maxSamples = 2000000;
       maxSteps = 15;
     };
-    # r[verify store.materialize.executor+2]
+    # r[verify store.materialize.executor+3]
+    # r[verify sched.materialize.settlement]
     quint-materialization-holds-failover = mkQuintSimHoldsCheck {
       name = "materialization-holds-failover";
       spec = "materializationJob";
@@ -3350,7 +3351,7 @@ in
     # column-agnostic core of the durability rule (the evidence-column
     # subject was deleted; migration 080). Falsifiability pair:
     # quint-materialization-calib-f11-unfenced-resolve.
-    # r[verify sched.evidence.durability+2]
+    # r[verify sched.evidence.durability+3]
     quint-materialization-holds-stale-tenure = mkQuintSimHoldsCheck {
       name = "materialization-holds-stale-tenure";
       spec = "materializationJob";
@@ -3700,7 +3701,7 @@ in
     # on. Weakened test: deleting the serve-time conjunct re-finds
     # VMatJobServed (procedure in the regime module's comment; depth in
     # the introducing commit).
-    # r[verify sched.materialize.job]
+    # r[verify sched.materialize.job+2]
     quint-spawn-coherence-mat-jobs = mkQuintCheck {
       name = "spawn-coherence-mat-jobs";
       spec = "spawnCoherence";
@@ -4241,7 +4242,7 @@ in
     # Paired falsifiability pins (the sim-holds vacuity rule):
     # quint-closure-calib-f1-stale-produced (B9) and
     # quint-closure-calib-f4-demand-drop (B10) below.
-    # r[verify sched.merge.substitute-topdown+12]
+    # r[verify sched.merge.substitute-topdown+13]
     quint-closure-survivors-core = mkQuintSimHoldsCheck {
       name = "closure-survivors-core";
       spec = "closureEvidence";

@@ -19,7 +19,9 @@ use tonic::Status;
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 pub enum AdmissionError {
     /// Queued for [`SUBSTITUTE_ADMISSION_WAIT`] without acquiring.
-    /// Transient — caller retries per `r[sched.substitute.detached+5]`.
+    /// Transient — the gateway caller retries
+    /// (`r[gw.store.transient-retry]`); the in-process materialization
+    /// executor re-arms through its job budget.
     #[error("substitute admission saturated; retry (transient)")]
     Saturated,
     /// Semaphore closed. Unreachable in production (nothing calls
@@ -40,8 +42,8 @@ impl From<AdmissionError> for Status {
 
 /// How long [`AdmissionGate::acquire_bounded`] queues server-side
 /// before returning `RESOURCE_EXHAUSTED`. 25 s sits inside the
-/// scheduler's detached-fetch retry window (8 attempts × backoff ≈
-/// 90 s; see `r[sched.substitute.detached+5]`), so a transient burst
+/// retry windows of the surviving callers (the gateway's transient
+/// retry; the executor's claim/re-arm cycle), so a transient burst
 /// is absorbed in ONE store-side wait rather than N client retries.
 /// Spike 0.1 proved the prior immediate-RE design demoted 50/50
 /// derivations to build-from-source under any hold ≥ 8 s.
@@ -101,7 +103,7 @@ impl AdmissionGate {
     /// non-zero on that counter means the replica is genuinely
     /// saturated (ComponentScaler should already be reacting via the
     /// `GetLoad` utilization signal).
-    // r[impl store.substitute.admission]
+    // r[impl store.substitute.admission+2]
     pub async fn acquire_bounded(&self) -> Result<OwnedSemaphorePermit, AdmissionError> {
         match tokio::time::timeout(SUBSTITUTE_ADMISSION_WAIT, self.sem.clone().acquire_owned())
             .await

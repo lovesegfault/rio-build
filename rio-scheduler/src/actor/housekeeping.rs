@@ -363,7 +363,7 @@ impl DagActor {
                 .await
             {
                 Ok(crate::db::FencedWrite::Applied(_)) => {}
-                // r[impl sched.evidence.durability+2]
+                // r[impl sched.evidence.durability+3]
                 // Fenced: deposed replica. The PG clear did not happen,
                 // so the PG-first contract skips the in-memory removal
                 // exactly like the PG-failure arm — the successor owns
@@ -392,7 +392,7 @@ impl DagActor {
         }
         surviving_parents.sort();
         surviving_parents.dedup();
-        // r[impl sched.poison.clear-survivor-reevaluation]
+        // r[impl sched.poison.clear-survivor-reevaluation+2]
         // Wake the surviving parents (the TTL-sweep twin of the admin
         // ClearPoison hook): settle marked-Broken survivors, promote
         // Queued ones whose deps are now (vacuously) satisfied. A parent
@@ -421,7 +421,7 @@ impl DagActor {
         });
     }
 
-    // r[impl sched.db.derivations-gc+3]
+    // r[impl sched.db.derivations-gc+4]
     /// I-169.2: periodic sweep of orphan-terminal `derivations` rows.
     /// Every 30th tick (~5min at the default 10s interval) → delete
     /// ≤1000. A 1.16M backlog drains in ~4 days; steady-state churn
@@ -585,7 +585,7 @@ impl DagActor {
         // materialization budget and toward NOTHING else), never
         // executor_crash. The branch is an early return for a kind no
         // build attempt carries — the as-built arms below are untouched.
-        // r[impl sched.materialize.routing+2]
+        // r[impl sched.materialize.routing+3]
         if attempt.attempt_kind == crate::state::AttemptKind::Materialization.as_str() {
             self.establish_materialization_attempt(attempt).await;
             return;

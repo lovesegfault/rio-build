@@ -540,12 +540,12 @@ in
   # spawns for fresh work (criterion 3 — through D3, when the walk
   # machinery deletes).
   #
-  # r[verify sched.materialize.job]
+  # r[verify sched.materialize.job+2]
   #   substitute-scheduler-owned: a direct (gateway-bypassing) submission
   #   of 4 substitutable nodes creates exactly 4 cache_opportunity jobs in
   #   the merge transaction; all resolve resolved_success; the
   #   jobs-created metric moves by 4 while the walk-spawn metric stays 0.
-  # r[verify sched.materialize.routing+2]
+  # r[verify sched.materialize.routing+3]
   #   substitute-scheduler-owned + materialization-active: every job's
   #   Success outcome is consumed — nodes complete, the build succeeds,
   #   no unresolved jobs remain (all-resolved assertion).
@@ -583,7 +583,7 @@ in
   #   substitute-ssh-ng: gateway propagates JWT through wopQueryPathInfo
   #   → store's try_substitute_on_miss fires → path substitutable via
   #   the real ssh-ng protocol path (not grpcurl backdoor).
-  # r[verify sched.merge.substitute-probe-indeterminate]
+  # r[verify sched.merge.substitute-probe-indeterminate+2]
   #   substitute-scheduler-owned: the merge probe classifies 4
   #   substitutable (probe-indeterminate) nodes and routes them to
   #   materialization jobs created in the merge transaction (zero
@@ -597,7 +597,7 @@ in
   # success paths never reach. One mode-switched fake upstream drives
   # every arm (per-path 404/503/head-only narinfo answers).
   #
-  # r[verify sched.materialize.routing+2]
+  # r[verify sched.materialize.routing+3]
   #   routing-fail-fast: a topdown-pruned root whose output is confirmed
   #   missing upstream fails every interested build with the
   #   resubmit-directing error (arm 3: Unobtainable → consumption
@@ -617,7 +617,7 @@ in
   #   interested build is live; the §5.3 all-interest-terminal release
   #   frees them and the next sweep collects. The unpinned control path
   #   collected in sweep #1 is the non-vacuity proof that the sweep ran.
-  # r[verify sched.materialize.job]
+  # r[verify sched.materialize.job+2]
   #   routing-fail-fast: the topdown prune creates the origin=pruned job
   #   inside the merge transaction (and the pruned dep never enters the
   #   DAG); routing-vouched-from-source: the indeterminate probe creates
@@ -899,7 +899,7 @@ in
       #   with the subtests above), so it folds into core rather than
       #   paying a separate k3s boot.
       "pool-lifecycle"
-      # r[verify sched.materialize.job]      (kind boundary: flag-on build traffic mints only build-kind rows; the wanted relation is written)
+      # r[verify sched.materialize.job+2]      (kind boundary: flag-on build traffic mints only build-kind rows; the wanted relation is written)
       # r[verify sched.materialize.pinning]  (kind boundary: flag-on builds write only build_input pins)
       #   materialization-boundary: against a flag-on deployment whose
       #   builder traffic (cancel-cgroup-kill, build-timeout above) HAS
@@ -1189,17 +1189,17 @@ in
   # desiredReplicas never moves. Set via the chart key (not extraEnv)
   # so the values.yaml → store.yaml templating is exercised.
   #
-  # r[verify ctrl.scaler.signal-substituting+2]
+  # r[verify ctrl.scaler.signal-substituting+3]
   #   cascade: the §2.6 re-sourced substituting bucket (pending unclaimed
   #   jobs) drives the P1 closed loop — desiredReplicas rises and never
   #   drops mid-cascade while the job backlog drains.
-  # r[verify store.substitute.admission]
+  # r[verify store.substitute.admission+2]
   # r[verify store.admin.get-load+2]
   #   cascade: the store executors' fetches go through the per-replica
   #   admission gate; GetLoad's admission utilization reaches CR.status
   #   (P2) unchanged.
   # r[verify sched.substitute.eager-probe]
-  # r[verify sched.materialize.job]
+  # r[verify sched.materialize.job+2]
   #   deep-chain: one merge burst classifies all 49 seeded links —
   #   rio_scheduler_materialization_jobs_created_total delta ≥45 + ≥49
   #   cache_opportunity job rows, while the walk-spawn counter stays at
@@ -1217,12 +1217,16 @@ in
   # assertions pass sooner. The scenario asserts end states, not view
   # internals, precisely so T-4.3 extends rather than rewrites it.
   #
-  # r[verify sched.materialize.job]
+  # r[verify sched.materialize.job+2]
   #   failover: 10 jobs created in the merge tx; the leader is
   #   force-deleted while >=1 is still unresolved; the standby acquires;
   #   the job rows survive byte-identically (count + job_ids); all 10
   #   resolve and the build succeeds. PG is the authority — no job is
   #   lost with the leader.
+  # r[verify sched.materialize.settlement]
+  #   the armed-action totality across failover: the in-flight job is
+  #   re-claimed/settled by the new leader (no unresolved job is left
+  #   with no armed action by the failover).
   vm-materialization-failover-k3s = materializeFailoverTest;
 
   # ── leader-election splits (2 tests, k3s-full fixture) ───────────────
@@ -1277,7 +1281,7 @@ in
   # r[verify sched.admin.list-tenants]
   # r[verify sched.admin.list-executors+2]
   # r[verify sched.admin.list-builds]
-  # r[verify sched.admin.clear-poison+2]
+  # r[verify sched.admin.clear-poison+3]
   # r[verify cli.cmd.sla]
   # rio-cli had 0% coverage — never invoked by any test. This runs
   # status + create-tenant + list-tenants against the live scheduler's

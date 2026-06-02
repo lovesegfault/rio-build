@@ -701,7 +701,7 @@ mod tests {
     /// the admin-service side (which reports) MUST be the same
     /// `AdmissionGate` clone — main.rs wires it; this test proves the
     /// admin side reads through.
-    // r[verify store.substitute.admission]
+    // r[verify store.substitute.admission+2]
     // r[verify store.admin.get-load+2]
     #[tokio::test]
     async fn get_load_tracks_substitute_admission() {

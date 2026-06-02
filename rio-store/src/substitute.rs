@@ -205,7 +205,7 @@ pub enum SubstituteError {
     #[error("transient: concurrent uploader holds placeholder")]
     Raced,
 
-    /// Transient upstream-429 (`r[store.substitute.probe-429-retry+2]`).
+    /// Transient upstream-429 (`r[store.substitute.probe-429-retry+3]`).
     /// `retry_after` is the parsed `Retry-After` header (delta-seconds
     /// or HTTP-date), `None` if absent or unparseable. Returned as
     /// `Err` so moka does NOT cache it; the admission permit is
@@ -277,7 +277,7 @@ enum ProbeOutcome {
 /// Accepts both forms: delta-seconds (`"120"`) and HTTP-date
 /// (`"Wed, 21 Oct 2026 07:28:00 GMT"`). Returns the raw duration —
 /// NO clamping; the caller's deadline budget decides whether to honor
-/// it (`r[store.substitute.probe-429-retry+2]`).
+/// it (`r[store.substitute.probe-429-retry+3]`).
 ///
 /// Takes `&HeaderMap` (not `&reqwest::Response`) so the HTTP-date
 /// branch is unit-testable without a live socket — see
@@ -462,9 +462,10 @@ impl Substituter {
     /// within the window returns the cached result without re-checking.
     ///
     /// **One path, one answer.** The store does NOT walk
-    /// `info.references`; closure completeness is the caller's
-    /// responsibility (`r[sched.substitute.detached+5]` for the
-    /// scheduler; the nix client for the gateway). Matches upstream
+    /// `info.references` here; closure completeness is the caller's
+    /// responsibility (the materialization executor's own walk,
+    /// `r[store.materialize.executor+3]`; the nix client for the
+    /// gateway). Matches upstream
     /// Nix's `BinaryCacheStore::queryPathInfo` contract.
     #[instrument(skip(self), fields(tenant = %tenant_id, path = store_path))]
     pub async fn try_substitute(
@@ -582,7 +583,7 @@ impl Substituter {
                     .increment(1);
                     return Ok(None);
                 }
-                // r[impl store.substitute.admission]
+                // r[impl store.substitute.admission+2]
                 // Leader-only permit: this init future runs ONCE per
                 // `(tenant, path)` per TTL window; coalesced waiters
                 // block on the moka future without entering this body,
@@ -705,7 +706,7 @@ impl Substituter {
                     // will not cache the eventual `Err`, and the
                     // admission permit drops on return so the wait
                     // happens caller-side
-                    // (r[store.substitute.probe-429-retry+2]).
+                    // (r[store.substitute.probe-429-retry+3]).
                     debug!(upstream = %upstream.url, ?retry_after,
                            "upstream 429, trying next");
                     // Max across upstreams that 429'd (matches probe_one).
@@ -780,7 +781,7 @@ impl Substituter {
         if is_not_found(resp.status()) {
             return Ok(UpstreamOutcome::Miss);
         }
-        // r[impl store.substitute.probe-429-retry+2]
+        // r[impl store.substitute.probe-429-retry+3]
         // 429 on the GET path: return RateLimited{retry_after}
         // immediately. The AdmissionGate permit drops on return so the
         // wait happens caller-side without holding per-replica
@@ -1032,7 +1033,7 @@ impl Substituter {
             .send()
             .await
             .map_err(|e| SubstituteError::Fetch(format!("{nar_url}: {e}")))?;
-        // r[impl store.substitute.probe-429-retry+2]
+        // r[impl store.substitute.probe-429-retry+3]
         // 429 on the NAR body GET maps to `RateLimited` (same as the
         // narinfo GET) so `do_substitute` continues to the next
         // upstream and moka doesn't cache the result. Without this, a
@@ -1233,7 +1234,7 @@ impl Substituter {
     /// hide paths that OTHER upstreams have). 429 responses are retried
     /// (≤ `SUBSTITUTE_PROBE_429_MAX_PASSES`) with `Retry-After`
     /// honored and concurrency adaptively halved — see
-    /// `r[store.substitute.probe-429-retry+2]`. No batch-size truncation:
+    /// `r[store.substitute.probe-429-retry+3]`. No batch-size truncation:
     /// the originating RPC's wall-clock is `⌈N_uncached/128⌉ × RTT`;
     /// the scheduler's merge-time caller carries a wider timeout
     /// (`r[sched.substitute.eager-probe]`).
@@ -1382,7 +1383,7 @@ impl Substituter {
         };
 
         // r[impl store.substitute.probe-bounded+4]
-        // r[impl store.substitute.probe-429-retry+2]
+        // r[impl store.substitute.probe-429-retry+3]
         // 429-aware retry loop. Pass 0 covers the full uncached set;
         // each retry pass re-probes only the RateLimited subset after
         // sleeping max(Retry-After) (Fastly's 429 is edge-wide, not
@@ -2525,7 +2526,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.probe-429-retry+2]
+    // r[verify store.substitute.probe-429-retry+3]
     /// First upstream 429s the narinfo GET; second upstream has the
     /// path. `do_substitute` MUST continue to the second (matching the
     /// HEAD-probe semantics) and return a hit, not stop at the first
@@ -2686,7 +2687,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.probe-429-retry+2]
+    // r[verify store.substitute.probe-429-retry+3]
     /// 429 + `Retry-After` honored: upstream 429s the first
     /// `head_429_first_n` HEADs then 200s. All paths MUST end up in
     /// `hits` (the rate-limited subset is retried, not dropped to
@@ -2751,7 +2752,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.probe-429-retry+2]
+    // r[verify store.substitute.probe-429-retry+3]
     /// >10% rate-limited → concurrency halves for the retry pass.
     /// 200 paths at 128 concurrency; ALL of pass-0 429s. Retry pass
     /// MUST observe max-concurrent ≤ 64.
@@ -2798,7 +2799,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.probe-429-retry+2]
+    // r[verify store.substitute.probe-429-retry+3]
     /// `Retry-After` exceeding the caller's deadline budget → retry
     /// pass is SKIPPED (no sleep), rate-limited paths returned as
     /// not-substitutable for this call (uncached → re-probed next time).
@@ -2934,7 +2935,7 @@ mod tests {
             "deadline must truncate the pass; got all {} hits",
             available.hits.len()
         );
-        // r[verify sched.merge.substitute-probe-indeterminate]
+        // r[verify sched.merge.substitute-probe-indeterminate+2]
         // Un-yielded paths are reported indeterminate (not silently
         // dropped). hits ∪ indeterminate covers the full input.
         assert_eq!(
@@ -2969,7 +2970,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.probe-429-retry+2]
+    // r[verify store.substitute.probe-429-retry+3]
     /// `Retry-After` as an RFC 9110 HTTP-date (not delta-seconds):
     /// parsed via `httpdate` and honored. Upstream sends a date ~3s
     /// in the future (`fmt_http_date` truncates sub-second, so +2s
@@ -3028,7 +3029,7 @@ mod tests {
         );
     }
 
-    // r[verify store.substitute.probe-429-retry+2]
+    // r[verify store.substitute.probe-429-retry+3]
     /// Direct unit test of [`parse_retry_after`]'s HTTP-date branch.
     /// The integration test above (`check_available_429_http_date`)
     /// can't tell a parsed ~2 s from the None-default 1 s floor via
@@ -3071,7 +3072,7 @@ mod tests {
         assert_eq!(parse_retry_after(&h), None);
     }
 
-    // r[verify store.substitute.probe-429-retry+2]
+    // r[verify store.substitute.probe-429-retry+3]
     /// 429 on the narinfo GET path (`try_upstream`) → returns
     /// `Err(RateLimited{retry_after: Some})` IMMEDIATELY (no inline
     /// sleep). The admission permit drops on return so per-replica
@@ -3385,7 +3386,7 @@ mod tests {
         assert_eq!(got2.nar_size, nar.len() as u64);
     }
 
-    // r[verify store.substitute.admission]
+    // r[verify store.substitute.admission+2]
     /// N concurrent `try_substitute` calls for the SAME `(tenant, path)`
     /// coalesce on the moka singleflight; only the leader's init future
     /// runs and only IT acquires an admission permit. With cap=2 and 5
@@ -4025,7 +4026,7 @@ mod tests {
             .await
             .unwrap();
         assert!(first.hits.is_empty(), "503 → no hit");
-        // r[verify sched.merge.substitute-probe-indeterminate]
+        // r[verify sched.merge.substitute-probe-indeterminate+2]
         assert_eq!(
             first.indeterminate,
             vec![path.clone()],

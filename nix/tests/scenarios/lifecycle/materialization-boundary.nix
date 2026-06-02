@@ -24,7 +24,7 @@ scope: with scope; ''
   # the non-vacuity precondition below fails loudly instead of letting
   # the kind-boundary clauses pass as a proof of nothing.
   #
-  # Tracey: r[verify sched.materialize.job] / r[verify
+  # Tracey: r[verify sched.materialize.job+2] / r[verify
   # sched.materialize.pinning] live at the default.nix subtests entry
   # (P0341 convention — marker at wiring point, not fragment header).
   with subtest("materialization-boundary: flag-on builder traffic stays build-kind"):

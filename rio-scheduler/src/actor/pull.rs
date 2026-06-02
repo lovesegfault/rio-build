@@ -469,7 +469,7 @@ impl DagActor {
             crate::state::AttemptKind::Build => {
                 self.emit_assignment_started(drv_hash, pulling_identity);
             }
-            // r[impl sched.materialize.job]
+            // r[impl sched.materialize.job+2]
             crate::state::AttemptKind::Materialization => {
                 self.emit_materialization_claimed(drv_hash);
             }

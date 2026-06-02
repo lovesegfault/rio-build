@@ -5,7 +5,7 @@
 //! runtime's `PullTransport` precedent — copied shape, not shared code)
 //! so the claim/report state machines are unit-testable against a
 //! scripted mock with no wire and no scheduler.
-// r[impl store.materialize.executor+2]
+// r[impl store.materialize.executor+3]
 
 use std::time::Duration;
 
@@ -85,7 +85,7 @@ pub struct ClaimedJob {
 /// between list and claim — never an error and never retried within
 /// the pass (the next poll re-lists). `Gone` likewise. Per-RPC errors
 /// are logged and skipped; a failed listing yields an empty pass.
-// r[impl store.materialize.executor+2]
+// r[impl store.materialize.executor+3]
 pub async fn poll_and_claim<T: MaterializeTransport>(
     transport: &mut T,
     executor_instance: &str,
@@ -164,7 +164,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
 /// permanent rejections (auth / invalid-argument / unimplemented) give
 /// up after one call — retrying cannot succeed and the establishment
 /// sweep remains the scheduler-side backstop for the open attempt.
-// r[impl store.materialize.executor+2]
+// r[impl store.materialize.executor+3]
 pub async fn report_until_acked<T: MaterializeTransport>(
     transport: &mut T,
     exec_id: &str,
@@ -537,7 +537,7 @@ mod tests {
     /// (a) The happy path: 2 listed jobs, both claims deliver → 2
     /// ClaimedJobs carrying the descriptors' identity joined with the
     /// assignments' exec ids.
-    // r[verify store.materialize.executor+2]
+    // r[verify store.materialize.executor+3]
     #[tokio::test]
     async fn poll_and_claim_claims_listed_jobs() {
         let d1 = descriptor(1);
@@ -567,7 +567,7 @@ mod tests {
     /// (b) NotYetReady on a claim is race tolerance, not an error: the
     /// pass returns the claims that DID deliver and never retries the
     /// lost one (the next poll re-lists).
-    // r[verify store.materialize.executor+2]
+    // r[verify store.materialize.executor+3]
     #[tokio::test]
     async fn poll_and_claim_tolerates_not_yet_ready() {
         let mut t = MockTransport::new(
@@ -592,7 +592,7 @@ mod tests {
     }
 
     /// (c) The slot bound: 5 listed, 2 slots → exactly 2 pulls.
-    // r[verify store.materialize.executor+2]
+    // r[verify store.materialize.executor+3]
     #[tokio::test]
     async fn poll_and_claim_respects_slots() {
         let mut t = MockTransport::new(
@@ -617,7 +617,7 @@ mod tests {
     /// (d) The BC-1 wire obligation: every claim carries
     /// kind=MATERIALIZATION + the configured executor_instance, no
     /// executor token, and the listed job's drv hash as the intent.
-    // r[verify store.materialize.executor+2]
+    // r[verify store.materialize.executor+3]
     #[tokio::test]
     async fn claim_carries_kind_and_instance() {
         let d1 = descriptor(1);
@@ -654,7 +654,7 @@ mod tests {
     /// (e) The report loop: two transient failures then an ack → 3
     /// calls, returns true. A permanent rejection gives up after one
     /// call. Budget exhaustion gives up.
-    // r[verify store.materialize.executor+2]
+    // r[verify store.materialize.executor+3]
     #[tokio::test(start_paused = true)]
     async fn report_until_acked_retries() {
         let outcome = MaterializationOutcome {
@@ -840,7 +840,7 @@ mod tests {
         (addr, backend)
     }
 
-    // r[verify store.materialize.executor+2]
+    // r[verify store.materialize.executor+3]
     /// FINDING 18 (the transition claim stall; red-first): the executor
     /// transport must abandon a connection pinned to a standby scheduler
     /// replica and reach the leader within a bounded number of poll
@@ -907,7 +907,7 @@ mod tests {
     /// retried against a standby-pinned connection burns its whole
     /// budget without ever landing. With reconnect-on-UNAVAILABLE the
     /// retry envelope converges on the leader and the report acks.
-    // r[verify store.materialize.executor+2]
+    // r[verify store.materialize.executor+3]
     #[tokio::test]
     async fn report_abandons_connection_pinned_to_standby_replica() {
         let standby_addr = spawn_executor_service(StandbyExecutorService).await;

@@ -204,7 +204,7 @@ impl SchedulerDb {
         Ok(())
     }
 
-    // r[impl sched.evidence.durability+2]
+    // r[impl sched.evidence.durability+3]
     /// Flip a build to Active inside an existing transaction. The merge
     /// path runs this as the LAST statement of `persist_merge_to_db`'s
     /// transaction so a committed merge implies an Active build: an

@@ -755,7 +755,7 @@ async fn test_cancel_records_duration_histogram() -> TestResult {
 /// falls back to the latest-exec log instead of the exact execution
 /// this build observed.
 ///
-/// r[verify sched.merge.exec-correlation+7]
+/// r[verify sched.merge.exec-correlation+8]
 #[rstest::rstest]
 #[case::running(DerivationStatus::Running)]
 #[case::assigned(DerivationStatus::Assigned)]

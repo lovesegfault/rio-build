@@ -163,7 +163,7 @@ async fn pull_unbuilt_deps_returns_not_yet_ready() -> TestResult {
 // unresolved materialization job. (The walk-era marked-no-job shape is
 // the documented FP-7 transition residual: it re-enters via the probe
 // partition / from-source dispatch.)
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// A Ready node with an unresolved materialization job is never served
 /// from source by the pull path: the build pull answers NotYetReady,
 /// mints nothing (no assignments / drv_executions rows, no

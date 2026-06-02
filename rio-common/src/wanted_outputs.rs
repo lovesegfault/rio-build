@@ -39,7 +39,7 @@
 /// will-dispatch prediction operates on the proto type itself; every
 /// call site MUST share one implementation or the hit criterion drifts
 /// between prediction time, merge time, and dispatch time.
-// r[impl sched.merge.wanted-outputs+2]
+// r[impl sched.merge.wanted-outputs+3]
 pub fn wanted_subset<'a>(
     output_names: &'a [String],
     expected_output_paths: &'a [String],
@@ -72,7 +72,7 @@ pub fn wanted_subset<'a>(
 /// fall back to all declared paths, or treat the node as unavailable.
 /// Falling through to a from-source build / the full merge is always
 /// safe; a false "complete" is not.
-// r[impl sched.merge.wanted-outputs+2]
+// r[impl sched.merge.wanted-outputs+3]
 pub fn verifiable_wanted_paths<'a>(
     output_names: &'a [String],
     expected_output_paths: &'a [String],
@@ -120,7 +120,7 @@ pub fn union_wanted_saturating(dst: &mut Vec<String>, src: &[String]) {
 mod tests {
     use super::*;
 
-    // r[verify sched.merge.wanted-outputs+2]
+    // r[verify sched.merge.wanted-outputs+3]
     /// The saturation algebra of [`union_wanted_saturating`]: empty is
     /// the "all outputs wanted" sentinel, so the union of "all" with
     /// anything saturates to "all" (stays/becomes empty) regardless of

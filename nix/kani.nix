@@ -332,10 +332,10 @@ in
   #     answers RejectToken on a mis-bound token and
   #     RejectStaleGeneration on a below-floor pull; nothing else is
   #     ever rejected.
-  # r[verify sched.merge.substitute-topdown+12]
+  # r[verify sched.merge.substitute-topdown+13]
   # r[verify sched.executor.pull-gone]
   # r[verify sched.executor.pull-not-ready+2]
-  # r[verify sched.materialize.job]
+  # r[verify sched.materialize.job+2]
   kani-rio-evidence-kernel = mkKaniCheck {
     name = "rio-evidence-kernel";
     crate = crateBuildKani.members.rio-evidence-kernel;

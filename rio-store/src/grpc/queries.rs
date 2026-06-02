@@ -228,7 +228,7 @@ impl StoreServiceImpl {
         // Fails-open on probe errors (a down upstream shouldn't hide
         // paths the scheduler can otherwise substitute). Empty if no
         // substituter / no tenant / no upstreams — the normal case.
-        // r[impl sched.merge.substitute-probe-indeterminate]
+        // r[impl sched.merge.substitute-probe-indeterminate+2]
         // `indeterminate` = paths the probe couldn't classify (429,
         // 5xx, deadline). Scheduler treats them optimistically; without
         // this field they were silently treated as confirmed-miss and

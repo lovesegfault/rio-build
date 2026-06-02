@@ -79,7 +79,7 @@ impl DagActor {
     /// batch). On RPC error/timeout this is the tail only — the
     /// stamped head is protected via `probed_generation`, so neither
     /// hits the per-drv fallback.
-    // r[impl sched.dispatch.fod-substitute+2]
+    // r[impl sched.dispatch.fod-substitute+3]
     async fn batch_probe_cached_ready(&mut self) -> HashSet<DrvHash> {
         let Some(store) = &self.store_client else {
             return HashSet::new();
@@ -191,7 +191,7 @@ impl DagActor {
         let mut to_create_job: Vec<DrvHash> = Vec::new();
         for (drv_hash, paths) in candidates {
             checked.insert(drv_hash.clone());
-            // r[impl sched.merge.wanted-outputs+2]
+            // r[impl sched.merge.wanted-outputs+3]
             // Demand-driven completeness: only the WANTED outputs must
             // be present (→ complete inline) or present-or-
             // substitutable (→ detached fetch). A missing output
@@ -226,8 +226,8 @@ impl DagActor {
             } else if wanted.iter().all(|p| {
                 !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
             }) {
-                // r[impl sched.materialize.job]
-                // r[impl sched.merge.substitute-probe-indeterminate]
+                // r[impl sched.materialize.job+2]
+                // r[impl sched.merge.substitute-probe-indeterminate+2]
                 // Route to a materialization job. The job row is the
                 // in-flight marker; the node stays Ready (claimable by
                 // a store replica). Indeterminate (probe got
@@ -302,7 +302,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.merge.substitute-topdown+12]
+    // r[impl sched.merge.substitute-topdown+13]
     /// Topdown-pruned fail-fast: the node's dep subgraph was dropped
     /// from its submission, so a from-source build dispatch cannot
     /// succeed (the worker ENOENTs on inputDrvs that were never
@@ -316,7 +316,7 @@ impl DagActor {
     /// Sole caller: the materialization consumption routing's arm 3
     /// (route_unobtainable in materialize.rs) — an unobtainable outcome
     /// on a pruned-origin job whose live-wanted outputs are confirmed
-    /// missing (the four-conjunct settlement; r[sched.evidence.settlement]).
+    /// missing (the four-conjunct settlement; r[sched.materialize.settlement]).
     /// The walk-era callers (the SubstituteComplete Broken arm, the
     /// reap-time survivor settlement, the dispatch-probe fail-fast
     /// cell) died with the walk.
@@ -399,8 +399,8 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.poison.clear-survivor-reevaluation]
-    // r[impl sched.merge.substitute-topdown+12]
+    // r[impl sched.poison.clear-survivor-reevaluation+2]
+    // r[impl sched.merge.substitute-topdown+13]
     /// Per-survivor verdicts after children were removed from the DAG.
     /// Shared by every leader-side removal path that leaves surviving
     /// parents behind: the terminal-build reap
@@ -444,7 +444,7 @@ impl DagActor {
                 continue;
             }
             let status = node.status();
-            // r[impl sched.materialize.job]
+            // r[impl sched.materialize.job+2]
             // Substitution-replacement Phase B (T-4.3): a survivor
             // carrying an unresolved materialization job needs NOTHING
             // from this loop — the job is already the armed action

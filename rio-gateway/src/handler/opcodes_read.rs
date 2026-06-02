@@ -162,7 +162,7 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
     };
 
     let jwt = jwt_unless_drv(jwt_token, &path);
-    // Transient store status (RE from `r[store.substitute.admission]`,
+    // Transient store status (RE from `r[store.substitute.admission+2]`,
     // Unavailable) is retried inside `grpc_query_path_info`; only
     // exhausted-budget or non-transient errors reach `stderr_err!`.
     let info = match grpc_query_path_info(store_client, jwt, path.as_str()).await {

@@ -126,7 +126,7 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.db.derivations-gc+3]
+// r[verify sched.db.derivations-gc+4]
 /// I-169.2: orphan-terminal rows are deleted; rows with a live
 /// `build_derivations` link, an `assignments` row, or non-terminal
 /// status are kept. LIMIT respected.
@@ -265,7 +265,7 @@ async fn test_gc_orphan_terminal_derivations() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.db.derivations-gc+3]
+// r[verify sched.db.derivations-gc+4]
 /// LIMIT batches the sweep: 5 orphans, limit=2 → 2, 2, 1, 0.
 #[tokio::test]
 async fn test_gc_orphan_terminal_derivations_limit() -> anyhow::Result<()> {
@@ -372,7 +372,7 @@ async fn test_sweep_stale_assignments_repairs_torn_terminal() -> anyhow::Result<
 /// Pre-fence these writes applied unconditionally — the A17
 /// stale-override window for status/poison evidence (red transcript in
 /// the introducing commit).
-// r[verify sched.evidence.durability+2]
+// r[verify sched.evidence.durability+3]
 #[tokio::test]
 async fn stale_tenure_status_and_poison_writes_are_fenced() -> anyhow::Result<()> {
     use crate::state::DerivationStatus;
@@ -470,7 +470,7 @@ async fn stale_tenure_status_and_poison_writes_are_fenced() -> anyhow::Result<()
 
 /// The status/poison fence is not over-eager: the current tenure (at
 /// the floor) and a fresh cluster (empty floor) apply normally.
-// r[verify sched.evidence.durability+2]
+// r[verify sched.evidence.durability+3]
 #[tokio::test]
 async fn current_tenure_status_and_poison_writes_apply() -> anyhow::Result<()> {
     use crate::state::DerivationStatus;

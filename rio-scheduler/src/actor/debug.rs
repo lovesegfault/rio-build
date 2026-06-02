@@ -275,12 +275,13 @@ impl DagActor {
         let state = crate::state::DerivationState::from_recovery_row(row, DerivationStatus::Ready)
             .expect("test_drv_path generates valid StorePath");
         self.dag.insert_recovered_node(state);
-        // r[sched.admin.spawn-intents.probed-gate+2]: injected nodes
+        // r[sched.admin.spawn-intents.probed-gate+3]: injected nodes
         // model "probed, not substitutable" so existing
         // compute_spawn_intents filter tests stay focused on
         // kind/system/feature logic. Reset via
         // [`Self::test_set_probed_generation`] to model the
-        // SubstituteComplete cascade window.
+        // promotion-to-probe window (a consumption-promoted dependent
+        // not yet probed this Tick).
         self.dag
             .node_mut(&hash)
             .expect("just inserted")
@@ -297,8 +298,8 @@ impl DagActor {
     /// Set `probed_generation` on an already-injected node. For
     /// `r[sched.admin.spawn-intents.probed-gate]` tests —
     /// [`Self::test_inject_ready_row`] stamps `1` so injected nodes are
-    /// intent-eligible; reset to `0` to model the SubstituteComplete
-    /// cascade window (Ready, not yet probed).
+    /// intent-eligible; reset to `0` to model the promotion-to-probe
+    /// window (Ready, not yet probed).
     pub(crate) fn test_set_probed_generation(&mut self, hash: &str, g: u64) {
         self.dag
             .node_mut(hash)

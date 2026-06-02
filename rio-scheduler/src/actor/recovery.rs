@@ -184,7 +184,7 @@ impl DagActor {
 
         self.restore_builds(build_rows, build_drv_hashes).await?;
 
-        // r[impl sched.materialize.job]
+        // r[impl sched.materialize.job+2]
         // Substitution-replacement Phase B (T-4.3): rebuild the
         // in-memory materialization job view from PG. Flag-gated:
         // Without the rebuild, the failed-over leader
@@ -341,7 +341,7 @@ impl DagActor {
                 info!(drv_hash = %row.drv_hash, elapsed_secs = row.elapsed_secs,
                       "poison already past TTL at recovery — clearing");
                 let hash: crate::state::DrvHash = row.drv_hash.into();
-                // r[impl sched.evidence.durability+2]
+                // r[impl sched.evidence.durability+3]
                 // Ordering tripwire: this recovery-time fenced write
                 // must run AFTER handle_leader_acquired's generation
                 // claim stamped serving_generation (the claims-floor
@@ -1559,7 +1559,7 @@ impl DagActor {
         // reads a floor that covers our claim and exceeds it.
         let rounds_at_claim = self.leader.renew_rounds_started();
 
-        // r[impl sched.evidence.durability+2]
+        // r[impl sched.evidence.durability+3]
         // The claim above is durable (or, on the unclaimed degradation
         // paths, was at least offered to the ledger): every evidence
         // write this tenure issues from here on — starting with
@@ -2008,7 +2008,7 @@ impl DagActor {
         // under-retains. output_paths was just set above
         // (= expected_outputs, verified present in store).
         self.upsert_path_tenants_for(drv_hash).await;
-        // r[impl sched.merge.exec-correlation+7]
+        // r[impl sched.merge.exec-correlation+8]
         // Same gap as path-tenants above: `handle_success_completion`
         // never fired for this drv, so the terminal chokepoint
         // (correlate + stamp) must run here.

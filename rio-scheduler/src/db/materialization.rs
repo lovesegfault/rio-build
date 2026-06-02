@@ -16,7 +16,7 @@
 //!     [`SchedulerDb::claims_floor`] /
 //!     [`SchedulerDb::at_or_above_floor`] helpers, and calls the
 //!     in-tx core.
-// r[impl sched.materialize.job]
+// r[impl sched.materialize.job+2]
 
 use std::collections::{HashMap, HashSet};
 

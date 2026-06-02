@@ -15,7 +15,7 @@ use tonic::Code;
 /// (transient — caller retries). Paused time: advancing past 25 s
 /// resolves the timeout deterministically without a 25 s wall-clock
 /// test.
-// r[verify store.substitute.admission]
+// r[verify store.substitute.admission+2]
 #[tokio::test(start_paused = true)]
 async fn admission_returns_re_after_wait() {
     let gate = AdmissionGate::new(2);
@@ -50,7 +50,7 @@ async fn admission_returns_re_after_wait() {
 /// than fail. Releasing the holder before the 25 s deadline lets the
 /// waiter acquire — proving `acquire_bounded` is `sem.acquire` under
 /// timeout, not `try_acquire` (the rejected-at-spike-0.1 design).
-// r[verify store.substitute.admission]
+// r[verify store.substitute.admission+2]
 #[tokio::test(start_paused = true)]
 async fn admission_queues_under_wait() {
     let gate = AdmissionGate::new(1);
@@ -81,7 +81,7 @@ async fn admission_queues_under_wait() {
 /// `OwnedSemaphorePermit` (RAII), so this is structural — but the
 /// gate's correctness depends on it (an error inside
 /// `try_substitute_on_miss` after acquire must not leak the slot).
-// r[verify store.substitute.admission]
+// r[verify store.substitute.admission+2]
 #[tokio::test]
 async fn admission_permit_released_on_error() {
     let gate = AdmissionGate::new(1);
@@ -109,7 +109,7 @@ async fn admission_permit_released_on_error() {
 }
 
 /// `utilization()` = held/capacity, clamped, and clones share state.
-// r[verify store.substitute.admission]
+// r[verify store.substitute.admission+2]
 #[tokio::test]
 async fn admission_utilization_tracks_held() {
     let gate = AdmissionGate::new(4);
@@ -124,7 +124,7 @@ async fn admission_utilization_tracks_held() {
     assert_eq!(AdmissionGate::new(0).utilization(), 0.0);
 }
 
-// r[verify store.substitute.admission]
+// r[verify store.substitute.admission+2]
 #[test]
 fn admission_wait_below_grpc_timeout() {
     // If SUBSTITUTE_ADMISSION_WAIT ≥ DEFAULT_GRPC_TIMEOUT, callers see

@@ -51,7 +51,7 @@ async fn raw_rows(
 /// pair; re-recording the same build replaces its row (last-write-wins
 /// per build) and never touches another build's row (PK isolation —
 /// the B5-supersession semantics, design §6/PP-5).
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 #[tokio::test]
 async fn wanted_rows_recorded_and_isolated_per_build() -> anyhow::Result<()> {
     let (test_db, db) = setup().await;
@@ -132,7 +132,7 @@ async fn wanted_rows_recorded_and_isolated_per_build() -> anyhow::Result<()> {
 /// (b) `effective_wanted_union` unions over LIVE builds' rows only;
 /// '{}' saturates to "all declared"; terminal builds' rows drop out
 /// (C5); zero live rows → None (never a vacuous empty set — B4).
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 #[tokio::test]
 async fn effective_wanted_union_is_live_only_and_saturating() -> anyhow::Result<()> {
     let (_test_db, db) = setup().await;
@@ -210,7 +210,7 @@ async fn effective_wanted_union_is_live_only_and_saturating() -> anyhow::Result<
 /// (c) The fence: `record_wanted_fenced` with a serving generation
 /// below the durable claims floor → `FencedWrite::Fenced`, zero rows
 /// written (the A17/A18 extension the Phase A exit gate names).
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 #[tokio::test]
 async fn wanted_write_below_floor_is_fenced() -> anyhow::Result<()> {
     let (test_db, db) = setup().await;
@@ -271,7 +271,7 @@ async fn wanted_write_below_floor_is_fenced() -> anyhow::Result<()> {
 /// (d) Purge: `delete_wanted_for_build` removes that build's wanted
 /// rows (and only that build's), and the `materialization_interest`
 /// view loses them.
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 #[tokio::test]
 async fn wanted_rows_purged_with_build() -> anyhow::Result<()> {
     let (test_db, db) = setup().await;

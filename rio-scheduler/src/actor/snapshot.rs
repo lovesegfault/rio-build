@@ -248,7 +248,7 @@ impl DagActor {
         let mut queued_derivations = 0u32;
         let mut substituting_derivations = 0u32;
         let mut queued_by_system: HashMap<String, u32> = HashMap::new();
-        // r[impl sched.admin.snapshot-substituting+2]
+        // r[impl sched.admin.snapshot-substituting+3]
         // Exhaustive over DerivationStatus so a future variant addition
         // is a compile-time break here, not a silently-zero autoscaler
         // input.
@@ -262,7 +262,7 @@ impl DagActor {
                     running_derivations += 1;
                 }
                 DerivationStatus::Ready => {
-                    // r[impl sched.materialize.job]
+                    // r[impl sched.materialize.job+2]
                     // §2.6: a Ready node carrying an unresolved,
                     // unclaimed materialization job is substitution
                     // backlog, not builder-queue backlog — count it in
@@ -415,7 +415,7 @@ impl DagActor {
             if state.status() != DerivationStatus::Ready {
                 continue;
             }
-            // r[impl sched.materialize.job]
+            // r[impl sched.materialize.job+2]
             // PD-7 (Phase B, design §2.3): nodes with an unresolved
             // materialization job are never spawn-intent candidates —
             // the controller must not spawn builder pods for work that
@@ -435,15 +435,13 @@ impl DagActor {
             // pool asked).
             *queued_by_system.entry(state.system.clone()).or_default() += 1;
 
-            // r[impl sched.admin.spawn-intents.probed-gate+2]
-            // SubstituteComplete{ok=true} promotes dependents
-            // Queued→Ready then defers their probe to next Tick. A
-            // poll in that ≤1s window would spawn pods that get
-            // reaped 10s later when the probe finds them
-            // substitutable. probed_generation==0 ⇔ "never probed
-            // since insert/recovery"; the inline-dispatch carve-out
-            // in `handle_substitute_complete` keeps this window
-            // narrow (≤BECAME_IDLE_INLINE_CAP per Tick fall-through).
+            // r[impl sched.admin.spawn-intents.probed-gate+3]
+            // A materialization success's consumption promotes
+            // dependents Queued→Ready with their probe deferred to
+            // the next Tick. A poll in that ≤1s window would spawn
+            // pods that get reaped 10s later when the probe finds
+            // them substitutable. probed_generation==0 ⇔ "never
+            // probed since insert/recovery".
             // The gate is moot when there is no store (test-only;
             // `batch_probe_cached_ready` early-returns without
             // stamping) or when the node is unprobeable (floating-CA
@@ -564,7 +562,7 @@ impl DagActor {
                 if state.status() != DerivationStatus::Queued {
                     continue;
                 }
-                // r[impl sched.materialize.job]
+                // r[impl sched.materialize.job+2]
                 // PD-7: the same unresolved-job exclusion as the Ready
                 // pass — a Queued node with a pending materialization
                 // job will be materialized (the PD-6 dep-racing claim),

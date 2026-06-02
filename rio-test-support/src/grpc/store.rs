@@ -49,7 +49,7 @@ pub struct MockStoreState {
     /// takes precedence — a path in BOTH is reported indeterminate-
     /// only by `find_missing_paths`, while `substitute_path` still
     /// succeeds (mirrors "HEAD 429'd but GET works").
-    /// `r[sched.merge.substitute-probe-indeterminate]`
+    /// `r[sched.merge.substitute-probe-indeterminate+2]`
     pub indeterminate: Arc<RwLock<Vec<String>>>,
     /// Per-path `SubstitutePath` shape: `(nar_size, progress_ticks)`.
     /// BLAKE3 digest → chunk bytes. dataplane2: backs the in-memory
@@ -756,9 +756,10 @@ impl StoreService for MockStore {
             .push(store_path.clone());
         // Substitution side-effect simulation: if the path is seeded
         // as substitutable, materialize a minimal PathInfo on QPI —
-        // mirrors the real store's try_substitute_on_miss. The
-        // scheduler's r[sched.merge.substitute-fetch] eager-fetch
-        // depends on this returning Some rather than NotFound.
+        // mirrors the real store's try_substitute_on_miss. Surviving
+        // QPI consumers (gateway/builder paths) depend on this
+        // returning Some rather than NotFound (the walk-era eager
+        // fetch this originally served retired with Phase D-prime).
         if self
             .state
             .substitutable

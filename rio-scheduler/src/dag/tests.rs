@@ -66,7 +66,7 @@ fn test_merge_dedup() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs+2]
+// r[verify sched.merge.wanted-outputs+3]
 /// `merge` records WHICH build contributed WHICH wanted set in
 /// `wanted_by_build`, on both the new-node path and the existing-node
 /// path. The per-build entry is the submission's own set (empty = that

@@ -48,7 +48,7 @@ pub fn should_chunk(
 
 /// Default max concurrent S3 chunk uploads per `put_chunked` call.
 ///
-/// Per-replica `r[store.substitute.admission]` bounds how many
+/// Per-replica `r[store.substitute.admission+2]` bounds how many
 /// `put_chunked` calls run at once; this bounds fan-out WITHIN one.
 /// `substitute_admission_permits × this` is the per-replica in-flight
 /// PutObject ceiling — keep it under the aws-sdk's ~1024 connection

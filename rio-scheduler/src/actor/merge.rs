@@ -133,7 +133,7 @@ impl DagActor {
         // If a newly merged node depends on an already-poisoned existing
         // node, handle the failure now (fail build if !keepGoing, or sync
         // counts + check completion if keepGoing).
-        // r[impl sched.merge.reconcile-order]
+        // r[impl sched.merge.reconcile-order+2]
         // Defense-in-depth: re-read the node's CURRENT status before
         // fail-fasting. reconcile_merged_state's phase ordering
         // guarantees all dep-state corrections (cache-hit, stale-reset,
@@ -243,7 +243,7 @@ impl DagActor {
         }
 
         // === Step 0: Top-down demand-set substitution check =========
-        // r[impl sched.merge.substitute-topdown+12]
+        // r[impl sched.merge.substitute-topdown+13]
         // Before merging the full DAG, check if the DEMANDED
         // derivations' outputs are already available. The demand set is
         // the structural roots ∪ every node the gateway marked
@@ -270,10 +270,11 @@ impl DagActor {
         //
         // Falls through to the full DAG on any uncertainty (store
         // unreachable, partial demand-set cache, CA demanded nodes).
-        // The fetch itself is deferred
-        // (`r[sched.substitute.detached+5]`); on fetch failure the
-        // build fails fast (`r[sched.merge.substitute-topdown+12]` —
-        // resubmit re-probes). The existing check_cached_outputs at
+        // The fetch itself is a materialization job
+        // (`r[sched.materialize.job+2]`); on a confirmed-unobtainable
+        // outcome the pruned-origin job fails fast
+        // (`r[sched.merge.substitute-topdown+13]` — resubmit
+        // re-probes). The existing check_cached_outputs at
         // step 4 handles fall-through correctly — this is a fast-path,
         // not a replacement.
         let (nodes, edges, pruned_closure_parents) = match self
@@ -609,7 +610,7 @@ impl DagActor {
     /// DB write failures are log-and-continue (build is already Active;
     /// DB sync catches up on next status update or heartbeat
     /// reconciliation).
-    // r[impl sched.merge.reconcile-order]
+    // r[impl sched.merge.reconcile-order+2]
     async fn reconcile_merged_state(&mut self, ingest: &MergeIngest) -> MergeReconcile {
         let MergeIngest {
             nodes,
@@ -637,7 +638,7 @@ impl DagActor {
             };
         }
 
-        // r[sched.merge.reconcile-order]: split pending_substitute by
+        // r[sched.merge.reconcile-order+2]: split pending_substitute by
         // lane. Reprobe-substitutable (pre-existing Poisoned/Failed/
         // DependencyFailed) MUST transition →Substituting BEFORE
         // seed_initial_states reads `any_co_owned_dep_terminally_failed`
@@ -701,7 +702,7 @@ impl DagActor {
         // Poisoned status, first_dep_failed=Some(A), and !keep_going
         // builds fail-fast while B's substitution is undecided.
         if !reprobe_sub.is_empty() {
-            // r[impl sched.materialize.job]
+            // r[impl sched.materialize.job+2]
             // PD-17 + AS-5 (Phase B): the reprobe lane's job rows
             // (origin=reprobe) and the durable AS-5 reset already
             // rode the merge transaction (batch 5 — committed before
@@ -775,7 +776,7 @@ impl DagActor {
         // Newly-inserted substitutable lane: nodes are at Created/
         // Queued/Ready (via seed_initial_states above) and stay there.
         if !new_sub.is_empty() {
-            // r[impl sched.materialize.job]
+            // r[impl sched.materialize.job+2]
             // Substitution-replacement: this lane's jobs were created
             // INSIDE the merge transaction (adjudication PDQ-9); the
             // job row is the in-flight marker and the nodes stay
@@ -843,7 +844,7 @@ impl DagActor {
     /// transitions them Queued→Ready AFTER `verify_preexisting_
     /// completed` (6c) has reset stale-Completed deps, re-checking
     /// `all_deps_completed` against the post-reset DAG
-    /// (r[sched.merge.reconcile-order]).
+    /// (r[sched.merge.reconcile-order+2]).
     ///
     /// All I/O here is best-effort log-and-continue (build is Active).
     /// Kept as a `&mut self` method (not a free decision fn) because
@@ -1128,7 +1129,7 @@ impl DagActor {
         (cached_count, deferred_hits, other_builds, reprobe_unlocked)
     }
 
-    // r[impl sched.materialize.job]
+    // r[impl sched.materialize.job+2]
     /// PD-17 + AS-5 (Phase B), the 6d slot's flag-on body: the IN-MEMORY
     /// half of the reprobe-lane reset. The durable half — the job rows
     /// (origin=reprobe), the poison clear, and the `poison_cleared`
@@ -1597,13 +1598,13 @@ impl DagActor {
             return HashSet::new();
         }
 
-        // r[impl sched.merge.stale-substitutable]
-        // r[impl sched.substitute.detached+5]
-        // Missing-but-substitutable: instead of awaiting eager-fetch
-        // (which blocked the actor), reset Completed→Ready and spawn
-        // the detached fetch (Ready→Substituting). SubstituteComplete
-        // brings the node back to Completed. Dependents stay gated
-        // during the window — same outcome, no actor stall.
+        // r[impl sched.merge.stale-substitutable+2]
+        // Missing-but-substitutable: reset the stale Completed node and
+        // give it a stale_reset-origin materialization job (the store
+        // executor re-fetches; the success consumption re-completes the
+        // node). Dependents stay gated during the window — same outcome,
+        // no actor stall (the walk-era detached re-fetch died with
+        // Phase D-prime).
         let substitutable: HashSet<String> = resp.substitutable_paths.into_iter().collect();
         let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
 
@@ -1733,7 +1734,7 @@ impl DagActor {
             // stays — output WAS gone, even if upstream can re-provide
             // it.
             //
-            // r[impl sched.merge.wanted-outputs+2]
+            // r[impl sched.merge.wanted-outputs+3]
             // Like the reset decision above, the routing forgives
             // `unwanted` paths: a recorded output no LIVE interested
             // build wants (typically never present and not
@@ -1805,7 +1806,7 @@ impl DagActor {
         }
 
         if !to_spawn.is_empty() {
-            // r[impl sched.materialize.job]
+            // r[impl sched.materialize.job+2]
             // PD-18 (Phase B, design §2.1 row 4): the substitutable
             // stale-reset subset routes to materialization jobs
             // (origin=stale_reset) — this closed the SECOND of the two
@@ -1882,7 +1883,7 @@ impl DagActor {
     /// pruned roots and the new_sub lane — riding the same
     /// claims-floor fence (no extra floor read). The created jobs are
     /// returned so the caller can feed the in-memory view POST-commit.
-    // r[impl sched.evidence.durability+2]
+    // r[impl sched.evidence.durability+3]
     #[allow(clippy::too_many_arguments)]
     async fn persist_merge_to_db(
         &mut self,
@@ -1934,7 +1935,7 @@ impl DagActor {
         // Transaction: 3 batched roundtrips instead of 2N+E serial.
         let mut tx = self.db.pool().begin().await?;
 
-        // r[impl sched.evidence.durability+2]
+        // r[impl sched.evidence.durability+3]
         // Claims-floor fence for the whole merge transaction (stamps,
         // links, edges, activation). Checked twice: once here at
         // begin() — a cheap early abort so a large merge from a deposed
@@ -2016,7 +2017,7 @@ impl DagActor {
             // (a) The durable wanted relation — one row per
             // (build, node) pair, written by every merge regardless of
             // routing (design §6 / AS-1).
-            // r[impl sched.materialize.job]
+            // r[impl sched.materialize.job+2]
             let wanted_rows: Vec<crate::db::wanted::WantedRow<'_>> = nodes
                 .iter()
                 .filter_map(|node| {
@@ -2083,7 +2084,7 @@ impl DagActor {
             // in-memory status correction applies post-commit at the 6d
             // slot, BEFORE seed_initial_states reads dep statuses
             // (the bug_089/bug_132 phase-ordering invariant).
-            // r[impl sched.materialize.job]
+            // r[impl sched.materialize.job+2]
             let already_queued: std::collections::HashSet<&str> =
                 job_rows.iter().map(|r| r.drv_hash).collect();
             let mut reset_hashes: Vec<DrvHash> = Vec::new();
@@ -2162,7 +2163,7 @@ impl DagActor {
             }
         }
 
-        // r[impl sched.evidence.durability+2]
+        // r[impl sched.evidence.durability+3]
         // The AUTHORITATIVE claims-floor re-read, as the last statement
         // before commit. Under READ COMMITTED a successor's claim
         // INSERT can commit while the multi-batch tx body above runs
@@ -2332,12 +2333,10 @@ impl DagActor {
         };
 
         // r[impl sched.merge.substitute-probe]
-        // r[impl sched.merge.substitute-fetch]
-        // r[impl sched.substitute.detached+5]
         // Locally-present → cached_hits (Created→Completed inline).
-        // Upstream-substitutable → pending_substitute (caller spawns
-        // the detached fetch after seed_initial_states; the actor loop
-        // is NOT blocked on the NAR download).
+        // Upstream-substitutable → pending_substitute (the merge
+        // creates materialization jobs in-tx; the store executor owns
+        // the NAR download — the actor loop is never blocked on it).
         let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
         let substitutable: HashSet<String> = resp.substitutable_paths.into_iter().collect();
         let indeterminate: HashSet<String> = resp.indeterminate_paths.into_iter().collect();
@@ -2350,14 +2349,14 @@ impl DagActor {
         // expected output path AND all of its WANTED outputs are
         // LOCALLY present. Skip nodes the floating-CA lane already
         // resolved.
-        // r[impl sched.merge.substitute-probe-indeterminate]
+        // r[impl sched.merge.substitute-probe-indeterminate+2]
         // Indeterminate (probe got 429/5xx/deadline-cut) is treated the
         // SAME as substitutable here: optimistically route to a
         // materialization job — the store-side fetch decides; a true
         // miss settles through the job's routing, not a wrong build
         // dispatch.
         //
-        // r[impl sched.merge.wanted-outputs+2]
+        // r[impl sched.merge.wanted-outputs+3]
         // Demand-driven completeness: only the WANTED outputs (the ones
         // some consumer's inputDrvs names, or the root asked for) must
         // be present for a hit / present-or-substitutable for
@@ -2694,7 +2693,7 @@ impl DagActor {
         Ok(Some(resp))
     }
 
-    // r[impl sched.merge.substitute-topdown+12]
+    // r[impl sched.merge.substitute-topdown+13]
     /// Top-down demand-set substitution pre-check (step 0 of
     /// `handle_merge_dag`).
     ///
@@ -2855,7 +2854,7 @@ impl DagActor {
         );
 
         // --- All-or-nothing: every WANTED demanded output available? -
-        // r[impl sched.merge.wanted-outputs+2]
+        // r[impl sched.merge.wanted-outputs+3]
         // "Available" = present in store (NOT in missing_paths) OR
         // substitutable upstream. A single unavailable wanted output of
         // any demanded node → fall through to the full merge. Unwanted

@@ -905,7 +905,7 @@ content-addressed output mappings independently of narinfo signatures.
   gRPC-level `DEFAULT_MAX_BATCH_PATHS` (1 048 576) remains the DoS guard.
 ]
 
-#r("store.substitute.probe-429-retry+2")[
+#r("store.substitute.probe-429-retry+3")[
   The substituter MUST honor HTTP 429 + `Retry-After` (delta-seconds OR RFC
   9110 HTTP-date) on both the narinfo HEAD and GET. A 429 is NOT cached. *HEAD
   path* (`check_available`): after each pass over the uncached set, the
@@ -926,19 +926,22 @@ content-addressed output mappings independently of narinfo signatures.
   tenant with `[rate-limited-A, healthy-B]` should hit B). Only if no upstream
   had the path does `RateLimited` propagate (no inline sleep) so the
   #rref("store.substitute.admission") permit is released before any wait; the
-  gRPC caller (scheduler #rref("sched.substitute.detached") / gateway
-  #rref("gw.store.transient-retry")) owns the retry.
+  gRPC caller (gateway #rref("gw.store.transient-retry")) owns the retry, and
+  the in-process materialization executor re-arms through its job budget
+  (#rref("store.materialize.executor")).
 ]
 
-#r("store.substitute.admission")[
+#r("store.substitute.admission+2")[
   Each rio-store replica MUST gate `try_substitute_on_miss` behind a
   per-replica admission semaphore (`substitute_admission_permits`; default
   `(pg_max_connections × 3).clamp(64, 128)`). Requests beyond cap queue
   server-side up to `SUBSTITUTE_ADMISSION_WAIT` (25 s --- kept below the 30 s
   `DEFAULT_GRPC_TIMEOUT` so callers observe `RESOURCE_EXHAUSTED`, not a
   client-side `DeadlineExceeded`); on timeout the store returns
-  `RESOURCE_EXHAUSTED` (transient --- caller retries per
-  #rref("sched.substitute.detached") and #rref("gw.store.transient-retry")).
+  `RESOURCE_EXHAUSTED` (transient --- the gateway caller retries per
+  #rref("gw.store.transient-retry"); the in-process materialization
+  executor's fetch re-arms through its job budget,
+  #rref("store.materialize.executor")).
   Additive to #rref("store.put.nar-bytes-budget"): admission bounds request
   COUNT, byte-budget bounds buffered BYTES. The permit is acquired by the
   singleflight leader only, inside the moka init future (per
@@ -1027,8 +1030,8 @@ content-addressed output mappings independently of narinfo signatures.
   indicates under-sized fetcher pods (I-207/I-208).
 ]
 
-#r("store.materialize.executor+2")[
-  When the store-side materialization executor is enabled, each store replica
+#r("store.materialize.executor+3")[
+  Whenever a scheduler address is configured, each store replica
   MUST execute materialization jobs as a pull-protocol client: discover jobs by
   polling the scheduler, claim exactly one open attempt per job through
   PullAssignment carrying the materialization kind and a per-replica executor

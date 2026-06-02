@@ -1278,7 +1278,7 @@ async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
 /// UNCLAIMED materialization job and is disjoint from queued/running:
 /// a Ready node with a pending job is substitution backlog (the
 /// ComponentScaler's store signal), not builder-queue backlog.
-// r[verify sched.admin.snapshot-substituting+2]
+// r[verify sched.admin.snapshot-substituting+3]
 #[tokio::test]
 async fn snapshot_counts_substituting() {
     let db = TestDb::new(&MIGRATOR).await;

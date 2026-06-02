@@ -2289,7 +2289,7 @@ mod tests {
         }
     }
 
-    // r[verify sched.merge.wanted-outputs+2]
+    // r[verify sched.merge.wanted-outputs+3]
     /// Multi-root submissions concatenate per-root node lists, so a drv
     /// reachable from two roots appears twice — each copy carrying the
     /// wanted set computed from THAT root's consumers/spec only.

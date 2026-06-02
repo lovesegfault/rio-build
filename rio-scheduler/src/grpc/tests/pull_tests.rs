@@ -98,7 +98,7 @@ async fn pull_unaries_enforce_executor_identity_when_hmac_configured() -> anyhow
 
 // ── Materialization kind intake (the BC-1 identity rule) ──
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// BC-1: a materialization pull MUST carry a per-replica executor
 /// identity (`executor_instance` = the store pod name) — the identity
 /// is what makes the kernel's one-winner arbitration per-replica. A
@@ -148,7 +148,7 @@ async fn materialization_pull_with_empty_instance_rejected() -> anyhow::Result<(
 
 // ── Materialization authorization (security review: dormant ≠ unprotected) ──
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// Phase A authorization: an executor token (the per-intent
 /// builder/fetcher credential) never authorizes a materialization pull —
 /// the kind-attested store credential is the Wave-4 store-executor
@@ -227,7 +227,7 @@ async fn materialization_pull_with_executor_token_rejected() -> anyhow::Result<(
     Ok(())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// Phase A authorization for the listing: executor tokens are per-intent
 /// builder credentials — they do not authorize the fleet-wide
 /// materialization-job listing (job descriptors carry cross-tenant drv
@@ -298,7 +298,7 @@ async fn list_materialization_jobs_with_executor_token_rejected() -> anyhow::Res
     Ok(())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// BC-1 identity hygiene: `executor_instance` is interpolated into the
 /// composite ExecutorId (`{intent}@{instance}`), so it must be a clean
 /// DNS-1123 label — lowercase alphanumerics + interior hyphens, ≤63
@@ -476,7 +476,7 @@ fn mat_success_outcome() -> rio_proto::types::MaterializationOutcome {
     }
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// Wave-4 kind-attested credential (T-5.1: now also INSTANCE-BOUND —
 /// the enumerated Phase A assertion change): `ServiceClaims{caller=
 /// "rio-store", instance: Some(<replica>)}` signed with the SERVICE
@@ -567,7 +567,7 @@ async fn materialization_ops_accept_store_service_credential() -> anyhow::Result
     Ok(())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// The credential is exactly `caller="rio-store"`: another control-plane
 /// caller's service token (e.g. the gateway's) does NOT authorize
 /// materialization operations; executor tokens stay rejected (the Wave-3
@@ -678,7 +678,7 @@ async fn store_service_credential_scoping_is_exact() -> anyhow::Result<()> {
 
 // ── T-5.1 (Phase B): the instance token-claim binding ──────────────────────
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// T-5.1 (security obligation 1, red-first): the scheduler VERIFIES the
 /// `executor_instance` a materialization claim asserts against the
 /// instance bound INSIDE the signed store-service credential — a
@@ -755,7 +755,7 @@ async fn materialization_claim_with_mismatched_instance_rejected() -> anyhow::Re
     Ok(())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// T-5.1 privilege narrowing (red-first): an INSTANCE-LESS ServiceClaims
 /// token — the gateway-PutPath-style credential every non-store caller
 /// mints — no longer authorizes materialization operations. The work
@@ -869,7 +869,7 @@ async fn materialization_claim_without_instance_claim_rejected() -> anyhow::Resu
     Ok(())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// Defense in depth, symmetric with the pull-side kind rejection: an
 /// EXECUTOR-authenticated ReportOutcome carrying a materialization
 /// outcome is rejected PermissionDenied — a builder pod that somehow
@@ -927,7 +927,7 @@ async fn executor_token_report_with_materialization_outcome_rejected() -> anyhow
     Ok(())
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 /// The third dormant materialization RPC (the Phase-A ack-and-drop
 /// progress stub) carries the same identity posture as its siblings —
 /// dormant ≠ unprotected. With the HMAC posture configured:
@@ -1017,8 +1017,8 @@ async fn report_materialization_progress_requires_store_credential() -> anyhow::
 // ── T-6.2: the wire-level flag-on lifecycle (review finding dormancy-5;
 //    PD-14 as amended) ────────────────────────────────────────────────────
 
-// r[verify sched.materialize.job]
-// r[verify store.materialize.executor+2]
+// r[verify sched.materialize.job+2]
+// r[verify store.materialize.executor+3]
 /// The store-to-scheduler seam, flag-on, through the REAL wire: a real
 /// in-process tonic `ExecutorService` server with BOTH HMAC key families
 /// configured (the production posture), driven by a real tonic client
@@ -1197,7 +1197,7 @@ async fn flag_on_materialization_lifecycle_through_grpc() -> anyhow::Result<()> 
 
 // ── T-1.2 (Phase B): the BC-4 progress relay through the wire ──────────────
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 // r[verify gw.activity.subst-progress]
 /// The Phase B progress relay (BC-4, replacing the PD-15b ack-and-drop
 /// stub): `ReportMaterializationProgress` through the REAL wire — with
@@ -1394,7 +1394,7 @@ async fn call_mat_surface(
     }
 }
 
-// r[verify sched.materialize.job]
+// r[verify sched.materialize.job+2]
 // r[verify sec.executor.identity-token+2]
 /// T-1.9 / PD-B18: the materialization-surface authentication sweep —
 /// the cross-surface structural pin that catches the NEXT handler
