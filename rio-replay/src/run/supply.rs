@@ -33,7 +33,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use rio_nix::derivation::Derivation;
-use rio_nix::hash::NixHash;
 use rio_nix::nar::{self, NarNode};
 use rio_nix::narinfo::NarInfo;
 use rio_nix::protocol::pathinfo::ValidPathInfo;
@@ -43,6 +42,7 @@ use tokio::sync::Notify;
 
 use crate::archive::reader::ReplayArchive;
 use crate::archive::schema::ClosureRecord;
+use crate::narhash::NarHash;
 
 use super::spec::SupplyDependencies;
 
@@ -646,15 +646,12 @@ fn info_from_narinfo(
     store_path: &str,
     narinfo: &NarInfo,
 ) -> std::result::Result<ValidPathInfo, String> {
-    let nar_hash = NixHash::parse_colon(&narinfo.nar_hash).map_err(|err| {
+    // One decoder for every NarHash spelling (NarHash::parse) — the archive
+    // format layer accepts both the nixbase32 and hex narinfo forms, so the
+    // planner must decode whatever the format admitted.
+    let nar_hash = NarHash::parse(&narinfo.nar_hash).map_err(|err| {
         format!(
-            "narinfo NarHash {:?} is not decodable: {err}",
-            narinfo.nar_hash
-        )
-    })?;
-    let digest: [u8; 32] = nar_hash.digest().try_into().map_err(|_| {
-        format!(
-            "narinfo NarHash {:?} is not a SHA-256 digest",
+            "narinfo NarHash {:?} is not decodable: {err:#}",
             narinfo.nar_hash
         )
     })?;
@@ -664,7 +661,7 @@ fn info_from_narinfo(
             .deriver
             .as_deref()
             .map(|deriver| full_store_path(store_dir, deriver)),
-        nar_hash: digest.to_vec(),
+        nar_hash: nar_hash.digest().to_vec(),
         references: narinfo
             .references
             .iter()
@@ -989,6 +986,33 @@ mod tests {
             file_hash: None,
             file_size: None,
         }
+    }
+
+    /// One decoder for narinfo NarHash values: the nixbase32 spelling
+    /// cache.nixos.org serves and the hex spelling rio-store records both
+    /// decode to the same digest, so a hex-sidecar archive (or a hex-serving
+    /// relay cache) plans exactly like a nixbase32 one instead of having its
+    /// paths silently skipped.
+    #[test]
+    fn info_from_narinfo_accepts_nixbase32_and_hex_narhash() {
+        let digest = [0x42u8; 32];
+        let mut base32_form = fake_narinfo(DEP_OUT, 100, &[]);
+        base32_form.nar_hash = format!("sha256:{}", nixbase32::encode(&digest));
+        let mut hex_form = fake_narinfo(DEP_OUT, 100, &[]);
+        hex_form.nar_hash = format!("sha256:{}", hex::encode(digest));
+
+        let from_base32 = info_from_narinfo(DEP_OUT, &base32_form).unwrap();
+        let from_hex = info_from_narinfo(DEP_OUT, &hex_form)
+            .expect("the hex NarHash spelling must decode, not skip the path");
+        assert_eq!(from_base32.nar_hash, digest.to_vec());
+        assert_eq!(from_hex.nar_hash, digest.to_vec());
+
+        // A genuinely undecodable NarHash still degrades to a skip reason
+        // naming the value.
+        let mut bad = fake_narinfo(DEP_OUT, 100, &[]);
+        bad.nar_hash = "md5:abcd".to_string();
+        let err = info_from_narinfo(DEP_OUT, &bad).unwrap_err();
+        assert!(err.contains("md5:abcd"), "{err}");
     }
 
     /// Skip reason recorded for `path`, or a panic naming what IS skipped.
@@ -1416,7 +1440,7 @@ mod tests {
         assert!(matches!(src_item.payload, UploadPayload::ArchivePath));
         let sidecar = archive.narinfo(SRC).unwrap();
         assert_eq!(src_item.info.nar_size, sidecar.nar_size);
-        let decoded = NixHash::parse_colon(&sidecar.nar_hash).unwrap();
+        let decoded = NarHash::parse(&sidecar.nar_hash).unwrap();
         assert_eq!(src_item.info.nar_hash, decoded.digest());
         assert!(src_item.info.references.is_empty());
         assert!(src_item.info.signatures.is_empty());

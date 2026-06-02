@@ -21,9 +21,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use futures_util::TryStreamExt as _;
 use rio_nix::narinfo::NarInfo;
-use rio_nix::store_path::nixbase32;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
+
+use crate::narhash::NarHash;
 
 /// TCP/TLS connect timeout for HTTP substituters. There is deliberately no
 /// overall request timeout: NAR bodies can be multi-GB and legitimately
@@ -292,14 +293,26 @@ impl Substituter {
             info.nar_size,
             nar.len()
         );
+        // Digest-to-digest verification through the one NarHash decoder: a
+        // byte-correct NAR must verify whatever spelling (nixbase32 or hex)
+        // the cache's narinfo used, and an undecodable declared hash is its
+        // own error — the NAR cannot be verified at all.
+        let declared = NarHash::parse(&info.nar_hash).map_err(|err| {
+            anyhow!(
+                "narinfo NarHash {:?} for {} from {} is not decodable: {err:#}",
+                info.nar_hash,
+                info.store_path,
+                self.url()
+            )
+        })?;
         let digest: [u8; 32] = Sha256::digest(&nar).into();
-        let got = format!("sha256:{}", nixbase32::encode(&digest));
         ensure!(
-            got == info.nar_hash,
-            "NAR hash mismatch for {} from {}: narinfo declares {}, got {got}",
+            NarHash::from_digest(digest) == declared,
+            "NAR hash mismatch for {} from {}: narinfo declares {}, got sha256:{}",
             info.store_path,
             self.url(),
             info.nar_hash,
+            hex::encode(digest),
         );
         Ok(nar)
     }
@@ -405,6 +418,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use rio_nix::store_path::nixbase32;
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
     use super::*;
@@ -746,6 +760,39 @@ References:
         let lzip_info = narinfo_for(&nar, "nar/good.nar.zst", "lzip");
         let err = format!("{:#}", sub.fetch_nar(&lzip_info).await.unwrap_err());
         assert!(err.contains("lzip") && err.contains(&sub.url()), "{err}");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_nar_verifies_hex_form_narhash() {
+        // rio-store-recorded narinfos carry `sha256:<hex>`; a byte-correct
+        // NAR must verify against that spelling exactly like the nixbase32
+        // one — verification compares digests, not formatted strings.
+        let nar: Vec<u8> = b"hex narinfo NAR payload 0123456789".repeat(64);
+        let zstd_body = zstd_compress(&nar).await;
+        let routes = HashMap::from([("/nar/hex.nar.zst".to_string(), (200, zstd_body))]);
+        let (base, server) = spawn_test_server(routes).await;
+        let sub = Substituter::parse(&base).await.unwrap();
+
+        let digest: [u8; 32] = Sha256::digest(&nar).into();
+        let mut info = narinfo_for(&nar, "nar/hex.nar.zst", "zstd");
+        info.nar_hash = format!("sha256:{}", hex::encode(digest));
+        assert_eq!(
+            sub.fetch_nar(&info).await.unwrap(),
+            nar,
+            "a byte-correct NAR must verify against a hex-spelled NarHash"
+        );
+
+        // An undecodable NarHash fails the fetch naming the value — the NAR
+        // cannot be verified — rather than reporting a spurious mismatch.
+        let mut bad = narinfo_for(&nar, "nar/hex.nar.zst", "zstd");
+        bad.nar_hash = "md5:0123".into();
+        let err = format!("{:#}", sub.fetch_nar(&bad).await.unwrap_err());
+        assert!(
+            err.contains("md5:0123") && err.contains("not decodable"),
+            "{err}"
+        );
 
         server.abort();
     }
