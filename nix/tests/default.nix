@@ -666,7 +666,7 @@ in
   # is standalone + a proxy systemd unit on control; see fixtures/
   # toxiproxy.nix for why not a separate VM (scheduler connect_store
   # boot race). ~4-5min.
-  # r[verify builder.exec.limits-isolated]
+  # r[verify builder.exec.limits-isolated+1]
   #   sched-stall-timeout-still-fires: the build-timeout kill lands
   #   DURING a 75s scheduler SIGSTOP — no process in the build cgroup
   #   10s past the deadline, while the scheduler link is still frozen —

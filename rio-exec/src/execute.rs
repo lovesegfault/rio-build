@@ -272,7 +272,7 @@ impl ActivityMeter {
     }
 
     /// Record `n` freshly read bytes and wake the watchdog.
-    // r[impl builder.exec.limits-isolated]
+    // r[impl builder.exec.limits-isolated+1]
     fn record(&self, n: usize) {
         let total = self.bytes.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
         self.tick.send_replace(total);
@@ -296,15 +296,18 @@ struct LimitWatchdog {
     started: Instant,
     activity: watch::Receiver<u64>,
     bytes: Arc<AtomicU64>,
-    /// Why the watchdog killed, if it did and the kill acted. Read by
-    /// `execute()` after the reap to map the final exit outcome.
+    /// Why the watchdog killed, if it did and the kill acted on a tree
+    /// the phase machine still believed live. A *claim*, not a
+    /// verdict: `execute()` reads it after the reap and [`map_exit`]
+    /// honors it only when the wait status corroborates death by the
+    /// executor's own SIGKILL.
     reason: Arc<std::sync::Mutex<Option<KillReason>>>,
 }
 
 impl LimitWatchdog {
     /// Enforce until a limit fires (kill, then return) or nothing can
     /// ever fire again (return without killing).
-    // r[impl builder.exec.limits-isolated]
+    // r[impl builder.exec.limits-isolated+1]
     async fn run(mut self) {
         // Tokio instants throughout: identical to the monotonic clock
         // in production, virtualizable under `start_paused` tests.
@@ -371,14 +374,19 @@ impl LimitWatchdog {
     }
 
     /// Kill the tree and record why — but only when the kill actually
-    /// acted on a live tree.
+    /// acted on a tree the state machine still believed live.
     ///
-    /// Kill-under-the-reason-mutex: the kill happens while the reason
-    /// slot is locked, so the exit it causes cannot be mapped before
-    /// the slot is consistent; and a deadline that fires after the
-    /// tree was reaped is a no-op that records nothing, so a late
-    /// timer can never misattribute a natural exit as a limit kill.
-    // r[impl builder.exec.limits-isolated]
+    /// This is the *narrowing* layer of the two-layer verdict contract
+    /// (see [`map_exit`] for the deciding layer). Kill-under-the-
+    /// reason-mutex: the kill happens while the reason slot is locked,
+    /// so the exit it causes cannot be mapped before the slot is
+    /// consistent; a deadline that fires after the tree settled is a
+    /// no-op that records nothing. The state machine necessarily lags
+    /// the kernel by the [exit observed, phase flipped] window, so a
+    /// recorded reason alone is a *claim*, not a verdict — `map_exit`
+    /// honors it only when the wait status corroborates death by our
+    /// own SIGKILL.
+    // r[impl builder.exec.limits-isolated+1]
     fn kill(&self, reason: KillReason) {
         let mut slot = self.reason.lock().unwrap_or_else(|e| e.into_inner());
         if self.tree.kill_tree() && slot.is_none() {
@@ -499,16 +507,12 @@ pub async fn execute(
     // Reap on a dedicated blocking thread. attach_reaper() and the
     // spawn happen with no await between them, so there is no state
     // where the guard believes a reaper exists but none was spawned.
+    // observe_then_reap flips the tree phase BEFORE the status is
+    // consumed, so a kill can never target a recycled pid.
     tree.attach_reaper();
     let wait_task = {
         let tree = Arc::clone(&tree);
-        tokio::task::spawn_blocking(move || {
-            let status = wait_for(intermediate);
-            // The pid is reaped: nothing may ever signal it again (it
-            // could be recycled).
-            tree.mark_reaped();
-            status
-        })
+        tokio::task::spawn_blocking(move || observe_then_reap(&tree, intermediate))
     };
 
     // ---- Cgroup attach, then the go byte ----------------------------------
@@ -587,7 +591,7 @@ pub async fn execute(
             // `reserve()` is its own arm, so the loop never parks on
             // the receiver: no capacity simply means this arm stays
             // pending while the others keep running.
-            // r[impl builder.exec.limits-isolated]
+            // r[impl builder.exec.limits-isolated+1]
             permit = events.reserve(), if events_open && !pending.is_empty() => {
                 match permit {
                     Ok(permit) => {
@@ -1108,9 +1112,14 @@ fn kill_pid_and_cgroup(cgroup: Option<&Path>, pid: nix::unistd::Pid) {
     if let Some(cgroup) = cgroup {
         let _ = std::fs::write(cgroup.join("cgroup.kill"), "1");
     }
-    // SAFETY: SIGKILL to a pid the TreeState state machine guarantees
-    // has not been reaped; a pid already dying from the cgroup kill
-    // ignores the extra signal.
+    // SAFETY: SIGKILL to a pid that is either live or an un-reaped
+    // zombie. The phase machine flips to `Reaped` BEFORE the wait
+    // status is consumed (`observe_then_reap`; the guard's no-reaper
+    // drop marks before its blocking reap too), and every kill path
+    // consults the phase under the same lock — so a pid is never
+    // signaled after it became recyclable. Signaling a zombie is a
+    // no-op; a pid already dying from the cgroup kill ignores the
+    // extra signal.
     unsafe {
         libc::kill(pid.as_raw(), libc::SIGKILL);
     }
@@ -1149,18 +1158,90 @@ fn wait_for(pid: nix::unistd::Pid) -> Result<i32, std::io::Error> {
     }
 }
 
+/// Observe the intermediate's exit *without* consuming it
+/// (`waitid(WEXITED | WNOWAIT)`), flip the tree phase to `Reaped` while
+/// the zombie still owns the pid, and only then perform the real reap.
+///
+/// The ordering is the point: by the instant the wait status is
+/// consumed — the only instant after which the kernel may recycle the
+/// pid — the phase machine already says `Reaped`, so
+/// [`TreeState::kill_tree`] (which consults the phase under the same
+/// lock) can never signal a recycled pid. A kill that races the
+/// [exit, observe] window signals a zombie, which is harmless: the
+/// zombie holds the pid until we consume the status. The recorded
+/// reason such a racing kill leaves behind is discarded by
+/// [`map_exit`]'s corroboration layer.
+///
+/// If `waitid` itself fails for any reason other than `EINTR`, fall
+/// back to the legacy reap-then-mark order: a tree must never be
+/// marked `Reaped` while the process may still be alive (the mark is
+/// what disarms every kill path).
+// r[impl builder.exec.limits-isolated+1]
+fn observe_then_reap(tree: &TreeState, pid: nix::unistd::Pid) -> Result<i32, std::io::Error> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waitid with WEXITED|WNOWAIT into a zeroed stack
+        // siginfo for a direct child; WNOWAIT leaves the child
+        // reapable (the status is not consumed).
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid.as_raw() as libc::id_t,
+                &raw mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            // Exit observed; the zombie still owns the pid. Disarm the
+            // kill paths first, then consume the status.
+            tree.mark_reaped();
+            return wait_for(pid);
+        }
+        let errno = Errno::last();
+        if errno == Errno::EINTR {
+            continue;
+        }
+        // waitid failed (it should not, for a direct child): legacy
+        // order — reap, then mark.
+        let status = wait_for(pid);
+        tree.mark_reaped();
+        return status;
+    }
+}
+
+/// SIGKILL-consistent wait statuses: death by `SIGKILL` directly, or
+/// the intermediate's forwarding convention for a SIGKILLed sandbox
+/// child (`128 + 9`). These are the only statuses the executor's own
+/// kill machinery can produce.
+fn sigkill_consistent(raw_status: i32) -> bool {
+    (libc::WIFSIGNALED(raw_status) && libc::WTERMSIG(raw_status) == libc::SIGKILL)
+        || (libc::WIFEXITED(raw_status) && libc::WEXITSTATUS(raw_status) == 128 + libc::SIGKILL)
+}
+
 /// Map the intermediate's raw wait status (plus any kill reason the
 /// executor recorded) to the caller-facing [`ExitOutcome`].
 ///
-/// A recorded kill reason wins: the raw status of a tree the executor
-/// itself killed is an implementation detail (`SIGKILL`, or whatever
-/// exit code the shell turned it into). Otherwise the intermediate's
-/// forwarding convention applies: exit codes `129..=192` are fatal
-/// signals forwarded as `128 + signo` (a process that genuinely exits
-/// with such a code is indistinguishable, which is the cost of the
-/// convention), everything else is a plain exit code.
+/// Two-layer verdict contract, deciding layer. A recorded kill reason
+/// is a *claim* — the watchdog issued a kill against a tree the phase
+/// machine still believed live, but the phase machine necessarily lags
+/// the kernel's exit event. The claim is honored only when the wait
+/// status corroborates it: the tree actually died of the executor's
+/// own `SIGKILL` ([`sigkill_consistent`]). Any other status means the
+/// kill lost the race to a natural exit, and the natural exit wins —
+/// a clean `exit(0)` can never be relabeled `TimedOut`/`Silent`/
+/// `LogLimitExceeded` by a deadline that fired into the
+/// [exit observed, phase flipped] window.
+///
+/// Otherwise the intermediate's forwarding convention applies: exit
+/// codes `129..=192` are fatal signals forwarded as `128 + signo` (a
+/// process that genuinely exits with such a code is indistinguishable,
+/// which is the cost of the convention), everything else is a plain
+/// exit code.
+// r[impl builder.exec.limits-isolated+1]
 fn map_exit(raw_status: i32, kill: Option<KillReason>) -> ExitOutcome {
-    if let Some(kill) = kill {
+    if let Some(kill) = kill
+        && sigkill_consistent(raw_status)
+    {
         return kill.into();
     }
     if libc::WIFEXITED(raw_status) {
@@ -1417,7 +1498,7 @@ fn spawn_log_readers(
                 match nix::unistd::read(&fd, &mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        // r[impl builder.exec.limits-isolated]
+                        // r[impl builder.exec.limits-isolated+1]
                         meter.record(n);
                         let chunk = LogChunk {
                             stream,
@@ -1583,8 +1664,12 @@ mod tests {
         assert_eq!(map_exit(signaled(9), None), ExitOutcome::Signaled(9));
     }
 
+    /// A recorded kill reason decides the outcome when — and only
+    /// when — the wait status corroborates death by our own SIGKILL
+    /// (direct, or forwarded as 137).
+    // r[verify builder.exec.limits-isolated+1]
     #[test]
-    fn map_exit_kill_reason_wins() {
+    fn map_exit_kill_reason_wins_when_corroborated() {
         assert_eq!(
             map_exit(exited(137), Some(KillReason::Timeout)),
             ExitOutcome::TimedOut
@@ -1594,8 +1679,37 @@ mod tests {
             ExitOutcome::Silent
         );
         assert_eq!(
-            map_exit(exited(0), Some(KillReason::LogLimit)),
+            map_exit(exited(137), Some(KillReason::LogLimit)),
             ExitOutcome::LogLimitExceeded
+        );
+    }
+
+    /// THE merged_bug_024 pin (flipped from the parent fix's racy
+    /// pinning): a kill claim over a wait status our SIGKILL cannot
+    /// have produced is discarded — the natural exit wins. The clean
+    /// `exit(0)` case is exactly the [exit observed, phase flipped]
+    /// window the shadow state machine cannot see.
+    // r[verify builder.exec.limits-isolated+1]
+    #[test]
+    fn map_exit_uncorroborated_kill_yields_to_natural_exit() {
+        assert_eq!(
+            map_exit(exited(0), Some(KillReason::LogLimit)),
+            ExitOutcome::Exited(0),
+            "a clean exit can never be relabeled as a limit kill"
+        );
+        assert_eq!(
+            map_exit(exited(7), Some(KillReason::Timeout)),
+            ExitOutcome::Exited(7)
+        );
+        assert_eq!(
+            map_exit(signaled(15), Some(KillReason::Timeout)),
+            ExitOutcome::Signaled(15),
+            "a SIGTERM death is not ours; the kill claim is discarded"
+        );
+        assert_eq!(
+            map_exit(exited(143), Some(KillReason::Silent)),
+            ExitOutcome::Signaled(15),
+            "forwarded SIGTERM is not SIGKILL-consistent either"
         );
     }
 
@@ -1982,7 +2096,7 @@ mod tests {
     /// kill fires with ZERO event consumers anywhere — no chunk
     /// channel, no events receiver, nothing draining. Enforcement
     /// owns no send path to park on.
-    // r[verify builder.exec.limits-isolated]
+    // r[verify builder.exec.limits-isolated+1]
     #[tokio::test(start_paused = true)]
     async fn watchdog_timeout_kills_with_zero_consumers() {
         let tree = TreeState::new(None);
@@ -2010,7 +2124,7 @@ mod tests {
 
     /// Activity recorded by the meter resets the silence clock; its
     /// absence fires the silence kill.
-    // r[verify builder.exec.limits-isolated]
+    // r[verify builder.exec.limits-isolated+1]
     // r[verify builder.silence.timeout-kill+3]
     #[tokio::test(start_paused = true)]
     async fn watchdog_silence_resets_on_activity() {
@@ -2048,7 +2162,7 @@ mod tests {
     }
 
     /// The byte cap is checked against the meter's raw-read total.
-    // r[verify builder.exec.limits-isolated]
+    // r[verify builder.exec.limits-isolated+1]
     #[tokio::test(start_paused = true)]
     async fn watchdog_log_cap_kills_at_threshold() {
         let tree = TreeState::new(None);
@@ -2076,7 +2190,7 @@ mod tests {
     /// THE misattribution pin: a deadline that fires after the tree
     /// was reaped records no reason — the natural exit status wins
     /// structurally, not by luck of timer ordering.
-    // r[verify builder.exec.limits-isolated]
+    // r[verify builder.exec.limits-isolated+1]
     #[tokio::test(start_paused = true)]
     async fn watchdog_records_reason_only_when_kill_acted() {
         let tree = TreeState::new(None);
@@ -2100,6 +2214,112 @@ mod tests {
             "a kill that never acted must not claim the exit"
         );
         assert!(matches!(*tree.lock(), TreePhase::Reaped));
+    }
+
+    /// Spawn a shell that exits with `code` (a real child whose natural
+    /// exit the tests observe).
+    fn spawn_exiting(code: i32) -> (std::process::Child, nix::unistd::Pid) {
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", &format!("exit {code}")])
+            .spawn()
+            .expect("spawn exiting child");
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        (child, pid)
+    }
+
+    /// Block until `pid`'s exit is observable, WITHOUT consuming it
+    /// (`waitid(WEXITED | WNOWAIT)`): on return the child is a zombie
+    /// that still owns its pid.
+    fn observe_exit_nowait(pid: nix::unistd::Pid) {
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: waitid with WEXITED|WNOWAIT into a zeroed stack
+            // siginfo for a direct child.
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid.as_raw() as libc::id_t,
+                    &raw mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if rc == 0 {
+                return;
+            }
+            assert_eq!(Errno::last(), Errno::EINTR, "waitid failed");
+        }
+    }
+
+    /// THE merged_bug_024 near-miss window, constructed
+    /// deterministically (no /proc polling, no sleeps): the child has
+    /// exited 0 and is a zombie, but the phase machine still says
+    /// `Adopted` — a deadline kill ACTS (signals the zombie, harmless;
+    /// records its claim) and the corroboration layer then discards
+    /// the claim because the wait status is a clean exit our SIGKILL
+    /// cannot have produced.
+    // r[verify builder.exec.limits-isolated+1]
+    #[test]
+    fn zombie_window_kill_claim_is_discarded() {
+        let tree = TreeState::new(None);
+        let (_child, pid) = spawn_exiting(0);
+        tree.adopt(pid).expect("adopt");
+        tree.attach_reaper();
+
+        // Deterministically reach the window: exit observed by the
+        // kernel, status not yet consumed, phase not yet flipped.
+        observe_exit_nowait(pid);
+        assert!(
+            tree.kill_tree(),
+            "the kill acts on the shadow-live zombie (the racy window)"
+        );
+
+        // What observe_then_reap's tail does: flip, then consume.
+        tree.mark_reaped();
+        let status = wait_for(pid).expect("zombie stays reapable");
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        assert_eq!(
+            map_exit(status, Some(KillReason::Timeout)),
+            ExitOutcome::Exited(0),
+            "the uncorroborated claim must not relabel the clean exit"
+        );
+    }
+
+    /// `observe_then_reap`: the WNOWAIT observation leaves the child
+    /// reapable (the real reap still returns the full status) and the
+    /// phase is `Reaped` by return.
+    // r[verify builder.exec.limits-isolated+1]
+    #[test]
+    fn observe_then_reap_preserves_status_and_flips_phase() {
+        let tree = TreeState::new(None);
+        let (_child, pid) = spawn_exiting(7);
+        tree.adopt(pid).expect("adopt");
+        tree.attach_reaper();
+
+        let status = observe_then_reap(&tree, pid).expect("status");
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 7,
+            "WNOWAIT must not consume the exit status"
+        );
+        assert!(matches!(*tree.lock(), TreePhase::Reaped));
+    }
+
+    /// Once `observe_then_reap` has run, every kill path is disarmed:
+    /// a late deadline's `kill_tree()` no-ops (returns false, signals
+    /// nothing) — the structural guarantee that a recycled pid can
+    /// never be targeted.
+    // r[verify builder.exec.limits-isolated+1]
+    #[test]
+    fn late_kill_after_observe_then_reap_is_inert() {
+        let tree = TreeState::new(None);
+        let (_child, pid) = spawn_exiting(0);
+        tree.adopt(pid).expect("adopt");
+        tree.attach_reaper();
+
+        observe_then_reap(&tree, pid).expect("status");
+        assert!(
+            !tree.kill_tree(),
+            "a reaped tree is unkillable; no signal may chase the pid"
+        );
     }
 
     /// Readers gone + tree settled = nothing left to enforce: the
