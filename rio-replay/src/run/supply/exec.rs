@@ -269,6 +269,16 @@ pub struct SupplyStageReport {
     /// when the prefetch policy wanted nothing at all; an all-unavailable
     /// wanted set yields 100, never a skipped gate.
     pub shortfall_pct: Option<f64>,
+    /// The prewarm upload pass ended with its gateway circuit breaker
+    /// tripped: the remaining planned uploads were skipped without an
+    /// attempt (recorded `skipped`, retiring nobody), so the campaign
+    /// would otherwise start execution with its planned supply largely
+    /// undelivered. Gated behind the campaign PAUSE file by
+    /// [`run_supply_stage`], exactly like the prefetch shortfall — whether
+    /// to accept the gap or abort is an operator decision, never an
+    /// engine heuristic. Defaults false on reports written before the
+    /// flag existed.
+    pub upload_collapsed: bool,
 }
 
 /// What the prefetch arm settled, per path.
@@ -1528,6 +1538,7 @@ pub async fn prewarm_uploads(
         uploaded_bytes: totals.uploaded_bytes,
         upload_secs,
         upload_mib_per_s,
+        upload_collapsed: breaker.is_tripped(),
         ..SupplyStageReport::default()
     })
 }
@@ -2102,6 +2113,7 @@ async fn run_upload_ladder(
             report.uploaded_bytes = upload.uploaded_bytes;
             report.upload_secs = upload.upload_secs;
             report.upload_mib_per_s = upload.upload_mib_per_s;
+            report.upload_collapsed = upload.upload_collapsed;
         }
         SupplyDelivery::Inline => {
             // Inline delivery defers planned uploads to the per-submission
@@ -2272,6 +2284,29 @@ pub async fn run_supply_stage(
         .await?;
     }
 
+    // ── Upload-collapse gate ────────────────────────────────────────────
+    // The prewarm pass ended with its circuit breaker tripped: everything
+    // it had not yet sent was skipped without an attempt (bookkeeping
+    // rows — nothing settled, nothing retires), so the campaign would
+    // start execution with its planned supply largely undelivered and
+    // only the per-submission top-up between every affected unit and a
+    // missing-input failure. Like the prefetch shortfall below, that is
+    // an operator decision: pause before the execution clock starts —
+    // removing the PAUSE file accepts the gap (the top-up re-attempts
+    // skipped paths against a fresh breaker), re-running the stage after
+    // deleting the supply marker re-prewarms, aborting costs nothing.
+    if report.upload_collapsed {
+        tracing::error!(
+            delivered = report.delivered,
+            failed = report.failed,
+            skipped = report.skipped,
+            "the prewarm upload circuit breaker tripped (gateway unreachable); the campaign is \
+             paused before execution — remove the PAUSE file to proceed on the per-submission \
+             top-up alone, or abort"
+        );
+        pause_campaign(&state, "supply upload collapse", knobs, wait_for_resume).await?;
+    }
+
     // ── Prefetch shortfall gate ─────────────────────────────────────────
     // The denominator is the whole wanted-but-not-yet-present set: planned
     // prefetches plus the paths that could not be planned (or ladder-
@@ -2289,9 +2324,6 @@ pub async fn run_supply_stage(
             * 100.0;
         report.shortfall_pct = Some(shortfall_pct);
         if shortfall_pct > knobs.prefetch_shortfall_pause_pct {
-            let pause = state.path("PAUSE");
-            std::fs::write(&pause, b"prefetch shortfall\n")
-                .with_context(|| format!("write {}", pause.display()))?;
             tracing::error!(
                 prefetch_missing = report.prefetch_missing,
                 prefetch_unavailable = report.prefetch_unavailable,
@@ -2301,17 +2333,35 @@ pub async fn run_supply_stage(
                 "prefetch shortfall above the pause threshold; the campaign is paused before \
                  execution — remove the PAUSE file to accept the shortfall and resume, or abort"
             );
-            if wait_for_resume {
-                let poll = Duration::from_secs(knobs.cluster_status_poll_secs.max(1));
-                while state.path("PAUSE").exists() {
-                    tokio::time::sleep(poll).await;
-                }
-                tracing::info!("PAUSE file removed; resuming after the prefetch shortfall");
-            }
+            pause_campaign(&state, "prefetch shortfall", knobs, wait_for_resume).await?;
         }
     }
 
     Ok(SupplyStageOutput { report, ladder })
+}
+
+/// Write the campaign PAUSE file naming `reason` and (when
+/// `wait_for_resume`) block until an operator removes it — the shared
+/// chokepoint of the pre-execution supply gates (prefetch shortfall,
+/// upload collapse), so every gate pauses the same way and the execution
+/// clock never starts on a silently under-supplied campaign.
+async fn pause_campaign(
+    state: &StateDir,
+    reason: &str,
+    knobs: &Knobs,
+    wait_for_resume: bool,
+) -> Result<()> {
+    let pause = state.path("PAUSE");
+    std::fs::write(&pause, format!("{reason}\n"))
+        .with_context(|| format!("write {}", pause.display()))?;
+    if wait_for_resume {
+        let poll = Duration::from_secs(knobs.cluster_status_poll_secs.max(1));
+        while state.path("PAUSE").exists() {
+            tokio::time::sleep(poll).await;
+        }
+        tracing::info!(reason, "PAUSE file removed; resuming");
+    }
+    Ok(())
 }
 
 /// Re-derive the per-path outcome counts of a [`SupplyStageReport`] from the
@@ -2751,6 +2801,94 @@ mod tests {
             // (fresh breaker) can claim the path again.
             assert_eq!(claims.claim(path), ClaimOutcome::Won, "{path}");
         }
+        // The collapse is reported for the stage's operator PAUSE gate.
+        assert!(report.upload_collapsed);
+    }
+
+    /// The upload-collapse PAUSE gate, both directions, on the real stage
+    /// surface: a prewarm pass whose circuit breaker trips writes the
+    /// campaign PAUSE file naming the collapse (the operator decides —
+    /// proceed on the per-submission top-up alone, re-run the stage, or
+    /// abort — exactly like the sibling prefetch-shortfall gate), while a
+    /// healthy prewarm pass of the same shape pauses nothing. The wide
+    /// archive's units are independent, so every drv text dials the
+    /// gateway and the scripted transport failures latch the breaker.
+    #[tokio::test]
+    async fn run_supply_stage_pauses_when_the_upload_breaker_collapses() {
+        use crate::run::archive_input::write_mini_wide_archive;
+
+        let inputs_for = |archive: Arc<ReplayArchive>, drvs: &[String]| SupplyInputs {
+            workload_outputs: BTreeSet::new(),
+            workload_drvs: drvs.iter().cloned().collect(),
+            prefetch_paths: BTreeMap::new(),
+            prior_valid: BTreeSet::new(),
+            target_coverage: BTreeSet::new(),
+            archive: Some(archive),
+            target_substituters: Vec::new(),
+            relay_substituters: Vec::new(),
+            // Hermetic: no substituter rungs, so the test never probes.
+            dependencies: SupplyDependencies::EmbeddedOnly,
+            delivery: SupplyDelivery::Prewarm,
+        };
+        let knobs = Knobs {
+            upload_workers: 1,
+            upload_batch_max_entries: 1,
+            ..Knobs::default()
+        };
+
+        // Collapse: every upload fails; eight independent drv texts give
+        // eight consecutive transport failures (threshold 6).
+        let archive_dir = tempfile::tempdir().unwrap();
+        let drvs = write_mini_wide_archive(archive_dir.path(), 8);
+        let archive = Arc::new(ReplayArchive::open(archive_dir.path()).unwrap());
+        let (_dir, state) = state();
+        let state = Arc::new(state);
+        let fake = Arc::new(FakeSupplyTransport::default());
+        fake.fail_uploads.store(true, Ordering::SeqCst);
+        let report = run_supply_stage(
+            state.clone(),
+            fake,
+            inputs_for(archive.clone(), &drvs),
+            &knobs,
+            Arc::new(AtomicU64::new(1)),
+            // Tests never block on the operator: the PAUSE file is
+            // asserted on directly instead of being waited for.
+            false,
+        )
+        .await
+        .unwrap()
+        .report;
+        assert!(report.upload_collapsed);
+        assert!(report.skipped > 0, "{report:?}");
+        assert_eq!(
+            std::fs::read_to_string(state.path("PAUSE")).unwrap(),
+            "supply upload collapse\n",
+            "the collapse must pause the campaign before execution"
+        );
+
+        // Healthy: same archive shape, accepting transport — no PAUSE.
+        let archive_dir2 = tempfile::tempdir().unwrap();
+        let drvs2 = write_mini_wide_archive(archive_dir2.path(), 8);
+        let archive2 = Arc::new(ReplayArchive::open(archive_dir2.path()).unwrap());
+        let (_dir2, state2) = state2();
+        let state2 = Arc::new(state2);
+        let report = run_supply_stage(
+            state2.clone(),
+            Arc::new(FakeSupplyTransport::default()),
+            inputs_for(archive2, &drvs2),
+            &knobs,
+            Arc::new(AtomicU64::new(1)),
+            false,
+        )
+        .await
+        .unwrap()
+        .report;
+        assert!(!report.upload_collapsed);
+        assert_eq!(report.delivered, 8, "{report:?}");
+        assert!(
+            !state2.path("PAUSE").exists(),
+            "a healthy prewarm pass must not pause"
+        );
     }
 
     /// One planned upload item per [`UploadPayload`] family. The `match`

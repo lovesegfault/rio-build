@@ -853,6 +853,78 @@ pub(crate) fn write_mini_archive(dir: &std::path::Path) -> MiniArchive {
     }
 }
 
+/// Write a synthetic directory-form v1 replay archive of `units`
+/// INDEPENDENT workload units (`wideN.x86_64-linux`, no dependency edges,
+/// no embedded store paths, no relay substituters): every drv text plans
+/// at topological level 0, so a scripted transport failure produces one
+/// consecutive upload failure per unit — enough units trip the upload
+/// circuit breaker, which the chained mini archive cannot reach (its
+/// pre-skipped dependents never dial). Returns the workload drv paths.
+#[cfg(test)]
+pub(crate) fn write_mini_wide_archive(dir: &std::path::Path, units: usize) -> Vec<String> {
+    use crate::archive::schema::{Capabilities, RequestRecord, RequestTarget, Substituters};
+    use crate::archive::writer::{ArchiveWriter, ManifestSeed};
+
+    let writer = ArchiveWriter::create(dir).unwrap();
+    let mut drvs = Vec::with_capacity(units);
+    let mut closures = Vec::with_capacity(units);
+    let mut requests = Vec::with_capacity(units);
+    for index in 0..units {
+        let name = format!("wide{index}-1.0");
+        let drv = format!(
+            "/nix/store/{}-{name}.drv",
+            fake_hash(&format!("{name}-drv"))
+        );
+        let out = format!("/nix/store/{}-{name}", fake_hash(&format!("{name}-out")));
+        writer
+            .add_drv(
+                &drv,
+                &synth_aterm(&[("out", out.as_str())], &[], "x86_64-linux"),
+            )
+            .unwrap();
+        closures.push(ClosureRecord {
+            drv: drv.clone(),
+            inputs: Vec::new(),
+            srcs: Vec::new(),
+            outputs: BTreeMap::from([("out".to_string(), Some(out))]),
+        });
+        requests.push(RequestRecord {
+            session: 0,
+            offset_s: 0.0,
+            targets: vec![RequestTarget {
+                drv: drv.clone(),
+                outputs: vec!["*".to_string()],
+            }],
+        });
+        drvs.push(drv);
+    }
+    writer.write_requests(&requests).unwrap();
+    writer.write_closures(&closures).unwrap();
+    let stamp: jiff::Timestamp = "2026-05-28T00:00:00Z".parse().unwrap();
+    writer
+        .finalize(ManifestSeed {
+            created_at: stamp,
+            from: stamp,
+            to: stamp,
+            capabilities: Capabilities {
+                timed: false,
+                expected_outcomes: false,
+                output_hashes: false,
+                embedded_store_paths: false,
+                impure_env: false,
+                dependency_closures: true,
+            },
+            substituters: Substituters {
+                relay: Vec::new(),
+                target: Vec::new(),
+            },
+            fat: false,
+            provenance: serde_json::Map::new(),
+        })
+        .unwrap();
+    drvs
+}
+
 /// Axes of the synthetic timed archive [`write_mini_timed_archive`]
 /// stages. Named fields instead of positional booleans so call sites read
 /// as the archive shape they request.
