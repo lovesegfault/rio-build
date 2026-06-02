@@ -15,8 +15,8 @@
 //! `delete_swept_path` (`gc/sweep.rs`): realisations have no FK to
 //! narinfo and must be deleted explicitly, as must `path_tenants`
 //! (orphaned rows would grant stale tenant visibility on a later
-//! re-upload of the same path); `manifests` / `manifest_data` /
-//! `content_index` follow the narinfo row via `ON DELETE CASCADE`.
+//! re-upload of the same path); `manifests` / `manifest_data` follow
+//! the narinfo row via `ON DELETE CASCADE`.
 //! Beyond the sweep, this also removes `realisation_deps` junction
 //! rows touching the deleted realisations in either role — their FKs
 //! are `ON DELETE RESTRICT`, and an explicit operator invalidation is
@@ -83,58 +83,57 @@ pub(crate) async fn invalidate_path(
     keep_realisations: bool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
 ) -> Result<InvalidateCounts> {
+    use super::per_path::{Bind, InvalidatePolicy, PerPathTable};
+
     let mut tx = pool.begin().await?;
     let mut counts = InvalidateCounts::default();
     let path_str = store_path.as_str();
     let path_hash = store_path.sha256_digest().to_vec();
 
-    if !keep_realisations {
-        // Junction rows first: their FKs are ON DELETE RESTRICT, so the
-        // realisations delete below would otherwise fail whenever the
-        // invalidated realisation participates in a dependency edge.
-        counts.realisation_deps_deleted = sqlx::query(
-            r#"
-            DELETE FROM realisation_deps
-             WHERE (drv_hash, output_name) IN (
-                     SELECT drv_hash, output_name FROM realisations WHERE output_path = $1
-                   )
-                OR (dep_drv_hash, dep_output_name) IN (
-                     SELECT drv_hash, output_name FROM realisations WHERE output_path = $1
-                   )
-            "#,
-        )
-        .bind(path_str)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-
-        counts.realisations_deleted =
-            sqlx::query("DELETE FROM realisations WHERE output_path = $1")
-                .bind(path_str)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
+    // r[impl store.db.per-path-registry]
+    // Iterate the lifecycle registry in its pinned execution order
+    // (RESTRICT-guarded junction rows first, the CASCADE root last).
+    // The SQL strings and per-table rationale live with the policies in
+    // `metadata/per_path.rs`. The Narinfo arm is special-cased below
+    // the loop: the manifest `FOR UPDATE` hoist must read pre-CASCADE
+    // state, so it sits between the registry's non-root deletes and
+    // the root delete.
+    for table in PerPathTable::ALL {
+        if table == PerPathTable::Narinfo {
+            break; // root delete runs after the FOR-UPDATE hoist below
+        }
+        let (sql, bind) = match table.invalidate_policy() {
+            InvalidatePolicy::Delete { sql, bind } => (sql, bind),
+            InvalidatePolicy::DeleteUnlessKeptRealisations { sql, bind } => {
+                if keep_realisations {
+                    continue;
+                }
+                (sql, bind)
+            }
+            InvalidatePolicy::Cascade { .. } | InvalidatePolicy::Survive { .. } => continue,
+        };
+        let q = match bind {
+            Bind::PathHash => sqlx::query(sql).bind(&path_hash),
+            Bind::PathText => sqlx::query(sql).bind(path_str),
+        };
+        let affected = q.execute(&mut *tx).await?.rows_affected();
+        match table {
+            PerPathTable::RealisationDeps => counts.realisation_deps_deleted = affected,
+            PerPathTable::Realisations => counts.realisations_deleted = affected,
+            PerPathTable::PathTenants => counts.path_tenants_deleted = affected,
+            // r[impl store.admin.invalidate-total]
+            // Key equivalence: drv_modulo_cache's `drv_path_hash` is
+            // sha256(store_path) — the SAME digest as `path_hash`
+            // (StorePath::sha256_digest hashes the full path string;
+            // populate_on_ingest hashes the identical string).
+            // Unconditional: for non-.drv paths the row never exists.
+            PerPathTable::DrvModuloCache => counts.drv_modulo_deleted = affected,
+            PerPathTable::SchedulerLivePins
+            | PerPathTable::ManifestData
+            | PerPathTable::Manifests
+            | PerPathTable::Narinfo => unreachable!("non-Delete policies are skipped above"),
+        }
     }
-
-    counts.path_tenants_deleted =
-        sqlx::query("DELETE FROM path_tenants WHERE store_path_hash = $1")
-            .bind(&path_hash)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-
-    // r[impl store.admin.invalidate-total]
-    // drv_modulo_cache keys on `drv_path_hash = sha256(store_path)` —
-    // the SAME digest as `path_hash` above (StorePath::sha256_digest is
-    // sha256 over the full path string; populate_on_ingest hashes the
-    // identical string). Unconditional: for non-.drv paths the row
-    // simply never exists and this is a no-op.
-    counts.drv_modulo_deleted =
-        sqlx::query("DELETE FROM drv_modulo_cache WHERE drv_path_hash = $1")
-            .bind(&path_hash)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
 
     // Read the manifest's chunk_list BEFORE the narinfo delete: the
     // CASCADE destroys the only record of which chunks carry this
@@ -167,7 +166,16 @@ pub(crate) async fn invalidate_path(
         counts.chunks_zeroed = stats.chunks_zeroed;
     }
 
-    counts.narinfo_deleted = sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
+    // The registry's root delete (Narinfo, last by pinned order):
+    // CASCADE takes manifests / manifest_data.
+    let InvalidatePolicy::Delete {
+        sql,
+        bind: Bind::PathHash,
+    } = PerPathTable::Narinfo.invalidate_policy()
+    else {
+        unreachable!("narinfo's invalidate policy is a hash-bound Delete by construction")
+    };
+    counts.narinfo_deleted = sqlx::query(sql)
         .bind(&path_hash)
         .execute(&mut *tx)
         .await?

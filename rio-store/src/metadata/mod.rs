@@ -44,6 +44,7 @@ mod cluster_key_history;
 pub(crate) mod drv_modulo;
 mod inline;
 pub(crate) mod invalidate;
+pub(crate) mod per_path;
 mod queries;
 pub(crate) mod tenant_keys;
 pub(crate) mod upstreams;

@@ -1261,10 +1261,34 @@ Operator invalidation is the remediation for wrong-content incidents; a
 surviving modulo-cache row would keep proving IA outputs of a `.drv` whose
 narinfo the operator just removed, so "invalidate" must mean *every* table.
 The sweep, by contrast, preserves `drv_modulo_cache` by design
-(#rref("store.put.ia-deriver-proof+3") --- proofs survive deriver GC).
+(#rref("store.put.ia-deriver-proof+3") --- proofs survive deriver GC). The
+per-table policy split is the registry's job
+(#rref("store.db.per-path-registry")).
 
 = PostgreSQL Schema
 <store-schema>
+
+#r("store.db.per-path-registry")[
+  Every store table keyed by a store path (directly or via its
+  `sha256(store_path)` digest) MUST be enumerated in the per-path lifecycle
+  registry (`metadata/per_path.rs`) with an explicit GC-sweep policy AND an
+  explicit operator-invalidation policy (`Delete` with the statement,
+  `Cascade` naming the parent, `RestrictGuard`, or `Survive` with the
+  rationale). Both deletion paths MUST iterate the registry in its pinned
+  order (`RESTRICT`-guarded junction rows first, the `CASCADE` root last),
+  and a schema-conformance test MUST fail when a path-keyed table exists
+  without a registry entry or a registry entry without a table.
+]
+
+bug_102 was the third per-path table to silently join neither deletion path
+--- the lifecycle decision used to live as hand enumeration at each deletion
+site, so a table authored before a rule existed (or after the last sweep of
+the sites) defaulted to "leak". The registry inverts the default: a migration
+adding per-path table N+1 fails CI until a variant --- and therefore both
+policy decisions --- exists. The opposite regression is pinned too: GC
+survival of `drv_modulo_cache` is a typed `Survive` declaration backed by
+`sweep_preserves_drv_modulo_rows`, so the wrong-direction "fix" (sweeping
+proof rows) cannot merge either.
 
 #r("store.db.migrate-try-lock")[
   Startup migrations MUST serialize across replicas via a non-blocking

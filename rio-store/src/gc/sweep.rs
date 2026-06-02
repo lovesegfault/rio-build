@@ -215,43 +215,36 @@ async fn select_sweep_order(conn: &mut sqlx::PgConnection) -> Result<Vec<Vec<u8>
 /// only touches the path-keyed tables.
 // r[impl store.realisation.gc-sweep]
 // r[impl store.gc.sweep-path-tenants]
+// r[impl store.db.per-path-registry]
 async fn delete_swept_path(
     tx: &mut Transaction<'_, Postgres>,
     store_path_hash: &[u8],
 ) -> Result<bool, sqlx::Error> {
-    // Step 2a: DELETE realisations. NOT via CASCADE — realisations has
-    // NO FK to narinfo (002_store.sql:134). Without this, dangling
-    // realisations rows point to swept paths → wopQueryRealisation
-    // returns a path that 404s on fetch. realisations_output_idx makes
-    // the subselect fast.
-    sqlx::query(
-        r#"
-        DELETE FROM realisations
-         WHERE output_path = (
-           SELECT store_path FROM narinfo WHERE store_path_hash = $1
-         )
-        "#,
-    )
-    .bind(store_path_hash)
-    .execute(&mut **tx)
-    .await?;
+    use crate::metadata::per_path::{PerPathTable, SweepPolicy};
 
-    // Step 2a': DELETE path_tenants. NOT via CASCADE — path_tenants has
-    // NO FK to narinfo (012_path_tenants.sql). Without this, orphaned
-    // rows survive the sweep and grant wrong-tenant visibility when a
-    // different tenant later re-uploads the same store path (the stale
-    // row still JOINs in the r[store.gc.tenant-retention] CTE arm).
-    sqlx::query("DELETE FROM path_tenants WHERE store_path_hash = $1")
-        .bind(store_path_hash)
-        .execute(&mut **tx)
-        .await?;
-
-    // Step 2b: DELETE narinfo. CASCADE takes manifests, manifest_data.
-    let deleted = sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
-        .bind(store_path_hash)
-        .execute(&mut **tx)
-        .await?;
-    Ok(deleted.rows_affected() > 0)
+    // Iterate the lifecycle registry in its pinned execution order.
+    // The SQL strings (and the per-statement rationale) live with the
+    // policies in `metadata/per_path.rs`; Cascade / RestrictGuard /
+    // Survive variants execute no statement BY DESIGN — see each
+    // variant's rationale.
+    let mut narinfo_deleted = false;
+    for table in PerPathTable::ALL {
+        match table.sweep_policy() {
+            SweepPolicy::Delete { sql } => {
+                let r = sqlx::query(sql)
+                    .bind(store_path_hash)
+                    .execute(&mut **tx)
+                    .await?;
+                if table == PerPathTable::Narinfo {
+                    narinfo_deleted = r.rows_affected() > 0;
+                }
+            }
+            SweepPolicy::Cascade { .. }
+            | SweepPolicy::RestrictGuard { .. }
+            | SweepPolicy::Survive { .. } => {}
+        }
+    }
+    Ok(narinfo_deleted)
 }
 
 /// Re-check whether `store_path_hash` has any concurrent-writable mark
