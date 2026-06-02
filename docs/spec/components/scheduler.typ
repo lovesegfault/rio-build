@@ -819,6 +819,24 @@ from); content-binding for inline submissions is the authoritative-content
 validation, and full evidence-ranked binding for store-backed claims is a
 documented follow-up.
 
+#r("sched.merge.ingress-output-names-unique")[
+  SubmitBuild ingress MUST reject any node whose `output_names` carry a
+  duplicate entry, for every node — bare store-backed nodes included —
+  before any DAG state, claims derivation, or store probe consults the
+  list.
+]
+The scheduler's name-keyed views (validator zips over
+`output_names ⇄ expected_output_paths`, dispatch `position()` lookups,
+the HMAC claims allowlist) assume pairwise-distinct names; a collapsed
+duplicate leaves them silently partial over positional storage. The
+round-15 fix-genealogy lesson is recorded here deliberately
+(merged_bug_072, pattern R2): the rio-nix parse boundary rejects
+duplicates inside derivation BYTES (`nix.drv.type-classify+1`), but a
+bare proto echo carries no bytes — a cross-crate invariant needs a
+chokepoint per ingestion surface, and "the other crate validates it"
+is exactly how the Nth surface gets missed. The two layers are
+independent and independently tested.
+
 #r("sched.merge.ingress-inline-drv-binding+1")[
   `SubmitBuild` ingress MUST validate every node that carries non-empty
   `drv_content` without the authoritative flag (the gateway's

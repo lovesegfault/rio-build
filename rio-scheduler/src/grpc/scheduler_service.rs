@@ -206,6 +206,33 @@ impl SchedulerService for SchedulerGrpc {
                     node.drv_hash
                 )));
             }
+            // r[impl sched.merge.ingress-output-names-unique]
+            // Duplicate output names are rejected for EVERY node —
+            // bare store-backed ones included — BEFORE any DAG state,
+            // claims derivation, or FindMissingPaths consults the
+            // list. The scheduler's name-keyed views (the
+            // output_names ⇄ expected_output_paths zips in the
+            // authoritative and inline validators, dispatch's
+            // position() lookups, the HMAC claims allowlist) assume
+            // pairwise-distinct names; a collapsed duplicate would
+            // make them silently partial over the positional storage
+            // (round-15 merged_bug_072). rio-nix's parse boundary
+            // independently rejects duplicate names INSIDE derivation
+            // bytes (nix.drv.type-classify+1) — that layer covers
+            // inline content, this one covers the proto echo on bare
+            // nodes that carry no bytes at all.
+            {
+                let mut seen_names =
+                    std::collections::HashSet::with_capacity(node.output_names.len());
+                for name in &node.output_names {
+                    if !seen_names.insert(name.as_str()) {
+                        return Err(Status::invalid_argument(format!(
+                            "node {} duplicate output name {name:?} in output_names[]",
+                            node.drv_hash
+                        )));
+                    }
+                }
+            }
             // Per-node drv_content bound, shared with the gateway
             // (rio_common::limits::MAX_DRV_CONTENT_BYTES = 1 MiB). Two
             // gateway producers fill this field: the inline-.drv
@@ -776,6 +803,10 @@ fn validate_authoritative_drv_content(
         .output_names
         .iter()
         .map(String::as_str)
+        // TOTALITY: pairwise-distinct output names are an ingress
+        // invariant (sched.merge.ingress-output-names-unique), so this
+        // name-keyed zip is total over the node's outputs — no
+        // duplicate can shadow a (name, path) pair.
         .zip(node.expected_output_paths.iter().map(String::as_str))
         .collect();
     let drv_name = StorePath::parse(&node.drv_path)
@@ -1090,6 +1121,10 @@ pub(crate) fn validate_inline_drv_content(
             .output_names
             .iter()
             .map(String::as_str)
+            // TOTALITY: pairwise-distinct output names are an ingress
+            // invariant (sched.merge.ingress-output-names-unique), so this
+            // name-keyed zip is total over the node's outputs — no
+            // duplicate can shadow a (name, path) pair.
             .zip(node.expected_output_paths.iter().map(String::as_str))
             .collect();
         let drv_name = drv_sp

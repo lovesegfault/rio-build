@@ -209,6 +209,67 @@ async fn test_submit_build_accepts_empty_expected_output_paths() {
     }
 }
 
+// r[verify sched.merge.ingress-output-names-unique]
+/// THE merged_bug_072 proto shape: a bare store-backed node whose
+/// output_names echo carries a duplicate. No derivation bytes exist
+/// for the parse boundary to reject — this ingress scan is the only
+/// layer that can see it before the name-keyed views (validator zips,
+/// claims allowlist, dispatch position()) silently collapse it.
+#[tokio::test]
+async fn test_submit_build_rejects_duplicate_output_names() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    let mut node = make_node("dup-names");
+    node.output_names = vec!["out".into(), "dev".into(), "out".into()];
+    node.expected_output_paths = vec![
+        "/nix/store/ffffffffffffffffffffffffffffffff-a-out".to_owned(),
+        "/nix/store/gggggggggggggggggggggggggggggggg-a-dev".to_owned(),
+        "/nix/store/hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh-a-out2".to_owned(),
+    ];
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("duplicate output name"),
+        "error names the duplication: {}",
+        status.message()
+    );
+}
+
+// r[verify sched.merge.ingress-output-names-unique]
+/// Layer independence: a CLEAN proto name list over inline bytes that
+/// contain the duplicate inside the derivation is rejected by the
+/// rio-nix parse boundary (nix.drv.type-classify+1) through the inline
+/// validator — proving the two layers fire independently and a
+/// submitter cannot pick whichever layer is weaker.
+#[tokio::test]
+async fn test_submit_build_duplicate_inside_bytes_rejected_by_parse_boundary() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    let mut node = make_node("dup-bytes");
+    // Clean echo: one name.
+    node.output_names = vec!["out".into()];
+    node.is_content_addressed = true;
+    node.expected_output_paths = vec![String::new()];
+    // Bytes with a DUPLICATE output tuple.
+    node.drv_content =
+        br#"Derive([("out","","r:sha256",""),("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",[],[])"#
+            .to_vec();
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+}
+
 // r[verify sched.merge.ingress-edge-endpoints]
 /// An edge whose parent is not a node of this request would attach a
 /// dependency to ANOTHER submitter's resident node via the global path
