@@ -75,19 +75,20 @@ impl FloatingCaSpec {
     /// `hash_algo` set, `hash` empty (a set hash would make it a
     /// fixed-output derivation, which is verified — not finalized).
     ///
-    /// Rejects mixed shapes: when ANY output is floating-CA, EVERY output
-    /// must be (CppNix "can't mix derivation output types"). Defense in
-    /// depth — the request glue's `validate_output_type_shape` is the
-    /// primary gate; the pipeline must never finalize a shape where a
-    /// non-CA sibling's bytes would be left unrewritten.
-    // r[impl builder.exec.output-types-unmixed]
+    /// Mixed shapes (a floating-CA output next to any other kind) are
+    /// unrepresentable past the typed parse boundary ("can't mix
+    /// derivation output types" fires at construction), so the pipeline
+    /// can never be asked to finalize a shape where a non-CA sibling's
+    /// bytes would be left unrewritten — there is no mixed re-check
+    /// left to run.
+    // r[impl builder.exec.output-types-unmixed+1]
     pub(crate) fn from_outputs(outputs: &[DerivationOutput]) -> Result<Self, OutputRejection> {
+        use rio_nix::derivation::OutputKind;
         let mut methods = HashMap::new();
         for o in outputs {
-            if !o.path().is_empty() || !o.has_hash_algo() || !o.hash().is_empty() {
+            let OutputKind::Floating { hash_algo: raw } = o.kind() else {
                 continue;
-            }
-            let raw = o.hash_algo();
+            };
             let (recursive, algo_str) = match raw.strip_prefix("r:") {
                 Some(rest) => (true, rest),
                 None => (false, raw),
@@ -104,16 +105,6 @@ impl FloatingCaSpec {
                 }
             };
             methods.insert(o.name().to_owned(), (recursive, algo));
-        }
-        if !methods.is_empty() && methods.len() != outputs.len() {
-            let other: Vec<String> = outputs
-                .iter()
-                .filter(|o| !methods.contains_key(o.name()))
-                .map(|o| o.name().to_owned())
-                .collect();
-            let mut floating: Vec<String> = methods.keys().cloned().collect();
-            floating.sort();
-            return Err(OutputRejection::MixedOutputTypes { floating, other });
         }
         Ok(Self { methods })
     }

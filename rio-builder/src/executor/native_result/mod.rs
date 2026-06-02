@@ -247,21 +247,6 @@ pub(crate) enum OutputRejection {
     PolicyParse(#[from] PolicyParseError),
     #[error("reference scan of output '{output}' failed: {message}")]
     Scan { output: String, message: String },
-    /// CppNix `BasicDerivation::type()`: "can't mix derivation output
-    /// types". Defense-in-depth twin of the request glue's
-    /// `GlueError::MixedOutputTypes` — the pipeline must never finalize a
-    /// derivation whose floating-CA outputs coexist with other kinds,
-    /// because only floating outputs are restored through the rewriting
-    /// sink (a non-CA sibling would get its references remapped but its
-    /// bytes never rewritten).
-    #[error(
-        "can't mix derivation output types: floating content-addressed output(s) cannot \
-         coexist with other outputs (floating: {floating:?}, other: {other:?})"
-    )]
-    MixedOutputTypes {
-        floating: Vec<String>,
-        other: Vec<String>,
-    },
     #[error(
         "outputs reference each other in a cycle ({involving:?}); cyclic outputs cannot be \
          registered"
@@ -458,19 +443,21 @@ fn populate_fixed_output_descriptors(
 ) -> Result<(), OutputRejection> {
     // Strict-FOD gate: a `fixed:` descriptor asserts content the
     // pipeline verified, and `verify_fod_hashes` /
-    // `enforce_fod_has_no_references` only run for derivations matching
-    // the strict `is_fixed_output()` predicate (the request glue
-    // rejects every other hash-declaring shape outright). Keying the
-    // stamping on the same predicate keeps the descriptor honest even
-    // if a non-conforming shape ever reaches this point.
+    // `enforce_fod_has_no_references` only run for derivations
+    // classifying as Fixed. Non-conforming hash-declaring shapes are
+    // unrepresentable past the typed parse boundary, so the stamping
+    // and the verifiers key on one and the same classification.
     if !drv.is_fixed_output() {
         return Ok(());
     }
     for o in drv.outputs() {
-        if !o.has_hash_algo() || o.hash().is_empty() {
+        let rio_nix::derivation::OutputKind::Fixed {
+            hash_algo: raw_algo,
+            ..
+        } = o.kind()
+        else {
             continue;
-        }
-        let raw_algo = o.hash_algo();
+        };
         let (recursive, algo_str) = match raw_algo.strip_prefix("r:") {
             Some(rest) => (true, rest),
             None => (false, raw_algo),
@@ -1398,7 +1385,7 @@ mod tests {
         // The legal all-floating sibling case (references remapped AND
         // bytes rewritten) is pinned by
         // `floating_ca_sibling_reference_finalized`.
-        // r[verify builder.exec.output-types-unmixed]
+        // r[verify builder.exec.output-types-unmixed+1]
         // The shape is now unrepresentable: the typed parse boundary
         // classifies the output SET at parse, so the corrupt-artifact
         // hazard (references remapped to out's final path while lib's

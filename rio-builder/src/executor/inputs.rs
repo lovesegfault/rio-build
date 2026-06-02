@@ -143,10 +143,13 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
     use anyhow::{Context, bail};
 
     for output in drv.outputs() {
-        // Only FOD outputs have a declared hash
-        if output.hash().is_empty() {
+        // Only fixed outputs carry a declared hash (typed dispatch).
+        let rio_nix::derivation::OutputKind::Fixed {
+            path: typed_path, ..
+        } = output.kind()
+        else {
             continue;
-        }
+        };
 
         // Dispatch on outputHashAlgo. Unknown algo → reject. This gate
         // is the only content verification between an egress-open
@@ -183,9 +186,9 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
 
         let is_recursive = output.hash_algo().starts_with("r:");
 
-        let store_basename = rio_nix::store_path::basename(output.path())
-            .with_context(|| format!("invalid output path: {}", output.path()))?;
-        let fs_path = upper_store.join(store_basename);
+        // The basename comes from the TYPED declared path — no free
+        // string re-derivation over a declared output path remains.
+        let fs_path = upper_store.join(typed_path.basename());
 
         let computed = if is_recursive {
             // Compute NAR hash locally (before upload) so a bad

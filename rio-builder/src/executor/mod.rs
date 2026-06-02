@@ -1442,7 +1442,7 @@ async fn run_native_lifecycle(
                             // rejects non-store-path declarations), so
                             // this join can never receive a
                             // tenant-controlled arbitrary string.
-                            // r[impl builder.exec.declared-path-validated]
+                            // r[impl builder.exec.declared-path-validated+1]
                             host_path: overlay_mount.upper_store().join(&po.basename),
                         })
                         .collect();

@@ -414,7 +414,7 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
             store_path: po.path.clone(),
             // Planning-time validated basename — same invariant as the
             // production executor path.
-            // r[impl builder.exec.declared-path-validated]
+            // r[impl builder.exec.declared-path-validated+1]
             host_path: store_dir.join(&po.basename),
         })
         .collect();

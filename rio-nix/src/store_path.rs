@@ -17,6 +17,13 @@ pub const STORE_PREFIX: &str = "/nix/store/";
 /// basename (`{hash}-{name}`). Returns `None` if `s` doesn't start with
 /// [`STORE_PREFIX`]. Prefer the infallible [`StorePath::basename`] when you
 /// already hold a parsed [`StorePath`].
+///
+/// Declared OUTPUT paths MUST NOT come through here: they are typed at
+/// the parse boundary (`DerivationOutput::store_path()` /
+/// `OutputKind`), and host-side joins over output locations take the
+/// typed basename (`builder.exec.declared-path-validated+1`). This
+/// helper remains for input/closure/proto-string paths whose origin is
+/// not a derivation's output table.
 pub fn basename(s: &str) -> Option<&str> {
     s.strip_prefix(STORE_PREFIX)
 }

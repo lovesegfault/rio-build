@@ -660,29 +660,32 @@ hand-rolled walk can reintroduce the hang.
   scheduler and uploaded to the store with their content-address descriptor.
 ]
 
-#r("builder.exec.declared-path-validated")[
-  The request glue MUST reject any non-empty declared output path that does
-  not parse as a store path, and every host-side filesystem join over an
-  output location MUST use the basename computed from the parsed store path
-  at planning time — never a re-derivation from the raw declared string.
+#r("builder.exec.declared-path-validated+1")[
+  A malformed declared output path MUST be unrepresentable in the glue's
+  input type: the typed parse boundary (#rref("nix.drv.output-typed"))
+  validates every non-empty declared output path with `StorePath::parse`
+  at construction, and every host-side filesystem join over an output
+  location MUST use the basename of the TYPED store path — the free
+  string re-derivation has no remaining data source.
 ]
 
-#r("builder.exec.output-types-unmixed")[
-  The request glue and the result pipeline MUST reject any derivation in
-  which a floating content-addressed output coexists with an output of any
-  other kind (CppNix `BasicDerivation::type()`: "can't mix derivation output
-  types").
+#r("builder.exec.output-types-unmixed+1")[
+  A derivation in which a floating content-addressed output coexists with
+  an output of any other kind MUST be unrepresentable in the glue's and
+  the result pipeline's input types: the drv-level classifier
+  (#rref("nix.drv.type-classify")) rejects the mix at construction with
+  CppNix's wording ("can't mix derivation output types"), so neither
+  component carries a re-check.
 ]
 
 Only floating outputs are restored through the CA finalization's rewriting
 sink; a non-CA sibling in the same derivation would get its *references*
 remapped to the final CA paths while its *bytes* still name the scratch
-paths — a corrupt artifact that no honest toolchain can produce
-(`nix-instantiate` refuses the shape, which is also why the differential
-corpus cannot pin this rule; unit tests against the oracle's wording are the
-evidence). The glue check covers the sandbox, builtin, and differential
-planning paths; the pipeline check is defense in depth for results that
-arrive without passing through planning.
+paths — a corrupt artifact that is now structurally impossible to ask the
+pipeline to produce (`nix-instantiate` refuses the shape too, which is why
+the differential corpus cannot pin this rule; unit tests against the
+oracle's wording are the evidence). Both rules are structural inheritance
+of the parse boundary across the sandbox, builtin, and differential paths.
 
 Defense in depth under #rref("sec.trust.workers-untrusted"): the
 authoritative rejection is the gateway's binding gate

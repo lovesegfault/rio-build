@@ -41,7 +41,7 @@ use std::time::Duration;
 use rio_exec::{
     ExecutionRequest, InlineFile, Isolation, Limits, Mount, OutputCapture, Personality,
 };
-use rio_nix::derivation::{BasicDerivation, DerivationLike as _, DerivationOutput, StructuredEnv};
+use rio_nix::derivation::{BasicDerivation, DerivationLike as _, StructuredEnv};
 use rio_nix::store_path::{self, hash_placeholder};
 use rio_proto::validated::ValidatedPathInfo;
 
@@ -159,37 +159,6 @@ pub(crate) enum GlueError {
     #[error("derivation path {path} is not a valid store path: {message}")]
     BadDerivationPath { path: String, message: String },
 
-    /// A non-empty declared output path that does not parse as a store
-    /// path. Defense-in-depth under `sec.trust.workers-untrusted`: the
-    /// gateway's binding gate (`gw.reject.output-path-mismatch+2`) is the
-    /// authoritative rejection, and the scheduler shape-checks
-    /// `expected_output_paths` too — a malformed path reaching the worker
-    /// means both were bypassed. Rejecting it here keeps tenant-controlled
-    /// non-store-path strings out of every host-side filesystem join.
-    #[error("output `{output}` declares path {path:?}, which is not a valid store path: {message}")]
-    MalformedOutputPath {
-        output: String,
-        path: String,
-        message: String,
-    },
-
-    /// CppNix `BasicDerivation::type()` (derivations.cc): "can't mix
-    /// derivation output types". A floating content-addressed output
-    /// cannot coexist with any other output kind in one derivation.
-    /// Without this rule the result pipeline's CA finalization would
-    /// remap a non-CA sibling's *references* to the final CA paths but
-    /// never rewrite its *bytes* (only floating outputs are restored
-    /// through the rewriting sink), shipping a corrupt artifact whose
-    /// content still names scratch paths.
-    #[error(
-        "can't mix derivation output types: floating content-addressed output(s) {floating:?} \
-         cannot coexist with non-floating output(s) {other:?}"
-    )]
-    MixedOutputTypes {
-        floating: Vec<String>,
-        other: Vec<String>,
-    },
-
     #[error("builtin:fetchurl derivation has no (non-empty) `url` attribute")]
     FetchurlMissingUrl,
 
@@ -221,17 +190,6 @@ pub(crate) enum GlueError {
     /// result pipeline's `FodDeclaredHashInvalid`.
     #[error("fixed-output output `{output}` declares an unverifiable hash: {message}")]
     FixedOutputHashInvalid { output: String, message: String },
-
-    /// A derivation declares a fixed output but is not the one shape
-    /// CppNix accepts for fixed-output derivations
-    /// (`BasicDerivation::type()`: "only one fixed output is allowed",
-    /// "single fixed output must be named \"out\"", "can't mix
-    /// derivation output types"). Rejecting the shape here keeps every
-    /// downstream FOD gate — hash verification, the no-references rule,
-    /// `fixed:` descriptor stamping, fetcher-pool routing — keyed on
-    /// one and the same strict predicate.
-    #[error("invalid fixed-output derivation: {reason}")]
-    FixedOutputBadShape { reason: String },
 
     /// The declared store path of a fixed-output output is not the path
     /// derived from its declared hash. CppNix discards the declared
@@ -382,7 +340,10 @@ pub(crate) fn derivation_into_request(
     // CppNix-parity shape rules run before ANY planning — including the
     // builtin:fetchurl dispatch below, whose declared output path is
     // just as tenant-controlled as a sandboxed FOD's.
-    validate_output_type_shape(drv)?;
+    // Drv-level shape rules (mixed sets, multi-fixed, misnamed fixed)
+    // are inherited from the typed parse boundary — BasicDerivation
+    // cannot exist ill-typed (nix.drv.type-classify), so the glue
+    // validates only the SEMANTIC fixed-output binding below.
     validate_fixed_output_declarations(drv_path, drv)?;
 
     // builtin: builders never get a generic sandbox request — they
@@ -566,44 +527,6 @@ pub(crate) fn derivation_into_request(
     })))
 }
 
-/// CppNix `BasicDerivation::type()` shape rule (derivations.cc): output
-/// types cannot be mixed in one derivation. rio enforces the floating-CA
-/// half here — a derivation with any floating-CA output must be ALL
-/// floating-CA. (The fixed-output half — exactly one output, named
-/// `out` — is `validate_fixed_output_declarations`' shape rule, and
-/// plain IA + deferred-IA mixing is resolved upstream before the worker
-/// ever sees the derivation.)
-///
-/// Run before any planning so the sandbox, builtin, and differential
-/// paths all share it. The differential corpus cannot pin this rule:
-/// `nix-instantiate` refuses to even produce the mixed shape, which is
-/// exactly why an honest client can never hit this error.
-// r[impl builder.exec.output-types-unmixed]
-fn validate_output_type_shape(drv: &BasicDerivation) -> Result<(), GlueError> {
-    let is_floating =
-        |o: &DerivationOutput| o.path().is_empty() && o.has_hash_algo() && o.hash().is_empty();
-
-    let floating: Vec<String> = drv
-        .outputs()
-        .iter()
-        .filter(|o| is_floating(o))
-        .map(|o| o.name().to_owned())
-        .collect();
-    if floating.is_empty() {
-        return Ok(());
-    }
-    let other: Vec<String> = drv
-        .outputs()
-        .iter()
-        .filter(|o| !is_floating(o))
-        .map(|o| o.name().to_owned())
-        .collect();
-    if !other.is_empty() {
-        return Err(GlueError::MixedOutputTypes { floating, other });
-    }
-    Ok(())
-}
-
 /// CppNix-parity validation of declared fixed-output (`CAFixed`)
 /// outputs, run before any sandbox or builtin planning.
 ///
@@ -631,38 +554,20 @@ fn validate_fixed_output_declarations(
 ) -> Result<(), GlueError> {
     use rio_nix::hash::{HashAlgo, NixHash};
 
-    let fixed_count = drv
+    // Shape rules (single fixed output, named "out", unmixed) are the
+    // parse boundary's: an ill-typed BasicDerivation is unconstructible
+    // (nix.drv.type-classify), so the strict is_fixed_output()
+    // predicate is true iff ANY output declares a hash and every
+    // downstream FOD gate keys on the same classification. What
+    // remains here is the SEMANTIC binding: the declared path must be
+    // the one the declared hash derives to.
+    use rio_nix::derivation::OutputKind;
+    let has_fixed = drv
         .outputs()
         .iter()
-        .filter(|o| !o.hash_algo().is_empty() && !o.hash().is_empty())
-        .count();
-    if fixed_count == 0 {
+        .any(|o| matches!(o.kind(), OutputKind::Fixed { .. }));
+    if !has_fixed {
         return Ok(());
-    }
-
-    // Shape rule — CppNix `BasicDerivation::type()`: a derivation with
-    // a fixed output must consist of exactly that one output, and it
-    // must be named `out`. After this check the strict
-    // `DerivationLike::is_fixed_output()` predicate is true iff *any*
-    // output declares a hash, so hash verification, the no-references
-    // rule, descriptor stamping and fetcher routing all see the same
-    // set of derivations — no hash-declaring shape can reach upload
-    // unverified.
-    if drv.outputs().len() != 1 {
-        let reason = if fixed_count == drv.outputs().len() {
-            "only one fixed output is allowed".to_owned()
-        } else {
-            "fixed-output and non-fixed outputs cannot be mixed in one derivation".to_owned()
-        };
-        return Err(GlueError::FixedOutputBadShape { reason });
-    }
-    if drv.outputs()[0].name() != "out" {
-        return Err(GlueError::FixedOutputBadShape {
-            reason: format!(
-                "the single fixed output must be named \"out\", not \"{}\"",
-                drv.outputs()[0].name()
-            ),
-        });
     }
 
     let drv_sp =
@@ -678,7 +583,7 @@ fn validate_fixed_output_declarations(
     for o in drv
         .outputs()
         .iter()
-        .filter(|o| !o.hash_algo().is_empty() && !o.hash().is_empty())
+        .filter(|o| matches!(o.kind(), OutputKind::Fixed { .. }))
     {
         let raw_algo = o.hash_algo();
         let (recursive, algo_str) = match raw_algo.strip_prefix("r:") {
@@ -738,26 +643,19 @@ fn plan_outputs(
     let mut rewrites = BTreeMap::new();
     let mut outputs = Vec::with_capacity(drv.outputs().len());
     for o in drv.outputs() {
-        let (path, basename, floating) = if !o.path().is_empty() {
-            // Declared (input-addressed / fixed-output) path: must parse
-            // as a store path. Defense-in-depth under
-            // sec.trust.workers-untrusted — the gateway rejects these at
-            // submission (gw.reject.output-path-mismatch+2) and the
-            // scheduler shape-checks expected_output_paths; a malformed
-            // declaration reaching this point means both gates were
-            // bypassed. The basename it yields feeds host-side
-            // filesystem joins, so it is computed from the PARSED path
-            // only.
-            // r[impl builder.exec.declared-path-validated]
-            let sp = store_path::StorePath::parse(o.path()).map_err(|e| {
-                GlueError::MalformedOutputPath {
-                    output: o.name().to_owned(),
-                    path: o.path().to_owned(),
-                    message: e.to_string(),
-                }
-            })?;
-            (o.path().to_owned(), sp.basename().to_owned(), false)
-        } else if o.has_hash_algo() {
+        use rio_nix::derivation::OutputKind;
+        let (path, basename, floating) = if let Some(sp) = o.store_path() {
+            // Declared (input-addressed / fixed-output) path: already a
+            // PARSED store path — malformed declarations are
+            // unrepresentable past the typed boundary, so the
+            // tenant-string→filesystem-join flow has no data source
+            // (the gateway and scheduler gates remain authoritative
+            // under sec.trust.workers-untrusted; this is the structural
+            // inheritance of the same rule). The basename feeding
+            // host-side joins comes from the typed path only.
+            // r[impl builder.exec.declared-path-validated+1]
+            (sp.as_str().to_owned(), sp.basename().to_owned(), false)
+        } else if matches!(o.kind(), OutputKind::Floating { .. }) {
             let drv_sp = match &parsed_drv_path {
                 Some(p) => p,
                 None => {
@@ -1230,7 +1128,7 @@ mod tests {
     /// coexist with any other output kind ("can't mix derivation output
     /// types"). The glue rejects the shape before any planning, on every
     /// path (sandbox, builtin, differential).
-    // r[verify builder.exec.output-types-unmixed]
+    // r[verify builder.exec.output-types-unmixed+1]
     #[test]
     fn derivation_into_request_rejects_mixed_output_types() {
         // The drv-level shape gate now lives at CONSTRUCTION
@@ -1403,7 +1301,7 @@ mod tests {
     /// writable-mount validation but escape the overlay upper store via a
     /// raw-string `Path::join` (an absolute path replaces the join target).
     /// Defense-in-depth; the gateway and scheduler gates are authoritative.
-    // r[verify builder.exec.declared-path-validated]
+    // r[verify builder.exec.declared-path-validated+1]
     #[test]
     fn plan_outputs_rejects_malformed_declared_path() {
         // The typed parse boundary makes a malformed declared output
@@ -1438,7 +1336,7 @@ mod tests {
     /// Every PlannedOutput's basename comes from the PARSED store path —
     /// declared (IA) and scratch (floating-CA) alike — so host-side joins
     /// never re-derive it from the raw string.
-    // r[verify builder.exec.declared-path-validated]
+    // r[verify builder.exec.declared-path-validated+1]
     #[test]
     fn planned_outputs_carry_store_basenames() {
         // Input-addressed: basename of the declared path.
