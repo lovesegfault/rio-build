@@ -380,6 +380,73 @@ async fn corrupt_inline_drv_nar_yields_internal_not_permission_denied() -> TestR
 }
 
 // r[verify store.put.ia-deriver-proof+3]
+/// Duplicate-output derivation bytes fail the deriver proof CLOSED:
+/// the parse boundary (nix.drv.type-classify+1, fail-closed divergence
+/// #4) rejects duplicates, so the walk reports the deriver as
+/// `Absent(Unparseable)` -> `PERMISSION_DENIED` naming the path. The
+/// duplicate deriver is never deferred-exempt (its outputs are
+/// concrete) and never contributes a partially-collapsed output
+/// allowlist -- the collapse semantics that made name-keyed views
+/// silently partial are unreachable past the parser (merged_bug_072,
+/// store layer; test-only, falls out of C5c1 + C1c3).
+#[tokio::test]
+async fn duplicate_output_deriver_fails_proof_closed() -> TestResult {
+    let mut s =
+        StoreSession::new_with_service_hmac(TEST_KEY.to_vec(), SERVICE_KEY.to_vec()).await?;
+
+    // An otherwise-plausible Derive ATerm whose two outputs share the
+    // name "out". The text-CA gate accepts the UPLOAD (any bytes at
+    // their own text-CA path), but parse-time classification rejects
+    // the shape, so cache population skips and the proof fails closed.
+    let dup = format!(
+        "Derive([(\"out\",\"/nix/store/{p1}-dup-out\",\"\",\"\"),\
+         (\"out\",\"/nix/store/{p2}-dup-out\",\"\",\"\")],[],[],\
+         \"x86_64-linux\",\"/bin/sh\",[],[(\"k\",\"v\")])",
+        p1 = "b".repeat(32),
+        p2 = "c".repeat(32),
+    );
+    let (drv_path, drv_nar) =
+        rio_test_support::fixtures::make_drv_nar("dup-out.drv", dup.as_bytes(), &[]);
+    let info = make_path_info_for_nar(&drv_path, &drv_nar);
+    assert!(
+        put_path_with_header(
+            &mut s.client,
+            info,
+            drv_nar,
+            rio_proto::SERVICE_TOKEN_HEADER,
+            &service_token(),
+        )
+        .await?,
+        "upload itself is text-CA-clean"
+    );
+    assert!(
+        cache_row(&s.db.pool, &drv_path).await?.is_none(),
+        "duplicate-output bytes must not populate the modulo cache"
+    );
+
+    // IA upload claiming an output of the duplicate-output deriver: the
+    // read-through parses the store's own bytes and fails CLOSED.
+    let (nar, _) = make_nar(b"claimed output bytes");
+    let out_path = test_store_path("dup-claimed-out");
+    let info = make_path_info_for_nar(&out_path, &nar);
+    let token = ia_claims_token(&drv_path, vec![out_path.clone()]);
+    let err = put_path_with_token(&mut s.client, info, nar, &token)
+        .await
+        .expect_err("duplicate-output deriver must fail the proof");
+    assert_eq!(
+        err.code(),
+        tonic::Code::PermissionDenied,
+        "closure verdict, not infra: {err:?}"
+    );
+    assert!(
+        err.message().contains("cannot be used"),
+        "names the unusable deriver: {}",
+        err.message()
+    );
+    Ok(())
+}
+
+// r[verify store.put.ia-deriver-proof+3]
 /// Database failure during the proof lookup is an INTERNAL error, never
 /// `PERMISSION_DENIED`: with the cache table dropped, the proof's own
 /// SELECT fails — pre-fix the `.ok()??` fold reported "deriver closure
