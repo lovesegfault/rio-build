@@ -1287,26 +1287,18 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     // realization probe decides; rejection keeps the existing
     // STDERR_ERROR delivery. The inline BasicDerivation is all we have
     // on the single-node fallback path.
+    // (A floating output declaring a path can no longer arrive here:
+    // read_basic_derivation rejects the shape at the wire parse.)
     let mut inline_offender_realized = false;
-    if let Some(out) = basic_drv.outputs().iter().find(|o| {
-        (!o.hash().is_empty() || !o.hash_algo().is_empty())
-            && !translate::fod_algo_verifiable(o.hash_algo())
-    }) {
-        // The floating-CA shape rule applies to offenders too.
-        if let Err(reason) = translate::validate_floating_ca_shape(
-            &drv_path_str,
-            basic_drv
-                .outputs()
-                .iter()
-                .map(|o| (o.name(), o.path(), o.hash_algo(), o.hash())),
-        ) {
-            warn!(
-                drv_path = %drv_path_str,
-                reason = %reason,
-                "rejecting inline derivation: floating-CA output declares a path"
-            );
-            stderr_err!(stderr, "{reason}");
-        }
+    let unverifiable = |o: &rio_nix::derivation::DerivationOutput| {
+        use rio_nix::derivation::OutputKind;
+        matches!(
+            o.kind(),
+            OutputKind::Fixed { hash_algo, .. } | OutputKind::Floating { hash_algo }
+                if !translate::fod_algo_verifiable(hash_algo)
+        )
+    };
+    if let Some(out) = basic_drv.outputs().iter().find(|o| unverifiable(o)) {
         let offender = translate::UnverifiableFodOffender {
             drv_path: drv_path_str.clone(),
             output_name: out.name().to_string(),
@@ -1374,13 +1366,8 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
             // unverifiable-algo offender (its algo cannot be parsed and
             // nothing will be built from it).
             if !inline_offender_realized
-                && let Err(reason) = translate::validate_declared_hash_outputs(
-                    &drv_path_str,
-                    basic_drv
-                        .outputs()
-                        .iter()
-                        .map(|o| (o.name(), o.path(), o.hash_algo(), o.hash())),
-                )
+                && let Err(reason) =
+                    translate::validate_declared_hash_outputs(&drv_path_str, basic_drv.outputs())
             {
                 warn!(
                     drv_path = %drv_path_str,

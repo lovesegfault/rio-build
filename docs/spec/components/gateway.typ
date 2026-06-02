@@ -1182,6 +1182,14 @@ crafted submissions; proper floating-CA outputs (empty declared path) are
 unaffected. Accepting it would have exempted the declared path from both
 the input-addressed and the declared-hash output-path bindings.
 
+The binding gates dispatch on the typed output model: shape rules
+(malformed paths, floating-with-path, fixed-without-path, mixed sets) are
+enforced once at the parse boundary (#rref("nix.drv.output-typed"),
+#rref("nix.drv.type-classify")), and the gateway's validators retain only
+the SEMANTIC half — deriving paths from derivation or declared-hash
+contents and comparing. Re-introducing a divergent shape classification in
+the gateway would require re-adding data the types no longer carry.
+
 #r("gw.reject.output-path-mismatch+2")[
   The gateway MUST NOT trust declared output paths. For input-addressed
   outputs it MUST re-derive the paths from the derivation contents

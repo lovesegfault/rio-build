@@ -540,30 +540,21 @@ pub fn validate_dag(
     // re-verifies FOD uploads and rejects descriptor-less ones under a
     // scheduler-signed fixed-output assignment — but only at upload
     // time, after a pod has already run).
+    // (The floating-CA-with-declared-path shape — formerly checked here
+    // for offenders too — is unrepresentable past the typed parse
+    // boundary, so a path-declaring floating output cannot exist in the
+    // drv cache to slip through via an unparseable algo.)
     let mut offenders = Vec::new();
     for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_dag") {
-        let unverifiable = drv.outputs().iter().any(|o| {
-            (!o.hash().is_empty() || !o.hash_algo().is_empty())
-                && !fod_algo_verifiable(o.hash_algo())
-        });
-        if unverifiable {
-            // The floating-CA shape rule applies to every output,
-            // offenders included — a path-declaring floating-CA output
-            // must never slip through via an unparseable algo.
-            validate_floating_ca_shape(
-                &node.drv_path,
-                drv.outputs()
-                    .iter()
-                    .map(|o| (o.name(), o.path(), o.hash_algo(), o.hash())),
-            )?;
-            let out = drv
-                .outputs()
-                .iter()
-                .find(|o| {
-                    (!o.hash().is_empty() || !o.hash_algo().is_empty())
-                        && !fod_algo_verifiable(o.hash_algo())
-                })
-                .expect("checked by `unverifiable` above");
+        use rio_nix::derivation::OutputKind;
+        let unverifiable = |o: &rio_nix::derivation::DerivationOutput| {
+            matches!(
+                o.kind(),
+                OutputKind::Fixed { hash_algo, .. } | OutputKind::Floating { hash_algo }
+                    if !fod_algo_verifiable(hash_algo)
+            )
+        };
+        if let Some(out) = drv.outputs().iter().find(|o| unverifiable(o)) {
             offenders.push(UnverifiableFodOffender {
                 drv_path: node.drv_path.clone(),
                 output_name: out.name().to_string(),
@@ -572,12 +563,7 @@ pub fn validate_dag(
             });
             continue;
         }
-        validate_declared_hash_outputs(
-            &node.drv_path,
-            drv.outputs()
-                .iter()
-                .map(|o| (o.name(), o.path(), o.hash_algo(), o.hash())),
-        )?;
+        validate_declared_hash_outputs(&node.drv_path, drv.outputs())?;
     }
 
     Ok(offenders)
@@ -799,33 +785,26 @@ pub(crate) fn validate_output_path_bindings(
     let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
     let resolve = |p: &str| StorePath::parse(p).ok().and_then(|sp| drv_cache.get(&sp));
     for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_output_path_bindings") {
-        // Per-output classification: only plain input-addressed
-        // outputs (empty hash_algo) with a parseable declared path
-        // are bound by the derivation hash; content-bound outputs
-        // (fixed-output / floating-CA) are governed by the
-        // content-hash rules and deferred (empty) paths have
-        // nothing to validate. (A floating-CA output that DOES
-        // declare a path is rejected earlier by validate_dag's
-        // gw.reject.floating-ca-declared-path+1 shape rule, so it can
-        // never reach — let alone exempt itself from — this gate.)
-        // The derivation-level fast path
-        // therefore applies only when EVERY output is
-        // content-bound — neither a deferred output nor a
-        // floating-CA output may exempt a sibling static path
-        // from validation. Mixed shapes (which Nix itself never
-        // produces: "can't mix derivation output types") fall
-        // through to input_addressed_output_paths(), which
-        // refuses them, and the submission is rejected
-        // fail-closed rather than half-validated.
-        if drv.outputs().iter().all(|o| !o.hash_algo().is_empty()) {
-            continue;
-        }
-        if !drv
-            .outputs()
-            .iter()
-            .any(|o| o.hash_algo().is_empty() && !o.path().is_empty())
-        {
-            continue;
+        // Drv-level dispatch on the typed classifier: content-bound
+        // derivations (fixed / floating) are governed by the content-
+        // hash rules, deferred IA has nothing to bind yet, and only
+        // CONCRETE input-addressed sets are derivation-hash-bound.
+        // Mixed shapes are unrepresentable past the parse boundary
+        // ("can't mix derivation output types"), so there is no
+        // fall-through to half-validate; classify failure on a value
+        // predating the gate is impossible, but stays fail-closed.
+        use rio_nix::derivation::{DerivationType, OutputKind};
+        match drv.derivation_type() {
+            Ok(DerivationType::Fixed | DerivationType::Floating) => continue,
+            Ok(DerivationType::InputAddressed { deferred: true }) => continue,
+            Ok(DerivationType::InputAddressed { deferred: false }) => {}
+            Err(e) => {
+                return Err(format!(
+                    "cannot classify outputs of {} (rejecting rather than trusting the \
+                     declared paths): {e}",
+                    node.drv_path
+                ));
+            }
         }
         let derived = rio_nix::derivation::input_addressed_output_paths(
             drv,
@@ -841,38 +820,20 @@ pub(crate) fn validate_output_path_bindings(
             )
         })?;
         for output in drv.outputs() {
-            // Content-bound outputs are not derivation-path-derived.
-            if !output.hash_algo().is_empty() {
-                continue;
-            }
-            // Deferred IA (empty declared path): the path is computed at
-            // resolution time; nothing to bind yet.
-            if output.path().is_empty() {
-                continue;
-            }
-            // A non-empty declared path that does not parse as a store
-            // path is rejected fail-closed: it can never equal the
-            // derivation-derived path, and forwarding it would hand the
-            // worker glue and result pipeline a tenant-controlled string
-            // where a store path is expected.
-            if let Err(e) = StorePath::parse(output.path()) {
-                return Err(format!(
-                    "derivation {} declares output '{}' at {:?}, which is not a valid store \
-                     path: {e} — declared output paths must parse as store paths",
-                    node.drv_path,
-                    output.name(),
-                    output.path(),
-                ));
-            }
+            // Concrete-IA sets: every output carries a typed declared
+            // path (malformed ones are unrepresentable).
+            let OutputKind::InputAddressed(declared) = output.kind() else {
+                unreachable!("uniform concrete-IA set classified above");
+            };
             match derived.get(output.name()) {
-                Some(expected) if expected.as_str() == output.path() => {}
+                Some(expected) if expected.as_str() == declared.as_str() => {}
                 Some(expected) => {
                     return Err(format!(
                         "derivation {} declares output '{}' at {} but the derivation \
                          derives to {} — declared output paths must match the derivation",
                         node.drv_path,
                         output.name(),
-                        output.path(),
+                        declared.as_str(),
                         expected.as_str(),
                     ));
                 }
@@ -893,83 +854,43 @@ pub(crate) fn validate_output_path_bindings(
 /// Trusted-plane binding of declared-hash (fixed-output) output paths to
 /// their declared hash. Mirrors rio-builder's
 /// `validate_fixed_output_declarations` (the worker-side check is
-/// defense in depth — workers are untrusted) and CppNix:
-/// a CAFixed output's path is never trusted, every consumer recomputes
-/// `makeFixedOutputPath`, and `BasicDerivation::type()` requires that a
-/// derivation with a fixed output consists of exactly one output named
-/// `out` ("only one fixed output is allowed", "can't mix derivation
-/// output types").
+/// defense in depth — workers are untrusted) and CppNix: a CAFixed
+/// output's path is never trusted; every consumer recomputes
+/// `makeFixedOutputPath`.
 ///
-/// `outputs` yields `(name, path, hash_algo, hash)` tuples so both the
-/// cached full [`Derivation`] and the wire `BasicDerivation` can be
-/// checked with one implementation.
-///
-/// Scope: a non-empty declared path must parse as a store path
-/// (rejected otherwise — same fail-closed rule as the input-addressed
-/// binding gate); empty declared paths (deferred fixed-output shape)
-/// are skipped. For parseable declared paths any malformed algo/hash
-/// or any mismatch with `StorePath::make_fixed_output(declared hash)`
-/// is rejected fail-closed — otherwise a junk outputHash would exempt
-/// an arbitrary declared path from validation.
+/// SHAPE rules live at the typed parse boundary now: a fixed output
+/// without a path, a floating output with one, a malformed declared
+/// path, a multi-fixed / mixed / misnamed output set — all
+/// unrepresentable past `Derivation::parse` / `BasicDerivation::new`
+/// (`nix.drv.output-typed`, `nix.drv.type-classify`). What remains
+/// here is pure SEMANTIC binding: decode the declared hash
+/// (base16/nixbase32/base64) and require the declared path to equal
+/// `StorePath::make_fixed_output` over it — otherwise a junk
+/// outputHash would exempt an arbitrary (well-formed) declared path
+/// from validation.
 ///
 /// Keep the accepted algo set in sync with [`fod_algo_verifiable`]
 /// (the algo gate runs first, so unsupported algos already carry their
 /// own error message).
-///
-/// Also enforces the floating-CA shape rule
-/// (`gw.reject.floating-ca-declared-path+1`): an output with an algo but
-/// no hash must not declare an output path — see the inline comment.
-pub(crate) fn validate_declared_hash_outputs<'a>(
+pub(crate) fn validate_declared_hash_outputs(
     drv_path: &str,
-    outputs: impl Iterator<Item = (&'a str, &'a str, &'a str, &'a str)>,
+    outputs: &[rio_nix::derivation::DerivationOutput],
 ) -> Result<(), String> {
+    use rio_nix::derivation::OutputKind;
     use rio_nix::hash::{HashAlgo, NixHash};
 
-    let outputs: Vec<(&str, &str, &str, &str)> = outputs.collect();
-
-    validate_floating_ca_shape(drv_path, outputs.iter().copied())?;
-
-    let declared_hash: Vec<&(&str, &str, &str, &str)> = outputs
-        .iter()
-        .filter(|(_, _, algo, hash)| !algo.is_empty() && !hash.is_empty())
-        .collect();
-    if declared_hash.is_empty() {
+    let Some((name, declared_path, raw_algo, raw_hash)) =
+        outputs.iter().find_map(|o| match o.kind() {
+            OutputKind::Fixed {
+                path,
+                hash_algo,
+                hash,
+            } => Some((o.name(), path.as_str(), hash_algo, hash)),
+            _ => None,
+        })
+    else {
         return Ok(());
-    }
-
-    // Shape rule (CppNix `BasicDerivation::type()`).
-    if outputs.len() != 1 {
-        let reason = if declared_hash.len() == outputs.len() {
-            "only one fixed output is allowed"
-        } else {
-            "fixed-output and non-fixed outputs cannot be mixed in one derivation"
-        };
-        return Err(format!(
-            "derivation {drv_path} declares a fixed-output hash but has {} outputs — {reason}",
-            outputs.len()
-        ));
-    }
-    let (name, declared_path, raw_algo, raw_hash) = outputs[0];
-    if name != "out" {
-        return Err(format!(
-            "derivation {drv_path}: the single fixed output must be named \"out\", not \"{name}\""
-        ));
-    }
-
-    // Deferred (empty) declared path: the fixed-output path is computed at
-    // resolution time; nothing to bind yet.
-    if declared_path.is_empty() {
-        return Ok(());
-    }
-    // A non-empty declared path that does not parse as a store path is
-    // rejected fail-closed — the trusted plane must not forward a
-    // tenant-controlled non-store-path string to untrusted workers.
-    if let Err(e) = StorePath::parse(declared_path) {
-        return Err(format!(
-            "derivation {drv_path} output '{name}' declares path {declared_path:?}, which is \
-             not a valid store path: {e} — declared output paths must parse as store paths"
-        ));
-    }
+    };
 
     let drv_sp = StorePath::parse(drv_path)
         .map_err(|e| format!("derivation path {drv_path} is not a valid store path: {e}"))?;
@@ -1004,32 +925,6 @@ pub(crate) fn validate_declared_hash_outputs<'a>(
             "derivation {drv_path} declares fixed output '{name}' at {declared_path} but the \
              declared hash derives to {} — declared output paths must match the derivation",
             expected.as_str()
-        ));
-    }
-    Ok(())
-}
-
-/// Floating-CA shape rule (`gw.reject.floating-ca-declared-path+1`):
-/// an output that sets `outputHashAlgo` with an EMPTY `outputHash`
-/// (floating content-addressed) must not declare an output path. The
-/// AUTHORITATIVE enforcement is the typed parse boundary
-/// (`nix.drv.output-typed` — the shape is unrepresentable past
-/// `DerivationOutput::new`); this validator is residual defense in
-/// depth over the legacy string view and is slated for deletion once
-/// the gateway gates dispatch on the typed model.
-pub(crate) fn validate_floating_ca_shape<'a>(
-    drv_path: &str,
-    outputs: impl Iterator<Item = (&'a str, &'a str, &'a str, &'a str)>,
-) -> Result<(), String> {
-    if let Some((name, path, algo, _)) = outputs
-        .into_iter()
-        .find(|(_, path, algo, hash)| !algo.is_empty() && hash.is_empty() && !path.is_empty())
-    {
-        return Err(format!(
-            "derivation {drv_path} output '{name}' declares outputHashAlgo '{algo}' with no \
-             outputHash (floating content-addressed) but also declares output path {path} — \
-             CppNix refuses this shape and rio rejects it: floating-CA outputs must leave the \
-             output path empty"
         ));
     }
     Ok(())
@@ -1833,28 +1728,32 @@ mod tests {
         );
     }
 
-    /// The declared-hash gate likewise rejects a non-empty declared path
-    /// that does not parse as a store path (and keeps skipping empty ones).
+    /// Both former carve-outs of the declared-hash gate (malformed
+    /// declared path, empty "deferred FOD" path) are unrepresentable
+    /// at the typed boundary — the gate's input type cannot carry them.
     // r[verify gw.reject.output-path-mismatch+2]
     #[test]
     fn declared_hash_gate_rejects_malformed_declared_path() {
-        let drv_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-fetch.drv";
         let hex_hash = "5a".repeat(32);
 
-        // Non-empty, unparseable declared path → rejected.
-        let outputs = vec![("out", "/nix/store/zzz-evil", "sha256", hex_hash.as_str())];
-        let err = validate_declared_hash_outputs(drv_path, outputs.into_iter()).unwrap_err();
-        assert!(
-            err.contains("not a valid store path"),
-            "malformed declared path must be rejected: {err}"
-        );
+        // Non-empty, unparseable declared path → constructor rejection.
+        assert!(matches!(
+            rio_nix::derivation::DerivationOutput::new(
+                "out",
+                "/nix/store/zzz-evil",
+                "sha256",
+                hex_hash.as_str()
+            ),
+            Err(rio_nix::derivation::DerivationError::InvalidOutputPath(_))
+        ));
 
-        // Empty declared path (deferred fixed-output) → still skipped.
-        let outputs = vec![("out", "", "sha256", hex_hash.as_str())];
-        assert!(
-            validate_declared_hash_outputs(drv_path, outputs.into_iter()).is_ok(),
-            "empty declared path keeps the deferred carve-out"
-        );
+        // Empty declared path on a hash-declaring output → constructor
+        // rejection (oracle validatePath analog); the gate has no
+        // deferred carve-out left to maintain.
+        assert!(matches!(
+            rio_nix::derivation::DerivationOutput::new("out", "", "sha256", hex_hash.as_str()),
+            Err(rio_nix::derivation::DerivationError::FixedOutputNoPath(_))
+        ));
     }
 
     /// A crafted derivation pairing a floating-CA output with a squatted
