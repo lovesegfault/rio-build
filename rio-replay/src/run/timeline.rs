@@ -2,9 +2,15 @@
 //!
 //! [`build_schedule`] turns recorded client requests into a paced
 //! [`ScheduledRequest`] list — offset-sorted, speedup-scaled, optionally
-//! truncated — and arms a per-request disconnect timer for requests whose
-//! recorded outcome was an interruption (a cancellation or a client
-//! disconnect). [`build_timeout_for`] derives the per-request build deadline
+//! truncated — with ALL scheduling policy resolved at construction: each
+//! target carries its job key ([`ScheduledTarget`], unit mapping with
+//! drv-path fallback) and each request whose recorded outcome was an
+//! interruption (a cancellation or a client disconnect) over a unit the
+//! target cluster builds carries an [`InterruptionPlan`], whose disconnect
+//! timer is derived from the interrupted-target set itself. The dispatcher,
+//! the resume skip-check, and the offline dry-run planner all read these
+//! resolved fields — none re-derives policy from raw archive records.
+//! [`build_timeout_for`] derives the per-request build deadline
 //! from recorded durations, [`lateness_summary`] condenses per-request
 //! dispatch lateness into max/p50/p95, and [`re_anchor_pending`] shifts a
 //! partially completed schedule at resume time so pending requests fire
@@ -101,37 +107,127 @@ pub struct RecordedTiming {
     pub expected_built: bool,
 }
 
-/// One recorded request, scheduled for replay.
+/// One requested derivation within a [`ScheduledRequest`], with its job key
+/// resolved at schedule construction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScheduledTarget {
+    /// Store path of the requested derivation.
+    pub drv: String,
+    /// Requested output names; `[]` and `["*"]` both mean every output.
+    pub outputs: Vec<String>,
+    /// The workload-unit job this target resolved to at schedule
+    /// construction, `None` when the archive has no unit record for the
+    /// drv. Kept as an `Option` (rather than pre-collapsed into
+    /// [`job_key`](Self::job_key)) because the resume skip-check needs to
+    /// know whether the key can ever appear in results.jsonl: collect only
+    /// writes records for mapped jobs, so an unmapped target's settled-ness
+    /// is its prior dispatch, not a terminal record.
+    pub job: Option<String>,
+}
+
+impl ScheduledTarget {
+    /// The job key every consumer of this target uses — batch bookkeeping,
+    /// the in-flight tracker, and the resume skip-check alike: the resolved
+    /// workload job, or the drv path itself for targets without a unit
+    /// mapping. Resolved once at schedule construction so sibling consumers
+    /// cannot derive it differently.
+    pub fn job_key(&self) -> &str {
+        self.job.as_deref().unwrap_or(&self.drv)
+    }
+}
+
+/// The resolved interruption-replay policy for one scheduled request: every
+/// interrupted target the replay stands in for (already filtered to units
+/// the target cluster actually builds) together with its recorded
+/// dispatch-to-stop gap. The armed channel-abandon timer is derived from
+/// this set ([`disconnect_after`](Self::disconnect_after)), so the timer and
+/// the set it stands for cannot diverge.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterruptionPlan {
+    /// Interrupted workload targets and their recorded gaps, scaled by the
+    /// speedup; `None` when the record carries no stop offset. Non-empty by
+    /// construction ([`build_schedule`] arms a request only when at least
+    /// one interrupted target survives the workload filter).
+    entries: Vec<(String, Option<Duration>)>,
+    /// Scaled fallback delay ([`DEFAULT_DISCONNECT_DELAY_S`] over the
+    /// speedup), used only when no entry carries a recorded stop offset.
+    default_gap: Duration,
+}
+
+impl InterruptionPlan {
+    /// How long after dispatch to abandon the channel: the earliest recorded
+    /// gap over the set (a recorded stop offset always wins over the
+    /// default), the scaled default delay when no entry carries one, never
+    /// below the 1 s disconnect floor (the interrupted build is always
+    /// actually submitted before the channel is dropped).
+    pub fn disconnect_after(&self) -> Duration {
+        self.entries
+            .iter()
+            .filter_map(|(_, gap)| *gap)
+            .min()
+            .unwrap_or(self.default_gap)
+            .max(DISCONNECT_FLOOR)
+    }
+
+    /// The interrupted targets the armed timer stands in for.
+    pub fn drvs(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|(drv, _)| drv.as_str())
+    }
+
+    /// Number of interrupted targets the armed timer stands in for
+    /// (at least one by construction — an empty plan is never built).
+    pub fn unit_count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// One recorded request, scheduled for replay. All scheduling policy —
+/// per-target job keys, which interruptions count, the disconnect timer —
+/// is resolved by [`build_schedule`]; the dispatcher, the resume skip-check,
+/// and the offline dry-run planner read the same resolved fields and cannot
+/// re-derive it differently.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScheduledRequest {
     /// Unique per-run id (index into the schedule).
     pub index: usize,
-    /// The recorded request being replayed.
-    pub request: RecordedRequest,
+    /// Recorded session of the replayed request (the timing-truth lookup
+    /// key, paired with each target's drv).
+    pub session: i64,
+    /// The recorded targets, each with its resolved job key.
+    pub targets: Vec<ScheduledTarget>,
     /// When to dispatch, relative to the run start: `offset_s / speedup`.
     pub due: Duration,
-    /// When interruption replay is armed for this request: how long after
-    /// dispatch to abandon the channel
-    /// (`(stop_offset_s − offset_s).max(0) / speedup`, or 60 s divided by
-    /// the speedup when no stop offset was recorded, never below 1 s);
-    /// `None` otherwise.
-    pub disconnect_after: Option<Duration>,
-    /// The targets whose recorded timing was interrupted — the units the
-    /// armed disconnect timer stands in for. Empty whenever interruption
-    /// replay is disabled or nothing in the request was interrupted, so a
-    /// timer is armed exactly when this list is non-empty.
-    pub interruption_drvs: Vec<String>,
+    /// Interruption replay for this request: present exactly when replay is
+    /// enabled and at least one target's recorded timing was an interruption
+    /// over a unit the target cluster builds (impure-demoted units are
+    /// supplied rather than rebuilt, so their recorded interruptions are
+    /// never armed).
+    pub interruption: Option<InterruptionPlan>,
 }
 
 /// Sort the recorded requests by offset, apply the optional limit, and
-/// compute each request's due time and (when interruption replay is
-/// enabled) its disconnect timer and interrupted targets.
+/// resolve each request's scheduling policy: due time, per-target job keys
+/// (`job_of_drv`, drv-path fallback applied here and nowhere else), and —
+/// when interruption replay is enabled — the [`InterruptionPlan`] over the
+/// interrupted targets that pass `workload_member` (units the target
+/// cluster actually builds; supplied units are never armed).
 ///
-/// `timing` answers per-`(session, drv)` lookups; it is a closure so callers
-/// can serve it from whatever expected-outcome index they hold.
+/// `timing` answers per-`(session, drv)` lookups; like the other two
+/// resolvers it is a closure so callers can serve it from whatever index
+/// they hold. Both the live wiring and the offline dry-run planner build
+/// their schedule through this one function, which is what makes the
+/// dry-run numbers match a live run by construction.
+//
+// TODO: timing lookups key off the recorded (session, drv) identity as a
+// loose i64 + &str pair here and at the truth seam
+// (run/truth.rs::expected_outcomes_for_units). Once a typed session key is
+// minted at that seam, thread it through this signature so schedule
+// construction and truth resolution share one identity type.
 pub fn build_schedule(
     requests: &[RecordedRequest],
     timing: &dyn Fn(i64, &str) -> Option<RecordedTiming>,
+    job_of_drv: &dyn Fn(&str) -> Option<String>,
+    workload_member: &dyn Fn(&str) -> bool,
     speedup: f64,
     limit: Option<usize>,
     replay_interruptions: bool,
@@ -149,61 +245,61 @@ pub fn build_schedule(
         .map(|(index, request)| {
             let offset = request.offset_s.max(0.0);
             let due = Duration::from_secs_f64(offset / speedup);
-            let (disconnect_after, interruption_drvs) = if replay_interruptions {
-                (
-                    disconnect_after_for(&request, timing, speedup),
-                    interrupted_targets(&request, timing),
-                )
+            let interruption = if replay_interruptions {
+                interruption_plan_for(&request, timing, workload_member, speedup)
             } else {
-                (None, Vec::new())
+                None
             };
+            let targets = request
+                .targets
+                .iter()
+                .map(|target| ScheduledTarget {
+                    drv: target.drv.clone(),
+                    outputs: target.outputs.clone(),
+                    job: job_of_drv(&target.drv),
+                })
+                .collect();
             ScheduledRequest {
                 index,
-                request,
+                session: request.session,
+                targets,
                 due,
-                disconnect_after,
-                interruption_drvs,
+                interruption,
             }
         })
         .collect()
 }
 
-/// Disconnect timer for one request: present only when at least one of its
-/// targets has an interrupted recorded timing. The delay is the recorded
-/// dispatch-to-stop gap scaled by the speedup ([`DEFAULT_DISCONNECT_DELAY_S`]
-/// when the record carries no stop offset), never below
-/// [`DISCONNECT_FLOOR`].
-fn disconnect_after_for(
+/// Interruption plan for one request: present only when at least one target
+/// has an interrupted recorded timing over a workload unit. Each surviving
+/// target's recorded dispatch-to-stop gap is scaled by the speedup at
+/// construction; targets whose record carries no stop offset keep `None`
+/// (the plan's derived timer falls back to the scaled
+/// [`DEFAULT_DISCONNECT_DELAY_S`] only when no entry has a recorded gap).
+fn interruption_plan_for(
     request: &RecordedRequest,
     timing: &dyn Fn(i64, &str) -> Option<RecordedTiming>,
+    workload_member: &dyn Fn(&str) -> bool,
     speedup: f64,
-) -> Option<Duration> {
+) -> Option<InterruptionPlan> {
     let offset = request.offset_s.max(0.0);
-    let interrupted = request
+    let entries: Vec<(String, Option<Duration>)> = request
         .targets
         .iter()
-        .find_map(|target| timing(request.session, &target.drv).filter(|t| t.interrupted))?;
-    let scaled = match interrupted.stop_offset_s {
-        Some(stop) => (stop - offset).max(0.0) / speedup,
-        None => DEFAULT_DISCONNECT_DELAY_S / speedup,
-    };
-    Some(Duration::from_secs_f64(scaled).max(DISCONNECT_FLOOR))
-}
-
-/// The request's targets whose recorded timing was an interruption — the
-/// units a replayed disconnect stands in for.
-fn interrupted_targets(
-    request: &RecordedRequest,
-    timing: &dyn Fn(i64, &str) -> Option<RecordedTiming>,
-) -> Vec<String> {
-    request
-        .targets
-        .iter()
-        .filter(|target| {
-            timing(request.session, &target.drv).is_some_and(|record| record.interrupted)
+        .filter_map(|target| {
+            let record = timing(request.session, &target.drv)?;
+            (record.interrupted && workload_member(&target.drv)).then(|| {
+                let gap = record
+                    .stop_offset_s
+                    .map(|stop| Duration::from_secs_f64((stop - offset).max(0.0) / speedup));
+                (target.drv.clone(), gap)
+            })
         })
-        .map(|target| target.drv.clone())
-        .collect()
+        .collect();
+    (!entries.is_empty()).then(|| InterruptionPlan {
+        entries,
+        default_gap: Duration::from_secs_f64(DEFAULT_DISCONNECT_DELAY_S / speedup),
+    })
 }
 
 /// Build deadline for one scheduled request: twice the slowest recorded
@@ -215,9 +311,8 @@ pub fn build_timeout_for(
     floor: Duration,
     cap: Duration,
 ) -> Duration {
-    let session = scheduled.request.session;
+    let session = scheduled.session;
     let slowest = scheduled
-        .request
         .targets
         .iter()
         .filter_map(|target| timing(session, &target.drv).and_then(|record| record.duration_s))
@@ -314,10 +409,13 @@ pub struct TimedDryRunPlan {
     /// Due time of the last scheduled request, in seconds — the replayed
     /// window length at the configured speedup.
     pub due_window_secs: f64,
-    /// Scheduled requests with at least one interrupted target that the
-    /// target cluster will actually build (impure-demoted units are supplied
-    /// rather than rebuilt, so their recorded interruptions are not
-    /// candidates for replay).
+    /// Scheduled requests carrying an armed [`InterruptionPlan`] — at least
+    /// one interrupted target the target cluster will actually build.
+    /// [`build_schedule`] filters impure-demoted units out of every plan
+    /// (they are supplied rather than rebuilt, so their recorded
+    /// interruptions are never armed), and the live dispatcher runs the same
+    /// schedule, so this count is exactly the number of requests a live run
+    /// arms.
     pub interruption_candidates: usize,
     /// Derivations with a recorded expected outcome the target must build
     /// itself.
@@ -348,12 +446,15 @@ pub struct TimedDryRunPlan {
 /// network.
 ///
 /// The schedule uses the campaign knobs exactly as the timed wiring does
-/// (`speedup`, `replay_interruptions`, the optional request `limit`) and the
-/// same sanitizing conversions from archive records, so the dry-run numbers
-/// match what a live timed run would schedule. Source resolution runs with
-/// empty target-coverage and relay sets — without probes the ladder can only
-/// answer workload / embedded / unresolved, which is exactly the offline
-/// summary an operator needs before committing to a live run.
+/// (`speedup`, `replay_interruptions`, the optional request `limit`), the
+/// same sanitizing conversions from archive records, and the same resolved
+/// inputs (the units.jsonl job mapping and the workload split), so the
+/// dry-run numbers match what a live timed run would schedule by
+/// construction — both paths read the one schedule [`build_schedule`]
+/// resolves. Source resolution runs with empty target-coverage and relay
+/// sets — without probes the ladder can only answer workload / embedded /
+/// unresolved, which is exactly the offline summary an operator needs
+/// before committing to a live run.
 pub fn plan_timed_dry_run(
     archive: &ReplayArchive,
     knobs: &Knobs,
@@ -369,9 +470,20 @@ pub fn plan_timed_dry_run(
         .collect();
     let timing_index = super::timing_index(archive);
     let timing = |session: i64, drv: &str| timing_index.get(&(session, drv.to_string())).cloned();
+    // The same job mapping and workload split the live wiring resolves the
+    // schedule with (units.jsonl through `load_units`, the impure demotion
+    // through `workload_set`).
+    let units = super::archive_input::load_units(archive)?;
+    let job_of_drv: BTreeMap<String, String> = units
+        .into_iter()
+        .map(|unit| (unit.drv_path, unit.job))
+        .collect();
+    let workload = workload_set(archive);
     let schedule = build_schedule(
         &requests,
         &timing,
+        &|drv| job_of_drv.get(drv).cloned(),
+        &|drv| workload.drvs.contains(drv),
         knobs.speedup,
         limit,
         knobs.replay_interruptions,
@@ -381,24 +493,18 @@ pub fn plan_timed_dry_run(
         .map(|entry| entry.due.as_secs_f64())
         .unwrap_or_default();
 
-    // Workload split, and which scheduled requests carry an interruption the
-    // replay would actually reproduce (one over a unit the target builds).
-    let workload = workload_set(archive);
+    // Requests the dispatcher would arm: the schedule already carries the
+    // workload-filtered interruption plans.
     let interruption_candidates = schedule
         .iter()
-        .filter(|entry| {
-            entry
-                .interruption_drvs
-                .iter()
-                .any(|drv| workload.drvs.contains(drv))
-        })
+        .filter(|entry| entry.interruption.is_some())
         .count();
 
     // Union closure of every scheduled target, in first-appearance order.
     let mut roots: Vec<String> = Vec::new();
     let mut seen_roots: BTreeSet<&str> = BTreeSet::new();
     for entry in &schedule {
-        for target in &entry.request.targets {
+        for target in &entry.targets {
             if seen_roots.insert(target.drv.as_str()) {
                 roots.push(target.drv.clone());
             }
@@ -568,7 +674,6 @@ struct DispatchShared {
     state: Arc<StateDir>,
     submitter: Arc<dyn Submitter>,
     tracker: Arc<SubmitTracker>,
-    job_of_drv: Arc<BTreeMap<String, String>>,
     timing: SharedTimingLookup,
     deadline_reached: Arc<dyn Fn() -> bool + Send + Sync>,
     /// Pre-submission supply hook (the campaign's [`LadderTopup`] when the
@@ -629,12 +734,16 @@ fn engine_side_submission_failure(record: &BatchRecord) -> bool {
 /// missed. Top-up failures degrade to a warning; the request is submitted
 /// regardless.
 ///
-/// Resume semantics: requests whose every target is already terminal (per
-/// `terminal_jobs`, keyed by job) are skipped — counted into `resume_count`
-/// when a prior dispatch.jsonl entry shows they were dispatched before —
-/// and, when any prior dispatch entry exists, the pending schedule is
-/// re-anchored so the first pending request fires immediately and
-/// `timing_degraded` is set.
+/// Resume semantics: requests whose every target is already settled are
+/// skipped — counted into `resume_count` when a prior dispatch.jsonl entry
+/// shows they were dispatched before — and, when any prior dispatch entry
+/// exists, the pending schedule is re-anchored so the first pending request
+/// fires immediately and `timing_degraded` is set. A mapped target is
+/// settled when its job is terminal (per `terminal_jobs`); a target without
+/// a unit mapping can never get a terminal record (collect has no job
+/// context for it), so it is settled once a prior run actually submitted
+/// the request — the same drv-path job key the dispatch bookkeeping uses,
+/// judged by the only evidence that key can ever leave.
 ///
 /// The campaign deadline stops new dispatches only: a request whose sleep
 /// completes after `deadline_reached()` is recorded with `attempts: 0` and
@@ -649,7 +758,6 @@ pub async fn run_timed_dispatch(
     submitter: Arc<dyn Submitter>,
     tracker: Arc<SubmitTracker>,
     mut schedule: Vec<ScheduledRequest>,
-    job_of_drv: Arc<BTreeMap<String, String>>,
     timing: SharedTimingLookup,
     store_url: String,
     config: TimelineConfig,
@@ -663,22 +771,34 @@ pub async fn run_timed_dispatch(
 
     // ── Resume ──────────────────────────────────────────────────────────
     // Prior dispatch entries prove a previous dispatcher run happened;
-    // terminal jobs decide which requests are already settled and must not
-    // be re-submitted.
+    // terminal jobs (and, for unmapped targets, prior submissions) decide
+    // which requests are already settled and must not be re-submitted.
     let prior_entries: Vec<DispatchEntry> = state.load_jsonl(StateFile::Dispatch)?;
     let prior_indexes: HashSet<usize> = prior_entries
         .iter()
+        .map(|entry| entry.request_index)
+        .collect();
+    // Requests a prior run actually submitted (a deadline-skip entry has
+    // `attempts: 0` and proves nothing was sent).
+    let prior_submitted: HashSet<usize> = prior_entries
+        .iter()
+        .filter(|entry| entry.attempts > 0)
         .map(|entry| entry.request_index)
         .collect();
     let terminal_snapshot = terminal_jobs.lock().await.clone();
     let mut already_terminal: HashSet<usize> = HashSet::new();
     let mut resume_count = 0usize;
     for entry in &schedule {
-        let all_terminal = !entry.request.targets.is_empty()
-            && entry.request.targets.iter().all(|target| {
-                job_of_drv
-                    .get(&target.drv)
-                    .is_some_and(|job| terminal_snapshot.contains(job))
+        let all_terminal = !entry.targets.is_empty()
+            && entry.targets.iter().all(|target| match &target.job {
+                Some(job) => terminal_snapshot.contains(job),
+                // An unmapped target's drv-path job key never reaches
+                // results.jsonl (collect skips members with no job
+                // context), so requiring a terminal record would
+                // re-dispatch the request on every resume, forever. Its
+                // dispatch entry is the only settlement evidence that can
+                // exist.
+                None => prior_submitted.contains(&entry.index),
             });
         if all_terminal {
             already_terminal.insert(entry.index);
@@ -713,7 +833,6 @@ pub async fn run_timed_dispatch(
         state,
         submitter,
         tracker,
-        job_of_drv,
         timing,
         deadline_reached: Arc::new(deadline_reached),
         topup,
@@ -813,23 +932,18 @@ async fn dispatch_one_request(
     let dispatched_at = now_rfc3339();
 
     let drvs: Vec<String> = scheduled
-        .request
         .targets
         .iter()
         .map(|target| target.drv.clone())
         .collect();
-    let jobs: Vec<String> = drvs
+    // Job keys resolved at schedule construction: the mapped workload job,
+    // or the drv path for unmapped targets — collect skips those (no job
+    // context) but the batch bookkeeping and watchdog visibility stay
+    // complete, and the resume skip-check reads the same resolution.
+    let jobs: Vec<String> = scheduled
+        .targets
         .iter()
-        .map(|drv| {
-            // Targets without a workload-unit mapping keep their drv path as
-            // the job key: collect skips them (no job context) but the batch
-            // bookkeeping and watchdog visibility stay complete.
-            shared
-                .job_of_drv
-                .get(drv)
-                .cloned()
-                .unwrap_or_else(|| drv.clone())
-        })
+        .map(|target| target.job_key().to_string())
         .collect();
 
     // Inline top-up fallback (prewarm-miss / inline delivery): a failure
@@ -854,16 +968,22 @@ async fn dispatch_one_request(
         shared.config.build_timeout_floor,
         shared.config.build_timeout_cap,
     );
-    let timeout = match scheduled.disconnect_after {
-        Some(after) => {
-            let remaining = after
+    let timeout = match scheduled.interruption.as_ref() {
+        Some(plan) => {
+            let remaining = plan
+                .disconnect_after()
                 .saturating_sub(admitted_at.elapsed())
                 .max(DISCONNECT_FLOOR);
             build_deadline.min(remaining)
         }
         None => build_deadline,
     };
-    let armed = !scheduled.interruption_drvs.is_empty();
+    let armed = scheduled.interruption.is_some();
+    let interruption_drvs: Vec<String> = scheduled
+        .interruption
+        .as_ref()
+        .map(|plan| plan.drvs().map(str::to_string).collect())
+        .unwrap_or_default();
 
     // Reserve the jobs as in flight so the shared tracker (and through it
     // the watchdog poller) sees this request as Active while it runs;
@@ -877,7 +997,7 @@ async fn dispatch_one_request(
     let batch_id = shared.batch_seq.fetch_add(1, Ordering::SeqCst);
     tracing::info!(
         request = scheduled.index,
-        session = scheduled.request.session,
+        session = scheduled.session,
         batch_id,
         targets = drvs.len(),
         lateness_ms,
@@ -899,7 +1019,7 @@ async fn dispatch_one_request(
         },
         timeout,
         shared.cooldown,
-        scheduled.interruption_drvs.clone(),
+        interruption_drvs.clone(),
     )
     .await?;
     let mut batch_ids = vec![batch_id];
@@ -910,13 +1030,12 @@ async fn dispatch_one_request(
     // them: an engine cancellation reproduces the recorded interruption; a
     // unit that settled with any in-band success status out-raced it.
     let fired = armed && record.engine_cancelled;
-    let (replayed, not_reproduced) = if armed {
+    let (replayed, not_reproduced) = if let Some(plan) = scheduled.interruption.as_ref() {
         if record.engine_cancelled {
-            (scheduled.interruption_drvs.len(), 0)
+            (plan.unit_count(), 0)
         } else {
-            let succeeded = scheduled
-                .interruption_drvs
-                .iter()
+            let succeeded = plan
+                .drvs()
                 .filter(|drv| in_band_success(&record, drv))
                 .count();
             (0, succeeded)
@@ -938,19 +1057,17 @@ async fn dispatch_one_request(
             .map(|result| (result.drv_path.clone(), result.status.clone()))
             .collect();
         loop {
-            let failing: Vec<String> = scheduled
-                .request
+            let failing: Vec<&ScheduledTarget> = scheduled
                 .targets
                 .iter()
                 .filter(|target| {
-                    let expected_built = (shared.timing)(scheduled.request.session, &target.drv)
+                    let expected_built = (shared.timing)(scheduled.session, &target.drv)
                         .is_some_and(|timing| timing.expected_built);
                     expected_built
                         && last_status.get(&target.drv).is_some_and(|status| {
                             !build_status_from_name(status).is_some_and(|s| s.is_success())
                         })
                 })
-                .map(|target| target.drv.clone())
                 .collect();
             if failing.is_empty()
                 || attempts >= shared.config.confirm_attempts
@@ -958,15 +1075,12 @@ async fn dispatch_one_request(
             {
                 break;
             }
+            let failing_drvs: Vec<String> =
+                failing.iter().map(|target| target.drv.clone()).collect();
+            // The same resolved job keys the initial submission used.
             let retry_jobs: Vec<String> = failing
                 .iter()
-                .map(|drv| {
-                    shared
-                        .job_of_drv
-                        .get(drv)
-                        .cloned()
-                        .unwrap_or_else(|| drv.clone())
-                })
+                .map(|target| target.job_key().to_string())
                 .collect();
             {
                 let mut in_flight = shared.tracker.in_flight.lock().await;
@@ -991,8 +1105,8 @@ async fn dispatch_one_request(
                 retry_id,
                 Batch {
                     jobs: retry_jobs,
-                    root_drvs: failing.clone(),
-                    est_nodes: failing.len(),
+                    root_drvs: failing_drvs.clone(),
+                    est_nodes: failing_drvs.len(),
                 },
                 build_deadline,
                 shared.cooldown,
@@ -1012,7 +1126,7 @@ async fn dispatch_one_request(
         StateFile::Dispatch,
         &DispatchEntry {
             request_index: scheduled.index,
-            session: scheduled.request.session,
+            session: scheduled.session,
             due_offset_s: scheduled.due.as_secs_f64(),
             dispatched_at,
             dispatch_lateness_ms: lateness_ms,
@@ -1057,24 +1171,23 @@ fn record_deadline_skip(
     );
     tracing::info!(
         request = scheduled.index,
-        session = scheduled.request.session,
+        session = scheduled.session,
         "campaign deadline reached before this request was admitted; not dispatching it"
     );
     shared.state.append_jsonl(
         StateFile::Dispatch,
         &DispatchEntry {
             request_index: scheduled.index,
-            session: scheduled.request.session,
+            session: scheduled.session,
             due_offset_s: scheduled.due.as_secs_f64(),
             dispatched_at: now_rfc3339(),
             dispatch_lateness_ms: 0,
             deadline_secs: build_deadline.as_secs(),
-            interruption_armed: !scheduled.interruption_drvs.is_empty(),
+            interruption_armed: scheduled.interruption.is_some(),
             interruption_fired: false,
             attempts: 0,
             batch_ids: Vec::new(),
             drvs: scheduled
-                .request
                 .targets
                 .iter()
                 .map(|target| target.drv.clone())
@@ -1137,6 +1250,22 @@ mod tests {
         move |session, drv| map.get(&(session, drv.to_string())).cloned()
     }
 
+    /// Job resolver that maps nothing: every target keeps its drv path as
+    /// the job key.
+    fn no_jobs(_: &str) -> Option<String> {
+        None
+    }
+
+    /// Job resolver backed by an explicit drv → job map.
+    fn jobs_in(map: &BTreeMap<String, String>) -> impl Fn(&str) -> Option<String> + '_ {
+        move |drv| map.get(drv).cloned()
+    }
+
+    /// Workload predicate that accepts everything (no impure demotion).
+    fn all_workload(_: &str) -> bool {
+        true
+    }
+
     /// Recorded timing for an interrupted attempt with an optional stop
     /// offset.
     fn interrupted(stop_offset_s: Option<f64>) -> RecordedTiming {
@@ -1153,10 +1282,14 @@ mod tests {
     fn scheduled(index: usize, due_secs: u64) -> ScheduledRequest {
         ScheduledRequest {
             index,
-            request: request(index as i64, due_secs as f64, DRV_A),
+            session: index as i64,
+            targets: vec![ScheduledTarget {
+                drv: DRV_A.to_string(),
+                outputs: vec!["out".to_string()],
+                job: None,
+            }],
             due: Duration::from_secs(due_secs),
-            disconnect_after: None,
-            interruption_drvs: Vec::new(),
+            interruption: None,
         }
     }
 
@@ -1171,7 +1304,15 @@ mod tests {
             request(12, 9.0, DRV_C),
             request(13, 2.0, DRV_D),
         ];
-        let schedule = build_schedule(&requests, &no_timing, 2.0, None, true);
+        let schedule = build_schedule(
+            &requests,
+            &no_timing,
+            &no_jobs,
+            &all_workload,
+            2.0,
+            None,
+            true,
+        );
         assert_eq!(schedule.len(), 4);
         let due: Vec<Duration> = schedule.iter().map(|entry| entry.due).collect();
         assert_eq!(
@@ -1183,25 +1324,109 @@ mod tests {
                 Duration::from_millis(4500),
             ]
         );
-        let sessions: Vec<i64> = schedule.iter().map(|entry| entry.request.session).collect();
+        let sessions: Vec<i64> = schedule.iter().map(|entry| entry.session).collect();
         assert_eq!(sessions, vec![10, 13, 11, 12]);
         let indices: Vec<usize> = schedule.iter().map(|entry| entry.index).collect();
         assert_eq!(indices, vec![0, 1, 2, 3]);
 
         // The limit keeps the first N by offset.
-        let limited = build_schedule(&requests, &no_timing, 2.0, Some(2), true);
+        let limited = build_schedule(
+            &requests,
+            &no_timing,
+            &no_jobs,
+            &all_workload,
+            2.0,
+            Some(2),
+            true,
+        );
         assert_eq!(limited.len(), 2);
-        let limited_sessions: Vec<i64> =
-            limited.iter().map(|entry| entry.request.session).collect();
+        let limited_sessions: Vec<i64> = limited.iter().map(|entry| entry.session).collect();
         assert_eq!(limited_sessions, vec![10, 13]);
 
         // A fabricated negative offset clamps to a zero due time and sorts
         // ahead of everything else.
         let mut requests = requests.clone();
         requests.push(request(99, -3.5, DRV_A));
-        let schedule = build_schedule(&requests, &no_timing, 2.0, None, false);
-        assert_eq!(schedule[0].request.session, 99);
+        let schedule = build_schedule(
+            &requests,
+            &no_timing,
+            &no_jobs,
+            &all_workload,
+            2.0,
+            None,
+            false,
+        );
+        assert_eq!(schedule[0].session, 99);
         assert_eq!(schedule[0].due, Duration::ZERO);
+    }
+
+    /// Job keys are resolved once at schedule construction: mapped targets
+    /// carry their workload job, unmapped ones fall back to the drv path —
+    /// the single fallback rule every consumer (dispatch bookkeeping,
+    /// resume skip-check) reads.
+    #[test]
+    fn build_schedule_resolves_job_keys_with_drv_fallback() {
+        let two_targets = RecordedRequest {
+            session: 5,
+            offset_s: 0.0,
+            targets: vec![
+                RecordedTarget {
+                    drv: DRV_A.to_string(),
+                    outputs: vec!["out".to_string()],
+                },
+                RecordedTarget {
+                    drv: DRV_B.to_string(),
+                    outputs: vec!["out".to_string()],
+                },
+            ],
+        };
+        let map = BTreeMap::from([(DRV_A.to_string(), "a".to_string())]);
+        let schedule = build_schedule(
+            &[two_targets],
+            &no_timing,
+            &jobs_in(&map),
+            &all_workload,
+            1.0,
+            None,
+            true,
+        );
+        let targets = &schedule[0].targets;
+        assert_eq!(targets[0].job.as_deref(), Some("a"));
+        assert_eq!(targets[0].job_key(), "a");
+        assert_eq!(targets[1].job, None);
+        assert_eq!(targets[1].job_key(), DRV_B);
+    }
+
+    /// The armed disconnect timer of a schedule entry, when present.
+    fn timer(entry: &ScheduledRequest) -> Option<Duration> {
+        entry
+            .interruption
+            .as_ref()
+            .map(InterruptionPlan::disconnect_after)
+    }
+
+    /// The interrupted targets the entry's plan stands in for.
+    fn armed_drvs(entry: &ScheduledRequest) -> Vec<&str> {
+        entry
+            .interruption
+            .as_ref()
+            .map(|plan| plan.drvs().collect())
+            .unwrap_or_default()
+    }
+
+    /// Multi-target request over the given drvs, all asking for `out`.
+    fn multi_request(session: i64, offset_s: f64, drvs: &[&str]) -> RecordedRequest {
+        RecordedRequest {
+            session,
+            offset_s,
+            targets: drvs
+                .iter()
+                .map(|drv| RecordedTarget {
+                    drv: drv.to_string(),
+                    outputs: vec!["out".to_string()],
+                })
+                .collect(),
+        }
     }
 
     #[test]
@@ -1228,29 +1453,29 @@ mod tests {
             },
         );
         let timing = timing_in(&map);
-        let schedule = build_schedule(&requests, &timing, 2.0, None, true);
-        let timers: Vec<Option<Duration>> = schedule
-            .iter()
-            .map(|entry| entry.disconnect_after)
-            .collect();
+        let schedule = build_schedule(&requests, &timing, &no_jobs, &all_workload, 2.0, None, true);
+        let timers: Vec<Option<Duration>> = schedule.iter().map(timer).collect();
         assert_eq!(timers, vec![None, None, None, Some(Duration::from_secs(1))]);
         // The armed request also names which targets the timer stands in
         // for; unarmed requests name none.
-        assert_eq!(schedule[3].interruption_drvs, vec![DRV_C.to_string()]);
+        assert_eq!(armed_drvs(&schedule[3]), vec![DRV_C]);
         assert!(
             schedule[..3]
                 .iter()
-                .all(|entry| entry.interruption_drvs.is_empty())
+                .all(|entry| entry.interruption.is_none())
         );
 
-        // Interruption replay disabled: no timers and nothing armed at all.
-        let schedule = build_schedule(&requests, &timing, 2.0, None, false);
-        assert!(
-            schedule
-                .iter()
-                .all(|entry| entry.disconnect_after.is_none()
-                    && entry.interruption_drvs.is_empty())
+        // Interruption replay disabled: nothing armed at all.
+        let schedule = build_schedule(
+            &requests,
+            &timing,
+            &no_jobs,
+            &all_workload,
+            2.0,
+            None,
+            false,
         );
+        assert!(schedule.iter().all(|entry| entry.interruption.is_none()));
 
         // An interruption without a stop offset falls back to 60s scaled by
         // the speedup.
@@ -1258,8 +1483,8 @@ mod tests {
         let mut map = HashMap::new();
         map.insert((50_i64, DRV_A.to_string()), interrupted(None));
         let timing = timing_in(&map);
-        let schedule = build_schedule(&requests, &timing, 2.0, None, true);
-        assert_eq!(schedule[0].disconnect_after, Some(Duration::from_secs(30)));
+        let schedule = build_schedule(&requests, &timing, &no_jobs, &all_workload, 2.0, None, true);
+        assert_eq!(timer(&schedule[0]), Some(Duration::from_secs(30)));
 
         // The 1s floor holds when the recorded gap is tiny and the speedup
         // is high.
@@ -1267,8 +1492,106 @@ mod tests {
         let mut map = HashMap::new();
         map.insert((51_i64, DRV_A.to_string()), interrupted(Some(5.001)));
         let timing = timing_in(&map);
-        let schedule = build_schedule(&requests, &timing, 100.0, None, true);
-        assert_eq!(schedule[0].disconnect_after, Some(Duration::from_secs(1)));
+        let schedule = build_schedule(
+            &requests,
+            &timing,
+            &no_jobs,
+            &all_workload,
+            100.0,
+            None,
+            true,
+        );
+        assert_eq!(timer(&schedule[0]), Some(Duration::from_secs(1)));
+    }
+
+    /// With several interrupted targets the timer is derived from the whole
+    /// set: the earliest recorded gap wins regardless of target-list order,
+    /// and a recorded stop offset always beats the 60s default — a
+    /// first-listed target without one cannot force the default over a
+    /// sibling's recorded data.
+    #[test]
+    fn disconnect_after_takes_earliest_recorded_stop_over_the_set() {
+        // Three interrupted targets at offsets 30/12/None for a request at
+        // offset 2.0: gaps 28s and 10s; the earliest recorded gap (10s) arms
+        // the timer even though it belongs to the SECOND-listed target and
+        // the third has no recorded stop at all.
+        let req = multi_request(20, 2.0, &[DRV_A, DRV_B, DRV_C]);
+        let mut map = HashMap::new();
+        map.insert((20_i64, DRV_A.to_string()), interrupted(Some(30.0)));
+        map.insert((20_i64, DRV_B.to_string()), interrupted(Some(12.0)));
+        map.insert((20_i64, DRV_C.to_string()), interrupted(None));
+        let timing = timing_in(&map);
+        let schedule = build_schedule(
+            std::slice::from_ref(&req),
+            &timing,
+            &no_jobs,
+            &all_workload,
+            1.0,
+            None,
+            true,
+        );
+        assert_eq!(timer(&schedule[0]), Some(Duration::from_secs(10)));
+        // The plan still stands in for ALL interrupted targets — the set the
+        // accounting credits when the one timer fires.
+        assert_eq!(armed_drvs(&schedule[0]), vec![DRV_A, DRV_B, DRV_C]);
+
+        // First-listed target has no stop offset, sibling has one: the
+        // recorded 5s gap wins over the 60s default.
+        let req = multi_request(21, 0.0, &[DRV_A, DRV_B]);
+        let mut map = HashMap::new();
+        map.insert((21_i64, DRV_A.to_string()), interrupted(None));
+        map.insert((21_i64, DRV_B.to_string()), interrupted(Some(5.0)));
+        let timing = timing_in(&map);
+        let schedule = build_schedule(&[req], &timing, &no_jobs, &all_workload, 1.0, None, true);
+        assert_eq!(timer(&schedule[0]), Some(Duration::from_secs(5)));
+
+        // Only when NO interrupted target carries a stop offset does the
+        // scaled default apply.
+        let req = multi_request(22, 0.0, &[DRV_A, DRV_B]);
+        let mut map = HashMap::new();
+        map.insert((22_i64, DRV_A.to_string()), interrupted(None));
+        map.insert((22_i64, DRV_B.to_string()), interrupted(None));
+        let timing = timing_in(&map);
+        let schedule = build_schedule(&[req], &timing, &no_jobs, &all_workload, 2.0, None, true);
+        assert_eq!(timer(&schedule[0]), Some(Duration::from_secs(30)));
+    }
+
+    /// Interrupted targets outside the workload (impure-demoted units the
+    /// campaign supplies instead of building) never arm a timer and never
+    /// enter the plan: schedule construction applies the workload filter,
+    /// so the dispatcher and the dry-run planner read the same already-
+    /// filtered schedule.
+    #[test]
+    fn interruptions_over_non_workload_targets_are_not_armed() {
+        // Request whose ONLY interruption is over a demoted target: not
+        // armed at all, even though the timing record says interrupted.
+        let req = multi_request(30, 1.0, &[DRV_A, DRV_B]);
+        let mut map = HashMap::new();
+        map.insert((30_i64, DRV_A.to_string()), interrupted(Some(3.0)));
+        let timing = timing_in(&map);
+        let workload = |drv: &str| drv != DRV_A;
+        let schedule = build_schedule(
+            std::slice::from_ref(&req),
+            &timing,
+            &no_jobs,
+            &workload,
+            1.0,
+            None,
+            true,
+        );
+        assert!(schedule[0].interruption.is_none());
+
+        // Mixed request: a demoted interrupted target alongside a workload
+        // interrupted one. Only the workload target enters the plan, and
+        // the timer comes from ITS recorded gap (4s), not the demoted
+        // target's earlier 2s gap.
+        let mut map = HashMap::new();
+        map.insert((30_i64, DRV_A.to_string()), interrupted(Some(3.0)));
+        map.insert((30_i64, DRV_B.to_string()), interrupted(Some(5.0)));
+        let timing = timing_in(&map);
+        let schedule = build_schedule(&[req], &timing, &no_jobs, &workload, 1.0, None, true);
+        assert_eq!(armed_drvs(&schedule[0]), vec![DRV_B]);
+        assert_eq!(timer(&schedule[0]), Some(Duration::from_secs(4)));
     }
 
     #[test]
@@ -1296,6 +1619,8 @@ mod tests {
             let schedule = build_schedule(
                 &[request(session, 0.0, DRV_A)],
                 &no_timing,
+                &no_jobs,
+                &all_workload,
                 1.0,
                 None,
                 false,
@@ -1326,6 +1651,8 @@ mod tests {
         let schedule = build_schedule(
             &[request(session, 0.0, DRV_A)],
             &no_timing,
+            &no_jobs,
+            &all_workload,
             1.0,
             None,
             false,
@@ -1336,21 +1663,16 @@ mod tests {
         );
 
         // Several targets: the slowest recorded duration wins.
-        let two_targets = RecordedRequest {
-            session,
-            offset_s: 0.0,
-            targets: vec![
-                RecordedTarget {
-                    drv: DRV_A.to_string(),
-                    outputs: vec!["out".to_string()],
-                },
-                RecordedTarget {
-                    drv: DRV_B.to_string(),
-                    outputs: vec!["out".to_string()],
-                },
-            ],
-        };
-        let schedule = build_schedule(&[two_targets], &no_timing, 1.0, None, false);
+        let two_targets = multi_request(session, 0.0, &[DRV_A, DRV_B]);
+        let schedule = build_schedule(
+            &[two_targets],
+            &no_timing,
+            &no_jobs,
+            &all_workload,
+            1.0,
+            None,
+            false,
+        );
         let mut map = HashMap::new();
         map.insert(
             (session, DRV_A.to_string()),
@@ -1580,7 +1902,6 @@ mod tests {
         state: &Arc<StateDir>,
         submitter: Arc<dyn Submitter>,
         schedule: Vec<ScheduledRequest>,
-        job_of_drv: BTreeMap<String, String>,
         timing: SharedTimingLookup,
         config: TimelineConfig,
         terminal: HashSet<String>,
@@ -1590,7 +1911,6 @@ mod tests {
             submitter,
             Arc::new(SubmitTracker::default()),
             schedule,
-            Arc::new(job_of_drv),
             timing,
             "ssh-ng://test".into(),
             config,
@@ -1658,7 +1978,20 @@ mod tests {
             request(2, 10.0, DRV_B),
             request(3, 20.0, DRV_C),
         ];
-        let schedule = build_schedule(&requests, &no_timing, 2.0, None, true);
+        let jobs = BTreeMap::from([
+            (DRV_A.to_string(), "a".to_string()),
+            (DRV_B.to_string(), "b".to_string()),
+            (DRV_C.to_string(), "c".to_string()),
+        ]);
+        let schedule = build_schedule(
+            &requests,
+            &no_timing,
+            &jobs_in(&jobs),
+            &all_workload,
+            2.0,
+            None,
+            true,
+        );
         // Each scripted submission succeeds after 7s of paused-clock time,
         // so with one admission permit the second request (due 5s) is
         // admitted at 7s and the third (due 10s) at 14s.
@@ -1679,11 +2012,6 @@ mod tests {
             &state,
             submitter.clone(),
             schedule,
-            BTreeMap::from([
-                (DRV_A.to_string(), "a".to_string()),
-                (DRV_B.to_string(), "b".to_string()),
-                (DRV_C.to_string(), "c".to_string()),
-            ]),
             timing_arc(HashMap::new()),
             config,
             HashSet::new(),
@@ -1765,7 +2093,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = Arc::new(StateDir::new(dir.path()).unwrap());
         let requests = vec![request(1, 0.0, DRV_A), request(2, 5.0, DRV_B)];
-        let schedule = build_schedule(&requests, &no_timing, 1.0, None, true);
+        let jobs = BTreeMap::from([
+            (DRV_A.to_string(), "a".to_string()),
+            (DRV_B.to_string(), "b".to_string()),
+        ]);
+        let schedule = build_schedule(
+            &requests,
+            &no_timing,
+            &jobs_in(&jobs),
+            &all_workload,
+            1.0,
+            None,
+            true,
+        );
         let fake = FakeSubmitter::default();
         for _ in 0..2 {
             fake.outcomes
@@ -1784,10 +2124,6 @@ mod tests {
             submitter.clone(),
             Arc::new(SubmitTracker::default()),
             schedule,
-            Arc::new(BTreeMap::from([
-                (DRV_A.to_string(), "a".to_string()),
-                (DRV_B.to_string(), "b".to_string()),
-            ])),
             timing_arc(HashMap::new()),
             "ssh-ng://test".into(),
             TimelineConfig::from_knobs(&Knobs::default()),
@@ -1836,7 +2172,16 @@ mod tests {
                 expected_built: true,
             },
         );
-        let schedule = build_schedule(&requests, &timing_in(&map), 1.0, None, true);
+        let jobs = BTreeMap::from([(DRV_A.to_string(), "a".to_string())]);
+        let schedule = build_schedule(
+            &requests,
+            &timing_in(&map),
+            &jobs_in(&jobs),
+            &all_workload,
+            1.0,
+            None,
+            true,
+        );
         let fake = FakeSubmitter::default();
         fake.outcomes
             .lock()
@@ -1847,7 +2192,6 @@ mod tests {
             &state,
             submitter.clone(),
             schedule,
-            BTreeMap::from([(DRV_A.to_string(), "a".to_string())]),
             timing_arc(map),
             TimelineConfig::from_knobs(&Knobs::default()),
             HashSet::new(),
@@ -1886,8 +2230,17 @@ mod tests {
                 expected_built: false,
             },
         );
-        let schedule = build_schedule(&requests, &timing_in(&map), 1.0, None, true);
-        assert_eq!(schedule[0].disconnect_after, Some(Duration::from_secs(2)));
+        let jobs = BTreeMap::from([(DRV_A.to_string(), "a".to_string())]);
+        let schedule = build_schedule(
+            &requests,
+            &timing_in(&map),
+            &jobs_in(&jobs),
+            &all_workload,
+            1.0,
+            None,
+            true,
+        );
+        assert_eq!(timer(&schedule[0]), Some(Duration::from_secs(2)));
 
         // The scripted outcome is an engine cancellation: the abandon
         // deadline won the race against the build.
@@ -1901,7 +2254,6 @@ mod tests {
             &state,
             submitter.clone(),
             schedule,
-            BTreeMap::from([(DRV_A.to_string(), "a".to_string())]),
             timing_arc(map),
             TimelineConfig::from_knobs(&Knobs::default()),
             HashSet::new(),
@@ -1960,7 +2312,16 @@ mod tests {
                 expected_built: false,
             },
         );
-        let schedule = build_schedule(&requests, &timing_in(&map), 1.0, None, true);
+        let jobs = BTreeMap::from([(DRV_A.to_string(), "a".to_string())]);
+        let schedule = build_schedule(
+            &requests,
+            &timing_in(&map),
+            &jobs_in(&jobs),
+            &all_workload,
+            1.0,
+            None,
+            true,
+        );
 
         // The scripted outcome completes in band (no cancellation) with a
         // non-Built success status.
@@ -1975,7 +2336,6 @@ mod tests {
             &state,
             submitter.clone(),
             schedule,
-            BTreeMap::from([(DRV_A.to_string(), "a".to_string())]),
             timing_arc(map),
             TimelineConfig::from_knobs(&Knobs::default()),
             HashSet::new(),
@@ -2010,20 +2370,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = Arc::new(StateDir::new(dir.path()).unwrap());
         // One recorded request carrying two targets, both expected built.
-        let two_targets = RecordedRequest {
-            session: 5,
-            offset_s: 0.0,
-            targets: vec![
-                RecordedTarget {
-                    drv: DRV_A.to_string(),
-                    outputs: vec!["out".to_string()],
-                },
-                RecordedTarget {
-                    drv: DRV_B.to_string(),
-                    outputs: vec!["out".to_string()],
-                },
-            ],
-        };
+        let two_targets = multi_request(5, 0.0, &[DRV_A, DRV_B]);
         let mut map = HashMap::new();
         for drv in [DRV_A, DRV_B] {
             map.insert(
@@ -2036,7 +2383,19 @@ mod tests {
                 },
             );
         }
-        let schedule = build_schedule(&[two_targets], &timing_in(&map), 1.0, None, true);
+        let jobs = BTreeMap::from([
+            (DRV_A.to_string(), "a".to_string()),
+            (DRV_B.to_string(), "b".to_string()),
+        ]);
+        let schedule = build_schedule(
+            &[two_targets],
+            &timing_in(&map),
+            &jobs_in(&jobs),
+            &all_workload,
+            1.0,
+            None,
+            true,
+        );
 
         // Scripted from the back: the initial submission fails only B, the
         // confirmation retry then builds it.
@@ -2063,10 +2422,6 @@ mod tests {
             &state,
             submitter.clone(),
             schedule,
-            BTreeMap::from([
-                (DRV_A.to_string(), "a".to_string()),
-                (DRV_B.to_string(), "b".to_string()),
-            ]),
             timing_arc(map),
             config,
             HashSet::new(),
@@ -2104,7 +2459,19 @@ mod tests {
         // Request 0 already settled in the prior run; request 1 was
         // recorded 300s later.
         let requests = vec![request(1, 0.0, DRV_A), request(2, 300.0, DRV_B)];
-        let schedule = build_schedule(&requests, &no_timing, 1.0, None, true);
+        let jobs = BTreeMap::from([
+            (DRV_A.to_string(), "a".to_string()),
+            (DRV_B.to_string(), "b".to_string()),
+        ]);
+        let schedule = build_schedule(
+            &requests,
+            &no_timing,
+            &jobs_in(&jobs),
+            &all_workload,
+            1.0,
+            None,
+            true,
+        );
         state
             .append_jsonl(StateFile::Results, &terminal_job_record("a", DRV_A))
             .unwrap();
@@ -2122,10 +2489,6 @@ mod tests {
             &state,
             submitter.clone(),
             schedule,
-            BTreeMap::from([
-                (DRV_A.to_string(), "a".to_string()),
-                (DRV_B.to_string(), "b".to_string()),
-            ]),
             timing_arc(HashMap::new()),
             TimelineConfig::from_knobs(&Knobs::default()),
             ["a".to_string()].into_iter().collect(),
@@ -2154,5 +2517,70 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].request_index, 1);
         assert_eq!(entries[1].attempts, 1);
+    }
+
+    /// A request whose targets include one WITHOUT a units.jsonl mapping is
+    /// retired on resume once a prior run submitted it: the unmapped
+    /// target's drv-path job key can never reach results.jsonl (collect
+    /// skips members with no job context), so its prior dispatch entry is
+    /// the settlement evidence — without this, the request would be
+    /// re-submitted to the cluster on every resume, forever. A deadline-skip
+    /// entry (`attempts: 0`) proves nothing was sent and must NOT retire it.
+    #[tokio::test(start_paused = true)]
+    async fn timed_resume_retires_requests_with_unmapped_targets_after_prior_submission() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        // Request 0: a mapped (terminal) target plus an unmapped one,
+        // submitted by a prior run. Request 1: an unmapped target whose
+        // prior entry is a deadline skip (attempts: 0) — never submitted.
+        let req0 = multi_request(1, 0.0, &[DRV_A, DRV_B]);
+        let req1 = request(2, 5.0, DRV_C);
+        let jobs = BTreeMap::from([(DRV_A.to_string(), "a".to_string())]);
+        let schedule = build_schedule(
+            &[req0, req1],
+            &no_timing,
+            &jobs_in(&jobs),
+            &all_workload,
+            1.0,
+            None,
+            true,
+        );
+        assert_eq!(schedule[0].targets[1].job, None);
+        state
+            .append_jsonl(StateFile::Results, &terminal_job_record("a", DRV_A))
+            .unwrap();
+        state
+            .append_jsonl(StateFile::Dispatch, &prior_dispatch_entry(0, 1, DRV_A))
+            .unwrap();
+        let mut skipped = prior_dispatch_entry(1, 2, DRV_C);
+        skipped.attempts = 0;
+        skipped.batch_ids = Vec::new();
+        state.append_jsonl(StateFile::Dispatch, &skipped).unwrap();
+
+        let fake = FakeSubmitter::default();
+        fake.outcomes
+            .lock()
+            .unwrap()
+            .push(Ok(BatchOutcome::default()));
+        let submitter = Arc::new(InstrumentedSubmitter::new(fake, Duration::ZERO));
+        let stats = drive_dispatch(
+            &state,
+            submitter.clone(),
+            schedule,
+            timing_arc(HashMap::new()),
+            TimelineConfig::from_knobs(&Knobs::default()),
+            ["a".to_string()].into_iter().collect(),
+        )
+        .await;
+
+        // Only the deadline-skipped request is (re-)submitted; the request
+        // with the unmapped-but-already-submitted target is retired.
+        let calls = submitter.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].1, vec![DRV_C.to_string()]);
+        assert_eq!(stats.requests_total, 2);
+        assert_eq!(stats.dispatched, 1);
+        assert_eq!(stats.resume_count, 1);
+        assert!(stats.timing_degraded);
     }
 }

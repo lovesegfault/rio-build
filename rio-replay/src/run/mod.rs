@@ -1018,13 +1018,12 @@ async fn write_terminal_stall(
 }
 
 /// Inputs the timed scheduling arm needs, prepared once from the open
-/// archive at the wiring point: the built schedule, the per-`(session, drv)`
-/// timing lookup, the drv → job mapping for batch bookkeeping, and the
-/// dispatcher tuning.
+/// archive at the wiring point: the built schedule (job keys and
+/// interruption policy already resolved by `build_schedule`), the
+/// per-`(session, drv)` timing lookup, and the dispatcher tuning.
 struct TimedInputs {
     schedule: Vec<ScheduledRequest>,
     timing: SharedTimingLookup,
-    job_of_drv: Arc<BTreeMap<String, String>>,
     config: TimelineConfig,
 }
 
@@ -1852,17 +1851,24 @@ pub async fn run_with_backends(
                 let index = timing_index(&archive);
                 Arc::new(move |session, drv| index.get(&(session, drv.to_string())).cloned())
             };
-            let schedule = build_schedule(
-                &requests,
-                &|session, drv| timing(session, drv),
-                spec.knobs.speedup,
-                spec.filters.limit,
-                replay_interruptions,
-            );
+            // The same job mapping and workload split the offline dry-run
+            // planner resolves its schedule with: build_schedule bakes both
+            // into the schedule, so the dispatcher, the resume skip-check,
+            // and the dry run all read one resolved artifact.
             let job_of_drv: BTreeMap<String, String> = manifest
                 .iter()
                 .map(|m| (m.drv_path.clone(), m.job.clone()))
                 .collect();
+            let workload = supply::workload_set(&archive);
+            let schedule = build_schedule(
+                &requests,
+                &|session, drv| timing(session, drv),
+                &|drv| job_of_drv.get(drv).cloned(),
+                &|drv| workload.drvs.contains(drv),
+                spec.knobs.speedup,
+                spec.filters.limit,
+                replay_interruptions,
+            );
             let mut config = TimelineConfig::from_knobs(&spec.knobs);
             config.replay_interruptions = replay_interruptions;
             tracing::info!(
@@ -1876,7 +1882,6 @@ pub async fn run_with_backends(
             Some(TimedInputs {
                 schedule,
                 timing,
-                job_of_drv: Arc::new(job_of_drv),
                 config,
             })
         }
@@ -1944,7 +1949,6 @@ pub async fn run_with_backends(
                         backends.submitter.clone(),
                         tracker.clone(),
                         inputs.schedule.clone(),
-                        inputs.job_of_drv.clone(),
                         inputs.timing.clone(),
                         spec.cluster.gateway_store_url.clone(),
                         inputs.config.clone(),
@@ -3042,7 +3046,15 @@ mod tests {
             .iter()
             .map(|offset| recorded_request_from(&req(*offset)))
             .collect();
-        let schedule = timeline::build_schedule(&requests, &|_, _| None, 1.0, None, true);
+        let schedule = timeline::build_schedule(
+            &requests,
+            &|_, _| None,
+            &|_| None,
+            &|_| true,
+            1.0,
+            None,
+            true,
+        );
         assert_eq!(schedule.len(), 2);
 
         let outcome = |outcome, duration_s, stop_offset_s| OutcomeRecord {
@@ -3120,6 +3132,120 @@ mod tests {
         );
     }
 
+    /// Fixture-driven dry-run == live parity: over one archive, the offline
+    /// dry-run plan and a live run's schedule construction must agree —
+    /// they read the same resolved schedule, so the planner's numbers are
+    /// the dispatcher's numbers.
+    ///
+    /// Interruption axis: an archive whose ONLY recorded interruption is
+    /// over an impure-demoted unit arms nothing on either side (the unit is
+    /// supplied, never built, so its recorded disconnect is not replayed),
+    /// while the same archive without the demotion arms it on both sides.
+    /// The demotion/exclusion-set axis (plan-time `workload_set` parity)
+    /// extends this test.
+    #[test]
+    fn dry_run_and_live_planner_agree_on_one_archive() {
+        use timeline::plan_timed_dry_run;
+
+        // The schedule a live timed campaign would run, constructed exactly
+        // as the run_with_backends wiring does.
+        let live_schedule = |archive: &ReplayArchive| -> Vec<timeline::ScheduledRequest> {
+            let requests: Vec<timeline::RecordedRequest> = archive
+                .requests()
+                .iter()
+                .map(recorded_request_from)
+                .collect();
+            let manifest = load_units(archive).unwrap();
+            let job_of_drv: BTreeMap<String, String> = manifest
+                .iter()
+                .map(|m| (m.drv_path.clone(), m.job.clone()))
+                .collect();
+            let workload = supply::workload_set(archive);
+            let index = timing_index(archive);
+            timeline::build_schedule(
+                &requests,
+                &|session, drv| index.get(&(session, drv.to_string())).cloned(),
+                &|drv| job_of_drv.get(drv).cloned(),
+                &|drv| workload.drvs.contains(drv),
+                Knobs::default().speedup,
+                None,
+                Knobs::default().replay_interruptions,
+            )
+        };
+
+        // Interrupted appB, impure-demoted: the recorded interruption is
+        // over a supplied unit.
+        let dir = tempfile::tempdir().unwrap();
+        write_mini_timed_archive(dir.path(), true, true);
+        let archive = ReplayArchive::open(dir.path()).unwrap();
+        // Non-vacuity: the archive really records an interruption for the
+        // demoted unit — the zero below proves filtering, not absence.
+        let app_b_drv = load_units(&archive)
+            .unwrap()
+            .iter()
+            .find(|m| m.job == "appB.x86_64-linux")
+            .unwrap()
+            .drv_path
+            .clone();
+        // The lookup key comes from the recorded request itself (the only
+        // place a session id should ever originate): the typed SessionKey
+        // is mintable only from a recorded request.
+        let app_b_request = archive
+            .requests()
+            .iter()
+            .find(|req| req.targets.iter().any(|t| t.drv == app_b_drv))
+            .unwrap();
+        assert!(
+            recorded_timing_from(
+                archive
+                    .expected_outcome(SessionKey::of_request(app_b_request), &app_b_drv)
+                    .unwrap()
+            )
+            .interrupted
+        );
+        assert!(
+            supply::workload_set(&archive)
+                .demoted_impure
+                .contains(&app_b_drv)
+        );
+
+        let plan = plan_timed_dry_run(&archive, &Knobs::default(), None).unwrap();
+        let schedule = live_schedule(&archive);
+        assert_eq!(plan.schedule_len, schedule.len());
+        assert_eq!(plan.demoted_impure, 1);
+        assert_eq!(plan.workload_units, 1);
+        let armed = schedule
+            .iter()
+            .filter(|entry| entry.interruption.is_some())
+            .count();
+        assert_eq!(
+            (plan.interruption_candidates, armed),
+            (0, 0),
+            "an interruption over a supplied unit must be armed on neither side"
+        );
+
+        // Same archive without the demotion: armed on both sides.
+        let dir = tempfile::tempdir().unwrap();
+        write_mini_timed_archive(dir.path(), true, false);
+        let archive = ReplayArchive::open(dir.path()).unwrap();
+        let plan = plan_timed_dry_run(&archive, &Knobs::default(), None).unwrap();
+        let schedule = live_schedule(&archive);
+        let armed = schedule
+            .iter()
+            .filter(|entry| entry.interruption.is_some())
+            .count();
+        assert_eq!((plan.interruption_candidates, armed), (1, 1));
+        // The resolved job keys agree with the dry run's source: every
+        // scheduled target maps to its units.jsonl job.
+        assert!(
+            schedule
+                .iter()
+                .flat_map(|entry| entry.targets.iter())
+                .all(|target| target.job.is_some()),
+            "every fixture target has a unit mapping"
+        );
+    }
+
     /// A missing narinfo probe (no probeable public-HTTPS substituter in
     /// the archive) fails only at its single point of use — the leaf-mode
     /// warm-set coverage probe — with an error naming the requirement.
@@ -3167,7 +3293,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn replay_interruptions_forced_off_without_interruption_records() {
         let archive_dir = tempfile::tempdir().unwrap();
-        let built = write_mini_timed_archive(archive_dir.path(), false);
+        let built = write_mini_timed_archive(archive_dir.path(), false, false);
         let archive = Arc::new(ReplayArchive::open(archive_dir.path()).unwrap());
         let manifest = load_units(&archive).unwrap();
         let app_a = manifest
@@ -3262,7 +3388,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn mini_timed_campaign_end_to_end() {
         let archive_dir = tempfile::tempdir().unwrap();
-        let built = write_mini_timed_archive(archive_dir.path(), true);
+        let built = write_mini_timed_archive(archive_dir.path(), true, false);
         let archive = Arc::new(ReplayArchive::open(archive_dir.path()).unwrap());
         let manifest = load_units(&archive).unwrap();
         let app_a = manifest

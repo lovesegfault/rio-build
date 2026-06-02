@@ -663,13 +663,22 @@ pub(crate) fn write_mini_archive(dir: &std::path::Path) -> MiniArchive {
 /// otherwise), `closures.jsonl` adjacency for all three derivations, and
 /// synthetic ATerm members. Capabilities: `timed`, `expected_outcomes`,
 /// `dependency_closures`.
+///
+/// When `impure_demote_app_b` is set, an `impure-env.json` member lists an
+/// impure environment variable for appB (and the manifest declares the
+/// `impure_env` capability): appB then has an expected-outcome record but is
+/// demoted out of the workload — combined with `with_interruption`, the
+/// archive's only recorded interruption is over a unit the campaign supplies
+/// instead of building.
 #[cfg(test)]
 pub(crate) fn write_mini_timed_archive(
     dir: &std::path::Path,
     with_interruption: bool,
+    impure_demote_app_b: bool,
 ) -> MiniArchive {
     use crate::archive::schema::{
-        Capabilities, ExpectedOutcome, OutcomeRecord, RequestRecord, RequestTarget, Substituters,
+        Capabilities, ExpectedOutcome, ImpureEnv, OutcomeRecord, RequestRecord, RequestTarget,
+        Substituters,
     };
     use crate::archive::writer::{ArchiveWriter, ManifestSeed};
 
@@ -799,6 +808,18 @@ pub(crate) fn write_mini_timed_archive(
         ])
         .unwrap();
 
+    // impure-env.json — when requested, demote appB out of the workload:
+    // the recorder observed an impure environment variable for it, so a
+    // campaign supplies its outputs instead of rebuilding it.
+    if impure_demote_app_b {
+        writer
+            .write_impure_env(&ImpureEnv::from([(
+                app_b_drv.clone(),
+                vec!["NIX_SECRET_TOKEN".to_string()],
+            )]))
+            .unwrap();
+    }
+
     // closures.jsonl — direct adjacency for every derivation.
     writer
         .write_closures(&[
@@ -841,7 +862,7 @@ pub(crate) fn write_mini_timed_archive(
                 expected_outcomes: true,
                 output_hashes: false,
                 embedded_store_paths: false,
-                impure_env: false,
+                impure_env: impure_demote_app_b,
                 dependency_closures: true,
             },
             substituters: Substituters {
@@ -916,7 +937,7 @@ mod tests {
         // completeness penalty applies) — distinct from Some(0), which would
         // be a positive "nothing was excluded" claim.
         let tmp = tempfile::tempdir().unwrap();
-        write_mini_timed_archive(tmp.path(), false);
+        write_mini_timed_archive(tmp.path(), false, false);
         let archive = ReplayArchive::open(tmp.path()).unwrap();
         assert_eq!(exclusions_recorded(&archive), None);
         assert!(exclusion_counts(&archive).is_empty());
