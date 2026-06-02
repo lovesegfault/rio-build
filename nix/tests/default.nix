@@ -286,7 +286,6 @@ in
   # r[verify builder.mountd.backing-broker]
   # r[verify builder.mountd.concurrency]
   # r[verify builder.mountd.build-id-validated]
-  # r[verify builder.mountd.uid-bound]
   # r[verify builder.mountd.build-id-unique]
   # r[verify builder.mountd.one-mount]
   # r[verify builder.mountd.staging-quota]

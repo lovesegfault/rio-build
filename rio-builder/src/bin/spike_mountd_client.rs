@@ -253,10 +253,9 @@ enum Cmd {
         #[arg(long)]
         expect: String,
     },
-    /// Assert the connection is refused: connect(2) fails outright
-    /// (socket-file DAC) or the first request gets the typed retryable
-    /// uid-busy rejection. A silent drop is a failure — it would mean
-    /// regressing to the EOF the client cannot tell from a daemon crash.
+    /// Assert the daemon refuses service entirely: connect(2) itself
+    /// must fail with EACCES on the 0660 root:rio-builder socket inode
+    /// (the DAC gate). Reaching the protocol at all is a failure.
     ExpectRejected,
     /// Mount twice on one connection; assert the second is
     /// `AlreadyMounted`.
@@ -465,20 +464,15 @@ fn expect_mount_err(socket: &Path, build_id: &str, expect: &str) -> anyhow::Resu
 }
 
 fn expect_rejected(socket: &Path) -> anyhow::Result<()> {
-    let client = MountdClient::connect(socket)?;
-    // A uid-colliding connection is answered, not dropped: the first
-    // request gets a typed Retryable naming the holder. EOF or a frame
-    // error here would mean the daemon regressed to the silent drop the
-    // client cannot tell from a crash.
-    match client.mount("rejected", RPC_TIMEOUT) {
-        Err(MountdError::Rejected(ErrKind::Retryable(msg)))
-            if msg.contains("already has a live mountd connection") =>
+    match MountdClient::connect(socket) {
+        Err(MountdError::Connect { source, .. })
+            if source.kind() == std::io::ErrorKind::PermissionDenied =>
         {
-            println!("RESULT rejected=uid-busy msg={msg}");
+            println!("RESULT rejected=connect-denied");
             Ok(())
         }
-        Ok(_) => bail!("expected the typed uid-busy rejection, got Mounted"),
-        Err(other) => bail!("expected the typed uid-busy rejection, got {other}"),
+        Err(other) => bail!("expected EACCES at connect(2), got {other}"),
+        Ok(_) => bail!("expected connect(2) to be refused, got a connection"),
     }
 }
 
@@ -650,8 +644,9 @@ fn concurrency(
     // Raw wire connection, not MountdClient: the count below is defined
     // by reply *arrival order* on the socket, which needs a single
     // receive loop (see the Conn comment). The Mount has to ride the
-    // same connection — the daemon binds one connection per uid and the
-    // backing/promote requests must belong to this mount.
+    // same connection — mountd's kept fuse fd, staging dirfds, and
+    // backing ids are connection-scoped, so the backing/promote
+    // requests must belong to this mount's connection.
     let mut conn = Conn::connect(socket)?;
     let (resp, mut fds) = conn.call(
         Req::Mount {
