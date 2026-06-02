@@ -1,22 +1,29 @@
 //! `cargo xtask replay delete` — delete one recorded replay archive from S3.
 //!
-//! Deletion order is the reverse of the recorder's write-once publish
-//! order: `complete.json` goes first, which makes the prefix atomically
-//! invisible to `replay list`/`replay launch` (both treat the marker as
-//! the existence test) and reopens it for write-once publishing; then
-//! `manifest.json` and the bulk `archive.dwarfs`. The recorder's
-//! by-recipe idempotency pointer is removed only when it still points at
-//! the deleted archive — pointers are last-writer-wins, so a newer
-//! re-record of the same recipe owns it.
+//! The deletion is driven by what exists: a ListObjectsV2 sweep of the
+//! archive prefix removes every object found there, `complete.json`
+//! strictly first — its removal atomically unpublishes the prefix for
+//! `replay list`/`replay launch` (candidacy is the marker) and reopens it
+//! for write-once publishing — then the data objects. Because the sweep
+//! deletes what is listed rather than a fixed object set behind a marker
+//! precondition, the resolve step tolerates a missing `complete.json`: an
+//! interrupted delete is re-runnable, and the marker-less leftovers of an
+//! interrupted publish (which `list`/`launch` hide and the write-once
+//! publisher refuses to overwrite) are deletable. Every interrupted state
+//! converges on an empty prefix.
+//!
+//! The recorder's by-recipe idempotency pointer is removed only when it
+//! still points at the deleted archive — pointers are last-writer-wins,
+//! so a newer re-record of the same recipe owns it.
 //!
 //! Campaigns that pinned the deleted archive keep their own S3 artifacts
 //! (results, reports) but lose `replay repro` and pod-reschedule resume:
 //! both re-fetch the archive by its pin.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use clap::Args;
 use rio_replay::archive::s3::{
-    ARCHIVE_COMPLETE_OBJECT, ARCHIVE_IMAGE_OBJECT, ARCHIVE_MANIFEST_OBJECT, CompleteMarker,
+    ARCHIVE_COMPLETE_OBJECT, ARCHIVE_IMAGE_OBJECT, ARCHIVE_MANIFEST_OBJECT,
 };
 use rio_replay::s3::ByRecipePointer;
 
@@ -50,11 +57,28 @@ fn pointer_owned_by(pointer_json: &str, short_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Order the sweep over one archive prefix: `complete.json` strictly
+/// first — its removal atomically unpublishes the prefix — then the
+/// remaining objects in name order. Pure for testability.
+fn sweep_order(mut keys: Vec<String>, complete_key: &str) -> Vec<String> {
+    keys.sort_by(|a, b| (a != complete_key, a).cmp(&(b != complete_key, b)));
+    keys
+}
+
+/// The object name of one swept key, relative to the archive prefix (for
+/// step labels and the confirmation listing).
+fn object_name<'a>(key: &'a str, prefix: &str) -> &'a str {
+    key.strip_prefix(prefix)
+        .map(|rest| rest.trim_start_matches('/'))
+        .unwrap_or(key)
+}
+
 /// The pre-deletion summary line: what `replay list` shows for this
 /// archive, so the operator confirms against the same facts the listing
 /// presented. Pure for testability.
-fn deletion_summary(candidate: &launch::ArchiveCandidate, marker: &CompleteMarker) -> String {
-    let size = marker
+fn deletion_summary(candidate: &launch::ArchiveCandidate) -> String {
+    let size = candidate
+        .marker()
         .objects
         .get(ARCHIVE_IMAGE_OBJECT)
         .map(|digest| s3::human_bytes(digest.size))
@@ -65,7 +89,7 @@ fn deletion_summary(candidate: &launch::ArchiveCandidate, marker: &CompleteMarke
     };
     format!(
         "{} | hydra eval {} | {} | created {} | {} | fidelity {}",
-        candidate.archive_id_short,
+        candidate.archive_id_short(),
         eval,
         candidate.scope_summary(),
         candidate.created_at,
@@ -74,47 +98,85 @@ fn deletion_summary(candidate: &launch::ArchiveCandidate, marker: &CompleteMarke
     )
 }
 
+/// Recipe digest read straight from a prefix's `manifest.json`, for
+/// marker-less prefixes (an interrupted delete removes the marker first,
+/// but the manifest may survive and its recipe still owns a pointer).
+/// `None` when the manifest is gone or unreadable too — the pointer is
+/// then left dangling, which is harmless: the recorder probes archive
+/// existence before trusting one, and a re-record overwrites it.
+async fn orphan_recipe_digest(region: &str, bucket: &str, prefix: &str) -> Result<Option<String>> {
+    let manifest_key = format!("{prefix}/{ARCHIVE_MANIFEST_OBJECT}");
+    let Some(text) = s3::get_text(region, bucket, &manifest_key).await? else {
+        return Ok(None);
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(None);
+    };
+    Ok(manifest["provenance"]["recipe_digest"]
+        .as_str()
+        .filter(|digest| !digest.is_empty())
+        .map(str::to_string))
+}
+
 pub async fn run(a: DeleteArgs) -> Result<()> {
+    // The sweep deletes everything under the derived prefix, so the short
+    // id must be exactly an archive prefix segment — never e.g. the
+    // sibling `by-recipe/` pointer tree or an empty segment.
+    ensure!(
+        a.short_id.len() == 16
+            && a.short_id
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "{:?} is not an archive short id (16 lowercase hex characters, as shown by \
+         `cargo xtask replay list`)",
+        a.short_id
+    );
     let tf = tofu::outputs(TF_DIR)?;
     let region = tf.get("region")?;
     let bucket = tf.get("chunk_bucket_name")?;
     let prefix = s3::archive_prefix(&a.short_id);
-
-    // -- Resolve ----------------------------------------------------------
-    // A recording exists iff its completion marker does — the same
-    // definition `replay list` and `replay launch` use, so delete can
-    // never remove something the other commands still consider absent.
     let complete_key = format!("{prefix}/{ARCHIVE_COMPLETE_OBJECT}");
-    let marker_text = s3::get_text(&region, &bucket, &complete_key)
-        .await?
-        .with_context(|| {
-            format!(
-                "no such recording: s3://{bucket}/{prefix}/{ARCHIVE_COMPLETE_OBJECT} does not \
-                 exist — `cargo xtask replay list` shows the deletable recordings. (If a \
-                 previous delete was interrupted, leftover objects under s3://{bucket}/{prefix}/ \
-                 can be removed with `aws s3 rm --recursive`.)"
-            )
-        })?;
-    let marker: CompleteMarker = serde_json::from_str(&marker_text)
-        .with_context(|| format!("parse s3://{bucket}/{complete_key}"))?;
-    // The manifest provides the operator-facing summary and the recipe
-    // digest for the by-recipe pointer cleanup. A recording with a
-    // missing/unreadable manifest can still be deleted — there is just
-    // less to show and no pointer to consider.
+
+    // -- Resolve ------------------------------------------------------------
+    // Driven by what exists, NOT by the completion marker: an interrupted
+    // delete already removed the marker, and an interrupted publish never
+    // wrote it — both leave objects this command must still remove
+    // (`replay list`/`replay launch` hide such prefixes, so this is the
+    // in-tool way out the write-once publisher's refusal points at).
+    let keys = s3::list_keys(&region, &bucket, &format!("{prefix}/")).await?;
+    ensure!(
+        !keys.is_empty(),
+        "no such recording: s3://{bucket}/{prefix}/ has no objects — `cargo xtask replay list` \
+         shows the published recordings"
+    );
+    // The candidate (marker + manifest) provides the operator-facing
+    // summary and the recipe digest for the pointer cleanup. A marker-less
+    // or corrupted prefix yields no candidate but is still swept; the
+    // recipe digest is then read straight from the manifest if it
+    // survives.
     let candidate = launch::read_candidate(&region, &bucket, &a.short_id).await?;
+    let recipe_digest = match &candidate {
+        Some(candidate) if !candidate.recipe_digest.is_empty() => {
+            Some(candidate.recipe_digest.clone())
+        }
+        Some(_) => None,
+        None => orphan_recipe_digest(&region, &bucket, &prefix).await?,
+    };
 
     // -- Confirm ------------------------------------------------------------
     match &candidate {
-        Some(candidate) => tracing::info!("will delete: {}", deletion_summary(candidate, &marker)),
+        Some(candidate) => tracing::info!("will delete: {}", deletion_summary(candidate)),
         None => tracing::info!(
-            "will delete: {} (its manifest.json is missing or unreadable — no further metadata \
-             to show)",
+            "will delete: {} (not a published recording — no usable \
+             {ARCHIVE_COMPLETE_OBJECT}; these are the leftovers of an interrupted publish or \
+             delete)",
             a.short_id
         ),
     }
+    let listing: Vec<&str> = keys.iter().map(|key| object_name(key, &prefix)).collect();
     tracing::info!(
-        "objects: {ARCHIVE_COMPLETE_OBJECT}, {ARCHIVE_MANIFEST_OBJECT}, {ARCHIVE_IMAGE_OBJECT} \
-         under s3://{bucket}/{prefix}/"
+        "objects: {} under s3://{bucket}/{prefix}/",
+        listing.join(", ")
     );
     if !a.yes {
         let confirmed = ui::confirm_held(&format!(
@@ -127,29 +189,26 @@ pub async fn run(a: DeleteArgs) -> Result<()> {
         );
     }
 
-    // -- Delete the archive objects ----------------------------------------
-    // Marker first (atomic disappearance from list/launch and write-once
-    // probes), then metadata, then the bulk image. Each delete is
-    // idempotent, so re-running after an interruption converges.
-    for object in [
-        ARCHIVE_COMPLETE_OBJECT,
-        ARCHIVE_MANIFEST_OBJECT,
-        ARCHIVE_IMAGE_OBJECT,
-    ] {
-        let key = format!("{prefix}/{object}");
+    // -- Delete the archive objects ------------------------------------------
+    // complete.json strictly first: its removal atomically unpublishes the
+    // prefix (list/launch candidacy and the publisher's write-once probe
+    // all key on it), so no consumer can resolve a half-deleted archive.
+    // The data objects follow. Each delete is idempotent and a re-run
+    // sweeps whatever is still listed, so every interrupted state
+    // converges.
+    for key in sweep_order(keys, &complete_key) {
+        let object = object_name(&key, &prefix).to_string();
         ui::step(&format!("delete {object}"), || {
             s3::delete_object(&region, &bucket, &key)
         })
         .await?;
     }
 
-    // -- By-recipe pointer ---------------------------------------------------
+    // -- By-recipe pointer -----------------------------------------------------
     // Only recorder archives have one (recipe digest in the provenance),
     // and only the archive the pointer currently names may take it down.
-    if let Some(candidate) = &candidate
-        && !candidate.recipe_digest.is_empty()
-    {
-        let pointer_key = format!("{}{}.json", s3::by_recipe_prefix(), candidate.recipe_digest);
+    if let Some(digest) = &recipe_digest {
+        let pointer_key = format!("{}{digest}.json", s3::by_recipe_prefix());
         match s3::get_text(&region, &bucket, &pointer_key).await? {
             Some(pointer_json) if pointer_owned_by(&pointer_json, &a.short_id) => {
                 ui::step("delete by-recipe pointer", || {
@@ -176,9 +235,6 @@ pub async fn run(a: DeleteArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use rio_replay::archive::schema::MemberDigest;
     use serde_json::json;
 
     use super::*;
@@ -207,36 +263,62 @@ mod tests {
     }
 
     #[test]
+    fn sweep_deletes_the_marker_first_and_converges() {
+        let prefix = "replay/archives/8b919129046e0f60";
+        let complete_key = format!("{prefix}/{ARCHIVE_COMPLETE_OBJECT}");
+
+        // A fully published prefix: the marker goes strictly first, the
+        // data objects follow.
+        let keys = vec![
+            format!("{prefix}/{ARCHIVE_IMAGE_OBJECT}"),
+            format!("{prefix}/{ARCHIVE_MANIFEST_OBJECT}"),
+            complete_key.clone(),
+        ];
+        let order = sweep_order(keys, &complete_key);
+        assert_eq!(order[0], complete_key, "the marker is unpublished first");
+        assert_eq!(order.len(), 3);
+
+        // An interrupted delete's leftovers (marker already gone) and an
+        // interrupted publish's partial objects (marker never written) are
+        // swept as-is: the order is total over whatever exists, so a
+        // re-run over the remainder converges on an empty prefix.
+        let leftovers = vec![
+            format!("{prefix}/{ARCHIVE_MANIFEST_OBJECT}"),
+            format!("{prefix}/{ARCHIVE_IMAGE_OBJECT}"),
+        ];
+        let order = sweep_order(leftovers, &complete_key);
+        assert_eq!(
+            order,
+            vec![
+                format!("{prefix}/{ARCHIVE_IMAGE_OBJECT}"),
+                format!("{prefix}/{ARCHIVE_MANIFEST_OBJECT}"),
+            ]
+        );
+
+        // Object names rendered for the confirmation listing are relative
+        // to the prefix.
+        assert_eq!(object_name(&complete_key, prefix), ARCHIVE_COMPLETE_OBJECT);
+        assert_eq!(object_name("unrelated/key", prefix), "unrelated/key");
+    }
+
+    #[test]
     fn deletion_summary_mirrors_the_list_row() {
-        let candidate = launch::ArchiveCandidate {
-            archive_id_short: "8b919129046e0f60".into(),
-            s3_prefix: s3::archive_prefix("8b919129046e0f60"),
-            archive_id: "8b".repeat(32),
-            recipe_digest: "fe".repeat(32),
-            hydra_eval_id: 1824219,
-            created_at: "2026-06-01T10:00:00Z".into(),
-            manifest: json!({
+        let archive_id = "8b919129046e0f60".to_string() + &"a".repeat(48);
+        let candidate = launch::ArchiveCandidate::fixture(
+            &archive_id,
+            Some(1024 * 1024),
+            &"fe".repeat(32),
+            1824219,
+            "2026-06-01T10:00:00Z",
+            json!({
                 "provenance": {
                     "fidelity": {"checked": 12, "matched": 12, "divergent": false},
                     "scope": {"kind": "jobs", "jobs": ["a", "b"]},
                     "systems": ["x86_64-linux"],
                 },
             }),
-        };
-        let marker = CompleteMarker {
-            archive_id: "8b".repeat(32),
-            archive_id_short: "8b919129046e0f60".into(),
-            objects: BTreeMap::from([(
-                ARCHIVE_IMAGE_OBJECT.to_string(),
-                MemberDigest {
-                    sha256: "ab".repeat(32),
-                    size: 1024 * 1024,
-                },
-            )]),
-            uploaded_at: "2026-06-01T11:00:00Z".parse().unwrap(),
-            uploader: "rio-replay-eval/0.1.0".into(),
-        };
-        let summary = deletion_summary(&candidate, &marker);
+        );
+        let summary = deletion_summary(&candidate);
         for needle in [
             "8b919129046e0f60",
             "hydra eval 1824219",

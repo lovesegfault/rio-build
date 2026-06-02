@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use clap::Args;
-use rio_replay::archive::s3::{ARCHIVE_COMPLETE_OBJECT, ARCHIVE_IMAGE_OBJECT, CompleteMarker};
+use rio_replay::archive::s3::ARCHIVE_IMAGE_OBJECT;
 use sha2::{Digest, Sha256};
 
 use super::jobs::{self, EngineJobCommon};
@@ -234,26 +234,15 @@ async fn archive_summary(region: &str, bucket: &str, eval: u64) -> Result<String
                 s3::archives_prefix()
             )
         })?;
-    // complete.json: per-object sizes + upload metadata. It is uploaded
-    // strictly last, so a just-published archive always has it; a missing
-    // or malformed marker degrades those summary fields to "?" rather
-    // than failing a recording that otherwise succeeded.
-    let complete_key = format!("{}/{ARCHIVE_COMPLETE_OBJECT}", latest.s3_prefix);
-    let marker: Option<CompleteMarker> = s3::get_text(region, bucket, &complete_key)
-        .await?
-        .and_then(|text| serde_json::from_str(&text).ok());
-    Ok(render_summary(&latest, marker.as_ref(), bucket))
+    Ok(render_summary(&latest, bucket))
 }
 
 /// Render the post-recording summary block: archive identity and S3
-/// location, image size and upload time (from the completion marker),
-/// scope/counts/capabilities/fidelity (from the manifest), and the launch
-/// command that consumes the archive. Pure so it is unit-testable.
-fn render_summary(
-    candidate: &launch::ArchiveCandidate,
-    marker: Option<&CompleteMarker>,
-    bucket: &str,
-) -> String {
+/// location, image size and upload time (from the completion marker that
+/// IS the candidate's proof of publication), scope/counts/capabilities/
+/// fidelity (from the manifest), and the launch command that consumes the
+/// archive. Pure so it is unit-testable.
+fn render_summary(candidate: &launch::ArchiveCandidate, bucket: &str) -> String {
     let manifest = &candidate.manifest;
     let count = |key: &str| manifest["counts"][key].as_u64().unwrap_or(0);
     // Capabilities: the flags the manifest sets true, in document order.
@@ -268,16 +257,13 @@ fn render_summary(
         })
         .filter(|joined| !joined.is_empty())
         .unwrap_or_else(|| "none".to_string());
-    let (image_size, uploaded_at) = match marker {
-        Some(m) => (
-            m.objects
-                .get(ARCHIVE_IMAGE_OBJECT)
-                .map(|digest| s3::human_bytes(digest.size))
-                .unwrap_or_else(|| "?".to_string()),
-            m.uploaded_at.to_string(),
-        ),
-        None => ("?".to_string(), "?".to_string()),
-    };
+    let marker = candidate.marker();
+    let image_size = marker
+        .objects
+        .get(ARCHIVE_IMAGE_OBJECT)
+        .map(|digest| s3::human_bytes(digest.size))
+        .unwrap_or_else(|| "?".to_string());
+    let uploaded_at = marker.uploaded_at.to_string();
     format!(
         "recording complete.\n  \
          archive:        {short} (full id {full})\n  \
@@ -290,7 +276,7 @@ fn render_summary(
          capabilities:   {capabilities}\n  \
          fidelity:       {fidelity}\n  \
          next:           cargo xtask replay launch --eval {eval}",
-        short = candidate.archive_id_short,
+        short = candidate.archive_id_short(),
         full = candidate.archive_id,
         prefix = candidate.s3_prefix,
         scope = candidate.scope_summary(),
@@ -308,9 +294,6 @@ fn render_summary(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use rio_replay::archive::schema::MemberDigest;
     use serde_json::json;
 
     use super::*;
@@ -394,18 +377,17 @@ mod tests {
     }
 
     /// Candidate shaped like what the recorder publishes for the summary
-    /// renderer (the launch tests own the filtering-field coverage).
-    fn published_candidate() -> launch::ArchiveCandidate {
-        let archive_id = "deadbeef".repeat(8);
-        let archive_id_short = archive_id[..16].to_string();
-        launch::ArchiveCandidate {
-            s3_prefix: s3::archive_prefix(&archive_id_short),
-            archive_id: archive_id.clone(),
-            archive_id_short,
-            recipe_digest: "feedc0de".repeat(8),
-            hydra_eval_id: 1824219,
-            created_at: "2026-06-01T10:00:00Z".into(),
-            manifest: json!({
+    /// renderer (the launch tests own the filtering-field coverage). The
+    /// completion marker advertising `image_size` rides inside the
+    /// candidate.
+    fn published_candidate(image_size: Option<u64>) -> launch::ArchiveCandidate {
+        launch::ArchiveCandidate::fixture(
+            &"deadbeef".repeat(8),
+            image_size,
+            &"feedc0de".repeat(8),
+            1824219,
+            "2026-06-01T10:00:00Z",
+            json!({
                 "created_at": "2026-06-01T10:00:00Z",
                 "capabilities": {
                     "expected_outcomes": true,
@@ -428,35 +410,13 @@ mod tests {
                     "scope": {"kind": "constituents", "aggregate_job": "tested"},
                 },
             }),
-        }
+        )
     }
 
     #[test]
     fn summary_renders_identity_size_counts_and_next_command() {
-        let candidate = published_candidate();
-        let marker = CompleteMarker {
-            archive_id: candidate.archive_id.clone(),
-            archive_id_short: candidate.archive_id_short.clone(),
-            objects: BTreeMap::from([
-                (
-                    ARCHIVE_IMAGE_OBJECT.to_string(),
-                    MemberDigest {
-                        sha256: "ab".repeat(32),
-                        size: 3 * 1024 * 1024 * 1024,
-                    },
-                ),
-                (
-                    "manifest.json".to_string(),
-                    MemberDigest {
-                        sha256: "cd".repeat(32),
-                        size: 4096,
-                    },
-                ),
-            ]),
-            uploaded_at: "2026-06-01T11:00:00Z".parse().unwrap(),
-            uploader: "rio-replay-eval/0.1.0".into(),
-        };
-        let summary = render_summary(&candidate, Some(&marker), "rio-build-chunks-deadbeef");
+        let candidate = published_candidate(Some(3 * 1024 * 1024 * 1024));
+        let summary = render_summary(&candidate, "rio-build-chunks-deadbeef");
         // Identity: short + full id, and the exact S3 location.
         assert!(
             summary.contains("deadbeefdeadbeef (full id deadbeef"),
@@ -497,13 +457,10 @@ mod tests {
             "{summary}"
         );
 
-        // Without a (readable) completion marker the summary still renders,
-        // degrading the marker-derived fields to "?".
-        let degraded = render_summary(&candidate, None, "rio-build-chunks-deadbeef");
-        assert!(
-            degraded.contains("archive.dwarfs: ?, uploaded ?"),
-            "{degraded}"
-        );
+        // A marker without an image entry degrades the size to "?" instead
+        // of failing a recording that otherwise succeeded.
+        let degraded = render_summary(&published_candidate(None), "rio-build-chunks-deadbeef");
+        assert!(degraded.contains("archive.dwarfs: ?,"), "{degraded}");
         assert!(
             degraded.contains("cargo xtask replay launch --eval 1824219"),
             "{degraded}"

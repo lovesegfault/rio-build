@@ -78,6 +78,31 @@ pub async fn list_subprefixes(region: &str, bucket: &str, prefix: &str) -> Resul
     Ok(out)
 }
 
+/// List every object key under `prefix` (one ListObjectsV2 paginator
+/// walk, no delimiter), sorted. `replay delete` sweeps one archive prefix
+/// with it so the deletion is driven by what exists, not by a marker
+/// object an earlier interrupted run may already have removed.
+pub async fn list_keys(region: &str, bucket: &str, prefix: &str) -> Result<Vec<String>> {
+    let s3 = aws_sdk_s3::Client::new(crate::aws::config(Some(region)).await);
+    let mut out = Vec::new();
+    let mut pages = s3
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(prefix)
+        .into_paginator()
+        .send();
+    while let Some(page) = pages.next().await {
+        let page = page.with_context(|| format!("ListObjectsV2 s3://{bucket}/{prefix}"))?;
+        for object in page.contents() {
+            if let Some(key) = object.key() {
+                out.push(key.to_string());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// Where the campaign artifacts live: chunk bucket + region, resolved
 /// once from the EKS tofu outputs (one `tofu output -json` spawn) so
 /// `status --watch` and `report` share the same

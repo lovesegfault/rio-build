@@ -28,6 +28,7 @@ use kube::api::Api;
 use rio_replay::archive::reader::ReplayArchive;
 use rio_replay::archive::s3::{
     ARCHIVE_COMPLETE_OBJECT, ARCHIVE_MANIFEST_OBJECT, ArchiveStore, CompleteMarker,
+    PublishedArchive,
 };
 use rio_replay::archive::schema::{Capabilities, Manifest};
 use rio_replay::archive::writer::pack_with_mkdwarfs;
@@ -851,8 +852,12 @@ async fn resolve_published_archive(
              finish, or check the prefix for a typo"
         );
     };
-    let marker: CompleteMarker = serde_json::from_str(&text)
-        .with_context(|| format!("parse s3://{bucket}/{complete_key}"))?;
+    // The operator may reference a copied prefix whose last segment is not
+    // the short id, so only the marker's internal consistency is checked
+    // here; the spec's digest pin is the authority the engine re-verifies.
+    let published = PublishedArchive::from_complete_json(text.as_bytes())
+        .with_context(|| format!("s3://{bucket}/{complete_key}"))?;
+    let marker = published.into_marker();
     Ok(ArchiveLocation {
         archive_id: marker.archive_id,
         archive_id_short: marker.archive_id_short,
@@ -976,14 +981,18 @@ async fn archive_capabilities_from_s3(
     Ok(manifest.capabilities)
 }
 
-/// One archive prefix found under `replay/archives/`, with the provenance
-/// fields candidate filtering reads from its manifest.json. Shared
-/// (`pub(super)`) with `replay record`'s post-completion summary and
-/// `replay list`, which render additional manifest fields via the
+/// One published archive found under `replay/archives/`, with the
+/// provenance fields candidate filtering reads from its manifest.json.
+/// Candidacy is keyed on `complete.json` — the [`PublishedArchive`] proof
+/// is the only way to construct one, so `replay launch`, `replay list`,
+/// `replay delete`, and the engine all share the same existence predicate.
+/// Shared (`pub(super)`) with `replay record`'s post-completion summary
+/// and `replay list`, which render additional manifest fields via the
 /// `*_summary` helpers below.
 #[derive(Debug)]
 pub(super) struct ArchiveCandidate {
-    pub(super) archive_id_short: String,
+    /// Proof of publication: the parsed completion marker.
+    pub(super) published: PublishedArchive,
     pub(super) s3_prefix: String,
     pub(super) archive_id: String,
     pub(super) recipe_digest: String,
@@ -991,11 +1000,24 @@ pub(super) struct ArchiveCandidate {
     pub(super) created_at: String,
     /// The full parsed manifest.json document, kept so summary/list
     /// rendering can read fields beyond the filtering ones above (counts,
-    /// capabilities, fidelity, scope) without a second S3 GET.
+    /// capabilities, fidelity, scope) without a second S3 GET. `Null` when
+    /// the prefix carries a completion marker but its manifest.json is
+    /// missing (a corrupted upload): the prefix stays visible and
+    /// deletable, with the summaries degrading to `?`.
     pub(super) manifest: serde_json::Value,
 }
 
 impl ArchiveCandidate {
+    /// 16-char short id — the S3 prefix segment.
+    pub(super) fn archive_id_short(&self) -> &str {
+        self.published.archive_id_short()
+    }
+
+    /// The completion marker (per-object sizes + upload metadata).
+    pub(super) fn marker(&self) -> &CompleteMarker {
+        self.published.marker()
+    }
+
     /// Human-readable scope from the manifest provenance — the recorder's
     /// scope re-rendered (`constituents:<aggregate>`, `jobs:<count>`,
     /// `full`); `?` for archives whose provenance has no scope block
@@ -1055,6 +1077,60 @@ impl ArchiveCandidate {
     }
 }
 
+#[cfg(test)]
+impl ArchiveCandidate {
+    /// Test fixture, shared with the sibling modules' tests: builds the
+    /// candidate through the real marker-checking constructor (so even
+    /// fixtures cannot exist without a consistent `complete.json`).
+    /// `archive_id` must be 64 lowercase hex; the marker advertises
+    /// `image_size` for `archive.dwarfs` when given (the SIZE column in
+    /// listings and summaries).
+    pub(super) fn fixture(
+        archive_id: &str,
+        image_size: Option<u64>,
+        recipe_digest: &str,
+        hydra_eval_id: u64,
+        created_at: &str,
+        manifest: serde_json::Value,
+    ) -> Self {
+        use rio_replay::archive::s3::ARCHIVE_IMAGE_OBJECT;
+        use rio_replay::archive::schema::MemberDigest;
+
+        let archive_id_short: String = archive_id.chars().take(16).collect();
+        let mut objects = BTreeMap::new();
+        if let Some(size) = image_size {
+            objects.insert(
+                ARCHIVE_IMAGE_OBJECT.to_string(),
+                MemberDigest {
+                    sha256: "ab".repeat(32),
+                    size,
+                },
+            );
+        }
+        let marker = CompleteMarker {
+            archive_id: archive_id.to_string(),
+            archive_id_short: archive_id_short.clone(),
+            objects,
+            uploaded_at: "2026-06-01T11:00:00Z".parse().unwrap(),
+            uploader: "rio-replay-eval/test".to_string(),
+        };
+        let published = PublishedArchive::from_complete_json_at(
+            &serde_json::to_vec(&marker).unwrap(),
+            &archive_id_short,
+        )
+        .unwrap();
+        Self {
+            s3_prefix: s3::archive_prefix(&archive_id_short),
+            archive_id: archive_id.to_string(),
+            recipe_digest: recipe_digest.to_string(),
+            hydra_eval_id,
+            created_at: created_at.to_string(),
+            manifest,
+            published,
+        }
+    }
+}
+
 /// Whether `--eval-digest` is a full lowercase-hex recipe digest (64
 /// chars) — the form the recorder keys its by-recipe pointers by. Shorter
 /// values are treated as digest prefixes and resolved by listing.
@@ -1091,18 +1167,20 @@ async fn resolve_archive(
             s3::archives_prefix()
         )
     })?;
-    // complete.json is uploaded last: without it the prefix is a partial
-    // upload and the engine would refuse it anyway.
-    let complete_key = format!("{}/complete.json", chosen.s3_prefix);
+    // Candidacy already proved complete.json existed when the candidate was
+    // read; this re-probe is only a race guard against a concurrent
+    // `replay delete` between listing and choosing (the engine re-fetches
+    // the marker at bootstrap either way).
+    let complete_key = format!("{}/{ARCHIVE_COMPLETE_OBJECT}", chosen.s3_prefix);
     ensure!(
         s3::get_text(region, bucket, &complete_key).await?.is_some(),
-        "s3://{bucket}/{} has no complete.json — the recorder Job has not finished \
-         (complete.json is uploaded last)",
+        "s3://{bucket}/{} lost its {ARCHIVE_COMPLETE_OBJECT} while resolving — was the archive \
+         just deleted?",
         chosen.s3_prefix
     );
     Ok(ArchiveLocation {
         archive_id: chosen.archive_id.clone(),
-        archive_id_short: chosen.archive_id_short.clone(),
+        archive_id_short: chosen.archive_id_short().to_string(),
         s3_prefix: chosen.s3_prefix.clone(),
         // Recorder archives live in the campaign chunk bucket.
         s3_bucket: None,
@@ -1111,29 +1189,91 @@ async fn resolve_archive(
     })
 }
 
-/// Read one archive prefix's standalone `manifest.json` and extract the
-/// fields candidate filtering needs. `Ok(None)` when the manifest is not
-/// there yet (an upload in flight, or a foreign prefix).
+/// Read one archive prefix into a candidate. Candidacy is keyed on
+/// `complete.json` — the same completeness predicate `replay list`,
+/// `replay delete`, and the engine apply: the marker is uploaded strictly
+/// last, so a prefix without it is an in-flight or interrupted upload (or
+/// an interrupted delete's leftovers), never a launchable archive.
+/// `Ok(None)` for such prefixes, and (with a warning) for prefixes whose
+/// marker is unparseable or inconsistent — junk must not brick the whole
+/// listing, and `replay delete`'s sweep can still remove it.
 pub(super) async fn read_candidate(
     region: &str,
     bucket: &str,
     archive_id_short: &str,
 ) -> Result<Option<ArchiveCandidate>> {
     let prefix = s3::archive_prefix(archive_id_short);
-    let manifest_key = format!("{prefix}/manifest.json");
-    let Some(text) = s3::get_text(region, bucket, &manifest_key).await? else {
+    let complete_key = format!("{prefix}/{ARCHIVE_COMPLETE_OBJECT}");
+    let Some(marker_text) = s3::get_text(region, bucket, &complete_key).await? else {
+        tracing::debug!(
+            "skipping {archive_id_short}: no {ARCHIVE_COMPLETE_OBJECT} (upload in flight or \
+             interrupted)"
+        );
         return Ok(None);
     };
-    let manifest: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("parse s3://{bucket}/{manifest_key}"))?;
+    let manifest_key = format!("{prefix}/{ARCHIVE_MANIFEST_OBJECT}");
+    let manifest_text = s3::get_text(region, bucket, &manifest_key).await?;
+    candidate_from_objects(archive_id_short, &marker_text, manifest_text.as_deref())
+        .with_context(|| format!("read archive candidate s3://{bucket}/{prefix}/"))
+}
+
+/// Build a candidate from the objects fetched at one archive prefix: the
+/// `complete.json` text (presence already established — it IS candidacy)
+/// and the standalone `manifest.json` text when present. Pure so the
+/// predicate is unit-testable without S3.
+///
+/// - An unparseable or inconsistent marker yields `Ok(None)` with a
+///   warning: the prefix is junk, invisible to launch/list but still
+///   removable by `replay delete`'s sweep.
+/// - A missing manifest yields a degraded candidate (provenance fields
+///   empty, `manifest: Null`): visible and deletable, summaries render
+///   `?`, and no `--eval` filter can match it.
+/// - A manifest that does not hash to the marker's archive id is treated
+///   like a malformed marker: the prefix is corrupt, never a candidate.
+fn candidate_from_objects(
+    archive_id_short: &str,
+    marker_text: &str,
+    manifest_text: Option<&str>,
+) -> Result<Option<ArchiveCandidate>> {
+    let published =
+        match PublishedArchive::from_complete_json_at(marker_text.as_bytes(), archive_id_short) {
+            Ok(published) => published,
+            Err(e) => {
+                tracing::warn!(
+                    "skipping {archive_id_short}: malformed {ARCHIVE_COMPLETE_OBJECT} ({e:#})"
+                );
+                return Ok(None);
+            }
+        };
+    let (archive_id, manifest) = match manifest_text {
+        Some(text) => {
+            // The archive id is the SHA-256 over the manifest.json bytes; a
+            // standalone manifest that does not reproduce the marker's
+            // claim means the prefix holds mismatched objects (a corrupted
+            // upload) — refuse it as a candidate rather than pinning an id
+            // the engine's own verification would reject at bootstrap.
+            let manifest_id = sha256_hex(text.as_bytes());
+            if manifest_id != published.archive_id() {
+                tracing::warn!(
+                    "skipping {archive_id_short}: {ARCHIVE_MANIFEST_OBJECT} hashes to \
+                     {manifest_id} but {ARCHIVE_COMPLETE_OBJECT} says the archive id is {}",
+                    published.archive_id()
+                );
+                return Ok(None);
+            }
+            let manifest: serde_json::Value = serde_json::from_str(text)
+                .with_context(|| format!("parse {ARCHIVE_MANIFEST_OBJECT}"))?;
+            (manifest_id, manifest)
+        }
+        // Marker present, manifest missing: a corrupted upload. Keep it
+        // visible (and deletable) with the marker's claimed id; the empty
+        // provenance below means no --eval resolution can choose it.
+        None => (published.archive_id().to_string(), serde_json::Value::Null),
+    };
     let provenance = &manifest["provenance"];
     Ok(Some(ArchiveCandidate {
-        archive_id_short: archive_id_short.to_string(),
-        s3_prefix: prefix,
-        // The archive id is the SHA-256 over the manifest.json bytes; the
-        // engine re-verifies it against the spec pin and the downloaded
-        // complete.json marker before planning anything.
-        archive_id: sha256_hex(text.as_bytes()),
+        s3_prefix: s3::archive_prefix(archive_id_short),
+        archive_id,
         recipe_digest: provenance["recipe_digest"]
             .as_str()
             .unwrap_or_default()
@@ -1144,6 +1284,7 @@ pub(super) async fn read_candidate(
             .unwrap_or_default()
             .to_string(),
         manifest,
+        published,
     }))
 }
 
@@ -1200,7 +1341,8 @@ async fn by_recipe_candidates(
         .with_context(|| {
             format!(
                 "the by-recipe pointer s3://{bucket}/{pointer_key} names archive {short}, but \
-                 s3://{bucket}/{}/manifest.json does not exist — re-record with \
+                 s3://{bucket}/{}/ is not a published archive (no usable {ARCHIVE_COMPLETE_OBJECT} \
+                 — its publish was interrupted or it was deleted) — re-record with \
                  `cargo xtask replay record --eval {eval} … --force`",
                 s3::archive_prefix(short)
             )
@@ -1240,7 +1382,7 @@ fn pick_candidate<'a>(
                 .map(|c| {
                     format!(
                         "{} (recipe {}…, created {})",
-                        c.archive_id_short,
+                        c.archive_id_short(),
                         &c.recipe_digest[..c.recipe_digest.len().min(16)],
                         c.created_at
                     )
@@ -1660,25 +1802,26 @@ mod tests {
         }
     }
 
-    /// Candidate fixture for the pure archive-filtering tests; `archive_id`
-    /// is irrelevant to filtering and left obviously fake. The manifest is
-    /// shaped like what the recorder publishes (provenance scope/systems/
-    /// fidelity + top-level counts/capabilities) so the summary helpers
-    /// are exercised against the real document shape.
+    /// Candidate fixture for the pure archive-filtering tests, built
+    /// through [`ArchiveCandidate::fixture`] (and so through the real
+    /// marker-checking constructor); `short` must be 16 lowercase hex
+    /// characters. The manifest is shaped like what the recorder publishes
+    /// (provenance scope/systems/fidelity + top-level counts/capabilities)
+    /// so the summary helpers are exercised against the real document
+    /// shape.
     fn candidate(
         short: &str,
         eval: u64,
         recipe_digest: &str,
         created_at: &str,
     ) -> ArchiveCandidate {
-        ArchiveCandidate {
-            archive_id_short: short.to_string(),
-            s3_prefix: s3::archive_prefix(short),
-            archive_id: "ab".repeat(32),
-            recipe_digest: recipe_digest.to_string(),
-            hydra_eval_id: eval,
-            created_at: created_at.to_string(),
-            manifest: json!({
+        ArchiveCandidate::fixture(
+            &short.repeat(4),
+            None,
+            recipe_digest,
+            eval,
+            created_at,
+            json!({
                 "created_at": created_at,
                 "capabilities": {"expected_outcomes": true, "output_hashes": true},
                 "counts": {
@@ -1702,7 +1845,7 @@ mod tests {
                     "scope": {"kind": "constituents", "aggregate_job": "tested"},
                 },
             }),
-        }
+        )
     }
 
     #[test]
@@ -1719,24 +1862,112 @@ mod tests {
 
         // Jobs scope renders the job count; full scope renders "full"; a
         // divergent fidelity gate is loud.
-        let mut jobs_scoped = candidate("b", 1, "22", "2026-05-01T00:00:00Z");
+        let mut jobs_scoped = candidate("bbbbbbbbbbbbbbbb", 1, "22", "2026-05-01T00:00:00Z");
         jobs_scoped.manifest["provenance"]["scope"] =
             json!({"kind": "jobs", "jobs": ["a.x86_64-linux", "b.x86_64-linux"]});
         jobs_scoped.manifest["provenance"]["fidelity"]["divergent"] = json!(true);
         jobs_scoped.manifest["provenance"]["fidelity"]["matched"] = json!(11);
         assert_eq!(jobs_scoped.scope_summary(), "jobs:2");
         assert_eq!(jobs_scoped.fidelity_summary(), "DIVERGENT 11/12");
-        let mut full_scoped = candidate("c", 1, "33", "2026-05-01T00:00:00Z");
+        let mut full_scoped = candidate("cccccccccccccccc", 1, "33", "2026-05-01T00:00:00Z");
         full_scoped.manifest["provenance"]["scope"] = json!({"kind": "full"});
         assert_eq!(full_scoped.scope_summary(), "full");
 
         // Archives without recorder provenance (published via --archive)
         // degrade to "?" everywhere instead of panicking or lying.
-        let mut foreign = candidate("d", 0, "", "2026-05-01T00:00:00Z");
+        let mut foreign = candidate("dddddddddddddddd", 0, "", "2026-05-01T00:00:00Z");
         foreign.manifest = json!({"created_at": "2026-05-01T00:00:00Z"});
         assert_eq!(foreign.scope_summary(), "?");
         assert_eq!(foreign.systems_summary(), "?");
         assert_eq!(foreign.fidelity_summary(), "?");
+    }
+
+    #[test]
+    fn candidacy_is_keyed_on_the_completion_marker() {
+        let archive_id = "a".repeat(64);
+        let short = &archive_id[..16];
+        let manifest = json!({
+            "created_at": "2026-05-01T00:00:00Z",
+            "provenance": {
+                "recipe_digest": "11".repeat(32),
+                "source": {"kind": "hydra", "hydra_eval_id": 1824219},
+            },
+        });
+        let manifest_text = manifest.to_string();
+        let marker = CompleteMarker {
+            archive_id: archive_id.clone(),
+            archive_id_short: short.to_string(),
+            objects: BTreeMap::new(),
+            uploaded_at: "2026-06-01T11:00:00Z".parse().unwrap(),
+            uploader: "rio-replay-eval/test".to_string(),
+        };
+
+        // A consistent marker + matching manifest is a full candidate. The
+        // marker's claimed id must match the manifest hash, so build the
+        // marker around the manifest's actual digest.
+        let real_id = sha256_hex(manifest_text.as_bytes());
+        let real_short = &real_id[..16];
+        let mut real_marker = marker.clone();
+        real_marker.archive_id = real_id.clone();
+        real_marker.archive_id_short = real_short.to_string();
+        let candidate = candidate_from_objects(
+            real_short,
+            &serde_json::to_string(&real_marker).unwrap(),
+            Some(&manifest_text),
+        )
+        .unwrap()
+        .expect("a marked prefix with a matching manifest is a candidate");
+        assert_eq!(candidate.archive_id_short(), real_short);
+        assert_eq!(candidate.archive_id, real_id);
+        assert_eq!(candidate.hydra_eval_id, 1824219);
+        assert_eq!(candidate.recipe_digest, "11".repeat(32));
+
+        // Marker present but manifest missing (a corrupted upload): still a
+        // candidate — visible and deletable — with degraded provenance, so
+        // no --eval filter can ever choose it.
+        let degraded =
+            candidate_from_objects(short, &serde_json::to_string(&marker).unwrap(), None)
+                .unwrap()
+                .expect("marker-only prefixes stay visible");
+        assert_eq!(degraded.archive_id, archive_id);
+        assert_eq!(degraded.hydra_eval_id, 0);
+        assert!(degraded.recipe_digest.is_empty());
+        assert_eq!(degraded.scope_summary(), "?");
+        assert!(
+            pick_candidate(std::slice::from_ref(&degraded), 1824219, None).is_err(),
+            "degraded candidates must not match a real --eval"
+        );
+
+        // A malformed or prefix-mismatched marker is junk, never a
+        // candidate (and never an error that bricks the whole listing).
+        assert!(
+            candidate_from_objects(short, "not json", Some(&manifest_text))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            candidate_from_objects(
+                "bbbbbbbbbbbbbbbb",
+                &serde_json::to_string(&marker).unwrap(),
+                Some(&manifest_text),
+            )
+            .unwrap()
+            .is_none(),
+            "a marker living under a foreign prefix is not a candidate"
+        );
+
+        // A manifest that does not hash to the marker's archive id means
+        // the prefix holds mismatched objects: not a candidate.
+        assert!(
+            candidate_from_objects(
+                short,
+                &serde_json::to_string(&marker).unwrap(),
+                Some(&manifest_text),
+            )
+            .unwrap()
+            .is_none(),
+            "marker/manifest digest mismatch is a corrupted prefix"
+        );
     }
 
     fn outcome() -> PreflightOutcome {
@@ -2143,16 +2374,16 @@ mod tests {
 
         // Single match: an eval recorded exactly once needs no digest.
         let only = pick_candidate(&cands, 999, None).unwrap();
-        assert_eq!(only.archive_id_short, "cccccccccccccccc");
+        assert_eq!(only.archive_id_short(), "cccccccccccccccc");
 
         // A recipe-digest prefix narrows same-eval candidates down to one.
         let narrowed = pick_candidate(&cands, 1824219, Some("22")).unwrap();
-        assert_eq!(narrowed.archive_id_short, "bbbbbbbbbbbbbbbb");
+        assert_eq!(narrowed.archive_id_short(), "bbbbbbbbbbbbbbbb");
         // The full digest narrows the same way (the by-recipe fast path
         // hands pick_candidate a single candidate, but the filter must
         // still hold for it).
         let full = pick_candidate(&cands, 1824219, Some(&"22".repeat(32))).unwrap();
-        assert_eq!(full.archive_id_short, "bbbbbbbbbbbbbbbb");
+        assert_eq!(full.archive_id_short(), "bbbbbbbbbbbbbbbb");
 
         // Zero matches: the error names the eval, the listing prefix, and
         // the recorder command that produces an archive.

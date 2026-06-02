@@ -4,12 +4,15 @@
 //! bucket, newest first. "Published" means the prefix carries
 //! `complete.json` (the recorder uploads it last): prefixes without it
 //! are in-flight or interrupted uploads, invisible to `replay launch`
-//! and to this listing alike — and therefore also not deletable by
-//! `replay delete`, which shares the same definition of "a recording".
+//! and to this listing alike. The candidate listing itself applies that
+//! predicate (candidacy is the marker), so this command, launch, and the
+//! engine cannot disagree on what "a recording" is. `replay delete`
+//! deliberately tolerates more: its sweep also removes the marker-less
+//! leftovers of an interrupted publish or delete.
 
 use anyhow::Result;
 use clap::Args;
-use rio_replay::archive::s3::{ARCHIVE_COMPLETE_OBJECT, ARCHIVE_IMAGE_OBJECT, CompleteMarker};
+use rio_replay::archive::s3::ARCHIVE_IMAGE_OBJECT;
 
 use super::{launch, s3};
 use crate::k8s::eks::TF_DIR;
@@ -42,10 +45,11 @@ impl Row {
     }
 }
 
-/// Build one row from a candidate and its (parsed) completion marker.
-fn row(candidate: &launch::ArchiveCandidate, marker: &CompleteMarker) -> Row {
+/// Build one row from a candidate (whose completion marker carries the
+/// image size).
+fn row(candidate: &launch::ArchiveCandidate) -> Row {
     Row {
-        short_id: candidate.archive_id_short.clone(),
+        short_id: candidate.archive_id_short().to_string(),
         // 0 = the archive's provenance names no Hydra eval (published via
         // `launch --archive`, not the recorder).
         hydra_eval: match candidate.hydra_eval_id {
@@ -54,7 +58,8 @@ fn row(candidate: &launch::ArchiveCandidate, marker: &CompleteMarker) -> Row {
         },
         scope: candidate.scope_summary(),
         created: candidate.created_at.clone(),
-        size: marker
+        size: candidate
+            .marker()
             .objects
             .get(ARCHIVE_IMAGE_OBJECT)
             .map(|digest| s3::human_bytes(digest.size))
@@ -102,32 +107,17 @@ pub async fn run(_a: ListArgs) -> Result<()> {
     let region = tf.get("region")?;
     let bucket = tf.get("chunk_bucket_name")?;
 
-    // Every prefix with a manifest is a candidate; only those whose
-    // completion marker exists are published recordings (the marker also
-    // carries the image size the table shows).
+    // Candidacy is keyed on the completion marker (uploaded strictly
+    // last), so every candidate IS a published recording — and its marker
+    // already carries the image size the table shows.
     let candidates = ui::step("list recorded archives", || {
         launch::listed_candidates(&region, &bucket)
     })
     .await?;
-    let mut rows: Vec<(String, Row)> = Vec::new();
-    for candidate in &candidates {
-        let complete_key = format!("{}/{ARCHIVE_COMPLETE_OBJECT}", candidate.s3_prefix);
-        let Some(text) = s3::get_text(&region, &bucket, &complete_key).await? else {
-            tracing::debug!(
-                "skipping {}: no {ARCHIVE_COMPLETE_OBJECT} (upload in flight or interrupted)",
-                candidate.archive_id_short
-            );
-            continue;
-        };
-        let Ok(marker) = serde_json::from_str::<CompleteMarker>(&text) else {
-            tracing::warn!(
-                "skipping {}: malformed {ARCHIVE_COMPLETE_OBJECT}",
-                candidate.archive_id_short
-            );
-            continue;
-        };
-        rows.push((candidate.created_at.clone(), row(candidate, &marker)));
-    }
+    let mut rows: Vec<(String, Row)> = candidates
+        .iter()
+        .map(|candidate| (candidate.created_at.clone(), row(candidate)))
+        .collect();
 
     if rows.is_empty() {
         println!(
@@ -199,42 +189,27 @@ mod tests {
 
     #[test]
     fn rows_render_recorder_and_foreign_archives() {
-        use std::collections::BTreeMap;
-
-        use rio_replay::archive::schema::MemberDigest;
         use serde_json::json;
 
         // A recorder candidate renders its eval id, scope, and fidelity; the
-        // image size comes from the completion marker.
-        let candidate = launch::ArchiveCandidate {
-            archive_id_short: "8b919129046e0f60".into(),
-            s3_prefix: s3::archive_prefix("8b919129046e0f60"),
-            archive_id: "8b".repeat(32),
-            recipe_digest: "fe".repeat(32),
-            hydra_eval_id: 1824219,
-            created_at: "2026-06-01T10:00:00Z".into(),
-            manifest: json!({
+        // image size comes from its completion marker.
+        let archive_id = "8b919129046e0f60".to_string() + &"a".repeat(48);
+        let candidate = launch::ArchiveCandidate::fixture(
+            &archive_id,
+            Some(3 * 1024 * 1024 * 1024),
+            &"fe".repeat(32),
+            1824219,
+            "2026-06-01T10:00:00Z",
+            json!({
                 "provenance": {
                     "fidelity": {"checked": 12, "matched": 12, "divergent": false},
                     "scope": {"kind": "constituents", "aggregate_job": "tested"},
                     "systems": ["x86_64-linux"],
                 },
             }),
-        };
-        let marker = CompleteMarker {
-            archive_id: "8b".repeat(32),
-            archive_id_short: "8b919129046e0f60".into(),
-            objects: BTreeMap::from([(
-                ARCHIVE_IMAGE_OBJECT.to_string(),
-                MemberDigest {
-                    sha256: "ab".repeat(32),
-                    size: 3 * 1024 * 1024 * 1024,
-                },
-            )]),
-            uploaded_at: "2026-06-01T11:00:00Z".parse().unwrap(),
-            uploader: "rio-replay-eval/0.1.0".into(),
-        };
-        let r = row(&candidate, &marker);
+        );
+        let r = row(&candidate);
+        assert_eq!(r.short_id, "8b919129046e0f60");
         assert_eq!(r.hydra_eval, "1824219");
         assert_eq!(r.scope, "constituents:tested");
         assert_eq!(r.size, "3.0 GiB");
@@ -243,23 +218,15 @@ mod tests {
         // A non-recorder archive (no provenance) renders "-" for the eval
         // and "?" for scope/fidelity; a marker without the image entry
         // renders "?" for size.
-        let foreign = launch::ArchiveCandidate {
-            archive_id_short: "aaaaaaaaaaaaaaaa".into(),
-            s3_prefix: s3::archive_prefix("aaaaaaaaaaaaaaaa"),
-            archive_id: "aa".repeat(32),
-            recipe_digest: String::new(),
-            hydra_eval_id: 0,
-            created_at: "2026-06-02T10:00:00Z".into(),
-            manifest: json!({}),
-        };
-        let empty_marker = CompleteMarker {
-            archive_id: "aa".repeat(32),
-            archive_id_short: "aaaaaaaaaaaaaaaa".into(),
-            objects: BTreeMap::new(),
-            uploaded_at: "2026-06-02T11:00:00Z".parse().unwrap(),
-            uploader: "xtask-replay-launch".into(),
-        };
-        let r = row(&foreign, &empty_marker);
+        let foreign = launch::ArchiveCandidate::fixture(
+            &"aa".repeat(32),
+            None,
+            "",
+            0,
+            "2026-06-02T10:00:00Z",
+            json!({}),
+        );
+        let r = row(&foreign);
         assert_eq!(r.hydra_eval, "-");
         assert_eq!(r.scope, "?");
         assert_eq!(r.size, "?");
