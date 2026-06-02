@@ -147,6 +147,88 @@ pub fn classify_reason(reason: &str) -> ReasonClass {
     ReasonClass::Target
 }
 
+/// The scheduler's terminal-failure reason vocabulary, paired with the
+/// class the comparison model assigns each string — the shared corpus for
+/// every test that quantifies over "what reasons can the scheduler relay".
+/// Strings are verbatim producer shapes from completion.rs / executor.rs /
+/// dispatch.rs / recovery.rs; the embedded-cause rows compose the relay
+/// prefix with rio's own worker/transport error text exactly as production
+/// does (`completion.rs` embeds the worker's `error_msg`, which for a
+/// store-upload failure is rio-builder's "output upload failed: …" wrapping
+/// rio-common's "'<op>' timed out after <t>") — those rows are what give
+/// the needle-collision cross-product its non-vacuous pairs.
+#[cfg(test)]
+pub(crate) fn scheduler_reason_corpus() -> Vec<(&'static str, ReasonClass)> {
+    use ReasonClass::*;
+    vec![
+        (
+            "max_infra_retries=3 exhausted after infrastructure failures: store unavailable",
+            Infra,
+        ),
+        // Embedded worker cause: rio-builder wraps a store-upload failure
+        // ("output upload failed: {e}", executor/outputs.rs) around
+        // rio-common's timeout text ("'{name}' timed out after {timeout:?}",
+        // grpc.rs) before completion.rs relays it — infra vocabulary that
+        // CONTAINS the "timed out" needle.
+        (
+            "max_infra_retries=3 exhausted after infrastructure failures: output upload \
+             failed: 'PutPathChunked' timed out after 30s",
+            Infra,
+        ),
+        // Embedded transport cause: rio-common's with_retry timeout text
+        // ("gRPC call '{name}' timed out after {timeout:?}", grpc.rs).
+        (
+            "max_infra_retries=3 exhausted after infrastructure failures: gRPC call \
+             'PutPath' timed out after 30s",
+            Infra,
+        ),
+        (
+            "max_exempt_infra_retries=10 exceeded: concurrent PutPath in progress",
+            Infra,
+        ),
+        (
+            "max_infra_retries=3 exhausted at resource ceiling (OomKilled)",
+            ResourceCeiling,
+        ),
+        (
+            "max_timeout_retries=2 exhausted (DeadlineExceeded backstop)",
+            Timeout,
+        ),
+        (
+            "poison threshold reached after 3 distinct-worker failures",
+            Target,
+        ),
+        (
+            "poison threshold reached on worker disconnect after prior failures",
+            Target,
+        ),
+        (
+            "poison threshold reached on recovery (orphan worker did not reconnect)",
+            Target,
+        ),
+        ("failed on every eligible worker", Target),
+        ("max_retries=5 exhausted after transient failures", Target),
+        (
+            "builder failed with exit code 2: make: *** [all] Error 2",
+            Target,
+        ),
+        // Unprefixed worker message carrying a real fetch failure — the
+        // must-admit control for the source-rot scan: Target-classified,
+        // so the needle scan IS consulted for a fixed-output drv.
+        (
+            "builder failed: unable to download 'https://example.com/src.tar.gz'",
+            Target,
+        ),
+        (
+            "dependency '/nix/store/cccccccccccccccccccccccccccccccc-dep.drv' failed: poison \
+             threshold reached after 3 distinct-worker failures",
+            Dependency {
+                failing_drv: "/nix/store/cccccccccccccccccccccccccccccccc-dep.drv".into(),
+            },
+        ),
+    ]
+}
+
 /// Failure signature: a deterministic short string for grouping identical
 /// failures across jobs, derived from the relayed reason (preferred) or the
 /// captured log tail (fallback). Signatures are raw-evidence-derived — they
@@ -326,55 +408,12 @@ mod tests {
         assert_eq!(p.reasons[drv], "first reason");
     }
 
-    /// Every scheduler terminal-failure reason string maps to the class the
-    /// comparison model assigns it (strings from completion.rs/executor.rs/
-    /// dispatch.rs/recovery.rs).
+    /// Every scheduler terminal-failure reason string in the shared corpus
+    /// ([`scheduler_reason_corpus`]) maps to the class the comparison model
+    /// assigns it.
     #[test]
     fn reason_classification_covers_all_scheduler_strings() {
-        use ReasonClass::*;
-        let cases: Vec<(&str, ReasonClass)> = vec![
-            (
-                "max_infra_retries=3 exhausted after infrastructure failures: store unavailable",
-                Infra,
-            ),
-            (
-                "max_exempt_infra_retries=10 exceeded: concurrent PutPath in progress",
-                Infra,
-            ),
-            (
-                "max_infra_retries=3 exhausted at resource ceiling (OomKilled)",
-                ResourceCeiling,
-            ),
-            (
-                "max_timeout_retries=2 exhausted (DeadlineExceeded backstop)",
-                Timeout,
-            ),
-            (
-                "poison threshold reached after 3 distinct-worker failures",
-                Target,
-            ),
-            (
-                "poison threshold reached on worker disconnect after prior failures",
-                Target,
-            ),
-            (
-                "poison threshold reached on recovery (orphan worker did not reconnect)",
-                Target,
-            ),
-            ("failed on every eligible worker", Target),
-            ("max_retries=5 exhausted after transient failures", Target),
-            (
-                "builder failed with exit code 2: make: *** [all] Error 2",
-                Target,
-            ),
-            (
-                "dependency '/nix/store/cccccccccccccccccccccccccccccccc-dep.drv' failed: poison threshold reached after 3 distinct-worker failures",
-                Dependency {
-                    failing_drv: "/nix/store/cccccccccccccccccccccccccccccccc-dep.drv".into(),
-                },
-            ),
-        ];
-        for (reason, expected) in cases {
+        for (reason, expected) in scheduler_reason_corpus() {
             assert_eq!(classify_reason(reason), expected, "reason: {reason}");
         }
     }

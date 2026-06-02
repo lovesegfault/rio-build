@@ -244,6 +244,40 @@ impl CollectDecision {
     }
 }
 
+/// Fetch-error signatures for the fixed-output source-rot arm: text a
+/// failed FOD's evidence carries when the upstream origin (not rio)
+/// refused the fetch. Sourced from real fetcher output — curl/wget lines
+/// the daemon's last-N-log-lines block embeds, plus the nixpkgs fetchurl
+/// builder's mirror-exhaustion line ("error: cannot download X from any
+/// mirror") and modern curl's "(22) The requested URL returned error:
+/// NNN" shape.
+///
+/// Needles are heuristics and several ("TLS", "SSL", "timed out") overlap
+/// rio's own infrastructure vocabulary — the scheduler's infra relay
+/// routinely embeds `'PutPathChunked' timed out after 30s` from a
+/// store-upload failure. They are therefore consulted ONLY for evidence
+/// whose Signal 1 carries no positive structured classification (see
+/// [`resolve_failure_kind`]); the cross-product test
+/// `needle_scan_never_shadows_positively_classified_reasons` pins that no
+/// positively-classified scheduler reason can be shadowed by a needle.
+const FETCH_NEEDLES: &[&str] = &[
+    "unable to download",
+    "cannot download",
+    "couldn't resolve host",
+    "Couldn't resolve host",
+    "error 404",
+    "404 Not Found",
+    "The requested URL returned error:",
+    "TLS",
+    "SSL",
+    "timed out",
+];
+
+/// Whether `text` carries a fetch-error signature ([`FETCH_NEEDLES`]).
+fn fetch_signature_present(text: &str) -> bool {
+    FETCH_NEEDLES.iter().any(|n| text.contains(n))
+}
+
 /// Failure-kind resolution from the two signals (+ fixed-output knowledge
 /// and a log tail). Ambiguous or contradictory evidence defaults to
 /// [`FailureKind::Genuine`] — an unexplained failure is charged to rio,
@@ -251,6 +285,19 @@ impl CollectDecision {
 /// purpose: the source-rot arm is reachable exactly when the caller's
 /// derivation facts say so, not gated behind an optional default that
 /// silently disables it.
+///
+/// Precedence: positive structured classification beats the source-rot
+/// needle heuristic. The design's two-signal rule gives infrastructure
+/// attribution precedence over every comparison verdict (§7.1:
+/// "infra-indeterminate takes precedence over every comparison verdict"),
+/// and source-unavailable is defined upstream-origin-only (§7.1: "failed
+/// only because a fixed-output input could not be fetched from its
+/// upstream origin") — so a reason the scheduler positively classifies as
+/// Infra/Timeout/ResourceCeiling is never excused as source rot, however
+/// many needle words its text happens to contain. The needle scan runs
+/// only in the arms with no positive Signal-1 classification, and inside
+/// the lost-Signal-1 arm only when Signal 2 does not positively identify
+/// infrastructure (a poison row with an empty executor list).
 pub fn resolve_failure_kind(
     reason: Option<&str>,
     failed_builders: Option<&[String]>,
@@ -259,53 +306,48 @@ pub fn resolve_failure_kind(
 ) -> (FailureKind, Option<String>) {
     let signal1 = reason.map(classify_reason);
     // Source rot: a fixed-output derivation whose evidence text carries a
-    // fetch-error signature (conservative needle list) failed because the
-    // upstream source is gone, not because rio mis-built it.
-    let fetchish = |text: &str| {
-        [
-            "unable to download",
-            "couldn't resolve host",
-            "Couldn't resolve host",
-            "error 404",
-            "404 Not Found",
-            "TLS",
-            "SSL",
-            "timed out",
-        ]
-        .iter()
-        .any(|n| text.contains(n))
-    };
-    if is_fixed_output {
+    // fetch-error signature failed because the upstream source is gone,
+    // not because rio mis-built it. Only consulted from the
+    // non-positively-classified arms below.
+    let source_rot = || -> Option<(FailureKind, Option<String>)> {
+        if !is_fixed_output {
+            return None;
+        }
         let evidence_text = format!(
             "{} {}",
             reason.unwrap_or_default(),
             log_tail.unwrap_or_default()
         );
-        if fetchish(&evidence_text) {
-            return (FailureKind::SourceRot, None);
-        }
-    }
+        fetch_signature_present(&evidence_text).then_some((FailureKind::SourceRot, None))
+    };
     match signal1 {
         Some(ReasonClass::Timeout) => (FailureKind::Timeout, None),
         Some(ReasonClass::ResourceCeiling) => (FailureKind::ResourceCeiling, None),
         Some(ReasonClass::Infra) => match failed_builders {
             // Contradicting target evidence (real on-worker failures
             // recorded) ⇒ NOT infra: both signals must agree before a
-            // failure is excused as infrastructure.
+            // failure is excused as infrastructure. Charged to rio — the
+            // infra-vocabulary reason is not upstream-fetch evidence, so
+            // the needle scan does not get a say here either.
             Some(builders) if !builders.is_empty() => (FailureKind::Genuine, None),
             _ => (FailureKind::Infra, None),
         },
         Some(ReasonClass::Target) | Some(ReasonClass::Dependency { .. }) => {
-            (FailureKind::Genuine, None)
+            source_rot().unwrap_or((FailureKind::Genuine, None))
         }
         None => match failed_builders {
+            // Signal 2 positively identifies infrastructure (a poison row
+            // whose executor list is empty — infra never inserts into
+            // failed_builders): same precedence as a positive Signal 1.
             Some([]) => (FailureKind::Infra, None),
-            Some(_) => (FailureKind::Genuine, None),
+            Some(_) => source_rot().unwrap_or((FailureKind::Genuine, None)),
             // Signal 1 lost AND Signal 2 decayed (the failure outlived the
             // scheduler's poison-evidence TTL): only the log tail is left,
             // so the record carries the "log-tail-only" evidence-quality
             // flag.
-            None => (FailureKind::Genuine, Some("log-tail-only".to_string())),
+            None => {
+                source_rot().unwrap_or((FailureKind::Genuine, Some("log-tail-only".to_string())))
+            }
         },
     }
 }
@@ -1474,6 +1516,151 @@ mod tests {
             .0,
             FailureKind::Genuine
         );
+        // Positive structured classification beats the needle scan, even
+        // for a fixed-output drv whose reason text contains a needle: an
+        // agreed-infra reason embedding rio's own "timed out" transport
+        // text is infrastructure (design §7.1 gives the two-signal infra
+        // attribution precedence over every verdict; source-unavailable
+        // is upstream-origin-only). Pre-empting it as SourceRot would
+        // excuse a rio infra incident from the headline.
+        assert_eq!(
+            resolve_failure_kind(
+                Some(
+                    "max_infra_retries=3 exhausted after infrastructure failures: output \
+                     upload failed: 'PutPathChunked' timed out after 30s"
+                ),
+                Some(&[]),
+                true,
+                None
+            )
+            .0,
+            FailureKind::Infra
+        );
+        // Same collision under contradicting signal 2: charged to rio as
+        // Genuine (the two signals disagree), still never SourceRot.
+        assert_eq!(
+            resolve_failure_kind(
+                Some(
+                    "max_infra_retries=3 exhausted after infrastructure failures: output \
+                     upload failed: 'PutPathChunked' timed out after 30s"
+                ),
+                Some(&["b1".to_string()]),
+                true,
+                None
+            )
+            .0,
+            FailureKind::Genuine
+        );
+        // Signal-2-only infra (signal 1 lost, poison row with empty
+        // executor list) keeps the same precedence: a needle-bearing log
+        // tail on a FOD must not reclassify a positively-identified
+        // infrastructure failure.
+        assert_eq!(
+            resolve_failure_kind(None, Some(&[]), true, Some("fetch timed out")).0,
+            FailureKind::Infra
+        );
+        // Without any positive signal, the same needle-bearing log tail
+        // IS source rot for a FOD — the must-admit direction.
+        assert_eq!(
+            resolve_failure_kind(
+                None,
+                Some(&["b1".to_string()]),
+                true,
+                Some("curl: (22) The requested URL returned error: 404")
+            )
+            .0,
+            FailureKind::SourceRot
+        );
+        assert_eq!(
+            resolve_failure_kind(
+                None,
+                None,
+                true,
+                Some("error: cannot download src.tar.gz from any mirror")
+            )
+            .0,
+            FailureKind::SourceRot
+        );
+    }
+
+    /// Vocabulary-collision cross-product: the scheduler's relayed-reason
+    /// corpus × the fixed-output fetch-needle list. Quantification domain:
+    /// every reason string the scheduler can relay
+    /// ([`scheduler_reason_corpus`] — the same corpus that pins
+    /// `classify_reason`'s totality) crossed with every needle in
+    /// [`FETCH_NEEDLES`].
+    ///
+    /// Must-block: no positively-classified reason (Infra / Timeout /
+    /// ResourceCeiling — the scheduler's own structured vocabulary) may be
+    /// shadowed into SourceRot by a needle match, under any signal-2 state,
+    /// even with fixed-output knowledge asserted; the resolved kind must
+    /// stay the one the structured classification dictates. Contract:
+    /// design §7.1 — infra attribution by the two-signal rule "takes
+    /// precedence over every comparison verdict", and source-unavailable
+    /// is defined upstream-origin-only.
+    ///
+    /// Must-admit: a non-positively-classified corpus reason carrying a
+    /// needle still resolves SourceRot for a fixed-output drv (the scan
+    /// stays reachable where it belongs).
+    ///
+    /// Non-vacuity: the corpus must contain at least one
+    /// positively-classified reason that textually collides with a needle
+    /// (rio's own infra relay embeds "timed out" transport text), so the
+    /// must-block direction is exercised by a real collision, not an empty
+    /// intersection — and future needle additions that newly shadow a
+    /// scheduler vocabulary entry fail here the day they land.
+    #[test]
+    fn needle_scan_never_shadows_positively_classified_reasons() {
+        use crate::run::stderrparse::scheduler_reason_corpus;
+        let builder = ["b1".to_string()];
+        let signal2_states: [Option<&[String]>; 3] = [Some(&[]), Some(&builder), None];
+        let mut positive_collisions = 0usize;
+        let mut admitted = 0usize;
+        for (reason, class) in scheduler_reason_corpus() {
+            let collides = FETCH_NEEDLES.iter().any(|n| reason.contains(n));
+            let positive = matches!(
+                class,
+                ReasonClass::Infra | ReasonClass::Timeout | ReasonClass::ResourceCeiling
+            );
+            for builders in signal2_states {
+                let (kind, _) = resolve_failure_kind(Some(reason), builders, true, None);
+                if positive {
+                    positive_collisions += usize::from(collides);
+                    assert_ne!(
+                        kind,
+                        FailureKind::SourceRot,
+                        "needle scan shadowed a positively-classified scheduler reason \
+                         (signal2={builders:?}): {reason}"
+                    );
+                    let expected = match (&class, builders) {
+                        (ReasonClass::Timeout, _) => FailureKind::Timeout,
+                        (ReasonClass::ResourceCeiling, _) => FailureKind::ResourceCeiling,
+                        (ReasonClass::Infra, Some(b)) if !b.is_empty() => FailureKind::Genuine,
+                        (ReasonClass::Infra, _) => FailureKind::Infra,
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(kind, expected, "structured kind for: {reason}");
+                } else if collides {
+                    admitted += 1;
+                    assert_eq!(
+                        kind,
+                        FailureKind::SourceRot,
+                        "non-positively-classified needle-bearing reason must stay \
+                         source rot for a FOD (signal2={builders:?}): {reason}"
+                    );
+                }
+            }
+        }
+        assert!(
+            positive_collisions > 0,
+            "vacuous cross-product: the corpus must contain a positively-classified \
+             reason that collides with a needle"
+        );
+        assert!(
+            admitted > 0,
+            "vacuous must-admit direction: the corpus must contain a needle-bearing \
+             reason the scan still classifies as source rot"
+        );
     }
 
     #[test]
@@ -1582,6 +1769,52 @@ mod tests {
             CollectDecision::Terminal {
                 rio: RioOutcome::TargetFailed {
                     kind: FailureKind::Genuine
+                },
+                ..
+            }
+        ));
+        // A FIXED-OUTPUT target with the same agreed-infra shape, whose
+        // reason embeds rio's own "timed out" transport text: the positive
+        // infra classification wins over the source-rot needle scan
+        // (design §7.1 precedence; source-unavailable is upstream-origin
+        // only), so the failure keeps the infra auto-retry instead of
+        // being excused from the headline as source rot.
+        let mut fod_ctx = ctx("app.x86_64-linux", T, &[DEP], ExpectedOutcome::Built);
+        fod_ctx.fixed_output_drvs = std::sync::Arc::new([T.to_string()].into_iter().collect());
+        let infra_needle = po(
+            T,
+            BuildStatus::TransientFailure,
+            "max_infra_retries=3 exhausted after infrastructure failures: output upload \
+             failed: 'PutPathChunked' timed out after 30s",
+        );
+        assert_eq!(
+            decide(
+                &fod_ctx,
+                Some(&infra_needle),
+                &batch,
+                &poisoned_no_builders,
+                0,
+                &knobs,
+                None
+            )
+            .requeue_why(),
+            Some("infra-auto-retry"),
+            "agreed infra on a fixed-output drv must keep the infra auto-retry, \
+             not be reclassified source rot by the 'timed out' needle"
+        );
+        assert!(matches!(
+            decide(
+                &fod_ctx,
+                Some(&infra_needle),
+                &batch,
+                &poisoned_no_builders,
+                1,
+                &knobs,
+                None
+            ),
+            CollectDecision::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::Infra
                 },
                 ..
             }
