@@ -37,7 +37,7 @@ use super::DerivationError;
 
 /// A single derivation output.
 ///
-/// The classified shape is private ([`OutputRepr`]); consumers either
+/// The classified shape is private (`OutputRepr`); consumers either
 /// use the legacy string accessors (`path()` returns `""` for shapes
 /// without one — byte-compatible with the pre-typed struct) or match
 /// on [`DerivationOutput::kind`] for shape-dispatched logic.
