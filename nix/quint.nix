@@ -4218,8 +4218,10 @@ in
     # calibration pins. Model: docs/spec/models/closureEvidence.qnt —
     # the PREDECESSOR system's evidence lifecycle (the walk, the
     # topdown_pruned / closure_hole columns, the Substituting status,
-    # the forgiveness chain), retained as the campaign record until its
-    # A6 archive; the production machinery it verified was deleted by
+    # the forgiveness chain), archived IN PLACE 2026-06-02 (the A6 step,
+    # post-soak precondition owner-waived; the file is the campaign
+    # record at its original path — see its header banner); the
+    # production machinery it verified was deleted by
     # substitution-replacement Phase D-prime (Waves D3-D6, migration
     # 080) — the store-owned materialization job (the
     # quint-materialization-* family above) is the only substitution

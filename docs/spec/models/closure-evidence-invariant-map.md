@@ -2301,6 +2301,23 @@ carried unchanged):
 > dispositions and the model's archive plan (A6, post-soak) are in
 > `substitution-replacement-invariant-map.md` § "Phase D′ stage record".
 
+> **A6 archive executed (substitution-replacement follow-up close-out,
+> 2026-06-02).** The archive plan named above ran 2026-06-02 under the
+> owner's waiver of the post-soak precondition: the archive is the file
+> IN PLACE at `docs/spec/models/closureEvidence.qnt` — full pre-D7 model
+> text and all 14 legacy regime modules retained verbatim at the
+> original path (the wired checks stage it by exact path and the kept
+> pins import it; no `archive/` move), with the executed-archival banner
+> in the file header. The wired family is unchanged: the survivors core
+> + the two kept pins, plus the seeded FailoverDuo B9 corner check
+> `quint-closure-corner-failover-duo-b9` (follow-up ledger row 2; module
+> `closureEvidenceCornerFailoverDuo`, the discovery configuration) — the
+> corner and seed `0xffbfc9ac0c85df5b` ride the archive machine-checked.
+> Pre-prune wiring and the 27 retired checks' dispositions: D7 commit
+> `94996482b` ("chore(models): wire the closure-evidence survivors core
+> and prune superseded checks"; identify by subject after rebases). The
+> 15 unwired calibration overrides' retirement notes remain valid as-is.
+
 ### Owner-decision provenance
 
 Every owner decision this campaign executed under, with date and Phase-1 outcome:

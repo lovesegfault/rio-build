@@ -115,15 +115,30 @@
 // deleted the walk machinery, the Substituting status, the coexistence
 // flag and both evidence columns from production (migration 080); the
 // store-owned materialization job (materializationJob.qnt) is the only
-// substitution mechanism. This file's full-alphabet text is retained
-// UNCHANGED as the predecessor record (archive is stage A6's move, after
-// the survivors core has soaked one integration); the live wired oracle
-// is the closureEvidenceSurvivors module at the end of this file — the
-// six surviving invariants (A14/A15/A22/B9/B10/L3) over the restricted
-// post-deletion action alphabet — plus the two kept calibration pins
-// (closure-f1-stale-produced, closure-f4-demand-drop). The 27 retired
-// walk-era checks' dispositions: the T-D7.1 commit body and the Phase
-// D-prime stage record in substitution-replacement-invariant-map.md.
+// substitution mechanism.
+//
+// ARCHIVED IN PLACE 2026-06-02 (stage A6, follow-up ledger row 3; the
+// post-soak precondition was owner-waived 2026-06-02): this file IS the
+// archive — the full-alphabet predecessor record retained at this path,
+// model text unchanged, AND the live host of the wired oracle. Wired
+// here: the survivors core (closureEvidenceSurvivors,
+// closureEvidenceSurvivorsFailover — the six surviving invariants
+// A14/A15/A22/B9/B10/L3 over the restricted post-deletion alphabet),
+// the two kept calibration pins' import target
+// (closure-f1-stale-produced, closure-f4-demand-drop), and the seeded
+// FailoverDuo B9 corner check (quint-closure-corner-failover-duo-b9
+// over module closureEvidenceCornerFailoverDuo, seed
+// 0xffbfc9ac0c85df5b — the recorded post-failover stored-union
+// widening that violates B9 at the two-builds+failover scope and
+// documents why the 062 semantics had to die; SCOPE NOTE above the
+// survivors modules, transcript in the T-D7.1 commit body). The 27
+// retired walk-era checks' dispositions and the pre-prune wiring: D7
+// commit 94996482b ("chore(models): wire the closure-evidence
+// survivors core and prune superseded checks" — identify by subject
+// after rebases) and the Phase D-prime stage record in
+// substitution-replacement-invariant-map.md. The 15 unwired
+// calibration overrides' retirement notes remain valid as-is against
+// this retained model text.
 //
 // Measured state counts, depths and wall-clocks live in the introducing
 // commits' messages and the invariant map's stage records, never here.
