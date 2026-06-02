@@ -304,6 +304,10 @@ impl DagActor {
                     self.dag
                         .hash_for_path(input)
                         .and_then(|h| self.dag.node(h))
+                        // Same input-form discipline as submission_seed:
+                        // a resident floating node's stored hash is the
+                        // masked published form, never an input digest.
+                        .filter(|s| s.is_fixed_output || !s.ca.is_ca)
                         .and_then(|s| s.ca.modular_hash)
                 });
                 match hash {
@@ -746,8 +750,15 @@ impl DagActor {
             std::collections::HashSet::new();
         let mut settled_evidence_displaced: Vec<String> = Vec::new();
         let mut evidence_budget: u32 = MERGE_STORE_EVIDENCE_BUDGET;
+        // Input-form seeds only: a floating-CA sibling's published
+        // hash is the masked-subject form (oracle parity) and cannot
+        // stand in for its input-position digest — seeding it would
+        // re-create the masked-form false-rejection class fixed at
+        // ingress (ingress-inline-drv-binding+1). Floating inputs that
+        // matter resolve to Unverifiable in check_store_evidence.
         let submission_seed: HashMap<String, [u8; 32]> = nodes
             .iter()
+            .filter(|n| n.is_fixed_output || !n.is_content_addressed)
             .filter_map(|n| n.ca_modular_hash.map(|h| (n.drv_path.clone(), h)))
             .collect();
         let non_resident: Vec<String> = nodes

@@ -3123,6 +3123,17 @@ mod tests {
         inline.drv_content = b"Derive(...)".to_vec();
         inline.drv_content_authoritative = false;
         assert_eq!(DefinitionEvidence::from_node_shape(&inline), PathBoundBytes);
+
+        // Rank is ca_modular_hash-INDEPENDENT: a declared hash earns
+        // nothing, so the ingress strip (a forged-then-stripped claim,
+        // ingress-inline-drv-binding+1) and a never-claimed node are
+        // indistinguishable to the lattice — no rank inflation channel.
+        let mut hash_claimed = dummy_node();
+        hash_claimed.ca_modular_hash = Some([7u8; 32]);
+        assert_eq!(
+            DefinitionEvidence::from_node_shape(&hash_claimed),
+            DefinitionEvidence::from_node_shape(&dummy_node()),
+        );
     }
 
     // r[verify sched.derivation.evidence-rank]
