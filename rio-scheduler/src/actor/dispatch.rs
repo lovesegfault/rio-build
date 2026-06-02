@@ -2570,6 +2570,28 @@ impl DagActor {
                     // crafted ones). Excluded children make the input
                     // unseedable instead, which is the fail-closed
                     // direction.
+                    //
+                    // TODO: round-15 C3c7 (slipped to follow-up) — these
+                    // seeds are rank-blind: a non-floating child whose
+                    // recorded hash is still a submitter echo
+                    // (UnverifiedClaim) seeds the parent's verification
+                    // with an unverified value (merged_bug_039's
+                    // value-trust half). The fix is a
+                    // min_rank=PathBoundBytes floor here plus a store
+                    // read-through for sub-floor/unseedable children —
+                    // but the M_068-backed digests (`prove_drv_modulo`)
+                    // have NO read RPC on StoreService today, and a
+                    // floor without the fallback livelocks honest bare
+                    // closures (cache-hit children never re-verify).
+                    // Minting that read surface is trusted-plane design
+                    // (auth posture for a scheduler-privileged read,
+                    // walk-budget-over-wire), deferred wholesale per the
+                    // round-15 plan §4.3.1 slip clause. Residual until
+                    // then: a forged child echo steers THIS node's
+                    // verification toward Contradicts/Unverifiable —
+                    // bounded backoff + noisy rejection, never a forged
+                    // Verified for a path the store's bytes don't derive
+                    // (the parent's own bytes are still text-CA-bound).
                     let seed = super::merge::InputFormSeed::from_dag_children(&self.dag, drv_hash);
                     Some(self.check_store_evidence(&node, &seed).await)
                 }
