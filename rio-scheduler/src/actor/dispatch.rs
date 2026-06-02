@@ -1,6 +1,6 @@
 //! Ready-queue dispatch: assign ready derivations to available workers.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -934,7 +934,7 @@ impl DagActor {
             hash: DrvHash,
             drv_path: String,
             output_paths: Vec<String>,
-            interested: HashSet<Uuid>,
+            interested: BTreeSet<Uuid>,
         }
         let mut spawned: Vec<Spawned> = Vec::with_capacity(candidates.len());
         for (drv_hash, paths) in candidates {
@@ -1143,8 +1143,9 @@ impl DagActor {
             // build_summary counts Substituting as running — emit a
             // progress snapshot so the queued/running flip is visible
             // (matches `emit_assignment_started`). Dedup builds across
-            // all spawned drvs; emit once per build.
-            let interested_builds: HashSet<Uuid> = spawned
+            // all spawned drvs; emit once per build, in build-UUID
+            // order (BTreeSet — keeps the emit sequence deterministic).
+            let interested_builds: BTreeSet<Uuid> = spawned
                 .iter()
                 .flat_map(|s| s.interested.iter().copied())
                 .collect();
@@ -1970,7 +1971,7 @@ impl DagActor {
             hash: DrvHash,
             drv_path: String,
             output_paths: Vec<String>,
-            interested: HashSet<Uuid>,
+            interested: BTreeSet<Uuid>,
         }
         let mut ok: Vec<Done> = Vec::with_capacity(hashes.len());
         for drv_hash in hashes {

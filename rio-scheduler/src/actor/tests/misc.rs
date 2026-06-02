@@ -8,15 +8,17 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tracing_test::traced_test;
 
-/// Regression for bug_032: `DerivationState.interested_builds` is a
-/// `HashSet<Uuid>` (RandomState); the flusher uses `.first()` on the vec
-/// returned here to pick the S3-key build_id. Before the fix this was
-/// HashSet-iteration-ordered → re-flush across a restart could pick a
-/// different bid → new S3 key → ON CONFLICT repoints PG rows and orphans
-/// the previous blob. `get_interested_builds()` now sorts, so `.first()`
-/// is always min(UUID). Reverting the sort fails this test (P(false-pass)
-/// = 1/8! ≈ 2.5e-5 — HashSet would have to iterate in sorted order by
-/// chance).
+/// `get_interested_builds()` returns ascending build UUIDs; the
+/// flusher's `.first()` on this vec picked the S3-key build_id, so an
+/// unstable order meant a re-flush across a restart could pick a
+/// different bid → new S3 key → ON CONFLICT repoints PG rows and
+/// orphans the previous blob. Originally enforced by an explicit sort
+/// over the then-`HashSet` (RandomState) field; `interested_builds`
+/// is now a `BTreeSet`, so iteration itself is sorted and the
+/// accessor's contract holds by construction. This test pins the
+/// CONTRACT independent of the field's type — a future type change
+/// back to an unordered collection (or dropping the collect-from-set)
+/// fails here (P(false-pass) = 1/8! ≈ 2.5e-5).
 #[tokio::test]
 async fn get_interested_builds_is_sorted() {
     let db = TestDb::new(&MIGRATOR).await;

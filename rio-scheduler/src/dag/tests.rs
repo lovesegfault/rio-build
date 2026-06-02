@@ -336,7 +336,7 @@ fn test_merge_rollback_duplicate_drv_on_retriable_node_restores_exactly() -> any
     );
     assert_eq!(
         n.interested_builds,
-        HashSet::from([build_a]),
+        BTreeSet::from([build_a]),
         "interest must be exactly the pre-merge set"
     );
     Ok(())
@@ -1032,7 +1032,7 @@ fn test_cyclic_merge_restores_removed_retriable() -> anyhow::Result<()> {
     );
     assert_eq!(
         x.interested_builds,
-        HashSet::from([b1]),
+        BTreeSet::from([b1]),
         "prior interest restored, b2 NOT added"
     );
     assert_eq!(
@@ -1106,7 +1106,7 @@ fn test_invalid_drv_path_rolls_back_everything() -> anyhow::Result<()> {
     let x = dag.node("hashX").expect("hashX restored");
     assert_eq!(x.status(), DerivationStatus::Failed);
     assert_eq!(x.retry.resubmit_cycles, 1);
-    assert_eq!(x.interested_builds, HashSet::from([b1]));
+    assert_eq!(x.interested_builds, BTreeSet::from([b1]));
     // Earlier-iteration fresh insert rolled back.
     assert!(
         !dag.nodes.contains_key("good-new"),
@@ -1115,7 +1115,7 @@ fn test_invalid_drv_path_rolls_back_everything() -> anyhow::Result<()> {
     // Interest added to pre-existing node reverted.
     assert_eq!(
         dag.node("good-pre").expect("good-pre").interested_builds,
-        HashSet::from([b1]),
+        BTreeSet::from([b1]),
         "b2 interest in pre-existing node must be reverted"
     );
     assert!(!dag.nodes.contains_key("bad"));

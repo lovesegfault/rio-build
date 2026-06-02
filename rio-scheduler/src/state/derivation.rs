@@ -11,7 +11,7 @@
 //! `DependencyFailed` (upstream failed). A derivation observed in
 //! `Failed` is mid-retry, not stuck.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Instant;
 
 use uuid::Uuid;
@@ -762,7 +762,17 @@ pub struct DerivationState {
     /// or `reset_to_ready()` to preserve invariants.
     status: DerivationStatus,
     /// Set of build IDs interested in this derivation.
-    pub interested_builds: HashSet<Uuid>,
+    ///
+    /// `BTreeSet`, deliberately: every iteration of this set is sorted
+    /// by build UUID, so no consumer can mint hash-iteration order
+    /// (RandomState) into a decision — "first element" is well-defined
+    /// and stable for a given set, by construction. Note that sorted
+    /// BUILD order is still not a stable TENANT choice under build
+    /// churn (a tenant resubmitting under a fresh build UUID moves
+    /// position); single-tenant selection goes through the
+    /// `attributed_tenant` / `live_attributed_tenant` accessors, which
+    /// take the min over tenants instead.
+    pub interested_builds: BTreeSet<Uuid>,
     /// Worker currently assigned/running this derivation.
     pub assigned_executor: Option<ExecutorId>,
     /// Per-execution identifier minted by `assign_to_worker` for the
@@ -1075,7 +1085,7 @@ impl DerivationState {
                 output_unchanged: false,
             },
             status: DerivationStatus::Created,
-            interested_builds: HashSet::new(),
+            interested_builds: BTreeSet::new(),
             assigned_executor: None,
             exec_id: None,
             // est_duration/priority: placeholders — merge.rs sets them
@@ -1164,7 +1174,7 @@ impl DerivationState {
                 ..Default::default()
             },
             status,
-            interested_builds: HashSet::new(), // populated by build_derivations join
+            interested_builds: BTreeSet::new(), // populated by build_derivations join
             assigned_executor: row.assigned_builder_id.map(Into::into),
             // From the active `assignments` row, scoped by the JOIN to
             // currently-assigned drvs (`load_nonterminal_derivations`) —
@@ -1290,7 +1300,7 @@ impl DerivationState {
             is_fixed_output: row.is_fixed_output,
             ca: CaState::default(),
             status: DerivationStatus::Poisoned,
-            interested_builds: HashSet::new(),
+            interested_builds: BTreeSet::new(),
             assigned_executor: None,
             exec_id: None,
             sched: SchedHint::default(),
@@ -1435,14 +1445,17 @@ impl DerivationState {
     /// `record_build_sample` so the estimator's cache key matches the
     /// rows that fed it.
     ///
-    /// `.min()` not `.next()`: `interested_builds` is a `HashSet`
-    /// (RandomState iteration order). When a second tenant merges the
-    /// same drv mid-build, `.next()` would let solve key on tenant_A
-    /// and the completion sample land under tenant_B (or flip the
-    /// SpawnIntent shape between controller polls). `.min()` is stable
-    /// for a given set; cross-tenant dedup is rare enough that
-    /// "smallest UUID wins" is fine — per-tenant key is a grouping
-    /// dimension, not an accounting ledger.
+    /// `.min()` not `.next()`: `interested_builds` is now a `BTreeSet`
+    /// (sorted iteration), but first-in-build-order is still not a
+    /// stable tenant: the answer must be a pure function of the TENANT
+    /// set, and a build completing (or a tenant resubmitting under a
+    /// fresh build UUID) reorders the build walk while the tenant set
+    /// is unchanged — `.next()` would let solve key on tenant_A and
+    /// the completion sample land under tenant_B (or flip the
+    /// SpawnIntent shape between controller polls). `.min()` over
+    /// tenants is stable for a given tenant set; cross-tenant dedup is
+    /// rare enough that "smallest UUID wins" is fine — per-tenant key
+    /// is a grouping dimension, not an accounting ledger.
     pub fn attributed_tenant(&self, builds: &super::Builds) -> Option<Uuid> {
         self.attributed_tenants(builds).min()
     }
@@ -1951,7 +1964,7 @@ mod tests {
             "an interested build with no BuildInfo entry counts as terminal"
         );
         // 5c. Empty interest set (recovered orphan) → None.
-        s.interested_builds = HashSet::new();
+        s.interested_builds = BTreeSet::new();
         s.wanted_by_build = HashMap::new();
         assert_eq!(effective_wanted(&s, &builds), None);
 

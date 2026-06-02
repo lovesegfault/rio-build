@@ -352,19 +352,18 @@ impl DagActor {
     }
 
     pub(super) fn get_interested_builds(&self, drv_hash: &DrvHash) -> Vec<Uuid> {
-        // Sorted: `interested_builds` is a HashSet (RandomState), so raw
-        // iteration order is process-dependent. The flusher's S3 key is
-        // now `(drv_hash, exec_id)` and no longer derives from a build_id
-        // — but `record_exec_correlation` and the per-build `BuildEvent`
-        // emitters still iterate this set, and a deterministic order
-        // keeps test assertions and PG-side trace ordering stable.
-        let mut v: Vec<Uuid> = self
-            .dag
+        // Sorted ascending by construction: `interested_builds` is a
+        // `BTreeSet`, so iteration IS the sort — no re-sort needed.
+        // The sorted contract still matters downstream:
+        // `record_exec_correlation` and the per-build `BuildEvent`
+        // emitters iterate this Vec, and a deterministic order keeps
+        // test assertions and PG-side trace ordering stable
+        // (`get_interested_builds_is_sorted` pins the contract
+        // independent of the field's type).
+        self.dag
             .node(drv_hash)
             .map(|s| s.interested_builds.iter().copied().collect())
-            .unwrap_or_default();
-        v.sort_unstable();
-        v
+            .unwrap_or_default()
     }
 
     /// Resolve drv_path → drv_hash → interested_builds, then emit

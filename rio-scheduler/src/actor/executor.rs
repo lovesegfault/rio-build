@@ -55,9 +55,9 @@ const MAX_READY_TO_SCAN: usize = 32;
 /// needed by 5 submissions — that's a stronger dispatch-priority signal
 /// than which single build submitted first.
 ///
-/// `interested_builds.len()` is O(1) (`HashSet::len`). Sort is
-/// O(n log n) over Ready nodes. Acceptable: registration is once per
-/// worker per reconnect, not hot-path.
+/// `interested_builds.len()` is O(1) (`BTreeSet` tracks its length).
+/// Sort is O(n log n) over Ready nodes. Acceptable: registration is
+/// once per worker per reconnect, not hot-path.
 pub(crate) fn compute_initial_prefetch_paths(dag: &DerivationDag) -> Vec<String> {
     let mut ready: Vec<(&str, &crate::state::DerivationState)> = dag
         .iter_nodes()
