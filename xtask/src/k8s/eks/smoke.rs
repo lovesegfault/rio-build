@@ -534,7 +534,13 @@ pub fn smoke_expr(tag: &str, secs: u32, out_kb: u32) -> String {
 /// The expr must evaluate to a single derivation. Factored out of the
 /// busybox-only path so qa scenarios can submit derivations with
 /// `requiredSystemFeatures`, multi-output, custom names, etc.
-pub async fn build_expr(expr: &str, store_url: &str) -> Result<()> {
+///
+/// Returns the built `.drv` store path. It is captured from the LOCAL
+/// `nix-instantiate` — identical to the path built on the cluster: drv
+/// paths are content-addressed over the derivation ATerm, `nix copy
+/// --derivation` ships the literal path, `nix build {drv}^*` builds the
+/// literal path, and PG `derivations.drv_path` records the same string.
+pub async fn build_expr(expr: &str, store_url: &str) -> Result<String> {
     // IdentitiesOnly=yes (see `shared::NIX_SSHOPTS_BASE`): the user's
     // deploy key (comment "default") is in authorized_keys too. Without
     // this, ssh-agent offers that key first → gateway routes the build
@@ -553,6 +559,7 @@ pub async fn build_expr(expr: &str, store_url: &str) -> Result<()> {
         crate::sh::run_read(cmd!(sh, "nix-instantiate --expr {expr}"))
     })
     .await?;
+    validate_drv_path(&drv)?;
 
     ui::step_debug(
         &format!("nix copy {}", drv.rsplit('/').next().unwrap_or(&drv)),
@@ -577,14 +584,37 @@ pub async fn build_expr(expr: &str, store_url: &str) -> Result<()> {
             .env("NIX_SSHOPTS", SSHOPTS),
         )
     })
-    .await
+    .await?;
+    Ok(drv)
+}
+
+/// Shape guard for the captured `nix-instantiate` output: `build_expr`'s
+/// contract is "the expr evaluates to a SINGLE derivation", and the
+/// captured string is the only build identifier the harness ever holds
+/// (QA scenarios feed it to `rio-cli logs`). A multi-derivation expr or
+/// a nix CLI output change would otherwise break that contract silently.
+fn validate_drv_path(s: &str) -> Result<()> {
+    anyhow::ensure!(
+        !s.contains('\n'),
+        "nix-instantiate returned multiple lines (the expr must evaluate to a single derivation): {s:?}"
+    );
+    anyhow::ensure!(
+        s.starts_with("/nix/store/"),
+        "nix-instantiate output is not a store path: {s:?}"
+    );
+    anyhow::ensure!(
+        s.ends_with(".drv"),
+        "nix-instantiate output is not a .drv path: {s:?}"
+    );
+    Ok(())
 }
 
 /// Busybox build = `build_expr(smoke_expr(...))`. Kept as a convenience
 /// for the health-check path where most callers don't care about the
 /// expression body.
 pub async fn smoke_build(tag: &str, secs: u32, out_kb: u32, store_url: &str) -> Result<()> {
-    build_expr(&smoke_expr(tag, secs, out_kb), store_url).await
+    build_expr(&smoke_expr(tag, secs, out_kb), store_url).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -610,5 +640,20 @@ mod tests {
                 "ephemeral-port guard regressed: {err:#}"
             );
         }
+    }
+
+    #[test]
+    fn validate_drv_path_accepts_single_drv_store_path() {
+        assert!(validate_drv_path("/nix/store/abc123-rio-smoke-x.drv").is_ok());
+    }
+
+    #[test]
+    fn validate_drv_path_rejects_shape_violations() {
+        // Multi-line: the single-derivation contract broke.
+        assert!(validate_drv_path("/nix/store/a-x.drv\n/nix/store/b-y.drv").is_err());
+        // Output path, not a derivation.
+        assert!(validate_drv_path("/nix/store/abc123-rio-smoke-x").is_err());
+        // Not a store path at all.
+        assert!(validate_drv_path("relative/path/x.drv").is_err());
     }
 }

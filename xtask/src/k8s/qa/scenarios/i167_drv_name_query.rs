@@ -40,7 +40,7 @@ impl Scenario for DrvNameQuery {
         );
 
         match ctx.nix_build_expr_via_gateway(0, &expr).await {
-            Ok(()) => Ok(Verdict::Pass),
+            Ok(_) => Ok(Verdict::Pass),
             Err(e) => {
                 let msg = format!("{e:#}");
                 if msg.contains("invalid path component") || msg.contains("synth_db") {

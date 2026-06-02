@@ -98,13 +98,21 @@ impl QaCtx {
     /// `self.tenants[tenant_idx]`, block until it completes. The build
     /// authenticates with that tenant's ephemeral SSH key, so it's
     /// attributed to the right tenant.
+    ///
+    /// Returns the built `.drv` store path: instantiated locally,
+    /// identical to the path built on the cluster (content-addressed;
+    /// `nix copy --derivation` ships it verbatim; matches PG
+    /// `derivations.drv_path`). Under the transient-retry path the
+    /// returned path is the SUCCEEDING attempt's (`smoke_expr` embeds
+    /// `builtins.currentTime`, so retry attempts can instantiate
+    /// different drvs).
     pub async fn nix_build_via_gateway(
         &self,
         tenant_idx: usize,
         tag: &str,
         secs: u32,
         out_kb: u32,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let key = self.tenant(tenant_idx).key.clone();
         gateway_build(key, smoke::smoke_expr(tag, secs, out_kb)).await
     }
@@ -119,7 +127,10 @@ impl QaCtx {
         out_kb: u32,
     ) -> tokio::task::JoinHandle<Result<()>> {
         let key = self.tenant(tenant_idx).key.clone();
-        tokio::spawn(gateway_build(key, smoke::smoke_expr(tag, secs, out_kb)))
+        let expr = smoke::smoke_expr(tag, secs, out_kb);
+        // Keep JoinHandle<Result<()>>: bg callers abort mid-flight and
+        // pattern-match Ok(()); none can use a drv path.
+        tokio::spawn(async move { gateway_build(key, expr).await.map(drop) })
     }
 
     /// Submit an arbitrary Nix expression via the gateway as
@@ -127,7 +138,14 @@ impl QaCtx {
     /// single derivation (`nix-instantiate --expr` is the front end).
     /// Unlocks scenarios that need `requiredSystemFeatures`, multi-
     /// output, custom name, etc. — everything `smoke_expr` can't shape.
-    pub async fn nix_build_expr_via_gateway(&self, tenant_idx: usize, expr: &str) -> Result<()> {
+    /// Returns the built `.drv` store path (see
+    /// [`Self::nix_build_via_gateway`] for the identity + retry
+    /// semantics).
+    pub async fn nix_build_expr_via_gateway(
+        &self,
+        tenant_idx: usize,
+        expr: &str,
+    ) -> Result<String> {
         let key = self.tenant(tenant_idx).key.clone();
         gateway_build(key, expr.to_owned()).await
     }
@@ -140,7 +158,8 @@ impl QaCtx {
         expr: &str,
     ) -> tokio::task::JoinHandle<Result<()>> {
         let key = self.tenant(tenant_idx).key.clone();
-        tokio::spawn(gateway_build(key, expr.to_owned()))
+        let expr = expr.to_owned();
+        tokio::spawn(async move { gateway_build(key, expr).await.map(drop) })
     }
 
     /// Port-forward gateway:22 and return the ssh-ng store URL for
@@ -199,8 +218,9 @@ impl QaCtx {
 
 /// Port-forward gateway:22, wait for SSH banner, run `build_expr`.
 /// Shared body of all four `nix_build[_expr]_via_gateway[_bg]` so each
-/// variant is a one-liner.
-async fn gateway_build(key: PathBuf, expr: String) -> Result<()> {
+/// variant is a one-liner. Returns the built `.drv` store path from the
+/// SUCCEEDING `build_expr` attempt.
+async fn gateway_build(key: PathBuf, expr: String) -> Result<String> {
     // Mechanism steps (`step_debug`) — repeated ~50× per QA run, only
     // useful under `-v`. Failures still propagate via `?`; the
     // *scenario* verdict (PASS/FAIL) surfaces them at default
@@ -242,7 +262,7 @@ async fn gateway_build(key: PathBuf, expr: String) -> Result<()> {
     let mut attempts = 0;
     loop {
         match smoke::build_expr(&expr, &store).await {
-            Ok(()) => return Ok(()),
+            Ok(drv) => return Ok(drv),
             Err(e) if attempts < 5 && is_transient_gateway_err(&e) => {
                 attempts += 1;
                 tracing::info!(

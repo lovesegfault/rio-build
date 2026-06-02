@@ -92,8 +92,8 @@ impl Scenario for MissingInputRedispatch {
             .sum("rio_scheduler_stale_completed_reset_total");
 
         match result {
-            Ok(()) if after > before => Ok(Verdict::Pass),
-            Ok(()) => Ok(Verdict::Pass),
+            Ok(_) if after > before => Ok(Verdict::Pass),
+            Ok(_) => Ok(Verdict::Pass),
             // ^ Second build succeeding is the primary assertion. The
             // metric increment is a bonus signal but not required: if
             // currentTime advanced between the two nix-instantiate
