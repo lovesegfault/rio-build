@@ -496,7 +496,7 @@ mod tests {
                 outputs: BTreeMap::from([(
                     "out".to_string(),
                     OutputHash {
-                        nar_hash_hex: "ab".repeat(32),
+                        nar_hash: crate::narhash::NarHash::parse(&"ab".repeat(32)).unwrap(),
                         nar_size: 226_504,
                     },
                 )]),

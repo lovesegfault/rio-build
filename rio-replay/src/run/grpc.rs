@@ -18,10 +18,14 @@ use async_trait::async_trait;
 /// triggers substitution.
 #[async_trait]
 pub trait StoreApi: Send + Sync {
-    /// For every requested path: Some((nar_hash_hex, nar_size)) when the path
-    /// is valid in rio-store, None otherwise. Order-insensitive.
-    async fn query_valid(&self, paths: &[String])
-    -> Result<HashMap<String, Option<(String, u64)>>>;
+    /// For every requested path: Some((nar_hash, nar_size)) when the path
+    /// is valid in rio-store, None otherwise. Order-insensitive. The hash
+    /// is typed at this boundary (the wire carries the raw digest bytes),
+    /// so downstream comparison is digest-to-digest by construction.
+    async fn query_valid(
+        &self,
+        paths: &[String],
+    ) -> Result<HashMap<String, Option<(crate::narhash::NarHash, u64)>>>;
 }
 
 /// Chunk size for BatchQueryPathInfo calls (store-side `= ANY(...)` query;
@@ -50,7 +54,7 @@ impl StoreApi for GrpcStoreApi {
     async fn query_valid(
         &self,
         paths: &[String],
-    ) -> Result<HashMap<String, Option<(String, u64)>>> {
+    ) -> Result<HashMap<String, Option<(crate::narhash::NarHash, u64)>>> {
         let channel = rio_proto::client::connect_channel(&self.addr)
             .await
             .with_context(|| format!("connect rio-store at {}", self.addr))?;
@@ -68,7 +72,25 @@ impl StoreApi for GrpcStoreApi {
             .await
             .map_err(|s| anyhow::anyhow!("BatchQueryPathInfo against {}: {s}", self.addr))?;
             for (path, info) in entries {
-                out.insert(path, info.map(|i| (hex::encode(i.nar_hash), i.nar_size)));
+                // A valid path whose reported digest is malformed (not 32
+                // bytes) is a store-contract violation: degrade it to
+                // "valid without NAR identity" with a loud warning instead
+                // of failing the whole batch — the path's record then says
+                // not-comparable, the same as any identity-less success.
+                let identity = info.and_then(|i| {
+                    match crate::narhash::NarHash::from_digest_slice(&i.nar_hash) {
+                        Ok(hash) => Some((hash, i.nar_size)),
+                        Err(e) => {
+                            tracing::warn!(
+                                path,
+                                error = %format!("{e:#}"),
+                                "rio-store reported a malformed nar_hash; recording the path without NAR identity"
+                            );
+                            None
+                        }
+                    }
+                });
+                out.insert(path, identity);
             }
         }
         Ok(out)
@@ -596,7 +618,7 @@ pub(crate) mod test_support {
     /// (collect's store-failure paths).
     #[derive(Default)]
     pub struct FakeStoreApi {
-        pub valid: HashMap<String, (String, u64)>,
+        pub valid: HashMap<String, (crate::narhash::NarHash, u64)>,
         pub calls: Mutex<usize>,
         /// When set, `query_valid` fails with this message.
         pub error: Mutex<Option<String>>,
@@ -614,7 +636,7 @@ pub(crate) mod test_support {
         async fn query_valid(
             &self,
             paths: &[String],
-        ) -> Result<HashMap<String, Option<(String, u64)>>> {
+        ) -> Result<HashMap<String, Option<(crate::narhash::NarHash, u64)>>> {
             *self.calls.lock().unwrap() += 1;
             if let Some(message) = self.error.lock().unwrap().clone() {
                 anyhow::bail!("{message}");

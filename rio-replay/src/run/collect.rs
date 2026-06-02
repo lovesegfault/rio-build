@@ -381,7 +381,7 @@ pub fn build_record(
     target: Option<&PathOutcome>,
     batch: &BatchView,
     poisoned: &HashMap<String, Vec<String>>,
-    rio_paths: &HashMap<String, Option<(String, u64)>>,
+    rio_paths: &HashMap<String, Option<(crate::narhash::NarHash, u64)>>,
     mode: &str,
     campaign_id: &str,
     attempts: u32,
@@ -418,20 +418,16 @@ pub fn build_record(
             name.clone(),
             super::model::RioOutput {
                 path: path.clone(),
-                nar_hash: rio_info.as_ref().map(|(h, _)| h.clone()),
+                nar_hash: rio_info.as_ref().map(|(h, _)| *h),
                 nar_size: rio_info.as_ref().map(|(_, s)| *s),
             },
         );
         if classification.class == UnifiedClass::Verdict(Verdict::MatchBuilt) {
-            let expected_hash = ctx
-                .expected_outputs
-                .get(name)
-                .and_then(|h| h.nar_hash.clone());
             nar_compare.insert(
                 name.clone(),
                 compare_output(&OutputHashes {
-                    rio_hex: rio_info.as_ref().map(|(h, _)| h.clone()),
-                    expected_narhash: expected_hash,
+                    rio: rio_info.as_ref().map(|(h, _)| *h),
+                    expected: ctx.expected_outputs.get(name).and_then(|h| h.nar_hash),
                 })
                 .to_string(),
             );
@@ -1534,7 +1530,7 @@ mod tests {
     fn timed_interruption_flag_derivation() {
         let job_ctx = ctx("app.x86_64-linux", T, &[], ExpectedOutcome::Built);
         let no_poison: HashMap<String, Vec<String>> = HashMap::new();
-        let no_paths: HashMap<String, Option<(String, u64)>> = HashMap::new();
+        let no_paths: HashMap<String, Option<(crate::narhash::NarHash, u64)>> = HashMap::new();
         let record = |batch: &BatchView, rio: &RioOutcome, target: Option<&PathOutcome>| {
             build_record(
                 &job_ctx, rio, None, target, batch, &no_poison, &no_paths, "leaf", "c1", 1, None,
@@ -1907,9 +1903,10 @@ mod tests {
         let mate_job = ctx("mate.x86_64-linux", OTHER, &[], ExpectedOutcome::Built);
 
         let mut store = FakeStoreApi::default();
-        store
-            .valid
-            .insert(ok_job.outputs["out"].clone(), ("ab".repeat(32), 7));
+        store.valid.insert(
+            ok_job.outputs["out"].clone(),
+            (crate::narhash::NarHash::parse(&"ab".repeat(32)).unwrap(), 7),
+        );
         let artifacts_dir = tempfile::tempdir().unwrap();
         let artifacts = LocalDirArtifactStore::new(artifacts_dir.path());
         let admin = LogAdmin {
@@ -1995,8 +1992,8 @@ mod tests {
             "exec id is null under in-band collection"
         );
         assert_eq!(
-            ok.rio.outputs["out"].nar_hash.as_deref(),
-            Some("ab".repeat(32).as_str())
+            ok.rio.outputs["out"].nar_hash,
+            Some(crate::narhash::NarHash::parse(&"ab".repeat(32)).unwrap())
         );
         assert_eq!(ok.repro, format!("cargo xtask replay repro c1 {T}"));
         let bad = records
@@ -2152,7 +2149,9 @@ mod tests {
             "out".to_string(),
             super::super::model::ExpectedOutput {
                 narinfo_present: true,
-                nar_hash: Some(format!("sha256:{}", "0".repeat(52))),
+                nar_hash: Some(
+                    crate::narhash::NarHash::parse(&format!("sha256:{}", "0".repeat(52))).unwrap(),
+                ),
                 nar_size: Some(1),
             },
         );

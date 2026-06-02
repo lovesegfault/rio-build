@@ -13,42 +13,6 @@ use futures_util::StreamExt;
 use rio_nix::narinfo::NarInfo;
 use rio_nix::store_path::StorePath;
 
-/// Convert a narinfo `NarHash` value (`sha256:<52-char nixbase32>` as
-/// served by cache.nixos.org, or `sha256:<64-char hex>` as stored by
-/// rio-store) to lowercase hex. Anything else is an error.
-///
-/// Lives here rather than reusing [`rio_nix::hash::NixHash::parse_colon`]
-/// because that parser accepts only the nixbase32 digest form, while this
-/// helper also normalizes the already-hex form rio-store records.
-pub fn narhash_to_hex(nar_hash: &str) -> anyhow::Result<String> {
-    let rest = nar_hash
-        .strip_prefix("sha256:")
-        .ok_or_else(|| anyhow::anyhow!("unsupported NarHash algo (want sha256:…): {nar_hash}"))?;
-    match rest.len() {
-        52 => {
-            let bytes = rio_nix::store_path::nixbase32::decode(rest)
-                .map_err(|e| anyhow::anyhow!("decode nixbase32 NarHash {nar_hash}: {e}"))?;
-            anyhow::ensure!(
-                bytes.len() == 32,
-                "NarHash decoded to {} bytes, want 32",
-                bytes.len()
-            );
-            Ok(hex::encode(bytes))
-        }
-        64 => {
-            let bytes =
-                hex::decode(rest).with_context(|| format!("decode hex NarHash {nar_hash}"))?;
-            anyhow::ensure!(
-                bytes.len() == 32,
-                "NarHash decoded to {} bytes, want 32",
-                bytes.len()
-            );
-            Ok(hex::encode(bytes))
-        }
-        n => anyhow::bail!("NarHash digest has unexpected length {n}: {nar_hash}"),
-    }
-}
-
 /// cache.nixos.org (or any Nix binary cache) narinfo reader.
 pub struct NixCacheClient {
     http: reqwest::Client,
@@ -350,17 +314,17 @@ fn validate_redirect_hop(from: &reqwest::Url, next: &reqwest::Url) -> anyhow::Re
 }
 
 /// Upstream narinfo facts for one store path, as collected by
-/// [`sweep_narinfos`]: presence plus the NAR identity (lowercase hex
-/// NarHash and NarSize) when the narinfo carried a usable hash.
+/// [`sweep_narinfos`]: presence plus the NAR identity (NarHash digest and
+/// NarSize) when the narinfo carried a usable hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NarinfoFact {
     /// The cache served a narinfo for this path (HTTP 200). A 200 body
     /// that fails to parse still counts as found — the path demonstrably
     /// exists upstream — it just carries no usable NAR identity.
     pub found: bool,
-    /// Lowercase hex sha256 NarHash, present only when the narinfo
-    /// parsed and its `NarHash` converted cleanly via [`narhash_to_hex`].
-    pub nar_hash_hex: Option<String>,
+    /// The narinfo's `NarHash`, present only when the narinfo parsed and
+    /// the hash decoded cleanly through [`crate::narhash::NarHash::parse`].
+    pub nar_hash: Option<crate::narhash::NarHash>,
     /// `NarSize` in bytes, present whenever the narinfo parsed.
     pub nar_size: Option<u64>,
 }
@@ -386,10 +350,9 @@ const SWEEP_PROGRESS_LOG_EVERY: usize = 500;
 
 /// Fetch one path's narinfo with bounded retries (transient errors only)
 /// and fold it into a [`NarinfoFact`]. A 200 body that fails to parse,
-/// or whose `NarHash` cannot be converted to hex, is recorded as found
-/// with no usable hash: the path demonstrably exists upstream, so
-/// treating it as absent would mis-classify it, but its hash cannot be
-/// compared.
+/// or whose `NarHash` does not decode, is recorded as found with no
+/// usable hash: the path demonstrably exists upstream, so treating it as
+/// absent would mis-classify it, but its hash cannot be compared.
 async fn fetch_one_fact(
     client: &NixCacheClient,
     path: &str,
@@ -411,21 +374,21 @@ async fn fetch_one_fact(
     Ok(match text {
         None => NarinfoFact {
             found: false,
-            nar_hash_hex: None,
+            nar_hash: None,
             nar_size: None,
         },
         Some(text) => match NarInfo::parse(&text) {
             Ok(ni) => {
-                let nar_hash_hex = match narhash_to_hex(&ni.nar_hash) {
-                    Ok(hex) => Some(hex),
+                let nar_hash = match crate::narhash::NarHash::parse(&ni.nar_hash) {
+                    Ok(hash) => Some(hash),
                     Err(e) => {
-                        tracing::warn!(path, error = %e, "narinfo NarHash unusable; recorded as found without a hash");
+                        tracing::warn!(path, error = %format!("{e:#}"), "narinfo NarHash unusable; recorded as found without a hash");
                         None
                     }
                 };
                 NarinfoFact {
                     found: true,
-                    nar_hash_hex,
+                    nar_hash,
                     nar_size: Some(ni.nar_size),
                 }
             }
@@ -433,7 +396,7 @@ async fn fetch_one_fact(
                 tracing::warn!(path, error = %e, "malformed narinfo treated as found (hash unusable)");
                 NarinfoFact {
                     found: true,
-                    nar_hash_hex: None,
+                    nar_hash: None,
                     nar_size: None,
                 }
             }
@@ -510,40 +473,6 @@ mod tests {
             "https://cache.nixos.org/10s5j3mfdg22k1597x580qrhprnzcjwb.narinfo"
         );
         assert!(c.narinfo_url("not-a-store-path").is_err());
-    }
-
-    #[test]
-    fn narhash_base32_to_hex_roundtrip() {
-        // Use a known digest (sha256 of "hello") and rio-nix's own
-        // encoder to build the cache.nixos.org-style NarHash, then
-        // assert the conversion recovers the hex form.
-        let digest =
-            hex::decode("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
-                .unwrap();
-        let b32 = rio_nix::store_path::nixbase32::encode(&digest);
-        let narhash = format!("sha256:{b32}");
-        assert_eq!(
-            narhash_to_hex(&narhash).unwrap(),
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-        );
-        // Independent known-value pair (not via rio-nix): the base32
-        // form below is `nix-hash --type sha256 --to-base32` of the
-        // same digest, so an encoder/decoder bug that cancels out in
-        // the roundtrip above would still be caught here.
-        assert_eq!(
-            narhash_to_hex("sha256:094qif9n4cq4fdg459qzbhg1c6wywawwaaivx0k0x8xhbyx4vwic").unwrap(),
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-        );
-        // Already-hex form is normalized (rio-store stores hex).
-        assert_eq!(
-            narhash_to_hex(
-                "sha256:2CF24DBA5FB0A30E26E83B2AC5B9E29E1B161E5C1FA7425E73043362938B9824"
-            )
-            .unwrap(),
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-        );
-        assert!(narhash_to_hex("sha256:short").is_err());
-        assert!(narhash_to_hex("md5:abcd").is_err());
     }
 
     #[test]
@@ -777,10 +706,10 @@ NarSize: 4242
         let hello = &facts[HELLO_PATH];
         assert!(hello.found);
         assert_eq!(hello.nar_size, Some(226504));
-        assert!(hello.nar_hash_hex.is_some());
+        assert!(hello.nar_hash.is_some());
         let gone = &facts[&absent];
         assert!(!gone.found);
-        assert!(gone.nar_hash_hex.is_none());
+        assert!(gone.nar_hash.is_none());
     }
 
     #[tokio::test]
@@ -794,7 +723,7 @@ NarSize: 4242
         let fact = &facts[&unusable];
         assert!(fact.found, "the cache served a narinfo, so the path exists");
         assert!(
-            fact.nar_hash_hex.is_none(),
+            fact.nar_hash.is_none(),
             "an md5 NarHash cannot be converted to a hex sha256"
         );
         assert_eq!(fact.nar_size, Some(4242), "NarSize is still usable");
@@ -814,7 +743,7 @@ NarSize: 4242
             .unwrap();
         let fact = &facts[&garbled];
         assert!(fact.found, "a 200 body counts as present upstream");
-        assert!(fact.nar_hash_hex.is_none(), "no parseable NarHash");
+        assert!(fact.nar_hash.is_none(), "no parseable NarHash");
         assert!(fact.nar_size.is_none(), "no parseable NarSize");
     }
 

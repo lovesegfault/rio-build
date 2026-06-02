@@ -598,9 +598,13 @@ mod tests {
             .outputs["out"]
             .clone();
         let mut store = FakeStoreApi::default();
-        store
-            .valid
-            .insert(app_a_out.clone(), ("ab".repeat(32), 123));
+        store.valid.insert(
+            app_a_out.clone(),
+            (
+                crate::narhash::NarHash::parse(&"ab".repeat(32)).unwrap(),
+                123,
+            ),
+        );
 
         let spec = leaf_spec();
         let result = run_plan(&spec, &archive, &store, false).await.unwrap();

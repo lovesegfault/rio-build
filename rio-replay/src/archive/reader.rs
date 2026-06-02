@@ -628,8 +628,9 @@ impl ReplayArchive {
         // cannot happen if open succeeded.
         match self.narinfo(store_path) {
             Some(narinfo) => {
-                let sidecar_hex = crate::nixcache::narhash_to_hex(&narinfo.nar_hash)
-                    .with_context(|| format!("narinfo sidecar for {store_path}"))?;
+                let sidecar_hex = crate::narhash::NarHash::parse(&narinfo.nar_hash)
+                    .with_context(|| format!("narinfo sidecar for {store_path}"))?
+                    .to_hex();
                 let nar_hex = identity::sha256_hex(&nar);
                 ensure!(
                     nar_hex == sidecar_hex && nar.len() as u64 == narinfo.nar_size,
@@ -1299,7 +1300,9 @@ mod tests {
         assert_eq!(nar.len() as u64, sidecar.nar_size);
         assert_eq!(
             identity::sha256_hex(&nar),
-            crate::nixcache::narhash_to_hex(&sidecar.nar_hash).unwrap()
+            crate::narhash::NarHash::parse(&sidecar.nar_hash)
+                .unwrap()
+                .to_hex()
         );
 
         // The URL-less c111… sidecar is accepted via the URL-synthesis
@@ -1326,7 +1329,9 @@ mod tests {
         assert_eq!(nar.len() as u64, sidecar.nar_size);
         assert_eq!(
             identity::sha256_hex(&nar),
-            crate::nixcache::narhash_to_hex(&sidecar.nar_hash).unwrap()
+            crate::narhash::NarHash::parse(&sidecar.nar_hash)
+                .unwrap()
+                .to_hex()
         );
     }
 

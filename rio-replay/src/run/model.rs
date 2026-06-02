@@ -388,11 +388,16 @@ pub struct Durations {
 }
 
 /// One rio-built output path with its NAR identity (when collected).
+///
+/// `nar_hash` is typed: it serializes to results.jsonl as bare lowercase
+/// hex (the form rio-store reports) and reloads through
+/// [`crate::narhash::NarHash::parse`], so older records in any spelling
+/// keep loading.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RioOutput {
     pub path: String,
-    pub nar_hash: Option<String>,
+    pub nar_hash: Option<crate::narhash::NarHash>,
     pub nar_size: Option<u64>,
 }
 
@@ -427,11 +432,17 @@ pub struct RioSide {
 /// Expected NAR identity of one output, taken from the archive's recorded
 /// truth. `narinfo_present` is false when the recorder captured no hash for
 /// the output — the output is then merely not comparable.
+///
+/// `nar_hash` carries the typed digest straight from the archive record
+/// (no re-parse between truth loading and comparison); it serializes as
+/// bare lowercase hex and reloads through
+/// [`crate::narhash::NarHash::parse`], so older records in any spelling
+/// keep loading.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ExpectedOutput {
     pub narinfo_present: bool,
-    pub nar_hash: Option<String>,
+    pub nar_hash: Option<crate::narhash::NarHash>,
     pub nar_size: Option<u64>,
 }
 

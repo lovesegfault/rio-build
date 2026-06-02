@@ -442,7 +442,7 @@ pub(crate) fn write_mini_archive(dir: &std::path::Path) -> MiniArchive {
                 outputs: BTreeMap::from([(
                     "out".to_string(),
                     OutputHash {
-                        nar_hash_hex: "ab".repeat(32),
+                        nar_hash: crate::narhash::NarHash::parse(&"ab".repeat(32)).unwrap(),
                         nar_size: 226_504,
                     },
                 )]),

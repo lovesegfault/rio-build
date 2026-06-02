@@ -192,14 +192,17 @@ pub fn classify(expected: &ExpectedOutcome, rio: &RioOutcome, flags: &AuxFlags) 
     }
 }
 
-/// Per-output NAR comparison input.
-#[derive(Debug, Clone, Default)]
+/// Per-output NAR comparison input. Both sides are typed digests
+/// ([`crate::narhash::NarHash`]): spelling questions are settled at the
+/// boundaries that parsed them (archive load for the expected side, the
+/// store query for rio's), so the comparator can never receive a value it
+/// cannot decode.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct OutputHashes {
-    /// rio nar_hash as lowercase hex (raw SHA-256), when the path is valid.
-    pub rio_hex: Option<String>,
-    /// Expected NarHash from the archive's recorded truth (e.g.
-    /// `sha256:<nixbase32>`), when present.
-    pub expected_narhash: Option<String>,
+    /// rio-store's NAR digest for the path, when the path is valid.
+    pub rio: Option<crate::narhash::NarHash>,
+    /// Expected NAR digest from the archive's recorded truth, when present.
+    pub expected: Option<crate::narhash::NarHash>,
 }
 
 /// Per-output NAR comparison verdict strings (the `narCompare` values in
@@ -208,32 +211,15 @@ pub const NAR_EQUAL: &str = "equal";
 pub const NAR_DIFFERS: &str = "differs";
 pub const NAR_NOT_COMPARABLE: &str = "not-comparable";
 
-/// Compare one output: comparable iff both sides have a hash; equality is on
-/// the raw SHA-256 digest (the recorded NarHash is nixbase32, rio's is hex).
-/// Anything that cannot be compared meaningfully — an expected hash that is
-/// not SHA-256, or a rio value that is not 64 lowercase hex characters — is
-/// `not-comparable` rather than a false `differs`.
+/// Compare one output: comparable iff both sides carry a digest; equality
+/// is digest-to-digest. A side with no digest (path not valid in rio-store,
+/// or no recorded hash for the output) is `not-comparable`, never a false
+/// `differs`.
 pub fn compare_output(h: &OutputHashes) -> &'static str {
-    let (Some(rio_hex), Some(expected)) = (&h.rio_hex, &h.expected_narhash) else {
-        return NAR_NOT_COMPARABLE;
-    };
-    let Ok(parsed) = rio_nix::hash::NixHash::parse(expected) else {
-        return NAR_NOT_COMPARABLE;
-    };
-    if parsed.algo() != rio_nix::hash::HashAlgo::SHA256 {
-        return NAR_NOT_COMPARABLE;
-    }
-    if rio_hex.len() != 64
-        || !rio_hex
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return NAR_NOT_COMPARABLE;
-    }
-    if parsed.to_hex().eq_ignore_ascii_case(rio_hex) {
-        NAR_EQUAL
-    } else {
-        NAR_DIFFERS
+    match (h.rio, h.expected) {
+        (Some(rio), Some(expected)) if rio == expected => NAR_EQUAL,
+        (Some(_), Some(_)) => NAR_DIFFERS,
+        _ => NAR_NOT_COMPARABLE,
     }
 }
 
@@ -677,34 +663,45 @@ mod tests {
 
     #[test]
     fn nar_comparison_and_verdicts() {
-        // The recorded NarHash is nixbase32; rio stores raw bytes (hex here).
-        // Build a matching pair via rio-nix to avoid hand-encoding base32.
+        // The two sides arrive as typed digests, whatever spelling they were
+        // recorded in: the expected side here parses from the nixbase32
+        // colon form, the bare-hex production form, and SRI; rio's side is
+        // the raw digest. All comparisons are digest-to-digest.
         let digest = [7u8; 32];
+        let rio = crate::narhash::NarHash::from_digest(digest);
         let nix_hash =
             rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, digest.to_vec()).unwrap();
-        let equal = compare_output(&OutputHashes {
-            rio_hex: Some(hex::encode(digest)),
-            expected_narhash: Some(nix_hash.to_colon()),
-        });
-        assert_eq!(equal, NAR_EQUAL);
+        for spelling in [nix_hash.to_colon(), hex::encode(digest), nix_hash.to_sri()] {
+            let expected = crate::narhash::NarHash::parse(&spelling).unwrap();
+            assert_eq!(
+                compare_output(&OutputHashes {
+                    rio: Some(rio),
+                    expected: Some(expected),
+                }),
+                NAR_EQUAL,
+                "spelling {spelling:?}"
+            );
+        }
         let differs = compare_output(&OutputHashes {
-            rio_hex: Some(hex::encode([8u8; 32])),
-            expected_narhash: Some(nix_hash.to_colon()),
+            rio: Some(crate::narhash::NarHash::from_digest([8u8; 32])),
+            expected: Some(crate::narhash::NarHash::parse(&nix_hash.to_colon()).unwrap()),
         });
         assert_eq!(differs, NAR_DIFFERS);
+        // A side with no digest is not comparable, never a false differs.
         assert_eq!(
             compare_output(&OutputHashes {
-                rio_hex: None,
-                expected_narhash: Some(nix_hash.to_colon())
+                rio: None,
+                expected: Some(rio),
             }),
             NAR_NOT_COMPARABLE
         );
-        // SRI form is also accepted (NixHash::parse handles both).
-        let sri = compare_output(&OutputHashes {
-            rio_hex: Some(hex::encode(digest)),
-            expected_narhash: Some(nix_hash.to_sri()),
-        });
-        assert_eq!(sri, NAR_EQUAL);
+        assert_eq!(
+            compare_output(&OutputHashes {
+                rio: Some(rio),
+                expected: None,
+            }),
+            NAR_NOT_COMPARABLE
+        );
 
         let mut outs = BTreeMap::new();
         outs.insert("out".to_string(), NAR_EQUAL);
@@ -721,53 +718,6 @@ mod tests {
             .map(|(k, v)| (k.clone(), (*v).to_string()))
             .collect();
         assert_eq!(job_nar_verdict(&owned), NAR_DIFFERS);
-    }
-
-    /// A hash pair the engine cannot meaningfully compare must come out
-    /// `not-comparable`, never a false `differs`.
-    #[test]
-    fn nar_comparison_guards_against_unusable_hashes() {
-        // 0xab digests so the hex form contains letters (the uppercase case
-        // below must actually differ from the lowercase form).
-        let digest = [0xab_u8; 32];
-        let rio_hex = hex::encode(digest);
-        // Upstream NarHash with a non-SHA-256 algorithm.
-        let sha512 =
-            rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA512, vec![7u8; 64]).unwrap();
-        assert_eq!(
-            compare_output(&OutputHashes {
-                rio_hex: Some(rio_hex.clone()),
-                expected_narhash: Some(sha512.to_colon()),
-            }),
-            NAR_NOT_COMPARABLE
-        );
-        // Rio-side value that is not a 64-char lowercase hex digest: wrong
-        // length, non-hex characters, or uppercase hex.
-        let sha256 = rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, digest.to_vec())
-            .unwrap()
-            .to_colon();
-        for bad in [
-            "0badc0ffee".to_string(),
-            format!("{}zz", &rio_hex[..62]),
-            rio_hex.to_ascii_uppercase(),
-        ] {
-            assert_eq!(
-                compare_output(&OutputHashes {
-                    rio_hex: Some(bad.clone()),
-                    expected_narhash: Some(sha256.clone()),
-                }),
-                NAR_NOT_COMPARABLE,
-                "rio_hex={bad}"
-            );
-        }
-        // The well-formed pair still compares equal.
-        assert_eq!(
-            compare_output(&OutputHashes {
-                rio_hex: Some(rio_hex),
-                expected_narhash: Some(sha256),
-            }),
-            NAR_EQUAL
-        );
     }
 
     /// The headline numerator/denominator are an explicit verdict list, so

@@ -279,7 +279,9 @@ pub fn expected_outcomes_for_units(
         // The timeless engine treats the whole archive as one session-less
         // workload, so the probe session is 0; the reader falls back to the
         // session-less record, which is the form session-less recorders
-        // write for every unit.
+        // write for every unit. This lookup is the one place where archive
+        // record identity (session, drv) is resolved onto engine units —
+        // any richer typed session identity belongs at exactly this seam.
         let entry = match archive.expected_outcome(0, &unit.drv_path) {
             None => unknown_truth(unit),
             Some(record) => UnitTruth {
@@ -290,11 +292,15 @@ pub fn expected_outcomes_for_units(
                         .outputs
                         .keys()
                         .map(|name| {
+                            // The typed digest is carried straight through
+                            // (no re-encode/re-parse): the comparator
+                            // receives exactly what the archive record
+                            // decoded to.
                             let output = record.outputs.get(name).map_or_else(
                                 ExpectedOutput::default,
                                 |hash| ExpectedOutput {
                                     narinfo_present: true,
-                                    nar_hash: Some(hash.nar_hash_hex.clone()),
+                                    nar_hash: Some(hash.nar_hash),
                                     nar_size: Some(hash.nar_size),
                                 },
                             );
@@ -501,10 +507,14 @@ mod tests {
 
         let app_a = &truth["appA.x86_64-linux"];
         assert_eq!(app_a.outcome, ExpectedOutcome::Built);
-        // per-output expected NAR identity carried into ExpectedSide
+        // per-output expected NAR identity carried into ExpectedSide: the
+        // typed digest matches the archive record's hex value exactly.
         let out = app_a.side.outputs.get("out").unwrap();
         assert!(out.narinfo_present);
-        assert!(out.nar_hash.as_deref().unwrap().len() == 64);
+        assert_eq!(
+            out.nar_hash,
+            Some(crate::narhash::NarHash::parse(&"ab".repeat(32)).unwrap())
+        );
         assert!(out.nar_size.is_some());
 
         // A built record may carry hashes for only some outputs or none at
@@ -524,5 +534,50 @@ mod tests {
         assert_eq!(kvm.outcome, ExpectedOutcome::Unknown);
         assert!(!kvm.side.outputs["out"].narinfo_present);
         assert!(kvm.side.outputs["out"].nar_hash.is_none());
+    }
+
+    /// Archive-sourced truth must reach a real comparison: the expected
+    /// hash loaded from the archive's `outcomes.jsonl` (production wire
+    /// form, bare hex), fed through the comparator against rio's digest,
+    /// yields equal/differs — and a differing match-built is projected to
+    /// output-divergence. This pins the producer→comparator path end to
+    /// end, so the comparator can never again expect a spelling production
+    /// truth does not supply.
+    #[test]
+    fn archive_truth_is_comparable_and_divergence_is_reachable() {
+        use crate::run::classify::{
+            NAR_DIFFERS, NAR_EQUAL, OutputHashes, compare_output, project_output_divergence,
+        };
+        use crate::run::model::Verdict;
+
+        let tmp = tempfile::tempdir().unwrap();
+        crate::run::archive_input::write_mini_archive(tmp.path());
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let units = crate::run::archive_input::load_units(&archive).unwrap();
+        let truth = expected_outcomes_for_units(&archive, &units).unwrap();
+        let expected = truth["appA.x86_64-linux"].side.outputs["out"]
+            .nar_hash
+            .expect("appA carries a recorded output hash");
+
+        // rio rebuilt the path bit-identically: equal.
+        assert_eq!(
+            compare_output(&OutputHashes {
+                rio: Some(expected),
+                expected: Some(expected),
+            }),
+            NAR_EQUAL
+        );
+        // rio produced different bytes: differs, and the verdict projection
+        // promotes the match-built to output-divergence.
+        let differing = crate::narhash::NarHash::from_digest([0x5au8; 32]);
+        let nar_verdict = compare_output(&OutputHashes {
+            rio: Some(differing),
+            expected: Some(expected),
+        });
+        assert_eq!(nar_verdict, NAR_DIFFERS);
+        assert_eq!(
+            project_output_divergence(Verdict::MatchBuilt, nar_verdict),
+            Verdict::OutputDivergence,
+        );
     }
 }

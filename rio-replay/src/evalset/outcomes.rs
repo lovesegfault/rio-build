@@ -70,22 +70,16 @@ pub fn expected_outcome_for_unit(
 
     // Per-output NAR identity travels only on `built` records (that is what
     // the archive's `output_hashes` capability asserts). An entry needs both
-    // the hex NarHash and the NarSize; a found-but-unusable narinfo yields
+    // the NarHash and the NarSize; a found-but-unusable narinfo yields
     // neither an entry nor a downgrade of the outcome.
     let output_hashes: BTreeMap<String, OutputHash> = if outcome == ExpectedOutcome::Built {
         outputs
             .iter()
             .filter_map(|(name, path)| {
                 let fact = facts.get(path)?;
-                let nar_hash_hex = fact.nar_hash_hex.clone()?;
+                let nar_hash = fact.nar_hash?;
                 let nar_size = fact.nar_size?;
-                Some((
-                    name.clone(),
-                    OutputHash {
-                        nar_hash_hex,
-                        nar_size,
-                    },
-                ))
+                Some((name.clone(), OutputHash { nar_hash, nar_size }))
             })
             .collect()
     } else {
@@ -113,7 +107,7 @@ mod tests {
     fn fact(found: bool, hash: Option<&str>, size: Option<u64>) -> NarinfoFact {
         NarinfoFact {
             found,
-            nar_hash_hex: hash.map(String::from),
+            nar_hash: hash.map(|h| crate::narhash::NarHash::parse(h).unwrap()),
             nar_size: size,
         }
     }
@@ -190,7 +184,7 @@ mod tests {
         assert!(rec.outputs.is_empty());
         // A found-but-unusable hash keeps the outcome built but omits that output's hash entry.
         facts.get_mut(&outputs["dev"]).unwrap().found = true;
-        facts.get_mut(&outputs["dev"]).unwrap().nar_hash_hex = None;
+        facts.get_mut(&outputs["dev"]).unwrap().nar_hash = None;
         let rec = expected_outcome_for_unit(
             "/nix/store/dddddddddddddddddddddddddddddddd-x-1.0.drv",
             &outputs,
@@ -229,7 +223,7 @@ mod tests {
         assert_eq!(rec.outcome.as_str(), "built");
         assert!(rec.detail.is_none());
         assert_eq!(rec.outputs.len(), 1);
-        assert_eq!(rec.outputs["out"].nar_hash_hex, "cc".repeat(32));
+        assert_eq!(rec.outputs["out"].nar_hash.to_hex(), "cc".repeat(32));
         assert_eq!(rec.outputs["out"].nar_size, 11);
         // Recorder-written records are timeless and session-less.
         assert_eq!(rec.drv, drv);

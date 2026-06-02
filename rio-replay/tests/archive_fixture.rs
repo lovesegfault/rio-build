@@ -157,7 +157,7 @@ fn generate_v1_basic(root: &Path) -> FinalizedArchive {
                 outputs: BTreeMap::from([(
                     "out".to_string(),
                     OutputHash {
-                        nar_hash_hex: "1".repeat(64),
+                        nar_hash: rio_replay::narhash::NarHash::parse(&"1".repeat(64)).unwrap(),
                         nar_size: 120,
                     },
                 )]),

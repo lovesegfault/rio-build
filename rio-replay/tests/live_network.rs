@@ -9,7 +9,8 @@
 //! cache.nixos.org request total.
 
 use rio_replay::hydra::HydraClient;
-use rio_replay::nixcache::{NixCacheClient, narhash_to_hex};
+use rio_replay::narhash::NarHash;
+use rio_replay::nixcache::NixCacheClient;
 
 const EVAL_ID: u64 = 1824219;
 
@@ -75,7 +76,9 @@ async fn live_cache_narinfo_for_a_known_hydra_output() {
         .expect("HTTP ok")
         .expect("hello narinfo present upstream");
     assert!(info.nar_hash.starts_with("sha256:"));
-    let hexhash = narhash_to_hex(&info.nar_hash).expect("convertible");
+    let hexhash = NarHash::parse(&info.nar_hash)
+        .expect("convertible")
+        .to_hex();
     assert_eq!(hexhash.len(), 64);
     assert!(info.nar_size > 0);
 }

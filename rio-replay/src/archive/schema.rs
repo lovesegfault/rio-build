@@ -232,8 +232,14 @@ pub struct OutcomeRecord {
 /// Expected NAR identity of one output of a `built` outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputHash {
-    /// Lowercase hex SHA-256 of the uncompressed NAR.
-    pub nar_hash_hex: String,
+    /// SHA-256 of the uncompressed NAR. The wire field is `nar_hash_hex` and
+    /// writers emit lowercase hex per the format specification; loading goes
+    /// through [`crate::narhash::NarHash`], so any spelling a recorder
+    /// legitimately produces (hex, `sha256:` nixbase32/hex, SRI) decodes to
+    /// the same digest, and a value no spelling explains is a loud parse
+    /// error at archive open instead of a silently incomparable record.
+    #[serde(rename = "nar_hash_hex")]
+    pub nar_hash: crate::narhash::NarHash,
     pub nar_size: u64,
 }
 

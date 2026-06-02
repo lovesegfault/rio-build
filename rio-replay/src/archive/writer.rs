@@ -402,8 +402,9 @@ impl ArchiveWriter {
             let nar_size = rio_nix::nar::dump_path_streaming(tree, &mut hasher)
                 .with_context(|| format!("NAR-serialize {}", tree.display()))?;
             let nar_sha256 = hasher.finish();
-            let sidecar_hex = crate::nixcache::narhash_to_hex(&narinfo.nar_hash)
-                .with_context(|| format!("narinfo sidecar for {store_path}"))?;
+            let sidecar_hex = crate::narhash::NarHash::parse(&narinfo.nar_hash)
+                .with_context(|| format!("narinfo sidecar for {store_path}"))?
+                .to_hex();
             anyhow::ensure!(
                 nar_sha256 == sidecar_hex && nar_size == narinfo.nar_size,
                 "narinfo sidecar for {store_path} disagrees with the embedded tree \
@@ -807,7 +808,7 @@ pub(crate) mod test_support {
                     outputs: BTreeMap::from([(
                         "out".to_string(),
                         OutputHash {
-                            nar_hash_hex: "1".repeat(64),
+                            nar_hash: crate::narhash::NarHash::parse(&"1".repeat(64)).unwrap(),
                             nar_size: 120,
                         },
                     )]),
