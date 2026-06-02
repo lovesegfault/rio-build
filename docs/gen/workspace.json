@@ -172,7 +172,9 @@
         "rio-proto"
       ],
       "optional": [],
-      "dev": []
+      "dev": [
+        "rio-test-support"
+      ]
     },
     "rio-scheduler": {
       "prod": [

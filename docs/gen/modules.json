@@ -903,6 +903,11 @@
       "doc": "rio-replay binary entry point."
     },
     {
+      "path": "narhash.rs",
+      "depth": 0,
+      "doc": "The boundary type for NAR content identity."
+    },
+    {
       "path": "nixcache.rs",
       "depth": 0,
       "doc": "cache.nixos.org narinfo client (mass per-path ground truth; Fastly"

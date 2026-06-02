@@ -1454,6 +1454,11 @@
       "doc": ""
     },
     {
+      "name": "CallError",
+      "crate": "rio-replay",
+      "doc": "Failure of one attempt inside `GrpcAdminApi::with_retry`. `Rpc` is the plain tonic outcome: UNAVAILABLE is retried (standby replica, failover window), everything else is terminal. `Fatal` opts a failure OUT of retry even when the underlying status is UNAVAILABLE — `log_tail` uses it for a stream that breaks after data already flowed, where a retry would restart the log from line 0 and splice two reads together (see `collect_log_tail`)."
+    },
+    {
       "name": "SupplyTransportError",
       "crate": "rio-replay",
       "doc": "Errors the upload arms distinguish: a daemon refusal (retry once on a fresh channel, then mark refused) vs. everything else (failed)."
