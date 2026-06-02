@@ -8,9 +8,25 @@
 //! deletes what is listed rather than a fixed object set behind a marker
 //! precondition, the resolve step tolerates a missing `complete.json`: an
 //! interrupted delete is re-runnable, and the marker-less leftovers of an
-//! interrupted publish (which `list`/`launch` hide and the write-once
-//! publisher refuses to overwrite) are deletable. Every interrupted state
-//! converges on an empty prefix.
+//! interrupted publish (which the write-once publisher refuses to
+//! overwrite) are deletable.
+//!
+//! Concurrency is handled at both human gates and at the sweep itself.
+//! The operator confirms against a listing that is re-resolved after the
+//! prompt: an unbounded confirmation pause cannot act on a stale
+//! snapshot — any drift in the key set refuses and asks for a re-run.
+//! The sweep then re-lists and repeats until the prefix lists empty, so
+//! objects landing mid-sweep — a publisher of the same archive id racing
+//! this delete; the confirmed intent "this archive id must not exist"
+//! covers whatever it writes — are removed on a later pass, and the
+//! terminal empty LIST is the convergence proof: the command succeeds
+//! only after observing the prefix empty. What it cannot exclude (S3 has
+//! no cross-key transactions) is a racing publisher's marker landing
+//! after that final LIST, its data objects already swept: that leaves a
+//! marker-only prefix, visible in `replay list` and removed by re-running
+//! this command. Every interrupted state converges on an empty prefix —
+//! within one run for everything the sweep can observe, across a re-run
+//! for a marker that slips into that milliseconds-wide window.
 //!
 //! The recorder's by-recipe idempotency pointer is removed only when it
 //! still points at the deleted archive — pointers are last-writer-wins,
@@ -63,6 +79,105 @@ fn pointer_owned_by(pointer_json: &str, short_id: &str) -> bool {
 fn sweep_order(mut keys: Vec<String>, complete_key: &str) -> Vec<String> {
     keys.sort_by(|a, b| (a != complete_key, a).cmp(&(b != complete_key, b)));
     keys
+}
+
+/// Cap on LIST→sweep passes. A pass beyond the first only happens when a
+/// publisher landed objects mid-sweep; one publish adds at most three, so
+/// repeated non-empty re-lists mean an active stream of publishers this
+/// command should not fight silently.
+const MAX_SWEEP_PASSES: usize = 5;
+
+/// The two S3 operations the converging sweep performs, factored out so
+/// the LIST→sweep loop is unit-testable against a scripted prefix.
+trait SweepOps {
+    /// List every key currently under the archive prefix.
+    async fn list(&mut self) -> Result<Vec<String>>;
+    /// Delete one key (idempotent — S3 DeleteObject tolerates absence).
+    async fn delete(&mut self, key: &str) -> Result<()>;
+}
+
+/// The real prefix: [`s3::list_keys`] + per-object [`ui::step`] deletes.
+struct PrefixSweep<'a> {
+    region: &'a str,
+    bucket: &'a str,
+    prefix: &'a str,
+}
+
+impl SweepOps for PrefixSweep<'_> {
+    async fn list(&mut self) -> Result<Vec<String>> {
+        s3::list_keys(self.region, self.bucket, &format!("{}/", self.prefix)).await
+    }
+
+    async fn delete(&mut self, key: &str) -> Result<()> {
+        let object = object_name(key, self.prefix).to_string();
+        ui::step(&format!("delete {object}"), || {
+            s3::delete_object(self.region, self.bucket, key)
+        })
+        .await
+    }
+}
+
+/// Sweep `initial` (the keys the operator confirmed), then re-list and
+/// sweep again until the prefix lists empty — a marker or data object
+/// landing mid-sweep (a publisher of the same archive id racing this
+/// delete) is removed on the next pass instead of being silently left
+/// behind a "successful" delete. The terminal empty LIST is the
+/// convergence proof. Returns the number of passes taken; errors out
+/// after [`MAX_SWEEP_PASSES`] non-empty re-lists rather than fighting an
+/// active publisher stream forever.
+async fn sweep_until_empty(
+    ops: &mut impl SweepOps,
+    complete_key: &str,
+    initial: Vec<String>,
+) -> Result<usize> {
+    let mut keys = initial;
+    for pass in 1..=MAX_SWEEP_PASSES {
+        for key in sweep_order(keys, complete_key) {
+            ops.delete(&key).await?;
+        }
+        keys = ops.list().await?;
+        if keys.is_empty() {
+            return Ok(pass);
+        }
+        tracing::info!(
+            "prefix still lists {} object(s) after sweep pass {pass} — a publisher landed them \
+             mid-sweep; sweeping again",
+            keys.len()
+        );
+    }
+    anyhow::bail!(
+        "the prefix still lists objects after {MAX_SWEEP_PASSES} sweep passes — a publisher is \
+         actively writing to it; wait for the publish to finish (or fail against the write-once \
+         conditionals), then re-run the delete"
+    )
+}
+
+/// The refusal raised when the prefix's key set changed between the
+/// operator's confirmation and the sweep: what would be deleted is no
+/// longer what was shown. `None` when the sets are identical (both sides
+/// come from [`s3::list_keys`], which sorts). Pure for testability.
+fn confirmation_drift(confirmed: &[String], fresh: &[String]) -> Option<String> {
+    if confirmed == fresh {
+        return None;
+    }
+    let added: Vec<&str> = fresh
+        .iter()
+        .filter(|key| !confirmed.contains(key))
+        .map(String::as_str)
+        .collect();
+    let removed: Vec<&str> = confirmed
+        .iter()
+        .filter(|key| !fresh.contains(key))
+        .map(String::as_str)
+        .collect();
+    let mut drift = Vec::new();
+    if !added.is_empty() {
+        drift.push(format!("appeared: {}", added.join(", ")));
+    }
+    if !removed.is_empty() {
+        drift.push(format!("vanished: {}", removed.join(", ")));
+    }
+    Some(drift.join("; "))
 }
 
 /// The object name of one swept key, relative to the archive prefix (for
@@ -189,20 +304,32 @@ pub async fn run(a: DeleteArgs) -> Result<()> {
         );
     }
 
+    // -- Re-resolve after the human gate --------------------------------------
+    // The confirmation pause is unbounded; act only on the key set the
+    // operator actually saw. Any drift — a publish completing into the
+    // prefix, another delete racing this one — refuses, so what gets
+    // swept first is always what was confirmed.
+    let fresh = s3::list_keys(&region, &bucket, &format!("{prefix}/")).await?;
+    if let Some(drift) = confirmation_drift(&keys, &fresh) {
+        anyhow::bail!(
+            "the prefix changed while awaiting confirmation ({drift}) — re-run \
+             `cargo xtask replay delete {}` to see and confirm the current state",
+            a.short_id
+        );
+    }
+
     // -- Delete the archive objects ------------------------------------------
     // complete.json strictly first: its removal atomically unpublishes the
     // prefix (list/launch candidacy and the publisher's write-once probe
     // all key on it), so no consumer can resolve a half-deleted archive.
-    // The data objects follow. Each delete is idempotent and a re-run
-    // sweeps whatever is still listed, so every interrupted state
-    // converges.
-    for key in sweep_order(keys, &complete_key) {
-        let object = object_name(&key, &prefix).to_string();
-        ui::step(&format!("delete {object}"), || {
-            s3::delete_object(&region, &bucket, &key)
-        })
-        .await?;
-    }
+    // The data objects follow, then the prefix is re-listed and swept
+    // until it lists empty — convergence is observed, not assumed.
+    let mut sweep = PrefixSweep {
+        region: &region,
+        bucket: &bucket,
+        prefix: &prefix,
+    };
+    sweep_until_empty(&mut sweep, &complete_key, fresh).await?;
 
     // -- By-recipe pointer -----------------------------------------------------
     // Only recorder archives have one (recipe digest in the provenance),
@@ -299,6 +426,121 @@ mod tests {
         // to the prefix.
         assert_eq!(object_name(&complete_key, prefix), ARCHIVE_COMPLETE_OBJECT);
         assert_eq!(object_name("unrelated/key", prefix), "unrelated/key");
+    }
+
+    /// A scripted prefix: records deletions, serves the queued LIST
+    /// results in order (empty once the script runs out).
+    struct ScriptedPrefix {
+        lists: std::collections::VecDeque<Vec<String>>,
+        deleted: Vec<String>,
+    }
+
+    impl ScriptedPrefix {
+        fn new(lists: Vec<Vec<String>>) -> Self {
+            Self {
+                lists: lists.into(),
+                deleted: Vec::new(),
+            }
+        }
+    }
+
+    impl SweepOps for ScriptedPrefix {
+        async fn list(&mut self) -> Result<Vec<String>> {
+            Ok(self.lists.pop_front().unwrap_or_default())
+        }
+
+        async fn delete(&mut self, key: &str) -> Result<()> {
+            self.deleted.push(key.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_converges_when_a_marker_lands_mid_sweep() {
+        let prefix = "replay/archives/8b919129046e0f60";
+        let complete_key = format!("{prefix}/{ARCHIVE_COMPLETE_OBJECT}");
+        let image_key = format!("{prefix}/{ARCHIVE_IMAGE_OBJECT}");
+        let manifest_key = format!("{prefix}/{ARCHIVE_MANIFEST_OBJECT}");
+
+        // The confirmed listing was marker-less (an in-flight publish);
+        // while the data objects are being swept, the racing publisher's
+        // marker lands. The first re-list catches it, the second pass
+        // sweeps it, and the terminal LIST proves the prefix empty —
+        // without the loop this delete would have "succeeded" leaving a
+        // marker claiming completeness over nothing.
+        let mut prefix_state = ScriptedPrefix::new(vec![vec![complete_key.clone()], vec![]]);
+        let passes = sweep_until_empty(
+            &mut prefix_state,
+            &complete_key,
+            vec![image_key.clone(), manifest_key.clone()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(passes, 2);
+        assert_eq!(
+            prefix_state.deleted,
+            vec![image_key, manifest_key, complete_key],
+            "the mid-sweep marker is swept on the second pass"
+        );
+        assert!(
+            prefix_state.lists.is_empty(),
+            "the sweep observed the terminal empty LIST"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_refuses_an_actively_refilling_prefix() {
+        let prefix = "replay/archives/8b919129046e0f60";
+        let complete_key = format!("{prefix}/{ARCHIVE_COMPLETE_OBJECT}");
+        let image_key = format!("{prefix}/{ARCHIVE_IMAGE_OBJECT}");
+
+        // Every re-list finds new objects: an active publisher stream.
+        // The sweep must give up loudly after the pass cap instead of
+        // fighting forever (or declaring success while objects remain).
+        let mut prefix_state = ScriptedPrefix::new(vec![vec![image_key.clone()]; MAX_SWEEP_PASSES]);
+        let err = sweep_until_empty(&mut prefix_state, &complete_key, vec![image_key])
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("actively writing"),
+            "the refusal names the racing publisher: {message}"
+        );
+        assert!(
+            message.contains("re-run the delete"),
+            "the refusal names the recovery: {message}"
+        );
+        assert_eq!(prefix_state.deleted.len(), MAX_SWEEP_PASSES);
+    }
+
+    #[test]
+    fn confirmation_drift_names_what_changed() {
+        let confirmed = vec![
+            "a/archive.dwarfs".to_string(),
+            "a/manifest.json".to_string(),
+        ];
+
+        // No drift: the confirmed set is exactly what is still there.
+        assert_eq!(confirmation_drift(&confirmed, &confirmed), None);
+
+        // A publish completed into the prefix during the pause: the
+        // marker appeared. The drift message names it so the operator
+        // knows what they would now be deleting.
+        let with_marker = vec![
+            "a/archive.dwarfs".to_string(),
+            "a/complete.json".to_string(),
+            "a/manifest.json".to_string(),
+        ];
+        let drift = confirmation_drift(&confirmed, &with_marker).unwrap();
+        assert!(drift.contains("appeared: a/complete.json"), "{drift}");
+
+        // Another delete raced this one: objects vanished.
+        let emptied: Vec<String> = Vec::new();
+        let drift = confirmation_drift(&confirmed, &emptied).unwrap();
+        assert!(
+            drift.contains("vanished: a/archive.dwarfs, a/manifest.json"),
+            "{drift}"
+        );
     }
 
     #[test]
