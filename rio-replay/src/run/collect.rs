@@ -456,6 +456,12 @@ pub fn timed_interruption_for(
 /// guarantees via the `batch_timeout_hours > active_stall_hours` ordering.
 /// Exhausted bounds terminalize — a deterministic condition can delay a
 /// campaign by its budget, never wedge it.
+///
+/// `log_tail` is third-signal evidence the caller fetched: the TARGET's
+/// log tail for evidence-aged failures (the `needs_log_signal` gate), or
+/// the TRIGGER's log tail for a dependency-failed row whose fixed-output
+/// trigger failed in an earlier batch (cross-batch cascade attribution) —
+/// the two gates are disjoint, so the channel is unambiguous per row.
 pub fn decide(
     ctx: &JobContext,
     target: Option<&PathOutcome>,
@@ -612,6 +618,27 @@ pub fn decide(
         // infra-poisoned or source-rotted dependency cascade out of the
         // headline instead of being charged as rio failures.
         let trigger_signal1 = batch.reasons.get(&trigger).map(String::as_str);
+        // Evidence-channel completeness for the source-rot scan: the
+        // relayed-line capture splits the gateway's multi-line failure
+        // payload, so `batch.reasons[trigger]` is the trigger's
+        // needle-free FIRST line ("builder for '…' failed with exit code
+        // 1;") — the fetch-error signature lives in the lines below it.
+        // The dependent's own in-band message is the channel that carries
+        // the trigger's COMPLETE text: the scheduler formats the cascade
+        // as "dependency '<drv>' failed: <full text>" (embedding the
+        // daemon's last-N-log-lines block), and that is exactly this
+        // arm's `signal1`. For cross-batch cascades — the trigger failed
+        // in an earlier batch, so neither in-band channel carries its
+        // text — the caller fetched the TRIGGER's log tail into
+        // `log_tail`. Both feed the scan channel; classification of the
+        // trigger's reason stays on the relayed line.
+        let scan_evidence = (signal1.is_some() || log_tail.is_some()).then(|| {
+            format!(
+                "{} {}",
+                signal1.unwrap_or_default(),
+                log_tail.unwrap_or_default()
+            )
+        });
         let (kind, evidence) = resolve_failure_kind(
             trigger_signal1,
             poisoned.get(&trigger).map(Vec::as_slice),
@@ -620,7 +647,7 @@ pub fn decide(
             // fixed-output dependency cascades as source rot instead of a
             // genuine dependency failure.
             ctx.fixed_output_drvs.contains(&trigger),
-            None,
+            scan_evidence.as_deref(),
         );
         let root = match kind {
             FailureKind::Infra => RootCauseKind::Infra,
@@ -1131,6 +1158,48 @@ pub async fn process_settled_batch(
             .as_deref()
             .filter(|bytes| !bytes.is_empty())
             .map(lossy_log_text);
+        // Trigger-keyed evidence for fixed-output cascade attribution
+        // (the cross-batch shape): a dependency-failed root whose trigger
+        // failed in an EARLIER batch carries neither the trigger's
+        // relayed reason (this batch's stderr never saw the trigger fail)
+        // nor its full failure text (the dependent's own message wraps a
+        // needle-free poison/DAG fallback). When that trigger is a
+        // fixed-output derivation and no in-band channel already carries
+        // a fetch signature, fetch the TRIGGER's log tail so the
+        // source-rot scan sees the fetcher's own output — without it,
+        // one rotted FOD charges its whole dependent fan-out to the
+        // parity headline as rio regressions. The fetch is keyed by the
+        // trigger and feeds only the scan (via decide's log_tail
+        // channel, unused for dependency-failed rows otherwise); the
+        // dependent's own evidence capture below stays keyed by the
+        // dependent.
+        let trigger_log_text = if target_status == Some(BuildStatus::DependencyFailed) {
+            let signal1 = target
+                .map(|t| t.error_msg.as_str())
+                .filter(|m| !m.is_empty())
+                .or_else(|| batch.reasons.get(&ctx.drv_path).map(String::as_str));
+            let trigger = signal1.map(classify_reason).and_then(|class| match class {
+                ReasonClass::Dependency { failing_drv } => Some(failing_drv),
+                _ => None,
+            });
+            match trigger {
+                Some(trigger)
+                    if ctx.fixed_output_drvs.contains(&trigger)
+                        && !batch.reasons.contains_key(&trigger)
+                        && !signal1.is_some_and(fetch_signature_present) =>
+                {
+                    admin
+                        .log_tail(&trigger, None, knobs.log_tail_bytes)
+                        .await
+                        .ok()
+                        .filter(|bytes| !bytes.is_empty())
+                        .map(|bytes| lossy_log_text(&bytes))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         match decide(
             ctx,
             target,
@@ -1138,7 +1207,9 @@ pub async fn process_settled_batch(
             &poisoned,
             prior,
             knobs,
-            log_signal_text.as_deref(),
+            // At most one is Some: the Signal-3 fetch excludes
+            // dependency-failed rows, the trigger fetch covers only them.
+            log_signal_text.as_deref().or(trigger_log_text.as_deref()),
         ) {
             // decide() never defers or belt-drops — membership decisions
             // are made above, outcome decisions here.
@@ -1373,6 +1444,11 @@ mod tests {
     /// and evidence capture) can be asserted.
     struct LogAdmin {
         log_calls: AtomicUsize,
+        /// Drv paths `log_tail` was asked for, in call order — so tests
+        /// can assert WHICH derivation's evidence was fetched (the
+        /// cascade-attribution fetch must be keyed by the trigger, not
+        /// the dependent).
+        log_drvs: std::sync::Mutex<Vec<String>>,
         poisoned_calls: AtomicUsize,
         tail: Vec<u8>,
         poisoned: Vec<PoisonedView>,
@@ -1382,6 +1458,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 log_calls: AtomicUsize::new(0),
+                log_drvs: std::sync::Mutex::new(Vec::new()),
                 poisoned_calls: AtomicUsize::new(0),
                 tail: b"gcc: fatal error\n".to_vec(),
                 poisoned: Vec::new(),
@@ -1401,8 +1478,9 @@ mod tests {
             }
             Ok(self.poisoned.clone())
         }
-        async fn log_tail(&self, _d: &str, _e: Option<&str>, _m: usize) -> Result<Vec<u8>> {
+        async fn log_tail(&self, d: &str, _e: Option<&str>, _m: usize) -> Result<Vec<u8>> {
             self.log_calls.fetch_add(1, Ordering::SeqCst);
+            self.log_drvs.lock().unwrap().push(d.to_string());
             Ok(self.tail.clone())
         }
         async fn list_builds(&self, _t: &str, _l: u32) -> Result<Vec<(String, Option<String>)>> {
@@ -2197,28 +2275,69 @@ mod tests {
         ));
     }
 
-    /// A failing dependency trigger in the fixed-output set cascades as
-    /// source rot: the dependent is excluded from the headline instead of
-    /// being charged an unexpected dependency failure.
+    /// A failing fixed-output trigger cascades as source rot through the
+    /// evidence channels production actually fills — producer-verbatim
+    /// fixtures, not hand-planted ones:
+    ///
+    /// - The captured relayed reason for the trigger is built by running
+    ///   the engine's own line-split capture (`parse_stderr`) over the
+    ///   gateway's multi-line relay payload ("derivation '<drv>' failed:
+    ///   <full text>" + the rio-cli hint line). That capture keeps only
+    ///   the FIRST line of the failure text — needle-free, asserted as
+    ///   such — so `batch.reasons[trigger]` structurally cannot carry the
+    ///   fetch signature.
+    /// - The dependent's own in-band message is the scheduler's cascade
+    ///   shape ("dependency '<drv>' failed: <full text>", completion.rs),
+    ///   embedding the trigger's complete failure text including the
+    ///   daemon's last-N-log-lines block where the curl error lives.
+    ///
+    /// The cascade arm must classify SourceRot from the dependent's full
+    /// text; with only the first-line relay channel (the pre-fix scan
+    /// input) the needle is invisible and one rotted FOD charges its
+    /// whole dependent fan-out to the headline.
     #[test]
     fn fixed_output_dependency_trigger_cascades_source_rot() {
+        use crate::run::stderrparse::parse_stderr;
         let knobs = Knobs::default();
         let mut c = ctx("app.x86_64-linux", T, &[DEP], ExpectedOutcome::Built);
         c.fixed_output_drvs = std::sync::Arc::new([DEP.to_string()].into_iter().collect());
+
+        // The trigger's full terminal message as the daemon produces it:
+        // builder-failure line, then the embedded last-N-log-lines block
+        // carrying the fetcher's own output.
+        let trigger_full_msg = format!(
+            "builder for '{DEP}' failed with exit code 1;\n\
+             last 10 log lines:\n\
+             > trying https://example.com/dep-1.0.tar.gz\n\
+             > curl: (22) The requested URL returned error: 404\n\
+             For full logs, run 'nix log {DEP}'."
+        );
+        // The gateway relays it as one multi-line stderr payload with the
+        // rio-cli hint appended; the engine's capture splits lines.
+        let relay_payload =
+            format!("derivation '{DEP}' failed: {trigger_full_msg}\n  ↳ rio-cli logs '{DEP}'");
+        let parsed = parse_stderr(&relay_payload);
+        // Producer parity: the captured channel is the needle-free first
+        // line. If this assertion ever fails, the relay capture changed
+        // and the fixture must be re-derived from the new producer.
+        assert_eq!(
+            parsed.reasons[DEP],
+            format!("builder for '{DEP}' failed with exit code 1;")
+        );
+        assert!(
+            !fetch_signature_present(&parsed.reasons[DEP]),
+            "the relayed first line must not carry the fetch signature — \
+             otherwise this test no longer proves the dependent-text channel"
+        );
+
         let batch = BatchView {
-            reasons: BTreeMap::from([(
-                DEP.to_string(),
-                "builder failed: unable to download 'https://example.com/dep.tar.gz'".to_string(),
-            )]),
+            reasons: parsed.reasons,
             ..BatchView::default()
         };
         let target = po(
             T,
             BuildStatus::DependencyFailed,
-            &format!(
-                "dependency '{DEP}' failed: builder failed: unable to download \
-                 'https://example.com/dep.tar.gz'"
-            ),
+            &format!("dependency '{DEP}' failed: {trigger_full_msg}"),
         );
         match decide(
             &c,
@@ -2238,6 +2357,100 @@ mod tests {
             }
             other => panic!("expected a source-rot dependency failure, got {other:?}"),
         }
+    }
+
+    /// Cross-batch cascade attribution: the fixed-output trigger failed in
+    /// an EARLIER batch, so neither in-band channel of THIS batch carries
+    /// its failure text — the dependent's message wraps the scheduler's
+    /// needle-free poison reason, and `batch.reasons` has no entry for the
+    /// trigger. The collector must fetch the TRIGGER's log tail (keyed by
+    /// the trigger drv, not the dependent) and classify the cascade as
+    /// source rot from the fetcher output found there; the record then
+    /// carries the cascaded source-unavailable verdict instead of charging
+    /// the dependent to the headline.
+    #[tokio::test]
+    async fn cross_batch_fixed_output_cascade_fetches_trigger_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+
+        let mut app = ctx("app.x86_64-linux", T, &[DEP], ExpectedOutcome::Built);
+        app.fixed_output_drvs = std::sync::Arc::new([DEP.to_string()].into_iter().collect());
+        let admin = LogAdmin {
+            // The trigger's log: the fetcher's own output (what the
+            // scheduler's log retention still holds for the poisoned
+            // FOD).
+            tail: b"trying https://example.com/dep-1.0.tar.gz\n\
+                    curl: (22) The requested URL returned error: 404\n"
+                .to_vec(),
+            // The trigger's poison row survives with real worker rows —
+            // a 404'd FOD fails on every worker that tries it.
+            poisoned: vec![PoisonedView {
+                drv_path: DEP.to_string(),
+                failed_executors: vec!["b1".into()],
+                poisoned_secs_ago: 60,
+            }],
+            ..LogAdmin::default()
+        };
+        let store = FakeStoreApi::default();
+        let contexts: HashMap<String, JobContext> = [("app.x86_64-linux".to_string(), app)].into();
+        // The dependent's row: merged onto the already-poisoned trigger,
+        // fail-fasted with the scheduler's cascade message wrapping the
+        // POISON reason — needle-free, like production emits for a node
+        // poisoned in a previous build.
+        let dep_msg = format!(
+            "dependency '{DEP}' failed: poison threshold reached after 3 distinct-worker \
+             failures"
+        );
+        let batch = BatchView {
+            kind: BATCH_KIND_SUBMIT.to_string(),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+            results: vec![po(T, BuildStatus::DependencyFailed, &dep_msg)],
+            // No entry for the trigger: its failure happened in an
+            // earlier batch, so this batch's stderr never relayed it.
+            reasons: BTreeMap::from([(T.to_string(), dep_msg.clone())]),
+            ..BatchView::default()
+        };
+        let decisions = process_settled_batch(
+            &state,
+            &admin,
+            &store,
+            None,
+            &contexts,
+            &["app.x86_64-linux".into()],
+            &batch,
+            &HashMap::new(),
+            &Knobs::default(),
+            "leaf",
+            "c1",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            decisions["app.x86_64-linux"],
+            CollectDecision::Terminal {
+                rio: RioOutcome::DependencyFailed {
+                    root: RootCauseKind::SourceRot,
+                    failing_drv: DEP.to_string(),
+                },
+                evidence: None,
+            },
+            "the trigger's log evidence must drive source-rot attribution"
+        );
+        // The attribution fetch is keyed by the TRIGGER.
+        assert!(
+            admin.log_drvs.lock().unwrap().iter().any(|d| d == DEP),
+            "expected a log fetch keyed by the trigger {DEP}, got {:?}",
+            admin.log_drvs.lock().unwrap()
+        );
+        // And the record carries the cascaded exclusion, not a headline
+        // charge.
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].verdict.as_deref(), Some("source-unavailable"));
+        assert!(records[0].cascaded, "cascaded dependent must be flagged");
     }
 
     /// Signal-1 source order is binding: the root's own in-band error
