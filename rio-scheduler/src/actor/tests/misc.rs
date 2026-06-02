@@ -2640,12 +2640,27 @@ async fn test_dispatch_claims_unavailable_backs_off_then_succeeds() -> TestResul
     for _ in 0..50 {
         handle.send_unchecked(ActorCommand::Tick).await?;
         barrier(&handle).await;
-        if let Some(a) = try_recv_assignment(&mut worker_rx, 50).await {
+        let got = match try_recv_assignment(&mut worker_rx, 50).await {
+            Some(a) => Some(a),
+            None => try_recv_assignment(&mut worker_rx2, 50).await,
+        };
+        if let Some(a) = got {
             assert_eq!(a.drv_path, drv_path);
-            return Ok(());
-        }
-        if let Some(a) = try_recv_assignment(&mut worker_rx2, 50).await {
-            assert_eq!(a.drv_path, drv_path);
+            // merged_bug_010 pin: silence deferrals charge their OWN
+            // budget, never the transient build budget — and the
+            // Verified edge resets the silence counter.
+            let info = handle
+                .debug_query_derivation(&drv_path)
+                .await?
+                .expect("resident");
+            assert_eq!(
+                info.retry.count, 0,
+                "transient build budget must not be consumed by store silence"
+            );
+            assert_eq!(
+                info.retry.claims_unavailable_count, 0,
+                "Verified edge resets the consecutive-silence budget"
+            );
             return Ok(());
         }
     }
@@ -3272,6 +3287,114 @@ async fn test_claims_gate_scale_one_getpath_per_node() -> TestResult {
         fetches as usize, N,
         "exactly ONE GetPath per node first-dispatch — no closure walks, \
          no refetch after the path_bound_bytes raise"
+    );
+    Ok(())
+}
+
+/// charge() unit semantics: per-class cap, attempt indices, reset.
+#[test]
+fn retry_charge_claims_budget_boundaries() {
+    use crate::state::{ChargeDecision, FailureClass, RetryState};
+    let mut r = RetryState::default();
+    assert_eq!(
+        r.charge(FailureClass::ClaimsUnavailable, 2),
+        ChargeDecision::Backoff(0)
+    );
+    assert_eq!(
+        r.charge(FailureClass::ClaimsUnavailable, 2),
+        ChargeDecision::Backoff(1)
+    );
+    assert_eq!(
+        r.charge(FailureClass::ClaimsUnavailable, 2),
+        ChargeDecision::Exhausted,
+        "cap reached -> terminal, never another retry"
+    );
+    assert_eq!(
+        r.charge(FailureClass::ClaimsUnavailable, 2),
+        ChargeDecision::Exhausted,
+        "exhaustion is sticky until a success edge"
+    );
+    // The other budgets are untouched by the claims charge.
+    assert_eq!(r.count, 0);
+    assert_eq!(r.infra_count, 0);
+    r.reset_claims_unavailable();
+    assert_eq!(
+        r.charge(FailureClass::ClaimsUnavailable, 2),
+        ChargeDecision::Backoff(0),
+        "success edge resets to consecutive-failure semantics"
+    );
+}
+
+// r[verify sched.dispatch.claims-derived+1]
+/// merged_bug_010 + merged_bug_019 residual: persistent store silence
+/// on a deterministic input converges to a VISIBLE poison at its own
+/// cap — and consumes neither the transient build budget nor the
+/// completion-side infra budget.
+#[tokio::test]
+async fn test_dispatch_claims_silence_poisons_at_cap() -> TestResult {
+    use rio_auth::hmac::HmacSigner;
+    let db = TestDb::new(&MIGRATOR).await;
+    let (_store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (handle, _actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |c, p| {
+            c.retry_policy.backoff_base_secs = 0.0;
+            c.retry_policy.max_infra_retries = 3;
+            p.hmac_signer = Some(Arc::new(HmacSigner::from_key(key)));
+        });
+
+    let (node, _aterm, _out) = mint_text_ca_leaf("silence-cap");
+    let drv_path = node.drv_path.clone();
+    // NEVER seeded: the store stays silent forever.
+
+    let mut worker_rx = connect_executor(&handle, "cap-w0", "x86_64-linux").await?;
+    let mut events = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    barrier(&handle).await;
+    assert!(try_recv_assignment(&mut worker_rx, 200).await.is_none());
+
+    // Pump dispatch attempts (fresh registration = the harness
+    // trigger) until the budget converges to poison.
+    for i in 1..=10 {
+        let st = handle
+            .debug_query_derivation(&drv_path)
+            .await?
+            .expect("resident")
+            .status;
+        if st == DerivationStatus::Poisoned {
+            break;
+        }
+        let _rx = connect_executor(&handle, &format!("cap-w{i}"), "x86_64-linux").await?;
+        barrier(&handle).await;
+    }
+    wait_for_status(&handle, &drv_path, DerivationStatus::Poisoned).await;
+
+    let info = handle
+        .debug_query_derivation(&drv_path)
+        .await?
+        .expect("resident");
+    assert_eq!(
+        info.retry.claims_unavailable_count, 3,
+        "poisoned exactly at the cap"
+    );
+    assert_eq!(info.retry.count, 0, "transient build budget untouched");
+    assert_eq!(
+        info.retry.infra_count, 0,
+        "completion-side infra budget untouched"
+    );
+
+    let mut failed_msg = None;
+    while let Ok(ev) = events.try_recv() {
+        if let Some(rio_proto::types::build_event::Event::Derivation(d)) = ev.event
+            && d.kind == rio_proto::types::DerivationEventKind::Failed as i32
+        {
+            failed_msg = Some(d.error_message);
+        }
+    }
+    let failed_msg = failed_msg.expect("visible failure event");
+    assert!(
+        failed_msg.contains("could not vouch") && failed_msg.contains("3 dispatch attempts"),
+        "remediation names the cap; got: {failed_msg}"
     );
     Ok(())
 }

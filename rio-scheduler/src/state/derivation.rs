@@ -604,6 +604,66 @@ pub struct RetryState {
     ///
     /// Cleared on successful dispatch (assign_to_worker).
     pub backoff_until: Option<Instant>,
+    /// Number of dispatch-time claims-derivation deferrals on STORE
+    /// SILENCE (`sched.dispatch.claims-derived+1`) for this node.
+    /// In-memory only — failover forgives (a fresh leader re-probes a
+    /// store that may have recovered; the bound exists to stop a
+    /// PERSISTENTLY silent store from deferring a deterministic input
+    /// forever, not to count lifetime attempts). Charged ONLY through
+    /// [`RetryState::charge`]; reset when a verification succeeds
+    /// (`Verified` / `VerifiedExceptDeclaredHash`). Deliberately
+    /// separate from `count` (the transient BUILD-failure budget,
+    /// which silence must not consume — merged_bug_010) and from the
+    /// completion-side poison budget.
+    pub claims_unavailable_count: u32,
+}
+
+/// Failure classes chargeable against [`RetryState`] through the
+/// single [`RetryState::charge`] entry point (fix-discipline R1:
+/// counters with distinct roles are split behind a typed API; an
+/// uncapped retry arm on a deterministic input should not be
+/// writable). Wave-1 carries the claims arm; sibling classes migrate
+/// onto `charge()` as they are touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    /// Dispatch-time claims derivation deferred on store silence.
+    ClaimsUnavailable,
+}
+
+/// Decision returned by [`RetryState::charge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargeDecision {
+    /// Within budget: schedule backoff for this attempt index.
+    Backoff(u32),
+    /// Budget exhausted: the caller MUST route to a terminal visible
+    /// outcome (poison with reason), never another retry.
+    Exhausted,
+}
+
+impl RetryState {
+    /// Charge one failure of `class` against its OWN capped budget and
+    /// decide the consequence. The cap is supplied by the caller from
+    /// the existing retry policy (no new knobs).
+    pub fn charge(&mut self, class: FailureClass, cap: u32) -> ChargeDecision {
+        match class {
+            FailureClass::ClaimsUnavailable => {
+                if self.claims_unavailable_count >= cap {
+                    ChargeDecision::Exhausted
+                } else {
+                    let attempt = self.claims_unavailable_count;
+                    self.claims_unavailable_count += 1;
+                    ChargeDecision::Backoff(attempt)
+                }
+            }
+        }
+    }
+
+    /// Reset the claims-unavailable budget after a successful
+    /// verification (the `Verified` / `VerifiedExceptDeclaredHash`
+    /// edges): consecutive-failure semantics, not lifetime.
+    pub fn reset_claims_unavailable(&mut self) {
+        self.claims_unavailable_count = 0;
+    }
 }
 
 impl RetryState {

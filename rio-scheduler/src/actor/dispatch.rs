@@ -2137,17 +2137,59 @@ impl DagActor {
             // assign → fetch-fail → rollback on every dispatch pass.
             AssignmentProtoOutcome::Unavailable(reason) => {
                 metrics::counter!("rio_scheduler_dispatch_claims_unavailable_total").increment(1);
-                warn!(
-                    drv_hash = %drv_hash,
-                    executor_id = %executor_id,
-                    reason,
-                    "claims derivation unavailable; assignment rolled back with backoff"
-                );
                 self.rollback_assignment(drv_hash, executor_id).await;
-                if let Some(state) = self.dag.node_mut(drv_hash) {
-                    let backoff = self.retry_policy.backoff_duration(state.retry.count);
-                    state.retry.count += 1;
-                    state.retry.backoff_until = Some(std::time::Instant::now() + backoff);
+                // r[impl sched.dispatch.claims-derived+1]
+                // Store silence is the SOLE transient verdict, and it
+                // is bounded by its OWN budget (charge(); cap = the
+                // existing max_infra_retries — no new knob): a
+                // persistently silent store on a deterministic input
+                // must converge to a visible poison, not retry
+                // forever. The charge deliberately does NOT touch
+                // retry.count — silence is not a build failure, and
+                // borrowing that counter polluted the transient build
+                // budget (merged_bug_010). Failover forgives: the
+                // counter is in-memory, a fresh leader re-probes.
+                let cap = self.retry_policy.max_infra_retries;
+                let decision = match self.dag.node_mut(drv_hash) {
+                    Some(state) => state
+                        .retry
+                        .charge(crate::state::FailureClass::ClaimsUnavailable, cap),
+                    None => return false,
+                };
+                match decision {
+                    crate::state::ChargeDecision::Backoff(attempt) => {
+                        warn!(
+                            drv_hash = %drv_hash,
+                            executor_id = %executor_id,
+                            reason,
+                            attempt,
+                            cap,
+                            "claims derivation unavailable; assignment rolled back with backoff"
+                        );
+                        if let Some(state) = self.dag.node_mut(drv_hash) {
+                            let backoff = self.retry_policy.backoff_duration(attempt);
+                            state.retry.backoff_until = Some(std::time::Instant::now() + backoff);
+                        }
+                    }
+                    crate::state::ChargeDecision::Exhausted => {
+                        warn!(
+                            drv_hash = %drv_hash,
+                            executor_id = %executor_id,
+                            reason,
+                            cap,
+                            "claims derivation unavailable budget exhausted; poisoning"
+                        );
+                        let msg = format!(
+                            "the store could not vouch for this derivation's claims \
+                             after {cap} dispatch attempts (last reason: {reason}); \
+                             verify the .drv is uploaded and the store is healthy, \
+                             then clear the poison or resubmit"
+                        );
+                        self.poison_and_cascade(drv_hash, &msg).await;
+                        for build_id in self.get_interested_builds(drv_hash) {
+                            self.record_failure_evidence(build_id, drv_hash).await;
+                        }
+                    }
                 }
                 return false;
             }
@@ -2546,6 +2588,8 @@ impl DagActor {
                     // degrades to re-derivation after failover.
                     if let Some(state) = self.dag.node_mut(drv_hash) {
                         state.evidence = crate::state::DefinitionEvidence::PathBoundBytes;
+                        // Verified edge: consecutive-silence budget resets.
+                        state.retry.reset_claims_unavailable();
                     }
                     if let Err(e) = self
                         .db
@@ -2614,6 +2658,8 @@ impl DagActor {
                     if let Some(state) = self.dag.node_mut(drv_hash) {
                         state.ca.modular_hash = None;
                         state.evidence = crate::state::DefinitionEvidence::PathBoundBytes;
+                        // Verified-modulo-strip edge: budget resets too.
+                        state.retry.reset_claims_unavailable();
                     }
                     if let Err(e) = self
                         .db
