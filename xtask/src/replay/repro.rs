@@ -56,13 +56,28 @@ fn repro_campaign_id(original: &str) -> String {
 /// results.jsonl. The job name — not the drv path — is the narrowing key:
 /// the spec's `Filters` has no per-drv selector, and an exact job name used
 /// as an include glob matches only itself.
-fn job_for_drv(results_jsonl: &str, campaign: &str, drv: &str) -> Result<String> {
-    for line in results_jsonl.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+///
+/// Takes the S3-synced copy as raw bytes: the sync runs while the engine
+/// is appending, so the copy can end in a torn tail (possibly cut mid
+/// multi-byte character). The tail is split off with the engine's own
+/// rule — `rio_replay::run::state::split_torn_tail` — because it was
+/// never a durable record and the engine itself ignores it on resume; a
+/// newline-terminated line that fails to parse stays a hard error, the
+/// same corruption stance the engine's loader takes.
+fn job_for_drv(results_jsonl: &[u8], campaign: &str, drv: &str) -> Result<String> {
+    let (complete, torn) = rio_replay::run::state::split_torn_tail(results_jsonl);
+    if !torn.is_empty() {
+        tracing::warn!(
+            campaign,
+            dropped_bytes = torn.len(),
+            "results.jsonl copy ends in a torn line (sync raced an append); ignoring it"
+        );
+    }
+    for line in complete.split(|&b| b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let record: serde_json::Value = serde_json::from_str(line)
+        let record: serde_json::Value = serde_json::from_slice(line)
             .with_context(|| format!("parse a results.jsonl line of campaign {campaign}"))?;
         if record["drvPath"].as_str() == Some(drv) {
             return record["job"]
@@ -140,7 +155,7 @@ pub async fn run(a: ReproArgs) -> Result<()> {
 
     let results_doc = ui::step("fetch results.jsonl", || async {
         store
-            .fetch_campaign_doc(&a.campaign, "results.jsonl")
+            .fetch_campaign_bytes(&a.campaign, "results.jsonl")
             .await?
             .with_context(|| {
                 format!(
@@ -378,7 +393,7 @@ mod tests {
         );
         assert_eq!(
             job_for_drv(
-                results,
+                results.as_bytes(),
                 "c1",
                 "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-app-2.0.drv"
             )
@@ -387,13 +402,72 @@ mod tests {
         );
         // Unknown drv: the error names the campaign and the requested drv so
         // a typo is visible.
-        let err = job_for_drv(results, "c1", "/nix/store/cccc-missing.drv")
+        let err = job_for_drv(results.as_bytes(), "c1", "/nix/store/cccc-missing.drv")
             .unwrap_err()
             .to_string();
         assert!(
             err.contains("c1") && err.contains("/nix/store/cccc-missing.drv"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn job_for_drv_tolerates_the_torn_tail_of_a_live_sync() {
+        // The S3 sync uploads results.jsonl byte-verbatim while the engine
+        // is appending, so a fetched copy can end in a torn line — here cut
+        // mid multi-byte character (the failure cause carries non-ASCII
+        // compiler output), which is not even valid UTF-8. The lookup must
+        // still resolve records in the complete prefix, and a record whose
+        // bytes sit in the torn tail was never durable, so it is reported
+        // as absent rather than parsed or failed on.
+        let mut results = concat!(
+            r#"{"job":"libfoo.x86_64-linux","drvPath":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv","verdict":"match-built"}"#,
+            "\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let mut torn = serde_json::to_vec(&serde_json::json!({
+            "job": "app.x86_64-linux",
+            "drvPath": "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-app-2.0.drv",
+            "failureCause": "error: expected \u{2018};\u{2019}",
+            "verdict": "unexpected-failure",
+        }))
+        .unwrap();
+        torn.truncate(torn.iter().position(|&b| b == 0xe2).unwrap() + 1);
+        results.extend_from_slice(&torn);
+        assert!(
+            std::str::from_utf8(&results).is_err(),
+            "fixture must end mid-character"
+        );
+
+        assert_eq!(
+            job_for_drv(
+                &results,
+                "c1",
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv"
+            )
+            .unwrap(),
+            "libfoo.x86_64-linux"
+        );
+        let err = job_for_drv(
+            &results,
+            "c1",
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-app-2.0.drv",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("has no results.jsonl record"),
+            "a record in the torn tail was never durable: {err}"
+        );
+
+        // A newline-terminated line that fails to parse is corruption, not
+        // a torn tail — same loud stance as the engine's loader.
+        let corrupt = b"not json\n".to_vec();
+        let err = job_for_drv(&corrupt, "c1", "/nix/store/dddd-any.drv")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("parse a results.jsonl line"), "{err}");
     }
 
     #[test]

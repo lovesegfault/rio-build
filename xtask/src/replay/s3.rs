@@ -130,9 +130,27 @@ impl CampaignStore {
 
     /// Download one campaign-scoped artifact (`rel` as in
     /// [`campaign_key`]) as text. `Ok(None)` when the engine has not
-    /// written it yet.
+    /// written it yet. For the atomically rewritten documents
+    /// (campaign.json, progress.json, report files), which are always
+    /// complete UTF-8; the JSONL streams must go through
+    /// [`Self::fetch_campaign_bytes`] instead.
     pub async fn fetch_campaign_doc(&self, campaign_id: &str, rel: &str) -> Result<Option<String>> {
         get_text(&self.region, &self.bucket, &campaign_key(campaign_id, rel)).await
+    }
+
+    /// Download one campaign-scoped artifact as raw bytes. The engine
+    /// syncs its JSONL streams byte-verbatim while it is still appending
+    /// to them, so a fetched copy can end in a torn tail — possibly cut
+    /// mid multi-byte character. Consumers split that tail off with the
+    /// engine's own rule (`rio_replay::run::state::split_torn_tail`)
+    /// before parsing; decoding to text first would reject exactly those
+    /// copies.
+    pub async fn fetch_campaign_bytes(
+        &self,
+        campaign_id: &str,
+        rel: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        get_bytes(&self.region, &self.bucket, &campaign_key(campaign_id, rel)).await
     }
 }
 
@@ -171,6 +189,17 @@ pub fn human_bytes(bytes: u64) -> String {
 /// Download an S3 object as UTF-8 text. `Ok(None)` when the key does not
 /// exist yet (campaign/stage not reached); other errors propagate.
 pub async fn get_text(region: &str, bucket: &str, key: &str) -> Result<Option<String>> {
+    match get_bytes(region, bucket, key).await? {
+        Some(bytes) => String::from_utf8(bytes)
+            .with_context(|| format!("s3://{bucket}/{key} is not UTF-8"))
+            .map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Download an S3 object as raw bytes. `Ok(None)` when the key does not
+/// exist yet (campaign/stage not reached); other errors propagate.
+pub async fn get_bytes(region: &str, bucket: &str, key: &str) -> Result<Option<Vec<u8>>> {
     let s3 = aws_sdk_s3::Client::new(crate::aws::config(Some(region)).await);
     let resp = match s3.get_object().bucket(bucket).key(key).send().await {
         Ok(o) => o,
@@ -187,9 +216,7 @@ pub async fn get_text(region: &str, bucket: &str, key: &str) -> Result<Option<St
         .await
         .with_context(|| format!("read body of s3://{bucket}/{key}"))?
         .into_bytes();
-    String::from_utf8(bytes.to_vec())
-        .with_context(|| format!("s3://{bucket}/{key} is not UTF-8"))
-        .map(Some)
+    Ok(Some(bytes.to_vec()))
 }
 
 #[cfg(test)]
