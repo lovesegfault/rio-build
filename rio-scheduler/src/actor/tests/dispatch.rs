@@ -1150,7 +1150,7 @@ async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.dispatch.fod-substitute+3]
+// r[verify sched.dispatch.fod-substitute+4]
 /// Dispatch-time substitution: a Ready IA derivation (FOD or non-FOD)
 /// whose output becomes substitutable AFTER merge (so merge-time
 /// `check_cached_outputs` missed it) is completed by
@@ -1453,7 +1453,7 @@ async fn batch_probe_classifies_against_live_builds_effective_wanted(
 /// dispatched to a builder (assignment sent), not routed to the
 /// substitute lane by the dispatch-time probe.
 // r[verify sched.merge.force-build-roots+2]
-// r[verify sched.dispatch.fod-substitute+3]
+// r[verify sched.dispatch.fod-substitute+4]
 #[tokio::test]
 async fn dispatch_time_force_build_root_dispatches_not_substitutes() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -1582,6 +1582,156 @@ async fn dispatch_probe_substitution_follows_force_build_liveness(
             "no substitute fetch for a live force-build root at dispatch time"
         );
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch-time probe tenant: deterministic min over live tenants
+// ---------------------------------------------------------------------------
+
+/// Bare actor with a service signer (so `substitute_auth_for_tenant`
+/// mints `Service` instead of degrading to `Jwt(vec![])`) — the probe
+/// tenant selection is only observable through the `Service` arm.
+fn bare_actor_with_service_signer(pool: sqlx::PgPool) -> DagActor {
+    let plumbing = DagActorPlumbing {
+        service_signer: Some(Arc::new(rio_auth::hmac::HmacSigner::from_key(
+            b"test-service-hmac-key-32-bytes!!".to_vec(),
+        ))),
+        ..Default::default()
+    };
+    DagActor::new(SchedulerDb::new(pool), DagActorConfig::default(), plumbing)
+}
+
+/// Pending `BuildInfo` with a tenant — the minimal shape
+/// `probe_substitute_auth` consults (liveness + `tenant_id`).
+fn probe_build(build_id: Uuid, tenant_id: Uuid) -> crate::state::BuildInfo {
+    crate::state::BuildInfo::new_pending(
+        build_id,
+        Some(tenant_id),
+        PriorityClass::Scheduled,
+        false,
+        BuildOptions::default(),
+        std::collections::HashSet::new(),
+    )
+}
+
+/// Tenant minted into the returned auth, if any.
+fn minted_tenant(auth: &crate::actor::dispatch::SubstituteAuth) -> Option<Uuid> {
+    match auth {
+        crate::actor::dispatch::SubstituteAuth::Service { tenant_id, .. } => Some(*tenant_id),
+        crate::actor::dispatch::SubstituteAuth::Jwt(_) => None,
+    }
+}
+
+// r[verify sched.dispatch.probe-tenant-stable]
+/// Cross-tenant batch: the probe tenant must be the MINIMUM tenant
+/// UUID over live interested builds across ALL candidate nodes — a
+/// pure function of the live tenant set, invariant to candidate
+/// enumeration order and to `interested_builds` iteration order.
+///
+/// The two cases permute which node carries the min tenant relative
+/// to the candidate iterator. Pre-fix (`find_map` first-seen), the
+/// `min_tenant_on_second_node` case deterministically picked the
+/// FIRST node's tenant; the per-node order axis was additionally a
+/// hash-order coin toss.
+#[rstest::rstest]
+#[case::min_tenant_on_first_node(true)]
+#[case::min_tenant_on_second_node(false)]
+#[tokio::test]
+async fn probe_tenant_is_min_live_tenant_across_batch(#[case] lo_first: bool) -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_with_service_signer(db.pool.clone());
+
+    let t_lo = Uuid::from_u128(0x1);
+    let t_hi = Uuid::from_u128(0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff);
+    let (b_lo, b_hi) = (Uuid::new_v4(), Uuid::new_v4());
+    actor.builds.insert(b_lo, probe_build(b_lo, t_lo));
+    actor.builds.insert(b_hi, probe_build(b_hi, t_hi));
+
+    // Two candidates, each interesting a different tenant's build
+    // (the cross-tenant shared-DAG shape after merge dedup).
+    actor.test_inject_ready("ptm-a", None, "x86_64-linux", false);
+    actor.test_inject_ready("ptm-b", None, "x86_64-linux", false);
+    let (first, second) = if lo_first { (b_lo, b_hi) } else { (b_hi, b_lo) };
+    actor
+        .dag
+        .node_mut("ptm-a")
+        .unwrap()
+        .interested_builds
+        .insert(first);
+    actor
+        .dag
+        .node_mut("ptm-b")
+        .unwrap()
+        .interested_builds
+        .insert(second);
+
+    let candidates = [DrvHash::from("ptm-a"), DrvHash::from("ptm-b")];
+    let auth = actor.probe_substitute_auth(candidates.iter());
+    assert_eq!(
+        minted_tenant(&auth),
+        Some(t_lo),
+        "min live tenant across the batch, regardless of which candidate carries it"
+    );
+    // The wire artifact the store actually consumes: the minted
+    // metadata must carry the same tenant (the type-level pick
+    // evaporates at the gRPC boundary; pin the header pair).
+    let meta = auth.mint();
+    assert!(
+        meta.contains(&(rio_proto::PROBE_TENANT_ID_HEADER, t_lo.to_string())),
+        "x-rio-probe-tenant-id must carry the min live tenant; got {meta:?}"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.probe-tenant-stable]
+/// Liveness axis of the probe-tenant policy, both directions:
+/// must-block — a lingering TERMINAL build's tenant must not win even
+/// though it is the minimum; must-admit — the remaining live build's
+/// tenant is selected. All-terminal → no tenant (`Jwt(vec![])`,
+/// no-auth probe), same as the no-candidate case.
+#[tokio::test]
+async fn probe_tenant_ignores_lingering_terminal_builds() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_with_service_signer(db.pool.clone());
+
+    let t_lo = Uuid::from_u128(0x1);
+    let t_hi = Uuid::from_u128(0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff);
+    let (b_lo, b_hi) = (Uuid::new_v4(), Uuid::new_v4());
+    // The MIN tenant's build is terminal (Pending → Cancelled), its
+    // BuildInfo lingering until the delayed terminal cleanup.
+    let mut lo_info = probe_build(b_lo, t_lo);
+    lo_info.transition(crate::state::BuildState::Cancelled)?;
+    actor.builds.insert(b_lo, lo_info);
+    actor.builds.insert(b_hi, probe_build(b_hi, t_hi));
+
+    actor.test_inject_ready("ptt-a", None, "x86_64-linux", false);
+    let node = actor.dag.node_mut("ptt-a").unwrap();
+    node.interested_builds.insert(b_lo);
+    node.interested_builds.insert(b_hi);
+
+    let candidates = [DrvHash::from("ptt-a")];
+    let auth = actor.probe_substitute_auth(candidates.iter());
+    assert_eq!(
+        minted_tenant(&auth),
+        Some(t_hi),
+        "terminal build's tenant must not authorize (even as the min); live tenant wins"
+    );
+
+    // All interested builds terminal → no tenant context at all.
+    let mut hi_info = probe_build(b_hi, t_hi);
+    hi_info.transition(crate::state::BuildState::Cancelled)?;
+    actor.builds.insert(b_hi, hi_info);
+    let auth = actor.probe_substitute_auth(candidates.iter());
+    assert_eq!(
+        minted_tenant(&auth),
+        None,
+        "all-terminal interest folds to the no-auth probe"
+    );
+    assert!(
+        auth.mint().is_empty(),
+        "no-auth probe must mint no service/tenant headers"
+    );
     Ok(())
 }
 
@@ -3591,7 +3741,7 @@ async fn rollback_assignment_persists_ready_to_pg() -> TestResult {
 // I-139/I-140: batch-probe truncated tail must NOT hit per-drv FMP fallback
 // ---------------------------------------------------------------------------
 
-// r[verify sched.dispatch.fod-substitute+3]
+// r[verify sched.dispatch.fod-substitute+4]
 /// With > `DISPATCH_PROBE_BATCH_CAP` Ready leaves and the batch RPC
 /// failing-open, the truncated tail must NOT fall through to the
 /// per-drv `ready_check_or_spawn` (one inline-awaited FMP each =

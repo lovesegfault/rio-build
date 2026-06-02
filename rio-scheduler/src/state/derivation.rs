@@ -1447,6 +1447,41 @@ impl DerivationState {
         self.attributed_tenants(builds).min()
     }
 
+    /// Tenant IDs of LIVE interested builds — the policy-side sibling
+    /// of [`Self::attributed_tenants`]. `Builds::get` (the live-only
+    /// default) instead of the bookkeeping accessor: a policy decision
+    /// must stop counting a build the moment it goes terminal, even
+    /// while its `BuildInfo` lingers until the delayed terminal
+    /// cleanup. Same `filter_map` drop of `None` tenants
+    /// (single-tenant mode).
+    pub fn live_attributed_tenants<'a>(
+        &'a self,
+        builds: &'a super::Builds,
+    ) -> impl Iterator<Item = Uuid> + 'a {
+        self.interested_builds
+            .iter()
+            .filter_map(|id| builds.get(id)?.tenant_id)
+    }
+
+    /// Minimum-UUID tenant among LIVE interested builds — the live
+    /// policy sibling of [`Self::attributed_tenant`], for sites that
+    /// must choose ONE tenant to act for this node right now (the
+    /// dispatch-time substitution probe's `x-rio-probe-tenant-id`).
+    ///
+    /// Same `.min()` discipline as the bookkeeping sibling, and it
+    /// carries the same load: the answer must be a pure function of
+    /// the live TENANT set. Any first-seen pick — under any iteration
+    /// order of build IDs — keys the choice to build-set composition
+    /// instead: a build finishing, or a tenant resubmitting under a
+    /// fresh build UUID, would flip the chosen tenant while the tenant
+    /// set is unchanged. For the substitution probe that flip is a
+    /// verdict change (the store answers availability per-tenant), not
+    /// just an attribution wobble.
+    // r[impl sched.dispatch.probe-tenant-stable]
+    pub fn live_attributed_tenant(&self, builds: &super::Builds) -> Option<Uuid> {
+        self.live_attributed_tenants(builds).min()
+    }
+
     /// Attempt to transition to a new status. Returns the old status on success.
     pub fn transition(
         &mut self,
@@ -2504,6 +2539,75 @@ mod tests {
             Some(t_lo),
             "insertion order irrelevant"
         );
+        Ok(())
+    }
+
+    // r[verify sched.dispatch.probe-tenant-stable]
+    /// `live_attributed_tenant()`: minimum tenant UUID over LIVE
+    /// interested builds, insertion-order-invariant (the rstest cases
+    /// permute insertion). Liveness in BOTH directions: a lingering
+    /// terminal build's tenant must not win even when it is the
+    /// minimum (must-block), the live build's tenant is still
+    /// returned (must-admit), and all-terminal folds to `None` —
+    /// distinct from the bookkeeping sibling `attributed_tenant`,
+    /// which keeps counting lingering terminal builds.
+    #[rstest::rstest]
+    #[case::lo_inserted_first(true)]
+    #[case::hi_inserted_first(false)]
+    fn live_attributed_tenant_min_over_live_only(#[case] lo_first: bool) -> anyhow::Result<()> {
+        use super::super::{BuildInfo, BuildOptions, BuildState, PriorityClass};
+        let t_hi = Uuid::from_u128(0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff);
+        let t_lo = Uuid::from_u128(0x1);
+        let (b_hi, b_lo) = (Uuid::new_v4(), Uuid::new_v4());
+        let mk = |bid, tid| {
+            BuildInfo::new_pending(
+                bid,
+                Some(tid),
+                PriorityClass::Scheduled,
+                false,
+                BuildOptions::default(),
+                HashSet::new(),
+            )
+        };
+        let mut builds = crate::state::Builds::new();
+        builds.insert(b_hi, mk(b_hi, t_hi));
+        builds.insert(b_lo, mk(b_lo, t_lo));
+
+        let mut s = DerivationState::try_from_node(&dummy_node())?;
+        let (first, second) = if lo_first { (b_lo, b_hi) } else { (b_hi, b_lo) };
+        s.interested_builds.insert(first);
+        s.interested_builds.insert(second);
+        assert_eq!(
+            s.live_attributed_tenant(&builds),
+            Some(t_lo),
+            "min over live tenants, not first-seen; insertion order irrelevant"
+        );
+        // Both live → live and bookkeeping selections agree.
+        assert_eq!(
+            s.live_attributed_tenant(&builds),
+            s.attributed_tenant(&builds)
+        );
+
+        // Must-block: the MIN tenant's build goes terminal (entry
+        // lingers until delayed cleanup) → its tenant stops counting;
+        // must-admit: the live hi tenant is returned.
+        let mut lo_terminal = mk(b_lo, t_lo);
+        lo_terminal.transition(BuildState::Cancelled)?;
+        builds.insert(b_lo, lo_terminal);
+        assert_eq!(
+            s.live_attributed_tenant(&builds),
+            Some(t_hi),
+            "terminal build's tenant excluded even as the min; live tenant admitted"
+        );
+        // The bookkeeping sibling still counts it — the two accessors
+        // deliberately differ on exactly this axis.
+        assert_eq!(s.attributed_tenant(&builds), Some(t_lo));
+
+        // All terminal → None (no live tenant to act for the node).
+        let mut hi_terminal = mk(b_hi, t_hi);
+        hi_terminal.transition(BuildState::Cancelled)?;
+        builds.insert(b_hi, hi_terminal);
+        assert_eq!(s.live_attributed_tenant(&builds), None);
         Ok(())
     }
 }

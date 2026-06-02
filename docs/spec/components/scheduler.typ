@@ -996,7 +996,7 @@ can be GC'd before the failover, and without the durable breadcrumb the
 surviving produced siblings would launder the clear and re-arm exactly that
 doomed dispatch.
 
-#r("sched.dispatch.fod-substitute+3")[
+#r("sched.dispatch.fod-substitute+4")[
   The dispatch-time store-check (`batch_probe_cached_ready` and the
   per-derivation `ready_check_or_spawn` fallback) MUST probe upstream
   substitutability for every Ready input-addressed derivation, not just FODs
@@ -1010,7 +1010,8 @@ doomed dispatch.
   `DISPATCH_PROBE_BATCH_CAP`. Because the actor has no per-derivation JWT to
   forward at dispatch time, the scheduler MUST mint an `x-rio-service-token`
   (`ServiceClaims { caller: "rio-scheduler" }`) and set `x-rio-probe-tenant-id`
-  to any interested build's tenant; the store MUST honour
+  to the deterministically-selected probe tenant
+  (#rref("sched.dispatch.probe-tenant-stable")); the store MUST honour
   `x-rio-probe-tenant-id` only when the request carries a valid allowlisted
   service-token (an unauthenticated request cannot self-select a tenant).
   Substitutable paths MUST be fetched (`QueryPathInfo` with the same metadata)
@@ -1021,6 +1022,35 @@ doomed dispatch.
   in the probe batch (the probe-tenant selection and locally-present completion
   are unchanged).
 ]
+
+#r("sched.dispatch.probe-tenant-stable")[
+  The tenant minted into `x-rio-probe-tenant-id` for a dispatch-time probe
+  batch MUST be a deterministic pure function of the batch's live interested
+  tenants: the minimum tenant UUID over all live (non-terminal) interested
+  builds across all candidate derivations. The selection MUST NOT depend on
+  hash-collection iteration order, on candidate enumeration order, or on
+  which build within a tenant carries the interest, and lingering terminal
+  builds MUST NOT contribute a tenant.
+]
+
+The store's substitutability answer is per-tenant, not global: present-path
+visibility is gated on the requesting tenant's ownership and trusted-signature
+set (#rref("store.substitute.tenant-sig-visibility")), and the upstream probe
+runs against that tenant's configured substituters --- a tenant with no
+upstreams gets `substitutable_paths = ∅` for everything. The probe tenant
+therefore _decides_ substitutable-vs-missing (substitute lane vs from-source
+dispatch) for every candidate in the batch. A first-seen pick over an
+unordered set re-rolls across leader restarts and re-merges, flipping that
+verdict on identical DAG state when tenants with divergent upstream
+visibility share nodes: redundant from-source rebuilds of cached paths, and
+--- in the post-failover pruned-root shape --- a spurious fail-fast where the
+documented behaviour is the substitute lane. Minimum-UUID over the live
+tenant set is otherwise arbitrary but total, keys the store-side probe cache
+(`(tenant, path)`) to a stable tenant, and matches the `.min()` discipline of
+the bookkeeping attribution accessor (`attributed_tenant`), so the live
+policy pick and the bookkeeping attribution agree on which tenant represents
+a shared node. Liveness is the established round-1 constraint: a lingering
+terminal build must not authorize a new fetch it no longer wants.
 
 #r("sched.substitute.eager-probe")[
   Every probeable node in a submission MUST receive a substitutability verdict

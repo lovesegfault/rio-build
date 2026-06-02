@@ -580,7 +580,7 @@ impl DagActor {
     /// batch). On RPC error/timeout this is the tail only — the
     /// stamped head is protected via `probed_generation`, so neither
     /// hits the per-drv fallback.
-    // r[impl sched.dispatch.fod-substitute+3]
+    // r[impl sched.dispatch.fod-substitute+4]
     async fn batch_probe_cached_ready(&mut self) -> HashSet<DrvHash> {
         let Some(store) = &self.store_client else {
             return HashSet::new();
@@ -626,12 +626,17 @@ impl DagActor {
             }
         }
 
-        // Tenant context for the upstream-substitution probe: any
-        // tenant that wants any candidate (substitution is content-
-        // addressed; whose upstream we use is irrelevant to the
-        // result). Without this the store sees tenant_id=None and
-        // substitutable_paths stays empty — the pre-fix behaviour
-        // that dispatched FODs already in cache.nixos.org.
+        // Tenant context for the upstream-substitution probe. The
+        // fetched CONTENT is tenant-independent (substitution is
+        // content-addressed) but the VERDICT is not: the store gates
+        // present-path visibility and the upstream check on the
+        // requesting tenant's ownership/trust/upstream config, so the
+        // tenant minted here decides substitutable-vs-missing for the
+        // whole batch — hence the deterministic selection in
+        // `probe_substitute_auth`. Without any tenant the store sees
+        // tenant_id=None and substitutable_paths stays empty — the
+        // pre-fix behaviour that dispatched FODs already in
+        // cache.nixos.org.
         let auth = self.probe_substitute_auth(candidates.iter().map(|(h, _)| h));
         let probe = auth.mint();
         let probe_meta: Vec<(&'static str, &str)> =
@@ -794,23 +799,42 @@ impl DagActor {
 
     /// Resolve auth for dispatch-time store calls. `Jwt(vec![])`
     /// (no-auth) when no `service_signer` (dev mode) or no candidate
-    /// has a known tenant (single-tenant mode / recovered orphan / all
-    /// interested builds already terminal); otherwise
+    /// has a known live tenant (single-tenant mode / recovered orphan /
+    /// all interested builds already terminal); otherwise
     /// `Service{signer, tenant_id}` so the detached closure-walk task
-    /// can re-mint tokens past the original 60s. Tenant selection is a
-    /// policy decision over LIVE builds (`Builds::get`): a lingering
-    /// terminal build must not authorize a new fetch it no longer
-    /// wants.
+    /// can re-mint tokens past the original 60s.
+    ///
+    /// Tenant selection is the minimum tenant UUID over LIVE
+    /// interested builds across the whole batch
+    /// ([`DerivationState::live_attributed_tenant`] per node, `.min()`
+    /// across nodes — together: min over the union of live tenants).
+    /// Two deliberate axes:
+    ///
+    /// - LIVE (`Builds::get`): a lingering terminal build must not
+    ///   authorize a new fetch it no longer wants.
+    /// - MINIMUM, not first-seen: the store answers the probe
+    ///   per-tenant (upstream set + signature visibility), so the
+    ///   tenant minted here DECIDES substitutable-vs-missing for every
+    ///   candidate. The pick must be a pure function of the live
+    ///   tenant set — invariant to hash-collection iteration order,
+    ///   candidate enumeration order, leader restarts, and build churn
+    ///   within a tenant — or the verdict re-rolls on identical state.
+    ///   Smallest-UUID is otherwise arbitrary but total; preferring,
+    ///   say, a tenant with configured upstreams would need store-side
+    ///   knowledge the scheduler doesn't have. Matches the
+    ///   `attributed_tenant` discipline so the live policy pick and
+    ///   the bookkeeping attribution agree on which tenant represents
+    ///   a shared node.
+    // r[impl sched.dispatch.probe-tenant-stable]
     #[allow(clippy::extra_unused_lifetimes)] // 'a only in impl-Trait arg
-    fn probe_substitute_auth<'a>(
+    pub(super) fn probe_substitute_auth<'a>(
         &self,
         drv_hashes: impl Iterator<Item = &'a DrvHash>,
     ) -> SubstituteAuth {
         let tid = drv_hashes
             .filter_map(|h| self.dag.node(h))
-            .flat_map(|s| s.interested_builds.iter())
-            .filter_map(|bid| self.builds.get(bid))
-            .find_map(|b| b.tenant_id);
+            .filter_map(|s| s.live_attributed_tenant(&self.builds))
+            .min();
         self.substitute_auth_for_tenant(tid)
     }
 
@@ -1826,7 +1850,7 @@ impl DagActor {
                 store.clone(),
             )
         };
-        // r[impl sched.dispatch.fod-substitute+3] — same probe-tenant
+        // r[impl sched.dispatch.fod-substitute+4] — same probe-tenant
         // wiring as batch_probe_cached_ready.
         let auth = self.probe_substitute_auth(std::iter::once(drv_hash));
         let probe = auth.mint();
