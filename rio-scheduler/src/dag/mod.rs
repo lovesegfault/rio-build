@@ -189,6 +189,24 @@ pub struct DerivationDag {
     /// for a single-threaded-actor test counter.
     #[cfg(test)]
     build_summary_calls: std::sync::atomic::AtomicU64,
+    /// Test-only unit-of-work counter for DAG traversal (same
+    /// philosophy as `build_summary_calls`: count at chokepoints, not
+    /// call sites). The accessor chokepoints (`node` / `node_mut` /
+    /// `get_parents` / `get_children` / `kahn_topo` / `iter_nodes`)
+    /// and the hot paths that iterate the private maps directly
+    /// (`build_summary`, `find_newly_ready` + `all_deps_completed`,
+    /// `remove_build_interest_and_reap` / `remove_node`) each bump it
+    /// by the work they perform — one step per node visited or edge
+    /// touched. The I-140 perf gate asserts per-size linear step
+    /// BUDGETS against this counter: counts are load- and
+    /// cache-invariant, unlike the cross-size wall-clock ratios they
+    /// replaced, which flaked on shared builders whenever the
+    /// out-of-LLC size paid ~5× per-node bandwidth inflation (healthy
+    /// ratios 40-46× vs the 32× bound; genuine quadratic ≈ 64×).
+    /// Atomic because most instrumented accessors take `&self`;
+    /// `Relaxed` is fine for a single-threaded-actor test counter.
+    #[cfg(test)]
+    work_steps: std::sync::atomic::AtomicU64,
 }
 
 impl DerivationDag {
@@ -196,6 +214,23 @@ impl DerivationDag {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Record `n` units of DAG traversal work (test builds only) — see
+    /// the `work_steps` field doc. Instrumented sites count one step
+    /// per node visited or edge touched, so a step total is a
+    /// wall-clock-free proxy for an operation's algorithmic cost.
+    #[cfg(test)]
+    #[inline]
+    fn count_steps(&self, n: u64) {
+        self.work_steps
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// No-op twin of the test-only step counter — keeps the hot-path
+    /// call sites free of `cfg` noise at zero cost in non-test builds.
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn count_steps(&self, _n: u64) {}
 
     /// Set soft features. Called once from `DagActor::with_soft_features`
     /// before any merge/recovery; stripping in `insert_recovered_node`
@@ -263,11 +298,13 @@ impl DerivationDag {
 
     /// Look up a derivation state by hash.
     pub fn node(&self, drv_hash: &str) -> Option<&DerivationState> {
+        self.count_steps(1);
         self.nodes.get(drv_hash)
     }
 
     /// Look up a mutable derivation state by hash.
     pub fn node_mut(&mut self, drv_hash: &str) -> Option<&mut DerivationState> {
+        self.count_steps(1);
         self.nodes.get_mut(drv_hash)
     }
 
@@ -328,7 +365,13 @@ impl DerivationDag {
     }
 
     /// Iterate all (drv_hash, state) pairs.
+    ///
+    /// Counts a full pass (`nodes.len()` steps) eagerly at call time:
+    /// the hot-path callers consume the iterator fully, and an
+    /// over-count for an early-exiting caller only ever makes a step
+    /// budget MORE conservative.
     pub fn iter_nodes(&self) -> impl Iterator<Item = (&str, &DerivationState)> {
+        self.count_steps(self.nodes.len() as u64);
         self.nodes.iter().map(|(k, v)| (k.as_str(), v))
     }
 
@@ -884,11 +927,13 @@ impl DerivationDag {
     /// through [`Self::any_dep_terminally_failed`] instead (cascades
     /// `DependencyFailed` rather than promoting to `Ready`).
     pub fn all_deps_completed(&self, drv_hash: &str) -> bool {
+        self.count_steps(1);
         let Some(children) = self.children.get(drv_hash) else {
             return true; // No dependencies
         };
 
         children.iter().all(|child_hash| {
+            self.count_steps(1);
             self.nodes.get(child_hash).is_some_and(|n| {
                 matches!(
                     n.status(),
@@ -989,10 +1034,14 @@ impl DerivationDag {
 
     /// Get all parent drv_hashes that depend on the given child.
     pub fn get_parents(&self, child_hash: &str) -> Vec<DrvHash> {
-        self.parents
+        let parents: Vec<DrvHash> = self
+            .parents
             .get(child_hash)
             .map(|p| p.iter().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // One step for the lookup plus one per cloned edge.
+        self.count_steps(1 + parents.len() as u64);
+        parents
     }
 
     /// Kahn's topo-sort over `scope`, children-before-parents.
@@ -1010,9 +1059,11 @@ impl DerivationDag {
         let mut in_degree: HashMap<DrvHash, usize> = scope
             .iter()
             .map(|h| {
-                let d = self
-                    .children
-                    .get(h)
+                let cs = self.children.get(h);
+                // One step per scope node plus one per child examined;
+                // the emit loop below counts via `get_parents`.
+                self.count_steps(1 + cs.map_or(0, |cs| cs.len() as u64));
+                let d = cs
                     .map(|cs| cs.iter().filter(|c| scope.contains(*c)).count())
                     .unwrap_or(0);
                 (h.clone(), d)
@@ -1044,10 +1095,14 @@ impl DerivationDag {
     /// (children), completion handling walks UP (parents). Both
     /// directions needed.
     pub fn get_children(&self, parent_hash: &str) -> Vec<DrvHash> {
-        self.children
+        let children: Vec<DrvHash> = self
+            .children
             .get(parent_hash)
             .map(|c| c.iter().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // One step for the lookup plus one per cloned edge.
+        self.count_steps(1 + children.len() as u64);
+        children
     }
 
     /// Find all derivations that become ready (all deps completed) after a
@@ -1056,6 +1111,7 @@ impl DerivationDag {
         let mut ready = Vec::new();
 
         for parent_hash in self.get_parents(completed_hash) {
+            self.count_steps(1);
             if let Some(node) = self.nodes.get(&parent_hash)
                 && node.status() == DerivationStatus::Queued
                 && self.all_deps_completed(&parent_hash)
@@ -1297,6 +1353,8 @@ impl DerivationDag {
     pub fn remove_build_interest_and_reap(&mut self, build_id: Uuid) -> ReapOutcome {
         let mut to_reap = Vec::new();
 
+        // The interest-strip pass below visits every node once.
+        self.count_steps(self.nodes.len() as u64);
         for (hash, state) in &mut self.nodes {
             state.interested_builds.remove(&build_id);
             // Contributions follow interest membership.
@@ -1325,10 +1383,12 @@ impl DerivationDag {
         let mut holed_parents: BTreeSet<DrvHash> = BTreeSet::new();
         let mut reaped_paths = Vec::with_capacity(to_reap.len());
         for (hash, path, unproduced) in to_reap {
+            self.count_steps(1);
             // Capture the parents BEFORE `remove_node` scrubs the edge maps —
             // afterwards neither the reaped hash nor its former parents are
             // recoverable from the DAG.
             if let Some(ps) = self.parents.get(&hash) {
+                self.count_steps(ps.len() as u64);
                 surviving_parents.extend(ps.iter().cloned());
                 if unproduced {
                     holed_parents.extend(ps.iter().cloned());
@@ -1337,6 +1397,8 @@ impl DerivationDag {
             self.remove_node(&hash);
             reaped_paths.push(path);
         }
+        // The two retain passes plus the breadcrumb loop below.
+        self.count_steps((surviving_parents.len() + 2 * holed_parents.len()) as u64);
         // Drop entries that were themselves reaped (or otherwise no longer
         // exist) so only true survivors are reported.
         surviving_parents.retain(|p| self.nodes.contains_key(p));
@@ -1366,6 +1428,7 @@ impl DerivationDag {
     /// `expected_output_paths`) and `compute_initial_states` only iterates
     /// `newly_inserted` — the node would sit in Created forever.
     pub fn remove_node(&mut self, hash: &DrvHash) {
+        self.count_steps(1);
         if let Some(state) = self.nodes.remove(hash) {
             self.path_to_hash.remove(state.drv_path().as_str());
         }
@@ -1378,11 +1441,13 @@ impl DerivationDag {
         // O(K×N) for K reaped nodes (≈10¹⁰ ops on a 100k-node sole-build
         // completion → minutes of single-threaded actor stall).
         for c in self.children.remove(hash).into_iter().flatten() {
+            self.count_steps(1);
             if let Some(ps) = self.parents.get_mut(&c) {
                 ps.remove(hash);
             }
         }
         for p in self.parents.remove(hash).into_iter().flatten() {
+            self.count_steps(1);
             if let Some(cs) = self.children.get_mut(&p) {
                 cs.remove(hash);
             }
@@ -1487,6 +1552,8 @@ impl DerivationDag {
         #[cfg(test)]
         self.build_summary_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The aggregation below is one full pass over all nodes.
+        self.count_steps(self.nodes.len() as u64);
         let mut summary = BuildSummary::default();
         let mut workers: BTreeSet<String> = BTreeSet::new();
 
@@ -1549,6 +1616,23 @@ impl DerivationDag {
     pub(crate) fn build_summary_call_count(&self) -> u64 {
         self.build_summary_calls
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total DAG traversal work steps recorded since the last
+    /// [`Self::reset_work_steps`] (see the `work_steps` field doc).
+    /// Read by the I-140 hot-ops perf gate to assert per-op linear
+    /// step budgets instead of wall-clock.
+    #[cfg(test)]
+    pub(crate) fn work_step_count(&self) -> u64 {
+        self.work_steps.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Zero the work-step counter so the next measured operation
+    /// starts from a clean slate.
+    #[cfg(test)]
+    pub(crate) fn reset_work_steps(&self) {
+        self.work_steps
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
