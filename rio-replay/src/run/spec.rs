@@ -1156,6 +1156,51 @@ mod tests {
         );
     }
 
+    /// Cross-crate calibration: the engine's default batch shape must fit
+    /// the protocol client's stderr drain budget. The budget constant lives
+    /// in rio-nix and is calibrated per submitted root; the decision of how
+    /// many roots (and how large a merged closure) one op carries is made
+    /// HERE, by these knobs — so this is the test that fails when either
+    /// crate moves its end of the calibration. Universe: `Knobs::default()`
+    /// (the shape every campaign gets unless overridden) against the
+    /// budget rio-nix derives for it.
+    #[test]
+    fn default_batch_shape_fits_the_stderr_drain_budget() {
+        use rio_nix::protocol::client::{
+            STDERR_BUDGET_ROOT_MULTIPLIER_CAP, stderr_budget_for_roots,
+        };
+
+        let knobs = Knobs::default();
+        // The multiplier cap must not bind for the default packing —
+        // otherwise raising batch_max_jobs would silently stop scaling the
+        // budget.
+        assert!(
+            knobs.batch_max_jobs <= STDERR_BUDGET_ROOT_MULTIPLIER_CAP,
+            "default batch_max_jobs ({}) exceeds the drain-budget multiplier cap ({}) — the \
+             per-root calibration would silently stop scaling; split batches or raise the cap \
+             in rio-nix",
+            knobs.batch_max_jobs,
+            STDERR_BUDGET_ROOT_MULTIPLIER_CAP,
+        );
+        // Per-closure-node log allowance the budget must absorb: 10k lines
+        // per merged-closure node is ~4.5× the mid-range from-source
+        // nixpkgs average (~2.2k lines/drv) — a deliberately log-heavy but
+        // healthy batch must never trip the count belt (the belt exists
+        // for a daemon that streams FOREVER, and wall-clock deadlines are
+        // the liveness bound).
+        const LOG_LINES_PER_CLOSURE_NODE: usize = 10_000;
+        let worst_healthy_batch = knobs.batch_max_nodes * LOG_LINES_PER_CLOSURE_NODE;
+        let budget = stderr_budget_for_roots(knobs.batch_max_jobs);
+        assert!(
+            budget >= worst_healthy_batch,
+            "a default-shaped batch ({} nodes × {LOG_LINES_PER_CLOSURE_NODE} lines = {} lines) \
+             would trip the drain budget ({budget}) — healthy log-heavy batches must never be \
+             cut off mid-DAG",
+            knobs.batch_max_nodes,
+            worst_healthy_batch,
+        );
+    }
+
     #[test]
     fn cluster_gateway_host_key_is_required_and_round_trips() {
         let spec: CampaignSpec = serde_json::from_str(

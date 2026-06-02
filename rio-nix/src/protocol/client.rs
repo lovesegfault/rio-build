@@ -239,13 +239,46 @@ pub enum ClientOpError {
     Wire(#[from] WireError),
 }
 
-/// Maximum STDERR messages [`drain_stderr_typed`] consumes before aborting.
+/// Per-ROOT ceiling on STDERR messages a build-op drain consumes.
 ///
-/// Deliberately ~100× the legacy `MAX_STDERR_MESSAGES`: operations like
-/// BuildPathsWithResults stream every build-log line through this drain, so a
-/// count cap must never fire on a legitimate long build. It exists only to
-/// cut off a pathological/looping daemon that never sends `STDERR_LAST`.
-const MAX_BUILD_LOG_STDERR_MESSAGES: usize = 10_000_000;
+/// Deliberately ~100× the legacy `MAX_STDERR_MESSAGES`: BuildPathsWithResults
+/// streams every build-log line of every build it triggers through one
+/// drain, so the cap must never fire on a legitimate long build. It exists
+/// only to cut off a pathological/looping daemon that never sends
+/// `STDERR_LAST`.
+///
+/// The calibration unit is one submitted ROOT (whose closure can
+/// legitimately stream millions of lines), but the drain's consumption
+/// scope is one whole op — and a batch submitter may pack many roots into
+/// one op. [`stderr_budget_for_roots`] therefore scales this constant by
+/// the op's root count: without that, a healthy log-heavy multi-root batch
+/// trips a cap calibrated for one build, the resulting Wire error mandates
+/// channel abandonment, and every still-running build in the DAG is
+/// cancelled. Single-unit ops ([`drain_stderr_typed`] /
+/// [`drain_stderr_with_observer`] callers) consume exactly one unit of this
+/// budget.
+pub const MAX_BUILD_LOG_STDERR_MESSAGES: usize = 10_000_000;
+
+/// Cap on the root-count multiplier in [`stderr_budget_for_roots`], so the
+/// count belt stays a real bound on a runaway daemon instead of scaling
+/// toward infinity with pathological root counts. 256 is >5× the largest
+/// in-repo roots-per-op (the replay engine's default batch packing submits
+/// up to 50 roots per op, pinned by a calibration test in that crate);
+/// callers packing more roots than this per op get no additional count
+/// headroom and should split the op or rely on their wall-clock deadline.
+pub const STDERR_BUDGET_ROOT_MULTIPLIER_CAP: usize = 256;
+
+/// STDERR message budget for one build op submitting `roots` derived
+/// paths: [`MAX_BUILD_LOG_STDERR_MESSAGES`] per root, with the multiplier
+/// clamped to `1..=`[`STDERR_BUDGET_ROOT_MULTIPLIER_CAP`].
+///
+/// This bounds MESSAGE COUNT only — wall-clock liveness remains the
+/// caller's per-op deadline (a count cap cannot protect against a silently
+/// stalled peer), and the drain never buffers the messages it counts, so
+/// the budget does not change memory bounds for any consumer.
+pub fn stderr_budget_for_roots(roots: usize) -> usize {
+    MAX_BUILD_LOG_STDERR_MESSAGES.saturating_mul(roots.clamp(1, STDERR_BUDGET_ROOT_MULTIPLIER_CAP))
+}
 
 /// Drain the STDERR loop until `STDERR_LAST`, surfacing `STDERR_ERROR` as
 /// [`ClientOpError::Daemon`]. Log lines, activities, and results are
@@ -556,7 +589,15 @@ where
     wire::write_u64(writer, BuildMode::Normal as u64).await?;
     writer.flush().await.map_err(WireError::Io)?;
 
-    drain_stderr_with_observer(reader, observer).await?;
+    // The drain budget scales with the number of submitted roots: this op
+    // streams every triggered build's log lines through one drain, so a
+    // flat per-build budget would be consumed at whole-batch scope.
+    drain_stderr_typed_bounded(
+        reader,
+        observer,
+        stderr_budget_for_roots(derived_paths.len()),
+    )
+    .await?;
 
     let count = wire::read_u64(reader).await?;
     if count > wire::MAX_COLLECTION_COUNT {
@@ -1482,6 +1523,36 @@ mod tests {
             "message must mention the exceeded bound: {err}"
         );
         Ok(())
+    }
+
+    /// The build-op drain budget is the per-root ceiling times the op's
+    /// root count, clamped to `1..=STDERR_BUDGET_ROOT_MULTIPLIER_CAP` —
+    /// the per-build calibration documented on
+    /// `MAX_BUILD_LOG_STDERR_MESSAGES` survives multi-root batch packing
+    /// (the budget's consumption scope is the whole op), while the cap
+    /// keeps the belt finite for pathological root counts. Universe: every
+    /// `client_build_paths_with_results*` call derives its drain budget
+    /// through this function.
+    #[test]
+    fn stderr_budget_scales_per_root_with_a_capped_multiplier() {
+        // Floor: zero/one root keep the single-build calibration.
+        assert_eq!(stderr_budget_for_roots(0), MAX_BUILD_LOG_STDERR_MESSAGES);
+        assert_eq!(stderr_budget_for_roots(1), MAX_BUILD_LOG_STDERR_MESSAGES);
+        // Linear region: a 50-root batch op (the replay engine's default
+        // packing) gets 50 builds' worth of headroom.
+        assert_eq!(
+            stderr_budget_for_roots(50),
+            50 * MAX_BUILD_LOG_STDERR_MESSAGES
+        );
+        // Cap region: the multiplier saturates at the documented cap.
+        assert_eq!(
+            stderr_budget_for_roots(STDERR_BUDGET_ROOT_MULTIPLIER_CAP),
+            STDERR_BUDGET_ROOT_MULTIPLIER_CAP * MAX_BUILD_LOG_STDERR_MESSAGES
+        );
+        assert_eq!(
+            stderr_budget_for_roots(STDERR_BUDGET_ROOT_MULTIPLIER_CAP + 1_000),
+            STDERR_BUDGET_ROOT_MULTIPLIER_CAP * MAX_BUILD_LOG_STDERR_MESSAGES
+        );
     }
 
     // -----------------------------------------------------------------------
