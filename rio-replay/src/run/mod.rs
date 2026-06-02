@@ -2099,7 +2099,22 @@ pub async fn run_with_backends(
                 if *stop_rx.borrow() {
                     break;
                 }
-                let cluster_counts = cluster.cluster_status().await.ok();
+                // Surfaced, not collapsed: a ClusterStatus failure is an
+                // event the watchdog must distinguish from a fresh
+                // observation — saturated idle/dispatch streaks stop
+                // asserting after consecutive failures instead of latching
+                // a stall-clock freeze (or a submission pause) across the
+                // outage. This log is what makes the outage itself visible.
+                let cluster_counts = match cluster.cluster_status().await {
+                    Ok(counts) => watchdog::Polled::Fresh(counts),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "cluster-status poll failed; idle/dispatch evidence not refreshed"
+                        );
+                        watchdog::Polled::Failed
+                    }
+                };
                 let ice = if ticks.is_multiple_of(ice_every) {
                     match cluster.spawn_intents().await {
                         Ok(snapshot) => IcePoll::Fresh(snapshot),
@@ -2142,7 +2157,7 @@ pub async fn run_with_backends(
                 // Backpressure: dispatch-gap pause, queue-depth threshold,
                 // rolling infra-failure rate.
                 let queue_depth_pause =
-                    queue_depth_exceeded(knobs.pause_queue_depth, cluster_counts.as_ref());
+                    queue_depth_exceeded(knobs.pause_queue_depth, cluster_counts.fresh());
                 let (terminal_in_scope, infra_rate_pct) = {
                     let res = results.lock().await;
                     let mut terminal: Vec<&JobRecord> = res
@@ -5717,7 +5732,7 @@ mod tests {
         };
         let tick_at = |at: i64| PollTick {
             at_unix: at,
-            cluster: Some(healthy.clone()),
+            cluster: watchdog::Polled::Fresh(healthy.clone()),
             ice: IcePoll::NotPolled,
             engine_paused: false,
         };

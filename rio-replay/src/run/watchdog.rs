@@ -13,7 +13,12 @@
 //! - [`COMPONENT_IDLE`]: the cluster reports queued derivations but nothing
 //!   occupied — running on an executor or substituting — for several
 //!   consecutive polls; the scheduler is not dispatching at all, which is a
-//!   cluster problem, not a per-job one.
+//!   cluster problem, not a per-job one. Asserts only while the
+//!   ClusterStatus feed is fresh: after
+//!   `CLUSTER_STALE_AFTER_FAILED_POLLS` consecutive failed polls the
+//!   saturated streak stops asserting until a poll succeeds again, so a
+//!   persistent RPC outage cannot freeze the stall clocks on a streak the
+//!   engine can no longer confirm.
 //! - [`COMPONENT_ICE`]: capacity provisioning is failing broadly (at least
 //!   the configured number of spawn cells are masked after capacity
 //!   errors). The masked-cells snapshot is sticky between the (slower)
@@ -32,7 +37,10 @@
 //!   to queued work indicts the dispatcher only once nothing is
 //!   substituting. The run loop also pauses submission on this component,
 //!   so the engine stops piling more work onto a scheduler that is not
-//!   dispatching what it already has.
+//!   dispatching what it already has. Like the idle component, a saturated
+//!   streak asserts only while the ClusterStatus feed is fresh — a
+//!   submission pause must never outlive the engine's ability to observe
+//!   the gap it is reacting to.
 //!
 //! While no component holds, the clocks run: a job Active for
 //! `active_stall_hours` is reported as an active stall (the run loop
@@ -90,6 +98,20 @@ pub const COMPONENT_DISPATCH: &str = "dispatch";
 /// evidence, not an observation that the cells were unmasked.
 const ICE_STALE_AFTER_FAILED_POLLS: u32 = 2;
 
+/// Consecutive failed ClusterStatus polls after which the saturated
+/// idle/dispatch streaks stop asserting their components — the cluster
+/// feed's twin of [`ICE_STALE_AFTER_FAILED_POLLS`], with the same
+/// rationale: one failed poll holds the prior state (no flapping on a
+/// leader-failover blip), a second leaves the latched streaks resting on
+/// evidence the engine can no longer confirm. The streak VALUES are
+/// retained, not zeroed — a failed poll is missing evidence, not an
+/// observation that the cluster recovered — so the first fresh poll that
+/// still matches the predicate re-asserts immediately. Gating matters on
+/// both components: a latched COMPONENT_DISPATCH wedges a timeless
+/// campaign (it pauses submission), and a latched COMPONENT_IDLE silently
+/// disables stall detection for as long as the outage lasts.
+const CLUSTER_STALE_AFTER_FAILED_POLLS: u32 = 2;
+
 /// Engine-side phase of one campaign job, as fed by the run loop.
 ///
 /// `Active` means "member of an in-flight batch"; everything else is
@@ -112,48 +134,80 @@ struct JobClock {
     requeues: u32,
 }
 
-/// Spawn-intents (capacity) observation carried by one [`PollTick`].
+/// One RPC-feed observation carried by a [`PollTick`]: the watchdog's two
+/// remote evidence feeds (ClusterStatus counts, spawn-intents capacity)
+/// both arrive through this type, never as `Option<T>`.
 ///
 /// Three-valued because a failed poll and a tick that never attempted one
-/// mean different things to the sticky [`COMPONENT_ICE`] snapshot: between
-/// polls the last snapshot simply stays current ([`IcePoll::NotPolled`] —
-/// the capacity poll cadence is slower than the tick cadence by design),
-/// while a failed attempt ([`IcePoll::Failed`]) leaves the snapshot one
-/// interval staler than the cadence promises. Collapsing failure into "not
-/// polled" would let one latched over-threshold snapshot assert the
-/// capacity suspension forever across a persistent RPC outage, freezing
-/// every stall clock on evidence the engine can no longer confirm.
+/// mean different things to latched suspension state: between polls the
+/// last observation simply stays current ([`Polled::NotPolled`] — a
+/// by-design cadence gap), while a failed attempt ([`Polled::Failed`])
+/// leaves the latched state one interval staler than the cadence
+/// promises. Collapsing failure into "no observation" (the `Option`/`.ok()`
+/// shape this type replaces) lets latched state — a sticky over-threshold
+/// capacity snapshot, a saturated idle/dispatch streak — assert a
+/// suspension forever across a persistent RPC outage, freezing stall
+/// clocks (or pausing submission) on evidence the engine can no longer
+/// confirm.
+///
+/// Scope: exactly the RPC feeds. `PollTick::engine_paused` is in-process
+/// state, fresh by construction, and needs no staleness arm; the
+/// infra-rate pause's evidence (the rolling terminal-record window) is not
+/// a poll at all — its staleness is causal (the pause suppresses its own
+/// producers) and is handled by the canary-probe ladder behind
+/// `BackpressureSource::InfraRate`'s self-clearing witness, not by this
+/// type.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub enum IcePoll {
-    /// No spawn-intents poll was attempted this tick (by-design cadence
-    /// gap): the last snapshot remains in effect.
+pub enum Polled<T> {
+    /// No poll was attempted this tick (by-design cadence gap): the last
+    /// observation remains in effect.
     #[default]
     NotPolled,
-    /// A poll was attempted and the RPC failed. The prior suspension state
-    /// holds for the first failure (a transient blip must not flap the
-    /// suspension, and the stall clocks with it); from
-    /// `ICE_STALE_AFTER_FAILED_POLLS` consecutive failures the sticky
-    /// snapshot is stale and stops asserting [`COMPONENT_ICE`] until a
-    /// poll succeeds again.
+    /// A poll was attempted and the RPC failed. The prior state holds for
+    /// the first failure (a transient blip must not flap a suspension, and
+    /// the stall clocks with it); from the per-feed staleness threshold
+    /// ([`ICE_STALE_AFTER_FAILED_POLLS`] /
+    /// [`CLUSTER_STALE_AFTER_FAILED_POLLS`]) consecutive failures the
+    /// latched state stops asserting its components until a poll succeeds
+    /// again.
     Failed,
-    /// The poll succeeded: this snapshot replaces the sticky one and
-    /// resets the failure streak.
-    Fresh(IceSnapshot),
+    /// The poll succeeded: this observation replaces the latched one and
+    /// resets the feed's failure streak.
+    Fresh(T),
 }
+
+impl<T> Polled<T> {
+    /// The fresh observation, when this tick carries one.
+    pub fn fresh(&self) -> Option<&T> {
+        match self {
+            Polled::Fresh(value) => Some(value),
+            Polled::Failed | Polled::NotPolled => None,
+        }
+    }
+}
+
+/// Spawn-intents (capacity) observation carried by one [`PollTick`].
+pub type IcePoll = Polled<IceSnapshot>;
 
 /// One observation the run loop feeds the watchdog (typically every
 /// `cluster_status_poll_secs`; `ice` is refreshed only every
-/// `spawn_intents_poll_secs`, so most ticks carry [`IcePoll::NotPolled`]
-/// and the last snapshot stays in effect).
+/// `spawn_intents_poll_secs`, so most ticks carry [`Polled::NotPolled`]
+/// there and the last snapshot stays in effect).
 #[derive(Debug, Clone, Default)]
 pub struct PollTick {
     pub at_unix: i64,
-    /// Latest ClusterStatus counts; `None` when the poll failed — the idle
-    /// and dispatch streaks then stay unchanged (a poll outage neither
-    /// builds nor clears a streak).
-    pub cluster: Option<ClusterCounts>,
+    /// Latest ClusterStatus counts. The run loop polls this feed every
+    /// tick, so `NotPolled` does not occur in production (tests use it for
+    /// ticks that only exercise the clocks); a failed poll arrives as
+    /// [`Polled::Failed`] — the idle and dispatch streaks then stay
+    /// unchanged (missing evidence is not an observation), and from
+    /// [`CLUSTER_STALE_AFTER_FAILED_POLLS`] consecutive failures the
+    /// saturated streaks stop asserting their components.
+    pub cluster: Polled<ClusterCounts>,
     /// Spawn-intents poll outcome for this tick.
     pub ice: IcePoll,
+    /// The engine's own submission-pause flag — in-process state, fresh by
+    /// construction (never an RPC feed, so no staleness arm).
     pub engine_paused: bool,
 }
 
@@ -220,6 +274,12 @@ pub struct Watchdog {
     jobs: BTreeMap<String, JobClock>,
     idle_streak: u32,
     dispatch_streak: u32,
+    /// Consecutive ClusterStatus polls that failed (not-polled ticks leave
+    /// it unchanged; a successful poll resets it). At
+    /// [`CLUSTER_STALE_AFTER_FAILED_POLLS`] the saturated idle/dispatch
+    /// streaks stop asserting their components — the streak values are
+    /// retained, only their authority lapses.
+    cluster_failed_polls: u32,
     /// Last seen capacity snapshot — sticky between the (less frequent)
     /// spawn-intent polls, but only allowed to assert [`COMPONENT_ICE`]
     /// while fresh: see [`ICE_STALE_AFTER_FAILED_POLLS`].
@@ -259,6 +319,7 @@ impl Watchdog {
             jobs: BTreeMap::new(),
             idle_streak: 0,
             dispatch_streak: 0,
+            cluster_failed_polls: 0,
             last_ice: IceSnapshot::default(),
             ice_failed_polls: 0,
             last_tick_unix: None,
@@ -311,7 +372,14 @@ impl Watchdog {
         if tick.engine_paused {
             components.push(COMPONENT_PAUSE);
         }
-        if let Some(cluster) = &tick.cluster {
+        match &tick.cluster {
+            Polled::Fresh(_) => self.cluster_failed_polls = 0,
+            Polled::Failed => {
+                self.cluster_failed_polls = self.cluster_failed_polls.saturating_add(1);
+            }
+            Polled::NotPolled => {}
+        }
+        if let Polled::Fresh(cluster) = &tick.cluster {
             if cluster.queued_derivations > 0 && cluster.occupied_derivations() == 0 {
                 self.idle_streak += 1;
             } else {
@@ -359,11 +427,23 @@ impl Watchdog {
                 self.dispatch_streak = 0;
             }
         }
-        if self.idle_streak >= self.knobs.idle_polls_for_suspend {
-            components.push(COMPONENT_IDLE);
-        }
-        if self.dispatch_streak >= self.knobs.dispatch_gap_polls {
-            components.push(COMPONENT_DISPATCH);
+        // Stale-evidence gate, the cluster feed's twin of the ICE gate
+        // below: a saturated streak asserts its component only while the
+        // feed is fresh. The streaks are mutated only under a fresh poll,
+        // so across an outage they latch at their last value — without the
+        // gate a persistent ClusterStatus outage would keep COMPONENT_IDLE
+        // freezing every stall clock and COMPONENT_DISPATCH pausing
+        // submission indefinitely, both resting on evidence the engine can
+        // no longer confirm (the cluster may have drained or recovered
+        // invisibly). The streak values survive the lapse: the first fresh
+        // poll that still matches the predicate re-asserts on that tick.
+        if self.cluster_failed_polls < CLUSTER_STALE_AFTER_FAILED_POLLS {
+            if self.idle_streak >= self.knobs.idle_polls_for_suspend {
+                components.push(COMPONENT_IDLE);
+            }
+            if self.dispatch_streak >= self.knobs.dispatch_gap_polls {
+                components.push(COMPONENT_DISPATCH);
+            }
         }
         match &tick.ice {
             IcePoll::Fresh(ice) => {
@@ -550,7 +630,7 @@ mod tests {
     fn tick(at: i64, c: ClusterCounts) -> PollTick {
         PollTick {
             at_unix: at,
-            cluster: Some(c),
+            cluster: Polled::Fresh(c),
             ice: IcePoll::NotPolled,
             engine_paused: false,
         }
@@ -901,17 +981,20 @@ mod tests {
         assert_eq!(o.components, vec![COMPONENT_DISPATCH]);
     }
 
+    /// One failed-poll tick during an outage: the streak must neither
+    /// advance nor reset (a single blip is anti-flap territory, below the
+    /// staleness threshold).
     #[test]
     fn poll_outage_preserves_an_in_progress_idle_streak() {
         let mut wd = Watchdog::new(knobs());
         // Two idle polls build the streak to 2 (threshold is 3).
         assert!(!wd.on_tick(&tick(0, cluster(10, 0, 0, 8))).suspended);
         assert!(!wd.on_tick(&tick(60, cluster(10, 0, 0, 8))).suspended);
-        // Poll outage: no cluster counts. The streak must neither advance
-        // nor reset.
+        // Poll outage: the ClusterStatus RPC failed. The streak must
+        // neither advance nor reset.
         let outage = PollTick {
             at_unix: 120,
-            cluster: None,
+            cluster: Polled::Failed,
             ice: IcePoll::NotPolled,
             engine_paused: false,
         };
@@ -921,6 +1004,113 @@ mod tests {
         let o = wd.on_tick(&tick(180, cluster(10, 0, 0, 8)));
         assert!(o.suspended, "outage tick preserved the idle streak");
         assert_eq!(o.components, vec![COMPONENT_IDLE]);
+    }
+
+    /// The cluster feed's stale-evidence gate, closed-loop: a saturated
+    /// idle streak (suspension active, stall clocks frozen) holds through
+    /// ONE failed poll, de-asserts at CLUSTER_STALE_AFTER_FAILED_POLLS
+    /// consecutive failures (window closes, clocks resume — a persistent
+    /// admin-RPC outage no longer disables stall detection), stays
+    /// de-asserted while the outage continues, and re-asserts on the FIRST
+    /// fresh poll that still matches the predicate (the streak value
+    /// survives the lapse — missing evidence is not an observation that
+    /// the cluster recovered).
+    #[test]
+    fn cluster_failed_polls_age_out_idle_and_dispatch_assertions() {
+        let mut wd = Watchdog::new(knobs());
+        wd.observe_job("queued.x86_64-linux", JobPhase::Queued);
+        let failed = |at: i64| PollTick {
+            at_unix: at,
+            cluster: Polled::Failed,
+            ice: IcePoll::NotPolled,
+            engine_paused: false,
+        };
+        // Saturate the idle streak: suspension active.
+        wd.on_tick(&tick(0, cluster(10, 0, 0, 8)));
+        wd.on_tick(&tick(60, cluster(10, 0, 0, 8)));
+        let o = wd.on_tick(&tick(120, cluster(10, 0, 0, 8)));
+        assert_eq!(o.components, vec![COMPONENT_IDLE]);
+
+        // First failed poll: prior state holds (no flapping on a blip).
+        let o = wd.on_tick(&failed(180));
+        assert_eq!(
+            o.components,
+            vec![COMPONENT_IDLE],
+            "one failure holds the prior assertion"
+        );
+        // Second consecutive failure: the latched streak is stale — the
+        // component de-asserts and the suspension window closes.
+        let o = wd.on_tick(&failed(240));
+        assert!(
+            o.components.is_empty(),
+            "stale streak stops asserting: {:?}",
+            o.components
+        );
+        assert!(!o.suspended);
+        assert!(o.closed_window.is_some(), "idle window closes at staleness");
+        // Further failures keep it de-asserted, and the stall clocks now
+        // run: 2h of unsuspended queued time later the queued watchdog
+        // fires — the outage no longer disables stall detection.
+        let o = wd.on_tick(&failed(300));
+        assert!(o.components.is_empty());
+        let o = wd.on_tick(&failed(300 + 2 * 3600));
+        assert_eq!(
+            o.stalled,
+            vec![StallVerdict {
+                job: "queued.x86_64-linux".into(),
+                kind: StallKind::QueuedRequeue,
+                requeues_used: 1,
+            }]
+        );
+
+        // The first fresh poll that still matches the idle predicate
+        // re-asserts immediately — the streak value survived the lapse.
+        let o = wd.on_tick(&tick(300 + 2 * 3600 + 60, cluster(10, 0, 0, 8)));
+        assert_eq!(
+            o.components,
+            vec![COMPONENT_IDLE],
+            "retained streak re-arms on the first confirming fresh poll"
+        );
+        // And a fresh poll showing recovery clears the streak entirely.
+        let o = wd.on_tick(&tick(300 + 2 * 3600 + 120, cluster(10, 5, 0, 8)));
+        assert!(o.components.is_empty());
+    }
+
+    /// The dispatch arm of the same gate: a saturated dispatch streak
+    /// pauses submission, and a persistent ClusterStatus outage must
+    /// release that pause at the staleness threshold instead of wedging
+    /// the campaign on evidence the engine can no longer confirm.
+    #[test]
+    fn cluster_outage_releases_a_latched_dispatch_pause() {
+        let mut wd = Watchdog::new(knobs());
+        let failed = |at: i64| PollTick {
+            at_unix: at,
+            cluster: Polled::Failed,
+            ice: IcePoll::NotPolled,
+            engine_paused: false,
+        };
+        // Saturate the dispatch streak (5 polls of gap > 50 with queued
+        // work and quiescent substitution).
+        for i in 0..5 {
+            wd.on_tick(&tick(i * 60, cluster(100, 10, 0, 100)));
+        }
+        let o = wd.on_tick(&tick(5 * 60, cluster(100, 10, 0, 100)));
+        assert!(o.dispatch_pause, "gap sustained → submission paused");
+
+        // One failed poll holds the pause; the second releases it.
+        let o = wd.on_tick(&failed(6 * 60));
+        assert!(o.dispatch_pause, "one failure holds the pause");
+        let o = wd.on_tick(&failed(7 * 60));
+        assert!(
+            !o.dispatch_pause,
+            "two consecutive failures release the submission pause"
+        );
+        assert!(!o.suspended);
+
+        // A fresh poll still showing the gap re-asserts the pause on that
+        // very tick (streak retained through the outage).
+        let o = wd.on_tick(&tick(8 * 60, cluster(100, 10, 0, 100)));
+        assert!(o.dispatch_pause, "confirming fresh poll re-arms the pause");
     }
 
     #[test]

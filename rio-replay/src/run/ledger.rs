@@ -315,7 +315,7 @@ impl JobLedger {
 mod tests {
     use super::*;
     use crate::run::spec::Knobs;
-    use crate::run::watchdog::{IcePoll, PollTick, StallKind};
+    use crate::run::watchdog::{IcePoll, PollTick, Polled, StallKind};
 
     fn ledger() -> (
         tempfile::TempDir,
@@ -343,7 +343,7 @@ mod tests {
     fn tick(at: i64) -> PollTick {
         PollTick {
             at_unix: at,
-            cluster: None,
+            cluster: Polled::NotPolled,
             ice: IcePoll::NotPolled,
             engine_paused: false,
         }
