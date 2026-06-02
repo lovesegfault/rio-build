@@ -1526,8 +1526,9 @@
                   # formal refinement). r[verify] markers are at the
                   # wiring point in nix/kani.nix.
                   #
-                  # kani-rio-store: same pipeline over the log-chunk
-                  # decision kernels (rio-store/src/logs/kernel.rs) — the
+                  # kani-rio-log-kernel: same pipeline over the log-chunk
+                  # decision kernels (rio-log-kernel, the dependency-free
+                  # crate rio_store::logs::kernel re-exports) — the
                   # chunk-interval arithmetic, the read-path overlap
                   # dedup, the accept verdict, and the completeness fold.
                   # The formal model (quint-log-service-*, in quintChecks)
@@ -1568,7 +1569,7 @@
                   # checks.* above, so they flow through automatically).
                   inherit (kaniChecks)
                     kani-rio-lease
-                    kani-rio-store
+                    kani-rio-log-kernel
                     kani-rio-retry-kernel
                     kani-rio-evidence-kernel
                     ;

@@ -13,13 +13,6 @@ name = "rio-store"
 path = "src/main.rs"
 required-features = ["server"]
 
-[lints.rust]
-# `cfg(kani)` is set by kani-compiler (nix `crateBuildKani` passes
-# `--cfg=kani --check-cfg=cfg(kani)`); register it here so the regular
-# cargo build doesn't warn `unexpected_cfgs` on the
-# `#[cfg_attr(kani, kani::...)]` contracts in logs/kernel.rs.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
-
 [features]
 default = ["server"]
 # Lean PG-schema accessors only (`error` + `realisations` modules). Lets
@@ -34,6 +27,7 @@ server = [
   "dep:rio-auth",
   "dep:rio-nix",
   "dep:rio-proto",
+  "dep:rio-log-kernel",
   "dep:tokio",
   "dep:async-trait",
   "dep:tonic",
@@ -94,6 +88,9 @@ rio-common = { workspace = true, features = ["aws"], optional = true }
 rio-auth = { workspace = true, optional = true }
 rio-nix = { workspace = true, optional = true }
 rio-proto = { workspace = true, optional = true }
+# The pure log decision kernels (logs/kernel re-export). `logs` is
+# server-gated, and the lean `schema` feature stays kernel-free.
+rio-log-kernel = { workspace = true, optional = true }
 # Optional: only when test-utils feature is on. Also a dev-dep below so
 # rio-store's own `cargo test` (which doesn't enable test-utils) still
 # sees it for the cfg(test) arm of test_helpers.rs.

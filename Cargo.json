@@ -11,6 +11,7 @@
     "rio-evidence-kernel": "rio-evidence-kernel",
     "rio-gateway": "rio-gateway",
     "rio-lease": "rio-lease",
+    "rio-log-kernel": "rio-log-kernel",
     "rio-migrations": "rio-migrations",
     "rio-nix": "rio-nix",
     "rio-proto": "rio-proto",
@@ -20199,6 +20200,21 @@
         "Rio Contributors"
       ]
     },
+    "rio-log-kernel": {
+      "crateName": "rio-log-kernel",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-log-kernel"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
     "rio-migrations": {
       "crateName": "rio-migrations",
       "version": "0.1.0",
@@ -20817,6 +20833,10 @@
         {
           "name": "rio-common",
           "packageId": "rio-common"
+        },
+        {
+          "name": "rio-log-kernel",
+          "packageId": "rio-log-kernel"
         },
         {
           "name": "rio-migrations",

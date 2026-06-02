@@ -4798,8 +4798,8 @@ gate, and the controller-side successors.
   (below).
 - **Kani.** No executor-side harness (the reasoned omission above);
   `kani-rio-retry-kernel` (7 harnesses) carries the decision
-  arithmetic unchanged; `kani-rio-lease` / `kani-rio-store`
-  unaffected.
+  arithmetic unchanged; `kani-rio-lease` / `kani-rio-log-kernel`
+  (the former `kani-rio-store`) unaffected.
 - **Spec.** The pull-protocol rule set landed marker-first across
   1a–1d (`sched.executor.pull-{transaction,gone,not-ready}`,
   `sched.executor.report-idempotent`, `sched.attempt.{no-attempt-no-op,

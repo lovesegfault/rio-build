@@ -1,14 +1,19 @@
 //! Pure decision kernels for the log chunk subsystem.
 //!
 //! Every function here is total, allocation-free, loop-free (except the
-//! bounded manifest fold), and depends on nothing but `core` — no SQL,
-//! no S3, no clocks, no `Vec<u8>` payloads. The I/O-shaped callers
-//! ([`super::tail::read_chunk`], [`super::ingest::IngestSession::accept`],
-//! [`super::gate`]'s completeness predicate) project their inputs into
-//! plain integers, delegate the decision here, and apply the returned
-//! verdict. The split mirrors `rio-lease`'s `decide()` / `decide_pure()`
-//! pair: the kernel is the verifiable core, the caller is the
-//! I/O-shaped shim.
+//! bounded manifest fold and the contiguous-prefix scan), and depends
+//! on nothing but `core` — no SQL, no S3, no clocks, no `Vec<u8>`
+//! payloads. The I/O-shaped callers (rio-store's `logs::tail::read_chunk`,
+//! `logs::ingest::IngestSession::accept`, and `logs::gate`'s
+//! completeness predicate) project their inputs into plain integers,
+//! delegate the decision here, and apply the returned verdict. The
+//! split mirrors `rio-lease`'s `decide()` / `decide_pure()` pair: the
+//! kernel is the verifiable core, the caller is the I/O-shaped shim.
+//!
+//! This crate is dependency-free so the CBMC goto model for the proof
+//! harnesses closes over it alone (the rio-retry-kernel template);
+//! rio-store re-exports it as `rio_store::logs::kernel`, which keeps
+//! every store-side import path unchanged.
 //!
 //! Each kernel parallels a `pure def` in the formal model
 //! (`docs/spec/models/logService.qnt`): [`visit_chunk`] is `visitChunk`,
@@ -29,7 +34,8 @@
 /// The contributed line numbers are the half-open range
 /// `[yield_from, yield_until)` — empty (`yield_from == yield_until`)
 /// when the chunk is skipped. `next_line` is the post-visit watermark
-/// the caller stores back into its [`super::tail::LineCursor`].
+/// the caller stores back into its `LineCursor` (rio-store's
+/// `logs::tail`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkVisit {
     /// First line number this chunk contributes:
@@ -154,10 +160,10 @@ pub fn visit_chunk(next_line: u64, first_line: u64, n_lines: u64) -> ChunkVisit 
 }
 
 /// The verdict of [`accept_verdict`] for one non-empty `AppendLog`
-/// batch. The three `Rejected*` variants map one-to-one onto
-/// [`super::ingest::AcceptOutcome`]'s rejection variants; `Accepted`
-/// carries the post-truncation exclusive end the caller needs to
-/// truncate the batch and advance its high-water mark.
+/// batch. The three `Rejected*` variants map one-to-one onto the
+/// rejection variants of rio-store's `logs::ingest::AcceptOutcome`;
+/// `Accepted` carries the post-truncation exclusive end the caller
+/// needs to truncate the batch and advance its high-water mark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcceptVerdict {
     /// `first_line_number + line_count` overflows `u64` or exceeds
@@ -343,6 +349,38 @@ pub fn manifest_covers_contiguously(chunks: &[(i64, i64)], up_to: i64) -> bool {
     covered >= up_to
 }
 
+/// Length of the longest prefix of `line_numbers` that is consecutive
+/// (each number is its predecessor plus one). Zero for an empty
+/// iterator — total over every input, unlike the slice predecessor in
+/// rio-store's cutter, which documented a non-empty precondition (the
+/// production caller still pre-checks emptiness before draining).
+///
+/// This is the cutter's "what may one chunk contain" decision: a chunk
+/// manifest row describes a gap-free `[first_line, first_line +
+/// line_count)`, so the cutter drains exactly one maximal contiguous
+/// run per chunk. Payload-free per the kernel style — the caller maps
+/// its `(line_number, bytes)` buffer down to the line numbers.
+///
+/// `checked_add` keeps the scan total at `u64::MAX` (the run simply
+/// ends there); under the `BIGINT` precondition every production input
+/// is far below the edge, so the result is identical to the old
+/// wrapping form.
+pub fn contiguous_prefix_len(line_numbers: impl Iterator<Item = u64>) -> usize {
+    let mut iter = line_numbers;
+    let Some(mut prev) = iter.next() else {
+        return 0;
+    };
+    let mut len = 1;
+    for n in iter {
+        if prev.checked_add(1) != Some(n) {
+            break;
+        }
+        len += 1;
+        prev = n;
+    }
+    len
+}
+
 #[cfg(kani)]
 mod proofs {
     use super::*;
@@ -410,10 +448,10 @@ mod proofs {
     }
 
     // (The tracey verify markers for these harnesses live at the
-    // `kani-rio-store` wiring point in nix/kani.nix, not here — same
-    // discipline as the VM-test subtests list: a marker in the harness
-    // would tell tracey the rule is verified even if the member were
-    // never wired into the check set.)
+    // `kani-rio-log-kernel` wiring point in nix/kani.nix, not here —
+    // same discipline as the VM-test subtests list: a marker in the
+    // harness would tell tracey the rule is verified even if the member
+    // were never wired into the check set.)
     /// The read path's dedup over TWO possibly-overlapping chunks
     /// visited in ascending `first_line` order (the
     /// `read_manifest_range` `ORDER BY`): every line is served at most
@@ -501,7 +539,7 @@ mod proofs {
     /// extension — the same shapes the model's `MAX_LINE = 3` domain
     /// reaches); the completeness direction (a fully-covered manifest
     /// is reported as covering) is pinned by the `contiguity_*` unit
-    /// tests in `gate.rs`.
+    /// tests in rio-store's `gate.rs`.
     #[kani::proof]
     #[kani::unwind(5)]
     fn check_manifest_covers_no_uncovered_point() {
@@ -528,5 +566,133 @@ mod proofs {
             kani::assume(x >= 0 && x < up_to);
             assert!(chunks.iter().any(|&(f, n)| f <= x && x < f + n));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One visit step per row: `(cursor, first, n) -> (yield_from,
+    /// yield_until, next_line)`. The skip rows pin the two skip causes
+    /// (zero-line chunk; chunk entirely below the watermark) leaving
+    /// the watermark untouched.
+    #[test]
+    fn visit_chunk_table() {
+        type Case = ((u64, u64, u64), (u64, u64, u64));
+        let cases: &[Case] = &[
+            // Fresh cursor, chunk ahead of it: full yield.
+            ((0, 0, 4), (0, 4, 4)),
+            ((0, 10, 4), (10, 14, 14)),
+            // Cursor inside the chunk: leading lines deduped.
+            ((12, 10, 4), (12, 14, 14)),
+            // Chunk entirely below the watermark: skipped, no advance.
+            ((20, 10, 4), (20, 20, 20)),
+            // Last line exactly at the watermark boundary: 10..14 with
+            // cursor 14 is fully served already.
+            ((14, 10, 4), (14, 14, 14)),
+            // Zero-line chunk past the cursor must NOT advance the
+            // watermark (the doc-comment's swallow hazard).
+            ((3, 50, 0), (3, 3, 3)),
+            // BIGINT-edge chunk: exact arithmetic at the precondition
+            // boundary (first + n == i64::MAX as u64 + 1 is the largest
+            // representable end).
+            (
+                (0, i64::MAX as u64 - 3, 3),
+                (i64::MAX as u64 - 3, i64::MAX as u64, i64::MAX as u64),
+            ),
+        ];
+        for &((cursor, first, n), (from, until, next)) in cases {
+            let v = visit_chunk(cursor, first, n);
+            assert_eq!(
+                (v.yield_from, v.yield_until, v.next_line),
+                (from, until, next),
+                "visit_chunk({cursor}, {first}, {n})"
+            );
+            assert_eq!(v.is_empty(), from == until);
+        }
+    }
+
+    /// The verdict partition in gate order: overflow beats
+    /// non-monotone beats past-final beats accept; truncation clamps
+    /// the accepted end to the ceiling.
+    #[test]
+    fn accept_verdict_partition() {
+        use AcceptVerdict::*;
+        // u64 wrap.
+        assert_eq!(accept_verdict(0, None, u64::MAX, 2), RejectedOverflow);
+        // Representable in u64 but past the BIGINT ceiling.
+        assert_eq!(
+            accept_verdict(0, None, i64::MAX as u64, 1),
+            RejectedOverflow
+        );
+        // Exactly at the BIGINT ceiling: still representable.
+        assert_eq!(
+            accept_verdict(0, None, i64::MAX as u64 - 1, 1),
+            Accepted {
+                end: i64::MAX as u64
+            }
+        );
+        // Overflow wins even when the batch is also non-monotone.
+        assert_eq!(accept_verdict(10, None, u64::MAX, 2), RejectedOverflow);
+        // Below the high-water mark.
+        assert_eq!(accept_verdict(10, None, 9, 1), RejectedNonMonotone);
+        // Non-monotone wins over past-final.
+        assert_eq!(accept_verdict(10, Some(5), 4, 1), RejectedNonMonotone);
+        // At or past the ceiling.
+        assert_eq!(accept_verdict(0, Some(5), 5, 1), RejectedPastFinal);
+        assert_eq!(accept_verdict(0, Some(5), 7, 1), RejectedPastFinal);
+        // Straddling the ceiling: truncated to it.
+        assert_eq!(accept_verdict(0, Some(5), 3, 4), Accepted { end: 5 });
+        // Under the ceiling: untouched.
+        assert_eq!(accept_verdict(0, Some(5), 3, 2), Accepted { end: 5 });
+        assert_eq!(accept_verdict(0, Some(9), 3, 2), Accepted { end: 5 });
+        // No ceiling: the batch's own end.
+        assert_eq!(accept_verdict(3, None, 3, 4), Accepted { end: 7 });
+        // Empty batch (the caller normally pre-handles it): total,
+        // accepted, end == first.
+        assert_eq!(accept_verdict(0, None, 3, 0), Accepted { end: 3 });
+    }
+
+    /// Coverage fold: gaps break it, overlap extends it, the empty
+    /// manifest covers exactly the empty range.
+    #[test]
+    fn covers_contiguously_table() {
+        // Exact cover.
+        assert!(manifest_covers_contiguously(&[(0, 5), (5, 5)], 10));
+        // Overlap extends coverage.
+        assert!(manifest_covers_contiguously(&[(0, 6), (4, 6)], 10));
+        // Duplicate-range chunks (failover twins) are harmless.
+        assert!(manifest_covers_contiguously(&[(0, 5), (0, 5), (5, 5)], 10));
+        // Interior gap.
+        assert!(!manifest_covers_contiguously(&[(0, 4), (5, 5)], 10));
+        // Doesn't reach up_to.
+        assert!(!manifest_covers_contiguously(&[(0, 5)], 10));
+        // Coverage past up_to is fine.
+        assert!(manifest_covers_contiguously(&[(0, 50)], 10));
+        // Empty manifest: covers [0, 0) only.
+        assert!(manifest_covers_contiguously(&[], 0));
+        assert!(!manifest_covers_contiguously(&[], 1));
+        // A manifest not starting at zero never covers.
+        assert!(!manifest_covers_contiguously(&[(1, 9)], 10));
+    }
+
+    /// The cutter's run rule: maximal consecutive prefix, zero on
+    /// empty, run ends at the u64 edge instead of wrapping.
+    #[test]
+    fn contiguous_prefix_len_runs() {
+        let lens = |v: &[u64]| contiguous_prefix_len(v.iter().copied());
+        assert_eq!(lens(&[]), 0);
+        assert_eq!(lens(&[7]), 1);
+        assert_eq!(lens(&[7, 8, 9]), 3);
+        // Forward gap splits the run.
+        assert_eq!(lens(&[7, 8, 10, 11]), 2);
+        // Backwards numbering is never consecutive.
+        assert_eq!(lens(&[7, 6, 5]), 1);
+        // Duplicate line number ends the run.
+        assert_eq!(lens(&[7, 7]), 1);
+        // The u64::MAX edge: checked_add ends the run; no wrap to 0.
+        assert_eq!(lens(&[u64::MAX, 0]), 1);
+        assert_eq!(lens(&[u64::MAX - 1, u64::MAX]), 2);
     }
 }

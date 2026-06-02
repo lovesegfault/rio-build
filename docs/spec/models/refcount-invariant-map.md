@@ -784,7 +784,7 @@ manifest, and the wrapper's pinned polarity.
 The design §4.6 Kani contract for that parse (no panic on arbitrary
 input; `Err` exactly when `Manifest::deserialize` rejects; on `Ok` an
 exact dedup of the entry hashes that is empty only for a zero-entry
-manifest) was attempted as a sixth `kani-rio-store` harness over bounded
+manifest) was attempted as a sixth `kani-rio-store` (now `kani-rio-log-kernel`) harness over bounded
 arbitrary inputs of one version byte plus four, then two, then one
 36-byte entry, each with explicit unwind bounds. None of the attempts
 converged inside the merge-gate budget on the CI builder, while the
@@ -2122,8 +2122,10 @@ time; no production code reads or writes a chunk reference counter.
 - **Kani.** No proof harness for this subsystem: the two §4.6
   candidates are closed as reasoned omissions (Phase-2 section above)
   because their load-bearing logic lives in SQL or in test-only
-  oracles after the v3/v4 re-entries. `kani-rio-store` continues to
-  carry the five log-kernel harnesses, unaffected.
+  oracles after the v3/v4 re-entries. `kani-rio-log-kernel` (formerly
+  `kani-rio-store`; the kernels were extracted to the dependency-free
+  rio-log-kernel crate) continues to carry the five log-kernel
+  harnesses, unaffected.
 - **Schema and instrumentation.** Migrations 068 (additive
   `last_referenced_at`), 069 (drop the M_023 CHECK and
   `idx_chunks_gc`), and 070 (drop the column itself; landed after this

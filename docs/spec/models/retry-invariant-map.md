@@ -1691,7 +1691,7 @@ harness. With that in place the harnesses converge inside the
 merge-gate budget (per-harness wall-clocks are recorded in the
 representation change's commit messages), `kani-rio-retry-kernel` is
 inherited into `checks.*` alongside `kani-rio-lease` /
-`kani-rio-store`, and the corresponding `r[verify]` markers live at
+`kani-rio-log-kernel` (the former `kani-rio-store`), and the corresponding `r[verify]` markers live at
 the wiring point in nix/kani.nix. One mechanism note: `classify()` and
 `placeable()` are verified as `proof_for_contract` harnesses, while
 `decide()`'s four clauses are asserted by its harness through shared

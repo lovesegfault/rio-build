@@ -6379,6 +6379,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-log-kernel"
+version = "0.1.0"
+
+[[package]]
 name = "rio-migrations"
 version = "0.1.0"
 dependencies = [
@@ -6536,6 +6540,7 @@ dependencies = [
  "reqwest",
  "rio-auth",
  "rio-common",
+ "rio-log-kernel",
  "rio-migrations",
  "rio-nix",
  "rio-proto",

@@ -16,6 +16,7 @@ members = [
   "rio-crds",
   "rio-retry-kernel",
   "rio-evidence-kernel",
+  "rio-log-kernel",
   "workspace-hack",
   "xtask",
 ]
@@ -46,6 +47,7 @@ rio-crds = { path = "rio-crds" }
 rio-lease = { path = "rio-lease" }
 rio-retry-kernel = { path = "rio-retry-kernel" }
 rio-evidence-kernel = { path = "rio-evidence-kernel" }
+rio-log-kernel = { path = "rio-log-kernel" }
 
 # Byte buffers
 bytes = "1"

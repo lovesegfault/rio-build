@@ -65,6 +65,10 @@
       "description": "Pure closure-evidence decision kernel for the rio-build scheduler (CBMC-verified)"
     },
     {
+      "name": "rio-log-kernel",
+      "description": "Pure log chunk-range/dedup/gate decision kernels for the rio-build store (CBMC-verified)"
+    },
+    {
       "name": "xtask",
       "description": "Dev/ops tooling: codegen, local cluster lifecycle, AMI build, helm/k8s helpers"
     }
@@ -153,6 +157,11 @@
         "rio-test-support"
       ]
     },
+    "rio-log-kernel": {
+      "prod": [],
+      "optional": [],
+      "dev": []
+    },
     "rio-migrations": {
       "prod": [],
       "optional": [],
@@ -199,6 +208,7 @@
       "prod": [
         "rio-auth",
         "rio-common",
+        "rio-log-kernel",
         "rio-migrations",
         "rio-nix",
         "rio-proto"

@@ -12646,6 +12646,21 @@
         "Rio Contributors"
       ]
     },
+    "rio-log-kernel": {
+      "crateName": "rio-log-kernel",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "../../rio-log-kernel"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
     "rio-migrations": {
       "crateName": "rio-migrations",
       "version": "0.1.0",
@@ -12923,6 +12938,10 @@
         {
           "name": "rio-common",
           "packageId": "rio-common"
+        },
+        {
+          "name": "rio-log-kernel",
+          "packageId": "rio-log-kernel"
         },
         {
           "name": "rio-migrations",

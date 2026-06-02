@@ -675,7 +675,8 @@ impl IngestSession {
             if shared.buffer.is_empty() {
                 return Ok(None);
             }
-            let run_len = contiguous_prefix_len(&shared.buffer);
+            let run_len =
+                super::kernel::contiguous_prefix_len(shared.buffer.iter().map(|(n, _)| *n));
             let rest = shared.buffer.split_off(run_len);
             shared.in_flight = std::mem::replace(&mut shared.buffer, rest);
             let drained_bytes: u64 = shared.in_flight.iter().map(|(_, l)| accounted_len(l)).sum();
@@ -801,19 +802,6 @@ impl IngestSession {
         }
         None
     }
-}
-
-/// Length of the longest prefix of `buffer` whose line numbers are
-/// consecutive (`buffer[i+1].0 == buffer[i].0 + 1`). `buffer` must be
-/// non-empty. The prefix is what one chunk may contain: the manifest
-/// describes a chunk as `[first_line, first_line + line_count)` with no
-/// interior gaps.
-fn contiguous_prefix_len(buffer: &[(u64, Vec<u8>)]) -> usize {
-    let mut len = 1;
-    while len < buffer.len() && buffer[len].0 == buffer[len - 1].0 + 1 {
-        len += 1;
-    }
-    len
 }
 
 #[cfg(test)]

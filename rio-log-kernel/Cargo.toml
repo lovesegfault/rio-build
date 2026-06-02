@@ -1,0 +1,35 @@
+# Dependency-free home for the store's log chunk-range/dedup/gate
+# decision kernels (the read-path overlap-dedup walk, the ingest accept
+# verdict, the completeness fold, the cutter's contiguous-prefix rule,
+# and their CBMC contracts). Extracted from rio-store/src/logs/kernel.rs
+# so the kani goto model for the proof harnesses closes over THIS crate
+# only — inside rio-store's artifact context the harnesses re-verified
+# on every rio-store or transitive-dep edit and sat one std-machinery
+# growth spurt away from the blowup class recorded at nix/kani.nix.
+# Keep it that way: no dependencies. The store-facing vocabulary
+# (BuildLogBatch, ChunkRef, IngestSession) stays in rio-store;
+# rio_store::logs::kernel is the re-export surface.
+[package]
+name = "rio-log-kernel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Pure log chunk-range/dedup/gate decision kernels for the rio-build store (CBMC-verified)"
+
+[lints.rust]
+# `cfg(kani)` is set by kani-compiler (nix `crateBuildKani` passes
+# `--cfg=kani --check-cfg=cfg(kani)`); register it here so the regular
+# cargo build doesn't warn `unexpected_cfgs` on the
+# `#[cfg_attr(kani, kani::...)]` contracts and the `#[cfg(kani)]`
+# proofs module.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+# No [dependencies]: the whole point of this crate is that the CBMC
+# proof harnesses' call graph stays inside core/alloc/std. It is also
+# excluded from hakari's workspace-hack unification
+# (.config/hakari.toml [final-excludes]) so it does not even carry the
+# feature-unification stub.
+[dependencies]

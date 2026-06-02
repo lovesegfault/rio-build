@@ -637,6 +637,13 @@
       "doc": "Model-based testing: replay traces generated from the leader-election"
     }
   ],
+  "rio-log-kernel": [
+    {
+      "path": "lib.rs",
+      "depth": 0,
+      "doc": "Pure decision kernels for the log chunk subsystem."
+    }
+  ],
   "rio-migrations": [
     {
       "path": "lib.rs",
@@ -1372,11 +1379,6 @@
       "path": "logs/ingest.rs",
       "depth": 1,
       "doc": "The per-stream ingest state machine for `LogService.AppendLog`."
-    },
-    {
-      "path": "logs/kernel.rs",
-      "depth": 1,
-      "doc": "Pure decision kernels for the log chunk subsystem."
     },
     {
       "path": "logs/mbt_tests.rs",

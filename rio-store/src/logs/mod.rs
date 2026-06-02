@@ -11,8 +11,10 @@
 //! Submodules (added incrementally):
 //! - [`kernel`] — the pure decision kernels (chunk-interval arithmetic,
 //!   the read-path overlap dedup, the accept verdict, the completeness
-//!   fold). No I/O, no allocation; the other submodules project their
-//!   inputs into these and apply the returned verdicts.
+//!   fold), re-exported from the dependency-free `rio-log-kernel` crate
+//!   (the kani-verified decision kernels; see its crate docs). No I/O,
+//!   no allocation; the other submodules project their inputs into
+//!   these and apply the returned verdicts.
 //! - [`chunks`] — the chunk key scheme, the line codec, and the
 //!   [`chunks::LogChunkStore`] storage abstraction (S3 + in-memory).
 //! - [`sessions`] — the live-ingest session registry (one `AppendLog`
@@ -36,7 +38,7 @@
 pub mod chunks;
 pub mod gate;
 pub mod ingest;
-pub mod kernel;
+pub use rio_log_kernel as kernel;
 #[cfg(test)]
 mod mbt_tests;
 pub mod service;

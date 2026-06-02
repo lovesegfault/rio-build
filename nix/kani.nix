@@ -141,7 +141,14 @@ in
     crate = crateBuildKani.members.rio-lease;
   };
 
-  # rio-store: the log-chunk decision kernels (rio-store/src/logs/kernel.rs).
+  # rio-log-kernel: the store's log-chunk decision kernels, extracted
+  # from rio-store/src/logs/kernel.rs into a dependency-free crate (the
+  # rio-retry-kernel template) so the harnesses' goto model closes over
+  # the kernel alone — the former kani-rio-store member re-verified on
+  # EVERY rio-store or transitive-dep edit and sat one std-machinery
+  # growth spurt away from the blowup class recorded below.
+  # rio_store::logs::kernel re-exports the crate, so the store-side
+  # call sites and the projection shims are unchanged.
   # Five harnesses:
   #   - check_visit_chunk_contract / check_accept_verdict_contract:
   #     #[kani::proof_for_contract] over the full input domain — the
@@ -161,39 +168,42 @@ in
   # no panic on arbitrary input; Err exactly when Manifest::deserialize
   # rejects; on Ok an exact dedup of the entry hashes that is empty only
   # for a zero-entry manifest, so corrupt input is never reported as an
-  # empty chunk set) was attempted with bounded arbitrary inputs of one
-  # version byte plus four, two, and finally one 36-byte entry, with
-  # explicit #[kani::unwind] bounds. None of those converged inside the
-  # merge-gate budget on the CI builder while this member's five wired
-  # harnesses verify in seconds — the dominant cost is the symbolic
-  # execution of the std Vec/slice/sort machinery the parse and dedup
-  # use, which travels with the code into the goto model (the same
-  # blowup class that kept rio-retry-kernel out of the gate before its
-  # bounded-representation change), not the contract assertions
-  # themselves. The deferral was closed as a reasoned omission at the
-  # refcount campaign's Phase-2 close-out instead of being revived:
-  # the refcount Release B deletion left try_parse_unique_chunk_hashes
-  # #[cfg(test)]-only (it is the differential-test oracle for the
-  # collector's server-side SQL expansion, not a production decision
-  # path), so a proof of it would not bind production behavior, and the
-  # collect eligibility predicate itself lives in SQL rather than Rust,
-  # so the once-planned decide_collect kernel proof has no production
-  # subject either. The production corrupt-vs-valid arbiters keep their
-  # coverage: Manifest::deserialize via the fuzz/rio-store
-  # manifest_deserialize target and unit tests, and the collector's
-  # fail-closed SQL validation pass via the differential pinning and
-  # abort tests in gc/collect.rs. No verify marker is claimed for the
-  # parse contract. Full record: docs/spec/models/refcount-invariant-map.md,
+  # empty chunk set) was attempted for the former kani-rio-store member
+  # with bounded arbitrary inputs of one version byte plus four, two,
+  # and finally one 36-byte entry, with explicit #[kani::unwind] bounds.
+  # None of those converged inside the merge-gate budget on the CI
+  # builder while the five wired harnesses verify in seconds — the
+  # dominant cost was the symbolic execution of the std Vec/slice/sort
+  # machinery the parse and dedup use, which travels with the code into
+  # the goto model (the same blowup class that kept rio-retry-kernel
+  # out of the gate before its bounded-representation change), not the
+  # contract assertions themselves. The deferral was closed as a
+  # reasoned omission at the refcount campaign's Phase-2 close-out
+  # instead of being revived: the refcount Release B deletion left
+  # try_parse_unique_chunk_hashes #[cfg(test)]-only (it is the
+  # differential-test oracle for the collector's server-side SQL
+  # expansion, not a production decision path), so a proof of it would
+  # not bind production behavior, and the collect eligibility predicate
+  # itself lives in SQL rather than Rust, so the once-planned
+  # decide_collect kernel proof has no production subject either. The
+  # production corrupt-vs-valid arbiters keep their coverage:
+  # Manifest::deserialize via the fuzz/rio-store manifest_deserialize
+  # target and unit tests, and the collector's fail-closed SQL
+  # validation pass via the differential pinning and abort tests in
+  # gc/collect.rs. No verify marker is claimed for the parse contract.
+  # Full record: docs/spec/models/refcount-invariant-map.md,
   # "Phase-2 assurance layer". If a Rust-side parse or eligibility
   # kernel ever returns to a production path, the cfg(kani) bounded
   # representation used by rio-retry-kernel is the template to bring a
-  # harness for it into this member within the gate budget.
+  # harness for it into the gate budget — now in this kernel crate, no
+  # longer coupled to rio-store's artifact context.
   # r[verify store.log.session-keyed]
   # r[verify store.log.ingest-bounds]
   # r[verify store.log.completeness-gate]
-  kani-rio-store = mkKaniCheck {
-    name = "rio-store";
-    crate = crateBuildKani.members.rio-store;
+  kani-rio-log-kernel = mkKaniCheck {
+    name = "rio-log-kernel";
+    crate = crateBuildKani.members.rio-log-kernel;
+    expectedHarnesses = 5;
   };
 
   # rio-retry-kernel: the scheduler's retry/poison decision kernels
