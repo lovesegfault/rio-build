@@ -11,16 +11,21 @@
 //! would leak unique chunks forever (the orphan sweep only reaps
 //! `refcount = 0`) and permanently over-count shared ones.
 //!
-//! The deletion set mirrors the GC sweep's `delete_swept_path`
-//! (`gc/sweep.rs`): realisations have no FK to narinfo and must be
-//! deleted explicitly, as must `path_tenants` (orphaned rows would
-//! grant stale tenant visibility on a later re-upload of the same
-//! path); `manifests` / `manifest_data` / `content_index` follow the
-//! narinfo row via `ON DELETE CASCADE`. Beyond the sweep, this also
-//! removes `realisation_deps` junction rows touching the deleted
-//! realisations in either role — their FKs are `ON DELETE RESTRICT`,
-//! and an explicit operator invalidation is precisely the case where
-//! removing the edges is intended rather than a bug to surface.
+//! The deletion set is a declared SUPERSET of the GC sweep's
+//! `delete_swept_path` (`gc/sweep.rs`): realisations have no FK to
+//! narinfo and must be deleted explicitly, as must `path_tenants`
+//! (orphaned rows would grant stale tenant visibility on a later
+//! re-upload of the same path); `manifests` / `manifest_data` /
+//! `content_index` follow the narinfo row via `ON DELETE CASCADE`.
+//! Beyond the sweep, this also removes `realisation_deps` junction
+//! rows touching the deleted realisations in either role — their FKs
+//! are `ON DELETE RESTRICT`, and an explicit operator invalidation is
+//! precisely the case where removing the edges is intended rather than
+//! a bug to surface — and `drv_modulo_cache`, which the sweep
+//! deliberately PRESERVES (`store.put.ia-deriver-proof+3`: proofs
+//! survive deriver GC) but which "invalidate everything about this
+//! path" must purge: a surviving modulo row would keep proving IA
+//! outputs of a `.drv` whose narinfo the operator just removed.
 
 use std::sync::Arc;
 
@@ -48,11 +53,16 @@ pub(crate) struct InvalidateCounts {
     /// deleted + enqueued for S3 delete). Log/observability only —
     /// not part of the RPC response.
     pub chunks_zeroed: u64,
+    /// `drv_modulo_cache` rows purged. The sweep preserves these; the
+    /// operator purge is their only path-scoped deletion.
+    pub drv_modulo_deleted: u64,
 }
 
 impl InvalidateCounts {
     pub(crate) fn found(&self) -> bool {
-        self.narinfo_deleted > 0 || self.realisations_deleted > 0
+        // An orphan-only modulo row still counts: the operator must see
+        // that the purge took effect (store.admin.invalidate-total).
+        self.narinfo_deleted > 0 || self.realisations_deleted > 0 || self.drv_modulo_deleted > 0
     }
 }
 
@@ -113,6 +123,19 @@ pub(crate) async fn invalidate_path(
             .await?
             .rows_affected();
 
+    // r[impl store.admin.invalidate-total]
+    // drv_modulo_cache keys on `drv_path_hash = sha256(store_path)` —
+    // the SAME digest as `path_hash` above (StorePath::sha256_digest is
+    // sha256 over the full path string; populate_on_ingest hashes the
+    // identical string). Unconditional: for non-.drv paths the row
+    // simply never exists and this is a no-op.
+    counts.drv_modulo_deleted =
+        sqlx::query("DELETE FROM drv_modulo_cache WHERE drv_path_hash = $1")
+            .bind(&path_hash)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
     // Read the manifest's chunk_list BEFORE the narinfo delete: the
     // CASCADE destroys the only record of which chunks carry this
     // path's refcount. `FOR UPDATE OF m` is the same locking
@@ -160,6 +183,7 @@ pub(crate) async fn invalidate_path(
         realisation_deps = counts.realisation_deps_deleted,
         path_tenants = counts.path_tenants_deleted,
         chunks_zeroed = counts.chunks_zeroed,
+        drv_modulo = counts.drv_modulo_deleted,
         keep_realisations,
         "invalidated store path metadata"
     );
@@ -274,6 +298,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rc, 1, "second invalidate must not double-decrement");
+    }
+
+    // r[verify store.admin.invalidate-total]
+    /// Invalidating a `.drv` path purges its `drv_modulo_cache` row in
+    /// the same transaction (the GC sweep deliberately preserves these,
+    /// so the operator purge is their only path-scoped deletion), stays
+    /// idempotent, and an ORPHAN-only cache row (no narinfo at all)
+    /// still reports `found = true` so the operator sees the purge took
+    /// effect.
+    #[tokio::test]
+    async fn invalidate_purges_drv_modulo_cache_and_reports_orphans() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let drv_path = test_store_path("invalidate-me.drv");
+        let sp = StorePath::parse(&drv_path).unwrap();
+
+        let seed_row = |pool: sqlx::PgPool, path: String| async move {
+            let hash: Vec<u8> = {
+                use sha2::Digest as _;
+                sha2::Sha256::digest(path.as_bytes()).to_vec()
+            };
+            sqlx::query(
+                "INSERT INTO drv_modulo_cache \
+                 (drv_path_hash, drv_path, modulo_hash, ia_output_paths, deferred) \
+                 VALUES ($1, $2, $3, '[]'::jsonb, FALSE) \
+                 ON CONFLICT (drv_path_hash) DO NOTHING",
+            )
+            .bind(&hash)
+            .bind(&path)
+            .bind([0u8; 32].as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+        };
+
+        // (a) Resident narinfo + cache row: both purged, counts split.
+        StoreSeed::raw_path(&drv_path).seed(&db.pool).await;
+        seed_row(db.pool.clone(), drv_path.clone()).await;
+        let counts = invalidate_path(&db.pool, &sp, false, None).await.unwrap();
+        assert!(counts.found());
+        assert_eq!(counts.narinfo_deleted, 1);
+        assert_eq!(counts.drv_modulo_deleted, 1, "modulo row purged");
+
+        // (b) Idempotent: second call finds nothing.
+        let counts = invalidate_path(&db.pool, &sp, false, None).await.unwrap();
+        assert!(!counts.found());
+        assert_eq!(counts.drv_modulo_deleted, 0);
+
+        // (c) Orphan-only: cache row without any narinfo (e.g. the
+        // narinfo was swept while the proof row survived by design).
+        seed_row(db.pool.clone(), drv_path.clone()).await;
+        let counts = invalidate_path(&db.pool, &sp, false, None).await.unwrap();
+        assert!(
+            counts.found(),
+            "orphan-only modulo purge must report found=true"
+        );
+        assert_eq!(counts.narinfo_deleted, 0);
+        assert_eq!(counts.drv_modulo_deleted, 1);
     }
 
     /// Inline (non-chunked) paths have no chunk_list: the decrement

@@ -1246,6 +1246,23 @@ leaked chunks not covered by manifest-based cleanup.
   ls}`; #rref("store.substitute.upstream") consumes the resulting rows.
 ]
 
+#r("store.admin.invalidate-total")[
+  `StoreAdminService.InvalidatePath` MUST delete every per-path metadata row
+  the store keeps for the target path --- a declared SUPERSET of the GC
+  sweep's deletion set: the sweep's tables (narinfo + CASCADE, realisations,
+  realisation_deps, path_tenants, chunk-refcount decrements) PLUS the rows the
+  sweep deliberately preserves (`drv_modulo_cache`, keyed by the same
+  `sha256(store_path)` digest). `found` MUST be true when any row existed,
+  including an orphan-only `drv_modulo_cache` row, and the call MUST stay
+  idempotent.
+]
+
+Operator invalidation is the remediation for wrong-content incidents; a
+surviving modulo-cache row would keep proving IA outputs of a `.drv` whose
+narinfo the operator just removed, so "invalidate" must mean *every* table.
+The sweep, by contrast, preserves `drv_modulo_cache` by design
+(#rref("store.put.ia-deriver-proof+3") --- proofs survive deriver GC).
+
 = PostgreSQL Schema
 <store-schema>
 

@@ -59,5 +59,6 @@ pub(crate) async fn run(
         resp.realisation_deps_deleted
     );
     println!("  path_tenants deleted:     {}", resp.path_tenants_deleted);
+    println!("  drv_modulo deleted:       {}", resp.drv_modulo_deleted);
     Ok(())
 }

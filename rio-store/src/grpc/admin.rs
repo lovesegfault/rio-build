@@ -643,6 +643,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
             realisations_deleted: counts.realisations_deleted,
             realisation_deps_deleted: counts.realisation_deps_deleted,
             path_tenants_deleted: counts.path_tenants_deleted,
+            drv_modulo_deleted: counts.drv_modulo_deleted,
         }))
     }
 }
@@ -1205,6 +1206,10 @@ mod tests {
         assert_eq!(resp.realisations_deleted, 1);
         assert_eq!(resp.realisation_deps_deleted, 1);
         assert_eq!(resp.path_tenants_deleted, 1);
+        // r[verify store.admin.invalidate-total]
+        // The new count survives the RPC round trip (0 here — not a
+        // .drv path; the metadata-level test owns the purge behavior).
+        assert_eq!(resp.drv_modulo_deleted, 0);
 
         // Cache-hit metadata is gone…
         let narinfo: i64 =

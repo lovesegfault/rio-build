@@ -481,8 +481,10 @@ message InvalidatePathRequest {
 }
 
 message InvalidatePathResponse {
-  // True if anything referencing the path existed (narinfo row or
-  // realisation rows). False = the call was a no-op (idempotent).
+  // True if anything referencing the path existed (narinfo row,
+  // realisation rows, or a drv_modulo_cache row — an orphan-only cache
+  // row still reports found=true so the operator sees the purge took
+  // effect). False = the call was a no-op (idempotent).
   bool found = 1;
   // Rows deleted per table. `manifest_existed` is 0/1 (the manifests /
   // manifest_data / content_index rows go via ON DELETE CASCADE, so
@@ -492,4 +494,8 @@ message InvalidatePathResponse {
   uint64 realisations_deleted = 4;
   uint64 realisation_deps_deleted = 5;
   uint64 path_tenants_deleted = 6;
+  // drv_modulo_cache rows purged (the GC sweep deliberately PRESERVES
+  // these — proofs survive deriver GC — so operator invalidation is
+  // the only path-scoped deletion they get).
+  uint64 drv_modulo_deleted = 7;
 }
