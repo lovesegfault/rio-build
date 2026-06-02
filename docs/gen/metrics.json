@@ -695,7 +695,7 @@
       {
         "name": "rio_scheduler_evidence_write_fenced_total",
         "kind": "counter",
-        "help": "Evidence writes (topdown_pruned/closure_hole stamps and clears, derivation status/poison persists, merge transactions) refused by the claims-floor generation fence: the writing replica's serving generation sat below the durable floor (GREATEST over assignments.generation and leader_generation_claims.generation). On a replica that just lost the lease this is the fence working — the successor owns the evidence now; on the current leader it should be ZERO (a nonzero rate there means a capture bug or a PG floor regression and needs investigation)."
+        "help": "Evidence writes (materialization job creation/resolution, wanted-relation rows, derivation status/poison persists, merge transactions) refused by the claims-floor generation fence: the writing replica's serving generation sat below the durable floor (GREATEST over assignments.generation and leader_generation_claims.generation). On a replica that just lost the lease this is the fence working — the successor owns the evidence now; on the current leader it should be ZERO (a nonzero rate there means a capture bug or a PG floor regression and needs investigation)."
       },
       {
         "name": "rio_scheduler_features_stripped_total",
@@ -1247,7 +1247,7 @@
       {
         "name": "rio_store_substitute_skipped_total",
         "kind": "counter",
-        "help": "Substitution requests short-circuited WITHOUT contacting any upstream, labeled by reason (no_tenant: the request carried no resolvable tenant identity; no_upstreams: the tenant has zero tenant_upstreams rows; disabled: no substituter on this replica; no_http_client: the reqwest client failed to build at startup so this replica cannot reach any upstream). Every skip degrades to a from-source build at the scheduler, so a sustained nonzero no_tenant/disabled/no_http_client rate means cache.nixos.org-cached paths are being compiled. Distinct from rio_store_substitute_total{result=miss}, which counts attempts that DID reach the upstreams and definitively missed. Granularity: no_tenant/disabled are per-request; no_upstreams and no_http_client are per singleflight leader (same as result=hit|miss)."
+        "help": "Substitution requests short-circuited WITHOUT contacting any upstream, labeled by reason (no_upstreams: the tenant has zero tenant_upstreams rows; no_http_client: the reqwest client failed to build at startup so this replica cannot reach any upstream). Every skip degrades to a from-source build at the scheduler, so a sustained nonzero no_http_client rate means cache.nixos.org-cached paths are being compiled. Distinct from rio_store_substitute_total{result=miss}, which counts attempts that DID reach the upstreams and definitively missed. Granularity: per singleflight leader (same as result=hit|miss). (The walk-era per-request no_tenant/disabled reasons died with the SubstitutePath RPC; the materialization executor reports a missing tenant as an InfraFailure outcome instead.)"
       },
       {
         "name": "rio_store_substitute_stale_reclaimed_total",

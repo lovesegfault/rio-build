@@ -520,7 +520,7 @@
     {
       "path": "lib.rs",
       "depth": 0,
-      "doc": "Pure closure-evidence decision kernel for the scheduler's"
+      "doc": "Pure closure-evidence decision kernel."
     },
     {
       "path": "pull.rs",
