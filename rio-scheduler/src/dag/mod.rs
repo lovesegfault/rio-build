@@ -110,6 +110,48 @@ pub enum DagError {
     AuthoritativeClaimIdentityConflict { drv_path: String },
 }
 
+/// Three-valued comparison of two recorded modular hashes.
+///
+/// Shared by BOTH identity matchers ([`verifiable_identity_matches`]
+/// and the settled-row matcher in `actor::merge`) so the hash clause
+/// cannot drift between them: a present-but-DIFFERENT pair is a
+/// conflict in its own right (`Differs` vetoes the match outright),
+/// never silently folded into "no hash evidence". A side that records
+/// no usable hash (absent, or a persisted blob that is not 32 bytes)
+/// contributes `Absent` — the matchers then fall back to path evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModularHashEvidence {
+    /// Both sides record a 32-byte hash and the bytes are equal.
+    Match,
+    /// Both sides record a 32-byte hash and the bytes DIFFER — the two
+    /// definitions are provably not the same derivation; the matchers
+    /// MUST veto regardless of path agreement.
+    Differs,
+    /// At least one side records no usable hash: no hash evidence in
+    /// either direction.
+    Absent,
+}
+
+// r[impl sched.merge.identity-hash-veto]
+/// Classify the modular-hash relationship between two identity records.
+/// Accepts raw byte slices so both matchers (in-memory `[u8; 32]` and
+/// persisted `bytea`) normalize through the same length check.
+pub(crate) fn modular_hash_evidence(
+    existing: Option<&[u8]>,
+    incoming: Option<&[u8]>,
+) -> ModularHashEvidence {
+    match (existing, incoming) {
+        (Some(a), Some(b)) if a.len() == 32 && b.len() == 32 => {
+            if a == b {
+                ModularHashEvidence::Match
+            } else {
+                ModularHashEvidence::Differs
+            }
+        }
+        _ => ModularHashEvidence::Absent,
+    }
+}
+
 /// `sched.merge.authoritative-conflict` cross-check: does the submission's
 /// verifiable identity agree with an existing authoritative node?
 ///
@@ -130,9 +172,13 @@ pub enum DagError {
 ///     equals the full-form hash a store-backed submission of the same
 ///     derivation computes — identical content still joins.
 ///
-/// No evidence (the degenerate floating-CA case where the incoming side
-/// carries no hash, or the hashes differ) is treated as a conflict and
-/// falls through to the reject-in-flight / displace-when-terminal arms.
+/// Present-but-DIFFERING modular hashes veto the match outright
+/// (`sched.merge.identity-hash-veto` via [`modular_hash_evidence`]) —
+/// path agreement cannot override a provable definition difference. No
+/// evidence at all (the degenerate floating-CA case where a side
+/// carries no hash and no path agreement exists) is likewise a conflict
+/// and falls through to the reject-in-flight / displace-when-terminal
+/// arms.
 ///
 /// Also used in the INVERSE direction
 /// (`sched.merge.authoritative-claim-no-redefine`): an incoming
@@ -155,6 +201,18 @@ pub(crate) fn verifiable_identity_matches(
     existing_names.sort_unstable();
     incoming_names.sort_unstable();
     if existing_names != incoming_names {
+        return false;
+    }
+    // r[impl sched.merge.identity-hash-veto]
+    // Present-but-differing modular hashes are a conflict in their own
+    // right — two definitions whose hashes both exist and differ are
+    // provably different derivations, and path agreement (copyable
+    // public data) must not override that. Veto BEFORE the path fold.
+    let hash_evidence = modular_hash_evidence(
+        existing.ca.modular_hash.as_ref().map(|h| h.as_slice()),
+        node.ca_modular_hash.as_ref().map(|h| h.as_slice()),
+    );
+    if hash_evidence == ModularHashEvidence::Differs {
         return false;
     }
     let existing_paths: HashMap<&str, &str> = existing
@@ -182,11 +240,7 @@ pub(crate) fn verifiable_identity_matches(
             path_evidence = true;
         }
     }
-    let hash_evidence = matches!(
-        (existing.ca.modular_hash, node.ca_modular_hash),
-        (Some(a), Some(b)) if a == b
-    );
-    path_evidence || hash_evidence
+    path_evidence || hash_evidence == ModularHashEvidence::Match
 }
 
 /// Result of a successful `merge()` operation. Surfaces all the rollback

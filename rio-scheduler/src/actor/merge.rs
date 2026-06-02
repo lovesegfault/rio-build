@@ -105,11 +105,11 @@ struct DisplacedPriorInterest {
 /// fixed-output flag, the content-addressed flag, and expected output
 /// paths for names where BOTH sides declare one), and at least one piece
 /// of content-bound evidence is required: agreement on a non-empty
-/// expected output path, or a byte-equal CA modular hash. The two
-/// matchers MUST stay in sync — they enforce the same rule
-/// (`sched.merge.authoritative-conflict` / settled-identity-freeze) at
-/// the two places a prior definition can live (resident DAG node vs
-/// settled PG row); a predicate added to one belongs in the other.
+/// expected output path, or a byte-equal CA modular hash. The hash
+/// clause is shared with the resident matcher through
+/// [`crate::dag::modular_hash_evidence`] — present-but-differing hashes
+/// veto the match outright (`sched.merge.identity-hash-veto`); a
+/// predicate added to one matcher belongs in the shared helper.
 fn settled_row_identity_matches(
     row: &crate::db::SettledIdentityRow,
     node: &crate::domain::DerivationNode,
@@ -125,6 +125,16 @@ fn settled_row_identity_matches(
     row_names.sort_unstable();
     incoming_names.sort_unstable();
     if row_names != incoming_names {
+        return false;
+    }
+    // r[impl sched.merge.identity-hash-veto]
+    // Shared with the resident matcher: present-but-differing hashes
+    // veto before any path agreement is considered.
+    let hash_evidence = crate::dag::modular_hash_evidence(
+        row.ca_modular_hash.as_deref(),
+        node.ca_modular_hash.as_ref().map(|h| h.as_slice()),
+    );
+    if hash_evidence == crate::dag::ModularHashEvidence::Differs {
         return false;
     }
     let row_paths: HashMap<&str, &str> = row
@@ -151,14 +161,7 @@ fn settled_row_identity_matches(
             path_evidence = true;
         }
     }
-    // The persisted hash is bytea: empty/NULL means "not recorded".
-    let hash_evidence = match (&row.ca_modular_hash, &node.ca_modular_hash) {
-        (Some(row_hash), Some(node_hash)) if row_hash.len() == 32 => {
-            row_hash.as_slice() == node_hash.as_slice()
-        }
-        _ => false,
-    };
-    path_evidence || hash_evidence
+    path_evidence || hash_evidence == crate::dag::ModularHashEvidence::Match
 }
 
 /// Per-merge budget for store-evidence `.drv` fetches
@@ -3893,5 +3896,77 @@ impl DagActor {
         // does the fetch detached under SUBSTITUTE_FETCH_TIMEOUT.
         // Prune benefit preserved; actor never blocks on QPI.
         Some(demanded.into_iter().cloned().collect())
+    }
+}
+
+#[cfg(test)]
+mod matcher_tests {
+    use super::*;
+
+    fn settled_row(hash: Option<Vec<u8>>) -> crate::db::SettledIdentityRow {
+        crate::db::SettledIdentityRow {
+            drv_hash: "h".into(),
+            drv_path: "/nix/store/h.drv".into(),
+            system: "x86_64-linux".into(),
+            output_names: vec!["out".into()],
+            expected_output_paths: vec!["/nix/store/agreed-out".into()],
+            is_fixed_output: false,
+            is_ca: true,
+            ca_modular_hash: hash,
+            evidence_rank: "content_bound_claim".into(),
+        }
+    }
+
+    fn incoming(hash: Option<[u8; 32]>) -> crate::domain::DerivationNode {
+        crate::domain::DerivationNode {
+            drv_hash: "h".into(),
+            drv_path: "/nix/store/h.drv".into(),
+            pname: String::new(),
+            system: "x86_64-linux".into(),
+            output_names: vec!["out".into()],
+            expected_output_paths: vec!["/nix/store/agreed-out".into()],
+            is_fixed_output: false,
+            is_content_addressed: true,
+            ca_modular_hash: hash,
+            drv_content: Vec::new(),
+            drv_content_authoritative: false,
+            required_features: Vec::new(),
+            wanted_output_names: Vec::new(),
+            explicitly_requested: false,
+            needs_resolve: false,
+            version: None,
+            enable_parallel_building: None,
+            enable_parallel_checking: None,
+            prefer_local_build: None,
+        }
+    }
+
+    // r[verify sched.merge.identity-hash-veto]
+    /// Settled-row matcher twin: a present-but-differing modular hash
+    /// vetoes the match even though the (copyable, public) expected
+    /// output paths agree. Pre-fix the differing hash was folded into
+    /// "no hash evidence" and path agreement carried the match.
+    #[test]
+    fn settled_row_differing_hash_vetoes_despite_path_agreement() {
+        let row = settled_row(Some(vec![0xAA; 32]));
+        assert!(
+            !settled_row_identity_matches(&row, &incoming(Some([0xBB; 32]))),
+            "present-but-differing hashes are a definition conflict"
+        );
+        assert!(
+            settled_row_identity_matches(&row, &incoming(Some([0xAA; 32]))),
+            "byte-equal hashes still match"
+        );
+        assert!(
+            settled_row_identity_matches(&row, &incoming(None)),
+            "an absent incoming hash falls back to path evidence"
+        );
+        // A persisted blob of the wrong width is "not recorded", never
+        // a veto (legacy rows).
+        let short = settled_row(Some(vec![0xAA; 16]));
+        assert!(settled_row_identity_matches(
+            &short,
+            &incoming(Some([0xBB; 32]))
+        ));
     }
 }

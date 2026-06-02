@@ -4850,3 +4850,54 @@ fn store_evidence_set_raises_displacer_standing() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// r[verify sched.merge.identity-hash-veto]
+/// Resident-matcher twin: a present-but-differing modular hash vetoes
+/// `verifiable_identity_matches` even when the (public, copyable)
+/// expected output paths agree byte-for-byte. Pre-fix the differing
+/// hash was treated as merely "no hash evidence" and path agreement
+/// carried the match — letting a provably different definition join or
+/// displace as identical.
+#[test]
+fn differing_modular_hash_vetoes_identity_match_despite_path_agreement() {
+    let mint_existing = |hash: Option<[u8; 32]>| {
+        let row = crate::db::RecoveryDerivationRow {
+            is_ca: true,
+            expected_output_paths: vec!["/nix/store/agreed-out".into()],
+            ca_modular_hash: hash.map(|h| h.to_vec()),
+            ..crate::db::RecoveryDerivationRow::test_default("hv", "x86_64-linux")
+        };
+        crate::state::DerivationState::from_recovery_row(row, DerivationStatus::Ready)
+            .expect("state mints")
+    };
+    let mint_incoming = |hash: Option<[u8; 32]>| {
+        let mut n = make_node("hv", "x86_64-linux");
+        n.is_content_addressed = true;
+        n.expected_output_paths = vec!["/nix/store/agreed-out".into()];
+        n.ca_modular_hash = hash;
+        n
+    };
+
+    let existing = mint_existing(Some([0xAA; 32]));
+    assert!(
+        !crate::dag::verifiable_identity_matches(&existing, &mint_incoming(Some([0xBB; 32]))),
+        "present-but-differing hashes are a definition conflict; path \
+         agreement must not override"
+    );
+    assert!(
+        crate::dag::verifiable_identity_matches(&existing, &mint_incoming(Some([0xAA; 32]))),
+        "byte-equal hashes still match"
+    );
+    assert!(
+        crate::dag::verifiable_identity_matches(&existing, &mint_incoming(None)),
+        "an absent incoming hash falls back to path evidence"
+    );
+    let no_hash_existing = mint_existing(None);
+    assert!(
+        crate::dag::verifiable_identity_matches(
+            &no_hash_existing,
+            &mint_incoming(Some([0xBB; 32]))
+        ),
+        "an absent existing hash falls back to path evidence"
+    );
+}

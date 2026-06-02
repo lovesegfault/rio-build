@@ -2378,6 +2378,27 @@ unwritable rather than merely unlikely. Floating inputs that genuinely
 matter to a verification resolve to store-silence (unseedable input)
 instead, which is the fail-closed direction under the trust model.
 
+#r("sched.merge.identity-hash-veto")[
+  In every identity matcher that compares a submission against a prior
+  definition (the resident-node matcher and the settled-row matcher),
+  two recorded 32-byte modular hashes that are both present and DIFFER
+  MUST veto the match regardless of any other agreement; the comparison
+  MUST go through the single shared classifier so the two matchers
+  cannot drift on the hash clause.
+]
+Expected output paths are public, copyable data --- a squatter can echo
+the victim's paths verbatim --- while a modular hash is content-derived.
+Before this rule the matchers treated a differing hash as merely "no
+hash evidence" and could still declare a match on path agreement,
+letting a definition that provably differs (its hash exists and
+disagrees) join or displace as if identical. The two matchers enforce
+the same identity rule at the two places a prior definition lives
+(resident DAG node, settled PG row); the previous "MUST stay in sync"
+comment pair is exactly the call-site-discipline shape that R2 retires
+--- the shared `modular_hash_evidence` classifier is the chokepoint.
+Scope note: the bare-vs-bare join consults neither matcher; closing
+that channel is the rank-gated-seed work staged behind this rule.
+
 #r("sched.persist.atomic-activation+2")[
   The merge-time persistence of (re)created derivation rows --- including
   the definition-change accumulator reset of
