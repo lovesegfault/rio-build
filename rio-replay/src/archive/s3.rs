@@ -705,12 +705,32 @@ impl ArchiveStore {
                                 );
                                 return Ok(existing.into_marker());
                             }
-                            // A foreign marker (different image bytes — or
-                            // an unparseable one) claimed the prefix between
-                            // the HEAD pre-check and this final upload.
-                            // Surface the same actionable refusal as the
-                            // pre-check.
-                            _ => anyhow::bail!(self.write_once_refusal(&archive_id_short)),
+                            // A parseable foreign marker (different image
+                            // bytes) claimed the prefix between the HEAD
+                            // pre-check and this final upload: the prefix
+                            // is a published archive and another publisher
+                            // won. Surface the same actionable refusal as
+                            // the pre-check.
+                            Ok(_) => anyhow::bail!(self.write_once_refusal(&archive_id_short)),
+                            // An unparseable marker claimed it (an
+                            // out-of-band write at the marker key).
+                            // [`PublishedArchive`] is the single candidacy
+                            // predicate — fetch, launch, and list all fail
+                            // on these same bytes — so "already published,
+                            // re-record under a new id" would be false on
+                            // both counts. Name the converging recovery the
+                            // partial-prefix data-object arm names: sweep
+                            // the junk, then retry THIS publish.
+                            Err(parse_err) => anyhow::bail!(
+                                "the conditional PUT of {ARCHIVE_COMPLETE_OBJECT} at s3://{}/{} \
+                                 lost to an existing marker that does not parse as a completion \
+                                 proof ({parse_err:#}); nothing at this prefix is retrievably \
+                                 published — if no other publisher is currently uploading it, \
+                                 run `cargo xtask replay delete {archive_id_short}` to sweep the \
+                                 junk marker, then retry the publish",
+                                self.bucket,
+                                self.prefix(&archive_id_short),
+                            ),
                         }
                     }
                     // The marker the conditional collided with is already
@@ -1406,6 +1426,78 @@ mod tests {
             1,
             "the lost marker conditional must probe the existing marker before refusing"
         );
+    }
+
+    #[tokio::test]
+    async fn publish_names_delete_then_retry_for_an_unparseable_marker_conflict() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+        let archive_id = identity::archive_id_from_manifest_bytes(&manifest_bytes);
+        let short = identity::short_id(&archive_id);
+
+        // Same race as above, but the marker the conditional collided with
+        // does not parse as a completion proof (an out-of-band write at the
+        // marker key). PublishedArchive is the single candidacy predicate —
+        // fetch, launch, and list all fail on these same bytes — so the
+        // "already published … only a re-record needs a new prefix" refusal
+        // would be false on both counts: nothing is retrievably published,
+        // and a retry of THIS publish converges once the junk is removed.
+        // The refusal must name the converging recovery the partial-prefix
+        // data-object arm already names: `replay delete <short>`, then
+        // retry.
+        let complete_suffix = format!("/{ARCHIVE_COMPLETE_OBJECT}");
+        let head_marker_suffix = complete_suffix.clone();
+        let head_marker_404 = mock!(aws_sdk_s3::Client::head_object)
+            .match_requests(move |req| req.key().is_some_and(|k| k.ends_with(&head_marker_suffix)))
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let head_data_suffix = complete_suffix.clone();
+        let head_data_present = mock!(aws_sdk_s3::Client::head_object)
+            .match_requests(move |req| !req.key().is_some_and(|k| k.ends_with(&head_data_suffix)))
+            .then_output(|| HeadObjectOutput::builder().build());
+        let data_suffix = complete_suffix.clone();
+        let put_data = mock!(aws_sdk_s3::Client::put_object)
+            .match_requests(move |req| !req.key().is_some_and(|k| k.ends_with(&data_suffix)))
+            .then_output(|| PutObjectOutput::builder().build());
+        let put_complete_412 = mock!(aws_sdk_s3::Client::put_object)
+            .match_requests(move |req| req.key().is_some_and(|k| k.ends_with(&complete_suffix)))
+            .then_error(|| {
+                PutObjectError::generic(ErrorMetadata::builder().code("PreconditionFailed").build())
+            });
+        let get_junk_marker = get_rule(
+            format!("replay/archives/{short}/{ARCHIVE_COMPLETE_OBJECT}"),
+            b"<html>502 Bad Gateway</html>".to_vec(),
+        );
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[
+                &head_marker_404,
+                &head_data_present,
+                &put_data,
+                &put_complete_412,
+                &get_junk_marker
+            ]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        let err = store
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&format!("replay delete {short}")) && message.contains("retry"),
+            "the refusal names the delete-then-retry recovery: {message}"
+        );
+        assert!(
+            !message.contains("already published"),
+            "an unparseable marker publishes nothing — the claim would be false: {message}"
+        );
+        assert!(
+            !message.contains("PreconditionFailed"),
+            "the raw SDK error must not surface: {message}"
+        );
+        assert_eq!(get_junk_marker.num_calls(), 1);
     }
 
     #[tokio::test]
