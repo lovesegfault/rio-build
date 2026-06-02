@@ -32,12 +32,6 @@ pub struct DagActorConfig {
     /// QueryPathInfo). Tests that arm a hung MockStore override to 3s
     /// for the wrapper-exists proof.
     pub grpc_timeout: std::time::Duration,
-    /// In-flight detached substitute-fetch task bound — memory-safety
-    /// only, NOT a throughput throttle. Per-replica admission is
-    /// `r[store.substitute.admission]`; saturation surfaces as
-    /// `ResourceExhausted` → handled by `SUBSTITUTE_FETCH_BACKOFF`.
-    /// Overridable via `RIO_SUBSTITUTE_MAX_CONCURRENT`.
-    pub substitute_max_concurrent: usize,
     /// `requiredSystemFeatures` values stripped at DAG insertion
     /// (I-204). Empty preserves pre-I-204 behavior — every feature is
     /// a gate.
@@ -65,7 +59,6 @@ impl Default for DagActorConfig {
             retry_policy: RetryPolicy::default(),
             poison: PoisonConfig::default(),
             grpc_timeout: rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-            substitute_max_concurrent: super::DEFAULT_SUBSTITUTE_CONCURRENCY,
             soft_features: Vec::new(),
             sla: crate::sla::config::SlaConfig::test_default(),
             establishment_report_slack: std::time::Duration::from_secs(120),

@@ -134,62 +134,13 @@ pub(super) const BUILD_EVENT_BUFFER_SIZE: usize = 4096;
 /// worth shrinking.
 pub(crate) const LOG_EVENT_BUFFER_SIZE: usize = 1024;
 
-/// Default cap on concurrent detached substitute-fetch tasks: an
-/// in-flight detached-task MEMORY bound, NOT a throughput throttle.
-/// Per-replica admission is `r[store.substitute.admission]` (the store
-/// owns the gate); saturation surfaces here as `ResourceExhausted` and
-/// is handled by [`SUBSTITUTE_FETCH_BACKOFF`]. Each task acquires a
-/// `DagActor.substitute_sem` permit before its `QueryPathInfo`.
-/// Overridable via `RIO_SUBSTITUTE_MAX_CONCURRENT` (operator escape
-/// hatch — not chart-set).
-// r[impl sched.substitute.fanout-bound]
-pub const DEFAULT_SUBSTITUTE_CONCURRENCY: usize = 256;
-
-/// Retry policy for the detached substitute fetch's `QueryPathInfo`.
-/// Transient store errors (`Unavailable`/`Aborted`/`ResourceExhausted`
-/// per [`rio_common::grpc::is_transient`]) retry up to
-/// [`SUBSTITUTE_FETCH_MAX_ATTEMPTS`] with this curve.
-pub const SUBSTITUTE_FETCH_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
-    base: std::time::Duration::from_millis(250),
-    mult: 2.0,
-    cap: std::time::Duration::from_secs(30),
-    jitter: rio_common::backoff::Jitter::Proportional(0.2),
-};
-
-/// Max attempts per path for the detached substitute fetch. With
-/// [`SUBSTITUTE_FETCH_BACKOFF`]: 250ms→500ms→1s→2s→4s→8s→16s ≈ 31.75 s
-/// total retry budget per path (7 backoffs between 8 attempts; the loop
-/// breaks before the final sleep) before demoting to cache-miss. Raised
-/// 5→8 alongside `r[store.substitute.admission]`: the store now queues
-/// up to `SUBSTITUTE_ADMISSION_WAIT` (25 s) before returning
-/// `RESOURCE_EXHAUSTED`, so each attempt is itself a 25 s server-side
-/// wait under saturation; 8 attempts give a ~90 s window
-/// (≥1 attempt's bounded-wait + backoffs) for the burst to clear
-/// before demoting. Belt-and-suspenders — under normal load the
-/// store's bounded-wait absorbs the burst on attempt 1.
-pub const SUBSTITUTE_FETCH_MAX_ATTEMPTS: u32 = 8;
-
-/// Per-path timeout for the detached substitute fetch's
-/// `QueryPathInfo`. Separate from `grpc_timeout` (30s): the call
-/// covers `walk_substitute_closure` (scheduler-side BFS over
-/// `info.references`) plus the largest single NAR fetch a
-/// `try_substitute` may block on — a single ghc-9.8.4 (1.9 GB) fetch
-/// legitimately takes minutes. The fetch runs OUTSIDE the actor loop,
-/// so a long timeout here doesn't head-of-line block.
-/// r[sched.substitute.detached+5]
-pub const SUBSTITUTE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-/// Re-mint cadence for `dispatch::SubstituteAuth` inside
-/// `walk_substitute_closure`'s serial `'paths` loop. The
-/// per-layer mint covers the `BatchQueryPathInfo` fast-path; the
-/// per-path QPI loop within a layer is serial and a wide cold layer
-/// (hundreds of paths × store-side `SUBSTITUTE_ADMISSION_WAIT` /
-/// retry backoff each) can outlive a `Service` token's 30 min expiry.
-/// Re-mint every 50 paths or 5 min, whichever comes first — 6×
-/// headroom under the 30 min `Service` expiry. `Jwt` re-mint is a
-/// cheap clone (and merge-time now uses `Service` anyway).
-pub const SUBSTITUTE_REMINT_PATHS: usize = 50;
-pub const SUBSTITUTE_REMINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// Expiry for the dispatch-probe service token
+/// (`dispatch::DagActor::probe_service_meta` — the `FindMissingPaths`
+/// tenant-context mint). Inherited unchanged from the deleted walk
+/// auth's token expiry (the probe used the same mint); generous for a
+/// single bounded probe call, deliberately not tightened in the
+/// deletion commit.
+pub const PROBE_TOKEN_EXPIRY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// LRU cap for [`DagActor::unroutable_features_warned`] (mb_001). The
 /// key's second component is tenant-controlled `requiredSystemFeatures`;
@@ -341,12 +292,6 @@ pub struct DagActor {
     /// rio-scheduler's test build links against rio-common built WITHOUT
     /// `cfg(test)`, so a test-gated constant there is invisible here.
     grpc_timeout: std::time::Duration,
-    /// Bounds in-flight detached substitute-fetch tasks. The
-    /// pre-59a6803a synchronous path used `buffer_unordered(max)`; the
-    /// detached spawn loop dropped that, so a 17k-path merge spawned
-    /// 23k unbounded QueryPathInfo's → store PG-pool/S3 saturated →
-    /// 90% failed → demoted to Ready → built from source.
-    substitute_sem: Arc<tokio::sync::Semaphore>,
     /// Circuit breaker for the cache-check FindMissingPaths call. Owned by
     /// the actor (single-threaded, no lock needed). Checked/updated in
     /// `merge.rs::check_cached_outputs`.
@@ -668,9 +613,6 @@ impl TestCounters {
             persist_status_calls: self.persist_status_calls.load(SeqCst),
             solve_inputs_calls: self.solve_inputs_calls.load(SeqCst),
             evidence_writes_fenced: self.evidence_writes_fenced.load(SeqCst),
-            // Filled by the `DebugCmd::Counters` handler — `substitute_sem`
-            // lives on `DagActor`, not here.
-            substitute_sem_permits: 0,
         }
     }
 }
@@ -687,11 +629,6 @@ pub struct TestCountersSnapshot {
     /// Mirror of `rio_scheduler_evidence_write_fenced_total` — see
     /// [`TestCounters::evidence_writes_fenced`].
     pub evidence_writes_fenced: u64,
-    /// `DagActor.substitute_sem.available_permits()` at snapshot time.
-    /// Filled by the [`DebugCmd::Counters`] handler (not
-    /// [`TestCounters::snapshot`] — the semaphore lives on the actor).
-    /// For r[sched.substitute.fanout-bound]'s no-permit-leak assertion.
-    pub substitute_sem_permits: usize,
 }
 
 impl DagActor {
@@ -778,9 +715,6 @@ impl DagActor {
             db,
             store_client: plumbing.store_client,
             grpc_timeout: cfg.grpc_timeout,
-            substitute_sem: Arc::new(tokio::sync::Semaphore::new(
-                cfg.substitute_max_concurrent.max(1),
-            )),
             cache_breaker: CacheCheckBreaker::default(),
             sla_estimator: crate::sla::SlaEstimator::new(&cfg.sla),
             sla_tiers: cfg.sla.solve_tiers(),
@@ -907,7 +841,6 @@ impl DagActor {
             db: _,
             store_client: _,
             grpc_timeout: _,
-            substitute_sem: _,
             cache_breaker: _,
             sla_estimator: _,
             sla_tiers: _,

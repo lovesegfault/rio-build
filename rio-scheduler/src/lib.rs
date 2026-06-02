@@ -49,8 +49,6 @@ pub mod state;
 // pub, but the re-export keeps main.rs's imports uniform
 // (crate-root path, no deep-module reach-in).
 pub use state::{PoisonConfig, RetryPolicy};
-// Default for main.rs Config's `#[serde(default = ...)]` fn.
-pub use actor::DEFAULT_SUBSTITUTE_CONCURRENCY;
 
 /// Re-export of the shared embedded migrator from `rio-migrations`.
 /// Test-only (`TestDb::new(&MIGRATOR)`) — production goes through
@@ -202,49 +200,20 @@ pub fn describe_metrics() {
          the newly-inserted-CA path, that one counts the pre-existing-completed path."
     );
     describe_counter!(
-        "rio_scheduler_substitute_demotions_total",
-        "Non-forgivable path failures in the detached substitute walk, labeled by a reason \
-         derived from the final error of the path's retry ladder: not_found (no configured \
-         upstream produced the path, or the store skipped substitution entirely — no \
-         upstreams configured for the tenant / no HTTP client on the replica; see \
-         rio_store_substitute_skipped_total for the store-side cause), not_found_infra (a \
-         NotFound that never reached an upstream — no tenant context / substituter not \
-         configured; fix the auth chain or config), error (non-transient gRPC error, no \
-         retry), exhausted (the retry budget ran out on a transient error). Any increment \
-         demotes the derivation — and therefore its whole build-time closure — to a \
-         from-source build over a failed download; page on any sustained rate."
-    );
-    describe_counter!(
-        "rio_scheduler_substitute_fetch_failures_total",
-        "Substitutable-path eager fetches (QueryPathInfo) that failed; path demoted to cache-miss"
-    );
-    describe_counter!(
-        "rio_scheduler_substitute_fetch_retries_total",
-        "Retryable substitute-fetch errors (transient Unavailable/Aborted/ResourceExhausted, \
-         or a NotFound that contradicts the earlier HEAD probe / narinfo) that triggered a \
-         backoff retry. High rate without matching failures = store load absorbed by retry; \
-         high rate WITH failures = backoff insufficient."
-    );
-    describe_counter!(
-        "rio_scheduler_substitute_spawned_total",
-        "Derivations transitioned to Substituting (detached upstream fetch spawned). \
-         Pairs with substitute_fetch_failures_total to derive success rate."
-    );
-    describe_counter!(
         "rio_scheduler_topdown_prune_total",
         "Submissions pruned to roots-only by the top-down substitution pre-check"
     );
     describe_counter!(
         "rio_scheduler_topdown_substitute_fail_total",
-        "Top-down-pruned roots that could not complete via substitution (deferred fetch failed, or a wanted output was definitively missing/unsubstitutable at dispatch time) — build failed fast; resubmit re-probes"
+        "Top-down-pruned roots that could not complete via substitution (a wanted output \
+         was definitively missing/unsubstitutable at settlement) — build failed fast; \
+         resubmit re-probes"
     );
     describe_counter!(
         "rio_scheduler_topdown_settlement_reprobe_total",
         "Settlement re-probes at topdown fail-fast decision points (labels: outcome = \
-         verification_walk|fail_fast). verification_walk: a stale walk verdict was about to \
-         wrongfully fail builds whose live-wanted outputs are obtainable — the settlement \
-         spawned a closure-re-verifying walk instead. fail_fast: the re-probe confirmed a \
-         wanted output missing and unsubstitutable (the genuine fail-fast)."
+         fail_fast). The re-probe confirmed a wanted output missing and unsubstitutable \
+         (the genuine fail-fast); an obtainable answer defers to the next sweep."
     );
     describe_counter!(
         "rio_scheduler_queue_backpressure",

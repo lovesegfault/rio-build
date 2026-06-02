@@ -131,13 +131,6 @@
           "park_backoff_cap_secs": 900
         }
       },
-      "substitute_max_concurrent": {
-        "description": "In-flight detached substitute-fetch task bound\n(r[sched.substitute.detached+5]) — memory-safety only; per-replica\nthrottling is `r[store.substitute.admission]`. Sizes\n`DagActor.substitute_sem`. Env: `RIO_SUBSTITUTE_MAX_CONCURRENT`\n(operator escape hatch — not chart-set). Default 256.",
-        "type": "integer",
-        "format": "uint",
-        "minimum": 0,
-        "default": 256
-      },
       "dashboard": {
         "description": "gRPC-Web / CORS config for the dashboard SPA. `[dashboard]`\ntable in scheduler.toml. Env: `RIO_DASHBOARD__*`.",
         "$ref": "#/$defs/DashboardConfig",
@@ -367,7 +360,6 @@
       "park_backoff_base_secs": 30,
       "park_backoff_cap_secs": 900
     },
-    "substitute_max_concurrent": 256,
     "dashboard": {
       "cors_allow_origins": "http://rio-dashboard.rio-system.svc.cluster.local"
     },

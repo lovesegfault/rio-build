@@ -1,19 +1,18 @@
-//! Ready-set store short-circuit and substitution machinery, plus the
-//! shared `WorkAssignment` payload constructor the pull path uses.
+//! Ready-set store short-circuit, plus the shared `WorkAssignment`
+//! payload constructor the pull path uses.
 //!
 //! The stream-era placement/assign pass (`dispatch_ready` and the
 //! 4-phase assign path) was deleted with the placement layer; work
-//! delivery is pull-only (`actor/pull.rs`). What remains here is
-//! dispatch-mode-independent: completing/substituting Ready
-//! derivations whose outputs already exist, the detached substitute
-//! fetch machinery, and `build_assignment_proto`/`emit_assignment_started`
-//! (shared with the pull mint).
+//! delivery is pull-only (`actor/pull.rs`). The detached substitute
+//! closure walk this file used to host was deleted with the
+//! substitution-replacement cutover (store replicas execute
+//! materialization jobs instead). What remains is
+//! dispatch-mode-independent: completing Ready derivations whose
+//! outputs already exist (or routing them to materialization jobs),
+//! and `build_assignment_proto`/`emit_assignment_started` (shared
+//! with the pull mint).
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
-use std::time::Instant;
-
-use rio_common::limits::MAX_SUBSTITUTE_CLOSURE;
+use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
@@ -134,8 +133,7 @@ impl DagActor {
         // result). Without this the store sees tenant_id=None and
         // substitutable_paths stays empty — the pre-fix behaviour
         // that dispatched FODs already in cache.nixos.org.
-        let auth = self.probe_substitute_auth(candidates.iter().map(|(h, _)| h));
-        let probe = auth.mint();
+        let probe = self.probe_service_meta(candidates.iter().map(|(h, _)| h));
         let probe_meta: Vec<(&'static str, &str)> =
             probe.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
@@ -176,13 +174,10 @@ impl DagActor {
                 }
             };
 
-        // r[impl sched.substitute.detached+5]
         // Partition: locally-present (not in missing_paths) → complete
-        // inline; substitutable → spawn detached fetch; truly-missing →
-        // leave Ready (dispatches normally). The detached fetch runs
-        // OUTSIDE the actor loop — before this, the awaited
-        // eager_substitute_fetch blocked MergeDag/dispatch for >100s
-        // when the closure walk pulled ghc-sized NARs.
+        // inline; missing-but-obtainable (substitutable/indeterminate)
+        // → route to a materialization job; truly-missing → leave Ready
+        // (dispatches normally from source).
         let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
         let substitutable: HashSet<String> = resp.substitutable_paths.into_iter().collect();
         let indeterminate: HashSet<String> = resp.indeterminate_paths.into_iter().collect();
@@ -190,20 +185,14 @@ impl DagActor {
         // `complete_ready_from_store` per item (≥3 sequential PG RTTs
         // each); on warm-restart of a large closure ~all 2048 candidates
         // hit it → 12-30s actor stall → heartbeats missed → live workers
-        // reaped. The Substituting branch already batched.
+        // reaped.
         let mut locally_present = Vec::new();
-        let mut to_spawn = Vec::new();
-        // Substitution-replacement (flag-on only): nodes routed to a
-        // materialization job instead of the detached walk.
+        // Nodes routed to a materialization job (creation itself stays
+        // flag-gated inside `create_materialization_job_if_enabled`
+        // until the flag collapse).
         let mut to_create_job: Vec<DrvHash> = Vec::new();
-        // Topdown-pruned roots with broken closure evidence (childless
-        // or closure-holed) whose wanted set can neither complete
-        // inline nor route to substitution: fail fast instead of
-        // leaving them Ready (see the arm below).
-        let mut to_fail_fast: Vec<DrvHash> = Vec::new();
         for (drv_hash, paths) in candidates {
             checked.insert(drv_hash.clone());
-            let substitute_tried = self.dag.node(&drv_hash).is_some_and(|s| s.substitute_tried);
             // r[impl sched.merge.wanted-outputs+2]
             // Demand-driven completeness: only the WANTED outputs must
             // be present (→ complete inline) or present-or-
@@ -235,83 +224,26 @@ impl DagActor {
                 })
                 .unwrap_or_else(|| paths.clone());
             if wanted.iter().all(|p| !missing.contains(p)) {
-                if !substitute_tried {
-                    locally_present.push(drv_hash);
-                } else if self.must_substitute(&drv_hash) {
-                    // r[impl sched.evidence.settlement]
-                    // D16: present + tried + must-substitute. As built this cell
-                    // took no action while admit_pull kept refusing the node —
-                    // the limbo the settlement rule forbids. Settle by spawning
-                    // the verification walk: FMP presence does not imply closure
-                    // completeness for a tried node (the walk may have ingested
-                    // the seed then failed on a ref), so completion must go
-                    // through the walk's re-verification; an all-local closure
-                    // makes that walk QPI-only. Its genuine failure lands at the
-                    // Broken-arm settlement with the one-shot spent and takes the
-                    // fail-fast there — no livelock: the node leaves Ready
-                    // (Substituting) the moment the walk spawns.
-                    to_spawn.push((drv_hash, paths));
-                }
-                // present + tried + NOT must-substitute keeps the as-built
-                // fall-through to from-source dispatch (deps are in the DAG):
-                // `substitute_tried` ⇒ the closure walk ingested the
-                // seed (output) then failed on a ref — output-present
-                // in PG does NOT imply closure-complete. FMP probes
-                // output paths only, so "present" here can hide a
-                // hole. Fall through to dispatch (build re-derives the
-                // full closure) instead of marking Completed.
-            } else if !substitute_tried
-                && wanted.iter().all(|p| {
-                    !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
-                })
-            {
-                if self.materialization_cfg.enabled {
-                    // r[impl sched.materialize.job]
-                    // Substitution-replacement: route to a materialization
-                    // job instead of the detached walk. The job row is the
-                    // in-flight marker; the node stays Ready (claimable by
-                    // a store replica).
-                    to_create_job.push(drv_hash);
-                } else {
-                    // r[impl sched.merge.substitute-probe-indeterminate]
-                    // Indeterminate treated optimistically — same as
-                    // merge.rs. The closure walk's failure path falls
-                    // through to build via `substitute_tried`.
-                    to_spawn.push((drv_hash, paths));
-                }
-            } else if self.must_substitute(&drv_hash) {
-                if wanted.iter().all(|p| {
-                    !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
-                }) {
-                    // r[impl sched.evidence.settlement]
-                    // tried + substitutable + must-substitute: the upstream may
-                    // have gained the output since the failed walk; same
-                    // verification re-spawn as the present cell (as built this
-                    // fell through to the fail-fast although the probe just said
-                    // the outputs are obtainable).
-                    to_spawn.push((drv_hash, paths));
-                } else {
-                    // r[impl sched.merge.substitute-topdown+12]
-                    // Confirmed-missing (a wanted output is missing upstream and
-                    // not substitutable): every other node is left Ready and
-                    // dispatches from source. A topdown-pruned root whose
-                    // closure evidence is Broken (childless or closure-holed)
-                    // must not — its dep closure was never merged, so a
-                    // from-source dispatch is doomed (worker ENOENTs on
-                    // inputDrvs). This is the post-failover shape: the
-                    // recovered wanted union ('{}' = all declared) is wider
-                    // than the prune-time criterion, so an output the prune
-                    // never vouched for can be definitively missing here.
-                    // Fail fast with the resubmit-directing error instead.
-                    to_fail_fast.push(drv_hash);
-                }
+                locally_present.push(drv_hash);
+            } else if wanted.iter().all(|p| {
+                !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
+            }) {
+                // r[impl sched.materialize.job]
+                // r[impl sched.merge.substitute-probe-indeterminate]
+                // Route to a materialization job. The job row is the
+                // in-flight marker; the node stays Ready (claimable by
+                // a store replica). Indeterminate (probe got
+                // 429/5xx/deadline) is treated optimistically — same as
+                // merge.rs; the job's own routing settles a genuine
+                // miss.
+                to_create_job.push(drv_hash);
             }
+            // else: a wanted output is confirmed missing upstream and
+            // not substitutable — leave Ready (dispatches from source).
         }
         self.complete_ready_from_store_batch(&locally_present).await;
-        self.spawn_substitute_fetches(to_spawn, auth).await;
-        // Substitution-replacement (flag-on only; the vec stays empty
-        // flag-off): the probe-partition creation site — the standalone
-        // fenced helper, no enclosing transaction (design §2.1 row 3).
+        // The probe-partition creation site — the standalone fenced
+        // helper, no enclosing transaction (design §2.1 row 3).
         for drv_hash in &to_create_job {
             self.create_materialization_job_if_enabled(
                 drv_hash,
@@ -320,49 +252,47 @@ impl DagActor {
             )
             .await;
         }
-        for drv_hash in &to_fail_fast {
-            self.fail_fast_pruned_root(
-                drv_hash,
-                "wanted output(s) missing upstream and not substitutable at dispatch \
-                 after deps were pruned",
-            )
-            .await;
-        }
         checked
     }
 
-    /// Resolve auth for dispatch-time store calls. `Jwt(vec![])`
-    /// (no-auth) when no `service_signer` (dev mode) or no candidate
-    /// has a known tenant (single-tenant mode / recovered orphan);
-    /// otherwise `Service{signer, tenant_id}` so the detached
-    /// closure-walk task can re-mint tokens past the original 60s.
+    /// Service-token metadata for dispatch-time store probes
+    /// (`FindMissingPaths`): `(service token, probe tenant id)` when
+    /// both `service_signer` and a tenant are resolvable from the
+    /// candidates' interested builds; empty (no-auth, dev mode /
+    /// single-tenant) otherwise. Tenant context matters because the
+    /// store's upstream-substitution probe resolves
+    /// `tenant_upstreams` from it — without it `substitutable_paths`
+    /// stays empty. One-shot mint: the probe is a single bounded gRPC
+    /// call (the re-mintable walk auth died with the walk).
     #[allow(clippy::extra_unused_lifetimes)] // 'a only in impl-Trait arg
-    fn probe_substitute_auth<'a>(
+    pub(super) fn probe_service_meta<'a>(
         &self,
         drv_hashes: impl Iterator<Item = &'a DrvHash>,
-    ) -> SubstituteAuth {
+    ) -> Vec<(&'static str, String)> {
         let tid = drv_hashes
             .filter_map(|h| self.dag.node(h))
             .flat_map(|s| s.interested_builds.iter())
             .filter_map(|bid| self.builds.get(bid))
             .find_map(|b| b.tenant_id);
-        self.substitute_auth_for_tenant(tid)
-    }
-
-    /// Build a [`SubstituteAuth`] for a known `tenant_id`. `Service`
-    /// when both `service_signer` and `tenant_id` are present (so
-    /// `walk_substitute_closure` can re-mint past the original
-    /// expiry); `Jwt(vec![])` (no-auth) otherwise — dev mode or
-    /// single-tenant. Used by both `probe_substitute_auth`
-    /// (dispatch-time, derives `tenant_id` from the DAG) and
-    /// merge-time (`MergeDagRequest.tenant_id` is already in hand).
-    pub(super) fn substitute_auth_for_tenant(&self, tenant_id: Option<Uuid>) -> SubstituteAuth {
-        match (&self.service_signer, tenant_id) {
-            (Some(signer), Some(tid)) => SubstituteAuth::Service {
-                signer: signer.clone(),
-                tenant_id: tid,
-            },
-            _ => SubstituteAuth::Jwt(Vec::new()),
+        match (&self.service_signer, tid) {
+            (Some(signer), Some(tenant_id)) => {
+                let claims = rio_auth::hmac::ServiceClaims {
+                    caller: "rio-scheduler".to_string(),
+                    expiry_unix: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                        + super::PROBE_TOKEN_EXPIRY.as_secs(),
+                    // Probe tokens are not replica-bound (T-5.1: only the
+                    // store's materialization client mints Some).
+                    instance: None,
+                };
+                vec![
+                    (rio_proto::SERVICE_TOKEN_HEADER, signer.sign(&claims)),
+                    (rio_proto::PROBE_TENANT_ID_HEADER, tenant_id.to_string()),
+                ]
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -375,265 +305,13 @@ impl DagActor {
     }
 
     // r[impl sched.substitute.detached+5]
-    /// Transition each candidate to `Substituting` and spawn a
-    /// background task that triggers store-side `try_substitute` (via
-    /// `QueryPathInfo`) for its output paths AND their transitive
-    /// reference closure, then posts
-    /// [`ActorCommand::SubstituteComplete`] back into the mailbox.
-    ///
-    /// Detaches the upstream NAR fetch from the actor event loop:
-    /// before this, `eager_substitute_fetch` was awaited inline and a
-    /// single ghc-sized closure walk blocked `MergeDag` for >100s
-    /// (`"actor command exceeded 1s","cmd":"MergeDag","elapsed":"135s"`).
-    ///
-    /// Candidates whose transition is rejected (vanished, wrong status)
-    /// are skipped — they fall through to normal scheduling.
-    /// `auth` is the `(signer, tenant_id)` pair (both merge- and
-    /// dispatch-time, via `substitute_auth_for_tenant`) so the spawned
-    /// task can re-mint a fresh service token AFTER acquiring
-    /// `substitute_sem`, once per BFS layer, and every
-    /// `SUBSTITUTE_REMINT_PATHS` / `SUBSTITUTE_REMINT_INTERVAL` inside
-    /// the per-path loop: a token minted at spawn-time would expire
-    /// while parked on the semaphore or mid-way through a wide cold
-    /// closure walk (later QPIs → `NotFound` → spurious `ok=false`).
-    pub(super) async fn spawn_substitute_fetches(
-        &mut self,
-        candidates: Vec<(DrvHash, Vec<String>)>,
-        auth: SubstituteAuth,
-    ) {
-        if candidates.is_empty() {
-            return;
-        }
-        let Some(store) = self.store_client.clone() else {
-            return;
-        };
-        let Some(weak_tx) = self.self_tx.clone() else {
-            return;
-        };
-        struct Spawned {
-            hash: DrvHash,
-            drv_path: String,
-            output_paths: Vec<String>,
-            interested: HashSet<Uuid>,
-        }
-        let mut spawned: Vec<Spawned> = Vec::with_capacity(candidates.len());
-        for (drv_hash, paths) in candidates {
-            // Live effective wanted set for the forgivable complement
-            // below (terminal builds' contributions excluded; stored-
-            // union fallback on None) — computed before the `node_mut`
-            // borrow since it needs `self.builds`.
-            let eff = self
-                .dag
-                .node(&drv_hash)
-                .and_then(|s| effective_wanted(s, &self.builds));
-            let Some(state) = self.dag.node_mut(&drv_hash) else {
-                continue;
-            };
-            let from = match state.transition(DerivationStatus::Substituting) {
-                Ok(f) => f,
-                Err(e) => {
-                    debug!(%drv_hash, %e, "spawn_substitute: transition rejected; falling through");
-                    continue;
-                }
-            };
-            // Stash the realized paths now so SubstituteComplete →
-            // complete_ready_from_store_batch doesn't have to recompute
-            // them. Dispatch-time callers pass `expected_output_paths`
-            // (no-op semantically); the verify_preexisting_completed
-            // reprobe lane passes the REALIZED floating-CA path which
-            // would otherwise be lost (cleared at merge.rs reset, then
-            // clobbered with `[""]` at the IA-only assignment below).
-            state.output_paths = paths.clone();
-            // I-094 reprobe substitutable lane: failure history is moot
-            // — we're fetching the upstream-built output. The
-            // `cache_hit_clear` reset row appended below (in
-            // `record_reset_with_clear_poison`, same shape as
-            // apply_cached_hits) is what clears the retry state: the
-            // fold's reset arm zeroes the counters and the cached view
-            // is refreshed when the row lands. Clearing at this point
-            // in the chain (not on SubstituteComplete{ok=true}) means a
-            // later fetch failure demotes via `revert_target_for`
-            // (Ready/Queued/DependencyFailed) and may get one more
-            // dispatch attempt — acceptable, since substitutability is
-            // evidence the world changed (Hydra/another tenant built
-            // it).
-            // r[impl sched.merge.wanted-outputs+2]
-            // The forgivable seed subset: declared output paths whose
-            // name is OUTSIDE the (non-empty) wanted set. The walk
-            // still attempts them (opportunistic completeness) but
-            // their failure must not demote the derivation to a
-            // from-source build. Computed from the LIVE effective
-            // wanted set (`effective_wanted` over live interested
-            // builds' contributions, stored-union fallback) — the same
-            // source the cache-hit classification uses — so a path is
-            // only forgiven when NO LIVE build wants it; a terminal
-            // build's wants stop pinning seeds as unforgivable. Empty
-            // wanted set = all wanted = nothing forgivable (today's
-            // behaviour). Only paths positively identifiable as
-            // unwanted (declared in `expected_output_paths` but outside
-            // the wanted subset) qualify; a seed that matches no
-            // declared path (the realized floating-CA path from the
-            // reprobe lane) is never forgiven, and neither is a path
-            // that already triggered a forgiven-seed-became-wanted
-            // downgrade (`never_forgive_paths` — see
-            // `handle_substitute_complete`'s termination argument).
-            //
-            // The complement MUST be taken against the *verifiable*
-            // wanted subset. A wanted set that resolves to no
-            // verifiable path (`drv^bogus`) yields an EMPTY wanted set
-            // here — and the complement of nothing is every declared
-            // path, which forgives every seed failure and lets the
-            // walk return ok=true having fetched NOTHING. On `None`
-            // nothing is positively identifiable as unwanted, so
-            // nothing is forgivable: every seed failure fails the walk
-            // (the conservative pre-feature behaviour).
-            let forgivable: HashSet<String> = match verifiable_wanted_paths(
-                &state.output_names,
-                &state.expected_output_paths,
-                eff.as_deref().unwrap_or(&state.wanted_output_names),
-            ) {
-                Some(wanted) => {
-                    let wanted: HashSet<&str> = wanted.into_iter().collect();
-                    state
-                        .expected_output_paths
-                        .iter()
-                        .filter(|p| {
-                            !p.is_empty()
-                                && !wanted.contains(p.as_str())
-                                && paths.contains(*p)
-                                && !state.never_forgive_paths.contains(p.as_str())
-                        })
-                        .cloned()
-                        .collect()
-                }
-                None => HashSet::new(),
-            };
-            let drv_path = state.drv_path().to_string();
-            let interested = state.interested_builds.clone();
-            // Best-effort PG clear so recovery doesn't resurrect the
-            // poison. After last use of `state` so the &mut self.dag
-            // borrow ends before &self.db.
-            if matches!(
-                from,
-                DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
-            ) {
-                // 1a: `cache_hit_clear` reset row + poison clear in one
-                // transaction (same shape as the merge-time cache-hit
-                // clears).
-                let reset_row = self.reset_row_for(
-                    &drv_hash,
-                    crate::state::OutcomeClass::CacheHitClear,
-                    crate::state::ReportingParty::Scheduler,
-                );
-                if let Err(e) = self
-                    .record_reset_with_clear_poison(&drv_hash, reset_row)
-                    .await
-                {
-                    warn!(%drv_hash, error = %e,
-                          "failed to clear poison in PG after re-probe substitutable hit");
-                }
-            }
-            let output_paths = paths.clone();
-            let store = store.clone();
-            let weak_tx = weak_tx.clone();
-            let auth = auth.clone();
-            let h = drv_hash.clone();
-            let sem = self.substitute_sem.clone();
-            let shutdown = self.shutdown.clone();
-            rio_common::task::spawn_monitored("substitute-fetch", async move {
-                // Bound in-flight closure walks across ALL spawned
-                // tasks. The task is already spawned (so the actor
-                // returned), but it parks here until a slot is free —
-                // Substituting status keeps dependents gated meanwhile.
-                // `auth.mint()` is deferred to inside the walk (per
-                // layer) so time parked here doesn't eat token expiry.
-                let _permit = sem.acquire_owned().await;
-                // r[impl gw.activity.subst-progress]
-                // Progress emits post back into the actor mailbox.
-                // `try_send` (via the weak upgrade) — if the actor is
-                // gone or its mailbox full, drop the emit (display-
-                // only; SubstituteComplete below uses `send` so the
-                // state transition is never lost to backpressure).
-                let progress_tx = weak_tx.clone();
-                let progress_hash = h.clone();
-                let on_progress = move |done: u64, expected: u64, upstream: &str| {
-                    if let Some(tx) = progress_tx.upgrade() {
-                        let _ = tx.try_send(super::ActorCommand::SubstituteProgress {
-                            drv_hash: progress_hash.clone(),
-                            bytes_done: done,
-                            bytes_expected: expected,
-                            upstream_uri: upstream.to_string(),
-                        });
-                    }
-                };
-                let (ok, forgiven) = walk_substitute_closure(
-                    &store,
-                    paths,
-                    &forgivable,
-                    &auth,
-                    &shutdown,
-                    on_progress,
-                )
-                .await;
-                if let Some(tx) = weak_tx.upgrade() {
-                    let _ = tx
-                        .send(super::ActorCommand::SubstituteComplete {
-                            drv_hash: h,
-                            ok,
-                            forgiven,
-                        })
-                        .await;
-                }
-            });
-            spawned.push(Spawned {
-                hash: drv_hash,
-                drv_path,
-                output_paths,
-                interested,
-            });
-        }
-        if !spawned.is_empty() {
-            debug!(
-                count = spawned.len(),
-                "detached upstream substitute fetch spawned"
-            );
-            metrics::counter!("rio_scheduler_substitute_spawned_total")
-                .increment(spawned.len() as u64);
-            let hashes: Vec<&str> = spawned.iter().map(|s| s.hash.as_str()).collect();
-            self.persist_status_batch(&hashes, DerivationStatus::Substituting)
-                .await;
-            for s in &spawned {
-                let event = rio_proto::types::build_event::Event::Derivation(
-                    rio_proto::types::DerivationEvent::substituting(
-                        s.drv_path.clone(),
-                        s.output_paths.clone(),
-                    ),
-                );
-                for &build_id in &s.interested {
-                    self.events.emit(build_id, event.clone());
-                }
-            }
-            // build_summary counts Substituting as running — emit a
-            // progress snapshot so the queued/running flip is visible
-            // (matches `emit_assignment_started`). Dedup builds across
-            // all spawned drvs; emit once per build.
-            let interested_builds: HashSet<Uuid> = spawned
-                .iter()
-                .flat_map(|s| s.interested.iter().copied())
-                .collect();
-            for build_id in interested_builds {
-                self.emit_progress(build_id);
-            }
-        }
-    }
-
-    // r[impl sched.substitute.detached+5]
     /// Handle a [`ActorCommand::SubstituteComplete`] posted by a
-    /// detached fetch task. `ok=true` → output now in rio-store with
-    /// its full reference closure ([`walk_substitute_closure`] walked
-    /// it), so `Substituting → Completed` is safe even if inputDrvs
-    /// aren't yet Completed in the DAG. `ok=false` → revert to
-    /// `Ready`/`Queued` for normal scheduling.
+    /// detached fetch task of a previous-generation walk. The walk
+    /// spawner is deleted (no new commands of this shape are ever
+    /// produced); the consumption side survives one more commit so the
+    /// mailbox arm keeps its handler. `ok=true` → output in rio-store
+    /// with its full reference closure, so `Substituting → Completed`
+    /// is safe. `ok=false` → revert to `Ready`/`Queued`.
     ///
     /// `forgiven` is the set of seeds the walk forgave against the
     /// wanted set *as snapshotted at spawn time*; see the re-check
@@ -845,12 +523,12 @@ impl DagActor {
                 )
                 .await
             {
-                BrokenSettlement::VerificationSpawned | BrokenSettlement::FailedFast => return,
+                BrokenSettlement::FailedFast => return,
                 BrokenSettlement::Deferred => {
-                    // No store answer / rejected revert: fall through to the
-                    // plain revert below (Ready/Queued, NO substitute_tried)
-                    // so the next sweep re-probes — never fail-fast on an
-                    // unanswerable probe.
+                    // No store answer / outputs obtainable: fall through
+                    // to the plain revert below (Ready/Queued, NO
+                    // substitute_tried) so the next sweep re-probes —
+                    // never fail-fast on an unanswerable probe.
                 }
             }
         }
@@ -860,101 +538,14 @@ impl DagActor {
         // Queued (Queued with a Poisoned dep is stuck forever — see
         // `revert_target_for`).
         let to = self.dag.revert_target_for(drv_hash);
-        // Must-substitute judgment for the downgrade re-spawn's topdown
-        // leg below: the flag now survives merges that add unbuilt
-        // children, so "flagged" no longer implies "childless" — the
-        // doomed-from-source shape this leg must catch is a marked node
-        // whose closure evidence is Broken (childless OR closure-holed,
-        // same predicate as the dispatch guards). A genuine failure on
-        // such a node takes the fail-fast arm before reaching here;
-        // this leg only matters for the forgiven-now-wanted downgrade.
-        // Evaluated before `node_mut` because the `&mut` borrow is held
-        // at the use site.
-        let must_sub = self.must_substitute(drv_hash);
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
         };
-        // r[impl sched.merge.wanted-outputs+2]
-        // Downgrade re-spawn: two revert targets must not wait for
-        // "the next pass" to re-substitute the delta.
-        //
-        //  - `DependencyFailed` (a dep is Poisoned — the I-094 lane):
-        //    the arm below runs `terminal_failure_epilogue`, terminally
-        //    failing every interested build — including the build whose
-        //    wanted subset WAS fully fetched and the build whose newly
-        //    wanted seed never had a single real attempt (forgivable
-        //    seeds are forgiven on their first failure). There is no
-        //    "next pass" out of DependencyFailed.
-        //  - a topdown-pruned root with broken closure evidence
-        //    (childless or closure-holed — `must_substitute`): its dep
-        //    closure was dropped from the submission and the current
-        //    child set cannot vouch for it, so plain Ready without
-        //    `substitute_tried` is a doomed from-source dispatch
-        //    (worker ENOENTs on inputDrvs) if the next probe finds the
-        //    now-wanted path definitively missing — the exact hazard
-        //    the fail-fast arm above exists to prevent.
-        //
-        // For both, re-spawn the walk NOW: `spawn_substitute_fetches`
-        // recomputes the forgivable set from the CURRENT effective
-        // wanted set, so the newly-wanted delta gets a real,
-        // retry-laddered attempt before any terminal verdict. If that
-        // walk genuinely fails it lands back here with
-        // `forgiven_now_wanted = false` and takes the normal arms
-        // (fail-fast / epilogue). Terminates: every downgrade first
-        // adds its trigger paths to `never_forgive_paths` (above), and
-        // a path in that set is excluded from every later walk's
-        // forgivable set within this chain — so it can never be
-        // reported forgiven (and trigger another downgrade) again,
-        // regardless of how the live effective wanted set shrinks (a
-        // build goes terminal) and re-grows (a new build merges)
-        // between walks. The trigger paths were forgivable, hence not
-        // yet in the set, so within one chain the set only grows
-        // between re-spawns and the chain takes at most |declared
-        // outputs| downgrades. The set does NOT persist past the
-        // chain: it is cleared at every chain ending (the ok=true
-        // completion, the genuine-failure revert below, the topdown
-        // fail-fast above, a worker-build verdict after a from-source
-        // routing, any non-substitution completion — inline
-        // store-batch, merge-time cached-hit, CA-cutoff Skip — or the
-        // node being reset/removed, including the stale-Completed
-        // reset that opens the next chain) — only this re-spawn and
-        // the deferred next-pass delta re-walk retain it. A NEW chain
-        // requires an external event (a later dispatch-pass or
-        // merge-time classification spawning a fresh walk), which
-        // re-establishes the same per-chain bound rather than
-        // re-opening this one.
-        //
-        // The in-memory revert to `to` only satisfies the transition
-        // table (there is no Substituting→Substituting); PG keeps
-        // `Substituting`, which the re-spawn re-persists (one nuance:
-        // for the DependencyFailed/Poisoned-origin arm the re-spawn's
-        // best-effort `clear_poison` transiently writes status
-        // 'created' to PG before that re-persist lands). The ordinary
-        // Ready/Queued downgrade keeps today's behaviour (revert; the
-        // next pass re-probes and re-substitutes — and a from-source
-        // dispatch there is safe because the node's deps ARE in the
-        // DAG and Completed). Falls through to that plain revert if the
-        // store/self handles are gone (shutdown) — pre-fix behaviour.
-        if forgiven_now_wanted
-            && (to == DerivationStatus::DependencyFailed || must_sub)
-            && !state.output_paths.is_empty()
-            && self.store_client.is_some()
-            && self.self_tx.is_some()
-        {
-            if let Err(e) = state.transition(to) {
-                warn!(%drv_hash, %e, "SubstituteComplete downgrade: revert-for-respawn rejected");
-                return;
-            }
-            let paths = state.output_paths.clone();
-            info!(%drv_hash, revert_target = ?to,
-                  "downgraded substitute completion would land in a \
-                   terminal/fail-fast arm; re-spawning the walk with the \
-                   corrected forgivable set");
-            let auth = self.probe_substitute_auth(std::iter::once(drv_hash));
-            self.spawn_substitute_fetches(vec![(drv_hash.clone(), paths)], auth)
-                .await;
-            return;
-        }
+        // The downgrade re-spawn that used to sit here (immediate
+        // re-walk for the DependencyFailed / must-substitute revert
+        // targets of the forgiven-now-wanted downgrade) died with the
+        // walk spawner — the downgrade now falls through to the plain
+        // revert below like every other ok=false outcome.
         // One-shot fall-through: FMP said substitutable, QPI said no.
         // Next dispatch pass skips substitution and routes to a worker
         // — without this the partition re-includes it every Tick (~1/s
@@ -1198,34 +789,15 @@ impl DagActor {
     /// walk-failure evidence that may predate out-of-band ingestion (the
     /// C3 defect), re-probe the LIVE effective wanted outputs and route:
     ///
-    ///  - every live-wanted output present / substitutable / indeterminate
-    ///    AND the verification one-shot is unspent (!substitute_tried):
-    ///    spend the one-shot and (re-)spawn the walk. The walk re-verifies
-    ///    the closure (the settlement rule's "completed with its closure
-    ///    re-verified") and its ok=true completion routes through
-    ///    complete_ready_from_store_batch; a genuine failure lands back at
-    ///    the Broken arm with the one-shot spent and fail-fasts there.
-    ///  - otherwise: the established fail-fast (now genuine — either a
-    ///    wanted output is confirmed missing+unsubstitutable, or the
-    ///    verification walk itself already failed).
+    ///  - every live-wanted output present / substitutable / indeterminate:
+    ///    defer. The verification walk this arm used to spawn died with
+    ///    the walk spawner (the helper itself dies with the consumption
+    ///    component); a deferral never burns the one-shot credit.
+    ///  - otherwise: the established fail-fast (genuine — a wanted output
+    ///    is confirmed missing+unsubstitutable, or the one-shot is spent).
     ///
-    /// Spawn mechanics: there is no Substituting->Substituting edge in the
-    /// transition table (state/derivation.rs validate_transition rejects
-    /// non-terminal self-transitions), and spawn_substitute_fetches
-    /// silently skips candidates whose transition is rejected. When the
-    /// caller's node is currently Substituting (the SubstituteComplete
-    /// Broken arm — its entry guard guarantees it), this helper first
-    /// reverts the node to dag.revert_target_for(..) — the same
-    /// revert-for-respawn the forgiven-now-wanted downgrade uses — and
-    /// only then spawns. Call sites whose node is Ready (dispatch probe)
-    /// or Created/Failed (reap survivors) need no revert; the helper keys
-    /// the revert on the node's CURRENT status, never unconditionally.
-    ///
-    /// Probe failure / missing store client / rejected revert defers (B3:
-    /// an indeterminate answer never fail-fasts on its own): the caller
-    /// falls through to its plain revert and the next dispatch sweep —
-    /// whose partition settles marked-Broken nodes in every cell — picks
-    /// it up.
+    /// Probe failure / missing store client defers (B3: an indeterminate
+    /// answer never fail-fasts on its own).
     pub(super) async fn settle_broken_marked_root(
         &mut self,
         drv_hash: &DrvHash,
@@ -1236,7 +808,6 @@ impl DagActor {
         };
         let tried = state.substitute_tried;
         let expected_paths = state.expected_output_paths.clone();
-        let current_status = state.status();
         // The wanted slice mirrors batch_probe_cached_ready: live
         // effective wanted, falling back to the stored union, degraded to
         // all expected paths when unresolvable.
@@ -1262,8 +833,7 @@ impl DagActor {
         let Some(store) = &self.store_client else {
             return BrokenSettlement::Deferred;
         };
-        let auth = self.probe_substitute_auth(std::iter::once(drv_hash));
-        let probe = auth.mint();
+        let probe = self.probe_service_meta(std::iter::once(drv_hash));
         let probe_meta: Vec<(&'static str, &str)> =
             probe.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let mut req = tonic::Request::new(FindMissingPathsRequest {
@@ -1292,36 +862,10 @@ impl DagActor {
             return BrokenSettlement::FailedFast;
         }
 
-        // Revert-for-respawn (CF-1/FC-1): a Substituting node cannot
-        // re-enter Substituting; transition it to its revert target
-        // FIRST, exactly like the forgiven-now-wanted downgrade re-spawn
-        // in handle_substitute_complete. Only Substituting needs this;
-        // Ready/Created/Failed have valid edges into Substituting.
-        if current_status == DerivationStatus::Substituting {
-            let to = self.dag.revert_target_for(drv_hash);
-            let Some(s) = self.dag.node_mut(drv_hash) else {
-                return BrokenSettlement::Deferred;
-            };
-            if let Err(e) = s.transition(to) {
-                warn!(%drv_hash, %e, "settlement revert-for-respawn rejected; deferring");
-                return BrokenSettlement::Deferred;
-            }
-        }
-        // Spend the one-shot and spawn the verification walk. The spend
-        // happens only on a path where the spawn's own transition is
-        // valid, so a deferral never burns the credit.
-        if let Some(s) = self.dag.node_mut(drv_hash) {
-            s.substitute_tried = true;
-        }
-        metrics::counter!("rio_scheduler_topdown_settlement_reprobe_total",
-            "outcome" => "verification_walk")
-        .increment(1);
-        info!(%drv_hash, cause,
-              "broken marked root's live-wanted outputs are available at \
-               re-probe; spawning verification walk instead of fail-fast");
-        self.spawn_substitute_fetches(vec![(drv_hash.clone(), expected_paths)], auth)
-            .await;
-        BrokenSettlement::VerificationSpawned
+        // All live-wanted outputs are obtainable: defer without burning
+        // the one-shot. The verification walk this arm spawned died
+        // with the walk spawner.
+        BrokenSettlement::Deferred
     }
 
     // r[impl sched.poison.clear-survivor-reevaluation]
@@ -1506,11 +1050,11 @@ impl DagActor {
             state.never_forgive_paths.clear();
             // IA-only convenience: `expected_output_paths` IS the
             // realised path. Non-destructive when a path is already
-            // known — the floating-CA reprobe→re-substitute lane
-            // arrives here with `output_paths` set to the realized
-            // path by `spawn_substitute_fetches`; clobbering it with
-            // `expected_output_paths == [""]` would drop GC retention
-            // and emit `[""]` to clients.
+            // known — a caller that resolved the REALIZED floating-CA
+            // path (the materialization consumption path carries it on
+            // the job report) must not have it clobbered with
+            // `expected_output_paths == [""]`, which would drop GC
+            // retention and emit `[""]` to clients.
             if state.output_paths.is_empty() {
                 state.output_paths = state.expected_output_paths.clone();
             }
@@ -2214,555 +1758,10 @@ impl DagActor {
 /// Outcome of [`DagActor::settle_broken_marked_root`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BrokenSettlement {
-    /// A verification walk was (re-)spawned; its completion settles
-    /// the node (ok => complete-from-store, fail => fail-fast).
-    VerificationSpawned,
     /// The node was fail-fasted (confirmed-missing wanted output, or
     /// the verification one-shot was already spent).
     FailedFast,
-    /// The store could not answer (no client / RPC failure), or the
-    /// revert-for-respawn transition was rejected: nothing was
-    /// decided; the node was left for the next dispatch sweep.
+    /// The store could not answer (no client / RPC failure), or every
+    /// live-wanted output is obtainable: nothing was decided.
     Deferred,
-}
-
-// r[impl sched.substitute.detached+5]
-/// Auth source for the detached substitute closure walk.
-///
-/// `Service` holds `(signer, tenant_id)` and re-mints a fresh
-/// `SUBSTITUTE_FETCH_TIMEOUT`-expiry token on every `mint()` so a long
-/// closure walk or time parked on `substitute_sem` can't outlive the
-/// token (a 60s spawn-time token expired mid-walk → later QPIs
-/// `NotFound` → spurious `ok=false`). Both merge-time and dispatch-time
-/// callers now use `Service` (via `substitute_auth_for_tenant`): the
-/// gateway JWT is single-shot and a wide cold closure can outlive its
-/// ~65 min expiry. `Jwt` remains only for the dev/no-signer/no-tenant
-/// fallback (`vec![]` — no-auth) where re-minting is meaningless.
-#[derive(Clone)]
-pub(super) enum SubstituteAuth {
-    Jwt(Vec<(&'static str, String)>),
-    Service {
-        signer: Arc<rio_auth::hmac::HmacSigner>,
-        tenant_id: Uuid,
-    },
-}
-
-impl SubstituteAuth {
-    pub(super) fn mint(&self) -> Vec<(&'static str, String)> {
-        match self {
-            SubstituteAuth::Jwt(m) => m.clone(),
-            SubstituteAuth::Service { signer, tenant_id } => {
-                let claims = rio_auth::hmac::ServiceClaims {
-                    caller: "rio-scheduler".to_string(),
-                    expiry_unix: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0)
-                        + super::SUBSTITUTE_FETCH_TIMEOUT.as_secs(),
-                    // Probe tokens are not replica-bound (T-5.1: only the
-                    // store's materialization client mints Some).
-                    instance: None,
-                };
-                vec![
-                    (rio_proto::SERVICE_TOKEN_HEADER, signer.sign(&claims)),
-                    (rio_proto::PROBE_TENANT_ID_HEADER, tenant_id.to_string()),
-                ]
-            }
-        }
-    }
-}
-
-/// `reason` label values for `rio_scheduler_substitute_demotions_total`,
-/// derived from the FINAL error that demoted a non-forgivable path
-/// (attempts within one path's retry ladder can fail with different
-/// codes; the last one is what the walk gave up on). A small fixed set
-/// — never the raw store message or the path.
-///
-/// - `not_found`: the final attempt was a plain path-not-found — no
-///   configured upstream produced the path, or the store skipped
-///   substitution entirely (no upstreams configured for the tenant /
-///   the replica's HTTP client failed at boot). The skip cases are
-///   counted store-side in `rio_store_substitute_skipped_total`; the
-///   bare message gives the scheduler no way to tell them apart from a
-///   genuine all-upstreams miss.
-/// - `not_found_infra`: the final attempt's NotFound message indicates
-///   the request never reached an upstream (auth chain / substituter
-///   config) — fix the infrastructure, the path is probably fine. The
-///   substrings are pinned against rio-store's `substitute_path_impl`
-///   refusal messages by `demotion_reason_classifies_store_messages`.
-/// - `error`: a non-transient, non-NotFound gRPC error (no retry).
-/// - `exhausted`: the retry budget ran out on a transient error.
-fn demotion_reason(e: &tonic::Status) -> &'static str {
-    match e.code() {
-        tonic::Code::NotFound => {
-            let m = e.message();
-            if m.contains("no tenant context") || m.contains("substituter not configured") {
-                "not_found_infra"
-            } else {
-                "not_found"
-            }
-        }
-        c if rio_common::grpc::is_transient(c) => "exhausted",
-        _ => "error",
-    }
-}
-
-/// Bump the demotion counters for a non-forgivable path whose failure
-/// is about to set `ok = false` — the derivation and its build-time
-/// closure are about to be compiled from source because a download
-/// failed. The caller emits the `error!` (the message differs per
-/// arm); this owns the two counters so no demotion site can increment
-/// one and forget the other.
-fn record_demotion(e: &tonic::Status) {
-    metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
-    metrics::counter!(
-        "rio_scheduler_substitute_demotions_total",
-        "reason" => demotion_reason(e)
-    )
-    .increment(1);
-}
-
-/// `MAX_SUBSTITUTE_CLOSURE` overshoot guard for [`walk_substitute_closure`].
-/// Re-checked after every per-path `references` push so a hostile
-/// upstream can overshoot by at most one path's `MAX_REFERENCES` (10k),
-/// not `layer_width × MAX_REFERENCES` (~100M strings before the next
-/// top-of-loop check).
-fn closure_cap_exceeded(visited: usize) -> bool {
-    if visited > MAX_SUBSTITUTE_CLOSURE {
-        warn!(
-            visited,
-            cap = MAX_SUBSTITUTE_CLOSURE,
-            "substitute closure walk exceeded MAX_SUBSTITUTE_CLOSURE; \
-             demoting to cache-miss (hostile upstream reference chain?)"
-        );
-        metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
-        true
-    } else {
-        false
-    }
-}
-
-/// BFS over `info.references` from `seeds`, issuing `QueryPathInfo`
-/// (which triggers store-side `try_substitute`) for every node. Returns
-/// `true` iff every node in the closure is present in the store on
-/// return — the contract `handle_substitute_complete{ok=true}` relies
-/// on for `Substituting → Completed`.
-///
-/// The store substitutes ONE path per call (no closure walk), so this
-/// is the only place the runtime closure can be completed. Without it,
-/// `compute_input_closure`'s `BatchQueryPathInfo` (local-only) drops a
-/// transitive ref from the JIT allowlist → ENOENT at exec time (e.g.
-/// `rustc-wrapper` execs `rustc-1.94.0`).
-///
-/// **Layer-batched fast-path:** each BFS layer is first probed via
-/// `BatchQueryPathInfo` (local-only, one PG `= ANY()` round-trip — the
-/// I-110 pattern from `compute_input_closure`). Refs already in PG
-/// contribute their `references` to the next layer without a per-path
-/// RPC; only the absent subset gets a substituting `QueryPathInfo`. For
-/// an 800-path closure that's mostly warm, this is O(depth) ≈ 10 batch
-/// RPCs instead of 800 unary ones. A `BatchQueryPathInfo` error falls
-/// through to per-path QPI for the whole layer (correctness over
-/// throughput).
-///
-/// A non-transient `Err`, a retry-exhausted path (NotFound and
-/// transient errors share the backoff ladder — a NotFound inside the
-/// walk contradicts the HEAD probe / narinfo that named the path, so
-/// it is retried rather than believed on first occurrence), or the
-/// `MAX_SUBSTITUTE_CLOSURE` cap → `false`. Self-references and
-/// diamonds dedup via `visited`.
-///
-/// **`forgivable`** is the subset of `seeds` whose failure must NOT
-/// fail the walk: the declared-but-unwanted output paths (no consumer's
-/// `inputDrvs` names them and the root didn't ask for them). The seeds
-/// stay ALL expected output paths — opportunistic completeness: fetch
-/// the `-debug` output if the upstream has it — but when the upstream
-/// definitively misses one, condemning the derivation (and its whole
-/// build-time closure) to a from-source rebuild over an output nothing
-/// consumes is the incident this gate exists to prevent. A failed
-/// WANTED seed and a failed reference-BFS-discovered path (a runtime
-/// reference of something already fetched — its absence is a hole in a
-/// closure we are about to declare complete) keep failing the walk;
-/// only unwanted seeds are in `forgivable` by construction. A
-/// forgivable seed is forgiven on its FIRST failure of any kind — it
-/// does not consume the retry budget (the per-path loop is serial, so
-/// ~32 s of backoff on an output nobody consumes delays every path
-/// behind it).
-///
-/// **Residual hole risk.** If a WANTED output runtime-references an
-/// unwanted sibling output, forgiving that sibling can leave a hole in
-/// the wanted output's runtime closure even though the walk returns
-/// `ok=true`. The no-hole guarantee only holds when the forgiven
-/// error is a **NotFound**, and only against an upstream that
-/// maintains its closure invariant: an upstream that served the wanted
-/// output has every path in that output's closure, so a true miss on
-/// the sibling proves the wanted output does not reference it. A
-/// forgiven **transient or non-transient error** carries no such proof
-/// — the upstream may well have the sibling (a 500, a timeout, a flaky
-/// connection) and the walk still completes with the reference
-/// unsatisfied; first-failure forgiveness widens this slightly (a
-/// transient blip that one retry would have cleared is now forgiven
-/// instead of retried). Accepted
-/// because (a) it requires the rare wanted→unwanted-sibling reference
-/// direction (`-debug`/`-doc` outputs reference their `out`, not the
-/// reverse), and (b) the alternative — failing the walk — is a
-/// GUARANTEED from-source rebuild of the derivation and its entire
-/// build-time closure, versus a POSSIBLE FUSE ENOENT on one path in
-/// one dependent's build, whose retry re-queries the path and
-/// re-triggers substitution.
-///
-/// Returns `(ok, forgiven)`: `forgiven` is the subset of `forgivable`
-/// seeds that actually FAILED and were forgiven (not the ones that
-/// substituted fine). `forgivable` is a snapshot of the wanted set at
-/// spawn time; a build that merges during the (potentially minutes-
-/// long) walk can grow the node's wanted set to include a forgiven
-/// seed. `handle_substitute_complete` re-checks `forgiven` against the
-/// node's CURRENT wanted set and downgrades a stale `ok=true` to a
-/// revert.
-pub(super) async fn walk_substitute_closure(
-    store: &rio_proto::store::store_service_client::StoreServiceClient<tonic::transport::Channel>,
-    seeds: Vec<String>,
-    forgivable: &HashSet<String>,
-    auth: &SubstituteAuth,
-    shutdown: &rio_common::signal::Token,
-    mut on_progress: impl FnMut(u64, u64, &str),
-) -> (bool, Vec<String>) {
-    let mut visited: HashSet<String> = seeds.iter().cloned().collect();
-    let mut frontier: VecDeque<String> = seeds.into_iter().collect();
-    let mut ok = true;
-    let mut forgiven: Vec<String> = Vec::new();
-    // Aggregate across the closure for `r[gw.activity.subst-progress]`.
-    // `done_base` accumulates completed-path nar_sizes; the per-path
-    // callback adds its in-flight `done` on top. `expected` grows as
-    // each path's narinfo is read (first progress emit OR Ok(Some)).
-    // `seen_expected` tracks which paths have already contributed to
-    // `expected` so a retry after a transient error doesn't double-count.
-    //
-    // `expected_total` grows as the BFS discovers references — nom's
-    // denominator increases mid-stream. Inherent to walk-and-discover
-    // (we don't pre-fetch all narinfos), not a bug; the invariants
-    // below keep it from rendering as >100%.
-    let mut done_base: u64 = 0;
-    let mut expected_total: u64 = 0;
-    let mut seen_expected: HashSet<String> = HashSet::new();
-    while !frontier.is_empty() {
-        if shutdown.is_cancelled() {
-            return (false, forgiven);
-        }
-        if closure_cap_exceeded(visited.len()) {
-            return (false, forgiven);
-        }
-        // Re-mint per layer: dispatch-time `Service` tokens are
-        // short-lived; minting once at spawn meant a ghc-sized walk or
-        // time on `substitute_sem` outlived the token. `Jwt` is a
-        // cheap clone. Only the per-path QPIs need tenant context (for
-        // store-side `try_substitute_on_miss → tenant_upstreams`).
-        let mut meta_owned = auth.mint();
-        let mut paths_since_mint = 0usize;
-        let mut mint_at = Instant::now();
-        // Layer-batched fast-path: drain the current frontier into one
-        // BatchQueryPathInfo. Present refs (warm in PG) push their
-        // references; absent refs go to per-path QPI to trigger
-        // substitution. Batch error → treat the whole layer as absent
-        // (per-path QPI then handles each, including retry).
-        //
-        // `&[]` metadata: BatchQPI is local-only and rejects end-user
-        // tenant JWTs (`reject_end_user_tenant`); the merge-time `Jwt`
-        // path carries one, so passing `meta` here →
-        // `PermissionDenied` → debug! + per-path fallback (fast-path
-        // never fired). The call needs no tenant.
-        let layer: Vec<String> = frontier.drain(..).collect();
-        let mut absent: Vec<String> = Vec::new();
-        let mut c = store.clone();
-        match rio_proto::client::batch_query_path_info(
-            &mut c,
-            layer.clone(),
-            super::SUBSTITUTE_FETCH_TIMEOUT,
-            &[],
-        )
-        .await
-        {
-            Ok(entries) => {
-                for (path, info) in entries {
-                    match info {
-                        Some(info) => {
-                            for r in &info.references {
-                                if visited.insert(r.to_string()) {
-                                    frontier.push_back(r.to_string());
-                                }
-                            }
-                            if closure_cap_exceeded(visited.len()) {
-                                return (false, forgiven);
-                            }
-                        }
-                        None => absent.push(path),
-                    }
-                }
-            }
-            Err(e) => {
-                debug!(error = %e, layer = layer.len(),
-                       "substitute closure: batch probe failed; \
-                        falling through to per-path QPI");
-                absent = layer;
-            }
-        }
-        // Per-path QPI for the absent subset — triggers store-side
-        // try_substitute. Same retry/error handling as before; on
-        // success, push references for the next layer.
-        'paths: for p in absent {
-            // Per-path high-water mark for the in-flight `done`.
-            // `do_substitute` may iterate upstreams (or the outer
-            // attempt loop may retry), each restarting at `done=0`;
-            // emitting raw `done` would make the bar jump backward.
-            // The hwm makes the per-path contribution monotone.
-            let mut in_flight_hwm: u64 = 0;
-            // Final error of the retry ladder, for the post-loop
-            // exhaustion arm: the demotion log and the
-            // `substitute_demotions_total{reason}` label need to know
-            // whether the budget was burned by NotFounds (the upstream
-            // kept contradicting the probe) or by transient errors
-            // (the store never answered).
-            let mut last_err: Option<tonic::Status> = None;
-            // Per-path re-mint cadence: the per-layer mint above is
-            // not enough — this serial loop can run >30 min on a wide
-            // cold layer (hundreds of paths × admission-wait + retry
-            // backoff each), outliving a `Service` token. Re-mint
-            // every `SUBSTITUTE_REMINT_PATHS` paths OR
-            // `SUBSTITUTE_REMINT_INTERVAL` elapsed, whichever first.
-            // Expired-token QPI surfaces as `NotFound`/
-            // `Unauthenticated` (NON-transient) → spurious `ok=false`
-            // → demote to build-from-source.
-            if paths_since_mint >= super::SUBSTITUTE_REMINT_PATHS
-                || mint_at.elapsed() >= super::SUBSTITUTE_REMINT_INTERVAL
-            {
-                meta_owned = auth.mint();
-                paths_since_mint = 0;
-                mint_at = Instant::now();
-            }
-            paths_since_mint += 1;
-            let meta: Vec<(&'static str, &str)> =
-                meta_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            for attempt in 0..super::SUBSTITUTE_FETCH_MAX_ATTEMPTS {
-                if shutdown.is_cancelled() {
-                    return (false, forgiven);
-                }
-                let mut c = store.clone();
-                // r[impl gw.activity.subst-progress]
-                // Per-path progress: store streams (done, expected,
-                // upstream) per ~1 MiB. First emit for `p` adds its
-                // `expected` to the closure aggregate; subsequent emits
-                // (and retries) only update the in-flight hwm on top of
-                // `done_base`. `seen_expected` keys on path so a retry
-                // after a transient error doesn't re-add `expected`.
-                let path_progress = |done: u64, expected: u64, upstream: &str| {
-                    if seen_expected.insert(p.clone()) {
-                        expected_total = expected_total.saturating_add(expected);
-                    }
-                    in_flight_hwm = in_flight_hwm.max(done);
-                    on_progress(
-                        done_base.saturating_add(in_flight_hwm),
-                        expected_total,
-                        upstream,
-                    );
-                };
-                match rio_proto::client::substitute_path_with_progress(
-                    &mut c,
-                    &p,
-                    super::SUBSTITUTE_FETCH_TIMEOUT,
-                    &meta,
-                    path_progress,
-                )
-                .await
-                {
-                    Ok(info) => {
-                        // Store-side cache-hit / AlreadyComplete returns
-                        // here without ever calling `path_progress`, so
-                        // `expected_total` must learn `nar_size` here too
-                        // — otherwise `done_base` outgrows it and the
-                        // next path's emit shows >100%.
-                        if seen_expected.insert(p.clone()) {
-                            expected_total = expected_total.saturating_add(info.nar_size);
-                        }
-                        done_base = done_base.saturating_add(info.nar_size);
-                        for r in &info.references {
-                            if visited.insert(r.to_string()) {
-                                frontier.push_back(r.to_string());
-                            }
-                        }
-                        if closure_cap_exceeded(visited.len()) {
-                            return (false, forgiven);
-                        }
-                        continue 'paths;
-                    }
-                    // An unwanted seed is forgiven on its FIRST
-                    // failure of ANY kind: not a failure (no metric),
-                    // the walk continues, the closure is still
-                    // complete for every output anything consumes.
-                    // Checked before the retry ladder — burning ~32 s
-                    // of serialized backoff on an output nobody
-                    // consumes delays every path behind it in the
-                    // layer. The path was still ATTEMPTED once
-                    // (opportunistic completeness — it stays in the
-                    // seed list). `store_msg` for the same reason as
-                    // the fatal arms below: "no tenant context" /
-                    // "substituter not configured" mean the request
-                    // never reached the upstream — a forgiven skip
-                    // that should have been a fetch.
-                    Err(e) if forgivable.contains(&p) => {
-                        info!(path = %p, code = ?e.code(), store_msg = e.message(),
-                              "unwanted output not substituted; continuing without it");
-                        forgiven.push(p.clone());
-                        continue 'paths;
-                    }
-                    // A NotFound inside the walk is always a
-                    // contradiction: every path here was either
-                    // HEAD-probed as available minutes earlier (a
-                    // seed) or named in a narinfo the upstream just
-                    // served (a reference), so "the upstream doesn't
-                    // have it" disagrees with an observation the
-                    // store/upstream made moments ago. The genuinely-
-                    // not-on-any-upstream case never enters the walk.
-                    // Treat it like a transient error: retry through
-                    // the same backoff ladder. The 2026-05 incident
-                    // demoted 235 paths to from-source builds on
-                    // first-occurrence NotFounds that the store never
-                    // actually checked against the upstream; all 235
-                    // substituted fine 80 seconds later.
-                    Err(e)
-                        if e.code() == tonic::Code::NotFound
-                            || rio_common::grpc::is_transient(e.code()) =>
-                    {
-                        debug!(path = %p, attempt, code = ?e.code(), store_msg = e.message(),
-                               "substitute fetch retryable error; retrying");
-                        metrics::counter!("rio_scheduler_substitute_fetch_retries_total")
-                            .increment(1);
-                        let exhausted = attempt + 1 == super::SUBSTITUTE_FETCH_MAX_ATTEMPTS;
-                        last_err = Some(e);
-                        if exhausted {
-                            break;
-                        }
-                        tokio::select! {
-                            _ = shutdown.cancelled() => return (false, forgiven),
-                            _ = tokio::time::sleep(
-                                super::SUBSTITUTE_FETCH_BACKOFF.duration(attempt)
-                            ) => {}
-                        }
-                    }
-                    Err(e) => {
-                        // Non-transient, non-NotFound: retrying won't
-                        // change the answer. error! (not warn!) — this
-                        // event means a derivation and its build-time
-                        // closure are about to be compiled from source
-                        // because a download failed; it should page.
-                        error!(path = %p, error = %e, store_msg = e.message(),
-                               reason = demotion_reason(&e),
-                               "detached substitute fetch failed; demoting to cache-miss");
-                        record_demotion(&e);
-                        ok = false;
-                        continue 'paths;
-                    }
-                }
-            }
-            // Retry ladder exhausted: every attempt failed with a
-            // retryable error (NotFound or transient) on a
-            // non-forgivable path — every other arm `continue 'paths`
-            // out of the attempt loop, so `last_err` is always the
-            // final attempt's error here. The consequence is "compile
-            // the derivation (and its build closure) from source", so
-            // the WHY must survive into the log: `store_msg` is
-            // rio-store's own reason for the FINAL attempt — "no
-            // tenant context on request" / "substituter not
-            // configured" mean that request never reached
-            // cache.nixos.org (fix the auth chain / config); a bare
-            // "path not found" means no configured upstream produced
-            // it — or the store skipped substitution entirely (no
-            // upstreams configured for the tenant / no HTTP client on
-            // the replica; rio_store_substitute_skipped_total carries
-            // the store-side cause). Indistinguishable before
-            // 2026-05-23.
-            let store_msg = last_err
-                .as_ref()
-                .map(|e| e.message().to_owned())
-                .unwrap_or_default();
-            let reason = last_err.as_ref().map_or("exhausted", demotion_reason);
-            error!(path = %p, attempts = super::SUBSTITUTE_FETCH_MAX_ATTEMPTS,
-                   store_msg, reason,
-                   "detached substitute fetch exhausted retries; demoting to cache-miss");
-            match last_err {
-                Some(e) => record_demotion(&e),
-                // Unreachable in practice; keep the failure counted
-                // rather than silently losing the demotion.
-                None => {
-                    metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
-                    metrics::counter!(
-                        "rio_scheduler_substitute_demotions_total",
-                        "reason" => "exhausted"
-                    )
-                    .increment(1);
-                }
-            }
-            ok = false;
-        }
-    }
-    (ok, forgiven)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Pin `demotion_reason`'s message-substring classifier against the
-    /// THREE NotFound shapes rio-store's `substitute_path_impl`
-    /// actually produces (rio-store/src/grpc/queries.rs). The reason
-    /// label is the only alertable signal that distinguishes "the
-    /// upstream really missed" from "the request never reached the
-    /// upstream"; if the store re-words a refusal message and the
-    /// substring no longer matches, the infra case silently collapses
-    /// into `not_found` — this test breaks instead.
-    #[test]
-    fn demotion_reason_classifies_store_messages() {
-        let p = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x";
-        for (status, want) in [
-            // queries.rs: the no-substituter refusal.
-            (
-                tonic::Status::not_found(format!(
-                    "path not found (substituter not configured on this store replica): {p}"
-                )),
-                "not_found_infra",
-            ),
-            // queries.rs: the no-tenant refusal.
-            (
-                tonic::Status::not_found(format!(
-                    "path not found (no tenant context on request — substitution \
-                     requires x-rio-tenant-token or x-rio-probe-tenant-id + \
-                     x-rio-service-token): {p}"
-                )),
-                "not_found_infra",
-            ),
-            // queries.rs: the bare terminal. Reached on a genuine
-            // all-upstreams miss, but ALSO when the store skipped
-            // substitution entirely (no upstreams configured for the
-            // tenant / no HTTP client on the replica) — same message
-            // either way; the store-side cause is only visible in
-            // rio_store_substitute_skipped_total.
-            (
-                tonic::Status::not_found(format!("path not found: {p}")),
-                "not_found",
-            ),
-            // Transient code → the ladder ran out of budget.
-            (
-                tonic::Status::unavailable("connection refused"),
-                "exhausted",
-            ),
-            // Non-transient, non-NotFound → no retry.
-            (tonic::Status::internal("boom"), "error"),
-        ] {
-            assert_eq!(
-                demotion_reason(&status),
-                want,
-                "code={:?} msg={:?}",
-                status.code(),
-                status.message()
-            );
-        }
-    }
 }

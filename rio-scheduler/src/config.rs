@@ -93,13 +93,6 @@ pub struct Config {
     /// cutover switch), while this struct's default stays `false` —
     /// a bare binary without deployment config runs the as-built walk.
     pub materialization: MaterializationConfig,
-    /// In-flight detached substitute-fetch task bound
-    /// (r[sched.substitute.detached+5]) — memory-safety only; per-replica
-    /// throttling is `r[store.substitute.admission]`. Sizes
-    /// `DagActor.substitute_sem`. Env: `RIO_SUBSTITUTE_MAX_CONCURRENT`
-    /// (operator escape hatch — not chart-set). Default 256.
-    #[serde(default = "default_substitute_concurrency")]
-    pub substitute_max_concurrent: usize,
     /// gRPC-Web / CORS config for the dashboard SPA. `[dashboard]`
     /// table in scheduler.toml. Env: `RIO_DASHBOARD__*`.
     pub dashboard: DashboardConfig,
@@ -189,10 +182,6 @@ impl Default for MaterializationConfig {
     }
 }
 
-fn default_substitute_concurrency() -> usize {
-    crate::DEFAULT_SUBSTITUTE_CONCURRENCY
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -211,7 +200,6 @@ impl Default for Config {
             poison: crate::PoisonConfig::default(),
             retry: crate::RetryPolicy::default(),
             materialization: MaterializationConfig::default(),
-            substitute_max_concurrent: default_substitute_concurrency(),
             dashboard: DashboardConfig::default(),
             sla: crate::sla::config::SlaConfig::defaults_baseline(),
             allow_reference_change: false,

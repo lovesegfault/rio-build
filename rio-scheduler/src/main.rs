@@ -281,7 +281,6 @@ async fn main() -> anyhow::Result<()> {
             soft_features: cfg.soft_features,
             poison: cfg.poison,
             retry_policy: cfg.retry,
-            substitute_max_concurrent: cfg.substitute_max_concurrent,
             sla: cfg.sla,
             establishment_report_slack: cfg.establishment_report_slack,
             materialization: cfg.materialization,

@@ -50,17 +50,13 @@ pub(super) struct MergeIngest {
     pub existing_reprobe: HashSet<DrvHash>,
     pub cached_hits: HashMap<DrvHash, Vec<String>>,
     /// Derivations whose outputs are upstream-substitutable but not
-    /// yet locally present. `reconcile_merged_state` spawns the
-    /// detached fetch for these after `seed_initial_states`.
-    /// r[sched.substitute.detached+5]
+    /// yet locally present. Their materialization jobs ride the merge
+    /// transaction (the new_sub/reprobe lanes); `reconcile_merged_state`
+    /// applies the matching in-memory corrections after
+    /// `seed_initial_states`.
     pub pending_substitute: Vec<(DrvHash, Vec<String>)>,
     /// Threaded for `verify_preexisting_completed`'s store call.
     pub jwt_token: Option<String>,
-    /// Threaded so `reconcile_merged_state` can build a re-mintable
-    /// `SubstituteAuth::Service` for `spawn_substitute_fetches`
-    /// (the gateway JWT is never re-mintable; a wide cold closure
-    /// outlives its ~65 min expiry).
-    pub tenant_id: Option<Uuid>,
 }
 
 /// Output of [`DagActor::reconcile_merged_state`].
@@ -684,7 +680,6 @@ impl DagActor {
             cached_hits,
             pending_substitute,
             jwt_token,
-            tenant_id,
         })
     }
 
@@ -814,7 +809,6 @@ impl DagActor {
             cached_hits,
             pending_substitute,
             jwt_token,
-            tenant_id,
             ..
         } = ingest;
         let newly_inserted = &merge_result.newly_inserted;
@@ -833,18 +827,6 @@ impl DagActor {
                 t_phase = Instant::now();
             };
         }
-
-        // `Service` (re-mintable) for the detached closure walk: the
-        // gateway JWT (`jwt_token`) is single-shot — a wide cold
-        // closure walk can outlive its ~65 min expiry, and an expired
-        // JWT surfaces as `NotFound`/`Unauthenticated` (NON-transient)
-        // → spurious demote-to-build. With `Service`, the per-layer +
-        // per-N-paths re-mint in `walk_substitute_closure` keeps the
-        // token fresh for the full walk. Falls back to `Jwt(vec![])`
-        // (no-auth) only when no `service_signer` (dev mode) or no
-        // `tenant_id` (single-tenant). The gateway JWT is still used
-        // for FMP metadata (`find_missing_with_breaker`) below.
-        let sub_auth = self.substitute_auth_for_tenant(*tenant_id);
 
         // r[sched.merge.reconcile-order]: split pending_substitute by
         // lane. Reprobe-substitutable (pre-existing Poisoned/Failed/
@@ -896,47 +878,36 @@ impl DagActor {
         // Reset stale nodes to Ready; they re-dispatch and re-complete.
         // r[impl sched.merge.stale-completed-verify+5]
         let stale_reset = self
-            .verify_preexisting_completed(
-                nodes,
-                newly_inserted,
-                cached_hits,
-                jwt_token.as_deref(),
-                *tenant_id,
-            )
+            .verify_preexisting_completed(nodes, newly_inserted, cached_hits, jwt_token.as_deref())
             .await;
         phase!("6c-verify-preexisting");
 
-        // r[impl sched.substitute.detached+5]
         // Reprobe-substitutable lane FIRST: a hard-Poisoned node whose
-        // output is now upstream-substitutable transitions Poisoned →
-        // Substituting BEFORE seed_initial_states reads
+        // output is now upstream-substitutable must have its status
+        // corrected BEFORE seed_initial_states reads
         // `any_co_owned_dep_terminally_failed` for its dependents (the
         // merging build co-owns its whole submission, so the scoped check
         // fires for these). Otherwise a newly-inserted dependent A of a
         // reprobe-Poisoned B is marked DependencyFailed against B's stale
         // Poisoned status, first_dep_failed=Some(A), and !keep_going
-        // builds fail-fast while B's fetch is mid-flight.
+        // builds fail-fast while B's substitution is undecided.
         if !reprobe_sub.is_empty() {
-            if self.materialization_cfg.enabled {
-                // r[impl sched.materialize.job]
-                // PD-17 + AS-5 (Phase B): the reprobe lane's job rows
-                // (origin=reprobe) and the durable AS-5 reset already
-                // rode the merge transaction (batch 5 — committed before
-                // this slot runs; the DF-7 ordering). Apply the matching
-                // IN-MEMORY status correction here, in the 6d slot,
-                // before seed_initial_states (6e) reads dep statuses —
-                // the same phase-ordering invariant the as-built
-                // Substituting transition carries (bug_089/bug_132). No
-                // walk spawns: this closes the FIRST of the two
-                // merge-lane spawn sites (the stale-Completed verify's
-                // own site closes at PD-18).
-                self.apply_reprobe_reset_in_memory(&reprobe_sub).await;
-            } else {
-                self.spawn_substitute_fetches(reprobe_sub, sub_auth.clone())
-                    .await;
-            }
+            // r[impl sched.materialize.job]
+            // PD-17 + AS-5 (Phase B): the reprobe lane's job rows
+            // (origin=reprobe) and the durable AS-5 reset already
+            // rode the merge transaction (batch 5 — committed before
+            // this slot runs; the DF-7 ordering). Apply the matching
+            // IN-MEMORY status correction here, in the 6d slot,
+            // before seed_initial_states (6e) reads dep statuses —
+            // the same phase-ordering invariant the deleted
+            // Substituting transition carried (bug_089/bug_132). No
+            // walk spawns: this closed the FIRST of the two
+            // merge-lane spawn sites (the stale-Completed verify's
+            // own site closed at PD-18); the spawner itself is now
+            // deleted.
+            self.apply_reprobe_reset_in_memory(&reprobe_sub).await;
         }
-        phase!("6d-spawn-substitute-reprobe");
+        phase!("6d-reprobe-reset");
 
         // Compute initial states for the remaining (non-cached) newly-inserted
         // derivations. Cached derivations above are now Completed, so their
@@ -992,32 +963,24 @@ impl DagActor {
         }
         phase!("6f-reprobe-unlocked");
 
-        // r[impl sched.substitute.detached+5]
         // Newly-inserted substitutable lane: nodes are at Created/
-        // Queued/Ready (via seed_initial_states above). Nodes whose
-        // transition is rejected (e.g. apply_cached_hits already
-        // completed a chain that included them) fall through to normal
-        // scheduling.
+        // Queued/Ready (via seed_initial_states above) and stay there.
         if !new_sub.is_empty() {
-            if self.materialization_cfg.enabled {
-                // r[impl sched.materialize.job]
-                // Substitution-replacement: this lane's jobs were created
-                // INSIDE the merge transaction (adjudication PDQ-9); the
-                // job row is the in-flight marker and the nodes stay
-                // Ready (claimable by store replicas) — no walk spawns.
-                // (The reprobe lane (6d above) and the stale-Completed
-                // verify (6c) are likewise job-routed flag-on since
-                // PD-17/PD-18 — the T-5.3 audit's criterion-3 statement:
-                // zero walks for fresh flag-on work, from any lane.)
-                debug!(
-                    count = new_sub.len(),
-                    "new_sub lane routed to materialization jobs; no walks spawned"
-                );
-            } else {
-                self.spawn_substitute_fetches(new_sub, sub_auth).await;
-            }
+            // r[impl sched.materialize.job]
+            // Substitution-replacement: this lane's jobs were created
+            // INSIDE the merge transaction (adjudication PDQ-9); the
+            // job row is the in-flight marker and the nodes stay
+            // Ready (claimable by store replicas). (The reprobe lane
+            // (6d above) and the stale-Completed verify (6c) are
+            // likewise job-routed since PD-17/PD-18 — the T-5.3
+            // audit's criterion-3 statement made structural: the walk
+            // spawner no longer exists.)
+            debug!(
+                count = new_sub.len(),
+                "new_sub lane routed to materialization jobs"
+            );
         }
-        phase!("6g-spawn-substitute-new");
+        phase!("6g-new-sub-jobs");
 
         // Pre-existing Ready nodes whose interest set grew: their
         // critical-path priority may have risen (compute_initial above
@@ -1489,12 +1452,10 @@ impl DagActor {
             if cached_hits.contains_key(node.drv_hash.as_str()) {
                 continue;
             }
-            // I-094 substitutable lane: re-probe hits are now
-            // Substituting (or in transition); don't fail-fast on
-            // them. Parallel to the cached_hits skip above; defensive
-            // — once Substituting they fall to `_ => {}` anyway, but
-            // this is robust to ordering changes between
-            // spawn_substitute_fetches and reconcile_preexisting.
+            // I-094 substitutable lane: re-probe hits carry pending
+            // materialization jobs (their reset puts them at
+            // Queued/Ready); don't fail-fast on them. Parallel to the
+            // cached_hits skip above.
             if pending_sub.contains(node.drv_hash.as_str()) {
                 continue;
             }
@@ -1673,7 +1634,6 @@ impl DagActor {
         newly_inserted: &HashSet<DrvHash>,
         cached_hits: &HashMap<DrvHash, Vec<String>>,
         jwt_token: Option<&str>,
-        tenant_id: Option<Uuid>,
     ) -> HashSet<String> {
         // Collect (drv_hash, output_paths, unwanted_paths) for
         // pre-existing Completed OR Skipped nodes in this merge.
@@ -1978,10 +1938,10 @@ impl DagActor {
                 reset.insert(drv_hash);
                 continue;
             }
-            // Substitutable subset: spawn the detached fetch (Ready →
-            // Substituting) instead of pushing to ready_queue. The
-            // metric above stays — output WAS gone, even if upstream
-            // can re-provide it.
+            // Substitutable subset: route to a materialization job
+            // instead of pushing to ready_queue. The metric above
+            // stays — output WAS gone, even if upstream can re-provide
+            // it.
             //
             // r[impl sched.merge.wanted-outputs+2]
             // Like the reset decision above, the routing forgives
@@ -2055,37 +2015,31 @@ impl DagActor {
         }
 
         if !to_spawn.is_empty() {
-            if self.materialization_cfg.enabled {
-                // r[impl sched.materialize.job]
-                // PD-18 (Phase B, design §2.1 row 4): the substitutable
-                // stale-reset subset routes to materialization jobs
-                // (origin=stale_reset) instead of this site's OWN walks
-                // — closing the SECOND of the two merge-lane walk-spawn
-                // sites (walk unreachability for fresh flag-on work is
-                // provable from here on: a node Completed via
-                // materialization whose outputs are GC'd re-merges
-                // through exactly this lane). The pass-2 demote already
-                // put the node at Ready and persisted it; the job row
-                // is the in-flight marker a store replica claims.
-                //
-                // Posture (PDQ-9's per-§2.1-row split, recorded for the
-                // T-5.2 table): this site runs POST-tx (reconcile 6c —
-                // persist_merge_to_db committed long before), so the
-                // job INSERT uses the standalone fenced helper (the
-                // probe-origin posture), not batch 5. The wanted
-                // relation for this (build, node) pair already rode the
-                // merge transaction.
-                for (drv_hash, _) in to_spawn {
-                    self.create_materialization_job_if_enabled(
-                        &drv_hash,
-                        crate::state::JobOrigin::StaleReset,
-                        None,
-                    )
-                    .await;
-                }
-            } else {
-                let auth = self.substitute_auth_for_tenant(tenant_id);
-                self.spawn_substitute_fetches(to_spawn, auth).await;
+            // r[impl sched.materialize.job]
+            // PD-18 (Phase B, design §2.1 row 4): the substitutable
+            // stale-reset subset routes to materialization jobs
+            // (origin=stale_reset) — this closed the SECOND of the two
+            // merge-lane walk-spawn sites, and the spawner itself is
+            // now deleted (a node Completed via materialization whose
+            // outputs are GC'd re-merges through exactly this lane).
+            // The pass-2 demote already put the node at Ready and
+            // persisted it; the job row is the in-flight marker a
+            // store replica claims.
+            //
+            // Posture (PDQ-9's per-§2.1-row split, recorded for the
+            // T-5.2 table): this site runs POST-tx (reconcile 6c —
+            // persist_merge_to_db committed long before), so the
+            // job INSERT uses the standalone fenced helper (the
+            // probe-origin posture), not batch 5. The wanted
+            // relation for this (build, node) pair already rode the
+            // merge transaction.
+            for (drv_hash, _) in to_spawn {
+                self.create_materialization_job_if_enabled(
+                    &drv_hash,
+                    crate::state::JobOrigin::StaleReset,
+                    None,
+                )
+                .await;
             }
         }
 
@@ -3282,18 +3236,16 @@ impl DagActor {
             return None;
         }
 
-        // r[impl sched.substitute.detached+5]
         // No inline QPI: awaiting query_path_info_opt here blocked the
         // actor for the duration of the store-side closure walk
         // (ghc-sized roots take minutes; grpc_timeout = 30s) — the
         // very builds the prune helps most timed out and fell through
-        // anyway, AND reintroduced the >100s MergeDag stall that
-        // detached-substitute was created to fix. Instead: return the
-        // pruned demand set; the caller continues into the full merge
-        // with those nodes only; check_cached_outputs re-probes them,
-        // populates pending_substitute, and spawn_substitute_fetches
-        // does the fetch detached under SUBSTITUTE_FETCH_TIMEOUT.
-        // Prune benefit preserved; actor never blocks on QPI.
+        // anyway. Instead: return the pruned demand set; the caller
+        // continues into the full merge with those nodes only;
+        // check_cached_outputs re-probes them, populates
+        // pending_substitute, and the fetch happens store-side via the
+        // materialization job. Prune benefit preserved; actor never
+        // blocks on QPI.
         Some(demanded.into_iter().cloned().collect())
     }
 }

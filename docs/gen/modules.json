@@ -864,7 +864,7 @@
     {
       "path": "actor/dispatch.rs",
       "depth": 1,
-      "doc": "Ready-set store short-circuit and substitution machinery, plus the"
+      "doc": "Ready-set store short-circuit, plus the shared `WorkAssignment`"
     },
     {
       "path": "actor/event.rs",

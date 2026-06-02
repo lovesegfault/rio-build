@@ -159,17 +159,19 @@ async fn pull_unbuilt_deps_returns_not_yet_ready() -> TestResult {
 
 // D4-retarget: flips when the must_substitute arm dies (T-D4.1) — refusal
 // becomes the JobView arm; re-assert NotYetReady-while-job-unresolved.
+// (The sweep-settlement half this test carried — "the next Tick's batch
+// probe takes the resubmit-directing fail-fast" — asserted the
+// dispatch-partition fail-fast cell deleted with the walk spawner; the
+// settlement successor is the origin-keyed consumption fail-fast,
+// pinned by the routing-matrix and T-D2.1 batteries.)
 // r[verify sched.merge.substitute-topdown+12]
 /// A Ready node that may only complete via substitution (topdown-pruned
 /// with Broken closure evidence — childless here) is never served from
 /// source by the pull path: the pull answers NotYetReady, mints nothing
 /// (no assignments / drv_executions rows, no Ready→Assigned
-/// transition), and the node is settled by the sweep arms instead — in
-/// this fixture the store says the wanted output is definitively
-/// missing and not substitutable, so the next Tick's batch probe takes
-/// the resubmit-directing fail-fast (the pull itself never does).
+/// transition).
 #[tokio::test]
-async fn pull_must_substitute_node_refused_and_settled_by_sweep() -> TestResult {
+async fn pull_must_substitute_node_refused() -> TestResult {
     let (db, _store, handle, _tasks) = setup_with_mock_store().await?;
 
     // A childless target whose output is not in the store and not
@@ -204,23 +206,7 @@ async fn pull_must_substitute_node_refused_and_settled_by_sweep() -> TestResult 
         "the refused pull must not move the node out of Ready"
     );
 
-    // The node is settled by the sweep, not by the pull: the next
-    // Tick's batch probe finds the wanted output definitively missing
-    // and unsubstitutable and takes the resubmit-directing fail-fast.
-    tick(&handle).await?;
-    barrier(&handle).await;
-    let s = query_status(&handle, build_id).await?;
-    assert_eq!(
-        s.state,
-        rio_proto::types::BuildState::Failed as i32,
-        "the sweep's fail-fast settles the node; got error={:?}",
-        s.error_summary
-    );
-    assert!(
-        s.error_summary.contains("resubmit"),
-        "the fail-fast carries the resubmit-directing error; got {:?}",
-        s.error_summary
-    );
+    let _ = build_id;
     Ok(())
 }
 

@@ -376,18 +376,10 @@ let
             f"resolved_success (one per matjob node); got total={total} "
             f"resolved_success={resolved} cache_opportunity={cache_opp}"
         )
-        # Walk unreachability for fresh flag-on work (criterion 3): the
-        # walk-spawn counter never moved. Absent metric (never
-        # incremented) counts as 0.
-        walks = ${gatewayHost}.succeed(
-            "curl -s localhost:9091/metrics"
-            " | grep '^rio_scheduler_substitute_spawned_total'"
-            " || echo 'rio_scheduler_substitute_spawned_total 0'"
-        )
-        assert walks.strip().endswith(" 0"), (
-            f"flag-on deployment spawned walks for fresh work: {walks}"
-        )
-        # And the flag-on twin metric DID move: one creation per matjob
+        # Walk unreachability is structural now (the walk spawner and
+        # its metric were deleted); the job-creation counter below is
+        # the surviving mechanism proof.
+        # The job-creation metric DID move: one creation per matjob
         # node (plus the progress-e2e build's pruned-origin job). The
         # counter carries an `origin` label, so the grep matches one
         # line per origin — sum the values across every labeled series.
@@ -404,7 +396,7 @@ let
             f"rio_scheduler_materialization_jobs_created_total should be >=4 "
             f"(one per matjob node), got {created_n}"
         )
-        print("substitute-scheduler-owned PASS (mechanism): 4 jobs resolved, zero walks")
+        print("substitute-scheduler-owned PASS (mechanism): 4 jobs resolved via jobs")
   '';
 
   # ════════════════════════════════════════════════════════════════════
@@ -504,16 +496,9 @@ let
             "journalctl -u rio-scheduler --no-pager"
             " | grep -q 'materialization pins released'"
         )
-        # Walk unreachability over the WHOLE scenario (criterion 3).
-        walks = ${gatewayHost}.succeed(
-            "curl -s localhost:9091/metrics"
-            " | grep '^rio_scheduler_substitute_spawned_total'"
-            " || echo 'rio_scheduler_substitute_spawned_total 0'"
-        )
-        assert walks.strip().endswith(" 0"), (
-            f"flag-on deployment spawned walks: {walks}"
-        )
-        # And the flags really are ON in the units' environment (the
+        # Walk unreachability over the WHOLE scenario is structural now
+        # (the walk spawner and its metric were deleted).
+        # The flags really are ON in the units' environment (the
         # deployment-layer cutover this scenario proves). Asserted against
         # the units' real environment via systemd, mirroring the dormant
         # oracle's inverse guard.
@@ -525,7 +510,7 @@ let
         print(
             f"materialization-active PASS: {total} jobs all resolved, "
             f"{wanted_total} wanted rows, {n_mat} materialization execution(s), "
-            f"pins released, zero walks, flags on"
+            f"pins released, flags on"
         )
   '';
 in

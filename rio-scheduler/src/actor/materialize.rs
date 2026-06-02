@@ -1212,19 +1212,15 @@ impl DagActor {
             return Some(ReprobeAnswer::Obtainable);
         }
         let store = self.store_client.clone()?;
-        let tenant = self
-            .dag
-            .node(drv_hash)
-            .into_iter()
-            .flat_map(|s| s.interested_builds.iter())
-            .filter_map(|bid| self.builds.get(bid))
-            .find_map(|b| b.tenant_id);
-        let auth = self.substitute_auth_for_tenant(tenant);
-        let can_confirm = matches!(auth, super::dispatch::SubstituteAuth::Service { .. });
+        // One-shot service-token probe metadata (the same mint the
+        // dispatch probe uses); non-empty ⟺ a signer + tenant were
+        // resolvable, which is exactly the can-confirm criterion.
+        let probe = self.probe_service_meta(std::iter::once(drv_hash));
+        let can_confirm = !probe.is_empty();
         let mut req = tonic::Request::new(rio_proto::types::FindMissingPathsRequest {
             store_paths: live_wanted.to_vec(),
         });
-        for (k, v) in auth.mint() {
+        for (k, v) in probe {
             if let Ok(mv) = tonic::metadata::MetadataValue::try_from(v.as_str()) {
                 req.metadata_mut().insert(k, mv);
             }

@@ -741,12 +741,7 @@ pkgs.testers.runNixOSTest {
         # Eager: one MergeDag burst → +49. Lazy: depth-50 chain at
         # ~1/tick → +1-4 at first sighting. cache_check_failures /
         # topdown_prune are diagnostic deltas printed on failure.
-        # The walk-spawn counter scrape feeds the criterion-3 zero-walk
-        # assert below (absent metric → 0.0).
         m_before = scrape_metrics(k3s_server, 19091)
-        spawned_before = metric_value(
-            m_before, "rio_scheduler_substitute_spawned_total"
-        ) or 0.0
         # The job-creation counter carries an `origin` label
         # (cache_opportunity/pruned/reprobe/stale_reset), so sum every
         # labeled series — a bare-name lookup misses them all.
@@ -783,10 +778,6 @@ pkgs.testers.runNixOSTest {
             timeout=90,
         )
         m_after = scrape_metrics(k3s_server, 19091)
-        spawned_delta = (
-            metric_value(m_after, "rio_scheduler_substitute_spawned_total")
-            or 0.0
-        ) - spawned_before
         prune_delta = (
             metric_value(m_after, "rio_scheduler_topdown_prune_total") or 0.0
         ) - prune_before
@@ -833,15 +824,12 @@ pkgs.testers.runNixOSTest {
             f"expected >=49 cache_opportunity materialization jobs "
             f"after the deep-chain merge, got {chain_jobs}"
         )
-        # And the walk counter must NOT have moved (criterion 3):
-        assert spawned_delta == 0, (
-            f"deployment spawned walks during the deep-chain "
-            f"merge: {spawned_delta}"
-        )
+        # Walk unreachability is structural now (the walk spawner and
+        # its metric were deleted); the job rows above are the proof.
         print(
             f"substitute-deep-chain: jobs_created Δ={created_delta} "
             f"({chain_jobs} cache_opportunity rows) "
-            f"topdown_prune Δ={prune_delta} spawned Δ={spawned_delta} "
+            f"topdown_prune Δ={prune_delta} "
             f"ccf Δ={ccf_delta} ✓"
         )
 

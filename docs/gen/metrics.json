@@ -137,10 +137,6 @@
     "rio_scheduler_stale_completed_reset_total",
     "rio_scheduler_stale_completed_substituted_total",
     "rio_scheduler_stale_realisation_filtered_total",
-    "rio_scheduler_substitute_demotions_total",
-    "rio_scheduler_substitute_fetch_failures_total",
-    "rio_scheduler_substitute_fetch_retries_total",
-    "rio_scheduler_substitute_spawned_total",
     "rio_scheduler_topdown_prune_total",
     "rio_scheduler_topdown_settlement_reprobe_total",
     "rio_scheduler_topdown_substitute_fail_total",
@@ -908,26 +904,6 @@
         "help": "CA realisations dropped from cache-hit set because the realized path was GC'd from store. Same operator signal as stale_completed_reset; this counts the newly-inserted-CA path, that one counts the pre-existing-completed path."
       },
       {
-        "name": "rio_scheduler_substitute_demotions_total",
-        "kind": "counter",
-        "help": "Non-forgivable path failures in the detached substitute walk, labeled by a reason derived from the final error of the path's retry ladder: not_found (no configured upstream produced the path, or the store skipped substitution entirely — no upstreams configured for the tenant / no HTTP client on the replica; see rio_store_substitute_skipped_total for the store-side cause), not_found_infra (a NotFound that never reached an upstream — no tenant context / substituter not configured; fix the auth chain or config), error (non-transient gRPC error, no retry), exhausted (the retry budget ran out on a transient error). Any increment demotes the derivation — and therefore its whole build-time closure — to a from-source build over a failed download; page on any sustained rate."
-      },
-      {
-        "name": "rio_scheduler_substitute_fetch_failures_total",
-        "kind": "counter",
-        "help": "Substitutable-path eager fetches (QueryPathInfo) that failed; path demoted to cache-miss"
-      },
-      {
-        "name": "rio_scheduler_substitute_fetch_retries_total",
-        "kind": "counter",
-        "help": "Retryable substitute-fetch errors (transient Unavailable/Aborted/ResourceExhausted, or a NotFound that contradicts the earlier HEAD probe / narinfo) that triggered a backoff retry. High rate without matching failures = store load absorbed by retry; high rate WITH failures = backoff insufficient."
-      },
-      {
-        "name": "rio_scheduler_substitute_spawned_total",
-        "kind": "counter",
-        "help": "Derivations transitioned to Substituting (detached upstream fetch spawned). Pairs with substitute_fetch_failures_total to derive success rate."
-      },
-      {
         "name": "rio_scheduler_topdown_prune_total",
         "kind": "counter",
         "help": "Submissions pruned to roots-only by the top-down substitution pre-check"
@@ -935,12 +911,12 @@
       {
         "name": "rio_scheduler_topdown_settlement_reprobe_total",
         "kind": "counter",
-        "help": "Settlement re-probes at topdown fail-fast decision points (labels: outcome = verification_walk|fail_fast). verification_walk: a stale walk verdict was about to wrongfully fail builds whose live-wanted outputs are obtainable — the settlement spawned a closure-re-verifying walk instead. fail_fast: the re-probe confirmed a wanted output missing and unsubstitutable (the genuine fail-fast)."
+        "help": "Settlement re-probes at topdown fail-fast decision points (labels: outcome = fail_fast). The re-probe confirmed a wanted output missing and unsubstitutable (the genuine fail-fast); an obtainable answer defers to the next sweep."
       },
       {
         "name": "rio_scheduler_topdown_substitute_fail_total",
         "kind": "counter",
-        "help": "Top-down-pruned roots that could not complete via substitution (deferred fetch failed, or a wanted output was definitively missing/unsubstitutable at dispatch time) — build failed fast; resubmit re-probes"
+        "help": "Top-down-pruned roots that could not complete via substitution (a wanted output was definitively missing/unsubstitutable at settlement) — build failed fast; resubmit re-probes"
       },
       {
         "name": "rio_scheduler_transition_rejected_total",

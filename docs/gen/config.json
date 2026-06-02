@@ -322,12 +322,6 @@
         "description": "Park backoff cap (seconds)."
       },
       {
-        "key": "substitute_max_concurrent",
-        "type": "uint",
-        "default": "256",
-        "description": "In-flight detached substitute-fetch task bound (r[sched.substitute.detached+5]) — memory-safety only; per-replica throttling is `r[store.substitute.admission]`."
-      },
-      {
         "key": "dashboard.cors_allow_origins",
         "type": "string",
         "default": "http://rio-dashboard.rio-system.svc.cluster.local",

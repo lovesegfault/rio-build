@@ -360,78 +360,69 @@ async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
     Ok(())
 }
 
-// D3-retarget: dispatch-time classification survives; the routed-mechanism
-// assertion flips to inline-complete/job creation when the walk spawner dies.
+// D3-retarget (flipped with the walk spawner's deletion): dispatch-time
+// classification survives; the routed mechanism is now a materialization
+// job — the store replica executes the fetch and the consumption path
+// completes the node.
 // r[verify sched.dispatch.fod-substitute+2]
-/// Dispatch-time substitution: a Ready IA derivation (FOD or non-FOD)
-/// whose output becomes substitutable AFTER merge (so merge-time
-/// `check_cached_outputs` missed it) is completed by
-/// `batch_probe_cached_ready` without dispatching to a worker.
+/// Dispatch-time substitution routing: a Ready IA derivation (FOD or
+/// non-FOD) whose output becomes substitutable AFTER merge (so
+/// merge-time `check_cached_outputs` missed it) is routed to a
+/// materialization job (origin=cache_opportunity) by
+/// `batch_probe_cached_ready` — never dispatched to a builder, never
+/// walked scheduler-side.
 ///
-/// Pre-fix: the batch was FOD-only AND read only `missing_paths` (no
-/// service-token, ignored `substitutable_paths`) → non-FODs relied on
-/// merge-time `check_available` which truncates at 4096 → an 18k-drv
-/// build's IA cache-hits dispatched to builders.
+/// Pre-fix lineage: the batch was FOD-only AND read only
+/// `missing_paths` (no service-token, ignored `substitutable_paths`)
+/// → non-FODs relied on merge-time `check_available` which truncates
+/// at 4096 → an 18k-drv build's IA cache-hits dispatched to builders.
 #[rstest::rstest]
 #[case::fod(true)]
 #[case::non_fod(false)]
 #[tokio::test]
-async fn dispatch_time_substitutable_completes(#[case] is_fod: bool) -> TestResult {
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+async fn dispatch_time_substitutable_routes_to_job(#[case] is_fod: bool) -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
     let out = test_store_path("dispatch-sub-out");
     let mut n = make_node("dispatch-sub-drv");
     n.is_fixed_output = is_fod;
     n.system = "aarch64-linux".into();
     n.expected_output_paths = vec![out.clone()];
-    let drv_path = n.drv_path.clone();
     let build_id = Uuid::new_v4();
-    let mut ev_rx = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    let _ev_rx = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
     barrier(&handle).await;
     // Merge-time saw nothing (substitutable not yet seeded) → node
     // stays Ready, stamped probed_generation=1. Seed; the next Tick
     // advances probe_generation and re-runs the ready-set sweep → the
-    // batch probe sees it → spawns the substitute fetch.
+    // batch probe sees it → creates the job.
     store.state.substitutable.write().unwrap().push(out.clone());
     tick(&handle).await?;
-    settle_substituting(&handle, &[&make_node("dispatch-sub-drv").drv_hash]).await;
-    tick(&handle).await?;
+    barrier(&handle).await;
 
-    let status = query_status(&handle, build_id).await?;
+    // The probe partition routed the node to a job, not a walk and not
+    // a builder dispatch.
+    let (origin, job_state): (String, String) = sqlx::query_as(
+        "SELECT origin, state FROM materialization_jobs WHERE drv_hash = 'dispatch-sub-drv'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
     assert_eq!(
-        status.state,
-        rio_proto::types::BuildState::Succeeded as i32,
-        "is_fod={is_fod}: should complete via dispatch-time substitution probe"
+        origin, "cache_opportunity",
+        "is_fod={is_fod}: the dispatch-probe creation site's origin"
     );
-    let qpi = store.calls.qpi_calls.read().unwrap();
-    assert!(
-        qpi.contains(&out),
-        "dispatch-time eager-fetch must call QueryPathInfo for the substitutable path; \
-         qpi_calls={qpi:?}"
+    assert_eq!(job_state, "pending", "claimable by a store replica");
+    let d = expect_drv(&handle, "dispatch-sub-drv").await;
+    assert_eq!(
+        d.status,
+        DerivationStatus::Ready,
+        "is_fod={is_fod}: the node stays Ready (job is the in-flight marker)"
     );
-
-    // Gateway visibility: both Substituting and Cached events must
-    // reach interested builds (order is structurally guaranteed by
-    // the actor — emit-after-transition + mailbox-ordered
-    // SubstituteComplete — so this asserts presence only).
-    use rio_proto::types::{DerivationEventKind, build_event::Event};
-    let (mut got_substituting, mut got_cached) = (None, None);
-    while let Ok(be) = ev_rx.try_recv() {
-        if let Some(Event::Derivation(d)) = be.event
-            && d.derivation_path == drv_path
-        {
-            match d.kind() {
-                DerivationEventKind::Substituting => got_substituting = Some(d.clone()),
-                DerivationEventKind::Cached => got_cached = Some(d.clone()),
-                _ => {}
-            }
-        }
+    {
+        let qpi = store.calls.qpi_calls.read().unwrap();
+        assert!(
+            !qpi.contains(&out),
+            "no scheduler-side walk fetch may run; qpi_calls={qpi:?}"
+        );
     }
-    let s = got_substituting.expect("Substituting event must be emitted to interested builds");
-    assert_eq!(s.output_paths, vec![out.clone()], "carries output paths");
-    assert!(
-        got_cached.is_some(),
-        "Cached event (existing) must still arrive after substitution completes"
-    );
     Ok(())
 }
 
@@ -1745,54 +1736,6 @@ async fn batch_probe_tail_never_per_drv_fmp() -> TestResult {
          leaked to per-drv calls each pass)"
     );
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// SubstituteComplete{ok=false} 3-way revert (DependencyFailed branch)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// walk_substitute_closure (Option C: scheduler-side closure BFS)
-// ---------------------------------------------------------------------------
-
-/// Seed a path into MockStore with the given references. The seeded
-/// `ValidatedPathInfo` is what `QueryPathInfo` / `BatchQueryPathInfo`
-/// return, so `walk_substitute_closure` pushes `refs` onto its frontier.
-fn seed_with_refs(store: &rio_test_support::grpc::MockStore, path: &str, refs: &[&str]) {
-    let (nar, hash) = rio_test_support::fixtures::make_nar(path.as_bytes());
-    let mut info = rio_test_support::fixtures::make_path_info(path, &nar, hash);
-    info.references = refs
-        .iter()
-        .map(|r| rio_nix::store_path::StorePath::parse(r).unwrap())
-        .collect();
-    store.seed(info, nar);
-}
-
-/// Sum every series of counter `name` in a debugging-recorder snapshot,
-/// returning `(total, per-series labels)`. The labels let demotion
-/// tests assert the `reason` value without hard-coding series order.
-fn counter_series(
-    snap: &metrics_util::debugging::Snapshotter,
-    name: &str,
-) -> (u64, Vec<Vec<(String, String)>>) {
-    use metrics_util::debugging::DebugValue;
-    let mut total = 0u64;
-    let mut labels = Vec::new();
-    for (ck, _, _, v) in snap.snapshot().into_vec() {
-        if ck.key().name() != name {
-            continue;
-        }
-        if let DebugValue::Counter(c) = v {
-            total += c;
-            labels.push(
-                ck.key()
-                    .labels()
-                    .map(|l| (l.key().to_string(), l.value().to_string()))
-                    .collect(),
-            );
-        }
-    }
-    (total, labels)
 }
 
 /// merged_bug_017: SolveCache is keyed on `model_key_hash` and bounded
