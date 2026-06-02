@@ -3,31 +3,20 @@
 # vm-materialization-{unobtainable,gc-pin}; plan T-3.1).
 #
 # The substitute scenarios prove the SUCCESS path (cache-hit submission
-# completes via jobs flag-on / walks flag-off). This scenario exercises
-# what they cannot: the §2.4 Unobtainable routing arms (fail-fast,
+# completes via materialization jobs). This scenario exercises what
+# they cannot: the §2.4 Unobtainable routing arms (fail-fast,
 # durable-Vouched from-source), the §2.5 infra park/backoff path, and
 # the §5.3 pin lifecycle against a real GC sweep.
 #
-# ── Both flag states (PD-B3, review eq-1) ─────────────────────────────
-# Parametrized on `materializationEnabled` and wired twice:
-#   vm-materialization-standalone       — flag-ON: the §2.4 consumption
-#                                         routing + §2.5 park + §5.3 pins
-#   vm-materialization-standalone-walk  — flag-OFF oracle: the SAME
-#                                         upstream/build sequences served
-#                                         by the as-built walk path
-# Each pair of subtests asserts the SAME client-visible outcome triple
-# (build verdict, final node statuses, store end-state — criterion 1)
-# through the shared `assert_outcome` helper, so the equivalence claim
-# is literal shared text (review eq-5); only the per-branch mechanism
-# blocks differ (jobs/ledger flag-on, walk metrics flag-off).
+# Wired once in default.nix as vm-materialization-standalone. Each
+# subtest asserts the client-visible outcome triple (build verdict,
+# final node statuses, store end-state) through the `assert_outcome`
+# helper, plus the per-mechanism job/ledger assertions.
 #
-# ── The OQ7 sequence ↔ subtest map ────────────────────────────────────
-#   unobtainable-then-fail-fast   routing-fail-fast / walk-unobtainable
-#   unobtainable-then-from-source routing-vouched-from-source /
-#                                 walk-vouched-from-source
-#   infra-retry                   infra-park / walk-infra-retry
-#   (gc-pin has no flag-off oracle: the walk creates no materialization
-#    pins; as-built pin behavior is covered by vm-lifecycle-gc-k3s.)
+# ── The sequence ↔ subtest map ────────────────────────────────────────
+#   unobtainable-then-fail-fast   routing-fail-fast
+#   unobtainable-then-from-source routing-vouched-from-source
+#   infra-retry                   infra-park
 #
 # ── The mode-switched fake upstream ───────────────────────────────────
 # One Python cache server whose narinfo answers are controlled per-path
@@ -48,12 +37,12 @@
 #   marked-root fail-fast pair) is unreachable.
 # * tickIntervalSecs=600 (fixture): the dispatch-time re-probe
 #   (batch_probe_cached_ready, advanced by housekeeping's
-#   probe_generation) never fires inside a subtest window, so flag-on
-#   the §2.4 CONSUMPTION routing is the only decision path for a
-#   reported outcome — the mechanism assertions are deterministic, not
-#   racing the as-built dispatch-probe fail-fast cell. Everything the
-#   subtests need (job claim/report/consumption, build completion, pin
-#   release) is event-driven, not tick-driven.
+#   probe_generation) never fires inside a subtest window, so the §2.4
+#   CONSUMPTION routing is the only decision path for a reported
+#   outcome — the mechanism assertions are deterministic, not racing
+#   the dispatch-probe cells. Everything the subtests need (job
+#   claim/report/consumption, build completion, pin release) is
+#   event-driven, not tick-driven.
 # * Store executor poll interval = 3600 s (fixture): the executor polls
 #   (= claims) only at store startup, so every claim wave is an explicit
 #   restart_store() step. This makes claim timing fully scriptable (the
@@ -62,10 +51,6 @@
 #   (no orphaned open attempts — establishment is tick-driven and the
 #   tick is 600 s), and clears the store's 1 h HEAD-probe cache so each
 #   wave classifies against the upstream's CURRENT answers.
-# * Flag-off, the walk's per-path retry ladder is ~32 s
-#   (SUBSTITUTE_FETCH_MAX_ATTEMPTS=8 over SUBSTITUTE_FETCH_BACKOFF);
-#   walk-infra-retry must heal the upstream well inside that window and
-#   walk-unobtainable needs ~2 ladders before its fail-fast.
 #
 # Markers live at the wiring point (nix/tests/default.nix) per the
 # tracey VM convention; this header is prose only.
@@ -73,10 +58,8 @@
   pkgs,
   common,
   fixture,
-  materializationEnabled ? true,
 }:
 let
-  inherit (pkgs) lib;
   inherit (fixture) gatewayHost;
 
   protoset = import ../lib/protoset.nix { inherit pkgs; };
@@ -492,9 +475,9 @@ let
   '';
 
   # ════════════════════════════════════════════════════════════════════
-  # Flag-ON subtests: the §2.4 routing arms + §2.5 park + §5.3 pins
+  # Subtests: the §2.4 routing arms + §2.5 park + §5.3 pins
   # ════════════════════════════════════════════════════════════════════
-  flagOnSubtests = ''
+  routingSubtests = ''
     # ══════════════════════════════════════════════════════════════════
     # routing-fail-fast — §2.4 arm 3 (Broken + confirmed-missing)
     # ══════════════════════════════════════════════════════════════════
@@ -836,206 +819,14 @@ let
             assert "RIO_MATERIALIZATION__ENABLED=true" in env, f"{unit} not flag-on: {env}"
         print(f"materialize-no-walks PASS: substitute_spawned_total={spawned}, flags on")
   '';
-
-  # ════════════════════════════════════════════════════════════════════
-  # Flag-OFF (-walk oracle) subtests: the same sequences via the walk
-  # ════════════════════════════════════════════════════════════════════
-  walkSubtests = ''
-    # ══════════════════════════════════════════════════════════════════
-    # walk-unobtainable — oracle of routing-fail-fast (OQ7 sequence:
-    # unobtainable-then-fail-fast)
-    # ══════════════════════════════════════════════════════════════════
-    # Same submission, same upstream behavior at probe time (head-only).
-    # As-built disposition for a MARKED root: walk 1 fails (GET 503,
-    # ~32 s retry ladder) -> settle re-probe says still available ->
-    # verification walk (the one-shot) -> walk 2 fails -> one-shot spent
-    # -> fail_fast_topdown_pruned_root. Same client-visible outcome as
-    # the flag-on arm-3 routing: build failed, resubmit-directing error,
-    # nothing ingested.
-    with subtest("walk-unobtainable: marked root walk failure fail-fasts the build"):
-        spawned_before = scheduler_metric("rio_scheduler_substitute_spawned_total")
-        ff_root_drv, ff_root_out = build_and_publish("ffroot")
-        ff_dep_drv, ff_dep_out = drv_info("ffdep")
-        set_mode(ff_root_out, "head-only")
-
-        ff_build = submit_dag(
-            "ff", [(ff_root_drv, ff_root_out), (ff_dep_drv, ff_dep_out)],
-            [(ff_root_drv, ff_dep_drv)],
-        )
-
-        # The prune fired here too: the dep never enters the DAG.
-        ${gatewayHost}.wait_until_succeeds(
-            "sudo -u postgres psql rio -qtAc \"SELECT count(*) FROM derivations"
-            f" WHERE drv_hash = '{ff_root_drv}'\" | grep -qx 1",
-            timeout=60,
-        )
-        dep_rows = psql(
-            ${gatewayHost},
-            f"SELECT count(*) FROM derivations WHERE drv_hash = '{ff_dep_drv}'",
-        )
-        assert dep_rows == "0", (
-            f"the topdown prune must drop the dep from the DAG; found {dep_rows} row(s)"
-        )
-
-        # Two ~32 s walk retry ladders + settlement -> failed.
-        wait_build_status(ff_build, "failed", timeout=300)
-        assert_failed_with_resubmit_error("walk-unobtainable", ff_build)
-
-        # Mechanism: the walk path did the work — walks spawned, zero
-        # materialization state, zero build-kind charges.
-        spawned_after = scheduler_metric("rio_scheduler_substitute_spawned_total")
-        assert spawned_after - spawned_before >= 1, (
-            f"flag-off the walk must serve this sequence: spawned delta "
-            f"{spawned_after - spawned_before}"
-        )
-        jobs = psql(${gatewayHost}, "SELECT count(*) FROM materialization_jobs")
-        assert jobs == "0", f"flag-off deployment created {jobs} materialization job(s)"
-        builds_kind, _, _ = attempt_counts(ff_root_drv)
-        assert builds_kind == 0, (
-            f"fail-fast must not touch build budgets: {builds_kind} build-kind row(s)"
-        )
-
-        # Client-visible outcome triple — IDENTICAL values to the
-        # flag-on routing-fail-fast assertion.
-        assert_outcome(
-            "walk-unobtainable", ff_build,
-            verdict="failed",
-            node_statuses={},
-            present=[], absent=[ff_root_out],
-        )
-
-    # ══════════════════════════════════════════════════════════════════
-    # walk-vouched-from-source — oracle of routing-vouched-from-source
-    # (OQ7 sequence: unobtainable-then-from-source)
-    # ══════════════════════════════════════════════════════════════════
-    with subtest("walk-vouched-from-source: failed walk falls through to from-source"):
-        vouch_dep_drv, vouch_dep_out = build_and_publish("vouchdep")
-        vouch_parent_drv, vouch_parent_out = drv_info("vouchparent")
-
-        # Step 1: the dep's own 1-node build completes via the WALK
-        # (flag-off Success-path mechanism).
-        dep_build = submit_dag("vouchdep", [(vouch_dep_drv, vouch_dep_out)])
-        wait_build_status(dep_build, "succeeded", timeout=120)
-
-        # Step 2: same parent sequence — probe indeterminate, then 404.
-        set_mode(vouch_parent_out, "503")
-        vouch_build = submit_dag(
-            "vouch", [(vouch_parent_drv, vouch_parent_out), (vouch_dep_drv, vouch_dep_out)],
-            [(vouch_parent_drv, vouch_dep_drv)],
-        )
-        # The walk is in flight (Substituting) until its retry ladder
-        # exhausts (~32 s), then the node reverts to from-source
-        # eligibility (Ready/Queued) — the as-built unmarked-node
-        # disposition.
-        ${gatewayHost}.wait_until_succeeds(
-            "sudo -u postgres psql rio -qtAc \"SELECT status FROM derivations"
-            f" WHERE drv_hash = '{vouch_parent_drv}'\" | grep -qx substituting",
-            timeout=60,
-        )
-        set_mode(vouch_parent_out, "404")
-        ${gatewayHost}.wait_until_succeeds(
-            "sudo -u postgres psql rio -qtAc \"SELECT status FROM derivations"
-            f" WHERE drv_hash = '{vouch_parent_drv}'\" | grep -qEx 'ready|queued'",
-            timeout=120,
-        )
-
-        # Mechanism: zero materialization state flag-off.
-        jobs = psql(${gatewayHost}, "SELECT count(*) FROM materialization_jobs")
-        assert jobs == "0", f"flag-off deployment created {jobs} materialization job(s)"
-
-        # Client-visible outcome triple — IDENTICAL values to the
-        # flag-on routing-vouched-from-source assertion.
-        assert_outcome(
-            "walk-vouched-from-source", vouch_build,
-            verdict="active",
-            node_statuses={
-                vouch_parent_drv: ("ready", "queued"),
-                vouch_dep_drv: ("completed",),
-            },
-            present=[vouch_dep_out], absent=[vouch_parent_out],
-        )
-
-        cancel_build(vouch_build)
-        wait_build_status(vouch_build, "cancelled", timeout=60)
-
-    # ══════════════════════════════════════════════════════════════════
-    # walk-infra-retry — oracle of infra-park (OQ7 sequence: infra-retry)
-    # ══════════════════════════════════════════════════════════════════
-    # The walk's in-flight retry ladder (8 attempts, ~32 s) is the
-    # as-built analog of the §2.5 park: upstream trouble is retried, the
-    # build never wrongly fails, and recovery inside the window completes
-    # the build. The upstream MUST be healed quickly (well inside the
-    # ladder) — that is the as-built tolerance bound this oracle pins.
-    with subtest("walk-infra-retry: walk retry ladder absorbs the outage and completes"):
-        park_drv, park_out = build_and_publish("park")
-        set_mode(park_out, "503")
-
-        park_build = submit_dag("park", [(park_drv, park_out)])
-
-        # The walk is in flight and retrying against the 503 upstream;
-        # the build is live the whole time (never wrongly failed).
-        ${gatewayHost}.wait_until_succeeds(
-            "sudo -u postgres psql rio -qtAc \"SELECT status FROM derivations"
-            f" WHERE drv_hash = '{park_drv}'\" | grep -qx substituting",
-            timeout=60,
-        )
-        assert build_status(park_build) == "active", (
-            "the outage must never fail the build (B3, as-built form)"
-        )
-
-        # Heal inside the retry ladder -> the next attempt succeeds.
-        clear_mode(park_out)
-        wait_build_status(park_build, "succeeded", timeout=180)
-
-        # Mechanism: zero materialization state flag-off.
-        jobs = psql(${gatewayHost}, "SELECT count(*) FROM materialization_jobs")
-        assert jobs == "0", f"flag-off deployment created {jobs} materialization job(s)"
-
-        # Client-visible outcome triple — IDENTICAL values to the
-        # flag-on infra-park assertion.
-        assert_outcome(
-            "walk-infra-retry", park_build,
-            verdict="succeeded",
-            node_statuses={park_drv: ("completed",)},
-            present=[park_out], absent=[],
-        )
-
-    # ══════════════════════════════════════════════════════════════════
-    # The flag-off dormancy guard (criterion 2): all that walk traffic
-    # created zero materialization state, and the flags are really off.
-    # ══════════════════════════════════════════════════════════════════
-    with subtest("walk-dormancy: flag-off deployment created no materialization state"):
-        rows = psql(
-            ${gatewayHost},
-            "SELECT (SELECT count(*) FROM materialization_jobs)"
-            " + (SELECT count(*) FROM build_wanted_outputs)"
-            " + (SELECT count(*) FROM drv_attempts WHERE outcome_class LIKE 'materialization%')"
-            " + (SELECT count(*) FROM drv_executions WHERE attempt_kind = 'materialization')"
-            " + (SELECT count(*) FROM scheduler_live_pins WHERE pin_kind = 'materialization')",
-        )
-        assert rows == "0", (
-            f"flag-off deployment created materialization state: {rows} row(s) "
-            "across the five dormancy clauses"
-        )
-        for unit in ["rio-scheduler", "rio-store"]:
-            env = ${gatewayHost}.succeed(f"systemctl show {unit} --property=Environment")
-            assert "RIO_MATERIALIZATION__ENABLED=true" not in env, (
-                f"the -walk oracle must run flag-off on {unit}: {env}"
-            )
-        print("walk-dormancy PASS: zero materialization rows, flags off")
-  '';
 in
 pkgs.testers.runNixOSTest {
-  # Distinct derivation names per flag state so the two check attrs never
-  # collide and CI logs name the right one.
-  name = "rio-materialize" + lib.optionalString (!materializationEnabled) "-walk";
+  name = "rio-materialize";
   skipTypeCheck = true;
 
-  # Flag-on: ~60 s boot + 4 subtests (fail-fast ~30 s, vouched ~40 s,
-  # park ~60 s [3 budget-burning claim waves + backoff], gc-pin ~60 s
-  # [2 claim waves + 2 sweeps]); each claim wave is a ~5 s store
-  # restart. Flag-off: ~60 s boot + 3 subtests dominated by walk retry
-  # ladders (~32 s each; walk-unobtainable needs two back-to-back).
+  # ~60 s boot + 4 subtests (fail-fast ~30 s, vouched ~40 s, park ~60 s
+  # [3 budget-burning claim waves + backoff], gc-pin ~60 s [2 claim
+  # waves + 2 sweeps]); each claim wave is a ~5 s store restart.
   globalTimeout = 900 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
@@ -1047,7 +838,7 @@ pkgs.testers.runNixOSTest {
     }}
 
     ${prelude}
-    ${if materializationEnabled then flagOnSubtests else walkSubtests}
+    ${routingSubtests}
 
     # Stop the detached submission units + the cache server so the test
     # driver's shutdown isn't blocked on streaming grpcurl processes.

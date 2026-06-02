@@ -61,7 +61,6 @@ let
   log-service = import ./scenarios/log-service.nix;
   substitute-scale = import ./scenarios/substitute-scale.nix;
   materialize = import ./scenarios/materialize.nix;
-  materialize-transition = import ./scenarios/materialize-transition.nix;
   materialize-failover = import ./scenarios/materialize-failover.nix;
   sla-sizing = import ./scenarios/sla-sizing.nix;
   forecast-provisioning = import ./scenarios/forecast-provisioning.nix;
@@ -276,8 +275,7 @@ let
   #     resolve_tenant → mint JWT → attach to outbound gRPC; P0465).
   #   - grpcurl + postgresql on control for direct probing + psql.
   #   - Client :8080 open for the fake-upstream http.server.
-  mkSubstituteStandalone =
-    materializationEnabled:
+  substituteStandaloneTest =
     let
       jwtKeys = import ./lib/jwt-keys.nix;
       jwtPubkey = pkgs.writeText "jwt-pubkey" jwtKeys.pubkeyB64;
@@ -289,43 +287,33 @@ let
       rioSigningKey = pkgs.writeText "rio-signing-key" "rio-vm-test-1:VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
     in
     substitute {
-      inherit pkgs common materializationEnabled;
-      fixture = standalone (
-        {
-          workers = { };
-          withHmac = true;
-          extraStoreConfig = {
-            signingKeyFile = "${rioSigningKey}";
-            extraConfig = ''
-              [jwt]
-              key_path = "${jwtPubkey}"
-            '';
-          };
-          extraGatewayEnv.RIO_JWT__KEY_PATH = "${jwtSeed}";
-          extraPackages = [
-            pkgs.grpcurl
-            pkgs.postgresql_18
-          ];
-          extraClientModules = [
-            { networking.firewall.allowedTCPPorts = [ 8080 ]; }
-          ];
-        }
-        # The flag-on attr inherits the fixture's flipped default (the
-        # T-2.3 default-plumb proof); the -walk oracle pins flag-off
-        # explicitly, OVERRIDING the default (criterion 2's
-        # revertability posture).
-        // pkgs.lib.optionalAttrs (!materializationEnabled) {
-          materializationEnabled = false;
-        }
-      );
+      inherit pkgs common;
+      fixture = standalone {
+        workers = { };
+        withHmac = true;
+        extraStoreConfig = {
+          signingKeyFile = "${rioSigningKey}";
+          extraConfig = ''
+            [jwt]
+            key_path = "${jwtPubkey}"
+          '';
+        };
+        extraGatewayEnv.RIO_JWT__KEY_PATH = "${jwtSeed}";
+        extraPackages = [
+          pkgs.grpcurl
+          pkgs.postgresql_18
+        ];
+        extraClientModules = [
+          { networking.firewall.allowedTCPPorts = [ 8080 ]; }
+        ];
+      };
     };
 
-  # ── materialize scenario builder (both flag states — T-3.1/PD-B3) ───
+  # ── materialize scenario builder (T-3.1) ────────────────────────────
   # The §2.4 routing-arms / §2.5 park / §5.3 gc-pin scenario
   # (scenarios/materialize.nix) — the substitution failure paths the
-  # substitute scenarios' success paths never reach. Same
-  # one-builder-two-attrs pattern as mkSubstituteStandalone. Fixture
-  # knobs that are load-bearing for determinism:
+  # substitute scenarios' success paths never reach. Fixture knobs that
+  # are load-bearing for determinism:
   #   - withHmac: the consumption re-probe can only CONFIRM a missing
   #     path with service-auth probes (x-rio-service-token +
   #     x-rio-probe-tenant-id); without it, arm 3's fail-fast is
@@ -347,117 +335,81 @@ let
   #     marked-root fail-fast sequence is unreachable. The store
   #     verifies that JWT for its upstream probes (the same
   #     gateway-JWT-propagation path substitute.nix exercises).
-  mkMaterializeStandalone =
-    materializationEnabled:
+  materializeStandaloneTest =
     let
       jwtKeys = import ./lib/jwt-keys.nix;
       jwtPubkey = pkgs.writeText "jwt-pubkey" jwtKeys.pubkeyB64;
     in
     materialize {
-      inherit pkgs common materializationEnabled;
-      fixture = standalone (
-        {
-          workers = { };
-          withHmac = true;
-          extraStoreConfig = {
-            # [jwt]: verify the scenario's minted tenant tokens (see the
-            # builder comment above).
-            #
-            # [materialization] poll_interval_secs=3600: the executor
-            # polls (and therefore claims) ONLY at store startup — each
-            # claim wave is an explicit `restart_store()` step in the
-            # scenario, so a claim can never be in flight when the
-            # scenario restarts the store and no open attempt can be
-            # orphaned mid-execution (establishment is tick-driven and
-            # the tick is 600 s here). The env layer still owns
-            # `enabled` (the flag under test); this file key only paces
-            # the executor.
-            extraConfig = ''
-              [jwt]
-              key_path = "${jwtPubkey}"
+      inherit pkgs common;
+      fixture = standalone {
+        workers = { };
+        withHmac = true;
+        extraStoreConfig = {
+          # [jwt]: verify the scenario's minted tenant tokens (see the
+          # builder comment above).
+          #
+          # [materialization] poll_interval_secs=3600: the executor
+          # polls (and therefore claims) ONLY at store startup — each
+          # claim wave is an explicit `restart_store()` step in the
+          # scenario, so a claim can never be in flight when the
+          # scenario restarts the store and no open attempt can be
+          # orphaned mid-execution (establishment is tick-driven and
+          # the tick is 600 s here). This file key only paces the
+          # executor.
+          extraConfig = ''
+            [jwt]
+            key_path = "${jwtPubkey}"
 
-              [materialization]
-              poll_interval_secs = 3600
-            '';
-          };
-          extraSchedulerEnv = {
-            RIO_MATERIALIZATION__PARK_BACKOFF_BASE_SECS = "5";
-          };
-          extraSchedulerConfig = {
-            tickIntervalSecs = 600;
-          };
-          extraPackages = [
-            pkgs.grpcurl
-            pkgs.postgresql_18
-          ];
-          extraClientModules = [
-            { networking.firewall.allowedTCPPorts = [ 8080 ]; }
-          ];
-        }
-        # The flag-on attr inherits the fixture's flipped default; the
-        # -walk oracle pins flag-off explicitly, OVERRIDING the default
-        # (criterion 2's revertability posture).
-        // pkgs.lib.optionalAttrs (!materializationEnabled) {
-          materializationEnabled = false;
-        }
-      );
-    };
-
-  # ── materialize-failover scenario builder (both flag states — T-3.3) ─
-  # Failover + AS-6 mixed-flag windows on the k3s fixture (2 scheduler
-  # replicas per vmtest-full.yaml — the failover needs a standby). Same
-  # one-builder-two-attrs pattern as mkSubstituteScale: the flag-on attr
-  # inherits the chart's flipped values.yaml default; the -walk oracle
-  # pins both chart flags off explicitly.
-  mkMaterializeFailover =
-    materializationEnabled:
-    materialize-failover {
-      inherit pkgs common materializationEnabled;
-      fixture = k3sFull (
-        {
-          jwtEnabled = true;
-        }
-        // pkgs.lib.optionalAttrs (!materializationEnabled) {
-          extraValuesTyped = {
-            "scheduler.materialization.enabled" = false;
-            "store.materialization.enabled" = false;
-          };
-        }
-      );
-    };
-
-  # ── substitute-scale scenario builder (both flag states) ────────────
-  # Same one-builder-two-attrs pattern as mkSubstituteStandalone, on the
-  # k3s fixture: the materialization flag is threaded to the scenario
-  # (selects the mechanism-assertion branch) AND pinned on both chart
-  # components via extraValuesTyped (sets the deployed posture), so the
-  # two can never flip independently across a commit boundary.
-  mkSubstituteScale =
-    materializationEnabled:
-    substitute-scale {
-      inherit pkgs common materializationEnabled;
-      fixture = k3sFull {
-        jwtEnabled = true;
-        extraValuesTyped = {
-          "componentScaler.store.enabled" = true;
-          "componentScaler.store.min" = 1;
-          "componentScaler.store.max" = 4;
-          "componentScaler.store.seedRatio" = 10;
-          "store.substituteAdmissionPermits" = 1;
-        }
-        # Substitution-replacement Phase B (PD-B13): the flag-on attr
-        # inherits the chart's flipped values.yaml default (the T-2.3
-        # default-plumb proof: no --set override, the rendered env
-        # comes straight from values.yaml); the -walk oracle pins both
-        # chart flags OFF explicitly, OVERRIDING the default
-        # (criterion 2's revertability posture; the AS-6 pairing keeps
-        # creation and execution flags equal).
-        // pkgs.lib.optionalAttrs (!materializationEnabled) {
-          "scheduler.materialization.enabled" = false;
-          "store.materialization.enabled" = false;
+            [materialization]
+            poll_interval_secs = 3600
+          '';
         };
+        extraSchedulerEnv = {
+          RIO_MATERIALIZATION__PARK_BACKOFF_BASE_SECS = "5";
+        };
+        extraSchedulerConfig = {
+          tickIntervalSecs = 600;
+        };
+        extraPackages = [
+          pkgs.grpcurl
+          pkgs.postgresql_18
+        ];
+        extraClientModules = [
+          { networking.firewall.allowedTCPPorts = [ 8080 ]; }
+        ];
       };
     };
+
+  # ── materialize-failover scenario builder (T-3.3) ───────────────────
+  # Materialization under leader failover on the k3s fixture (2
+  # scheduler replicas per vmtest-full.yaml — the failover needs a
+  # standby).
+  materializeFailoverTest = materialize-failover {
+    inherit pkgs common;
+    fixture = k3sFull {
+      jwtEnabled = true;
+    };
+  };
+
+  # ── substitute-scale scenario builder ───────────────────────────────
+  # Substitution → ComponentScaler closed loop on the k3s fixture; the
+  # deployed materialization posture comes straight from the chart's
+  # values.yaml default (no --set override — the rendered env IS the
+  # default-plumb proof).
+  substituteScaleTest = substitute-scale {
+    inherit pkgs common;
+    fixture = k3sFull {
+      jwtEnabled = true;
+      extraValuesTyped = {
+        "componentScaler.store.enabled" = true;
+        "componentScaler.store.min" = 1;
+        "componentScaler.store.max" = 4;
+        "componentScaler.store.seedRatio" = 10;
+        "store.substituteAdmissionPermits" = 1;
+      };
+    };
+  };
 in
 {
   # ── nixos-node AMI bootstrap (mocked IMDS, no AWS) ────────────────────
@@ -579,18 +531,14 @@ in
   # Upstream binary-cache substitution: fake cache on client VM, store
   # fetches + ingests on QueryPathInfo miss. Validates the P0462/P0463
   # chain at the store-gRPC level plus the ssh-ng path (P0465 JWT
-  # propagation), in BOTH materialization flag states (PD-B3): the
-  # flag-on attr below is the deployed-default posture; the -walk attr
-  # is the flag-off as-built-walk oracle. Fixture/JWT/signing notes live
-  # on mkSubstituteStandalone (the shared builder).
+  # propagation). Fixture/JWT/signing notes live on
+  # substituteStandaloneTest (the builder).
   #
-  # ── Flag-ON (design §8-B vm-materialization-basic — PD-B2) ──────────
   # Scheduler-owned substitution routes through materialization jobs:
   # merge probe → cache_opportunity job rows (in the merge transaction)
   # → store-executor claim/fetch/report → consumption. The walk never
-  # spawns for fresh flag-on work (criterion 3). No explicit pin: the
-  # attr inherits the fixture's flipped default (the Phase B cutover) —
-  # its green-ness IS the standalone default-plumb proof.
+  # spawns for fresh work (criterion 3 — through D3, when the walk
+  # machinery deletes).
   #
   # r[verify sched.materialize.job]
   #   substitute-scheduler-owned: a direct (gateway-bypassing) submission
@@ -611,15 +559,7 @@ in
   #   captured internal-json wire stream asserts every actCopyPath
   #   start has a matching stop, every resProgress has done≤expected,
   #   and per-aid done is monotone non-decreasing — the §8-B
-  #   basic-scenario pair-rendering obligation, preserved flag-on.
-  vm-substitute-standalone = mkSubstituteStandalone true;
-
-  # ── Flag-OFF oracle (design §8-B "both flag states") ────────────────
-  # The as-built scheduler walk path, with the Phase A assertions
-  # byte-original (criterion 2's deployment-level revertability proof:
-  # flipping back must always work). Explicit `false` pin, OVERRIDING
-  # the flipped fixture default.
-  #
+  #   basic-scenario pair-rendering obligation.
   # r[verify store.substitute.upstream]
   #   substitute-cold-fetch: miss → HTTP GET narinfo → sig-verify →
   #   GET nar → CAS ingest → narinfo INSERT. Metric + psql assertions.
@@ -644,29 +584,19 @@ in
   #   → store's try_substitute_on_miss fires → path substitutable via
   #   the real ssh-ng protocol path (not grpcurl backdoor).
   # r[verify sched.merge.substitute-probe-indeterminate]
-  #   substitute-scheduler-owned (flag-off branch): the merge probe
-  #   routes 4 substitutable nodes to detached walks
-  #   (rio_scheduler_substitute_spawned_total >= 4, zero job rows) —
-  #   the as-built mechanism pinned at deployment level. Plus
-  #   materialization-dormant: the five-table zero-count after all the
-  #   walk traffic (jobs/wanted clauses non-vacuously — substitution
-  #   traffic is exactly what would create jobs flag-on; the
-  #   attempt/execution/pin clauses are covered by the lifecycle-core
-  #   fragment, which has real builder traffic), plus the systemd-unit
-  #   env guard on scheduler + store.
-  vm-substitute-standalone-walk = mkSubstituteStandalone false;
+  #   substitute-scheduler-owned: the merge probe classifies 4
+  #   substitutable (probe-indeterminate) nodes and routes them to
+  #   materialization jobs created in the merge transaction (zero
+  #   walks) — the indeterminate→job disposition at deployment level.
+  vm-substitute-standalone = substituteStandaloneTest;
 
-  # ── materialization routing/park/gc-pin (both flag states — T-3.1) ──
+  # ── materialization routing/park/gc-pin (T-3.1) ─────────────────────
   # The substitution FAILURE paths at deployment level: the §2.4
   # Unobtainable routing arms, the §2.5 infra park, and the §5.3 pin
   # lifecycle against a real GC sweep — what the substitute scenarios'
   # success paths never reach. One mode-switched fake upstream drives
-  # every arm (per-path 404/503/head-only narinfo answers); the flag-on
-  # and flag-off attrs script the SAME sequences and assert the SAME
-  # client-visible outcome triple through shared assertion text
-  # (criterion 1 / review eq-5); only the mechanism blocks differ.
+  # every arm (per-path 404/503/head-only narinfo answers).
   #
-  # ── Flag-ON: the §2.4 routing arms + §2.5 park + §5.3 pins ──────────
   # r[verify sched.materialize.routing+2]
   #   routing-fail-fast: a topdown-pruned root whose output is confirmed
   #   missing upstream fails every interested build with the
@@ -692,31 +622,7 @@ in
   #   inside the merge transaction (and the pruned dep never enters the
   #   DAG); routing-vouched-from-source: the indeterminate probe creates
   #   the cache_opportunity job (B3's optimistic creation).
-  vm-materialization-standalone = mkMaterializeStandalone true;
-
-  # ── Flag-OFF oracle: the as-built walk path, same sequences ─────────
-  # The OQ7 comparison legs for unobtainable-then-fail-fast,
-  # unobtainable-then-from-source, and infra-retry (review eq-1): the
-  # same submissions and upstream behavior, served by the as-built walk;
-  # identical client-visible outcome assertions (shared assert_outcome
-  # text), per-branch mechanism assertions (walk metrics, zero
-  # materialization rows). Plus the five-clause dormancy zero-count over
-  # all that walk traffic (criterion 2). No gc-pin oracle: the walk
-  # creates no materialization pins (as-built pin behavior is covered by
-  # vm-lifecycle-gc-k3s).
-  # r[verify sched.merge.substitute-topdown+12]
-  #   walk-unobtainable: the marked pruned root's failed walk settles
-  #   through the verification one-shot then fail-fasts with the same
-  #   resubmit-directing error the flag-on arm-3 routing produces.
-  # r[verify sched.evidence.settlement]
-  #   walk-unobtainable: the settlement path (re-probe → verification
-  #   walk → spent one-shot → fail-fast) is what disposes the marked
-  #   root; the build's terminal verdict is its observable outcome.
-  # r[verify sched.substitute.detached+5]
-  #   walk-vouched-from-source + walk-infra-retry: the detached walk
-  #   serves both sequences — exhaustion reverts the node to from-source
-  #   eligibility; in-ladder upstream recovery completes the build.
-  vm-materialization-standalone-walk = mkMaterializeStandalone false;
+  vm-materialization-standalone = materializeStandaloneTest;
 
   # ── log-service (standalone fixture, no workers) ─────────────────────
   # rio-store LogService end-to-end: authenticated AppendLog ingest →
@@ -1260,18 +1166,18 @@ in
     };
   };
 
-  # ── substitute-scale (both flag states — PD-B3/PD-B13) ──────────────
+  # ── substitute-scale ─────────────────────────────────────────────────
   #   Substitution → ComponentScaler closed loop. 30-leaf substitutable
   #   fanout against a 1-permit store admission gate: scheduler reports
   #   substituting_derivations → ComponentScaler counts it (P1) →
   #   desiredReplicas RISES (never drops mid-cascade) → GetLoad's
   #   substitute_admission_utilization reaches CR.status (P2). Zero
   #   builder pods for the leaves. Plus the depth-50 deep-chain
-  #   eager-burst proof. ~7min (k3s + cache-seed + 90s poll) per attr.
+  #   eager-burst proof. ~7min (k3s + cache-seed + 90s poll).
   #
-  # Distinct runNixOSTest names (rio-substitute-scale[-walk]) — NOT
-  # variants of rio-componentscaler / rio-substitute, so the derivation
-  # names don't collide.
+  # Distinct runNixOSTest name (rio-substitute-scale) — NOT a variant
+  # of rio-componentscaler / rio-substitute, so the derivation names
+  # don't collide.
   #
   # jwtEnabled: substitution is tenant-scoped (try_substitute_on_miss
   # short-circuits without x-rio-tenant-token); the gateway must mint
@@ -1283,99 +1189,26 @@ in
   # desiredReplicas never moves. Set via the chart key (not extraEnv)
   # so the values.yaml → store.yaml templating is exercised.
   #
-  # The deployed flag posture per attr (the scenario's Python branch
-  # selects the matching mechanism assertions; assertions and posture
-  # flip together — commit rule 3 / PD-B13): the flag-on attr inherits
-  # the chart's flipped values.yaml default (its green-ness IS the
-  # values.yaml default-plumb proof); the -walk attr pins both chart
-  # flags off via extraValuesTyped, OVERRIDING the default.
-
-  # ── Flag-ON: substitution routes through materialization jobs ───────
-  # (no explicit chart pins — inherits the flipped values.yaml default)
   # r[verify ctrl.scaler.signal-substituting+2]
   #   cascade: the §2.6 re-sourced substituting bucket (pending unclaimed
   #   jobs) drives the P1 closed loop — desiredReplicas rises and never
   #   drops mid-cascade while the job backlog drains.
   # r[verify store.substitute.admission]
   # r[verify store.admin.get-load+2]
-  #   cascade: the store executors' fetches go through the SAME
-  #   per-replica admission gate as the walk; GetLoad's admission
-  #   utilization reaches CR.status (P2) unchanged.
+  #   cascade: the store executors' fetches go through the per-replica
+  #   admission gate; GetLoad's admission utilization reaches CR.status
+  #   (P2) unchanged.
   # r[verify sched.substitute.eager-probe]
   # r[verify sched.materialize.job]
-  #   deep-chain (re-keyed): one merge burst classifies all 49 seeded
-  #   links — rio_scheduler_materialization_jobs_created_total delta
-  #   ≥45 + ≥49 cache_opportunity job rows, while the walk-spawn
-  #   counter stays at 0 (criterion 3). Same eager-vs-lazy property,
-  #   flag-on twin counter.
-  vm-substitute-scale-k3s = mkSubstituteScale true;
+  #   deep-chain: one merge burst classifies all 49 seeded links —
+  #   rio_scheduler_materialization_jobs_created_total delta ≥45 + ≥49
+  #   cache_opportunity job rows, while the walk-spawn counter stays at
+  #   0 (criterion 3). The eager-vs-lazy property.
+  vm-substitute-scale-k3s = substituteScaleTest;
 
-  # ── Flag-OFF oracle: the as-built walk path, byte-original ──────────
-  # r[verify ctrl.scaler.signal-substituting+2]
-  #   cascade: the status-sourced substituting bucket (Substituting
-  #   nodes) drives the same P1 closed loop — the as-built signal half.
-  # r[verify store.substitute.admission]
-  # r[verify store.admin.get-load+2]
-  # r[verify sched.substitute.eager-probe]
-  #   deep-chain (byte-original): one merge burst spawns all 49 walks —
-  #   rio_scheduler_substitute_spawned_total delta ≥45.
-  vm-substitute-scale-walk-k3s = mkSubstituteScale false;
-
-  # ── materialization flag-transition rollouts (T-3.2 / FP-4) ─────────
-  # The deployment-level revertability proof (RFB-4): the chart deploys
-  # flag-OFF, the scenario flips ON at runtime over in-flight walk-era
-  # state (kubectl set env + rollouts, the AS-6 store-first order), then
-  # flips back OFF over live job-era state — both directions leave no
-  # orphaned state, no stuck node, and no wrongful failure. Inherently
-  # both-state (it flips at runtime), so it needs no -walk oracle twin.
-  #
-  # k3s (NOT the standalone fixture) because recovery — the §4 mechanism
-  # that absorbs the other era's in-flight state — runs only on
-  # LeaderAcquired, which only fires in lease-based deployments. A
-  # standalone scheduler restart never reloads PG state, so FP-4
-  # transitions are k8s-only operations by construction.
-  #
-  # r[verify sched.materialize.job]
-  #   flip-on: walk-era nodes (Substituting / unresolved) at flip time
-  #   are absorbed — the new leader's recovery resets them, the flag-on
-  #   dispatch probe creates jobs for them, and the build completes
-  #   through the job path. Zero wrongful failures.
-  # r[verify sched.materialize.routing+2]
-  #   flag-on-marks + flip-off-marks: the topdown-pruned mark is
-  #   dual-written at merge, the consumption transaction's clear-mirror
-  #   clears it when the pruned job resolves successfully, and the clear
-  #   is durable across the ON->OFF flip (a re-submission of the node
-  #   never wrongfully fail-fasts).
-  #   flip-off: parked flag-on-era jobs survive the flip as inert rows
-  #   (still pending, never claimed again, never cancelled) while the
-  #   as-built walk completes their build around them.
-  # r[verify sched.materialize.pinning]
-  #   flag-on-pins + flip-off-pins: pin-at-ingest rows survive the
-  #   ON->OFF flip while their interested build is live; the always-on
-  #   release fires FLAG-OFF when that interest goes terminal, and the
-  #   path becomes GC-collectable.
-  vm-materialization-transition-k3s = materialize-transition {
-    inherit pkgs common;
-    fixture = k3sFull {
-      jwtEnabled = true;
-      # The chart deploys flag-OFF (both components — the AS-6 pairing);
-      # the scenario's kubectl-set-env flips are the runtime cutover and
-      # the rollback rendering.
-      extraValuesTyped = {
-        "scheduler.materialization.enabled" = false;
-        "store.materialization.enabled" = false;
-      };
-    };
-  };
-
-  # ── materialization under leader failover + AS-6 mixed-flag (T-3.3) ─
+  # ── materialization under leader failover (T-3.3) ───────────────────
   # What the standalone scenarios cannot prove: materialization jobs are
-  # PG-authoritative state that survives the scheduler leader's death,
-  # and the AS-6 mixed-flag windows are visible waits / no-ops, never
-  # strands. Both flag states (review eq-1: the OQ7
-  # failover-during-substitution comparison): the flag-on attr inherits
-  # the chart's flipped default; the -walk oracle pins both chart flags
-  # off and runs the same failover sequence through the as-built walk.
+  # PG-authoritative state that survives the scheduler leader's death.
   #
   # Wave-3-honest assertions (the acknowledged recovery limitation): the
   # new leader's in-memory job view is rebuilt indirectly (the dispatch
@@ -1384,31 +1217,13 @@ in
   # assertions pass sooner. The scenario asserts end states, not view
   # internals, precisely so T-4.3 extends rather than rewrites it.
   #
-  # ── Flag-ON ──────────────────────────────────────────────────────────
   # r[verify sched.materialize.job]
   #   failover: 10 jobs created in the merge tx; the leader is
   #   force-deleted while >=1 is still unresolved; the standby acquires;
   #   the job rows survive byte-identically (count + job_ids); all 10
   #   resolve and the build succeeds. PG is the authority — no job is
   #   lost with the leader.
-  # r[verify sched.materialize.routing+2]
-  #   mixed-flag: scheduler-on/store-off (the rollout-race window the
-  #   chart AND-guard cannot close) is a visible wait — jobs pending,
-  #   build active, backlog reported via substituting_derivations — and
-  #   drains the moment the store executor returns.
-  #   store-only-noop: scheduler-off/store-on serves builds via the
-  #   as-built walk; the executor's polls return empty; zero jobs.
-  vm-materialization-failover-k3s = mkMaterializeFailover true;
-
-  # ── Flag-OFF oracle: the as-built walk path under the same failover ─
-  # r[verify sched.merge.substitute-probe-indeterminate]
-  #   failover: the same 10-leaf submission runs as walks; the leader is
-  #   force-deleted mid-walk; the standby's recovery resets Substituting
-  #   nodes and the re-probe re-spawns the walks; the build completes
-  #   with the same client-visible outcome the flag-on attr asserts
-  #   (succeeded, all paths present, no stuck nodes) and zero
-  #   materialization jobs.
-  vm-materialization-failover-walk-k3s = mkMaterializeFailover false;
+  vm-materialization-failover-k3s = materializeFailoverTest;
 
   # ── leader-election splits (2 tests, k3s-full fixture) ───────────────
   # ~0 wall-clock savings (4min bootstrap dominates both) but failures

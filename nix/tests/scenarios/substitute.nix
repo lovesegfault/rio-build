@@ -30,35 +30,22 @@
 # is content-addressed (fixed input → fixed hash) so it's deterministic
 # across runs.
 #
-# ── Both flag states (substitution-replacement Phase B, design §8-B) ──
-# The scenario is parametrized on `materializationEnabled` and wired
-# twice in default.nix:
-#   vm-substitute-standalone       — flag-ON (the deployed default after
-#                                    the Phase B cutover): scheduler-owned
-#                                    substitution routes through
-#                                    materialization jobs (store-executor
-#                                    pull), never the walk.
-#   vm-substitute-standalone-walk  — flag-OFF oracle: the as-built walk
-#                                    path, byte-original Phase A
-#                                    assertions (criterion 2's
-#                                    deployment-level revertability proof).
-# The six store-side subtests and the gateway-path progress-e2e subtest
-# are flag-independent and run identically in both attrs; the
-# scheduler-owned subtest runs in both attrs with per-mechanism
-# assertions; the store end-state block (PD-B21) is identical text in
-# both attrs; the dormancy subtest's posture selects on the flag
-# (materialization-active flag-on / materialization-dormant flag-off).
+# ── Mechanism (substitution-replacement Phase B/D′) ──────────────────
+# Wired once in default.nix as vm-substitute-standalone: scheduler-owned
+# substitution routes through materialization jobs (store-executor
+# pull). The six store-side subtests and the gateway-path progress-e2e
+# subtest are mechanism-independent; the scheduler-owned subtest pins
+# the job mechanism; the store end-state block (PD-B21) and the
+# materialization-active end-state subtest close the scenario.
 #
 # store.substitute.{upstream,sig-mode,tenant-sig-visibility} — verify
-# markers at default.nix:vm-substitute-standalone(-walk) subtests entries
+# markers at default.nix:vm-substitute-standalone subtests entries
 {
   pkgs,
   common,
   fixture,
-  materializationEnabled ? true,
 }:
 let
-  inherit (pkgs) lib;
   inherit (fixture) gatewayHost;
 
   jwtKeys = import ../lib/jwt-keys.nix;
@@ -366,7 +353,7 @@ let
   # Its own `with subtest` block (not a continuation of the one above)
   # so failures attribute to the right subtest and the Python
   # indentation survives nixfmt's indented-string normalization.
-  + lib.optionalString materializationEnabled ''
+  + ''
     with subtest("substitute-scheduler-owned: flag-on mechanism — jobs, never walks"):
         # The merge's new_sub lane created one cache_opportunity job per
         # matjob node inside the merge transaction (T-1.1's lane); the
@@ -418,47 +405,23 @@ let
             f"(one per matjob node), got {created_n}"
         )
         print("substitute-scheduler-owned PASS (mechanism): 4 jobs resolved, zero walks")
-  ''
-  + lib.optionalString (!materializationEnabled) ''
-    with subtest("substitute-scheduler-owned: flag-off mechanism — walks, never jobs"):
-        # The merge probe spawned one detached walk per node
-        # (spawn_substitute_fetches); SubstituteComplete completed them.
-        # This is the -walk oracle's pin of the as-built mechanism.
-        spawned = ${gatewayHost}.succeed(
-            "curl -s localhost:9091/metrics"
-            " | grep '^rio_scheduler_substitute_spawned_total'"
-            " || echo 'rio_scheduler_substitute_spawned_total 0'"
-        )
-        spawned_n = float(spawned.strip().rsplit(" ", 1)[1])
-        assert spawned_n >= 4, (
-            f"flag-off the scheduler walks all 4 nodes "
-            f"(rio_scheduler_substitute_spawned_total >= 4), got {spawned_n}"
-        )
-        # And no materialization state exists (the dormancy oracle —
-        # re-asserted in full by materialization-dormant below).
-        jobs = psql(${gatewayHost}, "SELECT count(*) FROM materialization_jobs")
-        assert jobs == "0", (
-            f"flag-off deployment created {jobs} materialization job(s)"
-        )
-        print(f"substitute-scheduler-owned PASS (mechanism): {spawned_n:.0f} walks, zero jobs")
   '';
 
   # ════════════════════════════════════════════════════════════════════
-  # Flag-ON: materialization-active (the Phase A dormancy successor)
+  # materialization-active (the scenario end-state subtest)
   # ════════════════════════════════════════════════════════════════════
   materializationActive = ''
     # ══════════════════════════════════════════════════════════════════
-    # materialization-active — Phase B flag-on cutover proof
+    # materialization-active — the deployment end-state proof
     # ══════════════════════════════════════════════════════════════════
-    # The dormancy subtest's successor (PD-B5): after all the substitution
-    # subtests above, the flag-on deployment's residue must show the
-    # materialization mechanism — and only it — did the scheduler-side
-    # work: jobs all resolved, the durable wanted relation written by the
-    # merges, every execution materialization-kind, pins released after
-    # the interested builds went terminal (§5.3 / T-1.8), the walk-spawn
-    # counter at zero (criterion 3), and the flag genuinely ON in both
-    # units' environment.
-    with subtest("materialization-active: flag-on deployment substitutes via jobs, never walks"):
+    # After all the substitution subtests above, the deployment's residue
+    # must show the materialization mechanism — and only it — did the
+    # scheduler-side work: jobs all resolved, the durable wanted relation
+    # written by the merges, every execution materialization-kind, pins
+    # released after the interested builds went terminal (§5.3 / T-1.8),
+    # the walk-spawn counter at zero (criterion 3), and the flag
+    # genuinely ON in both units' environment.
+    with subtest("materialization-active: deployment substitutes via jobs, never walks"):
         # The exact job ledger of this scenario flag-on, mirroring the
         # flag-off walk ledger one-to-one:
         #   1 origin=pruned          — progress-e2e's substitutable root
@@ -565,57 +528,9 @@ let
             f"pins released, zero walks, flags on"
         )
   '';
-
-  # ════════════════════════════════════════════════════════════════════
-  # Flag-OFF: materialization-dormant (the Phase A oracle, byte-original)
-  # ════════════════════════════════════════════════════════════════════
-  materializationDormant = ''
-    # ══════════════════════════════════════════════════════════════════
-    # materialization-dormant — Phase A dormancy criterion 2 (flag-off)
-    # ══════════════════════════════════════════════════════════════════
-    # Substitution-replacement campaign: after the substitution subtests
-    # above (cold-fetch, sig-mode-add, cross-tenant-gate,
-    # built-path-cross-tenant-gate, ssh-ng, progress-e2e,
-    # scheduler-owned) have driven the full merge → probe → walk →
-    # completion path — exactly the path that would create
-    # materialization jobs flag-on — the materialization tables must be
-    # EMPTY and no ledger/execution row may carry a materialization
-    # kind/class. Asserted against a real deployment doing real
-    # substitution work with the flags off (the -walk oracle attr). The
-    # attempt/execution/pin clauses are vacuously zero here (this fixture
-    # has zero workers); the lifecycle-core fragment proves those against
-    # real builder traffic.
-    with subtest("materialization-dormant: flag-off deployment creates no materialization state"):
-        rows = psql(
-            ${gatewayHost},
-            "SELECT (SELECT count(*) FROM materialization_jobs)"
-            " + (SELECT count(*) FROM build_wanted_outputs)"
-            " + (SELECT count(*) FROM drv_attempts WHERE outcome_class LIKE 'materialization%')"
-            " + (SELECT count(*) FROM drv_executions WHERE attempt_kind = 'materialization')"
-            " + (SELECT count(*) FROM scheduler_live_pins WHERE pin_kind = 'materialization')",
-        )
-        assert rows == "0", (
-            f"flag-off deployment created materialization state: {rows} row(s) "
-            f"across the five dormancy tables/clauses (Phase A criterion 2 violation)"
-        )
-
-        # And the flags really are off in the SERVICES' environment (not
-        # the test driver's shell — printenv in a fresh succeed() shell
-        # can never see the unit's env, so that guard could never fail).
-        # Assert against the units' real environment via systemd.
-        for unit in ["rio-scheduler", "rio-store"]:
-            env = ${gatewayHost}.succeed(f"systemctl show {unit} --property=Environment")
-            assert "RIO_MATERIALIZATION__ENABLED=true" not in env, (
-                f"scenario unexpectedly enables materialization on {unit}: {env}"
-            )
-        print("materialization-dormant PASS: zero rows in all five clauses, flags off")
-  '';
 in
 pkgs.testers.runNixOSTest {
-  # Distinct derivation names per flag state so the two check attrs
-  # (vm-substitute-standalone / vm-substitute-standalone-walk) never
-  # collide and CI logs name the right one.
-  name = "rio-substitute" + lib.optionalString (!materializationEnabled) "-walk";
+  name = "rio-substitute";
   skipTypeCheck = true;
 
   # ~60s boot + cache setup ~10s + grpcurl round-trips + ssh-ng build
@@ -1213,7 +1128,7 @@ pkgs.testers.runNixOSTest {
 
     ${storeEndState}
     ${schedulerOwned}
-    ${if materializationEnabled then materializationActive else materializationDormant}
+    ${materializationActive}
     client.execute("systemctl stop test-cache 2>/dev/null || true")
     ${gatewayHost}.execute("systemctl stop matjob-submit 2>/dev/null || true")
 

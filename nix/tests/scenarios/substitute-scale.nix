@@ -21,23 +21,11 @@
 # upstream_v6 (already in CoreDNS test-vms.server, already serving
 # /srv on :8080 — see common.mkUpstreamNode).
 #
-# ── Both flag states (substitution-replacement Phase B, design §8-B) ──
-# The scenario is parametrized on `materializationEnabled` and wired
-# twice in default.nix:
-#   vm-substitute-scale-k3s       — flag-ON (the deployed default after
-#                                   the Phase B cutover): the cascade's
-#                                   30 leaves and the deep chain's 49
-#                                   links route through materialization
-#                                   jobs (store-executor pull); the
-#                                   deep-chain eager-burst proof is
-#                                   re-keyed to the job-creation counter.
-#   vm-substitute-scale-walk-k3s  — flag-OFF oracle: the as-built walk
-#                                   path, byte-original Phase A
-#                                   assertions.
-# Realized as a Python-level branch on MATERIALIZATION_ENABLED (a
-# rendered constant): the shared submission/poll/scaler text is
-# single-sourced, both mechanism-assertion texts live in the testScript
-# of both attrs, and the deployed flag state selects which branch runs.
+# ── Mechanism (substitution-replacement Phase B/D′) ──────────────────
+# Wired once in default.nix as vm-substitute-scale-k3s: the cascade's
+# 30 leaves and the deep chain's 49 links route through materialization
+# jobs (store-executor pull); the deep-chain eager-burst proof is keyed
+# to the job-creation counter.
 #
 # Tracey: ctrl.scaler.signal-substituting / store.substitute.admission /
 # store.admin.get-load — verify markers at default.nix wiring per the
@@ -46,7 +34,6 @@
   pkgs,
   common,
   fixture,
-  materializationEnabled ? true,
 }:
 let
   inherit (fixture) ns nsStore nsBuilders;
@@ -142,10 +129,7 @@ let
   '';
 in
 pkgs.testers.runNixOSTest {
-  # Distinct derivation names per flag state so the two check attrs
-  # (vm-substitute-scale-k3s / vm-substitute-scale-walk-k3s) never
-  # collide and CI logs name the right one.
-  name = if materializationEnabled then "rio-substitute-scale" else "rio-substitute-scale-walk";
+  name = "rio-substitute-scale";
   skipTypeCheck = true;
   # k3s bring-up ~240s + cache-seed ~20s + scale-up wait ≤90s + drain
   # ≤90s + chain seed ~10s + chain submit ≤120s + slack. The 30-leaf
@@ -162,14 +146,6 @@ pkgs.testers.runNixOSTest {
       withSsh = false;
       withSeed = false;
     }}
-
-    # Which substitution mechanism does this attr's deployment run?
-    # (substitution-replacement Phase B both-state parametrization: the
-    # Nix-level flag is rendered as a Python constant; the
-    # mechanism-assertion branches below select on it. The deployment's
-    # actual flag state is pinned by default.nix's extraValuesTyped on
-    # the same parameter, so assertions and posture flip together.)
-    MATERIALIZATION_ENABLED = ${if materializationEnabled then "True" else "False"}
 
     # ══════════════════════════════════════════════════════════════════
     # Fake upstream: build 30 leaves on upstream_v6, publish to /srv
@@ -498,25 +474,20 @@ pkgs.testers.runNixOSTest {
         # leaf went Ready→Substituting (not Ready→Queued). Structural
         # — independent of poll timing (ci-failure-patterns
         # "structural > retry > widen").
-        # Both flag states emit the same 30 events (BC-4, wire-retained
-        # kind): flag-off at walk spawn (Ready→Substituting status);
-        # flag-on at materialization-claim intake (one claim per job per
-        # leaf) — the count and meaning are preserved, only the emission
-        # site moves (claim spread ≤ poll interval, absorbed by the
-        # 90-tick sample loop above).
-        if MATERIALIZATION_ENABLED:
-            # Flag-on, the LAST claim's event fires right at sample-loop
-            # exit (the loop exits when the unclaimed backlog hits 0);
-            # give the WatchBuild → grpcurl → journald pipeline a bounded
-            # window to serialize all 30 before the structural count
-            # below. Flag-off needs no wait: every event fired in the
-            # merge burst, ~20s before the loop exited.
-            k3s_server.wait_until_succeeds(
-                "n=$(journalctl -u subscale-submit --no-pager "
-                "| grep -c DERIVATION_EVENT_KIND_SUBSTITUTING || true); "
-                'test "$n" -ge 30',
-                timeout=60,
-            )
+        # The 30 events fire at materialization-claim intake (BC-4,
+        # wire-retained kind: one claim per job per leaf; claim spread
+        # ≤ poll interval, absorbed by the 90-tick sample loop above).
+        #
+        # The LAST claim's event fires right at sample-loop exit (the
+        # loop exits when the unclaimed backlog hits 0); give the
+        # WatchBuild → grpcurl → journald pipeline a bounded window to
+        # serialize all 30 before the structural count below.
+        k3s_server.wait_until_succeeds(
+            "n=$(journalctl -u subscale-submit --no-pager "
+            "| grep -c DERIVATION_EVENT_KIND_SUBSTITUTING || true); "
+            'test "$n" -ge 30',
+            timeout=60,
+        )
         sub_events = int(k3s_server.succeed(
             "journalctl -u subscale-submit --no-pager "
             "| grep -c DERIVATION_EVENT_KIND_SUBSTITUTING || true"
@@ -606,24 +577,20 @@ pkgs.testers.runNixOSTest {
         # excludes the 30 .drv ATerms `nix copy --derivation` PutPath'd
         # earlier (store_path '%-rio-subscale-leaf-N.drv' also matches
         # the bare LIKE). psql_k8s execs into rio-postgresql-0.
-        if MATERIALIZATION_ENABLED:
-            # Flag-on, the sample loop above exits when every job is
-            # CLAIMED (the §2.6 substituting bucket counts pending
-            # unclaimed jobs, which empties at the last claim); the
-            # store executors' ingest tail for the final claimed batch
-            # can still be in flight. Bounded wait for the tail, then
-            # the same row-count assertion. Flag-off needs no wait: the
-            # bucket counts walk-in-progress nodes, so loop exit
-            # already implies every fetch completed.
-            for _ in range(90):
-                if psql_k8s(
-                    k3s_server,
-                    "SELECT count(*) FROM narinfo "
-                    "WHERE store_path LIKE '%rio-subscale-leaf-%' "
-                    "AND store_path NOT LIKE '%.drv'",
-                ) == "30":
-                    break
-                k3s_server.sleep(1)
+        # The sample loop above exits when every job is CLAIMED (the
+        # §2.6 substituting bucket counts pending unclaimed jobs, which
+        # empties at the last claim); the store executors' ingest tail
+        # for the final claimed batch can still be in flight. Bounded
+        # wait for the tail, then the row-count assertion.
+        for _ in range(90):
+            if psql_k8s(
+                k3s_server,
+                "SELECT count(*) FROM narinfo "
+                "WHERE store_path LIKE '%rio-subscale-leaf-%' "
+                "AND store_path NOT LIKE '%.drv'",
+            ) == "30":
+                break
+            k3s_server.sleep(1)
         n = psql_k8s(
             k3s_server,
             "SELECT count(*) FROM narinfo "
@@ -763,31 +730,26 @@ pkgs.testers.runNixOSTest {
         pf_open(leader, 19001, 9001, tag="pf-sched")
         pf_open(leader, 19091, 9091, tag="pf-sched-metrics")
 
-        # ── (1) eager burst: the spawn/creation counter jumps by 49 at merge ──
-        # Flag-off: rio_scheduler_substitute_spawned_total increments
-        # inside spawn_substitute_fetches at merge time. Flag-on: its
-        # twin rio_scheduler_materialization_jobs_created_total
-        # increments inside the merge transaction's job-creation batch
-        # (the new_sub lane). Either way the counter is NOT subject to
-        # WatchBuild stream serialization (gRPC stream → grpcurl →
-        # journalctl trickles events serially even when the actor
-        # classifies all 49 in one burst, so an anchored `grep -c` sees
-        # only the first 1-2 under gate contention).
+        # ── (1) eager burst: the job-creation counter jumps by 49 at merge ──
+        # rio_scheduler_materialization_jobs_created_total increments
+        # inside the merge transaction's job-creation batch (the new_sub
+        # lane). The counter is NOT subject to WatchBuild stream
+        # serialization (gRPC stream → grpcurl → journalctl trickles
+        # events serially even when the actor classifies all 49 in one
+        # burst, so an anchored `grep -c` sees only the first 1-2 under
+        # gate contention).
         # Eager: one MergeDag burst → +49. Lazy: depth-50 chain at
         # ~1/tick → +1-4 at first sighting. cache_check_failures /
         # topdown_prune are diagnostic deltas printed on failure.
+        # The walk-spawn counter scrape feeds the criterion-3 zero-walk
+        # assert below (absent metric → 0.0).
         m_before = scrape_metrics(k3s_server, 19091)
         spawned_before = metric_value(
             m_before, "rio_scheduler_substitute_spawned_total"
         ) or 0.0
-        # Flag-on twin of the walk-spawn counter (the deep-chain re-key
-        # target — substitution-replacement Phase B): increments once per
-        # substitutable link inside the merge transaction, exactly where
-        # the walk counter increments flag-off. The counter carries an
-        # `origin` label (cache_opportunity/pruned/reprobe/stale_reset),
-        # so sum every labeled series — a bare-name lookup misses them
-        # all. Absent flag-off (counter never registered) → empty dict
-        # → 0.0.
+        # The job-creation counter carries an `origin` label
+        # (cache_opportunity/pruned/reprobe/stale_reset), so sum every
+        # labeled series — a bare-name lookup misses them all.
         created_before = sum(
             m_before.get(
                 "rio_scheduler_materialization_jobs_created_total", {}
@@ -832,88 +794,56 @@ pkgs.testers.runNixOSTest {
             metric_value(m_after, "rio_scheduler_cache_check_failures_total")
             or 0.0
         ) - ccf_before
-        if MATERIALIZATION_ENABLED:
-            # ── Flag-ON re-key (substitution-replacement Phase B) ─────
-            # The eager-burst proof moves from the walk-spawn counter
-            # (which stays 0 flag-on — walk unreachability for fresh
-            # work, criterion 3) to its flag-on twin: the job-creation
-            # counter. Same one-merge-burst property, same before/after
-            # scrape pattern — both increment once per substitutable
-            # link inside the merge transaction. Plus a psql cross-check
-            # on the durable job rows (origin=cache_opportunity, one per
-            # seeded chain link).
-            created_delta = sum(
-                m_after.get(
-                    "rio_scheduler_materialization_jobs_created_total", {}
-                ).values()
-            ) - created_before
-            if created_delta < 45 or prune_delta != 0:
-                print("=== scheduler leader (since=60s, merge/probe lines) ===")
-                print(k3s_server.execute(
-                    f"k3s kubectl -n ${ns} logs {leader} --since=60s 2>&1 "
-                    "| grep -Ei 'find_missing|breaker|top-?down|check_cached"
-                    "|substitute|probe|materializ' | tail -60"
-                )[1])
-            # Root NOT seeded → topdown-prune MUST NOT fire (the prune
-            # decision and its metric are flag-independent merge
-            # classification).
-            assert prune_delta == 0, (
-                f"rio_scheduler_topdown_prune_total delta={prune_delta} — "
-                f"topdown pruned despite root not seeded on upstream"
-            )
-            assert created_delta >= 45, (
-                f"eager-probe burst: "
-                f"rio_scheduler_materialization_jobs_created_total "
-                f"delta={created_delta} (expected ≥45; lazy mode shows "
-                f"~1-4). cache_check_failures Δ={ccf_delta}, "
-                f"topdown_prune Δ={prune_delta}"
-            )
-            chain_jobs = int(psql_k8s(
-                k3s_server,
-                "SELECT count(*) FROM materialization_jobs "
-                "WHERE origin = 'cache_opportunity' "
-                "AND drv_hash LIKE '%rio-subchain-%'",
-            ))
-            assert chain_jobs >= 49, (
-                f"expected >=49 cache_opportunity materialization jobs "
-                f"after the deep-chain merge, got {chain_jobs}"
-            )
-            # And the walk counter must NOT have moved (criterion 3):
-            assert spawned_delta == 0, (
-                f"flag-on deployment spawned walks during the deep-chain "
-                f"merge: {spawned_delta}"
-            )
-            print(
-                f"substitute-deep-chain: jobs_created Δ={created_delta} "
-                f"({chain_jobs} cache_opportunity rows) "
-                f"topdown_prune Δ={prune_delta} spawned Δ={spawned_delta} "
-                f"ccf Δ={ccf_delta} ✓"
-            )
-        else:
-            if spawned_delta < 45 or prune_delta != 0:
-                print("=== scheduler leader (since=60s, merge/probe lines) ===")
-                print(k3s_server.execute(
-                    f"k3s kubectl -n ${ns} logs {leader} --since=60s 2>&1 "
-                    "| grep -Ei 'find_missing|breaker|top-?down|check_cached"
-                    "|substitute|probe' | tail -60"
-                )[1])
-            # Root NOT seeded → topdown-prune MUST NOT fire. If it did,
-            # check_available reported subchain-49 substitutable (a real
-            # bug) or the seed-exclusion above is broken.
-            assert prune_delta == 0, (
-                f"rio_scheduler_topdown_prune_total delta={prune_delta} — "
-                f"topdown pruned despite root not seeded on upstream"
-            )
-            assert spawned_delta >= 45, (
-                f"eager-probe burst: rio_scheduler_substitute_spawned_total "
-                f"delta={spawned_delta} at first event (expected ≥45; lazy "
-                f"mode shows ~1-4). cache_check_failures Δ={ccf_delta}, "
-                f"topdown_prune Δ={prune_delta}"
-            )
-            print(
-                f"substitute-deep-chain: spawned_total Δ={spawned_delta} "
-                f"topdown_prune Δ={prune_delta} ccf Δ={ccf_delta} ✓"
-            )
+        # The eager-burst proof is keyed to the job-creation counter:
+        # it increments once per substitutable link inside the merge
+        # transaction. Plus a psql cross-check on the durable job rows
+        # (origin=cache_opportunity, one per seeded chain link).
+        created_delta = sum(
+            m_after.get(
+                "rio_scheduler_materialization_jobs_created_total", {}
+            ).values()
+        ) - created_before
+        if created_delta < 45 or prune_delta != 0:
+            print("=== scheduler leader (since=60s, merge/probe lines) ===")
+            print(k3s_server.execute(
+                f"k3s kubectl -n ${ns} logs {leader} --since=60s 2>&1 "
+                "| grep -Ei 'find_missing|breaker|top-?down|check_cached"
+                "|substitute|probe|materializ' | tail -60"
+            )[1])
+        # Root NOT seeded → topdown-prune MUST NOT fire (the prune
+        # decision and its metric are merge classification).
+        assert prune_delta == 0, (
+            f"rio_scheduler_topdown_prune_total delta={prune_delta} — "
+            f"topdown pruned despite root not seeded on upstream"
+        )
+        assert created_delta >= 45, (
+            f"eager-probe burst: "
+            f"rio_scheduler_materialization_jobs_created_total "
+            f"delta={created_delta} (expected ≥45; lazy mode shows "
+            f"~1-4). cache_check_failures Δ={ccf_delta}, "
+            f"topdown_prune Δ={prune_delta}"
+        )
+        chain_jobs = int(psql_k8s(
+            k3s_server,
+            "SELECT count(*) FROM materialization_jobs "
+            "WHERE origin = 'cache_opportunity' "
+            "AND drv_hash LIKE '%rio-subchain-%'",
+        ))
+        assert chain_jobs >= 49, (
+            f"expected >=49 cache_opportunity materialization jobs "
+            f"after the deep-chain merge, got {chain_jobs}"
+        )
+        # And the walk counter must NOT have moved (criterion 3):
+        assert spawned_delta == 0, (
+            f"deployment spawned walks during the deep-chain "
+            f"merge: {spawned_delta}"
+        )
+        print(
+            f"substitute-deep-chain: jobs_created Δ={created_delta} "
+            f"({chain_jobs} cache_opportunity rows) "
+            f"topdown_prune Δ={prune_delta} spawned Δ={spawned_delta} "
+            f"ccf Δ={ccf_delta} ✓"
+        )
 
         # ── (2) all 49 links entered Substituting ─────────────────────
         # The root is NOT substitutable (not seeded) so it will dispatch
