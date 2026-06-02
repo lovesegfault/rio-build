@@ -37,6 +37,14 @@ struct ShowDrv {
     /// Legacy flat spelling of the direct input sources.
     #[serde(default, rename = "inputSrcs")]
     input_srcs: Vec<String>,
+    /// The `__structuredAttrs` user-attr payload as nix ≥ 2.34 show
+    /// JSON emits it: lifted to a top-level object (the env then
+    /// carries only output placeholder keys, never the user attrs).
+    /// Older show output mirrors the raw derivation env instead, where
+    /// the same payload is the `env.__json` string —
+    /// [`structured_payload`] handles that fallback.
+    #[serde(default, rename = "structuredAttrs")]
+    structured_attrs: Option<serde_json::Value>,
 }
 
 /// The nested `inputs` object of a `nix derivation show` entry
@@ -72,17 +80,16 @@ fn normalize_store_path(p: &str) -> String {
 /// 1. `outputs.<name>.path` (input-addressed drvs; basenames normalized);
 /// 2. else `env.<name>` when it is a real `/nix/store/` path
 ///    (fixed-output drvs: nix 2.34's JSON puts hash/method in `outputs`
-///    and the real path only in the builder env);
+///    and the real path only in the builder env). `__structuredAttrs`
+///    derivations keep their per-output env keys — nix writes output
+///    placeholders into the env separately from the user attrs it
+///    serializes into the structured payload — so fixed-output paths
+///    recover the same way for both encodings (pinned by the
+///    structured-attrs fixture test);
 /// 3. else None — floating CA output.
 ///
-/// Known mis-fire: `__structuredAttrs` fixed-output drvs have no
-/// per-output `env` key, so their outputs degrade to `caOutputs` (and
-/// the target-level `requiredSystemFeatures` extraction returns None
-/// for structuredAttrs targets). Both degrade conservatively — an
-/// output is reported as not statically resolvable rather than
-/// resolved to a wrong path — and structuredAttrs derivations are rare
-/// in the Hydra jobsets this targets. The `/nix/store/` prefix check
-/// shares `normalize_store_path`'s standard-store-dir assumption.
+/// The `/nix/store/` prefix check shares `normalize_store_path`'s
+/// standard-store-dir assumption.
 fn output_path(drv: &ShowDrv, output_name: &str) -> Option<String> {
     if let Some(p) = drv.outputs.get(output_name).and_then(|o| o.path.as_deref()) {
         return Some(normalize_store_path(p));
@@ -90,6 +97,71 @@ fn output_path(drv: &ShowDrv, output_name: &str) -> Option<String> {
     match drv.env.get(output_name) {
         Some(serde_json::Value::String(s)) if s.starts_with("/nix/store/") => Some(s.clone()),
         _ => None,
+    }
+}
+
+/// The derivation's `__structuredAttrs` user-attr payload, if any:
+/// the top-level `structuredAttrs` object when the show format lifts
+/// it there (nix ≥ 2.34, format version 4), else parsed out of
+/// `env.__json` (older show output mirrors the raw derivation env,
+/// where `derivationStrict` serializes the user attrs into that one
+/// key — the same encoding the gateway's `StructuredEnv` reads from
+/// ATerm-derived envs). A malformed `__json` string yields `None`,
+/// matching the gateway's tolerance; the payload is machine-written
+/// by nix, so that arm is never expected to fire.
+///
+/// Returns an owned value only for the `__json` arm (one parse per
+/// derivation); the lifted form is borrowed.
+fn structured_payload(drv: &ShowDrv) -> Option<std::borrow::Cow<'_, serde_json::Value>> {
+    use std::borrow::Cow;
+    if let Some(value) = &drv.structured_attrs {
+        return Some(Cow::Borrowed(value));
+    }
+    drv.env
+        .get("__json")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .map(Cow::Owned)
+}
+
+/// Read a string-list derivation attr (`impureEnvVars`,
+/// `requiredSystemFeatures`) the way the gateway's `StructuredEnv`
+/// does — structured payload first, flat env key second — so the
+/// recorder can never silently disagree with the cluster about the
+/// same derivation:
+///
+/// - in the structured payload the attr is a JSON array of strings
+///   (non-string elements are skipped, like the gateway's reader);
+/// - in the flat env (non-structuredAttrs derivations) it is an
+///   ASCII-whitespace-separated name list.
+///
+/// A structured payload whose object lacks the attr falls through to
+/// the flat env, mirroring the gateway's `or_else` chain. Names are
+/// returned in declaration order; callers needing sorted/deduplicated
+/// forms post-process.
+fn string_list_attr(
+    structured: Option<&serde_json::Value>,
+    env: &BTreeMap<String, serde_json::Value>,
+    key: &str,
+) -> Vec<String> {
+    let from_structured = structured.and_then(|payload| {
+        Some(
+            payload
+                .get(key)?
+                .as_array()?
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<String>>(),
+        )
+    });
+    if let Some(names) = from_structured {
+        return names;
+    }
+    match env.get(key) {
+        Some(serde_json::Value::String(raw)) => {
+            raw.split_ascii_whitespace().map(String::from).collect()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -133,8 +205,10 @@ pub struct ClosureAdjacency {
     /// keyed by the derivation's full `/nix/store/` path.
     pub records: BTreeMap<String, ClosureRecord>,
     /// Derivation store path → the impure environment variable names it
-    /// declares via `env.impureEnvVars`, sorted and deduplicated. Only
-    /// derivations declaring at least one variable are present.
+    /// declares via `impureEnvVars` (read from the structured-attrs
+    /// payload or the flat env, see `string_list_attr`), sorted and
+    /// deduplicated. Only derivations declaring at least one variable
+    /// are present.
     pub impure_env: ImpureEnv,
     /// Derivation store path → its declared `requiredSystemFeatures`,
     /// in declaration order. Only derivations declaring at least one
@@ -201,26 +275,31 @@ pub fn closure_adjacency_from_show_json(show_json: &str) -> anyhow::Result<Closu
             },
         );
 
-        // env.impureEnvVars is an ASCII-whitespace-separated name list;
-        // store it sorted and deduplicated, and only when non-empty.
-        if let Some(serde_json::Value::String(raw)) = drv.env.get("impureEnvVars") {
-            let mut names: Vec<String> = raw.split_ascii_whitespace().map(String::from).collect();
-            names.sort();
-            names.dedup();
-            if !names.is_empty() {
-                adjacency.impure_env.insert(drv_path.clone(), names);
-            }
+        // impureEnvVars / requiredSystemFeatures are read structured-
+        // payload-first ([`string_list_attr`]): for `__structuredAttrs`
+        // derivations the flat env never carries them, so an env-only
+        // read would silently record no impure declarations (the unit
+        // is then built without its recorded impure env and charged as
+        // a false rio regression) and no required features (the
+        // plan-stage exclusion filter cannot fire while the gateway
+        // still extracts the real features at submit time).
+        let structured = structured_payload(drv);
+        let payload = structured.as_deref();
+        // impureEnvVars is stored sorted and deduplicated, and only
+        // when non-empty.
+        let mut names = string_list_attr(payload, &drv.env, "impureEnvVars");
+        names.sort();
+        names.dedup();
+        if !names.is_empty() {
+            adjacency.impure_env.insert(drv_path.clone(), names);
         }
-        // env.requiredSystemFeatures gets the same whitespace-split
-        // treatment but keeps declaration order (it backfills per-unit
-        // metadata, not an archive member of its own).
-        if let Some(serde_json::Value::String(raw)) = drv.env.get("requiredSystemFeatures") {
-            let features: Vec<String> = raw.split_ascii_whitespace().map(String::from).collect();
-            if !features.is_empty() {
-                adjacency
-                    .required_system_features
-                    .insert(drv_path.clone(), features);
-            }
+        // requiredSystemFeatures keeps declaration order (it backfills
+        // per-unit metadata, not an archive member of its own).
+        let features = string_list_attr(payload, &drv.env, "requiredSystemFeatures");
+        if !features.is_empty() {
+            adjacency
+                .required_system_features
+                .insert(drv_path.clone(), features);
         }
     }
     Ok(adjacency)
@@ -409,6 +488,114 @@ mod tests {
             vec!["/nix/store/cccccccccccccccccccccccccccccccc-dep-1.0.drv".to_string()]
         );
         assert!(adj.required_system_features.is_empty());
+    }
+
+    /// Two real records captured verbatim from a `nix derivation show
+    /// -r` run (nix 2.34.7, JSON format version 4) over a
+    /// `__structuredAttrs = true` closure: an input-addressed target
+    /// declaring `requiredSystemFeatures` and a fixed-output dependency
+    /// declaring `impureEnvVars`. In this format the user attrs live in
+    /// the top-level `structuredAttrs` object — the env carries only
+    /// output placeholder keys.
+    fn structured_attrs_fixture() -> String {
+        std::fs::read_to_string(
+            crate::test_manifest_dir().join("tests/fixtures/derivation-show/structured-attrs.json"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn structured_attrs_declarations_are_extracted() {
+        // The flat-env-only reader extracted nothing from either record
+        // (structuredAttrs derivations carry no flat user-attr env
+        // keys), so this fixture samples exactly the population the
+        // structured-first read exists for.
+        let adj = closure_adjacency_from_show_json(&structured_attrs_fixture()).unwrap();
+        assert_eq!(adj.records.len(), 2);
+        // impureEnvVars from the structured payload, sorted and
+        // deduplicated (declared order in the fixture: https_proxy,
+        // http_proxy, no_proxy).
+        let fod = "/nix/store/h37kzbmx226b0i2gb7bhcc668wwgxkgs-structured-fetch-1.0.drv";
+        assert_eq!(
+            adj.impure_env[fod],
+            vec![
+                "http_proxy".to_string(),
+                "https_proxy".to_string(),
+                "no_proxy".to_string()
+            ]
+        );
+        assert_eq!(adj.impure_env.len(), 1);
+        // requiredSystemFeatures from the structured payload, in
+        // declaration order.
+        let target = "/nix/store/2s7zynm430f86wwgv80pg59dpmhqc449-structured-vm-test.drv";
+        assert_eq!(
+            adj.required_system_features[target],
+            vec!["kvm".to_string(), "nixos-test".to_string()]
+        );
+        assert_eq!(adj.required_system_features.len(), 1);
+        // The structuredAttrs fixed-output drv still resolves its out
+        // path through the per-output env key: nix writes output
+        // placeholders into the env separately from the user attrs it
+        // serializes into the structured payload.
+        assert_eq!(
+            adj.records[fod].outputs["out"].as_deref(),
+            Some("/nix/store/rsrhap460vd96m7fwffigi23cprl38r2-structured-fetch-1.0")
+        );
+    }
+
+    #[test]
+    fn env_json_payload_is_read_when_structured_attrs_is_not_lifted() {
+        // Older `nix derivation show` mirrors the raw derivation env,
+        // where `__structuredAttrs` serializes the user attrs into
+        // `env.__json` only. Both `__json` strings here are verbatim
+        // raw-ATerm env values of the same two derivations the
+        // structured-attrs fixture records (read from the .drv files).
+        // The decoy flat `requiredSystemFeatures` key on the first
+        // entry can never co-occur with `__json` in real output; it
+        // pins the precedence order — the structured payload wins over
+        // the flat env, mirroring the gateway's `StructuredEnv`.
+        let show = serde_json::json!({
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-structured-vm-test.drv": {
+                "name": "structured-vm-test",
+                "outputs": {"out": {"path": "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-structured-vm-test"}},
+                "env": {
+                    "__json": "{\"builder\":\"/bin/sh\",\"fetched\":\"/nix/store/rsrhap460vd96m7fwffigi23cprl38r2-structured-fetch-1.0\",\"name\":\"structured-vm-test\",\"requiredSystemFeatures\":[\"kvm\",\"nixos-test\"],\"system\":\"x86_64-linux\"}",
+                    "out": "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-structured-vm-test",
+                    "requiredSystemFeatures": "decoy-flat-feature"
+                },
+                "inputDrvs": {
+                    "/nix/store/cccccccccccccccccccccccccccccccc-structured-fetch-1.0.drv": ["out"]
+                },
+                "inputSrcs": []
+            },
+            "/nix/store/cccccccccccccccccccccccccccccccc-structured-fetch-1.0.drv": {
+                "name": "structured-fetch-1.0",
+                "outputs": {"out": {"hash": "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=", "method": "flat"}},
+                "env": {
+                    "__json": "{\"builder\":\"/bin/sh\",\"impureEnvVars\":[\"https_proxy\",\"http_proxy\",\"no_proxy\"],\"name\":\"structured-fetch-1.0\",\"outputHash\":\"sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\",\"outputHashAlgo\":\"sha256\",\"outputHashMode\":\"flat\",\"system\":\"x86_64-linux\"}",
+                    "out": "/nix/store/dddddddddddddddddddddddddddddddd-structured-fetch-1.0"
+                },
+                "inputDrvs": {},
+                "inputSrcs": []
+            }
+        })
+        .to_string();
+        let adj = closure_adjacency_from_show_json(&show).unwrap();
+        assert_eq!(adj.records.len(), 2);
+        // The __json payload wins over the decoy flat key.
+        assert_eq!(
+            adj.required_system_features["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-structured-vm-test.drv"],
+            vec!["kvm".to_string(), "nixos-test".to_string()]
+        );
+        // impureEnvVars parsed out of __json, sorted and deduplicated.
+        assert_eq!(
+            adj.impure_env["/nix/store/cccccccccccccccccccccccccccccccc-structured-fetch-1.0.drv"],
+            vec![
+                "http_proxy".to_string(),
+                "https_proxy".to_string(),
+                "no_proxy".to_string()
+            ]
+        );
     }
 
     #[test]
