@@ -8,5 +8,5 @@ fn main() {
     // track_dir also emits the rerun-if-changed. Same treatment for
     // `.sqlx/` (`query!` in src/schema.rs). See rio-buildhash.
     rio_buildhash::track_dir("RIO_MIGRATIONS_HASH", std::path::Path::new("migrations"));
-    rio_buildhash::track_dir_upwards("RIO_SQLX_HASH", ".sqlx");
+    rio_buildhash::track_dir_upwards_or_env("RIO_SQLX_HASH", "SQLX_OFFLINE_DIR", ".sqlx");
 }

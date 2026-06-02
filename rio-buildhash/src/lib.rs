@@ -61,7 +61,14 @@ fn collect_files(dir: &Path) -> Vec<(String, PathBuf)> {
                     .strip_prefix(root)
                     .expect("walk stays under root")
                     .components()
-                    .map(|c| c.as_os_str().to_string_lossy())
+                    .map(|c| {
+                        c.as_os_str().to_str().unwrap_or_else(|| {
+                            panic!(
+                                "rio-buildhash: non-UTF-8 path component under {}",
+                                root.display()
+                            )
+                        })
+                    })
                     .collect::<Vec<_>>()
                     .join("/");
                 out.push((rel, path));
@@ -111,14 +118,9 @@ pub fn track_dir(env_name: &str, dir: &Path) {
 }
 
 /// Like [`track_dir`], but finds `dir_name` by walking up from
-/// `CARGO_MANIFEST_DIR` — the same discovery sqlx uses for `.sqlx/`, so it
-/// works in both plain-cargo layouts and sandboxed (crate2nix) source
-/// trees.
+/// `CARGO_MANIFEST_DIR` (plain cargo worktree layouts).
 pub fn track_dir_upwards(env_name: &str, dir_name: &str) {
-    let manifest_dir = PathBuf::from(
-        std::env::var_os("CARGO_MANIFEST_DIR")
-            .expect("rio-buildhash: CARGO_MANIFEST_DIR unset (not run from a build script?)"),
-    );
+    let manifest_dir = manifest_dir();
     let found = manifest_dir
         .ancestors()
         .map(|a| a.join(dir_name))
@@ -131,6 +133,53 @@ pub fn track_dir_upwards(env_name: &str, dir_name: &str) {
             )
         });
     track_dir(env_name, &found);
+}
+
+/// Like [`track_dir_upwards`], but mirrors sqlx-macros-core 0.9's own
+/// discovery chain so it works in every layout this repo builds in:
+///
+/// 1. `$<override_var>` as a real environment variable;
+/// 2. a `<override_var>=<path>` line in `$CARGO_MANIFEST_DIR/.env` —
+///    crate2nix's buildRustCrate sandbox provides `.sqlx` this way
+///    (see nix/crate2nix.nix `sqlxOffline`: per-crate sources have no
+///    workspace root above them, so a `.env` file points at a separate
+///    fileset store path);
+/// 3. walking up from `CARGO_MANIFEST_DIR` (plain cargo worktrees).
+pub fn track_dir_upwards_or_env(env_name: &str, override_var: &str, dir_name: &str) {
+    println!("cargo:rerun-if-env-changed={override_var}");
+    if let Some(dir) = std::env::var_os(override_var).map(PathBuf::from)
+        && dir.is_dir()
+    {
+        track_dir(env_name, &dir);
+        return;
+    }
+    let dotenv = manifest_dir().join(".env");
+    if let Ok(contents) = std::fs::read_to_string(&dotenv)
+        && let Some(dir) = dotenv_value(&contents, override_var)
+        && dir.is_dir()
+    {
+        track_dir(env_name, &dir);
+        return;
+    }
+    track_dir_upwards(env_name, dir_name);
+}
+
+/// First `VAR=value` line in dotenv-style `contents`, as a path.
+fn dotenv_value(contents: &str, var: &str) -> Option<PathBuf> {
+    let prefix = format!("{var}=");
+    contents
+        .lines()
+        .filter_map(|l| l.strip_prefix(&prefix))
+        .map(str::trim)
+        .find(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("rio-buildhash: CARGO_MANIFEST_DIR unset (not run from a build script?)"),
+    )
 }
 
 #[cfg(test)]
@@ -187,6 +236,20 @@ mod tests {
         let before = dir_hash(dir.path());
         fs::rename(dir.path().join("a.json"), dir.path().join("z.json")).unwrap();
         assert_ne!(before, dir_hash(dir.path()));
+    }
+
+    #[test]
+    fn dotenv_value_parses_first_match() {
+        let contents = "OTHER=x\nSQLX_OFFLINE_DIR=/nix/store/abc/.sqlx\nSQLX_OFFLINE_DIR=/dup\n";
+        assert_eq!(
+            super::dotenv_value(contents, "SQLX_OFFLINE_DIR"),
+            Some(std::path::PathBuf::from("/nix/store/abc/.sqlx"))
+        );
+        assert_eq!(super::dotenv_value(contents, "MISSING"), None);
+        assert_eq!(
+            super::dotenv_value("SQLX_OFFLINE_DIR=\n", "SQLX_OFFLINE_DIR"),
+            None
+        );
     }
 
     #[test]
