@@ -839,7 +839,7 @@ impl DagActor {
             debug!(build_id = %build_id, reaped = reap.reaped_paths.len(), "reaped orphaned terminal DAG nodes");
         }
 
-        // r[impl sched.merge.substitute-topdown+11]
+        // r[impl sched.merge.substitute-topdown+12]
         // Re-evaluate the surviving parents that just lost children to this
         // reap. The hook lives HERE (the terminal-build reap) and not in
         // `dag::remove_node` because the poison-TTL sweep and admin

@@ -812,7 +812,7 @@ async fn test_substitute_fetch_transient_retry() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Top-down short-circuit: when the root is substitutable, deps are
 /// pruned from the merge — only the root's NAR is fetched, build
 /// completes immediately.
@@ -894,7 +894,7 @@ async fn test_topdown_root_substitutable_prunes_deps() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Top-down negative: an `explicitly_requested` NON-root (a client
 /// target folded inside another target's closure by the gateway's
 /// multi-target dedup) whose wanted output is NOT available must block
@@ -973,7 +973,7 @@ async fn test_topdown_explicit_target_unavailable_blocks_prune() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Top-down positive: when every demanded node — structural roots AND
 /// `explicitly_requested` non-roots — is available upstream, the prune
 /// fires and keeps the whole demand set, not just the roots.
@@ -1070,7 +1070,7 @@ async fn test_topdown_explicit_target_substitutable_kept_in_prune() -> TestResul
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Top-down + deferred-fetch failure: when the prune commits and the
 /// detached `query_path_info` then fails, the build MUST fail with a
 /// resubmit-directing error — NOT dispatch the root as a build.
@@ -1168,7 +1168,7 @@ async fn test_topdown_pruned_root_substitute_fail_does_not_dispatch_build() -> T
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The roots-only prune's `topdown_pruned` stamp must survive a leader
 /// failover, so it is persisted: once a pruned merge commits, the kept
 /// (demanded) node's PG row carries `topdown_pruned = true`; a later
@@ -1289,7 +1289,7 @@ async fn test_topdown_pruned_persisted_to_pg_and_cleared_when_children_added() -
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// A kept (demanded) node whose existing DAG children are ALL already
 /// produced (Completed/Skipped) must NOT be stamped `topdown_pruned` —
 /// its dependency closure exists in the store, so a from-source
@@ -1382,7 +1382,7 @@ async fn test_topdown_stamp_skips_kept_node_whose_children_are_already_produced(
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// A kept (demanded) node whose existing DAG children are still UNBUILT
 /// must keep the `topdown_pruned` stamp. Those children can belong to a
 /// different build and be reaped unbuilt later (that build cancelled →
@@ -1470,7 +1470,7 @@ async fn test_topdown_stamp_kept_when_existing_children_unbuilt() -> TestResult 
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// `topdown_pruned` flag persistence bypass: B1 topdown-prunes R; while
 /// R's fetch is in-flight, B2 full-merges R WITH its deps. R is
 /// pre-existing `Substituting` so `dag.merge` doesn't reset it; the
@@ -1565,7 +1565,7 @@ async fn test_topdown_pruned_flag_ignored_after_full_merge_adds_deps() -> TestRe
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The reap hazard, end to end: B1's prune stamps childless R and parks
 /// its detached fetch; B2 full-merges app→R→dep, which previously
 /// cleared the stamp even though dep was UNBUILT; B2 is cancelled and
@@ -1733,7 +1733,7 @@ async fn test_topdown_pruned_kept_when_merge_adds_unbuilt_children_then_reaped()
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The reap hazard with the ORDERING REVERSED: the walk verdict arrives
 /// while another build's unbuilt children are still attached, and only
 /// then are those children reaped. B1's prune stamps childless R and
@@ -1906,7 +1906,7 @@ async fn test_topdown_pruned_root_fail_fast_when_children_reaped_after_failed_wa
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Companion to the test above with the children PRODUCED (not reaped
 /// unbuilt) before the terminal-build reap: the surviving root must NOT
 /// be fail-fasted and the surviving build must not hang.
@@ -2278,7 +2278,7 @@ async fn test_topdown_pruned_survivor_not_fail_fasted_when_cleanup_drains_on_ex_
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The reap-time fail-fast must defer to a substitution walk that is IN
 /// FLIGHT at cleanup time, even when `substitute_tried` is already set.
 /// The one-shot bit is sticky: after R's first walk failed (suppressed —
@@ -2479,7 +2479,7 @@ async fn test_topdown_pruned_root_not_failed_at_reap_while_respawned_walk_in_fli
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The MIXED-children reap shape, ordering A (verdict before the reap):
 /// B1's prune stamps R and parks its detached fetch; BC produces a
 /// second child dep2 (cache-hit at merge) and its interest keeps dep2
@@ -2679,7 +2679,7 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The mixed-children reap shape with the ORDERING REVERSED: B2's
 /// unbuilt dep1 is reaped while R's walk is still in flight (the reap
 /// hook rightly defers to the walk — that skip is pinned by the
@@ -2909,7 +2909,7 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Negative companion to the two mixed-shape tests above: the reap
 /// removes only PRODUCED children (dep1, completed via a cache hit and
 /// orphaned when B2 goes away) while an UNBUILT child (dep2, kept by
@@ -3100,7 +3100,7 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The `topdown_pruned` STAMP must treat a closure-holed kept node like
 /// a childless one. Staging: BC full-merges R → D (D's output already
 /// present upstream, so it cache-hits to Completed) and keeps both
@@ -3278,7 +3278,7 @@ async fn test_topdown_stamp_fires_for_closure_holed_node_with_produced_survivors
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The dispatch-time guards must treat a marked closure-holed survivor
 /// like a childless one (bughunter round-20 merged_bug_001). Staging
 /// follows that report's proof: B1's prune (wanting only R's `out`,
@@ -3524,7 +3524,7 @@ async fn test_topdown_pruned_holed_survivor_fails_fast_at_dispatch_not_assigned_
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Guard companion: a closure hole alone — no `topdown_pruned` mark —
 /// must not defer or fail-fast anything at dispatch time. Same staging
 /// as the stamp test above (B2 — the build that declares E — CREATES R
@@ -3848,7 +3848,7 @@ async fn test_gate_skipped_edge_does_not_heal_closure_hole() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The closure-hole VETO on the produced-children clears, and the HEAL
 /// that lifts it. Staging: B1's prune stamps R and parks its detached
 /// fetch on the QPI gate; B3 (a live single-node build) holds the
@@ -4185,7 +4185,7 @@ async fn test_topdown_pruned_kept_after_closure_hole_until_full_remerge_heals() 
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The closure-hole breadcrumb must survive the node's own Completed →
 /// stale-reset round-trip (bughunter round-21 bug_007). Staging: B1's
 /// prune stamps R and parks its detached fetch; BC produces dep2; B2
@@ -4481,7 +4481,7 @@ async fn test_closure_hole_survives_completion_and_stale_completed_reset() -> Te
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The closure-hole breadcrumb must be carried across the merge-time
 /// resubmit-reset (bughunter round-22 bug_006). Staging: B1's prune
 /// stamps R and parks its detached fetch; BC produces dep2; B2
@@ -4787,7 +4787,7 @@ async fn test_resubmit_reset_carries_closure_hole_and_restamps_topdown_pruned() 
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The topdown fail-fast must consume the MARK only and retain the
 /// closure-hole breadcrumb, so the directed resubmit it solicits stays
 /// protected (bughunter round-23 bug_006). Staging: B1's prune stamps R
@@ -5088,7 +5088,7 @@ async fn test_fail_fast_keeps_closure_hole_so_directed_resubmit_restamps() -> Te
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Both poison-removal paths — admin `ClearPoison` and the poison-TTL
 /// sweep — must stamp the closure-hole breadcrumb on surviving parents
 /// when they remove a Poisoned (by definition un-produced) child,
@@ -5372,7 +5372,7 @@ async fn test_poison_clear_paths_stamp_closure_hole_on_surviving_parent(
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The merge-time heal must clear the PERSISTED closure-hole breadcrumb
 /// for every edge parent it re-declares, even when the in-memory copy
 /// of the breadcrumb is GONE (bughunter round-21 merged_bug_001;
@@ -5627,7 +5627,7 @@ async fn test_full_remerge_heals_persisted_closure_hole_after_node_completion() 
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The lazy clear in `handle_substitute_complete`: when a pruned root's
 /// children are ALL produced by the time its own walk fails, the mark is
 /// moot — cleared in memory AND in PG (best-effort, so a failover cannot
@@ -5708,7 +5708,7 @@ async fn test_topdown_pruned_lazy_clear_when_children_produced_at_walk_failure()
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The clear decision must be taken AFTER `verify_preexisting_completed`
 /// (phase 6c) has had its say: a merge that re-adds the edge R → C while
 /// C is `Completed` in the DAG but C's recorded output is gone from the
@@ -5814,7 +5814,7 @@ async fn test_topdown_pruned_kept_when_merge_child_is_stale_completed() -> TestR
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// A prune-led merge that fails at the PG-persist step (step 5) must
 /// not leave `topdown_pruned=true` on a pre-existing childless root
 /// shared with an unrelated live build. `cleanup_failed_merge` →
@@ -5962,7 +5962,7 @@ async fn test_topdown_stamp_not_leaked_when_merge_fails_at_persist() -> TestResu
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The `topdown_pruned` marker must land only on kept nodes whose
 /// dependency closure the prune actually dropped. A dep-less demanded
 /// leaf (here: one target of a multi-target submission with no
@@ -6042,7 +6042,7 @@ async fn test_topdown_stamp_only_nodes_whose_closure_was_dropped() -> TestResult
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// A pruned merge whose build-activation write fails must reject the
 /// build AND leave nothing of the merge behind in PG — in particular no
 /// `topdown_pruned = true` on a shared pre-existing childless root.
@@ -6210,7 +6210,7 @@ async fn test_topdown_stamp_rolled_back_when_activation_fails() -> TestResult {
 }
 
 // r[verify sched.merge.edge-creation-scoped]
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Production-order variant of the topdown-pruned dependency top-up: B1's
 /// topdown prune leaves R resident (Substituting, `topdown_pruned`,
 /// no children) and B2's later full merge attaches R→glibc WITHOUT
@@ -6295,7 +6295,7 @@ async fn test_topdown_pruned_root_dep_topup_production_order() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Top-down negative: root NOT substitutable → fall through to
 /// full bottom-up check. All nodes merged, deps processed normally.
 #[tokio::test]
@@ -6405,7 +6405,7 @@ async fn test_topdown_unresolvable_wanted_set_falls_through() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 // r[verify sched.merge.wanted-outputs+2]
 /// Top-down negative: a PRE-EXISTING root shared with a live build whose
 /// effective wanted set is NOT satisfiable must refuse the prune, even
@@ -6520,7 +6520,7 @@ async fn test_topdown_prune_gated_on_live_effective_wanted_of_preexisting_root()
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Top-down positive companion: a PRE-EXISTING root whose live
 /// effective wanted set IS satisfiable keeps the prune. Same shape as
 /// the negative test above, but build A wants only `out` too — the
@@ -6604,7 +6604,7 @@ async fn test_topdown_prune_fires_when_preexisting_roots_live_wanted_satisfiable
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 // r[verify sched.merge.wanted-outputs+2]
 /// Top-down negative: the submission's OWN root selector resolving to
 /// no declared output (`drv^bogus`) blocks the prune even when the
@@ -6804,7 +6804,7 @@ async fn test_cache_hit_gates_on_inputdrv_completion() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Top-down: deps pruned from this build are NOT in the global DAG,
 /// so a later build that needs them triggers its own cache-check.
 ///
@@ -11562,5 +11562,179 @@ async fn test_strip_case_remediation_is_executable() -> TestResult {
         .fetch_one(&db.pool)
         .await?;
     assert_eq!(pname, "evi-strip");
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+12]
+// r[verify sched.merge.heal-accepted-edges+1]
+/// THE childless kill (round-15 C6c3, merged_bug_073 aggravator): a
+/// pruned root is born holed with the children its prune dropped, so a
+/// single junk child completing can no longer flip its closure
+/// evidence to Vouched and clear the mark — pre-C6c3 that channel
+/// dispatched the root from source into a guaranteed ENOENT.
+#[tokio::test]
+async fn test_pruned_root_junk_child_completion_does_not_vouch() -> TestResult {
+    let root_out = test_store_path("bhk-root-out");
+    let dep_out = test_store_path("bhk-dep-out");
+    let junk_out = test_store_path("bhk-junk-out");
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    {
+        let mut sub = store.state.substitutable.write().unwrap();
+        sub.push(root_out.clone());
+        sub.push(dep_out.clone());
+    }
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _actor_task) = setup_actor_with_store(db.pool.clone(), Some(store_client));
+
+    // The prune fires: root→dep, both substitutable; root is kept,
+    // born holed with witness {bhk-dep}.
+    let b1 = Uuid::new_v4();
+    let mut root = make_node("bhk-root");
+    root.expected_output_paths = vec![root_out.clone()];
+    let mut dep = make_node("bhk-dep");
+    dep.expected_output_paths = vec![dep_out.clone()];
+    merge_dag(
+        &handle,
+        b1,
+        vec![root, dep],
+        vec![make_test_edge("bhk-root", "bhk-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    let d = expect_drv(&handle, "bhk-root").await;
+    assert!(d.topdown_pruned, "fixture premise: the prune fired");
+    assert!(d.closure_hole, "born holed: the prune dropped the closure");
+    assert_eq!(
+        d.closure_missing_count, 1,
+        "witness records the dropped dep"
+    );
+    let (pg_hole,): (bool,) =
+        sqlx::query_as("SELECT closure_hole FROM derivations WHERE drv_hash = 'bhk-root'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(pg_hole, "born-holed flag rides the merge transaction");
+    let (rows,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM derivation_closure_missing WHERE drv_hash = 'bhk-root'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(rows, 1, "witness rows ride the same transaction");
+
+    // A second build attaches ONE junk child through the pruned-root
+    // carve-out and that child completes via the store-hit lane.
+    store.seed_with_content(&junk_out, b"junk");
+    let b2 = Uuid::new_v4();
+    let mut junk = make_node("bhk-junk");
+    junk.expected_output_paths = vec![junk_out.clone()];
+    merge_dag(
+        &handle,
+        b2,
+        vec![make_node("bhk-root"), junk],
+        vec![make_test_edge("bhk-root", "bhk-junk")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert!(
+        matches!(
+            expect_drv(&handle, "bhk-junk").await.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "fixture premise: the junk child is produced"
+    );
+    let d = expect_drv(&handle, "bhk-root").await;
+    assert!(
+        d.closure_hole && d.closure_missing_count == 1,
+        "the junk child does not cover the witness: still holed"
+    );
+    assert!(
+        d.topdown_pruned,
+        "one produced junk child must NOT vouch a born-holed pruned root \
+         (the pre-C6c3 junk-Vouched channel)"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+12]
+/// The legitimate full top-up of a born-holed pruned root heals the
+/// hole AT MERGE (witness covered by the re-supplied closure) — no
+/// fail-fast bounce, no resubmit detour.
+#[tokio::test]
+async fn test_pruned_root_full_topup_heals_born_hole() -> TestResult {
+    let root_out = test_store_path("bht-root-out");
+    let dep_out = test_store_path("bht-dep-out");
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    {
+        let mut sub = store.state.substitutable.write().unwrap();
+        sub.push(root_out.clone());
+        sub.push(dep_out.clone());
+    }
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _actor_task) = setup_actor_with_store(db.pool.clone(), Some(store_client));
+
+    // Park the detached fetch on the QPI gate so the pruned root stays
+    // Substituting (the mock store would otherwise complete it
+    // instantly and moot the heal).
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let b1 = Uuid::new_v4();
+    let mut root = make_node("bht-root");
+    root.expected_output_paths = vec![root_out.clone()];
+    let mut dep = make_node("bht-dep");
+    dep.expected_output_paths = vec![dep_out.clone()];
+    merge_dag(
+        &handle,
+        b1,
+        vec![root.clone(), dep.clone()],
+        vec![make_test_edge("bht-root", "bht-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "bht-root").await.closure_missing_count,
+        1,
+        "fixture premise: born holed"
+    );
+
+    // A non-prunable full re-merge (dep's output now missing upstream →
+    // the all-or-nothing prune cannot fire) re-supplies the dropped
+    // child: coverage met, hole healed at merge.
+    {
+        let mut sub = store.state.substitutable.write().unwrap();
+        sub.retain(|p| p != &dep_out && p != &root_out);
+    }
+    let b2 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b2,
+        vec![root, dep],
+        vec![make_test_edge("bht-root", "bht-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    let d = expect_drv(&handle, "bht-root").await;
+    assert!(
+        !d.closure_hole && d.closure_missing_count == 0,
+        "the covering top-up heals the born hole at merge"
+    );
+    let (pg_hole,): (bool,) =
+        sqlx::query_as("SELECT closure_hole FROM derivations WHERE drv_hash = 'bht-root'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(!pg_hole, "the heal reaches PG");
+    let (rows,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM derivation_closure_missing WHERE drv_hash = 'bht-root'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(rows, 0, "witness rows deleted with the heal");
     Ok(())
 }

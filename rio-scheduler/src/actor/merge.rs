@@ -3,7 +3,7 @@
 // r[impl sched.merge.shared-priority-max]
 // r[impl sched.merge.toctou-serial]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use tracing::{debug, error, info, instrument, warn};
@@ -851,7 +851,7 @@ impl DagActor {
         // (total, completed, cached) to PG so list_builds is O(LIMIT).
         self.update_build_counts(build_id).await;
 
-        // r[impl sched.merge.substitute-topdown+11]
+        // r[impl sched.merge.substitute-topdown+12]
         // Post-reconciliation `topdown_pruned` clear pass. A node may
         // only lose the mark once its children (in the post-merge DAG)
         // are all already produced — its closure is then in the store,
@@ -1115,7 +1115,7 @@ impl DagActor {
         }
 
         // === Step 0: Top-down demand-set substitution check =========
-        // r[impl sched.merge.substitute-topdown+11]
+        // r[impl sched.merge.substitute-topdown+12]
         // Before merging the full DAG, check if the DEMANDED
         // derivations' outputs are already available. The demand set is
         // the structural roots ∪ every node the gateway marked
@@ -1175,14 +1175,32 @@ impl DagActor {
                     .iter()
                     .map(|n| (n.drv_path.as_str(), n.drv_hash.as_str()))
                     .collect();
-                let parents: HashSet<String> = edges
-                    .iter()
-                    .filter_map(|e| path_to_hash.get(e.parent_drv_path.as_str()))
-                    .map(|h| (*h).to_string())
-                    .collect();
+                // Parent → the children whose edges this prune DROPS:
+                // the born-holed witness set (round-15 C6c3). The
+                // original edge list is only in scope here, so this is
+                // the one place the witness can be recorded — a pruned
+                // root is born holed and stays Broken until a full
+                // top-up positively covers exactly this set
+                // (sched.merge.heal-accepted-edges+1). Children whose
+                // path does not resolve in the submission never were
+                // attachable; skipping them cannot under-record the
+                // closure the prune dropped.
+                let mut parents: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                for e in &edges {
+                    let (Some(p), Some(c)) = (
+                        path_to_hash.get(e.parent_drv_path.as_str()),
+                        path_to_hash.get(e.child_drv_path.as_str()),
+                    ) else {
+                        continue;
+                    };
+                    parents
+                        .entry((*p).to_string())
+                        .or_default()
+                        .push((*c).to_string());
+                }
                 (demanded, Vec::new(), true, parents)
             }
-            None => (nodes, edges, false, HashSet::new()),
+            None => (nodes, edges, false, BTreeMap::new()),
         };
         phase!("0-topdown-roots");
 
@@ -1588,7 +1606,7 @@ impl DagActor {
         phase!("5-persist-and-activate");
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
-        // r[impl sched.merge.substitute-topdown+11]
+        // r[impl sched.merge.substitute-topdown+12]
         // Stamp topdown_pruned on the kept (demanded) nodes only now
         // that the merge is committed (steps 4–5 can no longer fail).
         // The stamp is a cross-build-visible mutation of possibly
@@ -1623,11 +1641,22 @@ impl DagActor {
         // trade. Mirrors the row-level bind in persist_merge_to_db.
         if topdown_fired {
             for n in &nodes {
-                if pruned_closure_parents.contains(n.drv_hash.as_str())
+                if let Some(dropped) = pruned_closure_parents.get(n.drv_hash.as_str())
                     && !self.closure_vouched(&n.drv_hash)
                     && let Some(s) = self.dag.node_mut(&n.drv_hash)
                 {
                     s.topdown_pruned = true;
+                    // Born holed (round-15 C6c3): the prune dropped
+                    // this node's declared closure, so its child set
+                    // under-represents it FROM BIRTH. Recording the
+                    // dropped children closes the childless
+                    // junk-Vouched channel — one junk child completing
+                    // can no longer flip closure evidence to Vouched,
+                    // because the witness set demands the real closure
+                    // back (the vouch-gated mark clear structurally
+                    // cannot fire while holed).
+                    s.closure_hole
+                        .stamp(dropped.iter().cloned().map(Into::into));
                 }
             }
         }
@@ -1681,7 +1710,7 @@ impl DagActor {
         build_id: Uuid,
         nodes: &[crate::domain::DerivationNode],
         merge_result: &crate::dag::MergeResult,
-        topdown_pruned_parents: &HashSet<String>,
+        topdown_pruned_parents: &BTreeMap<String, Vec<String>>,
         settled_evidence_displaced: &[String],
     ) -> Result<(), ActorError> {
         self.persist_merge_to_db(
@@ -2965,7 +2994,7 @@ impl DagActor {
         self.dag.closure_evidence(drv_hash) == ClosureEvidence::Vouched
     }
 
-    // r[impl sched.merge.substitute-topdown+11]
+    // r[impl sched.merge.substitute-topdown+12]
     /// True when `drv_hash` carries the `topdown_pruned` mark AND its
     /// closure evidence is [`ClosureEvidence::Broken`] (childless or
     /// closure-holed): its dependency closure was dropped from the
@@ -3067,7 +3096,7 @@ impl DagActor {
         build_id: Uuid,
         nodes: &[crate::domain::DerivationNode],
         merge_result: &crate::dag::MergeResult,
-        topdown_pruned_parents: &HashSet<String>,
+        topdown_pruned_parents: &BTreeMap<String, Vec<String>>,
         settled_evidence_displaced: &[String],
     ) -> Result<(), ActorError> {
         let newly_inserted = &merge_result.newly_inserted;
@@ -3123,21 +3152,22 @@ impl DagActor {
                     // gate in validate_and_ingest. OR-on-conflict
                     // upsert: a later non-pruned merge of the same drv
                     // (false here) never clears it.
-                    topdown_pruned: topdown_pruned_parents.contains(node.drv_hash.as_str())
+                    topdown_pruned: topdown_pruned_parents.contains_key(node.drv_hash.as_str())
                         && !self.closure_vouched(&node.drv_hash),
-                    // Always false: a merge never creates a closure hole
-                    // (holes are stamped in PG via
-                    // `set_closure_holes` by the leader's reap
-                    // hook, the recovery-time stamp in
-                    // `load_dag_from_rows`, and the poison-clear paths —
-                    // admin ClearPoison and the poison-TTL sweep), and
-                    // binding the in-memory value here would turn the
-                    // upsert into a second stamping site. The
-                    // OR-on-conflict SET keeps any existing persisted
-                    // hole; the merge-side clears are the explicit heal
-                    // in `handle_merge_dag` and the both-bits batched
-                    // mark clear it runs for Vouched parents.
-                    closure_hole: false,
+                    // A pruned merge is a STAMPING site for the parents
+                    // whose declared closure it drops (round-15 C6c3:
+                    // born holed; the witness rows ride this same
+                    // transaction via insert_closure_missing_tx). For
+                    // every other row this stays false — non-pruned
+                    // merges never create holes (those are stamped via
+                    // `set_closure_holes` by the reap hook, the
+                    // recovery-time stamp, and the poison-clear paths),
+                    // and the OR-on-conflict SET keeps any existing
+                    // persisted hole. The merge-side clears are the
+                    // witnessed heal in `handle_merge_dag` and the
+                    // both-bits batched mark clear for Vouched parents.
+                    closure_hole: topdown_pruned_parents.contains_key(node.drv_hash.as_str())
+                        && !self.closure_vouched(&node.drv_hash),
                     // r[impl sched.recovery.inline-drv-durability+3]
                     // Persist the authoritative inline derivation
                     // (content-bound hook fallback: these bytes are
@@ -3198,13 +3228,24 @@ impl DagActor {
         // parents of the ORIGINAL submission's edges, minus nodes whose
         // existing children the closure classifier vouches for.
         let joined_stamped: Vec<String> = topdown_pruned_parents
-            .iter()
+            .keys()
             .filter(|h| !newly_inserted.contains(h.as_str()))
             .filter(|h| !self.closure_vouched(h.as_str()))
             .cloned()
             .collect();
         if !joined_stamped.is_empty() {
             crate::db::SchedulerDb::stamp_topdown_pruned_tx(&mut tx, &joined_stamped).await?;
+        }
+        // Born-holed witness rows (069) for EVERY stamped pruned parent
+        // — joined and newly-inserted alike — in the SAME transaction
+        // as the flag/row bind (the flag ⇔ side-rows invariant).
+        let stamped_witness: Vec<(String, Vec<String>)> = topdown_pruned_parents
+            .iter()
+            .filter(|(h, _)| !self.closure_vouched(h.as_str()))
+            .map(|(h, cs)| (h.clone(), cs.clone()))
+            .collect();
+        if !stamped_witness.is_empty() {
+            crate::db::SchedulerDb::insert_closure_missing_tx(&mut tx, &stamped_witness).await?;
         }
 
         // Batch 2: link ALL submitted nodes to this build — newly-created
@@ -4020,7 +4061,7 @@ impl DagActor {
         Ok(Some(resp))
     }
 
-    // r[impl sched.merge.substitute-topdown+11]
+    // r[impl sched.merge.substitute-topdown+12]
     /// Top-down demand-set substitution pre-check (step 0 of
     /// `handle_merge_dag`).
     ///

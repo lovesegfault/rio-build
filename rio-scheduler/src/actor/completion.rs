@@ -226,7 +226,7 @@ impl DagActor {
             .await;
     }
 
-    // r[impl sched.merge.substitute-topdown+11]
+    // r[impl sched.merge.substitute-topdown+12]
     /// Completion-time `topdown_pruned` clear: walk the (deduped) DAG
     /// parents of every hash in `completed` and drop the mark from any
     /// flagged parent whose closure is now vouched for
@@ -2426,7 +2426,7 @@ impl DagActor {
         // `builds.error_summary` above, before the row reset erased the
         // only other durable trace of the failure.
         //
-        // r[impl sched.merge.substitute-topdown+11]
+        // r[impl sched.merge.substitute-topdown+12]
         // Capture the parents BEFORE `remove_node` scrubs the edge maps:
         // a Poisoned child is by definition un-produced, so removing it
         // truncates each surviving parent's child set relative to the

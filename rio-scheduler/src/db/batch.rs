@@ -594,6 +594,37 @@ impl SchedulerDb {
     /// existing children the closure classifier vouches for). Clearing is
     /// unchanged (`clear_topdown_pruned_by_hashes` and friends).
     /// Plain runtime query — no `.sqlx/` impact.
+    /// In-transaction 069 witness-row insert for born-holed pruned
+    /// parents (round-15 C6c3): rides the merge transaction with the
+    /// row bind / `stamp_topdown_pruned_tx`, so the flag ⇔ side-rows
+    /// invariant holds for the prune stamping site exactly as it does
+    /// for `set_closure_holes`. ON CONFLICT DO NOTHING — a re-pruned
+    /// parent appends only new children. Plain runtime query.
+    pub(crate) async fn insert_closure_missing_tx(
+        tx: &mut PgConnection,
+        holes: &[(String, Vec<String>)],
+    ) -> Result<(), sqlx::Error> {
+        let (parents, children): (Vec<String>, Vec<String>) = holes
+            .iter()
+            .flat_map(|(p, cs)| cs.iter().map(move |c| (p.clone(), c.clone())))
+            .unzip();
+        if parents.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO derivation_closure_missing (drv_hash, missing_child)
+            SELECT * FROM UNNEST($1::text[], $2::text[])
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(&parents)
+        .bind(&children)
+        .execute(&mut *tx)
+        .await?;
+        Ok(())
+    }
+
     pub(crate) async fn stamp_topdown_pruned_tx(
         tx: &mut PgConnection,
         drv_hashes: &[String],
