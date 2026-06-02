@@ -1103,22 +1103,20 @@ pub struct DerivationState {
     pub wanted_output_names: Vec<String>,
     /// Per-build wanted-output contributions: for each interested build,
     /// the `wanted_output_names` of THAT build's submission for this
-    /// node (the per-submission sets that [`Self::wanted_output_names`]
-    /// unions together). An entry whose value is the EMPTY Vec means
-    /// that build wants ALL declared outputs (same sentinel as the
-    /// union). A MISSING entry for an interested build means its
-    /// contribution is UNKNOWN — recovery rebuilds `interested_builds`
-    /// from `build_derivations`, which carries no per-build wanted data
-    /// — and [`effective_wanted`] must then fall back to the stored
-    /// node-level union instead of guessing.
+    /// node. An entry whose value is the EMPTY Vec means that build
+    /// wants ALL declared outputs (same sentinel as the union). A
+    /// MISSING entry for an interested build means its contribution is
+    /// UNKNOWN — [`effective_wanted`]'s conservative-absent arm then
+    /// saturates the union to all-declared width (T-D2.3/PD-D5).
     ///
-    /// Entries follow `interested_builds` membership exactly: recorded
-    /// where interest is recorded (`dag.merge`'s existing-node and
-    /// new-node paths, plus the resubmit-reset carry-over), removed
+    /// **A droppable cache of `build_wanted_outputs`** (the durable
+    /// relation): rebuilt from it at recovery
+    /// (`load_wanted_for_live_builds`), never reconciled, never written
+    /// back. Entries follow `interested_builds` membership exactly:
+    /// recorded where interest is recorded (`dag.merge`'s existing-node
+    /// and new-node paths, plus the resubmit-reset carry-over), removed
     /// where interest is removed (`rollback_merge`,
     /// `remove_build_interest`, `remove_build_interest_and_reap`).
-    /// In-memory only — never persisted, so the map starts empty after
-    /// leader failover.
     pub wanted_by_build: HashMap<Uuid, Vec<String>>,
     /// Database UUID (set after insertion).
     pub db_id: Option<Uuid>,
@@ -2032,21 +2030,24 @@ pub use rio_common::wanted_outputs::{
 /// counts as terminal (terminal cleanup removes the `BuildInfo` and the
 /// DAG interest in the same handler).
 ///
-/// Returns `None` when the caller MUST fall back to the stored
-/// node-level union ([`DerivationState::wanted_output_names`]):
-/// - the node has zero live interested builds (all terminal, missing
-///   from `builds`, or an empty interest set — recovered orphans), or
-/// - any live interested build's contribution is unknown (no
-///   `wanted_by_build` entry — post-failover, where recovery rebuilds
-///   interest from `build_derivations` but contributions are not
-///   persisted). A partial union would silently under-count that
-///   build's wants, so the conservative union wins instead.
+/// **The conservative-absent arm (T-D2.3/PD-D5, DQ-2):** a live
+/// interested build with NO `wanted_by_build` entry (the legacy shape:
+/// a build whose contributions predate `build_wanted_outputs`, or whose
+/// rows were purged) contributes `{}` — ALL declared outputs — which
+/// SATURATES the union to maximal width. Never the stored union, never
+/// a vacuous narrow set; divergence from the exact union is strictly in
+/// the widening direction. The degradation is observable:
+/// [`note_wanted_width_saturated`] (counter + rate-limited warn).
 ///
-/// `Some(vec![])` means "ALL declared outputs wanted": at least one live
-/// build contributed the empty all-wanted sentinel, which saturates the
-/// union (same algebra as [`union_wanted_saturating`]). Note the
-/// asymmetry with `None`: the empty Vec is an explicit per-build
-/// contribution, never a fallback value.
+/// Returns `None` only when the node has zero live interested builds
+/// (all terminal, missing from `builds`, or an empty interest set —
+/// recovered orphans): callers treat that as all-declared too (the
+/// conservative branch).
+///
+/// `Some(vec![])` means "ALL declared outputs wanted": a live build
+/// contributed the empty all-wanted sentinel (or the conservative
+/// arm fired), which saturates the union (same algebra as
+/// [`union_wanted_saturating`]).
 ///
 /// Free function (not a `DerivationState` method) because liveness needs
 /// the actor's `builds` map, which the node cannot see; it lives here
@@ -2069,15 +2070,47 @@ pub fn effective_wanted(
         if !live {
             continue;
         }
-        // A live interested build with an unknown contribution: a partial
-        // union would under-count its wants — bail to the stored union.
-        let contribution = state.wanted_by_build.get(build_id)?;
+        // The conservative-absent arm: a live interested build with an
+        // unknown contribution saturates the union to all-declared
+        // (MAXIMAL width — never under-counted, never the stored
+        // union). Observable via counter + rate-limited warn.
+        let Some(contribution) = state.wanted_by_build.get(build_id) else {
+            note_wanted_width_saturated(build_id);
+            return Some(Vec::new());
+        };
         match &mut effective {
             None => effective = Some(contribution.clone()),
             Some(acc) => union_wanted_saturating(acc, contribution),
         }
     }
     effective
+}
+
+/// DQ-2 observability: the conservative-absent arm fired — a live
+/// build's wanted contributions are unknown and the effective width
+/// degraded to all-declared. Counter always; warn rate-limited (the
+/// arm can fire per classification pass).
+pub fn note_wanted_width_saturated(build_id: &Uuid) {
+    metrics::counter!("rio_scheduler_wanted_width_saturated_total").increment(1);
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST_WARN_EPOCH: AtomicI64 = AtomicI64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let last = LAST_WARN_EPOCH.load(Ordering::Relaxed);
+    if now - last >= 10
+        && LAST_WARN_EPOCH
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::warn!(
+            build_id = %build_id,
+            "wanted contributions unknown for live build; degrading to \
+             all-declared width (rate-limited; see \
+             rio_scheduler_wanted_width_saturated_total)"
+        );
+    }
 }
 
 /// Poison detection config. Replaces the former `POISON_THRESHOLD` const.
@@ -2341,24 +2374,28 @@ mod tests {
             "a terminal build's all-wanted contribution must stop counting"
         );
 
-        // 4. A live build whose contribution is unknown → None (fallback),
-        //    even though another live build's contribution is known.
+        // 4. A live build whose contribution is unknown SATURATES the
+        //    union to all-declared (the conservative-absent arm,
+        //    T-D2.3/PD-D5/DQ-2 — maximal width, never the stored
+        //    union), even though another live build's contribution is
+        //    known.
         s.interested_builds = [live_out, live_unknown].into();
         s.wanted_by_build = [(live_out, vec!["out".to_string()])].into();
         assert_eq!(
             effective_wanted(&s, &builds),
-            None,
-            "an unknown contribution of a live build forces the stored-union fallback"
+            Some(vec![]),
+            "an unknown contribution of a live build saturates to all-declared"
         );
 
-        // 5. Zero live interested builds → None.
+        // 5. Zero live interested builds → None (callers treat as
+        //    all-declared — the conservative branch).
         // 5a. Only a terminal build is interested.
         s.interested_builds = [done].into();
         s.wanted_by_build = [(done, vec!["out".to_string()])].into();
         assert_eq!(
             effective_wanted(&s, &builds),
             None,
-            "no live interested builds → fallback to the stored union"
+            "no live interested builds → None (callers degrade to all-declared)"
         );
         // 5b. The interested build has no BuildInfo at all (terminal
         //     cleanup already removed it) — treated as terminal.

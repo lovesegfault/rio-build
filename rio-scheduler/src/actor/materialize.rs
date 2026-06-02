@@ -254,21 +254,19 @@ impl DagActor {
         build_id: Uuid,
         drv_hash: &DrvHash,
     ) {
-        let Some((db_id, wanted)) = self
-            .dag
-            .node(drv_hash)
-            .and_then(|s| s.db_id.map(|id| (id, s.wanted_output_names.clone())))
-        else {
+        let Some(db_id) = self.dag.node(drv_hash).and_then(|s| s.db_id) else {
             return;
         };
-        let rows = [crate::db::wanted::WantedRow {
-            build_id,
-            derivation_id: db_id,
-            wanted_output_names: &wanted,
-        }];
+        // The backfill row is the SATURATING '{}' (all-declared) row —
+        // matching the model's backfill encoding (materializationJob.qnt
+        // puts OUTPUTS): a legacy build's true narrow wants are unknown
+        // here, and the relation must never under-state interest width
+        // (T-D2.3 step 5; widening-only divergence). GAP-FILLING ONLY
+        // (ON CONFLICT DO NOTHING): a build that merged flag-on already
+        // has its EXACT row and the backfill must never widen it.
         match self
             .db
-            .record_wanted_fenced(self.serving_generation(), &rows)
+            .backfill_wanted_fenced(self.serving_generation(), build_id, db_id)
             .await
         {
             Ok(crate::db::FencedWrite::Applied(_)) => {}
@@ -888,8 +886,10 @@ impl DagActor {
 
     /// The live effective wanted PATHS for a node: the §6 wanted-union
     /// (joined over live builds' contributions), resolved to store
-    /// paths against the node's declared outputs. Falls back to the
-    /// node-level union when no live contribution exists.
+    /// paths against the node's declared outputs. Zero live relation
+    /// rows (the legacy shape) saturate to ALL DECLARED outputs — the
+    /// conservative-absent arm (T-D2.3/PD-D5, DQ-2): arm-0 coverage
+    /// becomes HARDER to satisfy, never vacuously complete.
     async fn live_wanted_paths_for(
         &self,
         derivation_id: Uuid,
@@ -900,8 +900,12 @@ impl DagActor {
             return Ok(Vec::new());
         };
         let wanted_names: Vec<String> = match union {
-            // No live contribution: fall back to the node-level union.
-            None => state.wanted_output_names.clone(),
+            // Zero live relation rows: the conservative-absent arm —
+            // saturate to all-declared width (observable).
+            None => {
+                crate::state::note_wanted_width_saturated(&Uuid::nil());
+                Vec::new()
+            }
             // '{}' saturation = all declared outputs.
             Some(v) if v.is_empty() => Vec::new(),
             Some(v) => v,

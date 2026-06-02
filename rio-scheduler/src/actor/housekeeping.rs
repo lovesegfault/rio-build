@@ -643,11 +643,17 @@ impl DagActor {
 
         // Store-probe arm: every verifiable wanted output present →
         // adopt as completed; the attempt is closed and never charged.
+        // The wanted set is the LIVE effective resolution (T-D2.3: the
+        // rebuilt in-memory union over live builds' durable
+        // contributions, saturating-absent — the design's
+        // establishment-sweep successor in its in-memory form; the
+        // stored-union read is gone).
         if let Some(state) = self.dag.node(&drv_hash) {
+            let eff = crate::state::effective_wanted(state, &self.builds);
             let adopt = verifiable_wanted_paths(
                 &state.output_names,
                 &state.expected_output_paths,
-                &state.wanted_output_names,
+                eff.as_deref().unwrap_or(&[]),
             )
             .is_some_and(|verifiable| {
                 missing.is_some_and(|m| verifiable.iter().all(|p| !m.contains(*p)))

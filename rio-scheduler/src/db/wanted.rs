@@ -129,6 +129,59 @@ impl SchedulerDb {
         Ok(Some(union))
     }
 
+    /// Gap-filling backfill write (T-D2.3 step 5 — the B4 backfill's
+    /// row source): INSERT the saturating `'{}'` (all-declared) row for
+    /// (build, derivation) pairs that have NO row yet; `ON CONFLICT DO
+    /// NOTHING` — a build that merged flag-on already has its EXACT
+    /// row, and the backfill must never widen it (the relation's exact
+    /// rows are the AW4 fix; the backfill only fills legacy gaps).
+    pub(crate) async fn backfill_wanted_fenced(
+        &self,
+        serving_generation: i64,
+        build_id: Uuid,
+        derivation_id: Uuid,
+    ) -> Result<FencedWrite, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let floor = Self::claims_floor(&mut tx).await?;
+        if !Self::at_or_above_floor(floor, serving_generation) {
+            tx.rollback().await?;
+            return Ok(FencedWrite::Fenced);
+        }
+        let n = sqlx::query(
+            "INSERT INTO build_wanted_outputs (build_id, derivation_id, wanted_output_names) \
+             VALUES ($1, $2, '{}') \
+             ON CONFLICT (build_id, derivation_id) DO NOTHING",
+        )
+        .bind(build_id)
+        .bind(derivation_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(FencedWrite::Applied(n))
+    }
+
+    /// Recovery wanted-cache rebuild load (T-D2.3/PD-D5): every
+    /// (build, derivation, wanted) contribution row belonging to a
+    /// LIVE (`pending`/`active`) build. Feeds `wanted_by_build` at
+    /// recovery so the in-memory union is the EXACT live union — the
+    /// relation has exactly the per-build rows (written by every
+    /// flag-on merge since Phase B; the B4 backfill covers probe-era
+    /// gaps). A live build with NO rows here is the legacy shape: the
+    /// conservative-absent arm saturates it to all-declared width.
+    pub(crate) async fn load_wanted_for_live_builds(
+        &self,
+    ) -> Result<Vec<(Uuid, Uuid, Vec<String>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT w.build_id, w.derivation_id, w.wanted_output_names \
+               FROM build_wanted_outputs w \
+               JOIN builds b ON b.build_id = w.build_id \
+              WHERE b.status IN ('pending', 'active')",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Purge a build's contributions (called with the build row's own
     /// purge — existing lifecycle; in Phase A only tests call it).
     pub(crate) async fn delete_wanted_for_build(&self, build_id: Uuid) -> Result<u64, sqlx::Error> {

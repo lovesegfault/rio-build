@@ -212,13 +212,15 @@ impl DagActor {
             // The wanted slice is the LIVE effective wanted set
             // (`effective_wanted` over live interested builds'
             // contributions; a terminal build's wants stop counting),
-            // falling back to the stored node-level union when it is
-            // unavailable. `verifiable_wanted_paths` returns None for a
-            // wanted set that resolves to no verifiable path; degrade
-            // to all of `paths` then (and for a node that vanished from
-            // the DAG mid-probe). The probe set and the `to_spawn` walk
-            // seeds stay ALL expected paths (opportunistic completeness
-            // — fetch the unwanted output too if the upstream has it).
+            // degrading to ALL DECLARED outputs when no live union
+            // resolves (the conservative-absent branch, T-D2.3 — the
+            // stored-union fallback is gone; divergence is
+            // widening-only). `verifiable_wanted_paths` returns None
+            // for a wanted set that resolves to no verifiable path;
+            // degrade to all of `paths` then (and for a node that
+            // vanished from the DAG mid-probe). The probe set stays
+            // ALL expected paths (opportunistic completeness — fetch
+            // the unwanted output too if the upstream has it).
             let wanted: Vec<String> = self
                 .dag
                 .node(&drv_hash)
@@ -227,7 +229,7 @@ impl DagActor {
                     verifiable_wanted_paths(
                         &s.output_names,
                         &s.expected_output_paths,
-                        eff.as_deref().unwrap_or(&s.wanted_output_names),
+                        eff.as_deref().unwrap_or(&[]),
                     )
                     .map(|w| w.into_iter().map(str::to_owned).collect::<Vec<String>>())
                 })

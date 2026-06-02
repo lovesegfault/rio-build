@@ -4531,8 +4531,11 @@ async fn flag_on_probe_job_backfills_wanted_relation_for_flag_off_era_builds() -
     .await?;
     assert_eq!(
         wanted_names,
-        Some(vec!["out".to_string()]),
-        "the executor's wanted-set resolution must find the build's wanted names"
+        Some(vec![]),
+        "the backfill writes the SATURATING all-declared ('{{}}') row \
+         (T-D2.3 step 5 — a legacy build's true narrow wants are unknown; \
+         the relation must never under-state interest width). The \
+         executor's wanted-set resolution reads it as all-declared"
     );
     Ok(())
 }
@@ -5968,6 +5971,267 @@ async fn classify_durable_evidence_ignores_dead_voucher() -> TestResult {
         r2_state, "pending",
         "the park tick must NOT auto-resolve on dead-voucher evidence \
          (stale previous-generation rows are Broken, not Vouched)"
+    );
+    Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Phase D' T-D2.3 (PD-D5): the wanted cache rebuilds from
+// build_wanted_outputs at recovery; the stored-union fallback is
+// replaced by the conservative-absent (MAXIMAL-width) arm
+// ════════════════════════════════════════════════════════════════════
+
+/// Two-phase flag-on failover scaffold for the wanted-rebuild tests:
+/// run `seed` against a flag-on phase-1 actor (no store client — the
+/// merge probe stays indeterminate so nothing classifies early), drop
+/// it, spawn a flag-on phase-2 actor WITH the store client, recover.
+async fn wanted_failover<F, Fut>(
+    store_client: StoreServiceClient<Channel>,
+    seed: F,
+) -> anyhow::Result<(
+    TestDb,
+    ActorHandle,
+    ConfirmationLoop,
+    tokio::task::JoinHandle<()>,
+)>
+where
+    F: FnOnce(ActorHandle, sqlx::PgPool) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let db = TestDb::new(&MIGRATOR).await;
+    {
+        let (handle, task) = setup_actor_configured(db.pool.clone(), None, |cfg, _| {
+            cfg.materialization.enabled = true;
+        });
+        seed(handle, db.pool.clone()).await?;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    }
+    let leader = crate::lease::LeaderState::always_leader(std::sync::Arc::new(
+        std::sync::atomic::AtomicU64::new(1),
+    ));
+    let confirmations = spawn_leading_confirmations(leader.clone());
+    let phase2_leader = leader.clone();
+    let (handle, task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), move |cfg, p| {
+            cfg.materialization.enabled = true;
+            p.leader = phase2_leader;
+        });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+    Ok((db, handle, confirmations, task))
+}
+
+// r[verify sched.materialize.job]
+/// The recovery wanted-cache rebuild (the AW4/D8 headline): two builds
+/// merge with distinct narrow wants flag-on; one cancels; after
+/// failover the effective wanted set must be the EXACT narrow union of
+/// the LIVE builds' durable contributions — not the stored node-level
+/// union. Observable through the dispatch probe: the node's only LIVE
+/// want (out1) is present in the store, so the narrow set
+/// inline-completes the node and the surviving build succeeds; the
+/// stored-union fallback would keep waiting on the dead build's out2.
+#[tokio::test]
+async fn recovery_rebuilds_wanted_contributions() -> TestResult {
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+
+    let out1 = test_store_path("d23a-out1");
+    let out2 = test_store_path("d23a-out2");
+    let mk = |wanted: &[&str]| {
+        let mut n = make_node("d23a");
+        n.output_names = vec!["out1".into(), "out2".into()];
+        n.expected_output_paths = vec![out1.clone(), out2.clone()];
+        n.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        n
+    };
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    let (db, handle, _conf, _task) = wanted_failover(store_client, async |handle, _pool| {
+        // b1 wants out1 only; b2 wants out2 only. Both relation rows
+        // are written by the flag-on merges. b2 then CANCELS — its
+        // contribution must stop counting after the failover.
+        let _ev1 = merge_dag(&handle, b1, vec![mk(&["out1"])], vec![], false).await?;
+        let _ev2 = merge_dag(&handle, b2, vec![mk(&["out2"])], vec![], false).await?;
+        barrier(&handle).await;
+        cancel_build(&handle, b2).await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+
+    // Phase 2: out1 (the only LIVE want) is present in the store.
+    {
+        let (nar, hash) = rio_test_support::fixtures::make_nar(out1.as_bytes());
+        let info = rio_test_support::fixtures::make_path_info(&out1, &nar, hash);
+        store.seed(info, nar);
+    }
+
+    // The dispatch probe classifies over the REBUILT live contribution
+    // (b1 → [out1], exact): out1 present → inline complete → b1
+    // succeeds. The stored-union fallback ([out1, out2]) would block on
+    // the cancelled build's out2 (absent and not substitutable).
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        expect_drv(&handle, "d23a").await.status,
+        DerivationStatus::Completed,
+        "the rebuilt narrow wanted union (live b1 -> [out1], from \
+         build_wanted_outputs) must classify the node complete; the \
+         stored-union fallback would wait on the dead b2's out2"
+    );
+    let st = query_status(&handle, b1).await?;
+    assert_eq!(
+        st.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "b1 (the live narrow-want build) succeeds post-failover"
+    );
+    drop(db);
+    Ok(())
+}
+
+// r[verify sched.materialize.job]
+/// The conservative-absent arm (DQ-2: absent = MAXIMAL width): a live
+/// interested build with NO cache entry and NO relation row (the
+/// legacy/pre-relation shape) contributes `{}` = ALL DECLARED outputs
+/// — never the stored union, never a vacuous narrow set. The
+/// degradation is observable: rio_scheduler_wanted_width_saturated_
+/// total increments. Observable through the dispatch probe: with the
+/// node's stored union narrow ([out1], present), the OLD fallback
+/// would inline-complete; the saturated all-declared width keeps the
+/// node waiting on the absent out2.
+#[tokio::test]
+async fn unknown_contribution_saturates_conservatively() -> TestResult {
+    use crate::sla::metrics::counter_map;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&rec);
+
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+
+    let out1 = test_store_path("d23b-out1");
+    let out2 = test_store_path("d23b-out2");
+    let b1 = Uuid::new_v4();
+
+    let (db, handle, _conf, _task) = wanted_failover(store_client, async |handle, pool| {
+        let mut n = make_node("d23b");
+        n.output_names = vec!["out1".into(), "out2".into()];
+        n.expected_output_paths = vec![out1.clone(), out2.clone()];
+        n.wanted_output_names = vec!["out1".into()];
+        let _ev = merge_dag(&handle, b1, vec![n], vec![], false).await?;
+        barrier(&handle).await;
+        // The legacy shape: the live build has NO relation rows (a
+        // build that merged before the relation existed).
+        sqlx::query("DELETE FROM build_wanted_outputs")
+            .execute(&pool)
+            .await?;
+        Ok(())
+    })
+    .await?;
+
+    // out1 (the stored-union want) is present; out2 is absent and not
+    // substitutable.
+    {
+        let (nar, hash) = rio_test_support::fixtures::make_nar(out1.as_bytes());
+        let info = rio_test_support::fixtures::make_path_info(&out1, &nar, hash);
+        store.seed(info, nar);
+    }
+
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    // MAXIMAL width: all-declared [out1, out2]; out2 absent → the node
+    // must NOT vacuously complete on the stored union's narrow [out1].
+    let status = expect_drv(&handle, "d23b").await.status;
+    assert_ne!(
+        status,
+        DerivationStatus::Completed,
+        "a live build with no relation row must degrade to ALL-DECLARED \
+         width (never the stored union): out2 is absent, so the node \
+         cannot complete"
+    );
+    // The degradation is visible (DQ-2 observability).
+    let saturated = counter_map(&snap)
+        .get("rio_scheduler_wanted_width_saturated_total")
+        .copied()
+        .unwrap_or(0);
+    assert!(
+        saturated >= 1,
+        "the conservative-absent arm must count its firings \
+         (rio_scheduler_wanted_width_saturated_total >= 1, got {saturated})"
+    );
+    drop(db);
+    Ok(())
+}
+
+// r[verify sched.materialize.routing+2]
+/// The consumption None-arm (step 4's red test, RS-2): a job's
+/// consumption where `effective_wanted_union` returns None (zero live
+/// relation rows — the legacy shape) must saturate `live_wanted_paths`
+/// to ALL DECLARED outputs, making arm-0 coverage HARDER to satisfy —
+/// never the vacuous CompleteForLiveInterest the stored-union fallback
+/// produces when the union is narrow.
+#[tokio::test]
+async fn consumption_coverage_saturates_on_missing_relation_rows() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    let out1 = test_store_path("d23c-out1");
+    let out2 = test_store_path("d23c-out2");
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.push(out1.clone());
+        subs.push(out2.clone());
+    }
+    let mut n = make_node("d23c");
+    n.output_names = vec!["out1".into(), "out2".into()];
+    n.expected_output_paths = vec![out1.clone(), out2.clone()];
+    n.wanted_output_names = vec!["out1".into()];
+    let b1 = Uuid::new_v4();
+    let _ev = merge_dag(&handle, b1, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    let assignment = match claim_materialization(&handle, "d23c", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+
+    // The legacy shape lands between claim and consumption: the live
+    // build's relation rows are gone.
+    sqlx::query("DELETE FROM build_wanted_outputs")
+        .execute(&db.pool)
+        .await?;
+
+    // Success ingesting only out1: covered for the narrow stored union,
+    // NOT covered for the saturated all-declared width.
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "d23c",
+        mat_success_outcome(vec![out1.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    let job_state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = 'd23c'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        job_state, "pending",
+        "zero live relation rows must saturate the coverage check to \
+         all-declared width (out2 not ingested -> ReArm; the job stays \
+         pending) — never a vacuous resolved_success on the stored union"
+    );
+    assert_ne!(
+        expect_drv(&handle, "d23c").await.status,
+        DerivationStatus::Completed,
+        "the node must not vacuously complete for the legacy shape"
     );
     Ok(())
 }

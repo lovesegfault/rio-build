@@ -1745,7 +1745,10 @@ impl DagActor {
             let unwanted: HashSet<String> = match verifiable_wanted_paths(
                 &node.output_names,
                 &node.expected_output_paths,
-                eff.as_deref().unwrap_or(&state.wanted_output_names),
+                // Zero-live-interest degrades to all-declared (the
+                // conservative-absent branch, T-D2.3 — the stored-union
+                // fallback is gone).
+                eff.as_deref().unwrap_or(&[]),
             ) {
                 Some(wanted) => {
                     let wanted: HashSet<&str> = wanted.into_iter().collect();
@@ -2748,10 +2751,15 @@ impl DagActor {
             let Some(wanted) = verifiable_wanted_paths(
                 &n.output_names,
                 &n.expected_output_paths,
+                // Pre-existing node with zero live interest degrades to
+                // all-declared (conservative-absent, T-D2.3); a node
+                // not in the DAG keeps the submission's own wanted set.
                 eff.as_deref().unwrap_or_else(|| {
-                    dag_state
-                        .map(|s| s.wanted_output_names.as_slice())
-                        .unwrap_or(&n.wanted_output_names)
+                    if dag_state.is_some() {
+                        &[]
+                    } else {
+                        &n.wanted_output_names
+                    }
                 }),
             ) else {
                 continue;
@@ -3234,8 +3242,10 @@ impl DagActor {
             // nothing else to consult — submission-only criterion.
             let mut criterion_wanted = n.wanted_output_names.clone();
             if let Some(existing) = self.dag.node(&n.drv_hash) {
-                let eff = effective_wanted(existing, &self.builds)
-                    .unwrap_or_else(|| existing.wanted_output_names.clone());
+                // Zero-live-interest saturates the criterion to
+                // all-declared (conservative-absent, T-D2.3 — the
+                // widening direction; an empty union saturates).
+                let eff = effective_wanted(existing, &self.builds).unwrap_or_default();
                 union_wanted_saturating(&mut criterion_wanted, &eff);
             }
             // The submission's OWN wanted set must also resolve to a

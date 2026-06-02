@@ -312,6 +312,16 @@ pub fn describe_metrics() {
          psql origin distributions diverge from creation-rate dashboards by \
          exactly this counter."
     );
+    describe_counter!(
+        "rio_scheduler_wanted_width_saturated_total",
+        "The conservative-absent wanted-width arm fired (DQ-2): a live \
+         interested build's wanted contributions could not be resolved \
+         (no in-memory cache entry / no build_wanted_outputs rows — the \
+         legacy pre-relation shape), so the effective wanted width \
+         degraded to ALL DECLARED outputs (maximal width, never a vacuous \
+         narrow set). Sustained increments mean pre-relation builds are \
+         still live; the population shrinks to zero as they terminate."
+    );
     describe_gauge!(
         "rio_scheduler_materialization_stalled",
         "Parked materialization jobs (infra budget exhausted; waiting on upstream \

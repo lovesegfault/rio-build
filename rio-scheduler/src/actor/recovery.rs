@@ -210,6 +210,48 @@ impl DagActor {
                            NotYetReady/Gone until then)");
                 }
             }
+
+            // T-D2.3 (PD-D5): rebuild the per-build wanted-contribution
+            // cache from the durable relation, so the post-failover
+            // effective wanted union is the EXACT live union (the
+            // AW4/D8 post-failover-widening class becomes structurally
+            // impossible). `wanted_by_build` is a droppable cache of
+            // `build_wanted_outputs` — rebuilt here, never reconciled,
+            // never written back. A live build with no relation rows
+            // (the legacy shape) gets no entry; the conservative-absent
+            // arm saturates it to all-declared width at read time.
+            match self.db.load_wanted_for_live_builds().await {
+                Ok(rows) => {
+                    let mut id_to_hash: HashMap<Uuid, DrvHash> = HashMap::new();
+                    for (hash, state) in self.dag.iter_nodes() {
+                        if let Some(db_id) = state.db_id {
+                            id_to_hash.insert(db_id, DrvHash::from(hash));
+                        }
+                    }
+                    let mut fed = 0usize;
+                    for (build_id, derivation_id, names) in rows {
+                        let Some(hash) = id_to_hash.get(&derivation_id) else {
+                            continue; // node not recovered (terminal) — no cache entry needed
+                        };
+                        if let Some(state) = self.dag.node_mut(hash.as_str()) {
+                            state.wanted_by_build.insert(build_id, names);
+                            fed += 1;
+                        }
+                    }
+                    if fed > 0 {
+                        info!(
+                            contributions = fed,
+                            "rebuilt wanted-contribution cache from build_wanted_outputs (recovery)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e,
+                          "failed to rebuild the wanted-contribution cache (effective \
+                           wanted degrades to the conservative all-declared width until \
+                           the builds re-merge)");
+                }
+            }
         }
 
         self.seed_ready_queue(&failed_dep_parents).await;

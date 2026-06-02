@@ -147,6 +147,7 @@
     "rio_scheduler_transition_rejected_total",
     "rio_scheduler_undeclared_built_output_total",
     "rio_scheduler_unroutable_features_total",
+    "rio_scheduler_wanted_width_saturated_total",
     "rio_store_check_available_duration_seconds",
     "rio_store_chunk_cache_hits_total",
     "rio_store_chunk_cache_misses_total",
@@ -955,6 +956,11 @@
         "name": "rio_scheduler_unroutable_features_total",
         "kind": "counter",
         "help": "§13c: solve_intent_for found NO hwClass whose provides_features hosts the drv's required_features (labeled tenant). Debounced once per (tenant, required_features) edge. The intent is unroutable until a `[sla.hw_classes.$h]` with matching providesFeatures is added; the WARN names which features."
+      },
+      {
+        "name": "rio_scheduler_wanted_width_saturated_total",
+        "kind": "counter",
+        "help": "The conservative-absent wanted-width arm fired (DQ-2): a live interested build's wanted contributions could not be resolved (no in-memory cache entry / no build_wanted_outputs rows — the legacy pre-relation shape), so the effective wanted width degraded to ALL DECLARED outputs (maximal width, never a vacuous narrow set). Sustained increments mean pre-relation builds are still live; the population shrinks to zero as they terminate."
       }
     ],
     "store": [
