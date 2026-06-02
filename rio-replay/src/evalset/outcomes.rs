@@ -13,21 +13,48 @@ use crate::nixcache::NarinfoFact;
 
 /// Map a Hydra `buildstatus` code to the neutral expected outcome.
 ///
-/// The mapping is deliberately coarse: `0` (success) becomes `built` with
-/// no detail; every non-zero code becomes `failed`, with the raw numeric
-/// code preserved verbatim in the returned detail string
-/// (`hydra buildstatus=<code>`). Finer Hydra status semantics (timed out,
-/// aborted, output limit exceeded, …) are never interpreted — they stay
-/// visible to humans through the detail string only.
+/// Per-code, sourced against Hydra's own status enum — `BuildStatus` in
+/// `subprojects/crates/db/src/models.rs` and the `/build/<id>` API
+/// contract in `hydra-api.yaml`, both at NixOS/hydra commit `3ccd938cd`
+/// (<https://github.com/NixOS/hydra/blob/3ccd938cd7d0085a2915132369eb09e35991550b/subprojects/crates/db/src/models.rs>)
+/// — so each native condition lands on the vocabulary value whose
+/// [`crate::archive::schema`] contract describes it, instead of
+/// collapsing into `failed` ("deterministic build failure attributable
+/// to the unit itself"), which most non-zero codes are not:
+///
+/// - `0` Success → `built`.
+/// - `4` Cancelled ("canceled by the user") → `cancelled`: the source
+///   attempt ended before completion; there is no deterministic
+///   expectation to compare against.
+/// - `2` DepFailed, `3` Aborted, `9` Unsupported (the API doc presents
+///   9 as "aborted": no machine of the required system type) →
+///   `indeterminate`: the unit itself was never fairly attempted, so
+///   the attempt is not usable truth.
+/// - `7` TimedOut, `10` LogLimitExceeded, `11` NarSizeLimitExceeded →
+///   `resource-exhausted`: source-side resource limits (build-time
+///   quota, log size, output size) — compared like `failed` but
+///   reported separately, so source limits never hide inside the
+///   deterministic-failure counts.
+/// - anything else → `failed`: `1` Failed and `6` FailedWithOutput are
+///   real build failures, `12` NotDeterministic fails the unit's own
+///   determinism check, and unknown or retired codes follow Hydra's own
+///   API contract, which presents every undocumented code as failed
+///   (`* : failed`). `8` CachedFailure and `13` Resolved are step-only
+///   statuses a build's `buildstatus` never carries.
+///
+/// Every non-zero code keeps the raw numeric value verbatim in the
+/// returned detail string (`hydra buildstatus=<code>`), so the native
+/// status stays visible to humans even though the engine never
+/// interprets `detail`.
 pub fn outcome_from_buildstatus(status: i64) -> (ExpectedOutcome, Option<String>) {
-    if status == 0 {
-        (ExpectedOutcome::Built, None)
-    } else {
-        (
-            ExpectedOutcome::Failed,
-            Some(format!("hydra buildstatus={status}")),
-        )
-    }
+    let outcome = match status {
+        0 => return (ExpectedOutcome::Built, None),
+        4 => ExpectedOutcome::Cancelled,
+        2 | 3 | 9 => ExpectedOutcome::Indeterminate,
+        7 | 10 | 11 => ExpectedOutcome::ResourceExhausted,
+        _ => ExpectedOutcome::Failed,
+    };
+    (outcome, Some(format!("hydra buildstatus={status}")))
 }
 
 /// Decide the expected-outcome record for one workload unit.
@@ -114,23 +141,26 @@ mod tests {
 
     #[test]
     fn buildstatus_mapping_is_pinned() {
-        // (status, expected outcome string, detail must contain).
-        // The recorder mapping is deliberately coarse: 0 → built, every
-        // non-zero Hydra buildstatus → failed with the numeric code kept
-        // in detail (the design's truth-baking rule); finer Hydra status
-        // semantics stay visible through the detail string only.
+        // (status, expected outcome string, detail must contain) — one
+        // row per code Hydra's BuildStatus enum defines (NixOS/hydra
+        // 3ccd938cd, subprojects/crates/db/src/models.rs), plus an
+        // unknown code. Every non-zero code keeps the raw numeric value
+        // in detail; the engine never interprets it.
         let cases = [
-            (0, "built", None),
-            (1, "failed", Some("buildstatus=1")),
-            (2, "failed", Some("buildstatus=2")),
-            (3, "failed", Some("buildstatus=3")),
-            (4, "failed", Some("buildstatus=4")),
-            (6, "failed", Some("buildstatus=6")),
-            (7, "failed", Some("buildstatus=7")),
-            (9, "failed", Some("buildstatus=9")),
-            (10, "failed", Some("buildstatus=10")),
-            (11, "failed", Some("buildstatus=11")),
-            (177, "failed", Some("buildstatus=177")),
+            (0, "built", None),                                 // Success
+            (1, "failed", Some("buildstatus=1")),               // Failed
+            (2, "indeterminate", Some("buildstatus=2")),        // DepFailed
+            (3, "indeterminate", Some("buildstatus=3")),        // Aborted
+            (4, "cancelled", Some("buildstatus=4")),            // Cancelled (by the user)
+            (6, "failed", Some("buildstatus=6")),               // FailedWithOutput
+            (7, "resource-exhausted", Some("buildstatus=7")),   // TimedOut
+            (8, "failed", Some("buildstatus=8")),               // CachedFailure (step-only)
+            (9, "indeterminate", Some("buildstatus=9")),        // Unsupported system
+            (10, "resource-exhausted", Some("buildstatus=10")), // LogLimitExceeded
+            (11, "resource-exhausted", Some("buildstatus=11")), // NarSizeLimitExceeded
+            (12, "failed", Some("buildstatus=12")),             // NotDeterministic
+            (13, "failed", Some("buildstatus=13")),             // Resolved (step-only)
+            (177, "failed", Some("buildstatus=177")),           // unknown codes stay failures
         ];
         for (status, want, detail_needle) in cases {
             let (outcome, detail) = outcome_from_buildstatus(status);
@@ -140,6 +170,42 @@ mod tests {
                 Some(n) => assert!(detail.as_deref().unwrap().contains(n)),
             }
         }
+    }
+
+    #[test]
+    fn buildstatus_mapping_covers_the_neutral_vocabulary() {
+        // The mapping's image over the build statuses Hydra's API
+        // documents for `/build/<id>` (hydra-api.yaml: 0, 1, 2, 3, 4,
+        // 6, 7, 9, 10, 11) must cover every neutral-vocabulary value a
+        // Hydra recording can express — a re-collapse (e.g. every
+        // non-zero code → failed) cannot land without failing this
+        // assertion, even if the per-code pin above were edited to
+        // match.
+        let documented_build_codes = [0, 1, 2, 3, 4, 6, 7, 9, 10, 11];
+        let image: std::collections::BTreeSet<&str> = documented_build_codes
+            .iter()
+            .map(|&status| outcome_from_buildstatus(status).0.as_str())
+            .collect();
+        let expressible: std::collections::BTreeSet<&str> = [
+            ExpectedOutcome::Built,
+            ExpectedOutcome::Failed,
+            ExpectedOutcome::ResourceExhausted,
+            ExpectedOutcome::Cancelled,
+            ExpectedOutcome::Indeterminate,
+        ]
+        .map(ExpectedOutcome::as_str)
+        .into();
+        assert_eq!(
+            image, expressible,
+            "every expressible neutral outcome must be reachable from some documented Hydra code"
+        );
+        // The two remaining vocabulary values are structurally out of a
+        // buildstatus's reach, by design rather than by collapse:
+        // `disconnected` describes a recording client's disconnect, and
+        // this recorder is timeless and session-less (the v0 recorder
+        // maps it from its CLIENT_DISCONNECT status); `unknown` is
+        // produced only by the narinfo-presence path when no
+        // buildstatus exists at all (`expected_outcome_for_unit`).
     }
 
     #[test]

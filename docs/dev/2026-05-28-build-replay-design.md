@@ -416,7 +416,7 @@ The eval-set machinery (`rio-replay eval`, the Job behind `cargo xtask replay re
 
 | Today (eval set) | v1 recorder |
 |---|---|
-| Truth fetched at campaign time: the engine's hydra-truth stage sweeps cache.nixos.org narinfo for every target and warm path into `hydra.jsonl`; scoped campaigns optionally read a buildstatus file. | Truth baked in at creation: the recorder performs the narinfo sweep (same concurrency and retry discipline as today's stage) and the optional buildstatus ingestion **before packaging**, and writes `outcomes.jsonl`: all outputs present upstream → `built` with `nar_hash_hex`/`nar_size` taken from the narinfo; any output missing → `unknown`; buildstatus 0 → `built`; non-zero buildstatus → `failed` with the numeric code in `detail`. Campaigns never query cache.nixos.org or Hydra for truth again. |
+| Truth fetched at campaign time: the engine's hydra-truth stage sweeps cache.nixos.org narinfo for every target and warm path into `hydra.jsonl`; scoped campaigns optionally read a buildstatus file. | Truth baked in at creation: the recorder performs the narinfo sweep (same concurrency and retry discipline as today's stage) and the optional buildstatus ingestion **before packaging**, and writes `outcomes.jsonl`: all outputs present upstream → `built` with `nar_hash_hex`/`nar_size` taken from the narinfo; any output missing → `unknown`; buildstatus mapped per code into the neutral vocabulary (0 → `built`; 4 cancelled-by-user → `cancelled`; 2 dependency-failed / 3 aborted / 9 unsupported-system → `indeterminate`; 7 timed-out / 10 log-limit / 11 output-limit → `resource-exhausted`; any other non-zero → `failed`), each non-zero code retained verbatim in `detail`. The per-code table is sourced from Hydra's own `BuildStatus` enum so each native condition lands on the §4.6 value whose contract describes it — collapsing them all into `failed` would judge the same source condition (e.g. a cancellation) differently depending on which recorder produced the archive, which §3.2 forbids. Campaigns never query cache.nixos.org or Hydra for truth again. |
 | `manifest.jsonl` (job, system, attr, drvPath, outputs, requiredFeatures) | `units.jsonl` (label = job, system, outputs, required_features) plus one synthesized record per unit in `requests.jsonl` (`session: 0`, `offset_s` omitted, `targets: [{drv, outputs: ["*"]}]`). The archive is timeless: `capabilities.timed = false`, `from == to`. |
 | `dep-closure.jsonl` (per-target transitive closure, camelCase) | `closures.jsonl` (direct adjacency over the union closure, snake_case), `capabilities.dependency_closures = true`. |
 | `drvs.tar.zst` (a `nix copy --derivation` file:// binary-cache layout, tarred) | Plain ATerm members under `nix/store/*.drv` covering the full requisite closure of every unit. The recorder copies the `.drv` files directly out of its local store; no binary-cache layout is constructed. |
@@ -428,6 +428,8 @@ The eval-set machinery (`rio-replay eval`, the Job behind `cargo xtask replay re
 Capability flags written by this recorder: `expected_outcomes = true`, `output_hashes = true` (narinfo always carries NarHash), `dependency_closures = true`, `impure_env = true` when any unit declares `impureEnvVars` (the recorder extracts this from the parsed derivations during the closure pass), `embedded_store_paths` per thin/fat mode, `timed = false`.
 
 Eval sets already in S3 are not migrated: per the deployment policy (§2.5), pre-v1 eval-set prefixes are simply abandoned, and a scope still wanted as a campaign input is re-recorded as a v1 archive (§11.5).
+
+Operational note on the per-code buildstatus mapping: archives recorded before it landed bake the earlier coarse translation (every non-zero code → `failed`) into their write-once `outcomes.jsonl`, and truth is never reinterpreted after creation (§3.2) — the only remedy for the affected expectations is re-recording. Divergence-gated campaign sets must not mix archives recorded on both sides of the change: the same source condition (e.g. an upstream cancellation that rio then builds successfully) classifies `unexpected-success` under the old baked truth but `truth-indeterminate` under the new, so verdict distributions across the two are not comparable.
 
 ### 5.2 nxb-replay
 
@@ -1193,7 +1195,7 @@ Today's eval set is six S3 objects under `<prefix>/evals/<hydra_eval_id>/<key_sh
 | Today (campaign-time) | v1 destination |
 |---|---|
 | `hydra.jsonl` — the hydra-truth stage's narinfo sweep cache (per output path: present/absent, NarHash, NarSize) | `outcomes.jsonl` records (`outcome: "built"` with per-output `nar_hash_hex`/`nar_size`); sweep performed by the recorder at creation time (§5.1) |
-| `spec.hydra.buildstatus_file` (JSON map job → Hydra buildstatus) | folded into the same `outcomes.jsonl` records at creation (`built` for 0, `failed` for nonzero); the raw native code retained in `detail` |
+| `spec.hydra.buildstatus_file` (JSON map job → Hydra buildstatus) | folded into the same `outcomes.jsonl` records at creation, mapped per code (0 → `built`; 4 → `cancelled`; 2/3/9 → `indeterminate`; 7/10/11 → `resource-exhausted`; any other non-zero → `failed`, see §5.1); the raw native code retained in `detail` |
 | narinfo absence (today ⇒ `HydraOutcome::Unknown`) | `outcome: "unknown"` (replays as `no-truth`) |
 
 **A.6 `drvs.tar.zst` → embedded derivations**
