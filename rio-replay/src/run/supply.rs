@@ -136,8 +136,10 @@ pub fn walk_closure(archive: &ReplayArchive, roots: &[String]) -> Result<Closure
 }
 
 /// Closure construction over embedded `.drv` ATerm texts: read and parse
-/// each derivation the walk reaches.
-fn closure_from_drv_texts(archive: &ReplayArchive, roots: &[String]) -> Result<Closure> {
+/// each derivation the walk reaches. Crate-visible because the plan-stage
+/// closure loader reuses it as the capability-less fallback (see
+/// `run::archive_input::load_closures`).
+pub(crate) fn closure_from_drv_texts(archive: &ReplayArchive, roots: &[String]) -> Result<Closure> {
     walk_from(roots, |drv_path, root| {
         let text = archive
             .read_drv(drv_path)

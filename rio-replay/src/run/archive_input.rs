@@ -151,25 +151,31 @@ fn workload_entry(
     })
 }
 
-/// Per-unit proper transitive dependency closures, reconstructed from the
-/// archive's direct-adjacency `closures.jsonl`: for each unit, walk the
-/// `inputs` edges breadth-first and emit every reachable derivation
-/// (the unit itself excluded) with its statically declared output paths
-/// (floating content-addressed outputs, recorded as null, are skipped).
+/// Per-unit proper transitive dependency closures: for each unit, walk the
+/// direct-adjacency `inputs` edges breadth-first and emit every reachable
+/// derivation (the unit itself excluded) with its statically declared
+/// output paths (floating content-addressed outputs are skipped).
 ///
-/// Requires the `dependency_closures` capability: without `closures.jsonl`
-/// the engine cannot compute warm sets or leaf-mode attemptability.
+/// The adjacency comes from `closures.jsonl` when the archive declares the
+/// `dependency_closures` capability; otherwise it is recovered by walking
+/// and parsing the embedded derivation ATerms — the documented fallback
+/// for recorders that skip the ATerm pass, and the only construction v0
+/// archives (which never carry `closures.jsonl`) can use. A derivation the
+/// fallback walk needs but the archive does not embed is a hard error
+/// naming it and the unit that needed it.
 pub fn load_closures(
     archive: &ReplayArchive,
     units: &[ManifestEntry],
 ) -> Result<Vec<DepClosureEntry>> {
-    anyhow::ensure!(
-        archive.capabilities().dependency_closures,
-        "archive lacks dependency_closures; the engine's ATerm fallback walk is not implemented \
-         — re-record the archive with closures.jsonl"
-    );
-    let adjacency: HashMap<&str, &ClosureRecord> = archive
-        .closures()
+    let recovered: Vec<ClosureRecord>;
+    let records: &[ClosureRecord] = if archive.capabilities().dependency_closures {
+        archive.closures()
+    } else {
+        let roots: Vec<String> = units.iter().map(|unit| unit.drv_path.clone()).collect();
+        recovered = aterm_adjacency(archive, &roots)?;
+        &recovered
+    };
+    let adjacency: HashMap<&str, &ClosureRecord> = records
         .iter()
         .map(|record| (record.drv.as_str(), record))
         .collect();
@@ -219,6 +225,33 @@ pub fn load_closures(
         });
     }
     Ok(entries)
+}
+
+/// Direct-adjacency records recovered from the embedded derivation ATerms:
+/// the union closure of `roots`, each derivation mapped into the
+/// `closures.jsonl` record shape (direct inputs, input sources, declared
+/// outputs — floating content-addressed outputs as `None`). Reuses the
+/// supply planner's ATerm closure walk so both capability-less consumers
+/// construct the same closure.
+fn aterm_adjacency(archive: &ReplayArchive, roots: &[String]) -> Result<Vec<ClosureRecord>> {
+    let closure = super::supply::closure_from_drv_texts(archive, roots)?;
+    Ok(closure
+        .topo
+        .into_iter()
+        .map(|node| ClosureRecord {
+            drv: node.drv_path,
+            inputs: node.input_drvs.into_keys().collect(),
+            srcs: node.input_srcs,
+            outputs: node
+                .outputs
+                .into_iter()
+                .map(|(name, path)| {
+                    let path = (!path.is_empty()).then_some(path);
+                    (name, path)
+                })
+                .collect(),
+        })
+        .collect())
 }
 
 /// Count of `exclusions.jsonl` records per exclusion reason (empty when
@@ -1083,5 +1116,141 @@ mod tests {
         let err = format!("{:#}", load_units(&archive).unwrap_err());
         assert!(err.contains("no units.jsonl record"), "got: {err}");
         assert!(err.contains("libB-2.0.drv"), "error names the drv: {err}");
+    }
+
+    /// One-unit archive with the dependency chain app → libC → stdenv in
+    /// the embedded ATerms only: no `units.jsonl`, no `closures.jsonl`,
+    /// `dependency_closures` false — the minimal capability surface a v0
+    /// archive (or a recorder that skips the ATerm pass) presents.
+    fn write_capabilityless_chain_archive(dir: &std::path::Path) {
+        use crate::archive::schema::{
+            Capabilities, ExpectedOutcome, OutcomeRecord, RequestRecord, RequestTarget,
+            Substituters,
+        };
+        use crate::archive::writer::{ArchiveWriter, ManifestSeed};
+
+        let app_drv = format!("/nix/store/{}-app-3.0.drv", fake_hash("chain-app-drv"));
+        let app_out = format!("/nix/store/{}-app-3.0", fake_hash("chain-app-out"));
+        let lib_c_drv = format!("/nix/store/{}-libC-1.0.drv", fake_hash("chain-libC-drv"));
+        let lib_c_out = format!("/nix/store/{}-libC-1.0", fake_hash("chain-libC-out"));
+        let stdenv_drv = format!("/nix/store/{}-stdenv-9.drv", fake_hash("chain-stdenv-drv"));
+        let stdenv_out = format!("/nix/store/{}-stdenv-9", fake_hash("chain-stdenv-out"));
+
+        let writer = ArchiveWriter::create(dir).unwrap();
+        writer
+            .add_drv(
+                &app_drv,
+                &synth_aterm(
+                    &[("out", app_out.as_str())],
+                    &[lib_c_drv.as_str()],
+                    "x86_64-linux",
+                ),
+            )
+            .unwrap();
+        writer
+            .add_drv(
+                &lib_c_drv,
+                &synth_aterm(
+                    &[("out", lib_c_out.as_str())],
+                    &[stdenv_drv.as_str()],
+                    "x86_64-linux",
+                ),
+            )
+            .unwrap();
+        writer
+            .add_drv(
+                &stdenv_drv,
+                &synth_aterm(&[("out", stdenv_out.as_str())], &[], "x86_64-linux"),
+            )
+            .unwrap();
+        writer
+            .write_requests(&[RequestRecord {
+                session: 0,
+                offset_s: 0.0,
+                targets: vec![RequestTarget {
+                    drv: app_drv.clone(),
+                    outputs: vec!["*".to_string()],
+                }],
+            }])
+            .unwrap();
+        writer
+            .write_outcomes(&[OutcomeRecord {
+                session: None,
+                drv: app_drv.clone(),
+                outcome: ExpectedOutcome::Built,
+                detail: None,
+                duration_s: None,
+                stop_offset_s: None,
+                outputs: BTreeMap::new(),
+            }])
+            .unwrap();
+        let stamp: jiff::Timestamp = "2026-05-28T00:00:00Z".parse().unwrap();
+        writer
+            .finalize(ManifestSeed {
+                created_at: stamp,
+                from: stamp,
+                to: stamp,
+                capabilities: Capabilities {
+                    timed: false,
+                    expected_outcomes: true,
+                    output_hashes: false,
+                    embedded_store_paths: false,
+                    impure_env: false,
+                    dependency_closures: false,
+                },
+                substituters: Substituters::default(),
+                fat: false,
+                provenance: serde_json::Map::new(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn load_closures_falls_back_to_the_embedded_aterm_walk() {
+        // Without the dependency_closures capability the adjacency is
+        // recovered from the embedded derivations — the same per-unit
+        // transitive closure shape closures.jsonl would have produced,
+        // instead of refusing the archive.
+        let tmp = tempfile::tempdir().unwrap();
+        write_capabilityless_chain_archive(tmp.path());
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        assert!(!archive.capabilities().dependency_closures);
+        assert!(archive.closures().is_empty());
+
+        let units = load_units(&archive).unwrap();
+        assert_eq!(units.len(), 1, "the workload itself comes from requests");
+
+        let closures = load_closures(&archive, &units).unwrap();
+        assert_eq!(closures.len(), 1);
+        let app = &closures[0];
+        let dep_drvs: Vec<&str> = app.deps.iter().map(|d| d.drv_path.as_str()).collect();
+        assert_eq!(dep_drvs.len(), 2);
+        assert!(dep_drvs.iter().any(|d| d.contains("-libC-")));
+        assert!(
+            dep_drvs.iter().any(|d| d.contains("-stdenv-")),
+            "transitive dep reached through libC: {dep_drvs:?}"
+        );
+        assert!(
+            app.deps.iter().all(|d| !d.output_paths.is_empty()),
+            "declared output paths recovered from the ATerms"
+        );
+    }
+
+    #[test]
+    fn aterm_fallback_fails_loudly_when_a_dependency_drv_is_missing() {
+        // The fallback walk reads real derivations; a dependency the
+        // archive does not embed is a hard error naming the derivation and
+        // the unit whose closure needed it — never a silently shallower
+        // closure.
+        let tmp = tempfile::tempdir().unwrap();
+        write_capabilityless_chain_archive(tmp.path());
+        let lib_c_drv_name = format!("{}-libC-1.0.drv", fake_hash("chain-libC-drv"));
+        std::fs::remove_file(tmp.path().join("nix/store").join(&lib_c_drv_name)).unwrap();
+
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let units = load_units(&archive).unwrap();
+        let err = format!("{:#}", load_closures(&archive, &units).unwrap_err());
+        assert!(err.contains("libC-1.0.drv"), "got: {err}");
+        assert!(err.contains("-app-3.0.drv"), "error names the root: {err}");
     }
 }

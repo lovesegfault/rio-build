@@ -984,7 +984,7 @@ Scope:
 
 - Re-home the v0 reader (`xtask/src/k8s/replay/archive.rs` on origin/xtask-replay) into a library crate owned by the engine side (crate/module placement per §6 The replayer; the constraint here is only that xtask stops owning it). The `dwarfs` dependency moves with it.
 - Extend it to v1 per §4 Archive format v1: `format_version`, capability flags, the neutral expected-outcome vocabulary, dependency-closure data, provenance block, content-addressed identity, completion-marker upload discipline, S3 layout.
-- Add the writer half (used by the Phase 3 recorder) and the v0 ingestion path (§4 owns the exact compat semantics; the requirement here is that a v0 archive — including every archive nxb-replay has already produced — opens and replays without re-recording).
+- Add the writer half (used by the Phase 3 recorder) and the v0 ingestion path (§4 owns the exact compat semantics; the requirement here is that a v0 archive — including every archive nxb-replay has already produced — opens without re-recording: it maps onto the full v1 in-memory model, is inspectable, and plans offline timed dry-runs, with the engine's ATerm fallbacks covering the members v0 never carries. Live campaigns additionally require the v1 content-addressed identity — campaign pinning, resume, and publication key on `archive_id`, which v0 archives lack — so a live campaign over a v0 recording is out of scope until an identity for id-less archives is designed).
 - Move the committed fixture archive with the reader; add a v1 sibling fixture.
 
 Validation: unit round-trip tests for every file in the format; the v0 fixture parses to the same in-memory model through the compat path as it does today through the v0 reader; a golden test pins the content-digest computation (same discipline as the EvalSetKey golden digest). No engine behavior changes in this phase.
@@ -1091,7 +1091,7 @@ The branch is closed after Phase 5 without a wholesale merge; everything that su
 
 - **Eval sets** (`parity/evals/<eval>/<digest16>/`): abandoned in place at Phase 3 per the deployment policy (§2.5). They are not converted and nothing reads them after the eval-set input path is removed in Phase 5; a scope still wanted as a campaign input is re-recorded as a v1 archive (§11.5). The prefixes are not rewritten or deleted — they simply stop mattering.
 - **Campaign artifacts** (`parity/campaigns/<campaign-id>/`): never rewritten. Pre-rename campaigns keep the old bucket vocabulary in their stored `results.jsonl`/`summary.md`; the comparability block's `engine_version` and the Appendix C mapping make cross-era reading unambiguous. Report tooling is not required to re-render old campaigns.
-- **nxb-replay archives** (operator-held `.dwarfs` files): readable forever via the v0 ingestion path decided in §4; re-recording is never required.
+- **nxb-replay archives** (operator-held `.dwarfs` files): readable forever via the v0 ingestion path decided in §4 — opening, inspecting, and offline dry-run planning never require re-recording (and could not: they are recordings of past production windows). Live campaigns key identity, resume, and publication on the v1 `archive_id`, which v0 archives lack, so they are not live-campaign inputs today.
 
 ## 12. Risks & open questions
 

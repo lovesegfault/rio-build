@@ -683,13 +683,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_refuses_archives_without_dependency_closures() {
+    async fn plan_computes_closures_without_the_dependency_closures_capability() {
         use crate::archive::schema::{Capabilities, RequestRecord, RequestTarget, Substituters};
         use crate::archive::writer::{ArchiveWriter, ManifestSeed};
 
         // A minimal v1 archive with one workload unit but no closures.jsonl
-        // (dependency_closures = false): the plan stage cannot compute warm
-        // sets or attemptability and must refuse loudly.
+        // (dependency_closures = false): the plan stage falls back to the
+        // embedded ATerm walk instead of refusing the archive.
         let dir = tempfile::tempdir().unwrap();
         let drv = format!(
             "/nix/store/{}-solo-1.0.drv",
@@ -753,9 +753,9 @@ mod tests {
         let archive = ReplayArchive::open(dir.path()).unwrap();
 
         let store = FakeStoreApi::default();
-        let err = run_plan(&leaf_spec(), &archive, &store, false)
+        let result = run_plan(&leaf_spec(), &archive, &store, false)
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("dependency_closures"), "{err:#}");
+            .expect("the ATerm fallback makes capability-less archives plannable");
+        assert_eq!(result.output.in_scope, vec!["solo.x86_64-linux"]);
     }
 }
