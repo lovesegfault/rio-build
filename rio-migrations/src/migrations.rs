@@ -1160,9 +1160,11 @@ pub const M_064: () = ();
 ///
 /// Persistence for the per-build force-build-roots policy
 /// (`SubmitBuildRequest.force_build_roots`): `builds.force_build_roots`
-/// plus the per-(build, derivation) submission-root marker
-/// `build_derivations.is_root`, so recovery can rebuild the per-node
-/// "do not substitute" sticky-OR after leader failover.
+/// plus the per-(build, derivation) demand-set marker
+/// `build_derivations.is_root` (writer semantics below). After leader
+/// failover, recovery re-reads the build flag into `BuildInfo` and
+/// joins the `is_root` rows to rebuild the per-build demand set, from
+/// which it re-derives the per-node "do not substitute" sticky-OR.
 ///
 /// `DEFAULT FALSE` is deliberate — the flag is opt-in per submission
 /// (gateway stamps it from tenant policy; absent = today's substitute-
@@ -1170,12 +1172,12 @@ pub const M_064: () = ();
 /// precedent: that default encoded recovery semantics for pre-existing
 /// builds, not an opt-in policy.
 ///
-/// `is_root` lives on `build_derivations` because "was a root of this
-/// build's submission" is a per-(build, derivation) fact: the same
-/// derivation can be a root of build A and an interior node of build B,
-/// and the global `derivation_edges` table (deduped across all builds)
-/// cannot reconstruct which nodes were parentless *within one
-/// submission*.
+/// `is_root` lives on `build_derivations` because demand membership is
+/// a per-(build, derivation) fact: the same derivation can be a root
+/// (or an explicitly-requested target) of build A and a plain interior
+/// node of build B, and the global `derivation_edges` table (deduped
+/// across all builds) cannot reconstruct which nodes were parentless
+/// *within one submission*.
 ///
 /// Both columns are written only on the insert path: insert_build binds
 /// `force_build_roots`, batch_insert_build_derivations binds `is_root`.
@@ -1186,15 +1188,25 @@ pub const M_064: () = ();
 /// backfill — pre-existing rows keep FALSE, which preserves their
 /// original (non-forced) semantics.
 ///
-/// **Writer-semantics widening (no schema change, frozen .sql
-/// untouched):** `is_root = TRUE` originally marked structural
-/// submission roots only. The scheduler now writes it for the
-/// submission's full *demand set* — structural roots ∪ every node the
-/// gateway marked `explicitly_requested` (a client-named target folded
-/// inside a sibling target's closure by multi-target dedup). The
-/// force-build gates and the top-down prune both key on that demand
-/// set, and recovery re-derives the protection from these rows, so the
-/// two consumers cannot drift.
+/// **Writer-semantics widening (no schema change):** `is_root = TRUE`
+/// originally marked structural submission roots only. The scheduler
+/// now writes it for the submission's full *demand set* — structural
+/// roots ∪ every node the gateway marked `explicitly_requested` (a
+/// client-named target folded inside a sibling target's closure by
+/// multi-target dedup). The force-build gates and the top-down prune
+/// both key on that demand set, and recovery re-derives the protection
+/// from these rows, so the two consumers cannot drift.
+///
+/// The `.sql` originally carried a comment block stating the roots-only
+/// semantics, which the widening made false. While the migration was
+/// still unshipped — applied by no persistent DB, so the checksum
+/// freeze had not yet engaged — that block was stripped to bare SQL
+/// plus the commentary pointer line and the pinned SHA-384 for version
+/// 65 updated in the same commit. The freeze-bound surface now states
+/// no writer semantics at all; this const is the only commentary
+/// surface, and `migration_prose_lives_in_doc_consts` (in
+/// `rio-migrations/tests/migrations.rs`) keeps every later migration's
+/// `.sql` equally prose-free.
 ///
 /// Mixed-era consequence, decided deliberately: rows persisted by a
 /// pre-widening leader carry structural roots only, so across a

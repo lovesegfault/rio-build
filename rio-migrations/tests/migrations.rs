@@ -209,7 +209,11 @@ fn migration_checksums_frozen() {
         (62, "ef8bc881b70d800f4eba8923d56500243083ac855716636b4e916ef2b8c94ebabea751bb87e274f65cbb45baf8cb0e63"),
         (63, "3590687681bee63e3254a1ae52c20768b547f6d26d3ee126aeca5e0e284f869afea4f25d03cd15cb49d68655af24531a"),
         (64, "0b64d644a1fdb2f381c8655bbe2a8ab4258dba6fe8bf4fa428cc1df7e627b3b9c4eb8152cc640215dff290bd3ac72dea"),
-        (65, "9145f38b2a6f191cd1c5fa1d6bf98d4b265084881ab1c7aad64ecd3c1cd7c856a65cb0519a2f3f6f3a6bff3c12ffdae4"),
+        // 065 re-pinned once pre-ship: its is_root comment block stated
+        // roots-only semantics the demand-set widening had retired, and
+        // was stripped to bare SQL + pointer while no persistent DB had
+        // applied the migration — see M_065.
+        (65, "cc52c19eb5252bbea84d661f3f7cf864f2fb8c014bd0b3b8fbe6458db8a3f0becfd92ee5f38ce4a49af69ca4af46c41d"),
     ];
 
     let pinned: std::collections::HashMap<i64, &str> = PINNED.iter().copied().collect();
@@ -252,6 +256,78 @@ fn migration_checksums_frozen() {
             "PINNED lists migration {v} but migrations/ has no such file — \
              remove the stale row",
         );
+    }
+}
+
+/// Policy guard for the commentary-relocation rule (see the module
+/// header of `rio-migrations/src/migrations.rs`): a migration `.sql`
+/// carries only bare SQL plus at most the single pointer line
+/// `-- Commentary: see rio-migrations/src/migrations.rs M_NNN`.
+///
+/// A `.sql` file is a freeze-bound doc surface: once the migration
+/// ships to a persistent DB, the checksum freeze makes every comment in
+/// it permanently uneditable, so semantic prose there cannot be
+/// corrected when the code it describes moves on. Migration 065 hit
+/// exactly this shape pre-ship — its `is_root` comment block stated
+/// roots-only semantics after the writer had widened to the demand set
+/// (M_065) — and only the not-yet-shipped status made the fix possible.
+/// A prose-free `.sql` leaves nothing on the frozen surface to go
+/// stale.
+///
+/// Scope: versions > 064 only. 001–064 shipped with historical comment
+/// blocks and are checksum-frozen — editing them now is exactly what
+/// the freeze forbids. The boundary is a fixed historical constant
+/// (the highest migration predating this guard), never moved.
+#[test]
+fn migration_prose_lives_in_doc_consts() {
+    const FROZEN_PROSE_MAX_VERSION: i64 = 64;
+
+    for m in MIGRATOR.iter() {
+        if m.version <= FROZEN_PROSE_MAX_VERSION {
+            continue;
+        }
+        let pointer = format!(
+            "-- Commentary: see rio-migrations/src/migrations.rs M_{:03}",
+            m.version
+        );
+        let sql = m.sql.as_str();
+        for (idx, line) in sql.lines().enumerate() {
+            let trimmed = line.trim();
+            if !trimmed.contains("--") {
+                continue;
+            }
+            // The per-file pointer line is the one allowed comment;
+            // anything else containing `--` — leading block comments,
+            // trailing same-line comments — is prose that belongs in
+            // the M_NNN doc-const. (A SQL literal legitimately
+            // containing `--` would need this guard refined; none
+            // exists today.)
+            assert_eq!(
+                trimmed,
+                pointer,
+                "\n  migration {:03} line {}: comment prose in a migration .sql.\n  \
+                 Move it to rio-migrations/src/migrations.rs (M_{:03}) and keep the\n  \
+                 .sql to bare SQL + the one-line commentary pointer — the file is\n  \
+                 checksum-frozen once it ships, so prose here cannot be fixed when\n  \
+                 it goes stale.",
+                m.version,
+                idx + 1,
+                m.version,
+            );
+        }
+        // A pointer must not dangle: if the .sql names M_NNN, the
+        // doc-const must exist. Match the full declaration so e.g.
+        // `M_065_RENAMED` cannot satisfy a check for `M_065`.
+        if sql.contains(&pointer) {
+            assert!(
+                include_str!("../src/migrations.rs")
+                    .contains(&format!("pub const M_{:03}: () = ();", m.version)),
+                "migration {:03}'s .sql points at M_{:03}, but \
+                 rio-migrations/src/migrations.rs has no such const",
+                m.version,
+                m.version,
+            );
+        }
     }
 }
 
