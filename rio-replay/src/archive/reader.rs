@@ -231,7 +231,7 @@ impl ReplayArchive {
         };
 
         let (narinfos, narinfo_digests) = index_narinfos(&backend, SidecarPolicy::Strict)?;
-        let store_entries = index_store_entries(&backend)?;
+        let store_entries = index_store_entries(&backend, SidecarPolicy::Strict)?;
 
         // The narinfo listing digest covers the sidecars' load-bearing
         // References lines; verify it at open time (sidecars are small).
@@ -415,7 +415,7 @@ impl ReplayArchive {
         // nothing to be checked against, so the recomputed digests are
         // dropped.
         let (narinfos, _) = index_narinfos(&backend, SidecarPolicy::WarnAndSkip)?;
-        let store_entries = index_store_entries(&backend)?;
+        let store_entries = index_store_entries(&backend, SidecarPolicy::WarnAndSkip)?;
 
         let output_hashes_present = outcomes
             .values()
@@ -742,9 +742,10 @@ fn warn_unusable_relay_substituters(substituters: &Substituters) {
     }
 }
 
-/// What to do with a defective narinfo sidecar — one that fails to parse,
-/// or whose filename names a different store hash than its content
-/// describes — the one place the v0 and v1 open paths deliberately differ.
+/// What to do with a defective archive member observation — a narinfo
+/// sidecar that fails to parse or misnames its store hash, or two
+/// `nix/store/` members colliding on hash part — the one axis on which
+/// the v0 and v1 open paths deliberately differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SidecarPolicy {
     /// v1: a hard open error naming the offending file. Skipping an
@@ -848,10 +849,45 @@ fn index_narinfos(
 
 /// Index `nix/store/`: hash part → entry. Drives the store-path keyed
 /// lookups; contents stay in the backend until asked for.
-fn index_store_entries(backend: &Backend) -> Result<HashMap<String, WalkEntry>> {
+///
+/// Two members colliding on hash part cannot both be served — this map
+/// and every lookup through it key on the hash part — and real store
+/// paths derive the hash from the name, so a collision proves the
+/// archive was mis-assembled. It is handled per `policy`, exactly like
+/// a defective narinfo sidecar: refused at open for v1, where silent
+/// last-wins indexing would otherwise serve whichever member the
+/// backend listed last (a vanished supply rung, or the wrong ATerm,
+/// surfacing mid-campaign); warn-and-keep-the-first-observed for v0,
+/// whose irreplaceable recordings must stay openable — the shadowed
+/// member was unreachable through this map either way, the skip just
+/// makes it loud.
+fn index_store_entries(
+    backend: &Backend,
+    policy: SidecarPolicy,
+) -> Result<HashMap<String, WalkEntry>> {
     let mut store_entries: HashMap<String, WalkEntry> = HashMap::new();
     for entry in backend.list_dir(STORE_DIR)?.unwrap_or_default() {
-        store_entries.insert(super::hash_part(&entry.name).to_string(), entry);
+        match store_entries.entry(super::hash_part(&entry.name).to_string()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(entry);
+            }
+            std::collections::hash_map::Entry::Occupied(slot) => {
+                let collision = anyhow!(
+                    "{STORE_DIR}/ members {} and {} collide on store hash part {} — lookups key \
+                     on the hash part, so one member would silently shadow the other (the \
+                     archive was mis-assembled)",
+                    slot.get().name,
+                    entry.name,
+                    slot.key(),
+                );
+                match policy {
+                    SidecarPolicy::Strict => return Err(collision),
+                    SidecarPolicy::WarnAndSkip => {
+                        tracing::warn!("skipping colliding store member: {collision:#}");
+                    }
+                }
+            }
+        }
     }
     Ok(store_entries)
 }
@@ -1388,6 +1424,30 @@ mod tests {
         );
     }
 
+    /// Two `nix/store/` members colliding on store hash part cannot both
+    /// be served — every lookup keys on the hash part — so a v1 archive
+    /// carrying them is refused at open, like the narinfo identity
+    /// mismatch above: real store paths derive the hash from the name,
+    /// so a collision proves mis-assembly, and last-wins indexing would
+    /// silently serve whichever member the backend listed last (a
+    /// vanished supply rung or the wrong ATerm, surfacing mid-campaign).
+    #[test]
+    fn colliding_store_members_are_an_open_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        let collider = format!("{}-src2", hash_part(SRC_PATH));
+        std::fs::write(root.join(STORE_DIR).join(&collider), b"foreign member\n").unwrap();
+
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(err.contains("collide on store hash part"), "got: {err}");
+        // The refusal names both members and the shared hash part.
+        assert!(
+            err.contains("-src") && err.contains(&collider) && err.contains(hash_part(SRC_PATH)),
+            "got: {err}"
+        );
+    }
+
     /// A v1 archive whose RELAY list carries an entry the admission screen
     /// rejects still opens. Our writer cannot produce such an archive (the
     /// finalize check refuses it), so the fixture edits the manifest after
@@ -1811,6 +1871,36 @@ mod tests {
         assert!(
             archive.narinfo(V0_SRC_PATH).is_some(),
             "the intact sidecar still loads"
+        );
+    }
+
+    /// The same store hash-part collision that hard-fails a v1 open
+    /// (`colliding_store_members_are_an_open_error`) warns and keeps one
+    /// member in a v0 archive: the recording is irreplaceable and the
+    /// shadowed member was unreachable under hash-part keying anyway —
+    /// what changes is that the collapse is loud and bounded to one
+    /// entry per hash part instead of silently last-wins.
+    #[test]
+    fn v0_colliding_store_members_warn_and_keep_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        copy_v0_fixture_to(&root);
+
+        let collider = format!("{}-src2.txt", hash_part(V0_SRC_PATH));
+        std::fs::write(root.join(STORE_DIR).join(&collider), b"foreign member\n").unwrap();
+
+        let archive =
+            ReplayArchive::open(&root).expect("an irreplaceable v0 recording must stay openable");
+        let hash = hash_part(V0_SRC_PATH);
+        let with_hash: Vec<String> = archive
+            .embedded_store_paths()
+            .into_iter()
+            .filter(|path| hash_part(path) == hash)
+            .collect();
+        assert_eq!(
+            with_hash.len(),
+            1,
+            "exactly one member per hash part survives: {with_hash:?}"
         );
     }
 
