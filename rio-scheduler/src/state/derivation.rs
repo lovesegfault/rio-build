@@ -953,7 +953,7 @@ pub struct DerivationState {
     /// (`UnverifiedClaim` → `PathBoundBytes` after the store `.drv` is
     /// fetched, text-CA-verified, and found to match the recorded
     /// claims). Persisted (`M_067`, creation-snapshot semantics) and
-    /// restored verbatim by [`Self::from_recovery_row`] with a
+    /// restored verbatim by `Self::from_recovery_row` (private) with a
     /// content-presence floor.
     pub evidence: DefinitionEvidence,
     /// `inputSrcs` from the derivation ATerm — already-built store

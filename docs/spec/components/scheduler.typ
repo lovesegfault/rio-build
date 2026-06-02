@@ -2343,7 +2343,7 @@ bytes into the comparison. The fetch budget (8 per merge) bounds the
 single-threaded actor's exposure to a submission manufactured to carry
 many settled conflicts; conflicts past the budget keep the fail-closed
 rejection and are observable (`over_budget` on the
-`rio_scheduler_merge_store_evidence_total` counter). The rank gate on
+#(refs.metric)("rio_scheduler_merge_store_evidence_total") counter). The rank gate on
 row-only victims is uniform with the displacement primitive's settled
 rule (#rref("sched.merge.evidence-ranked-displacement")); it is also
 unreachable in honest operation --- store bytes cannot contradict an

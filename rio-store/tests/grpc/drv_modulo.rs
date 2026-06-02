@@ -13,23 +13,27 @@ use rio_auth::hmac::{HmacSigner, ServiceClaims};
 const TEST_KEY: &[u8] = b"test-key-at-least-32-bytes-long!";
 const SERVICE_KEY: &[u8] = b"test-service-hmac-key-32-bytes!!!!";
 
+// The files under `fixtures/` are byte-identical vendored copies of
+// rio-nix/tests/fixtures/drv/ (source of truth, where nix minted them).
+// They are immutable by construction — the store-path file names embed
+// the content hash and these tests depend on path↔content text-CA
+// agreement, so any edit breaks both crates' suites loudly. Vendoring
+// (rather than a `../../../rio-nix/...` include) keeps the include
+// inside this crate's source tree: crate2nix builds each crate from a
+// filtered per-crate source where sibling crates' files do not exist.
 const GOLDEN_LEAF_PATH: &str = "/nix/store/ragyx33c7zn1kxaag6nc57aiw71699ln-rio-golden-leaf.drv";
-const GOLDEN_LEAF: &str = include_str!(
-    "../../../rio-nix/tests/fixtures/drv/ragyx33c7zn1kxaag6nc57aiw71699ln-rio-golden-leaf.drv"
-);
+const GOLDEN_LEAF: &str =
+    include_str!("fixtures/ragyx33c7zn1kxaag6nc57aiw71699ln-rio-golden-leaf.drv");
 const GOLDEN_MULTI_PATH: &str = "/nix/store/jkafcgv3rmnnyrhbr0zmfmh58fnw8wgw-rio-golden-multi.drv";
-const GOLDEN_MULTI: &str = include_str!(
-    "../../../rio-nix/tests/fixtures/drv/jkafcgv3rmnnyrhbr0zmfmh58fnw8wgw-rio-golden-multi.drv"
-);
+const GOLDEN_MULTI: &str =
+    include_str!("fixtures/jkafcgv3rmnnyrhbr0zmfmh58fnw8wgw-rio-golden-multi.drv");
 const GOLDEN_FOD_PATH: &str = "/nix/store/5d0dlxwjfzi5pbqb526pd35ny1rcmm7x-rio-golden-fod.drv";
-const GOLDEN_FOD: &str = include_str!(
-    "../../../rio-nix/tests/fixtures/drv/5d0dlxwjfzi5pbqb526pd35ny1rcmm7x-rio-golden-fod.drv"
-);
+const GOLDEN_FOD: &str =
+    include_str!("fixtures/5d0dlxwjfzi5pbqb526pd35ny1rcmm7x-rio-golden-fod.drv");
 const GOLDEN_CONSUMER_PATH: &str =
     "/nix/store/92fkmfw4x3ks4dl3pvhk9s0hm3z30cc2-rio-golden-consumer.drv";
-const GOLDEN_CONSUMER: &str = include_str!(
-    "../../../rio-nix/tests/fixtures/drv/92fkmfw4x3ks4dl3pvhk9s0hm3z30cc2-rio-golden-consumer.drv"
-);
+const GOLDEN_CONSUMER: &str =
+    include_str!("fixtures/92fkmfw4x3ks4dl3pvhk9s0hm3z30cc2-rio-golden-consumer.drv");
 
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
