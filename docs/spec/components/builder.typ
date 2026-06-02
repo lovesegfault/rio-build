@@ -949,7 +949,7 @@ backpressure is display loss only, never control-plane loss.
   non-retryable semantics as the byte limit.
 ]
 
-#r("builder.log-limit+2")[
+#r("builder.log-limit+3")[
   The log batcher enforces per-build `LogLimits`. `total_bytes` (cumulative
   across flushed batches) is a hard cap: a line whose PROSPECTIVE total would
   exceed it is rejected, `add_line` returns `LimitExceeded{reason}`, the
@@ -963,8 +963,21 @@ backpressure is display loss only, never control-plane loss.
   injected at the next window reset. The build continues. Dropped lines do not
   count toward `total_bytes`. Maps to
   #(refs.metric)("rio_builder_log_lines_suppressed_total"). Either limit set
-  to `0` means unlimited.
+  to `0` means unlimited. On loop exit the batcher MUST be consumed
+  (`finish`), which unconditionally drains the final suppression window and
+  the relay-shed tally --- the final window's marker and metric MUST NOT be
+  lost when the build exits within a suppression window, including when no
+  buffered lines remain, and the terminal line count is obtainable only by
+  consuming the batcher.
 ]
+
+The terminal-drain clause is structural, not procedural: `final_line_count`
+--- which every exit path needs for the footer banner and retry seeding ---
+exists only as `finish(self)`'s return value, so an exit path that skips the
+terminal drain does not compile. The previous shape (a terminal flush gated
+on `has_pending()`, which sees buffered lines but not pending window drops)
+lost the marker exactly when the final window's accepted lines had already
+been flushed by a tick.
 
 = Overlay Store Architecture
 
@@ -1657,12 +1670,17 @@ construction site goes through it --- the log loop's five sends and
 footer) --- so a degraded scheduler link degrades the *display* stream only:
 builds keep running, limit kills keep firing
 (#rref("builder.exec.limits-isolated+1")), completions keep their guaranteed
-delivery. The suppression marker consumes a line number and counts toward
-the byte cap exactly like the rate-suppression marker, so persisted logs
-show a forward line-number gap over the shed span (the `obs.log.gap-span`
-shape the scheduler ring buffer already accepts); the marker itself is
-best-effort --- a shed final flush leaves a bounded display gap with no
-later carrier.
+delivery. The marker clause holds by construction, not by delivery-site
+discipline: the shed tally is drained inside the batcher's `flush()`, so
+every assembled batch --- batch-full, tick, phase boundary, terminal
+`finish` --- carries the marker for everything shed since the last flush.
+The marker consumes a line number and counts toward the byte cap exactly
+like the rate-suppression marker, so persisted logs show a forward
+line-number gap over the shed span (the `obs.log.gap-span` shape the
+scheduler ring buffer already accepts); marker *delivery* at the terminal
+boundary remains best-effort --- a shed terminal batch leaves a bounded
+display gap (#rref("builder.log-limit+3") guarantees its assembly, not its
+delivery).
 
 #r("builder.result.input-materialization-is-infra+4")[
   A build failure caused by an input path that was verified present in

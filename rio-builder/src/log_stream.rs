@@ -95,6 +95,15 @@ pub struct LogBatcher {
     pub(crate) window_start: Instant,
     /// Total bytes across all lines ever added (including flushed batches).
     pub(crate) total_bytes: u64,
+    /// Relay-shed tally shared with the build's [`SheddingLogSender`]
+    /// (attached by the log loop). Drained inside [`flush`](Self::flush),
+    /// so EVERY assembled batch carries the suppression marker for
+    /// display messages shed since the last delivery — the
+    /// `builder.relay.log-shed` "next delivered batch MUST carry a
+    /// single suppression marker" clause holds at every call site by
+    /// construction instead of by per-caller discipline. `None` only
+    /// for batchers tested in isolation.
+    relay_shed: Option<Arc<AtomicU64>>,
 }
 
 impl LogBatcher {
@@ -134,15 +143,24 @@ impl LogBatcher {
             lines_dropped_this_window: 0,
             window_start: now,
             total_bytes: 0,
+            relay_shed: None,
         }
     }
 
-    /// Total lines accounted for: `initial_line` + every line ever
-    /// flushed (including rate-suppression markers, excluding currently
-    /// buffered lines — call after [`Self::final_flush`]). The executor
-    /// reads this after the stderr loop drains to set the footer
-    /// banner's `first_line_number`.
-    pub fn line_count(&self) -> u64 {
+    /// Share the relay-shed tally with this batcher so
+    /// [`flush`](Self::flush) injects the suppression marker for shed
+    /// display messages. Called once by the log loop at entry.
+    pub(crate) fn attach_relay_shed(&mut self, sender: &SheddingLogSender) {
+        self.relay_shed = Some(Arc::clone(&sender.shed));
+    }
+
+    /// Lines accounted for so far: `initial_line` + every line ever
+    /// flushed (including suppression markers, excluding currently
+    /// buffered lines). Mid-build observation only — the terminal
+    /// count is obtainable solely by consuming the batcher through
+    /// [`finish`](Self::finish).
+    #[cfg(test)]
+    pub(crate) fn line_count(&self) -> u64 {
         self.next_line_number
     }
 
@@ -151,12 +169,12 @@ impl LogBatcher {
     ///
     /// Limit checks happen BEFORE buffering — a line that would exceed the
     /// size limit is rejected, not half-accepted.
-    // r[impl builder.log-limit+2]
+    // r[impl builder.log-limit+3]
     pub fn add_line(&mut self, line: Vec<u8>) -> AddLineResult {
         // --- Rate limit (suppression, not abort) ---
         // Runs BEFORE the size check: a rate-dropped line is never
         // transmitted, so it has zero infrastructure cost and must not
-        // count toward `total_bytes` (`r[builder.log-limit+2]`). Tumbling
+        // count toward `total_bytes` (`r[builder.log-limit+3]`). Tumbling
         // window: if ≥ 1s has elapsed since window_start, reset. Instant
         // (monotonic) so NTP jumps don't spuriously trip/un-trip.
         if self.limits.rate_lines_per_sec > 0 {
@@ -235,18 +253,33 @@ impl LogBatcher {
 
     /// Flush buffered lines as a batch.
     ///
+    /// Drains the relay-shed tally first (when attached): the assembled
+    /// batch carries one `[rio: N log messages shed …]` marker covering
+    /// every display message shed since the last flush, so the
+    /// `builder.relay.log-shed` marker clause is true wherever a batch
+    /// is assembled — `BatchReady`, the periodic `flush_tick`, the
+    /// phase-boundary flush, and [`finish`](Self::finish) — instead of
+    /// depending on each delivery site remembering to inject it.
+    ///
     /// Does NOT drain `lines_dropped_this_window` — drops belong to the
     /// rate window, not the batch. Draining here would let the 100ms
     /// `flush_tick` emit a fragmentary marker mid-window whenever some
     /// accepted lines are still buffered alongside drops (any
     /// `rate % MAX_BATCH_LINES != 0`), violating the spec's "single
-    /// marker at window reset" (`r[builder.log-limit+2]`). Only
-    /// `add_line`'s window-reset and [`final_flush`](Self::final_flush)
-    /// drain drops.
-    ///
-    /// Callers: `BatchReady` (mid-build), the periodic `flush_tick`
-    /// (gated on `has_pending()`), and `final_flush()`.
+    /// marker at window reset" (`r[builder.log-limit+3]`). Only
+    /// `add_line`'s window-reset and [`finish`](Self::finish) drain
+    /// drops.
+    // r[impl builder.relay.log-shed]
     pub fn flush(&mut self) -> BuildLogBatch {
+        if let Some(shed) = &self.relay_shed {
+            let shed = shed.swap(0, Ordering::Relaxed);
+            if shed > 0 {
+                self.push_marker(format!(
+                    "[rio: {shed} log messages shed (scheduler link backpressure)]"
+                ));
+            }
+        }
+
         let first_line_number = self.next_line_number;
         self.next_line_number += self.lines.len() as u64;
 
@@ -260,16 +293,21 @@ impl LogBatcher {
         }
     }
 
-    /// Terminal flush: drain `lines_dropped_this_window` (emitting the
-    /// suppression marker + metric) then [`flush`](Self::flush).
+    /// Consume the batcher: drain the final suppression window and the
+    /// relay-shed tally, and return the terminal batch (if anything
+    /// resulted) plus the final line count.
     ///
-    /// Call ONLY on exit paths (`STDERR_LAST`, `LimitExceeded`,
-    /// silence-timeout). A build whose final burst exceeds the rate and
-    /// then exits within the same 1s window never triggers `add_line`'s
-    /// window-reset, so without this the marker + metric would be lost
-    /// (silent truncation, undercounted
-    /// `rio_builder_log_lines_suppressed_total`).
-    pub fn final_flush(&mut self) -> BuildLogBatch {
+    /// This is the ONLY source of the terminal line count — exit paths
+    /// cannot skip the terminal drain, because the count they need is
+    /// behind the consumption. A build whose final burst exceeds the
+    /// rate and then exits within the same 1s window never triggers
+    /// `add_line`'s window-reset; without the unconditional drain here
+    /// the marker + metric would be lost (silent truncation,
+    /// undercounted `rio_builder_log_lines_suppressed_total`) — and a
+    /// terminal drain gated on buffered lines loses them exactly when
+    /// the buffer happens to be empty.
+    // r[impl builder.log-limit+3]
+    pub fn finish(mut self) -> (Option<BuildLogBatch>, u64) {
         let dropped = std::mem::take(&mut self.lines_dropped_this_window);
         if dropped > 0 {
             metrics::counter!("rio_builder_log_lines_suppressed_total").increment(dropped);
@@ -281,16 +319,26 @@ impl LogBatcher {
             self.total_bytes += marker.len() as u64;
             self.lines.push(marker);
         }
-        self.flush()
+        // flush() drains the relay-shed tally (when attached), so the
+        // terminal batch also carries the trailing shed marker that
+        // would otherwise have no later batch to ride.
+        let batch = self.flush();
+        let count = self.next_line_number;
+        if batch.lines.is_empty() {
+            (None, count)
+        } else {
+            (Some(batch), count)
+        }
     }
 
     /// Whether there are buffered lines waiting to be sent.
     ///
-    /// Used by `executor/daemon/stderr_loop.rs` to gate the periodic
-    /// `flush_tick`. Deliberately does NOT check
+    /// Gates the periodic `flush_tick` and the phase-boundary flush in
+    /// the executor's log loop. Deliberately does NOT check
     /// `lines_dropped_this_window`: it's not this tick's job to emit the
-    /// marker (only window-reset / `final_flush` do), and reporting
-    /// "pending" with no lines would send an empty batch every 100ms.
+    /// marker (only window-reset / [`finish`](Self::finish) do), and
+    /// reporting "pending" with no lines would send an empty batch every
+    /// 100ms.
     pub fn has_pending(&self) -> bool {
         !self.lines.is_empty()
     }
@@ -506,7 +554,7 @@ mod tests {
     // Rate limiting
     // -----------------------------------------------------------------------
 
-    // r[verify builder.log-limit+2]
+    // r[verify builder.log-limit+3]
     #[test]
     fn rate_limit_drops_excess_within_window() {
         let mut batcher = mk(LogLimits {
@@ -521,21 +569,23 @@ mod tests {
                 other => panic!("line {i} should be Buffered, got {other:?}"),
             }
         }
-        let batch = batcher.final_flush();
+        let (batch, count) = batcher.finish();
+        let batch = batch.expect("buffered lines + marker");
         assert_eq!(batch.lines.len(), 6, "5 buffered + 1 suppression marker");
         assert_eq!(batch.lines[4], vec![4u8], "last buffered is index 4");
         let marker = std::str::from_utf8(&batch.lines[5]).unwrap();
         assert!(
             marker.contains("5 lines suppressed"),
-            "final_flush() emits marker for drops never followed by window-reset: {marker}"
+            "finish() emits marker for drops never followed by window-reset: {marker}"
         );
+        assert_eq!(count, 6, "terminal count covers lines + marker");
     }
 
-    /// Regression: build ends within the suppression window → final_flush()
-    /// must emit the marker (was lost: only add_line()'s window-reset drained
-    /// it).
+    /// Regression: build ends within the suppression window → finish()
+    /// must emit the marker (was lost: only add_line()'s window-reset
+    /// drained it).
     #[test]
-    fn rate_limit_flush_emits_marker_when_build_ends_in_window() {
+    fn rate_limit_finish_emits_marker_when_build_ends_in_window() {
         let mut batcher = mk(LogLimits {
             rate_lines_per_sec: 3,
             total_bytes: 0,
@@ -543,24 +593,122 @@ mod tests {
         for _ in 0..7 {
             batcher.add_line(b"l".to_vec());
         }
-        // No sleep, no further add_line — straight to final flush.
+        // No sleep, no further add_line — straight to consumption.
         // has_pending() is true here because 3 lines are buffered; it
-        // does NOT report the 4 drops. Exit paths call final_flush()
-        // unconditionally.
+        // does NOT report the 4 drops.
         assert!(batcher.has_pending());
-        let batch = batcher.final_flush();
+        let (batch, _) = batcher.finish();
+        let batch = batch.expect("buffered lines + marker");
         assert_eq!(batch.lines.len(), 4, "3 accepted + 1 marker");
         let marker = std::str::from_utf8(&batch.lines[3]).unwrap();
         assert!(marker.contains("4 lines suppressed"));
-        assert!(!batcher.has_pending(), "drained after flush");
+    }
+
+    /// merged_bug_022 regression (the deleted daemon-era property,
+    /// restored): a final suppression window whose accepted lines were
+    /// ALL flushed already — empty buffer, drops pending — must still
+    /// emit the marker + metric. The old exit path gated the terminal
+    /// flush on `has_pending()`, which only sees buffered lines, so
+    /// exactly this state lost the marker silently.
+    // r[verify builder.log-limit+3]
+    #[test]
+    fn finish_drains_drops_with_empty_buffer() {
+        let rec = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let mut b = mk(LogLimits {
+            rate_lines_per_sec: 2,
+            total_bytes: 0,
+        });
+        // 2 accepted + 3 dropped in the window…
+        for _ in 0..5 {
+            b.add_line(b"x".to_vec());
+        }
+        // …and the accepted lines are flushed mid-window (tick): the
+        // buffer is now empty while 3 drops are pending.
+        let mid = b.flush();
+        assert_eq!(mid.lines.len(), 2);
+        assert!(
+            !b.has_pending(),
+            "the lost-marker precondition: empty buffer"
+        );
+
+        let (batch, count) = b.finish();
+        let batch = batch.expect("the marker must still be emitted");
+        assert_eq!(batch.lines.len(), 1, "exactly the suppression marker");
+        assert!(
+            std::str::from_utf8(&batch.lines[0])
+                .unwrap()
+                .contains("3 lines suppressed"),
+        );
+        assert_eq!(count, 3, "2 lines + 1 marker numbered");
+        assert_eq!(rec.get("rio_builder_log_lines_suppressed_total{}"), 3);
+    }
+
+    /// finish() with nothing pending — no lines, no drops, no shed —
+    /// produces no batch (an empty terminal batch would be a useless
+    /// 100-byte message per build).
+    #[test]
+    fn empty_finish_sends_nothing() {
+        let b = mk(LogLimits {
+            rate_lines_per_sec: 3,
+            total_bytes: 0,
+        });
+        let (batch, count) = b.finish();
+        assert!(batch.is_none());
+        assert_eq!(count, 0);
+    }
+
+    /// The relay-shed marker is injected inside flush() itself (when the
+    /// tally is attached): the batch being assembled carries it — no
+    /// delivery site can forget, and the marker can never trail with no
+    /// later batch to ride.
+    // r[verify builder.relay.log-shed]
+    #[test]
+    fn marker_injected_inside_flush() {
+        let (tx, _rx) = mpsc::channel(1);
+        let sender = SheddingLogSender::new(tx);
+        let mut b = mk(LogLimits::UNLIMITED);
+        b.attach_relay_shed(&sender);
+
+        b.add_line(b"real".to_vec());
+        // Two display sends shed (the single sink slot is empty but we
+        // never deliver — simulate by filling it).
+        assert_eq!(
+            sender.try_send_phase(BuildPhase {
+                derivation_path: "/rio/store/aaa-x.drv".into(),
+                phase: "buildPhase".into(),
+            }),
+            LogSendOutcome::Sent
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                sender.try_send_phase(BuildPhase {
+                    derivation_path: "/rio/store/aaa-x.drv".into(),
+                    phase: "buildPhase".into(),
+                }),
+                LogSendOutcome::Shed
+            );
+        }
+
+        let batch = b.flush();
+        assert_eq!(batch.lines.len(), 2, "real line + shed marker, same batch");
+        assert!(
+            std::str::from_utf8(&batch.lines[1])
+                .unwrap()
+                .contains("2 log messages shed"),
+        );
+        // The tally drained: the next flush carries no marker.
+        b.add_line(b"next".to_vec());
+        assert_eq!(b.flush().lines.len(), 1);
     }
 
     /// Regression: mid-window tick `flush()` with buffered lines + drops
     /// must NOT drain drops (would emit a fragmentary marker, then a
-    /// second one at window-reset — violates `r[builder.log-limit+2]`'s
+    /// second one at window-reset — violates `r[builder.log-limit+3]`'s
     /// "single marker at window reset"). Only `add_line`'s reset and
     /// `final_flush()` drain.
-    // r[verify builder.log-limit+2]
+    // r[verify builder.log-limit+3]
     #[test]
     fn rate_limit_single_marker_per_window_under_mixed_tick_flush() {
         let mut b = mk(LogLimits {
@@ -804,7 +952,7 @@ mod tests {
     /// bug_140 regression: a large line arriving while the rate window is
     /// full would have been rate-dropped (zero transmitted bytes) — it
     /// must NOT trip the size limit.
-    // r[verify builder.log-limit+2]
+    // r[verify builder.log-limit+3]
     #[test]
     fn rate_dropped_large_line_does_not_trip_size() {
         let mut b = mk(LogLimits {
