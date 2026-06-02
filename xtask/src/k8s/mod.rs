@@ -50,6 +50,21 @@ pub const NS_BUILDERS: &str = "rio-builders";
 /// open internet egress on 80/443 (FOD fetchurl/git).
 pub const NS_FETCHERS: &str = "rio-fetchers";
 
+/// In-cluster gRPC port of the scheduler AdminService. The chart's
+/// `rio.grpcServicePair` renders Service port and container port `grpc`
+/// as the same number, so this is both the port clients dial on the
+/// rio-scheduler Service and the pod port the scheduler-ingress
+/// CiliumNetworkPolicy scopes its `toPorts` to (helm/27 pins the
+/// rendered pairing). A string because every consumer is one: dial
+/// address formatting and CNP `toPorts` JSON, where Cilium serializes
+/// ports as strings.
+pub const SCHEDULER_GRPC_PORT: &str = "9001";
+
+/// In-cluster gRPC port of the store StoreService — same Service/pod
+/// port identity and same consumers as [`SCHEDULER_GRPC_PORT`], for the
+/// rio-store Service and the store-ingress CiliumNetworkPolicy.
+pub const STORE_GRPC_PORT: &str = "9002";
+
 /// All four rio namespaces and whether each needs the `privileged` PSA
 /// label. Providers iterate this at deploy time so the namespaces exist
 /// before `helm upgrade` (which renders cross-ns resources into them).

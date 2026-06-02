@@ -372,14 +372,25 @@ pub fn campaign_annotations(
 }
 
 /// In-cluster scheduler AdminService address recorded in the campaign
-/// spec (ClusterIP Service, gRPC).
+/// spec (ClusterIP Service, gRPC). Built from the same port constant the
+/// CNP read-back verifies admissions against, so the port the engine
+/// dials and the port the verifier demands cannot drift apart.
 fn scheduler_addr() -> String {
-    format!("rio-scheduler.{}.svc:9001", crate::k8s::NS)
+    format!(
+        "rio-scheduler.{}.svc:{}",
+        crate::k8s::NS,
+        crate::k8s::SCHEDULER_GRPC_PORT
+    )
 }
 
 /// In-cluster store StoreService address recorded in the campaign spec.
+/// Same port-constant coupling as [`scheduler_addr`].
 fn store_addr() -> String {
-    format!("rio-store.{}.svc:9002", crate::k8s::NS_STORE)
+    format!(
+        "rio-store.{}.svc:{}",
+        crate::k8s::NS_STORE,
+        crate::k8s::STORE_GRPC_PORT
+    )
 }
 
 /// ssh-ng store URL for one campaign tenant: the in-cluster gateway

@@ -219,16 +219,31 @@ fn replay_currently_enabled(values: Option<&serde_json::Value>) -> bool {
         == Some(true)
 }
 
-/// Whether one CiliumNetworkPolicy admits the campaign engine: some
-/// ingress `fromEndpoints` entry matches the replay namespace plus the
-/// `rio-replay` name label — exactly what the chart renders under
-/// `replay.enabled=true` (infra/helm/rio-build/templates/networkpolicy.yaml).
-/// Pure so the predicate is unit-testable against chart-shaped JSON.
-fn cnp_admits_replay(cnp: &serde_json::Value) -> bool {
+/// Whether one CiliumNetworkPolicy admits the campaign engine ON THE
+/// SERVICE'S gRPC PORT: some ingress rule whose `toPorts` contains
+/// `grpc_port` carries a `fromEndpoints` entry matching the replay
+/// namespace plus the `rio-replay` name label — exactly what the chart
+/// renders under `replay.enabled=true`
+/// (infra/helm/rio-build/templates/networkpolicy.yaml; helm/27 pins the
+/// rendered pairing). Rules are selected by port content first: an
+/// admission entry parked on some other rule (e.g. the metrics one)
+/// admits nothing the engine dials, so it must NOT satisfy this
+/// predicate — Cilium would still drop every gRPC call. Pure so the
+/// predicate is unit-testable against chart-shaped JSON.
+fn cnp_admits_replay(cnp: &serde_json::Value, grpc_port: &str) -> bool {
     cnp.pointer("/spec/ingress")
         .and_then(|v| v.as_array())
         .into_iter()
         .flatten()
+        .filter(|rule| {
+            rule.get("toPorts")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|tp| tp.get("ports").and_then(|v| v.as_array()))
+                .flatten()
+                .any(|p| p.get("port").and_then(|v| v.as_str()) == Some(grpc_port))
+        })
         .filter_map(|rule| rule.get("fromEndpoints").and_then(|v| v.as_array()))
         .flatten()
         .filter_map(|ep| ep.get("matchLabels").and_then(|v| v.as_object()))
@@ -245,16 +260,27 @@ fn cnp_admits_replay(cnp: &serde_json::Value) -> bool {
 }
 
 /// Read back both component-ingress CiliumNetworkPolicies and assert each
-/// admits the campaign engine. The chart renders the admissions into
-/// scheduler-ingress (rio-system) and store-ingress (rio-store); a miss
-/// on either means replay traffic is silently dropped.
+/// admits the campaign engine on the port the engine dials
+/// ([`crate::k8s::SCHEDULER_GRPC_PORT`] / [`crate::k8s::STORE_GRPC_PORT`]
+/// — the same constants the campaign-spec addresses are built from). The
+/// chart renders the admissions into scheduler-ingress (rio-system) and
+/// store-ingress (rio-store); a miss on either means replay traffic is
+/// silently dropped. On the already-enabled idempotent path this
+/// read-back is the ONLY check against whatever CNPs an older deployment
+/// left behind, which is why it verifies the deployed artifact rather
+/// than trusting the release values.
 async fn verify_cnp_admissions(client: &kclient::Client) -> Result<()> {
     use ::kube::api::Api;
     use ::kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 
+    use crate::k8s::{SCHEDULER_GRPC_PORT, STORE_GRPC_PORT};
+
     let gvk = GroupVersionKind::gvk("cilium.io", "v2", "CiliumNetworkPolicy");
     let ar = ApiResource::from_gvk(&gvk);
-    for (ns, name) in [(NS, "scheduler-ingress"), (NS_STORE, "store-ingress")] {
+    for (ns, name, port) in [
+        (NS, "scheduler-ingress", SCHEDULER_GRPC_PORT),
+        (NS_STORE, "store-ingress", STORE_GRPC_PORT),
+    ] {
         let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), ns, &ar);
         let cnp = api
             .get_opt(name)
@@ -267,10 +293,12 @@ async fn verify_cnp_admissions(client: &kclient::Client) -> Result<()> {
                 )
             })?;
         ensure!(
-            cnp_admits_replay(&cnp.data),
+            cnp_admits_replay(&cnp.data, port),
             "CiliumNetworkPolicy {ns}/{name} has no ingress admission for the campaign engine \
-             (namespace {NS_REPLAY}, label rio-replay) — the helm upgrade did not take effect; \
-             check `helm get values {RELEASE} -n {NS}` for replay.enabled"
+             (namespace {NS_REPLAY}, label rio-replay) on gRPC port {port} — Cilium would \
+             silently drop the engine's traffic to this service; check `helm get values \
+             {RELEASE} -n {NS}` for replay.enabled and a replay.namespace override, then re-run \
+             `cargo xtask replay setup`"
         );
     }
     Ok(())
@@ -315,71 +343,176 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn cnp_admission_predicate_matches_chart_shape() {
-        // The exact fromEndpoints entry the chart renders under
-        // replay.enabled=true (networkpolicy.yaml), surrounded by the
-        // always-present entries — the predicate must find it among them.
-        let enabled = json!({
-            "spec": {
-                "endpointSelector": {"matchLabels": {"app.kubernetes.io/name": "rio-scheduler"}},
-                "ingress": [
-                    {
-                        "fromEndpoints": [
-                            {"matchLabels": {"k8s:io.kubernetes.pod.namespace": "rio-system"}},
-                            {
-                                "matchLabels": {"app.kubernetes.io/component": "rio-builder"},
-                                "matchExpressions": [
-                                    {"key": "k8s:io.kubernetes.pod.namespace", "operator": "Exists"}
-                                ]
-                            },
-                            {
-                                "matchLabels": {
-                                    "k8s:io.kubernetes.pod.namespace": "rio-replay",
-                                    "k8s:app.kubernetes.io/name": "rio-replay"
-                                }
+    /// `spec` of the scheduler-ingress CNP, captured verbatim from the
+    /// producer: `helm template rio . --set global.image.tag=test --set
+    /// replay.enabled=true` (yq'd to JSON) — terminators, sibling
+    /// entries, metrics rule and all. Hand-trimming the fixture is how a
+    /// predicate quietly ends up tested against a shape the chart never
+    /// renders.
+    fn scheduler_ingress_rendered() -> serde_json::Value {
+        json!({
+            "endpointSelector": {"matchLabels": {"app.kubernetes.io/name": "rio-scheduler"}},
+            "ingress": [
+                {
+                    "fromEndpoints": [
+                        {"matchLabels": {"app.kubernetes.io/name": "rio-gateway"}},
+                        {"matchLabels": {"app.kubernetes.io/name": "rio-controller"}},
+                        {"matchLabels": {"gateway.networking.k8s.io/gateway-name": "rio-dashboard"}},
+                        {
+                            "matchLabels": {"app.kubernetes.io/component": "rio-builder"},
+                            "matchExpressions": [
+                                {"key": "k8s:io.kubernetes.pod.namespace", "operator": "Exists"}
+                            ]
+                        },
+                        {
+                            "matchLabels": {"app.kubernetes.io/component": "rio-fetcher"},
+                            "matchExpressions": [
+                                {"key": "k8s:io.kubernetes.pod.namespace", "operator": "Exists"}
+                            ]
+                        },
+                        {
+                            "matchLabels": {
+                                "k8s:io.kubernetes.pod.namespace": "rio-replay",
+                                "k8s:app.kubernetes.io/name": "rio-replay"
                             }
-                        ],
-                        "toPorts": [{"ports": [{"port": "9001", "protocol": "TCP"}]}]
-                    },
-                    {"fromEntities": ["host", "remote-node", "cluster"]}
-                ]
-            }
-        });
-        assert!(cnp_admits_replay(&enabled));
+                        }
+                    ],
+                    "toPorts": [{"ports": [{"port": "9001", "protocol": "TCP"}]}]
+                },
+                {
+                    "fromEntities": ["host", "remote-node", "cluster"],
+                    "toPorts": [{"ports": [{"port": "9091", "protocol": "TCP"}]}]
+                }
+            ]
+        })
+    }
 
-        // Same policy without the replay entry (replay.enabled=false).
+    /// `spec` of the store-ingress CNP from the same render.
+    fn store_ingress_rendered() -> serde_json::Value {
+        json!({
+            "endpointSelector": {"matchLabels": {"app.kubernetes.io/name": "rio-store"}},
+            "ingress": [
+                {
+                    "fromEndpoints": [
+                        {"matchLabels": {"k8s:io.kubernetes.pod.namespace": "rio-system"}},
+                        {
+                            "matchLabels": {"app.kubernetes.io/component": "rio-builder"},
+                            "matchExpressions": [
+                                {"key": "k8s:io.kubernetes.pod.namespace", "operator": "Exists"}
+                            ]
+                        },
+                        {
+                            "matchLabels": {"app.kubernetes.io/component": "rio-fetcher"},
+                            "matchExpressions": [
+                                {"key": "k8s:io.kubernetes.pod.namespace", "operator": "Exists"}
+                            ]
+                        },
+                        {
+                            "matchLabels": {
+                                "k8s:io.kubernetes.pod.namespace": "rio-replay",
+                                "k8s:app.kubernetes.io/name": "rio-replay"
+                            }
+                        }
+                    ],
+                    "toPorts": [{"ports": [{"port": "9002", "protocol": "TCP"}]}]
+                },
+                {
+                    "fromEntities": ["host", "remote-node", "cluster"],
+                    "toPorts": [{"ports": [{"port": "9092", "protocol": "TCP"}]}]
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn cnp_admission_predicate_matches_chart_render() {
+        // Both rendered policies admit the engine on their gRPC port —
+        // the predicate must find the entry among the sibling admissions.
+        let scheduler = json!({"spec": scheduler_ingress_rendered()});
+        let store = json!({"spec": store_ingress_rendered()});
+        assert!(cnp_admits_replay(&scheduler, "9001"));
+        assert!(cnp_admits_replay(&store, "9002"));
+
+        // Wiring the verifier to the wrong service's port must fail even
+        // against a fully correct render: the admission exists, but not
+        // on the demanded port.
+        assert!(!cnp_admits_replay(&scheduler, "9002"));
+        assert!(!cnp_admits_replay(&store, "9001"));
+    }
+
+    #[test]
+    fn cnp_admission_rejects_admission_on_non_grpc_rule() {
+        // The discriminating case for port scoping: the rio-replay
+        // fromEndpoints entry exists, but parked on the METRICS rule
+        // (port 9091) while the gRPC rule (9001) carries only the
+        // always-present admissions. A labels-only scan that flattens
+        // every rule's fromEndpoints accepts this policy — yet Cilium
+        // drops all engine gRPC, the exact silent failure the read-back
+        // exists to catch (e.g. a divergent older deployment on setup's
+        // idempotent no-upgrade path).
+        let mut mis_paired = scheduler_ingress_rendered();
+        let rules = mis_paired["ingress"].as_array_mut().unwrap();
+        let admission = rules[0]["fromEndpoints"]
+            .as_array_mut()
+            .unwrap()
+            .pop()
+            .unwrap();
+        rules[1]["fromEndpoints"] = json!([admission]);
+        let mis_paired = json!({"spec": mis_paired});
+        assert!(
+            !cnp_admits_replay(&mis_paired, "9001"),
+            "an admission on a non-gRPC rule admits nothing the engine dials"
+        );
+
+        // Same shape with the admission in place still passes — proves
+        // the rejection above is the port pairing, not fixture damage.
+        assert!(cnp_admits_replay(
+            &json!({"spec": scheduler_ingress_rendered()}),
+            "9001"
+        ));
+    }
+
+    #[test]
+    fn cnp_admission_predicate_rejects_weaker_shapes() {
+        // replay.enabled=false: no admission entry anywhere.
         let disabled = json!({
             "spec": {
                 "ingress": [
                     {
                         "fromEndpoints": [
                             {"matchLabels": {"k8s:io.kubernetes.pod.namespace": "rio-system"}}
-                        ]
+                        ],
+                        "toPorts": [{"ports": [{"port": "9001", "protocol": "TCP"}]}]
                     }
                 ]
             }
         });
-        assert!(!cnp_admits_replay(&disabled));
+        assert!(!cnp_admits_replay(&disabled, "9001"));
 
         // The namespace label alone is not enough — the chart's admission
         // pairs it with the engine's name label, and the predicate must
-        // demand both (a namespace-wide hole would be a policy bug).
+        // demand both (a namespace-wide hole would be a policy bug). The
+        // rule carries the right port so the rejection below is about
+        // the labels, not the port filter.
         let ns_only = json!({
             "spec": {
                 "ingress": [
                     {
                         "fromEndpoints": [
                             {"matchLabels": {"k8s:io.kubernetes.pod.namespace": "rio-replay"}}
-                        ]
+                        ],
+                        "toPorts": [{"ports": [{"port": "9001", "protocol": "TCP"}]}]
                     }
                 ]
             }
         });
-        assert!(!cnp_admits_replay(&ns_only));
+        assert!(!cnp_admits_replay(&ns_only, "9001"));
 
         // Degenerate shapes never panic and never pass.
-        assert!(!cnp_admits_replay(&json!({})));
-        assert!(!cnp_admits_replay(&json!({"spec": {"ingress": []}})));
+        assert!(!cnp_admits_replay(&json!({}), "9001"));
+        assert!(!cnp_admits_replay(
+            &json!({"spec": {"ingress": []}}),
+            "9001"
+        ));
     }
 }
