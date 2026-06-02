@@ -49,6 +49,23 @@ pub fn by_recipe_prefix() -> String {
     format!("{S3_PREFIX}/{ARCHIVES_PREFIX_SEGMENT}/{BY_RECIPE_SEGMENT}/")
 }
 
+/// Is `segment` a per-archive prefix handle under [`archives_prefix`] —
+/// a segment `replay list` renders a row for and `replay delete` sweeps?
+///
+/// ONE predicate for both surfaces, so they cannot disagree: every
+/// INCOMPLETE row the listing surfaces carries the footer's
+/// `replay delete <short id>` hint, and the delete gate must accept
+/// exactly those handles. The recorder always writes 16-lowercase-hex
+/// segments, but out-of-band writes can park any segment name here, and
+/// the listing's whole point is making such residue removable in-tool.
+/// Deliberately shape-agnostic beyond the structural requirements: a
+/// single non-empty path segment (the sweep prefix is derived from it,
+/// so a multi-segment or empty handle would address the wrong subtree)
+/// that is not the recorder-owned `by-recipe/` pointer tree.
+pub fn is_archive_handle(segment: &str) -> bool {
+    !segment.is_empty() && segment != BY_RECIPE_SEGMENT && !segment.contains('/')
+}
+
 /// List the immediate "subdirectory" segment names under `prefix` (which
 /// must end with `/`): one ListObjectsV2 delimiter walk, returning each
 /// CommonPrefix with the leading `prefix` and trailing `/` stripped.
@@ -259,6 +276,30 @@ mod tests {
         // overflowing into nonsense.
         assert_eq!(human_bytes(5 * 1024_u64.pow(4)), "5.0 TiB");
         assert_eq!(human_bytes(2048 * 1024_u64.pow(4)), "2048.0 TiB");
+    }
+
+    #[test]
+    fn archive_handle_predicate_is_shared_by_list_and_delete() {
+        // One predicate decides BOTH list-row rendering (and with it the
+        // footer's `replay delete <short id>` hint) and delete's
+        // acceptance, so the listing can never advertise a removal
+        // command that refuses the handle. Domain: every segment an S3
+        // delimiter walk under replay/archives/ can yield (non-empty,
+        // slash-free), plus the raw operator argument delete receives.
+
+        // Admitted: recorder-conformant short ids AND any out-of-band
+        // residue segment the listing would flag INCOMPLETE.
+        for handle in ["0123456789abcdef", "test", "0123456789ABCDEF", "x"] {
+            assert!(is_archive_handle(handle), "{handle:?} must be deletable");
+        }
+        // Refused: nothing the listing renders. The by-recipe pointer
+        // tree is excluded from listing by this same predicate; empty
+        // and multi-segment strings cannot come out of the delimiter
+        // walk but CAN arrive as the raw delete argument, where they
+        // would derive a sweep prefix addressing the wrong subtree.
+        for handle in ["", BY_RECIPE_SEGMENT, "a/b", "by-recipe/x"] {
+            assert!(!is_archive_handle(handle), "{handle:?} must be refused");
+        }
     }
 
     #[test]

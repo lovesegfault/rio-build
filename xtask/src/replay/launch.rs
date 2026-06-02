@@ -1521,9 +1521,13 @@ pub(super) async fn listed_archives(region: &str, bucket: &str) -> Result<Vec<Li
     let shorts = s3::list_subprefixes(region, bucket, &archives_prefix).await?;
     let mut entries = Vec::new();
     for short in shorts {
-        // The recorder-owned idempotency pointers live under by-recipe/;
-        // they are not archive prefixes.
-        if short == rio_replay::s3::BY_RECIPE_SEGMENT {
+        // One handle predicate with `replay delete`: rows (and the
+        // footer's delete hint) are rendered for exactly the segments
+        // the delete gate accepts. Today this excludes only the
+        // recorder-owned by-recipe/ pointer tree — the delimiter walk
+        // never yields the empty or multi-level segments the predicate
+        // also refuses.
+        if !s3::is_archive_handle(&short) {
             continue;
         }
         if let Some(entry) = read_entry(region, bucket, &short).await? {

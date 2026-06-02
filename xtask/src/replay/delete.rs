@@ -49,8 +49,10 @@ use crate::{tofu, ui};
 
 #[derive(Args)]
 pub struct DeleteArgs {
-    /// Archive id to delete — the 16-char short form shown by
-    /// `replay list` (the S3 prefix segment under `replay/archives/`).
+    /// Archive handle to delete — the S3 prefix segment under
+    /// `replay/archives/` as shown by `replay list` (recorder archives
+    /// use the 16-char short id; INCOMPLETE residue from out-of-band
+    /// writes may carry any segment name, and is equally deletable).
     pub short_id: String,
     /// Skip the confirmation prompt. Required for non-interactive runs.
     #[arg(long)]
@@ -234,16 +236,18 @@ async fn orphan_recipe_digest(region: &str, bucket: &str, prefix: &str) -> Resul
 }
 
 pub async fn run(a: DeleteArgs) -> Result<()> {
-    // The sweep deletes everything under the derived prefix, so the short
-    // id must be exactly an archive prefix segment — never e.g. the
-    // sibling `by-recipe/` pointer tree or an empty segment.
+    // The sweep deletes everything under the derived prefix, so the
+    // handle must be a single archive prefix segment — never the sibling
+    // `by-recipe/` pointer tree, an empty segment, or a multi-segment
+    // path. The predicate is shared with `replay list`, which renders a
+    // row (and the footer's delete hint) for exactly the segments
+    // accepted here — including non-hex residue left by out-of-band
+    // writes, which only this command's sweep can remove in-tool.
     ensure!(
-        a.short_id.len() == 16
-            && a.short_id
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
-        "{:?} is not an archive short id (16 lowercase hex characters, as shown by \
-         `cargo xtask replay list`)",
+        s3::is_archive_handle(&a.short_id),
+        "{:?} is not an archive handle (a single non-empty path segment under \
+         replay/archives/, excluding by-recipe/) — `cargo xtask replay list` shows the \
+         deletable prefixes",
         a.short_id
     );
     let tf = tofu::outputs(TF_DIR)?;
