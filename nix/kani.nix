@@ -283,38 +283,25 @@ in
   # protocol over these predicates, these harnesses prove the predicates
   # themselves over their full bounded input domain.
   #
-  # Fourteen harnesses, measured at ~0.05–0.65 s CBMC time each (~4 s
+  # Nine harnesses, measured at ~0.05–0.65 s CBMC time each (~3 s
   # total, ~15 s wall with the kani-compiler build) on the dev builder.
   #
-  # Classifier (rio-evidence-kernel/src/lib.rs `mod proofs`):
+  # Classifier (rio-evidence-kernel/src/lib.rs `mod proofs` — reduced
+  # to the 2-input domain in T-D5.2: the walk-era hole/mark inputs and
+  # the must_substitute predicate died with the evidence columns):
   #   - check_classifier_exhaustive_case_analysis: the classifier's
-  #     five-case partition (absent/holed/childless → Broken; non-empty
+  #     four-case partition (absent/childless → Broken; non-empty
   #     all-produced → Vouched; otherwise Pending) is exact, total, and
   #     panic-free over every bounded child set.
-  #   - check_marked_broken_must_substitute: marked + Broken evidence
-  #     (absent, holed, or childless) ⇒ must_substitute — the
-  #     "MUST NOT be dispatched as a from-source build" clause.
-  #   - check_vouched_never_must_substitute: Vouched (and Pending)
-  #     evidence never produces a must_substitute verdict, marked or
-  #     not.
-  #   - check_unmarked_evidence_inert: without the topdown_pruned mark
-  #     no evidence state forces substitution (the closure-hole rule's
-  #     inert-on-unmarked clause).
-  #   - check_hole_breaks_and_never_vouches: setting the closure_hole
-  #     bit forces Broken, never vouches however many surviving
-  #     children are produced, and never turns a must-substitute
-  #     verdict off (the OR-monotonicity / stale-true-is-safe
-  #     asymmetry).
   #   - check_vouched_iff_nonempty_all_produced: Vouched exactly when
-  #     present ∧ un-holed ∧ non-empty ∧ all children produced — the
-  #     criterion the mark clear and stamp exemption key on.
-  #   - check_must_substitute_contract / check_closure_vouched_contract:
-  #     proof_for_contract over the predicates' #[kani::ensures]
-  #     clauses, full input domain.
+  #     present ∧ non-empty ∧ all children produced — the criterion the
+  #     pruned-origin exemption keys on.
+  #   - check_closure_vouched_contract: proof_for_contract over the
+  #     predicate's #[kani::ensures] clause, full evidence alphabet.
   #
   # Pull admission (rio-evidence-kernel/src/pull.rs `mod proofs`):
   #   - check_admit_pull_partition: the base table's exhaustive
-  #     decision partition over (token, fence, status×13, attempt
+  #     decision partition over (token, fence, status×12, attempt
   #     identity), via the public fn's kind=Build/no-job path — total
   #     and panic-free.
   #   - check_admit_pull_rejections_dominate: the load-bearing check
@@ -346,13 +333,12 @@ in
   #     RejectStaleGeneration on a below-floor pull; nothing else is
   #     ever rejected.
   # r[verify sched.merge.substitute-topdown+12]
-  # r[verify sched.evidence.closure-hole]
   # r[verify sched.executor.pull-gone]
   # r[verify sched.executor.pull-not-ready+2]
   # r[verify sched.materialize.job]
   kani-rio-evidence-kernel = mkKaniCheck {
     name = "rio-evidence-kernel";
     crate = crateBuildKani.members.rio-evidence-kernel;
-    expectedHarnesses = 14;
+    expectedHarnesses = 9;
   };
 }

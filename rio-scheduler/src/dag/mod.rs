@@ -861,10 +861,6 @@ impl DerivationDag {
         let node = self.nodes.get(drv_hash);
         rio_evidence_kernel::closure_evidence(
             node.is_some(),
-            // The walk-era closure-hole breadcrumb is gone (T-D5.1);
-            // the kernel's hole parameter goes with the kernel
-            // reduction (T-D5.2).
-            false,
             self.children.get(drv_hash).map(|children| {
                 children.iter().map(|child_hash| {
                     self.nodes.get(child_hash).is_some_and(|n| {

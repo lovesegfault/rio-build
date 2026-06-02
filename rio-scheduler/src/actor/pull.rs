@@ -131,10 +131,8 @@ pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
 }
 
 /// `DerivationStatus` → kernel [`PullNodeStatus`]. The exhaustive
-/// `match` (no wildcard arm) pins the alphabets: adding a scheduler
-/// variant the kernel lacks fails this compile. (The kernel keeps a
-/// `Substituting` variant the scheduler no longer produces — it
-/// shrinks with the kernel reduction, not here.)
+/// `match` (no wildcard arm) pins the alphabets in lockstep: adding a
+/// scheduler variant the kernel lacks fails this compile.
 ///
 /// [`PullNodeStatus`]: rio_evidence_kernel::pull::PullNodeStatus
 fn pull_node_status(status: DerivationStatus) -> rio_evidence_kernel::pull::PullNodeStatus {

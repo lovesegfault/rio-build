@@ -51,8 +51,6 @@ pub enum PullNodeStatus {
     Assigned,
     /// Running on an executor.
     Running,
-    /// Upstream substitution in flight.
-    Substituting,
     /// Terminal: produced.
     Completed,
     /// Failed, awaiting retry verdict.
@@ -162,10 +160,10 @@ where
         S::Completed | S::Cancelled | S::Skipped | S::Poisoned | S::DependencyFailed => {
             PullAdmission::Gone
         }
-        // Wanted but not deliverable yet: deps unbuilt, a legacy
-        // substitution in flight, or a retry waiting to requeue. Never
-        // `Gone` (the reap→respawn churn loop), never a write.
-        S::Created | S::Queued | S::Substituting | S::Failed => PullAdmission::NotYetReady,
+        // Wanted but not deliverable yet: deps unbuilt or a retry
+        // waiting to requeue. Never `Gone` (the reap→respawn churn
+        // loop), never a write.
+        S::Created | S::Queued | S::Failed => PullAdmission::NotYetReady,
         // Ready: deliverable now — mint a fresh attempt.
         S::Ready => PullAdmission::DeliverNew,
         // Already open on some executor: idempotent re-delivery only
@@ -222,7 +220,6 @@ mod tests {
             (None, PullAdmission::Gone),
             (Some(S::Created), PullAdmission::NotYetReady),
             (Some(S::Queued), PullAdmission::NotYetReady),
-            (Some(S::Substituting), PullAdmission::NotYetReady),
             (Some(S::Failed), PullAdmission::NotYetReady),
             (Some(S::Ready), PullAdmission::DeliverNew),
             (Some(S::Completed), PullAdmission::Gone),
@@ -314,7 +311,7 @@ mod proofs {
 
     fn any_status() -> Option<PullNodeStatus> {
         let sel: u8 = kani::any();
-        kani::assume(sel < 13);
+        kani::assume(sel < 12);
         match sel {
             0 => None,
             1 => Some(PullNodeStatus::Created),
@@ -322,12 +319,11 @@ mod proofs {
             3 => Some(PullNodeStatus::Ready),
             4 => Some(PullNodeStatus::Assigned),
             5 => Some(PullNodeStatus::Running),
-            6 => Some(PullNodeStatus::Substituting),
-            7 => Some(PullNodeStatus::Completed),
-            8 => Some(PullNodeStatus::Failed),
-            9 => Some(PullNodeStatus::Poisoned),
-            10 => Some(PullNodeStatus::DependencyFailed),
-            11 => Some(PullNodeStatus::Cancelled),
+            6 => Some(PullNodeStatus::Completed),
+            7 => Some(PullNodeStatus::Failed),
+            8 => Some(PullNodeStatus::Poisoned),
+            9 => Some(PullNodeStatus::DependencyFailed),
+            10 => Some(PullNodeStatus::Cancelled),
             _ => Some(PullNodeStatus::Skipped),
         }
     }
@@ -398,9 +394,7 @@ mod proofs {
                 Some(
                     S::Completed | S::Cancelled | S::Skipped | S::Poisoned | S::DependencyFailed,
                 ) => PullAdmission::Gone,
-                Some(S::Created | S::Queued | S::Substituting | S::Failed) => {
-                    PullAdmission::NotYetReady
-                }
+                Some(S::Created | S::Queued | S::Failed) => PullAdmission::NotYetReady,
                 Some(S::Ready) => PullAdmission::DeliverNew,
                 Some(S::Assigned | S::Running) => match inputs.open {
                     Some((executor, exec_id)) if executor == inputs.pulling => {
@@ -956,7 +950,7 @@ mod kinded_proofs {
 
     fn any_status() -> Option<PullNodeStatus> {
         let sel: u8 = kani::any();
-        kani::assume(sel < 13);
+        kani::assume(sel < 12);
         match sel {
             0 => None,
             1 => Some(PullNodeStatus::Created),
@@ -964,12 +958,11 @@ mod kinded_proofs {
             3 => Some(PullNodeStatus::Ready),
             4 => Some(PullNodeStatus::Assigned),
             5 => Some(PullNodeStatus::Running),
-            6 => Some(PullNodeStatus::Substituting),
-            7 => Some(PullNodeStatus::Completed),
-            8 => Some(PullNodeStatus::Failed),
-            9 => Some(PullNodeStatus::Poisoned),
-            10 => Some(PullNodeStatus::DependencyFailed),
-            11 => Some(PullNodeStatus::Cancelled),
+            6 => Some(PullNodeStatus::Completed),
+            7 => Some(PullNodeStatus::Failed),
+            8 => Some(PullNodeStatus::Poisoned),
+            9 => Some(PullNodeStatus::DependencyFailed),
+            10 => Some(PullNodeStatus::Cancelled),
             _ => Some(PullNodeStatus::Skipped),
         }
     }
