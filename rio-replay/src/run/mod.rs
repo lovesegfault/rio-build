@@ -2140,10 +2140,14 @@ pub async fn run_with_backends(
         // declared substituter for every warm path so the supply stage never
         // asks the target to substitute a path its substituter cannot serve.
         // Absent paths are pre-classified `unavailable` in supply.jsonl by
-        // the probe; found paths seed the ladder's coverage set. Running
-        // under the supply gate means a resumed campaign that has not
-        // finished its supply stage re-probes — resume costs re-probing,
-        // never correctness.
+        // the probe; found paths seed the ladder's coverage set; paths whose
+        // probe errored are neither (design §8.4: probe errors are not
+        // misses) — they fall through to the ladder, whose archive/relay
+        // rungs can still deliver them, with the prefetch-shortfall pause
+        // gate as the systemic backstop when an upstream errors broadly.
+        // Running under the supply gate means a resumed campaign that has
+        // not finished its supply stage re-probes — resume costs
+        // re-probing, never correctness.
         let target_coverage: BTreeSet<String> =
             if spec.mode == Mode::Leaf && !plan_output.warm_set.is_empty() {
                 // The probe's single point of use: only here does a missing
