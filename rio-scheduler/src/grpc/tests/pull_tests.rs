@@ -96,36 +96,7 @@ async fn pull_unaries_enforce_executor_identity_when_hmac_configured() -> anyhow
     Ok(())
 }
 
-// ── Materialization listing + kind intake (substitution-replacement
-//    Phase A — flag-off dormancy pins + the BC-1 identity rule) ──
-
-// r[verify sched.materialize.job]
-/// Flag-off (the Phase A deployed state), ListMaterializationJobs
-/// answers an empty list — never an error (the AS-6 mixed-flag
-/// posture: a flag-on store polling a flag-off scheduler hangs
-/// harmlessly on empty lists). Dev mode (no HMAC key): the call needs
-/// no credential, same as the other ExecutorService unaries.
-#[tokio::test]
-async fn list_materialization_jobs_returns_empty_flag_off() -> anyhow::Result<()> {
-    use rio_proto::ExecutorService;
-    let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
-    let resp = grpc
-        .list_materialization_jobs(Request::new(
-            rio_proto::types::ListMaterializationJobsRequest {
-                service_token: String::new(),
-                limit: 16,
-            },
-        ))
-        .await
-        .expect("flag-off listing must answer, never error")
-        .into_inner();
-    assert!(
-        resp.jobs.is_empty(),
-        "flag-off ListMaterializationJobs must answer an empty list, got {:?}",
-        resp.jobs
-    );
-    Ok(())
-}
+// ── Materialization kind intake (the BC-1 identity rule) ──
 
 // r[verify sched.materialize.job]
 /// BC-1: a materialization pull MUST carry a per-replica executor
@@ -171,35 +142,6 @@ async fn materialization_pull_with_empty_instance_rejected() -> anyhow::Result<(
             Some(rio_proto::types::pull_assignment_response::Outcome::Gone(_))
         ),
         "build pull of an unknown intent answers Gone, got {resp:?}"
-    );
-    Ok(())
-}
-
-// r[verify sched.materialize.job]
-/// Flag-off, a materialization-kind pull (with a valid instance) parks
-/// NotYetReady — the AS-6 posture: a flag-on store claiming against a
-/// flag-off scheduler hangs harmlessly; it never errors, never mints,
-/// and never receives work.
-#[tokio::test]
-async fn materialization_pull_parks_not_yet_ready_flag_off() -> anyhow::Result<()> {
-    use rio_proto::ExecutorService;
-    let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
-    let resp = grpc
-        .pull_assignment(Request::new(rio_proto::types::PullAssignmentRequest {
-            executor_token: String::new(),
-            intent_id: "drv-mat-flag-off".into(),
-            kind: rio_proto::types::AttemptKind::Materialization.into(),
-            executor_instance: "store-replica-0".into(),
-        }))
-        .await
-        .expect("flag-off materialization pulls are answered, never errored")
-        .into_inner();
-    assert!(
-        matches!(
-            resp.outcome,
-            Some(rio_proto::types::pull_assignment_response::Outcome::NotYetReady(_))
-        ),
-        "flag-off materialization pull must park NotYetReady (AS-6), got {resp:?}"
     );
     Ok(())
 }

@@ -300,6 +300,9 @@ mod tests {
         }
     }
 
+    // D4-retarget: pins the as-built must_substitute arm, which survives
+    // until the kinded-admission collapse (T-D4.1) — deletes there with
+    // the arm (refusal becomes the JobView arm).
     #[test]
     fn must_substitute_refuses_mint() {
         let me = 1u8;

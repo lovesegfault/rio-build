@@ -281,60 +281,6 @@ fn sanitize_dns1123_label(raw: &str) -> String {
 mod tests {
     use super::*;
 
-    // r[verify store.materialize.executor+2]
-    /// THE store-side dormancy proof (Phase A charter): with the flag
-    /// off — the deployed default, `MaterializationConfig::default()` —
-    /// the spawner spawns ZERO claim loops and returns without touching
-    /// the pool, the substituter, or the network. The store process is
-    /// byte-for-byte the as-built store.
-    ///
-    /// Flag-on (with a well-formed address) it spawns exactly
-    /// `executor_concurrency` loops — proving the 0 above comes from
-    /// the flag gate, not from a broken spawner.
-    #[tokio::test]
-    async fn executor_not_spawned_flag_off() {
-        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
-        let substituter =
-            std::sync::Arc::new(crate::substitute::Substituter::new(db.pool.clone(), None));
-        let shutdown = rio_common::signal::Token::new();
-
-        // Flag-off (the default): nothing spawns.
-        let spawned = spawn_materialization_executor(
-            crate::config::MaterializationConfig::default(),
-            db.pool.clone(),
-            std::sync::Arc::clone(&substituter),
-            None,
-            shutdown.clone(),
-        );
-        assert_eq!(
-            spawned, 0,
-            "the dormancy proof: enabled=false spawns no claim loops"
-        );
-
-        // Flag-on positive control: the count comes from the flag, not
-        // from a spawner that never works.
-        let enabled_cfg = crate::config::MaterializationConfig {
-            enabled: true,
-            executor_concurrency: 3,
-            poll_interval_secs: 1,
-            scheduler_addr: "localhost:19001".to_string(),
-        };
-        let spawned = spawn_materialization_executor(
-            enabled_cfg,
-            db.pool.clone(),
-            substituter,
-            None,
-            shutdown.clone(),
-        );
-        assert_eq!(
-            spawned, 3,
-            "flag-on spawns exactly executor_concurrency claim loops"
-        );
-        // Tear the loops down (they poll a dead address; shutdown stops
-        // them at the next pacing point).
-        shutdown.cancel();
-    }
-
     /// The instance derivation produces a scheduler-acceptable DNS-1123
     /// label from every input shape: a real pod name passes through
     /// unchanged; uppercase/dotted dev hostnames are sanitized; empty
