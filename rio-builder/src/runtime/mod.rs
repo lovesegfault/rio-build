@@ -136,8 +136,8 @@ pub struct BuildSpawnContext {
     /// wrote.
     pub hw_class: Arc<std::sync::Mutex<Option<String>>>,
     /// Shared handle to the cgroup-poll `ResourceUsage` snapshot
-    /// (same `Arc` as the heartbeat loop). Read once at completion
-    /// time to populate `CompletionReport.final_resources` — the
+    /// (same `Arc` the cgroup poller publishes to). Read once at
+    /// completion time to populate `CompletionReport.final_resources` — the
     /// only telemetry channel for the scheduler's `build_samples`
     /// writer (ADR-023).
     pub resources: ResourceSnapshotHandle,

@@ -5,15 +5,15 @@
 //! Instead: plain HTTP `/healthz` + `/readyz` via the shared
 //! [`rio_common::server::health_router`].
 //!
-//! The readiness flag flips to `true` on the first accepted heartbeat
-//! — a builder that can't reach the scheduler is alive (don't restart;
-//! restarting won't fix the network) but not ready (don't count as
-//! capacity).
+//! The readiness flag flips to `true` once the pull is accepted
+//! (readiness = pulled/building) — a builder that can't reach the
+//! scheduler is alive (don't restart; restarting won't fix the
+//! network) but not ready (don't count as capacity).
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-/// Shared readiness flag. Heartbeat loop writes, `/readyz` reads.
+/// Shared readiness flag. The pull loop writes, `/readyz` reads.
 /// Relaxed ordering: pure signal, no other state shared between
 /// writer and reader.
 pub type ReadyFlag = Arc<AtomicBool>;

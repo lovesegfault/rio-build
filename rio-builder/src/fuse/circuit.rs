@@ -259,8 +259,9 @@ impl<C: Clock> CircuitBreaker<C> {
             // trip opens at cf=1; without the `since.is_some()` arm, a
             // failed probe at cf 1→2<5 leaves `since` stale → next
             // `check()` is half-open again → 4 failed probes pass before
-            // re-open, with `is_open()` lying false throughout (heartbeat
-            // reports `store_degraded=false` to a degraded worker).
+            // re-open, with `is_open()` lying false throughout (an
+            // observability poller would read a degraded worker as
+            // healthy).
             //
             //   closed    → opens (since: None → Some(now)) iff n≥threshold
             //   open      → stays open (timer refresh is harmless)
@@ -288,7 +289,8 @@ impl<C: Clock> CircuitBreaker<C> {
     }
 
     /// Whether the breaker is open RIGHT NOW. Half-open counts as NOT
-    /// open (the probe is allowed). P0210's heartbeat reports this.
+    /// open (the probe is allowed). The stream-era P0210 heartbeat was
+    /// the original reporter of this.
     ///
     /// Doesn't mutate — the stale `open_since` is cleaned up lazily on
     /// the next `record(true)`.

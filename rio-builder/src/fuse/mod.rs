@@ -86,7 +86,7 @@ pub struct NixStoreFs {
     fetch_timeout: Duration,
     /// Circuit breaker for the fetch path. Opens after `threshold`
     /// consecutive failures OR `wall_clock_trip` since last success.
-    /// `Arc` so P0210's heartbeat can clone a handle before
+    /// `Arc` so a handle can be cloned out before
     /// `fuser::spawn_mount2` consumes `self` — same pattern as `cache`.
     /// Checked/recorded by every singleflight `Fetch` owner
     /// (`ensure_cached` AND `prefetch_path_blocking`): under singleflight,
@@ -137,9 +137,11 @@ impl NixStoreFs {
         }
     }
 
-    /// Clone a handle to the circuit breaker. P0210's heartbeat calls
-    /// this BEFORE `fuser::spawn_mount2` consumes the fs, then polls
-    /// `is_open()` from the heartbeat loop.
+    /// Clone a handle to the circuit breaker BEFORE
+    /// `fuser::spawn_mount2` consumes the fs. The stream-era P0210
+    /// heartbeat was the original `is_open()` poller; the handle is
+    /// kept for observability callers (currently unused outside the
+    /// FUSE pool — see `runtime/setup.rs`).
     pub fn circuit(&self) -> Arc<CircuitBreaker> {
         Arc::clone(&self.circuit)
     }
@@ -484,10 +486,10 @@ fn fusectl_abort_path_at(mount_point: &Path, connections_root: &Path) -> Option<
 ///
 /// Returns the [`FuseMount`] handle (drop on shutdown — `Drop` writes
 /// the fusectl abort then unmounts) plus the circuit breaker handle
-/// (cloned out BEFORE `spawn_mount2` consumes the fs). The heartbeat
-/// loop polls `is_open()` on the
-/// returned handle; the fuser thread pool writes to the same breaker
-/// via `ensure_cached`.
+/// (cloned out BEFORE `spawn_mount2` consumes the fs; `is_open()` can
+/// be polled on it from outside the FUSE pool — the stream-era
+/// heartbeat was its original poller); the fuser thread pool writes
+/// to the same breaker via `ensure_cached`.
 pub fn mount_fuse_background(
     mount_point: &Path,
     cache: Arc<Cache>,

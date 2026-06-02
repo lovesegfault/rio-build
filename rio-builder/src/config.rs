@@ -44,8 +44,9 @@ pub struct Config {
     pub executor_id: String,
     /// Builder (airgapped, arbitrary derivation code) or fetcher
     /// (open egress, FOD-only). Env: `RIO_EXECUTOR_KIND=builder|fetcher`.
-    /// Default builder (wire-compat pre-ADR-019). Sent in heartbeat
-    /// so the scheduler routes FODs to fetchers only
+    /// Default builder (wire-compat pre-ADR-019). Bound into the
+    /// executor-token claims and presented on `PullAssignment` so the
+    /// scheduler routes FODs to fetchers only
     /// (spec sched.dispatch.fod-to-fetcher).
     #[serde(
         deserialize_with = "executor_kind",
@@ -113,8 +114,9 @@ pub struct Config {
     pub common: rio_common::config::CommonConfig,
     /// HTTP /healthz + /readyz listen address. Builder has no gRPC
     /// server so tonic-health doesn't fit — plain HTTP via axum.
-    /// K8s readinessProbe hits /readyz (200 after first accepted
-    /// heartbeat), livenessProbe hits /healthz (always 200).
+    /// K8s readinessProbe hits /readyz (200 once the assignment is
+    /// pulled — readiness = pulled/building), livenessProbe hits
+    /// /healthz (always 200).
     pub health_addr: std::net::SocketAddr,
     /// Log rate limit (lines/s). 0 = unlimited.
     /// Wired into LogLimits → LogBatcher in main().
@@ -149,16 +151,17 @@ pub struct Config {
     pub hw_bench_needed: bool,
     /// ADR-023 SpawnIntent match key from the pod's
     /// `rio.build/intent-id` annotation (downward API →
-    /// `RIO_INTENT_ID`). Sent in every heartbeat so the scheduler can
+    /// `RIO_INTENT_ID`). Sent on `PullAssignment` so the scheduler can
     /// match this pod to its pre-computed assignment. Empty =
     /// Static-sized pod (no intent).
     pub intent_id: String,
     /// HMAC-signed `ExecutorClaims{intent_id, kind, expiry}` from the
     /// controller's `RIO_EXECUTOR_TOKEN` env var (passed through from
     /// `SpawnIntent.executor_token`). Presented as
-    /// `x-rio-executor-token` on `BuildExecution` open and every
-    /// `Heartbeat` so the scheduler can bind this pod's stream to the
-    /// intent it was spawned for. Empty in dev mode → header omitted.
+    /// `x-rio-executor-token` on every `ExecutorService` unary (and
+    /// kept in the `PullAssignment` body — frozen signature) so the
+    /// scheduler can bind this pod's pulls to the intent it was
+    /// spawned for. Empty in dev mode → header omitted.
     /// See `r[sec.executor.identity-token]`.
     pub executor_token: String,
     /// Timeout (seconds) for the local nix-daemon subprocess build when

@@ -36,11 +36,11 @@ struct SlotInner {
 /// knob. Replaces the old `Semaphore::new(1)` + `RwLock<HashSet<String>>`
 /// pair — both "is a build running?" and "which drv_path?" live here.
 ///
-/// `try_claim` is non-blocking by design: with one build per pod, the
-/// scheduler shouldn't dispatch while busy (heartbeat reports
-/// `running_build`). An assignment arriving while busy is a scheduler
-/// bug; the old `acquire_owned().await` would have queued it locally,
-/// silently defeating capacity reporting.
+/// `try_claim` is non-blocking by design: with one build per pod, a
+/// second assignment can never legitimately arrive (the pod pulls
+/// exactly once). One arriving while busy is a scheduler bug; the old
+/// `acquire_owned().await` would have queued it locally, silently
+/// masking the protocol violation.
 #[derive(Default)]
 pub struct BuildSlot {
     /// `Some` while a build is in-flight. Single mutex over all
@@ -78,7 +78,7 @@ impl BuildSlot {
         })
     }
 
-    /// Current in-flight drv_path, for heartbeat `running_build`.
+    /// Current in-flight drv_path (cancel target / tests).
     pub fn running(&self) -> Option<String> {
         self.inner
             .lock()

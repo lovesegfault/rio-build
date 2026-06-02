@@ -11,7 +11,7 @@
         "default": ""
       },
       "executor_kind": {
-        "description": "Builder (airgapped, arbitrary derivation code) or fetcher\n(open egress, FOD-only). Env: `RIO_EXECUTOR_KIND=builder|fetcher`.\nDefault builder (wire-compat pre-ADR-019). Sent in heartbeat\nso the scheduler routes FODs to fetchers only\n(spec sched.dispatch.fod-to-fetcher).",
+        "description": "Builder (airgapped, arbitrary derivation code) or fetcher\n(open egress, FOD-only). Env: `RIO_EXECUTOR_KIND=builder|fetcher`.\nDefault builder (wire-compat pre-ADR-019). Bound into the\nexecutor-token claims and presented on `PullAssignment` so the\nscheduler routes FODs to fetchers only\n(spec sched.dispatch.fod-to-fetcher).",
         "type": "string",
         "default": "builder"
       },
@@ -96,7 +96,7 @@
         "default": 6
       },
       "health_addr": {
-        "description": "HTTP /healthz + /readyz listen address. Builder has no gRPC\nserver so tonic-health doesn't fit — plain HTTP via axum.\nK8s readinessProbe hits /readyz (200 after first accepted\nheartbeat), livenessProbe hits /healthz (always 200).",
+        "description": "HTTP /healthz + /readyz listen address. Builder has no gRPC\nserver so tonic-health doesn't fit — plain HTTP via axum.\nK8s readinessProbe hits /readyz (200 once the assignment is\npulled — readiness = pulled/building), livenessProbe hits\n/healthz (always 200).",
         "type": "string",
         "default": "[::]:9193"
       },
@@ -130,12 +130,12 @@
         "default": false
       },
       "intent_id": {
-        "description": "ADR-023 SpawnIntent match key from the pod's\n`rio.build/intent-id` annotation (downward API →\n`RIO_INTENT_ID`). Sent in every heartbeat so the scheduler can\nmatch this pod to its pre-computed assignment. Empty =\nStatic-sized pod (no intent).",
+        "description": "ADR-023 SpawnIntent match key from the pod's\n`rio.build/intent-id` annotation (downward API →\n`RIO_INTENT_ID`). Sent on `PullAssignment` so the scheduler can\nmatch this pod to its pre-computed assignment. Empty =\nStatic-sized pod (no intent).",
         "type": "string",
         "default": ""
       },
       "executor_token": {
-        "description": "HMAC-signed `ExecutorClaims{intent_id, kind, expiry}` from the\ncontroller's `RIO_EXECUTOR_TOKEN` env var (passed through from\n`SpawnIntent.executor_token`). Presented as\n`x-rio-executor-token` on `BuildExecution` open and every\n`Heartbeat` so the scheduler can bind this pod's stream to the\nintent it was spawned for. Empty in dev mode → header omitted.\nSee `r[sec.executor.identity-token]`.",
+        "description": "HMAC-signed `ExecutorClaims{intent_id, kind, expiry}` from the\ncontroller's `RIO_EXECUTOR_TOKEN` env var (passed through from\n`SpawnIntent.executor_token`). Presented as\n`x-rio-executor-token` on every `ExecutorService` unary (and\nkept in the `PullAssignment` body — frozen signature) so the\nscheduler can bind this pod's pulls to the intent it was\nspawned for. Empty in dev mode → header omitted.\nSee `r[sec.executor.identity-token]`.",
         "type": "string",
         "default": ""
       },

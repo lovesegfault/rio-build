@@ -675,8 +675,8 @@ fn mem_fraction(current: u64, max: Option<u64>) -> f64 {
 }
 
 /// Shared handle to the worker's whole-tree resource usage, published
-/// by [`utilization_reporter_loop_with_shutdown`] and read by the
-/// heartbeat loop.
+/// by [`utilization_reporter_loop_with_shutdown`] and read at
+/// completion time to populate `CompletionReport.final_resources`.
 ///
 /// `cpu_fraction` is cores-equivalent (1.0 = one core fully busy; >1.0
 /// on multi-core). `memory_total_bytes` is the cgroup `memory.max`
@@ -703,9 +703,9 @@ pub type ResourceSnapshotHandle =
 /// Refreshes only the fields `build_samples` consumes (completion.rs):
 /// `cpu_seconds_total` (cumulative — fresh `cpu.stat` read),
 /// `peak_disk_bytes` / `peak_io_pressure_pct` (running-max — `.max()`
-/// against `prev`). The instantaneous heartbeat fields (`cpu_fraction`,
-/// `memory_*`, `disk_*`) are left as-is from `prev`; they don't feed
-/// the SLA fit and a 10s-stale value there is harmless.
+/// against `prev`). The instantaneous utilization fields
+/// (`cpu_fraction`, `memory_*`, `disk_*`) are left as-is from `prev`;
+/// they don't feed the SLA fit and a 10s-stale value there is harmless.
 ///
 /// `peak_disk_bytes` is supplied by the caller (sampled inside
 /// `execute_build` BEFORE `teardown_overlay`): `dqb_curspace` is
@@ -774,7 +774,7 @@ fn sample_disk(overlay_base: &Path) -> (u64, u64) {
 /// memory utilization, emitting `rio_builder_cpu_fraction` and
 /// `rio_builder_memory_fraction` gauges every 10s, and publishes a
 /// [`ResourceUsage`](rio_proto::types::ResourceUsage) snapshot for the
-/// heartbeat loop.
+/// completion report.
 ///
 /// `root` is the PARENT cgroup (what `delegated_root()` returns) —
 /// this captures the whole worker's tree: rio-builder process + all
@@ -890,8 +890,8 @@ pub async fn utilization_reporter_loop_with_shutdown(
             metrics::gauge!("rio_builder_memory_fraction").set(mem_fraction(current, mem_max));
         }
 
-        // Publish snapshot. Heartbeat reads this; it's always one poll
-        // behind reality (up to 10s stale), which is fine for placement.
+        // Publish snapshot. The completion report reads this; one poll
+        // behind reality (up to 10s stale) is fine for telemetry.
         // unwrap_or_else(into_inner): a poisoned RwLock here means the
         // sampler itself panicked previously — recover and keep writing.
         *snapshot.write().unwrap_or_else(|e| e.into_inner()) = rio_proto::types::ResourceUsage {

@@ -104,7 +104,7 @@ pub struct ExecutorEnv {
     pub executor_kind: rio_proto::types::ExecutorKind,
     /// Advertised target systems (resolved `RIO_SYSTEMS`). Threaded to
     /// `setup_nix_conf` so the per-build daemon's `extra-platforms`
-    /// stays consistent with what the heartbeat advertises.
+    /// stays consistent with the advertised target set.
     pub systems: Arc<[String]>,
     /// Resolved `hw_class` (controller-stamped pod annotation,
     /// downward-API volume). Read once per assignment by
@@ -617,7 +617,7 @@ pub async fn execute_build(
             // 2. Set up overlay. `setup_overlay` is synchronous (mkdir + stat +
             // overlayfs mount syscall); run on the blocking pool so a slow mount
             // (e.g., FUSE lower stalled on remote fetch) doesn't starve the Tokio
-            // worker thread and block the heartbeat loop.
+            // worker thread and stall the async runtime.
             let fuse_mp = env.fuse_mount_point.clone();
             let overlay_base = env.overlay_base_dir.clone();
             let build_id_owned = build_id.clone();
@@ -832,7 +832,7 @@ pub async fn execute_build(
     // tokio worker (multi-GB `remove_dir_all`), and `Wire(UnexpectedEof)`
     // is `is_daemon_transient()` → the retry loop at runtime/mod.rs calls
     // back in instead of exiting, so the worker would block across the
-    // retry and starve heartbeats.
+    // retry and starve the async runtime.
     let collect_result = match build_result {
         Err(e) => Err(e),
         Ok(br) => collect_outputs(
@@ -854,7 +854,7 @@ pub async fn execute_build(
     // OverlayMount, so Drop is a no-op (mounted=false after
     // teardown_overlay). teardown_overlay does `remove_dir_all` over
     // upper/nix/store/ — multi-GB / 100k+ inodes for large builds. Same
-    // heartbeat-starvation concern as setup_overlay above.
+    // runtime-starvation concern as setup_overlay above.
     //
     // We don't override a successful build result just because its own
     // teardown fails. Teardown failure increments
