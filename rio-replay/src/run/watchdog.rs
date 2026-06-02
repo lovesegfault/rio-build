@@ -15,7 +15,13 @@
 //!   consecutive polls; the scheduler is not dispatching at all, which is a
 //!   cluster problem, not a per-job one.
 //! - [`COMPONENT_ICE`]: capacity provisioning is failing broadly (at least
-//!   the configured number of spawn cells are masked after capacity errors).
+//!   the configured number of spawn cells are masked after capacity
+//!   errors). The masked-cells snapshot is sticky between the (slower)
+//!   spawn-intent polls but may not outlive failed ones: after
+//!   `ICE_STALE_AFTER_FAILED_POLLS` consecutive failed polls the component
+//!   de-asserts until a poll succeeds again, so a persistent RPC outage
+//!   cannot freeze the stall clocks on a snapshot the engine can no longer
+//!   confirm.
 //! - [`COMPONENT_DISPATCH`]: executors sit idle while work is queued and
 //!   substitution is quiescent (the active-executors minus
 //!   running-derivations gap stays above the threshold for several
@@ -72,6 +78,18 @@ pub const COMPONENT_ICE: &str = "ice";
 /// for `dispatch_gap_polls` consecutive polls. Also pauses submission.
 pub const COMPONENT_DISPATCH: &str = "dispatch";
 
+/// Consecutive failed spawn-intents polls after which the sticky
+/// [`COMPONENT_ICE`] snapshot is considered stale and stops asserting the
+/// component. One failed poll holds the prior state — a leader-failover or
+/// deadline blip must not flap the suspension; from the second consecutive
+/// failure the latched evidence is at least two poll intervals old (~2 ×
+/// `spawn_intents_poll_secs`). A capacity suspension freezes every stall
+/// clock, so it must never persist on evidence the engine can no longer
+/// confirm — only a fresh successful poll re-arms the component. The stale
+/// snapshot itself is retained, not zeroed: a failed poll is missing
+/// evidence, not an observation that the cells were unmasked.
+const ICE_STALE_AFTER_FAILED_POLLS: u32 = 2;
+
 /// Engine-side phase of one campaign job, as fed by the run loop.
 ///
 /// `Active` means "member of an in-flight batch"; everything else is
@@ -94,10 +112,39 @@ struct JobClock {
     requeues: u32,
 }
 
+/// Spawn-intents (capacity) observation carried by one [`PollTick`].
+///
+/// Three-valued because a failed poll and a tick that never attempted one
+/// mean different things to the sticky [`COMPONENT_ICE`] snapshot: between
+/// polls the last snapshot simply stays current ([`IcePoll::NotPolled`] —
+/// the capacity poll cadence is slower than the tick cadence by design),
+/// while a failed attempt ([`IcePoll::Failed`]) leaves the snapshot one
+/// interval staler than the cadence promises. Collapsing failure into "not
+/// polled" would let one latched over-threshold snapshot assert the
+/// capacity suspension forever across a persistent RPC outage, freezing
+/// every stall clock on evidence the engine can no longer confirm.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum IcePoll {
+    /// No spawn-intents poll was attempted this tick (by-design cadence
+    /// gap): the last snapshot remains in effect.
+    #[default]
+    NotPolled,
+    /// A poll was attempted and the RPC failed. The prior suspension state
+    /// holds for the first failure (a transient blip must not flap the
+    /// suspension, and the stall clocks with it); from
+    /// `ICE_STALE_AFTER_FAILED_POLLS` consecutive failures the sticky
+    /// snapshot is stale and stops asserting [`COMPONENT_ICE`] until a
+    /// poll succeeds again.
+    Failed,
+    /// The poll succeeded: this snapshot replaces the sticky one and
+    /// resets the failure streak.
+    Fresh(IceSnapshot),
+}
+
 /// One observation the run loop feeds the watchdog (typically every
 /// `cluster_status_poll_secs`; `ice` is refreshed only every
-/// `spawn_intents_poll_secs`, so most ticks carry `None` and the last
-/// snapshot stays in effect).
+/// `spawn_intents_poll_secs`, so most ticks carry [`IcePoll::NotPolled`]
+/// and the last snapshot stays in effect).
 #[derive(Debug, Clone, Default)]
 pub struct PollTick {
     pub at_unix: i64,
@@ -105,8 +152,8 @@ pub struct PollTick {
     /// and dispatch streaks then stay unchanged (a poll outage neither
     /// builds nor clears a streak).
     pub cluster: Option<ClusterCounts>,
-    /// Fresh GetSpawnIntents snapshot, when this tick carried one.
-    pub ice: Option<IceSnapshot>,
+    /// Spawn-intents poll outcome for this tick.
+    pub ice: IcePoll,
     pub engine_paused: bool,
 }
 
@@ -174,8 +221,14 @@ pub struct Watchdog {
     idle_streak: u32,
     dispatch_streak: u32,
     /// Last seen capacity snapshot — sticky between the (less frequent)
-    /// spawn-intent polls.
+    /// spawn-intent polls, but only allowed to assert [`COMPONENT_ICE`]
+    /// while fresh: see [`ICE_STALE_AFTER_FAILED_POLLS`].
     last_ice: IceSnapshot,
+    /// Consecutive spawn-intents polls that failed (not-polled ticks leave
+    /// it unchanged; a successful poll resets it). At
+    /// [`ICE_STALE_AFTER_FAILED_POLLS`] the sticky snapshot stops
+    /// asserting [`COMPONENT_ICE`].
+    ice_failed_polls: u32,
     last_tick_unix: Option<i64>,
     current_window: Option<SuspensionWindow>,
     summary: SuspensionSummary,
@@ -207,6 +260,7 @@ impl Watchdog {
             idle_streak: 0,
             dispatch_streak: 0,
             last_ice: IceSnapshot::default(),
+            ice_failed_polls: 0,
             last_tick_unix: None,
             current_window: None,
             summary: SuspensionSummary::default(),
@@ -311,8 +365,15 @@ impl Watchdog {
         if self.dispatch_streak >= self.knobs.dispatch_gap_polls {
             components.push(COMPONENT_DISPATCH);
         }
-        if let Some(ice) = &tick.ice {
-            self.last_ice = ice.clone();
+        match &tick.ice {
+            IcePoll::Fresh(ice) => {
+                self.last_ice = ice.clone();
+                self.ice_failed_polls = 0;
+            }
+            IcePoll::Failed => {
+                self.ice_failed_polls = self.ice_failed_polls.saturating_add(1);
+            }
+            IcePoll::NotPolled => {}
         }
         // TODO: only the masked-cell-count arm of the capacity suspension is
         // implemented. The complementary arm — suspend when ALL spawn cells
@@ -320,7 +381,18 @@ impl Watchdog {
         // needs a stable mapping from spawn-intent cell names to nixpkgs
         // systems before it can be added; until then a 1–2-cell fleet for a
         // niche system can starve without suspending the clocks.
-        if self.last_ice.ice_masked_cells.len() >= self.knobs.ice_masked_cells_threshold {
+        //
+        // Stale-evidence gate: the sticky snapshot asserts the component
+        // only while fresh. An ICE suspension freezes every stall clock,
+        // so — like the dispatch predicate's queued guard — it must only
+        // persist on state the engine can still observe changing. Without
+        // the gate, a latched over-threshold snapshot plus a persistent
+        // poll outage would keep the suspension active forever after the
+        // cluster recovered, silently disabling stall detection for the
+        // rest of the campaign.
+        if self.ice_failed_polls < ICE_STALE_AFTER_FAILED_POLLS
+            && self.last_ice.ice_masked_cells.len() >= self.knobs.ice_masked_cells_threshold
+        {
             components.push(COMPONENT_ICE);
         }
         components
@@ -479,8 +551,16 @@ mod tests {
         PollTick {
             at_unix: at,
             cluster: Some(c),
-            ice: None,
+            ice: IcePoll::NotPolled,
             engine_paused: false,
+        }
+    }
+
+    /// An ice snapshot with `n` masked spawn cells.
+    fn masked(n: usize) -> IceSnapshot {
+        IceSnapshot {
+            ice_masked_cells: (0..n).map(|i| format!("cell-{i}:spot")).collect(),
+            dead_nodes: vec![],
         }
     }
 
@@ -517,7 +597,7 @@ mod tests {
         // ICE: 3 masked cells trip it; the ice snapshot is sticky between
         // (less frequent) spawn-intent polls.
         let mut t = tick(0, cluster(5, 5, 0, 10));
-        t.ice = Some(IceSnapshot {
+        t.ice = IcePoll::Fresh(IceSnapshot {
             ice_masked_cells: vec!["a:spot".into(), "b:spot".into(), "c:od".into()],
             dead_nodes: vec![],
         });
@@ -529,7 +609,7 @@ mod tests {
         );
         // Clearing the mask clears the component.
         let mut t = tick(120, cluster(5, 5, 0, 10));
-        t.ice = Some(IceSnapshot::default());
+        t.ice = IcePoll::Fresh(IceSnapshot::default());
         assert!(wd.on_tick(&t).components.is_empty());
 
         // Dispatch gap: needs 5 consecutive polls of gap > 50, then also
@@ -832,7 +912,7 @@ mod tests {
         let outage = PollTick {
             at_unix: 120,
             cluster: None,
-            ice: None,
+            ice: IcePoll::NotPolled,
             engine_paused: false,
         };
         assert!(!wd.on_tick(&outage).suspended);
@@ -841,6 +921,101 @@ mod tests {
         let o = wd.on_tick(&tick(180, cluster(10, 0, 0, 8)));
         assert!(o.suspended, "outage tick preserved the idle streak");
         assert_eq!(o.components, vec![COMPONENT_IDLE]);
+    }
+
+    #[test]
+    fn ice_failed_polls_age_out_the_sticky_snapshot() {
+        let mut wd = Watchdog::new(knobs());
+        wd.observe_job("queued.x86_64-linux", JobPhase::Queued);
+        // t=0: a fresh over-threshold snapshot latches → suspended, stall
+        // clocks frozen.
+        let mut t = tick(0, cluster(5, 5, 0, 10));
+        t.ice = IcePoll::Fresh(masked(3));
+        assert_eq!(wd.on_tick(&t).components, vec![COMPONENT_ICE]);
+        // Not-polled ticks keep it asserted (by-design stickiness).
+        assert_eq!(
+            wd.on_tick(&tick(300, cluster(5, 5, 0, 10))).components,
+            vec![COMPONENT_ICE]
+        );
+        // First failed poll: the prior state holds — a transient RPC blip
+        // must not flap the suspension.
+        let mut t = tick(600, cluster(5, 5, 0, 10));
+        t.ice = IcePoll::Failed;
+        assert_eq!(
+            wd.on_tick(&t).components,
+            vec![COMPONENT_ICE],
+            "one failure holds the prior state"
+        );
+        // Second consecutive failed poll: the latched evidence is now ~two
+        // poll intervals old — stale. The component de-asserts and the
+        // window closes; only a successful poll may re-arm it.
+        let mut t = tick(900, cluster(5, 5, 0, 10));
+        t.ice = IcePoll::Failed;
+        let o = wd.on_tick(&t);
+        assert!(
+            o.components.is_empty(),
+            "stale snapshot stops asserting: {:?}",
+            o.components
+        );
+        assert!(!o.suspended);
+        assert!(o.closed_window.is_some(), "ice window closed at staleness");
+        // Not-polled ticks must NOT re-arm the component from the stale
+        // snapshot...
+        assert!(
+            wd.on_tick(&tick(1200, cluster(5, 5, 0, 10)))
+                .components
+                .is_empty()
+        );
+        // ...and further failures keep it de-asserted.
+        let mut t = tick(1500, cluster(5, 5, 0, 10));
+        t.ice = IcePoll::Failed;
+        assert!(wd.on_tick(&t).components.is_empty());
+        // The stall clocks resumed when the suspension aged out: 2h of
+        // unsuspended queued time later the queued watchdog fires — a
+        // persistent poll outage no longer disables stall detection.
+        let o = wd.on_tick(&tick(900 + 2 * 3600, cluster(5, 5, 0, 10)));
+        assert_eq!(
+            o.stalled,
+            vec![StallVerdict {
+                job: "queued.x86_64-linux".into(),
+                kind: StallKind::QueuedRequeue,
+                requeues_used: 1,
+            }]
+        );
+        // A fresh over-threshold snapshot re-arms the component with
+        // confirmable evidence...
+        let mut t = tick(900 + 2 * 3600 + 60, cluster(5, 5, 0, 10));
+        t.ice = IcePoll::Fresh(masked(3));
+        assert_eq!(wd.on_tick(&t).components, vec![COMPONENT_ICE]);
+        // ...and a fresh clear snapshot clears it.
+        let mut t = tick(900 + 2 * 3600 + 120, cluster(5, 5, 0, 10));
+        t.ice = IcePoll::Fresh(IceSnapshot::default());
+        assert!(wd.on_tick(&t).components.is_empty());
+    }
+
+    #[test]
+    fn ice_poll_failure_streak_resets_on_a_fresh_snapshot() {
+        let mut wd = Watchdog::new(knobs());
+        let mut t = tick(0, cluster(5, 5, 0, 10));
+        t.ice = IcePoll::Fresh(masked(3));
+        assert_eq!(wd.on_tick(&t).components, vec![COMPONENT_ICE]);
+        // One failure (prior state holds), then a success: the failure
+        // streak restarts from zero.
+        let mut t = tick(300, cluster(5, 5, 0, 10));
+        t.ice = IcePoll::Failed;
+        assert_eq!(wd.on_tick(&t).components, vec![COMPONENT_ICE]);
+        let mut t = tick(600, cluster(5, 5, 0, 10));
+        t.ice = IcePoll::Fresh(masked(3));
+        assert_eq!(wd.on_tick(&t).components, vec![COMPONENT_ICE]);
+        // The next single failure is the FIRST of its streak — the prior
+        // state holds instead of compounding with the pre-success failure.
+        let mut t = tick(900, cluster(5, 5, 0, 10));
+        t.ice = IcePoll::Failed;
+        assert_eq!(
+            wd.on_tick(&t).components,
+            vec![COMPONENT_ICE],
+            "failure streak restarted by the successful poll"
+        );
     }
 
     #[test]

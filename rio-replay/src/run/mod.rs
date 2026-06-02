@@ -84,7 +84,7 @@ use self::timeline::{
 };
 use self::truth::NarinfoSource;
 use self::watchdog::{
-    COMPONENT_DISPATCH, COMPONENT_PAUSE, PollTick, StallKind, StallVerdict, Watchdog,
+    COMPONENT_DISPATCH, COMPONENT_PAUSE, IcePoll, PollTick, StallKind, StallVerdict, Watchdog,
 };
 
 /// CLI arguments for `rio-replay run`.
@@ -1895,9 +1895,25 @@ pub async fn run_with_backends(
                 }
                 let cluster_counts = cluster.cluster_status().await.ok();
                 let ice = if ticks.is_multiple_of(ice_every) {
-                    cluster.spawn_intents().await.ok()
+                    match cluster.spawn_intents().await {
+                        Ok(snapshot) => IcePoll::Fresh(snapshot),
+                        Err(e) => {
+                            // Surfaced, not swallowed: GetSpawnIntents is
+                            // service-token gated (ClusterStatus is not), so
+                            // an allowlist or key regression can fail exactly
+                            // this RPC persistently while every other poll
+                            // keeps flowing. The watchdog ages out its sticky
+                            // capacity snapshot on consecutive failures; this
+                            // log is what makes the outage itself visible.
+                            tracing::warn!(
+                                error = %e,
+                                "spawn-intents poll failed; capacity snapshot not refreshed"
+                            );
+                            IcePoll::Failed
+                        }
+                    }
                 } else {
-                    None
+                    IcePoll::NotPolled
                 };
                 let manual_pause = state.path("PAUSE").exists();
                 pause.set_manual(manual_pause);
@@ -4595,7 +4611,7 @@ mod tests {
         let tick_at = |at: i64| PollTick {
             at_unix: at,
             cluster: Some(healthy.clone()),
-            ice: None,
+            ice: IcePoll::NotPolled,
             engine_paused: false,
         };
 
