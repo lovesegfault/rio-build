@@ -37,6 +37,14 @@ pub async fn run() -> Result<()> {
     // workspace crate to force proc-macro re-expansion (stable can't
     // track env vars). Snapshot mtimes now, restore after, so the
     // main target/ fingerprint stays valid.
+    //
+    // The devshell's kache RUSTC_WRAPPER does not defeat that forcing:
+    // kache runs a real `rustc --emit=dep-info` pre-pass before any
+    // cache lookup, and dep-info emission fully expands proc macros —
+    // so query! hits the live DB and emits prepare's metadata even
+    // when the compiled artifact is then restored from cache. Verified
+    // by deleting a .sqlx entry and watching regen restore it
+    // byte-for-byte with caching enabled.
     let snapshot = snapshot_mtimes()?;
     let _restore = scopeguard::guard(snapshot, |s| {
         for (p, t) in s {
