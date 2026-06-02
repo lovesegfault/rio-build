@@ -945,7 +945,7 @@
     {
       "path": "run/glob.rs",
       "depth": 1,
-      "doc": "Minimal glob matching for job-name filters (`*` = any run of"
+      "doc": "Minimal glob matching for job-name filters (`*` = any run of bytes,"
     },
     {
       "path": "run/grpc.rs",
