@@ -5,7 +5,7 @@
 // r[impl sched.materialize.job+2]
 
 use tokio::sync::oneshot;
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::db::materialization::FencedJobCreate;
@@ -59,6 +59,12 @@ pub(crate) struct JobViewEntry {
     /// SUBSTITUTING event; the executor and the consumption coverage
     /// read the durable column directly.
     pub carried_realized_paths: Option<Vec<String>>,
+    /// When the job's MOST RECENT park began (re-park overwrites — the
+    /// dwell clock restarts). Mirror of the durable `park_began_at`
+    /// (migration 083): set at park time, restored failover-exact by
+    /// the recovery rebuild. `None` = never parked (or parked pre-083
+    /// — the dwell gate treats it as unmet, conservatively).
+    pub parked_at: Option<std::time::Instant>,
 }
 
 /// One job the merge transaction created (or found via the dedup) —
@@ -179,6 +185,7 @@ impl DagActor {
                             parked_until: None,
                             claimed_by: None,
                             carried_realized_paths: None,
+                            parked_at: None,
                         });
                 // Mirror the durable set-if-null carrier semantics on
                 // the view copy (display only).
@@ -313,6 +320,7 @@ impl DagActor {
                     // realized paths (only the stale_reset post-tx
                     // site does); recovery rebuilds from the column.
                     carried_realized_paths: None,
+                    parked_at: None,
                 });
             if job.created {
                 metrics::counter!(
@@ -479,6 +487,17 @@ impl DagActor {
                         }),
                     claimed_by: row.claimed_by.map(ExecutorId::from),
                     carried_realized_paths: row.carried_realized_paths,
+                    // Failover-exact dwell (migration 083): the durable
+                    // park-begin anchor, replayed as "that many seconds
+                    // ago" on the recovered leader's clock.
+                    parked_at: row
+                        .park_began_secs_ago
+                        .filter(|secs| *secs >= 0.0)
+                        .map(|secs| {
+                            std::time::Instant::now()
+                                .checked_sub(std::time::Duration::from_secs_f64(secs))
+                                .unwrap_or_else(std::time::Instant::now)
+                        }),
                 },
             );
         }
@@ -991,6 +1010,28 @@ impl DagActor {
             .unwrap_or(0)
     }
 
+    /// Worker-reported-only variant of the count above (the Item T
+    /// strictness recount, `sched.materialize.conversion-strictness`):
+    /// `materialization_infra` rows whose reporting party is Worker —
+    /// Scheduler-party establishment ("unreported") rows are excluded.
+    /// Party survives recovery: the suffix load parses
+    /// `drv_attempts.reporting_party` into every rebuilt record.
+    fn count_worker_materialization_infra_in_history(&self, drv_hash: &DrvHash) -> u32 {
+        self.dag
+            .node(drv_hash)
+            .map(|s| {
+                s.attempt_history()
+                    .iter()
+                    .filter(|r| {
+                        r.attempt_kind == crate::state::AttemptKind::Materialization
+                            && r.outcome_class == crate::state::OutcomeClass::MaterializationInfra
+                            && r.reporting_party == crate::state::ReportingParty::Worker
+                    })
+                    .count() as u32
+            })
+            .unwrap_or(0)
+    }
+
     /// Close the open materialization attempt (assignment row) and
     /// append the charge row when one is given, in ONE transaction
     /// carrying the same claims-floor fence as every other attempt
@@ -1195,6 +1236,9 @@ impl DagActor {
             entry.claimed_by = None;
             entry.parked_until =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs));
+            // The dwell clock (migration 083 mirror): this park is the
+            // most recent — re-park restarts the clock by design.
+            entry.parked_at = Some(std::time::Instant::now());
         }
     }
 
@@ -1301,7 +1345,7 @@ impl DagActor {
         );
     }
 
-    // r[impl obs.metric.materialization-stalled]
+    // r[impl obs.metric.materialization-stalled+2]
     // r[impl sched.materialize.routing+3]
     /// PD-20 (design §2.5, Phase B T-6.1): the parked-job housekeeping
     /// arm. Every tick, flag-on, leader-only:
@@ -1367,6 +1411,48 @@ impl DagActor {
             );
             if !from_source_viable {
                 continue;
+            }
+            // r[impl sched.materialize.conversion-strictness]
+            // Item T strictness gate (default-off; whole-arm scope —
+            // every origin's Vouched/Pending conversion). Both halves
+            // gate the CONVERSION ACT only: the park predicate, the
+            // party-blind budget fold, and the stalled-gauge
+            // definition are untouched (OQ1 amendment 1 forecloses
+            // re-keying parking), so default-off is byte-identical
+            // and knob-ON extends the gauge population by exactly the
+            // deferred-conversion class. A refused job stays parked:
+            // counted by the gauge below, armed via park-expiry
+            // re-claim, accruing further worker charges across cycles.
+            let strict_worker = self.materialization_cfg.conversion_requires_worker_charge;
+            let dwell_secs = self.materialization_cfg.conversion_min_park_dwell_secs;
+            let max_attempts = self.materialization_cfg.max_attempts;
+            if strict_worker {
+                let worker_only = self.count_worker_materialization_infra_in_history(&drv_hash);
+                if worker_only < max_attempts {
+                    debug!(
+                        drv_hash = %drv_hash, %job_id, worker_only, max_attempts,
+                        "conversion deferred: worker-reported charges alone do not \
+                         exhaust the budget (conversion_requires_worker_charge)"
+                    );
+                    continue;
+                }
+            }
+            if dwell_secs > 0 {
+                let dwell_met = self
+                    .materialization_jobs
+                    .get(&drv_hash)
+                    .and_then(|e| e.parked_at)
+                    .is_some_and(|began| {
+                        now.saturating_duration_since(began).as_secs() >= dwell_secs
+                    });
+                if !dwell_met {
+                    debug!(
+                        drv_hash = %drv_hash, %job_id, dwell_secs,
+                        "conversion deferred: minimum park dwell not yet elapsed \
+                         (conversion_min_park_dwell_secs)"
+                    );
+                    continue;
+                }
             }
             // Item T conversion visibility: read the (still-pending)
             // job's origin BEFORE resolving — PG is the origin

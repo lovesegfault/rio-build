@@ -1403,6 +1403,36 @@ faithfulness, all five materialization regimes) with the F10/B5(a)
 calibration pins as its falsifiability pair; production verification: the
 armed-action totality test and the failover VM scenario.
 
+#r("sched.materialize.conversion-strictness")[
+  The parked-job re-evaluation MUST support two independently default-off
+  strictness fields on the `[materialization]` config surface ---
+  `conversion_requires_worker_charge` (refuse the from-source conversion
+  unless worker-reported `materialization_infra` charges alone exhaust
+  `max_attempts`; Scheduler-party establishment charges keep counting toward
+  PARKING, never toward conversion authorization) and
+  `conversion_min_park_dwell_secs` (refuse conversion until the configured
+  dwell has elapsed since the job's MOST RECENT park began --- a re-park
+  restarts the clock; the anchor is the durable
+  `materialization_jobs.park_began_at`, so the dwell is failover-exact).
+  With both fields at their defaults the re-evaluation MUST be
+  byte-identical to the unconditional form: the park predicate, the
+  party-blind budget fold, and the stalled-gauge definition are never
+  re-keyed by the knob. A refused job MUST stay parked --- counted by the
+  stalled gauge, armed via park-expiry re-claim, accruing further
+  worker-reported charges across claim cycles --- and MUST convert at the
+  first re-evaluation after its strictness conditions clear.
+]
+
+The knob is the Item T strictness half (harden-store reconciliation memo
+§6.2(b)); the observability half (the conversion counter and the
+`RioSchedulerMaterializationConversions` alert) landed first, and flipping
+either field's default ON in deployment is an operational act gated on that
+alert's evidence (owner ruling 2026-06-02). Knob-ON defers --- never
+forecloses --- the settlement rule's "resolves from-source the moment its
+durable closure evidence allows" arm: the deferred job remains armed
+through park-expiry re-claim, so the armed-action totality above is
+unchanged.
+
 #r("sched.materialize.pinning")[
   Every store path a materialization job ingests or verifies present MUST be
   pinned against garbage collection at ingest time, under a pin kind

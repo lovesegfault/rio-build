@@ -161,6 +161,27 @@ pub struct MaterializationConfig {
     pub park_backoff_base_secs: u64,
     /// Park backoff cap (seconds).
     pub park_backoff_cap_secs: u64,
+    /// Item T conversion-strictness, worker-charge half (harden-store
+    /// reconciliation memo §6.2(b)): `false` = off (the shipped
+    /// default; walk-equivalence preserved). When ON, the PD-20 park
+    /// re-evaluation converts a parked Vouched/Pending job from-source
+    /// ONLY when worker-reported `materialization_infra` charges alone
+    /// exhaust `max_attempts`; Scheduler-party establishment
+    /// ("unreported") charges still count toward PARKING (OQ1
+    /// amendment 1 — unchanged) but no longer authorize conversion.
+    /// The job stays parked (armed: park-expiry re-claim; further
+    /// worker charges accrue across cycles) until they do. Flipping
+    /// the default ON later is an operational act gated on
+    /// `RioSchedulerMaterializationConversions` alert evidence.
+    pub conversion_requires_worker_charge: bool,
+    /// Item T conversion-strictness, dwell half: minimum seconds since
+    /// the job's MOST RECENT park began (re-park restarts the clock;
+    /// durable `materialization_jobs.park_began_at`, failover-exact)
+    /// before PD-20 may convert. `0` = off (knob disabled — the
+    /// shipped default). The re-evaluation only runs inside the park
+    /// window, so a dwell beyond `park_backoff_cap_secs` could never
+    /// convert via PD-20 — rejected at config validation.
+    pub conversion_min_park_dwell_secs: u64,
 }
 
 impl Default for MaterializationConfig {
@@ -169,6 +190,8 @@ impl Default for MaterializationConfig {
             max_attempts: 3,
             park_backoff_base_secs: 30,
             park_backoff_cap_secs: 900,
+            conversion_requires_worker_charge: false,
+            conversion_min_park_dwell_secs: 0,
         }
     }
 }
@@ -309,6 +332,23 @@ impl rio_common::config::ValidateConfig for Config {
          (got max={}, base={})",
             cfg.retry.backoff_max_secs,
             cfg.retry.backoff_base_secs
+        );
+        // The PD-20 park re-evaluation only visits jobs whose park
+        // window is still open (`park_until` in the future), so a
+        // conversion dwell longer than the largest possible park
+        // backoff can NEVER be satisfied at a re-evaluation — the
+        // dwell knob would be a silent conversion-never, which is not
+        // a posture the Item T record orders (the record's dwell is a
+        // MINIMUM, implying eventual conversion). Fail fast at load.
+        anyhow::ensure!(
+            cfg.materialization.conversion_min_park_dwell_secs
+                <= cfg.materialization.park_backoff_cap_secs,
+            "materialization.conversion_min_park_dwell_secs must be <= \
+         park_backoff_cap_secs (got dwell={}, cap={}); a dwell beyond the \
+         park cap can never be met at a PD-20 re-evaluation and silently \
+         disables conversion entirely",
+            cfg.materialization.conversion_min_park_dwell_secs,
+            cfg.materialization.park_backoff_cap_secs
         );
         // `actor/completion.rs` resets the per-executor `infra_count` when
         // `last.elapsed().as_secs_f64() > infra_retry_window_secs`. `as_secs_f64()`

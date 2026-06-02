@@ -4493,7 +4493,30 @@ fn gauge_value(snap: &metrics_util::debugging::Snapshotter, name: &str) -> Optio
         })
 }
 
-// r[verify obs.metric.materialization-stalled]
+/// Labeled-counter reader (destructive snapshot — call once per
+/// assertion batch or share a drain like the PD-20 test does).
+fn counter_value(
+    snap: &metrics_util::debugging::Snapshotter,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<u64> {
+    use metrics_util::debugging::DebugValue;
+    snap.snapshot()
+        .into_vec()
+        .into_iter()
+        .find_map(|(ck, _, _, v)| {
+            let key = ck.key();
+            let label_match = labels
+                .iter()
+                .all(|(lk, lv)| key.labels().any(|l| l.key() == *lk && l.value() == *lv));
+            (key.name() == name && label_match).then_some(match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+        })
+}
+
+// r[verify obs.metric.materialization-stalled+2]
 // r[verify sched.materialize.routing+3]
 /// PD-20 (design §2.5, red-first): parked materialization jobs are
 /// VISIBLE (the `rio_scheduler_materialization_stalled` gauge, set from
@@ -4713,6 +4736,360 @@ async fn parked_job_stalled_gauge_and_reevaluation() -> TestResult {
         stalled,
         Some(1.0),
         "the gauge holds at ground truth across ticks, got {stalled:?}"
+    );
+    Ok(())
+}
+
+// ── Item T conversion strictness (follow-up ledger row 7, second half;
+//    knob default-off — the F6 closure) ──────────────────────────────────────
+
+/// Shared staging for the strictness tests: the Y-chain (root→Y→leaf,
+/// only Y substitutable, leaf unproduced ⇒ Pending evidence — the
+/// from-source-viable shape PD-20 would convert) merged under `tag`,
+/// Y's job claimed and parked per the caller's charge recipe.
+async fn merge_pending_evidence_chain(
+    handle: &ActorHandle,
+    store: &rio_test_support::grpc::MockStore,
+    tag: &str,
+) -> anyhow::Result<(
+    Uuid,
+    tokio::sync::broadcast::Receiver<rio_proto::types::BuildEvent>,
+)> {
+    let out_y = test_store_path(&format!("{tag}-out"));
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out_y.clone());
+    let root = make_node(&format!("{tag}-root"));
+    let mut ny = make_node(tag);
+    ny.expected_output_paths = vec![out_y];
+    ny.wanted_output_names = vec!["out".into()];
+    let leaf = make_node(&format!("{tag}-leaf"));
+    let by = Uuid::new_v4();
+    let ev = merge_dag(
+        handle,
+        by,
+        vec![root, ny, leaf],
+        vec![
+            make_test_edge(&format!("{tag}-root"), tag),
+            make_test_edge(tag, &format!("{tag}-leaf")),
+        ],
+        false,
+    )
+    .await?;
+    barrier(handle).await;
+    Ok((by, ev))
+}
+
+/// Drive ONE Scheduler-party establishment charge against `tag`'s job:
+/// claim, age the open attempt past every deadline+slack, tick (the
+/// establishment sweep closes it with a `materialization_infra`
+/// "unreported" charge and re-arms the job claimable).
+async fn drive_establishment_charge(
+    handle: &ActorHandle,
+    pool: &sqlx::PgPool,
+    tag: &str,
+    instance: &str,
+) -> anyhow::Result<()> {
+    let assignment = match claim_materialization(handle, tag, instance).await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => anyhow::bail!("claim for establishment must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    sqlx::query(
+        "UPDATE assignments SET assigned_at = now() - interval '100 days' WHERE exec_id = $1",
+    )
+    .bind(exec_id)
+    .execute(pool)
+    .await?;
+    tick(handle).await?;
+    barrier(handle).await;
+    Ok(())
+}
+
+// r[verify sched.materialize.conversion-strictness]
+/// Knob ON, worker-charge half (the §6 block B interpretation (i) in
+/// its REACHABLE form): a job parked party-blind by 2 establishment
+/// charges + 1 worker charge (3 ≥ max_attempts=3) must NOT convert at
+/// PD-20 — the worker-only recount (1 < 3) refuses; the job stays
+/// parked, the stalled gauge counts it, the conversion counter stays
+/// silent. Red pre-gate: the conversion happened anyway.
+#[tokio::test]
+async fn conversion_strictness_requires_worker_charges_to_exhaust() -> TestResult {
+    use metrics_util::debugging::DebuggingRecorder;
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&rec);
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.materialization.max_attempts = 3;
+            cfg.materialization.park_backoff_base_secs = 3600;
+            cfg.materialization.park_backoff_cap_secs = 3600;
+            cfg.materialization.conversion_requires_worker_charge = true;
+        });
+    let _tasks = (store_task, actor_task);
+
+    let tag = "strict-worker";
+    let (_by, _ev) = merge_pending_evidence_chain(&handle, &store, tag).await?;
+
+    // Two Scheduler-party establishment charges...
+    drive_establishment_charge(&handle, &db.pool, tag, "store-test-0").await?;
+    drive_establishment_charge(&handle, &db.pool, tag, "store-test-0").await?;
+    // ...plus one worker-reported InfraFailure: parks party-blind
+    // (count 3 ≥ 3; OQ1 amendment 1 — parking is unchanged by the knob).
+    let assignment = match claim_materialization(&handle, tag, "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the worker claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(&handle, exec_id, tag, mat_infra_outcome("upstream 503"))
+        .await
+        .map_err(|e| anyhow::anyhow!("worker infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    let parked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM materialization_jobs \
+          WHERE drv_hash = $1 AND state = 'pending' AND park_until > now()",
+    )
+    .bind(tag)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(parked, 1, "precondition: the job parked party-blind");
+
+    // The PD-20 tick: the strictness gate must refuse the conversion.
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let job_state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = $1")
+            .bind(tag)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        job_state, "pending",
+        "knob ON: a budget exhausted by establishment charges (worker-only \
+         recount 1 < 3) must NOT authorize conversion — the job stays parked"
+    );
+    let stalled = gauge_value(&snap, "rio_scheduler_materialization_stalled");
+    assert_eq!(
+        stalled,
+        Some(1.0),
+        "the deferred-conversion job is counted by the stalled gauge, got {stalled:?}"
+    );
+    let converted = counter_value(
+        &snap,
+        "rio_scheduler_materialization_converted_total",
+        &[("origin", "cache_opportunity")],
+    );
+    assert!(
+        matches!(converted, None | Some(0)),
+        "no conversion was counted (the applied-only edge never fired; the \
+         per-origin counter is pre-registered at 0), got {converted:?}"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.conversion-strictness]
+/// Knob ON, the condition-clears half: when worker-reported charges
+/// ALONE exhaust the budget (2 of 2 — no establishment rows at all),
+/// the strictness gate is satisfied and PD-20 converts exactly once
+/// (the applied-only at-most-once edge).
+#[tokio::test]
+async fn conversion_strictness_converts_when_worker_charges_alone_exhaust() -> TestResult {
+    use metrics_util::debugging::DebuggingRecorder;
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&rec);
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.materialization.max_attempts = 2;
+            cfg.materialization.park_backoff_base_secs = 3600;
+            cfg.materialization.park_backoff_cap_secs = 3600;
+            cfg.materialization.conversion_requires_worker_charge = true;
+        });
+    let _tasks = (store_task, actor_task);
+
+    let tag = "strict-clears";
+    let (_by, _ev) = merge_pending_evidence_chain(&handle, &store, tag).await?;
+
+    for _ in 0..2 {
+        let assignment = match claim_materialization(&handle, tag, "store-test-0").await {
+            Ok(PullOutcome::Deliver(a)) => *a,
+            other => panic!("worker claim must deliver, got {other:?}"),
+        };
+        let exec_id: Uuid = assignment.exec_id.parse()?;
+        report_materialization_outcome(&handle, exec_id, tag, mat_infra_outcome("upstream 503"))
+            .await
+            .map_err(|e| anyhow::anyhow!("worker infra report rejected: {e:?}"))?;
+        barrier(&handle).await;
+    }
+
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let job_state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = $1")
+            .bind(tag)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        job_state, "resolved_from_source",
+        "worker charges alone exhausted the budget — the strict gate clears \
+         and PD-20 converts"
+    );
+    let converted = counter_value(
+        &snap,
+        "rio_scheduler_materialization_converted_total",
+        &[("origin", "cache_opportunity")],
+    );
+    assert_eq!(
+        converted,
+        Some(1),
+        "exactly one conversion counted, got {converted:?}"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.conversion-strictness]
+/// Knob ON, dwell half: a freshly parked job must NOT convert before
+/// `conversion_min_park_dwell_secs` has elapsed since the park began;
+/// it converts at the first tick after the dwell. Red pre-gate: the
+/// first tick converted immediately.
+#[tokio::test]
+async fn conversion_strictness_dwell_defers_then_converts() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.materialization.max_attempts = 1;
+            cfg.materialization.park_backoff_base_secs = 3600;
+            cfg.materialization.park_backoff_cap_secs = 3600;
+            cfg.materialization.conversion_min_park_dwell_secs = 3;
+        });
+    let _tasks = (store_task, actor_task);
+
+    let tag = "strict-dwell";
+    let (_by, _ev) = merge_pending_evidence_chain(&handle, &store, tag).await?;
+
+    let assignment = match claim_materialization(&handle, tag, "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("worker claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(&handle, exec_id, tag, mat_infra_outcome("upstream 503"))
+        .await
+        .map_err(|e| anyhow::anyhow!("worker infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // Tick well inside the dwell: must stay parked.
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let job_state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = $1")
+            .bind(tag)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        job_state, "pending",
+        "the dwell gate defers conversion inside the dwell window"
+    );
+
+    // After the dwell elapses the next tick converts.
+    tokio::time::sleep(std::time::Duration::from_millis(3400)).await;
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let job_state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = $1")
+            .bind(tag)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        job_state, "resolved_from_source",
+        "the first tick after the dwell converts"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.conversion-strictness]
+/// Dwell carrier recovery posture (failover-EXACT, the owner's durable
+///-column choice): the dwell clock anchors to the DURABLE
+/// `park_began_at`, so a failover does NOT restart it. Phase 1 parks
+/// the job and lets the dwell elapse in real time; phase 2 (a fresh
+/// actor recovering from PG) must convert at its first tick — a
+/// rebuild-time clock would have restarted the dwell and refused.
+#[tokio::test]
+async fn conversion_strictness_dwell_survives_failover() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let configure = |cfg: &mut crate::actor::config::DagActorConfig| {
+        cfg.materialization.max_attempts = 1;
+        cfg.materialization.park_backoff_base_secs = 3600;
+        cfg.materialization.park_backoff_cap_secs = 3600;
+        cfg.materialization.conversion_min_park_dwell_secs = 3;
+    };
+
+    // Phase 1: park the job, let the dwell elapse.
+    {
+        let (store, store_client, store_task) =
+            rio_test_support::grpc::spawn_mock_store_with_client().await?;
+        let (handle, actor_task) =
+            setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| configure(cfg));
+        let tag = "strict-failover";
+        let (_by, _ev) = merge_pending_evidence_chain(&handle, &store, tag).await?;
+        let assignment = match claim_materialization(&handle, tag, "store-test-0").await {
+            Ok(PullOutcome::Deliver(a)) => *a,
+            other => panic!("worker claim must deliver, got {other:?}"),
+        };
+        let exec_id: Uuid = assignment.exec_id.parse()?;
+        report_materialization_outcome(&handle, exec_id, tag, mat_infra_outcome("upstream 503"))
+            .await
+            .map_err(|e| anyhow::anyhow!("worker infra report rejected: {e:?}"))?;
+        barrier(&handle).await;
+        let began: Option<bool> = sqlx::query_scalar(
+            "SELECT park_began_at IS NOT NULL FROM materialization_jobs WHERE drv_hash = $1",
+        )
+        .bind(tag)
+        .fetch_optional(&db.pool)
+        .await?;
+        assert_eq!(began, Some(true), "the park persisted park_began_at");
+        tokio::time::sleep(std::time::Duration::from_millis(3400)).await;
+        drop(handle);
+        drop(store);
+        let _ = tokio::time::timeout(Duration::from_secs(5), actor_task).await;
+        store_task.abort();
+    }
+
+    // Phase 2: fresh actor recovers; its first tick must convert.
+    let leader = crate::lease::LeaderState::always_leader(std::sync::Arc::new(
+        std::sync::atomic::AtomicU64::new(1),
+    ));
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let phase2_leader = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |cfg, p| {
+        configure(cfg);
+        p.leader = phase2_leader;
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let job_state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = $1")
+            .bind("strict-failover")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        job_state, "resolved_from_source",
+        "the recovered leader's dwell clock anchors to the durable park_began_at \
+         (elapsed pre-failover) — its first tick converts; a rebuild-time clock \
+         would have restarted the dwell and refused"
     );
     Ok(())
 }

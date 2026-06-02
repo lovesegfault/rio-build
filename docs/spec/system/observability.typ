@@ -230,16 +230,19 @@ published only by the serving leader); publishing from the snapshot
 computation makes the scrape surface and the admin RPC agree by
 construction.
 
-#r("obs.metric.materialization-stalled")[
+#r("obs.metric.materialization-stalled+2")[
   When materialization dispatch is enabled, the scheduler MUST publish
   #(refs.metric)("rio_scheduler_materialization_stalled") (gauge): the count
   of parked materialization jobs, set from ground truth at every
   housekeeping tick by the leader, after the parked-job re-evaluation pass
-  has run. The gauge MUST exclude jobs the re-evaluation resolved (a parked
-  job whose node's durable closure evidence reads Vouched or Pending is
-  resolved from-source in the same pass, so it can never be reported as
-  stalled), and MUST NOT be published while materialization dispatch is
-  disabled.
+  has run. The gauge MUST exclude jobs the re-evaluation resolved; with the
+  conversion-strictness knob at its shipped default (off,
+  #rref("sched.materialize.conversion-strictness")) a parked job whose
+  node's durable closure evidence reads Vouched or Pending is resolved
+  from-source in the same pass, so it can never be reported as stalled ---
+  when the knob is ON such a job MAY remain parked (conversion deferred)
+  and MUST then be counted. The gauge MUST NOT be published while
+  materialization dispatch is disabled.
 ]
 The gauge follows the leader-gate posture above (a state gauge, published
 only by the serving leader). Its operational meaning: every counted job has

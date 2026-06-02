@@ -402,7 +402,7 @@ impl SchedulerDb {
         }
         let result = sqlx::query(
             "UPDATE materialization_jobs \
-                SET park_until = to_timestamp($2) \
+                SET park_until = to_timestamp($2), park_began_at = now() \
               WHERE job_id = $1 AND state = 'pending'",
         )
         .bind(job_id)
@@ -497,6 +497,7 @@ impl SchedulerDb {
         sqlx::query_as(
             "SELECT j.job_id, j.drv_hash, j.carried_realized_paths, \
                     EXTRACT(EPOCH FROM (j.park_until - now()))::float8 AS park_remaining_secs, \
+                    EXTRACT(EPOCH FROM (now() - j.park_began_at))::float8 AS park_began_secs_ago, \
                     a.builder_id AS claimed_by \
                FROM materialization_jobs j \
                LEFT JOIN assignments a ON a.derivation_id = j.derivation_id \
@@ -518,6 +519,10 @@ pub(crate) struct RecoveredJobRow {
     /// Seconds until the park expires; `None` or non-positive = not
     /// parked (or the park already lapsed).
     pub park_remaining_secs: Option<f64>,
+    /// Seconds since the most recent park began (migration 083, the
+    /// failover-exact dwell anchor); `None` = never parked or parked
+    /// pre-083 (the dwell gate treats it as unmet — conservative).
+    pub park_began_secs_ago: Option<f64>,
     /// The open attempt's holder identity; `None` = unclaimed.
     pub claimed_by: Option<String>,
 }

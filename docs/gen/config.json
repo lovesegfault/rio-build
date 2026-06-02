@@ -316,6 +316,18 @@
         "description": "Park backoff cap (seconds)."
       },
       {
+        "key": "materialization.conversion_requires_worker_charge",
+        "type": "boolean",
+        "default": "false",
+        "description": "Item T conversion-strictness, worker-charge half (harden-store reconciliation memo §6.2(b)): `false` = off (the shipped default; walk-equivalence preserved)."
+      },
+      {
+        "key": "materialization.conversion_min_park_dwell_secs",
+        "type": "uint64",
+        "default": "0",
+        "description": "Item T conversion-strictness, dwell half: minimum seconds since the job's MOST RECENT park began (re-park restarts the clock; durable `materialization_jobs.park_began_at`, failover-exact) before PD-20 may convert. `0` = off (knob disabled — the shipped default)."
+      },
+      {
         "key": "dashboard.cors_allow_origins",
         "type": "string",
         "default": "http://rio-dashboard.rio-system.svc.cluster.local",

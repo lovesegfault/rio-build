@@ -1351,6 +1351,7 @@ async fn snapshot_counts_substituting() {
                 parked_until: None,
                 claimed_by: None,
                 carried_realized_paths: None,
+                parked_at: None,
             },
         );
     }

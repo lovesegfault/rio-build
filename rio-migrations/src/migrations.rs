@@ -1831,6 +1831,30 @@ pub const M_081: () = ();
 /// upgraded executor claims it — additive-only, never a crash).
 pub const M_082: () = ();
 
+/// `migrations/083_materialization_job_park_began.sql`
+///
+/// Dwell-clock carrier for the Item T conversion-strictness knob
+/// (follow-up ledger row 7, second half; spec rule
+/// `sched.materialize.conversion-strictness`; owner decision
+/// 2026-06-02: durable carrier — failover-EXACT dwell over the
+/// in-memory alternative). One nullable column on
+/// `materialization_jobs`:
+///
+/// - `park_began_at TIMESTAMPTZ`: when the job's MOST RECENT park
+///   began. Written by the park UPDATE in the same statement as
+///   `park_until`; a re-park overwrites it (the dwell clock restarts
+///   by design — one mechanism, no re-arm-path throttling). The
+///   recovery view rebuild replays it as an in-memory Instant
+///   (`now - (now_db - park_began_at)`), so a leader failover does
+///   not restart the dwell.
+///
+/// NULL = never parked, or parked before this migration: the dwell
+/// gate treats NULL as unmet (stays parked — conservative) and the
+/// next park cycle stamps it (self-healing). Old binaries ignore the
+/// column entirely; the knob ships default-off, so a mixed-version
+/// window has zero behavioral delta.
+pub const M_083: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
