@@ -776,6 +776,11 @@
       "doc": "Nix hash types: SHA-256, SHA-512, SHA-1."
     },
     {
+      "path": "hash_oracle.rs",
+      "depth": 0,
+      "doc": "Vendored line-by-line port of CppNix 2.34.7's non-SRI unprefixed"
+    },
+    {
       "path": "lib.rs",
       "depth": 0,
       "doc": "Nix protocol types and wire format."

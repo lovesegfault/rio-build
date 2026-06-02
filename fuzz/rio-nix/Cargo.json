@@ -8563,6 +8563,10 @@
           "path": "fuzz_targets/derived_path_parsing.rs"
         },
         {
+          "name": "fod_hash_decode",
+          "path": "fuzz_targets/fod_hash_decode.rs"
+        },
+        {
           "name": "nar_parsing",
           "path": "fuzz_targets/nar_parsing.rs"
         },

@@ -10,6 +10,9 @@ pub mod ca;
 pub mod closure;
 pub mod derivation;
 pub mod hash;
+/// CppNix hash-decode port for differential testing — never production.
+#[cfg(any(test, feature = "test-oracle"))]
+pub mod hash_oracle;
 pub mod nar;
 pub mod narinfo;
 pub mod protocol;

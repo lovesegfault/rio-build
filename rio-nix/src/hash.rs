@@ -446,7 +446,7 @@ mod tests {
             ]
         }
 
-        fn arb_nixhash() -> impl Strategy<Value = NixHash> {
+        pub(super) fn arb_nixhash() -> impl Strategy<Value = NixHash> {
             arb_hash_algo().prop_flat_map(|algo| {
                 proptest::collection::vec(any::<u8>(), algo.digest_len()).prop_map(move |digest| {
                     NixHash::new(algo, digest).expect("length matches algo")
@@ -573,5 +573,119 @@ mod tests {
     #[test]
     fn md5_spelling_is_a_registered_divergence() {
         assert!("md5".parse::<HashAlgo>().is_err());
+    }
+
+    /// Differential properties against the vendored CppNix decode port
+    /// (`hash_oracle.rs`, line-by-line from the pinned 2.34.7 source).
+    /// 4096 cases each — the merge-gate evidence for
+    /// `nix.divergence.fod-base64-strict`'s containment claim: rio's
+    /// accept-set is a SUBSET of the oracle's with identical digests
+    /// (fail-closed in exactly one direction), the canonical encodings
+    /// are accepted identically by both, and the length-discrimination
+    /// arm selection is the same function.
+    mod oracle_differential {
+        use super::proptests::arb_nixhash;
+        use super::*;
+        use crate::hash_oracle::{self, OracleReject};
+        use proptest::prelude::*;
+
+        fn arb_algo() -> impl Strategy<Value = HashAlgo> {
+            prop_oneof![
+                Just(HashAlgo::SHA1),
+                Just(HashAlgo::SHA256),
+                Just(HashAlgo::SHA512),
+            ]
+        }
+
+        /// Inputs biased toward near-misses: canonical encodings of
+        /// random digests, single-character mutations of them, and raw
+        /// junk of plausible lengths.
+        fn arb_input() -> impl Strategy<Value = (HashAlgo, String)> {
+            use base64::Engine;
+            (
+                arb_algo(),
+                proptest::collection::vec(any::<u8>(), 0..70),
+                0usize..3,
+                any::<u8>(),
+                any::<u16>(),
+            )
+                .prop_map(|(algo, bytes, enc, mutate_to, pos)| {
+                    let digest: Vec<u8> = bytes
+                        .iter()
+                        .copied()
+                        .chain(std::iter::repeat(0))
+                        .take(algo.digest_len())
+                        .collect();
+                    let mut s = match enc {
+                        0 => hex::encode(&digest),
+                        1 => nixbase32::encode(&digest),
+                        _ => base64::engine::general_purpose::STANDARD.encode(&digest),
+                    };
+                    // Half the cases: mutate one byte to an arbitrary
+                    // ASCII char (possibly '=', '\n', uppercase, junk).
+                    if mutate_to >= 0x80 {
+                        let i = (pos as usize) % s.len().max(1);
+                        let c = (mutate_to & 0x7f) as char;
+                        s.replace_range(i..i + 1, &c.to_string());
+                    }
+                    (algo, s)
+                })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(4096))]
+
+            /// Containment + length-identity. Named by the
+            /// `nix.divergence.fod-base64-strict` rule rationale.
+            #[test]
+            fn oracle_containment_4096((algo, s) in arb_input()) {
+                let rio = NixHash::parse_nonsri_unprefixed(algo, &s);
+                let oracle = hash_oracle::parse_nonsri_unprefixed_oracle(algo, &s);
+                match (&rio, &oracle) {
+                    // Containment: rio accepts ⇒ oracle accepts, same digest.
+                    (Ok(h), Ok(d)) => prop_assert_eq!(h.digest(), &d[..]),
+                    (Ok(h), Err(rej)) => prop_assert!(
+                        false,
+                        "rio accepted {:?} (digest {}) but the oracle rejected with {:?}",
+                        s, hex::encode(h.digest()), rej
+                    ),
+                    // Length-discrimination identity: the arm SELECTION
+                    // is the same function on both sides.
+                    (Err(HashError::WrongEncodedLength { .. }), rej) => {
+                        prop_assert_eq!(rej, &Err(OracleReject::WrongLength));
+                    }
+                    // rio rejected inside a codec: fail-closed strictness
+                    // is allowed (that IS the registered divergence), but
+                    // the oracle must have selected the same arm — i.e.
+                    // not have called it a wrong-length input.
+                    (Err(_), rej) => {
+                        prop_assert!(
+                            !matches!(rej, Err(OracleReject::WrongLength)),
+                            "rio decoded an input the oracle length-rejects: {:?}", s
+                        );
+                    }
+                }
+            }
+
+            /// Canonical completeness: every digest's three canonical
+            /// encodings are accepted by BOTH sides with the digest
+            /// round-tripping exactly.
+            #[test]
+            fn oracle_canonical_completeness_4096(h in arb_nixhash()) {
+                use base64::Engine;
+                let encodings = [
+                    hex::encode(h.digest()),
+                    nixbase32::encode(h.digest()),
+                    base64::engine::general_purpose::STANDARD.encode(h.digest()),
+                ];
+                for s in encodings {
+                    let rio = NixHash::parse_nonsri_unprefixed(h.algo(), &s);
+                    let oracle =
+                        hash_oracle::parse_nonsri_unprefixed_oracle(h.algo(), &s);
+                    prop_assert_eq!(rio.as_ref().map(|x| x.digest()).ok(), Some(h.digest()));
+                    prop_assert_eq!(oracle.as_deref().ok(), Some(h.digest()));
+                }
+            }
+        }
     }
 }

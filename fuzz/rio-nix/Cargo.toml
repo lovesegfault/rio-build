@@ -79,3 +79,9 @@ name = "closure_walk"
 path = "fuzz_targets/closure_walk.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fod_hash_decode"
+path = "fuzz_targets/fod_hash_decode.rs"
+test = false
+doc = false
