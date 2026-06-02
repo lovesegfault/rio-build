@@ -1389,6 +1389,57 @@ mod tests {
         assert_eq!(schedule[0].due, Duration::ZERO);
     }
 
+    #[test]
+    fn schedule_offsets_at_the_cap_survive_the_smallest_admitted_speedup() {
+        // The archive reader clamps recorded offsets and stop offsets to
+        // MAX_RECORDED_OFFSET_S, and spec validation refuses any speedup
+        // whose worst-case quotient MAX_RECORDED_OFFSET_S / speedup does
+        // not fit a Duration (see
+        // `speedup_too_small_for_the_offset_cap_is_refused` in spec.rs).
+        // This pins that the two bounds compose: at the offset cap, with
+        // a speedup the spec still admits, all three division sites —
+        // the due time, the recorded disconnect gap, and the default
+        // disconnect gap — build durations instead of panicking in
+        // Duration::from_secs_f64.
+        let cap = crate::run::MAX_RECORDED_OFFSET_S;
+        let speedup = 2e-12;
+        let requests = vec![request(1, cap, DRV_A), request(2, 0.0, DRV_B)];
+        let mut timing = HashMap::new();
+        // Recorded stop at the cap: the recorded-gap site divides
+        // (stop - offset) by the speedup.
+        timing.insert((2, DRV_B.to_string()), interrupted(Some(cap)));
+        // Interrupted with no recorded stop: the plan's default-gap site
+        // divides the fallback delay.
+        timing.insert((1, DRV_A.to_string()), interrupted(None));
+
+        let schedule = build_schedule(
+            &requests,
+            &timing_in(&timing),
+            &no_jobs,
+            &all_workload,
+            speedup,
+            None,
+            true,
+        );
+        assert_eq!(schedule.len(), 2);
+        // Session 2 (offset 0) sorts first; its plan scales the recorded
+        // cap-sized gap. Session 1 parks at the scaled cap.
+        assert_eq!(schedule[0].session, 2);
+        let plan = schedule[0].interruption.as_ref().unwrap();
+        assert_eq!(
+            plan.entries[0].1,
+            Some(Duration::from_secs_f64(cap / speedup))
+        );
+        assert_eq!(schedule[1].session, 1);
+        assert_eq!(schedule[1].due, Duration::from_secs_f64(cap / speedup));
+        let plan = schedule[1].interruption.as_ref().unwrap();
+        assert_eq!(plan.entries[0].1, None, "no recorded stop offset");
+        assert_eq!(
+            plan.default_gap,
+            Duration::from_secs_f64(DEFAULT_DISCONNECT_DELAY_S / speedup)
+        );
+    }
+
     /// Job keys are resolved once at schedule construction: mapped targets
     /// carry their workload job, unmapped ones fall back to the drv path —
     /// the single fallback rule every consumer (dispatch bookkeeping,

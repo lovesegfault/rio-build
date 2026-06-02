@@ -615,6 +615,27 @@ impl CampaignSpec {
             self.knobs.speedup.is_finite() && self.knobs.speedup > 0.0,
             "campaign spec field knobs.speedup must be a positive finite number"
         );
+        // The schedule's duration math divides recorded offsets by the
+        // speedup before Duration::from_secs_f64. The archive reader
+        // clamps every recorded offset and stop offset to
+        // MAX_RECORDED_OFFSET_S (one year), so the worst-case quotient is
+        // MAX_RECORDED_OFFSET_S / speedup — demand here that it stays a
+        // representable Duration, as a named-field refusal like every
+        // other bad knob, instead of letting an absurdly small stretch
+        // factor panic schedule construction and crash-loop the campaign
+        // Job. The bound is derived from those two contracts, not picked:
+        // anything that survives this check cannot overflow any of the
+        // schedule's division sites.
+        anyhow::ensure!(
+            std::time::Duration::try_from_secs_f64(
+                super::MAX_RECORDED_OFFSET_S / self.knobs.speedup
+            )
+            .is_ok(),
+            "campaign spec field knobs.speedup ({}) is too small: a recorded offset at the \
+             one-year cap divided by it exceeds the representable Duration range — use a larger \
+             speedup",
+            self.knobs.speedup
+        );
         // The build-deadline cap is a duration; it must be a usable number
         // of hours for the same reason as the batch timeout above.
         anyhow::ensure!(
@@ -1385,6 +1406,34 @@ mod tests {
                         "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"},
             "tenants": {"build_tenant": "replay-leaf", "warm_tenant": "replay-warm",
                         "upstreams_verified": true}"#
+    }
+
+    #[test]
+    fn speedup_too_small_for_the_offset_cap_is_refused() {
+        let base = spec_base();
+        // The timed schedule divides recorded offsets — clamped to the
+        // one-year MAX_RECORDED_OFFSET_S by the archive reader — by the
+        // speedup before Duration::from_secs_f64. A divisor small enough
+        // to push that worst-case quotient past Duration's representable
+        // range must die here as a named-field refusal like every other
+        // bad knob, not as a schedule-construction panic that crash-loops
+        // the campaign Job. 1.5e-12 stretches one clamped year past
+        // Duration::MAX; 2e-12 keeps it representable and stays admitted
+        // (the bound is derived, not a round number — both sides of it
+        // are pinned so it cannot silently widen).
+        let spec: CampaignSpec = serde_json::from_str(&format!(
+            "{base}, \"scheduling\": {{\"mode\": \"timed\"}}, \"knobs\": {{\"speedup\": 1.5e-12}}}}"
+        ))
+        .unwrap();
+        let err = spec.validate().unwrap_err().to_string();
+        assert!(err.contains("speedup"), "{err}");
+
+        let spec: CampaignSpec = serde_json::from_str(&format!(
+            "{base}, \"scheduling\": {{\"mode\": \"timed\"}}, \"knobs\": {{\"speedup\": 2e-12}}}}"
+        ))
+        .unwrap();
+        spec.validate()
+            .expect("a speedup whose worst-case quotient fits a Duration is admitted");
     }
 
     #[test]
