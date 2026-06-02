@@ -114,6 +114,13 @@ impl ArchiveS3 {
         self.store().object_key(archive_id_short, object)
     }
 
+    /// Key prefix of one archive: `<prefix>/archives/<archive_id_short>/`.
+    /// The recorder logs it before uploading so an interrupted attempt's
+    /// destination survives in the Job log.
+    pub fn archive_prefix(&self, archive_id_short: &str) -> String {
+        self.store().prefix(archive_id_short)
+    }
+
     /// Is this archive already published — does its `complete.json` exist?
     pub async fn archive_exists(
         &self,

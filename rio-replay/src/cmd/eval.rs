@@ -1084,6 +1084,19 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
                 rio_common::s3::default_client(rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS).await;
             let layout = ArchiveS3::new(bucket, &args.s3_prefix);
             let uploader = format!("rio-replay-eval/{}", env!("CARGO_PKG_VERSION"));
+            // Name the destination BEFORE any byte moves: archive ids hash
+            // the manifest's created_at, so a crashed attempt is never
+            // retried under the same id and this log line is the only place
+            // its prefix survives — `cargo xtask replay delete <short id>`
+            // removes the marker-less leftovers it names.
+            tracing::info!(
+                destination = %format!(
+                    "s3://{bucket}/{}",
+                    layout.archive_prefix(&staged.archive_id_short)
+                ),
+                archive_id = %staged.archive_id,
+                "uploading archive"
+            );
             let uploaded = layout
                 .upload_archive(
                     &client,

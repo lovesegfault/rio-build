@@ -31,6 +31,22 @@
 //! header-supplied SHA-256 checksums; on a backend that does not, the
 //! image conflict is unattributable and the refusal stands — exactly the
 //! pre-disambiguation behavior, never worse.
+//!
+//! Deletion can race publication, and S3 has no cross-key transactions
+//! for the two sides to linearize on: `replay delete` sweeps whatever a
+//! LIST returned, and a mid-publish prefix carries no marker to exclude
+//! it. The race is narrowed, not closed. On this side, publish
+//! re-observes every object its marker lists immediately before the
+//! conditional marker PUT and refuses ("swept mid-publish — re-run")
+//! when one is missing or replaced; the delete sweep, for its part,
+//! re-lists until the prefix is empty. The residual window — a sweep
+//! passing entirely between those revalidation HEADs and the marker PUT,
+//! then finishing before the marker lands — is milliseconds wide, and
+//! what it leaves is a marker-only prefix: still listed by the operator
+//! tooling (summaries degrade to `?`), still removable by
+//! `replay delete`, and rejected loudly by any fetch (every object is
+//! digest-verified at download). Every interrupted state stays nameable
+//! and converges; none is silently consumed.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -397,13 +413,15 @@ impl ArchiveStore {
 
     /// Publish a packed archive: upload `archive.dwarfs`, the standalone
     /// `manifest.json` (the exact bytes passed in), and finally
-    /// `complete.json` strictly last. EVERY PUT carries `If-None-Match: *`:
-    /// the marker so two racing uploads cannot both claim completeness, and
-    /// the data objects so a racing publisher of the same archive id (same
-    /// manifest bytes, but mkdwarfs packing is not deterministic, so
-    /// different image bytes) can never overwrite an object that already
-    /// landed — a winner's published image stays exactly the bytes its
-    /// marker hashes.
+    /// `complete.json` strictly last — after re-HEADing every object the
+    /// marker lists, so completeness is never claimed over state a
+    /// concurrent `replay delete` swept mid-upload. EVERY PUT carries
+    /// `If-None-Match: *`: the marker so two racing uploads cannot both
+    /// claim completeness, and the data objects so a racing publisher of
+    /// the same archive id (same manifest bytes, but mkdwarfs packing is
+    /// not deterministic, so different image bytes) can never overwrite an
+    /// object that already landed — a winner's published image stays
+    /// exactly the bytes its marker hashes.
     ///
     /// `manifest_bytes` must be byte-identical to the `manifest.json`
     /// member inside the image (the archive's identity bytes): the image is
@@ -619,6 +637,39 @@ impl ArchiveStore {
             uploaded_at: jiff::Timestamp::now(),
             uploader: uploader.to_string(),
         };
+
+        // Re-observe every object the marker is about to vouch for: a
+        // concurrent `replay delete` may have swept the prefix while the
+        // uploads above were in flight (its sweep removes whatever a LIST
+        // returned, and a mid-publish prefix has no marker to exclude it).
+        // The marker must never claim completeness over unobserved state,
+        // so each object it lists is re-HEADed immediately before the
+        // conditional marker PUT — the HEAD set is derived from the marker
+        // itself, so an object the marker lists can never escape this.
+        // Existence (and size) is the load-bearing check; the stored
+        // checksum hardens it where the backend returns one. Unverifiable
+        // passes here — unlike in the lost-conditional arms — because this
+        // publish itself just uploaded or digest-verified these objects;
+        // the fetch path re-verifies every digest at consume time either
+        // way. See the module doc for the residual race this narrows but
+        // cannot close.
+        for (object, expected) in &marker.objects {
+            let key = self.object_key(&archive_id_short, object);
+            match self.remote_object_match(client, &key, expected).await? {
+                RemoteObjectMatch::Identical | RemoteObjectMatch::Unverifiable(_) => {}
+                RemoteObjectMatch::Absent => {
+                    return Err(self.swept_mid_publish(&archive_id_short, object));
+                }
+                RemoteObjectMatch::Foreign(detail) => anyhow::bail!(
+                    "archive prefix s3://{}/{} was swept and re-claimed mid-publish: the \
+                     {object} at rest is not the one this publish uploaded ({detail}) — \
+                     re-run the publish and let the write-once conditionals settle the claim",
+                    self.bucket,
+                    self.prefix(&archive_id_short)
+                ),
+            }
+        }
+
         let mut marker_bytes =
             serde_json::to_vec_pretty(&marker).context("serialize complete.json")?;
         marker_bytes.push(b'\n');
@@ -1056,6 +1107,21 @@ mod tests {
             })
     }
 
+    /// A HEAD rule for exactly the object at `key`, answering with the
+    /// stored checksum and size a publish PUT recorded — what the
+    /// self-write check and the pre-marker revalidation read back.
+    fn head_object_rule(key: String, sha256_hex: &str, size: u64) -> Rule {
+        let stored = sha256_base64(sha256_hex).unwrap();
+        mock!(aws_sdk_s3::Client::head_object)
+            .match_requests(move |req| req.key() == Some(key.as_str()))
+            .then_output(move || {
+                HeadObjectOutput::builder()
+                    .content_length(size as i64)
+                    .checksum_sha256(stored.clone())
+                    .build()
+            })
+    }
+
     /// A fixed timestamp for markers built by tests.
     fn test_stamp() -> jiff::Timestamp {
         "2026-05-28T00:00:00Z".parse().unwrap()
@@ -1113,12 +1179,12 @@ mod tests {
             (
                 ARCHIVE_IMAGE_OBJECT,
                 "application/octet-stream",
-                Some(image_checksum),
+                Some(image_checksum.clone()),
             ),
             (
                 ARCHIVE_MANIFEST_OBJECT,
                 "application/json",
-                Some(manifest_checksum),
+                Some(manifest_checksum.clone()),
             ),
             // The marker's bytes (and so its digest) embed the upload
             // timestamp; pin only that a checksum is attached.
@@ -1140,8 +1206,42 @@ mod tests {
                 .then_output(|| PutObjectOutput::builder().build())
         })
         .collect();
-        let mut rules: Vec<&Rule> = vec![&head_404];
-        rules.extend(puts.iter());
+        // Between the data uploads and the marker PUT, publish re-HEADs
+        // every object the marker lists (completeness is never claimed
+        // over unobserved state); one rule per object, pinned to the key
+        // and to checksum-mode retrieval, answering with the digests the
+        // uploads stored.
+        let revalidations: Vec<_> = [
+            (
+                ARCHIVE_IMAGE_OBJECT,
+                image_checksum.clone(),
+                std::fs::metadata(&image).unwrap().len() as i64,
+            ),
+            (
+                ARCHIVE_MANIFEST_OBJECT,
+                manifest_checksum.clone(),
+                manifest_bytes.len() as i64,
+            ),
+        ]
+        .into_iter()
+        .map(|(object, stored, size)| {
+            let key = format!("replay/archives/{short}/{object}");
+            mock!(aws_sdk_s3::Client::head_object)
+                .match_requests(move |req| {
+                    req.key() == Some(key.as_str())
+                        && req.checksum_mode() == Some(&aws_sdk_s3::types::ChecksumMode::Enabled)
+                })
+                .then_output(move || {
+                    HeadObjectOutput::builder()
+                        .content_length(size)
+                        .checksum_sha256(stored.clone())
+                        .build()
+                })
+        })
+        .collect();
+        let mut rules: Vec<&Rule> = vec![&head_404, &puts[0], &puts[1]];
+        rules.extend(revalidations.iter());
+        rules.push(&puts[2]);
         let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, rules);
 
         let store = ArchiveStore::new("rio-chunks", "replay");
@@ -1149,6 +1249,13 @@ mod tests {
             .publish(&client, &image, &manifest_bytes, "rio-replay/test")
             .await
             .unwrap();
+        for revalidation in &revalidations {
+            assert_eq!(
+                revalidation.num_calls(),
+                1,
+                "every object the marker lists is re-observed before the marker PUT"
+            );
+        }
 
         assert_eq!(marker.archive_id, archive_id);
         assert_eq!(marker.archive_id_short, short);
@@ -1243,9 +1350,17 @@ mod tests {
             uploaded_at: test_stamp(),
             uploader: "rio-replay/test".to_string(),
         };
-        let head_404 = mock!(aws_sdk_s3::Client::head_object)
-            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
         let complete_suffix = format!("/{ARCHIVE_COMPLETE_OBJECT}");
+        let head_marker_suffix = complete_suffix.clone();
+        let head_marker_404 = mock!(aws_sdk_s3::Client::head_object)
+            .match_requests(move |req| req.key().is_some_and(|k| k.ends_with(&head_marker_suffix)))
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        // The pre-marker revalidation HEADs find the data objects in place
+        // (a bare 200 — existence is what it needs).
+        let head_data_suffix = complete_suffix.clone();
+        let head_data_present = mock!(aws_sdk_s3::Client::head_object)
+            .match_requests(move |req| !req.key().is_some_and(|k| k.ends_with(&head_data_suffix)))
+            .then_output(|| HeadObjectOutput::builder().build());
         let data_suffix = complete_suffix.clone();
         let put_data = mock!(aws_sdk_s3::Client::put_object)
             .match_requests(move |req| !req.key().is_some_and(|k| k.ends_with(&data_suffix)))
@@ -1262,7 +1377,13 @@ mod tests {
         let client = mock_client!(
             aws_sdk_s3,
             RuleMode::MatchAny,
-            &[&head_404, &put_data, &put_complete_412, &get_foreign_marker]
+            &[
+                &head_marker_404,
+                &head_data_present,
+                &put_data,
+                &put_complete_412,
+                &get_foreign_marker
+            ]
         );
 
         let store = ArchiveStore::new("rio-chunks", "replay");
@@ -1439,11 +1560,17 @@ mod tests {
                         .build()
                 })
         };
-        let put_rest = mock!(aws_sdk_s3::Client::put_object)
-            .sequence()
-            .output(|| PutObjectOutput::builder().build())
-            .times(2)
-            .build();
+        let put_manifest = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().build());
+        let reval_image =
+            head_object_rule(image_key.clone(), &image_sha256, image_bytes.len() as u64);
+        let reval_manifest = head_object_rule(
+            format!("replay/archives/{short}/{ARCHIVE_MANIFEST_OBJECT}"),
+            &archive_id,
+            manifest_bytes.len() as u64,
+        );
+        let put_marker = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().build());
         let client = mock_client!(
             aws_sdk_s3,
             RuleMode::Sequential,
@@ -1451,7 +1578,10 @@ mod tests {
                 &head_404_precheck,
                 &put_image_lost_then_412,
                 &head_image_ours,
-                &put_rest
+                &put_manifest,
+                &reval_image,
+                &reval_manifest,
+                &put_marker
             ]
         );
 
@@ -1468,9 +1598,9 @@ mod tests {
         assert_eq!(marker.archive_id, archive_id);
         assert_eq!(marker.objects[ARCHIVE_IMAGE_OBJECT].sha256, image_sha256);
         assert_eq!(
-            put_rest.num_calls(),
-            2,
-            "manifest and marker still upload after the rescued image claim"
+            put_marker.num_calls(),
+            1,
+            "the marker still uploads after the rescued image claim"
         );
     }
 
@@ -1511,6 +1641,16 @@ mod tests {
             format!("replay/archives/{short}/{ARCHIVE_MANIFEST_OBJECT}"),
             manifest_bytes.clone(),
         );
+        let reval_image = head_object_rule(
+            format!("replay/archives/{short}/{ARCHIVE_IMAGE_OBJECT}"),
+            &identity::sha256_hex(&image_bytes),
+            image_bytes.len() as u64,
+        );
+        let reval_manifest = head_object_rule(
+            format!("replay/archives/{short}/{ARCHIVE_MANIFEST_OBJECT}"),
+            &archive_id,
+            manifest_bytes.len() as u64,
+        );
         let put_marker = mock!(aws_sdk_s3::Client::put_object)
             .then_output(|| PutObjectOutput::builder().build());
         let client = mock_client!(
@@ -1522,6 +1662,8 @@ mod tests {
                 &head_image_ours,
                 &put_manifest_412,
                 &get_manifest_ours,
+                &reval_image,
+                &reval_manifest,
                 &put_marker
             ]
         );
@@ -1578,6 +1720,16 @@ mod tests {
             .output(|| PutObjectOutput::builder().build())
             .times(2)
             .build();
+        let reval_image = head_object_rule(
+            format!("replay/archives/{short}/{ARCHIVE_IMAGE_OBJECT}"),
+            &identity::sha256_hex(&image_bytes),
+            image_bytes.len() as u64,
+        );
+        let reval_manifest = head_object_rule(
+            format!("replay/archives/{short}/{ARCHIVE_MANIFEST_OBJECT}"),
+            &archive_id,
+            manifest_bytes.len() as u64,
+        );
         let put_marker_412 = mock!(aws_sdk_s3::Client::put_object).then_error(|| {
             PutObjectError::generic(ErrorMetadata::builder().code("PreconditionFailed").build())
         });
@@ -1591,6 +1743,8 @@ mod tests {
             &[
                 &head_404_precheck,
                 &put_data,
+                &reval_image,
+                &reval_manifest,
                 &put_marker_412,
                 &get_existing_marker
             ]
@@ -1614,6 +1768,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (image, manifest_bytes) = packed_tiny_archive(dir.path());
         let image_bytes = std::fs::read(&image).unwrap();
+        let archive_id = identity::archive_id_from_manifest_bytes(&manifest_bytes);
+        let short = identity::short_id(&archive_id);
 
         // S3's other documented conditional-write rejection: HTTP 409
         // ConditionalRequestConflict (a concurrent conditional operation on
@@ -1639,11 +1795,20 @@ mod tests {
                     .build()
             })
         };
-        let put_rest = mock!(aws_sdk_s3::Client::put_object)
-            .sequence()
-            .output(|| PutObjectOutput::builder().build())
-            .times(2)
-            .build();
+        let put_manifest = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().build());
+        let reval_image = head_object_rule(
+            format!("replay/archives/{short}/{ARCHIVE_IMAGE_OBJECT}"),
+            &identity::sha256_hex(&image_bytes),
+            image_bytes.len() as u64,
+        );
+        let reval_manifest = head_object_rule(
+            format!("replay/archives/{short}/{ARCHIVE_MANIFEST_OBJECT}"),
+            &archive_id,
+            manifest_bytes.len() as u64,
+        );
+        let put_marker = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().build());
         let client = mock_client!(
             aws_sdk_s3,
             RuleMode::Sequential,
@@ -1651,7 +1816,10 @@ mod tests {
                 &head_404_precheck,
                 &put_image_409,
                 &head_image_ours,
-                &put_rest
+                &put_manifest,
+                &reval_image,
+                &reval_manifest,
+                &put_marker
             ]
         );
 
@@ -1661,7 +1829,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(put_image_409.num_calls(), 1);
-        assert_eq!(put_rest.num_calls(), 2);
+        assert_eq!(put_marker.num_calls(), 1);
     }
 
     #[tokio::test]
@@ -1749,6 +1917,112 @@ mod tests {
             "the sweep is named: {message}"
         );
         assert!(message.contains("re-run"), "recovery named: {message}");
+    }
+
+    #[tokio::test]
+    async fn publish_refuses_when_the_prefix_was_swept_mid_publish() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+
+        // Both data uploads land, but a concurrent `replay delete` sweeps
+        // the prefix before the marker PUT (the sweep removes whatever a
+        // LIST returned, and a mid-publish prefix has no marker to exclude
+        // it). The pre-marker revalidation finds the image gone: publish
+        // must refuse — the marker may never vouch for unobserved state —
+        // and the marker PUT must never be issued.
+        let head_404_precheck = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let put_data = mock!(aws_sdk_s3::Client::put_object)
+            .sequence()
+            .output(|| PutObjectOutput::builder().build())
+            .times(2)
+            .build();
+        let reval_image_404 = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let put_marker = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().build());
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&head_404_precheck, &put_data, &reval_image_404, &put_marker]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        let err = store
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("swept mid-publish"),
+            "the sweep is named: {message}"
+        );
+        assert!(message.contains("re-run"), "recovery named: {message}");
+        assert_eq!(
+            put_marker.num_calls(),
+            0,
+            "completeness must never be claimed over a swept prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_refuses_a_replaced_object_at_completeness_time() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+        let image_bytes = std::fs::read(&image).unwrap();
+
+        // Worse than swept: between this publish's image upload and its
+        // marker PUT, the prefix was swept AND a foreign publisher of the
+        // same archive id re-claimed the image key with different bytes
+        // (mkdwarfs is not deterministic). The revalidation HEAD sees the
+        // size match but a different stored checksum — the marker this
+        // publish built hashes ITS image, not the one at rest, so claiming
+        // completeness would publish a lie.
+        let head_404_precheck = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let put_data = mock!(aws_sdk_s3::Client::put_object)
+            .sequence()
+            .output(|| PutObjectOutput::builder().build())
+            .times(2)
+            .build();
+        let reval_image_foreign = {
+            let stored = sha256_base64(&"f0".repeat(32)).unwrap();
+            let size = image_bytes.len() as i64;
+            mock!(aws_sdk_s3::Client::head_object).then_output(move || {
+                HeadObjectOutput::builder()
+                    .content_length(size)
+                    .checksum_sha256(stored.clone())
+                    .build()
+            })
+        };
+        let put_marker = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().build());
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[
+                &head_404_precheck,
+                &put_data,
+                &reval_image_foreign,
+                &put_marker
+            ]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        let err = store
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("swept and re-claimed mid-publish"),
+            "the replaced object is named: {message}"
+        );
+        assert_eq!(
+            put_marker.num_calls(),
+            0,
+            "the marker must not vouch for another publisher's bytes"
+        );
     }
 
     #[test]
