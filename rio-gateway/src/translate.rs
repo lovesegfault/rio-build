@@ -1533,7 +1533,12 @@ mod tests {
     use rstest::rstest;
 
     fn make_basic_drv(env: BTreeMap<String, String>) -> anyhow::Result<BasicDerivation> {
-        let output = DerivationOutput::new("out", "/nix/store/test-out", "", "")?;
+        let output = DerivationOutput::new(
+            "out",
+            "/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-out",
+            "",
+            "",
+        )?;
         Ok(BasicDerivation::new(
             vec![output],
             BTreeSet::new(),
@@ -1546,7 +1551,12 @@ mod tests {
 
     /// Same as make_basic_drv but with a configurable single output.
     fn make_basic_drv_with_output(hash_algo: &str, hash: &str) -> anyhow::Result<BasicDerivation> {
-        let output = DerivationOutput::new("out", "/nix/store/test-out", hash_algo, hash)?;
+        let output = DerivationOutput::new(
+            "out",
+            "/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-out",
+            hash_algo,
+            hash,
+        )?;
         Ok(BasicDerivation::new(
             vec![output],
             BTreeSet::new(),
@@ -1584,13 +1594,13 @@ mod tests {
     ) -> anyhow::Result<()> {
         // BasicDerivation path (single-node fallback).
         let basic = make_basic_drv_with_output(basic_algo, hash)?;
-        let node = build_node("/nix/store/test.drv", &basic);
+        let node = build_node("/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi.drv", &basic);
         assert_eq!(node.is_content_addressed, want_ca, "basic: is_ca");
         assert_eq!(node.is_fixed_output, want_fod, "basic: strict is_fod");
 
         // Full Derivation path (via ATerm parse).
         let aterm = format!(
-            r#"Derive([("out","/nix/store/aaa-out","{aterm_algo}","{hash}")],[],[],"x86_64-linux","/bin/sh",[],[])"#
+            r#"Derive([("out","/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-out","{aterm_algo}","{hash}")],[],[],"x86_64-linux","/bin/sh",[],[])"#
         );
         let node = build_node(&test_drv_path("ca-test"), &Derivation::parse(&aterm)?);
         assert_eq!(node.is_content_addressed, want_ca, "full: is_ca");
@@ -1620,7 +1630,7 @@ mod tests {
         env.insert("requiredSystemFeatures".into(), "kvm big-parallel".into());
         let drv = make_basic_drv(env)?;
 
-        let node = build_node("/nix/store/test.drv", &drv);
+        let node = build_node("/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi.drv", &drv);
         assert_eq!(
             node.required_features,
             vec!["kvm".to_string(), "big-parallel".to_string()],
@@ -1657,12 +1667,12 @@ mod tests {
         // no __noChroot → Ok.
         let nodes = vec![
             types::DerivationNode {
-                drv_path: "/nix/store/aaa-test.drv".into(),
+                drv_path: "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-test.drv".into(),
                 drv_hash: "aaa".into(),
                 ..Default::default()
             },
             types::DerivationNode {
-                drv_path: "/nix/store/bbb-test.drv".into(),
+                drv_path: "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-test.drv".into(),
                 drv_hash: "bbb".into(),
                 ..Default::default()
             },
@@ -1684,7 +1694,7 @@ mod tests {
     ) -> (Vec<types::DerivationNode>, HashMap<StorePath, Derivation>) {
         let drv_path = "/nix/store/nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn-nochroot-probe.drv";
         let aterm = format!(
-            r#"Derive([("out","/nix/store/oooooooooooooooooooooooooooooooo-out","","")],[],[],"x86_64-linux","/bin/sh",[],[("out","/nix/store/oooooooooooooooooooooooooooooooo-out"){extra_env}])"#
+            r#"Derive([("out","/nix/store/gsqizyqxzjbdjyb1jav5zjndvsadgs15-out","","")],[],[],"x86_64-linux","/bin/sh",[],[("out","/nix/store/gsqizyqxzjbdjyb1jav5zjndvsadgs15-out"){extra_env}])"#
         );
         let drv = Derivation::parse(&aterm).expect("test ATerm parses");
         let node = types::DerivationNode {
@@ -2726,7 +2736,7 @@ mod tests {
     #[test]
     fn test_single_node_no_features() -> anyhow::Result<()> {
         let drv = make_basic_drv(BTreeMap::new())?;
-        let node = build_node("/nix/store/test.drv", &drv);
+        let node = build_node("/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi.drv", &drv);
         assert!(node.required_features.is_empty());
         Ok(())
     }
@@ -2741,14 +2751,14 @@ mod tests {
         env.insert("pname".into(), "hello".into());
         env.insert("name".into(), "hello-2.12".into());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.pname, "hello", "pname preferred over name");
 
         // name fallback when pname absent (raw derivation{} case).
         let mut env = BTreeMap::new();
         env.insert("name".into(), "rawbuild-1.0".into());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(
             node.pname, "rawbuild-1.0",
             "name fallback — less stable (includes version) but beats empty"
@@ -2756,7 +2766,7 @@ mod tests {
 
         // neither → empty (no build_samples key possible).
         let drv = make_basic_drv(BTreeMap::new())?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.pname, "");
 
         Ok(())
@@ -2774,7 +2784,7 @@ mod tests {
         env.insert("enableParallelBuilding".into(), "1".into());
         env.insert("preferLocalBuild".into(), "true".into());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.version.as_deref(), Some("2.12"));
         assert_eq!(node.enable_parallel_building, Some(true));
         assert_eq!(node.enable_parallel_checking, None, "absent stays None");
@@ -2788,7 +2798,7 @@ mod tests {
         env.insert("enableParallelChecking".into(), "1".into());
         env.insert("preferLocalBuild".into(), "false".into());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.enable_parallel_building, Some(false));
         assert_eq!(node.enable_parallel_checking, Some(true));
         assert_eq!(node.prefer_local_build, Some(false));
@@ -2804,7 +2814,7 @@ mod tests {
         env.insert("pname".into(), long.clone());
         env.insert("version".into(), long.clone());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.pname.chars().count(), MAX_ATTR_LEN);
         assert_eq!(
             node.version.as_deref().map(|s| s.chars().count()),
@@ -2814,7 +2824,7 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("name".into(), long.clone());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.pname.chars().count(), MAX_ATTR_LEN);
         // Multi-byte: clamp is by chars not bytes (don't split a code
         // point). 300×'é' (2 bytes each) → 256 chars = 512 bytes.
@@ -2822,14 +2832,17 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("pname".into(), mb);
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.pname.chars().count(), MAX_ATTR_LEN);
         assert_eq!(node.pname.len(), MAX_ATTR_LEN * 2, "bytes ≠ chars");
         // Under-threshold is unchanged (no spurious reallocation/copy).
         let mut env = BTreeMap::new();
         env.insert("pname".into(), "hello".into());
         let drv = make_basic_drv(env)?;
-        assert_eq!(build_node("/nix/store/x.drv", &drv).pname, "hello");
+        assert_eq!(
+            build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv).pname,
+            "hello"
+        );
         Ok(())
     }
 
@@ -2852,7 +2865,7 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("requiredSystemFeatures".into(), many);
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.required_features.len(), MAX_LIST_LEN);
         assert_eq!(node.required_features[0], "f0", "head preserved");
         assert_eq!(
@@ -2866,7 +2879,7 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("requiredSystemFeatures".into(), long);
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.required_features.len(), 1);
         assert_eq!(node.required_features[0].chars().count(), MAX_ATTR_LEN);
 
@@ -2883,7 +2896,7 @@ mod tests {
             serde_json::json!({ "requiredSystemFeatures": json_features }).to_string(),
         );
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.required_features.len(), MAX_LIST_LEN);
         for f in &node.required_features {
             assert_eq!(f.chars().count(), MAX_ATTR_LEN);
@@ -2893,7 +2906,7 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("requiredSystemFeatures".into(), "kvm big-parallel".into());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.required_features, vec!["kvm", "big-parallel"]);
         Ok(())
     }
@@ -2922,7 +2935,7 @@ mod tests {
             .to_string(),
         );
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.pname, "foo", "pname from __json, not name fallback");
         assert_eq!(node.version.as_deref(), Some("1.0"));
         assert_eq!(
@@ -2938,7 +2951,7 @@ mod tests {
         env.insert("__json".into(), "{not json".into());
         env.insert("version".into(), "2.0".into());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.version.as_deref(), Some("2.0"));
         Ok(())
     }
@@ -2953,7 +2966,7 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("pname".into(), "hello".into());
         let drv = make_basic_drv(env)?;
-        let node = build_node("/nix/store/x.drv", &drv);
+        let node = build_node("/nix/store/mj459285d27za2vpn2gggwqzk4c7glz9.drv", &drv);
         assert_eq!(node.version, None);
         assert_eq!(
             node.enable_parallel_building, None,
@@ -3024,7 +3037,8 @@ mod tests {
     #[tokio::test]
     async fn test_reconstruct_dag_single_node_no_inputs() {
         let root_path = sp(&test_drv_path("root"));
-        let root_drv = make_test_derivation("/nix/store/aaa-root-out", &[]);
+        let root_drv =
+            make_test_derivation("/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-root-out", &[]);
 
         let mut store = unreachable_store();
         let mut cache = HashMap::new();
@@ -3045,10 +3059,11 @@ mod tests {
         let child_path = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-child.drv");
 
         let root_drv = make_test_derivation(
-            "/nix/store/aaa-root-out",
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-root-out",
             &[(child_path.as_str(), &["out"])],
         );
-        let child_drv = make_test_derivation("/nix/store/bbb-child-out", &[]);
+        let child_drv =
+            make_test_derivation("/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-child-out", &[]);
 
         let mut store = unreachable_store();
         // Pre-populate cache so resolve_derivation finds the child without gRPC.
@@ -3154,8 +3169,10 @@ mod tests {
         let root_path = sp(&test_drv_path("root"));
         let missing_child = "/nix/store/cccccccccccccccccccccccccccccccc-missing.drv";
 
-        let root_drv =
-            make_test_derivation("/nix/store/aaa-root-out", &[(missing_child, &["out"])]);
+        let root_drv = make_test_derivation(
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-root-out",
+            &[(missing_child, &["out"])],
+        );
 
         let mut store = unreachable_store();
         let mut cache = HashMap::new(); // child NOT in cache
@@ -3185,7 +3202,10 @@ mod tests {
         let root_path = sp(&test_drv_path("root"));
         let bogus_child = "/not/a/store/path";
 
-        let root_drv = make_test_derivation("/nix/store/aaa-root-out", &[(bogus_child, &["out"])]);
+        let root_drv = make_test_derivation(
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-root-out",
+            &[(bogus_child, &["out"])],
+        );
 
         let mut store = unreachable_store();
         let mut cache = HashMap::new();
@@ -3211,9 +3231,15 @@ mod tests {
         let b_path = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv");
         let c_path = sp("/nix/store/cccccccccccccccccccccccccccccccc-c.drv");
 
-        let a_drv = make_test_derivation("/nix/store/aaa-out", &[(b_path.as_str(), &["out"])]);
-        let b_drv = make_test_derivation("/nix/store/bbb-out", &[(c_path.as_str(), &["out"])]);
-        let c_drv = make_test_derivation("/nix/store/ccc-out", &[]);
+        let a_drv = make_test_derivation(
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-out",
+            &[(b_path.as_str(), &["out"])],
+        );
+        let b_drv = make_test_derivation(
+            "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-out",
+            &[(c_path.as_str(), &["out"])],
+        );
+        let c_drv = make_test_derivation("/nix/store/h215ws5mqjq1pnqd7j0incvdyqk96lhp-out", &[]);
 
         let mut store = unreachable_store();
         let mut cache = HashMap::new();
@@ -3249,7 +3275,10 @@ mod tests {
             .map(|p| (p.as_str(), &["out"][..]))
             .collect();
         let root_path = sp(&test_drv_path("wide"));
-        let root_drv = make_test_derivation("/nix/store/aaa-wide-out", &child_refs);
+        let root_drv = make_test_derivation(
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-wide-out",
+            &child_refs,
+        );
 
         let mut store = unreachable_store();
         let mut cache = HashMap::new();
@@ -3416,7 +3445,7 @@ mod tests {
     #[tokio::test]
     async fn test_filter_and_inline_drv_store_error_skips_safely() {
         let drv_path = sp(&test_drv_path("x"));
-        let drv = make_test_derivation("/nix/store/aaa-out", &[]);
+        let drv = make_test_derivation("/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-out", &[]);
 
         let mut cache = HashMap::new();
         cache.insert(drv_path.clone(), drv.clone());
@@ -3656,8 +3685,14 @@ mod tests {
 
         // Only a + c in the cache; b is the miss (BFS-inconsistency).
         let mut drv_cache = HashMap::new();
-        drv_cache.insert(a, make_test_derivation("/nix/store/aaa-out", &[]));
-        drv_cache.insert(c, make_test_derivation("/nix/store/ccc-out", &[]));
+        drv_cache.insert(
+            a,
+            make_test_derivation("/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-out", &[]),
+        );
+        drv_cache.insert(
+            c,
+            make_test_derivation("/nix/store/h215ws5mqjq1pnqd7j0incvdyqk96lhp-out", &[]),
+        );
 
         let hits: Vec<usize> = iter_cached_drvs(&nodes, &drv_cache, "test")
             .map(|(i, _, _)| i)
@@ -3670,7 +3705,7 @@ mod tests {
     #[test]
     fn modular_hash_wrapper_none_on_resolver_miss() {
         let drv = make_test_derivation(
-            "/nix/store/oooooooooooooooooooooooooooooooo-out",
+            "/nix/store/gsqizyqxzjbdjyb1jav5zjndvsadgs15-out",
             &[(
                 "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-missing.drv",
                 &["out"],
@@ -3708,17 +3743,19 @@ mod tests {
         let ca_child = Derivation::parse(ca_child_aterm).unwrap();
 
         // IA child: all-empty output tuple.
-        let ia_child = make_test_derivation("/nix/store/ia-out", &[]);
+        let ia_child = make_test_derivation("/nix/store/x265isadxs1xhsd5larxdal956cxmsk1-out", &[]);
 
         // IA parent depending on the floating-CA child.
         let ia_parent = make_test_derivation(
-            "/nix/store/parent-out",
+            "/nix/store/pj8izfqdpab526ki2jvdgjfmvjs5zs9x-out",
             &[(ca_child_path.as_str(), &["out"])],
         );
 
         // IA parent depending only on the IA child (pure IA-on-IA).
-        let ia_pure =
-            make_test_derivation("/nix/store/pure-out", &[(ia_child_path.as_str(), &["out"])]);
+        let ia_pure = make_test_derivation(
+            "/nix/store/9js5mjfd9addln5rwamdijq5mj4x9j7d-out",
+            &[(ia_child_path.as_str(), &["out"])],
+        );
 
         let mut drv_cache = HashMap::new();
         drv_cache.insert(ca_child_path.clone(), ca_child.clone());
@@ -3782,9 +3819,11 @@ mod tests {
         let ia_gp = make_deferred_derivation(&[(ia_mid_path.as_str(), &["out"])]);
         // Concrete-IA child (non-empty out_path) and a parent on it —
         // proves concrete-IA-on-concrete-IA still stays false.
-        let ia_conc = make_test_derivation("/nix/store/ia-out", &[]);
-        let ia_pure =
-            make_test_derivation("/nix/store/pure-out", &[(ia_conc_path.as_str(), &["out"])]);
+        let ia_conc = make_test_derivation("/nix/store/x265isadxs1xhsd5larxdal956cxmsk1-out", &[]);
+        let ia_pure = make_test_derivation(
+            "/nix/store/9js5mjfd9addln5rwamdijq5mj4x9j7d-out",
+            &[(ia_conc_path.as_str(), &["out"])],
+        );
 
         let mut drv_cache = HashMap::new();
         for (p, d) in [
@@ -3879,7 +3918,7 @@ mod tests {
             &[],
         );
         let parent = make_test_derivation(
-            "/nix/store/ppp-parent-out",
+            "/nix/store/mjc59j05djg72j3gf2pp7487bwwg7cgr-parent-out",
             &[(child_path.as_str(), &["out"])],
         );
 
@@ -3934,10 +3973,16 @@ mod tests {
             &[],
         );
         // A consumes child^out, B consumes child^dev.
-        let a = make_test_derivation("/nix/store/aaa-out", &[(child_path.as_str(), &["out"])]);
-        let b = make_test_derivation("/nix/store/bbb-out", &[(child_path.as_str(), &["dev"])]);
+        let a = make_test_derivation(
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-out",
+            &[(child_path.as_str(), &["out"])],
+        );
+        let b = make_test_derivation(
+            "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-out",
+            &[(child_path.as_str(), &["dev"])],
+        );
         let root = make_test_derivation(
-            "/nix/store/rrr-out",
+            "/nix/store/zjsm32y5pjmp8y5v8a5gdls3m0az5lx1-out",
             &[(a_path.as_str(), &["out"]), (b_path.as_str(), &["out"])],
         );
 
@@ -4035,9 +4080,10 @@ mod tests {
         let parent_path = sp("/nix/store/pppppppppppppppppppppppppppppppp-parent.drv");
         let child_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc.drv");
 
-        let child = make_test_derivation("/nix/store/aaa-glibc-out", &[]);
+        let child =
+            make_test_derivation("/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-glibc-out", &[]);
         let parent = make_test_derivation(
-            "/nix/store/ppp-parent-out",
+            "/nix/store/mjc59j05djg72j3gf2pp7487bwwg7cgr-parent-out",
             &[(child_path.as_str(), &["out"])],
         );
 
@@ -4082,7 +4128,7 @@ mod tests {
             &[],
         );
         let root = make_test_derivation(
-            "/nix/store/aaa-root-out",
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-root-out",
             &[(child_path.as_str(), &["dev"])],
         );
 

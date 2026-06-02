@@ -566,7 +566,7 @@ async fn test_query_derivation_output_map_missing_drv() -> anyhow::Result<()> {
 async fn test_query_derivation_output_map_found() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
 
-    let drv_text = r#"Derive([("out","/nix/store/zzz-output","",""),("dev","/nix/store/yyy-dev","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
+    let drv_text = r#"Derive([("out","/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output","",""),("dev","/nix/store/f23masp5n2jmrjnxda2x0l9dw45d8lsb-dev","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output")])"#;
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
     h.store.seed_with_content(drv_path, drv_text.as_bytes());
 
@@ -584,11 +584,11 @@ async fn test_query_derivation_output_map_found() -> anyhow::Result<()> {
     }
     assert_eq!(
         outputs.get("out").expect("output present"),
-        "/nix/store/zzz-output"
+        "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output"
     );
     assert_eq!(
         outputs.get("dev").expect("output present"),
-        "/nix/store/yyy-dev"
+        "/nix/store/f23masp5n2jmrjnxda2x0l9dw45d8lsb-dev"
     );
 
     h.finish().await;

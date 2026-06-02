@@ -493,12 +493,15 @@ mod tests {
 
     #[test]
     fn parse_simple_derivation() -> anyhow::Result<()> {
-        let aterm = r#"Derive([("out","/nix/store/abc-simple-test","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello > $out"],[("builder","/bin/sh"),("name","simple-test"),("out","/nix/store/abc-simple-test"),("system","x86_64-linux")])"#;
+        let aterm = r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-simple-test","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello > $out"],[("builder","/bin/sh"),("name","simple-test"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-simple-test"),("system","x86_64-linux")])"#;
 
         let drv = Derivation::parse(aterm)?;
         assert_eq!(drv.outputs().len(), 1);
         assert_eq!(drv.outputs()[0].name(), "out");
-        assert_eq!(drv.outputs()[0].path(), "/nix/store/abc-simple-test");
+        assert_eq!(
+            drv.outputs()[0].path(),
+            "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-simple-test"
+        );
         assert_eq!(drv.outputs()[0].hash_algo(), "");
         assert_eq!(drv.outputs()[0].hash(), "");
         assert!(!drv.outputs()[0].has_hash_algo());
@@ -514,7 +517,7 @@ mod tests {
 
     #[test]
     fn parse_multi_output_derivation() -> anyhow::Result<()> {
-        let aterm = r#"Derive([("dev","/nix/store/abc-dev","",""),("lib","/nix/store/abc-lib","",""),("out","/nix/store/abc-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","mkdir $out $dev $lib"],[("dev","/nix/store/abc-dev"),("lib","/nix/store/abc-lib"),("name","multi"),("out","/nix/store/abc-out"),("outputs","out dev lib"),("system","x86_64-linux")])"#;
+        let aterm = r#"Derive([("dev","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-dev","",""),("lib","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-lib","",""),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","mkdir $out $dev $lib"],[("dev","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-dev"),("lib","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-lib"),("name","multi"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-out"),("outputs","out dev lib"),("system","x86_64-linux")])"#;
 
         let drv = Derivation::parse(aterm)?;
         assert_eq!(drv.outputs().len(), 3);
@@ -527,7 +530,7 @@ mod tests {
 
     #[test]
     fn parse_fixed_output_derivation() -> anyhow::Result<()> {
-        let aterm = r#"Derive([("out","/nix/store/abc-fixed","sha256","abcdef0123456789")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/abc-fixed"),("outputHash","abcdef0123456789"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#;
+        let aterm = r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-fixed","sha256","abcdef0123456789")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-fixed"),("outputHash","abcdef0123456789"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#;
 
         let drv = Derivation::parse(aterm)?;
         assert_eq!(drv.outputs().len(), 1);
@@ -539,22 +542,34 @@ mod tests {
 
     #[test]
     fn parse_with_input_drvs() -> anyhow::Result<()> {
-        let aterm = r#"Derive([("out","/nix/store/abc-hello","","")],[("/nix/store/abc-bash.drv",["out"]),("/nix/store/abc-stdenv.drv",["out"])],["/nix/store/abc-source.sh"],"x86_64-linux","/nix/store/abc-bash/bin/bash",["-e","/nix/store/abc-source.sh"],[("name","hello"),("out","/nix/store/abc-hello"),("system","x86_64-linux")])"#;
+        let aterm = r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-hello","","")],[("/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-bash.drv",["out"]),("/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-stdenv.drv",["out"])],["/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-source.sh"],"x86_64-linux","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-bash/bin/bash",["-e","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-source.sh"],[("name","hello"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-hello"),("system","x86_64-linux")])"#;
 
         let drv = Derivation::parse(aterm)?;
         assert_eq!(drv.input_drvs().len(), 2);
-        assert!(drv.input_drvs().contains_key("/nix/store/abc-bash.drv"));
-        assert!(drv.input_drvs().contains_key("/nix/store/abc-stdenv.drv"));
-        let bash_outputs = drv.input_drvs().get("/nix/store/abc-bash.drv").unwrap();
+        assert!(
+            drv.input_drvs()
+                .contains_key("/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-bash.drv")
+        );
+        assert!(
+            drv.input_drvs()
+                .contains_key("/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-stdenv.drv")
+        );
+        let bash_outputs = drv
+            .input_drvs()
+            .get("/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-bash.drv")
+            .unwrap();
         assert!(bash_outputs.contains("out"));
         assert_eq!(drv.input_srcs().len(), 1);
-        assert!(drv.input_srcs().contains("/nix/store/abc-source.sh"));
+        assert!(
+            drv.input_srcs()
+                .contains("/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-source.sh")
+        );
         Ok(())
     }
 
     #[test]
     fn parse_with_escaped_strings() -> anyhow::Result<()> {
-        let aterm = r#"Derive([("out","/nix/store/abc-escape","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo \"hello\\nworld\" > $out"],[("env_val","line1\nline2\ttab\nquote\"end"),("name","escape"),("out","/nix/store/abc-escape"),("system","x86_64-linux")])"#;
+        let aterm = r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-escape","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo \"hello\\nworld\" > $out"],[("env_val","line1\nline2\ttab\nquote\"end"),("name","escape"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-escape"),("system","x86_64-linux")])"#;
 
         let drv = Derivation::parse(aterm)?;
         assert_eq!(drv.args(), &["-c", "echo \"hello\\nworld\" > $out"]);
@@ -567,7 +582,7 @@ mod tests {
 
     #[test]
     fn parse_empty_env_value() -> anyhow::Result<()> {
-        let aterm = r#"Derive([("out","/nix/store/abc-test","","")],[],[],"x86_64-linux","/bin/sh",[],[("empty",""),("name","test"),("out","/nix/store/abc-test"),("system","x86_64-linux")])"#;
+        let aterm = r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-test","","")],[],[],"x86_64-linux","/bin/sh",[],[("empty",""),("name","test"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-test"),("system","x86_64-linux")])"#;
 
         let drv = Derivation::parse(aterm)?;
         assert_eq!(drv.env().get("empty").unwrap(), "");
@@ -576,16 +591,16 @@ mod tests {
 
     #[rstest]
     #[case::simple(
-        r#"Derive([("out","/nix/store/abc-simple","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello > $out"],[("builder","/bin/sh"),("name","simple"),("out","/nix/store/abc-simple"),("system","x86_64-linux")])"#
+        r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-simple","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello > $out"],[("builder","/bin/sh"),("name","simple"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-simple"),("system","x86_64-linux")])"#
     )]
     #[case::with_input_drvs(
-        r#"Derive([("out","/nix/store/abc-hello","","")],[("/nix/store/abc-bash.drv",["out"]),("/nix/store/abc-stdenv.drv",["out"])],["/nix/store/abc-source.sh"],"x86_64-linux","/nix/store/abc-bash/bin/bash",["-e","/nix/store/abc-source.sh"],[("name","hello"),("out","/nix/store/abc-hello"),("system","x86_64-linux")])"#
+        r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-hello","","")],[("/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-bash.drv",["out"]),("/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-stdenv.drv",["out"])],["/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-source.sh"],"x86_64-linux","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-bash/bin/bash",["-e","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-source.sh"],[("name","hello"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-hello"),("system","x86_64-linux")])"#
     )]
     #[case::with_escapes(
-        r#"Derive([("out","/nix/store/abc-escape","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo \"hello\\nworld\""],[("env","line1\nline2\ttab\nquote\"end"),("name","escape"),("out","/nix/store/abc-escape"),("system","x86_64-linux")])"#
+        r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-escape","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo \"hello\\nworld\""],[("env","line1\nline2\ttab\nquote\"end"),("name","escape"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-escape"),("system","x86_64-linux")])"#
     )]
     #[case::fixed_output(
-        r#"Derive([("out","/nix/store/abc-fixed","sha256","abcdef0123456789")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/abc-fixed"),("system","x86_64-linux")])"#
+        r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-fixed","sha256","abcdef0123456789")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-fixed"),("system","x86_64-linux")])"#
     )]
     fn roundtrip(#[case] aterm: &str) -> anyhow::Result<()> {
         let drv = Derivation::parse(aterm)?;
@@ -603,7 +618,7 @@ mod tests {
         // Non-trivial body: inputSrcs, args, env all populated so
         // write_aterm_tail is fully exercised. inputDrvs empty by
         // construction (the case BasicDerivation represents).
-        let aterm = r#"Derive([("dev","/nix/store/abc-dev","",""),("out","/nix/store/abc-out","sha256","")],[],["/nix/store/src-a","/nix/store/src-b"],"x86_64-linux","/bin/sh",["-c","build"],[("name","t"),("out","/nix/store/abc-out"),("system","x86_64-linux")])"#;
+        let aterm = r#"Derive([("dev","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-dev","",""),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-out","sha256","")],[],["/nix/store/v2nxzjj53jrp4yik4a9g9wyk9hfg1cii-a","/nix/store/v2nxzjj53jrp4yik4a9g9wyk9hfg1cii-b"],"x86_64-linux","/bin/sh",["-c","build"],[("name","t"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-out"),("system","x86_64-linux")])"#;
         let drv = Derivation::parse(aterm)?;
         assert!(drv.input_drvs().is_empty());
 
@@ -621,7 +636,7 @@ mod tests {
     /// source `Derivation` carried.
     #[test]
     fn from_resolved_merges_extra_srcs_sorted() -> anyhow::Result<()> {
-        let aterm = r#"Derive([("out","/nix/store/abc","","")],[("/nix/store/dep.drv",["out"])],["/nix/store/zzz"],"x86_64-linux","/bin/sh",[],[("name","t")])"#;
+        let aterm = r#"Derive([("out","/nix/store/abc","","")],[("/nix/store/jsgmnakmssnxxajxi2n5lld58c9mcly3.drv",["out"])],["/nix/store/zzz"],"x86_64-linux","/bin/sh",[],[("name","t")])"#;
         let drv = Derivation::parse(aterm)?;
         assert_eq!(drv.input_drvs().len(), 1);
 
@@ -655,7 +670,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_empty_output_name() {
-        let aterm = r#"Derive([("","/nix/store/abc-test","","")],[],[],"x86_64-linux","/bin/sh",[],[("name","test"),("system","x86_64-linux")])"#;
+        let aterm = r#"Derive([("","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-test","","")],[],[],"x86_64-linux","/bin/sh",[],[("name","test"),("system","x86_64-linux")])"#;
         assert!(matches!(
             Derivation::parse(aterm),
             Err(DerivationError::EmptyOutputName(0))
@@ -673,7 +688,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_invalid_escape() {
-        let aterm = r#"Derive([("out","/nix/store/abc-test","","")],[],[],"x86_64-linux","/bin/sh",[],[("name","tes\x")])"#;
+        let aterm = r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-test","","")],[],[],"x86_64-linux","/bin/sh",[],[("name","tes\x")])"#;
         assert!(matches!(
             Derivation::parse(aterm),
             Err(DerivationError::InvalidEscape('x'))
@@ -682,10 +697,13 @@ mod tests {
 
     #[test]
     fn parse_input_drvs_with_multiple_outputs() -> anyhow::Result<()> {
-        let aterm = r#"Derive([("out","/nix/store/abc-test","","")],[("/nix/store/abc-multi.drv",["dev","lib","out"])],[],"x86_64-linux","/bin/sh",[],[("name","test"),("system","x86_64-linux")])"#;
+        let aterm = r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-test","","")],[("/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-multi.drv",["dev","lib","out"])],[],"x86_64-linux","/bin/sh",[],[("name","test"),("system","x86_64-linux")])"#;
 
         let drv = Derivation::parse(aterm)?;
-        let multi_outputs = drv.input_drvs().get("/nix/store/abc-multi.drv").unwrap();
+        let multi_outputs = drv
+            .input_drvs()
+            .get("/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-multi.drv")
+            .unwrap();
         assert_eq!(multi_outputs.len(), 3);
         assert!(multi_outputs.contains("dev"));
         assert!(multi_outputs.contains("lib"));
@@ -828,7 +846,7 @@ mod tests {
             r#"Derive([("out","/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-multi","","")]"#,
             r#",[("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep1.drv",["out"]),"#,
             r#"("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep2.drv",["dev","out"])]"#,
-            r#",["/nix/store/aaa-src1","/nix/store/bbb-src2","/nix/store/ccc-src3"]"#,
+            r#",["/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-src2","/nix/store/h215ws5mqjq1pnqd7j0incvdyqk96lhp-src3","/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-src1"]"#,
             r#","x86_64-linux","/bin/sh",["-e","build.sh","arg2"]"#,
             r#",[("name","multi-input"),"#,
             r#"("out","/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-multi"),"#,
@@ -912,9 +930,21 @@ mod tests {
                 "separator/count mutation: {:?}",
                 parsed.input_srcs
             );
-            assert!(parsed.input_srcs.contains("/nix/store/aaa-src1"));
-            assert!(parsed.input_srcs.contains("/nix/store/bbb-src2"));
-            assert!(parsed.input_srcs.contains("/nix/store/ccc-src3"));
+            assert!(
+                parsed
+                    .input_srcs
+                    .contains("/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-src1")
+            );
+            assert!(
+                parsed
+                    .input_srcs
+                    .contains("/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-src2")
+            );
+            assert!(
+                parsed
+                    .input_srcs
+                    .contains("/nix/store/h215ws5mqjq1pnqd7j0incvdyqk96lhp-src3")
+            );
             // Same mutation class applies to parse_input_drvs and the
             // nested output-names list.
             assert_eq!(parsed.input_drvs.len(), 2);
@@ -968,7 +998,7 @@ mod tests {
         /// comma (catches `i > 0` at aterm.rs:360 for multi-output case).
         #[test]
         fn modulo_mask_multi_output() {
-            let aterm = r#"Derive([("dev","/nix/store/aaa-dev","",""),("out","/nix/store/aaa-out","","")],[],[],"x86_64-linux","/bin/sh",[],[("name","x")])"#;
+            let aterm = r#"Derive([("dev","/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-dev","",""),("out","/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-out","","")],[],[],"x86_64-linux","/bin/sh",[],[("name","x")])"#;
             let parsed = Derivation::parse(aterm).unwrap();
             let rewrites = BTreeMap::new();
             let masked = parsed.to_aterm_modulo(&rewrites, true).unwrap();
@@ -1009,26 +1039,59 @@ mod tests {
             .prop_map(|chars| chars.into_iter().collect())
         }
 
-        fn arb_output() -> impl Strategy<Value = DerivationOutput> {
-            (
-                "[a-z]{1,8}",                                                 // name
-                "/nix/store/[a-z0-9]{32}-[a-z]{1,10}",                        // path
-                prop_oneof![Just(String::new()), Just("sha256".to_string())], // hash_algo
+        // Output paths use the CANONICAL nixbase32 alphabet
+        // ([0-9a-df-np-sv-z] -- no e/o/t/u): `StorePath::parse` rejects
+        // anything else, and the typed constructor validates every
+        // non-empty declared output path. Output SETS are constrained
+        // to the well-typed shapes the constructor + drv-level
+        // classifier accept -- uniform kind per derivation. Coverage:
+        // all four kinds are generated explicitly, including
+        // multi-output input-addressed.
+        fn arb_outputs() -> impl Strategy<Value = Vec<DerivationOutput>> {
+            let names = || proptest::collection::btree_set("[a-z]{1,8}", 1..4);
+            let ia = (
+                names(),
+                proptest::collection::vec("/nix/store/[0-9a-df-np-sv-z]{32}-[a-z]{1,10}", 4),
             )
-                .prop_map(|(name, path, hash_algo)| {
-                    let hash = if hash_algo.is_empty() {
-                        String::new()
-                    } else {
-                        "0".repeat(64) // 64-char hex digest
-                    };
-                    DerivationOutput::new(name, path, hash_algo, hash)
-                        .expect("generated to be valid")
-                })
+                .prop_map(|(names, paths)| {
+                    names
+                        .into_iter()
+                        .zip(paths)
+                        .map(|(n, p)| {
+                            DerivationOutput::new(n, p, "", "").expect("IA output is valid")
+                        })
+                        .collect()
+                });
+            let deferred = names().prop_map(|names| {
+                names
+                    .into_iter()
+                    .map(|n| {
+                        DerivationOutput::new(n, "", "", "").expect("deferred output is valid")
+                    })
+                    .collect()
+            });
+            let floating = names().prop_map(|names| {
+                names
+                    .into_iter()
+                    .map(|n| {
+                        DerivationOutput::new(n, "", "sha256", "")
+                            .expect("floating output is valid")
+                    })
+                    .collect()
+            });
+            let fod = (
+                "/nix/store/[0-9a-df-np-sv-z]{32}-[a-z]{1,10}",
+                "[0-9a-f]{64}",
+            )
+                .prop_map(|(p, h)| {
+                    vec![DerivationOutput::new("out", p, "sha256", h).expect("FOD output is valid")]
+                });
+            prop_oneof![ia, deferred, fod, floating]
         }
 
         fn arb_derivation() -> impl Strategy<Value = Derivation> {
             (
-                proptest::collection::vec(arb_output(), 1..4),
+                arb_outputs(),
                 proptest::collection::vec(
                     (
                         "/nix/store/[a-z0-9]{32}-[a-z]{1,8}\\.drv",

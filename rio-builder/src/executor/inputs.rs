@@ -706,9 +706,14 @@ mod tests {
         // 16 MiB of pseudo-random-ish bytes (not all-zero — we want a
         // digest that changes if a chunk is dropped or reordered).
         let content: Vec<u8> = (0..16 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
-        let (_tmp, store_dir) = seed_output("test-flat-large", &content)?;
+        let (_tmp, store_dir) =
+            seed_output("gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-large", &content)?;
         let expected = hex::encode(sha2::Sha256::digest(&content));
-        let drv = make_fod_drv("/nix/store/test-flat-large", "sha256", &expected);
+        let drv = make_fod_drv(
+            "/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-large",
+            "sha256",
+            &expected,
+        );
         verify_fod_hashes(&drv, &store_dir)
     }
 
@@ -721,14 +726,23 @@ mod tests {
     fn test_verify_fod_flat_executable_rejected() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let content = b"#!/bin/sh\necho fetched\n";
-        let (_tmp, store_dir) = seed_output("test-flat-exec", content)?;
+        let (_tmp, store_dir) = seed_output("gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-exec", content)?;
         std::fs::set_permissions(
-            store_dir.join("test-flat-exec"),
+            store_dir.join("gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-exec"),
             std::fs::Permissions::from_mode(0o755),
         )?;
         // The declared hash is CORRECT for the bytes — only the shape is wrong.
-        let declared = correct_fod_hash(&store_dir, "test-flat-exec", content, "sha256")?;
-        let drv = make_fod_drv("/nix/store/test-flat-exec", "sha256", &declared);
+        let declared = correct_fod_hash(
+            &store_dir,
+            "gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-exec",
+            content,
+            "sha256",
+        )?;
+        let drv = make_fod_drv(
+            "/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-exec",
+            "sha256",
+            &declared,
+        );
         let err = verify_fod_hashes(&drv, &store_dir)
             .expect_err("executable flat FOD must be rejected like CppNix");
         assert!(
@@ -747,10 +761,19 @@ mod tests {
         let (_tmp, store_dir) = seed_output("test-flat-target", content)?;
         std::os::unix::fs::symlink(
             store_dir.join("test-flat-target"),
-            store_dir.join("test-flat-link"),
+            store_dir.join("gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-link"),
         )?;
-        let declared = correct_fod_hash(&store_dir, "test-flat-link", content, "sha256")?;
-        let drv = make_fod_drv("/nix/store/test-flat-link", "sha256", &declared);
+        let declared = correct_fod_hash(
+            &store_dir,
+            "gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-link",
+            content,
+            "sha256",
+        )?;
+        let drv = make_fod_drv(
+            "/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-flat-link",
+            "sha256",
+            &declared,
+        );
         let err = verify_fod_hashes(&drv, &store_dir)
             .expect_err("symlinked flat FOD must be rejected like CppNix");
         assert!(
@@ -767,7 +790,7 @@ mod tests {
     fn test_verify_fod_unknown_algo_rejected() -> anyhow::Result<()> {
         let (_tmp, store_dir) = seed_output("test-md5-fod", b"content")?;
         let drv = make_fod_drv(
-            "/nix/store/test-md5-fod",
+            "/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-md5-fod",
             "md5",
             "deadbeefdeadbeefdeadbeefdeadbeef",
         );
@@ -784,7 +807,11 @@ mod tests {
     #[test]
     fn test_verify_fod_non_fod_skipped() -> anyhow::Result<()> {
         // Non-FOD (no hash) should be skipped without error
-        let drv = make_fod_drv("/nix/store/test-non-fod", "", "");
+        let drv = make_fod_drv(
+            "/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-non-fod",
+            "",
+            "",
+        );
         let tmp = tempfile::tempdir()?;
         assert!(verify_fod_hashes(&drv, tmp.path()).is_ok());
         Ok(())

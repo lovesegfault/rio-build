@@ -20,7 +20,7 @@ use crate::store_path::StorePath;
 /// - **CA floating / impure**: same as input-addressed but output paths are masked
 ///   to `""` in the ATerm
 ///
-/// `resolve_input` maps a drv path string (e.g. `"/nix/store/abc.drv"`) to
+/// `resolve_input` maps a drv path string (e.g. `"/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31.drv"`) to
 /// the parsed `Derivation`. All transitive inputs must be resolvable.
 ///
 /// `hash_cache` provides memoisation across calls (keyed by drv path string).
@@ -337,21 +337,21 @@ mod hash_derivation_modulo_tests {
     /// Helper: create a simple input-addressed derivation (no inputDrvs).
     fn leaf_ia_drv() -> Derivation {
         Derivation::parse(
-                r#"Derive([("out","/nix/store/abc-leaf","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello"],[("name","leaf"),("out","/nix/store/abc-leaf"),("system","x86_64-linux")])"#,
+                r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-leaf","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello"],[("name","leaf"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-leaf"),("system","x86_64-linux")])"#,
             ).expect("static fixture")
     }
 
     /// Helper: create a fixed-output derivation.
     fn fod_drv() -> Derivation {
         Derivation::parse(
-                r#"Derive([("out","/nix/store/xyz-fixed","sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/xyz-fixed"),("outputHash","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#,
+                r#"Derive([("out","/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed","sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed"),("outputHash","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#,
             ).expect("static fixture")
     }
 
     /// Helper: create an IA derivation that depends on the FOD.
     fn ia_with_fod_input() -> Derivation {
         Derivation::parse(
-                r#"Derive([("out","/nix/store/def-dependent","","")],[("/nix/store/xyz-fixed.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","dependent"),("out","/nix/store/def-dependent"),("system","x86_64-linux")])"#,
+                r#"Derive([("out","/nix/store/lfmx061x46cmzac9zywx6lb1yhvxyl8z-dependent","","")],[("/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","dependent"),("out","/nix/store/lfmx061x46cmzac9zywx6lb1yhvxyl8z-dependent"),("system","x86_64-linux")])"#,
             ).expect("static fixture")
     }
 
@@ -364,11 +364,16 @@ mod hash_derivation_modulo_tests {
 
         let mut cache = HashMap::new();
         let resolve = |_: &str| -> Option<&Derivation> { None };
-        let hash = hash_derivation_modulo(&drv, "/nix/store/xyz-fixed.drv", &resolve, &mut cache)?;
+        let hash = hash_derivation_modulo(
+            &drv,
+            "/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed.drv",
+            &resolve,
+            &mut cache,
+        )?;
 
-        // Expected: SHA-256("fixed:out:sha256:<hex>:/nix/store/xyz-fixed")
+        // Expected: SHA-256("fixed:out:sha256:<hex>:/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed")
         let expected: [u8; 32] = Sha256::digest(
-            b"fixed:out:sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855:/nix/store/xyz-fixed",
+            b"fixed:out:sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855:/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed",
         )
         .into();
 
@@ -400,21 +405,25 @@ mod hash_derivation_modulo_tests {
         // All three encodings must produce the fingerprint built from the
         // canonical hex rendering.
         let expected: [u8; 32] = Sha256::digest(format!(
-            "fixed:out:sha256:{digest_hex}:/nix/store/xyz-fixed"
+            "fixed:out:sha256:{digest_hex}:/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed"
         ))
         .into();
 
         for declared_hash in declared {
             let aterm = format!(
-                r#"Derive([("out","/nix/store/xyz-fixed","sha256","{declared_hash}")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/xyz-fixed"),("outputHash","{declared_hash}"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#
+                r#"Derive([("out","/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed","sha256","{declared_hash}")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed"),("outputHash","{declared_hash}"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#
             );
             let drv = Derivation::parse(&aterm)?;
             assert!(drv.is_fixed_output());
 
             let mut cache = HashMap::new();
             let resolve = |_: &str| -> Option<&Derivation> { None };
-            let hash =
-                hash_derivation_modulo(&drv, "/nix/store/xyz-fixed.drv", &resolve, &mut cache)?;
+            let hash = hash_derivation_modulo(
+                &drv,
+                "/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed.drv",
+                &resolve,
+                &mut cache,
+            )?;
             assert_eq!(
                 hash, expected,
                 "declared encoding {declared_hash:?} must canonicalize to the hex fingerprint"
@@ -433,26 +442,37 @@ mod hash_derivation_modulo_tests {
 
         // md5 is not a supported HashAlgo; the raw declared string must be
         // used verbatim.
-        let aterm = r#"Derive([("out","/nix/store/xyz-fixed","md5","0123456789abcdef0123456789abcdef")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/xyz-fixed"),("outputHash","0123456789abcdef0123456789abcdef"),("outputHashAlgo","md5"),("system","x86_64-linux")])"#;
+        let aterm = r#"Derive([("out","/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed","md5","0123456789abcdef0123456789abcdef")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed"),("outputHash","0123456789abcdef0123456789abcdef"),("outputHashAlgo","md5"),("system","x86_64-linux")])"#;
         let drv = Derivation::parse(aterm)?;
 
         let mut cache = HashMap::new();
         let resolve = |_: &str| -> Option<&Derivation> { None };
-        let hash = hash_derivation_modulo(&drv, "/nix/store/xyz-fixed.drv", &resolve, &mut cache)?;
+        let hash = hash_derivation_modulo(
+            &drv,
+            "/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed.drv",
+            &resolve,
+            &mut cache,
+        )?;
 
         let expected: [u8; 32] =
-            Sha256::digest(b"fixed:out:md5:0123456789abcdef0123456789abcdef:/nix/store/xyz-fixed")
+            Sha256::digest(b"fixed:out:md5:0123456789abcdef0123456789abcdef:/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed")
                 .into();
         assert_eq!(hash, expected);
 
         // A wrong-length sha256 digest also falls back to raw.
-        let aterm_junk = r#"Derive([("out","/nix/store/xyz-fixed","sha256","deadbeef")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/xyz-fixed"),("outputHash","deadbeef"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#;
+        let aterm_junk = r#"Derive([("out","/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed","sha256","deadbeef")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed"),("outputHash","deadbeef"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#;
         let drv_junk = Derivation::parse(aterm_junk)?;
         let mut cache2 = HashMap::new();
-        let hash_junk =
-            hash_derivation_modulo(&drv_junk, "/nix/store/xyz-fixed.drv", &resolve, &mut cache2)?;
-        let expected_junk: [u8; 32] =
-            Sha256::digest(b"fixed:out:sha256:deadbeef:/nix/store/xyz-fixed").into();
+        let hash_junk = hash_derivation_modulo(
+            &drv_junk,
+            "/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed.drv",
+            &resolve,
+            &mut cache2,
+        )?;
+        let expected_junk: [u8; 32] = Sha256::digest(
+            b"fixed:out:sha256:deadbeef:/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed",
+        )
+        .into();
         assert_eq!(hash_junk, expected_junk);
         Ok(())
     }
@@ -467,7 +487,12 @@ mod hash_derivation_modulo_tests {
 
         let mut cache = HashMap::new();
         let resolve = |_: &str| -> Option<&Derivation> { None };
-        let hash = hash_derivation_modulo(&drv, "/nix/store/abc-leaf.drv", &resolve, &mut cache)?;
+        let hash = hash_derivation_modulo(
+            &drv,
+            "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-leaf.drv",
+            &resolve,
+            &mut cache,
+        )?;
 
         // Leaf IA with no inputDrvs: to_aterm_modulo(empty, false) == to_aterm()
         let expected: [u8; 32] = Sha256::digest(drv.to_aterm().as_bytes()).into();
@@ -484,30 +509,37 @@ mod hash_derivation_modulo_tests {
 
         let mut cache = HashMap::new();
         let resolve = |path: &str| -> Option<&Derivation> {
-            if path == "/nix/store/xyz-fixed.drv" {
+            if path == "/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed.drv" {
                 Some(&fod)
             } else {
                 None
             }
         };
-        let hash =
-            hash_derivation_modulo(&dep, "/nix/store/def-dependent.drv", &resolve, &mut cache)?;
+        let hash = hash_derivation_modulo(
+            &dep,
+            "/nix/store/lfmx061x46cmzac9zywx6lb1yhvxyl8z-dependent.drv",
+            &resolve,
+            &mut cache,
+        )?;
 
         // The FOD modular hash
         let fod_hash: [u8; 32] = Sha256::digest(
-            b"fixed:out:sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855:/nix/store/xyz-fixed",
+            b"fixed:out:sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855:/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed",
         )
         .into();
         let fod_hex = hex::encode(fod_hash);
 
         // The modified ATerm should have the FOD hex hash instead of the drv path
         let mut rewrites = BTreeMap::new();
-        rewrites.insert("/nix/store/xyz-fixed.drv".to_string(), fod_hex.clone());
+        rewrites.insert(
+            "/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed.drv".to_string(),
+            fod_hex.clone(),
+        );
         let modified_aterm = dep.to_aterm_modulo(&rewrites, false)?;
 
         // Verify the modified ATerm contains the hex hash, not the drv path
         assert!(modified_aterm.contains(&fod_hex));
-        assert!(!modified_aterm.contains("/nix/store/xyz-fixed.drv"));
+        assert!(!modified_aterm.contains("/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed.drv"));
 
         let expected: [u8; 32] = Sha256::digest(modified_aterm.as_bytes()).into();
         assert_eq!(hash, expected);
@@ -520,27 +552,37 @@ mod hash_derivation_modulo_tests {
         let fod_a = fod_drv();
         let b = ia_with_fod_input(); // depends on FOD
         let c = Derivation::parse(
-            r#"Derive([("out","/nix/store/ghi-chain","","")],[("/nix/store/def-dependent.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","chain"),("out","/nix/store/ghi-chain"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","/nix/store/bj25pjndbamvhnxz8advdq6p5cf3xhir-chain","","")],[("/nix/store/lfmx061x46cmzac9zywx6lb1yhvxyl8z-dependent.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","chain"),("out","/nix/store/bj25pjndbamvhnxz8advdq6p5cf3xhir-chain"),("system","x86_64-linux")])"#,
         )?;
 
         let mut cache = HashMap::new();
         let resolve = |path: &str| -> Option<&Derivation> {
             match path {
-                "/nix/store/xyz-fixed.drv" => Some(&fod_a),
-                "/nix/store/def-dependent.drv" => Some(&b),
+                "/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed.drv" => Some(&fod_a),
+                "/nix/store/lfmx061x46cmzac9zywx6lb1yhvxyl8z-dependent.drv" => Some(&b),
                 _ => None,
             }
         };
 
-        let hash = hash_derivation_modulo(&c, "/nix/store/ghi-chain.drv", &resolve, &mut cache)?;
+        let hash = hash_derivation_modulo(
+            &c,
+            "/nix/store/bj25pjndbamvhnxz8advdq6p5cf3xhir-chain.drv",
+            &resolve,
+            &mut cache,
+        )?;
 
         // Both A and B should now be cached
-        assert!(cache.contains_key("/nix/store/xyz-fixed.drv"));
-        assert!(cache.contains_key("/nix/store/def-dependent.drv"));
-        assert!(cache.contains_key("/nix/store/ghi-chain.drv"));
+        assert!(cache.contains_key("/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed.drv"));
+        assert!(cache.contains_key("/nix/store/lfmx061x46cmzac9zywx6lb1yhvxyl8z-dependent.drv"));
+        assert!(cache.contains_key("/nix/store/bj25pjndbamvhnxz8advdq6p5cf3xhir-chain.drv"));
 
         // Verify determinism: computing again gives same result
-        let hash2 = hash_derivation_modulo(&c, "/nix/store/ghi-chain.drv", &resolve, &mut cache)?;
+        let hash2 = hash_derivation_modulo(
+            &c,
+            "/nix/store/bj25pjndbamvhnxz8advdq6p5cf3xhir-chain.drv",
+            &resolve,
+            &mut cache,
+        )?;
         assert_eq!(hash, hash2);
         Ok(())
     }
@@ -550,12 +592,17 @@ mod hash_derivation_modulo_tests {
         use crate::protocol::build::{BuildResult, BuildStatus};
 
         let drv = Derivation::parse(
-            r#"Derive([("dev","/nix/store/abc-dev","",""),("lib","/nix/store/abc-lib","",""),("out","/nix/store/abc-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","multi"),("out","/nix/store/abc-out"),("system","x86_64-linux")])"#,
+            r#"Derive([("dev","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-dev","",""),("lib","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-lib","",""),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","multi"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-out"),("system","x86_64-linux")])"#,
         )?;
 
         let mut cache = HashMap::new();
         let resolve = |_: &str| -> Option<&Derivation> { None };
-        let hash = hash_derivation_modulo(&drv, "/nix/store/abc.drv", &resolve, &mut cache)?;
+        let hash = hash_derivation_modulo(
+            &drv,
+            "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31.drv",
+            &resolve,
+            &mut cache,
+        )?;
         let drv_hash_hex = hex::encode(hash);
 
         let result =
@@ -568,19 +615,28 @@ mod hash_derivation_modulo_tests {
             result.built_outputs[0].drv_output_id,
             format!("sha256:{drv_hash_hex}!dev")
         );
-        assert_eq!(result.built_outputs[0].out_path, "/nix/store/abc-dev");
+        assert_eq!(
+            result.built_outputs[0].out_path,
+            "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-dev"
+        );
 
         assert_eq!(
             result.built_outputs[1].drv_output_id,
             format!("sha256:{drv_hash_hex}!lib")
         );
-        assert_eq!(result.built_outputs[1].out_path, "/nix/store/abc-lib");
+        assert_eq!(
+            result.built_outputs[1].out_path,
+            "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-lib"
+        );
 
         assert_eq!(
             result.built_outputs[2].drv_output_id,
             format!("sha256:{drv_hash_hex}!out")
         );
-        assert_eq!(result.built_outputs[2].out_path, "/nix/store/abc-out");
+        assert_eq!(
+            result.built_outputs[2].out_path,
+            "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-out"
+        );
         Ok(())
     }
 
@@ -588,7 +644,7 @@ mod hash_derivation_modulo_tests {
     fn ca_floating_masks_output_paths() -> anyhow::Result<()> {
         // CA floating: hash_algo set, hash empty
         let ca_drv = Derivation::parse(
-            r#"Derive([("out","/nix/store/placeholder-ca","sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","ca-test"),("out","/nix/store/placeholder-ca"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","/nix/store/yybiyabxfnjrmn69rna94qxr881rwqfv-ca","sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","ca-test"),("out","/nix/store/yybiyabxfnjrmn69rna94qxr881rwqfv-ca"),("system","x86_64-linux")])"#,
         )?;
 
         assert!(ca_drv.has_ca_floating_outputs());
@@ -596,7 +652,12 @@ mod hash_derivation_modulo_tests {
 
         let mut cache = HashMap::new();
         let resolve = |_: &str| -> Option<&Derivation> { None };
-        let hash = hash_derivation_modulo(&ca_drv, "/nix/store/ca.drv", &resolve, &mut cache)?;
+        let hash = hash_derivation_modulo(
+            &ca_drv,
+            "/nix/store/vfhik20db6k5ff75sf3dbf6i3jymbnir.drv",
+            &resolve,
+            &mut cache,
+        )?;
 
         // Verify the hash uses masked ATerm (empty output path AND empty
         // env value for the `out` key — Nix C++ masks both; missing the
@@ -606,13 +667,13 @@ mod hash_derivation_modulo_tests {
         let masked_aterm = ca_drv.to_aterm_modulo(&BTreeMap::new(), true)?;
         assert!(masked_aterm.contains(r#"("out","","sha256","")"#));
         // Env `out` value masked: original fixture has
-        // ("out","/nix/store/placeholder-ca"), masked has ("out","").
+        // ("out","/nix/store/yybiyabxfnjrmn69rna94qxr881rwqfv-ca"), masked has ("out","").
         assert!(
             masked_aterm.contains(r#"("out","")"#),
             "env out var should be masked to empty; got: {masked_aterm}"
         );
         assert!(
-            !masked_aterm.contains("/nix/store/placeholder-ca"),
+            !masked_aterm.contains("/nix/store/yybiyabxfnjrmn69rna94qxr881rwqfv-ca"),
             "placeholder path should not appear anywhere after masking"
         );
         let expected: [u8; 32] = Sha256::digest(masked_aterm.as_bytes()).into();
@@ -626,22 +687,37 @@ mod hash_derivation_modulo_tests {
         let mut cache = HashMap::new();
         let resolve = |_: &str| -> Option<&Derivation> { None };
 
-        let hash1 = hash_derivation_modulo(&drv, "/nix/store/abc-leaf.drv", &resolve, &mut cache)?;
+        let hash1 = hash_derivation_modulo(
+            &drv,
+            "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-leaf.drv",
+            &resolve,
+            &mut cache,
+        )?;
         assert_eq!(cache.len(), 1);
-        assert!(cache.contains_key("/nix/store/abc-leaf.drv"));
+        assert!(cache.contains_key("/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-leaf.drv"));
 
-        let hash2 = hash_derivation_modulo(&drv, "/nix/store/abc-leaf.drv", &resolve, &mut cache)?;
+        let hash2 = hash_derivation_modulo(
+            &drv,
+            "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-leaf.drv",
+            &resolve,
+            &mut cache,
+        )?;
         assert_eq!(hash1, hash2);
         Ok(())
     }
 
     #[test]
     fn missing_input_returns_error() {
-        let dep = ia_with_fod_input(); // depends on /nix/store/xyz-fixed.drv
+        let dep = ia_with_fod_input(); // depends on /nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed.drv
         let mut cache = HashMap::new();
         let resolve = |_: &str| -> Option<&Derivation> { None }; // no inputs available
 
-        let result = hash_derivation_modulo(&dep, "/nix/store/dep.drv", &resolve, &mut cache);
+        let result = hash_derivation_modulo(
+            &dep,
+            "/nix/store/jsgmnakmssnxxajxi2n5lld58c9mcly3.drv",
+            &resolve,
+            &mut cache,
+        );
         assert!(matches!(result, Err(DerivationError::InputNotFound(_))));
     }
 
@@ -649,20 +725,24 @@ mod hash_derivation_modulo_tests {
     fn cycle_detection() -> anyhow::Result<()> {
         // Create a derivation that references itself
         let cyclic = Derivation::parse(
-            r#"Derive([("out","/nix/store/abc-cyclic","","")],[("/nix/store/abc-cyclic.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","cyclic"),("out","/nix/store/abc-cyclic"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-cyclic","","")],[("/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-cyclic.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","cyclic"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-cyclic"),("system","x86_64-linux")])"#,
         )?;
 
         let mut cache = HashMap::new();
         let resolve = |path: &str| -> Option<&Derivation> {
-            if path == "/nix/store/abc-cyclic.drv" {
+            if path == "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-cyclic.drv" {
                 Some(&cyclic)
             } else {
                 None
             }
         };
 
-        let result =
-            hash_derivation_modulo(&cyclic, "/nix/store/abc-cyclic.drv", &resolve, &mut cache);
+        let result = hash_derivation_modulo(
+            &cyclic,
+            "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-cyclic.drv",
+            &resolve,
+            &mut cache,
+        );
         assert!(matches!(result, Err(DerivationError::CycleDetected(_))));
         Ok(())
     }
@@ -670,26 +750,29 @@ mod hash_derivation_modulo_tests {
     #[test]
     fn to_aterm_modulo_replaces_input_keys() -> anyhow::Result<()> {
         let drv = Derivation::parse(
-            r#"Derive([("out","/nix/store/abc-test","","")],[("/nix/store/aaa-input.drv",["out"]),("/nix/store/bbb-input.drv",["dev","out"])],[],"x86_64-linux","/bin/sh",[],[("name","test"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-test","","")],[("/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-input.drv",["out"]),("/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-input.drv",["dev","out"])],[],"x86_64-linux","/bin/sh",[],[("name","test"),("system","x86_64-linux")])"#,
         )?;
 
         let mut rewrites = BTreeMap::new();
         rewrites.insert(
-            "/nix/store/aaa-input.drv".to_string(),
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-input.drv".to_string(),
             "aaaa".repeat(16), // 64-char hex
         );
-        rewrites.insert("/nix/store/bbb-input.drv".to_string(), "bbbb".repeat(16));
+        rewrites.insert(
+            "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-input.drv".to_string(),
+            "bbbb".repeat(16),
+        );
 
         let result = drv.to_aterm_modulo(&rewrites, false)?;
 
         // Keys should be the hex hashes, not the drv paths
         assert!(result.contains(&"aaaa".repeat(16)));
         assert!(result.contains(&"bbbb".repeat(16)));
-        assert!(!result.contains("/nix/store/aaa-input.drv"));
-        assert!(!result.contains("/nix/store/bbb-input.drv"));
+        assert!(!result.contains("/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-input.drv"));
+        assert!(!result.contains("/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-input.drv"));
 
         // Output paths should be preserved (mask_outputs=false)
-        assert!(result.contains("/nix/store/abc-test"));
+        assert!(result.contains("/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-test"));
         Ok(())
     }
 
@@ -698,16 +781,16 @@ mod hash_derivation_modulo_tests {
         // Original keys sorted: aaa < bbb
         // Replacement keys sorted: zzzz > aaaa (reversed!)
         let drv = Derivation::parse(
-            r#"Derive([("out","/nix/store/abc-test","","")],[("/nix/store/aaa.drv",["out"]),("/nix/store/bbb.drv",["out"])],[],"x86_64-linux","/bin/sh",[],[("name","test"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-test","","")],[("/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb.drv",["out"]),("/nix/store/gjamk2f57j5pqymvqamgxla350szmld1.drv",["out"])],[],"x86_64-linux","/bin/sh",[],[("name","test"),("system","x86_64-linux")])"#,
         )?;
 
         let mut rewrites = BTreeMap::new();
         rewrites.insert(
-            "/nix/store/aaa.drv".to_string(),
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb.drv".to_string(),
             "z".repeat(64), // sorts AFTER b...
         );
         rewrites.insert(
-            "/nix/store/bbb.drv".to_string(),
+            "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1.drv".to_string(),
             "a".repeat(64), // sorts BEFORE z...
         );
 
@@ -729,18 +812,23 @@ mod hash_derivation_modulo_tests {
 
         // Recursive FOD: hash_algo = "r:sha256"
         let drv = Derivation::parse(
-            r#"Derive([("out","/nix/store/xyz-rec","r:sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","rec"),("out","/nix/store/xyz-rec"),("outputHash","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),("outputHashAlgo","r:sha256"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-rec","r:sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","rec"),("out","/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-rec"),("outputHash","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),("outputHashAlgo","r:sha256"),("system","x86_64-linux")])"#,
         )?;
 
         assert!(drv.is_fixed_output());
 
         let mut cache = HashMap::new();
         let resolve = |_: &str| -> Option<&Derivation> { None };
-        let hash = hash_derivation_modulo(&drv, "/nix/store/xyz-rec.drv", &resolve, &mut cache)?;
+        let hash = hash_derivation_modulo(
+            &drv,
+            "/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-rec.drv",
+            &resolve,
+            &mut cache,
+        )?;
 
-        // Expected: SHA-256("fixed:out:r:sha256:<hex>:/nix/store/xyz-rec")
+        // Expected: SHA-256("fixed:out:r:sha256:<hex>:/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-rec")
         let expected: [u8; 32] = Sha256::digest(
-            b"fixed:out:r:sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855:/nix/store/xyz-rec",
+            b"fixed:out:r:sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855:/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-rec",
         )
         .into();
 
@@ -754,18 +842,26 @@ mod hash_derivation_modulo_tests {
     #[test]
     fn fod_different_paths_different_hashes() -> anyhow::Result<()> {
         let drv_a = Derivation::parse(
-            r#"Derive([("out","/nix/store/aaa-fixed","sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed-a"),("out","/nix/store/aaa-fixed"),("outputHash","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-fixed","sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed-a"),("out","/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-fixed"),("outputHash","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#,
         )?;
         let drv_b = Derivation::parse(
-            r#"Derive([("out","/nix/store/bbb-fixed","sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed-b"),("out","/nix/store/bbb-fixed"),("outputHash","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-fixed","sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed-b"),("out","/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-fixed"),("outputHash","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#,
         )?;
 
         let mut cache = HashMap::new();
         let resolve = |_: &str| -> Option<&Derivation> { None };
-        let hash_a =
-            hash_derivation_modulo(&drv_a, "/nix/store/aaa-fixed.drv", &resolve, &mut cache)?;
-        let hash_b =
-            hash_derivation_modulo(&drv_b, "/nix/store/bbb-fixed.drv", &resolve, &mut cache)?;
+        let hash_a = hash_derivation_modulo(
+            &drv_a,
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-fixed.drv",
+            &resolve,
+            &mut cache,
+        )?;
+        let hash_b = hash_derivation_modulo(
+            &drv_b,
+            "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-fixed.drv",
+            &resolve,
+            &mut cache,
+        )?;
 
         assert_ne!(
             hash_a, hash_b,
@@ -778,33 +874,43 @@ mod hash_derivation_modulo_tests {
     fn diamond_dag_memoization() -> anyhow::Result<()> {
         // Diamond: D depends on B and C, both depend on FOD A
         let a = fod_drv();
-        let b = ia_with_fod_input(); // depends on /nix/store/xyz-fixed.drv
+        let b = ia_with_fod_input(); // depends on /nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed.drv
         let c = Derivation::parse(
-            r#"Derive([("out","/nix/store/ccc-other","","")],[("/nix/store/xyz-fixed.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","other"),("out","/nix/store/ccc-other"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","/nix/store/h215ws5mqjq1pnqd7j0incvdyqk96lhp-other","","")],[("/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","other"),("out","/nix/store/h215ws5mqjq1pnqd7j0incvdyqk96lhp-other"),("system","x86_64-linux")])"#,
         )?;
         let d = Derivation::parse(
-            r#"Derive([("out","/nix/store/ddd-diamond","","")],[("/nix/store/ccc-other.drv",["out"]),("/nix/store/def-dependent.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","diamond"),("out","/nix/store/ddd-diamond"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","/nix/store/9jhm52c51jvgn2p7a2kzv44pg4q7bwv1-diamond","","")],[("/nix/store/h215ws5mqjq1pnqd7j0incvdyqk96lhp-other.drv",["out"]),("/nix/store/lfmx061x46cmzac9zywx6lb1yhvxyl8z-dependent.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","diamond"),("out","/nix/store/9jhm52c51jvgn2p7a2kzv44pg4q7bwv1-diamond"),("system","x86_64-linux")])"#,
         )?;
 
         let mut cache = HashMap::new();
         let resolve = |path: &str| -> Option<&Derivation> {
             match path {
-                "/nix/store/xyz-fixed.drv" => Some(&a),
-                "/nix/store/def-dependent.drv" => Some(&b),
-                "/nix/store/ccc-other.drv" => Some(&c),
+                "/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed.drv" => Some(&a),
+                "/nix/store/lfmx061x46cmzac9zywx6lb1yhvxyl8z-dependent.drv" => Some(&b),
+                "/nix/store/h215ws5mqjq1pnqd7j0incvdyqk96lhp-other.drv" => Some(&c),
                 _ => None,
             }
         };
 
         // Should not produce a false CycleDetected for the shared FOD A
-        let hash = hash_derivation_modulo(&d, "/nix/store/ddd-diamond.drv", &resolve, &mut cache)?;
+        let hash = hash_derivation_modulo(
+            &d,
+            "/nix/store/9jhm52c51jvgn2p7a2kzv44pg4q7bwv1-diamond.drv",
+            &resolve,
+            &mut cache,
+        )?;
 
         // All 4 should be cached
         assert_eq!(cache.len(), 4);
-        assert!(cache.contains_key("/nix/store/xyz-fixed.drv"));
+        assert!(cache.contains_key("/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed.drv"));
 
         // Determinism check
-        let hash2 = hash_derivation_modulo(&d, "/nix/store/ddd-diamond.drv", &resolve, &mut cache)?;
+        let hash2 = hash_derivation_modulo(
+            &d,
+            "/nix/store/9jhm52c51jvgn2p7a2kzv44pg4q7bwv1-diamond.drv",
+            &resolve,
+            &mut cache,
+        )?;
         assert_eq!(hash, hash2);
         Ok(())
     }
@@ -813,22 +919,27 @@ mod hash_derivation_modulo_tests {
     fn indirect_cycle_detection() -> anyhow::Result<()> {
         // A -> B -> A (indirect cycle)
         let a = Derivation::parse(
-            r#"Derive([("out","/nix/store/aaa-cycle","","")],[("/nix/store/bbb-cycle.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","a"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-cycle","","")],[("/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-cycle.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","a"),("system","x86_64-linux")])"#,
         )?;
         let b = Derivation::parse(
-            r#"Derive([("out","/nix/store/bbb-cycle","","")],[("/nix/store/aaa-cycle.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","b"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-cycle","","")],[("/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-cycle.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","b"),("system","x86_64-linux")])"#,
         )?;
 
         let mut cache = HashMap::new();
         let resolve = |path: &str| -> Option<&Derivation> {
             match path {
-                "/nix/store/aaa-cycle.drv" => Some(&a),
-                "/nix/store/bbb-cycle.drv" => Some(&b),
+                "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-cycle.drv" => Some(&a),
+                "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-cycle.drv" => Some(&b),
                 _ => None,
             }
         };
 
-        let result = hash_derivation_modulo(&a, "/nix/store/aaa-cycle.drv", &resolve, &mut cache);
+        let result = hash_derivation_modulo(
+            &a,
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-cycle.drv",
+            &resolve,
+            &mut cache,
+        );
         assert!(matches!(result, Err(DerivationError::CycleDetected(_))));
         Ok(())
     }
@@ -840,7 +951,12 @@ mod hash_derivation_modulo_tests {
         let drv = fod_drv(); // FOD with known hash
         let mut cache = HashMap::new();
         let resolve = |_: &str| -> Option<&Derivation> { None };
-        let hash = hash_derivation_modulo(&drv, "/nix/store/xyz-fixed.drv", &resolve, &mut cache)?;
+        let hash = hash_derivation_modulo(
+            &drv,
+            "/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed.drv",
+            &resolve,
+            &mut cache,
+        )?;
         let drv_hash_hex = hex::encode(hash);
 
         let result =
@@ -852,7 +968,10 @@ mod hash_derivation_modulo_tests {
             result.built_outputs[0].drv_output_id,
             format!("sha256:{drv_hash_hex}!out")
         );
-        assert_eq!(result.built_outputs[0].out_path, "/nix/store/xyz-fixed");
+        assert_eq!(
+            result.built_outputs[0].out_path,
+            "/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed"
+        );
         Ok(())
     }
 
@@ -867,7 +986,7 @@ mod hash_derivation_modulo_tests {
     #[test]
     fn to_aterm_modulo_missing_key_errors() -> anyhow::Result<()> {
         let drv = Derivation::parse(
-            r#"Derive([("out","/nix/store/abc-test","","")],[("/nix/store/missing.drv",["out"])],[],"x86_64-linux","/bin/sh",[],[("name","test"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-test","","")],[("/nix/store/mjwdi20mx2gg223z6jpgpwq7k4wp74zi.drv",["out"])],[],"x86_64-linux","/bin/sh",[],[("name","test"),("system","x86_64-linux")])"#,
         )?;
 
         let result = drv.to_aterm_modulo(&BTreeMap::new(), false);
@@ -895,14 +1014,20 @@ mod hash_derivation_modulo_tests {
         let y = ca_floating_leaf();
         // X: CA-floating, depends on Y.
         let x = Derivation::parse(
-            r#"Derive([("out","","r:sha256","")],[("/nix/store/yyy-ca-leaf.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","ca-x"),("out","/04fmi8q93y9c8zd2hcq8dckk8lgm75wqjaj4hbn03ikl5ich30bi"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","","r:sha256","")],[("/nix/store/f23masp5n2jmrjnxda2x0l9dw45d8lsb-ca-leaf.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","ca-x"),("out","/04fmi8q93y9c8zd2hcq8dckk8lgm75wqjaj4hbn03ikl5ich30bi"),("system","x86_64-linux")])"#,
         )?;
         assert!(x.has_ca_floating_outputs());
 
         let mut cache = HashMap::new();
-        let resolve =
-            |p: &str| -> Option<&Derivation> { (p == "/nix/store/yyy-ca-leaf.drv").then_some(&y) };
-        hash_derivation_modulo(&x, "/nix/store/xxx-ca-x.drv", &resolve, &mut cache)?;
+        let resolve = |p: &str| -> Option<&Derivation> {
+            (p == "/nix/store/f23masp5n2jmrjnxda2x0l9dw45d8lsb-ca-leaf.drv").then_some(&y)
+        };
+        hash_derivation_modulo(
+            &x,
+            "/nix/store/dj451jq5mjppa2vgn2g7g40pkw4zgcp9-ca-x.drv",
+            &resolve,
+            &mut cache,
+        )?;
 
         // Y's UNMASKED hash (mask_outputs=false → env `out` placeholder kept).
         let y_unmasked: [u8; 32] =
@@ -914,7 +1039,7 @@ mod hash_derivation_modulo_tests {
 
         // The cache holds Y's input-form (mask=false) hash.
         assert_eq!(
-            cache.get("/nix/store/yyy-ca-leaf.drv"),
+            cache.get("/nix/store/f23masp5n2jmrjnxda2x0l9dw45d8lsb-ca-leaf.drv"),
             Some(&y_unmasked),
             "CA-floating input must be hashed with mask_outputs=false"
         );
@@ -935,23 +1060,37 @@ mod hash_derivation_modulo_tests {
         let mut cache = HashMap::new();
         let resolve_none = |_: &str| -> Option<&Derivation> { None };
         // Top-level call on Y (mask=true since Y is CA-floating).
-        let y_top = hash_derivation_modulo(&y, "/nix/store/yyy.drv", &resolve_none, &mut cache)?;
+        let y_top = hash_derivation_modulo(
+            &y,
+            "/nix/store/f23masp5n2jmrjnxda2x0l9dw45d8lsb.drv",
+            &resolve_none,
+            &mut cache,
+        )?;
         assert_ne!(y_top, y_unmasked, "top-level CA hash is the masked form");
         // mask=true result must NOT be cached.
         assert!(
-            !cache.contains_key("/nix/store/yyy.drv"),
+            !cache.contains_key("/nix/store/f23masp5n2jmrjnxda2x0l9dw45d8lsb.drv"),
             "mask=true hash must not populate the (mask=false) cache"
         );
 
         // Now compute a consumer X depending on Y with the SAME cache.
         let x = Derivation::parse(
-            r#"Derive([("out","/nix/store/xxx-ia","","")],[("/nix/store/yyy.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","ia-x"),("out","/nix/store/xxx-ia"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","/nix/store/dj451jq5mjppa2vgn2g7g40pkw4zgcp9-ia","","")],[("/nix/store/f23masp5n2jmrjnxda2x0l9dw45d8lsb.drv",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","ia-x"),("out","/nix/store/dj451jq5mjppa2vgn2g7g40pkw4zgcp9-ia"),("system","x86_64-linux")])"#,
         )?;
-        let resolve =
-            |p: &str| -> Option<&Derivation> { (p == "/nix/store/yyy.drv").then_some(&y) };
-        hash_derivation_modulo(&x, "/nix/store/xxx.drv", &resolve, &mut cache)?;
+        let resolve = |p: &str| -> Option<&Derivation> {
+            (p == "/nix/store/f23masp5n2jmrjnxda2x0l9dw45d8lsb.drv").then_some(&y)
+        };
+        hash_derivation_modulo(
+            &x,
+            "/nix/store/dj451jq5mjppa2vgn2g7g40pkw4zgcp9.drv",
+            &resolve,
+            &mut cache,
+        )?;
         // After recursing, Y's mask=false hash is cached and is the unmasked one.
-        assert_eq!(cache.get("/nix/store/yyy.drv"), Some(&y_unmasked));
+        assert_eq!(
+            cache.get("/nix/store/f23masp5n2jmrjnxda2x0l9dw45d8lsb.drv"),
+            Some(&y_unmasked)
+        );
         Ok(())
     }
 
@@ -961,13 +1100,19 @@ mod hash_derivation_modulo_tests {
     #[test]
     fn to_aterm_modulo_merges_colliding_rewrite_keys() -> anyhow::Result<()> {
         let drv = Derivation::parse(
-            r#"Derive([("out","/nix/store/ccc-consumer","","")],[("/nix/store/aaa-libA.drv",["out"]),("/nix/store/bbb-libB.drv",["dev"])],[],"x86_64-linux","/bin/sh",[],[("name","consumer"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","/nix/store/h215ws5mqjq1pnqd7j0incvdyqk96lhp-consumer","","")],[("/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-libA.drv",["out"]),("/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-libB.drv",["dev"])],[],"x86_64-linux","/bin/sh",[],[("name","consumer"),("system","x86_64-linux")])"#,
         )?;
 
         let h = "d".repeat(64);
         let mut rewrites = BTreeMap::new();
-        rewrites.insert("/nix/store/aaa-libA.drv".to_string(), h.clone());
-        rewrites.insert("/nix/store/bbb-libB.drv".to_string(), h.clone());
+        rewrites.insert(
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-libA.drv".to_string(),
+            h.clone(),
+        );
+        rewrites.insert(
+            "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-libB.drv".to_string(),
+            h.clone(),
+        );
 
         let result = drv.to_aterm_modulo(&rewrites, false)?;
 

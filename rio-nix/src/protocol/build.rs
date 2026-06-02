@@ -490,7 +490,7 @@ mod tests {
             cpu_system: Some(6789),
             built_outputs: vec![BuiltOutput {
                 drv_output_id: "sha256:abcdef0123456789!out".to_string(),
-                out_path: "/nix/store/abc-hello".to_string(),
+                out_path: "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-hello".to_string(),
             }],
             ..Default::default()
         };
@@ -516,7 +516,7 @@ mod tests {
             cpu_system: Some(6789),
             built_outputs: vec![BuiltOutput {
                 drv_output_id: "sha256:abcdef0123456789!out".to_string(),
-                out_path: "/nix/store/abc-hello".to_string(),
+                out_path: "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-hello".to_string(),
             }],
             ..Default::default()
         };
@@ -556,15 +556,25 @@ mod tests {
     #[tokio::test]
     async fn basic_derivation_roundtrip() -> anyhow::Result<()> {
         let outputs = vec![
-            DerivationOutput::new("out", "/nix/store/abc-hello", "", "")?,
-            DerivationOutput::new("dev", "/nix/store/def-hello-dev", "", "")?,
+            DerivationOutput::new(
+                "out",
+                "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-hello",
+                "",
+                "",
+            )?,
+            DerivationOutput::new(
+                "dev",
+                "/nix/store/lfmx061x46cmzac9zywx6lb1yhvxyl8z-hello-dev",
+                "",
+                "",
+            )?,
         ];
         let input_srcs: std::collections::BTreeSet<String> =
-            ["/nix/store/ghi-source.sh".to_string()]
+            ["/nix/store/bj25pjndbamvhnxz8advdq6p5cf3xhir-source.sh".to_string()]
                 .into_iter()
                 .collect();
         let platform = "x86_64-linux".to_string();
-        let builder = "/nix/store/jkl-bash/bin/bash".to_string();
+        let builder = "/nix/store/ffvx2ypxfn215nn916a14lxrhwr94wn3-bash/bin/bash".to_string();
         let args = vec!["-e".to_string(), "script.sh".to_string()];
         let env_map: std::collections::BTreeMap<String, String> = [
             ("name".to_string(), "hello".to_string()),
@@ -655,17 +665,52 @@ mod tests {
                 )
         }
 
-        fn arb_derivation_output() -> impl Strategy<Value = DerivationOutput> {
-            (
-                "[a-z]{1,8}",
-                "/nix/store/[a-z0-9]{32}-[a-z]{1,10}",
-                prop_oneof![Just(String::new()), Just("sha256".to_string())],
-                prop_oneof![Just(String::new()), "[0-9a-f]{64}"],
+        // Canonical nixbase32 paths + well-typed output SETS (uniform
+        // kind per derivation; FOD = single "out"; floating/deferred =
+        // empty path) -- the typed constructor and drv-level classifier
+        // reject everything else, and this generator previously emitted
+        // floating-with-path and hash-without-algo shapes. All four
+        // kinds + multi-output IA are generated explicitly.
+        fn arb_derivation_outputs() -> impl Strategy<Value = Vec<DerivationOutput>> {
+            let names = || proptest::collection::btree_set("[a-z]{1,8}", 1..5);
+            let ia = (
+                names(),
+                proptest::collection::vec("/nix/store/[0-9a-df-np-sv-z]{32}-[a-z]{1,10}", 5),
             )
-                .prop_map(|(name, path, hash_algo, hash)| {
-                    DerivationOutput::new(name, path, hash_algo, hash)
-                        .expect("generated to be valid")
-                })
+                .prop_map(|(names, paths)| {
+                    names
+                        .into_iter()
+                        .zip(paths)
+                        .map(|(n, p)| {
+                            DerivationOutput::new(n, p, "", "").expect("IA output is valid")
+                        })
+                        .collect()
+                });
+            let deferred = names().prop_map(|names| {
+                names
+                    .into_iter()
+                    .map(|n| {
+                        DerivationOutput::new(n, "", "", "").expect("deferred output is valid")
+                    })
+                    .collect()
+            });
+            let floating = names().prop_map(|names| {
+                names
+                    .into_iter()
+                    .map(|n| {
+                        DerivationOutput::new(n, "", "sha256", "")
+                            .expect("floating output is valid")
+                    })
+                    .collect()
+            });
+            let fod = (
+                "/nix/store/[0-9a-df-np-sv-z]{32}-[a-z]{1,10}",
+                "[0-9a-f]{64}",
+            )
+                .prop_map(|(p, h)| {
+                    vec![DerivationOutput::new("out", p, "sha256", h).expect("FOD output is valid")]
+                });
+            prop_oneof![ia, deferred, fod, floating]
         }
 
         proptest! {
@@ -685,7 +730,7 @@ mod tests {
 
             #[test]
             fn basic_derivation_roundtrip(
-                outputs in proptest::collection::vec(arb_derivation_output(), 1..5),
+                outputs in arb_derivation_outputs(),
                 input_srcs in proptest::collection::btree_set("/nix/store/[a-z0-9]{32}-[a-z]{1,8}", 0..3),
                 platform in "(x86_64|aarch64)-linux",
                 builder in "/nix/store/[a-z0-9]{32}-bash/bin/bash",

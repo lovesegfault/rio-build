@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn to_basic_strips_input_drvs() -> anyhow::Result<()> {
-        let aterm = r#"Derive([("out","/nix/store/abc-hello","","")],[("/nix/store/abc-bash.drv",["out"])],["/nix/store/abc-source.sh"],"x86_64-linux","/bin/bash",["-e","script.sh"],[("name","hello"),("system","x86_64-linux")])"#;
+        let aterm = r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-hello","","")],[("/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-bash.drv",["out"])],["/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-source.sh"],"x86_64-linux","/bin/bash",["-e","script.sh"],[("name","hello"),("system","x86_64-linux")])"#;
 
         let drv = Derivation::parse(aterm)?;
         let basic = drv.to_basic();

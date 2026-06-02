@@ -362,7 +362,15 @@ mod tests {
 
     fn test_drv() -> BasicDerivation {
         BasicDerivation::new(
-            vec![DerivationOutput::new("out", "/nix/store/abc-hello", "", "").unwrap()],
+            vec![
+                DerivationOutput::new(
+                    "out",
+                    "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-hello",
+                    "",
+                    "",
+                )
+                .unwrap(),
+            ],
             std::collections::BTreeSet::new(),
             "x86_64-linux".into(),
             "/bin/sh".into(),

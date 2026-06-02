@@ -16,11 +16,11 @@ use rio_proto::types::WorkAssignment;
 
 /// Minimal non-FOD ATerm: empty hashAlgo/hash in the output tuple →
 /// `Derivation::is_fixed_output()` returns `false`.
-const NON_FOD_DRV: &[u8] = br#"Derive([("out","/nix/store/abc-simple-test","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello > $out"],[("builder","/bin/sh"),("name","simple-test"),("out","/nix/store/abc-simple-test"),("system","x86_64-linux")])"#;
+const NON_FOD_DRV: &[u8] = br#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-simple-test","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello > $out"],[("builder","/bin/sh"),("name","simple-test"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-simple-test"),("system","x86_64-linux")])"#;
 
 /// Minimal FOD ATerm: `sha256` + hash populated → `is_fixed_output()`
 /// returns `true`.
-const FOD_DRV: &[u8] = br#"Derive([("out","/nix/store/abc-fixed","sha256","abcdef0123456789")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/abc-fixed"),("outputHash","abcdef0123456789"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#;
+const FOD_DRV: &[u8] = br#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-fixed","sha256","abcdef0123456789")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-fixed"),("outputHash","abcdef0123456789"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#;
 
 fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
     ExecutorEnv {

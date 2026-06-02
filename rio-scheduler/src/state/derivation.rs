@@ -1970,11 +1970,14 @@ mod tests {
     fn try_from_node_parses_input_srcs() {
         let mut node = dummy_node();
         // Minimal valid ATerm with two inputSrcs (3rd Derive field).
-        node.drv_content = br#"Derive([("out","/nix/store/abc-out","","")],[],["/nix/store/abc-gcc","/nix/store/abc-glibc"],"x86_64-linux","/bin/sh",[],[("out","/nix/store/abc-out")])"#.to_vec();
+        node.drv_content = br#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-out","","")],[],["/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-gcc","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-glibc"],"x86_64-linux","/bin/sh",[],[("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-out")])"#.to_vec();
         let state = DerivationState::try_from_node(&node).unwrap();
         assert_eq!(
             state.input_srcs,
-            vec!["/nix/store/abc-gcc", "/nix/store/abc-glibc"],
+            vec![
+                "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-gcc",
+                "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-glibc"
+            ],
         );
 
         // Empty drv_content (gateway didn't inline / store-hit) → empty,
@@ -1998,9 +2001,9 @@ mod tests {
         let mut s = DerivationState::try_from_node(&dummy_node()).unwrap();
         s.output_names = vec!["out".into(), "dev".into(), "debug".into()];
         s.expected_output_paths = vec![
-            "/nix/store/aaaa-glibc".into(),
-            "/nix/store/bbbb-glibc-dev".into(),
-            "/nix/store/cccc-glibc-debug".into(),
+            "/nix/store/bawi36wxbj7xnyz9napm3aaxpayxk25x-glibc".into(),
+            "/nix/store/gsh1gf0xzjkmsf3raakd7s65kjam72im-glibc-dev".into(),
+            "/nix/store/bawi36wxbj7xnyz9napm3aaxpayxk25x-glibc-debug".into(),
         ];
         fn wanted_paths(s: &DerivationState) -> Vec<&String> {
             wanted_subset(
@@ -2015,9 +2018,9 @@ mod tests {
         assert_eq!(
             wanted_paths(&s),
             vec![
-                "/nix/store/aaaa-glibc",
-                "/nix/store/bbbb-glibc-dev",
-                "/nix/store/cccc-glibc-debug"
+                "/nix/store/bawi36wxbj7xnyz9napm3aaxpayxk25x-glibc",
+                "/nix/store/gsh1gf0xzjkmsf3raakd7s65kjam72im-glibc-dev",
+                "/nix/store/bawi36wxbj7xnyz9napm3aaxpayxk25x-glibc-debug"
             ],
             "empty wanted set must mean ALL declared outputs"
         );
@@ -2025,13 +2028,19 @@ mod tests {
         s.wanted_output_names = vec!["out".into(), "dev".into()];
         assert_eq!(
             wanted_paths(&s),
-            vec!["/nix/store/aaaa-glibc", "/nix/store/bbbb-glibc-dev"],
+            vec![
+                "/nix/store/bawi36wxbj7xnyz9napm3aaxpayxk25x-glibc",
+                "/nix/store/gsh1gf0xzjkmsf3raakd7s65kjam72im-glibc-dev"
+            ],
             "wanted subset must exclude the unwanted -debug path"
         );
 
         // A wanted name with no matching declared output (defensive) is ignored.
         s.wanted_output_names = vec!["out".into(), "nonexistent".into()];
-        assert_eq!(wanted_paths(&s), vec!["/nix/store/aaaa-glibc"]);
+        assert_eq!(
+            wanted_paths(&s),
+            vec!["/nix/store/bawi36wxbj7xnyz9napm3aaxpayxk25x-glibc"]
+        );
     }
 
     // r[verify sched.merge.wanted-outputs+2]
@@ -2815,7 +2824,7 @@ mod tests {
     // r[verify sched.recovery.inline-drv-durability+3]
     #[test]
     fn from_recovery_row_hydrates_authoritative_drv_content() {
-        let aterm = br#"Derive([("out","/nix/store/abc-out","","")],[],["/nix/store/abc-gcc","/nix/store/abc-glibc"],"x86_64-linux","/bin/sh",[],[("out","/nix/store/abc-out")])"#;
+        let aterm = br#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-out","","")],[],["/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-gcc","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-glibc"],"x86_64-linux","/bin/sh",[],[("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-out")])"#;
         let row = crate::db::RecoveryDerivationRow {
             drv_content: Some(aterm.to_vec()),
             ..crate::db::RecoveryDerivationRow::test_default("durable-drv", "x86_64-linux")
@@ -2825,7 +2834,10 @@ mod tests {
         assert_eq!(state.drv_content, aterm.to_vec(), "bytes restored");
         assert_eq!(
             state.input_srcs,
-            vec!["/nix/store/abc-gcc", "/nix/store/abc-glibc"],
+            vec![
+                "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-gcc",
+                "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-glibc"
+            ],
             "inputSrcs re-parsed from the restored content"
         );
 

@@ -164,7 +164,7 @@ async fn test_build_paths_eof_triggers_reconnect_not_error() -> anyhow::Result<(
             sequence: 2,
             timestamp: None,
             event: Some(build_event::Event::Completed(types::BuildCompleted {
-                output_paths: vec!["/nix/store/zzz-out".into()],
+                output_paths: vec!["/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-out".into()],
             })),
         }]),
         ..Default::default()
@@ -287,7 +287,7 @@ async fn test_build_derivation_basic_format() -> anyhow::Result<()> {
         // BasicDerivation: outputs
         u64: 1,                                  // 1 output
         string: "out",                           // name
-        string: "/nix/store/zzz-output",         // path
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",         // path
         string: "",                              // hash_algo (input-addressed)
         string: "",                              // hash
         // input_srcs
@@ -301,7 +301,7 @@ async fn test_build_derivation_basic_format() -> anyhow::Result<()> {
         // env pairs (count + flat key/value strings; no string_pairs kind)
         u64: 1,
         string: "out",
-        string: "/nix/store/zzz-output",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         // build_mode
         u64: 0,
     );
@@ -475,7 +475,7 @@ async fn test_build_derivation_dag_reject_clean_stderr_last() -> anyhow::Result<
         string: drv_path,
         u64: 1,                                  // 1 output
         string: "out",
-        string: "/nix/store/zzz-output",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         string: "",                              // hash_algo
         string: "",                              // hash
         strings: wire::NO_STRINGS,               // input_srcs
@@ -484,7 +484,7 @@ async fn test_build_derivation_dag_reject_clean_stderr_last() -> anyhow::Result<
         strings: &["-c", "echo hi"],
         u64: 1,                                  // 1 env pair (NOT __noChroot)
         string: "out",
-        string: "/nix/store/zzz-output",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         u64: 0,                                  // build_mode
     );
 
@@ -622,7 +622,7 @@ async fn test_build_derivation_inline_nochroot_rejected() -> anyhow::Result<()> 
         // BasicDerivation:
         u64: 1,                                  // 1 output
         string: "out",
-        string: "/nix/store/zzz-output",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         string: "",                              // hash_algo (input-addressed)
         string: "",                              // hash
         strings: wire::NO_STRINGS,               // input_srcs
@@ -681,7 +681,7 @@ async fn build_derivation_rejects_wrong_typed_nochroot() -> anyhow::Result<()> {
         // BasicDerivation:
         u64: 1,                                  // 1 output
         string: "out",
-        string: "/nix/store/zzz-output",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         string: "",                              // hash_algo (input-addressed)
         string: "",                              // hash
         strings: wire::NO_STRINGS,               // input_srcs
@@ -1487,7 +1487,7 @@ async fn test_build_derivation_after_drv_upload_submitted() -> anyhow::Result<()
         string: drv_path,
         u64: 1,                                  // 1 output
         string: "out",
-        string: "/nix/store/zzz-output",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         string: "",                              // hash_algo (input-addressed)
         string: "",                              // hash
         strings: wire::NO_STRINGS,               // input_srcs
@@ -1496,7 +1496,7 @@ async fn test_build_derivation_after_drv_upload_submitted() -> anyhow::Result<()
         strings: &["-c", "echo hi"],
         u64: 1,                                  // 1 env pair
         string: "out",
-        string: "/nix/store/zzz-output",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         u64: 0,                                  // build_mode
     );
 
@@ -2234,7 +2234,7 @@ async fn test_build_paths_log_events_become_stderr_next() -> anyhow::Result<()> 
 #[tokio::test]
 async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let target = "/nix/store/aaa-activity-test.drv".to_string();
+    let target = "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-activity-test.drv".to_string();
     h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
         ev(build_event::Event::Started(types::BuildStarted {
             total_derivations: 1,
@@ -2307,7 +2307,7 @@ async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()
             assert_eq!(*activity_type, 105, "ActivityType::Build");
             assert_eq!(*level, 3, "lvlInfo");
             assert_eq!(*parent_id, root_id, "parent = actBuilds root");
-            assert!(text.contains("aaa-activity-test.drv"));
+            assert!(text.contains("n2v52szmyja512fxmaax8lixl4dxh4jb-activity-test.drv"));
             // [drvPath, machineName, curRound, nrRounds].
             // machineName is the cluster-stable RIO_GATEWAY_MACHINE_NAME
             // (empty in tests), NOT the per-pod executor_id "w1" — the
@@ -2349,7 +2349,7 @@ async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()
 #[tokio::test]
 async fn test_build_paths_redispatch_reuses_activity() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let target = "/nix/store/ccc-redispatch.drv".to_string();
+    let target = "/nix/store/h215ws5mqjq1pnqd7j0incvdyqk96lhp-redispatch.drv".to_string();
     h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
         ev(build_event::Event::Started(types::BuildStarted {
             total_derivations: 1,
@@ -2424,7 +2424,7 @@ async fn test_build_paths_redispatch_reuses_activity() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let target = "/nix/store/bbb-failed.drv".to_string();
+    let target = "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-failed.drv".to_string();
     h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
         ev(build_event::Event::Started(types::BuildStarted {
             total_derivations: 1,
@@ -2499,8 +2499,8 @@ async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Resu
 #[tokio::test]
 async fn test_build_paths_dependency_failed_omits_rio_cli_hint() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let trigger = "/nix/store/aaa-trigger.drv".to_string();
-    let cascaded = "/nix/store/bbb-cascaded.drv".to_string();
+    let trigger = "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-trigger.drv".to_string();
+    let cascaded = "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-cascaded.drv".to_string();
     h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
         ev(build_event::Event::Started(types::BuildStarted {
             total_derivations: 2,
@@ -2638,10 +2638,13 @@ async fn test_build_paths_progress_events_emit_result() -> anyhow::Result<()> {
             ..Default::default()
         })),
         ev(build_event::Event::Derivation(
-            types::DerivationEvent::cached("/nix/store/cached.drv".into(), vec![]),
+            types::DerivationEvent::cached(
+                "/nix/store/rjamm2fxraddla1xqs5dij891nhdrjp1.drv".into(),
+                vec![],
+            ),
         )),
         ev(build_event::Event::Derivation(types::DerivationEvent {
-            derivation_path: "/nix/store/queued.drv".into(),
+            derivation_path: "/nix/store/cw550c9mlwlzml0grcczlldvl85zwly7.drv".into(),
             kind: types::DerivationEventKind::Queued as i32,
             ..Default::default()
         })),
@@ -2720,7 +2723,7 @@ async fn test_build_paths_progress_events_emit_result() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_build_paths_log_and_phase_attached_to_activity() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let target = "/nix/store/ccc-loglines.drv".to_string();
+    let target = "/nix/store/h215ws5mqjq1pnqd7j0incvdyqk96lhp-loglines.drv".to_string();
     h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
         ev(build_event::Event::Started(types::BuildStarted {
             total_derivations: 1,
@@ -2929,7 +2932,7 @@ async fn test_build_paths_empty_stream_reconnects_via_header() -> anyhow::Result
     h.scheduler.set_watch_outcome(WatchOutcome {
         scripted_events: Some(vec![ev(build_event::Event::Completed(
             types::BuildCompleted {
-                output_paths: vec!["/nix/store/zzz-out".into()],
+                output_paths: vec!["/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-out".into()],
             },
         ))]),
         ..Default::default()
@@ -3066,7 +3069,7 @@ async fn test_build_paths_reconnect_on_transport_error() -> anyhow::Result<()> {
             sequence: 2,
             timestamp: None,
             event: Some(build_event::Event::Completed(types::BuildCompleted {
-                output_paths: vec!["/nix/store/zzz-output".into()],
+                output_paths: vec!["/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output".into()],
             })),
         }]),
         ..Default::default()
@@ -3840,12 +3843,12 @@ async fn test_build_derivation_rejects_check_mode() -> anyhow::Result<()> {
         u64: 36,
         string: drv_path,
         u64: 1,
-        string: "out", string: "/nix/store/zzz-output", string: "", string: "",
+        string: "out", string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output", string: "", string: "",
         strings: wire::NO_STRINGS,
         string: "x86_64-linux",
         string: "/bin/sh",
         strings: &["-c", "echo hi"],
-        u64: 1, string: "out", string: "/nix/store/zzz-output",
+        u64: 1, string: "out", string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         u64: 2, // BuildMode::Check
     );
 
@@ -3884,7 +3887,7 @@ async fn test_reconnect_propagates_jwt() -> anyhow::Result<()> {
     h.scheduler.set_watch_outcome(WatchOutcome {
         scripted_events: Some(vec![ev(build_event::Event::Completed(
             types::BuildCompleted {
-                output_paths: vec!["/nix/store/zzz-out".into()],
+                output_paths: vec!["/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-out".into()],
             },
         ))]),
         ..Default::default()
@@ -4660,7 +4663,7 @@ async fn test_build_derivation_ifd_heuristic_unchanged() -> anyhow::Result<()> {
         string: drv_path,
         u64: 1,
         string: "out",
-        string: "/nix/store/zzz-output",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         string: "",
         string: "",
         strings: wire::NO_STRINGS,
@@ -4669,7 +4672,7 @@ async fn test_build_derivation_ifd_heuristic_unchanged() -> anyhow::Result<()> {
         strings: &["-c", "echo hi"],
         u64: 1,
         string: "out",
-        string: "/nix/store/zzz-output",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         u64: 0,
     );
     drain_stderr_until_last(&mut h.stream).await?;
@@ -4694,7 +4697,7 @@ async fn test_build_derivation_ifd_heuristic_unchanged() -> anyhow::Result<()> {
         string: drv_path,
         u64: 1,
         string: "out",
-        string: "/nix/store/zzz-output",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         string: "",
         string: "",
         strings: wire::NO_STRINGS,
@@ -4703,7 +4706,7 @@ async fn test_build_derivation_ifd_heuristic_unchanged() -> anyhow::Result<()> {
         strings: &["-c", "echo hi"],
         u64: 1,
         string: "out",
-        string: "/nix/store/zzz-output",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
         u64: 0,
     );
     drain_stderr_until_last(&mut h.stream).await?;
