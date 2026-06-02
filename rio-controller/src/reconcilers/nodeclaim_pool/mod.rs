@@ -78,12 +78,14 @@ pub(crate) const TICK: Duration = Duration::from_secs(10);
 /// are kube-only.
 const BOT_TICKS_BEFORE_CONSOLIDATE_ONLY: u8 = 5;
 
-/// Unix-epoch seconds `now()`. Condition `lastTransitionTime` and
+/// Unix-epoch seconds of `t`. Condition `lastTransitionTime` and
 /// `creationTimestamp` are RFC3339; comparing in epoch-seconds keeps
-/// arithmetic in `f64` throughout.
-fn now_epoch() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+/// arithmetic in `f64` throughout. The tick path threads one
+/// `SystemTime` from [`NodeClaimPoolReconciler::tick`] (sampled once
+/// per tick in `run()`, injectable by the lifecycle-invariants suite)
+/// and derives epoch-seconds through this at the top of each body.
+fn epoch_secs(t: std::time::SystemTime) -> f64 {
+    t.duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
@@ -939,111 +941,119 @@ impl NodeClaimPoolReconciler {
                 _ = shutdown.cancelled() => break,
                 _ = interval.tick() => {}
             }
-            // Lease-loss edge: unarm the gate so an ex-leader's stale
-            // set doesn't drive `reap_excess_pending` against the new
-            // leader's Jobs. Checked BEFORE `is_leader()` so it fires
-            // on the same tick as the loss.
-            // r[impl ctrl.nodeclaim.placeable-gate+5]
-            if self
-                .hooks
-                .lose
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                self.placeable_tx.send_replace(None);
-            }
-            if !self.leader.is_leader() {
-                debug!("standby; skipping nodeclaim_pool tick");
-                continue;
-            }
-            // Lease-acquire edge: reload sketches from PG and clear
-            // edge-detector state so a long-running standby that wins
-            // the lease doesn't `persist()` stale startup-time
-            // sketches over the previous leader's accumulated samples,
-            // and so `observe_registered`'s recency-gate sees an empty
-            // `recorded_boot` (else days-old registrations mass-clear
-            // the scheduler's IceBackoff).
-            //
-            // Latch-on-Ok-only: a transient PG error must NOT consume
-            // the one-shot flag. On `Err`, warn and fall through —
-            // `reconcile_once` runs degraded (in-memory sketches
-            // suffice for FFD/reap), `persist()` is gated off via
-            // `reload_pending()` so the stale state doesn't overwrite
-            // the previous leader's PG rows. The flag stays set; next
-            // tick retries the reload. Clears (recorded_boot etc.) go
-            // in the Ok-arm only — atomic edge: full reload or full
-            // retry.
-            //
-            // EXCEPTION: `prev_idle` clears unconditionally. Its
-            // stale-state polarity is opposite the other two sets
-            // (see the per-field table below): a stale `prev_idle`
-            // entry inflates `now − since` and CAUSES a reap, not
-            // suppresses one. Even if `load_seeded` errors, leaving a
-            // pre-lapse timestamp over-reaps. Clearing here makes the
-            // `Err` arm under-reap by one cycle (the documented SAFE
-            // direction) instead of unboundedly over-reaping.
-            // r[impl ctrl.nodeclaim.lease-edge-polarity]
-            if self.reload_pending() {
-                self.prev_idle.clear();
-                let halflife = Duration::from_secs(self.cfg.sketch_halflife_secs);
-                match CellSketches::load_seeded(
-                    &self.pg,
-                    &self.cfg.lead_time_seed,
-                    halflife,
-                    std::time::SystemTime::now(),
-                )
-                .await
-                {
-                    Ok(s) => {
-                        self.sketches = s;
-                        self.recorded_boot.clear();
-                        self.inflight_created.clear();
-                        // `prev_extra_cells` is intentionally NOT cleared
-                        // here (r41 bug_025). Per-field stale-state
-                        // polarity on the lease-acquire edge:
-                        //
-                        //   - `recorded_boot`   suppress  → cleared in Ok arm
-                        //     (stale entry skips a record; lost sample)
-                        //   - `inflight_created` suppress → cleared in Ok arm
-                        //     (stale entry → spurious ICE-mask)
-                        //   - `prev_idle`       AMPLIFY   → cleared BEFORE the
-                        //     match (stale entry inflates idle → over-reap;
-                        //     r43 merged_bug_016)
-                        //   - `prev_extra_cells` CLEANUP  → never cleared
-                        //     (stale entry → one trailing zero-write — the
-                        //     desired behavior; clearing would orphan a gauge
-                        //     series at its last possibly-paging value)
-                        //   - `prev_unplaced_extras` CLEANUP → never cleared
-                        //     (stale entry → one trailing zero-write for
-                        //     `ffd_unplaced_cores`; r43 bug_026)
-                        //
-                        // When adding a field that holds in-memory edge
-                        // state, classify its polarity here and put the
-                        // clear (or not-clear) on the matching edge. See
-                        // [`gauge_universe`].
-                        self.hooks
-                            .reload
-                            .store(false, std::sync::atomic::Ordering::SeqCst);
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            "CellSketches reload on leader-acquire failed; \
-                             retrying next tick (persist gated)"
-                        );
-                    }
-                }
-            }
-            metrics::gauge!("rio_controller_sketches_reload_pending")
-                .set(if self.reload_pending() { 1.0 } else { 0.0 });
-            self.tick_counter = self.tick_counter.wrapping_add(1);
-            let started = std::time::Instant::now();
-            if let Err(e) = self.reconcile_once().await {
-                warn!(error = %e, "nodeclaim_pool tick failed");
-            }
-            metrics::histogram!("rio_controller_nodeclaim_tick_duration_seconds")
-                .record(started.elapsed().as_secs_f64());
+            self.tick(std::time::SystemTime::now()).await;
         }
         info!("nodeclaim_pool reconciler stopped");
+    }
+
+    /// One run-loop iteration: lease-edge work, standby skip,
+    /// acquire-reload latch, then the reconcile dispatch. Extracted
+    /// from [`Self::run`] so the lifecycle-invariants suite can drive
+    /// real ticks with an injected `now` (the only wall-clock reads
+    /// left in the tick path are the `Instant` duration histogram and
+    /// tracing timestamps — both harmless). Behavior-identical to the
+    /// pre-extraction loop body.
+    async fn tick(&mut self, now: std::time::SystemTime) {
+        // Lease-loss edge: unarm the gate so an ex-leader's stale
+        // set doesn't drive `reap_excess_pending` against the new
+        // leader's Jobs. Checked BEFORE `is_leader()` so it fires
+        // on the same tick as the loss.
+        // r[impl ctrl.nodeclaim.placeable-gate+5]
+        if self
+            .hooks
+            .lose
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.placeable_tx.send_replace(None);
+        }
+        if !self.leader.is_leader() {
+            debug!("standby; skipping nodeclaim_pool tick");
+            return;
+        }
+        // Lease-acquire edge: reload sketches from PG and clear
+        // edge-detector state so a long-running standby that wins
+        // the lease doesn't `persist()` stale startup-time
+        // sketches over the previous leader's accumulated samples,
+        // and so `observe_registered`'s recency-gate sees an empty
+        // `recorded_boot` (else days-old registrations mass-clear
+        // the scheduler's IceBackoff).
+        //
+        // Latch-on-Ok-only: a transient PG error must NOT consume
+        // the one-shot flag. On `Err`, warn and fall through —
+        // `reconcile_once` runs degraded (in-memory sketches
+        // suffice for FFD/reap), `persist()` is gated off via
+        // `reload_pending()` so the stale state doesn't overwrite
+        // the previous leader's PG rows. The flag stays set; next
+        // tick retries the reload. Clears (recorded_boot etc.) go
+        // in the Ok-arm only — atomic edge: full reload or full
+        // retry.
+        //
+        // EXCEPTION: `prev_idle` clears unconditionally. Its
+        // stale-state polarity is opposite the other two sets
+        // (see the per-field table below): a stale `prev_idle`
+        // entry inflates `now − since` and CAUSES a reap, not
+        // suppresses one. Even if `load_seeded` errors, leaving a
+        // pre-lapse timestamp over-reaps. Clearing here makes the
+        // `Err` arm under-reap by one cycle (the documented SAFE
+        // direction) instead of unboundedly over-reaping.
+        // r[impl ctrl.nodeclaim.lease-edge-polarity]
+        if self.reload_pending() {
+            self.prev_idle.clear();
+            let halflife = Duration::from_secs(self.cfg.sketch_halflife_secs);
+            match CellSketches::load_seeded(&self.pg, &self.cfg.lead_time_seed, halflife, now).await
+            {
+                Ok(s) => {
+                    self.sketches = s;
+                    self.recorded_boot.clear();
+                    self.inflight_created.clear();
+                    // `prev_extra_cells` is intentionally NOT cleared
+                    // here (r41 bug_025). Per-field stale-state
+                    // polarity on the lease-acquire edge:
+                    //
+                    //   - `recorded_boot`   suppress  → cleared in Ok arm
+                    //     (stale entry skips a record; lost sample)
+                    //   - `inflight_created` suppress → cleared in Ok arm
+                    //     (stale entry → spurious ICE-mask)
+                    //   - `prev_idle`       AMPLIFY   → cleared BEFORE the
+                    //     match (stale entry inflates idle → over-reap;
+                    //     r43 merged_bug_016)
+                    //   - `prev_extra_cells` CLEANUP  → never cleared
+                    //     (stale entry → one trailing zero-write — the
+                    //     desired behavior; clearing would orphan a gauge
+                    //     series at its last possibly-paging value)
+                    //   - `prev_unplaced_extras` CLEANUP → never cleared
+                    //     (stale entry → one trailing zero-write for
+                    //     `ffd_unplaced_cores`; r43 bug_026)
+                    //
+                    // When adding a field that holds in-memory edge
+                    // state, classify its polarity here and put the
+                    // clear (or not-clear) on the matching edge. See
+                    // [`gauge_universe`].
+                    self.hooks
+                        .reload
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "CellSketches reload on leader-acquire failed; \
+                         retrying next tick (persist gated)"
+                    );
+                }
+            }
+        }
+        metrics::gauge!("rio_controller_sketches_reload_pending").set(if self.reload_pending() {
+            1.0
+        } else {
+            0.0
+        });
+        self.tick_counter = self.tick_counter.wrapping_add(1);
+        let started = std::time::Instant::now();
+        if let Err(e) = self.reconcile_once(now).await {
+            warn!(error = %e, "nodeclaim_pool tick failed");
+        }
+        metrics::histogram!("rio_controller_nodeclaim_tick_duration_seconds")
+            .record(started.elapsed().as_secs_f64());
     }
 
     /// Kube-only sketch observations shared by [`Self::reconcile_once`]
@@ -1072,6 +1082,7 @@ impl NodeClaimPoolReconciler {
         &mut self,
         live: &[ffd::LiveNode],
         now: f64,
+        now_sys: std::time::SystemTime,
     ) -> (Vec<Cell>, Vec<rio_proto::types::ObservedInstanceType>) {
         // Uncensored idle→busy edges (see caller-ordering note above).
         consolidate::observe_idle_to_busy(live, &mut self.prev_idle, &mut self.sketches, now);
@@ -1087,10 +1098,8 @@ impl NodeClaimPoolReconciler {
         let result = self
             .sketches
             .observe_registered(live, &mut self.recorded_boot, now);
-        self.sketches.maybe_rotate_all(
-            std::time::SystemTime::now(),
-            Duration::from_secs(self.cfg.sketch_halflife_secs),
-        );
+        self.sketches
+            .maybe_rotate_all(now_sys, Duration::from_secs(self.cfg.sketch_halflife_secs));
         result
     }
 
@@ -1100,8 +1109,8 @@ impl NodeClaimPoolReconciler {
     /// crate's `Error` enum (built around `error_policy` requeue) doesn't
     /// apply. Any error is logged + retried next tick.
     // r[impl ctrl.nodeclaim.ffd-sim]
-    #[instrument(skip(self), fields(tick = self.tick_counter))]
-    async fn reconcile_once(&mut self) -> anyhow::Result<()> {
+    #[instrument(skip(self, now_sys), fields(tick = self.tick_counter))]
+    async fn reconcile_once(&mut self, now_sys: std::time::SystemTime) -> anyhow::Result<()> {
         // ⊥ on scheduler unreachable: warn + count, don't propagate.
         // `admin_call` bounds at ADMIN_RPC_TIMEOUT so a stalled
         // scheduler doesn't wedge the tick.
@@ -1134,7 +1143,7 @@ impl NodeClaimPoolReconciler {
             self.consecutive_bot_ticks = self.consecutive_bot_ticks.saturating_add(1);
             // r[impl ctrl.nodeclaim.consolidate-only-degraded]
             if self.consecutive_bot_ticks >= BOT_TICKS_BEFORE_CONSOLIDATE_ONLY {
-                return self.consolidate_only().await;
+                return self.consolidate_only(now_sys).await;
             }
             // TODO(r43 merged_bug_016/bug_023): ticks 1..BOT_TICKS_BEFORE_
             // CONSOLIDATE_ONLY take this early exit and skip ALL kube-only
@@ -1227,11 +1236,11 @@ impl NodeClaimPoolReconciler {
         // silent stale-data degradation.
         let pod_snapshot = self.list_pool_pods().await?;
         let live = self.list_live_nodeclaims(&pod_snapshot).await?;
-        let now = now_epoch();
+        let now = epoch_secs(now_sys);
         // `registered_cells` feeds `report_unfulfillable`'s ICE-clear;
         // `observed_types` feeds the scheduler's `CostTable.cells`
         // (R24B7 instance-type autodiscovery).
-        let (registered_cells, observed_types) = self.kube_only_observations(&live, now);
+        let (registered_cells, observed_types) = self.kube_only_observations(&live, now, now_sys);
 
         let bound = pod_snapshot.bound_intents();
         // §13d STRIKE-7 (mb_012): the agnostic-fallback admit predicate
@@ -1409,7 +1418,7 @@ impl NodeClaimPoolReconciler {
     /// can't reach the scheduler either, so it has `intents=[]` and the
     /// stale set filters nothing. See [`PlaceableGate`] for the full
     /// staleness argument and the lease-loss contrast.
-    async fn consolidate_only(&mut self) -> anyhow::Result<()> {
+    async fn consolidate_only(&mut self, now_sys: std::time::SystemTime) -> anyhow::Result<()> {
         debug!(
             consecutive_bot = self.consecutive_bot_ticks,
             "consolidate-only (scheduler unreachable)"
@@ -1420,12 +1429,12 @@ impl NodeClaimPoolReconciler {
         // consumer of it needs the scheduler.
         let pod_snapshot = self.list_pool_pods().await?;
         let live = self.list_live_nodeclaims(&pod_snapshot).await?;
-        let now = now_epoch();
+        let now = epoch_secs(now_sys);
         // r43 bug_023: same kube-only block as `reconcile_once`. Discard
         // the return — `report_unfulfillable` and the scheduler's
         // `CostTable.cells` need the scheduler reachable; same shape as
         // the `ice_cells` discard below.
-        let _ = self.kube_only_observations(&live, now);
+        let _ = self.kube_only_observations(&live, now, now_sys);
         // r42 bug_023: `consolidate_only` calls `emit_live_gauges`
         // AFTER `reap_idle`, so `prev_extra_cells` is still the
         // previous tick's value here — use it directly.
