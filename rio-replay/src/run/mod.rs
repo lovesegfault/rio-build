@@ -1163,6 +1163,9 @@ async fn apply_stall_actions(
                         ledger,
                         &stall.job,
                         "stalled-active",
+                        // ActiveStall fires for a job in a committed batch:
+                        // the stalled attempt is a real submission.
+                        true,
                         mode,
                         campaign_id,
                     )
@@ -1182,6 +1185,9 @@ async fn apply_stall_actions(
                     ledger,
                     &stall.job,
                     "stalled-queued",
+                    // The job has sat in the queue since its last requeue:
+                    // no committed attempt to count.
+                    false,
                     mode,
                     campaign_id,
                 )
@@ -1200,6 +1206,15 @@ async fn apply_stall_actions(
 /// Append the terminal stall record, mirror it into the in-memory results
 /// map (so the submit loop's terminal set sees it immediately), and retire
 /// the job through the ledger (watchdog removal + in-flight release).
+///
+/// `currently_committed` is whether the job sits in a committed batch as
+/// the stall fires: true for a stalled-active terminal (its committed,
+/// stalled attempt counts), false for a stalled-queued one (the job has
+/// waited in the queue since its last requeue — there is no current
+/// attempt to count). The stamped `attempts` goes through the same
+/// journal projection and stamping helper as every collect writer
+/// (`ledger::stamped_attempts`), so the stall arm can no longer drift to
+/// a different +1 convention.
 #[allow(clippy::too_many_arguments)]
 async fn write_terminal_stall(
     state: &StateDir,
@@ -1208,6 +1223,7 @@ async fn write_terminal_stall(
     ledger: &ledger::JobLedger,
     job: &str,
     signature: &str,
+    currently_committed: bool,
     mode: &str,
     campaign_id: &str,
 ) -> Result<()> {
@@ -1219,7 +1235,11 @@ async fn write_terminal_stall(
         );
         return Ok(());
     };
-    let attempts = ledger.tracker().resubmission_count(job).await;
+    let prior = ledger::measured_attempt_requeues(state)?
+        .get(job)
+        .copied()
+        .unwrap_or(0);
+    let attempts = ledger::stamped_attempts(prior, currently_committed);
     let record = stall_record(ctx, signature, mode, campaign_id, attempts);
     state.append_jsonl(StateFile::Results, &record)?;
     results.lock().await.insert(job.to_string(), record);
@@ -2531,7 +2551,7 @@ async fn collect_pass_with(
         for (job, decision) in &decisions {
             match decision {
                 collect::CollectDecision::Requeue { why, .. } => {
-                    ledger.requeue_collected(job, why).await?;
+                    ledger.requeue_collected(job, *why).await?;
                     requeued += 1;
                 }
                 collect::CollectDecision::Terminal { .. } => {
@@ -4180,9 +4200,14 @@ mod tests {
                 Some(Verdict::InfraIndeterminate.as_str()),
                 "budget exhausted across the restart: terminal infra record"
             );
+            // The measurement is the journal's cluster-attempt projection:
+            // the journaled engine-side submission failure never reached
+            // the cluster, so it does not count — only the final failed
+            // submission this record is about is stamped. (The BUDGET fold
+            // above still counts both, which is what exhausted it.)
             assert_eq!(
-                record.attempts, 2,
-                "attempts accounting also survives the restart"
+                record.attempts, 1,
+                "engine-side requeues stay out of the measured attempts across the restart"
             );
         }
     }
@@ -5163,6 +5188,12 @@ mod tests {
             records[active_job].signature.as_deref(),
             Some("stalled-active")
         );
+        // The stall writer shares the collect writers' stamping convention
+        // (journal projection + the current attempt): the journaled stall
+        // auto-retry counts as a cluster attempt, and the committed,
+        // stalled attempt this record retires is the +1 — a collect
+        // terminal with the identical history would also stamp 2.
+        assert_eq!(records[active_job].attempts, 2);
         assert!(
             results.lock().await.contains_key(active_job),
             "in-memory results updated"
@@ -5197,6 +5228,10 @@ mod tests {
             records[queued_job].signature.as_deref(),
             Some("stalled-queued")
         );
+        // A stalled-queued job has no committed attempt to count (it sat in
+        // the queue since its last requeue) and this one was never
+        // submitted at all: zero attempts, not a phantom one.
+        assert_eq!(records[queued_job].attempts, 0);
     }
 
     /// One disposition per excluded job, by the documented precedence: a

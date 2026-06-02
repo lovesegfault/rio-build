@@ -869,6 +869,115 @@ pub const REQUEUE_SOURCE_COLLECT: &str = "collect";
 /// auto-retry.
 pub const REQUEUE_SOURCE_STALL: &str = "stall";
 
+/// Why the engine re-offered a job: the closed requeue-reason vocabulary,
+/// journaled on every [`RequeueRecord`].
+///
+/// One enum because requeue history has two consumers with deliberately
+/// different semantics, and string literals let them drift:
+///
+/// - The retry **budget** counts every reason (`collect::decide`'s
+///   conservative-budget contract: any prior re-offer consumes auto-retry
+///   headroom, so the budget can never multiply across reasons).
+/// - The **measurement** — the `attempts` stamped on results.jsonl
+///   records, the `flaky` flag, the report's first-attempt/after-retries
+///   split — counts only reasons that represent a real cluster attempt,
+///   through [`RequeueReason::counts_as_cluster_attempt`], the ONLY path
+///   from reasons to the measurement.
+///
+/// Adding a reason refuses to compile until its measurement semantics are
+/// decided in the predicate's exhaustive match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequeueReason {
+    /// The engine itself cancelled the batch (deadline, abort) before
+    /// results arrived. Documented at the carve-out as "the engine's own
+    /// act, not evidence about the job".
+    EngineCancelled,
+    /// The submission failed engine-side (channel open, drv import, the
+    /// build op erroring before any result) — the build never reached the
+    /// cluster.
+    EngineSubmissionFailure,
+    /// The settled batch carried no in-band result for this root: a
+    /// transport defect on a submission that did reach the cluster.
+    NoInbandResult,
+    /// A positively-identified infrastructure failure consumed the single
+    /// auto-retry.
+    InfraAutoRetry,
+    /// Fail-fast marked this job dependency-failed for a trigger outside
+    /// its own closure: a cluster attempt denied a fair run by its
+    /// batch-mates.
+    FailfastBatchMate,
+    /// A dependency-failed result with no identifiable trigger, treated
+    /// like a fail-fast batch-mate.
+    DependencyFailedNoTrigger,
+    /// The watchdog's single active-stall auto-retry: the committed
+    /// attempt ran (and stalled) on the cluster.
+    ActiveStall,
+}
+
+impl RequeueReason {
+    /// Every requeue reason. The vocabulary as data: the per-reason
+    /// measurement-semantics test iterates this, so a new reason cannot
+    /// ship without an expected-flakiness row.
+    pub const ALL: [RequeueReason; 7] = [
+        RequeueReason::EngineCancelled,
+        RequeueReason::EngineSubmissionFailure,
+        RequeueReason::NoInbandResult,
+        RequeueReason::InfraAutoRetry,
+        RequeueReason::FailfastBatchMate,
+        RequeueReason::DependencyFailedNoTrigger,
+        RequeueReason::ActiveStall,
+    ];
+
+    /// The journal/log string for this reason ([`RequeueRecord::why`]).
+    /// Writers must use this — never literals — so the journal's reason
+    /// vocabulary cannot drift from the enum.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RequeueReason::EngineCancelled => "engine-cancelled",
+            RequeueReason::EngineSubmissionFailure => "engine-submission-failure",
+            RequeueReason::NoInbandResult => "no-inband-result",
+            RequeueReason::InfraAutoRetry => "infra-auto-retry",
+            RequeueReason::FailfastBatchMate => "failfast-batch-mate",
+            RequeueReason::DependencyFailedNoTrigger => "dependency-failed-no-trigger",
+            RequeueReason::ActiveStall => "active-stall",
+        }
+    }
+
+    /// Inverse of [`RequeueReason::as_str`] for reading journaled reasons
+    /// back; `None` for a string outside the vocabulary (a journal written
+    /// by a different engine version).
+    pub fn from_wire(why: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| reason.as_str() == why)
+    }
+
+    /// Whether a re-offer for this reason means the PRECEDING submission
+    /// was a real cluster attempt — evidence about the job — and so counts
+    /// toward the user-facing measurement (`attempts`, `flaky`, the
+    /// report's retry split).
+    ///
+    /// The two engine-side reasons do not count: an engine-cancelled batch
+    /// is the engine's own scheduling act (its members may never have
+    /// started), and an engine-side submission failure never reached the
+    /// cluster at all. Counting either marks first-real-attempt successes
+    /// flaky and reports a deadline-cut wave as "succeeded after retries".
+    /// Every other reason describes an attempt that ran (or was denied a
+    /// fair run) on the cluster, which is exactly what a flakiness
+    /// measurement is about.
+    ///
+    /// The retry BUDGET deliberately ignores this distinction — see
+    /// `collect::decide`.
+    pub const fn counts_as_cluster_attempt(self) -> bool {
+        match self {
+            RequeueReason::EngineCancelled | RequeueReason::EngineSubmissionFailure => false,
+            RequeueReason::NoInbandResult
+            | RequeueReason::InfraAutoRetry
+            | RequeueReason::FailfastBatchMate
+            | RequeueReason::DependencyFailedNoTrigger
+            | RequeueReason::ActiveStall => true,
+        }
+    }
+}
+
 /// One line of requeues.jsonl: an engine-initiated resubmission, journaled
 /// by the job ledger at the transition site BEFORE the in-memory counter
 /// moves.
@@ -890,9 +999,14 @@ pub struct RequeueRecord {
     /// in this module (writers must use the constants, never literals —
     /// the resume fold derives the stall-retry counters from this field).
     pub source: String,
-    /// The requeue reason (collect's decision reason, e.g.
-    /// "engine-cancelled" / "infra-auto-retry", or the stall kind).
-    /// Diagnostic: the fold counts entries, never parses reasons.
+    /// The requeue reason: a [`RequeueReason`] wire string (writers go
+    /// through [`RequeueReason::as_str`]). The BUDGET fold counts entries
+    /// without parsing reasons (every reason consumes budget); the
+    /// MEASUREMENT projection parses this field through
+    /// [`RequeueReason::counts_as_cluster_attempt`] to derive the
+    /// `attempts`/`flaky` stamped on records — an unrecognized string (a
+    /// journal from a different engine version) counts, preserving the
+    /// historical every-requeue semantics for foreign entries.
     pub why: String,
     pub at: String,
 }

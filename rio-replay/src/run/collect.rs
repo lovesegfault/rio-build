@@ -29,9 +29,11 @@ use super::classify::{
     project_output_divergence,
 };
 use super::grpc::{AdminApi, StoreApi};
+use super::ledger::{measured_attempt_requeues, stamped_attempts};
 use super::model::{
     BATCH_KIND_TIMED, ExpectedOutcome, ExpectedSide, FailureKind, JobRecord, PathOutcome,
-    RioOutcome, RioSide, RootCauseKind, UnifiedClass, Verdict, build_status_from_name, now_rfc3339,
+    RequeueReason, RioOutcome, RioSide, RootCauseKind, UnifiedClass, Verdict,
+    build_status_from_name, now_rfc3339,
 };
 use super::spec::Knobs;
 use super::state::{StateDir, StateFile};
@@ -144,7 +146,10 @@ pub use requeue_budget::RequeueBudget;
 /// the retry budget — there is no raw job-list return to reach for, and
 /// the `Requeue` variant itself demands a [`RequeueBudget`] witness that
 /// only the budget checks (or the named engine-cancelled carve-out) can
-/// mint.
+/// mint. The reason is a typed [`RequeueReason`], not a string: the
+/// journaled reason now carries measurement semantics
+/// (`counts_as_cluster_attempt`), so a new arm cannot invent a reason the
+/// measurement has not classified.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CollectDecision {
     /// Terminal outcome — the results.jsonl record has been written.
@@ -155,18 +160,18 @@ pub enum CollectDecision {
     /// Non-terminal: re-offer to the submit loop (fail-fast batch-mate,
     /// engine-cancelled batch, infra auto-retry, missing in-band result).
     Requeue {
-        why: &'static str,
+        why: RequeueReason,
         budget: RequeueBudget,
     },
 }
 
 impl CollectDecision {
-    /// The requeue reason when this decision is a re-offer, `None` for
-    /// terminals — the assertable view of a decision whose budget witness
-    /// callers cannot construct.
+    /// The requeue reason's wire string when this decision is a re-offer,
+    /// `None` for terminals — the assertable view of a decision whose
+    /// budget witness callers cannot construct.
     pub fn requeue_why(&self) -> Option<&'static str> {
         match self {
-            CollectDecision::Requeue { why, .. } => Some(why),
+            CollectDecision::Requeue { why, .. } => Some(why.as_str()),
             CollectDecision::Terminal { .. } => None,
         }
     }
@@ -351,13 +356,13 @@ pub fn decide(
         // auto-retry, then an infra failure.
         if batch.engine_cancelled {
             return CollectDecision::Requeue {
-                why: "engine-cancelled",
+                why: RequeueReason::EngineCancelled,
                 budget: RequeueBudget::engine_cancelled_carveout(),
             };
         }
         if let Some(budget) = RequeueBudget::auto_retry(prior_requeues, knobs) {
             return CollectDecision::Requeue {
-                why: "no-inband-result",
+                why: RequeueReason::NoInbandResult,
                 budget,
             };
         }
@@ -419,7 +424,7 @@ pub fn decide(
             // charge rio with a trigger nobody identified.
             return match RequeueBudget::unfair_attempt(prior_requeues, knobs) {
                 Some(budget) => CollectDecision::Requeue {
-                    why: "dependency-failed-no-trigger",
+                    why: RequeueReason::DependencyFailedNoTrigger,
                     budget,
                 },
                 None => CollectDecision::Terminal {
@@ -446,7 +451,7 @@ pub fn decide(
             // cycling submit→fail→requeue forever.
             return match RequeueBudget::unfair_attempt(prior_requeues, knobs) {
                 Some(budget) => CollectDecision::Requeue {
-                    why: "failfast-batch-mate",
+                    why: RequeueReason::FailfastBatchMate,
                     budget,
                 },
                 None => CollectDecision::Terminal {
@@ -503,7 +508,7 @@ pub fn decide(
         && let Some(budget) = RequeueBudget::auto_retry(prior_requeues, knobs)
     {
         return CollectDecision::Requeue {
-            why: "infra-auto-retry",
+            why: RequeueReason::InfraAutoRetry,
             budget,
         };
     }
@@ -730,6 +735,11 @@ pub async fn process_settled_batch(
     already_terminal: &HashSet<String>,
 ) -> Result<BTreeMap<String, CollectDecision>> {
     let mut decisions: BTreeMap<String, CollectDecision> = BTreeMap::new();
+    // Records stamp MEASURED attempts: the journal's cluster-attempt fold,
+    // not the budget counter the decisions consult. One journal, two
+    // projections — see `ledger::measured_attempt_requeues`. Loaded once
+    // per settled batch so every record this pass writes shares one view.
+    let prior_attempts = measured_attempt_requeues(state)?;
     // Members of timed batches are never re-offered to the timeless pending
     // pool: the timed dispatcher owns its own retries (confirmation
     // re-submissions), and whatever stays unresolved is covered by the
@@ -792,9 +802,9 @@ pub async fn process_settled_batch(
                     let why = if batch.engine_cancelled {
                         why
                     } else {
-                        "engine-submission-failure"
+                        RequeueReason::EngineSubmissionFailure
                     };
-                    tracing::info!(job, why, "re-queueing");
+                    tracing::info!(job, why = why.as_str(), "re-queueing");
                     decisions.insert(job.clone(), CollectDecision::Requeue { why, budget });
                 }
                 CollectDecision::Terminal { rio, .. } => {
@@ -814,7 +824,7 @@ pub async fn process_settled_batch(
                         &HashMap::new(),
                         mode,
                         campaign_id,
-                        prior + 1,
+                        stamped_attempts(prior_attempts.get(job).copied().unwrap_or(0), true),
                         None,
                         first_active.get(job).cloned(),
                         None,
@@ -941,7 +951,7 @@ pub async fn process_settled_batch(
                             &HashMap::new(),
                             mode,
                             campaign_id,
-                            prior + 1,
+                            stamped_attempts(prior_attempts.get(job).copied().unwrap_or(0), true),
                             None,
                             first_active.get(job).cloned(),
                             None,
@@ -955,10 +965,14 @@ pub async fn process_settled_batch(
                             },
                         );
                     } else {
-                        tracing::info!(job, why, "timed batch member is not re-offered");
+                        tracing::info!(
+                            job,
+                            why = why.as_str(),
+                            "timed batch member is not re-offered"
+                        );
                     }
                 } else {
-                    tracing::info!(job, why, "re-queueing");
+                    tracing::info!(job, why = why.as_str(), "re-queueing");
                     decisions.insert(job.clone(), CollectDecision::Requeue { why, budget });
                 }
             }
@@ -1043,7 +1057,7 @@ pub async fn process_settled_batch(
                     &rio_paths,
                     mode,
                     campaign_id,
-                    prior + 1,
+                    stamped_attempts(prior_attempts.get(job).copied().unwrap_or(0), true),
                     log_key,
                     first_active.get(job).cloned(),
                     captured_tail.as_deref(),
@@ -2251,8 +2265,22 @@ mod tests {
             stderr_tail: Some("engine submission error: ssh handshake: host key mismatch".into()),
             ..BatchView::default()
         };
-        // Knobs::default() grants one auto-retry: "spent" already burned it.
+        // Knobs::default() grants one auto-retry: "spent" already burned it
+        // on a real transport retry. The budget map drives the decision; the
+        // journal is what the record's attempts derive from (production
+        // keeps the two in lockstep via journal-then-increment).
         let prior: HashMap<String, u32> = [("spent.x86_64-linux".to_string(), 1)].into();
+        state
+            .append_jsonl(
+                StateFile::Requeues,
+                &crate::run::model::RequeueRecord {
+                    job: "spent.x86_64-linux".to_string(),
+                    source: crate::run::model::REQUEUE_SOURCE_COLLECT.to_string(),
+                    why: RequeueReason::NoInbandResult.as_str().to_string(),
+                    at: "2026-05-26T00:00:00Z".to_string(),
+                },
+            )
+            .unwrap();
         let decisions = process_settled_batch(
             &state,
             &admin,
@@ -2285,12 +2313,103 @@ mod tests {
             rec.evidence.as_deref(),
             Some("engine submission error: ssh handshake: host key mismatch")
         );
+        // attempts = the journaled cluster-attempt requeue + the final
+        // failed submission this record is about.
         assert_eq!(rec.attempts, 2);
         assert!(rec.build_ids.is_empty());
         // The failure pre-dates any build: nothing to fetch poison evidence
         // or a log tail for.
         assert_eq!(admin.poisoned_calls.load(Ordering::SeqCst), 0);
         assert_eq!(admin.log_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Both directions of the cluster-attempt measurement on success
+    /// records, derived from the journal: a success after an
+    /// engine-cancelled wave is a FIRST-attempt success — the cancellation
+    /// was the engine's own scheduling act, not evidence about the job
+    /// (the carve-out's documented contract) — while a success after a
+    /// real infra retry IS flaky: more than one cluster attempt was needed
+    /// (the `flaky` field's documented meaning, model::JobRecord).
+    #[tokio::test]
+    async fn engine_side_requeues_do_not_mark_successes_flaky() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let contexts: HashMap<String, JobContext> = [
+            (
+                "cut.x86_64-linux".to_string(),
+                ctx("cut.x86_64-linux", T, &[], ExpectedOutcome::Built),
+            ),
+            (
+                "retried.x86_64-linux".to_string(),
+                ctx("retried.x86_64-linux", DEP, &[], ExpectedOutcome::Built),
+            ),
+        ]
+        .into();
+        // History in the journal: "cut" was re-offered by an engine
+        // deadline cut, "retried" by a positively-identified infra failure.
+        for (job, why) in [
+            ("cut.x86_64-linux", RequeueReason::EngineCancelled),
+            ("retried.x86_64-linux", RequeueReason::InfraAutoRetry),
+        ] {
+            state
+                .append_jsonl(
+                    StateFile::Requeues,
+                    &crate::run::model::RequeueRecord {
+                        job: job.to_string(),
+                        source: crate::run::model::REQUEUE_SOURCE_COLLECT.to_string(),
+                        why: why.as_str().to_string(),
+                        at: "2026-05-26T00:00:00Z".to_string(),
+                    },
+                )
+                .unwrap();
+        }
+        // Both succeed on the next wave. The budget map mirrors the journal
+        // (one prior requeue each) — and must NOT leak into the records.
+        let prior: HashMap<String, u32> = [
+            ("cut.x86_64-linux".to_string(), 1),
+            ("retried.x86_64-linux".to_string(), 1),
+        ]
+        .into();
+        let batch = BatchView {
+            kind: BATCH_KIND_SUBMIT.to_string(),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-3f2e3d4c5b6c".into()),
+            results: vec![
+                po(T, BuildStatus::Built, ""),
+                po(DEP, BuildStatus::Built, ""),
+            ],
+            ..BatchView::default()
+        };
+        let decisions = process_settled_batch(
+            &state,
+            &LogAdmin::default(),
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &["cut.x86_64-linux".into(), "retried.x86_64-linux".into()],
+            &batch,
+            &prior,
+            &Knobs::default(),
+            "leaf",
+            "c1",
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert!(requeued(&decisions).is_empty(), "{decisions:?}");
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        let by_job = |job: &str| records.iter().find(|r| r.job == job).unwrap();
+        let cut = by_job("cut.x86_64-linux");
+        assert_eq!(cut.verdict.as_deref(), Some("match-built"));
+        assert_eq!(
+            cut.attempts, 1,
+            "an engine-cancelled re-offer is not a cluster attempt"
+        );
+        assert!(!cut.flaky, "first-real-attempt success is not flaky");
+        let retried = by_job("retried.x86_64-linux");
+        assert_eq!(retried.verdict.as_deref(), Some("match-built"));
+        assert_eq!(retried.attempts, 2, "the infra-failed attempt counts");
+        assert!(retried.flaky, "a needed retry IS flaky");
     }
 
     /// A duplicate batch for a job that already settled terminally (the

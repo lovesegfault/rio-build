@@ -42,9 +42,13 @@
 //! and [`JobLedger::from_journals`] rebuilds the counters as a pure fold of
 //! that stream. The resubmission counts back documented convergence bounds
 //! (the infra auto-retry budget, fail-fast singleton isolation, the stall
-//! auto-retry gate, `attempts` accounting); deriving them from anything
-//! volatile would zero every consumed budget at each pod restart — the
-//! exact spin the budget exists to prevent, reopened at the restart edge.
+//! auto-retry gate); the user-facing `attempts`/`flaky` measurement is a
+//! SEPARATE projection of the same journal ([`measured_attempt_requeues`]),
+//! folding only cluster-attempt reasons — one substrate, two consumers
+//! with explicitly different reason semantics. Deriving any of it from
+//! volatile state would zero every consumed budget at each pod restart —
+//! the exact spin the budget exists to prevent, reopened at the restart
+//! edge.
 //! Journal-then-increment keeps the invariant `in-memory counters ==
 //! fold(requeues.jsonl)` under append failures and batch re-processing
 //! alike; the equivalence test in `super::tests` pins it at every batch
@@ -67,10 +71,52 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use super::model::{REQUEUE_SOURCE_COLLECT, REQUEUE_SOURCE_STALL, RequeueRecord, now_rfc3339};
+use super::model::{
+    REQUEUE_SOURCE_COLLECT, REQUEUE_SOURCE_STALL, RequeueReason, RequeueRecord, now_rfc3339,
+};
 use super::state::{StateDir, StateFile};
 use super::submit::SubmitTracker;
 use super::watchdog::{JobPhase, Watchdog};
+
+/// Per-job CLUSTER-ATTEMPT requeues: the measurement projection of
+/// requeues.jsonl, folding only the entries whose reason
+/// [`RequeueReason::counts_as_cluster_attempt`] admits. This — never the
+/// tracker's resubmission counter — feeds the `attempts`/`flaky` stamped on
+/// results.jsonl records: the budget counter deliberately counts every
+/// reason (engine-cancelled batches and engine-side submission failures
+/// included), which is correct for bounding re-offers but marks
+/// first-real-attempt successes flaky when reused as the measurement.
+///
+/// An entry whose `why` is outside the vocabulary (a journal written by a
+/// different engine version) counts, preserving the historical
+/// every-requeue semantics for foreign entries; a state dir without the
+/// journal folds to empty counts.
+pub fn measured_attempt_requeues(state: &StateDir) -> Result<HashMap<String, u32>> {
+    let entries: Vec<RequeueRecord> = state.load_jsonl(StateFile::Requeues)?;
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for entry in &entries {
+        if RequeueReason::from_wire(&entry.why).is_none_or(RequeueReason::counts_as_cluster_attempt)
+        {
+            *counts.entry(entry.job.clone()).or_default() += 1;
+        }
+    }
+    Ok(counts)
+}
+
+/// The `attempts` value stamped on a results.jsonl record — the ONE
+/// stamping convention for every record writer (collect terminals and the
+/// stall writer alike, so the two cannot diverge on +1 conventions again):
+/// the job's prior cluster-attempt requeues
+/// ([`measured_attempt_requeues`]) plus the current attempt when the job
+/// is, or just was, committed to a batch. Collect terminals always count
+/// the current attempt (the record is about the submission that just
+/// settled — for the submission-failure exhaustion arm, the final failed
+/// submission itself); a stalled-active terminal counts its committed,
+/// stalled attempt; a stalled-queued terminal has no current attempt (the
+/// job sat in the queue since its last requeue).
+pub fn stamped_attempts(prior_cluster_requeues: u32, currently_committed: bool) -> u32 {
+    prior_cluster_requeues + u32::from(currently_committed)
+}
 
 /// Owner of job scheduling-state transitions. See the module docs.
 pub struct JobLedger {
@@ -196,10 +242,11 @@ impl JobLedger {
     /// Collect re-offers a settled batch's member to the pending pool:
     /// journal the requeue, count the engine resubmission, and observe the
     /// job `Queued` (the phase change resets its stall clock). `why` is
-    /// the collect decision's requeue reason, recorded on the journal line
-    /// for archaeology.
-    pub async fn requeue_collected(&self, job: &str, why: &str) -> Result<()> {
-        self.journal_requeue(job, REQUEUE_SOURCE_COLLECT, why)?;
+    /// the collect decision's requeue reason; the journaled string feeds
+    /// the measurement projection ([`measured_attempt_requeues`]) on top
+    /// of its archaeological value.
+    pub async fn requeue_collected(&self, job: &str, why: RequeueReason) -> Result<()> {
+        self.journal_requeue(job, REQUEUE_SOURCE_COLLECT, why.as_str())?;
         *self
             .tracker
             .resubmissions
@@ -219,7 +266,11 @@ impl JobLedger {
     /// `Queued` so its wait for the fresh batch is charged to the queued
     /// clock, not a stale `Active` one.
     pub async fn requeue_stalled(&self, job: &str) -> Result<()> {
-        self.journal_requeue(job, REQUEUE_SOURCE_STALL, "active-stall")?;
+        self.journal_requeue(
+            job,
+            REQUEUE_SOURCE_STALL,
+            RequeueReason::ActiveStall.as_str(),
+        )?;
         self.tracker.in_flight.lock().await.remove(job);
         *self
             .tracker
@@ -345,7 +396,7 @@ mod tests {
             .release_after_settle(&["job.x".to_string()], std::time::Duration::ZERO)
             .await;
         ledger
-            .requeue_collected("job.x", "infra-auto-retry")
+            .requeue_collected("job.x", RequeueReason::InfraAutoRetry)
             .await
             .unwrap();
         assert_eq!(ledger.tracker().resubmission_count("job.x").await, 1);
@@ -386,6 +437,99 @@ mod tests {
         );
     }
 
+    /// The (requeue reason × counter consumer) lattice over the WHOLE
+    /// vocabulary: every reason consumes retry BUDGET (decide()'s
+    /// conservative-budget contract — re-offers can never multiply across
+    /// reasons), while only cluster-attempt reasons enter the MEASUREMENT
+    /// projection, so the flakiness of a one-requeue-then-success history
+    /// follows the documented per-reason table. The expected rows derive
+    /// from the carve-outs' own contracts: an engine-cancelled batch is
+    /// "the engine's own act, not evidence about the job"
+    /// (collect::RequeueBudget::engine_cancelled_carveout) and an
+    /// engine-side submission failure never reached the cluster; every
+    /// other reason describes an attempt that ran — or was denied a fair
+    /// run — on the cluster. A new reason fails the row check until both
+    /// consumers' semantics are decided.
+    #[tokio::test]
+    async fn budget_counts_every_reason_but_measurement_only_cluster_attempts() {
+        let expected: &[(RequeueReason, bool)] = &[
+            (RequeueReason::EngineCancelled, false),
+            (RequeueReason::EngineSubmissionFailure, false),
+            (RequeueReason::NoInbandResult, true),
+            (RequeueReason::InfraAutoRetry, true),
+            (RequeueReason::FailfastBatchMate, true),
+            (RequeueReason::DependencyFailedNoTrigger, true),
+            (RequeueReason::ActiveStall, true),
+        ];
+        assert_eq!(
+            expected.len(),
+            RequeueReason::ALL.len(),
+            "every requeue reason needs a measurement-semantics row"
+        );
+        for reason in RequeueReason::ALL {
+            let counted = expected
+                .iter()
+                .find(|(r, _)| *r == reason)
+                .unwrap_or_else(|| panic!("no measurement row for {reason:?}"))
+                .1;
+            assert_eq!(reason.counts_as_cluster_attempt(), counted, "{reason:?}");
+            // The journal string round-trips, so the projection reads back
+            // exactly what the transitions wrote.
+            assert_eq!(RequeueReason::from_wire(reason.as_str()), Some(reason));
+
+            // One requeue of this reason, journaled through the ledger.
+            let (dir, ledger, _tracker, _watchdog) = ledger();
+            ledger.requeue_collected("job.x", reason).await.unwrap();
+            // Budget consumer: every reason counts.
+            assert_eq!(
+                ledger.tracker().resubmission_count("job.x").await,
+                1,
+                "{reason:?} must consume budget"
+            );
+            // Measurement consumer: only cluster-attempt reasons count, so
+            // a subsequent success is flaky (attempts > 1) exactly per the
+            // table.
+            let state = StateDir::new(dir.path()).unwrap();
+            let measured = measured_attempt_requeues(&state)
+                .unwrap()
+                .get("job.x")
+                .copied()
+                .unwrap_or(0);
+            assert_eq!(measured, u32::from(counted), "{reason:?}");
+            assert_eq!(
+                stamped_attempts(measured, true) > 1,
+                counted,
+                "{reason:?}: a success after this requeue must be flaky iff the reason is a \
+                 cluster attempt"
+            );
+        }
+    }
+
+    /// A journal entry whose reason string is outside the vocabulary (a
+    /// requeues.jsonl written by a different engine version) still parses
+    /// and counts in the measurement: foreign entries keep the historical
+    /// every-requeue-counts semantics instead of silently vanishing from
+    /// the attempts accounting.
+    #[tokio::test]
+    async fn foreign_journal_reasons_parse_and_count_in_the_measurement() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        state
+            .append_jsonl(
+                StateFile::Requeues,
+                &RequeueRecord {
+                    job: "old.x".to_string(),
+                    source: REQUEUE_SOURCE_COLLECT.to_string(),
+                    why: "some-future-reason".to_string(),
+                    at: "2026-01-01T00:00:00Z".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(RequeueReason::from_wire("some-future-reason"), None);
+        let measured = measured_attempt_requeues(&state).unwrap();
+        assert_eq!(measured.get("old.x"), Some(&1));
+    }
+
     /// Resume rehydration is a pure fold of the requeue journal: a fresh
     /// ledger built over the same state dir reproduces the previous
     /// process's resubmission counters and the stall slice that gates the
@@ -397,11 +541,11 @@ mod tests {
     async fn from_journals_rebuilds_counters_and_stall_slice() {
         let (dir, ledger, _tracker, _watchdog) = ledger();
         ledger
-            .requeue_collected("a.x", "infra-auto-retry")
+            .requeue_collected("a.x", RequeueReason::InfraAutoRetry)
             .await
             .unwrap();
         ledger
-            .requeue_collected("a.x", "engine-cancelled")
+            .requeue_collected("a.x", RequeueReason::EngineCancelled)
             .await
             .unwrap();
         ledger.commit_batch(&["b.x".to_string()]).await;
