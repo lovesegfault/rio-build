@@ -58,7 +58,9 @@ use super::state::{StateDir, StateFile};
 use super::submit::submit_one_batch;
 use super::submitter::{BatchDeadline, Submitter};
 use super::supply::exec::PreSubmitSupply;
-use super::supply::{PathSource, resolve_source, walk_closure, workload_set};
+use super::supply::{
+    PathSource, demoted_impure_jobs, protected_workload, resolve_source, walk_closure, workload_set,
+};
 
 /// Disconnect delay assumed when a recorded interruption carries no stop
 /// offset (scaled by the speedup like a recorded one).
@@ -422,14 +424,18 @@ pub struct TimedDryRunPlan {
     /// schedule, so this count is exactly the number of requests a live run
     /// arms.
     pub interruption_candidates: usize,
-    /// Derivations with a recorded expected outcome the target must build
-    /// itself.
+    /// Request-target derivations the target must build itself: the
+    /// archive's required workload (the union of all requests' targets)
+    /// minus impure-demoted units. Truth records do not affect this count
+    /// — an archive without an outcomes member has its full workload.
     pub workload_units: usize,
     /// Derivations demoted out of the workload because the archive lists
     /// impure environment variables for them.
     pub demoted_impure: usize,
-    /// Closure paths that are outputs of workload derivations: built by the
-    /// target, never supplied.
+    /// Closure paths the supply ladder protects as workload outputs —
+    /// declared outputs of the in-scope attemptable units, exactly the set
+    /// the live supply stage withholds (minus exclusions only a live plan
+    /// stage can derive): built by the target, never supplied.
     pub workload_outputs_never_supplied: usize,
     /// Distinct store paths in the union closure of every scheduled target
     /// (derivations, sources, and known outputs).
@@ -456,10 +462,13 @@ pub struct TimedDryRunPlan {
 /// inputs (the units.jsonl job mapping and the workload split), so the
 /// dry-run numbers match what a live timed run would schedule by
 /// construction — both paths read the one schedule [`build_schedule`]
-/// resolves. Source resolution runs with empty target-coverage and relay
-/// sets — without probes the ladder can only answer workload / embedded /
-/// unresolved, which is exactly the offline summary an operator needs
-/// before committing to a live run.
+/// resolves. Source resolution protects the [`protected_workload`] set the
+/// live supply stage computes, with the archive-derivable exclusions
+/// applied (a live plan stage can only subtract further, via
+/// cluster-derived exclusions), and runs with empty target-coverage and
+/// relay sets — without probes the ladder can only answer workload /
+/// embedded / unresolved, which is exactly the offline summary an operator
+/// needs before committing to a live run.
 pub fn plan_timed_dry_run(
     archive: &ReplayArchive,
     knobs: &Knobs,
@@ -480,8 +489,8 @@ pub fn plan_timed_dry_run(
     // through `workload_set`).
     let units = super::archive_input::load_units(archive)?;
     let job_of_drv: BTreeMap<String, String> = units
-        .into_iter()
-        .map(|unit| (unit.drv_path, unit.job))
+        .iter()
+        .map(|unit| (unit.drv_path.clone(), unit.job.clone()))
         .collect();
     let workload = workload_set(archive);
     let schedule = build_schedule(
@@ -517,15 +526,22 @@ pub fn plan_timed_dry_run(
     }
     let closure = walk_closure(archive, &roots)?;
 
-    // Outputs of workload drvs, taken from the closure nodes — a workload
-    // drv outside the closure cannot be requested, so these are sufficient.
-    let workload_outputs: BTreeSet<String> = closure
-        .topo
+    // The supply stage's never-supply protection, derived through the same
+    // helper the live engine calls. Offline, the whole manifest is in
+    // scope and the exclusions are the archive-derivable ones
+    // (identity-divergent and impure-demoted units); the cluster-derived
+    // plan exclusions (cached-prior, not-attemptable, scope filters) need
+    // a live plan stage and are the one axis a live campaign can subtract
+    // further.
+    let in_scope: HashSet<&str> = units.iter().map(|m| m.job.as_str()).collect();
+    let divergent = super::archive_input::identity_divergent_units(archive)?;
+    let demoted_jobs = demoted_impure_jobs(archive, &units, &in_scope);
+    let attempt_excluded: HashSet<&str> = divergent
         .iter()
-        .filter(|node| workload.drvs.contains(&node.drv_path))
-        .flat_map(|node| node.outputs.values().filter(|path| !path.is_empty()))
-        .cloned()
+        .chain(demoted_jobs.iter())
+        .map(String::as_str)
         .collect();
+    let protected = protected_workload(&units, &in_scope, &attempt_excluded);
     let input_srcs: BTreeSet<String> = closure
         .topo
         .iter()
@@ -551,7 +567,7 @@ pub fn plan_timed_dry_run(
         }
         match resolve_source(
             path,
-            &workload_outputs,
+            &protected.outputs,
             &target_coverage,
             &input_srcs,
             |candidate| archive.has_embedded(candidate),

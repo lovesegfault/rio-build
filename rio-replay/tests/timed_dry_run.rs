@@ -48,16 +48,21 @@ fn timed_dry_run_on_fixture_completes_offline() {
 
     // Exact shape of the committed fixture (pinned so a fixture or planner
     // change shows up as a deliberate diff here): four requests over four
-    // derivations, a 9-second recorded window at the default 1.0 speedup,
-    // two workload outputs withheld, one embedded source uploadable, and the
-    // demoted/cache-hit outputs left for a live run's substituter probes.
+    // derivations, a 9-second recorded window at the default 1.0 speedup.
+    // The workload is the request-target set minus the impure demotion —
+    // dep, app, AND cached (a request target with no truth record: a
+    // record-time cache hit is still attempted by a live campaign, with
+    // expected outcome Unknown) — so four workload outputs are withheld
+    // (dep, app, and cached's out+dev), one embedded source is uploadable,
+    // and only the demoted impure unit's output is left for a live run's
+    // substituter probes.
     assert!((plan.due_window_secs - 9.0).abs() < 1e-9, "{plan:?}");
-    assert_eq!(plan.workload_units, 2);
+    assert_eq!(plan.workload_units, 3);
     assert_eq!(plan.union_drvs, 4);
     assert_eq!(plan.union_paths, 10);
-    assert_eq!(plan.workload_outputs_never_supplied, 2);
+    assert_eq!(plan.workload_outputs_never_supplied, 4);
     assert_eq!(plan.embedded_uploadable, 1);
-    assert_eq!(plan.unresolved_offline, 3);
+    assert_eq!(plan.unresolved_offline, 1);
 
     // The plan block is operator-facing JSON: keys are camelCase.
     let json = serde_json::to_value(&plan).unwrap();

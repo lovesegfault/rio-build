@@ -700,28 +700,56 @@ pub(crate) fn write_mini_archive(dir: &std::path::Path) -> MiniArchive {
     }
 }
 
+/// Axes of the synthetic timed archive [`write_mini_timed_archive`]
+/// stages. Named fields instead of positional booleans so call sites read
+/// as the archive shape they request.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MiniTimedSpec {
+    /// appB's recorded outcome is `disconnected` with a stop offset of
+    /// 2.0 s instead of `built` (only meaningful with `with_outcomes`).
+    pub with_interruption: bool,
+    /// `impure-env.json` lists an impure environment variable for appB
+    /// (and the manifest declares the `impure_env` capability): appB is
+    /// demoted out of the workload — combined with `with_interruption`,
+    /// the archive's only recorded interruption is over a unit the
+    /// campaign supplies instead of building.
+    pub impure_demote_app_b: bool,
+    /// Stage the `outcomes.jsonl` truth member at all. The member is
+    /// OPTIONAL in the format (a separate capability from `timed`):
+    /// `false` produces the legal load/exercise archive shape whose units
+    /// replay with expected outcome Unknown.
+    pub with_outcomes: bool,
+}
+
+#[cfg(test)]
+impl Default for MiniTimedSpec {
+    fn default() -> Self {
+        Self {
+            with_interruption: false,
+            impure_demote_app_b: false,
+            with_outcomes: true,
+        }
+    }
+}
+
 /// Write a tiny synthetic directory-form v1 TIMED replay archive into `dir`:
 /// two workload units (`appA.x86_64-linux` requested at offset 0.0 s,
 /// `appB.x86_64-linux` at offset 1.0 s), appB depending on one
 /// dependency-only derivation (libA), expected outcomes `built` for appA
-/// (1.0 s recorded duration) and — when `with_interruption` — `disconnected`
-/// for appB with a recorded stop offset of 2.0 s (`built` like appA
-/// otherwise), `closures.jsonl` adjacency for all three derivations, and
-/// synthetic ATerm members. Capabilities: `timed`, `expected_outcomes`,
-/// `dependency_closures`.
-///
-/// When `impure_demote_app_b` is set, an `impure-env.json` member lists an
-/// impure environment variable for appB (and the manifest declares the
-/// `impure_env` capability): appB then has an expected-outcome record but is
-/// demoted out of the workload — combined with `with_interruption`, the
-/// archive's only recorded interruption is over a unit the campaign supplies
-/// instead of building.
+/// (1.0 s recorded duration) and — when `spec.with_interruption` —
+/// `disconnected` for appB with a recorded stop offset of 2.0 s (`built`
+/// like appA otherwise), `closures.jsonl` adjacency for all three
+/// derivations, and synthetic ATerm members. Capabilities: `timed`,
+/// `dependency_closures`, plus `expected_outcomes` when the truth member is
+/// staged; the remaining axes are documented on [`MiniTimedSpec`].
 #[cfg(test)]
-pub(crate) fn write_mini_timed_archive(
-    dir: &std::path::Path,
-    with_interruption: bool,
-    impure_demote_app_b: bool,
-) -> MiniArchive {
+pub(crate) fn write_mini_timed_archive(dir: &std::path::Path, spec: MiniTimedSpec) -> MiniArchive {
+    let MiniTimedSpec {
+        with_interruption,
+        impure_demote_app_b,
+        with_outcomes,
+    } = spec;
     use crate::archive::schema::{
         Capabilities, ExpectedOutcome, ImpureEnv, OutcomeRecord, RequestRecord, RequestTarget,
         Substituters,
@@ -817,42 +845,46 @@ pub(crate) fn write_mini_timed_archive(
 
     // outcomes.jsonl — session-less recorded truth: appA built in 1.0 s;
     // appB disconnected at recorded offset 2.0 s when an interruption is
-    // requested, otherwise built like appA.
-    let app_b_outcome = if with_interruption {
-        OutcomeRecord {
-            session: None,
-            drv: app_b_drv.clone(),
-            outcome: ExpectedOutcome::Disconnected,
-            detail: None,
-            duration_s: None,
-            stop_offset_s: Some(2.0),
-            outputs: BTreeMap::new(),
-        }
-    } else {
-        OutcomeRecord {
-            session: None,
-            drv: app_b_drv.clone(),
-            outcome: ExpectedOutcome::Built,
-            detail: None,
-            duration_s: Some(1.0),
-            stop_offset_s: None,
-            outputs: BTreeMap::new(),
-        }
-    };
-    writer
-        .write_outcomes(&[
+    // requested, otherwise built like appA. Skipped entirely for the
+    // outcomes-less shape (the member is optional truth, not workload
+    // membership).
+    if with_outcomes {
+        let app_b_outcome = if with_interruption {
             OutcomeRecord {
                 session: None,
-                drv: app_a_drv.clone(),
+                drv: app_b_drv.clone(),
+                outcome: ExpectedOutcome::Disconnected,
+                detail: None,
+                duration_s: None,
+                stop_offset_s: Some(2.0),
+                outputs: BTreeMap::new(),
+            }
+        } else {
+            OutcomeRecord {
+                session: None,
+                drv: app_b_drv.clone(),
                 outcome: ExpectedOutcome::Built,
                 detail: None,
                 duration_s: Some(1.0),
                 stop_offset_s: None,
                 outputs: BTreeMap::new(),
-            },
-            app_b_outcome,
-        ])
-        .unwrap();
+            }
+        };
+        writer
+            .write_outcomes(&[
+                OutcomeRecord {
+                    session: None,
+                    drv: app_a_drv.clone(),
+                    outcome: ExpectedOutcome::Built,
+                    detail: None,
+                    duration_s: Some(1.0),
+                    stop_offset_s: None,
+                    outputs: BTreeMap::new(),
+                },
+                app_b_outcome,
+            ])
+            .unwrap();
+    }
 
     // impure-env.json — when requested, demote appB out of the workload:
     // the recorder observed an impure environment variable for it, so a
@@ -905,7 +937,7 @@ pub(crate) fn write_mini_timed_archive(
             to: stamp,
             capabilities: Capabilities {
                 timed: true,
-                expected_outcomes: true,
+                expected_outcomes: with_outcomes,
                 output_hashes: false,
                 embedded_store_paths: false,
                 impure_env: impure_demote_app_b,
@@ -1160,7 +1192,7 @@ mod tests {
         // completeness penalty applies) — distinct from Some(0), which would
         // be a positive "nothing was excluded" claim.
         let tmp = tempfile::tempdir().unwrap();
-        write_mini_timed_archive(tmp.path(), false, false);
+        write_mini_timed_archive(tmp.path(), MiniTimedSpec::default());
         let archive = ReplayArchive::open(tmp.path()).unwrap();
         assert_eq!(exclusions_recorded(&archive), None);
         assert!(exclusion_counts(&archive).is_empty());

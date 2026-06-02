@@ -6,8 +6,10 @@
 //! consumed. This module owns that boundary for the campaign engine:
 //!
 //! - [`workload_set`]: which derivations the target must build itself
-//!   (everything with a recorded expected outcome, minus impure-demoted
-//!   derivations whose recorded environment cannot be forwarded).
+//!   (every request-target derivation — the archive's REQUIRED workload —
+//!   minus impure-demoted derivations whose recorded environment cannot be
+//!   forwarded), plus [`protected_workload`], the plan-scoped never-supply
+//!   set the live supply stage and the offline dry-run both derive from it.
 //! - [`walk_closure`]: the archive-side closure walk over `inputDrvs` /
 //!   `inputSrcs` for one or more request roots.
 //! - [`resolve_source`]: the supply ladder deciding where each needed path
@@ -27,7 +29,7 @@
 
 pub mod exec;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -44,43 +46,111 @@ use crate::archive::reader::ReplayArchive;
 use crate::archive::schema::{Capability, ClosureRecord};
 use crate::narhash::NarHash;
 
+use super::archive_input::ManifestEntry;
 use super::spec::SupplyDependencies;
 
 /// Derivations whose outputs the target must BUILD (never be given).
 ///
-/// Every derivation with a recorded expected outcome (any outcome), minus
+/// The drv-level workload split: every request-target derivation — the
+/// archive's REQUIRED workload, [`ReplayArchive::workload_units`] — minus
 /// impure-demoted derivations: rio cannot forward the recording client's
 /// `impureEnvVars` values, so replaying those builds would diverge — their
 /// outputs are supplied like any other dependency and the build is skipped.
+///
+/// Outcome records play no part in membership. Truth is OPTIONAL
+/// enrichment (a unit without a record replays with expected outcome
+/// Unknown and stays attemptable), so an archive with a partial truth
+/// member — or none at all — still has its full recorded workload.
 #[derive(Debug, Clone, Default)]
 pub struct WorkloadSet {
     /// Full `.drv` store paths.
     pub drvs: BTreeSet<String>,
-    /// Derivations that have an expected-outcome record but are demoted
-    /// because the archive lists impure environment variables for them.
-    /// Kept separately so the supply stage can record the skip reason for
-    /// each demoted unit.
+    /// Workload units demoted because the archive lists impure environment
+    /// variables for them. Kept separately so the supply stage can record
+    /// the skip reason for each demoted unit.
     pub demoted_impure: BTreeSet<String>,
 }
 
-/// Compute the workload set for an archive: every drv with a recorded
-/// expected outcome, minus drvs listed in the archive's impure-env map
-/// (those land in [`WorkloadSet::demoted_impure`] instead).
+/// Compute the workload set for an archive: every request-target drv
+/// ([`ReplayArchive::workload_units`]), partitioned by the archive's
+/// impure-env map into buildable ([`WorkloadSet::drvs`]) and demoted
+/// ([`WorkloadSet::demoted_impure`]). The two sets partition
+/// `workload_units()` exactly — no other member adds or removes
+/// membership.
 pub fn workload_set(archive: &ReplayArchive) -> WorkloadSet {
     let impure = archive.impure_env();
     let mut drvs = BTreeSet::new();
     let mut demoted_impure = BTreeSet::new();
-    for record in archive.outcome_records() {
-        if impure.contains_key(&record.drv) {
-            demoted_impure.insert(record.drv.clone());
+    for drv in archive.workload_units() {
+        if impure.contains_key(drv) {
+            demoted_impure.insert(drv.clone());
         } else {
-            drvs.insert(record.drv.clone());
+            drvs.insert(drv.clone());
         }
     }
     WorkloadSet {
         drvs,
         demoted_impure,
     }
+}
+
+/// In-scope jobs demoted out of the workload because the archive lists
+/// impure environment variables for their derivations: rio cannot forward
+/// the recording client's `impureEnvVars` values, so rebuilding them would
+/// diverge spuriously. Derived from the same [`workload_set`] split the
+/// offline timed dry-run reports, so the dry-run's demotion prediction and
+/// the live campaign's dispositions cannot disagree over the same archive.
+pub fn demoted_impure_jobs(
+    archive: &ReplayArchive,
+    manifest: &[ManifestEntry],
+    in_scope: &HashSet<&str>,
+) -> Vec<String> {
+    let demoted_drvs = workload_set(archive).demoted_impure;
+    manifest
+        .iter()
+        .filter(|m| in_scope.contains(m.job.as_str()) && demoted_drvs.contains(&m.drv_path))
+        .map(|m| m.job.clone())
+        .collect()
+}
+
+/// The supply stage's never-supply protection set: drv and output paths of
+/// every manifest unit that remains attemptable (in scope, not excluded).
+/// Those outputs are what the campaign measures, so they are never
+/// supplied; everything else in their closures is fair game for the supply
+/// ladder.
+#[derive(Debug, Clone, Default)]
+pub struct ProtectedWorkload {
+    /// Full `.drv` store paths of the attemptable units.
+    pub drvs: BTreeSet<String>,
+    /// Declared output store paths of the attemptable units.
+    pub outputs: BTreeSet<String>,
+}
+
+/// Compute the supply protection set over the planned manifest — THE one
+/// derivation of "never supply what the target must build".
+///
+/// The live supply stage calls it with the plan stage's scope and the full
+/// plan-time disposition map; the offline timed dry-run calls it with the
+/// whole manifest in scope and the exclusions derivable from the archive
+/// alone (identity-divergent and impure-demoted units). Both sides
+/// therefore protect sets computed by the same rule, and can differ only
+/// by the cluster-derived exclusions an offline planner cannot know
+/// (cached-prior, not-attemptable, plan filters) — never by a competing
+/// definition of the workload.
+pub fn protected_workload(
+    manifest: &[ManifestEntry],
+    in_scope: &HashSet<&str>,
+    attempt_excluded: &HashSet<&str>,
+) -> ProtectedWorkload {
+    let mut protected = ProtectedWorkload::default();
+    for entry in manifest
+        .iter()
+        .filter(|m| in_scope.contains(m.job.as_str()) && !attempt_excluded.contains(m.job.as_str()))
+    {
+        protected.drvs.insert(entry.drv_path.clone());
+        protected.outputs.extend(entry.outputs.values().cloned());
+    }
+    protected
 }
 
 /// One derivation in a request closure.
@@ -1054,22 +1124,72 @@ mod tests {
     }
 
     #[test]
-    fn workload_set_excludes_impure_demoted() {
+    fn workload_set_partitions_request_targets() {
         let archive = open_fixture();
         let workload = workload_set(&archive);
         assert!(workload.drvs.contains(DEP_DRV));
         assert!(workload.drvs.contains(APP_DRV));
-        // impure.drv has an expected-outcome record but is demoted via
-        // impure-env.json: its outputs get supplied like dependencies
-        // instead of rebuilt.
+        // cached.drv is a request target with NO truth record (it was a
+        // cache hit at record time, so the recorder never observed a
+        // build). Truth is enrichment, not membership: a live campaign
+        // still attempts the unit (expected outcome Unknown) and protects
+        // its outputs, so the workload must contain it.
+        assert!(workload.drvs.contains(CACHED_DRV));
+        // impure.drv is demoted via impure-env.json: its outputs get
+        // supplied like dependencies instead of rebuilt. The demotion is
+        // reported so the supply stage can record per-unit skip reasons.
         assert!(!workload.drvs.contains(IMPURE_DRV));
-        // cached.drv was a cache hit at record time — no expected outcome.
-        assert!(!workload.drvs.contains(CACHED_DRV));
-        assert_eq!(workload.drvs.len(), 2);
-        // The demotion is reported so the supply stage can record per-unit
-        // skip reasons.
         let demoted: Vec<&str> = workload.demoted_impure.iter().map(String::as_str).collect();
         assert_eq!(demoted, vec![IMPURE_DRV]);
+        // Membership derives from the REQUIRED member alone: drvs and
+        // demoted_impure partition workload_units() exactly — nothing
+        // dropped, nothing added from optional members, nothing
+        // double-classified.
+        let union: BTreeSet<String> = workload
+            .drvs
+            .union(&workload.demoted_impure)
+            .cloned()
+            .collect();
+        assert_eq!(&union, archive.workload_units());
+        assert!(workload.drvs.is_disjoint(&workload.demoted_impure));
+    }
+
+    #[test]
+    fn protected_workload_applies_scope_and_exclusions() {
+        let archive = open_fixture();
+        let manifest = crate::run::archive_input::load_units(&archive).unwrap();
+        let all: HashSet<&str> = manifest.iter().map(|m| m.job.as_str()).collect();
+        let none: HashSet<&str> = HashSet::new();
+
+        // Unscoped, nothing excluded: every manifest unit's drv and
+        // declared outputs are protected (cached.drv contributes both its
+        // out and dev outputs).
+        let full = protected_workload(&manifest, &all, &none);
+        assert!(full.drvs.contains(DEP_DRV) && full.drvs.contains(CACHED_DRV));
+        assert!(full.outputs.contains(DEP_OUT) && full.outputs.contains(APP_OUT));
+
+        // Scope filtering: only in-scope units are protected. The job key
+        // comes from the manifest itself (v0 archives have no units.jsonl,
+        // so jobs are recovered drv basenames).
+        let dep_job = manifest
+            .iter()
+            .find(|m| m.drv_path == DEP_DRV)
+            .unwrap()
+            .job
+            .as_str();
+        let dep_only: HashSet<&str> = [dep_job].into_iter().collect();
+        let scoped = protected_workload(&manifest, &dep_only, &none);
+        assert_eq!(
+            scoped.drvs.iter().collect::<Vec<_>>(),
+            vec![DEP_DRV],
+            "scope admits exactly the dep unit"
+        );
+        assert_eq!(scoped.outputs.iter().collect::<Vec<_>>(), vec![DEP_OUT]);
+
+        // An excluded job loses protection even when in scope: its outputs
+        // become suppliable and the target is not asked to build it.
+        let excluded = protected_workload(&manifest, &dep_only, &dep_only);
+        assert!(excluded.drvs.is_empty() && excluded.outputs.is_empty());
     }
 
     #[test]

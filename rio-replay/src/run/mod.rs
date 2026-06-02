@@ -695,26 +695,6 @@ pub async fn ensure_archive(
     Ok((local, Arc::new(archive)))
 }
 
-/// In-scope jobs demoted out of the workload because the archive lists
-/// impure environment variables for their derivations: rio cannot forward
-/// the recording client's `impureEnvVars` values, so rebuilding them would
-/// diverge spuriously. Derived from the same [`supply::workload_set`]
-/// policy the offline timed dry-run reports, so the dry-run's demotion
-/// prediction and the live campaign's dispositions cannot disagree over
-/// the same archive.
-fn demoted_impure_jobs(
-    archive: &ReplayArchive,
-    manifest: &[archive_input::ManifestEntry],
-    in_scope: &HashSet<&str>,
-) -> Vec<String> {
-    let demoted_drvs = supply::workload_set(archive).demoted_impure;
-    manifest
-        .iter()
-        .filter(|m| in_scope.contains(m.job.as_str()) && demoted_drvs.contains(&m.drv_path))
-        .map(|m| m.job.clone())
-        .collect()
-}
-
 /// Fixed-output derivations (outputHash present in the drv ATerm) among
 /// the in-scope targets and their dependency closures, parsed once from
 /// the archive's embedded drv texts at the campaign boundary. Collect's
@@ -1509,7 +1489,7 @@ pub async fn run_with_backends(
     // submission below, their outputs supplied like dependency outputs (the
     // workload-output never-supply rule no longer covers them), and retired
     // under the demoted-impure disposition.
-    let demoted_in_scope = demoted_impure_jobs(&archive, &manifest, &in_scope);
+    let demoted_in_scope = supply::demoted_impure_jobs(&archive, &manifest, &in_scope);
     // The single plan-time disposition map: one disposition per excluded
     // job, precedence settled by the classifier; records, the supply-stage
     // exclusion, and the submit pool below all read THIS map.
@@ -1557,17 +1537,12 @@ pub async fn run_with_backends(
         // Outputs (and drvs) of the units that remain attemptable: those
         // outputs are what the campaign measures, so they are never
         // supplied; everything else in their closures is fair game for the
-        // supply ladder.
+        // supply ladder. Shared with the offline dry-run, which calls the
+        // same helper with the archive-derivable subset of these
+        // exclusions.
         let attempt_excluded: HashSet<&str> =
             plan_dispositions.keys().map(String::as_str).collect();
-        let mut workload_drvs = BTreeSet::new();
-        let mut workload_outputs = BTreeSet::new();
-        for m in manifest.iter().filter(|m| {
-            in_scope.contains(m.job.as_str()) && !attempt_excluded.contains(m.job.as_str())
-        }) {
-            workload_drvs.insert(m.drv_path.clone());
-            workload_outputs.extend(m.outputs.values().cloned());
-        }
+        let protected = supply::protected_workload(&manifest, &in_scope, &attempt_excluded);
         // The prefetch arm only exists under the substituters policy; the
         // other policies deliver dependencies by client upload (or withhold
         // them entirely).
@@ -1618,8 +1593,8 @@ pub async fn run_with_backends(
             None => build_supply_transport(&spec)?,
         };
         let inputs = SupplyInputs {
-            workload_outputs,
-            workload_drvs,
+            workload_outputs: protected.outputs,
+            workload_drvs: protected.drvs,
             prefetch_paths,
             prior_valid: plan_output.cached_prior_paths.iter().cloned().collect(),
             target_coverage,
@@ -2562,7 +2537,7 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::run::archive_input::{
-        load_closures, load_units, write_mini_archive, write_mini_timed_archive,
+        MiniTimedSpec, load_closures, load_units, write_mini_archive, write_mini_timed_archive,
     };
     use crate::run::grpc::test_support::FakeStoreApi;
     use crate::run::grpc::{ClusterCounts, GraphSnapshot, IceSnapshot, PoisonedView};
@@ -3965,6 +3940,11 @@ mod tests {
     /// side (the unit is supplied, never built, so its recorded disconnect
     /// is not replayed), while the same archive without the demotion arms
     /// it on both sides.
+    ///
+    /// Outcomes-less-archive axis: the workload derives from the REQUIRED
+    /// member (request targets), so an archive without the optional truth
+    /// member keeps its full workload, demotions, and never-supply
+    /// protection on both sides.
     #[test]
     fn dry_run_and_live_planner_agree_on_the_same_archive() {
         use timeline::plan_timed_dry_run;
@@ -4010,7 +3990,7 @@ mod tests {
                 .iter()
                 .map(|m| (m.job.as_str(), m.drv_path.as_str()))
                 .collect();
-            demoted_impure_jobs(&archive, &manifest, &in_scope)
+            supply::demoted_impure_jobs(&archive, &manifest, &in_scope)
                 .iter()
                 .map(|job| by_job[job.as_str()].to_string())
                 .collect()
@@ -4033,7 +4013,14 @@ mod tests {
         // Interrupted appB, impure-demoted: the recorded interruption is
         // over a supplied unit.
         let dir = tempfile::tempdir().unwrap();
-        write_mini_timed_archive(dir.path(), true, true);
+        write_mini_timed_archive(
+            dir.path(),
+            MiniTimedSpec {
+                with_interruption: true,
+                impure_demote_app_b: true,
+                ..MiniTimedSpec::default()
+            },
+        );
         let archive = ReplayArchive::open(dir.path()).unwrap();
         // Non-vacuity: the archive really records an interruption for the
         // demoted unit — the zero below proves filtering, not absence.
@@ -4083,7 +4070,13 @@ mod tests {
 
         // Same archive without the demotion: armed on both sides.
         let dir = tempfile::tempdir().unwrap();
-        write_mini_timed_archive(dir.path(), true, false);
+        write_mini_timed_archive(
+            dir.path(),
+            MiniTimedSpec {
+                with_interruption: true,
+                ..MiniTimedSpec::default()
+            },
+        );
         let archive = ReplayArchive::open(dir.path()).unwrap();
         let plan = plan_timed_dry_run(&archive, &Knobs::default(), None).unwrap();
         let schedule = live_schedule(&archive);
@@ -4101,6 +4094,50 @@ mod tests {
                 .all(|target| target.job.is_some()),
             "every fixture target has a unit mapping"
         );
+
+        // ── Outcomes-less-archive axis ──────────────────────────────────
+        // The truth member is OPTIONAL and a separate capability from
+        // `timed`: an archive without it is a legal load/exercise
+        // recording whose units replay with expected outcome Unknown —
+        // still attempted, outputs still protected. The workload must
+        // therefore derive from the REQUIRED member (request targets) on
+        // both sides; keying it on truth records would zero the dry-run's
+        // workload (and report every measured output as suppliable) while
+        // the live campaign attempts every target.
+        let dir = tempfile::tempdir().unwrap();
+        write_mini_timed_archive(
+            dir.path(),
+            MiniTimedSpec {
+                impure_demote_app_b: true,
+                with_outcomes: false,
+                ..MiniTimedSpec::default()
+            },
+        );
+        let archive = ReplayArchive::open(dir.path()).unwrap();
+        assert_eq!(
+            archive.outcome_records().count(),
+            0,
+            "this axis needs a fixture with no truth member"
+        );
+        let plan = plan_timed_dry_run(&archive, &Knobs::default(), None).unwrap();
+        let schedule = live_schedule(&archive);
+        assert_eq!(plan.schedule_len, schedule.len());
+        assert_eq!(plan.schedule_len, 2, "both request targets are scheduled");
+        // The workload split is full-strength without truth: appA
+        // buildable, appB impure-demoted (demotion must not require an
+        // outcome record either — the impure-env map alone demotes).
+        assert_eq!((plan.workload_units, plan.demoted_impure), (1, 1));
+        // The live planner derives the same demotion, job for job.
+        let manifest = load_units(&archive).unwrap();
+        let in_scope: HashSet<&str> = manifest.iter().map(|m| m.job.as_str()).collect();
+        assert_eq!(
+            supply::demoted_impure_jobs(&archive, &manifest, &in_scope),
+            vec!["appB.x86_64-linux".to_string()]
+        );
+        // Supply protection: appA's output is withheld from the supply
+        // ladder even though no truth record exists for it — the very
+        // output the campaign measures.
+        assert_eq!(plan.workload_outputs_never_supplied, 1);
     }
 
     /// A missing narinfo probe (no probeable public-HTTPS substituter in
@@ -4150,7 +4187,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn replay_interruptions_forced_off_without_interruption_records() {
         let archive_dir = tempfile::tempdir().unwrap();
-        let built = write_mini_timed_archive(archive_dir.path(), false, false);
+        let built = write_mini_timed_archive(archive_dir.path(), MiniTimedSpec::default());
         let archive = Arc::new(ReplayArchive::open(archive_dir.path()).unwrap());
         let manifest = load_units(&archive).unwrap();
         let app_a = manifest
@@ -4245,7 +4282,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn mini_timed_campaign_end_to_end() {
         let archive_dir = tempfile::tempdir().unwrap();
-        let built = write_mini_timed_archive(archive_dir.path(), true, false);
+        let built = write_mini_timed_archive(
+            archive_dir.path(),
+            MiniTimedSpec {
+                with_interruption: true,
+                ..MiniTimedSpec::default()
+            },
+        );
         let archive = Arc::new(ReplayArchive::open(archive_dir.path()).unwrap());
         let manifest = load_units(&archive).unwrap();
         let app_a = manifest
@@ -4784,7 +4827,7 @@ mod tests {
         let archive = ReplayArchive::open(tmp.path()).unwrap();
         let manifest = load_units(&archive).unwrap();
         let in_scope: HashSet<&str> = manifest.iter().map(|m| m.job.as_str()).collect();
-        let demoted = demoted_impure_jobs(&archive, &manifest, &in_scope);
+        let demoted = supply::demoted_impure_jobs(&archive, &manifest, &in_scope);
         assert!(!demoted.is_empty(), "the fixture has an impure-env unit");
         let plan = PlanOutput {
             in_scope: manifest.iter().map(|m| m.job.clone()).collect(),
