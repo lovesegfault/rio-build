@@ -212,6 +212,12 @@ impl std::fmt::Display for GatewayEndpoint {
 
 /// Split `host[:port]` (or `[v6addr][:port]`) into host and port, defaulting
 /// the port to [`DEFAULT_SSH_PORT`].
+///
+/// IPv6 literals MUST be bracketed (RFC 3986 §3.2.2): a bare one is
+/// ambiguous with the `host:port` separator, and splitting on the last
+/// colon would silently dial a host the operator never wrote (`::1`
+/// would become host `":"` port `1`). Any colon left in the host after
+/// the split is therefore a parse-time refusal naming the bracket form.
 fn split_host_port(host_port: &str) -> Result<(String, u16)> {
     if let Some(rest) = host_port.strip_prefix('[') {
         let (host, after) = rest
@@ -229,6 +235,11 @@ fn split_host_port(host_port: &str) -> Result<(String, u16)> {
     }
     match host_port.rsplit_once(':') {
         Some((host, port)) => {
+            ensure!(
+                !host.contains(':'),
+                "IPv6 hosts must be bracketed: write [{host}:{port}] (with the port outside the \
+                 brackets if one is intended), not {host_port:?}"
+            );
             let port = port
                 .parse::<u16>()
                 .with_context(|| format!("invalid port {port:?} in {host_port:?}"))?;
@@ -1259,6 +1270,36 @@ mod tests {
 
         // An invalid port is an error rather than a silent default.
         assert!(GatewayEndpoint::parse("ssh-ng://gw:notaport?ssh-key=/k").is_err());
+    }
+
+    #[test]
+    fn unbracketed_ipv6_hosts_are_refused_naming_the_bracket_form() {
+        // RFC 3986 §3.2.2: an IPv6 literal in an authority MUST be
+        // bracketed, because a bare one is ambiguous with the host:port
+        // separator. The operator-written gateway_store_url is exactly
+        // where a bare `::1` is natural (dev/repro specs against a
+        // port-forwarded gateway), and rsplit-on-colon would silently
+        // misparse it (`::1` -> host \":\" port 1; `2001:db8::5` -> host
+        // \"2001:db8:\" port 5) into a dial against a host the operator
+        // never wrote. Refuse at parse time, naming the bracketed form.
+        for url in [
+            "ssh-ng://rio@::1?ssh-key=/k",
+            "ssh-ng://2001:db8::5?ssh-key=/k",
+            "ssh-ng://rio@fe80::1:2222?ssh-key=/k",
+        ] {
+            let err = GatewayEndpoint::parse(url).unwrap_err();
+            assert!(format!("{err:#}").contains("bracket"), "{url}: {err:#}");
+        }
+        // The bracketed spellings of the same hosts stay accepted (the
+        // positive direction lives in
+        // `gateway_endpoint_parse_extracts_host_port_user_and_key` for
+        // `[::1]:2222`; pin the no-port and full-address forms too).
+        let v6 = GatewayEndpoint::parse("ssh-ng://[2001:db8::5]?ssh-key=/k").unwrap();
+        assert_eq!(v6.host, "2001:db8::5");
+        assert_eq!(v6.port, 22);
+        let v6 = GatewayEndpoint::parse("ssh-ng://rio@[fe80::1]:2222?ssh-key=/k").unwrap();
+        assert_eq!(v6.host, "fe80::1");
+        assert_eq!(v6.port, 2222);
     }
 
     #[test]
