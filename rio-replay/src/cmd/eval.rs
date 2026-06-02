@@ -7,9 +7,12 @@
 //! fidelity gate → closure adjacency + drv members → truth sweep
 //! (cache.nixos.org narinfo presence + Hydra buildstatus) → archive
 //! staging + mkdwarfs pack → S3 upload. The by-recipe idempotency gate
-//! runs up front, the moment the recipe digest is computed: an
-//! already-recorded recipe exits in seconds instead of re-spending hours
-//! of evaluation only to skip the upload at the end.
+//! runs the moment the recipe digest is computed — necessarily after
+//! the Hydra fetches and source prep, whose outputs the digest hashes.
+//! A re-run of an already-recorded recipe therefore still spends those
+//! two phases (the politeness-budgeted Hydra requests and minutes of
+//! source prep); what the gate skips is the hours-long remainder:
+//! evaluation, closure pass, truth sweep, pack, and upload.
 //! `--dry-run` stops after the fidelity gate: no closure pass, no truth
 //! sweep, no archive, no upload (fidelity.json and a dry-run-marked
 //! provenance.json are still written locally, so the run is auditable).
@@ -748,14 +751,21 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
     let recipe_digest = set_key.digest();
     let short_digest = set_key.short_digest();
 
-    // By-recipe idempotency, evaluated the moment the recipe digest exists:
-    // a recipe that already produced a published archive exits here, in
-    // seconds — before the evaluator, the closure pass, the truth sweep,
-    // and the pack spend hours (and a duplicate Hydra request budget) only
-    // to skip the upload at the very end. --force salts the recipe key, so
-    // a forced re-record reads a different pointer and never trips this
-    // skip; --dry-run never uploads, so the gate does not apply (a dry run
-    // of an already-recorded recipe is still a useful fidelity check).
+    // By-recipe idempotency, evaluated the moment the recipe digest exists.
+    // The digest hashes Phase-1/2 products (project/jobset, an evaluator
+    // argv and selection that embed source_store_path), so the gate
+    // structurally cannot run earlier than this: a re-run of an
+    // already-recorded recipe has already re-spent Phase 1's
+    // politeness-budgeted Hydra requests and Phase 2's multi-minute
+    // source prep by the time it exits here. What the skip saves is
+    // everything downstream — the hours the evaluator, the closure pass,
+    // the truth sweep, and the pack/upload would spend. It saves no Hydra
+    // budget: no request is issued after this point (the truth sweep's
+    // buildstatus half reuses the builds Phase 1 already fetched).
+    // --force salts the recipe key, so a forced re-record reads a
+    // different pointer and never trips this skip; --dry-run never
+    // uploads, so the gate does not apply (a dry run of an
+    // already-recorded recipe is still a useful fidelity check).
     if !args.dry_run
         && !args.force
         && let Some(bucket) = &args.s3_bucket
