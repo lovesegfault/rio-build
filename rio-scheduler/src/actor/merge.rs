@@ -232,198 +232,370 @@ impl InputFormSeed {
     }
 }
 
-/// Outcome of [`DagActor::check_store_evidence`].
+/// Why the store stayed SILENT on a verification: nothing here is
+/// evidence in either direction, and every reason is TRANSIENT — the
+/// store may answer differently later (object uploaded, transport
+/// recovers, the genuine text-CA object replacing a hostile or corrupt
+/// answer that failed the self-consistency checks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SilenceReason {
+    /// Fetch failed or the path is absent from the store.
+    Fetch,
+    /// Bytes are not UTF-8 and not provably the path's text-CA object.
+    NotUtf8,
+    /// Bytes do not parse as a derivation and are not provably the
+    /// path's text-CA object.
+    Parse,
+    /// Bytes parse but do not re-serialize canonically — the store
+    /// holds SOME derivation there, but it cannot vouch identity.
+    NonCanonical,
+    /// A reference path inside the derivation does not parse.
+    RefPath,
+    /// Digest construction failed (defensive; unreachable for SHA-256).
+    Digest,
+    /// The bytes do not re-derive the declared path as their text
+    /// content-address — transport-grade noise, not the store's object.
+    TextCa,
+}
+
+impl SilenceReason {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::NotUtf8 => "not-utf8",
+            Self::Parse => "parse",
+            Self::NonCanonical => "non-canonical",
+            Self::RefPath => "ref-path",
+            Self::Digest => "digest",
+            Self::TextCa => "text-ca",
+        }
+    }
+}
+
+/// Why a verification is STRUCTURALLY impossible for this submission
+/// shape: PERMANENT for retries of the same submission against the
+/// same resident state — re-running deterministically reproduces it.
+/// (A DEEPER submission that uploads or submits the missing input
+/// changes the operands; a retry of this one does not.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum StructuralReason {
+    /// A direct input derivation is covered by neither the submission
+    /// seeds nor the resident DAG (carries the input's drv path).
+    UnseedableInput(String),
+    /// The node's own declared `drv_path` does not parse as a store
+    /// path.
+    UnparseableDrvPath,
+}
+
+impl StructuralReason {
+    pub(super) fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnseedableInput(_) => "inputs",
+            Self::UnparseableDrvPath => "drv-path",
+        }
+    }
+}
+
+/// Outcome of [`DagActor::check_store_evidence`]. Permanence is typed
+/// at the classification site (fix-discipline R1): consumers derive
+/// their consequence from the variant's documented permanence instead
+/// of guessing from a string reason — routing a PERMANENT arm into
+/// backoff (the merged_bug_019 livelock) now requires writing it
+/// against the variant's own rustdoc.
 pub(super) enum StoreEvidenceOutcome {
     /// The store's text-CA-bound bytes derive exactly the submission's
-    /// claimed identity — the claim is genuine. Carries the verified
-    /// bytes so callers (the dispatch claims derivation) can forward
-    /// them without a second fetch.
+    /// claimed identity — the claim is genuine. TERMINAL-POSITIVE.
+    /// Carries the verified bytes so callers (the dispatch claims
+    /// derivation) can forward them without a second fetch.
     Verified(Vec<u8>),
     /// The bytes are sound (text-CA-bound to the declared path) but the
-    /// derivation they parse as CONTRADICTS the claim — fail hard, a
+    /// derivation they parse as CONTRADICTS the claim — PERMANENT, a
     /// retry of the same claim can never succeed.
     Contradicts(String),
-    /// The store could not vouch either way (unreachable, path absent,
-    /// non-canonical bytes, unresolvable inputs). Fail closed: no
-    /// upgrade, the existing rejection stands. Store silence is not
-    /// evidence.
-    Unverifiable(&'static str),
+    /// The store could not vouch either way. TRANSIENT: retry when the
+    /// store recovers. Store silence is never evidence.
+    StoreSilence(SilenceReason),
+    /// Verification is impossible for this submission shape against
+    /// the current resident state. PERMANENT for retries of the same
+    /// submission: backoff cannot resolve it; consumers must surface
+    /// it (visible poison with remediation at dispatch, refusal with
+    /// remediation at merge).
+    StructurallyUnverifiable(StructuralReason),
+    /// The bytes ARE the store's text-CA object for the declared path
+    /// and the claimed identity verifies EXCEPT that the declared
+    /// modular hash cannot be recomputed (a floating store-backed
+    /// input is missing from the seeds — the ingress strip shape,
+    /// `ingress-inline-drv-binding+1`). Carries the verified bytes.
+    /// PERMANENT-as-claimed, RESOLVABLE-by-strip: the declared hash
+    /// can never be verified, but the submission minus that claim is
+    /// fully verified — an unverifiable claim is NO claim, so the
+    /// dispatch consumer strips it and proceeds; treating this as
+    /// silence livelocks (merged_bug_019).
+    // First production reader of the payload is the strip commit
+    // (C2c2) in this same stream; this commit is consequence-neutral.
+    VerifiedExceptDeclaredHash(#[allow(dead_code)] Vec<u8>),
     /// The bytes are PROVABLY the store's text-CA object for the
     /// declared path (zero-reference text-CA re-derivation matched) and
-    /// they do not parse as a derivation. Content-bound and permanent:
-    /// refetching reproduces the same garbage. Only the dispatch-time
-    /// caller distinguishes this (poison vs backoff); the merge-time
-    /// caller folds it into Unverifiable.
+    /// they do not parse as a derivation. Content-bound and PERMANENT:
+    /// refetching reproduces the same garbage.
     UnparseableVerified,
+}
+
+/// Classify fetched store bytes against a submission node's claimed
+/// identity. Pure (no I/O): the actor's [`DagActor::check_store_evidence`]
+/// supplies the fetched bytes and a resident-DAG input lookup; tests
+/// drive the full outcome matrix directly.
+///
+/// The verification never trusts store transport: the bytes must
+/// re-derive the declared path as their text content-address before
+/// anything is believed, and only then is the parsed derivation
+/// compared against the claimed identity by the SAME validator
+/// SubmitBuild ingress applies to inline content
+/// (`validate_inline_drv_content` — reusing it is what keeps the
+/// merge-time and ingress-time identity rules from drifting).
+///
+/// Outcome classification is deterministic, not message-matched:
+/// availability problems pre-check into [`StoreEvidenceOutcome::StoreSilence`],
+/// shape problems into [`StoreEvidenceOutcome::StructurallyUnverifiable`];
+/// once those pass, any validator failure IS an identity contradiction.
+pub(super) fn classify_store_evidence(
+    node: &crate::domain::DerivationNode,
+    bytes: Vec<u8>,
+    submission_seed: &InputFormSeed,
+    resident_input_form: &dyn Fn(&str) -> Option<[u8; 32]>,
+) -> StoreEvidenceOutcome {
+    use rio_nix::derivation::Derivation;
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+
+    let zero_ref_text_ca_matches = |bytes: &[u8]| -> bool {
+        let Ok(sp) = StorePath::parse(&node.drv_path) else {
+            return false;
+        };
+        let Ok(h) = NixHash::new(HashAlgo::SHA256, Sha256::digest(bytes).to_vec()) else {
+            return false;
+        };
+        matches!(StorePath::make_text(sp.name(), &h, &[]), Ok(p) if p.as_str() == node.drv_path)
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        // Binary garbage can still be the genuine (reference-free)
+        // text-CA object at this path — then it is PERMANENTLY not
+        // a derivation, not a transport blip.
+        if zero_ref_text_ca_matches(&bytes) {
+            return StoreEvidenceOutcome::UnparseableVerified;
+        }
+        return StoreEvidenceOutcome::StoreSilence(SilenceReason::NotUtf8);
+    };
+    let Ok(drv) = Derivation::parse(text) else {
+        if zero_ref_text_ca_matches(&bytes) {
+            return StoreEvidenceOutcome::UnparseableVerified;
+        }
+        return StoreEvidenceOutcome::StoreSilence(SilenceReason::Parse);
+    };
+    // Canonicality: the validator requires bytes == to_aterm(parse).
+    // A store object that parses but re-serializes differently
+    // cannot vouch identity (and is not a contradiction — the store
+    // holds SOME derivation there, just not canonically encoded).
+    if drv.to_aterm().as_bytes() != bytes.as_slice() {
+        return StoreEvidenceOutcome::StoreSilence(SilenceReason::NonCanonical);
+    }
+    // Text-CA self-consistency of the store object, verified HERE
+    // before any identity comparison: make_text(name, sha256(bytes),
+    // refs) must reproduce the declared path. The store enforces
+    // this at .drv ingestion (store.put.drv-text-ca); re-deriving it
+    // means a confused or hostile store answer cannot smuggle
+    // unrelated bytes into the comparison.
+    let Ok(drv_sp) = StorePath::parse(&node.drv_path) else {
+        return StoreEvidenceOutcome::StructurallyUnverifiable(
+            StructuralReason::UnparseableDrvPath,
+        );
+    };
+    let mut refs: Vec<StorePath> = Vec::new();
+    for r in drv.input_srcs().iter().chain(drv.input_drvs().keys()) {
+        match StorePath::parse(r) {
+            Ok(p) => refs.push(p),
+            Err(_) => return StoreEvidenceOutcome::StoreSilence(SilenceReason::RefPath),
+        }
+    }
+    let content_hash =
+        match NixHash::new(HashAlgo::SHA256, Sha256::digest(bytes.as_slice()).to_vec()) {
+            Ok(h) => h,
+            Err(_) => return StoreEvidenceOutcome::StoreSilence(SilenceReason::Digest),
+        };
+    match StorePath::make_text(drv_sp.name(), &content_hash, &refs) {
+        Ok(p) if p.as_str() == node.drv_path => {}
+        _ => return StoreEvidenceOutcome::StoreSilence(SilenceReason::TextCa),
+    }
+    // Declared-IA derivability pre-check: the validator derives
+    // input-addressed output paths with a sibling-seeded hash
+    // cache. Seed every direct input from the submission's declared
+    // hashes or the resident DAG; an input neither covers makes the
+    // verification STRUCTURALLY impossible for this submission (a
+    // deeper upload/submission is needed), never a contradiction.
+    let needs_ia = drv
+        .outputs()
+        .iter()
+        .any(|o| matches!(o.kind(), rio_nix::derivation::OutputKind::InputAddressed(_)));
+    let mut input_seed: Vec<rio_proto::types::DerivationNode> = Vec::new();
+    if needs_ia {
+        for input in drv.input_drvs().keys() {
+            let hash = submission_seed
+                .get(input.as_str())
+                .or_else(|| resident_input_form(input.as_str()));
+            match hash {
+                Some(h) => input_seed.push(rio_proto::types::DerivationNode {
+                    drv_path: input.clone(),
+                    ca_modular_hash: h.to_vec(),
+                    ..Default::default()
+                }),
+                None => {
+                    return StoreEvidenceOutcome::StructurallyUnverifiable(
+                        StructuralReason::UnseedableInput(input.clone()),
+                    );
+                }
+            }
+        }
+    }
+
+    // Identity comparison: the submission's claims, with the
+    // store's bytes attached, through the ingress inline validator.
+    // Every remaining failure mode is a contradiction between the
+    // claimed identity and what the verified bytes derive.
+    let mut synth = rio_proto::types::DerivationNode {
+        drv_hash: node.drv_hash.clone(),
+        drv_path: node.drv_path.clone(),
+        system: node.system.clone(),
+        output_names: node.output_names.clone(),
+        expected_output_paths: node.expected_output_paths.clone(),
+        is_fixed_output: node.is_fixed_output,
+        is_content_addressed: node.is_content_addressed,
+        ca_modular_hash: node.ca_modular_hash.map(|h| h.to_vec()).unwrap_or_default(),
+        drv_content: bytes,
+        drv_content_authoritative: false,
+        ..Default::default()
+    };
+    // The validator treats a node's own declared hash as
+    // self-certification and removes it; siblings carry the seeds.
+    let claimed_modular_hash = !synth.ca_modular_hash.is_empty();
+    let mut slice = vec![std::mem::take(&mut synth)];
+    slice.extend(input_seed);
+    match crate::grpc::validate_inline_drv_content(&mut slice) {
+        // Ingress strip semantics (ingress-inline-drv-binding+1):
+        // when a declared modular hash cannot be RECOMPUTED (a
+        // floating store-backed input is missing from the seeds)
+        // the validator strips the declaration and accepts. The
+        // submission MINUS the declared-hash claim is fully verified
+        // against the store's text-CA bytes; the declared hash itself
+        // can never be. The variant carries both facts — consumers
+        // decide (dispatch strips-and-proceeds; merge treats the
+        // declared hash as unprovable).
+        Ok(()) if claimed_modular_hash && slice[0].ca_modular_hash.is_empty() => {
+            StoreEvidenceOutcome::VerifiedExceptDeclaredHash(std::mem::take(
+                &mut slice[0].drv_content,
+            ))
+        }
+        Ok(()) => {
+            // `synth.drv_content` was moved into the slice; the
+            // verified bytes are returned from there.
+            StoreEvidenceOutcome::Verified(std::mem::take(&mut slice[0].drv_content))
+        }
+        Err(status) => StoreEvidenceOutcome::Contradicts(status.message().to_string()),
+    }
+}
+
+/// Shared consequence of a settled-conflict store-evidence verdict —
+/// the SINGLE arbiter for merge Steps 0.5 (settled rows) and 0.6
+/// (resident settled squats), so the two steps cannot drift on what a
+/// verdict means. Returns `Ok(true)` when the claim was verified (the
+/// hash joins the approved displacement set), `Ok(false)` when the
+/// existing rejection stands, `Err` on a contradiction.
+fn settle_evidence_verdict(
+    build_id: Uuid,
+    node: &crate::domain::DerivationNode,
+    outcome: StoreEvidenceOutcome,
+    store_evidence: &mut std::collections::HashSet<crate::state::DrvHash>,
+) -> Result<bool, ActorError> {
+    match outcome {
+        StoreEvidenceOutcome::Verified(_) => {
+            metrics::counter!(
+                "rio_scheduler_merge_store_evidence_total",
+                "result" => "displaced"
+            )
+            .increment(1);
+            store_evidence.insert(node.drv_hash.as_str().into());
+            Ok(true)
+        }
+        StoreEvidenceOutcome::Contradicts(detail) => {
+            metrics::counter!(
+                "rio_scheduler_merge_store_evidence_total",
+                "result" => "mismatch"
+            )
+            .increment(1);
+            warn!(
+                build_id = %build_id,
+                drv_hash = %node.drv_hash,
+                drv_path = %node.drv_path,
+                detail = %detail,
+                "store derivation contradicts the submission's claimed identity"
+            );
+            Err(ActorError::StoreEvidenceContradicts {
+                drv_path: node.drv_path.clone(),
+            })
+        }
+        // Consequence-neutral split (C2c1): silence, structural
+        // impossibility, an unverifiable declared hash, and verified
+        // garbage all keep today's fail-closed "unavailable" outcome —
+        // the rejection stands. The per-variant consequences
+        // (UNAVAILABLE wire code, budget code, strip remediation) land
+        // with the arbitration commit.
+        StoreEvidenceOutcome::StoreSilence(_)
+        | StoreEvidenceOutcome::StructurallyUnverifiable(_)
+        | StoreEvidenceOutcome::VerifiedExceptDeclaredHash(_)
+        | StoreEvidenceOutcome::UnparseableVerified => {
+            metrics::counter!(
+                "rio_scheduler_merge_store_evidence_total",
+                "result" => "unavailable"
+            )
+            .increment(1);
+            debug!(
+                build_id = %build_id,
+                drv_hash = %node.drv_hash,
+                "store evidence unavailable; existing rejection stands"
+            );
+            Ok(false)
+        }
+    }
 }
 
 impl DagActor {
     // r[impl sched.merge.store-evidence-displacement]
     /// Verify a bare store-backed submission node against the store's
-    /// OWN copy of the `.drv` its declared `drv_path` names.
-    ///
-    /// The verification is self-contained in the actor — never trust
-    /// store transport or silence: the fetched bytes must re-derive the
-    /// declared path as their text content-address before anything is
-    /// believed, and only then is the parsed derivation compared
-    /// against the submission's claimed identity by the SAME validator
-    /// SubmitBuild ingress applies to inline content
-    /// (`validate_inline_drv_content` — reusing it is what keeps the
-    /// merge-time and ingress-time identity rules from drifting).
-    ///
-    /// Outcome classification is deterministic, not message-matched:
-    /// availability problems (fetch, UTF-8, parse, canonicality,
-    /// text-CA, unresolvable declared-IA inputs) are pre-checked here
-    /// and return [`StoreEvidenceOutcome::Unverifiable`]; once those
-    /// pass, any validator failure IS an identity contradiction.
+    /// OWN copy of the `.drv` its declared `drv_path` names: fetch,
+    /// then classify through [`classify_store_evidence`].
     pub(super) async fn check_store_evidence(
         &self,
         node: &crate::domain::DerivationNode,
         submission_seed: &InputFormSeed,
     ) -> StoreEvidenceOutcome {
-        use rio_nix::derivation::Derivation;
-        use rio_nix::hash::{HashAlgo, NixHash};
-        use rio_nix::store_path::StorePath;
-        use sha2::{Digest, Sha256};
-
         let Some(bytes) = self
             .fetch_drv_content_from_store(node.drv_hash.as_str(), &node.drv_path)
             .await
         else {
-            return StoreEvidenceOutcome::Unverifiable("fetch");
+            return StoreEvidenceOutcome::StoreSilence(SilenceReason::Fetch);
         };
-        let zero_ref_text_ca_matches = |bytes: &[u8]| -> bool {
-            let Ok(sp) = StorePath::parse(&node.drv_path) else {
-                return false;
-            };
-            let Ok(h) = NixHash::new(HashAlgo::SHA256, Sha256::digest(bytes).to_vec()) else {
-                return false;
-            };
-            matches!(StorePath::make_text(sp.name(), &h, &[]), Ok(p) if p.as_str() == node.drv_path)
+        let resident = |path: &str| {
+            self.dag
+                .hash_for_path(path)
+                .and_then(|h| self.dag.node(h))
+                // Same input-form discipline as the submission seed
+                // (sched.merge.input-form-seed): a resident floating
+                // node's stored hash is the masked published form,
+                // never an input digest.
+                .filter(|s| s.is_fixed_output || !s.ca.is_ca)
+                .and_then(|s| s.ca.modular_hash)
         };
-        let Ok(text) = std::str::from_utf8(&bytes) else {
-            // Binary garbage can still be the genuine (reference-free)
-            // text-CA object at this path — then it is PERMANENTLY not
-            // a derivation, not a transport blip.
-            if zero_ref_text_ca_matches(&bytes) {
-                return StoreEvidenceOutcome::UnparseableVerified;
-            }
-            return StoreEvidenceOutcome::Unverifiable("not-utf8");
-        };
-        let Ok(drv) = Derivation::parse(text) else {
-            if zero_ref_text_ca_matches(&bytes) {
-                return StoreEvidenceOutcome::UnparseableVerified;
-            }
-            return StoreEvidenceOutcome::Unverifiable("parse");
-        };
-        // Canonicality: the validator requires bytes == to_aterm(parse).
-        // A store object that parses but re-serializes differently
-        // cannot vouch identity (and is not a contradiction — the store
-        // holds SOME derivation there, just not canonically encoded).
-        if drv.to_aterm().as_bytes() != bytes.as_slice() {
-            return StoreEvidenceOutcome::Unverifiable("non-canonical");
-        }
-        // Text-CA self-consistency of the store object, verified HERE
-        // before any identity comparison: make_text(name, sha256(bytes),
-        // refs) must reproduce the declared path. The store enforces
-        // this at .drv ingestion (store.put.drv-text-ca); re-deriving it
-        // means a confused or hostile store answer cannot smuggle
-        // unrelated bytes into the comparison.
-        let Ok(drv_sp) = StorePath::parse(&node.drv_path) else {
-            return StoreEvidenceOutcome::Unverifiable("drv-path");
-        };
-        let mut refs: Vec<StorePath> = Vec::new();
-        for r in drv.input_srcs().iter().chain(drv.input_drvs().keys()) {
-            match StorePath::parse(r) {
-                Ok(p) => refs.push(p),
-                Err(_) => return StoreEvidenceOutcome::Unverifiable("ref-path"),
-            }
-        }
-        let content_hash =
-            match NixHash::new(HashAlgo::SHA256, Sha256::digest(bytes.as_slice()).to_vec()) {
-                Ok(h) => h,
-                Err(_) => return StoreEvidenceOutcome::Unverifiable("digest"),
-            };
-        match StorePath::make_text(drv_sp.name(), &content_hash, &refs) {
-            Ok(p) if p.as_str() == node.drv_path => {}
-            _ => return StoreEvidenceOutcome::Unverifiable("text-ca"),
-        }
-        // Declared-IA derivability pre-check: the validator derives
-        // input-addressed output paths with a sibling-seeded hash
-        // cache. Seed every direct input from the submission's declared
-        // hashes or the resident DAG; an input neither covers makes the
-        // identity UNVERIFIABLE here (a deeper upload/submission is
-        // needed), never a contradiction.
-        let needs_ia = drv
-            .outputs()
-            .iter()
-            .any(|o| matches!(o.kind(), rio_nix::derivation::OutputKind::InputAddressed(_)));
-        let mut input_seed: Vec<rio_proto::types::DerivationNode> = Vec::new();
-        if needs_ia {
-            for input in drv.input_drvs().keys() {
-                let hash = submission_seed.get(input.as_str()).or_else(|| {
-                    self.dag
-                        .hash_for_path(input)
-                        .and_then(|h| self.dag.node(h))
-                        // Same input-form discipline as submission_seed:
-                        // a resident floating node's stored hash is the
-                        // masked published form, never an input digest.
-                        .filter(|s| s.is_fixed_output || !s.ca.is_ca)
-                        .and_then(|s| s.ca.modular_hash)
-                });
-                match hash {
-                    Some(h) => input_seed.push(rio_proto::types::DerivationNode {
-                        drv_path: input.clone(),
-                        ca_modular_hash: h.to_vec(),
-                        ..Default::default()
-                    }),
-                    None => return StoreEvidenceOutcome::Unverifiable("inputs"),
-                }
-            }
-        }
-
-        // Identity comparison: the submission's claims, with the
-        // store's bytes attached, through the ingress inline validator.
-        // Every remaining failure mode is a contradiction between the
-        // claimed identity and what the verified bytes derive.
-        let mut synth = rio_proto::types::DerivationNode {
-            drv_hash: node.drv_hash.clone(),
-            drv_path: node.drv_path.clone(),
-            system: node.system.clone(),
-            output_names: node.output_names.clone(),
-            expected_output_paths: node.expected_output_paths.clone(),
-            is_fixed_output: node.is_fixed_output,
-            is_content_addressed: node.is_content_addressed,
-            ca_modular_hash: node.ca_modular_hash.map(|h| h.to_vec()).unwrap_or_default(),
-            drv_content: bytes,
-            drv_content_authoritative: false,
-            ..Default::default()
-        };
-        // The validator treats a node's own declared hash as
-        // self-certification and removes it; siblings carry the seeds.
-        let claimed_modular_hash = !synth.ca_modular_hash.is_empty();
-        let mut slice = vec![std::mem::take(&mut synth)];
-        slice.extend(input_seed);
-        match crate::grpc::validate_inline_drv_content(&mut slice) {
-            // Ingress strip semantics (ingress-inline-drv-binding+1):
-            // when a declared modular hash cannot be RECOMPUTED (a
-            // floating store-backed input is missing from the seeds)
-            // the validator strips the declaration and accepts. At
-            // ingress that is correct (warm gateway shape). HERE it
-            // would be fail-open — Verified must mean "the store's
-            // bytes derive the claimed identity, hash included" — so a
-            // stripped claim is the store failing to vouch, not a
-            // verification.
-            Ok(()) if claimed_modular_hash && slice[0].ca_modular_hash.is_empty() => {
-                StoreEvidenceOutcome::Unverifiable("modular-hash-unrecomputable")
-            }
-            Ok(()) => {
-                // `synth.drv_content` was moved into the slice; the
-                // verified bytes are returned from there.
-                StoreEvidenceOutcome::Verified(std::mem::take(&mut slice[0].drv_content))
-            }
-            Err(status) => StoreEvidenceOutcome::Contradicts(status.message().to_string()),
-        }
+        classify_store_evidence(node, bytes, submission_seed, &resident)
     }
 
     // -----------------------------------------------------------------------
@@ -870,48 +1042,8 @@ impl DagActor {
                             false
                         } else {
                             evidence_budget -= 1;
-                            match self.check_store_evidence(node, &submission_seed).await {
-                                StoreEvidenceOutcome::Verified(_) => {
-                                    metrics::counter!(
-                                        "rio_scheduler_merge_store_evidence_total",
-                                        "result" => "displaced"
-                                    )
-                                    .increment(1);
-                                    store_evidence.insert(node.drv_hash.as_str().into());
-                                    true
-                                }
-                                StoreEvidenceOutcome::Contradicts(detail) => {
-                                    metrics::counter!(
-                                        "rio_scheduler_merge_store_evidence_total",
-                                        "result" => "mismatch"
-                                    )
-                                    .increment(1);
-                                    warn!(
-                                        build_id = %build_id,
-                                        drv_hash = %row.drv_hash,
-                                        drv_path = %row.drv_path,
-                                        detail = %detail,
-                                        "store derivation contradicts the submission's claimed identity"
-                                    );
-                                    return Err(ActorError::StoreEvidenceContradicts {
-                                        drv_path: node.drv_path.clone(),
-                                    });
-                                }
-                                StoreEvidenceOutcome::Unverifiable(_)
-                                | StoreEvidenceOutcome::UnparseableVerified => {
-                                    metrics::counter!(
-                                        "rio_scheduler_merge_store_evidence_total",
-                                        "result" => "unavailable"
-                                    )
-                                    .increment(1);
-                                    debug!(
-                                        build_id = %build_id,
-                                        drv_hash = %row.drv_hash,
-                                        "store evidence unavailable; settled-row rejection stands"
-                                    );
-                                    false
-                                }
-                            }
+                            let outcome = self.check_store_evidence(node, &submission_seed).await;
+                            settle_evidence_verdict(build_id, node, outcome, &mut store_evidence)?
                         }
                     } else {
                         false
@@ -976,45 +1108,8 @@ impl DagActor {
                 continue;
             }
             evidence_budget -= 1;
-            match self.check_store_evidence(node, &submission_seed).await {
-                StoreEvidenceOutcome::Verified(_) => {
-                    metrics::counter!(
-                        "rio_scheduler_merge_store_evidence_total",
-                        "result" => "displaced"
-                    )
-                    .increment(1);
-                    store_evidence.insert(node.drv_hash.as_str().into());
-                }
-                StoreEvidenceOutcome::Contradicts(detail) => {
-                    metrics::counter!(
-                        "rio_scheduler_merge_store_evidence_total",
-                        "result" => "mismatch"
-                    )
-                    .increment(1);
-                    warn!(
-                        build_id = %build_id,
-                        drv_hash = %node.drv_hash,
-                        detail = %detail,
-                        "store derivation contradicts the submission's claimed identity"
-                    );
-                    return Err(ActorError::StoreEvidenceContradicts {
-                        drv_path: node.drv_path.clone(),
-                    });
-                }
-                StoreEvidenceOutcome::Unverifiable(_)
-                | StoreEvidenceOutcome::UnparseableVerified => {
-                    metrics::counter!(
-                        "rio_scheduler_merge_store_evidence_total",
-                        "result" => "unavailable"
-                    )
-                    .increment(1);
-                    debug!(
-                        build_id = %build_id,
-                        drv_hash = %node.drv_hash,
-                        "store evidence unavailable; merge-gate rejection stands"
-                    );
-                }
-            }
+            let outcome = self.check_store_evidence(node, &submission_seed).await;
+            settle_evidence_verdict(build_id, node, outcome, &mut store_evidence)?;
         }
         phase!("0.6-store-evidence");
 
@@ -3968,5 +4063,202 @@ mod matcher_tests {
             &short,
             &incoming(Some([0xBB; 32]))
         ));
+    }
+}
+
+#[cfg(test)]
+mod evidence_matrix_tests {
+    use super::*;
+    use crate::actor::tests::helpers::{mint_floating_ca_leaf, mint_text_ca_leaf};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+
+    fn dn(proto: rio_proto::types::DerivationNode) -> crate::domain::DerivationNode {
+        proto.into()
+    }
+
+    fn classify(node: &crate::domain::DerivationNode, bytes: &[u8]) -> StoreEvidenceOutcome {
+        let seed = InputFormSeed::from_submission_nodes(&[]);
+        classify_store_evidence(node, bytes.to_vec(), &seed, &|_| None)
+    }
+
+    /// Table-driven outcome matrix for `classify_store_evidence`: every
+    /// variant of the typed verdict is reachable and lands exactly
+    /// where its permanence rustdoc says. Consequence-neutrality of
+    /// the C2c1 split is proven by the whole suite staying green.
+    #[test]
+    fn store_evidence_outcome_matrix() {
+        use StoreEvidenceOutcome as O;
+
+        // Verified: the store's canonical bytes at their text-CA path
+        // derive the claimed identity.
+        let (leaf, leaf_aterm, _out) = mint_text_ca_leaf("semx-ok");
+        let verified = dn(leaf.clone());
+        assert!(matches!(
+            classify(&verified, leaf_aterm.as_bytes()),
+            O::Verified(_)
+        ));
+
+        // Contradicts: same bytes, tampered claimed system.
+        let mut tampered = dn(leaf.clone());
+        tampered.system = "aarch64-linux".into();
+        assert!(matches!(
+            classify(&tampered, leaf_aterm.as_bytes()),
+            O::Contradicts(_)
+        ));
+
+        // StoreSilence(NotUtf8): binary garbage that is NOT the path's
+        // text-CA object.
+        assert!(matches!(
+            classify(&verified, &[0xFF, 0xFE, 0x00]),
+            O::StoreSilence(SilenceReason::NotUtf8)
+        ));
+
+        // StoreSilence(Parse): UTF-8 that is not a derivation and not
+        // the path's text-CA object.
+        assert!(matches!(
+            classify(&verified, b"definitely not a derivation"),
+            O::StoreSilence(SilenceReason::Parse)
+        ));
+
+        // UnparseableVerified: garbage bytes at their OWN zero-ref
+        // text-CA path — content-bound, permanent.
+        let garbage = b"content-bound garbage";
+        let gh = NixHash::new(HashAlgo::SHA256, Sha256::digest(garbage).to_vec()).unwrap();
+        let gpath = StorePath::make_text("semx-garbage.drv", &gh, &[])
+            .unwrap()
+            .as_str()
+            .to_owned();
+        let mut gnode = dn(leaf.clone());
+        gnode.drv_path = gpath.clone();
+        gnode.drv_hash = gpath;
+        assert!(matches!(classify(&gnode, garbage), O::UnparseableVerified));
+
+        // StoreSilence(TextCa): canonical derivation bytes at a WRONG
+        // (valid) store path.
+        let (other, other_aterm, _o) = mint_text_ca_leaf("semx-other");
+        let mut wrong_path = dn(other);
+        wrong_path.drv_path = verified.drv_path.clone();
+        wrong_path.drv_hash = verified.drv_hash.clone();
+        assert!(matches!(
+            classify(&wrong_path, other_aterm.as_bytes()),
+            O::StoreSilence(SilenceReason::TextCa)
+        ));
+
+        // StructurallyUnverifiable(UnparseableDrvPath): the node's own
+        // declared path is not a store path.
+        let mut bad_path = dn(leaf.clone());
+        bad_path.drv_path = "not-a-store-path".into();
+        bad_path.drv_hash = "not-a-store-path".into();
+        assert!(matches!(
+            classify(&bad_path, leaf_aterm.as_bytes()),
+            O::StructurallyUnverifiable(StructuralReason::UnparseableDrvPath)
+        ));
+
+        // StructurallyUnverifiable(UnseedableInput): an IA parent whose
+        // direct input is covered by neither seeds nor the DAG.
+        let (child, child_aterm, _h) = mint_floating_ca_leaf("semx-child");
+        let child_path = child.drv_path.clone();
+        let child_drv = rio_nix::derivation::Derivation::parse(&child_aterm).unwrap();
+        let build_parent = |out: &str| {
+            format!(
+                r#"Derive([("out","{out}","","")],[("{child_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","semx-parent"),("out","{out}")])"#
+            )
+        };
+        let masked = rio_nix::derivation::Derivation::parse(&build_parent("")).unwrap();
+        let name_only = format!("/nix/store/{}-semx-parent.drv", "a".repeat(32));
+        let resolver = |p: &str| -> Option<&rio_nix::derivation::Derivation> {
+            (p == child_path).then_some(&child_drv)
+        };
+        let paths = rio_nix::derivation::input_addressed_output_paths(
+            &masked,
+            &name_only,
+            &resolver,
+            &mut std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let parent_aterm = build_parent(paths["out"].as_str());
+        let phash = NixHash::new(
+            HashAlgo::SHA256,
+            Sha256::digest(parent_aterm.as_bytes()).to_vec(),
+        )
+        .unwrap();
+        let parent_path = StorePath::make_text(
+            "semx-parent.drv",
+            &phash,
+            &[StorePath::parse(&child_path).unwrap()],
+        )
+        .unwrap()
+        .as_str()
+        .to_owned();
+        let parent_node = dn(rio_proto::types::DerivationNode {
+            drv_path: parent_path.clone(),
+            drv_hash: parent_path,
+            system: "x86_64-linux".into(),
+            output_names: vec!["out".into()],
+            expected_output_paths: vec![paths["out"].as_str().to_owned()],
+            ..Default::default()
+        });
+        match classify(&parent_node, parent_aterm.as_bytes()) {
+            StoreEvidenceOutcome::StructurallyUnverifiable(StructuralReason::UnseedableInput(
+                p,
+            )) => assert_eq!(p, child_path),
+            other => panic!("expected UnseedableInput, got {}", outcome_name(&other)),
+        }
+
+        // VerifiedExceptDeclaredHash: a floating parent over an
+        // unresolvable floating input, with a DECLARED modular hash —
+        // the validator strips the unrecomputable claim and the rest
+        // verifies; the verified bytes ride along.
+        let build_fparent = |_unused: &str| {
+            format!(
+                r#"Derive([("out","","r:sha256","")],[("{child_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","semx-fparent"),("out","")])"#
+            )
+        };
+        let fparent_aterm = build_fparent("");
+        let fhash = NixHash::new(
+            HashAlgo::SHA256,
+            Sha256::digest(fparent_aterm.as_bytes()).to_vec(),
+        )
+        .unwrap();
+        let fparent_path = StorePath::make_text(
+            "semx-fparent.drv",
+            &fhash,
+            &[StorePath::parse(&child_path).unwrap()],
+        )
+        .unwrap()
+        .as_str()
+        .to_owned();
+        let fparent_node = dn(rio_proto::types::DerivationNode {
+            drv_path: fparent_path.clone(),
+            drv_hash: fparent_path,
+            system: "x86_64-linux".into(),
+            output_names: vec!["out".into()],
+            expected_output_paths: vec![String::new()],
+            is_content_addressed: true,
+            ca_modular_hash: vec![0xCC; 32],
+            ..Default::default()
+        });
+        match classify(&fparent_node, fparent_aterm.as_bytes()) {
+            StoreEvidenceOutcome::VerifiedExceptDeclaredHash(bytes) => {
+                assert_eq!(bytes, fparent_aterm.as_bytes(), "verified bytes ride along");
+            }
+            other => panic!(
+                "expected VerifiedExceptDeclaredHash, got {}",
+                outcome_name(&other)
+            ),
+        }
+    }
+
+    fn outcome_name(o: &StoreEvidenceOutcome) -> &'static str {
+        match o {
+            StoreEvidenceOutcome::Verified(_) => "Verified",
+            StoreEvidenceOutcome::Contradicts(_) => "Contradicts",
+            StoreEvidenceOutcome::StoreSilence(_) => "StoreSilence",
+            StoreEvidenceOutcome::StructurallyUnverifiable(_) => "StructurallyUnverifiable",
+            StoreEvidenceOutcome::VerifiedExceptDeclaredHash(_) => "VerifiedExceptDeclaredHash",
+            StoreEvidenceOutcome::UnparseableVerified => "UnparseableVerified",
+        }
     }
 }

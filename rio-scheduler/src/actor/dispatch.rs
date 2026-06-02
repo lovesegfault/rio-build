@@ -2533,8 +2533,20 @@ impl DagActor {
                             .into(),
                     );
                 }
-                Some(super::merge::StoreEvidenceOutcome::Unverifiable(reason)) => {
-                    return AssignmentProtoOutcome::Unavailable(reason);
+                // Consequence-neutral mapping (C2c1): all three
+                // non-positive, non-contradiction verdicts keep
+                // today's transient rollback+backoff. The per-variant
+                // consequences (strip-and-proceed for the verified
+                // bytes, visible poison for structural impossibility)
+                // land with the strip commit.
+                Some(super::merge::StoreEvidenceOutcome::StoreSilence(reason)) => {
+                    return AssignmentProtoOutcome::Unavailable(reason.as_str());
+                }
+                Some(super::merge::StoreEvidenceOutcome::StructurallyUnverifiable(reason)) => {
+                    return AssignmentProtoOutcome::Unavailable(reason.as_str());
+                }
+                Some(super::merge::StoreEvidenceOutcome::VerifiedExceptDeclaredHash(_)) => {
+                    return AssignmentProtoOutcome::Unavailable("modular-hash-unrecomputable");
                 }
             }
         } else {
