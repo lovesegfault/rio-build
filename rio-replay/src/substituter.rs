@@ -79,7 +79,10 @@ impl Substituter {
     /// redirect within its own origin or to a public HTTPS host, but a hop
     /// at a non-public address or a non-https scheme aborts the fetch —
     /// spec- and archive-provided caches must not be able to steer the
-    /// engine at internal endpoints via `Location` headers.
+    /// engine at internal endpoints via `Location` headers. Narinfo `URL:`
+    /// fields cannot steer it either: the object join refuses values that
+    /// leave the cache's origin (see [`NormalizedCacheBase::object_url`]),
+    /// so cross-origin handoffs only happen via those screened redirects.
     pub async fn parse(url: &str) -> Result<Self> {
         let parsed =
             reqwest::Url::parse(url).with_context(|| format!("invalid substituter URL {url:?}"))?;
@@ -306,6 +309,11 @@ impl Substituter {
     /// Streaming variant of [`fetch_nar`](Self::fetch_nar) for large paths:
     /// returns the expected decompressed size (`info.nar_size`) and a reader
     /// of the decompressed bytes.
+    ///
+    /// `info.url` comes from a narinfo body the cache served, so it is
+    /// joined through [`NormalizedCacheBase::object_url`], which refuses
+    /// values that leave the cache's origin — a hostile narinfo cannot
+    /// steer this fetch at another endpoint.
     ///
     /// No client-side hash verification — the daemon verifies on ingest and
     /// the caller knows the expected length.
@@ -786,6 +794,58 @@ References:
         reader.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, nar);
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_nar_refuses_cross_origin_narinfo_url() {
+        // A cache that passed the admission screen can still serve hostile
+        // narinfo BODIES. An absolute cross-origin `URL:` field must not
+        // steer the NAR GET off the cache's origin (RFC 3986 resolution
+        // would otherwise replace the base wholesale) — for an internal
+        // target or a public one alike, on both fetch paths.
+        let (base, server) = spawn_test_server(HashMap::new()).await;
+        let sub = Substituter::parse(&base).await.unwrap();
+        let nar: Vec<u8> = b"cross-origin fixture".repeat(8);
+        for hostile in [
+            "https://10.96.0.1/x.nar.zst",
+            "https://evil.example.org/nar/x.nar.zst",
+        ] {
+            let info = narinfo_for(&nar, hostile, "zstd");
+            let err = format!("{:#}", sub.fetch_nar(&info).await.unwrap_err());
+            assert!(
+                err.contains(hostile) && err.contains("narinfo"),
+                "fetch_nar of {hostile} must be refused naming the URL and the narinfo \
+                 field: {err}"
+            );
+            let err = format!(
+                "{:#}",
+                sub.fetch_nar_streaming(&info)
+                    .await
+                    .map(|_| ())
+                    .unwrap_err()
+            );
+            assert!(
+                err.contains(hostile) && err.contains("narinfo"),
+                "fetch_nar_streaming of {hostile} must be refused naming the URL and the \
+                 narinfo field: {err}"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_nar_accepts_absolute_same_origin_narinfo_url() {
+        // A `URL:` field spelled absolute but on the cache's own origin
+        // (scheme, host, and port all match) stays fetchable: no endpoint
+        // the admission screen did not already vet becomes reachable.
+        let nar: Vec<u8> = b"absolute same-origin payload".repeat(64);
+        let zstd_body = zstd_compress(&nar).await;
+        let routes = HashMap::from([("/nar/abs.nar.zst".to_string(), (200, zstd_body))]);
+        let (base, server) = spawn_test_server(routes).await;
+        let sub = Substituter::parse(&base).await.unwrap();
+        let info = narinfo_for(&nar, &format!("{base}/nar/abs.nar.zst"), "zstd");
+        assert_eq!(sub.fetch_nar(&info).await.unwrap(), nar);
         server.abort();
     }
 

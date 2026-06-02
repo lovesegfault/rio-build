@@ -15,7 +15,10 @@ use rio_nix::store_path::StorePath;
 
 /// One normalized binary-cache base URL: parsed once, query/fragment
 /// stripped, and the path slash-terminated. Owns the single narinfo/object
-/// join implementation every cache client in this crate uses.
+/// join implementation every cache client in this crate uses — and with it
+/// the same-origin screen on object names ([`Self::object_url`]), so no
+/// caller can be steered off the cache by an absolute URL smuggled into an
+/// object name (e.g. a narinfo's `URL:` field).
 ///
 /// nix.conf substituter strings often carry parameters (`?priority=40`,
 /// `?trusted=1`); they tune client-side substituter selection, not how
@@ -78,10 +81,43 @@ impl NormalizedCacheBase {
     /// Join a cache-relative object name (`<hash>.narinfo`, `nar/….nar.zst`)
     /// onto the base. The base's trailing slash guarantees the join appends
     /// to the path instead of replacing its last segment.
+    ///
+    /// The joined URL must stay on the base's origin (scheme, host, and
+    /// port unchanged). Object names are cache-relative by convention — a
+    /// narinfo's `URL:` field is a `nar/<hash>.nar.xz`-style path — but
+    /// narinfo bodies come from the cache server, and RFC 3986 resolution
+    /// replaces the base wholesale when the input is an absolute URL:
+    /// without this screen, an admitted-but-hostile cache could steer a NAR
+    /// fetch at an arbitrary endpoint by inlining one into a narinfo field,
+    /// sidestepping the substituter admission screen (which vets the base)
+    /// and the per-hop redirect screen (which only sees `Location`
+    /// headers). Cross-origin results are refused naming the offending URL;
+    /// absolute SAME-origin spellings are accepted, since no endpoint the
+    /// base did not already reach becomes reachable. Caches that
+    /// legitimately hand object fetches to another host (CDN layouts) do so
+    /// via HTTP redirects, which the engine-facing clients re-screen per
+    /// hop instead (see `substituter_redirect_policy`).
     pub fn object_url(&self, object: &str) -> anyhow::Result<reqwest::Url> {
-        self.base
+        let base = &self.base;
+        let url = base
             .join(object.trim_start_matches('/'))
-            .with_context(|| format!("join object {object:?} onto cache base {}", self.base))
+            .with_context(|| format!("join object {object:?} onto cache base {base}"))?;
+        // Compare scheme/host/port directly rather than via `Url::origin`:
+        // the WHATWG origin of non-special schemes is opaque (never equal,
+        // not even to itself), which would spuriously refuse relative joins
+        // onto exotic operator-supplied bases.
+        let same_origin = url.scheme() == base.scheme()
+            && url.host() == base.host()
+            && url.port_or_known_default() == base.port_or_known_default();
+        anyhow::ensure!(
+            same_origin,
+            "refusing cache object {object:?}: it resolves to {url}, which leaves the origin \
+             of the cache base {base}; object names (a narinfo's URL field included) are \
+             cache-relative paths like \"nar/<hash>.nar.xz\", so a cross-origin absolute URL \
+             is anomalous — caches that relocate objects to another host do so via redirects, \
+             which are screened per hop"
+        );
+        Ok(url)
     }
 
     /// The normalized base URL string (slash-terminated, parameter-free).
@@ -778,6 +814,96 @@ mod tests {
                 "cache URL spelling {spelling:?}"
             );
         }
+    }
+
+    #[test]
+    fn object_url_joins_relative_and_absolute_same_origin_names() {
+        let base = NormalizedCacheBase::parse("https://cache.example.org/prefix").unwrap();
+        // Relative names — the conventional narinfo URL field shapes.
+        assert_eq!(
+            base.object_url("nar/abcd.nar.xz").unwrap().as_str(),
+            "https://cache.example.org/prefix/nar/abcd.nar.xz"
+        );
+        assert_eq!(
+            base.object_url("abcd.narinfo").unwrap().as_str(),
+            "https://cache.example.org/prefix/abcd.narinfo"
+        );
+        // Leading slashes are trimmed, keeping the name cache-relative.
+        // This also defuses scheme-relative (`//host/...`) spellings: they
+        // join as a path on the base instead of replacing its host.
+        assert_eq!(
+            base.object_url("/nar/abcd.nar.xz").unwrap().as_str(),
+            "https://cache.example.org/prefix/nar/abcd.nar.xz"
+        );
+        assert_eq!(
+            base.object_url("//evil.example.org/x").unwrap().as_str(),
+            "https://cache.example.org/prefix/evil.example.org/x"
+        );
+        // Absolute spellings that stay on the cache's own origin are
+        // accepted — the screen is about where a fetch can be steered, not
+        // about the path within the cache.
+        assert_eq!(
+            base.object_url("https://cache.example.org/nar/abcd.nar.xz")
+                .unwrap()
+                .as_str(),
+            "https://cache.example.org/nar/abcd.nar.xz"
+        );
+        // An explicit default port is the same origin.
+        assert_eq!(
+            base.object_url("https://cache.example.org:443/nar/abcd.nar.xz")
+                .unwrap()
+                .as_str(),
+            "https://cache.example.org/nar/abcd.nar.xz"
+        );
+    }
+
+    #[test]
+    fn object_url_refuses_cross_origin_objects() {
+        let base = NormalizedCacheBase::parse("https://cache.example.org/prefix").unwrap();
+        let refused = [
+            // Non-public addresses: the channel the substituter screens
+            // exist to close (an admitted cache steering a fetch inward).
+            "https://10.96.0.1/x",
+            "https://169.254.169.254/latest/meta-data",
+            // A public host is refused all the same: narinfo URL fields are
+            // cache-relative by convention, so ANY cross-origin absolute
+            // value is anomalous — CDN handoffs happen via redirects, which
+            // the clients screen per hop.
+            "https://evil.example.org/nar/abcd.nar.xz",
+            // Same host, different scheme or port: a different origin.
+            "http://cache.example.org/nar/abcd.nar.xz",
+            "https://cache.example.org:8443/nar/abcd.nar.xz",
+        ];
+        for object in refused {
+            let err = base
+                .object_url(object)
+                .expect_err(&format!("{object} must be refused as a cache object"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(object) && msg.contains("narinfo"),
+                "error for {object} must name the offending URL and the narinfo URL field: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn screened_substituter_join_refuses_cross_origin_objects() {
+        // The same-origin screen rides the shared join, so the screened
+        // substituter trust level (validator-minted HttpsSubstituter, what
+        // the probe client is built from) cannot be steered through it
+        // either.
+        let ArchiveSubstituterUrl::Https(https) = classify_substituter("https://cache.example.org")
+        else {
+            panic!("public https must classify as Https");
+        };
+        let err = https
+            .base()
+            .object_url("https://10.96.0.1/x")
+            .expect_err("a cross-origin object must be refused on the screened base");
+        assert!(
+            format!("{err:#}").contains("https://10.96.0.1/x"),
+            "error must name the refused URL"
+        );
     }
 
     #[test]
