@@ -556,7 +556,7 @@ impl SchedulerDb {
 
     /// Persist a stripped-claim verification: the rank rises on the
     /// verified bytes AND the unverifiable declared modular hash is
-    /// cleared in the same statement (`sched.dispatch.claims-derived+1`
+    /// cleared in the same statement (`sched.dispatch.claims-derived+2`
     /// — an unverifiable claim is NO claim, never persisted; exact
     /// ingress-strip parity, `ingress-inline-drv-binding+1`). One
     /// statement so a failover between the two writes cannot leave the

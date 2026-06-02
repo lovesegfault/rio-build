@@ -210,7 +210,7 @@ pub fn describe_metrics() {
          shapes never land here — they poison with remediation \
          (..._claims_unverifiable_total) and unverifiable declared hashes \
          strip and proceed (..._claims_stripped_total) \
-         (sched.dispatch.claims-derived+1)"
+         (sched.dispatch.claims-derived+2)"
     );
     describe_counter!(
         "rio_scheduler_dispatch_claims_stripped_total",
@@ -219,7 +219,7 @@ pub fn describe_metrics() {
          STRIPPED at dispatch (an unverifiable claim is no claim — exact \
          ingress-strip parity): the node proceeds on the verified bytes at \
          path_bound_bytes with the hash cleared in memory and PG \
-         (sched.dispatch.claims-derived+1). The expected nonzero source is \
+         (sched.dispatch.claims-derived+2). The expected nonzero source is \
          warm gateway CA-chain / deferred-IA submissions."
     );
     describe_counter!(
@@ -227,7 +227,7 @@ pub fn describe_metrics() {
         "Bare store-backed nodes whose claims verification is STRUCTURALLY \
          impossible (unseedable input, unparseable declared path): poisoned \
          at dispatch with generated remediation instead of livelocking \
-         through backoff (sched.dispatch.claims-derived+1). Nonzero means \
+         through backoff (sched.dispatch.claims-derived+2). Nonzero means \
          submitters are submitting underspecified closures."
     );
     describe_counter!(

@@ -4832,21 +4832,30 @@ fn store_evidence_set_raises_displacer_standing() -> anyhow::Result<()> {
 
     let mut echo = make_node("sev", "aarch64-linux");
     echo.is_content_addressed = true;
+    // Forged echo: the submitter claims needs_resolve — the evidence
+    // map's byte-derived value (false) must win on the created node.
+    echo.needs_resolve = true;
 
     // Without evidence: rejected.
     let err = dag
-        .merge_with_evidence(victim, &[echo.clone()], &[], "", &HashSet::new())
+        .merge_with_evidence(victim, &[echo.clone()], &[], "", &HashMap::new())
         .unwrap_err();
     assert!(matches!(err, DagError::ConflictingInFlightContent { .. }));
 
     // With the hash in the store-evidence set: displaced.
-    let evidence: HashSet<DrvHash> = HashSet::from(["sev".into()]);
+    let evidence: HashMap<DrvHash, bool> = HashMap::from([("sev".into(), false)]);
     let res = dag.merge_with_evidence(victim, &[echo], &[], "", &evidence)?;
     assert!(res.displaced.contains(&"sev".into()));
     assert_eq!(
         dag.node("sev").unwrap().evidence,
         DefinitionEvidence::PathBoundBytes,
         "store-evidence-backed creation ranks PathBoundBytes"
+    );
+    // r[verify sched.dispatch.claims-derived+2]
+    assert!(
+        !dag.node("sev").unwrap().ca.needs_resolve,
+        "store-evidence-created node carries the BYTE-DERIVED resolve \
+         flag from the map, not the submitter's forged echo"
     );
     Ok(())
 }

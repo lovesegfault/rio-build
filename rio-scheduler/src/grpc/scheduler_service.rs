@@ -273,6 +273,7 @@ impl SchedulerService for SchedulerGrpc {
             move || -> Result<Vec<rio_proto::types::DerivationNode>, Status> {
                 validate_authoritative_drv_content(&nodes_for_validation)?;
                 validate_inline_drv_content(&mut nodes_for_validation)?;
+                normalize_inline_needs_resolve(&mut nodes_for_validation);
                 Ok(nodes_for_validation)
             },
         )
@@ -1279,4 +1280,122 @@ pub(crate) fn validate_inline_drv_content(
         nodes[idx].ca_modular_hash.clear();
     }
     Ok(())
+}
+
+/// Overwrite each inline node's `needs_resolve` echo with the value
+/// derived from its (just-validated) bytes through the shared oracle
+/// predicate — normalization, not rejection: an honest gateway always
+/// matches (it computed the same predicate at translate time), and a
+/// direct submitter's mismatch is corrected rather than punished
+/// because the field is advisory routing state, not identity.
+///
+/// Child output-path knowledge comes from the SUBMISSION itself (the
+/// gateway ships the full closure, so siblings carry their
+/// `expected_output_paths`); a child outside the submission degrades
+/// to not-unknown — the resident-DAG/store-evidence writers re-derive
+/// with wider knowledge at their own chokepoints.
+// r[impl sched.dispatch.claims-derived+2]
+fn normalize_inline_needs_resolve(nodes: &mut [rio_proto::types::DerivationNode]) {
+    use rio_nix::derivation::Derivation;
+
+    let unknown_by_path: std::collections::HashMap<String, bool> = nodes
+        .iter()
+        .map(|n| {
+            (
+                n.drv_path.clone(),
+                n.expected_output_paths.iter().any(|p| p.is_empty()),
+            )
+        })
+        .collect();
+    for node in nodes.iter_mut() {
+        if node.drv_content.is_empty() {
+            continue;
+        }
+        // Inline content was validated parseable just above; the
+        // skips are defensive only.
+        let Ok(text) = std::str::from_utf8(&node.drv_content) else {
+            continue;
+        };
+        let Ok(drv) = Derivation::parse(text) else {
+            continue;
+        };
+        let derived =
+            rio_nix::derivation::should_resolve(&drv, |p| unknown_by_path.get(p).copied());
+        if node.needs_resolve != derived {
+            tracing::debug!(
+                drv_path = %node.drv_path,
+                echoed = node.needs_resolve,
+                derived,
+                "needs_resolve echo disagrees with the inline bytes; normalized"
+            );
+            node.needs_resolve = derived;
+        }
+    }
+}
+
+#[cfg(test)]
+mod normalize_needs_resolve_tests {
+    use super::normalize_inline_needs_resolve;
+
+    fn node(
+        drv_path: &str,
+        content: &str,
+        echo: bool,
+        expected: Vec<String>,
+    ) -> rio_proto::types::DerivationNode {
+        rio_proto::types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: drv_path.into(),
+            drv_content: content.as_bytes().to_vec(),
+            needs_resolve: echo,
+            expected_output_paths: expected,
+            ..Default::default()
+        }
+    }
+
+    // r[verify sched.dispatch.claims-derived+2]
+    /// Both polarities: a forged-true echo on an inputless floating
+    /// leaf is normalized DOWN (oracle empty-inputs clause), a
+    /// forged-false echo on a deferred-IA consumer of a floating
+    /// sibling is normalized UP (type clause + sibling knowledge from
+    /// the submission itself). Bare nodes (no inline bytes) keep
+    /// their echo — they are normalized at their own chokepoints
+    /// (claims derivation / store-evidence stamp).
+    #[test]
+    fn normalizes_echo_from_validated_bytes_both_polarities() {
+        let leaf_path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-leaf.drv";
+        let mid_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-mid.drv";
+        let leaf_aterm =
+            r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",[],[])"#
+                .to_string();
+        let mid_aterm = format!(
+            r#"Derive([("out","","","")],[("{leaf_path}",["out"])],[],"x86_64-linux","/bin/sh",[],[])"#
+        );
+
+        let mut nodes = vec![
+            // Forged TRUE on an inputless floating leaf.
+            node(leaf_path, &leaf_aterm, true, vec![String::new()]),
+            // Forged FALSE on a deferred consumer of that leaf.
+            node(mid_path, &mid_aterm, false, vec![String::new()]),
+            // Bare store-backed node: echo untouched here.
+            rio_proto::types::DerivationNode {
+                drv_path: "/nix/store/cccccccccccccccccccccccccccccccc-bare.drv".into(),
+                needs_resolve: true,
+                ..Default::default()
+            },
+        ];
+        normalize_inline_needs_resolve(&mut nodes);
+        assert!(
+            !nodes[0].needs_resolve,
+            "inputless floating leaf normalized down (oracle clause 1)"
+        );
+        assert!(
+            nodes[1].needs_resolve,
+            "deferred consumer normalized up from its bytes"
+        );
+        assert!(
+            nodes[2].needs_resolve,
+            "bare node's echo passes through untouched"
+        );
+    }
 }

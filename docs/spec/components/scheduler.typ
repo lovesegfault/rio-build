@@ -1375,7 +1375,7 @@ to complete; if it cannot finish within the grace period, it is reassigned.
   always `{}` from current Nix.
 ]
 
-#r("sched.dispatch.claims-derived+1")[
+#r("sched.dispatch.claims-derived+2")[
   When assignment tokens are signed, the scheduler MUST NOT sign
   upload-authorization claims (`expected_outputs`, `is_ca`,
   `is_fixed_output`) or forward worker build instructions for a
@@ -1387,7 +1387,15 @@ to complete; if it cannot finish within the grace period, it is reassigned.
   validator SubmitBuild ingress applies to inline content; the
   resolve-need MUST be derived from those verified bytes, never from the
   submitter's `needs_resolve` echo, and deferred output paths MUST come
-  only from realisations resolved over those bytes. The verdict's
+  only from realisations resolved over those bytes. The byte-derived
+  resolve-need MUST be RECORDED on the node in the same motion as every
+  evidence raise to `path_bound_bytes` (the verified and
+  stripped-verified dispatch arms, and merge-time store-evidence node
+  creation), the dispatch resolve gate MUST read only that recorded
+  state, and SubmitBuild ingress MUST normalize each inline node's
+  `needs_resolve` echo to the value derived from its validated bytes
+  (the shared oracle predicate `rio_nix::derivation::should_resolve`).
+  The verdict's
   consequence MUST follow its typed permanence, and no arm may retry
   unbounded on deterministic inputs: a contradiction MUST poison the
   node without signing; STORE SILENCE — the only transient verdict —

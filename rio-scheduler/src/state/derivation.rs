@@ -605,7 +605,7 @@ pub struct RetryState {
     /// Cleared on successful dispatch (assign_to_worker).
     pub backoff_until: Option<Instant>,
     /// Number of dispatch-time claims-derivation deferrals on STORE
-    /// SILENCE (`sched.dispatch.claims-derived+1`) for this node.
+    /// SILENCE (`sched.dispatch.claims-derived+2`) for this node.
     /// In-memory only — failover forgives (a fresh leader re-probes a
     /// store that may have recovered; the bound exists to stop a
     /// PERSISTENTLY silent store from deferring a deterministic input

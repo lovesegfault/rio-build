@@ -2511,7 +2511,7 @@ async fn try_recv_assignment(
     }
 }
 
-// r[verify sched.dispatch.claims-derived+1]
+// r[verify sched.dispatch.claims-derived+2]
 /// Happy path: a bare store-backed node whose `.drv` is in the store
 /// gets its claims PROVEN against the store bytes — the token verifies
 /// with the derived (== recorded, now byte-bound) values, the verified
@@ -2556,7 +2556,46 @@ async fn test_dispatch_claims_derived_from_store_bytes() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+1]
+// r[verify sched.dispatch.claims-derived+2]
+/// Forged `needs_resolve` echo cannot steer post-verification
+/// dispatch: a bare store-backed deferred-IA node submitted with
+/// `needs_resolve = false` (the forged echo — its bytes derive TRUE:
+/// deferred type with an input) ends up with the BYTE-DERIVED flag
+/// recorded at the rank raise; the resolve gate reads only that
+/// recorded state.
+#[tokio::test]
+async fn test_dispatch_records_byte_derived_resolve_not_echo() -> TestResult {
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (_db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let (leaf, leaf_aterm, _out) = mint_text_ca_leaf("rne-leaf");
+    let leaf_path = leaf.drv_path.clone();
+    let (mut mid, mid_aterm) =
+        mint_deferred_ia_node("rne-mid", &leaf_path, &[(&leaf_path, &leaf_aterm)]);
+    let mid_path = mid.drv_path.clone();
+    // FORGE the echo: bytes say resolve (deferred + input), the
+    // submitter says don't.
+    mid.needs_resolve = false;
+    store.seed_with_content(&mid_path, mid_aterm.as_bytes());
+
+    let mut worker_rx = connect_executor(&handle, "rne-w", "x86_64-linux").await?;
+    // Submit the mid ALONE (no DAG edges): it is a root, dispatches
+    // immediately, and the claims derivation verifies its bytes.
+    let _events = merge_dag(&handle, Uuid::new_v4(), vec![mid], vec![], false).await?;
+
+    let assignment = recv_assignment(&mut worker_rx).await;
+    assert_eq!(assignment.drv_path, mid_path);
+
+    let probe = handle.debug_query_derivation(&mid_path).await?.unwrap();
+    assert!(
+        probe.ca.needs_resolve,
+        "recorded resolve flag is the byte-derived TRUE, not the \
+         forged echo FALSE: {probe:?}"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived+2]
 /// THE forged-claims kill test (merged_bug_053 variants 2/3 + the
 /// needs_resolve bypass): a submitter echoes forged expected outputs
 /// and a forged resolve flag for a store-backed node. The store bytes
@@ -2600,7 +2639,7 @@ async fn test_dispatch_claims_forgery_poisons_without_signing() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+1]
+// r[verify sched.dispatch.claims-derived+2]
 /// Store unavailability is transient: the assignment rolls back with
 /// backoff (no token, node NOT poisoned), and once the `.drv` appears
 /// the next dispatch derives the claims and assigns normally.
@@ -2667,7 +2706,7 @@ async fn test_dispatch_claims_unavailable_backs_off_then_succeeds() -> TestResul
     panic!("assignment never arrived after the store recovered");
 }
 
-// r[verify sched.dispatch.claims-derived+1]
+// r[verify sched.dispatch.claims-derived+2]
 /// Bytes that do not re-derive the declared text content-address are
 /// transport-grade noise, not evidence in either direction: the
 /// assignment is held (rolled back, NOT poisoned) — never signed.
@@ -2703,7 +2742,7 @@ async fn test_dispatch_claims_text_ca_mismatch_never_signs() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+1]
+// r[verify sched.dispatch.claims-derived+2]
 /// Text-CA-VERIFIED garbage is permanent: the bytes are content-bound
 /// to the declared path (zero-reference text-CA matches) and can never
 /// parse — refetching reproduces them, so the node is poisoned instead
@@ -2798,7 +2837,7 @@ fn input_form_seed_constructor_excludes_floating_published_hashes() {
 /// IA paths from a masked digest, the honest declared paths "differed",
 /// and the node was wrongfully poisoned as FORGED (a hostile-submitter
 /// verdict against an honest victim). Post-fix the child is excluded
-/// and the input is UNSEEDABLE — under the claims-derived+1 permanence
+/// and the input is UNSEEDABLE — under the claims-derived+2 permanence
 /// contract that is a structural poison carrying the unseedable-input
 /// remediation, NOT a forgery: the failure class is the discriminator.
 #[tokio::test]
@@ -2918,7 +2957,7 @@ async fn test_dispatch_floating_child_masked_hash_not_treated_as_forged() -> Tes
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+1]
+// r[verify sched.dispatch.claims-derived+2]
 /// THE merged_bug_019 strip kill (deploy-blocker; fix-child of
 /// e2c2dbfc2 × 31d281c4d, pattern R1): a bare floating-CA node whose
 /// declared modular hash cannot be recomputed (floating store-backed
@@ -3008,7 +3047,7 @@ async fn test_dispatch_strips_unverifiable_declared_hash_and_assigns() -> TestRe
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+1]
+// r[verify sched.dispatch.claims-derived+2]
 /// The verified 100%-livelock population end-to-end: a depth-3
 /// deferred-IA chain (floating leaf ← deferred mid ← deferred root),
 /// all bare store-backed with gateway-shaped declared hashes, under
@@ -3130,7 +3169,7 @@ async fn test_deferred_ia_chain_depth3_dispatches_under_signing() -> TestResult 
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+1]
+// r[verify sched.dispatch.claims-derived+2]
 /// Structurally unverifiable claims POISON with generated remediation
 /// instead of livelocking: an IA node whose direct input is neither
 /// submitted nor resident can never verify — pre-fix it bounced
@@ -3234,7 +3273,7 @@ async fn test_dispatch_unseedable_input_poisons_with_remediation() -> TestResult
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+1]
+// r[verify sched.dispatch.claims-derived+2]
 /// Computed-bound scale pin (counts OPS, not wall-clock): dispatching
 /// 128 independent bare store-backed nodes performs EXACTLY one store
 /// GetPath per node — no closure walks, no refetches after the rank
@@ -3325,7 +3364,7 @@ fn retry_charge_claims_budget_boundaries() {
     );
 }
 
-// r[verify sched.dispatch.claims-derived+1]
+// r[verify sched.dispatch.claims-derived+2]
 /// merged_bug_010 + merged_bug_019 residual: persistent store silence
 /// on a deterministic input converges to a VISIBLE poison at its own
 /// cap — and consumes neither the transient build budget nor the

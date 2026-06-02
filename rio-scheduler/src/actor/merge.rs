@@ -312,6 +312,22 @@ impl StructuralReason {
     }
 }
 
+/// A definition the store's text-CA-bound bytes verified, together
+/// with every fact the trusted plane derives FROM those bytes at the
+/// classification site (fix-discipline R1: facts ride the verified
+/// value; consumers cannot fall back to a submitter echo because the
+/// echo is not in scope where this is consumed).
+#[derive(Debug)]
+pub(super) struct VerifiedDefinition {
+    /// The verified canonical ATerm bytes.
+    pub(super) bytes: Vec<u8>,
+    /// Dispatch-resolve requirement derived from the bytes via the
+    /// shared oracle predicate (`rio_nix::derivation::should_resolve`)
+    /// over the resident DAG's child knowledge — never the submitter's
+    /// `needs_resolve` echo (sched.dispatch.claims-derived+2).
+    pub(super) needs_resolve: bool,
+}
+
 /// Outcome of [`DagActor::check_store_evidence`]. Permanence is typed
 /// at the classification site (fix-discipline R1): consumers derive
 /// their consequence from the variant's documented permanence instead
@@ -321,9 +337,10 @@ impl StructuralReason {
 pub(super) enum StoreEvidenceOutcome {
     /// The store's text-CA-bound bytes derive exactly the submission's
     /// claimed identity — the claim is genuine. TERMINAL-POSITIVE.
-    /// Carries the verified bytes so callers (the dispatch claims
-    /// derivation) can forward them without a second fetch.
-    Verified(Vec<u8>),
+    /// Carries the verified definition so callers (the dispatch claims
+    /// derivation) can forward the bytes and record the byte-derived
+    /// facts without a second fetch.
+    Verified(VerifiedDefinition),
     /// The bytes are sound (text-CA-bound to the declared path) but the
     /// derivation they parse as CONTRADICTS the claim — PERMANENT, a
     /// retry of the same claim can never succeed.
@@ -346,10 +363,10 @@ pub(super) enum StoreEvidenceOutcome {
     /// can never be verified, but the submission minus that claim is
     /// fully verified — an unverifiable claim is NO claim, so the
     /// dispatch consumer strips it and proceeds; treating this as
-    /// silence livelocks (merged_bug_019).
-    // First production reader of the payload is the strip commit
-    // (C2c2) in this same stream; this commit is consequence-neutral.
-    VerifiedExceptDeclaredHash(#[allow(dead_code)] Vec<u8>),
+    /// silence livelocks (merged_bug_019). Carries the verified
+    /// definition: the strip arm raises rank on these bytes, so the
+    /// byte-derived facts ride along exactly as on `Verified`.
+    VerifiedExceptDeclaredHash(VerifiedDefinition),
     /// The bytes are PROVABLY the store's text-CA object for the
     /// declared path (zero-reference text-CA re-derivation matched) and
     /// they do not parse as a derivation. Content-bound and PERMANENT:
@@ -379,6 +396,7 @@ pub(super) fn classify_store_evidence(
     bytes: Vec<u8>,
     submission_seed: &InputFormSeed,
     resident_input_form: &dyn Fn(&str) -> Option<[u8; 32]>,
+    child_has_unknown_output_paths: &dyn Fn(&str) -> Option<bool>,
 ) -> StoreEvidenceOutcome {
     use rio_nix::derivation::Derivation;
     use rio_nix::hash::{HashAlgo, NixHash};
@@ -494,6 +512,17 @@ pub(super) fn classify_store_evidence(
     // The validator treats a node's own declared hash as
     // self-certification and removes it; siblings carry the seeds.
     let claimed_modular_hash = !synth.ca_modular_hash.is_empty();
+    // r[impl sched.dispatch.claims-derived+2]
+    // Byte-derived dispatch facts, computed HERE — the single site
+    // that holds the verified parse — so the consumers that raise
+    // rank on these bytes record the derived flag in the same motion
+    // and the submitter's `needs_resolve` echo is structurally out of
+    // reach. Child knowledge comes from the resident DAG; an unknown
+    // child degrades to not-unknown (the predicate's documented
+    // fail-direction: a missed resolve fails the build visibly, a
+    // spurious one is a no-op walk).
+    let needs_resolve =
+        rio_nix::derivation::should_resolve(&drv, |p| child_has_unknown_output_paths(p));
     let mut slice = vec![std::mem::take(&mut synth)];
     slice.extend(input_seed);
     match crate::grpc::validate_inline_drv_content(&mut slice) {
@@ -507,14 +536,18 @@ pub(super) fn classify_store_evidence(
         // decide (dispatch strips-and-proceeds; merge treats the
         // declared hash as unprovable).
         Ok(()) if claimed_modular_hash && slice[0].ca_modular_hash.is_empty() => {
-            StoreEvidenceOutcome::VerifiedExceptDeclaredHash(std::mem::take(
-                &mut slice[0].drv_content,
-            ))
+            StoreEvidenceOutcome::VerifiedExceptDeclaredHash(VerifiedDefinition {
+                bytes: std::mem::take(&mut slice[0].drv_content),
+                needs_resolve,
+            })
         }
         Ok(()) => {
             // `synth.drv_content` was moved into the slice; the
             // verified bytes are returned from there.
-            StoreEvidenceOutcome::Verified(std::mem::take(&mut slice[0].drv_content))
+            StoreEvidenceOutcome::Verified(VerifiedDefinition {
+                bytes: std::mem::take(&mut slice[0].drv_content),
+                needs_resolve,
+            })
         }
         Err(status) => StoreEvidenceOutcome::Contradicts(status.message().to_string()),
     }
@@ -637,16 +670,20 @@ fn settle_evidence_verdict(
     build_id: Uuid,
     node: &crate::domain::DerivationNode,
     outcome: StoreEvidenceOutcome,
-    store_evidence: &mut std::collections::HashSet<crate::state::DrvHash>,
+    store_evidence: &mut std::collections::HashMap<crate::state::DrvHash, bool>,
 ) -> Result<EvidenceVerdict, ActorError> {
     match outcome {
-        StoreEvidenceOutcome::Verified(_) => {
+        StoreEvidenceOutcome::Verified(def) => {
             metrics::counter!(
                 "rio_scheduler_merge_store_evidence_total",
                 "result" => "displaced"
             )
             .increment(1);
-            store_evidence.insert(node.drv_hash.as_str().into());
+            // The map value is the byte-derived resolve flag: the DAG
+            // stamps it on the node it creates for this hash, so a
+            // store-evidence-created node never carries the
+            // submitter's echo (sched.dispatch.claims-derived+2).
+            store_evidence.insert(node.drv_hash.as_str().into(), def.needs_resolve);
             Ok(EvidenceVerdict::Approved)
         }
         StoreEvidenceOutcome::Contradicts(detail) => {
@@ -756,7 +793,18 @@ impl DagActor {
                 .filter(|s| s.is_fixed_output || !s.ca.is_ca)
                 .and_then(|s| s.ca.modular_hash)
         };
-        classify_store_evidence(node, bytes, submission_seed, &resident)
+        // Child output-path knowledge for the byte-derived resolve
+        // flag: a resident child's expected paths carry the same
+        // emptiness signal recovery degrades from
+        // (`should_resolve_from_expected_paths`); a non-resident
+        // child is unknown (None → not-unknown degrade).
+        let child_unknown = |path: &str| {
+            self.dag
+                .hash_for_path(path)
+                .and_then(|h| self.dag.node(h))
+                .map(|s| s.expected_output_paths.iter().any(|p| p.is_empty()))
+        };
+        classify_store_evidence(node, bytes, submission_seed, &resident, &child_unknown)
     }
 
     // -----------------------------------------------------------------------
@@ -1140,8 +1188,8 @@ impl DagActor {
         // store's own text-CA-bound bytes. Approved hashes bypass the
         // upsert's settled WHERE guard ($-array) and get their stale
         // parent-side edges scrubbed in the same transaction.
-        let mut store_evidence: std::collections::HashSet<crate::state::DrvHash> =
-            std::collections::HashSet::new();
+        let mut store_evidence: std::collections::HashMap<crate::state::DrvHash, bool> =
+            std::collections::HashMap::new();
         let mut settled_evidence_displaced: Vec<String> = Vec::new();
         let mut evidence_budget: u32 = MERGE_STORE_EVIDENCE_BUDGET;
         // Input-form seeds only — the not-floating predicate lives in
@@ -4291,7 +4339,7 @@ mod evidence_matrix_tests {
 
     fn classify(node: &crate::domain::DerivationNode, bytes: &[u8]) -> StoreEvidenceOutcome {
         let seed = InputFormSeed::from_submission_nodes(&[]);
-        classify_store_evidence(node, bytes.to_vec(), &seed, &|_| None)
+        classify_store_evidence(node, bytes.to_vec(), &seed, &|_| None, &|_| None)
     }
 
     /// Table-driven outcome matrix for `classify_store_evidence`: every
@@ -4306,10 +4354,32 @@ mod evidence_matrix_tests {
         // derive the claimed identity.
         let (leaf, leaf_aterm, _out) = mint_text_ca_leaf("semx-ok");
         let verified = dn(leaf.clone());
-        assert!(matches!(
-            classify(&verified, leaf_aterm.as_bytes()),
-            O::Verified(_)
-        ));
+        match classify(&verified, leaf_aterm.as_bytes()) {
+            O::Verified(def) => {
+                // r[verify sched.dispatch.claims-derived+2]
+                // Byte-derived resolve fact rides the verdict: an
+                // inputless leaf is `false` by the oracle predicate's
+                // empty-inputs clause EVEN IF a child lookup would
+                // claim unknown paths (clause-1 precedence) — the
+                // submitter's echo is not consulted anywhere here.
+                assert!(!def.needs_resolve, "inputless leaf: no resolve");
+            }
+            other => panic!("expected Verified, got {}", outcome_name(&other)),
+        }
+        let child_says_unknown: &dyn Fn(&str) -> Option<bool> = &|_| Some(true);
+        match classify_store_evidence(
+            &verified,
+            leaf_aterm.as_bytes().to_vec(),
+            &InputFormSeed::from_submission_nodes(&[]),
+            &|_| None,
+            child_says_unknown,
+        ) {
+            O::Verified(def) => assert!(
+                !def.needs_resolve,
+                "empty-inputs clause precedes the child lookup"
+            ),
+            other => panic!("expected Verified, got {}", outcome_name(&other)),
+        }
 
         // Contradicts: same bytes, tampered claimed system.
         let mut tampered = dn(leaf.clone());
@@ -4452,8 +4522,17 @@ mod evidence_matrix_tests {
             ..Default::default()
         });
         match classify(&fparent_node, fparent_aterm.as_bytes()) {
-            StoreEvidenceOutcome::VerifiedExceptDeclaredHash(bytes) => {
-                assert_eq!(bytes, fparent_aterm.as_bytes(), "verified bytes ride along");
+            StoreEvidenceOutcome::VerifiedExceptDeclaredHash(def) => {
+                assert_eq!(
+                    def.bytes,
+                    fparent_aterm.as_bytes(),
+                    "verified bytes ride along"
+                );
+                // r[verify sched.dispatch.claims-derived+2]
+                // Floating parent WITH an input: the type clause
+                // derives `true` from the bytes — recorded by the
+                // strip arm exactly like the Verified arm.
+                assert!(def.needs_resolve, "floating-with-input resolves");
             }
             other => panic!(
                 "expected VerifiedExceptDeclaredHash, got {}",

@@ -2127,7 +2127,7 @@ impl DagActor {
             // (TOCTOU vs. concurrent cancel) — legacy no-rollback
             // semantics: caller defers.
             AssignmentProtoOutcome::NodeGone => return false,
-            // r[impl sched.dispatch.claims-derived+1]
+            // r[impl sched.dispatch.claims-derived+2]
             // The store could not vouch for a bare store-backed node's
             // claims (fetch failure, absent .drv, text-CA mismatch,
             // unresolvable inputs). Transient, store-trust posture:
@@ -2138,7 +2138,7 @@ impl DagActor {
             AssignmentProtoOutcome::Unavailable(reason) => {
                 metrics::counter!("rio_scheduler_dispatch_claims_unavailable_total").increment(1);
                 self.rollback_assignment(drv_hash, executor_id).await;
-                // r[impl sched.dispatch.claims-derived+1]
+                // r[impl sched.dispatch.claims-derived+2]
                 // Store silence is the SOLE transient verdict, and it
                 // is bounded by its OWN budget (charge(); cap = the
                 // existing max_infra_retries — no new knob): a
@@ -2214,7 +2214,7 @@ impl DagActor {
                 }
                 return false;
             }
-            // r[impl sched.dispatch.claims-derived+1]
+            // r[impl sched.dispatch.claims-derived+2]
             // Structurally unverifiable: PERMANENT for retries of this
             // submission shape — surface a visible poison carrying the
             // generated remediation instead of livelocking through
@@ -2480,8 +2480,8 @@ impl DagActor {
         executor_id: &ExecutorId,
         generation: u64,
     ) -> AssignmentProtoOutcome {
-        // === Claims derivation (sched.dispatch.claims-derived+1) ======
-        // r[impl sched.dispatch.claims-derived+1]
+        // === Claims derivation (sched.dispatch.claims-derived+2) ======
+        // r[impl sched.dispatch.claims-derived+2]
         // Decide the byte-bound source of every value the token will
         // sign and the worker will obey, BEFORE any of it is used.
         // Unsigned dev mode mints no claims — nothing to derive (the
@@ -2576,7 +2576,7 @@ impl DagActor {
             };
             match verdict {
                 None => None,
-                Some(super::merge::StoreEvidenceOutcome::Verified(bytes)) => {
+                Some(super::merge::StoreEvidenceOutcome::Verified(def)) => {
                     metrics::counter!(
                         "rio_scheduler_dispatch_claims_source_total",
                         "source" => "store"
@@ -2586,8 +2586,16 @@ impl DagActor {
                     // raise the node's standing so re-dispatch skips
                     // the re-fetch. Best-effort persist — a lost write
                     // degrades to re-derivation after failover.
+                    // r[impl sched.dispatch.claims-derived+2]
+                    // The resolve flag is recorded HERE, in the same
+                    // node_mut block as the rank raise, from the
+                    // byte-derived fact the classification site
+                    // computed — every later read (maybe_resolve_ca)
+                    // consults recorded state only, so a forged echo
+                    // cannot steer post-verification dispatch.
                     if let Some(state) = self.dag.node_mut(drv_hash) {
                         state.evidence = crate::state::DefinitionEvidence::PathBoundBytes;
+                        state.ca.needs_resolve = def.needs_resolve;
                         // Verified edge: consecutive-silence budget resets.
                         state.retry.reset_claims_unavailable();
                     }
@@ -2602,7 +2610,7 @@ impl DagActor {
                         debug!(drv_hash = %drv_hash, error = %e,
                                "evidence-rank persist failed (best-effort)");
                     }
-                    Some(bytes)
+                    Some(def.bytes)
                 }
                 Some(super::merge::StoreEvidenceOutcome::Contradicts(detail)) => {
                     return AssignmentProtoOutcome::Forged(detail);
@@ -2615,7 +2623,7 @@ impl DagActor {
                             .into(),
                     );
                 }
-                // r[impl sched.dispatch.claims-derived+1]
+                // r[impl sched.dispatch.claims-derived+2]
                 // Three-way permanence contract (the merged_bug_019
                 // deploy-blocker fix; fix-discipline R1 — consequences
                 // derived from the variant's typed permanence):
@@ -2642,7 +2650,7 @@ impl DagActor {
                 // to path_bound_bytes on the verified bytes, and
                 // proceed. Pre-fix this arm livelocked 100% of bare
                 // CA-chain / deferred-IA dispatches under signing.
-                Some(super::merge::StoreEvidenceOutcome::VerifiedExceptDeclaredHash(bytes)) => {
+                Some(super::merge::StoreEvidenceOutcome::VerifiedExceptDeclaredHash(def)) => {
                     metrics::counter!(
                         "rio_scheduler_dispatch_claims_source_total",
                         "source" => "store"
@@ -2658,6 +2666,11 @@ impl DagActor {
                     if let Some(state) = self.dag.node_mut(drv_hash) {
                         state.ca.modular_hash = None;
                         state.evidence = crate::state::DefinitionEvidence::PathBoundBytes;
+                        // r[impl sched.dispatch.claims-derived+2]
+                        // Same record-at-raise as the Verified arm:
+                        // the strip raises rank on these bytes, so the
+                        // byte-derived resolve flag rides the raise.
+                        state.ca.needs_resolve = def.needs_resolve;
                         // Verified-modulo-strip edge: budget resets too.
                         state.retry.reset_claims_unavailable();
                     }
@@ -2672,7 +2685,7 @@ impl DagActor {
                         debug!(drv_hash = %drv_hash, error = %e,
                                "stripped-evidence persist failed (best-effort)");
                     }
-                    Some(bytes)
+                    Some(def.bytes)
                 }
             }
         } else {
@@ -2955,26 +2968,19 @@ impl DagActor {
         Vec<crate::ca::RealisationLookup>,
         Vec<(String, String)>,
     ) {
-        // Gate: ADR-018 Appendix B `shouldResolve`. For ingress-bound
-        // nodes the gateway computed `needs_resolve =
-        // has_ca_floating_outputs() || any inputDrv is floating-CA` at
-        // translate time and ingress bound the node's shape. For
-        // store-backed nodes whose bytes the claims derivation just
-        // verified, the gate is DERIVED from those bytes — the
-        // submitter's `needs_resolve` echo is never consulted
-        // (sched.dispatch.claims-derived: a forged resolve flag must
-        // not steer signing onto recorded echoes).
-        let needs_resolve = match verified_bytes {
-            Some(bytes) => std::str::from_utf8(bytes)
-                .ok()
-                .and_then(|t| rio_nix::derivation::Derivation::parse(t).ok())
-                .map(|d| {
-                    use rio_nix::derivation::DerivationLike;
-                    d.has_unknown_output_paths() || d.has_ca_floating_outputs()
-                })
-                .unwrap_or(false),
-            None => state.ca.needs_resolve,
-        };
+        // Gate: the RECORDED resolve flag, single-source
+        // (sched.dispatch.claims-derived+2). Every writer derived it
+        // from bytes through the shared oracle predicate
+        // (`rio_nix::derivation::should_resolve`): the gateway's
+        // post-BFS pass for ingress-bound nodes (normalized again at
+        // SubmitBuild from the validated inline bytes), the claims
+        // derivation's record-at-raise for store-backed nodes, the
+        // merge-time store-evidence stamp for evidence-created nodes,
+        // and recovery's expected-paths degrade. The submitter's echo
+        // is structurally out of reach here — the local re-derivation
+        // this read used to do (a clause-dropping copy of the
+        // predicate, merged_bug_035) is gone.
+        let needs_resolve = state.ca.needs_resolve;
         if !needs_resolve {
             return (
                 verified_bytes

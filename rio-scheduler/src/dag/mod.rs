@@ -759,7 +759,7 @@ impl DerivationDag {
             nodes,
             edges,
             submitter_traceparent,
-            &HashSet::new(),
+            &HashMap::new(),
         )
     }
 
@@ -778,7 +778,7 @@ impl DerivationDag {
         nodes: &[crate::domain::DerivationNode],
         edges: &[crate::domain::DerivationEdge],
         submitter_traceparent: &str,
-        store_evidence: &HashSet<DrvHash>,
+        store_evidence: &HashMap<DrvHash, bool>,
     ) -> Result<MergeResult, DagError> {
         let mut newly_inserted = HashSet::new();
         let mut reset_on_resubmit = Vec::new();
@@ -895,7 +895,7 @@ impl DerivationDag {
             // per node, consumed by every displace() call in the arms.
             let displacer_evidence = {
                 let shape = DefinitionEvidence::from_node_shape(node);
-                if store_evidence.contains(&drv_hash) {
+                if store_evidence.contains_key(&drv_hash) {
                     shape.max(DefinitionEvidence::PathBoundBytes)
                 } else {
                     shape
@@ -1239,6 +1239,16 @@ impl DerivationDag {
                 // carries the verified standing, not the bare echo's
                 // shape rank. Same value the displacement verdict used.
                 state.evidence = state.evidence.max(displacer_evidence);
+                // r[impl sched.dispatch.claims-derived+2]
+                // A store-evidence-created node's resolve flag is the
+                // BYTE-DERIVED one computed at the classification site
+                // (VerifiedDefinition.needs_resolve) — the proto echo
+                // try_from_node copied is overwritten so nothing
+                // downstream of a verified creation can consult the
+                // submitter's claim.
+                if let Some(derived_needs_resolve) = store_evidence.get(&drv_hash) {
+                    state.ca.needs_resolve = *derived_needs_resolve;
+                }
                 state.interested_builds.insert(build_id);
                 // The submitting build's per-build contribution — the
                 // counterpart of the existing-node path's insert.
