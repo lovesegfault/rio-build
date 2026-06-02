@@ -92,6 +92,30 @@ pub const DEFAULT_MAX_SESSIONS: usize = 4096;
 /// `gateway.toml max_channels_per_connection`.
 pub const DEFAULT_MAX_CHANNELS_PER_CONNECTION: usize = 512;
 
+/// Channels the replay engine's gateway transport multiplexes onto one
+/// SSH connection (`CHANNELS_PER_CONNECTION` in
+/// `rio-replay/src/run/transport.rs`) — a client-side fan-out choice
+/// rio-replay is free to tune, duplicated here because rio-replay is
+/// not a dependency of this crate.
+///
+/// Exceeding `max_channels_per_connection` TERMINATES the whole SSH
+/// connection — killing every sibling channel on it — so the default
+/// bound must keep clear headroom above the largest legitimate client
+/// fan-out, not merely equal it: the gateway's open-channel count can
+/// transiently exceed a client's steady-state fan-out while client-side
+/// closes (especially abandoned channels, which send no graceful close)
+/// are still being torn down. The assertion below enforces that
+/// headroom at compile time; if it fires, either keep the default at or
+/// above twice the replay fan-out or lower rio-replay's
+/// `CHANNELS_PER_CONNECTION` in the same change.
+const REPLAY_CLIENT_FAN_OUT: usize = 4;
+const _: () = assert!(
+    DEFAULT_MAX_CHANNELS_PER_CONNECTION >= 2 * REPLAY_CLIENT_FAN_OUT,
+    "the default per-connection channel bound must keep headroom above the replay engine's \
+     per-connection channel fan-out (CHANNELS_PER_CONNECTION in rio-replay/src/run/transport.rs); \
+     a connection at the bound is terminated, not refused"
+);
+
 /// Grace period a connection may have zero active protocol sessions —
 /// measured from authentication (established, nothing exec'd yet) or
 /// from the last session ending — before the gateway disconnects it
