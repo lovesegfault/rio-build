@@ -33,6 +33,13 @@ pub struct ReportArgs {
     /// `--report-policy regression-gate`).
     #[arg(long)]
     pub check: bool,
+    /// Additionally exit non-zero when the gate's coverage witness is zero
+    /// (`checked: 0`): an untripped gate that classified no evidence-bearing
+    /// units passed vacuously. Off by default because empty-scope campaigns
+    /// legitimately record a clean gate; pipelines whose campaigns must have
+    /// exercised real work opt in.
+    #[arg(long, requires = "check")]
+    pub require_coverage: bool,
 }
 
 /// The campaign-relative S3 path of the regression-gate result document.
@@ -53,8 +60,32 @@ pub fn local_path(out: &Path, campaign: &str, rel: &str) -> PathBuf {
 /// gate prints one summary line and turns `tripped: true` into a non-zero
 /// exit through xtask's normal error path. Malformed gate.json is an
 /// error, never silently treated as untripped.
+///
+/// `checked` is the gate's coverage witness (the engine's
+/// `GateResult::checked`: how many evidence-bearing classified units the
+/// trip sets were evaluated over — see the design doc §7.3). This is the
+/// design-named single CI consumption point for the gate, so the witness
+/// is DEMANDED here, across the JSON boundary the producer-side type
+/// cannot cross: `checked` is parsed, printed in the summary line, and an
+/// untripped gate with `checked: 0` is called out as a vacuous pass.
+///
+/// Vacuous-pass policy (deliberately staged):
+/// - default: a LOUD warning, exit 0 — an empty-scope campaign
+///   legitimately records a clean gate (the engine's `GateCoverage`
+///   contract: `NothingInScope` is clean by design), and smoke pipelines
+///   run such campaigns today;
+/// - `--require-coverage`: exit non-zero — for pipelines whose campaigns
+///   must have exercised real work, a vacuous pass is a failure.
+///
+/// Revisit flipping the default to fail once the recurring smoke
+/// pipelines either assert a non-empty scope themselves or adopt the
+/// flag; until then a hard default would turn every legitimately-empty
+/// campaign red. A gate.json without the `checked` key (written before
+/// the witness existed) reads as zero coverage — the honest reading of a
+/// record that never carried one — while a present-but-non-numeric value
+/// is malformed and errors like any other malformed field.
 #[allow(clippy::print_stdout)]
-fn check_gate(gate_json: Option<&[u8]>) -> Result<()> {
+fn check_gate(gate_json: Option<&[u8]>, require_coverage: bool) -> Result<()> {
     let Some(bytes) = gate_json else {
         anyhow::bail!(
             "--check requested but the campaign recorded no regression gate \
@@ -69,9 +100,24 @@ fn check_gate(gate_json: Option<&[u8]>) -> Result<()> {
     let tripped = gate["tripped"]
         .as_bool()
         .context("report/gate.json has no \"tripped\" boolean")?;
-    println!("gate: fail_on={fail_on} tripped={tripped}");
+    let checked = match gate.get("checked") {
+        None => 0,
+        Some(value) => value
+            .as_u64()
+            .context("report/gate.json \"checked\" is not an unsigned integer")?,
+    };
+    println!("gate: fail_on={fail_on} tripped={tripped} checked={checked}");
     if tripped {
         anyhow::bail!("regression gate tripped");
+    }
+    if checked == 0 {
+        let vacuous = "the regression gate passed VACUOUSLY: it was evaluated over zero \
+                       evidence-bearing classified units (checked: 0), so this pass verified \
+                       nothing about the target";
+        if require_coverage {
+            anyhow::bail!("{vacuous} (--require-coverage)");
+        }
+        println!("WARNING: {vacuous}; pass --require-coverage to fail on this");
     }
     Ok(())
 }
@@ -119,7 +165,7 @@ pub async fn run(a: ReportArgs) -> Result<()> {
             .iter()
             .find(|(rel, _, _)| *rel == GATE_DOC)
             .map(|(_, _, body)| body.as_bytes());
-        check_gate(gate_body)?;
+        check_gate(gate_body, a.require_coverage)?;
     }
     Ok(())
 }
@@ -140,26 +186,83 @@ mod tests {
     fn check_gate_maps_the_recorded_gate_to_the_exit_decision() {
         // No gate.json recorded: an error naming the launch flag that would
         // have produced one — never a silent pass.
-        let err = check_gate(None).unwrap_err().to_string();
+        let err = check_gate(None, false).unwrap_err().to_string();
         assert!(err.contains("--report-policy regression-gate"), "{err}");
 
-        // Untripped gate: success.
-        check_gate(Some(
-            br#"{"policy":"regression-gate","fail_on":"regression","tripped":false,"counts":{}}"#,
-        ))
-        .unwrap();
+        // Untripped gate with real coverage: success in both modes.
+        let covered =
+            br#"{"policy":"regression-gate","fail_on":"regression","tripped":false,"checked":12,"counts":{}}"#;
+        check_gate(Some(covered), false).unwrap();
+        check_gate(Some(covered), true).unwrap();
 
         // Tripped gate: non-zero exit through xtask's normal error path.
-        let err = check_gate(Some(
-            br#"{"policy":"regression-gate","fail_on":"regression","tripped":true,"counts":{"unexpected-failure":3}}"#,
-        ))
+        let err = check_gate(
+            Some(
+                br#"{"policy":"regression-gate","fail_on":"regression","tripped":true,"checked":3,"counts":{"unexpected-failure":3}}"#,
+            ),
+            false,
+        )
         .unwrap_err()
         .to_string();
         assert!(err.contains("regression gate tripped"), "{err}");
 
-        // Malformed documents are errors, never treated as untripped.
-        assert!(check_gate(Some(b"not json")).is_err());
-        assert!(check_gate(Some(br#"{"fail_on":"regression"}"#)).is_err());
-        assert!(check_gate(Some(br#"{"tripped":true}"#)).is_err());
+        // Malformed documents are errors, never treated as untripped. A
+        // present-but-non-numeric `checked` is malformed too — only a fully
+        // ABSENT key gets the legacy zero-coverage reading.
+        assert!(check_gate(Some(b"not json"), false).is_err());
+        assert!(check_gate(Some(br#"{"fail_on":"regression"}"#), false).is_err());
+        assert!(check_gate(Some(br#"{"tripped":true}"#), false).is_err());
+        assert!(
+            check_gate(
+                Some(br#"{"fail_on":"regression","tripped":false,"checked":"three"}"#),
+                false
+            )
+            .is_err()
+        );
+    }
+
+    /// The consumer-side contract for the gate's coverage witness, pinned
+    /// over canned gate.json BYTES because this is the wire boundary the
+    /// producer-side type witness (`rio_replay::run::report::GateCoverage`,
+    /// a `NonZeroUsize` wrapper) cannot cross: serde flattens it to a plain
+    /// JSON number, so only this consumer demanding the field makes it
+    /// load-bearing. Contract: design doc §7.3 names `report --check` "the
+    /// single CI consumption point" for the gate, and `GateResult::checked`
+    /// defines `checked: 0` on an untripped gate as a vacuous pass.
+    ///
+    /// Both directions are pinned: a vacuous pass must be called out (warn
+    /// by default, non-zero exit under --require-coverage), AND a covered
+    /// pass must stay clean in both modes — so the discriminator is the
+    /// witness, not the flag.
+    #[test]
+    fn check_gate_demands_the_coverage_witness_across_the_wire() {
+        // The exact attempted-nothing artifact an engine writes for a
+        // campaign whose classification was empty (or all backfill):
+        // untripped, checked: 0.
+        let vacuous =
+            br#"{"policy":"regression-gate","fail_on":"regression","tripped":false,"checked":0,"counts":{}}"#;
+        // Default: loud warning, exit 0 — empty-scope campaigns are
+        // legitimately clean (GateCoverage::NothingInScope is CLEAN by
+        // design; smoke pipelines run such campaigns today).
+        check_gate(Some(vacuous), false).unwrap();
+        // --require-coverage: the vacuous pass is a failure naming itself.
+        let err = check_gate(Some(vacuous), true).unwrap_err().to_string();
+        assert!(err.contains("VACUOUSLY"), "{err}");
+        assert!(err.contains("checked: 0"), "{err}");
+
+        // A pre-witness gate.json (no `checked` key at all) reads as zero
+        // coverage — the honest reading of a record that never carried the
+        // witness — and follows the same vacuous-pass policy.
+        let legacy =
+            br#"{"policy":"regression-gate","fail_on":"regression","tripped":false,"counts":{}}"#;
+        check_gate(Some(legacy), false).unwrap();
+        assert!(check_gate(Some(legacy), true).is_err());
+
+        // A tripped gate fails REGARDLESS of coverage mode or witness value:
+        // the trip decision is never weakened by the coverage check.
+        let tripped =
+            br#"{"policy":"regression-gate","fail_on":"regression","tripped":true,"checked":0,"counts":{"upload-rejected":1}}"#;
+        assert!(check_gate(Some(tripped), false).is_err());
+        assert!(check_gate(Some(tripped), true).is_err());
     }
 }
