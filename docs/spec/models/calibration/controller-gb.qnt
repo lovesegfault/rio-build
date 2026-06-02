@@ -26,7 +26,8 @@ module gbCalibAckAttempted {
     CEILING = 1,
     ENABLE_RPC_FAULT = true,
     ENABLE_LEASE_FAULT = false,
-    ENABLE_STALE_POLL = false
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the ack covers the attempted
@@ -204,6 +205,7 @@ module gbCalibAckAttempted {
       execr' = execr,
       leaderOld' = leaderOld,
       gate' = gate,
+      matJob' = matJob,
     }
   }
 
@@ -253,7 +255,8 @@ module gbCalibAckOnlyNew {
     CEILING = 2,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
-    ENABLE_STALE_POLL = false
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: only the spawned-this-tick set is
@@ -431,6 +434,7 @@ module gbCalibAckOnlyNew {
       execr' = execr,
       leaderOld' = leaderOld,
       gate' = gate,
+      matJob' = matJob,
     }
   }
 

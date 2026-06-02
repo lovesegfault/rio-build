@@ -31,7 +31,8 @@ module gaCalibNoLiveRecheck {
     CEILING = 1,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
-    ENABLE_STALE_POLL = false
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the live pod-phase re-check is
@@ -210,6 +211,7 @@ module gaCalibNoLiveRecheck {
       execr' = execr,
       leaderOld' = leaderOld,
       gate' = gate,
+      matJob' = matJob,
     }
   }
 
@@ -258,7 +260,8 @@ module gaCalibOrphanGateEmptyOk {
     CEILING = 1,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
-    ENABLE_STALE_POLL = false
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false
   ).* from "../spawnCoherence"
 
   /// The as-built tick with ONE change: the orphan-reap decision uses a
@@ -443,6 +446,7 @@ module gaCalibOrphanGateEmptyOk {
       execr' = execr,
       leaderOld' = leaderOld,
       gate' = gate,
+      matJob' = matJob,
     }
   }
 
@@ -491,7 +495,8 @@ module gaCalibCrdAbsentArmed {
     CEILING = 1,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
-    ENABLE_STALE_POLL = false
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false
   ).* from "../spawnCoherence"
 
   /// PRE-FIX gate retain: the crd-absent arm arms the gate (pass-through
@@ -687,6 +692,7 @@ module gaCalibCrdAbsentArmed {
       execr' = execr,
       leaderOld' = leaderOld,
       gate' = gate,
+      matJob' = matJob,
     }
   }
 

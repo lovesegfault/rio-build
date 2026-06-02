@@ -31,7 +31,8 @@ module ggCalibTerminatingPending {
     CEILING = 1,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
-    ENABLE_STALE_POLL = false
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false
   ).* from "../spawnCoherence"
 
   /// PRE-FIX pending predicate: no deletionTimestamp filter.
@@ -218,6 +219,7 @@ module ggCalibTerminatingPending {
       execr' = execr,
       leaderOld' = leaderOld,
       gate' = gate,
+      matJob' = matJob,
     }
   }
 
