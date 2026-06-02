@@ -214,16 +214,36 @@ pub async fn run() -> i32 {
     }
 }
 
-/// Typed marker for HTTP failures that will not change on retry
-/// (4xx other than 408/429): the retry loop skips the remaining
-/// attempts for that URL. Carried as an `anyhow` error so the context
-/// chains in the build log stay intact; the retry loop detects it by
-/// downcast instead of string matching.
-#[derive(Debug, thiserror::Error)]
-#[error("HTTP {status} from {url}")]
-struct PermanentHttpError {
-    status: reqwest::StatusCode,
-    url: String,
+/// Closed permanence classification for one fetch attempt.
+///
+/// Every failure source inside [`try_fetch_one`] must choose a class at
+/// the point where the error is produced — there is deliberately no
+/// `From<anyhow::Error>` impl and no default bucket, so a future
+/// failure source cannot silently inherit retryability (the
+/// downcast-marker shape this replaces let exactly that happen: any
+/// error NOT carrying the marker was retryable by omission). The retry
+/// loop matches exhaustively.
+#[derive(Debug)]
+enum FetchError {
+    /// Worth retrying against the SAME candidate: transport blips,
+    /// 5xx / 408 / 429, interrupted bodies — the next attempt can
+    /// genuinely see a different answer.
+    Transient(anyhow::Error),
+    /// Will not change on retry for THIS candidate: other HTTP
+    /// statuses, payloads that fail finalization deterministically.
+    /// The loop skips the candidate's remaining attempts and moves to
+    /// the next candidate (which may serve different bytes).
+    PermanentForCandidate(anyhow::Error),
+}
+
+impl FetchError {
+    /// Unwrap the carried error (test assertions on the context chain).
+    #[cfg(test)]
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            FetchError::Transient(e) | FetchError::PermanentForCandidate(e) => e,
+        }
+    }
 }
 
 /// Fetch `params.url` (or a mirror) to `params.output`.
@@ -254,16 +274,18 @@ async fn fetch(params: &FetchurlParams) -> anyhow::Result<()> {
                     eprintln!("builtin:fetchurl: fetched {url}");
                     return Ok(());
                 }
-                Err(e) => {
+                Err(FetchError::Transient(e)) => {
                     eprintln!("builtin:fetchurl: attempt failed: {e:#}");
-                    // Permanent (non-retryable) HTTP statuses skip the
-                    // remaining attempts for THIS url and move on to the
-                    // next candidate immediately.
-                    let permanent = e.downcast_ref::<PermanentHttpError>().is_some();
                     last_err = Some(e);
-                    if permanent {
-                        break;
-                    }
+                }
+                Err(FetchError::PermanentForCandidate(e)) => {
+                    // Will not change on the next attempt — skip the
+                    // remaining attempts for THIS url and move on to
+                    // the next candidate immediately, without burning
+                    // the backoff budget.
+                    eprintln!("builtin:fetchurl: attempt failed permanently: {e:#}");
+                    last_err = Some(e);
+                    break;
                 }
             }
         }
@@ -391,53 +413,71 @@ fn no_trust_tls_config() -> rustls::ClientConfig {
 /// One GET attempt: stream the body to a temp file next to the output,
 /// then finalize (rename, or xz→NAR restore) so a failed attempt never
 /// leaves a partial output behind.
+///
+/// Every failure is classified HERE, where it is produced
+/// ([`FetchError`] has no blanket conversion): transport and
+/// interrupted-body errors are transient; non-retryable HTTP statuses
+/// and deterministic finalize failures are permanent for this
+/// candidate.
 async fn try_fetch_one(
     client: &reqwest::Client,
     candidate: &Candidate,
     params: &FetchurlParams,
     tls_roots_available: bool,
-) -> anyhow::Result<()> {
+) -> Result<(), FetchError> {
     let url = candidate.url.as_str();
+    // Worker-local fs preparation: transient (retry may land on a
+    // recovered filesystem; a persistent fault fails all candidates and
+    // surfaces as infra).
     let parent = params
         .output
         .parent()
-        .context("output path has no parent directory")?;
+        .context("output path has no parent directory")
+        .map_err(FetchError::PermanentForCandidate)?;
     tokio::fs::create_dir_all(parent)
         .await
-        .with_context(|| format!("creating {}", parent.display()))?;
+        .with_context(|| format!("creating {}", parent.display()))
+        .map_err(FetchError::Transient)?;
 
     let mut req = client.get(url);
-    if let Some((user, pass)) = netrc_credentials(params.netrc.as_deref(), candidate)? {
+    // A malformed netrc parses the same way every time: permanent.
+    if let Some((user, pass)) = netrc_credentials(params.netrc.as_deref(), candidate)
+        .map_err(FetchError::PermanentForCandidate)?
+    {
         req = req.basic_auth(user, Some(pass));
     }
-    let resp = req.send().await.with_context(|| {
-        if url.starts_with("https://") && !tls_roots_available {
-            format!(
-                "request failed (https URL, but no CA roots are available in the \
-                 sandbox: configure RIO_CA_BUNDLE on the worker so a bundle is \
-                 mounted at {SANDBOX_CA_BUNDLE}, or use an http:// origin/mirror)"
-            )
-        } else {
-            "request failed".to_string()
-        }
-    })?;
+    // Transport errors (DNS, connect, TLS, read timeout): transient.
+    let resp = req
+        .send()
+        .await
+        .with_context(|| {
+            if url.starts_with("https://") && !tls_roots_available {
+                format!(
+                    "request failed (https URL, but no CA roots are available in the \
+                     sandbox: configure RIO_CA_BUNDLE on the worker so a bundle is \
+                     mounted at {SANDBOX_CA_BUNDLE}, or use an http:// origin/mirror)"
+                )
+            } else {
+                "request failed".to_string()
+            }
+        })
+        .map_err(FetchError::Transient)?;
     let status = resp.status();
     if !status.is_success() {
+        let err = anyhow::anyhow!("HTTP {status} from {url}");
         // 5xx / 408 / 429 are worth retrying against the same URL;
         // anything else (404 from a mirror, 403, …) will not change on
-        // the next attempt — fail fast so the next candidate URL is
-        // tried without burning the backoff budget.
-        if status.is_server_error()
-            || status == reqwest::StatusCode::REQUEST_TIMEOUT
-            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-        {
-            bail!("HTTP {status} from {url}");
-        }
-        return Err(PermanentHttpError {
-            status,
-            url: url.to_string(),
-        }
-        .into());
+        // the next attempt.
+        return Err(
+            if status.is_server_error()
+                || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            {
+                FetchError::Transient(err)
+            } else {
+                FetchError::PermanentForCandidate(err)
+            },
+        );
     }
 
     // Download to a temp file in the same directory (same filesystem →
@@ -451,18 +491,23 @@ async fn try_fetch_one(
             .map(|n| n.display().to_string())
             .unwrap_or_else(|| "out".to_owned())
     ));
+    // An interrupted body is transient: the server already proved it
+    // can answer, the stream just died.
     let download_result = download_to(resp, &tmp).await;
-    if download_result.is_err() {
+    if let Err(e) = download_result {
         let _ = tokio::fs::remove_file(&tmp).await;
-        return download_result;
+        return Err(FetchError::Transient(e));
     }
 
+    // Finalize failures (bad NAR / bad xz / chmod) are deterministic
+    // for THESE bytes: permanent for this candidate; the next candidate
+    // may serve different (correct) bytes.
     let finalize = finalize_output(&tmp, params).await;
     // The temp file is consumed by rename on the plain path; on the
     // unpack path (and on any failure) it must not linger in the store
     // scratch where the output scan would reject it as a stray.
     let _ = tokio::fs::remove_file(&tmp).await;
-    finalize
+    finalize.map_err(FetchError::PermanentForCandidate)
 }
 
 /// Stream an HTTP response body to `dest`.
@@ -904,6 +949,45 @@ mod tests {
         assert_eq!(std::fs::read(&p.output).unwrap(), b"from-mirror");
     }
 
+    /// A 404 candidate is attempted exactly ONCE: the closed
+    /// permanence enum routes it to `PermanentForCandidate`, which
+    /// skips the candidate's remaining attempts (no backoff burned, no
+    /// useless re-requests against an answer that cannot change).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn permanent_status_hits_candidate_once() {
+        use axum::{Router, routing::get};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let hits = Arc::new(AtomicU32::new(0));
+        let h = hits.clone();
+        let app = Router::new().route(
+            "/gone",
+            get(move || {
+                let h = h.clone();
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::NOT_FOUND
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let mut p = params(&format!("http://{addr}/gone"), &[]);
+        p.mirrors.clear();
+        p.output = out_dir.path().join("gone-out");
+        let err = fetch(&p).await.expect_err("404 must fail the fetch");
+        assert!(format!("{err:#}").contains("HTTP 404"), "{err:#}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a permanent status must not be re-attempted against the same candidate"
+        );
+    }
+
     /// A missing CA bundle must not be fatal: fetcher pods carry no
     /// system trust store, and plain-HTTP fetches never need one. (This
     /// is the regression vm-fetcher-split-k3s caught: reqwest's default
@@ -955,7 +1039,8 @@ mod tests {
         p.output = dir.path().join("out");
         let err = try_fetch_one(&client, &origin(&p.url), &p, roots)
             .await
-            .expect_err("https without roots must fail");
+            .expect_err("https without roots must fail")
+            .into_inner();
         let chain = format!("{err:#}");
         assert!(
             chain.contains("RIO_CA_BUNDLE"),
