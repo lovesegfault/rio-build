@@ -20465,6 +20465,10 @@
         {
           "name": "tokio",
           "packageId": "tokio"
+        },
+        {
+          "name": "tracing-test",
+          "packageId": "tracing-test"
         }
       ],
       "crateBin": [

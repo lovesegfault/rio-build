@@ -62,8 +62,8 @@ use crate::run::model::{
     SUPPLY_MECHANISM_UPLOAD_STREAM, SUPPLY_OUTCOME_ALREADY_PRESENT, SUPPLY_OUTCOME_DELEGATED,
     SUPPLY_OUTCOME_DELIVERED, SUPPLY_OUTCOME_FAILED, SUPPLY_OUTCOME_REFUSED,
     SUPPLY_OUTCOME_UNAVAILABLE, SUPPLY_SOURCE_EMBEDDED, SUPPLY_SOURCE_NONE, SUPPLY_SOURCE_RELAY,
-    SUPPLY_SOURCE_TARGET_SUBSTITUTER, SupplyEntry, build_status_from_name, build_status_name,
-    now_rfc3339,
+    SUPPLY_SOURCE_TARGET_SUBSTITUTER, SupplyEntry, build_status_from_name, now_rfc3339,
+    path_outcomes_from_keyed,
 };
 use crate::run::spec::{Knobs, SupplyDelivery, SupplyDependencies};
 use crate::run::state::{StateDir, StateFile};
@@ -602,17 +602,10 @@ impl SupplyTransport for PoolSupplyTransport {
             .context("open a daemon channel for the prefetch build")?;
         let derived: Vec<String> = roots.iter().map(|drv| format!("{drv}!*")).collect();
         match channel.build_paths_with_results(&derived, timeout).await {
-            Ok(results) => Ok(roots
-                .iter()
-                .zip(results)
-                .map(|(drv, keyed)| PathOutcome {
-                    drv_path: drv.clone(),
-                    status: build_status_name(keyed.result.status).to_string(),
-                    error_msg: keyed.result.error_msg,
-                    start_time: keyed.result.start_time,
-                    stop_time: keyed.result.stop_time,
-                })
-                .collect()),
+            // The mapping checks the daemon's result count against the
+            // submitted roots and warns on a mismatch; uncovered roots are
+            // handled by the prefetch arm's missing-result rule.
+            Ok(results) => Ok(path_outcomes_from_keyed(roots, &results)),
             Err(err) => {
                 channel.abandon();
                 Err(anyhow::Error::new(err).context("prefetch build over the prefetch tenant"))
@@ -2220,6 +2213,7 @@ pub(crate) mod test_support {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::run::model::build_status_name;
 
     /// See the module-level doc: a fully scripted, in-memory transport.
     #[derive(Default)]
@@ -2236,6 +2230,10 @@ pub(crate) mod test_support {
         /// Root drv → BuildStatus name returned by `prefetch_build`
         /// (unscripted roots report `Substituted`).
         pub prefetch_results: Mutex<HashMap<String, String>>,
+        /// Roots whose entry is omitted from `prefetch_build`'s answer — the
+        /// shape a daemon answering fewer results than submitted roots
+        /// leaves behind after the positional mapping.
+        pub prefetch_omitted: Mutex<BTreeSet<String>>,
         /// When set, every upload fails with [`SupplyTransportError::Other`]
         /// (the shape of a channel-open failure).
         pub fail_uploads: AtomicBool,
@@ -2322,8 +2320,10 @@ pub(crate) mod test_support {
             _timeout: Duration,
         ) -> anyhow::Result<Vec<PathOutcome>> {
             let scripted = self.prefetch_results.lock().unwrap();
+            let omitted = self.prefetch_omitted.lock().unwrap();
             Ok(roots
                 .iter()
+                .filter(|drv| !omitted.contains(*drv))
                 .map(|drv| {
                     let status = scripted
                         .get(drv)
@@ -2355,6 +2355,9 @@ mod tests {
 
     use super::test_support::FakeSupplyTransport;
     use super::*;
+    use crate::run::model::build_status_name;
+    use rio_nix::protocol::build::BuildResult;
+    use rio_nix::protocol::client::KeyedBuildResult;
 
     const PATH_A: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-supply-a";
     const PATH_B: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-supply-b";
@@ -2614,6 +2617,86 @@ mod tests {
         }
         assert_eq!(stats.delegated, 2);
         assert_eq!(stats.failed, 1);
+    }
+
+    /// A prefetch build that answers fewer results than submitted roots
+    /// degrades per contract: the uncovered root's paths are recorded
+    /// failed by the missing-result rule (with an explanatory detail) while
+    /// covered roots keep their dispositions — no outcome is invented and
+    /// nothing panics.
+    #[tokio::test]
+    async fn prefetch_arm_marks_roots_without_results_failed() {
+        let (_dir, state) = state();
+        let fake = FakeSupplyTransport::default();
+        let drv_a = "/nix/store/cccccccccccccccccccccccccccccccc-a.drv";
+        let drv_b = "/nix/store/dddddddddddddddddddddddddddddddd-b.drv";
+        let path_a = "/nix/store/ffffffffffffffffffffffffffffffff-out-a";
+        let path_b = "/nix/store/gggggggggggggggggggggggggggggggg-out-b";
+        fake.prefetch_omitted
+            .lock()
+            .unwrap()
+            .insert(drv_b.to_string());
+        let prefetch_roots: BTreeMap<String, Vec<String>> = [
+            (drv_a.to_string(), vec![path_a.to_string()]),
+            (drv_b.to_string(), vec![path_b.to_string()]),
+        ]
+        .into();
+        let batch_seq = AtomicU64::new(1);
+
+        let stats = prefetch_arm(
+            &fake,
+            &prefetch_roots,
+            &Knobs::default(),
+            &state,
+            &batch_seq,
+        )
+        .await
+        .unwrap();
+
+        let entries = entries(&state);
+        let entry_a = entry_for(&entries, path_a);
+        let entry_b = entry_for(&entries, path_b);
+        assert_eq!(entry_a.outcome, SUPPLY_OUTCOME_DELEGATED);
+        assert_eq!(entry_b.outcome, SUPPLY_OUTCOME_FAILED);
+        assert_eq!(
+            entry_b.detail.as_deref(),
+            Some("the prefetch build returned no result for this root")
+        );
+        assert_eq!(stats.delegated, 1);
+        assert_eq!(stats.failed, 1);
+    }
+
+    /// `prefetch_build` correlates the daemon's results with the submitted
+    /// roots through the shared positional mapping, so a result count
+    /// differing from the roots warns (the contract-mandated length check)
+    /// instead of zipping silently — pinned here because the prefetch arm
+    /// is the call site most likely to face a non-rio daemon.
+    #[test]
+    #[tracing_test::traced_test]
+    fn prefetch_result_mapping_warns_on_count_mismatch() {
+        let roots = vec![
+            "/nix/store/cccccccccccccccccccccccccccccccc-a.drv".to_string(),
+            "/nix/store/dddddddddddddddddddddddddddddddd-b.drv".to_string(),
+        ];
+        let keyed = vec![KeyedBuildResult {
+            derived_path: format!("{}!*", roots[0]),
+            result: BuildResult {
+                status: BuildStatus::Substituted,
+                ..BuildResult::default()
+            },
+        }];
+
+        let outcomes = path_outcomes_from_keyed(&roots, &keyed);
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].drv_path, roots[0]);
+        assert_eq!(
+            outcomes[0].status,
+            build_status_name(BuildStatus::Substituted)
+        );
+        assert!(logs_contain(
+            "BuildPathsWithResults returned a different result count than requested roots"
+        ));
     }
 
     #[test]

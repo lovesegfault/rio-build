@@ -80,3 +80,5 @@ rstest = { workspace = true }
 tempfile = { workspace = true }
 # Politeness-budget spacing test uses paused-clock time (start_paused).
 tokio = { workspace = true, features = ["test-util"] }
+# Asserts the keyed-result mapping's count-mismatch warning is emitted.
+tracing-test = { workspace = true }

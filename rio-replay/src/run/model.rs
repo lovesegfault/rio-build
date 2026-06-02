@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rio_nix::protocol::build::BuildStatus;
+use rio_nix::protocol::client::KeyedBuildResult;
 use serde::{Deserialize, Serialize};
 
 /// Wall-clock now as RFC3339 (UTC). Single helper so records stay uniform.
@@ -693,6 +694,43 @@ pub fn build_status_from_name(name: &str) -> Option<BuildStatus> {
     })
 }
 
+/// Map the daemon's per-root keyed results from one `BuildPathsWithResults`
+/// call onto the submitted roots positionally: the daemon answers in
+/// submission order, so entry *i* belongs to `root_drvs[i]`. The recorded
+/// `drv_path` is always the bare root drv path (what the result consumers
+/// index by), never the echoed `DerivedPath` string, which carries the
+/// output selector (`…!*`).
+///
+/// The positional contract obliges the correlating side to check that the
+/// returned length matches the submission, so the check lives here — next to
+/// the zip, where no caller can forget it. A mismatch only warns: a short
+/// result vector still maps the prefix it can (the uncovered roots fall to
+/// the caller's missing-result rule) and extra entries are ignored.
+pub(crate) fn path_outcomes_from_keyed(
+    root_drvs: &[String],
+    results: &[KeyedBuildResult],
+) -> Vec<PathOutcome> {
+    if results.len() != root_drvs.len() {
+        tracing::warn!(
+            requested = root_drvs.len(),
+            returned = results.len(),
+            "BuildPathsWithResults returned a different result count than requested roots; \
+             uncovered roots fall to the caller's missing-result rule"
+        );
+    }
+    root_drvs
+        .iter()
+        .zip(results)
+        .map(|(drv, keyed)| PathOutcome {
+            drv_path: drv.clone(),
+            status: build_status_name(keyed.result.status).to_string(),
+            error_msg: keyed.result.error_msg.clone(),
+            start_time: keyed.result.start_time,
+            stop_time: keyed.result.stop_time,
+        })
+        .collect()
+}
+
 /// One line of batches.jsonl — engine-internal bookkeeping for resume and
 /// build_id recovery (not part of the per-job results schema).
 ///
@@ -934,6 +972,56 @@ mod tests {
             );
         }
         assert_eq!(build_status_from_name("nonsense"), None);
+    }
+
+    /// The shared keyed→outcome mapping is the single place the positional
+    /// `BuildPathsWithResults` correlation contract is enforced: a result
+    /// count differing from the submitted roots warns (the only breadcrumb
+    /// every caller gets), a short vector still maps the prefix it can, and
+    /// extra entries are ignored.
+    #[test]
+    #[tracing_test::traced_test]
+    fn path_outcomes_from_keyed_warns_on_result_count_mismatch() {
+        use rio_nix::protocol::build::BuildResult;
+
+        let roots = vec![
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a.drv".to_string(),
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv".to_string(),
+        ];
+        // Three keyed results for two roots: slices of this vector script
+        // the matched, short, and oversized daemon answers.
+        let keyed: Vec<KeyedBuildResult> = (0..3)
+            .map(|i| KeyedBuildResult {
+                derived_path: format!("/nix/store/{i:032}-r{i}.drv!*"),
+                result: BuildResult {
+                    status: BuildStatus::Built,
+                    ..BuildResult::default()
+                },
+            })
+            .collect();
+
+        // Matched lengths: every root mapped, no warning.
+        let full = path_outcomes_from_keyed(&roots, &keyed[..2]);
+        assert_eq!(full.len(), 2);
+        assert_eq!(full[0].drv_path, roots[0]);
+        assert_eq!(full[1].drv_path, roots[1]);
+        assert!(!logs_contain("different result count"));
+
+        // Short answer: the prefix maps, the warning fires with both counts.
+        let short = path_outcomes_from_keyed(&roots, &keyed[..1]);
+        assert_eq!(short.len(), 1);
+        assert_eq!(short[0].drv_path, roots[0]);
+        assert!(logs_contain(
+            "BuildPathsWithResults returned a different result count than requested roots"
+        ));
+        assert!(logs_contain("requested=2"));
+        assert!(logs_contain("returned=1"));
+
+        // Oversized answer: extra entries are ignored, and the mismatch
+        // still warns.
+        let extra = path_outcomes_from_keyed(&roots, &keyed);
+        assert_eq!(extra.len(), 2);
+        assert!(logs_contain("returned=3"));
     }
 
     #[test]

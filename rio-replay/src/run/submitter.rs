@@ -16,11 +16,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use rio_nix::protocol::client::{KeyedBuildResult, StoreEntry};
+use rio_nix::protocol::client::StoreEntry;
 
 use super::batch::Batch;
 use super::drv_import::DrvArchive;
-use super::model::{PathOutcome, build_status_name};
+use super::model::{PathOutcome, path_outcomes_from_keyed};
 use super::stderrparse::{ParsedStderr, parse_line};
 use super::transport::{DaemonChannel, GatewayPool, TransportError};
 
@@ -88,30 +88,6 @@ fn observe_line(parsed: &mut ParsedStderr, tail: &mut VecDeque<String>, payload:
         parse_line(parsed, line);
         push_tail(tail, line.to_string());
     }
-}
-
-/// Map the daemon's per-root keyed results onto the batch's roots
-/// positionally: the daemon answers in submission order, so entry *i*
-/// belongs to `root_drvs[i]`. The recorded `drv_path` is always the bare
-/// root drv path (what collect indexes by), never the echoed `DerivedPath`
-/// string, which carries the output selector (`…!*`). A short result vector
-/// (fewer entries than roots) maps what it can — the uncovered roots are
-/// handled by collect's missing-result rule — and extra entries are ignored.
-fn path_outcomes_from_keyed(
-    root_drvs: &[String],
-    results: &[KeyedBuildResult],
-) -> Vec<PathOutcome> {
-    root_drvs
-        .iter()
-        .zip(results)
-        .map(|(drv, keyed)| PathOutcome {
-            drv_path: drv.clone(),
-            status: build_status_name(keyed.result.status).to_string(),
-            error_msg: keyed.result.error_msg.clone(),
-            start_time: keyed.result.start_time,
-            stop_time: keyed.result.stop_time,
-        })
-        .collect()
 }
 
 /// `AddMultipleToStore` entries per upload call during the drv-text import.
@@ -280,18 +256,10 @@ impl Submitter for ClientOpsSubmitter {
                 .await
         };
         let (results, engine_cancelled) = match build_result {
-            Ok(keyed) => {
-                if keyed.len() != batch.root_drvs.len() {
-                    tracing::warn!(
-                        connection = chan.connection_index(),
-                        requested = batch.root_drvs.len(),
-                        returned = keyed.len(),
-                        "BuildPathsWithResults returned a different result count than requested \
-                         roots; uncovered roots are handled by collect's missing-result rule"
-                    );
-                }
-                (path_outcomes_from_keyed(&batch.root_drvs, &keyed), false)
-            }
+            // The mapping checks the daemon's result count against the
+            // submitted roots and warns on a mismatch; uncovered roots are
+            // handled by collect's missing-result rule.
+            Ok(keyed) => (path_outcomes_from_keyed(&batch.root_drvs, &keyed), false),
             Err(TransportError::Timeout { .. }) => {
                 // The batch deadline fired mid-build. Abandoning the channel
                 // IS the cancellation mechanism (the gateway cancels the
@@ -383,7 +351,9 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::model::build_status_name;
     use rio_nix::protocol::build::{BuildResult, BuildStatus};
+    use rio_nix::protocol::client::KeyedBuildResult;
 
     fn batch() -> Batch {
         Batch {
@@ -458,9 +428,11 @@ mod tests {
     /// per-root outcomes: keyed by the bare ROOT drv path in submission
     /// order (never the echoed `DerivedPath` string, which carries the
     /// output selector), statuses written via `build_status_name`, error
-    /// message and timestamps carried over, and a short result vector maps
-    /// what it can without erroring.
+    /// message and timestamps carried over. A short result vector maps what
+    /// it can without erroring — the shared mapping warns about the count
+    /// mismatch and collect's missing-result rule covers the rest.
     #[test]
+    #[tracing_test::traced_test]
     fn client_ops_outcome_maps_keyed_results_positionally() {
         let roots = batch().root_drvs;
         let keyed = vec![
@@ -486,6 +458,9 @@ mod tests {
         ];
         let outcomes = path_outcomes_from_keyed(&roots, &keyed);
         assert_eq!(outcomes.len(), 2);
+        // A matched result count is the daemon honoring the contract — no
+        // mismatch warning.
+        assert!(!logs_contain("different result count"));
         // The recorded drv path is the plain root drv path collect indexes
         // by — no `!*` / `^*` output-selector suffix from the echoed key.
         assert_eq!(outcomes[0].drv_path, roots[0]);
@@ -505,10 +480,14 @@ mod tests {
         assert_eq!((outcomes[1].start_time, outcomes[1].stop_time), (300, 400));
 
         // A short result vector (one entry for two roots) is not an error:
-        // the uncovered root simply has no outcome.
+        // the uncovered root simply has no outcome, and the count mismatch
+        // is logged so the degradation leaves a breadcrumb.
         let short = path_outcomes_from_keyed(&roots, &keyed[..1]);
         assert_eq!(short.len(), 1);
         assert_eq!(short[0].drv_path, roots[0]);
+        assert!(logs_contain(
+            "BuildPathsWithResults returned a different result count than requested roots"
+        ));
     }
 
     /// The client-ops stderr observer captures the same evidence the warm

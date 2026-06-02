@@ -6428,6 +6428,7 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tracing",
+ "tracing-test",
  "uuid",
  "workspace-hack",
  "zstd",
