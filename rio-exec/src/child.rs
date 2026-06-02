@@ -541,9 +541,17 @@ fn setup(plan: &SandboxPlan, fds: &ChildFds) -> Result<(), SetupError> {
     arm_pdeathsig(SetupPhase::PdeathsigEarly)?;
 
     // --- Session and stdio -------------------------------------------------
-    // A fresh session so the pty the parent allocated can become the
-    // controlling terminal and so a later kill of the process group
-    // does not reach the executor.
+    // A fresh session so the build has NO controlling terminal — the
+    // oracle's stated intent (CppNix child.cc:17-22: "Put the child in
+    // a separate session (and thus a separate process group) so that
+    // it has no controlling terminal (meaning that e.g. ssh cannot
+    // open /dev/tty) and it doesn't receive terminal signals"). The
+    // pty fds the parent allocated arrive only via the dup2 below,
+    // which never acquires a ctty (no open(2) of the slave, no
+    // TIOCSCTTY) — so /dev/tty inside the sandbox is unopenable
+    // (ENXIO; pinned against the oracle by the sandbox-identity
+    // differential entry), and a later kill of the build's process
+    // group does not reach the executor.
     // SAFETY: no preconditions; fails only if we are already a group
     // leader, which a freshly forked process is not.
     if unsafe { libc::setsid() } < 0 {

@@ -257,6 +257,16 @@ rec {
       touch scratch-file
       if chmod 0755 scratch-file 2>/dev/null; then echo "plain-chmod=ok"; else echo "plain-chmod=denied"; fi
       if chmod u+s scratch-file 2>/dev/null; then echo "suid-chmod=ok"; else echo "suid-chmod=denied"; fi
+      # setsid leaves the build with NO controlling terminal (CppNix
+      # child.cc: "no controlling terminal (meaning that e.g. ssh
+      # cannot open /dev/tty)"); the /dev/tty NODE exists in both
+      # sandboxes, so the open must fail ENXIO — the strerror text
+      # pins the errno on both arms (same busybox sh emits it).
+      if msg=$( (: < /dev/tty) 2>&1 ); then
+        echo "dev-tty=open"
+      else
+        echo "dev-tty-err=$msg"
+      fi
     } > $out
   '' { };
 
