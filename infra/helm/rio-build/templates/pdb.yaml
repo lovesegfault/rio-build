@@ -1,8 +1,10 @@
 {{- if .Values.podDisruptionBudget.enabled }}
-# No PDB for controller/store: replicas=1. PDB on single-replica doesn't
-# help — minAvailable=1 blocks drain forever, minAvailable=0 is a no-op.
-# Controller tolerates 30s restart gap. Store outage → PutPath/GetPath fail,
-# scheduler's circuit-breaker handles gracefully, workers retry.
+# No PDB for the controller: replicas=1, and a PDB on a single replica
+# doesn't help — minAvailable=1 blocks drain forever, minAvailable=0 is
+# a no-op; the controller tolerates a 30s restart gap. (The store HAS a
+# PDB below, floor-gated: its KEDA floor is 2.) Store outage →
+# PutPath/GetPath fail, scheduler's circuit-breaker handles gracefully,
+# workers retry.
 #
 # Workers don't get a PDB here either — the Pool reconciler creates
 # per-pool PDBs (maxUnavailable=1) with ownerRef → GC on delete.
@@ -53,6 +55,38 @@ spec:
   selector:
     matchLabels:
       {{- include "rio.selectorLabels" "rio-gateway" | nindent 6 }}
+{{- end }}
+
+{{- $s := .Values.store }}
+{{- /* Floor-gated, mirroring the gateway PDB's gate (ceiling gates the
+       anti-affinity in store.yaml; the PDB keys on the FLOOR — a
+       disruption budget against a 1-pod floor either blocks every
+       drain or is a no-op). */}}
+{{- if and $s.enabled (gt (int (ternary $s.autoscaling.minReplicas ($s.replicas | default 1) $s.autoscaling.enabled)) 1) }}
+---
+# maxUnavailable: 10% — the percentage rounds UP in the disruption
+# controller, so 1 is allowed at the floor of 2 (drains never blocked)
+# and ~4-5 at the ~40-46 Karpenter-bound scale: `xtask k8s
+# rotate-general` (manual; rio-general carries a Drifted budget of 0)
+# parallelizes instead of serializing ~40 node drains, while mid-wave
+# voluntary capacity loss stays bounded at ~10% — the same harm the
+# scale-down damping guards against. Rejected: minAvailable: 1 (the
+# gateway's choice, right for a 2-8-replica hard-ingress, but at
+# scale-N it permits N−1 concurrent disruptions); integer
+# maxUnavailable: 1 (serializes large-N rotations). Namespace: the
+# store Deployment lives in namespaces.store.name, not system.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rio-store
+  namespace: {{ .Values.namespaces.store.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
+spec:
+  maxUnavailable: 10%
+  selector:
+    matchLabels:
+      {{- include "rio.selectorLabels" "rio-store" | nindent 6 }}
 {{- end }}
 
 {{- if .Values.buildScheduler.enabled }}

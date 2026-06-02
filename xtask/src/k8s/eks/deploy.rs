@@ -261,22 +261,26 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // I-054: JWT enables per-tenant upstream substitution
             // (cache.nixos.org). Keypair minted/read by jwt_keypair().
             //
-            // r[impl infra.store.autoscaling]
+            // r[impl infra.store.autoscaling+2]
             // Store replica count: owned by the chart-default KEDA
             // ScaledObject (store.autoscaling.enabled=true,
-            // 2..14 on backlog/builders/CPU triggers — the I-128
-            // fixed-8 era and the ComponentScaler era both retired).
+            // 2..105 (PG backstop; Karpenter-bounded in practice) on
+            // backlog/builders/CPU triggers — the I-128 fixed-8 era
+            // and the ComponentScaler era both retired).
             // No --set needed; store.replicas is not rendered while
             // autoscaling is on (store.yaml's lookup-echo branch).
             //
             // I-171: pgMaxConnections was 200 (sized for 16-ACU
-            // Aurora). At min 0.5 ACU (~105 conns) with
-            // store.autoscaling.maxReplicas=14, 200×14 = 2800
-            // saturates; even 2×200=400 does. 20 + idle_timeout
-            // (rio-store/src/main.rs) keeps steady-state under budget.
-            // 14×20=280 can still burst-saturate — TODO(P-new): bump
-            // Aurora min_capacity OR cap store.autoscaling.maxReplicas
-            // against (rds_max_conns / pgMaxConnections).
+            // Aurora); 20 + idle_timeout (rio-store/src/main.rs) keeps
+            // steady-state under budget and self-shrinks after bursts.
+            // The ceiling side is closed: values.yaml derives
+            // store.autoscaling.maxReplicas from (rds max_connections
+            // at the provisioned max_capacity / pgMaxConnections) with
+            // ~30% headroom — max_capacity was raised 16→32 ACU
+            // (2026-06-02, rds.tf), setting the runtime-constant
+            // parameter to ~3,000; min_capacity stays 0.5 (idle cost
+            // unchanged — the parameter derives from MAX capacity, and
+            // the idle_timeout pools self-correct after bursts).
             .set("store.pgMaxConnections", "20")
             // I-147/I-150: production-scale resources. values.yaml defaults
             // stay small so VM-test k3s (2-node QEMU) can schedule; EKS

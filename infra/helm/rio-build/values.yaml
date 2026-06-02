@@ -250,14 +250,29 @@ store:
     # raising it is a cost decision (store pods request 16 CPU / 8 Gi
     # on EKS).
     minReplicas: 2
-    # Inherited from the CR's max: 14 (sized when the store PG pool
-    # was 200 connections against 16-ACU Aurora). At the deployed
-    # pgMaxConnections=20, 14 × 20 = 280 can still burst-saturate
-    # Aurora at min 0.5 ACU (~105 usable connections) — bump Aurora
-    # min_capacity or lower this ceiling against
-    # (rds_max_connections / pgMaxConnections); see the deploy.rs
-    # I-171 note.
-    maxReplicas: 14
+    # PG-connection SAFETY BACKSTOP, NOT a product cap (owner decision
+    # 2026-06-02: store scale is Karpenter-bounded; the operative scale
+    # knob is karpenter.nodePools[rio-general].limits.cpu below).
+    # Derivation, against Aurora's runtime-constant max_connections at
+    # the provisioned max_capacity=32 ACU (~3,000; see infra/eks/rds.tf):
+    #   floor((3000 − scheduler 2×10 − controller 4 − psql headroom 10)
+    #         / pgMaxConnections 20) = floor(2966/20) = 148 (hard bound)
+    # Default 105 ⇒ worst case 105×20 = 2,100 store conns (2,134 with
+    # the non-store consumers) ≈ 70% of the parameter — ~30% headroom
+    # for migration bursts / ESO / ad-hoc psql. 105 is 2.3-3.4× the
+    # Karpenter-schedulable max (~31-46 store nodes at limits.cpu=1500
+    # with 32-vCPU one-per-node bin-packing), so KEDA never binds
+    # before Karpenter. Recompute if pgMaxConnections, Aurora
+    # max_capacity (rds.tf — 16 ACU would re-cap the parameter at
+    # 2,000) or min_capacity, or the scheduler/controller pools change.
+    # S3 is not a binding constraint: content-hashed chunk keys spread
+    # prefixes uniformly and ~46 replicas × chunkUploadMaxConcurrent=8
+    # ≈ 370 concurrent PUTs, orders below S3's per-prefix envelope.
+    # Replicas requested past node capacity simply stay Pending until
+    # Karpenter mints a node or the pool limit is raised (the
+    # AverageValue triggers divide by the scale subresource's count and
+    # the CPU trigger averages running pods — no thrash).
+    maxReplicas: 105
     # Desired replicas (backlog trigger) =
     # ceil(sum(rio_scheduler_substituting_derivations) / this).
     # Seeded 600: the reference incident's ~7.4k-path backlog asks for

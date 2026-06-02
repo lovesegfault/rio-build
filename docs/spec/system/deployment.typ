@@ -97,7 +97,7 @@ The EKS reference deployment (`infra/eks/`) uses Karpenter: the `executors` mana
 
 == Store autoscaling
 
-#r("infra.store.autoscaling")[
+#r("infra.store.autoscaling+2")[
   The rio-store Deployment's replica count MUST have exactly one writer ---
   the KEDA ScaledObject (`templates/store-scaledobject.yaml`): when
   `store.autoscaling.enabled` the chart MUST NOT render a static
@@ -109,10 +109,14 @@ The EKS reference deployment (`infra/eks/`) uses Karpenter: the `executors` mana
   the leading signal), builders-per-replica
   (#(refs.metric)("rio_scheduler_open_attempts") per replica), and CPU
   utilization (reactive corrective) --- with scale-up unstabilized,
-  scale-down damped (1800 s window, −1 pod / 600 s), and floor/ceiling
-  2/14; the store pods MUST carry a soft one-per-node
-  `topologySpreadConstraints` (maxSkew 1 on `kubernetes.io/hostname`,
-  `ScheduleAnyway`).
+  scale-down damped (1800 s window, max(25 %, 1 pod) / 600 s), and a
+  floor of 2 with a values-configurable ceiling (default 105) that MUST
+  be the PG-connection backstop (derived from the provisioned Aurora
+  `max_connections` / `pgMaxConnections` with headroom), not a product
+  cap --- the operative scale limit MUST be the Karpenter `rio-general`
+  pool; the store pods MUST carry required one-per-node `podAntiAffinity`
+  (`kubernetes.io/hostname`) gated on the autoscaling ceiling, plus a
+  PodDisruptionBudget (`maxUnavailable` 10 %) gated on the floor.
 ]
 The store carries three superimposed load classes --- substitution ingest
 (upstream → store → S3; leading indicator: the scheduler's materialization
@@ -120,12 +124,16 @@ backlog, known at merge time), builder read-serving (S3 → store → builder),
 and builder upload ingest (PutPath → S3; both keyed to busy builders) ---
 all flowing through the same pod NIC, NAR/chunk memory, and PG pool. One
 replica per node makes scale-out add NICs rather than re-partition one
-node's bandwidth; the soft constraint never blocks scale-out on a full
-pool (a stacked replica is slower, never wrong --- correctness never
-depends on scaling). The ceiling is bounded by Aurora connections
-(`maxReplicas × pgMaxConnections` against `rds_max_connections`); the
-trigger thresholds are seeded (600 backlog/replica, 50 builders/replica,
-70 % CPU) and re-derived from the post-wipe warm-phase capture. The
+node's bandwidth; the required rule never blocks scale-out, it delays it
+one Karpenter node-mint --- a Pending store pod on the untainted
+on-demand pool mints a node in tens of seconds, up to the pool's
+`limits.cpu`, which is the intended operative bound (correctness never
+depends on scaling). The KEDA ceiling is only the connection backstop:
+`maxReplicas × pgMaxConnections` stays ~30 % under the provisioned
+Aurora `max_connections` (runtime-constant at the configured
+`max_capacity`); the trigger thresholds are seeded (600 backlog/replica,
+50 builders/replica, 70 % CPU) and re-derived from the post-wipe
+warm-phase capture. The
 no-KEDA profiles (`values/vmtest-full.yaml`, `values/dev.yaml`) set
 `store.autoscaling.enabled=false` and render the static `store.replicas`.
 

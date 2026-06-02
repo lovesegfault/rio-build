@@ -1,6 +1,6 @@
 {{- if and .Values.store.enabled .Values.store.autoscaling.enabled }}
 {{- $a := .Values.store.autoscaling -}}
-# r[impl infra.store.autoscaling] (documentary — .yaml is not tracey-
+# r[impl infra.store.autoscaling+2] (documentary — .yaml is not tracey-
 # scanned; the scannable anchors are xtask deploy.rs and the helm-lint
 # fragment 26-store-scaling.sh asserts this render)
 #
@@ -29,13 +29,21 @@
 # signals plus CPU as the reactive corrective term for whatever the
 # ratios miss.
 #
-# Why scale-down is heavily damped (the gateway's policy): replica
-# count contracting mid-wave re-funnels ingest through fewer NICs
-# exactly when the backlog gauge is sawtoothing; 1800s stabilization
-# + at most 1 pod per 600s means a wave has to be over for 30 minutes
-# before the first pod is released. Scale-up has no stabilization —
-# adding a pod is cheap and the failure mode of being late is the
-# store at the floor through a whole substitution wave.
+# Why scale-down is heavily damped: replica count contracting
+# mid-wave re-funnels ingest through fewer NICs exactly when the
+# backlog gauge is sawtoothing; the 1800s stabilization window means
+# a wave has to be over for 30 minutes before the first pod is
+# released. Once draining engages it is geometric, not linear:
+# max(25%, 1 pod) per 600s (selectPolicy Max), so an uncapped fleet
+# drains 105→2 in ~12-16 periods (~2-2.7h; k8s removes ceil(25%) of
+# the remaining count per period — the slower bound assumes floor
+# removal) instead of 103 single-pod ticks (~17h of paid 32-vCPU
+# nodes); at small scale Pods-1 still floors the rate (14→2 in ~5-8
+# periods, at or below the old Pods-1-only pace). The gateway's
+# scaledobject deliberately stays Pods-1 (max 8 vs 105). Scale-up has
+# no stabilization — adding a pod is cheap and the failure mode of
+# being late is the store at the floor through a whole substitution
+# wave.
 #
 # Kill switch: deleting the ScaledObject freezes replicas at the
 # current count; `store.autoscaling.enabled=false` instead re-renders
@@ -54,12 +62,13 @@ spec:
     # apps/v1 Deployment is KEDA's default target kind; name matches
     # store.yaml's metadata.name.
     name: rio-store
-  # Floor/ceiling inherited from the retired ComponentScaler CR (2/14).
   # The floor carries the first ~1-4 min of a post-wipe wave at reduced
   # throughput until scale-out lands; raising it is a cost decision
-  # (store pods request 16 CPU / 8 Gi on EKS). The ceiling is bounded
-  # by Aurora connections: maxReplicas × pgMaxConnections must stay
-  # under rds_max_connections (see the values.yaml note).
+  # (store pods request 16 CPU / 8 Gi on EKS). The ceiling is the
+  # PG-connection SAFETY BACKSTOP (values.yaml carries the derivation
+  # against Aurora's runtime-constant max_connections), never the
+  # operative scale limit — Karpenter's rio-general pool limit binds
+  # first; a pod past node capacity just stays Pending one node-mint.
   minReplicaCount: {{ $a.minReplicas }}
   maxReplicaCount: {{ $a.maxReplicas }}
   advanced:
@@ -67,7 +76,13 @@ spec:
       behavior:
         scaleDown:
           stabilizationWindowSeconds: 1800
+          # Max of the two ⇒ geometric drain at scale, single-pod floor
+          # near the bottom (see the damping comment above).
+          selectPolicy: Max
           policies:
+            - type: Percent
+              value: 25
+              periodSeconds: 600
             - type: Pods
               value: 1
               periodSeconds: 600

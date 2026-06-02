@@ -40,6 +40,48 @@ spec:
   replicas: {{ .spec.replicas }}
   {{- end }}
   {{- end }}
+  # I-064-style trade-off analysis for the store (the four prerequisites
+  # the old soft-spread exemption deferred):
+  #   1. NO STICKY SESSIONS — clients resolve the headless Service to
+  #      pod IPs and pick per request (p2c, I-077); the one stateful
+  #      surface (live log tails) degrades gracefully: a killed
+  #      replica's ingest buffer is lost but readers fall back to the
+  #      history view via the TailLog proxy (RIO_STORE_REPLICA_ID note
+  #      below).
+  #   2. S3+PG-BACKED — no replica-local durable state; store outage →
+  #      PutPath/GetPath fail, the scheduler's circuit-breaker handles
+  #      it, workers retry (pdb.yaml header).
+  #   3. SURGE-FIRST DOES NOT APPLY — unlike the gateway there is no
+  #      NLB deregistration race pinning long-lived sessions to a dying
+  #      target (gateway.yaml's reason for maxUnavailable: 0). Losing 1
+  #      of N during rollout is the same budget the PDB grants, and the
+  #      freed node is immediately reusable by the replacement — no
+  #      forced node-mint per rollout step. INTEGER 1 (not a percent):
+  #      test 21's merged_021 loop does numeric comparison, and the
+  #      apps/v1 default 25% rounds DOWN to 0 for N<4 (rollout deadlock
+  #      with required anti-affinity on a fixed-size cluster).
+  #   4. REQUIRED-SPREAD-BLOCKS-SCALE-OUT — dissolved by Karpenter: a
+  #      Pending store pod on the untainted on-demand rio-general pool
+  #      mints a node in ~30-60s, up to the pool's limits.cpu — which
+  #      IS the intended operative scale bound (the KEDA ceiling is
+  #      only the PG backstop).
+  {{- /* Gated on the same ceiling as the anti-affinity below: the
+         explicit maxUnavailable: 1 exists to satisfy the merged_021
+         rollout-deadlock rule for the REQUIRED-aff render. On a
+         single-replica render (k3s fixtures, dev) it must NOT apply:
+         replicas=1 with maxUnavailable=1 makes the Deployment count
+         as Available at ZERO ready pods, turning every
+         `kubectl wait --for=condition=Available` into a vacuous pass
+         while the store is still starting (the apps/v1 default 25%
+         rounds down to 0 there, which is exactly right for one
+         replica). */}}
+  {{- if gt (int (ternary $s.autoscaling.maxReplicas ($s.replicas | default 1) $s.autoscaling.enabled)) 1 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  {{- end }}
   selector:
     matchLabels:
       {{- include "rio.selectorLabels" "rio-store" | nindent 6 }}
@@ -53,23 +95,37 @@ spec:
       nodeSelector:
         rio.build/node-role: general
       {{- end }}
-      # One replica per node (decision 5). All three store load
-      # classes — substitution ingest, builder read-serving, builder
-      # upload ingest — share the pod's NIC, NAR buffer memory, and PG
-      # pool, so a replica only adds capacity when it lands on its own
-      # node: N replicas must mean N NICs, or scale-out merely
-      # re-partitions one node's bandwidth. SOFT (ScheduleAnyway) so
-      # scale-out is never blocked when the pool is momentarily full —
-      # a stacked replica is slower, never wrong. The general node
-      # pool must be able to supply maxReplicas distinct nodes (its
-      # BASELINE — not burst — bandwidth is what each replica gets).
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              {{- include "rio.selectorLabels" "rio-store" | nindent 14 }}
+      {{- /* One replica per node (decision 5), REQUIRED. All three
+             store load classes — substitution ingest, builder
+             read-serving, builder upload ingest — share the pod's NIC,
+             NAR buffer memory, and PG pool, so a replica only adds
+             capacity when it lands on its own node: N replicas must
+             mean N NICs, or scale-out merely re-partitions one node's
+             bandwidth (the old SOFT spread was capacity-dishonest on
+             exactly that premise). Scale-out is never blocked, only
+             delayed one Karpenter node-mint (~30-60s on the untainted
+             on-demand rio-general pool) up to the pool's limits.cpu —
+             the operative scale bound. Gate on the CEILING, like
+             gateway.yaml: KEDA owns the live count anywhere in
+             [minReplicas, maxReplicas], so the rule must hold whenever
+             the autoscaler MAY run more than one pod (and a required
+             rule constrains nothing while only one pod exists). k3s/dev
+             single-node safety: the no-KEDA overlays set
+             store.autoscaling.enabled=false with replicas 1, rendering
+             no anti-affinity; an operator forcing replicas>1 with
+             autoscaling off accepts Pending-on-small-cluster — the same
+             documented trade as the gateway. IgnoredDuringExecution:
+             already-stacked live pods are not evicted; placement
+             converges on the next rollout/scale event. */}}
+      {{- if gt (int (ternary $s.autoscaling.maxReplicas ($s.replicas | default 1) $s.autoscaling.enabled)) 1 }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "rio.selectorLabels" "rio-store" | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+      {{- end }}
       # ≥ RIO_DRAIN_GRACE_SECS(6) + streamDrainSecs + slack. kubelet
       # SIGKILLs at this deadline; the store's own stream_drain timeout
       # fires first and exits cleanly, so SIGKILL is a backstop for a

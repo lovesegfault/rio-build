@@ -84,11 +84,18 @@ resource "aws_rds_cluster" "rio" {
     # I-110: ephemeral builders' QueryPathInfo burst (~800 QPI ×
     # N builders) saturates connections. At 2 ACU (~360 max_conn),
     # 4×50 store pool conns + scheduler hit the cap → 11s acquire
-    # times → builder FUSE circuit opens → builds fail. 16 ACU
-    # (~2800 max_conn) gives headroom for ~500 builders until
-    # batch-QPI (I-110b) lands. Aurora scales down to min_capacity
-    # at idle so cost is bounded.
-    max_capacity = 16
+    # times → builder FUSE circuit opens → builds fail.
+    #
+    # Connection-step semantics (Serverless v2): max_connections is
+    # RUNTIME-CONSTANT at the value derived from THIS max_capacity —
+    # 16 ACU ⇒ 2,000, 32 ACU ⇒ ~3,000, absolute Aurora cap 5,000. It
+    # does NOT scale with the live ACU (low-ACU instances merely have
+    # less memory per connection). Raised 16→32 (2026-06-02) to widen
+    # the store-fleet PG backstop: the helm store ceiling (values.yaml
+    # store.autoscaling.maxReplicas) is derived from this parameter —
+    # recompute it if max_capacity changes. Aurora still scales down
+    # to min_capacity at idle, so idle cost is unchanged.
+    max_capacity = 32
   }
 
   # Don't snapshot on destroy — this is dev/test. For prod, set

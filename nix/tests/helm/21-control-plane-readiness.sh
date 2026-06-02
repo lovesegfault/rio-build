@@ -46,15 +46,13 @@ test "$n" -ge 4 || {
 }
 
 # Documented exemptions: a Deployment listed here is EXPECTED to fail
-# the readiness checks; the exemption is visible and tracked.
-# - rio-store: KEDA-ScaledObject-managed (min:2..max:14) with a SOFT
-#   one-per-node topologySpreadConstraint (26-store-scaling.sh) but no
-#   required podAntiAffinity / PDB. Hardening to required rules is a
-#   deliberate change requiring the I-064-style trade-off analysis
-#   (no sticky sessions, S3+PG-backed, surge-first may not apply, and
-#   a required spread would block scale-out on a full pool).
-#   TODO(rio-store anti-affinity).
-exempt_aff_pdb="rio-store"
+# the readiness checks; the exemption is visible and tracked. (Empty
+# today: rio-store's former exemption closed when its placement was
+# hardened to required one-per-node podAntiAffinity + a floor-gated PDB
+# — the I-064-style analysis lives at store.yaml's affinity stanza and
+# pdb.yaml's store block; render-pinned by 26-store-scaling.sh. An
+# empty string never matches the case patterns below.)
+exempt_aff_pdb=""
 # - rio-gateway: required podAntiAffinity + maxUnavailable: 0 is a
 #   DELIBERATE I-064 trade-off (NLB drain race > rollout cost). See
 #   gateway.yaml's strategy comment.
