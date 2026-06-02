@@ -1375,7 +1375,7 @@ to complete; if it cannot finish within the grace period, it is reassigned.
   always `{}` from current Nix.
 ]
 
-#r("sched.dispatch.claims-derived")[
+#r("sched.dispatch.claims-derived+1")[
   When assignment tokens are signed, the scheduler MUST NOT sign
   upload-authorization claims (`expected_outputs`, `is_ca`,
   `is_fixed_output`) or forward worker build instructions for a
@@ -1387,12 +1387,22 @@ to complete; if it cannot finish within the grace period, it is reassigned.
   validator SubmitBuild ingress applies to inline content; the
   resolve-need MUST be derived from those verified bytes, never from the
   submitter's `needs_resolve` echo, and deferred output paths MUST come
-  only from realisations resolved over those bytes. A contradiction MUST
-  poison the node without signing; store unavailability MUST roll the
-  assignment back with dispatch backoff. Ingress-byte-bound nodes
-  (inline or authoritative content) sign their ingress-bound recorded
-  values; nodes already at `path_bound_bytes` or higher skip the
-  re-fetch. Unsigned dev mode mints no claims and is exempt.
+  only from realisations resolved over those bytes. The verdict's
+  consequence MUST follow its typed permanence, and no arm may retry
+  unbounded on deterministic inputs: a contradiction MUST poison the
+  node without signing; STORE SILENCE — the only transient verdict —
+  MUST roll the assignment back with dispatch backoff, bounded by its
+  own budget; a STRUCTURALLY unverifiable node (an input neither
+  submitted nor resident, an unparseable declared path) MUST be
+  poisoned with remediation generated from the typed reason, never
+  retried; and a node whose declared modular hash cannot be recomputed
+  against otherwise-fully-verified store bytes MUST have the
+  declaration STRIPPED — cleared in memory and in the persisted row,
+  exact ingress-strip parity (an unverifiable claim is no claim) — and
+  proceed on the verified bytes at `path_bound_bytes`. Ingress-byte-bound
+  nodes (inline or authoritative content) sign their ingress-bound
+  recorded values; nodes already at `path_bound_bytes` or higher skip
+  the re-fetch. Unsigned dev mode mints no claims and is exempt.
 ]
 This is the dispatch half of the worker-claims story (CppNix parity:
 `Store::queryPartialDerivationOutputMap` consults the store's own copy of

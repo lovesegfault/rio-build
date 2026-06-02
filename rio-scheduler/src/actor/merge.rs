@@ -288,10 +288,21 @@ pub(super) enum StructuralReason {
 }
 
 impl StructuralReason {
-    pub(super) fn as_str(&self) -> &'static str {
+    /// Client-facing remediation, GENERATED from the typed reason
+    /// (fix-discipline R6: prose coupled to mechanism — an arm cannot
+    /// promise a remedy its verdict does not support).
+    pub(super) fn remediation(&self) -> String {
         match self {
-            Self::UnseedableInput(_) => "inputs",
-            Self::UnparseableDrvPath => "drv-path",
+            Self::UnseedableInput(input) => format!(
+                "the derivation's direct input {input} is neither part of a \
+                 submission nor resident in the scheduler, so its identity \
+                 can never be verified from here: upload the input \
+                 derivation to the store (or submit the deeper closure) and \
+                 resubmit — retrying without it cannot succeed"
+            ),
+            Self::UnparseableDrvPath => "the declared drv_path does not parse as a store \
+                 path; resubmit with a valid .drv store path"
+                .to_string(),
         }
     }
 }

@@ -2511,7 +2511,7 @@ async fn try_recv_assignment(
     }
 }
 
-// r[verify sched.dispatch.claims-derived]
+// r[verify sched.dispatch.claims-derived+1]
 /// Happy path: a bare store-backed node whose `.drv` is in the store
 /// gets its claims PROVEN against the store bytes — the token verifies
 /// with the derived (== recorded, now byte-bound) values, the verified
@@ -2556,7 +2556,7 @@ async fn test_dispatch_claims_derived_from_store_bytes() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived]
+// r[verify sched.dispatch.claims-derived+1]
 /// THE forged-claims kill test (merged_bug_053 variants 2/3 + the
 /// needs_resolve bypass): a submitter echoes forged expected outputs
 /// and a forged resolve flag for a store-backed node. The store bytes
@@ -2578,7 +2578,7 @@ async fn test_dispatch_claims_forgery_poisons_without_signing() -> TestResult {
 
     let mut worker_rx = connect_executor(&handle, "forge-w", "x86_64-linux").await?;
     let build_id = Uuid::new_v4();
-    merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    let _events = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
     barrier(&handle).await;
 
     assert!(
@@ -2600,7 +2600,7 @@ async fn test_dispatch_claims_forgery_poisons_without_signing() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived]
+// r[verify sched.dispatch.claims-derived+1]
 /// Store unavailability is transient: the assignment rolls back with
 /// backoff (no token, node NOT poisoned), and once the `.drv` appears
 /// the next dispatch derives the claims and assigns normally.
@@ -2652,7 +2652,7 @@ async fn test_dispatch_claims_unavailable_backs_off_then_succeeds() -> TestResul
     panic!("assignment never arrived after the store recovered");
 }
 
-// r[verify sched.dispatch.claims-derived]
+// r[verify sched.dispatch.claims-derived+1]
 /// Bytes that do not re-derive the declared text content-address are
 /// transport-grade noise, not evidence in either direction: the
 /// assignment is held (rolled back, NOT poisoned) — never signed.
@@ -2688,7 +2688,7 @@ async fn test_dispatch_claims_text_ca_mismatch_never_signs() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived]
+// r[verify sched.dispatch.claims-derived+1]
 /// Text-CA-VERIFIED garbage is permanent: the bytes are content-bound
 /// to the declared path (zero-reference text-CA matches) and can never
 /// parse — refetching reproduces them, so the node is poisoned instead
@@ -2781,12 +2781,13 @@ fn input_form_seed_constructor_excludes_floating_published_hashes() {
 /// that hash seeded into the dispatch-time claims verification. Pre-fix
 /// the raw children loop seeded it, the validator derived the parent's
 /// IA paths from a masked digest, the honest declared paths "differed",
-/// and the node was wrongfully POISONED as forged. Post-fix the child
-/// is excluded, the input is unseedable, and the verdict is the
-/// fail-closed transient one: rolled back to Ready with backoff, no
-/// forgery counter, no poison.
+/// and the node was wrongfully poisoned as FORGED (a hostile-submitter
+/// verdict against an honest victim). Post-fix the child is excluded
+/// and the input is UNSEEDABLE — under the claims-derived+1 permanence
+/// contract that is a structural poison carrying the unseedable-input
+/// remediation, NOT a forgery: the failure class is the discriminator.
 #[tokio::test]
-async fn test_dispatch_floating_child_masked_hash_backs_off_not_forged() -> TestResult {
+async fn test_dispatch_floating_child_masked_hash_not_treated_as_forged() -> TestResult {
     use rio_nix::derivation::{Derivation, input_addressed_output_paths};
     use rio_nix::hash::{HashAlgo, NixHash};
     use rio_nix::store_path::StorePath;
@@ -2859,7 +2860,7 @@ async fn test_dispatch_floating_child_masked_hash_backs_off_not_forged() -> Test
     };
 
     let mut worker_rx = connect_executor(&handle, "ifs-w", "x86_64-linux").await?;
-    merge_dag(
+    let mut events = merge_dag(
         &handle,
         Uuid::new_v4(),
         vec![parent_node],
@@ -2873,16 +2874,404 @@ async fn test_dispatch_floating_child_masked_hash_backs_off_not_forged() -> Test
         try_recv_assignment(&mut worker_rx, 300).await.is_none(),
         "the masked child hash must not be signed against"
     );
-    let info = handle
-        .debug_query_derivation(&parent_drv_path)
-        .await?
-        .expect("parent resident");
+    wait_for_status(&handle, &parent_drv_path, DerivationStatus::Poisoned).await;
+    // The DISCRIMINATOR: the failure must be the unseedable-input
+    // structural class naming the excluded child — NEVER the forgery
+    // class a seeded masked digest produced pre-fix.
+    let mut failed_msg = None;
+    while let Ok(ev) = events.try_recv() {
+        if let Some(rio_proto::types::build_event::Event::Derivation(d)) = ev.event
+            && d.kind == rio_proto::types::DerivationEventKind::Failed as i32
+        {
+            failed_msg = Some(d.error_message);
+        }
+    }
+    let failed_msg = failed_msg.expect("failure event visible");
+    assert!(
+        failed_msg.contains("neither part of a submission nor resident"),
+        "unseedable-input class, not forgery; got: {failed_msg}"
+    );
+    assert!(
+        failed_msg.contains(&child_path),
+        "remediation names the EXCLUDED floating child (proves the seed \
+         filter held); got: {failed_msg}"
+    );
+    assert!(
+        !failed_msg.contains("failed permanently"),
+        "must not be the forgery/contradiction class"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived+1]
+/// THE merged_bug_019 strip kill (deploy-blocker; fix-child of
+/// e2c2dbfc2 × 31d281c4d, pattern R1): a bare floating-CA node whose
+/// declared modular hash cannot be recomputed (floating store-backed
+/// input missing from every seed) used to bounce Unavailable→backoff
+/// FOREVER — deterministic re-verification, identical verdict, no exit.
+/// Post-fix the declaration is STRIPPED (ingress-strip parity: an
+/// unverifiable claim is no claim), the node proceeds on the verified
+/// bytes, and both the cleared hash and the raised rank are persisted.
+#[tokio::test]
+async fn test_dispatch_strips_unverifiable_declared_hash_and_assigns() -> TestResult {
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    // Floating parent over a floating input that exists NOWHERE (not
+    // submitted, not resident, not in the store): the declared hash is
+    // structurally unrecomputable, but the parent's own bytes verify.
+    let (child, _child_aterm, _h) = mint_floating_ca_leaf("strip-child");
+    let child_path = child.drv_path.clone();
+    let fparent_aterm = format!(
+        r#"Derive([("out","","r:sha256","")],[("{child_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","strip-parent"),("out","")])"#
+    );
+    let fhash = NixHash::new(
+        HashAlgo::SHA256,
+        Sha256::digest(fparent_aterm.as_bytes()).to_vec(),
+    )
+    .unwrap();
+    let fparent_path = StorePath::make_text(
+        "strip-parent.drv",
+        &fhash,
+        &[StorePath::parse(&child_path).unwrap()],
+    )
+    .unwrap()
+    .as_str()
+    .to_owned();
+    store.seed_with_content(&fparent_path, fparent_aterm.as_bytes());
+
+    let node = rio_proto::types::DerivationNode {
+        drv_path: fparent_path.clone(),
+        drv_hash: fparent_path.clone(),
+        pname: "strip-parent".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: true,
+        expected_output_paths: vec![String::new()],
+        ca_modular_hash: vec![0xCC; 32], // junk claim, unrecomputable
+        ..Default::default()
+    };
+
+    let mut worker_rx = connect_executor(&handle, "strip-w", "x86_64-linux").await?;
+    let _events = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    // Pre-fix: no assignment, ever (infinite backoff). Post-fix: the
+    // verified bytes are forwarded.
+    let assignment = recv_assignment(&mut worker_rx).await;
+    assert_eq!(assignment.drv_path, fparent_path);
     assert_eq!(
-        info.status,
-        DerivationStatus::Ready,
-        "unseedable floating input is the fail-closed TRANSIENT verdict \
-         (rolled back with backoff) — pre-fix this was Poisoned via a \
-         wrongful Contradicts against the masked digest"
+        assignment.drv_content,
+        fparent_aterm.as_bytes(),
+        "the store-verified bytes are forwarded"
+    );
+
+    // The strip is durable AND in-memory: claim cleared, rank raised.
+    let info = handle
+        .debug_query_derivation(&fparent_path)
+        .await?
+        .expect("node resident");
+    assert!(
+        info.ca.modular_hash.is_none(),
+        "in-memory declared hash cleared (an unverifiable claim is no claim)"
+    );
+    let (rank, hash): (String, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT evidence_rank, ca_modular_hash FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(&fparent_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        rank, "path_bound_bytes",
+        "rank raised on the verified bytes"
+    );
+    assert!(hash.is_none(), "persisted declared hash cleared");
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived+1]
+/// The verified 100%-livelock population end-to-end: a depth-3
+/// deferred-IA chain (floating leaf ← deferred mid ← deferred root),
+/// all bare store-backed with gateway-shaped declared hashes, under
+/// signing. Pre-fix: the leaf dispatches (its hash recomputes — no
+/// inputs) but mid and root livelock forever. Post-fix: the whole
+/// chain dispatches and completes.
+#[tokio::test]
+async fn test_deferred_ia_chain_depth3_dispatches_under_signing() -> TestResult {
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    // IA leaf: completes without CA-realisation machinery; the
+    // deferred shape ABOVE it is what livelocked (the strip arm).
+    let (leaf, leaf_aterm, leaf_out) = mint_text_ca_leaf("dia-leaf");
+    let leaf_path = leaf.drv_path.clone();
+    let (mid, mid_aterm) =
+        mint_deferred_ia_node("dia-mid", &leaf_path, &[(&leaf_path, &leaf_aterm)]);
+    let mid_path = mid.drv_path.clone();
+    let (root, root_aterm) = mint_deferred_ia_node(
+        "dia-root",
+        &mid_path,
+        &[(&mid_path, &mid_aterm), (&leaf_path, &leaf_aterm)],
+    );
+    let root_path = root.drv_path.clone();
+    store.seed_with_content(&leaf_path, leaf_aterm.as_bytes());
+    store.seed_with_content(&mid_path, mid_aterm.as_bytes());
+    store.seed_with_content(&root_path, root_aterm.as_bytes());
+
+    let edges = vec![
+        rio_proto::types::DerivationEdge {
+            parent_drv_path: root_path.clone(),
+            child_drv_path: mid_path.clone(),
+        },
+        rio_proto::types::DerivationEdge {
+            parent_drv_path: mid_path.clone(),
+            child_drv_path: leaf_path.clone(),
+        },
+    ];
+    let mut worker_rx = connect_executor(&handle, "dia-w", "x86_64-linux").await?;
+    // Keep the event receiver alive: the orphan-watcher cancels
+    // watcher-less builds at the first housekeeping tick (grace 0 in
+    // tests), and this test pumps Ticks.
+    let _events = merge_dag(&handle, Uuid::new_v4(), vec![leaf, mid, root], edges, false).await?;
+
+    // Leaf: dispatches even pre-fix (no inputs, hash recomputes).
+    let a1 = recv_assignment(&mut worker_rx).await;
+    assert_eq!(a1.drv_path, leaf_path);
+    barrier(&handle).await;
+    let probe = handle.debug_query_derivation(&mid_path).await?.unwrap();
+    assert_eq!(
+        probe.status,
+        DerivationStatus::Queued,
+        "mid must be Queued while leaf builds; got {:?}",
+        probe.status
+    );
+    complete_success(&handle, "dia-w", &leaf_path, &leaf_out).await?;
+
+    // Mid: THE pre-fix livelock. Post-fix: stripped + assigned. A
+    // fresh worker registration is the harness's established
+    // post-completion dispatch trigger (Tick only dispatches when the
+    // dirty flag is set).
+    let mut worker_rx2 = connect_executor(&handle, "dia-w2", "x86_64-linux").await?;
+    let mut a2 = None;
+    for _ in 0..50 {
+        handle.send_unchecked(ActorCommand::Tick).await?;
+        barrier(&handle).await;
+        if let Some(a) = try_recv_assignment(&mut worker_rx, 50).await {
+            a2 = Some(a);
+            break;
+        }
+        if let Some(a) = try_recv_assignment(&mut worker_rx2, 50).await {
+            a2 = Some(a);
+            break;
+        }
+    }
+    if a2.is_none() {
+        let leaf_info = handle.debug_query_derivation(&leaf_path).await?;
+        let info = handle.debug_query_derivation(&mid_path).await?;
+        panic!("mid never dispatched; leaf: {leaf_info:?}\nmid: {info:?}");
+    }
+    let a2 = a2.expect("mid must dispatch after the strip (pre-fix: livelocked forever)");
+    assert_eq!(a2.drv_path, mid_path);
+    let a2_executor = handle
+        .debug_query_derivation(&mid_path)
+        .await?
+        .unwrap()
+        .assigned_executor
+        .expect("mid assigned");
+    let (mid_rank, mid_hash): (String, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT evidence_rank, ca_modular_hash FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(&mid_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(mid_rank, "path_bound_bytes");
+    assert!(mid_hash.is_none(), "mid's unverifiable claim stripped");
+    let mid_out = format!("/nix/store/{}-dia-mid-out", "c".repeat(32));
+    let mid_executor = a2_executor;
+    complete_success(&handle, &mid_executor, &mid_path, &mid_out).await?;
+
+    // Root: same strip path one level up.
+    let mut worker_rx3 = connect_executor(&handle, "dia-w3", "x86_64-linux").await?;
+    let mut a3 = None;
+    for _ in 0..50 {
+        handle.send_unchecked(ActorCommand::Tick).await?;
+        barrier(&handle).await;
+        for rx in [&mut worker_rx, &mut worker_rx2, &mut worker_rx3] {
+            if let Some(a) = try_recv_assignment(rx, 40).await {
+                a3 = Some(a);
+                break;
+            }
+        }
+        if a3.is_some() {
+            break;
+        }
+    }
+    let a3 = a3.expect("root must dispatch (pre-fix: livelocked forever)");
+    assert_eq!(a3.drv_path, root_path);
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived+1]
+/// Structurally unverifiable claims POISON with generated remediation
+/// instead of livelocking: an IA node whose direct input is neither
+/// submitted nor resident can never verify — pre-fix it bounced
+/// through backoff forever; post-fix it is visibly Poisoned and the
+/// build's failure evidence carries the typed-reason remediation.
+/// (This is the SIGNED counterpart of the unsigned closure-hole
+/// dispatch pin: unsigned mode mints no claims and still dispatches
+/// from source.)
+#[tokio::test]
+async fn test_dispatch_unseedable_input_poisons_with_remediation() -> TestResult {
+    use rio_nix::derivation::{Derivation, input_addressed_output_paths};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let (child, child_aterm, _h) = mint_floating_ca_leaf("unseed-child");
+    let child_path = child.drv_path.clone();
+    let child_drv = Derivation::parse(&child_aterm).unwrap();
+    let build_parent = |out: &str| {
+        format!(
+            r#"Derive([("out","{out}","","")],[("{child_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","unseed-parent"),("out","{out}")])"#
+        )
+    };
+    let masked = Derivation::parse(&build_parent("")).unwrap();
+    let name_only = format!("/nix/store/{}-unseed-parent.drv", "a".repeat(32));
+    let resolver = |p: &str| -> Option<&Derivation> { (p == child_path).then_some(&child_drv) };
+    let paths =
+        input_addressed_output_paths(&masked, &name_only, &resolver, &mut HashMap::new()).unwrap();
+    let parent_aterm = build_parent(paths["out"].as_str());
+    let phash = NixHash::new(
+        HashAlgo::SHA256,
+        Sha256::digest(parent_aterm.as_bytes()).to_vec(),
+    )
+    .unwrap();
+    let parent_path = StorePath::make_text(
+        "unseed-parent.drv",
+        &phash,
+        &[StorePath::parse(&child_path).unwrap()],
+    )
+    .unwrap()
+    .as_str()
+    .to_owned();
+    store.seed_with_content(&parent_path, parent_aterm.as_bytes());
+
+    let node = rio_proto::types::DerivationNode {
+        drv_path: parent_path.clone(),
+        drv_hash: parent_path.clone(),
+        pname: "unseed-parent".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        expected_output_paths: vec![paths["out"].as_str().to_owned()],
+        ..Default::default()
+    };
+
+    let mut worker_rx = connect_executor(&handle, "unseed-w", "x86_64-linux").await?;
+    let build_id = Uuid::new_v4();
+    let mut events = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    assert!(
+        try_recv_assignment(&mut worker_rx, 300).await.is_none(),
+        "no token may be signed for an unverifiable node"
+    );
+    wait_for_status(&handle, &parent_path, DerivationStatus::Poisoned).await;
+
+    // The remediation is CLIENT-VISIBLE: the DerivationFailed event's
+    // error_message carries the generated text (visible poison, not a
+    // silent backoff).
+    let mut failed_msg = None;
+    while let Ok(ev) = events.try_recv() {
+        if let Some(rio_proto::types::build_event::Event::Derivation(d)) = ev.event
+            && d.kind == rio_proto::types::DerivationEventKind::Failed as i32
+        {
+            failed_msg = Some(d.error_message);
+        }
+    }
+    let failed_msg = failed_msg.expect("a DerivationFailed event reaches the watcher");
+    assert!(
+        failed_msg.contains("neither part of a submission nor resident"),
+        "remediation is generated from the typed reason; got: {failed_msg}"
+    );
+    assert!(
+        failed_msg.contains(&child_path),
+        "remediation names the unseedable input"
+    );
+
+    // Failure evidence is durably recorded at source.
+    let (summary,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(build_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        summary.is_some(),
+        "failure evidence recorded at source for the interested build"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived+1]
+/// Computed-bound scale pin (counts OPS, not wall-clock): dispatching
+/// 128 independent bare store-backed nodes performs EXACTLY one store
+/// GetPath per node — no closure walks, no refetches after the rank
+/// raise. The claims gate's cost is O(nodes), in contrast to the
+/// store-side deriver-proof read-through (O(closure), own budget).
+/// One pre-connected worker per node so the merge-time dispatch pass
+/// assigns the whole set in one wave (the harness has no idle-worker
+/// heartbeat loop).
+#[tokio::test]
+async fn test_claims_gate_scale_one_getpath_per_node() -> TestResult {
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (_db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    const N: usize = 128;
+    let mut nodes = Vec::with_capacity(N);
+    for i in 0..N {
+        let (node, aterm, _out) = mint_text_ca_leaf(&format!("scale{i:03}"));
+        store.seed_with_content(&node.drv_path, aterm.as_bytes());
+        nodes.push(node);
+    }
+
+    let mut receivers = Vec::with_capacity(N);
+    for i in 0..N {
+        receivers.push(connect_executor(&handle, &format!("scale-w{i:03}"), "x86_64-linux").await?);
+    }
+    let _events = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
+    barrier(&handle).await;
+
+    // Every node dispatches exactly once across the worker fleet.
+    let mut assigned: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for _ in 0..20 {
+        for rx in receivers.iter_mut() {
+            while let Some(a) = try_recv_assignment(rx, 20).await {
+                assigned.insert(a.drv_path);
+            }
+        }
+        if assigned.len() == N {
+            break;
+        }
+        handle.send_unchecked(ActorCommand::Tick).await?;
+        barrier(&handle).await;
+    }
+    assert_eq!(assigned.len(), N, "all {N} nodes dispatch");
+
+    let fetches = store
+        .calls
+        .get_path_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        fetches as usize, N,
+        "exactly ONE GetPath per node first-dispatch — no closure walks, \
+         no refetch after the path_bound_bytes raise"
     );
     Ok(())
 }

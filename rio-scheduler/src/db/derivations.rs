@@ -553,4 +553,27 @@ impl SchedulerDb {
         .await?;
         Ok(())
     }
+
+    /// Persist a stripped-claim verification: the rank rises on the
+    /// verified bytes AND the unverifiable declared modular hash is
+    /// cleared in the same statement (`sched.dispatch.claims-derived+1`
+    /// — an unverifiable claim is NO claim, never persisted; exact
+    /// ingress-strip parity, `ingress-inline-drv-binding+1`). One
+    /// statement so a failover between the two writes cannot leave the
+    /// raised rank with the unverified hash still attached.
+    pub(crate) async fn persist_evidence_rank_and_clear_modular_hash(
+        &self,
+        drv_hash: &str,
+        rank: crate::state::DefinitionEvidence,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE derivations SET evidence_rank = $2, ca_modular_hash = NULL, \
+             updated_at = now() WHERE drv_hash = $1",
+        )
+        .bind(drv_hash)
+        .bind(rank.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }

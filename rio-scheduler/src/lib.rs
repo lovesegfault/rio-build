@@ -201,10 +201,32 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_dispatch_claims_unavailable_total",
-        "Dispatch-time claims derivations that could not complete because the \
-         store could not vouch (fetch failure, absent .drv, text-CA mismatch, \
-         unresolvable inputs): assignment rolled back with backoff, retried \
-         when the store recovers (sched.dispatch.claims-derived)"
+        "Dispatch-time claims derivations deferred on STORE SILENCE only \
+         (fetch failure, absent .drv, transport-grade byte noise): assignment \
+         rolled back with backoff and retried when the store recovers, \
+         bounded by the claims-unavailable budget. Structurally permanent \
+         shapes never land here — they poison with remediation \
+         (..._claims_unverifiable_total) and unverifiable declared hashes \
+         strip and proceed (..._claims_stripped_total) \
+         (sched.dispatch.claims-derived+1)"
+    );
+    describe_counter!(
+        "rio_scheduler_dispatch_claims_stripped_total",
+        "Bare store-backed nodes whose declared modular hash could not be \
+         recomputed against the store's text-CA-verified bytes and was \
+         STRIPPED at dispatch (an unverifiable claim is no claim — exact \
+         ingress-strip parity): the node proceeds on the verified bytes at \
+         path_bound_bytes with the hash cleared in memory and PG \
+         (sched.dispatch.claims-derived+1). The expected nonzero source is \
+         warm gateway CA-chain / deferred-IA submissions."
+    );
+    describe_counter!(
+        "rio_scheduler_dispatch_claims_unverifiable_total",
+        "Bare store-backed nodes whose claims verification is STRUCTURALLY \
+         impossible (unseedable input, unparseable declared path): poisoned \
+         at dispatch with generated remediation instead of livelocking \
+         through backoff (sched.dispatch.claims-derived+1). Nonzero means \
+         submitters are submitting underspecified closures."
     );
     describe_counter!(
         "rio_scheduler_cache_hits_total",

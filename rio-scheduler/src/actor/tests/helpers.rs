@@ -1402,3 +1402,70 @@ pub(crate) fn mint_floating_ca_leaf(
     };
     (node, aterm, published)
 }
+
+/// Mint a canonical DEFERRED-IA derivation over one CA input as a bare
+/// store-backed submission node (gateway warm shape: declared modular
+/// hash, `needs_resolve`, no inline content, `is_content_addressed =
+/// false` — deferred-IA nodes carry the hash with the IA flag). The
+/// declared hash is computed through the real input-form recursion
+/// (`hash_derivation_modulo`, mask=false for non-floating subjects), so
+/// it equals what an honest gateway publishes.
+pub(crate) fn mint_deferred_ia_node(
+    tag: &str,
+    input_drv_path: &str,
+    transitive_inputs: &[(&str, &str)],
+) -> (rio_proto::types::DerivationNode, String) {
+    use rio_nix::derivation::{Derivation, hash_derivation_modulo};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    let aterm = format!(
+        r#"Derive([("out","","","")],[("{input_drv_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","{tag}"),("out","")])"#
+    );
+    let drv = Derivation::parse(&aterm).expect("deferred-IA fixture parses");
+    assert_eq!(drv.to_aterm(), aterm, "fixture must be canonical");
+
+    let content_hash =
+        NixHash::new(HashAlgo::SHA256, Sha256::digest(aterm.as_bytes()).to_vec()).unwrap();
+    let drv_path = StorePath::make_text(
+        &format!("{tag}.drv"),
+        &content_hash,
+        &[StorePath::parse(input_drv_path).unwrap()],
+    )
+    .unwrap()
+    .as_str()
+    .to_owned();
+
+    // The modulo walk recurses through the WHOLE transitive input set;
+    // the caller supplies every (path, aterm) pair the recursion visits.
+    let parsed: Vec<(String, Derivation)> = transitive_inputs
+        .iter()
+        .map(|(p, a)| {
+            (
+                (*p).to_owned(),
+                Derivation::parse(a).expect("input fixture parses"),
+            )
+        })
+        .collect();
+    let resolver =
+        |p: &str| -> Option<&Derivation> { parsed.iter().find(|(ip, _)| ip == p).map(|(_, d)| d) };
+    let declared = hash_derivation_modulo(&drv, &drv_path, &resolver, &mut HashMap::new())
+        .expect("deferred-IA modulo hash");
+
+    let node = rio_proto::types::DerivationNode {
+        drv_path: drv_path.clone(),
+        drv_hash: drv_path,
+        pname: tag.to_owned(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: false,
+        expected_output_paths: vec![String::new()],
+        ca_modular_hash: declared.to_vec(),
+        needs_resolve: true,
+        ..Default::default()
+    };
+    (node, aterm)
+}

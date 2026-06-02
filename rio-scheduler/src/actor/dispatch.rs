@@ -121,6 +121,12 @@ pub(super) enum AssignmentProtoOutcome {
     /// content-bound garbage that can never parse: permanent — caller
     /// rolls back and poisons.
     Forged(String),
+    /// Claims verification is STRUCTURALLY impossible for this node
+    /// (`StoreEvidenceOutcome::StructurallyUnverifiable`): permanent
+    /// for retries — caller rolls back and poisons with the carried
+    /// remediation (generated from the typed reason, fix-discipline
+    /// R6) instead of livelocking through backoff.
+    PermanentlyUnverifiable(String),
 }
 
 /// `DrvHash` → owned `String` (the domain node synth wants `String`).
@@ -2121,7 +2127,7 @@ impl DagActor {
             // (TOCTOU vs. concurrent cancel) — legacy no-rollback
             // semantics: caller defers.
             AssignmentProtoOutcome::NodeGone => return false,
-            // r[impl sched.dispatch.claims-derived]
+            // r[impl sched.dispatch.claims-derived+1]
             // The store could not vouch for a bare store-backed node's
             // claims (fetch failure, absent .drv, text-CA mismatch,
             // unresolvable inputs). Transient, store-trust posture:
@@ -2160,6 +2166,29 @@ impl DagActor {
                 );
                 self.rollback_assignment(drv_hash, executor_id).await;
                 let msg = format!("dispatch claims derivation failed permanently: {detail}");
+                self.poison_and_cascade(drv_hash, &msg).await;
+                for build_id in self.get_interested_builds(drv_hash) {
+                    self.record_failure_evidence(build_id, drv_hash).await;
+                }
+                return false;
+            }
+            // r[impl sched.dispatch.claims-derived+1]
+            // Structurally unverifiable: PERMANENT for retries of this
+            // submission shape — surface a visible poison carrying the
+            // generated remediation instead of livelocking through
+            // backoff (pre-fix: deterministic re-verification forever).
+            AssignmentProtoOutcome::PermanentlyUnverifiable(remediation) => {
+                metrics::counter!("rio_scheduler_dispatch_claims_unverifiable_total").increment(1);
+                warn!(
+                    drv_hash = %drv_hash,
+                    executor_id = %executor_id,
+                    remediation = %remediation,
+                    "dispatch claims structurally unverifiable; poisoning with remediation"
+                );
+                self.rollback_assignment(drv_hash, executor_id).await;
+                let msg = format!(
+                    "dispatch claims verification is structurally impossible: {remediation}"
+                );
                 self.poison_and_cascade(drv_hash, &msg).await;
                 for build_id in self.get_interested_builds(drv_hash) {
                     self.record_failure_evidence(build_id, drv_hash).await;
@@ -2409,8 +2438,8 @@ impl DagActor {
         executor_id: &ExecutorId,
         generation: u64,
     ) -> AssignmentProtoOutcome {
-        // === Claims derivation (sched.dispatch.claims-derived) ========
-        // r[impl sched.dispatch.claims-derived]
+        // === Claims derivation (sched.dispatch.claims-derived+1) ======
+        // r[impl sched.dispatch.claims-derived+1]
         // Decide the byte-bound source of every value the token will
         // sign and the worker will obey, BEFORE any of it is used.
         // Unsigned dev mode mints no claims — nothing to derive (the
@@ -2428,6 +2457,15 @@ impl DagActor {
         // same identity validator SubmitBuild ingress applies — the
         // resolve-need is then derived from those verified bytes,
         // never from the submitter's `needs_resolve` echo.
+        //
+        // Computed cost bound: this gate performs exactly ONE store
+        // GetPath per FIRST dispatch of a bare store-backed node — the
+        // node's own `.drv`, never a closure walk (input digests come
+        // from the InputFormSeed over resident DAG children, zero
+        // fetches). A verified or stripped node is raised to
+        // `path_bound_bytes`, so re-dispatch skips the fetch entirely.
+        // Contrast with the store-side deriver-proof read-through,
+        // which is the O(closure) surface and carries its own budget.
         let verified_bytes: Option<Vec<u8>> = if self.hmac_signer.is_some() {
             let verdict = {
                 let Some(state) = self.dag.node(drv_hash) else {
@@ -2533,20 +2571,62 @@ impl DagActor {
                             .into(),
                     );
                 }
-                // Consequence-neutral mapping (C2c1): all three
-                // non-positive, non-contradiction verdicts keep
-                // today's transient rollback+backoff. The per-variant
-                // consequences (strip-and-proceed for the verified
-                // bytes, visible poison for structural impossibility)
-                // land with the strip commit.
+                // r[impl sched.dispatch.claims-derived+1]
+                // Three-way permanence contract (the merged_bug_019
+                // deploy-blocker fix; fix-discipline R1 — consequences
+                // derived from the variant's typed permanence):
+                //
+                // TRANSIENT silence → backoff. The ONLY arm allowed to
+                // retry, and it is bounded by its own budget.
                 Some(super::merge::StoreEvidenceOutcome::StoreSilence(reason)) => {
                     return AssignmentProtoOutcome::Unavailable(reason.as_str());
                 }
+                // PERMANENT structural impossibility → visible poison
+                // with remediation generated from the typed reason.
+                // Backoff cannot resolve it: pre-fix this arm
+                // livelocked (deterministic re-verification, identical
+                // result, forever).
                 Some(super::merge::StoreEvidenceOutcome::StructurallyUnverifiable(reason)) => {
-                    return AssignmentProtoOutcome::Unavailable(reason.as_str());
+                    return AssignmentProtoOutcome::PermanentlyUnverifiable(reason.remediation());
                 }
-                Some(super::merge::StoreEvidenceOutcome::VerifiedExceptDeclaredHash(_)) => {
-                    return AssignmentProtoOutcome::Unavailable("modular-hash-unrecomputable");
+                // Strip-resolvable: the bytes ARE the store's text-CA
+                // object and the identity verifies EXCEPT the declared
+                // modular hash, which can never be recomputed (floating
+                // store-backed input). Exact ingress-STRIP parity
+                // (ingress-inline-drv-binding+1): an unverifiable claim
+                // is NO claim — clear it (memory + row), raise the node
+                // to path_bound_bytes on the verified bytes, and
+                // proceed. Pre-fix this arm livelocked 100% of bare
+                // CA-chain / deferred-IA dispatches under signing.
+                Some(super::merge::StoreEvidenceOutcome::VerifiedExceptDeclaredHash(bytes)) => {
+                    metrics::counter!(
+                        "rio_scheduler_dispatch_claims_source_total",
+                        "source" => "store"
+                    )
+                    .increment(1);
+                    metrics::counter!("rio_scheduler_dispatch_claims_stripped_total").increment(1);
+                    info!(
+                        drv_hash = %drv_hash,
+                        "declared modular hash unverifiable against store bytes; \
+                         stripped (an unverifiable claim is no claim) and \
+                         proceeding on the verified bytes"
+                    );
+                    if let Some(state) = self.dag.node_mut(drv_hash) {
+                        state.ca.modular_hash = None;
+                        state.evidence = crate::state::DefinitionEvidence::PathBoundBytes;
+                    }
+                    if let Err(e) = self
+                        .db
+                        .persist_evidence_rank_and_clear_modular_hash(
+                            drv_hash.as_str(),
+                            crate::state::DefinitionEvidence::PathBoundBytes,
+                        )
+                        .await
+                    {
+                        debug!(drv_hash = %drv_hash, error = %e,
+                               "stripped-evidence persist failed (best-effort)");
+                    }
+                    Some(bytes)
                 }
             }
         } else {
