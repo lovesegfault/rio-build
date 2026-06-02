@@ -2523,7 +2523,7 @@ async fn collect_pass_with(
         .await?;
         for (job, decision) in &decisions {
             match decision {
-                collect::CollectDecision::Requeue { why } => {
+                collect::CollectDecision::Requeue { why, .. } => {
                     ledger.requeue_collected(job, why).await?;
                     requeued += 1;
                 }

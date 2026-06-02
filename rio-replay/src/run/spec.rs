@@ -588,6 +588,27 @@ impl CampaignSpec {
             self.knobs.batch_timeout_hours.is_finite() && self.knobs.batch_timeout_hours > 0.0,
             "campaign spec field knobs.batch_timeout_hours must be a positive finite number of hours"
         );
+        // The engine-cancelled requeue arm is deliberately unbudgeted (an
+        // engine-cancelled batch re-offers its members regardless of spent
+        // retries) and delegates its bound to the active-stall watchdog:
+        // each cancel-and-requeue cycle holds the job Active for the full
+        // batch timeout, so the stall clock fires mid-cycle, granting the
+        // single stall auto-retry and then a terminal stalled-active
+        // record. That backstop only exists when the batch timeout EXCEEDS
+        // the stall threshold — inverted, every cancellation flips the
+        // job's phase (resetting the stall clock) before it can fire, and
+        // the requeue loop is unbounded.
+        anyhow::ensure!(
+            self.knobs.batch_timeout_hours > self.knobs.active_stall_hours,
+            "campaign spec field knobs.batch_timeout_hours ({}) must exceed \
+             knobs.active_stall_hours ({}): the active-stall watchdog is the engine-cancelled \
+             requeue arm's only bound, and it can only fire while a batch outlives the stall \
+             threshold — with the inverted ordering (accepted by earlier engine versions, \
+             rejected now) an engine-cancelled batch resets the stall clock every cycle and is \
+             re-offered forever",
+            self.knobs.batch_timeout_hours,
+            self.knobs.active_stall_hours,
+        );
         // Recorded offsets are divided by the speedup; zero, NaN, infinity,
         // or a negative value would collapse or invert the schedule.
         anyhow::ensure!(
@@ -1172,6 +1193,45 @@ mod tests {
         let spec: CampaignSpec = serde_json::from_str(&json).unwrap();
         let err = spec.validate().unwrap_err();
         assert!(err.to_string().contains("batch_timeout_hours"), "{err:#}");
+    }
+
+    /// The engine-cancelled requeue arm's backstop ordering: the
+    /// active-stall watchdog can only bound the unbudgeted carve-out while
+    /// a batch outlives the stall threshold, so a spec whose batch timeout
+    /// is at or below active_stall_hours is rejected (such specs were
+    /// accepted by earlier engine versions — this is a deliberate
+    /// validation tightening, named in the error). The defaults (24h > 6h)
+    /// satisfy the ordering.
+    #[test]
+    fn batch_timeout_must_exceed_the_active_stall_threshold() {
+        let defaults = Knobs::default();
+        assert!(
+            defaults.batch_timeout_hours > defaults.active_stall_hours,
+            "default knobs must satisfy the backstop ordering"
+        );
+
+        let mut inverted = valid_spec();
+        inverted.knobs.batch_timeout_hours = 2.0;
+        inverted.knobs.active_stall_hours = 6.0;
+        let err = inverted.validate().unwrap_err().to_string();
+        assert!(err.contains("must exceed"), "{err}");
+        assert!(err.contains("active_stall_hours"), "{err}");
+        assert!(
+            err.contains("engine-cancelled"),
+            "the error must explain which bound depends on the ordering: {err}"
+        );
+
+        // Equality is rejected too: the stall clock needs the batch to
+        // OUTLIVE the threshold to fire.
+        let mut equal = valid_spec();
+        equal.knobs.batch_timeout_hours = 6.0;
+        equal.knobs.active_stall_hours = 6.0;
+        assert!(equal.validate().is_err());
+
+        let mut ordered = valid_spec();
+        ordered.knobs.batch_timeout_hours = 7.0;
+        ordered.knobs.active_stall_hours = 6.0;
+        ordered.validate().unwrap();
     }
 
     #[test]

@@ -63,6 +63,73 @@ pub struct JobContext {
     pub fixed_output_drvs: std::sync::Arc<HashSet<String>>,
 }
 
+/// Proof token that a requeue decision consulted its bound.
+///
+/// [`CollectDecision::Requeue`] cannot be constructed without a
+/// [`RequeueBudget`], and the witness's field is private to this module —
+/// the three minting methods below are the ONLY ways to obtain one. A new
+/// failure arm therefore cannot re-offer jobs while forgetting the retry
+/// budget: it must either pass one of the budget checks or explicitly name
+/// the carve-out (and inherit the carve-out's documented backstop).
+mod requeue_budget {
+    use super::super::spec::Knobs;
+
+    /// See the module docs. The unit field is private on purpose: outside
+    /// this module (including the rest of collect.rs) the type can be
+    /// moved and matched but never built.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct RequeueBudget(());
+
+    impl RequeueBudget {
+        /// The single auto-retry budget for transport-shaped defects
+        /// (missing in-band result, engine-side submission failure,
+        /// positively-identified infra failure): `prior_requeues <
+        /// max_auto_retries`. Any prior requeue of any reason consumes it
+        /// — see [`super::decide`]'s conservative-budget contract.
+        pub fn auto_retry(prior_requeues: u32, knobs: &Knobs) -> Option<Self> {
+            (prior_requeues < knobs.max_auto_retries).then_some(Self(()))
+        }
+
+        /// The bound for jobs denied a fair attempt by their batch (a
+        /// fail-fast cancellation whose trigger is outside the job's own
+        /// closure, or a dependency failure with no identifiable trigger):
+        /// `prior_requeues < failfast_singleton_after + max_auto_retries`.
+        ///
+        /// Wider than [`Self::auto_retry`] by design: these re-offers are
+        /// how a healthy job escapes a failing batch-mate, and fail-fast
+        /// singleton isolation — the mechanism that guarantees the escape —
+        /// only engages after `failfast_singleton_after` resubmissions. The
+        /// budget therefore covers isolation plus the standard auto-retry
+        /// slack; a job still hitting these arms past that point (singled
+        /// out, yet its "dependency" trigger keeps falling outside its
+        /// recorded closure) is wedged on defective closure data or
+        /// degraded scheduler triggers, and another re-offer cannot fix it.
+        pub fn unfair_attempt(prior_requeues: u32, knobs: &Knobs) -> Option<Self> {
+            let limit = knobs
+                .failfast_singleton_after
+                .saturating_add(knobs.max_auto_retries);
+            (prior_requeues < limit).then_some(Self(()))
+        }
+
+        /// The engine-cancelled carve-out: a batch the ENGINE itself
+        /// cancelled (batch deadline, abort) re-offers its members without
+        /// consuming budget — the cancellation is the engine's own act,
+        /// not evidence about the job. The arm's bound is delegated to the
+        /// active-stall watchdog: each cycle holds the job `Active` for
+        /// the full batch timeout, so the stall clock fires mid-cycle
+        /// (one stall auto-retry, then a terminal stalled-active record).
+        /// That backstop requires `batch_timeout_hours >
+        /// active_stall_hours`, which spec validation asserts — do NOT
+        /// reach for this constructor from a new arm without naming an
+        /// equivalent backstop.
+        pub fn engine_cancelled_carveout() -> Self {
+            Self(())
+        }
+    }
+}
+
+pub use requeue_budget::RequeueBudget;
+
 /// What collect decided for one job after looking at one settled batch.
 ///
 /// In-band per-root results are terminal by construction (the build call
@@ -74,7 +141,10 @@ pub struct JobContext {
 /// job: every job-state transition a settled batch causes is a
 /// `CollectDecision` the caller applies through the ledger, so a new
 /// failure arm cannot re-offer jobs through a side channel that forgets
-/// the retry budget — there is no raw job-list return to reach for.
+/// the retry budget — there is no raw job-list return to reach for, and
+/// the `Requeue` variant itself demands a [`RequeueBudget`] witness that
+/// only the budget checks (or the named engine-cancelled carve-out) can
+/// mint.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CollectDecision {
     /// Terminal outcome — the results.jsonl record has been written.
@@ -84,7 +154,22 @@ pub enum CollectDecision {
     },
     /// Non-terminal: re-offer to the submit loop (fail-fast batch-mate,
     /// engine-cancelled batch, infra auto-retry, missing in-band result).
-    Requeue { why: &'static str },
+    Requeue {
+        why: &'static str,
+        budget: RequeueBudget,
+    },
+}
+
+impl CollectDecision {
+    /// The requeue reason when this decision is a re-offer, `None` for
+    /// terminals — the assertable view of a decision whose budget witness
+    /// callers cannot construct.
+    pub fn requeue_why(&self) -> Option<&'static str> {
+        match self {
+            CollectDecision::Requeue { why, .. } => Some(why),
+            CollectDecision::Terminal { .. } => None,
+        }
+    }
 }
 
 /// Failure-kind resolution from the two signals (+ fixed-output knowledge
@@ -236,6 +321,17 @@ pub fn timed_interruption_for(
 /// (`knobs.max_auto_retries`). Conservative by design: a job that already
 /// burned an engine re-offer is not granted an extra infra retry on top, so
 /// the budget can never multiply across requeue reasons.
+///
+/// Every requeue arm is bounded through a [`RequeueBudget`] witness: the
+/// transport-shaped arms (no in-band result, infra) by the auto-retry
+/// budget, the unfair-attempt arms (fail-fast batch-mate, dependency
+/// failure with no identifiable trigger) by the wider
+/// `failfast_singleton_after + max_auto_retries` bound that covers
+/// singleton isolation, and the engine-cancelled arm by the named
+/// carve-out whose backstop (the active-stall watchdog) spec validation
+/// guarantees via the `batch_timeout_hours > active_stall_hours` ordering.
+/// Exhausted bounds terminalize — a deterministic condition can delay a
+/// campaign by its budget, never wedge it.
 pub fn decide(
     ctx: &JobContext,
     target: Option<&PathOutcome>,
@@ -249,16 +345,20 @@ pub fn decide(
     let Some(target) = target else {
         // No in-band result for this root. An engine-cancelled batch
         // (deadline/abort: the channel was abandoned before results arrived)
-        // is always re-offered; otherwise a missing result is a transport
-        // defect — one auto-retry, then an infra failure.
+        // is always re-offered — the carve-out's bound is the active-stall
+        // watchdog (see [`RequeueBudget::engine_cancelled_carveout`]);
+        // otherwise a missing result is a transport defect — one
+        // auto-retry, then an infra failure.
         if batch.engine_cancelled {
             return CollectDecision::Requeue {
                 why: "engine-cancelled",
+                budget: RequeueBudget::engine_cancelled_carveout(),
             };
         }
-        if prior_requeues < knobs.max_auto_retries {
+        if let Some(budget) = RequeueBudget::auto_retry(prior_requeues, knobs) {
             return CollectDecision::Requeue {
                 why: "no-inband-result",
+                budget,
             };
         }
         return CollectDecision::Terminal {
@@ -311,18 +411,54 @@ pub fn decide(
             _ => None,
         });
         let Some(trigger) = trigger else {
-            // No identifiable trigger: treat as a fail-fast batch-mate.
-            return CollectDecision::Requeue {
-                why: "dependency-failed-no-trigger",
+            // No identifiable trigger: treat as a fail-fast batch-mate —
+            // re-offered within the unfair-attempt budget. Exhaustion
+            // terminalizes as an infra-indeterminate target failure: the
+            // engine could not obtain an attributable attempt for this job
+            // within budget, and recording a dependency failure would
+            // charge rio with a trigger nobody identified.
+            return match RequeueBudget::unfair_attempt(prior_requeues, knobs) {
+                Some(budget) => CollectDecision::Requeue {
+                    why: "dependency-failed-no-trigger",
+                    budget,
+                },
+                None => CollectDecision::Terminal {
+                    rio: RioOutcome::TargetFailed {
+                        kind: FailureKind::Infra,
+                    },
+                    evidence: Some(format!(
+                        "dependency-failed-no-trigger: requeue budget exhausted after \
+                         {prior_requeues} re-offers"
+                    )),
+                },
             };
         };
         if !ctx.dep_drvs.contains(&trigger) && trigger != ctx.drv_path {
             // Fail-fast marks unrelated batch-mates dependency-failed — the
             // trigger is not in this job's own closure, so the job never got
             // a fair attempt and is re-queued instead of being charged with
-            // a dependency failure.
-            return CollectDecision::Requeue {
-                why: "failfast-batch-mate",
+            // a dependency failure. Bounded by the unfair-attempt budget:
+            // past it the job has been singled out (no batch-mates left to
+            // blame) and STILL reports an outside-closure trigger, which
+            // means defective closure data or a degraded scheduler trigger
+            // — re-offering cannot converge, so it terminalizes as
+            // infra-indeterminate with the trigger as evidence instead of
+            // cycling submit→fail→requeue forever.
+            return match RequeueBudget::unfair_attempt(prior_requeues, knobs) {
+                Some(budget) => CollectDecision::Requeue {
+                    why: "failfast-batch-mate",
+                    budget,
+                },
+                None => CollectDecision::Terminal {
+                    rio: RioOutcome::TargetFailed {
+                        kind: FailureKind::Infra,
+                    },
+                    evidence: Some(format!(
+                        "failfast-batch-mate: requeue budget exhausted after {prior_requeues} \
+                         re-offers; last trigger '{trigger}' is outside the job's recorded \
+                         dependency closure"
+                    )),
+                },
             };
         }
         // Root-cause classification of the trigger, so dependents of an
@@ -363,9 +499,12 @@ pub fn decide(
         ctx.fixed_output_drvs.contains(&ctx.drv_path),
         log_tail,
     );
-    if kind == FailureKind::Infra && prior_requeues < knobs.max_auto_retries {
+    if kind == FailureKind::Infra
+        && let Some(budget) = RequeueBudget::auto_retry(prior_requeues, knobs)
+    {
         return CollectDecision::Requeue {
             why: "infra-auto-retry",
+            budget,
         };
     }
     CollectDecision::Terminal {
@@ -645,17 +784,18 @@ pub async fn process_settled_batch(
             }
             let prior = prior_requeues.get(job).copied().unwrap_or(0);
             match decide(ctx, None, batch, &HashMap::new(), prior, knobs, None) {
-                CollectDecision::Requeue { why } => {
+                CollectDecision::Requeue { why, budget } => {
                     // The whole submission failed, so "no in-band result"
                     // understates the cause; the engine-cancelled reason
-                    // passes through unchanged.
+                    // passes through unchanged. The budget witness rides
+                    // along — relabeling the reason never re-mints it.
                     let why = if batch.engine_cancelled {
                         why
                     } else {
                         "engine-submission-failure"
                     };
                     tracing::info!(job, why, "re-queueing");
-                    decisions.insert(job.clone(), CollectDecision::Requeue { why });
+                    decisions.insert(job.clone(), CollectDecision::Requeue { why, budget });
                 }
                 CollectDecision::Terminal { rio, .. } => {
                     tracing::info!(
@@ -777,7 +917,7 @@ pub async fn process_settled_batch(
             knobs,
             log_signal_text.as_deref(),
         ) {
-            CollectDecision::Requeue { why } => {
+            CollectDecision::Requeue { why, budget } => {
                 if timed {
                     // Never re-offered (the timed dispatcher owns retries).
                     // An armed interruption whose disconnect-replay
@@ -819,7 +959,7 @@ pub async fn process_settled_batch(
                     }
                 } else {
                     tracing::info!(job, why, "re-queueing");
-                    decisions.insert(job.clone(), CollectDecision::Requeue { why });
+                    decisions.insert(job.clone(), CollectDecision::Requeue { why, budget });
                 }
             }
             CollectDecision::Terminal { rio, evidence } => {
@@ -1189,10 +1329,9 @@ mod tests {
                 0,
                 &knobs,
                 None
-            ),
-            CollectDecision::Requeue {
-                why: "infra-auto-retry"
-            }
+            )
+            .requeue_why(),
+            Some("infra-auto-retry")
         );
         assert!(matches!(
             decide(
@@ -1300,16 +1439,12 @@ mod tests {
             ..BatchView::default()
         };
         assert_eq!(
-            decide(&c, None, &cancelled_batch, &no_poison, 5, &knobs, None),
-            CollectDecision::Requeue {
-                why: "engine-cancelled"
-            }
+            decide(&c, None, &cancelled_batch, &no_poison, 5, &knobs, None).requeue_why(),
+            Some("engine-cancelled")
         );
         assert_eq!(
-            decide(&c, None, &batch, &no_poison, 0, &knobs, None),
-            CollectDecision::Requeue {
-                why: "no-inband-result"
-            }
+            decide(&c, None, &batch, &no_poison, 0, &knobs, None).requeue_why(),
+            Some("no-inband-result")
         );
         match decide(&c, None, &batch, &no_poison, 1, &knobs, None) {
             CollectDecision::Terminal {
@@ -1522,10 +1657,9 @@ mod tests {
                 0,
                 &knobs,
                 None
-            ),
-            CollectDecision::Requeue {
-                why: "infra-auto-retry"
-            }
+            )
+            .requeue_why(),
+            Some("infra-auto-retry")
         );
     }
 
@@ -1651,10 +1785,9 @@ mod tests {
                 0,
                 &knobs,
                 None
-            ),
-            CollectDecision::Requeue {
-                why: "failfast-batch-mate"
-            }
+            )
+            .requeue_why(),
+            Some("failfast-batch-mate")
         );
 
         // No identifiable trigger (no dependency-shaped message from either
@@ -1669,11 +1802,132 @@ mod tests {
                 0,
                 &knobs,
                 None
-            ),
-            CollectDecision::Requeue {
-                why: "dependency-failed-no-trigger"
-            }
+            )
+            .requeue_why(),
+            Some("dependency-failed-no-trigger")
         );
+    }
+
+    /// The two unfair-attempt arms (fail-fast batch-mate, dependency
+    /// failure with no identifiable trigger) are bounded: re-offered while
+    /// `prior_requeues < failfast_singleton_after + max_auto_retries` —
+    /// wide enough that singleton isolation engages and gets its fair
+    /// shot — and TERMINAL past it, as an infra-indeterminate target
+    /// failure carrying the arm and (for the batch-mate arm) the
+    /// outside-closure trigger as evidence. A deterministic condition
+    /// (truncated closure data, degraded scheduler triggers) can therefore
+    /// no longer cycle submit→fail→requeue forever: the watchdog's stall
+    /// clocks reset on every phase flip, so without this bound nothing
+    /// else terminates the loop.
+    #[test]
+    fn dependency_failed_arms_exhaust_their_budget_and_terminalize() {
+        let knobs = Knobs::default();
+        // Defaults: failfast_singleton_after = 3, max_auto_retries = 1 →
+        // the unfair-attempt bound is 4 re-offers.
+        let limit = knobs.failfast_singleton_after + knobs.max_auto_retries;
+        let c = ctx("app.x86_64-linux", T, &[DEP], ExpectedOutcome::Built);
+        let no_poison: HashMap<String, Vec<String>> = HashMap::new();
+        let mate = po(
+            T,
+            BuildStatus::DependencyFailed,
+            &format!("dependency '{OTHER}' failed: poison threshold reached"),
+        );
+        let no_trigger = po(T, BuildStatus::DependencyFailed, "");
+
+        // One under the bound: still re-offered.
+        for (target, why) in [
+            (&mate, "failfast-batch-mate"),
+            (&no_trigger, "dependency-failed-no-trigger"),
+        ] {
+            assert_eq!(
+                decide(
+                    &c,
+                    Some(target),
+                    &BatchView::default(),
+                    &no_poison,
+                    limit - 1,
+                    &knobs,
+                    None
+                )
+                .requeue_why(),
+                Some(why),
+                "one re-offer under the bound must still requeue ({why})"
+            );
+        }
+
+        // At the bound: terminal infra-indeterminate with arm-named
+        // evidence; the batch-mate arm names the outside-closure trigger.
+        match decide(
+            &c,
+            Some(&mate),
+            &BatchView::default(),
+            &no_poison,
+            limit,
+            &knobs,
+            None,
+        ) {
+            CollectDecision::Terminal {
+                rio:
+                    RioOutcome::TargetFailed {
+                        kind: FailureKind::Infra,
+                    },
+                evidence,
+            } => {
+                let evidence = evidence.unwrap();
+                assert!(evidence.contains("failfast-batch-mate"), "{evidence}");
+                assert!(evidence.contains(OTHER), "{evidence}");
+            }
+            other => panic!("expected terminal infra at the bound, got {other:?}"),
+        }
+        match decide(
+            &c,
+            Some(&no_trigger),
+            &BatchView::default(),
+            &no_poison,
+            limit,
+            &knobs,
+            None,
+        ) {
+            CollectDecision::Terminal {
+                rio:
+                    RioOutcome::TargetFailed {
+                        kind: FailureKind::Infra,
+                    },
+                evidence,
+            } => {
+                assert!(
+                    evidence.unwrap().contains("dependency-failed-no-trigger"),
+                    "evidence names the exhausted arm"
+                );
+            }
+            other => panic!("expected terminal infra at the bound, got {other:?}"),
+        }
+
+        // The exhausted record classifies infra-indeterminate (excluded
+        // from the genuine-failure headline: the job never got a fair,
+        // attributable attempt).
+        let record = build_record(
+            &c,
+            &RioOutcome::TargetFailed {
+                kind: FailureKind::Infra,
+            },
+            Some("failfast-batch-mate: requeue budget exhausted".to_string()),
+            Some(&mate),
+            &BatchView::default(),
+            &no_poison,
+            &HashMap::new(),
+            "leaf",
+            "c1",
+            limit + 1,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            record.verdict.as_deref(),
+            Some(Verdict::InfraIndeterminate.as_str())
+        );
+        assert_eq!(record.failure_cause.as_deref(), Some("infra"));
     }
 
     /// One settled multi-root batch whose in-band results mix a success, an
@@ -1715,16 +1969,12 @@ mod tests {
             }
         );
         assert_eq!(
-            decide(&job2, target_for(DEP), &batch, &poisoned, 0, &knobs, None),
-            CollectDecision::Requeue {
-                why: "infra-auto-retry"
-            }
+            decide(&job2, target_for(DEP), &batch, &poisoned, 0, &knobs, None).requeue_why(),
+            Some("infra-auto-retry")
         );
         assert_eq!(
-            decide(&job3, target_for(OTHER), &batch, &poisoned, 0, &knobs, None),
-            CollectDecision::Requeue {
-                why: "no-inband-result"
-            }
+            decide(&job3, target_for(OTHER), &batch, &poisoned, 0, &knobs, None).requeue_why(),
+            Some("no-inband-result")
         );
 
         // Second pass (one prior requeue each): both budget-consuming rows go
@@ -1965,10 +2215,8 @@ mod tests {
             (ctx("b.x86_64-linux", DEP, &[], ExpectedOutcome::Built), 5),
         ] {
             assert_eq!(
-                decide(&job, None, &batch, &no_poison, prior_requeues, &knobs, None),
-                CollectDecision::Requeue {
-                    why: "engine-cancelled"
-                },
+                decide(&job, None, &batch, &no_poison, prior_requeues, &knobs, None).requeue_why(),
+                Some("engine-cancelled"),
                 "prior_requeues = {prior_requeues}"
             );
         }
