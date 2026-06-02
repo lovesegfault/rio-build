@@ -3501,6 +3501,64 @@ mod tests {
         Ok(())
     }
 
+    /// The warm store-backed-floating shape is MANUFACTURED by the
+    /// per-node inline cap (round-15 C3c6, bug_048 lineage): a
+    /// floating-CA derivation whose canonical ATerm exceeds
+    /// `MAX_INLINE_DRV_BYTES` (64 KiB) is never inlined, so every
+    /// submission containing it ships the child STORE-BACKED while
+    /// its (inlined) consumers carry a declared `ca_modular_hash`
+    /// computed from the gateway's full session cache. At scheduler
+    /// ingress that declaration is unverifiable — the floating
+    /// input's bytes are not in the submission — and is STRIPPED
+    /// (`sched.merge.ingress-inline-drv-binding+1`). Arithmetic: ONE
+    /// >64 KiB floating .drv forces the shape on every warm
+    /// submission that consumes it, independent of the 16 MiB total
+    /// budget; this is honest gateway traffic, which is why the
+    /// scheduler strips instead of rejecting.
+    #[tokio::test]
+    async fn test_inline_cap_manufactures_store_backed_floating_shape() -> anyhow::Result<()> {
+        use rio_test_support::grpc::spawn_mock_store_with_client;
+
+        let (_store, mut store_client, _h) = spawn_mock_store_with_client().await?;
+
+        // Floating-CA child: empty output path, >64 KiB ATerm.
+        let pad_val = "x".repeat(MAX_INLINE_DRV_BYTES + 1024);
+        let big_floating_aterm = format!(
+            r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",[],[("PAD","{pad_val}"),("out","")])"#
+        );
+        let big_floating = Derivation::parse(&big_floating_aterm)?;
+        let child_path = sp(&format!("/nix/store/{:0>32}-bigfloat.drv", 7));
+
+        // Small inline-able consumer of the floating child.
+        let consumer = make_test_derivation(
+            "/nix/store/x265isadxs1xhsd5larxdal956cxmsk1-out",
+            &[(child_path.as_str(), &["out"])],
+        );
+        let consumer_path = sp(&format!("/nix/store/{:0>32}-consumer.drv", 8));
+
+        let mut cache = HashMap::new();
+        cache.insert(child_path.clone(), big_floating.clone());
+        cache.insert(consumer_path.clone(), consumer.clone());
+        let mut nodes = vec![
+            build_node(child_path.as_str(), &big_floating),
+            build_node(consumer_path.as_str(), &consumer),
+        ];
+
+        filter_and_inline_drv(&mut nodes, &cache, &mut store_client).await;
+
+        assert!(
+            nodes[0].drv_content.is_empty(),
+            "floating child above the per-node cap stays STORE-BACKED"
+        );
+        assert!(
+            !nodes[1].drv_content.is_empty(),
+            "small consumer inlines — together with the store-backed \
+             floating child this is exactly the shape the scheduler's \
+             ingress strip exists for"
+        );
+        Ok(())
+    }
+
     /// Once the budget gate rejects ANY node, the fast-path arms and
     /// every subsequent node (including tiny ones that would fit in
     /// the headroom) skips `to_aterm()`.

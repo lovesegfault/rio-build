@@ -909,8 +909,10 @@ fn validate_authoritative_drv_content(
 ///    claim: the declaration is STRIPPED (the submission is otherwise
 ///    accepted — warm gateway submissions legitimately have this
 ///    shape), so nothing downstream consumes a value ingress never
-///    checked; the dispatch-resolve/completion path re-establishes the
-///    hash from bytes it can verify.
+///    checked. The stripped node then completes WITHOUT a modular
+///    hash: completion-time CA bookkeeping skips are surfaced
+///    (sched.ca.absent-hash-surfaced) and the verifying
+///    re-establisher is the staged follow-up F2 — not yet built.
 ///
 /// The seeded-sibling design is sound against squats: a forged sibling
 /// hash moves every derived path AWAY from honest paths (SHA-256 second
@@ -1253,9 +1255,10 @@ pub(crate) fn validate_inline_drv_content(
                     // claim: the declaration is STRIPPED below, never
                     // forwarded unverified (it would otherwise flow into
                     // merge-gate identity evidence, realisation keys, and
-                    // the persisted row). The authoritative value is
-                    // re-established downstream by the dispatch-resolve /
-                    // completion path, which has the bytes to verify.
+                    // the persisted row). The stripped node completes
+                    // WITHOUT a hash — its CA bookkeeping skips are
+                    // surfaced (sched.ca.absent-hash-surfaced); the
+                    // verifying re-establisher is staged follow-up F2.
                     tracing::info!(
                         node = %node.drv_hash,
                         unresolvable_input = %input,

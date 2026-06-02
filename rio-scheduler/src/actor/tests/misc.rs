@@ -2556,6 +2556,89 @@ async fn test_dispatch_claims_derived_from_store_bytes() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.ca.absent-hash-surfaced]
+/// THE ingress-stripped node, followed end-to-end PAST ingress for the
+/// first time (round-15 C3c6, bug_048 part 2). Shape provenance: a
+/// warm gateway submission whose floating input is already realized
+/// and store-backed — the consumer's declared modular hash is
+/// unverifiable at ingress and STRIPPED
+/// (`sched.merge.ingress-inline-drv-binding+1`); this test submits the
+/// post-strip shape directly (inline floating node, empty
+/// ca_modular_hash). It dispatches (inline = ingress-byte-bound, no
+/// claims fetch), completes — and the completion-time CA bookkeeping
+/// SKIPS, surfaced by the counter: NO realisation row is written.
+///
+/// WHEN STAGED FOLLOW-UP F2 LANDS (the verifying re-establisher /
+/// ModularHashState): this test's final assertions FLIP — the
+/// realisation row EXISTS and the skip counter stays zero. Do not
+/// weaken either assertion before then; they are the visible record
+/// of the accepted gap.
+#[tokio::test]
+async fn test_stripped_node_completes_without_realisation_and_surfaces() -> TestResult {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _g = metrics::set_default_local_recorder(&rec);
+
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (db, _store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let (mut node, aterm, _hash) = mint_floating_ca_leaf("strip-e2e");
+    let drv_path = node.drv_path.clone();
+    // The post-strip shape: inline bytes, floating, NO declared hash.
+    node.drv_content = aterm.into_bytes();
+    node.ca_modular_hash = Vec::new();
+
+    let mut worker_rx = connect_executor(&handle, "strip-w", "x86_64-linux").await?;
+    let _events = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    let assignment = recv_assignment(&mut worker_rx).await;
+    assert_eq!(
+        assignment.drv_path, drv_path,
+        "stripped inline node dispatches"
+    );
+
+    let out_path = "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-strip-e2e-out";
+    complete_success(&handle, "strip-w", &drv_path, out_path).await?;
+    barrier(&handle).await;
+
+    let probe = handle.debug_query_derivation(&drv_path).await?.unwrap();
+    assert_eq!(probe.status, DerivationStatus::Completed);
+    assert!(
+        probe.ca.modular_hash.is_none(),
+        "still stripped at completion"
+    );
+
+    // F2 FLIP POINT 1: becomes count == 1 when the re-establisher lands.
+    let (n_rows,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM realisations WHERE output_path = $1")
+            .bind(out_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(n_rows, 0, "no realisation row for the stripped node");
+
+    // F2 FLIP POINT 2: becomes 0 when the re-establisher lands.
+    let skipped: u64 = snap
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(ck, ..)| {
+            ck.key().name() == "rio_scheduler_ca_bookkeeping_skipped_total"
+                && ck
+                    .key()
+                    .labels()
+                    .any(|l| l.key() == "consumer" && l.value() == "realisation_insert")
+        })
+        .map(|(.., v)| match v {
+            DebugValue::Counter(c) => c,
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(skipped, 1, "the realisation-insert skip is surfaced");
+    Ok(())
+}
+
 // r[verify sched.dispatch.claims-derived+2]
 /// Forged `needs_resolve` echo cannot steer post-verification
 /// dispatch: a bare store-backed deferred-IA node submitted with

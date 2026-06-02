@@ -875,9 +875,13 @@ gateway shape (inline will-dispatch consumer of an already-realized
 floating drv whose bytes are not re-inlined) is honest traffic whose
 hash is genuinely unverifiable at ingress; discard-not-accept because an
 unverified declaration would otherwise flow into merge-gate identity
-evidence, realisation keys, and the persisted row --- the authoritative
-value is re-established by the dispatch-resolve/completion path, which
-holds the bytes.
+evidence, realisation keys, and the persisted row. NO automatic
+re-establisher exists yet: a stripped node completes with its
+completion-time CA bookkeeping skipped — surfaced, never silent
+(#rref("sched.ca.absent-hash-surfaced")) — and the verifying
+re-establisher is the staged follow-up F2 (`ModularHashState`); until
+it lands, prose anywhere claiming the hash "is re-established" is the
+round-15 bug_048 pattern (R6) and must not return.
 
 #r("sched.merge.edge-creation-scoped")[
   The merge MUST attach a submitted dependency edge to its parent node only
