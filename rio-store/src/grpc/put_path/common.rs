@@ -748,7 +748,16 @@ impl StoreServiceImpl {
         let row = crate::metadata::drv_modulo::load_or_compute_drv_modulo(&self.pool, deriver)
             .await
             .map_err(|e| {
-                Status::internal(format!("{ctx_label}: deriver proof lookup failed: {e}"))
+                // Unlike this file's content-derived hash errors (computed
+                // over bytes the caller already holds), this error wraps a
+                // database lookup: sqlx errors can carry SQL fragments and
+                // connection details, and PutPath callers are untrusted
+                // workers. Log the cause server-side; return only a generic
+                // marker the caller can correlate by ctx_label.
+                tracing::error!(deriver, ctx_label, error = %e, "deriver proof lookup failed");
+                Status::internal(format!(
+                    "{ctx_label}: deriver proof lookup failed (see store logs)"
+                ))
             })?;
         let Some(row) = row else {
             // Unverifiable counter emitted inside the read-through.
