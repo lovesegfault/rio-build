@@ -83,7 +83,7 @@ impl Substituter {
     /// fields cannot steer it either, with a per-arm screen: the HTTP arm
     /// joins object names through [`NormalizedCacheBase::object_url`],
     /// which refuses values that leave the cache's origin, and the S3 arm
-    /// derives its object keys through [`s3_object_key`], which refuses
+    /// derives its object keys through `s3_object_key`, which refuses
     /// names that do not stay strictly under the cache's key prefix.
     pub async fn parse(url: &str) -> Result<Self> {
         let parsed =
@@ -317,7 +317,7 @@ impl Substituter {
     /// through [`NormalizedCacheBase::object_url`], which refuses values
     /// that leave the cache's origin (absolute SAME-origin spellings stay
     /// fetchable), and the S3 arm derives the object key through
-    /// [`s3_object_key`], which refuses names that do not stay strictly
+    /// `s3_object_key`, which refuses names that do not stay strictly
     /// under the cache's key prefix (no absolute spellings at all — keys
     /// have no origin to compare against). Either way a hostile narinfo
     /// cannot steer this fetch outside the cache the substituter URL
