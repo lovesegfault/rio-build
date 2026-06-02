@@ -2278,6 +2278,29 @@ carried unchanged):
 > (MD-D1..D4). CE-D6's conjunction re-run is deferred to that campaign's
 > Phase C′ go/no-go.
 
+> **Successor cross-reference (substitution-replacement Phase D′,
+> 2026-06-02).** The rows above remain this campaign's record as written.
+> Phase D′ (the deletion phase) removed the verification subject: the
+> walk, the `topdown_pruned`/`closure_hole` columns (migration 080), the
+> `Substituting` status and the coexistence flag are deleted; the
+> store-owned materialization job is the only substitution mechanism.
+> Dispositions of the rows that referenced this campaign's machinery:
+> **CE-D7 closes vacuous-by-construction** (the lost-hole-stamp ∩
+> builds-row-purge bound has no hole to lose — durable-relation
+> classification at decision time replaced the breadcrumb);
+> **CE-D8 splits per the D′ plan §5.4**: shape (a) — GC between vouch and
+> use — is delivered by pin-at-ingest
+> (`pinCoversIngestUntilAllInterestTerminal`, wired, with the
+> mat-b2-no-pin calibration re-finding the GC trace), and shape (b) — the
+> stale-Produced direction — narrows into the kept B9 guard
+> (`quint-closure-calib-f1-stale-produced`, still wired); **CE-D9 is
+> unchanged** (the expired-at-load poison residual survives, re-homed to
+> the surviving recovery-time fenced write). The wired check family here
+> shrank to the survivors core (A14/A15/A22/B9/B10/L3 over the
+> post-deletion alphabet) plus the two kept pins; the 27 retired checks'
+> dispositions and the model's archive plan (A6, post-soak) are in
+> `substitution-replacement-invariant-map.md` § "Phase D′ stage record".
+
 ### Owner-decision provenance
 
 Every owner decision this campaign executed under, with date and Phase-1 outcome:

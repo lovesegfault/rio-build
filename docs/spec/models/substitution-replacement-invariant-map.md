@@ -515,6 +515,17 @@ are unchanged.
 | MD-D3 | **Mixed-flag window guidance** | During a rollout where the scheduler is flag-on before the store (the transient AS-6 race the AND-guard cannot eliminate): jobs are created but not claimed — a visible wait (`substituting_derivations` > 0 via rio-cli status, builds Active), bounded by the store rollout completing, never a strand (the store's first poll drains the backlog). The reverse window (store on / scheduler off) is a no-op: the store polls empty lists harmlessly. | T-3.3 mixed-flag subtest (45 s observation window, drains on store rollout) |
 | MD-D4 | **Mixed-version (rolling upgrade) posture of the instance-bound credential** | The T-5.1 instance binding is FAIL-CLOSED across version skew: a pre-Phase-B scheduler that receives an instance-bound store token REJECTS it (`deny_unknown_fields` — `unknown field 'instance'`), so no mixed-version window exists in which an instance-bound token is authenticated while the binding check is skipped. The failure mode of that (unsupported, unreachable pre-D′) skew direction is store claim retries against the rolling scheduler — self-healing within the rollout window — never unenforced binding and never a wrongful build outcome. No deployment-ordering step is required for security: the store's instance-bound minting is flag-gated and the flag rolls atomically with the pod template (a pod is either old-binary+flag-off or new-binary+flag-on, never a cross). | `service_claims_instance_forward_skew` (the fail-closed pin); T-5.1 wire-compat battery; PD-B8/PDB-8 adjudication record |
 
+> **Phase D′ disposition (2026-06-02).** The rows above are the Phase B
+> record as written and are not edited. Phase D′ deleted the coexistence
+> flag and the walk: **MD-D1 survives verbatim** (the park
+> instrumentation, gauge, alert and runbook are untouched — Item T builds
+> on them); **MD-D2 and MD-D3 RETIRE** — there is no flag to flip and no
+> mixed-flag window (rollback through D′.1 is binary rollback; migration
+> 080 is roll-forward only). The replacement operator posture is the
+> Phase D′ stage record's "Deployment and rollback posture" section
+> below. MD-D4's skew posture is unchanged (the binding check is
+> unconditional post-D′).
+
 ---
 
 ## Phase B stage record (flag-on cutover; landed 2026-06-01)
@@ -1112,6 +1123,351 @@ NO-GO triggers checked and not fired: no transferred row held without
 falsifying; no §9.1 property needed a system change to hold; the
 six-delta review found no behavior the model verifies that the system
 lacks.
+
+## Phase D′ stage record (the deletion phase; landed 2026-06-02)
+
+**Authorization:** owner FINAL DECISION GATE 2026-06-01 ("D′ GO"), all five
+orchestrator rulings counter-signed (finding-11 mark discriminator among
+them). **Plan:** `substitution-phaseD-plan.md` (revised, adversarial review
+round 1 incorporated). **Worktree:** `a4-dprime` off `bf15fe57f`
+(formal-sprint @ Phases A+B+C′ integrated). **Result:** the walk machinery,
+the `Substituting` status, the wanted-set lossy semantics, both evidence
+columns, the coexistence flag and the superseded verification surface are
+DELETED; the store-owned materialization job is the only substitution
+mechanism; migration 080 retired the columns and narrowed the status CHECK;
+every commit boundary green; the full gate green at the phase exit.
+
+### Commit ledger (25 commits, bf15fe57f..668b5a229 + the close-out)
+
+| Wave | Commit | Subject (abbreviated) | Net |
+|---|---|---|---|
+| D1 | 65d285cb9 | retire the flag-off walk oracles + transition scenario | −5 VM attrs |
+| D1 | ea1e8e912 | retire the walk-path unit batteries | test-only |
+| D1 | cd4b9f30a | retire the executor dormancy pins | test-only |
+| D2 | d3aa9efec | settlement fail-fast keyed on job origin (PD-D1, red-first) | behavior |
+| D2 | 1b3eb9f39 | durable-relation settlement classifier (PD-D4, three-part) | behavior |
+| D2 | c922ee5c6 | wanted contributions rebuilt at recovery (PD-D5, DQ-2) | behavior |
+| D3 | aab018f87 | delete the walk spawn machinery (+588/−3112) | deletion |
+| D3 | 7d047f5a1 | delete the walk consumption machinery (+49/−883) | deletion |
+| D3 | daf36d3c2 | remove the Substituting status (+170/−298) | deletion |
+| D4 | 8ac576614 | materialization dispatch unconditional (+339/−961) | deletion |
+| D4 | 89e3198ab | store executor spawn-iff-addr (+70/−63) | deletion |
+| D4 | f513937c1 | drop the helm coexistence flags (+59/−218) | deletion |
+| D5 | 151df20a4 | delete the evidence-column machinery (+484/−2687) | deletion |
+| D5 | e07f9c22d | kernel reduced to the durable child relation (+118/−391) | deletion |
+| D5 | 504a20534 | retire the SubstitutePath RPC (+28/−433) | deletion |
+| D5 | 2ad710ddb | drop the stored wanted-union dual-write (+64/−428) | deletion |
+| D5 | 522e7597a | docs-data regen rider (+3/−3) | regen |
+| D6 | 41d714b04 | migration 080 + M_080 + PINNED + decode-arm removal (+119/−31) | migration |
+| D7 | 94996482b | survivors core wired + 27 closure checks pruned (FP-1) | verification |
+| D7 | ad23341ae | materializationJob re-targeted (delta-6 shrink + PD-D1 encoding) | verification |
+| D7 | 0f632aeb8 | stale walk-era narration re-worded at surviving sites | hygiene |
+| D7 | 06afc9409 | retire the walk-era substitution rules (R half) | spec |
+| D7 | 4d8478920 | re-state the substitution rules around materialization (S half) | spec |
+| D7 | 64939a7e0 | absence-gate narration stragglers | hygiene |
+| D7 | 668b5a229 | docs-lint metric-helper fixup (gate #4 finding) | hygiene |
+| D7 | (this commit) | the stage record | docs |
+
+### Deletion totals (measured, `git diff bf15fe57f..668b5a229`)
+
+134 files, **+5,409 / −21,484 = net −16,075** (the §3.10 estimate was net
+−9,000..−10,500 over a different counting basis — the estimate excluded the
+D1 test deletions' true breadth and the spec/model deltas land smaller than
+budgeted). By area (net): rio-scheduler/src −13,099 (52 files);
+nix/tests −1,770; rio-evidence-kernel −612; nix/quint.nix −473;
+rio-store/src −160; rio-test-support −100; rio-proto −91; docs/spec
+components −94; infra/helm −55; nix/kani.nix −25; rio-dashboard −3;
+docs/spec/models +449; rio-migrations +96; gateway/controller/common ≈0
+(comment/marker hygiene only); .github/codecov.yml 51→46.
+
+### Disposition ledgers (locations)
+
+- **5 VM attrs + subtests:** 65d285cb9 commit body (attr table verbatim).
+- **Unit batteries (~100 tests):** ea1e8e912 / cd4b9f30a bodies (per-test
+  class → successor-by-name or retired-with-mechanism); D1-escape fold-ins
+  recorded in aab018f87 (stop-1 carve-out, 9 tests).
+- **27 quint-closure checks:** 94996482b body (the 29-attr table: 2 KEPT +
+  27 retired, each with named successor or mechanism).
+- **26 spec rule IDs (the plan's 22-row table):** 06afc9409 (2 R) +
+  4d8478920 (4 R + 1 R→S transfer + 14 S re-statements + bumps) — final
+  tally below.
+- **Kernel harnesses 17→14→9:** 8ac576614 (D4.1, 17→14) and e07f9c22d
+  (D5.2, 14→9) bodies; kani.nix expectedHarnesses re-pinned in lockstep.
+
+### T-D7.2 verdict-identical re-run (the DS-1 tier protocol)
+
+All 43 materialization checks rebuilt after the model shrink (the .qnt edit
+rehashes every check). **43/43 verdict-identical; zero flakes; the
+reproduce-3× rule was never invoked; stop #3 not fired.**
+
+| Tier | Count | Result |
+|---|---|---|
+| Deterministic TLC (19 calib pins + spawn-coherence exhaustive + its witness) | 21 | 19× `[violation]` (pins still falsify), 2× spawn pair as expected (`[ok]` + `[violation]`) |
+| Deterministic run replays (runs-base ×7, runs-failover ×2, runs-adversarial ×1) | 3 | 7+2+1 passing, no run edits |
+| Unseeded sim witnesses (incl. noMarkedClaim — the B1 guard — and the F8/F13 anchor class) | 14 | 14× `[violation]` (all reachable post-shrink) |
+| Unseeded sim holds (5 regimes × 21-invariant conjunction) | 5 | 5× `[ok]` |
+
+Model deltas verified by the run: builderPull's mustSubstitute conjunct
+dropped (window-empty equivalence in the model header — every resolution
+arm, now including cancellation and obsolescence, ends the topdownPruned
+ghost with the row, so ghost ⟹ unresolved job ⟹ JobView non-None ⟹
+builderPull disabled by its existing guard); the PD-D1 dedup upgrade encoded
+as `dedupPrunedUpgrade` (armament preserved, the DQ-1 record) — this closes
+the recorded C′ delta-1 under-encoding scope note; spawnCoherence's
+ENABLE_MAT_JOBS=false regimes re-documented as the job-free trace subspace
+(PD-D8, kept).
+
+### T-D7.1 survivors core (and the recorded scope finding)
+
+`closureEvidenceSurvivors` (Duo constants) + `closureEvidenceSurvivorsFailover`
+(FailoverEx constants): the six surviving invariants
+A14/A15/A22/B9/B10/L3 over the restricted post-deletion alphabet (no
+probeWalk / walkFinishes / consumeWalk / dropStaleWalkResult /
+probeFailFastTried / probeSettleTried; MSubstituting unreachable), wired
+sim-holds tier (2 M × 15; 23 s / 15 s — minutes-class, stop #7 not
+approached), falsifiability pair = the two kept pins (f1-stale-produced ×
+B9, f4-demand-drop × B10).
+
+**Scope finding (follow-up candidate, predecessor encoding):** the first
+wiring attempt at the FailoverDuo constants (two builds AND failover)
+violated B9 within 2 M samples — REPRODUCED under the FULL alphabet at the
+same constants (trace inclusion; seed `0xffbfc9ac0c85df5b`, transcript in
+the T-D7.1 commit body and the module's scope note). The trace is the
+documented predecessor degradation (post-failover stored-union widening:
+narrow co-build → child Produced under width {1}; failover drops memory-only
+contributions; union widens to {1,2}; dependent opens from source above the
+stale Produced child) at a scope no holds record ever covered (FailoverDuo
+was a C1-strict probe scope). NOT a D′ regression — production deleted the
+lossy fallback in Wave D2.3 (durable relation rebuilt at recovery); the
+model corner is history. Recorded for the A6 archive decision: the corner
+documents WHY the 062 semantics had to die.
+
+Build note: the survivors instantiations grew the closureEvidence
+quint→TLA+ conversion past the 4 GiB Apalache server heap; both kept pins
+re-pinned at `serverHeapMb = 8192` (the gw-f1/f6 precedent; OOM reproduced
+and the fix validated locally).
+
+### T-D7.3 spec sweep (final tally; 26 plan IDs + 6 forced additions)
+
+- **Retired (6):** detached+5, fanout-bound, leader-gate,
+  substitute-complete-inline+2, evidence.closure-hole,
+  merge.substitute-fetch — house retirement notes in place, successors
+  named.
+- **Retired with transfer (1):** evidence.settlement →
+  `sched.materialize.settlement` (PD-D6: armed-action totality across
+  failover; impl markers on the park-reevaluation/cancellation ticks;
+  verify on `flag_on_every_job_state_has_armed_action`, the failover VM
+  attr, and the failover holds check).
+- **Re-stated + bumped (14 from the table):** substitute-topdown+13,
+  wanted-outputs+3, evidence.durability+3 (fence kept column-agnostic),
+  materialize.job+2 (admission-refusal arm added to the body),
+  materialize.routing+3 (pruned ORIGIN discriminator + the three-part
+  durable classification normed), substitute-probe-indeterminate+2,
+  stale-substitutable+2, reconcile-order+2, fod-substitute+3,
+  snapshot-substituting+3, spawn-intents.probed-gate+3,
+  state.terminal-idempotent+2 (the actual carrier of the stale status
+  alphabet — the plan's table placed this edit on state.machine+2, whose
+  body/figure/guards were already clean: recorded deviation),
+  exec-correlation+8, store.materialize.executor+3 (PD-D2),
+  ctrl.scaler.signal-substituting+3.
+- **Re-pointed only (4 + 1):** eager-probe, substitute-probe,
+  ca-fod-substitute, gw.activity.subst-progress (rref moved in 06afc9409);
+  ctrl.scaler resolved as S (body named the status).
+- **Forced additions (6, the dangling-ref/stale-mechanism class the plan's
+  R7 predicted):** poison.clear-survivor-reevaluation+2, admin.clear-poison+3,
+  db.derivations-gc+4 (victim-filter rationale re-keyed to the durable
+  classifier), store.substitute.probe-429-retry+3,
+  store.substitute.admission+2, sched.materialize.pinning untouched
+  (mechanism-clean) — and sched.materialize.job picked up the
+  admission-refusal sentence (the walk-era interlock's successor home).
+- tracey: 20 rules bumped in one staged-diff pass; every annotation site
+  re-pointed in the same commit (67 files); validate green at both
+  boundaries; `tracey query uncovered` = 11 pre-existing non-substitution
+  rules, ZERO stranded by D′.
+
+### T-D7.4 absence gate (the §11 patterns + both predecessors' additions)
+
+Final transcript (per-file hit counts; the full line list is reproducible
+by re-running the §11 grep at 64939a7e0):
+
+```
+    50 rio-scheduler/src/actor/tests/materialize.rs
+    18 rio-scheduler/src/dag/tests.rs
+    15 rio-scheduler/src/actor/tests/merge.rs
+    11 rio-scheduler/src/db/tests/wanted.rs
+    9 rio-scheduler/src/actor/merge.rs
+    8 rio-scheduler/src/db/wanted.rs
+    5 rio-store/src/materialize/executor.rs
+    5 rio-evidence-kernel/src/pull.rs
+    3 rio-scheduler/src/dag/mod.rs
+    3 rio-scheduler/src/actor/tests/dispatch.rs
+    3 nix/quint.nix
+    2 rio-scheduler/src/grpc/tests/pull_tests.rs
+    2 rio-scheduler/src/domain.rs
+    2 rio-scheduler/src/actor/dispatch.rs
+    2 nix/kani.nix
+    1 rio-scheduler/src/state/derivation.rs
+    1 rio-scheduler/src/db/tests/live_pins.rs
+    1 rio-scheduler/src/actor/tests/recovery.rs
+    1 rio-scheduler/src/actor/tests/pull.rs
+    1 rio-scheduler/src/actor/tests/misc.rs
+    1 rio-proto/proto/dag.proto.fields
+    1 rio-proto/proto/dag.proto
+    1 rio-evidence-kernel/src/lib.rs
+```
+
+**146 hits, every one classified; zero unexplained.**
+`infra/helm`: 0. `RIO_MATERIALIZATION__ENABLED`: 0.
+`substitute_spawned_total`: 0. Classes:
+
+1. `wanted_output_names` ×105 — the dag.proto submission field (dag.proto:96
+   + the .fields snapshot + domain.rs mirror) and the
+   `build_wanted_outputs.wanted_output_names` relation column (db/wanted.rs,
+   executor SQL) + their tests. Wire/schema-stable by design.
+2. Wire-retained surface — `SubstituteProgress` (build_types.proto, BC-4
+   relay), `DerivationEventKind::SUBSTITUTING` + `K::Substituting` event
+   asserts, `ClusterStatus.substituting_derivations` (bucket re-sourced,
+   field docs re-worded), gateway "substituting" display strings.
+3. Deletion-record / history comments at surviving sites (kernel lib/pull
+   docs, kani.nix harness notes, quint.nix family + delta narratives,
+   merge.rs bug_089/bug_132 archaeology, executor.rs origin note,
+   derivation.rs, dispatch.rs walk-era-caller notes, test docs).
+4. Surviving test names containing `topdown_prune` (the prune itself
+   survives; only column-naming identifiers were renamed — predecessor
+   note 5).
+
+Two hygiene commits (0f632aeb8, 64939a7e0) converted every
+present-tense straggler into the materialization-lane narration or an
+explicit past-tense record. Regen umbrella: idempotent, zero drift (the
+conditional ledger commit #22 was not needed); `after_n_builds` = 46
+(set at D1, unchanged).
+
+### Final counts (the §7 exit-gate populations)
+
+- VM attrs **32** (37 − 5); codecov-matrix-sync at **46**.
+- Quint: **43** materialization (verdict-identical) + **2** kept closure
+  pins + **2** survivors-core checks + all non-campaign families (273 → 246
+  quint attrs: −29 closure-evidence, +2 survivors).
+- Kani: kani-rio-evidence-kernel at **9** harnesses (expectedHarnesses
+  17→14→9 in lockstep; closure_vouched KEPT — live merge-time
+  pruned-origin gate).
+- Scheduler nextest 1113 → 1095 → (D7 marker hygiene leaves counts
+  unchanged) — every delta enumerated in the wave commit bodies; store 541;
+  kernel 16; migrations 11.
+- Spec: 565 rules; 7 retired (incl. the transfer), 1 created
+  (sched.materialize.settlement), 20 bumped.
+
+### Deviations (this block + both predecessors', consolidated)
+
+Predecessor blocks (recorded in their notes, restated here for the ledger):
+SubstituteProgress KEPT (BC-4 relay — T-D3.2 scope correction); the
+semaphore cluster rode T-D3.1 (deny-warnings, DOB-1 pre-authorization);
+rio-dashboard touched in T-D3.3 (§11.3 fence noted); PullNodeStatus
+alphabet shrink landed in D5.2 with the harness re-pin;
+create_materialization_job_if_enabled renamed create_materialization_job;
+the legacy decode arm removed in D6 (migrate-before-recovery verified);
+predecessor note 8's D5-marker claim about SQL seeds corrected by the
+stop-4 sweep (41d714b04).
+
+This block: (1) the survivors core wired as TWO instantiations at
+recorded-green scopes instead of one FailoverDuo module — forced by the B9
+scope finding above (the plan pre-authorized either form; the
+non-negotiable — six properties wired, one-landing swap — held). (2) The
+R/S commit partition: only fanout-bound and substitute-complete-inline
+retire in the R commit; the other retirements ride the S commit because
+their inbound rrefs live in re-stated bodies (no boundary holds a dangling
+ref — the green-boundary requirement outranked the table's halves).
+(3) state.machine+2 untouched; terminal-idempotent+2 carries the status
+alphabet edit (see above). (4) Six forced rule additions (R7 class).
+(5) The 15 closure calibration evidence files annotated (the plan named 9;
+the 6 newly-unwired get the same note naming successors). (6) Two hygiene
+commits outside the 5-task ledger (comment-only; the absence gate's
+zero-unexplained bar).
+
+### Follow-up candidates (recorded, NOT D′ work)
+
+1. **Floating-CA stale-reset carrier gap** (D3-D4 note 7): the stale-verify
+   reset clears output_paths; job assignments carry expected paths == [""].
+   Pre-existing Phase B shape; the walk's stash that papered over it is
+   gone. Candidate red-first fix outside D′.
+2. **FailoverDuo B9 corner** (this block): the predecessor encoding's
+   stored-union widening violates B9 at two-builds+failover scopes (full
+   alphabet, reproduced). History — the mechanism is deleted — but the A6
+   archive should carry the seed and the corner as part of the model's
+   final record.
+3. **setup_with_mock_store_materialization_enabled alias** (D3-D4 note 9):
+   fold the ~30 call sites onto setup_with_mock_store at leisure.
+
+### Deployment and rollback posture (the §7.5 record; replaces MD-D2/MD-D3)
+
+Through D5 (D′.1): revertable by binary rollback — the flag no longer
+exists after D4, so rollback to walk behavior = a pre-D′ BINARY; the DB
+schema is unchanged through D5 and pre-D′ binaries run against it
+unmodified. D6 (080 on a persistent DB) is roll-forward only (frozen
+migrations): a pre-D′ binary against a post-080 DB fails; a post-D′ binary
+against a pre-080 DB works (decode arm verified then removed in-wave).
+Deployment order: roll D′.1 binaries everywhere FIRST, then ship the
+080-carrying release. In-flight state across the upgrade: unresolved jobs
+survive (durable); claimed jobs drain through consumption (exec_id
+contract); leftover `substituting` rows decode to Queued pre-080 and are
+UPDATEd by 080. Transition residuals (bounded, self-identifying,
+resubmission-healed): the directed-error downgrade for pre-Phase-B-era
+marks whose upstream later vanished, and the pre-relation wanted-width
+saturation (counter + warn). MD-D1 (park alerting:
+`rio_scheduler_materialization_stalled` + the alert + PD-20 instrumentation)
+SURVIVES VERBATIM.
+
+### What D′ does not claim
+
+No production-deployment or soak evidence (house no-soak rule). No new
+model verdicts beyond verdict-preservation re-runs and the survivors-core
+re-hold. The counter-signature APPLICATION (B5 supersession, E5
+supersession, the bits' retirement counter-signature, CE-D8 split,
+frozen-contract addendum, finding-11 signature lines) is A6's; this record
+delivers the hand-back list. `closureEvidence.qnt` is NOT archived (A6,
+after the survivors core soaks one integration). Items S/T/I remain
+commissioned post-D′ work; the PD-20 surface they build on is intact.
+
+### Exit gate (the fourth full `--checks` run)
+
+Gate #4 ran on the tree at 64939a7e0 (`.claude/bin/nixbuild --checks`,
+nix-fast-build over `checks.x86_64-linux`, ~80 min wall on the dev host +
+remote builder; log `/tmp/rio-dev/rio-a4-dprime-39.log`): **392 successes,
+1 failure** — `docs-lint` flagged a raw metric name introduced by the
+durability re-statement's fencing prose (the only finding of the run; all
+32 VM attrs, cov-smoke, the full quint family incl. the survivors core and
+the 43 re-run checks, kani at 9, every per-member clippy/doc/nextest,
+pre-commit, helm-lint, codecov-matrix-sync at 46 and tracey-validate were
+green). The focused fixup is 668b5a229 (`#(refs.metric)` helper). Gate #4b
+on the fixed tree: **exit 0** (log `/tmp/rio-dev/rio-a4-dprime-40.log`,
+~6 min — only the docs/spec-affected attrs rebuilt; everything else
+cache-carried from #4). One transient infra signature during #4 (a window
+of `failed to start SSH master connection` to the remote builder; nix
+retried and recovered — the same class the D3-D4 block recorded). No flaky
+re-runs were needed; no materialization-check verdict change; no
+deleted-machinery resurrection.
+
+### A5/A6 handoff (what close-out still owes)
+
+1. **Counter-signature application (A6):** B5 supersession sign-off
+   (last-write-wins per build — `sched.merge.wanted-outputs+3`, the F5/PP-5
+   record); the E5-supersession record; the evidence-bits retirement
+   counter-signature (migration 080 + the §3.7 dispositions, this record);
+   finding-11 signature-line application (the pruned-origin discriminator,
+   `sched.materialize.routing+3`).
+2. **CE-D8 split** per the design §5.4 (the probe-vouched-closure-gone
+   flip's two shapes — pointer rows added to
+   `closure-evidence-invariant-map.md` in this commit).
+3. **`closureEvidence.qnt` archive** (A6, post-soak) — carry the survivors
+   core forward and the FailoverDuo B9 corner record (follow-up 2).
+4. **Frozen-contract extension note** in `executor-invariant-map.md` (the
+   materialization PullAssignment kind/executor_instance addendum's final
+   form — Item I pointer).
+5. **The acceptance table's final form** (design §8) — this record is the
+   D′ row's evidence; A5/A6 own the table.
+6. **Items I/S/T pointers:** Item T observability builds on the intact
+   PD-20 surface (MD-D1); Item S (store-side admission/throughput) and
+   Item I (the pull-contract addendum integration) unchanged by D′.
 
 ---
 
