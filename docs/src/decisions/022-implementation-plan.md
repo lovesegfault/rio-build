@@ -591,6 +591,18 @@ Adds the claim fields that P0573 (tenant for castore tenant-scoping), P0586 (`ro
 > binding (`builder.mountd.uid-bound`). Read the file table's "rejects connections where
 > `SO_PEERCRED.gid` != rio-builder" prose and the note above ("SO_PEERCRED for root") with that
 > in mind; `vm-mountd`'s gid-gate subtest now covers the DAC half only.
+>
+> **Reconciliation (2026-06-02, uid binding dropped).** The one-connection-per-uid binding the
+> note above says was kept (`builder.mountd.uid-bound`, plus the later `uid-busy-typed` typed
+> rejection) is now gone too. Production builders run `hostUsers: true` (FUSE passthrough
+> requirement), so every executor connects as host uid 0 and the binding degraded to
+> one-build-per-node — under a saturated scheduler packing several builder pods per node,
+> concurrent builds collided on the uid claim and exhausted their infra retries fleet-wide.
+> The build sandbox is the security boundary and the UDS peer is the trusted executor; the
+> remaining mountd defenses (`build-id-unique`, `one-mount`, validated `build_id` paths,
+> staging quotas, the DAC gate above) key on nothing uid-shaped. Full reasoning lives in the
+> design overview's mountd rationale. Read the file table's "one connection per `peer_uid`"
+> prose as plan-time history.
 
 The unprivileged builder cannot (a) open `/dev/fuse`, (b) call `FUSE_DEV_IOC_BACKING_OPEN`/`_CLOSE` (init-ns `CAP_SYS_ADMIN` — [`backing.c:91-93,147-149`](https://github.com/torvalds/linux/blob/master/fs/fuse/backing.c)), or (c) write the shared cache (integrity boundary). One DaemonSet per node with `CAP_SYS_ADMIN` brokers all three. **No overlay mount, no upcall relay** — builder does FUSE-serve + overlay itself.
 
@@ -1088,7 +1100,7 @@ rather than making end-user JWTs mandatory.
 | `builder.fs.streaming-open-threshold` | decisions/022 §2.8 | castore_fuse/open.rs (P0575; the config.rs field lands with P0560's mount sequence) | vm-castore-e2e `cold-build` (P0560§B) |
 | `gw.substitute.dag-delta-sync` | components/gateway.md | rio-gateway/substitute/dag_sync.rs (P0574) | vm-dag-delta-sync (P0574) |
 | `builder.result.input-eio-is-infra` | components/builder.md | executor/mod.rs (P0560§A, ported) | vm-castore-e2e `eio-on-fetch-fail` (P0560§B) |
-| `sec.boundary.mountd` | security.md | bin/rio-mountd.rs (P0567) | vm-mountd `gid-gate`+`traversal-reject`+`uid-bound` (P0567) |
+| `sec.boundary.mountd` | security.md | bin/rio-mountd.rs (P0567) | vm-mountd `gid-gate`+`traversal-reject`+`build-id-unique` (P0567) |
 | `builder.fs.listxattr-size-branch` | components/builder.md | castore_fuse/mod.rs (P0559) | vm-castore-e2e `shutil-copy2` (P0560§B) |
 | `obs.metric.mountd` | observability.md | castore_fuse/mountd.rs (P0567) | vm-castore-e2e (P0560§B) |
 | `builder.overlay.castore-lower` | components/builder.md | overlay.rs (P0560§A) | vm-castore-e2e (P0560§B) |

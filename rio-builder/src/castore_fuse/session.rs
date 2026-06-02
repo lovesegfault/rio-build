@@ -208,11 +208,11 @@ const MOUNT_RETRY_BASE_DELAY: Duration = Duration::from_millis(400);
 
 /// `true` for Mount rejections a short retry can absorb: a re-dispatch
 /// to the same pod can race mountd's teardown of the previous attempt's
-/// connection, in which case the uid is still registered (mountd drops
-/// the new connection without a reply → [`MountdError::Closed`]) or the
-/// build_id is still claimed ([`ErrKind::DuplicateBuildId`]). Validation
-/// rejections (`BadBuildId`, `AlreadyMounted`, …) are deterministic and
-/// never retried.
+/// connection — the build_id may still be claimed
+/// ([`ErrKind::DuplicateBuildId`]) — or hit a daemon mid-restart
+/// ([`MountdError::Closed`], EPIPE/ECONNRESET). Validation rejections
+/// (`BadBuildId`, `AlreadyMounted`, …) are deterministic and never
+/// retried.
 fn mount_rejection_is_transient(err: &MountdError) -> bool {
     match err {
         MountdError::Closed => true,
@@ -529,7 +529,7 @@ mod tests {
     /// deterministic failure and delays the scheduler requeue.
     #[test]
     fn mount_retry_skips_validation_rejections() {
-        // Transient/busy: uid-already-connected (surfaces as Closed),
+        // Transient/busy: daemon restart (surfaces as Closed),
         // build-id-still-claimed, daemon-side transient.
         assert!(mount_rejection_is_transient(&MountdError::Closed));
         // The same daemon-side close seen from the send path.
@@ -564,10 +564,10 @@ mod tests {
     /// A scripted mountd stand-in that accepts SUCCESSIVE connections
     /// (unlike `testing::RecordingMountd`, which serves exactly one):
     /// each accepted connection consumes the next entry of `script`.
-    /// `None` = close without replying (the daemon-side silent drop the
-    /// pre-`uid-busy-typed` daemon produced); `Some(resp)` = read one
-    /// frame, reply to its seq, attach a `/dev/null` fd iff the resp is
-    /// `Mounted`, keep the connection open until the client closes.
+    /// `None` = close without replying (what a crashing or restarting
+    /// daemon produces); `Some(resp)` = read one frame, reply to its
+    /// seq, attach a `/dev/null` fd iff the resp is `Mounted`, keep the
+    /// connection open until the client closes.
     fn scripted_serial_daemon(
         sock: &std::path::Path,
         script: Vec<Option<super::super::mountd_proto::Resp>>,
@@ -624,9 +624,9 @@ mod tests {
     }
 
     /// `mount_with_retry` must absorb the transient-rejection class —
-    /// a silent close (old daemons) and a typed retryable rejection
-    /// (`uid-busy-typed` daemons) — and succeed on a later attempt.
-    /// Red on the pre-backoff 2-attempt schedule.
+    /// a silent close (daemon restart) and a typed retryable rejection
+    /// — and succeed on a later attempt. Red on the pre-backoff
+    /// 2-attempt schedule.
     #[test]
     fn mount_with_retry_recovers_after_transient_rejections() {
         use super::super::mountd_proto::{ErrKind, Resp};
@@ -636,7 +636,9 @@ mod tests {
             &sock,
             vec![
                 None, // attempt 1: silent close → MountdError::Closed
-                Some(Resp::Err(ErrKind::Retryable("uid busy".into()))),
+                Some(Resp::Err(ErrKind::Retryable(
+                    "staging reap in progress".into(),
+                ))),
                 Some(Resp::Mounted {
                     staging_quota_bytes: 42,
                 }),

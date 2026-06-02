@@ -11,8 +11,7 @@
 #   gid-gate          socket perms (0660 root:rio-builder) reject non-group connect
 #   traversal-reject  Mount{"../escape"} → BadBuildId, no fs trace
 #   one-mount         second Mount on one conn → AlreadyMounted
-#   uid-bound         second conn from a live uid → dropped
-#   build-id-unique   Mount{X} from uid B while uid A owns X → DuplicateBuildId
+#   build-id-unique   Mount{X} while another conn owns X → DuplicateBuildId
 #   promote-verified  good content published 0444 exact bytes; corrupt rejected
 #   bounded-copy      concurrent appender cannot grow the published entry
 #   backing-broker    BackingOpen returns a usable backing_id
@@ -146,10 +145,10 @@ pkgs.testers.runNixOSTest {
         machine.wait_until_succeeds(f"test -f /tmp/{tag}.ready", timeout=30)
 
     def wait_idle():
-        # Every registered connection has been torn down (uids and
-        # build_ids released). The gauge is absent before the first
-        # connection and reads 0 after the last teardown; rejected
-        # connections never increment it.
+        # Every registered connection has been torn down (build_ids
+        # released). The gauge is absent before the first connection
+        # and reads 0 after the last teardown; rejected connections
+        # never increment it.
         machine.wait_until_succeeds(
             "c=$(curl -sf 127.0.0.1:9095/metrics"
             " | awk '/^rio_mountd_connections_current/ {print $2}');"
@@ -238,8 +237,7 @@ pkgs.testers.runNixOSTest {
         # 0660 root:rio-builder socket inode. This file-permission check
         # is mountd's only access control — there is no peer-credential
         # check after connect.
-        rc, out = machine.execute(client("outsider", "expect-rejected") + " 2>&1")
-        assert rc != 0 and "ermission denied" in out, f"rc={rc} out={out!r}"
+        machine.succeed(client("outsider", "expect-rejected"))
 
     # ── build_id validation ────────────────────────────────────────────
     # The full rejection matrix lives in the build_id_validation unit
@@ -252,13 +250,10 @@ pkgs.testers.runNixOSTest {
         machine.succeed("test ! -e /var/rio/escape")
         wait_idle()
 
-    # ── uid-bound + build-id-unique (one holder proves both) ───────────
-    with subtest("uid-bound + build-id-unique"):
+    # ── build-id-unique ─────────────────────────────────────────────────
+    with subtest("build-id-unique: a claimed build_id is refused"):
         serve("build1", "shared", "shared")
-        # Second connection from the same uid: typed retryable rejection
-        # naming the holder (a silent drop would fail the client).
-        machine.succeed(client("build1", "expect-rejected"))
-        # Different uid, same build_id: typed rejection.
+        # Another connection claiming the held build_id: typed rejection.
         machine.succeed(
             client("build2", "expect-mount-err --build-id shared --expect DuplicateBuildId")
         )
