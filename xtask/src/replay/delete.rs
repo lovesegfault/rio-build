@@ -30,7 +30,30 @@
 //!
 //! The recorder's by-recipe idempotency pointer is removed only when it
 //! still points at the deleted archive — pointers are last-writer-wins,
-//! so a newer re-record of the same recipe owns it.
+//! so a newer re-record of the same recipe owns it. That ownership check
+//! is a GET → compare → DELETE on a key with no conditional-delete
+//! support (S3 general-purpose buckets), so one residual race is
+//! tolerated rather than closed: a re-record's pointer PUT landing
+//! inside the GET→DELETE window is deleted even though it names the
+//! newer archive. The newer archive itself is untouched and stays
+//! published; what is lost is its by-recipe resolution — `replay launch
+//! --eval` reports the recipe as never recorded, and the recorder's
+//! idempotency gate would re-record it from scratch. The delete logs the
+//! pointer body it verified ownership against immediately before the
+//! DELETE, so a destroyed pointer stays attributable from logs (any
+//! "wrote by-recipe pointer" the recorder logged after that witness was
+//! the casualty); recovery is `replay launch --archive <short-id>`
+//! (by-ref launch never reads pointers) or a re-record, which writes a
+//! fresh pointer.
+//!
+//! Every S3 operation this command performs — the LIST→sweep loop, the
+//! pointer GET→DELETE pair, the orphan-manifest read — routes through
+//! the [`DeleteOps`] boundary, so each one can be interleaved against a
+//! scripted concurrent history in tests; a raw client call would sit
+//! outside every scriptable history, which is exactly how check-then-act
+//! races stay untestable. The `s3_calls_route_through_the_ops_boundary`
+//! lint pins that no such call exists in this module outside the
+//! [`LiveOps`] impl.
 //!
 //! Campaigns that pinned the deleted archive keep their own S3 artifacts
 //! (results, reports) but lose `replay repro` and pod-reschedule resume:
@@ -65,7 +88,8 @@ pub struct DeleteArgs {
 /// it, and deleting the older archive must not take the newer archive's
 /// pointer with it. Pure (pointer JSON in → decision out) so the
 /// keep/delete rule is unit-testable; unparsable pointers are kept (never
-/// delete what we cannot attribute).
+/// delete what we cannot attribute). The GET→DELETE pair applying this
+/// rule is non-atomic — see the module doc for the tolerated residual.
 fn pointer_owned_by(pointer_json: &str, short_id: &str) -> bool {
     serde_json::from_str::<ByRecipePointer>(pointer_json)
         // names_archive(): drift-tolerant reads turn garbage into empty
@@ -89,23 +113,42 @@ fn sweep_order(mut keys: Vec<String>, complete_key: &str) -> Vec<String> {
 /// command should not fight silently.
 const MAX_SWEEP_PASSES: usize = 5;
 
-/// The two S3 operations the converging sweep performs, factored out so
-/// the LIST→sweep loop is unit-testable against a scripted prefix.
-trait SweepOps {
+/// Every S3 operation `replay delete` performs, factored into one
+/// boundary so the command logic is unit-testable against scripted
+/// concurrent histories — a racing publisher's PUT can be interleaved
+/// between any two of these calls in a test, which is the only way the
+/// command's check-then-act sequences (the confirmed sweep, the pointer
+/// GET→DELETE pair) can be pinned against concurrent histories rather
+/// than static snapshots. The `s3_calls_route_through_the_ops_boundary`
+/// lint keeps the boundary complete: no raw S3 call may exist in this
+/// module outside the [`LiveOps`] impl. (The candidate summary shown at
+/// the confirmation prompt is read by [`launch::read_candidate`], a
+/// helper shared with `replay launch`/`list` that performs no
+/// mutations.)
+trait DeleteOps {
     /// List every key currently under the archive prefix.
     async fn list(&mut self) -> Result<Vec<String>>;
-    /// Delete one key (idempotent — S3 DeleteObject tolerates absence).
+    /// Delete one key under the archive prefix (idempotent — S3
+    /// DeleteObject tolerates absence).
     async fn delete(&mut self, key: &str) -> Result<()>;
+    /// Read one small text object (the by-recipe pointer, the orphan
+    /// manifest); `None` when the key does not exist.
+    async fn get_text(&mut self, key: &str) -> Result<Option<String>>;
+    /// Delete the by-recipe pointer object (idempotent, like
+    /// [`Self::delete`]; a separate method so scripted histories and the
+    /// live `ui::step` label both name the pointer explicitly).
+    async fn delete_pointer(&mut self, key: &str) -> Result<()>;
 }
 
-/// The real prefix: [`s3::list_keys`] + per-object [`ui::step`] deletes.
-struct PrefixSweep<'a> {
+/// The real S3 surface: [`s3::list_keys`] over the archive prefix,
+/// per-object [`ui::step`] deletes, and the small-text reads.
+struct LiveOps<'a> {
     region: &'a str,
     bucket: &'a str,
     prefix: &'a str,
 }
 
-impl SweepOps for PrefixSweep<'_> {
+impl DeleteOps for LiveOps<'_> {
     async fn list(&mut self) -> Result<Vec<String>> {
         s3::list_keys(self.region, self.bucket, &format!("{}/", self.prefix)).await
     }
@@ -113,6 +156,17 @@ impl SweepOps for PrefixSweep<'_> {
     async fn delete(&mut self, key: &str) -> Result<()> {
         let object = object_name(key, self.prefix).to_string();
         ui::step(&format!("delete {object}"), || {
+            s3::delete_object(self.region, self.bucket, key)
+        })
+        .await
+    }
+
+    async fn get_text(&mut self, key: &str) -> Result<Option<String>> {
+        s3::get_text(self.region, self.bucket, key).await
+    }
+
+    async fn delete_pointer(&mut self, key: &str) -> Result<()> {
+        ui::step("delete by-recipe pointer", || {
             s3::delete_object(self.region, self.bucket, key)
         })
         .await
@@ -128,7 +182,7 @@ impl SweepOps for PrefixSweep<'_> {
 /// after [`MAX_SWEEP_PASSES`] non-empty re-lists rather than fighting an
 /// active publisher stream forever.
 async fn sweep_until_empty(
-    ops: &mut impl SweepOps,
+    ops: &mut impl DeleteOps,
     complete_key: &str,
     initial: Vec<String>,
 ) -> Result<usize> {
@@ -152,6 +206,54 @@ async fn sweep_until_empty(
          actively writing to it; wait for the publish to finish (or fail against the write-once \
          conditionals), then re-run the delete"
     )
+}
+
+/// What the by-recipe pointer step did, returned (not just logged) so
+/// scripted-history tests pin which history produced which end state.
+#[derive(Debug, PartialEq, Eq)]
+enum PointerCleanup {
+    /// The pointer named the deleted archive when read — deleted.
+    Deleted,
+    /// The pointer exists but is not this archive's (a newer re-record
+    /// owns it, or the body is unattributable) — kept.
+    Kept,
+    /// No pointer object exists.
+    Absent,
+}
+
+/// Remove the by-recipe pointer iff it still names the deleted archive.
+/// GET → ownership check → DELETE is a non-atomic check-then-act on a
+/// last-writer-wins key (S3 general-purpose buckets have no conditional
+/// DeleteObject), so a re-record's pointer PUT landing inside the
+/// GET→DELETE window is destroyed even though it names the newer archive
+/// — the tolerated residual named in the module doc, pinned by the
+/// scripted-history test `pointer_race_inside_the_get_delete_window`.
+/// The witnessed pointer body is logged immediately before the DELETE so
+/// that destruction stays attributable from logs.
+async fn remove_pointer_if_owned(
+    ops: &mut impl DeleteOps,
+    pointer_key: &str,
+    short_id: &str,
+) -> Result<PointerCleanup> {
+    let Some(pointer_json) = ops.get_text(pointer_key).await? else {
+        return Ok(PointerCleanup::Absent);
+    };
+    if !pointer_owned_by(&pointer_json, short_id) {
+        return Ok(PointerCleanup::Kept);
+    }
+    // The ownership witness: everything the decision was based on, logged
+    // before the unconditional DELETE. A "wrote by-recipe pointer" log
+    // line from a recorder, stamped after this witness, identifies the
+    // pointer the residual race would have destroyed.
+    let witnessed: ByRecipePointer = serde_json::from_str(&pointer_json).unwrap_or_default();
+    tracing::info!(
+        key = %pointer_key,
+        archive_id = %witnessed.archive_id,
+        recorded_at = %witnessed.recorded_at,
+        "by-recipe pointer still names this archive — deleting it"
+    );
+    ops.delete_pointer(pointer_key).await?;
+    Ok(PointerCleanup::Deleted)
 }
 
 /// The refusal raised when the prefix's key set changed between the
@@ -221,9 +323,11 @@ fn deletion_summary(candidate: &launch::ArchiveCandidate) -> String {
 /// `None` when the manifest is gone or unreadable too — the pointer is
 /// then left dangling, which is harmless: the recorder probes archive
 /// existence before trusting one, and a re-record overwrites it.
-async fn orphan_recipe_digest(region: &str, bucket: &str, prefix: &str) -> Result<Option<String>> {
-    let manifest_key = format!("{prefix}/{ARCHIVE_MANIFEST_OBJECT}");
-    let Some(text) = s3::get_text(region, bucket, &manifest_key).await? else {
+async fn orphan_recipe_digest(
+    ops: &mut impl DeleteOps,
+    manifest_key: &str,
+) -> Result<Option<String>> {
+    let Some(text) = ops.get_text(manifest_key).await? else {
         return Ok(None);
     };
     let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -255,6 +359,11 @@ pub async fn run(a: DeleteArgs) -> Result<()> {
     let bucket = tf.get("chunk_bucket_name")?;
     let prefix = s3::archive_prefix(&a.short_id);
     let complete_key = format!("{prefix}/{ARCHIVE_COMPLETE_OBJECT}");
+    let mut ops = LiveOps {
+        region: &region,
+        bucket: &bucket,
+        prefix: &prefix,
+    };
 
     // -- Resolve ------------------------------------------------------------
     // Driven by what exists, NOT by the completion marker: an interrupted
@@ -263,7 +372,7 @@ pub async fn run(a: DeleteArgs) -> Result<()> {
     // (`replay list` flags such prefixes INCOMPLETE, and this command is
     // the in-tool way out that the write-once publisher's refusal and the
     // listing's removal hint both point at).
-    let keys = s3::list_keys(&region, &bucket, &format!("{prefix}/")).await?;
+    let keys = ops.list().await?;
     ensure!(
         !keys.is_empty(),
         "no such recording: s3://{bucket}/{prefix}/ has no objects — `cargo xtask replay list` \
@@ -280,7 +389,9 @@ pub async fn run(a: DeleteArgs) -> Result<()> {
             Some(candidate.recipe_digest.clone())
         }
         Some(_) => None,
-        None => orphan_recipe_digest(&region, &bucket, &prefix).await?,
+        None => {
+            orphan_recipe_digest(&mut ops, &format!("{prefix}/{ARCHIVE_MANIFEST_OBJECT}")).await?
+        }
     };
 
     // -- Confirm ------------------------------------------------------------
@@ -314,7 +425,7 @@ pub async fn run(a: DeleteArgs) -> Result<()> {
     // operator actually saw. Any drift — a publish completing into the
     // prefix, another delete racing this one — refuses, so what gets
     // swept first is always what was confirmed.
-    let fresh = s3::list_keys(&region, &bucket, &format!("{prefix}/")).await?;
+    let fresh = ops.list().await?;
     if let Some(drift) = confirmation_drift(&keys, &fresh) {
         anyhow::bail!(
             "the prefix changed while awaiting confirmation ({drift}) — re-run \
@@ -329,30 +440,22 @@ pub async fn run(a: DeleteArgs) -> Result<()> {
     // all key on it), so no consumer can resolve a half-deleted archive.
     // The data objects follow, then the prefix is re-listed and swept
     // until it lists empty — convergence is observed, not assumed.
-    let mut sweep = PrefixSweep {
-        region: &region,
-        bucket: &bucket,
-        prefix: &prefix,
-    };
-    sweep_until_empty(&mut sweep, &complete_key, fresh).await?;
+    sweep_until_empty(&mut ops, &complete_key, fresh).await?;
 
     // -- By-recipe pointer -----------------------------------------------------
     // Only recorder archives have one (recipe digest in the provenance),
     // and only the archive the pointer currently names may take it down.
     if let Some(digest) = &recipe_digest {
         let pointer_key = format!("{}{digest}.json", s3::by_recipe_prefix());
-        match s3::get_text(&region, &bucket, &pointer_key).await? {
-            Some(pointer_json) if pointer_owned_by(&pointer_json, &a.short_id) => {
-                ui::step("delete by-recipe pointer", || {
-                    s3::delete_object(&region, &bucket, &pointer_key)
-                })
-                .await?;
-            }
-            Some(_) => tracing::info!(
-                "keeping s3://{bucket}/{pointer_key}: it points at a different (newer) archive \
-                 of the same recipe"
+        match remove_pointer_if_owned(&mut ops, &pointer_key, &a.short_id).await? {
+            PointerCleanup::Deleted => {}
+            PointerCleanup::Kept => tracing::info!(
+                "keeping s3://{bucket}/{pointer_key}: it does not name this archive (a newer \
+                 re-record of the same recipe owns it, or the pointer body is unattributable)"
             ),
-            None => tracing::debug!("no by-recipe pointer at s3://{bucket}/{pointer_key}"),
+            PointerCleanup::Absent => {
+                tracing::debug!("no by-recipe pointer at s3://{bucket}/{pointer_key}")
+            }
         }
     }
 
@@ -433,11 +536,23 @@ mod tests {
         assert_eq!(object_name("unrelated/key", prefix), "unrelated/key");
     }
 
-    /// A scripted prefix: records deletions, serves the queued LIST
-    /// results in order (empty once the script runs out).
+    /// A scripted prefix-and-pointer: records every operation in arrival
+    /// order, serves the queued LIST results (empty once the script runs
+    /// out), holds the by-recipe pointer as last-writer-wins state, and
+    /// can land a racing pointer PUT immediately after the next pointer
+    /// GET — the interleaving a live S3 cannot be made to reproduce on
+    /// demand.
     struct ScriptedPrefix {
         lists: std::collections::VecDeque<Vec<String>>,
         deleted: Vec<String>,
+        /// Current by-recipe pointer object body (None = absent).
+        pointer: Option<String>,
+        /// A racing re-record's pointer PUT, applied right after the next
+        /// `get_text` serves — the last-writer-wins write landing inside
+        /// the GET→DELETE window.
+        pointer_put_after_get: Option<String>,
+        /// Every op in arrival order, for history assertions.
+        ops: Vec<String>,
     }
 
     impl ScriptedPrefix {
@@ -445,19 +560,49 @@ mod tests {
             Self {
                 lists: lists.into(),
                 deleted: Vec::new(),
+                pointer: None,
+                pointer_put_after_get: None,
+                ops: Vec::new(),
             }
         }
     }
 
-    impl SweepOps for ScriptedPrefix {
+    impl DeleteOps for ScriptedPrefix {
         async fn list(&mut self) -> Result<Vec<String>> {
+            self.ops.push("list".to_string());
             Ok(self.lists.pop_front().unwrap_or_default())
         }
 
         async fn delete(&mut self, key: &str) -> Result<()> {
+            self.ops.push(format!("delete {key}"));
             self.deleted.push(key.to_string());
             Ok(())
         }
+
+        async fn get_text(&mut self, key: &str) -> Result<Option<String>> {
+            self.ops.push(format!("get {key}"));
+            let served = self.pointer.clone();
+            if let Some(racer) = self.pointer_put_after_get.take() {
+                self.pointer = Some(racer);
+            }
+            Ok(served)
+        }
+
+        async fn delete_pointer(&mut self, key: &str) -> Result<()> {
+            self.ops.push(format!("delete-pointer {key}"));
+            self.pointer = None;
+            Ok(())
+        }
+    }
+
+    /// A pointer body naming `short_id`, as the recorder writes it.
+    fn pointer_naming(short_id: &str, recorded_at: &str) -> String {
+        json!({
+            "archive_id": short_id.repeat(4),
+            "archive_id_short": short_id,
+            "recorded_at": recorded_at,
+        })
+        .to_string()
     }
 
     #[tokio::test]
@@ -516,6 +661,206 @@ mod tests {
             "the refusal names the recovery: {message}"
         );
         assert_eq!(prefix_state.deleted.len(), MAX_SWEEP_PASSES);
+    }
+
+    #[tokio::test]
+    async fn pointer_cleanup_deletes_an_owned_pointer() {
+        // No race: the pointer still names the deleted archive, so the
+        // cleanup removes it — exactly one GET then one DELETE, in that
+        // order (must-delete direction of the ownership rule).
+        let pointer_key = "replay/archives/by-recipe/feed.json";
+        let mut state = ScriptedPrefix::new(vec![]);
+        state.pointer = Some(pointer_naming("8b919129046e0f60", "2026-06-01T11:00:00Z"));
+
+        let outcome = remove_pointer_if_owned(&mut state, pointer_key, "8b919129046e0f60")
+            .await
+            .unwrap();
+        assert_eq!(outcome, PointerCleanup::Deleted);
+        assert_eq!(state.pointer, None, "the owned pointer is gone");
+        assert_eq!(
+            state.ops,
+            vec![
+                format!("get {pointer_key}"),
+                format!("delete-pointer {pointer_key}"),
+            ],
+            "the pair is GET then DELETE, nothing else"
+        );
+    }
+
+    #[tokio::test]
+    async fn pointer_cleanup_keeps_a_newer_pointer_and_an_unattributable_one() {
+        // Must-keep direction: a re-record's pointer PUT that landed
+        // BEFORE the GET is observed and kept — no delete is issued, the
+        // newer archive keeps its by-recipe resolution.
+        let pointer_key = "replay/archives/by-recipe/feed.json";
+        let mut state = ScriptedPrefix::new(vec![]);
+        state.pointer = Some(pointer_naming("aaaaaaaaaaaaaaaa", "2026-06-01T12:00:00Z"));
+
+        let outcome = remove_pointer_if_owned(&mut state, pointer_key, "8b919129046e0f60")
+            .await
+            .unwrap();
+        assert_eq!(outcome, PointerCleanup::Kept);
+        assert_eq!(
+            state.pointer,
+            Some(pointer_naming("aaaaaaaaaaaaaaaa", "2026-06-01T12:00:00Z")),
+            "the newer pointer survives"
+        );
+        assert_eq!(state.ops, vec![format!("get {pointer_key}")], "no delete");
+
+        // An unattributable body is kept too: never delete what cannot be
+        // attributed.
+        let mut state = ScriptedPrefix::new(vec![]);
+        state.pointer = Some("not json".to_string());
+        let outcome = remove_pointer_if_owned(&mut state, pointer_key, "8b919129046e0f60")
+            .await
+            .unwrap();
+        assert_eq!(outcome, PointerCleanup::Kept);
+        assert_eq!(state.pointer, Some("not json".to_string()));
+
+        // And an absent pointer is simply reported absent.
+        let mut state = ScriptedPrefix::new(vec![]);
+        let outcome = remove_pointer_if_owned(&mut state, pointer_key, "8b919129046e0f60")
+            .await
+            .unwrap();
+        assert_eq!(outcome, PointerCleanup::Absent);
+        assert_eq!(state.ops, vec![format!("get {pointer_key}")]);
+    }
+
+    #[tokio::test]
+    async fn pointer_race_inside_the_get_delete_window() {
+        // THE residual race, scripted: the GET witnesses a pointer owned
+        // by the archive being deleted; a concurrent re-record of the
+        // same recipe lands its last-writer-wins pointer PUT inside the
+        // GET→DELETE window; the unconditional DELETE then destroys the
+        // NEWER pointer. This end state is the module doc's tolerated
+        // residual — S3 general-purpose buckets offer no conditional
+        // DeleteObject to close it, the newer archive stays published and
+        // launchable by reference, and the witness logged before the
+        // DELETE keeps the destruction attributable. If the substrate
+        // ever grows a conditional delete, closing the race flips exactly
+        // this pin: the racer's pointer must then survive (Kept).
+        let pointer_key = "replay/archives/by-recipe/feed.json";
+        let racer = pointer_naming("aaaaaaaaaaaaaaaa", "2026-06-01T12:00:00Z");
+        let mut state = ScriptedPrefix::new(vec![]);
+        state.pointer = Some(pointer_naming("8b919129046e0f60", "2026-06-01T11:00:00Z"));
+        state.pointer_put_after_get = Some(racer);
+
+        let outcome = remove_pointer_if_owned(&mut state, pointer_key, "8b919129046e0f60")
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            PointerCleanup::Deleted,
+            "the cleanup acted on its (stale) ownership witness"
+        );
+        assert_eq!(
+            state.pointer, None,
+            "the racer's newer pointer is destroyed — the tolerated residual; its archive \
+             stays published, only by-recipe resolution is lost"
+        );
+        assert_eq!(
+            state.ops,
+            vec![
+                format!("get {pointer_key}"),
+                format!("delete-pointer {pointer_key}"),
+            ],
+            "no second look exists between the GET and the DELETE"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_recipe_digest_reads_the_surviving_manifest() {
+        // A marker-less prefix (interrupted delete) still has its
+        // manifest: the recipe digest is read from it so the pointer
+        // cleanup can run. Garbage or absent manifests yield None — the
+        // pointer is then left dangling, which the recorder tolerates.
+        let manifest_key = "replay/archives/8b919129046e0f60/manifest.json";
+        let mut state = ScriptedPrefix::new(vec![]);
+        state.pointer = Some(
+            json!({"provenance": {"recipe_digest": "ab".repeat(32)}, "version": 1}).to_string(),
+        );
+        let digest = orphan_recipe_digest(&mut state, manifest_key)
+            .await
+            .unwrap();
+        assert_eq!(digest, Some("ab".repeat(32)));
+
+        let mut state = ScriptedPrefix::new(vec![]);
+        state.pointer = Some("not json".to_string());
+        assert_eq!(
+            orphan_recipe_digest(&mut state, manifest_key)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let mut state = ScriptedPrefix::new(vec![]);
+        assert_eq!(
+            orphan_recipe_digest(&mut state, manifest_key)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    /// FORCING FUNCTION for the ops boundary's completeness. Domain:
+    /// every call-shaped `s3::<fn>(` path and every raw-AWS-client token
+    /// in this file's production code (the file's own bytes via
+    /// `include_str!`, truncated at this test module — the same shape as
+    /// the SLA metrics source lint in rio-scheduler). Expected: exactly
+    /// the four calls the [`LiveOps`] impl owns and zero raw client
+    /// tokens, so any new S3 traffic added to the command logic fails
+    /// here until it is routed through [`DeleteOps`] — where scripted
+    /// histories can interleave a racing writer against it.
+    #[test]
+    fn s3_calls_route_through_the_ops_boundary() {
+        let src = include_str!("delete.rs");
+        let prod = src
+            .split_once("#[cfg(test)]\nmod tests")
+            .map(|(prod, _)| prod)
+            .unwrap_or(src);
+
+        // Call-shaped occurrences of `s3::<ident>(`, built at runtime so
+        // this test's own source cannot match itself.
+        let needle = format!("{}{}", "s3", "::");
+        let mut calls: Vec<String> = Vec::new();
+        let mut at = 0;
+        while let Some(found) = prod[at..].find(&needle) {
+            let start = at + found + needle.len();
+            let ident: String = prod[start..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if prod[start + ident.len()..].starts_with('(') && !ident.is_empty() {
+                calls.push(ident);
+            }
+            at = start;
+        }
+        calls.sort();
+        assert_eq!(
+            calls,
+            [
+                "archive_prefix",
+                "by_recipe_prefix",
+                "delete_object",
+                "delete_object",
+                "get_text",
+                "human_bytes",
+                "list_keys"
+            ],
+            "every S3 operation must route through the DeleteOps boundary (LiveOps owns \
+             list_keys/get_text and the two delete_object sites; archive_prefix, \
+             by_recipe_prefix and human_bytes are pure key/format helpers with no S3 \
+             traffic) — a raw call cannot be interleaved against a scripted history"
+        );
+
+        // No raw AWS client may be constructed or named here at all.
+        for raw in ["aws_sdk_s3", "crate::aws"] {
+            assert_eq!(
+                prod.matches(raw).count(),
+                0,
+                "{raw} must not appear in the delete command module"
+            );
+        }
     }
 
     #[test]
