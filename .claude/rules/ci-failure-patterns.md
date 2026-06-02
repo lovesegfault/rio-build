@@ -21,6 +21,7 @@ Reference catalog of CI-gate failure signatures that have bitten this project at
 | **statix style** | statix lint → shows under the `pre-commit` check, not standalone | `inherit (pkgs) lib` not `lib = pkgs.lib`. Mechanical fix. |
 | **stdenv pipefail SIGPIPE** | `runCommand` build fails exit-1 with no stderr; buildCommand has a `producer | head -c N` shape | stdenv sets `set -o pipefail`; head closes pipe → producer SIGPIPE → exit≠0. Reverse to `head -c N input | consumer`, or prefix `set +o pipefail;`. |
 | **Cilium config no-restart** | `helm upgrade cilium --reuse-values --set X` succeeds but `cilium-dbg config` still shows old value | Chart doesn't checksum-annotate `cilium-config` ConfigMap → DS pods don't restart. `kubectl -n kube-system rollout restart ds/cilium` after. |
+| **New crate untracked at eval** | `lib.fileset.unions: Element N (<store>/source/<crate>) is a path that does not exist` | Dirty-tree flake sources include **tracked files only**; a freshly created crate dir referenced by the regenerated (tracked) `Cargo.json` is invisible until `git add`. Stage the new crate, re-run. |
 
 ## Flaky tests
 

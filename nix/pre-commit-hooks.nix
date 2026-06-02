@@ -55,6 +55,17 @@
     name = "sqlx-prepare-check";
     entry = toString (
       pkgs.writeShellScript "sqlx-prepare-check" ''
+        # language=system → this runs in the COMMITTING environment, not a
+        # sandbox. Outside the dev shell (IDE git UIs, bare terminals) the
+        # build env is incomplete (no PROTOC/LIBCLANG_PATH) and, since the
+        # devshell exports RUSTC_WRAPPER, cargo would also see flipped
+        # fingerprints and rebuild the world just to fail confusingly.
+        # Skip with a note instead — CI's hermetic checks are the real
+        # enforcement of this gate.
+        if [ -z "''${PROTOC:-}" ]; then
+          echo 'sqlx-prepare-check: not in the dev shell (PROTOC unset); skipping — CI enforces this gate' >&2
+          exit 0
+        fi
         # Only check if any staged .rs file touches a query! macro.
         # Otherwise this is a no-op (e.g. pure-refactor commits
         # that don't change SQL).

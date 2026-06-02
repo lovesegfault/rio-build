@@ -25,11 +25,14 @@ pub async fn run() -> Result<()> {
     // without PG. Unset so prepare actually hits the DB.
     let _env = sh.push_env("DATABASE_URL", url);
     let _env2 = sh.push_env("SQLX_OFFLINE", "false");
-    // `cargo sqlx prepare` sets RUSTFLAGS before its internal `cargo
-    // check`, which poisons the main target/ fingerprint — the next
-    // `cargo run` sees different flags and rebuilds everything. Isolate
-    // into a sub-target so the main cache stays warm (build-dir defaults
-    // to the target dir, so this covers intermediates too).
+    // Isolate prepare's inner builds into a sub-target so the main
+    // target/ stays warm: `cargo sqlx prepare` does per-package feature
+    // resolution (different unit graphs than workspace builds) and bumps
+    // source mtimes, both of which would churn the main fingerprints.
+    // (sqlx-cli 0.9 only *forwards* a pre-existing RUSTFLAGS — verified
+    // against its prepare.rs — so the historical "sqlx sets RUSTFLAGS"
+    // poisoning rationale no longer applies; the isolation stays for the
+    // reasons above.)
     let isolated = sh.current_dir().join("target/sqlx-prepare");
     let _env3 = sh.push_env("CARGO_TARGET_DIR", &isolated);
 
