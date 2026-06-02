@@ -2845,6 +2845,61 @@ backoff. This prevents unbounded request queueing at the gateway layer.
   set classifies Broken (conservative), never Vouched.
 ]
 
+#r("sched.db.attempts-gc")[
+  `drv_attempts` rows MUST be deleted only by the leader's periodic
+  Tick-driven sweep, and the suffix every ledger loader returns MUST be
+  unchanged by any sweep. For a live derivation the sweep MUST delete only
+  attempt-kind rows strictly before its most recent reset row in
+  `(recorded_at, attempt_id)` order, older than the retention horizon, and
+  carrying no ACTIVE (`pending`/`acknowledged`) `assignments` row for their
+  `exec_id`; reset rows of a live derivation MUST never be deleted. Rows whose
+  `derivation_id` has no `derivations` row (orphaned histories) are deletable
+  past the horizon regardless of kind. The horizon MUST be at least
+  max(`LEDGER_RETENTION_FLOOR`, the LIVE configured
+  `infra_retry_window_secs`, `POISON_TTL`). The eligibility predicate ---
+  INCLUDING the active-assignment conjunct --- MUST be evaluated in the same
+  SQL statement (one MVCC snapshot) as the deletion. A closed
+  (terminal-status) `assignments` row MUST never return to
+  `pending`/`acknowledged`, and an `exec_id` MUST never be re-bound to an
+  active assignment.
+]
+
+The sweep is exact, not approximate, because the reset row is the
+checkpoint: the latest `resubmit_reset` row carries the cycle index in its
+`resubmit_cycle` column (#rref("sched.merge.poisoned-resubmit-bounded")), so
+deleting rows strictly below the cut can never lower a cycle count, and both
+suffix loaders cut at the same `(recorded_at, attempt_id)` tuple the sweep
+complements --- machine-checked by the kernel's sweep-equivalence harnesses
+(`decide()` and `materialization_decide()` bit-identical before/after any
+structural sweep). The active-assignment conjunct exists for the
+report-idempotency record, not the fold: `drv_attempts` rows double as the
+"already classified" evidence for late reports, and deleting a terminal
+attempt row whose assignment were still active would resurrect the attempt
+as open. Two stability premises make that guard hold under concurrency, and
+a refactor breaking either re-opens the hazard: (i) every report-idempotency
+reader --- `find_attempt_by_exec_id`, `find_open_pull_attempt_by_drv_hash`,
+and `list_open_pull_attempts` --- computes assignment-active and
+attempt-recorded/terminal in ONE SQL statement, so by snapshot transitivity
+no reader can observe "assignment active AND attempt row deleted"; (ii)
+assignment closure is monotone and claim upserts always mint a fresh
+`exec_id`, so no post-snapshot commit can re-activate a swept candidate's
+`exec_id` --- a closure committing after the sweep's snapshot only defers the
+row to the next pass. This is why the lock-free single-statement shape is
+sound here while rio-store's orphan reaper needs `FOR UPDATE`: re-uploads
+make THAT reaper's eligibility unstable mid-transaction, whereas no
+resurrection writer exists for a closed assignment. The orphan arm rests on
+referential unreachability, not the fold: a re-submitted `drv_hash` mints a
+FRESH derivation UUID after GC, so an orphaned history's `derivation_id` can
+never be named by any loader again (the active-assignment conjunct is
+vacuous there --- the migration-034 cascade removed the assignments rows with
+the derivation). Accepted narrowing: `ListPoisoned`'s display aggregates
+failed executors over full history, so pre-reset entries older than the
+horizon disappear from the operator display (decisions unaffected). The
+`POISON_TTL` term of the horizon max is currently dominated by the floor via
+the compile-time guard in `db/attempts.rs`; it binds independently only if
+the TTL ever becomes configurable or outgrows the floor (which that guard
+turns into a compile error first).
+
 #r("sched.db.assignment-terminal-on-status+2")[
   Every persist of a terminal `derivations.status` (via
   `update_derivation_status`, `update_derivation_status_batch`, or

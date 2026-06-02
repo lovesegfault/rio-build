@@ -226,7 +226,7 @@ in
   # each other by the kernel's differential unit tests plus the
   # set-semantics harness below.
   #
-  # Eight harnesses (in rio-retry-kernel/src/lib.rs `mod proofs`):
+  # Ten harnesses (in rio-retry-kernel/src/lib.rs `mod proofs`):
   #   - check_bounded_set_models_set_semantics: the proof-time bounded
   #     set obeys set semantics over symbolic values (insert newness,
   #     precise membership, distinct-count len, order-insensitivity,
@@ -267,16 +267,31 @@ in
   #   - check_materialization_never_poisons: the park-not-fail corollary
   #     — if the build-kind subset alone does not poison, no amount of
   #     interleaved materialization rows makes the full set poison.
+  #   - check_sweep_suffix_equivalence: the attempt-ledger GC sweep's
+  #     structural half — for every bounded history and every deletion
+  #     mask confined to attempt-kind rows strictly before the last
+  #     reset row (the sweep's E1+E2 conjuncts; the age conjunct is
+  #     deliberately absent, so every age implementation is a
+  #     mask-shrinking special case), the post-cut suffix is
+  #     element-wise unchanged (MAX=5: no decide() call, so the
+  #     structural harness carries the larger bound).
+  #   - check_sweep_decide_invariant: the loader-composed end-to-end
+  #     theorem — decide() and materialization_decide() over the cut
+  #     suffix are bit-identical before/after any structural sweep
+  #     (MAX=4, ~2× the check_decide_contract fold cost; documented
+  #     fallback to MAX=3 if the gate budget is ever exceeded — the
+  #     bounded-exhaustive unit test keeps len<=4 covered regardless).
   # r[verify sched.retry.transient-budget]
   # r[verify sched.retry.attempts-bounded+2]
   # r[verify sched.retry.exempt-infra-cap]
   # r[verify sched.retry.per-executor-budget+4]
   # r[verify sched.dispatch.fleet-exhaust+4]
   # r[verify sched.state.poisoned-ttl]
+  # r[verify sched.db.attempts-gc]
   kani-rio-retry-kernel = mkKaniCheck {
     name = "rio-retry-kernel";
     crate = crateBuildKani.members.rio-retry-kernel;
-    expectedHarnesses = 8;
+    expectedHarnesses = 10;
   };
 
   # rio-evidence-kernel: the scheduler's closure-evidence decision kernel

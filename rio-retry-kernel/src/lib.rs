@@ -1697,6 +1697,89 @@ pub fn materialization_decide<Id: Ord + Clone>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Ledger GC sweep eligibility (sched.db.attempts-gc)
+//
+// The pure half of the drv_attempts retention sweep: the scheduler's
+// SQL deletes the suffix complement (attempt-kind rows strictly before
+// the last reset row, past the retention horizon, with no active
+// assignment), and these functions state — and the proofs machine-check
+// — that such a deletion leaves the decision suffix element-wise
+// unchanged, hence `decide()` and `materialization_decide()`
+// bit-identical. The theorem is deliberately loader-composed
+// (suffix(sweep(L)) == suffix(L)) rather than raw fold equality over
+// whole histories: a whole-history fold is NOT invariant (a pre-reset
+// Transient's `backoff_until` survives a CacheHitClear in a raw fold),
+// but production never folds whole histories — both suffix loaders cut
+// at the last reset row, and that cut is what the sweep preserves.
+// ---------------------------------------------------------------------------
+
+/// The retention horizon for the attempt-ledger GC sweep, in seconds:
+/// the largest decision window any fold consumer can look back across,
+/// `max(retention_floor, infra_retry_window, poison_ttl)`.
+///
+/// The scheduler passes its `LEDGER_RETENTION_FLOOR` (24 h) as
+/// `retention_floor_secs`; taking the floor as an argument keeps this
+/// crate scheduler-agnostic while making the floor genuinely consulted
+/// by the sweep. The `infra_retry_window_secs` term honors the floor
+/// doc's "re-check against the configured value" clause: an
+/// operator-widened window > 24 h widens the horizon with it. The
+/// `poison_ttl_secs` term is currently dominated by the floor (the
+/// scheduler's compile-time guard asserts floor >= POISON_TTL); it
+/// binds independently only if the TTL ever becomes configurable or
+/// outgrows the floor.
+// r[impl sched.db.attempts-gc]
+pub fn sweep_horizon_secs(budget: &Budget, retention_floor_secs: u64) -> u64 {
+    retention_floor_secs
+        .max(budget.infra_retry_window_secs)
+        .max(budget.poison_ttl_secs)
+}
+
+/// Index where the decision suffix of `rows` begins: the position of
+/// the LAST row with `event_kind == Reset`, or 0 when no reset row
+/// exists (the whole history is the suffix). The kernel mirror of the
+/// SQL cut `(recorded_at, attempt_id) >= (last_reset.recorded_at,
+/// last_reset.attempt_id)` — slice order here corresponds to
+/// `(recorded_at, attempt_id)` order there, and the suffix INCLUDES the
+/// reset row itself, exactly as both loaders return it. Pinned to the
+/// SQL by the cross-layer DB test
+/// `test_suffix_cut_matches_kernel_ledger_suffix_start` in
+/// rio-scheduler.
+// r[impl sched.db.attempts-gc]
+pub fn ledger_suffix_start<Id>(rows: &[LedgerRow<Id>]) -> usize {
+    rows.iter()
+        .rposition(|r| r.event_kind == AttemptEventKind::Reset)
+        .unwrap_or(0)
+}
+
+/// Sweep eligibility of `rows[index]` under the live-derivation arm:
+/// an attempt-kind row strictly before the suffix cut, older than the
+/// horizon. Reset rows are NEVER eligible (keeping every reset row
+/// makes "the cut never moves backward" structural), and a history with
+/// no reset row has no cut — nothing is eligible, the whole history is
+/// the live suffix.
+///
+/// The age conjunct here models time on the kernel's single abstract
+/// clock while the SQL transcription ages on PG-assigned `recorded_at`;
+/// this is sound because the proofs quantify over the STRUCTURAL
+/// predicate only (any age conjunct merely shrinks the deleted set, so
+/// every age implementation — any clock, any skew — is a special case
+/// of the proven mask domain). The scheduler-side E4 conjunct (no
+/// active assignment for the row's exec_id) is likewise a
+/// deletion-set-shrinking refinement, owned by the SQL and its DB
+/// tests: it protects the report-idempotency probes, not the fold.
+// r[impl sched.db.attempts-gc]
+pub fn sweep_eligible<Id>(
+    rows: &[LedgerRow<Id>],
+    index: usize,
+    now: AbsTime,
+    horizon_secs: u64,
+) -> bool {
+    rows[index].event_kind == AttemptEventKind::Attempt
+        && index < ledger_suffix_start(rows)
+        && now.saturating_sub(rows[index].at) > horizon_secs
+}
+
 /// The floor-bump outcome as [`classify`] consumes it — a leaf-local
 /// mirror of the actor's `FloorOutcome` so this crate keeps no actor
 /// dependency. `promoted` and `at_cap` are mutually exclusive; both are
@@ -2316,6 +2399,170 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------
+    // Ledger GC sweep eligibility (sched.db.attempts-gc)
+    // -----------------------------------------------------------------
+
+    /// `sweep_eligible` truth table over the canonical hand history:
+    /// only old attempt-kind rows strictly before the cut are eligible;
+    /// post-reset age alone never deletes; reset rows are never
+    /// eligible; a no-reset history has no cut and nothing eligible.
+    // r[verify sched.db.attempts-gc]
+    #[test]
+    fn sweep_eligible_truth_table() {
+        let budget = Budget::default();
+        let horizon = sweep_horizon_secs(&budget, 86_400);
+        let now: AbsTime = 200_000;
+
+        // [attempt(old), attempt(old), reset, attempt(old), attempt(fresh)]
+        let rows = vec![
+            build_row(OutcomeClass::Transient, Some("w1"), 1),
+            build_row(OutcomeClass::Infra, None, 2),
+            reset_build_row(OutcomeClass::ResubmitReset, 1, 3),
+            build_row(OutcomeClass::Transient, Some("w2"), 4),
+            build_row(OutcomeClass::Transient, Some("w1"), 199_999),
+        ];
+        let eligible: Vec<bool> = (0..rows.len())
+            .map(|i| sweep_eligible(&rows, i, now, horizon))
+            .collect();
+        assert_eq!(
+            eligible,
+            [true, true, false, false, false],
+            "exactly the pre-cut old attempt rows; index 3 proves age \
+             alone never deletes (post-reset), index 4 fails the age \
+             conjunct"
+        );
+
+        // No reset row → no cut → nothing eligible, however old.
+        let no_reset = vec![
+            build_row(OutcomeClass::Transient, Some("w1"), 1),
+            build_row(OutcomeClass::Infra, None, 2),
+        ];
+        assert!(
+            (0..no_reset.len()).all(|i| !sweep_eligible(&no_reset, i, now, horizon)),
+            "a history with no reset row is entirely live suffix"
+        );
+
+        // Reset rows are never eligible — even ancient pre-cut ones.
+        let two_resets = vec![
+            reset_build_row(OutcomeClass::CacheHitClear, 0, 1),
+            reset_build_row(OutcomeClass::ResubmitReset, 1, 2),
+        ];
+        assert!(
+            (0..two_resets.len()).all(|i| !sweep_eligible(&two_resets, i, now, horizon)),
+            "reset rows of a live derivation are never deleted"
+        );
+    }
+
+    /// `sweep_horizon_secs` is the max of the floor, the LIVE configured
+    /// infra retry window, and the poison TTL — the attempts.rs
+    /// "re-check against the configured value" clause.
+    // r[verify sched.db.attempts-gc]
+    #[test]
+    fn sweep_horizon_dominates_floor_window_and_ttl() {
+        // Production defaults: floor (== TTL, 86_400) dominates the
+        // 300 s window.
+        assert_eq!(sweep_horizon_secs(&Budget::default(), 86_400), 86_400);
+
+        // Operator-widened infra window > floor → the window widens
+        // retention with it.
+        let wide = Budget {
+            infra_retry_window_secs: 200_000,
+            ..Budget::default()
+        };
+        assert_eq!(sweep_horizon_secs(&wide, 86_400), 200_000);
+
+        // A poison TTL outgrowing the floor enters the max (today the
+        // scheduler's compile guard keeps floor >= TTL; this pins the
+        // term anyway).
+        let ttl = Budget {
+            poison_ttl_secs: 100_000,
+            ..Budget::default()
+        };
+        assert_eq!(sweep_horizon_secs(&ttl, 86_400), 100_000);
+    }
+
+    /// sched.db.attempts-gc, exhaustively: over ALL histories of length
+    /// <= 4 drawn from a 6-shape alphabet (three attempt shapes × three
+    /// reset shapes, deliberately including the ResubmitReset cycle
+    /// seed and the CacheHitClear backoff carve-out) × ALL subsets of
+    /// fully-eligible indices, the cut suffix is element-wise unchanged
+    /// and decide()/materialization_decide() are bit-identical. The
+    /// dependency-free bounded-exhaustive twin of the kani harnesses —
+    /// runs under every cfg.
+    // r[verify sched.db.attempts-gc]
+    #[test]
+    fn decide_invariant_under_eligible_sweep_exhaustive() {
+        fn shape(code: usize, at: AbsTime) -> LedgerRow<String> {
+            match code {
+                0 => build_row(OutcomeClass::Transient, Some("w1"), at),
+                1 => build_row(OutcomeClass::Infra, None, at),
+                2 => build_row(OutcomeClass::ExecutorCrash, Some("w2"), at),
+                3 => reset_build_row(OutcomeClass::ResubmitReset, 2, at),
+                4 => reset_build_row(OutcomeClass::CacheHitClear, 0, at),
+                _ => reset_build_row(OutcomeClass::PoisonCleared, 0, at),
+            }
+        }
+
+        let budget = Budget::default();
+        let horizon = sweep_horizon_secs(&budget, 86_400);
+        let now: AbsTime = 1_000_000;
+        let mut cases: u64 = 0;
+
+        for len in 0..=4usize {
+            for history_code in 0..6usize.pow(u32::try_from(len).expect("small")) {
+                let mut code = history_code;
+                let mut rows: Vec<LedgerRow<String>> = Vec::with_capacity(len);
+                for position in 0..len {
+                    // Ancient timestamps (0..=3): every row passes the
+                    // age conjunct, so eligibility is decided by the
+                    // structural predicate (the truth-table test owns
+                    // the age corner).
+                    rows.push(shape(code % 6, position as AbsTime));
+                    code /= 6;
+                }
+
+                let eligible: Vec<usize> = (0..len)
+                    .filter(|&i| sweep_eligible(&rows, i, now, horizon))
+                    .collect();
+
+                for selection in 0..(1usize << eligible.len()) {
+                    let mut deleted = vec![false; len];
+                    for (bit, &idx) in eligible.iter().enumerate() {
+                        if selection & (1 << bit) != 0 {
+                            deleted[idx] = true;
+                        }
+                    }
+                    let swept: Vec<LedgerRow<String>> = rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !deleted[*i])
+                        .map(|(_, r)| r.clone())
+                        .collect();
+
+                    let s1 = ledger_suffix_start(&rows);
+                    let s2 = ledger_suffix_start(&swept);
+                    assert_eq!(
+                        &rows[s1..],
+                        &swept[s2..],
+                        "suffix changed under sweep: history {rows:?}, deleted {deleted:?}"
+                    );
+                    assert_eq!(
+                        decide(&rows[s1..], &budget, now),
+                        decide(&swept[s2..], &budget, now),
+                    );
+                    assert_eq!(
+                        materialization_decide(&rows[s1..], 1),
+                        materialization_decide(&swept[s2..], 1),
+                    );
+                    cases += 1;
+                }
+            }
+        }
+
+        assert!(cases > 1_500, "case-count sanity: {cases}");
+    }
 }
 
 #[cfg(kani)]
@@ -2800,5 +3047,102 @@ mod proofs {
         if !matches!(build_only.verdict, Verdict::Poison(_)) {
             assert!(!matches!(full.verdict, Verdict::Poison(_)));
         }
+    }
+
+    /// Compact the non-deleted rows of `rows[..n]` under `mask` into a
+    /// fresh fixed array (index loop, no Vec — the CBMC-blowup lesson):
+    /// the harness-side model of the sweep's DELETE.
+    fn sweep_view<const MAX: usize>(
+        rows: &[LedgerRow<u8>; MAX],
+        n: usize,
+        mask: &[bool; MAX],
+    ) -> ([LedgerRow<u8>; MAX], usize) {
+        let mut swept = rows.clone();
+        let mut m = 0;
+        let mut i = 0;
+        while i < n {
+            if !mask[i] {
+                swept[m] = rows[i].clone();
+                m += 1;
+            }
+            i += 1;
+        }
+        (swept, m)
+    }
+
+    /// sched.db.attempts-gc, structural half: for EVERY bounded history
+    /// and EVERY deletion mask confined to attempt-kind rows strictly
+    /// before the last reset row (`sweep_eligible`'s structural
+    /// conjuncts E1+E2; deliberately WITHOUT the age conjunct, so every
+    /// age implementation — any clock, any skew — is covered as a
+    /// mask-shrinking special case), the post-cut suffix is element-wise
+    /// unchanged. No decide() call — cheap row comparisons only, which
+    /// is what lets this harness carry the larger MAX=5 bound.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn check_sweep_suffix_equivalence() {
+        const MAX: usize = 5;
+        let (rows, n) = any_history::<MAX>();
+        let mask: [bool; MAX] = [(); MAX].map(|_| kani::any());
+        let s1 = ledger_suffix_start(&rows[..n]);
+        let mut i = 0;
+        while i < MAX {
+            kani::assume(
+                !mask[i] || (i < n && rows[i].event_kind == AttemptEventKind::Attempt && i < s1),
+            );
+            i += 1;
+        }
+
+        let (swept, m) = sweep_view(&rows, n, &mask);
+        let s2 = ledger_suffix_start(&swept[..m]);
+
+        let suffix = &rows[s1..n];
+        let swept_suffix = &swept[s2..m];
+        assert_eq!(suffix.len(), swept_suffix.len());
+        let mut k = 0;
+        while k < suffix.len() {
+            assert_eq!(suffix[k], swept_suffix[k]);
+            k += 1;
+        }
+    }
+
+    /// sched.db.attempts-gc, end-to-end half: the loader-composed
+    /// theorem itself — `decide()` and `materialization_decide()` over
+    /// the cut suffix are bit-identical before and after any structural
+    /// sweep. Folds decide() twice at MAX=4 (~2× check_decide_contract);
+    /// documented fallback if it ever exceeds the gate budget: shrink to
+    /// MAX=3 and record the measurement (the exhaustive unit test keeps
+    /// the len<=4 equivalence machine-checked under every cfg
+    /// regardless).
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn check_sweep_decide_invariant() {
+        const MAX: usize = 4;
+        let (rows, n) = any_history::<MAX>();
+        let mask: [bool; MAX] = [(); MAX].map(|_| kani::any());
+        let s1 = ledger_suffix_start(&rows[..n]);
+        let mut i = 0;
+        while i < MAX {
+            kani::assume(
+                !mask[i] || (i < n && rows[i].event_kind == AttemptEventKind::Attempt && i < s1),
+            );
+            i += 1;
+        }
+
+        let (swept, m) = sweep_view(&rows, n, &mask);
+        let s2 = ledger_suffix_start(&swept[..m]);
+
+        let budget = any_small_budget();
+        let now = small_time(16);
+        let before = decide(&rows[s1..n], &budget, now);
+        let after = decide(&swept[s2..m], &budget, now);
+        assert_eq!(before, after);
+
+        let k: u8 = kani::any();
+        kani::assume(k <= 2);
+        assert_eq!(
+            materialization_decide(&rows[s1..n], u32::from(k)),
+            materialization_decide(&swept[s2..m], u32::from(k)),
+        );
     }
 }
