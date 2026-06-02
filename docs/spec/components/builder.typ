@@ -1569,9 +1569,9 @@ is stable (post Phase 3).
   `BuildLogBatch` and `BuildPhase` messages MUST be submitted to the
   permanent sink with a non-blocking `try_send` through the worker's
   shedding log sender: a full sink sheds the message, counts it in
-  `rio_builder_log_messages_shed_total` (by `kind`), and the next
-  delivered batch MUST carry a single suppression marker line reporting
-  the shed count. `CompletionReport`, `PrefetchComplete`, and
+  #(refs.metric)("rio_builder_log_messages_shed_total") (by `kind`), and
+  the next delivered batch MUST carry a single suppression marker line
+  reporting the shed count. `CompletionReport`, `PrefetchComplete`, and
   `WorkAssignmentAck` MUST remain awaited, guaranteed sends, and MUST
   NOT be constructible through the shedding sender.
 ]
