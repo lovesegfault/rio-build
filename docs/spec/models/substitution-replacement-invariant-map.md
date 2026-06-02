@@ -667,7 +667,7 @@ durable record.
 | 11 | OQ7 divergence, unmarked-childless shape (B2) | STOP-AND-REPORT raised → orchestrator ruling → fixed `c952e5a51`; counter-signature pending |
 | 12 | Determinism mechanism: store `poll_interval_secs=3600` + restart-per-wave = exactly one claim wave per restart (also clears the 1 h HEAD-probe cache) | Adopted by all standalone materialization scenarios |
 | 13 | ARCHITECTURAL: `recover_from_pg` runs only on LeaderAcquired (k8s lease deployments); a standalone scheduler restart starts empty — ANY in-flight build is orphaned, flag flip or not | T-3.2 rewritten as `vm-materialization-transition-k3s` (the FP-4 story is k8s-only by construction); pre-existing as-built behavior, documented, NOT changed |
-| 14 | FP-4(a) establishment-drain not VM-testable (the establishment window anchors to SLA deadlines) | §4 inertness covered by the PARKED-jobs form (pending rows inert across the flip); establishment-drain stays unit-level (Phase A battery) |
+| 14 | FP-4(a) establishment-drain not VM-testable (the establishment window anchors to SLA deadlines) | §4 inertness covered by the PARKED-jobs form (pending rows inert across the flip); establishment-drain stays unit-level (Phase A battery); the SLA anchoring is restated as deliberate residual (b) of the follow-up ledger row 10 rationale ("Post-ledger closure — materialization-kind establishment deadline") |
 | 15 | Schema lessons: `drv_attempts` has no kind column (kind implied by outcome class); `drv_executions` keys on the executor-facing CHAR(32) hash | Baked into scenario assertions (deployment-wide zero-build-executions form) |
 | 16 | Mixed-flag window: pending-job backlog visible via the re-sourced `substituting_derivations` (≥2 across the 45 s window), drains on store rollout | Asserted in T-3.3 mixed-flag; MD-D3 guidance |
 | 17 | Post-failover completion initially via the dispatch-probe dedup re-feed (~1 tick lazy heal) | Closed by T-4.3's eager rebuild; failover scenario re-verified |
@@ -1636,6 +1636,103 @@ this table does not restate their bodies.
 | 7 | **Item T — conversion visibility & strictness** | Observability half LANDED (Items I/S/T integrated 2026-06-02): the conversion counter + paged alert `RioSchedulerMaterializationConversions` (`17e8de205`) on the intact PD-20/MD-D1 surface; the strictness knob remains trigger-gated — WAITS on alert evidence per harden-store trigger 1 (memo §6.2) |
 | 8 | **Standing owner line items, predecessor map** — closure-evidence Phase-2 counter-signature line items 5–8 (the decision-3 residual; the C5/CE-7 residual row; the trailing-EM closures; the admit_pull extraction scope) | Not in the 2026-06-01 signature set; remain open at the owner |
 | 9 | `setup_with_mock_store_materialization_enabled` alias fold-in (~30 call sites onto `setup_with_mock_store`) | Leisure cleanup (D′ follow-up 3) |
+| 10 | **Materialization-kind establishment deadline (post-ledger)** — can a claimed materialization attempt sit unestablished forever when its executor dies unreported? | CLOSED-WITH-RATIONALE (2026-06-02, this commit): the answer is NO — see "Post-ledger closure — materialization-kind establishment deadline" below; no code change, no new knob |
+
+### Post-ledger closure — materialization-kind establishment deadline (2026-06-02)
+
+**The decisive question** (owner brief, investigate-first): can a
+materialization job sit pending-establishment forever with no timer or tick
+reaping or re-evaluating it? **The answer is NO** — a claimed materialization
+attempt whose executor dies unreported CANNOT wait for establishment
+unboundedly. Every link of the bounding chain is in code today (line numbers
+as of this commit):
+
+1. **The claim mints a finite deadline anchor.** The shared pull mint
+   computes the solved deadline BEFORE the kind branch
+   (`mint_and_deliver`, rio-scheduler/src/actor/pull.rs — the
+   `solve_intent_for(...).deadline_secs` read precedes the kind mapping)
+   and persists it for BOTH kinds via `mint_pull_attempt_fenced`
+   (`drv_executions.deadline_secs`). `SolvedIntent.deadline_secs` is u32
+   (state/derivation.rs; the unfitted-probe fallback in sla/config.rs has
+   the same width — `f64::from` compiles only for ≤32-bit integers, so
+   finiteness is structurally enforced), and the node must be in the DAG at
+   mint, so every fresh materialization attempt row carries `Some(deadline)`.
+2. **The establishment sweep is kind-shared and tick-driven.**
+   `list_open_pull_attempts` has NO kind filter (db/open_attempts.rs —
+   `COALESCE(e.attempt_kind,'build')`; the module doc: every consumer reads
+   it unfiltered). `tick_sweep_open_pull_attempts` (actor/housekeeping.rs)
+   runs on every leader tick (`spawn_periodic("tick-loop", cfg.tick_interval)`,
+   default 10 s).
+3. **The window is finite and can only widen.** Expired ⟺ age >
+   max(persisted dispatched deadline, sweep-time re-solve) +
+   `establishment_report_slack` (default 120 s). The re-solve may only
+   WIDEN the window; a node evicted from the DAG falls back to 0.0 — the
+   sweep then over-fires, never hangs.
+4. **The kind branch establishes and re-arms.** `establish_open_pull_attempt`
+   routes kind=materialization into `establish_materialization_attempt`:
+   one fenced transaction closes the attempt and appends the
+   `materialization_infra` Scheduler-party ("unreported") charge
+   (`close_materialization_attempt`, exec_id terminal-row-wins idempotence),
+   re-arms the job pending claimable (`rearm_materialization_job` — "leave
+   the job pending"), and requeues the node (`reassign_derivations`). No
+   adopt arm, never an executor-crash charge (BC-2/BC-3; executor map,
+   Materialization addendum rule 3).
+5. **Failure and failover do not break the chain.** A failed close leaves
+   the attempt open for the next tick ("the establishment sweep remains the
+   backstop"); a failed sweep READ is likewise tick-retried over the same
+   durable view; a fenced close is the deposed-leader case, and the new
+   leader's sweep reads the same durable PG rows ("The sweep reads durable
+   rows — not an in-memory claim a one-shot timer can forget",
+   scheduler.typ); recovery rebuilds the job view including claim holders
+   and park expiries.
+6. **The spec already binds it; the pins exist.**
+   `sched.attempt.establishment-window+3` ("MUST visit every open attempt
+   ... on every sweep" — kind-agnostic) and `sched.materialize.settlement`
+   (claimed ⇒ report-or-establishment). Test pins:
+   `establishment_writes_materialization_infra_never_adopts`,
+   `flag_on_queued_mint_crash_between_commit_and_transition_recovers`,
+   `flag_on_every_job_state_has_armed_action`; model pin:
+   `unresolvedJobAlwaysArmed` across the five materialization regimes
+   (Phase C′ stage record).
+
+**Settlement totality across all three job states** (so the closure holds
+under either reading of "pending-establishment"): pending (unclaimed) has
+no deadline BY DESIGN — claimable is the armed action, with the backlog
+gauge published per tick and Item I's KEDA scaling as the visibility and
+capacity response (ledger row 5); claimed is bounded by
+deadline + slack + tick as traced above; parked has the per-tick PD-20
+re-evaluation, the finite durable backoff (cap 900 s), and the MD-D1
+stalled alert.
+
+**The two deliberate residuals** (recorded as record, NOT defects — owner
+ratified 2026-06-02, §6 block C):
+
+- *(a) Establishment never parks.* The park/budget decision rides ONLY the
+  worker-reported InfraFailure consumption arm, while establishment-written
+  rows DO count toward that budget (OQ1 amendment 1: "worker-reported AND
+  establishment-written — both channels charge the same budget"). A store
+  replica crash-looping without ever reporting therefore yields repeated
+  BOUNDED claim→establish cycles — each ≤ deadline + slack + tick, armed at
+  every step, never parked; the first worker-reported charge that lands
+  parks promptly under the party-blind fold. This matches the C′
+  delta-encoding row 3 wrong-verdict record exactly: a model that parked or
+  reset at establishment "would have verified a park cycle that cannot
+  stall" — changing the posture would re-key the MD-D1 stalled-alert
+  population and invalidate the calibrated model. The cycle count is
+  unbounded in REPETITIONS though bounded per cycle; its visibility
+  surfaces are the `drv_attempts` ledger rows, k8s CrashLoopBackOff on the
+  replica, and OA2's controller-side wedge clustering over per-node
+  attempt-deadline expiries.
+- *(b) The window anchors to the build-SLA solve* (FP-4(a), findings row
+  14). A download outliving deadline + slack is established mid-flight: one
+  infra charge plus a re-claim, with terminal-row-wins dropping the late
+  report against the closed attempt. Item S's progress/stall machinery is
+  store-side by scope and deliberately does not feed this window.
+
+NO mechanism is missing; NO materialization-specific deadline knob exists
+or is needed. Any future establishment-side park ladder or per-kind window
+is a behavior change requiring red-first justification, model recalibration
+(C′ delta row 3), and owner sign-off — out of scope for this closure.
 
 ---
 
