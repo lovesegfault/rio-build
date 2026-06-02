@@ -5,6 +5,10 @@
       "description": "Tenant JWT + assignment HMAC token sign/verify and the gRPC interceptor that wires them"
     },
     {
+      "name": "rio-buildhash",
+      "description": "Build-script helper: hash out-of-band macro inputs into tracked rustc env-deps"
+    },
+    {
       "name": "rio-cli",
       "description": "Admin CLI for rio-build — talks to the scheduler's AdminService"
     },
@@ -79,6 +83,11 @@
       "dev": [
         "rio-test-support"
       ]
+    },
+    "rio-buildhash": {
+      "prod": [],
+      "optional": [],
+      "dev": []
     },
     "rio-cli": {
       "prod": [

@@ -12,6 +12,13 @@
 //! resolving. Production startup callers that need an *owned*
 //! `Migrator` use [`migrator`].
 
+// Out-of-band macro inputs surfaced as tracked env-deps (see build.rs):
+// the env! reads record dep-info `# env-dep:` lines, so cargo AND
+// content-keyed rustc-wrapper caches (kache) re-key this crate when
+// migrations/ or .sqlx/ change without any .rs edit.
+const _: &str = env!("RIO_MIGRATIONS_HASH");
+const _: &str = env!("RIO_SQLX_HASH");
+
 /// Embedded migrator. Use `&MIGRATOR` for test fixtures (`TestDb::new`).
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 

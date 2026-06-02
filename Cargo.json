@@ -4,6 +4,7 @@
   "workspaceMembers": {
     "rio-auth": "rio-auth",
     "rio-builder": "rio-builder",
+    "rio-buildhash": "rio-buildhash",
     "rio-cli": "rio-cli",
     "rio-common": "rio-common",
     "rio-controller": "rio-controller",
@@ -19199,6 +19200,27 @@
         "Rio Contributors"
       ]
     },
+    "rio-buildhash": {
+      "crateName": "rio-buildhash",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-buildhash"
+      },
+      "devDependencies": [
+        {
+          "name": "tempfile",
+          "packageId": "tempfile"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
     "rio-cli": {
       "crateName": "rio-cli",
       "version": "0.1.0",
@@ -19535,6 +19557,12 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "rio-buildhash",
+          "packageId": "rio-buildhash"
         }
       ],
       "devDependencies": [
@@ -19883,6 +19911,12 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "rio-buildhash",
+          "packageId": "rio-buildhash"
         }
       ],
       "devDependencies": [
@@ -20287,6 +20321,12 @@
           "packageId": "zstd"
         }
       ],
+      "buildDependencies": [
+        {
+          "name": "rio-buildhash",
+          "packageId": "rio-buildhash"
+        }
+      ],
       "devDependencies": [
         {
           "name": "aws-sdk-ec2",
@@ -20534,6 +20574,12 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "rio-buildhash",
+          "packageId": "rio-buildhash"
         }
       ],
       "devDependencies": [

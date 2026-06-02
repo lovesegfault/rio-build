@@ -158,3 +158,8 @@ toml.workspace = true
 # lease/election.rs integration tests: ApiServerVerifier scenarios
 # need http::Method for the expected-request shape.
 http = { workspace = true }
+
+[build-dependencies]
+# Hashes .sqlx/ (and migrations/, where applicable) into tracked rustc
+# env-deps — see build.rs.
+rio-buildhash = { workspace = true }

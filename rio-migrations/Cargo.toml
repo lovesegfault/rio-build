@@ -24,3 +24,8 @@ rio-test-support = { workspace = true }
 # `migration_checksums_frozen` hex-encodes the embedded SHA-384.
 hex = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[build-dependencies]
+# Hashes .sqlx/ (and migrations/, where applicable) into tracked rustc
+# env-deps — see build.rs.
+rio-buildhash = { workspace = true }
