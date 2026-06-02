@@ -11572,6 +11572,7 @@ async fn test_strip_case_remediation_is_executable() -> TestResult {
 /// single junk child completing can no longer flip its closure
 /// evidence to Vouched and clear the mark — pre-C6c3 that channel
 /// dispatched the root from source into a guaranteed ENOENT.
+// r[verify sched.evidence.positive-witness]
 #[tokio::test]
 async fn test_pruned_root_junk_child_completion_does_not_vouch() -> TestResult {
     let root_out = test_store_path("bhk-root-out");

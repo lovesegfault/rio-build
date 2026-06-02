@@ -968,6 +968,37 @@ from hostile-shaped skips
 rejoined node's hole stays set until a submission re-creates the node with
 its full dependency set.
 
+#r("sched.evidence.positive-witness")[
+  A trusted-plane evidence UPGRADE --- clearing a closure hole, vouching a
+  node's closure, displacing settled state, or any future transition that
+  widens what the scheduler asserts about a derivation --- MUST be
+  authorized by a positive witness whose operands are owned by the
+  recording authority: the upgrade names what was previously recorded as
+  missing or contradicted, and proves the new state covers it. An upgrade
+  MUST NOT be derived from the absence of objection over a
+  submitter-controlled set (edges a submission happened to declare,
+  children that happened to complete, claims that happened not to
+  conflict).
+]
+
+The genealogy that forced this rule: 6799b70b5 derived the topdown clear
+from "children all produced" over whatever children remained (reap
+truncation made the set unrepresentative); 606390ea7 re-keyed the heal to
+"every declared edge accepted" (round-15 merged_bug_073: a subset
+re-declaration satisfies it); the witnessed heal
+(#rref("sched.merge.heal-accepted-edges+1")) closes the family by
+demanding coverage of the recorded witness set --- both operands
+scheduler-owned (the truncation recorded what it removed; the merge knows
+what it attached). Prior art in the same shape: the displacement
+primitive's evidence ranks (#rref("sched.merge.store-evidence-displacement+1"))
+refuse re-definition unless the incoming claim PROVES rank over the
+recorded row, and the born-holed prune stamp
+(#rref("sched.merge.substitute-topdown+12")) records the dropped closure
+at the only site that knows it. The `HealWitness` token is the mechanical
+form: mintable only by the coverage branch, demanded by the only clear
+path, so an absence-of-objection upgrade is unwritable rather than merely
+unreviewed.
+
 #r("sched.merge.dep-failed-transitive")[
   When a newly-merged node transitively depends on a node already in a
   failure-terminal state (`Poisoned`/`DependencyFailed`/`Cancelled`), it is

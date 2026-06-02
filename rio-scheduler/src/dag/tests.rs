@@ -4222,6 +4222,7 @@ fn test_healed_parents_includes_already_present_redeclaration() -> anyhow::Resul
 /// every declared edge is the laundering channel when the declared set
 /// silently omits what the reap removed. Coverage demands the missing
 /// child back.
+// r[verify sched.evidence.positive-witness]
 #[test]
 fn test_subset_redeclaration_does_not_heal_closure_hole() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -4292,6 +4293,7 @@ fn test_subset_redeclaration_does_not_heal_closure_hole() -> anyhow::Result<()> 
 /// Junk top-up refused: re-supplying SOMETHING is not re-supplying the
 /// MISSING thing. A re-creation that attaches a brand-new child while
 /// still omitting the reaped one keeps the hole.
+// r[verify sched.evidence.positive-witness]
 #[test]
 fn test_junk_topup_does_not_heal_closure_hole() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();

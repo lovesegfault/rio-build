@@ -1459,6 +1459,7 @@ impl DerivationDag {
         }
 
         // r[impl sched.merge.heal-accepted-edges+1]
+        // r[impl sched.evidence.positive-witness]
         // accepted = declared − vetoed (the TRIGGER); healed = accepted
         // ∧ witness-set coverage. The subset check runs over the
         // post-insert children map — both operands scheduler-owned
@@ -1812,6 +1813,7 @@ impl DerivationDag {
     /// an un-produced terminal child dropped at load), and by the
     /// poison-clear removals (admin `ClearPoison` and the poison-TTL
     /// sweep), and healed by the merge-time edge re-declaration.
+    // r[impl sched.evidence.positive-witness]
     pub fn closure_evidence(&self, drv_hash: &str) -> ClosureEvidence {
         let Some(node) = self.nodes.get(drv_hash) else {
             return ClosureEvidence::Broken;
