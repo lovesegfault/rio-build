@@ -419,7 +419,7 @@ pub(super) fn classify_store_evidence(
     // Text-CA self-consistency of the store object, verified HERE
     // before any identity comparison: make_text(name, sha256(bytes),
     // refs) must reproduce the declared path. The store enforces
-    // this at .drv ingestion (store.put.drv-text-ca); re-deriving it
+    // this at .drv ingestion (store.put.drv-text-ca+2); re-deriving it
     // means a confused or hostile store answer cannot smuggle
     // unrelated bytes into the comparison.
     let Ok(drv_sp) = StorePath::parse(&node.drv_path) else {

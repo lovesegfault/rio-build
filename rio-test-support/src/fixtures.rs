@@ -174,7 +174,7 @@ pub fn make_path_info_for_nar(store_path: &str, nar: &[u8]) -> ValidatedPathInfo
 /// bytes (`make_text(name, sha256(text), references)`).
 ///
 /// Tests that upload `.drv` blobs should claim THIS path — both the
-/// store (`store.put.drv-text-ca`) and the gateway's session cache
+/// store (`store.put.drv-text-ca+2`) and the gateway's session cache
 /// (`gw.dag.drv-cache-text-ca`) reject/skip `.drv` content presented
 /// under any other path.
 pub fn make_drv_nar(name: &str, drv_text: &[u8], references: &[&str]) -> (String, Vec<u8>) {

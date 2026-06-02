@@ -269,11 +269,9 @@ pub(in crate::grpc) fn verify_nar(
 /// Verify that a `.drv` upload is the text content-address of its bytes.
 ///
 /// CppNix mints every derivation path as
-/// `makeTextPath(name, sha256(text), inputSrcs ∪ inputDrvs)` and an
-/// untrusted `nix-daemon` client can only add an unsigned path when it
-/// is genuinely content-addressed; rio's multi-tenant gateway clients
-/// (and any worker relay) are the analogue, so the store enforces the
-/// same invariant at ingestion: the claimed path MUST equal
+/// `makeTextPath(name, sha256(text), inputSrcs ∪ inputDrvs)`; rio's
+/// multi-tenant gateway clients (and any worker relay) upload them, so
+/// the store enforces at ingestion: the claimed path MUST equal
 /// `make_text(name, sha256(single-file contents), declared references)`.
 /// This binds the registered bytes to the path for every caller —
 /// including service-token relays — so the derivation a gateway
@@ -281,11 +279,31 @@ pub(in crate::grpc) fn verify_nar(
 /// fetches from the store (`gw.dag.drv-cache-text-ca` is the cache-side
 /// half of the same invariant).
 ///
+/// REGISTERED FAIL-CLOSED DIVERGENCE (bug_084, corrected): the oracle
+/// does NOT enforce this. CppNix's `registerValidPath`
+/// (`local-store.cc:680-716`) parses (`readInvalidDerivation`) and
+/// invariant-checks (`checkInvariants`) every `.drv`-NAMED path — the
+/// invariants cover the derivation's OUTPUT paths, not the `.drv`
+/// path's own derivation — and accepts a source-CA byte-copy of a
+/// derivation file (its `info.ca` is a `fixed:` source CA, satisfied
+/// by `isContentAddressed`). Such paths are reachable in CppNix only
+/// via store surgery (`nix store add` of an existing `.drv`) plus
+/// `builtins.storePath`; no build pipeline emits them. rio rejects
+/// them because its identity chain assumes the stronger property:
+/// the modulo cache (M_068), the gateway derivation cache, and the
+/// deriver-proof claims binding all key on "registered `.drv` path ⇒
+/// unique TEXT-CA preimage of its bytes"; an oracle-style source copy
+/// would let a `*.drv`-named path carry bytes whose text-CA is a
+/// DIFFERENT path. Pinned by the unit test below and the
+/// service-relay e2e (`tests/grpc/drv_text_ca.rs`); deliberately NO
+/// differential-corpus entry — the corpus asserts parity, this is a
+/// registered divergence (`store.put.drv-text-ca+2`).
+///
 /// Non-`.drv` paths are untouched. Error split follows the existing
 /// gate convention: a NAR that is not a single regular file is
 /// `InvalidArgument`; a well-formed upload whose path does not derive
 /// from its bytes is `PermissionDenied`.
-// r[impl store.put.drv-text-ca]
+// r[impl store.put.drv-text-ca+2]
 pub(in crate::grpc) fn verify_drv_text_path(
     info: &ValidatedPathInfo,
     nar_data: &[u8],
@@ -1247,7 +1265,7 @@ impl StoreServiceImpl {
             info,
             "PutPath",
         )?;
-        // r[impl store.put.drv-text-ca]
+        // r[impl store.put.drv-text-ca+2]
         verify_drv_text_path(info, &nar_data, "PutPath")?;
         verify_ca_store_path(info, &nar_data, hmac_claims, "PutPath")?;
         Ok((nar_data, held_permits))
@@ -1843,7 +1861,7 @@ mod verify_nar_tests {
             .expect("flat upload larger than the old parser cap must pass");
     }
 
-    // r[verify store.put.drv-text-ca]
+    // r[verify store.put.drv-text-ca+2]
     /// A `.drv` upload is bound to its bytes: the canonical text-CA path
     /// (with and without references) is accepted, anything else is not.
     #[test]
@@ -1889,7 +1907,7 @@ mod verify_nar_tests {
         verify_drv_text_path(&info, &other_nar, "t").expect("non-.drv paths ignored");
     }
 
-    // r[verify store.put.drv-text-ca]
+    // r[verify store.put.drv-text-ca+2]
     /// A `.drv` claiming path with a directory NAR is malformed input.
     #[test]
     fn drv_text_path_requires_single_file_nar() {
@@ -1901,6 +1919,47 @@ mod verify_nar_tests {
         let err = verify_drv_text_path(&info, &nar, "t")
             .expect_err("directory NAR claiming a .drv path must be rejected");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // r[verify store.put.drv-text-ca+2]
+    /// The registered fail-closed divergence pin: a `.drv`-NAMED path
+    /// that is the legitimate SOURCE content-address of its bytes
+    /// (`make_fixed_output`, recursive-sha256 — exactly what CppNix
+    /// mints for `nix store add` of a `.drv` file, and what
+    /// `registerValidPath` accepts after parse + checkInvariants) is
+    /// REJECTED by rio: the path is not the TEXT-CA of the bytes, and
+    /// rio's identity chain (modulo cache, gateway drv cache, claims
+    /// binding) assumes text-CA uniqueness. See the gate doc's
+    /// divergence section; deliberately no differential-corpus entry.
+    #[test]
+    fn drv_named_source_ca_copy_rejected() {
+        use std::io::Write as _;
+        // A parseable derivation body — the oracle would parse and
+        // invariant-check it successfully.
+        let body = br#"Derive([("out","/nix/store/dddddddddddddddddddddddddddddddd-d-out","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
+        let nar = nar_of_file(body);
+        let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+        w.write_all(&nar).unwrap();
+        let nar_hash = w.finish();
+        // The SOURCE store path of these bytes, named like a .drv:
+        // recursive-sha256 fixed-output derivation of the NAR — the
+        // path `nix store add ./foo.drv` would mint.
+        let source_path = rio_nix::store_path::StorePath::make_fixed_output_with_self(
+            "copied.drv",
+            &nar_hash,
+            true,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(source_path.is_derivation(), "fixture: named *.drv");
+
+        let info = ca_info(&source_path, &[], &nar);
+        let err = verify_drv_text_path(&info, &nar, "t").expect_err(
+            "oracle-legal source-CA .drv copy must be rejected (registered divergence)",
+        );
+        assert_eq!(err.code(), tonic::Code::PermissionDenied, "got: {err:?}");
+        assert!(err.message().contains("text content-address"), "msg: {err}");
     }
 
     #[test]

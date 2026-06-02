@@ -144,7 +144,7 @@ impl StoreServiceImpl {
             if let Err(e) = verify_nar(computed, accum.nar_data.len() as u64, info, &ctx) {
                 bail!(e);
             }
-            // r[impl store.put.drv-text-ca]
+            // r[impl store.put.drv-text-ca+2]
             if let Err(e) = verify_drv_text_path(info, &accum.nar_data, &ctx) {
                 bail!(e);
             }

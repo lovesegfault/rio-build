@@ -165,7 +165,7 @@ pub(crate) fn try_cache_drv(
             // Bind the cache key to the bytes: only cache content whose
             // canonical text content-address equals the claimed path —
             // the same invariant the store enforces at ingestion
-            // (store.put.drv-text-ca). The session cache is what
+            // (store.put.drv-text-ca+2). The session cache is what
             // validate_dag judges and what expected_outputs are derived
             // from, while a worker may later fetch the store's copy of
             // the same path; if the cache could hold content that is not

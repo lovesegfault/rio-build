@@ -1,4 +1,4 @@
-//! `.drv` uploads are bound to their bytes (`store.put.drv-text-ca`).
+//! `.drv` uploads are bound to their bytes (`store.put.drv-text-ca+2`).
 //!
 //! A derivation's store path is the text content-address of its
 //! contents (`make_text(name, sha256(text), references)` — exactly how
@@ -35,7 +35,7 @@ const DRV_TEXT_A: &[u8] =
 const DRV_TEXT_B: &[u8] =
     br#"Derive([("out","/nix/store/cccccccccccccccccccccccccccccccc-b-out","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
 
-// r[verify store.put.drv-text-ca]
+// r[verify store.put.drv-text-ca+2]
 /// The honest flow: a `.drv` claimed at its canonical text-CA path is
 /// accepted and registered (service-token relay, the gateway's shape).
 #[tokio::test]
@@ -58,7 +58,7 @@ async fn drv_canonical_path_accepted() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.drv-text-ca]
+// r[verify store.put.drv-text-ca+2]
 /// The same bytes claimed under a different `.drv` path are rejected —
 /// even for trusted-plane (service-token) callers, since the binding is
 /// what makes the cached/validated copy and the stored copy identical.
@@ -89,7 +89,7 @@ async fn drv_wrong_path_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.drv-text-ca]
+// r[verify store.put.drv-text-ca+2]
 /// The declared references are part of the text-CA derivation: claiming
 /// a path minted with references while declaring none is rejected.
 #[tokio::test]
@@ -114,7 +114,7 @@ async fn drv_wrong_references_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.drv-text-ca]
+// r[verify store.put.drv-text-ca+2]
 /// The batch ingestion path enforces the same binding.
 #[tokio::test]
 async fn drv_batch_wrong_path_rejected() -> TestResult {
@@ -200,5 +200,55 @@ async fn drv_already_complete_stays_idempotent() -> TestResult {
     .await
     .context("re-upload at an already-complete path")?;
     assert!(!created, "already-complete path must no-op");
+    Ok(())
+}
+
+// r[verify store.put.drv-text-ca+2]
+/// The registered fail-closed divergence, end-to-end through the
+/// service relay: a `.drv`-named path that is the legitimate SOURCE
+/// content-address of its bytes (what `nix store add` of a `.drv` file
+/// mints, accepted by CppNix's `registerValidPath`) is rejected by
+/// rio's gate even for trusted-plane callers. Deliberately NO
+/// differential-corpus entry — the corpus asserts parity; this pin and
+/// the unit test are the divergence's record.
+#[tokio::test]
+async fn drv_named_source_ca_copy_rejected_via_relay() -> TestResult {
+    use std::io::Write as _;
+    let mut s =
+        StoreSession::new_with_service_hmac(TEST_KEY.to_vec(), SERVICE_KEY.to_vec()).await?;
+
+    let node = rio_nix::nar::NarNode::Regular {
+        executable: false,
+        contents: DRV_TEXT_A.to_vec(),
+    };
+    let mut nar = Vec::new();
+    rio_nix::nar::serialize(&mut nar, &node)?;
+    let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+    w.write_all(&nar)?;
+    let nar_hash = w.finish();
+    let source_path = rio_nix::store_path::StorePath::make_fixed_output_with_self(
+        "relay-copied.drv",
+        &nar_hash,
+        true,
+        &[],
+        false,
+    )?;
+
+    let info = make_path_info_for_nar(source_path.as_str(), &nar);
+    let err = put_path_with_header(
+        &mut s.client,
+        info,
+        nar,
+        rio_proto::SERVICE_TOKEN_HEADER,
+        &service_token(),
+    )
+    .await
+    .expect_err("source-CA .drv copy must be rejected at the relay too");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("text content-address"),
+        "msg: {}",
+        err.message()
+    );
     Ok(())
 }

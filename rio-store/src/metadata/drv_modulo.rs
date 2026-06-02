@@ -6,7 +6,7 @@
 //! `drvHashes`/`pathDerivationModulo`, `derivations.cc:856-874`) — never
 //! from a client's claim about it. This module is rio's persistent form
 //! of that table: rows are populated best-effort when a `.drv` is
-//! ingested (after the text-CA gate — `store.put.drv-text-ca` — has
+//! ingested (after the text-CA gate — `store.put.drv-text-ca+2` — has
 //! already bound the bytes to the path) and read-through-completed at
 //! proof time by the IA deriver-proof gate.
 //!
