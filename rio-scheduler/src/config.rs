@@ -147,20 +147,12 @@ impl Default for DashboardConfig {
 }
 
 /// Substitution-replacement campaign (design §8): store-owned
-/// materialization jobs. Phase B activated the mechanism: the helm
-/// values default `enabled: true` for both components (the deployment
-/// layer is the cutover switch — PD-B1), while this struct's default
-/// stays `false` so a bare binary runs the as-built walk. The
-/// deployment-ordering constraint (store executor flag first ON, last
-/// OFF — design §4/AS-6) is enforced by the chart's AND-guard
-/// (templates/scheduler.yaml), not here.
+/// materialization jobs — THE substitution mechanism (unconditional
+/// since the substitution-replacement cutover; the coexistence flag
+/// and the chart AND-guard died with it).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct MaterializationConfig {
-    /// Master switch for scheduler-side job creation, the kind-aware
-    /// pull-admission table, and materialization-outcome consumption.
-    /// false = the as-built substitution walk path runs unchanged.
-    pub enabled: bool,
     /// Budget: `materialization_infra` rows (worker-reported AND
     /// establishment-written — OQ1 amendment 1) per job before the job
     /// parks (design §2.5). Never causes a fail-fast.
@@ -174,7 +166,6 @@ pub struct MaterializationConfig {
 impl Default for MaterializationConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             max_attempts: 3,
             park_backoff_base_secs: 30,
             park_backoff_cap_secs: 900,

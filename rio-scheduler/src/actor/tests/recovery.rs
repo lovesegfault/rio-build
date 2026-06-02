@@ -2858,13 +2858,11 @@ async fn test_failover_keeps_topdown_pruned_when_produced_children_belong_to_ter
         "the recovery produced-children gate must keep the mark when the \
          produced children belong to a terminal build (no live co-owning voucher)"
     );
-    // And the must-substitute refusal still gates the from-source mint.
-    let pull = try_pull_attempt(&handle, "tdhist-root").await;
-    assert!(
-        !matches!(pull, Ok(crate::actor::pull::PullOutcome::Deliver(_))),
-        "a pruned root whose produced children belong to a terminal build \
-         must not be dispatched from source after failover; got {pull:?}"
-    );
+    // (The walk-era must-substitute pull refusal died with the kinded
+    // collapse: a marked node WITHOUT a job is the documented FP-7
+    // transition residual and may be served from source. The flag-on
+    // pruned shape always carries an origin='pruned' job, whose
+    // JobView refusal is pinned by pull_refused_while_job_unresolved.)
     let _ = b1;
     Ok(())
 }
@@ -2963,13 +2961,8 @@ async fn test_failover_keeps_topdown_pruned_when_closure_hole_recorded() -> Test
         "the persisted closure-hole breadcrumb must veto the produced-children \
          clear — the surviving children are a truncated view of the pruned closure"
     );
-    // And the must-substitute refusal still gates the from-source mint.
-    let pull = try_pull_attempt(&handle, "tdvh-root").await;
-    assert!(
-        !matches!(pull, Ok(crate::actor::pull::PullOutcome::Deliver(_))),
-        "a closure-holed pruned root must not be dispatched from source after \
-         failover, however produced its surviving persisted children look; got {pull:?}"
-    );
+    // (Same FP-7 residual note as the terminal-build keep test above —
+    // the mark-keyed pull refusal died with the kinded collapse.)
     let _ = build_id;
     Ok(())
 }

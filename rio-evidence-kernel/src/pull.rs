@@ -1,16 +1,20 @@
 //! The pull-admission decision kernel: [`admit_pull`].
 //!
 //! A pull-mode pod is born knowing its derivation (the HMAC-attested
-//! intent id); its first and only ask is `PullAssignment`, and this
-//! function is the pure decision behind it: given the already-loaded
-//! state of one node, either deliver (mint a fresh attempt / re-deliver
-//! the open one), refuse (token / generation fence), park
+//! intent id) and its work class (build / materialization); its first
+//! and only ask is `PullAssignment`, and this function is the pure
+//! decision behind it: given the already-loaded state of one node and
+//! its materialization-job view, either deliver (mint a fresh attempt /
+//! re-deliver the open one), refuse (token / generation fence), park
 //! (`NotYetReady`), or dismiss (`Gone`). The scheduler's
 //! `rio_scheduler::actor::pull::admit_pull` is the projection shim over
 //! this function (decision P10 — the function was kept pure from its
 //! introduction precisely so it could be lifted into a kani harness
 //! without refactoring); the durable mint that follows a `DeliverNew`
-//! is the fenced SQL transaction and stays in the scheduler.
+//! is the fenced SQL transaction and stays in the scheduler. The
+//! coexistence-era flag selection (`MaterializationInputs.enabled`) and
+//! the as-built `must_substitute` refusal arm died with the
+//! substitution-replacement cutover: the kinded table IS the table.
 //!
 //! ## Check order is load-bearing
 //!
@@ -29,8 +33,6 @@
 //! instantiates the intent with `str` and the executor identity with
 //! its `Arc<str>`-backed `ExecutorId`; the proofs use small copy types
 //! so the solver never models heap-allocated string comparison.
-
-use crate::{ClosureEvidence, must_substitute};
 
 /// The scheduler's derivation-status alphabet, as the pull admission
 /// sees it. Kernel-side mirror of `rio_scheduler`'s `DerivationStatus`
@@ -106,10 +108,6 @@ pub struct PullRequest<'a, IntentId: ?Sized, ExecutorIdent: ?Sized, ExecId> {
     pub generation_floor: Option<i64>,
     /// The derivation's current status; `None` if the DAG has no node.
     pub status: Option<PullNodeStatus>,
-    /// Whether the node may only complete via substitution (the
-    /// [`must_substitute`] judgment, computed
-    /// by the caller over the node's mark and closure evidence).
-    pub must_substitute: bool,
     /// The open attempt bound to the derivation, if any:
     /// (executor identity, exec id).
     pub open_attempt: Option<(&'a ExecutorIdent, ExecId)>,
@@ -117,28 +115,18 @@ pub struct PullRequest<'a, IntentId: ?Sized, ExecutorIdent: ?Sized, ExecId> {
     pub pulling_identity: &'a ExecutorIdent,
 }
 
-// r[impl sched.executor.pull-gone]
-// r[impl sched.executor.pull-not-ready+2]
-// r[impl sched.merge.substitute-topdown+12]
 // r[impl sched.lease.generation-fence+3]
-/// Decide one pull from already-projected state. Pure — no clocks, no
-/// IO — and total over its input domain (the proofs establish the full
-/// partition).
+/// The base (kind-independent) admission gates: token binding, the
+/// generation fence, then the node-status table. Private — every
+/// public decision routes through [`admit_pull`]'s kinded table, which
+/// composes this with the job view. (The walk-era `must_substitute`
+/// refusal arm died with the kinded collapse: an unresolved job is the
+/// only never-from-source gate now, and it lives in the kinded table.)
 ///
 /// Check order is load-bearing: identity first (a mis-bound token never
 /// learns anything about the drv), then the generation fence (a deposed
 /// believer answers nothing), then wantedness/deliverability.
-///
-/// The `Ready ∧ must_substitute` arm refuses the mint with
-/// `NotYetReady` — never `DeliverNew` (a from-source dispatch of a
-/// marked node with Broken closure evidence is doomed), and
-/// deliberately NOT `Gone` (the node is still wanted; the Tick sweep's
-/// probe/walk/reap arms own the definitive outcomes). The
-/// `Assigned/Running` re-delivery does NOT re-check `must_substitute`
-/// (the AW5 documented behavior: an attempt that was already minted is
-/// re-delivered to its own identity; the evidence re-judgment happens
-/// at the next decision point, not mid-attempt).
-pub fn admit_pull<IntentId, ExecutorIdent, ExecId>(
+fn base_admission<IntentId, ExecutorIdent, ExecId>(
     request: PullRequest<'_, IntentId, ExecutorIdent, ExecId>,
 ) -> PullAdmission<ExecId>
 where
@@ -174,18 +162,10 @@ where
         S::Completed | S::Cancelled | S::Skipped | S::Poisoned | S::DependencyFailed => {
             PullAdmission::Gone
         }
-        // Wanted but not deliverable yet: deps unbuilt, substitution in
-        // flight, or a retry waiting to requeue. Never `Gone` (the
-        // reap→respawn churn loop), never a write.
+        // Wanted but not deliverable yet: deps unbuilt, a legacy
+        // substitution in flight, or a retry waiting to requeue. Never
+        // `Gone` (the reap→respawn churn loop), never a write.
         S::Created | S::Queued | S::Substituting | S::Failed => PullAdmission::NotYetReady,
-        // Ready but marked must-substitute (topdown-pruned with Broken
-        // closure evidence): never serve it from source. Refuse the
-        // mint — NotYetReady, no write, and deliberately NOT a
-        // fail-fast: the pull carries no store verdict, so the node is
-        // left for the Tick sweep's probe/walk/reap arms, which own the
-        // definitive outcomes (inline-complete, route to substitution,
-        // or the resubmit-directing fail-fast).
-        S::Ready if request.must_substitute => PullAdmission::NotYetReady,
         // Ready: deliverable now — mint a fresh attempt.
         S::Ready => PullAdmission::DeliverNew,
         // Already open on some executor: idempotent re-delivery only
@@ -202,39 +182,12 @@ where
     }
 }
 
-/// The pull-refusal chain in one function: classify the node's closure
-/// evidence judgment ([`must_substitute`]) and
-/// admit a Ready-node pull against it. The code-level form of the
-/// closure-evidence campaign's A11 (`pullRefusalNoMint`):
-/// `check_pull_refusal_chain` proves a marked node with Broken evidence
-/// is always parked (`NotYetReady`), never minted and never dismissed.
-///
-/// `request.status` and `request.must_substitute` are overridden (the
-/// node is taken as Ready; the judgment is computed from `topdown_pruned`
-/// and `evidence`); every other request field is admitted as given.
-pub fn pull_refused_for_evidence<IntentId, ExecutorIdent, ExecId>(
-    topdown_pruned: bool,
-    evidence: ClosureEvidence,
-    request: PullRequest<'_, IntentId, ExecutorIdent, ExecId>,
-) -> PullAdmission<ExecId>
-where
-    IntentId: PartialEq + ?Sized,
-    ExecutorIdent: PartialEq + ?Sized,
-{
-    admit_pull(PullRequest {
-        status: Some(PullNodeStatus::Ready),
-        must_substitute: must_substitute(topdown_pruned, evidence),
-        ..request
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn request<'a>(
         status: Option<PullNodeStatus>,
-        must_sub: bool,
         open: Option<(&'a u8, u8)>,
         pulling: &'a u8,
     ) -> PullRequest<'a, u8, u8, u8> {
@@ -244,10 +197,21 @@ mod tests {
             serving_generation: 3,
             generation_floor: Some(3),
             status,
-            must_substitute: must_sub,
             open_attempt: open,
             pulling_identity: pulling,
         }
+    }
+
+    /// Route a request through the public table as a no-job build pull
+    /// (the base-table path).
+    fn admit_base(req: PullRequest<'_, u8, u8, u8>) -> PullAdmission<u8> {
+        admit_pull(
+            req,
+            MaterializationInputs {
+                kind: PullKind::Build,
+                job: JobView::None,
+            },
+        )
     }
 
     #[test]
@@ -268,14 +232,14 @@ mod tests {
             (Some(S::DependencyFailed), PullAdmission::Gone),
         ] {
             assert_eq!(
-                admit_pull(request(status, false, None, &me)),
+                admit_base(request(status, None, &me)),
                 want,
                 "status {status:?}"
             );
         }
         for status in [S::Assigned, S::Running] {
             assert_eq!(
-                admit_pull(request(Some(status), false, None, &me)),
+                admit_base(request(Some(status), None, &me)),
                 PullAdmission::NotYetReady,
                 "in-flight without exec bookkeeping must wait"
             );
@@ -289,70 +253,35 @@ mod tests {
         let other = 2u8;
         for status in [S::Assigned, S::Running] {
             assert_eq!(
-                admit_pull(request(Some(status), false, Some((&me, 9)), &me)),
+                admit_base(request(Some(status), Some((&me, 9)), &me)),
                 PullAdmission::DeliverExisting { exec_id: 9 }
             );
             assert_eq!(
-                admit_pull(request(Some(status), false, Some((&other, 9)), &me)),
+                admit_base(request(Some(status), Some((&other, 9)), &me)),
                 PullAdmission::NotYetReady,
                 "an attempt open on another executor is never re-delivered"
             );
         }
     }
 
-    // D4-retarget: pins the as-built must_substitute arm, which survives
-    // until the kinded-admission collapse (T-D4.1) — deletes there with
-    // the arm (refusal becomes the JobView arm).
-    #[test]
-    fn must_substitute_refuses_mint() {
-        let me = 1u8;
-        assert_eq!(
-            admit_pull(request(Some(PullNodeStatus::Ready), true, None, &me)),
-            PullAdmission::NotYetReady
-        );
-        // The flag only parks deliverable-from-source work: a terminal
-        // node still answers Gone.
-        assert_eq!(
-            admit_pull(request(Some(PullNodeStatus::Completed), true, None, &me)),
-            PullAdmission::Gone
-        );
-    }
-
     #[test]
     fn rejections_dominate() {
         let me = 1u8;
         // Token mismatch wins even for a Ready drv.
-        let mut req = request(Some(PullNodeStatus::Ready), false, None, &me);
+        let mut req = request(Some(PullNodeStatus::Ready), None, &me);
         req.auth_intent = Some(&8);
-        assert_eq!(admit_pull(req), PullAdmission::RejectToken);
+        assert_eq!(admit_base(req), PullAdmission::RejectToken);
         // Below-floor serving generation answers nothing.
-        let mut req = request(Some(PullNodeStatus::Ready), false, None, &me);
+        let mut req = request(Some(PullNodeStatus::Ready), None, &me);
         req.serving_generation = 2;
         req.generation_floor = Some(3);
-        assert_eq!(admit_pull(req), PullAdmission::RejectStaleGeneration);
+        assert_eq!(admit_base(req), PullAdmission::RejectStaleGeneration);
         // Dev mode (no token) and fresh cluster (no floor) both admit.
-        let mut req = request(Some(PullNodeStatus::Ready), false, None, &me);
+        let mut req = request(Some(PullNodeStatus::Ready), None, &me);
         req.auth_intent = None;
         req.generation_floor = None;
         req.serving_generation = 0;
-        assert_eq!(admit_pull(req), PullAdmission::DeliverNew);
-    }
-
-    #[test]
-    fn refusal_chain_composes_classifier_and_admission() {
-        let me = 1u8;
-        // Marked + holed (Broken evidence) ⇒ refused.
-        let ev = crate::closure_evidence(true, true, Some([true, true].into_iter()));
-        assert_eq!(
-            pull_refused_for_evidence(true, ev, request(None, false, None, &me)),
-            PullAdmission::NotYetReady
-        );
-        // Vouched evidence ⇒ delivered.
-        let ev = crate::closure_evidence(true, false, Some([true, true].into_iter()));
-        assert_eq!(
-            pull_refused_for_evidence(true, ev, request(None, false, None, &me)),
-            PullAdmission::DeliverNew
-        );
+        assert_eq!(admit_base(req), PullAdmission::DeliverNew);
     }
 }
 
@@ -379,7 +308,6 @@ mod proofs {
         serving: u64,
         floor: Option<i64>,
         status: Option<PullNodeStatus>,
-        must_sub: bool,
         open: Option<(u8, u8)>,
         pulling: u8,
     }
@@ -411,7 +339,6 @@ mod proofs {
             serving: kani::any(),
             floor: if kani::any() { Some(kani::any()) } else { None },
             status: any_status(),
-            must_sub: kani::any(),
             open: if kani::any() {
                 Some((kani::any(), kani::any()))
             } else {
@@ -421,27 +348,35 @@ mod proofs {
         }
     }
 
+    /// The base-table path of the public fn (kind=Build, no job).
     fn run(inputs: &Inputs) -> PullAdmission<u8> {
-        admit_pull(PullRequest {
-            intent_id: &inputs.intent,
-            auth_intent: inputs.auth.as_ref(),
-            serving_generation: inputs.serving,
-            generation_floor: inputs.floor,
-            status: inputs.status,
-            must_substitute: inputs.must_sub,
-            open_attempt: inputs.open.as_ref().map(|(e, x)| (e, *x)),
-            pulling_identity: &inputs.pulling,
-        })
+        admit_pull(
+            PullRequest {
+                intent_id: &inputs.intent,
+                auth_intent: inputs.auth.as_ref(),
+                serving_generation: inputs.serving,
+                generation_floor: inputs.floor,
+                status: inputs.status,
+                open_attempt: inputs.open.as_ref().map(|(e, x)| (e, *x)),
+                pulling_identity: &inputs.pulling,
+            },
+            MaterializationInputs {
+                kind: PullKind::Build,
+                job: JobView::None,
+            },
+        )
     }
 
-    /// The admission's exhaustive partition: for every input vector the
-    /// decision is exactly the one the documented case analysis names —
-    /// token mismatch → RejectToken; else below-floor →
+    /// The base table's exhaustive partition (via the public fn's
+    /// kind=Build/no-job path): for every input vector the decision is
+    /// exactly the one the documented case analysis names — token
+    /// mismatch → RejectToken; else below-floor →
     /// RejectStaleGeneration; else absent → Gone; else terminal → Gone;
-    /// else parked statuses → NotYetReady; else Ready+must_substitute →
-    /// NotYetReady; else Ready → DeliverNew; else (Assigned/Running)
-    /// identity-matched open attempt → DeliverExisting, otherwise
-    /// NotYetReady. Total and panic-free over the domain.
+    /// else parked statuses → NotYetReady; else Ready → DeliverNew;
+    /// else (Assigned/Running) identity-matched open attempt →
+    /// DeliverExisting, otherwise NotYetReady. Total and panic-free
+    /// over the domain. (The job-view arms' partition is covered by
+    /// the kinded harnesses below.)
     #[kani::proof]
     fn check_admit_pull_partition() {
         let inputs = any_inputs();
@@ -466,7 +401,6 @@ mod proofs {
                 Some(S::Created | S::Queued | S::Substituting | S::Failed) => {
                     PullAdmission::NotYetReady
                 }
-                Some(S::Ready) if inputs.must_sub => PullAdmission::NotYetReady,
                 Some(S::Ready) => PullAdmission::DeliverNew,
                 Some(S::Assigned | S::Running) => match inputs.open {
                     Some((executor, exec_id)) if executor == inputs.pulling => {
@@ -478,49 +412,6 @@ mod proofs {
         };
 
         assert_eq!(decision, expected);
-    }
-
-    /// A11 (`pullRefusalNoMint`), code half: a Ready node with
-    /// `must_substitute` is never delivered — the admission is
-    /// NotYetReady (parked for the sweep), never DeliverNew and never
-    /// DeliverExisting, and (being a refusal) implies no write. The
-    /// re-delivery arm for Assigned/Running deliberately does NOT
-    /// re-check the flag (AW5): that is the one delivery a
-    /// must-substitute node can still receive, and only to the identity
-    /// already holding the open attempt.
-    #[kani::proof]
-    fn check_admit_pull_refuses_must_substitute() {
-        let inputs = any_inputs();
-        let decision = run(&inputs);
-
-        if inputs.must_sub && inputs.status == Some(PullNodeStatus::Ready) {
-            // Possibly RejectToken/RejectStaleGeneration (they dominate),
-            // but never a delivery and never Gone.
-            assert!(matches!(
-                decision,
-                PullAdmission::NotYetReady
-                    | PullAdmission::RejectToken
-                    | PullAdmission::RejectStaleGeneration
-            ));
-        }
-        // DeliverNew is only ever produced for a Ready node WITHOUT the
-        // flag…
-        if decision == PullAdmission::DeliverNew {
-            assert_eq!(inputs.status, Some(PullNodeStatus::Ready));
-            assert!(!inputs.must_sub);
-        }
-        // …and a delivery of any kind to a must-substitute node can
-        // only be the AW5 re-delivery: an Assigned/Running attempt
-        // already bound to the pulling identity.
-        if inputs.must_sub
-            && let PullAdmission::DeliverExisting { .. } = decision
-        {
-            assert!(matches!(
-                inputs.status,
-                Some(PullNodeStatus::Assigned | PullNodeStatus::Running)
-            ));
-            assert!(inputs.open.is_some_and(|(e, _)| e == inputs.pulling));
-        }
     }
 
     /// The dominance order of the two rejections: a mismatched token is
@@ -574,84 +465,12 @@ mod proofs {
             }
         }
     }
-
-    /// The end-to-end refusal chain (A11 through both kernels): for ANY
-    /// classifier input whose judgment is must_substitute — a marked
-    /// node that is absent, holed, or childless — an authenticated,
-    /// at-or-above-floor pull of that Ready node is parked NotYetReady;
-    /// it is never minted, never re-delivered, and never dismissed as
-    /// Gone.
-    #[kani::proof]
-    #[kani::unwind(6)]
-    fn check_pull_refusal_chain() {
-        // Classifier inputs (the bounded child domain of the sibling
-        // proofs in crate::proofs).
-        let present: bool = kani::any();
-        let hole: bool = kani::any();
-        let has_entry: bool = kani::any();
-        let bits: [bool; 4] = kani::any();
-        let n: usize = kani::any();
-        kani::assume(n <= 4);
-        let marked: bool = kani::any();
-
-        let children = if has_entry {
-            Some(bits[..n].iter().copied())
-        } else {
-            None
-        };
-        let evidence = crate::closure_evidence(present, hole, children);
-
-        // Pull inputs: authenticated, at-or-above floor, free attempt
-        // state.
-        let open: Option<(u8, u8)> = if kani::any() {
-            Some((kani::any(), kani::any()))
-        } else {
-            None
-        };
-        let pulling: u8 = kani::any();
-        let intent: u8 = kani::any();
-
-        let decision = pull_refused_for_evidence(
-            marked,
-            evidence,
-            PullRequest {
-                intent_id: &intent,
-                auth_intent: Some(&intent),
-                serving_generation: 5,
-                generation_floor: Some(3),
-                status: None,
-                must_substitute: false,
-                open_attempt: open.as_ref().map(|(e, x)| (e, *x)),
-                pulling_identity: &pulling,
-            },
-        );
-
-        if crate::must_substitute(marked, evidence) {
-            assert_eq!(
-                decision,
-                PullAdmission::NotYetReady,
-                "a Ready must-substitute node is parked, never delivered or dismissed"
-            );
-        } else {
-            assert_eq!(
-                decision,
-                PullAdmission::DeliverNew,
-                "a Ready node without the must-substitute judgment mints"
-            );
-        }
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Substitution-replacement Phase A: the kind-aware coexistence wrapper.
-//
-// During Phases A–C′ the kernel carries BOTH refusal predicates
-// (design §2.3, finding FP-3): the as-built must_substitute arm
-// (admit_pull above, byte-identical, its battery and proofs untouched)
-// and the materialization kind/job-state table below, selected by the
-// scheduler.materialization.enabled flag. Phase D′ collapses the
-// wrapper into admit_pull when the flag and the must_substitute arm
-// are deleted.
+// The kind-aware admission table (design §2.3) — THE table since the
+// substitution-replacement cutover (the coexistence flag selection and
+// the as-built must_substitute arm died with Phase D').
 // ──────────────────────────────────────────────────────────────────────
 
 /// Which work class a pull claims (mirror of the proto AttemptKind;
@@ -686,43 +505,26 @@ pub enum JobView {
 /// The materialization-side inputs of one kinded admission.
 #[derive(Debug, Clone, Copy)]
 pub struct MaterializationInputs {
-    /// scheduler.materialization.enabled.
-    pub enabled: bool,
     /// The pull's claimed kind.
     pub kind: PullKind,
-    /// The node's job state (always JobView::None when !enabled — the
-    /// scheduler never loads the view flag-off).
+    /// The node's job state (the scheduler's in-memory job view).
     pub job: JobView,
 }
 
 // r[impl sched.materialize.job]
-/// The coexistence-form admission (design §2.3's table). Pure, total.
+// r[impl sched.executor.pull-gone]
+// r[impl sched.executor.pull-not-ready+2]
+/// The kinded admission (design §2.3's table). Pure, total.
 ///
-/// Flag-off: delegates to [`admit_pull`] for kind=Build (bit-identical
-/// as-built behavior) and parks kind=Materialization pulls NotYetReady
-/// (nothing is claimable while the scheduler-side flag is off — the
-/// AS-6 mixed-flag posture: a store whose flag is on but whose
-/// scheduler's is off must hang harmlessly, never error).
-///
-/// Flag-on:
 ///   kind=Build:
-///     job Pending/Claimed   → NotYetReady (the must_substitute
-///                             refusal's successor: never serve from
-///                             source while materialization is undecided)
-///     job None              → as-built admit_pull (which still carries
-///                             the must_substitute arm — the dual-write
-///                             window keeps marks meaningful: both
-///                             predicates are active flag-on, and the
-///                             job-state predicate only takes precedence
-///                             when a job exists)
+///     job Pending/Claimed   → NotYetReady (the never-from-source
+///                             gate: never serve from source while
+///                             materialization is undecided)
+///     job None              → the base table (token/fence/status)
 ///   kind=Materialization:
 ///     job None              → Gone (nothing to materialize)
-///     job Pending{parked:f} → as-built admission gates (token/fence/
-///                             status) then: node Ready → DeliverNew
-///                             (including Ready+must_substitute — the
-///                             A11 refusal blocks from-source BUILD
-///                             dispatch, never the materialization
-///                             claim, which IS the substitution);
+///     job Pending{parked:f} → the base gates (token/fence/status)
+///                             then: node Ready → DeliverNew;
 ///                             node Queued → DeliverNew (PD-6, Phase B:
 ///                             materialization does not wait for deps —
 ///                             the dep-racing claim is legal; the mint's
@@ -734,7 +536,7 @@ pub struct MaterializationInputs {
 ///                             replica — needs the open attempt's exec id,
 ///                             so this arm consumes request.open_attempt)
 ///     job Claimed{held:f}   → NotYetReady (the one-winner arbiter, BC-1)
-pub fn admit_pull_kinded<IntentId, ExecutorIdent, ExecId>(
+pub fn admit_pull<IntentId, ExecutorIdent, ExecId>(
     request: PullRequest<'_, IntentId, ExecutorIdent, ExecId>,
     mat: MaterializationInputs,
 ) -> PullAdmission<ExecId>
@@ -742,45 +544,37 @@ where
     IntentId: PartialEq + ?Sized,
     ExecutorIdent: PartialEq + ?Sized,
 {
-    if !mat.enabled {
-        return match mat.kind {
-            PullKind::Build => admit_pull(request),
-            // Store executor running against a flag-off scheduler:
-            // park, never error, never write (AS-6).
-            PullKind::Materialization => PullAdmission::NotYetReady,
-        };
-    }
     match (mat.kind, mat.job) {
         // Build pulls while a job is unresolved: refuse (A1/A11 successor).
         (PullKind::Build, JobView::Pending { .. } | JobView::Claimed { .. }) => {
             // Identity/fence rejections still dominate (check order is
-            // load-bearing): run the as-built kernel and override only
-            // its *delivery* outcomes.
-            match admit_pull(request) {
+            // load-bearing): run the base gates and override only
+            // their *delivery* outcomes.
+            match base_admission(request) {
                 PullAdmission::RejectToken => PullAdmission::RejectToken,
                 PullAdmission::RejectStaleGeneration => PullAdmission::RejectStaleGeneration,
                 PullAdmission::Gone => PullAdmission::Gone,
                 _ => PullAdmission::NotYetReady,
             }
         }
-        (PullKind::Build, JobView::None) => admit_pull(request),
+        (PullKind::Build, JobView::None) => base_admission(request),
         (PullKind::Materialization, JobView::None) => {
             // Token/fence still dominate; then Gone.
-            match admit_pull(request) {
+            match base_admission(request) {
                 PullAdmission::RejectToken => PullAdmission::RejectToken,
                 PullAdmission::RejectStaleGeneration => PullAdmission::RejectStaleGeneration,
                 _ => PullAdmission::Gone,
             }
         }
         (PullKind::Materialization, JobView::Pending { parked }) => {
-            // The node's status, captured before `request` moves into the
-            // as-built kernel: the PD-6 Queued arm below keys on it.
+            // The node's status, captured before `request` moves into
+            // the base gates: the PD-6 Queued arm below keys on it.
             let status = request.status;
-            match admit_pull(request) {
+            match base_admission(request) {
                 PullAdmission::RejectToken => PullAdmission::RejectToken,
                 PullAdmission::RejectStaleGeneration => PullAdmission::RejectStaleGeneration,
                 PullAdmission::Gone => PullAdmission::Gone,
-                // The as-built kernel said the node is deliverable from
+                // The base table said the node is deliverable from
                 // Ready; materialization claims need an unparked job.
                 PullAdmission::DeliverNew if !parked => PullAdmission::DeliverNew,
                 // r[impl sched.state.machine+2]
@@ -792,15 +586,10 @@ where
                 //    for deps — the store fetches from upstream, so dep
                 //    state is irrelevant to the claim.
                 //
-                //  - READY + must_substitute + unparked pending job: the
-                //    as-built kernel's A11 refusal exists to block
-                //    FROM-SOURCE dispatch of a marked node with Broken
-                //    closure evidence. A MATERIALIZATION claim is the
-                //    substitution mechanism itself — refusing it would
-                //    park exactly the nodes (pruned roots) whose jobs
-                //    most need claiming; the job's §2.4 routing (success
-                //    coverage / from-source / fail-fast) is the marked
-                //    node's flag-on settlement authority, not the mark.
+                //  - (Historical: the walk-era READY+must_substitute
+                //    refusal cell upgraded here too — a MATERIALIZATION
+                //    claim is the substitution mechanism itself; the
+                //    arm died with the as-built table.)
                 //
                 // The token/fence/Gone dominance above is untouched (a
                 // mis-bound token or terminal node never reaches here).
@@ -817,18 +606,18 @@ where
             }
         }
         (PullKind::Materialization, JobView::Claimed { held_by_puller }) => {
-            // The as-built gates run FIRST (gate-ordering: a mis-bound
+            // The base gates run FIRST (gate-ordering: a mis-bound
             // token or a below-floor generation must never receive a
             // re-delivery — the same dominance every other arm
             // enforces), and the re-delivery is exactly what the
-            // as-built kernel itself re-delivers: an Assigned/Running
+            // base table itself re-delivers: an Assigned/Running
             // attempt whose open-attempt identity equals the pulling
             // identity. The job view's held_by_puller must AGREE
             // (defense in depth, BC-1: the request-level identity
             // comparison and the scheduler's view projection are both
             // required; a stale view never re-delivers another
             // identity's attempt).
-            match admit_pull(request) {
+            match base_admission(request) {
                 PullAdmission::RejectToken => PullAdmission::RejectToken,
                 PullAdmission::RejectStaleGeneration => PullAdmission::RejectStaleGeneration,
                 PullAdmission::Gone => PullAdmission::Gone,
@@ -847,7 +636,6 @@ mod kinded_tests {
 
     fn request<'a>(
         status: Option<PullNodeStatus>,
-        must_sub: bool,
         open: Option<(&'a u8, u8)>,
         pulling: &'a u8,
     ) -> PullRequest<'a, u8, u8, u8> {
@@ -857,96 +645,8 @@ mod kinded_tests {
             serving_generation: 3,
             generation_floor: Some(3),
             status,
-            must_substitute: must_sub,
             open_attempt: open,
             pulling_identity: pulling,
-        }
-    }
-
-    /// Every (status, must_substitute, open-attempt, token, floor) corner the
-    /// as-built battery covers, swept for both flag-off kinds.
-    fn domain<'a>(me: &'a u8, other: &'a u8) -> Vec<PullRequest<'a, u8, u8, u8>> {
-        use PullNodeStatus as S;
-        let statuses = [
-            None,
-            Some(S::Created),
-            Some(S::Queued),
-            Some(S::Ready),
-            Some(S::Assigned),
-            Some(S::Running),
-            Some(S::Substituting),
-            Some(S::Completed),
-            Some(S::Failed),
-            Some(S::Poisoned),
-            Some(S::DependencyFailed),
-            Some(S::Cancelled),
-            Some(S::Skipped),
-        ];
-        let mut out = Vec::new();
-        for status in statuses {
-            for must_sub in [false, true] {
-                for open in [None, Some((me, 9u8)), Some((other, 9u8))] {
-                    // Plain authenticated at-floor request.
-                    out.push(request(status, must_sub, open, me));
-                    // Token mismatch.
-                    let mut req = request(status, must_sub, open, me);
-                    req.auth_intent = Some(&8);
-                    out.push(req);
-                    // Below-floor serving generation.
-                    let mut req = request(status, must_sub, open, me);
-                    req.serving_generation = 2;
-                    out.push(req);
-                    // Dev mode / fresh cluster.
-                    let mut req = request(status, must_sub, open, me);
-                    req.auth_intent = None;
-                    req.generation_floor = None;
-                    req.serving_generation = 0;
-                    out.push(req);
-                }
-            }
-        }
-        out
-    }
-
-    // r[verify sched.materialize.job]
-    /// THE dormancy theorem for pull admission (design §2.3 / FP-3): with
-    /// the materialization flag OFF, admit_pull_kinded is extensionally
-    /// EQUAL to the as-built admit_pull for every input — same decision,
-    /// every status, every attempt state, every fence/token state.
-    #[test]
-    fn kinded_wrapper_flag_off_equals_as_built() {
-        let me = 1u8;
-        let other = 2u8;
-        for req in domain(&me, &other) {
-            let mirror = PullRequest { ..req };
-            let expected = admit_pull(mirror);
-            let got = admit_pull_kinded(
-                req,
-                MaterializationInputs {
-                    enabled: false,
-                    kind: PullKind::Build,
-                    job: JobView::None,
-                },
-            );
-            assert_eq!(got, expected, "flag-off build pull must equal as-built");
-        }
-        // Flag-off materialization pulls (a flag-on store polling a
-        // flag-off scheduler — the AS-6 mixed-flag posture): always
-        // parked, never an error, never a delivery, never Gone.
-        for req in domain(&me, &other) {
-            let got = admit_pull_kinded(
-                req,
-                MaterializationInputs {
-                    enabled: false,
-                    kind: PullKind::Materialization,
-                    job: JobView::None,
-                },
-            );
-            assert_eq!(
-                got,
-                PullAdmission::NotYetReady,
-                "flag-off materialization pulls park harmlessly"
-            );
         }
     }
 
@@ -970,37 +670,33 @@ mod kinded_tests {
         ];
         for job in jobs {
             let mat = MaterializationInputs {
-                enabled: true,
                 kind: PullKind::Build,
                 job,
             };
             // Ready (deliverable as-built) → refused.
             assert_eq!(
-                admit_pull_kinded(request(Some(S::Ready), false, None, &me), mat),
+                admit_pull(request(Some(S::Ready), None, &me), mat),
                 PullAdmission::NotYetReady,
                 "build pull of a job-unresolved Ready node must park ({job:?})"
             );
             // Queued (not deliverable as-built) → still NotYetReady.
             assert_eq!(
-                admit_pull_kinded(request(Some(S::Queued), false, None, &me), mat),
+                admit_pull(request(Some(S::Queued), None, &me), mat),
                 PullAdmission::NotYetReady
             );
             // Terminal → Gone (never laundered into a park).
             assert_eq!(
-                admit_pull_kinded(request(Some(S::Completed), false, None, &me), mat),
+                admit_pull(request(Some(S::Completed), None, &me), mat),
                 PullAdmission::Gone
             );
             // Token mismatch dominates.
-            let mut req = request(Some(S::Ready), false, None, &me);
+            let mut req = request(Some(S::Ready), None, &me);
             req.auth_intent = Some(&8);
-            assert_eq!(admit_pull_kinded(req, mat), PullAdmission::RejectToken);
+            assert_eq!(admit_pull(req, mat), PullAdmission::RejectToken);
             // Below-floor dominates.
-            let mut req = request(Some(S::Ready), false, None, &me);
+            let mut req = request(Some(S::Ready), None, &me);
             req.serving_generation = 2;
-            assert_eq!(
-                admit_pull_kinded(req, mat),
-                PullAdmission::RejectStaleGeneration
-            );
+            assert_eq!(admit_pull(req, mat), PullAdmission::RejectStaleGeneration);
         }
     }
 
@@ -1016,22 +712,18 @@ mod kinded_tests {
         let me = 1u8;
         let other = 2u8;
         let mat = |job| MaterializationInputs {
-            enabled: true,
             kind: PullKind::Materialization,
             job,
         };
         // No job → Gone (nothing to materialize).
         assert_eq!(
-            admit_pull_kinded(
-                request(Some(S::Ready), false, None, &me),
-                mat(JobView::None)
-            ),
+            admit_pull(request(Some(S::Ready), None, &me), mat(JobView::None)),
             PullAdmission::Gone
         );
         // Pending unparked + node Ready → DeliverNew.
         assert_eq!(
-            admit_pull_kinded(
-                request(Some(S::Ready), false, None, &me),
+            admit_pull(
+                request(Some(S::Ready), None, &me),
                 mat(JobView::Pending { parked: false })
             ),
             PullAdmission::DeliverNew
@@ -1040,8 +732,8 @@ mod kinded_tests {
         // the dep-racing claim is legal (was the Phase A Ready-only
         // NotYetReady pin, flipped red-first per the PDQ-6 amendment).
         assert_eq!(
-            admit_pull_kinded(
-                request(Some(S::Queued), false, None, &me),
+            admit_pull(
+                request(Some(S::Queued), None, &me),
                 mat(JobView::Pending { parked: false })
             ),
             PullAdmission::DeliverNew
@@ -1050,15 +742,15 @@ mod kinded_tests {
         // Queued + parked → NotYetReady; Queued + Created (pre-dep
         // statuses other than Queued) stay NotYetReady.
         assert_eq!(
-            admit_pull_kinded(
-                request(Some(S::Queued), false, None, &me),
+            admit_pull(
+                request(Some(S::Queued), None, &me),
                 mat(JobView::Pending { parked: true })
             ),
             PullAdmission::NotYetReady
         );
         assert_eq!(
-            admit_pull_kinded(
-                request(Some(S::Created), false, None, &me),
+            admit_pull(
+                request(Some(S::Created), None, &me),
                 mat(JobView::Pending { parked: false })
             ),
             PullAdmission::NotYetReady,
@@ -1071,21 +763,20 @@ mod kinded_tests {
         // the substitution mechanism the mark demands. Refusing here
         // would park exactly the pruned-root jobs forever.
         assert_eq!(
-            admit_pull_kinded(
-                request(Some(S::Ready), true, None, &me),
+            admit_pull(
+                request(Some(S::Ready), None, &me),
                 mat(JobView::Pending { parked: false })
             ),
             PullAdmission::DeliverNew,
-            "a marked node's materialization claim must deliver (the claim IS the substitution)"
+            "the materialization claim delivers (the claim IS the substitution; \
+             the walk-era marked-cell upgrade is structural now — no mark input exists)"
         );
-        // ...but a marked node's BUILD pull stays refused (the as-built
-        // A11 arm, untouched — flag-on it is doubly refused by the
-        // job-unresolved rule).
+        // ...but the node's BUILD pull stays refused while the job is
+        // unresolved (the never-from-source gate).
         assert_eq!(
-            admit_pull_kinded(
-                request(Some(S::Ready), true, None, &me),
+            admit_pull(
+                request(Some(S::Ready), None, &me),
                 MaterializationInputs {
-                    enabled: true,
                     kind: PullKind::Build,
                     job: JobView::Pending { parked: false },
                 }
@@ -1094,16 +785,16 @@ mod kinded_tests {
         );
         // Pending unparked + node terminal → Gone.
         assert_eq!(
-            admit_pull_kinded(
-                request(Some(S::Completed), false, None, &me),
+            admit_pull(
+                request(Some(S::Completed), None, &me),
                 mat(JobView::Pending { parked: false })
             ),
             PullAdmission::Gone
         );
         // Pending parked → NotYetReady (backoff unexpired), even for Ready.
         assert_eq!(
-            admit_pull_kinded(
-                request(Some(S::Ready), false, None, &me),
+            admit_pull(
+                request(Some(S::Ready), None, &me),
                 mat(JobView::Pending { parked: true })
             ),
             PullAdmission::NotYetReady
@@ -1111,8 +802,8 @@ mod kinded_tests {
         // Claimed held-by-puller → DeliverExisting (re-delivery; consumes
         // request.open_attempt's exec id).
         assert_eq!(
-            admit_pull_kinded(
-                request(Some(S::Running), false, Some((&me, 9)), &me),
+            admit_pull(
+                request(Some(S::Running), Some((&me, 9)), &me),
                 mat(JobView::Claimed {
                     held_by_puller: true
                 })
@@ -1121,8 +812,8 @@ mod kinded_tests {
         );
         // Claimed held-by-puller but no open-attempt bookkeeping → park.
         assert_eq!(
-            admit_pull_kinded(
-                request(Some(S::Running), false, None, &me),
+            admit_pull(
+                request(Some(S::Running), None, &me),
                 mat(JobView::Claimed {
                     held_by_puller: true
                 })
@@ -1132,8 +823,8 @@ mod kinded_tests {
         // Claimed by another identity → NotYetReady (the one-winner
         // arbiter, BC-1).
         assert_eq!(
-            admit_pull_kinded(
-                request(Some(S::Running), false, Some((&other, 9)), &me),
+            admit_pull(
+                request(Some(S::Running), Some((&other, 9)), &me),
                 mat(JobView::Claimed {
                     held_by_puller: false
                 })
@@ -1141,26 +832,26 @@ mod kinded_tests {
             PullAdmission::NotYetReady
         );
         // Token/fence rejections dominate the whole table.
-        let mut req = request(Some(S::Ready), false, None, &me);
+        let mut req = request(Some(S::Ready), None, &me);
         req.auth_intent = Some(&8);
         assert_eq!(
-            admit_pull_kinded(req, mat(JobView::Pending { parked: false })),
+            admit_pull(req, mat(JobView::Pending { parked: false })),
             PullAdmission::RejectToken
         );
-        let mut req = request(Some(S::Ready), false, None, &me);
+        let mut req = request(Some(S::Ready), None, &me);
         req.serving_generation = 2;
         assert_eq!(
-            admit_pull_kinded(req, mat(JobView::None)),
+            admit_pull(req, mat(JobView::None)),
             PullAdmission::RejectStaleGeneration
         );
         // ...INCLUDING the Claimed re-delivery arm (the gate-ordering
         // pin: held_by_puller must never bypass the identity/fence
         // gates — a mis-bound token or a deposed believer must never
         // receive a re-delivery, exactly as the build-kind arms behave).
-        let mut req = request(Some(S::Running), false, Some((&me, 9)), &me);
+        let mut req = request(Some(S::Running), Some((&me, 9)), &me);
         req.auth_intent = Some(&8);
         assert_eq!(
-            admit_pull_kinded(
+            admit_pull(
                 req,
                 mat(JobView::Claimed {
                     held_by_puller: true
@@ -1169,10 +860,10 @@ mod kinded_tests {
             PullAdmission::RejectToken,
             "a mis-bound token must never receive a re-delivery"
         );
-        let mut req = request(Some(S::Running), false, Some((&me, 9)), &me);
+        let mut req = request(Some(S::Running), Some((&me, 9)), &me);
         req.serving_generation = 2;
         assert_eq!(
-            admit_pull_kinded(
+            admit_pull(
                 req,
                 mat(JobView::Claimed {
                     held_by_puller: true
@@ -1186,8 +877,8 @@ mod kinded_tests {
         // re-delivers — the request-level identity comparison and the
         // view's projection must both agree (BC-1).
         assert_eq!(
-            admit_pull_kinded(
-                request(Some(S::Running), false, Some((&other, 9)), &me),
+            admit_pull(
+                request(Some(S::Running), Some((&other, 9)), &me),
                 mat(JobView::Claimed {
                     held_by_puller: true
                 })
@@ -1205,32 +896,34 @@ mod kinded_tests {
     fn kinded_kind_match_worker() {
         use PullNodeStatus as S;
         let me = 1u8;
-        // As-built would deliver this Ready no-job node...
-        let as_built = admit_pull(request(Some(S::Ready), false, None, &me));
-        assert_eq!(as_built, PullAdmission::DeliverNew);
+        // A build pull of a Ready no-job node delivers...
+        let build = admit_pull(
+            request(Some(S::Ready), None, &me),
+            MaterializationInputs {
+                kind: PullKind::Build,
+                job: JobView::None,
+            },
+        );
+        assert_eq!(build, PullAdmission::DeliverNew);
         // ...but a materialization pull of the same node never gets it
-        // (no job → Gone), flag-on or flag-off.
-        for enabled in [false, true] {
-            let got = admit_pull_kinded(
-                request(Some(S::Ready), false, None, &me),
-                MaterializationInputs {
-                    enabled,
-                    kind: PullKind::Materialization,
-                    job: JobView::None,
-                },
-            );
-            assert_ne!(
-                got,
-                PullAdmission::DeliverNew,
-                "a materialization pull must never receive a build delivery (enabled={enabled})"
-            );
-        }
+        // (no job → Gone).
+        let got = admit_pull(
+            request(Some(S::Ready), None, &me),
+            MaterializationInputs {
+                kind: PullKind::Materialization,
+                job: JobView::None,
+            },
+        );
+        assert_ne!(
+            got,
+            PullAdmission::DeliverNew,
+            "a materialization pull must never receive a build delivery"
+        );
         // And a build pull while a materialization job is unresolved never
         // receives the job's delivery (it parks instead).
-        let got = admit_pull_kinded(
-            request(Some(S::Ready), false, None, &me),
+        let got = admit_pull(
+            request(Some(S::Ready), None, &me),
             MaterializationInputs {
-                enabled: true,
                 kind: PullKind::Build,
                 job: JobView::Pending { parked: false },
             },
@@ -1242,7 +935,7 @@ mod kinded_tests {
 #[cfg(kani)]
 mod kinded_proofs {
     //! CBMC proof harnesses for the kind-aware coexistence wrapper
-    //! ([`admit_pull_kinded`]). Same bounded domain as the as-built
+    //! ([`admit_pull`]). Same bounded domain as the as-built
     //! `mod proofs` above (u8 identities, full status alphabet, free
     //! token/floor/attempt options), extended with the materialization
     //! inputs (flag × kind × job view). The domain helpers are
@@ -1257,7 +950,6 @@ mod kinded_proofs {
         serving: u64,
         floor: Option<i64>,
         status: Option<PullNodeStatus>,
-        must_sub: bool,
         open: Option<(u8, u8)>,
         pulling: u8,
     }
@@ -1289,7 +981,6 @@ mod kinded_proofs {
             serving: kani::any(),
             floor: if kani::any() { Some(kani::any()) } else { None },
             status: any_status(),
-            must_sub: kani::any(),
             open: if kani::any() {
                 Some((kani::any(), kani::any()))
             } else {
@@ -1315,64 +1006,19 @@ mod kinded_proofs {
         }
     }
 
-    fn run_as_built(inputs: &Inputs) -> PullAdmission<u8> {
-        admit_pull(PullRequest {
-            intent_id: &inputs.intent,
-            auth_intent: inputs.auth.as_ref(),
-            serving_generation: inputs.serving,
-            generation_floor: inputs.floor,
-            status: inputs.status,
-            must_substitute: inputs.must_sub,
-            open_attempt: inputs.open.as_ref().map(|(e, x)| (e, *x)),
-            pulling_identity: &inputs.pulling,
-        })
-    }
-
     fn run_kinded(inputs: &Inputs, mat: MaterializationInputs) -> PullAdmission<u8> {
-        admit_pull_kinded(
+        admit_pull(
             PullRequest {
                 intent_id: &inputs.intent,
                 auth_intent: inputs.auth.as_ref(),
                 serving_generation: inputs.serving,
                 generation_floor: inputs.floor,
                 status: inputs.status,
-                must_substitute: inputs.must_sub,
                 open_attempt: inputs.open.as_ref().map(|(e, x)| (e, *x)),
                 pulling_identity: &inputs.pulling,
             },
             mat,
         )
-    }
-
-    /// The flag-off identity, proven over the full bounded input domain
-    /// (the dormancy theorem): !enabled ⇒ kinded(Build) ≡ as-built, and
-    /// kinded(Materialization) ≡ NotYetReady (the AS-6 harmless park) —
-    /// for EVERY job view (the scheduler never loads the view flag-off,
-    /// but the kernel must not depend on that).
-    #[kani::proof]
-    fn check_kinded_flag_off_identity() {
-        let inputs = any_inputs();
-        let job = any_job_view();
-
-        let kinded_build = run_kinded(
-            &inputs,
-            MaterializationInputs {
-                enabled: false,
-                kind: PullKind::Build,
-                job,
-            },
-        );
-        assert_eq!(kinded_build, run_as_built(&inputs));
-
-        let kinded_mat = run_kinded(
-            &inputs,
-            MaterializationInputs {
-                enabled: false,
-                kind: PullKind::Materialization,
-                job,
-            },
-        );
-        assert_eq!(kinded_mat, PullAdmission::NotYetReady);
     }
 
     /// Flag-on: a build pull is never delivered while a job is unresolved
@@ -1388,7 +1034,6 @@ mod kinded_proofs {
         let decision = run_kinded(
             &inputs,
             MaterializationInputs {
-                enabled: true,
                 kind: PullKind::Build,
                 job,
             },
@@ -1431,7 +1076,6 @@ mod kinded_proofs {
         let decision = run_kinded(
             &inputs,
             MaterializationInputs {
-                enabled: true,
                 kind: PullKind::Materialization,
                 job,
             },
@@ -1521,14 +1165,7 @@ mod kinded_proofs {
         };
         let job = any_job_view();
 
-        let decision = run_kinded(
-            &inputs,
-            MaterializationInputs {
-                enabled: true,
-                kind,
-                job,
-            },
-        );
+        let decision = run_kinded(&inputs, MaterializationInputs { kind, job });
 
         let token_mismatch = inputs.auth.is_some_and(|a| a != inputs.intent);
         let below_floor = inputs

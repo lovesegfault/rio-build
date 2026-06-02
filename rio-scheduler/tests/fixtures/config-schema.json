@@ -125,7 +125,6 @@
         "description": "Substitution-replacement campaign (design §8): store-owned\nmaterialization jobs. `[materialization]` table in\nscheduler.toml. Env: `RIO_MATERIALIZATION__*` (nested keys —\ndouble underscore). Phase B activated the mechanism at the\ndeployment layer: the helm values default the flag ON (the\ncutover switch), while this struct's default stays `false` —\na bare binary without deployment config runs the as-built walk.",
         "$ref": "#/$defs/MaterializationConfig",
         "default": {
-          "enabled": false,
           "max_attempts": 3,
           "park_backoff_base_secs": 30,
           "park_backoff_cap_secs": 900
@@ -274,14 +273,9 @@
         }
       },
       "MaterializationConfig": {
-        "description": "Substitution-replacement campaign (design §8): store-owned\nmaterialization jobs. Phase B activated the mechanism: the helm\nvalues default `enabled: true` for both components (the deployment\nlayer is the cutover switch — PD-B1), while this struct's default\nstays `false` so a bare binary runs the as-built walk. The\ndeployment-ordering constraint (store executor flag first ON, last\nOFF — design §4/AS-6) is enforced by the chart's AND-guard\n(templates/scheduler.yaml), not here.",
+        "description": "Substitution-replacement campaign (design §8): store-owned\nmaterialization jobs — THE substitution mechanism (unconditional\nsince the substitution-replacement cutover; the coexistence flag\nand the chart AND-guard died with it).",
         "type": "object",
         "properties": {
-          "enabled": {
-            "description": "Master switch for scheduler-side job creation, the kind-aware\npull-admission table, and materialization-outcome consumption.\nfalse = the as-built substitution walk path runs unchanged.",
-            "type": "boolean",
-            "default": false
-          },
           "max_attempts": {
             "description": "Budget: `materialization_infra` rows (worker-reported AND\nestablishment-written — OQ1 amendment 1) per job before the job\nparks (design §2.5). Never causes a fail-fast.",
             "type": "integer",
@@ -355,7 +349,6 @@
       "jitter_fraction": 0.2
     },
     "materialization": {
-      "enabled": false,
       "max_attempts": 3,
       "park_backoff_base_secs": 30,
       "park_backoff_cap_secs": 900

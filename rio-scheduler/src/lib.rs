@@ -293,8 +293,7 @@ pub fn describe_metrics() {
          re-evaluated and resolved from-source instead of staying parked (PD-20), so \
          a sustained nonzero value means a dead/misconfigured upstream is stalling \
          work that has NO from-source fallback — the operator signal to check \
-         upstream cache health and tenant upstream configuration. Absent while \
-         scheduler.materialization.enabled = false."
+         upstream cache health and tenant upstream configuration."
     );
     describe_counter!(
         "rio_scheduler_materialization_claims_total",
@@ -303,7 +302,7 @@ pub fn describe_metrics() {
          (drain) for the lifecycle rates: created-vs-claimed divergence means store \
          executors are not keeping up (or are partitioned from the leader); \
          claimed-vs-resolved divergence means executions are failing or reports are \
-         not landing. Absent while scheduler.materialization.enabled = false."
+         not landing."
     );
     describe_counter!(
         "rio_scheduler_materialization_jobs_resolved_total",
@@ -314,8 +313,7 @@ pub fn describe_metrics() {
          to normal from-source dispatch (durable Vouched/Pending evidence or the \
          PD-20 park re-evaluation); unobtainable = the fail-fast settlement; \
          cancelled = zero live interest remained. A high infra-failure or \
-         unobtainable rate is the upstream-health signal. Absent while \
-         scheduler.materialization.enabled = false."
+         unobtainable rate is the upstream-health signal."
     );
     describe_histogram!(
         "rio_scheduler_critical_path_accuracy",

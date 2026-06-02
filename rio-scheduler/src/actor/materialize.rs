@@ -1,10 +1,7 @@
-//! Materialization-job actor logic (substitution-replacement Phase A).
-//!
-//! Everything here is reachable ONLY when materialization dispatch is
-//! enabled (`materialization_cfg.enabled`); flag-off, the only
-//! reachable code is the empty-list answer and the kind=BUILD
-//! passthrough in pull admission. Design: substitution-replacement-
-//! design.md §2; spec: sched.materialize.{job,routing,pinning}.
+//! Materialization-job actor logic — the substitution mechanism
+//! (unconditional since the substitution-replacement cutover).
+//! Design: substitution-replacement-design.md §2; spec:
+//! sched.materialize.{job,routing,pinning}.
 // r[impl sched.materialize.job]
 
 use tokio::sync::oneshot;
@@ -77,17 +74,15 @@ pub(crate) struct CreatedJob {
 }
 
 impl DagActor {
-    /// Leader-served job listing (the store's poll). Flag-off, standby,
-    /// or no jobs → empty vec (never an error — the AS-6 mixed-flag
-    /// posture: a flag-on store polling a flag-off scheduler hangs
-    /// harmlessly on empty lists).
+    /// Leader-served job listing (the store's poll). Standby or no
+    /// jobs → empty vec (never an error).
     // r[impl sched.materialize.job]
     pub(super) async fn handle_list_materialization_jobs(
         &mut self,
         limit: u32,
         reply: oneshot::Sender<Vec<JobDescriptor>>,
     ) {
-        let jobs = if !self.materialization_cfg.enabled || !self.leader.is_leader() {
+        let jobs = if !self.leader.is_leader() {
             Vec::new()
         } else {
             match self
@@ -109,20 +104,20 @@ impl DagActor {
     /// transaction (every §2.1 probe-partition site calls this one fn —
     /// the "one helper" the design's B7 disposition requires; the merge
     /// sites use the in-tx core inside `persist_merge_to_db` instead).
-    /// No-op flag-off and on standby. Creates the job row fenced +
-    /// dedup'd, updates the in-memory view, and records the wanted
-    /// relation for the creating build when one is named.
+    /// No-op on standby. Creates the job row fenced + dedup'd, updates
+    /// the in-memory view, and records the wanted relation for the
+    /// creating build when one is named.
     ///
     /// Returns whether an unresolved job exists for the node after the
     /// call (created now or found by the dedup).
     // r[impl sched.materialize.job]
-    pub(super) async fn create_materialization_job_if_enabled(
+    pub(super) async fn create_materialization_job(
         &mut self,
         drv_hash: &DrvHash,
         origin: JobOrigin,
         creating_build: Option<Uuid>,
     ) -> bool {
-        if !self.materialization_cfg.enabled || !self.leader.is_leader() {
+        if !self.leader.is_leader() {
             return false;
         }
         let Some(state) = self.dag.node(drv_hash) else {
@@ -312,18 +307,13 @@ impl DagActor {
     }
 
     /// Project the node's materialization-job state for pull admission
-    /// (the kernel's `JobView` input). Flag-off: always `None` — the
-    /// view map is never populated, and the projection never even looks
-    /// (so the flag-off pull path does zero extra work).
+    /// (the kernel's `JobView` input).
     pub(super) fn materialization_job_view(
         &self,
         drv_hash: &DrvHash,
         pulling_identity: &ExecutorId,
     ) -> rio_evidence_kernel::pull::JobView {
         use rio_evidence_kernel::pull::JobView;
-        if !self.materialization_cfg.enabled {
-            return JobView::None;
-        }
         match self.materialization_jobs.get(drv_hash) {
             None => JobView::None,
             Some(entry) => match &entry.claimed_by {
@@ -406,12 +396,8 @@ impl DagActor {
     /// backoff expires). Claimed jobs do NOT count — their nodes are
     /// Assigned/Running and surface through `running_derivations`.
     ///
-    /// Reads only the in-memory view, which is populated exclusively by
-    /// the flag-gated creation paths — flag-off it is permanently empty,
-    /// so this is always false there. Callers still gate on
-    /// `materialization_cfg.enabled` (defense in depth: criterion 2 /
-    /// stop condition 8 — flag-off snapshot values must be byte-identical
-    /// to baseline regardless of view contents).
+    /// Reads only the in-memory view (a droppable cache of the durable
+    /// job table, rebuilt at recovery).
     pub(super) fn has_pending_unclaimed_job(&self, drv_hash: &str) -> bool {
         self.materialization_jobs
             .get(drv_hash)

@@ -333,8 +333,8 @@ async fn materialization_pull_instance_validated_as_dns_label() -> anyhow::Resul
             "instance {bad:?} must be InvalidArgument, got {err:?}"
         );
     }
-    // A valid DNS-1123 label is accepted (and parks NotYetReady
-    // flag-off, dev mode — the AS-6 posture).
+    // A valid DNS-1123 label is accepted (the unknown drv answers
+    // Gone — the gate passed and the kernel answered).
     let resp = grpc
         .pull_assignment(Request::new(rio_proto::types::PullAssignmentRequest {
             executor_token: String::new(),
@@ -348,9 +348,9 @@ async fn materialization_pull_instance_validated_as_dns_label() -> anyhow::Resul
     assert!(
         matches!(
             resp.outcome,
-            Some(rio_proto::types::pull_assignment_response::Outcome::NotYetReady(_))
+            Some(rio_proto::types::pull_assignment_response::Outcome::Gone(_))
         ),
-        "valid instance + flag-off parks NotYetReady, got {resp:?}"
+        "valid instance: the gate passes and the kernel answers Gone for an unknown drv, got {resp:?}"
     );
     Ok(())
 }
@@ -484,8 +484,8 @@ fn mat_success_outcome() -> rio_proto::types::MaterializationOutcome {
 /// exactly the materialization operations — ListMaterializationJobs
 /// (both carriers), kind=MATERIALIZATION PullAssignment, and
 /// materialization ReportOutcome — while the executor HMAC posture
-/// stays fully enforced. The flag-off answers stay dormant: empty
-/// list, NotYetReady, acknowledged-and-ignored.
+/// stays fully enforced. The empty-state answers: empty list, Gone,
+/// acknowledged-and-ignored.
 #[tokio::test]
 async fn materialization_ops_accept_store_service_credential() -> anyhow::Result<()> {
     use rio_auth::hmac::HmacKey;
@@ -514,7 +514,7 @@ async fn materialization_ops_accept_store_service_credential() -> anyhow::Result
         .await
         .expect("the store-service credential authorizes the listing (metadata carrier)")
         .into_inner();
-    assert!(resp.jobs.is_empty(), "flag-off listing stays empty");
+    assert!(resp.jobs.is_empty(), "no jobs: the listing is empty");
 
     // 2. ListMaterializationJobs, body carrier → same.
     let resp = grpc
@@ -530,7 +530,7 @@ async fn materialization_ops_accept_store_service_credential() -> anyhow::Result
     assert!(resp.jobs.is_empty());
 
     // 3. kind=MATERIALIZATION PullAssignment with the credential →
-    //    flag-off NotYetReady (the AS-6 posture), never a rejection.
+    //    Gone for the unknown drv, never a rejection.
     let mut req = Request::new(rio_proto::types::PullAssignmentRequest {
         executor_token: String::new(),
         intent_id: "drv-store-credential".into(),
@@ -547,9 +547,9 @@ async fn materialization_ops_accept_store_service_credential() -> anyhow::Result
     assert!(
         matches!(
             resp.outcome,
-            Some(rio_proto::types::pull_assignment_response::Outcome::NotYetReady(_))
+            Some(rio_proto::types::pull_assignment_response::Outcome::Gone(_))
         ),
-        "flag-off materialization pull parks NotYetReady, got {resp:?}"
+        "the credential authorizes; the unknown drv answers Gone, got {resp:?}"
     );
 
     // 4. Materialization ReportOutcome with the credential → reaches the
@@ -730,8 +730,8 @@ async fn materialization_claim_with_mismatched_instance_rejected() -> anyhow::Re
     );
 
     // The same token claiming AS "store-a" (claim == request) is
-    // admitted: flag-off it parks NotYetReady (the AS-6 posture), which
-    // proves the gate passed and the kernel answered.
+    // admitted: the unknown drv answers Gone, which proves the gate
+    // passed and the kernel answered.
     let mut req = Request::new(rio_proto::types::PullAssignmentRequest {
         executor_token: String::new(),
         intent_id: "drv-instance-mismatch".into(),
@@ -748,9 +748,9 @@ async fn materialization_claim_with_mismatched_instance_rejected() -> anyhow::Re
     assert!(
         matches!(
             resp.outcome,
-            Some(rio_proto::types::pull_assignment_response::Outcome::NotYetReady(_))
+            Some(rio_proto::types::pull_assignment_response::Outcome::Gone(_))
         ),
-        "matching instance + flag-off parks NotYetReady, got {resp:?}"
+        "matching instance: the kernel answers Gone for an unknown drv, got {resp:?}"
     );
     Ok(())
 }
@@ -1054,9 +1054,7 @@ async fn flag_on_materialization_lifecycle_through_grpc() -> anyhow::Result<()> 
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, _actor_task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
-            cfg.materialization.enabled = true;
-        });
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, _| {});
 
     // The production auth posture: BOTH key families, distinct keys.
     let executor_key = std::sync::Arc::new(HmacKey::from_key(
@@ -1222,9 +1220,7 @@ async fn flag_on_progress_relay_reaches_build_events() -> anyhow::Result<()> {
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, _actor_task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
-            cfg.materialization.enabled = true;
-        });
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, _| {});
 
     let executor_key = std::sync::Arc::new(HmacKey::from_key(
         b"executor-key-32-bytes-long!!!!!!".to_vec(),

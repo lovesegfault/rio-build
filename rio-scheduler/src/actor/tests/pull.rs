@@ -157,41 +157,45 @@ async fn pull_unbuilt_deps_returns_not_yet_ready() -> TestResult {
     Ok(())
 }
 
-// D4-retarget: flips when the must_substitute arm dies (T-D4.1) — refusal
-// becomes the JobView arm; re-assert NotYetReady-while-job-unresolved.
-// (The sweep-settlement half this test carried — "the next Tick's batch
-// probe takes the resubmit-directing fail-fast" — asserted the
-// dispatch-partition fail-fast cell deleted with the walk spawner; the
-// settlement successor is the origin-keyed consumption fail-fast,
-// pinned by the routing-matrix and T-D2.1 batteries.)
-// r[verify sched.merge.substitute-topdown+12]
-/// A Ready node that may only complete via substitution (topdown-pruned
-/// with Broken closure evidence — childless here) is never served from
-/// source by the pull path: the pull answers NotYetReady, mints nothing
-/// (no assignments / drv_executions rows, no Ready→Assigned
-/// transition).
+// D4-retargeted (T-D4.1): the must_substitute refusal arm died with
+// the kinded collapse — the never-from-source gate is the JobView arm:
+// a build pull is parked NotYetReady while the node carries an
+// unresolved materialization job. (The walk-era marked-no-job shape is
+// the documented FP-7 transition residual: it re-enters via the probe
+// partition / from-source dispatch.)
+// r[verify sched.materialize.job]
+/// A Ready node with an unresolved materialization job is never served
+/// from source by the pull path: the build pull answers NotYetReady,
+/// mints nothing (no assignments / drv_executions rows, no
+/// Ready→Assigned transition).
 #[tokio::test]
-async fn pull_must_substitute_node_refused() -> TestResult {
-    let (db, _store, handle, _tasks) = setup_with_mock_store().await?;
+async fn pull_refused_while_job_unresolved() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
-    // A childless target whose output is not in the store and not
-    // substitutable; the merge seeds it Ready.
+    // A substitutable target: the merge classifies it into the new_sub
+    // lane and creates its job in the merge transaction.
+    let out = rio_test_support::fixtures::test_store_path("pull-tdms-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
     let mut node = make_node("pull-tdms");
-    node.expected_output_paths = vec![rio_test_support::fixtures::test_store_path("pull-tdms-out")];
+    node.expected_output_paths = vec![out];
     let build_id = Uuid::new_v4();
     // Hold the event receiver: the test-build orphan watcher (zero
     // grace) auto-cancels an unwatched Active build on the second Tick.
     let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM materialization_jobs WHERE drv_hash = $1")
+            .bind("pull-tdms")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(jobs, 1, "precondition: the job is unresolved");
 
-    // Stage the post-prune / post-failover shape: childless + marked.
-    assert!(handle.debug_set_topdown_pruned("pull-tdms", true).await?);
-
-    // The pull refuses the mint: NotYetReady, nothing written, no
+    // The BUILD pull refuses the mint: NotYetReady, nothing written, no
     // Ready→Assigned transition, no exec minted.
     let outcome = pull(&handle, "pull-tdms", Some("pull-tdms")).await;
     assert!(
         matches!(outcome, Ok(PullOutcome::NotYetReady { .. })),
-        "a must-substitute node must not be served from source; got {outcome:?}"
+        "a job-unresolved node must not be served from source; got {outcome:?}"
     );
     let (assignments, executions) = row_counts(&db.pool, "pull-tdms").await;
     assert_eq!(

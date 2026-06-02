@@ -674,10 +674,8 @@ impl DagActor {
         // pattern) so (a) the PrometheusRule alerts have series to
         // evaluate from boot instead of returning empty until the first
         // job, and (b) the metrics-registered VM assertion sees them
-        // after a non-substitutable build. Flag-off, nothing is
-        // registered — the flag-off /metrics surface stays byte-identical
-        // to as-built (dormancy criterion 2).
-        if cfg.materialization.enabled {
+        // after a non-substitutable build.
+        {
             metrics::counter!("rio_scheduler_materialization_claims_total").absolute(0);
             for origin in ["pruned", "cache_opportunity", "stale_reset", "reprobe"] {
                 metrics::counter!(

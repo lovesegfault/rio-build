@@ -46,10 +46,8 @@ pub struct DagActorConfig {
     /// executor crash. main.rs loads from scheduler.toml
     /// `establishment_report_slack_secs` (default 120 s).
     pub establishment_report_slack: std::time::Duration,
-    /// Substitution-replacement materialization config (`[materialization]`
-    /// table). Default (`enabled = false`) is the Phase A deployed
-    /// state: every materialization mechanism on the actor is dormant
-    /// and the as-built substitution walk path runs unchanged.
+    /// Materialization config (`[materialization]` table): the job
+    /// budget and park backoff knobs.
     pub materialization: crate::config::MaterializationConfig,
 }
 

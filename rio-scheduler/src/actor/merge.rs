@@ -2016,7 +2016,7 @@ impl DagActor {
             // relation for this (build, node) pair already rode the
             // merge transaction.
             for (drv_hash, _) in to_spawn {
-                self.create_materialization_job_if_enabled(
+                self.create_materialization_job(
                     &drv_hash,
                     crate::state::JobOrigin::StaleReset,
                     None,
@@ -2066,33 +2066,9 @@ impl DagActor {
     /// evaluates a stricter SQL variant of the Vouched criterion over
     /// *persisted* children (`load_parents_with_all_children_produced`:
     /// every child produced AND vouched for by a still-live build that
-    /// also owns the parent); the dispatch-time and reap-time guards
-    /// consume the inverse judgment via [`Self::must_substitute`].
+    /// also owns the parent).
     pub(super) fn closure_vouched(&self, drv_hash: &str) -> bool {
         rio_evidence_kernel::closure_vouched(self.dag.closure_evidence(drv_hash))
-    }
-
-    // r[impl sched.merge.substitute-topdown+12]
-    /// True when `drv_hash` carries the `topdown_pruned` mark AND its
-    /// closure evidence is [`ClosureEvidence::Broken`](crate::dag::ClosureEvidence::Broken) (childless or
-    /// closure-holed): its dependency closure was dropped from the
-    /// submission and the current child set cannot vouch for it, so the
-    /// node must complete via substitution — a from-source dispatch is
-    /// doomed (the worker ENOENTs on inputDrvs that were never merged).
-    ///
-    /// This is the single predicate behind the dispatch-time carve-out
-    /// and fail-fast arms (`batch_probe_cached_ready`, the
-    /// pull-admission refusal in `admit_pull`), the
-    /// downgrade re-spawn key in `handle_substitute_complete`, and the
-    /// reap-hook fail-fast in `handle_cleanup_terminal_build` — a
-    /// closure-holed survivor is treated exactly like a childless node
-    /// at every guard. Unmarked nodes are never affected, whatever
-    /// their evidence.
-    pub(super) fn must_substitute(&self, drv_hash: &str) -> bool {
-        rio_evidence_kernel::must_substitute(
-            self.dag.node(drv_hash).is_some_and(|s| s.topdown_pruned),
-            self.dag.closure_evidence(drv_hash),
-        )
     }
 
     /// Persist nodes and edges to the DB after a successful DAG merge,
@@ -2291,11 +2267,8 @@ impl DagActor {
         // one cannot lose them to a failover racing the post-commit
         // phase. The writes ride this transaction's claims-floor fence
         // (begin-time check above, authoritative re-check below) — one
-        // fence per transaction, no extra floor read. Flag-off the
-        // whole block is skipped and the transaction is byte-identical
-        // to the as-built form.
-        let created_jobs: Vec<super::materialize::CreatedJob> = if self.materialization_cfg.enabled
-        {
+        // fence per transaction, no extra floor read.
+        let created_jobs: Vec<super::materialize::CreatedJob> = {
             // (a) The durable wanted relation — one row per
             // (build, node) pair, written by every merge regardless of
             // routing (design §6 / AS-1).
@@ -2426,8 +2399,6 @@ impl DagActor {
                     origin: row.origin,
                 })
                 .collect()
-        } else {
-            Vec::new()
         };
 
         // r[verify sched.db.tx-commit-before-mutate]

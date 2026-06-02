@@ -230,24 +230,18 @@ pub(crate) async fn setup_with_mock_store() -> anyhow::Result<(
     Ok((db, store, handle, (store_task, actor_task)))
 }
 
-/// Like [`setup_with_mock_store`] but with materialization dispatch
-/// enabled (`materialization.enabled = true`) — the substitution-
-/// replacement campaign's flag-on test harness. Production never runs
-/// this configuration in Phase A; only tests do.
+/// Alias of [`setup_with_mock_store`] since the substitution-
+/// replacement cutover (materialization is unconditional — the flag
+/// this fixture used to set is gone). Kept so the large flag-on
+/// battery did not churn; fold into the plain fixture in a later
+/// cleanup.
 pub(crate) async fn setup_with_mock_store_materialization_enabled() -> anyhow::Result<(
     TestDb,
     rio_test_support::grpc::MockStore,
     ActorHandle,
     (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>),
 )> {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, store_task) =
-        rio_test_support::grpc::spawn_mock_store_with_client().await?;
-    let (handle, actor_task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
-            cfg.materialization.enabled = true;
-        });
-    Ok((db, store, handle, (store_task, actor_task)))
+    setup_with_mock_store().await
 }
 
 /// Send `ActorCommand::Tick` and barrier on it. For tests driving the

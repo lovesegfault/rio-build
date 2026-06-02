@@ -1282,16 +1282,7 @@ async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
 #[tokio::test]
 async fn snapshot_counts_substituting() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_cfg(
-        db.pool.clone(),
-        DagActorConfig {
-            materialization: crate::config::MaterializationConfig {
-                enabled: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    );
+    let mut actor = bare_actor(db.pool.clone());
 
     // 3 Ready nodes with pending unclaimed jobs, 1 plain Ready,
     // 1 Running — disjoint counts.

@@ -186,7 +186,7 @@ impl DagActor {
         // reaped.
         let mut locally_present = Vec::new();
         // Nodes routed to a materialization job (creation itself stays
-        // flag-gated inside `create_materialization_job_if_enabled`
+        // flag-gated inside `create_materialization_job`
         // until the flag collapse).
         let mut to_create_job: Vec<DrvHash> = Vec::new();
         for (drv_hash, paths) in candidates {
@@ -243,7 +243,7 @@ impl DagActor {
         // The probe-partition creation site — the standalone fenced
         // helper, no enclosing transaction (design §2.1 row 3).
         for drv_hash in &to_create_job {
-            self.create_materialization_job_if_enabled(
+            self.create_materialization_job(
                 drv_hash,
                 crate::state::JobOrigin::CacheOpportunity,
                 None,
@@ -498,9 +498,8 @@ impl DagActor {
             // outright; the promotion arm would push a Ready node whose
             // builder pulls the kinded admission refuses anyway. The
             // job's own §2.4 consumption settlement is the survivor's
-            // settlement authority. Flag-gated: flag-off the view is
-            // empty and this gate never fires.
-            if self.materialization_cfg.enabled && self.has_unresolved_job(parent.as_str()) {
+            // settlement authority.
+            if self.has_unresolved_job(parent.as_str()) {
                 continue;
             }
             if status == DerivationStatus::Queued

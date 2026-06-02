@@ -79,13 +79,6 @@ pub(crate) struct PullInputs<'a> {
     pub auth_intent: Option<&'a str>,
     /// The derivation's current status; `None` if the DAG has no node.
     pub status: Option<DerivationStatus>,
-    /// Whether the node may only complete via substitution: it carries
-    /// the roots-only-prune marker (`topdown_pruned`) and its closure
-    /// evidence is Broken — childless or closure-holed — so its dep
-    /// closure was never merged (or the surviving children are a
-    /// reap-truncated view of it) and a from-source build is doomed.
-    /// Computed by the caller via [`DagActor::must_substitute`].
-    pub must_substitute: bool,
     /// The open attempt bound to the derivation, if any:
     /// (executor identity, exec_id).
     pub open_attempt: Option<(&'a ExecutorId, Uuid)>,
@@ -95,17 +88,10 @@ pub(crate) struct PullInputs<'a> {
     pub serving_generation: u64,
     /// The durable claims floor (`None` = fresh cluster, no rows).
     pub generation_floor: Option<i64>,
-    /// `scheduler.materialization.enabled` (substitution-replacement
-    /// Phase A). False — the deployed Phase A state — makes the kinded
-    /// kernel wrapper bit-identical to the as-built admission.
-    pub materialization_enabled: bool,
-    /// The pull's claimed work class. Build until the gRPC intake
-    /// plumbs the proto `kind` field; materialization claims arrive
-    /// only flag-on.
+    /// The pull's claimed work class.
     pub pull_kind: rio_evidence_kernel::pull::PullKind,
     /// The node's materialization-job state, projected from the actor's
-    /// in-memory job view. Always `None` flag-off (the view is never
-    /// loaded).
+    /// in-memory job view.
     pub job_view: rio_evidence_kernel::pull::JobView,
 }
 
@@ -123,30 +109,21 @@ pub(crate) struct PullInputs<'a> {
 /// Check order (proven in the kernel): identity first (a mis-bound
 /// token never learns anything about the drv), then the generation
 /// fence (a deposed believer answers nothing), then
-/// wantedness/deliverability — including the must-substitute refusal
-/// (`r[sched.merge.substitute-topdown+12]`) and the advisory
-/// generation-fence half (`r[sched.lease.generation-fence+3]`), both of
-/// which now live at the kernel's marked arms.
+/// wantedness/deliverability — including the advisory generation-fence
+/// half (`r[sched.lease.generation-fence+3]`) at the kernel's marked
+/// arms.
 pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
-    // Substitution-replacement Phase A: the shim routes through the
-    // kind-aware coexistence wrapper. Flag-off (the deployed state) the
-    // wrapper delegates straight to the as-built kernel for build pulls
-    // — proven bit-identical by the kernel's flag-off identity theorem
-    // (`kinded_wrapper_flag_off_equals_as_built` + the
-    // `check_kinded_flag_off_identity` CBMC harness).
-    rio_evidence_kernel::pull::admit_pull_kinded(
+    rio_evidence_kernel::pull::admit_pull(
         rio_evidence_kernel::pull::PullRequest {
             intent_id: inputs.intent_id,
             auth_intent: inputs.auth_intent,
             serving_generation: inputs.serving_generation,
             generation_floor: inputs.generation_floor,
             status: inputs.status.map(pull_node_status),
-            must_substitute: inputs.must_substitute,
             open_attempt: inputs.open_attempt,
             pulling_identity: inputs.pulling_identity,
         },
         rio_evidence_kernel::pull::MaterializationInputs {
-            enabled: inputs.materialization_enabled,
             kind: inputs.pull_kind,
             job: inputs.job_view,
         },
@@ -251,24 +228,16 @@ impl DagActor {
                     .map(|(executor, exec_id)| (executor.clone(), exec_id)),
             ),
         };
-        // The §carry of the deleted dispatch-time guard: a marked node
-        // with Broken closure evidence is never minted for pull.
-        let must_substitute = self.must_substitute(intent_id);
-
         let decision = admit_pull(&PullInputs {
             intent_id,
             auth_intent,
             status,
-            must_substitute,
             open_attempt: open_attempt.as_ref().map(|(e, x)| (e, *x)),
             pulling_identity: &pulling_identity,
             serving_generation,
             generation_floor,
-            materialization_enabled: self.materialization_cfg.enabled,
             pull_kind: kind,
-            // The job view: projected from the actor's in-memory job
-            // map (populated only by the flag-gated creation paths, so
-            // flag-off this is always JobView::None and costs nothing).
+            // The job view: projected from the actor's in-memory job map.
             job_view: self.materialization_job_view(&drv_hash, &pulling_identity),
         });
 
@@ -531,14 +500,10 @@ mod kernel_tests {
             intent_id: "drv-x",
             auth_intent: Some("drv-x"),
             status,
-            must_substitute: false,
             open_attempt: open,
             pulling_identity: pulling,
             serving_generation: 3,
             generation_floor: Some(3),
-            // Flag-off defaults (mechanical carve-out 1c): the kinded
-            // wrapper is bit-identical to the as-built kernel for these.
-            materialization_enabled: false,
             pull_kind: rio_evidence_kernel::pull::PullKind::Build,
             job_view: rio_evidence_kernel::pull::JobView::None,
         }
@@ -592,24 +557,6 @@ mod kernel_tests {
                 "an attempt open on another executor is never re-delivered or re-pointed"
             );
         }
-    }
-
-    // r[verify sched.merge.substitute-topdown+12]
-    /// A Ready node marked must-substitute (topdown-pruned with Broken
-    /// closure evidence) is refused: NotYetReady — not DeliverNew (it
-    /// must never be served from source) and not Gone (it is still
-    /// wanted; the sweep's substitution / fail-fast arms settle it).
-    #[test]
-    fn admit_pull_must_substitute_refuses_mint() {
-        let me = ExecutorId::from("drv-x");
-        let mut inputs = base_inputs(Some(DerivationStatus::Ready), &me, None);
-        inputs.must_substitute = true;
-        assert_eq!(admit_pull(&inputs), PullDecision::NotYetReady);
-        // The flag only parks deliverable-from-source work: a terminal
-        // node still answers Gone.
-        let mut inputs = base_inputs(Some(DerivationStatus::Completed), &me, None);
-        inputs.must_substitute = true;
-        assert_eq!(admit_pull(&inputs), PullDecision::Gone);
     }
 
     /// The token binding and the generation fence dominate everything.

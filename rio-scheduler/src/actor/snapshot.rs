@@ -255,9 +255,7 @@ impl DagActor {
         //
         // The substituting bucket is job-derived (§2.6): a node with an
         // unresolved unclaimed materialization job is substitution
-        // backlog whatever its status. (The walk-era Substituting
-        // status arm is gone with the status; the flag gate on the
-        // job-view disjunct collapses with the flag.)
+        // backlog whatever its status.
         for (drv_hash, s) in self.dag.iter_nodes() {
             match s.status() {
                 DerivationStatus::Assigned | DerivationStatus::Running => {
@@ -272,8 +270,7 @@ impl DagActor {
                     // queued_derivations/queued_by_system so the buckets
                     // stay disjoint and builder autoscalers don't scale
                     // on work that will be materialized, not built.
-                    if self.materialization_cfg.enabled && self.has_pending_unclaimed_job(drv_hash)
-                    {
+                    if self.has_pending_unclaimed_job(drv_hash) {
                         substituting_derivations += 1;
                     } else {
                         // The scalar and the I-107 per-system breakdown
@@ -289,12 +286,11 @@ impl DagActor {
                 // Pre-ready: not yet store/builder load. Created has no
                 // deps probed; Queued has unmet deps. Neither drives
                 // any RPC traffic — EXCEPT a Queued node carrying a
-                // pending materialization job (flag-on): materialization
-                // does not wait for deps, so that node is store-side
+                // pending materialization job: materialization does
+                // not wait for deps, so that node is store-side
                 // backlog exactly like its Ready sibling above.
                 DerivationStatus::Created | DerivationStatus::Queued => {
-                    if self.materialization_cfg.enabled
-                        && s.status() == DerivationStatus::Queued
+                    if s.status() == DerivationStatus::Queued
                         && self.has_pending_unclaimed_job(drv_hash)
                     {
                         substituting_derivations += 1;
@@ -429,9 +425,8 @@ impl DagActor {
             // bucket exclusion's controller-facing twin); retires the
             // CE-59 spawn-intent churn class as a side effect. Claimed
             // jobs' nodes are Assigned/Running and already excluded by
-            // the status check above. Flag-gated: flag-off the spawn
-            // stream is byte-identical to baseline (criterion 2).
-            if self.materialization_cfg.enabled && self.has_pending_unclaimed_job(drv_hash) {
+            // the status check above.
+            if self.has_pending_unclaimed_job(drv_hash) {
                 continue;
             }
             // Per-system aggregate: counted BEFORE the kind/feature
@@ -575,7 +570,7 @@ impl DagActor {
                 // job will be materialized (the PD-6 dep-racing claim),
                 // so forecasting a builder pod for it is exactly the
                 // churn the filter exists to prevent.
-                if self.materialization_cfg.enabled && self.has_pending_unclaimed_job(drv_hash) {
+                if self.has_pending_unclaimed_job(drv_hash) {
                     continue;
                 }
                 let kind = crate::state::kind_for_drv(state.is_fixed_output);

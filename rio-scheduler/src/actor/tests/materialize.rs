@@ -539,8 +539,14 @@ async fn build_attempt_with_materialization_payload_acked_and_ignored() -> TestR
         DerivationStatus::Running,
         "the open build attempt is untouched"
     );
-    let (jobs, wanted) = sdb(&db.pool).count_materialization_rows().await?;
-    assert_eq!((jobs, wanted), (0, 0), "no materialization state touched");
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        jobs, 0,
+        "no job state touched (the wanted relation is written by every \
+         merge — unconditional since the cutover — and is not attempt state)"
+    );
     Ok(())
 }
 
@@ -1432,8 +1438,7 @@ async fn flag_on_unmarked_leaf_confirmed_missing_releases_to_from_source() -> Te
     // settlement is unreachable and this test would be vacuous.
     let service_key = b"test-finding11-service-key-32-byt".to_vec();
     let (handle, actor_task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, p| {
-            cfg.materialization.enabled = true;
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, p| {
             p.service_signer = Some(Arc::new(HmacSigner::from_key(service_key)));
         });
     let _tasks = (store_task, actor_task);
@@ -1641,52 +1646,6 @@ async fn flag_on_pending_jobs_count_as_substituting_bucket() -> TestResult {
         "the claimed job's node counts as running (Assigned/Running by the mint)"
     );
     assert_eq!(snap.queued_derivations, 0);
-    Ok(())
-}
-
-// r[verify sched.admin.snapshot-substituting+2]
-/// Criterion 2 (its final commit — the flag dies next wave): flag-OFF
-/// the snapshot buckets are status-only — a Ready node is queued
-/// EVEN IF the in-memory job view somehow carries entries (defense in
-/// depth: the bucket re-sourcing is gated on the flag itself, not
-/// just on the view being empty). The walk-era Substituting staging
-/// died with the status.
-#[tokio::test]
-async fn flag_off_snapshot_buckets_match_baseline() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor(db.pool.clone()); // flag-off default
-
-    // 1 Ready (with a sneaky job-view entry below), 1 Running.
-    actor.test_inject_ready("off-ready", None, "x86_64-linux", false);
-    actor.test_inject_ready("off-run", None, "x86_64-linux", false);
-    actor
-        .dag
-        .node_mut("off-run")
-        .unwrap()
-        .set_status_for_test(DerivationStatus::Running);
-
-    // Defense-in-depth: even with a (production-unreachable) job-view
-    // entry for the Ready node, flag-off buckets stay status-only.
-    actor.materialization_jobs.insert(
-        DrvHash::from("off-ready"),
-        crate::actor::materialize::JobViewEntry {
-            job_id: Uuid::new_v4(),
-            parked_until: None,
-            claimed_by: None,
-        },
-    );
-
-    let snap = actor.compute_cluster_snapshot();
-    assert_eq!(
-        snap.substituting_derivations, 0,
-        "flag-off: the job-derived bucket never fires (the disjunct is flag-gated)"
-    );
-    assert_eq!(
-        snap.queued_derivations, 1,
-        "flag-off: a Ready node counts in queued even when a job-view entry exists"
-    );
-    assert_eq!(snap.running_derivations, 1);
-    assert_eq!(snap.queued_by_system.values().sum::<u32>(), 1);
     Ok(())
 }
 
@@ -1898,9 +1857,7 @@ async fn flag_on_queued_mint_crash_between_commit_and_transition_recovers() -> T
         .push(mid_out.clone());
     {
         let (handle, task) =
-            setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |cfg, _| {
-                cfg.materialization.enabled = true;
-            });
+            setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |_cfg, _| {});
         let root = make_node("mat-crash-root");
         let mut mid = make_node("mat-crash-mid");
         mid.expected_output_paths = vec![mid_out.clone()];
@@ -1962,8 +1919,7 @@ async fn flag_on_queued_mint_crash_between_commit_and_transition_recovers() -> T
     let _confirmations = spawn_leading_confirmations(leader.clone());
     let phase2_leader = leader.clone();
     let (handle, _task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), move |cfg, p| {
-            cfg.materialization.enabled = true;
+        setup_actor_configured(db.pool.clone(), Some(store_client), move |_cfg, p| {
             p.leader = phase2_leader;
         });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
@@ -2573,9 +2529,7 @@ async fn flag_on_job_success_then_flag_off_revert_no_wrongful_fail_fast() -> Tes
     // ── Phase 1 (flag-ON): prune → job → claim → Success → consume. ──
     {
         let (handle, task) =
-            setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |cfg, _| {
-                cfg.materialization.enabled = true;
-            });
+            setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |_cfg, _| {});
         store
             .state
             .substitutable
@@ -2873,9 +2827,7 @@ async fn flag_on_era_pins_release_after_revert() -> TestResult {
     //    stays live behind a blocker node. ──
     {
         let (handle, task) =
-            setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |cfg, _| {
-                cfg.materialization.enabled = true;
-            });
+            setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |_cfg, _| {});
         store.state.substitutable.write().unwrap().push(out.clone());
         let mut node = make_node(tag);
         node.expected_output_paths = vec![out.clone()];
@@ -3070,7 +3022,6 @@ async fn flag_on_every_job_state_has_armed_action() -> TestResult {
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
         setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
-            cfg.materialization.enabled = true;
             cfg.materialization.max_attempts = 1;
             cfg.materialization.park_backoff_base_secs = 1;
         });
@@ -3478,7 +3429,6 @@ async fn flag_on_recovery_rebuilds_job_view_and_jobs_survive() -> TestResult {
     {
         let (handle, task) =
             setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |cfg, _| {
-                cfg.materialization.enabled = true;
                 // One infra failure parks; the park outlives the test.
                 cfg.materialization.max_attempts = 1;
                 cfg.materialization.park_backoff_base_secs = 600;
@@ -3565,7 +3515,6 @@ async fn flag_on_recovery_rebuilds_job_view_and_jobs_survive() -> TestResult {
     let phase2_leader = leader.clone();
     let (handle, _task) =
         setup_actor_configured(db.pool.clone(), Some(store_client), move |cfg, p| {
-            cfg.materialization.enabled = true;
             cfg.materialization.max_attempts = 1;
             cfg.materialization.park_backoff_base_secs = 600;
             p.leader = phase2_leader;
@@ -3945,8 +3894,7 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let service_key = b"test-t44-service-key-32-bytes!!!!".to_vec();
     let (handle, _actor_task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, p| {
-            cfg.materialization.enabled = true;
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, p| {
             p.service_signer = Some(Arc::new(HmacSigner::from_key(service_key)));
         });
     let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "t44-tenant").await;
@@ -4167,8 +4115,7 @@ async fn flag_on_genuine_unobtainable_fail_fasts_with_resubmit_error() -> TestRe
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let service_key = b"test-t44-failfast-key-32-bytes!!!".to_vec();
     let (handle, _actor_task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, p| {
-            cfg.materialization.enabled = true;
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, p| {
             p.service_signer = Some(Arc::new(HmacSigner::from_key(service_key)));
         });
     let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "t44-ff-tenant").await;
@@ -4367,7 +4314,9 @@ async fn flag_on_probe_job_backfills_wanted_relation_for_flag_off_era_builds() -
 
     let out = test_store_path("fp4b-out");
 
-    // ── Phase 1: a FLAG-OFF leader merges the build (tenant attached) ──
+    // ── Phase 1: a pre-relation-era build (the flag-off-era residue,
+    //    staged by deleting the relation rows the modern merge writes —
+    //    the flag itself is gone) ──
     {
         let (handle, task) = setup_actor_with_store(db.pool.clone(), Some(store_client.clone()));
         let mut n = make_node("fp4b-node");
@@ -4391,28 +4340,31 @@ async fn flag_on_probe_job_backfills_wanted_relation_for_flag_off_era_builds() -
         )
         .await?;
         barrier(&handle).await;
-        // Flag-off dormancy: zero jobs, zero wanted-relation rows.
+        // Fabricate the pre-relation residue: scrub the wanted rows the
+        // modern merge wrote (and any probe-created job) so the node
+        // looks exactly like a flag-off-era build's.
+        sqlx::query("DELETE FROM build_wanted_outputs")
+            .execute(&db.pool)
+            .await?;
+        sqlx::query("DELETE FROM materialization_jobs")
+            .execute(&db.pool)
+            .await?;
         let (jobs, wanted) = sdb(&db.pool).count_materialization_rows().await?;
-        assert_eq!(
-            (jobs, wanted),
-            (0, 0),
-            "flag-off: the merge writes no materialization rows"
-        );
-        // The flip begins: the flag-off leader goes away.
+        assert_eq!((jobs, wanted), (0, 0), "staged: the pre-relation-era shape");
+        // The era ends: the old leader goes away.
         drop(handle);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
-    // ── Phase 2: the flag-ON leader recovers; its dispatch probe creates
-    //    the job for the flag-off-era build's node ──
+    // ── Phase 2: the new leader recovers; its dispatch probe creates
+    //    the job for the legacy build's node ──
     let leader = crate::lease::LeaderState::always_leader(std::sync::Arc::new(
         std::sync::atomic::AtomicU64::new(1),
     ));
     let _confirmations = spawn_leading_confirmations(leader.clone());
     let phase2_leader = leader.clone();
     let (handle, _task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), move |cfg, p| {
-            cfg.materialization.enabled = true;
+        setup_actor_configured(db.pool.clone(), Some(store_client), move |_cfg, p| {
             p.leader = phase2_leader;
         });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
@@ -4523,7 +4475,6 @@ async fn parked_job_stalled_gauge_and_reevaluation() -> TestResult {
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
         setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
-            cfg.materialization.enabled = true;
             cfg.materialization.max_attempts = 1;
             cfg.materialization.park_backoff_base_secs = 3600;
             cfg.materialization.park_backoff_cap_secs = 3600;
@@ -4829,8 +4780,7 @@ async fn routing_reads_origin_not_column() -> TestResult {
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let service_key = b"test-d21-origin-key-32-bytes!!!!".to_vec();
     let (handle, _actor_task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, p| {
-            cfg.materialization.enabled = true;
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, p| {
             p.service_signer = Some(Arc::new(HmacSigner::from_key(service_key)));
         });
     let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "d21-origin-tenant").await;
@@ -5000,8 +4950,7 @@ async fn unobtainable_on_upgraded_dedup_job_fail_fasts() -> TestResult {
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let service_key = b"test-d21-dedup-key-32-bytes!!!!!".to_vec();
     let (handle, _actor_task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, p| {
-            cfg.materialization.enabled = true;
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, p| {
             p.service_signer = Some(Arc::new(HmacSigner::from_key(service_key)));
         });
     let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "d21-dedup-tenant").await;
@@ -5148,7 +5097,6 @@ async fn dedup_upgrade_preserves_parked_armament() -> TestResult {
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
         setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
-            cfg.materialization.enabled = true;
             cfg.materialization.max_attempts = 1;
             cfg.materialization.park_backoff_base_secs = 3600;
             cfg.materialization.park_backoff_cap_secs = 3600;
@@ -5300,8 +5248,7 @@ async fn routing_evidence_survives_inmemory_truncation() -> TestResult {
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let service_key = b"test-d22-trunc-key-32-bytes!!!!!".to_vec();
     let (handle, _actor_task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, p| {
-            cfg.materialization.enabled = true;
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_cfg, p| {
             p.service_signer = Some(Arc::new(HmacSigner::from_key(service_key)));
         });
     let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "d22-trunc-tenant").await;
@@ -5395,7 +5342,6 @@ async fn park_reevaluation_resolves_on_durable_vouch() -> TestResult {
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) =
         setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
-            cfg.materialization.enabled = true;
             cfg.materialization.max_attempts = 1;
             cfg.materialization.park_backoff_base_secs = 3600;
             cfg.materialization.park_backoff_cap_secs = 3600;
@@ -5472,7 +5418,6 @@ async fn classify_durable_evidence_ignores_dead_voucher() -> TestResult {
     let service_key = b"test-d22-dead-key-32-bytes!!!!!!".to_vec();
     let (handle, _actor_task) =
         setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, p| {
-            cfg.materialization.enabled = true;
             cfg.materialization.max_attempts = 1;
             cfg.materialization.park_backoff_base_secs = 3600;
             cfg.materialization.park_backoff_cap_secs = 3600;
@@ -5638,9 +5583,7 @@ where
 {
     let db = TestDb::new(&MIGRATOR).await;
     {
-        let (handle, task) = setup_actor_configured(db.pool.clone(), None, |cfg, _| {
-            cfg.materialization.enabled = true;
-        });
+        let (handle, task) = setup_actor_configured(db.pool.clone(), None, |_cfg, _| {});
         seed(handle, db.pool.clone()).await?;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
     }
@@ -5650,8 +5593,7 @@ where
     let confirmations = spawn_leading_confirmations(leader.clone());
     let phase2_leader = leader.clone();
     let (handle, task) =
-        setup_actor_configured(db.pool.clone(), Some(store_client), move |cfg, p| {
-            cfg.materialization.enabled = true;
+        setup_actor_configured(db.pool.clone(), Some(store_client), move |_cfg, p| {
             p.leader = phase2_leader;
         });
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;

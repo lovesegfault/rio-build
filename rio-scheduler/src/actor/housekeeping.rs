@@ -129,18 +129,13 @@ impl DagActor {
         self.tick_sweep_dispatched_cells();
         self.tick_publish_gauges();
         self.tick_sweep_open_pull_attempts().await;
-        // Substitution-replacement (flag-gated — review finding
-        // dormancy-7: an unconditional call would issue PG queries
-        // against the materialization tables on every flag-off
-        // housekeeping cycle): cancel jobs whose derivation has no live
-        // interest left, closing open attempts charge-free; then the
-        // PD-20 parked-job arm — re-evaluate parked jobs whose nodes
-        // have buildable dependency closures (resolve from-source) and
-        // publish the stalled gauge from ground truth.
-        if self.materialization_cfg.enabled {
-            self.tick_cancel_zero_interest_materialization().await;
-            self.tick_reevaluate_parked_materialization_jobs().await;
-        }
+        // Materialization sweeps: cancel jobs whose derivation has no
+        // live interest left, closing open attempts charge-free; then
+        // the PD-20 parked-job arm — re-evaluate parked jobs whose
+        // nodes have buildable dependency closures (resolve
+        // from-source) and publish the stalled gauge from ground truth.
+        self.tick_cancel_zero_interest_materialization().await;
+        self.tick_reevaluate_parked_materialization_jobs().await;
 
         // Advance probe_generation here (1/s) — NOT per
         // `sweep_ready_cached` call — so a Ready node is FMP-probed at

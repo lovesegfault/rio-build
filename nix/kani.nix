@@ -283,7 +283,7 @@ in
   # protocol over these predicates, these harnesses prove the predicates
   # themselves over their full bounded input domain.
   #
-  # Thirteen harnesses, measured at ~0.05–0.65 s CBMC time each (~4 s
+  # Fourteen harnesses, measured at ~0.05–0.65 s CBMC time each (~4 s
   # total, ~15 s wall with the kani-compiler build) on the dev builder.
   #
   # Classifier (rio-evidence-kernel/src/lib.rs `mod proofs`):
@@ -313,13 +313,10 @@ in
   #     clauses, full input domain.
   #
   # Pull admission (rio-evidence-kernel/src/pull.rs `mod proofs`):
-  #   - check_admit_pull_partition: the admission's exhaustive decision
-  #     table over (token, fence, status×13, must_substitute, attempt
-  #     identity) — total and panic-free.
-  #   - check_admit_pull_refuses_must_substitute: A11/pullRefusalNoMint
-  #     code half — a Ready must-substitute node is parked NotYetReady,
-  #     never DeliverNew; the only delivery a must-substitute node can
-  #     receive is the AW5 re-delivery of its own open attempt.
+  #   - check_admit_pull_partition: the base table's exhaustive
+  #     decision partition over (token, fence, status×13, attempt
+  #     identity), via the public fn's kind=Build/no-job path — total
+  #     and panic-free.
   #   - check_admit_pull_rejections_dominate: the load-bearing check
   #     order — a mismatched token answers RejectToken whatever else
   #     holds; an authenticated below-floor pull answers
@@ -327,19 +324,11 @@ in
   #   - check_admit_pull_identity_match: DeliverExisting only for an
   #     Assigned/Running node whose open attempt is bound to the
   #     pulling identity, carrying exactly that attempt's exec id.
-  #   - check_pull_refusal_chain: the end-to-end A11 chain through both
-  #     kernels — for ANY classifier input judged must-substitute, an
-  #     authenticated at-or-above-floor pull of that Ready node is
-  #     parked, never minted and never dismissed Gone.
   #
-  # Kinded coexistence wrapper (rio-evidence-kernel/src/pull.rs
-  # `mod kinded_proofs` — substitution-replacement Phase A, design §2.3):
-  #   - check_kinded_flag_off_identity: the dormancy theorem — with the
-  #     materialization flag off, admit_pull_kinded(Build) is
-  #     extensionally equal to the as-built admit_pull over the full
-  #     bounded domain, and a materialization pull parks harmlessly
-  #     (never errors, never writes, never delivers).
-  #   - check_kinded_no_build_delivery_while_job_unresolved: flag-on, a
+  # Kinded admission table (rio-evidence-kernel/src/pull.rs
+  # `mod kinded_proofs` — design §2.3; THE table since the
+  # substitution-replacement cutover):
+  #   - check_kinded_no_build_delivery_while_job_unresolved: a
   #     build pull is never delivered (new or re-delivery) while the
   #     node has an unresolved materialization job; rejections keep
   #     their dominance order.
@@ -351,8 +340,8 @@ in
   #     identity/fence gates; a claim held by another identity never
   #     yields a delivery.
   #   - check_kinded_rejections_dominate: the token/fence dominance
-  #     order over the FULL flag-on (kind × job-view) domain — every
-  #     arm of the kinded table including the Claimed re-delivery arm
+  #     order over the FULL (kind × job-view) domain — every arm of
+  #     the kinded table including the Claimed re-delivery arm
   #     answers RejectToken on a mis-bound token and
   #     RejectStaleGeneration on a below-floor pull; nothing else is
   #     ever rejected.
@@ -364,6 +353,6 @@ in
   kani-rio-evidence-kernel = mkKaniCheck {
     name = "rio-evidence-kernel";
     crate = crateBuildKani.members.rio-evidence-kernel;
-    expectedHarnesses = 17;
+    expectedHarnesses = 14;
   };
 }

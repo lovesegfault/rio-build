@@ -650,28 +650,22 @@ async fn spawn_intents_excludes_unprobed_ready() -> TestResult {
 }
 
 // r[verify sched.materialize.job]
-/// PD-7 (Phase B, design §2.3): flag-on, a node with an unresolved
+/// PD-7 (Phase B, design §2.3): a node with an unresolved
 /// materialization job is never a spawn-intent candidate — the
 /// controller must not spawn builder pods for work that will be
 /// materialized — and it is excluded from the per-system counts (the
 /// §2.6 bucket exclusion's controller-facing twin, keeping
 /// `GetSpawnIntents.queued_by_system` coherent with
 /// `ClusterSnapshot.queued_by_system`). Resolving the job restores
-/// candidacy. Flag-off, the filter is inert even with view entries
-/// present (criterion 2 / stop condition 8).
+/// candidacy.
 #[tokio::test]
 async fn spawn_intents_excludes_job_pending_nodes() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
 
-    // ── Flag-on: the filter applies. ──
     let mut actor = bare_actor_cfg(
         db.pool.clone(),
         DagActorConfig {
             sla: test_sla_config(),
-            materialization: crate::config::MaterializationConfig {
-                enabled: true,
-                ..Default::default()
-            },
             ..Default::default()
         },
     );
@@ -714,33 +708,8 @@ async fn spawn_intents_excludes_job_pending_nodes() -> TestResult {
         "resolving the job restores spawn-intent candidacy"
     );
 
-    // ── Flag-off invariance: the same view state with the flag off
-    //    filters NOTHING (the gate is the flag itself, not view
-    //    emptiness — defense in depth). ──
-    let mut actor = bare_actor_cfg(
-        db.pool.clone(),
-        DagActorConfig {
-            sla: test_sla_config(),
-            ..Default::default() // materialization flag-off (default)
-        },
-    );
-    actor.test_inject_ready("pd7-off-pending", None, "x86_64-linux", false);
-    actor.materialization_jobs.insert(
-        DrvHash::from("pd7-off-pending"),
-        crate::actor::materialize::JobViewEntry {
-            job_id: Uuid::new_v4(),
-            parked_until: None,
-            claimed_by: None,
-        },
-    );
-    let snap = actor.compute_spawn_intents(&Default::default());
-    assert_eq!(
-        snap.intents.len(),
-        1,
-        "flag-off the spawn-intent stream is byte-identical to baseline \
-         (the PD-7 filter is flag-gated)"
-    );
-    assert_eq!(snap.intents[0].intent_id, "pd7-off-pending");
+    // (The flag-off invariance half died with the flag — the PD-7
+    // filter is unconditional now.)
     Ok(())
 }
 
