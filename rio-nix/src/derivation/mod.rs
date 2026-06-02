@@ -75,6 +75,11 @@ pub enum DerivationError {
 
     #[error("ill-typed derivation outputs: {0}")]
     IllTypedOutputs(#[from] output::DerivationTypeError),
+    #[error(
+        "internal: fill_deferred refused non-deferred output '{0}' \
+         (deferred-filter/fill drift — report this)"
+    )]
+    NonDeferredFill(String),
 
     #[error(
         "derivation '{0}' is not plain input-addressed (fixed-output and floating-CA \
@@ -534,7 +539,13 @@ impl BasicDerivation {
             let out_name = self.outputs[i].name().to_string();
             let typed = StorePath::make_output(&out_name, &drv_hash, drv_name)?;
             let path = typed.to_string();
-            self.outputs[i].fill_deferred(typed);
+            // The pre-filter above selected exactly the Deferred
+            // indices, so a refusal here is unreachable; surfacing it
+            // (instead of the old silent overwrite) keeps the typed
+            // boundary honest if the filter and the fill ever drift.
+            if !self.outputs[i].fill_deferred(typed) {
+                return Err(DerivationError::NonDeferredFill(out_name));
+            }
             self.env.insert(out_name.clone(), path.clone());
             filled.push((out_name, path));
         }

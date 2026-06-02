@@ -246,12 +246,23 @@ impl DerivationOutput {
     /// only by `Derivation::fill_deferred_outputs`, which derives the
     /// path itself — the value never originates from an untrusted
     /// declaration. No-op error if the output is not deferred.
-    pub(crate) fn fill_deferred(&mut self, path: StorePath) {
-        debug_assert!(
-            matches!(self.repr, OutputRepr::Deferred),
-            "fill_deferred on a non-deferred output"
-        );
+    /// No-ops (returning `false`) on a non-deferred output instead of
+    /// overwriting it: the previous `debug_assert!` + unconditional
+    /// overwrite undercut the parse boundary's unrepresentability
+    /// guarantee in release builds — a mis-targeted call would have
+    /// silently rewritten a Fixed/Floating/concrete-IA output's shape,
+    /// exactly the class the typed boundary exists to make unwritable.
+    /// The sole caller (`fill_deferred_outputs`) pre-filters on
+    /// `OutputKind::Deferred`, so a `false` return is a caller bug; it
+    /// is surfaced there, not absorbed here.
+    #[must_use]
+    pub(crate) fn fill_deferred(&mut self, path: StorePath) -> bool {
+        if !matches!(self.repr, OutputRepr::Deferred) {
+            debug_assert!(false, "fill_deferred on a non-deferred output");
+            return false;
+        }
         self.repr = OutputRepr::InputAddressed { path };
+        true
     }
 }
 

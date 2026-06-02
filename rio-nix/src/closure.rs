@@ -18,9 +18,10 @@
 //!   non-termination, and a node's resolution is never revisited by later
 //!   extensions (snapshot semantics).
 //! - [`find_cycle`]: Kahn-style peeling over a closed member set —
-//!   returns the (sorted) subset of members participating in reference
-//!   cycles. Self-references are ignored (a store path referencing itself
-//!   is ordinary metadata).
+//!   returns the (sorted) cycle members plus the members on paths
+//!   connecting two cycles; empty iff the member subgraph is acyclic.
+//!   Self-references are ignored (a store path referencing itself is
+//!   ordinary metadata).
 //! - [`closure_sizes`]: per-member closure sizes with one reusable
 //!   scratch set — auxiliary memory stays O(largest single closure),
 //!   never O(members × closure size) like a memoized-set approach.
@@ -104,7 +105,8 @@ impl<'a> ClosureSet<'a> {
 ///
 /// `refs_of` resolves each member's references. References that are not
 /// themselves members, and self-references, are ignored. Returns the
-/// sorted set of members that participate in reference cycles — empty iff
+/// sorted set of members that participate in reference cycles, plus any
+/// members lying on a path connecting two cycles (see below) — empty iff
 /// the member subgraph is acyclic.
 ///
 /// The detection is Kahn-style peeling, run in both directions: first
