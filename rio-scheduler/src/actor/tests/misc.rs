@@ -3,6 +3,7 @@
 //! leader/recovery dispatch gating.
 
 use super::*;
+use rstest::rstest;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tracing_test::traced_test;
@@ -2392,4 +2393,101 @@ async fn build_options_merge_zero_cores_is_all() {
     mk2(8);
     let opts = actor.build_options_for_derivation(&DrvHash::from("h2"));
     assert_eq!(opts.build_cores, 8, "all-positive → max");
+}
+
+/// `build_options_for_derivation` is a policy fold — the timeout/cores
+/// it computes are stamped onto the worker assignment at dispatch — so
+/// it must fold LIVE interested builds only. Terminal builds linger in
+/// the map until the delayed terminal cleanup, and a shared node can
+/// carry a dead build's interest during that window (keep_going
+/// failures and recovery-sweep failures don't strip interest; a
+/// retriable-node re-merge carries stale interest forward). Pre-fix
+/// the fold resolved interest through the terminal-inclusive accessor:
+/// a dead build's tighter `build_timeout`/`max_silent_time` kept
+/// min-folding into other builds' dispatches of the shared derivation
+/// (spurious TimedOut), and a dead build's `build_cores=0` ("all" —
+/// most permissive, sticky) overrode a live build's positive core cap.
+#[rstest]
+#[case::cancelled_interleaved(BuildState::Cancelled, true)]
+#[case::failed_interleaved(BuildState::Failed, true)]
+// All interest terminal → all-unset options, identical to the
+// post-cleanup steady state (entries removed, interest stripped) —
+// the flip only removes the transient inconsistency.
+#[case::all_terminal(BuildState::Cancelled, false)]
+#[tokio::test]
+async fn build_options_fold_skips_terminal_builds(
+    #[case] terminal_state: BuildState,
+    #[case] with_live: bool,
+) {
+    use crate::state::BuildInfo;
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor(db.pool.clone());
+    actor.test_inject_ready("h", None, "x86_64-linux", false);
+
+    let mut mk = |options: BuildOptions, terminal: Option<BuildState>| {
+        let bid = Uuid::new_v4();
+        let mut info = BuildInfo::new_pending(
+            bid,
+            None,
+            PriorityClass::Scheduled,
+            false,
+            options,
+            std::iter::once(DrvHash::from("h")).collect(),
+        );
+        if let Some(to) = terminal {
+            info.transition(BuildState::Active).unwrap();
+            info.transition(to).unwrap();
+        }
+        actor.builds.insert(bid, info);
+        actor
+            .dag
+            .node_mut("h")
+            .unwrap()
+            .interested_builds
+            .insert(bid);
+    };
+
+    // Dead build: tight timeouts + "all cores" — every axis would
+    // distort the fold if its lingering entry were included.
+    mk(
+        BuildOptions {
+            max_silent_time: 60,
+            build_timeout: 300,
+            build_cores: 0,
+        },
+        Some(terminal_state),
+    );
+    if with_live {
+        // Live build: no timeouts (0 = unset), positive core cap.
+        mk(
+            BuildOptions {
+                max_silent_time: 0,
+                build_timeout: 0,
+                build_cores: 4,
+            },
+            None,
+        );
+    }
+
+    let opts = actor.build_options_for_derivation(&DrvHash::from("h"));
+    if with_live {
+        assert_eq!(
+            opts.max_silent_time, 0,
+            "dead build's max_silent_time must not min-fold into a live dispatch"
+        );
+        assert_eq!(
+            opts.build_timeout, 0,
+            "dead build's build_timeout must not min-fold into a live dispatch"
+        );
+        assert_eq!(
+            opts.build_cores, 4,
+            "dead build's 0=all-cores must not override the live build's core cap"
+        );
+    } else {
+        assert_eq!(
+            (opts.max_silent_time, opts.build_timeout, opts.build_cores),
+            (0, 0, 0),
+            "all-terminal interest folds to all-unset, same as post-cleanup"
+        );
+    }
 }

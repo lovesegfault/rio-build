@@ -974,7 +974,16 @@ impl DagActor {
         }
 
         for build_id in &interested {
-            if let Some(build) = self.builds.get_including_terminal_for_bookkeeping(build_id) {
+            // Policy fold over LIVE builds only (`Builds::get`): these
+            // options are stamped onto the worker assignment at
+            // dispatch, and a finished build's lingering entry must not
+            // keep constraining shared nodes it no longer waits on — a
+            // dead build's tighter timeout would min-fold into other
+            // builds' dispatches (spurious TimedOut), and a dead
+            // build's `build_cores=0` ("all", sticky most-permissive)
+            // would override a live build's core cap. All-terminal
+            // interest folds to all-unset, identical to post-cleanup.
+            if let Some(build) = self.builds.get(build_id) {
                 max_silent_time = min_nonzero(max_silent_time, build.options.max_silent_time);
                 build_timeout = min_nonzero(build_timeout, build.options.build_timeout);
                 // 0 = "all cores" (proto:307) — most permissive, sticky
