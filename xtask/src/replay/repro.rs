@@ -42,8 +42,12 @@ pub struct ReproArgs {
 
 /// Derived repro campaign id: `<original>-repro-<8 hex>`. The random
 /// suffix keeps repeated repros of the same unit from colliding on the Job
-/// name; lowercase hex stays inside the campaign-id charset, so the derived
-/// id passes the same RFC-1123 validation as any launch-chosen id.
+/// name; lowercase hex stays inside the campaign-id charset. Launch-time
+/// validation reserves this suffix (plus the derived `-spec` ConfigMap) in
+/// its length budget — `launch::DERIVED_SUFFIXES` — so every launchable
+/// campaign id derives a label-safe repro id; the derived id is
+/// re-validated with [`launch::validate_repro_campaign_id`], whose budget
+/// reserves only the `-spec` still derived from it.
 fn repro_campaign_id(original: &str) -> String {
     format!("{original}-repro-{:08x}", rand::random::<u32>())
 }
@@ -151,7 +155,7 @@ pub async fn run(a: ReproArgs) -> Result<()> {
     // Derived one-unit spec, validated by the engine's own rules before
     // anything is created.
     let repro_id = repro_campaign_id(&a.campaign);
-    launch::validate_campaign_id(&repro_id)?;
+    launch::validate_repro_campaign_id(&repro_id)?;
     let spec = derive_repro_spec(&original, &job_name, &repro_id);
     spec.validate()
         .context("derived repro spec failed engine validation")?;
@@ -341,9 +345,27 @@ mod tests {
             "{suffix}"
         );
         assert_ne!(id1, id2);
-        // The derived id passes the same validation launch applies to
-        // operator-chosen ids (Job-name / label-value / ConfigMap budget).
-        launch::validate_campaign_id(&id1).unwrap();
+        // The derived id passes the validation repro applies before
+        // creating anything (Job-name / label-value / ConfigMap budget).
+        launch::validate_repro_campaign_id(&id1).unwrap();
+
+        // The suffix this derivation appends is exactly the one launch's
+        // budget reserves: same length as the DERIVED_SUFFIXES template
+        // (the template's `00000000` stands in for the 8-hex nonce).
+        assert_eq!(
+            repro_campaign_id("").len(),
+            launch::DERIVED_SUFFIXES[0].len(),
+            "repro_campaign_id's suffix drifted from the budget launch reserves for it"
+        );
+
+        // Every launchable campaign id is reproducible: even a MAX-length
+        // id (43 chars under launch's budget) derives a repro id that
+        // passes repro's own validation and a label-safe -spec ConfigMap.
+        let max_original = "a".repeat(43);
+        launch::validate_campaign_id(&max_original).unwrap();
+        let derived = repro_campaign_id(&max_original);
+        launch::validate_repro_campaign_id(&derived).unwrap();
+        assert!(jobs::spec_configmap_name(&derived).len() <= 63);
     }
 
     #[test]

@@ -256,15 +256,57 @@ pub fn default_campaign_id(mode: Mode, now: jiff::Zoned, nonce: u16) -> String {
     )
 }
 
+/// Every suffix a name can be derived from a campaign id with, in
+/// stacking order — the single list the launch-time length budget
+/// reserves. `replay repro` derives `<id>-repro-<8 hex>` from a campaign
+/// id, and the repro campaign's own spec ConfigMap is `<derived>-spec`,
+/// so the worst-case derived name is `<id>` plus ALL of these. Tests pin
+/// each entry to the live derivation it stands for; adding a new derived
+/// name means adding it here, which shrinks the budget instead of
+/// silently minting unreproducible campaigns.
+pub(super) const DERIVED_SUFFIXES: [&str; 2] = ["-repro-00000000", "-spec"];
+
 /// Campaign ids become the Job name (which the Job controller also
 /// stamps onto the campaign pods as the `job-name` label, so it must fit
 /// the 63-char label-value limit), the spec-ConfigMap name
-/// (`<id>-spec`), and the S3 prefix segment — they must be lowercase
-/// RFC-1123 labels. The cap leaves room for the `-spec` suffix inside
-/// the same 63-char budget so every derived name stays label-safe.
-/// Shared with `replay repro`, whose derived ids face the same limits.
+/// (`<id>-spec`), the S3 prefix segment, AND the base of the derived
+/// `replay repro` id (`<id>-repro-<8 hex>`, which needs its own `-spec`
+/// ConfigMap) — they must be lowercase RFC-1123 labels. The cap reserves
+/// room for every suffix in [`DERIVED_SUFFIXES`] inside the same 63-char
+/// budget, so every campaign that can be launched can also be reproduced.
 pub(super) fn validate_campaign_id(id: &str) -> Result<()> {
+    let max = 63 - DERIVED_SUFFIXES.iter().map(|s| s.len()).sum::<usize>();
+    validate_label_with_budget(id, max, "campaign id").with_context(|| {
+        format!(
+            "a campaign id becomes the campaign Job name (and so its pods' 63-char-capped \
+             `job-name` label), the `{}` ConfigMap name, and the base of the derived \
+             `replay repro` id `<id>-repro-<8 hex>` (with its own -spec ConfigMap) — the cap \
+             reserves room for all of them",
+            jobs::spec_configmap_name("<id>")
+        )
+    })
+}
+
+/// Validate a derived `replay repro` campaign id. Same charset/shape
+/// rules as [`validate_campaign_id`], but the repro suffix has already
+/// been spent: only the `-spec` ConfigMap name is still derived from a
+/// repro id, so the budget reserves just that. (A repro of a repro
+/// re-enters through this gate and is refused once the stacked suffixes
+/// genuinely no longer fit the 63-char label budget.)
+pub(super) fn validate_repro_campaign_id(id: &str) -> Result<()> {
     let max = 63 - jobs::spec_configmap_name("").len();
+    validate_label_with_budget(id, max, "derived repro campaign id").with_context(|| {
+        format!(
+            "a repro campaign id becomes the repro Job name (63-char-capped `job-name` \
+             label) and the `{}` ConfigMap name",
+            jobs::spec_configmap_name("<id>")
+        )
+    })
+}
+
+/// Shared RFC-1123 label validation with a caller-supplied length budget
+/// (63 minus whatever derived suffixes the id must still accommodate).
+fn validate_label_with_budget(id: &str, max: usize, what: &str) -> Result<()> {
     let charset_ok = id
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
@@ -272,11 +314,8 @@ pub(super) fn validate_campaign_id(id: &str) -> Result<()> {
         && id.ends_with(|c: char| c.is_ascii_alphanumeric());
     ensure!(
         !id.is_empty() && charset_ok && ends_ok && id.len() <= max,
-        "campaign id {id:?} must be a lowercase RFC-1123 label (a-z, 0-9, '-', \
-         alphanumeric first/last character) of at most {max} characters — it becomes the \
-         campaign Job name (and so its pods' 63-char-capped `job-name` label) and the `{}` \
-         ConfigMap name",
-        jobs::spec_configmap_name("<id>")
+        "{what} {id:?} must be a lowercase RFC-1123 label (a-z, 0-9, '-', alphanumeric \
+         first/last character) of at most {max} characters"
     );
     Ok(())
 }
@@ -2034,10 +2073,12 @@ mod tests {
             "ends-with-dash-",
             "-starts-with-dash",
             "under_score",
-            // 59 chars: a valid label on its own, but the 63-char budget
-            // (Job name → `job-name` label value) leaves no room for the
-            // derived `-spec` suffix we keep label-safe as well.
-            &"a".repeat(59),
+            // 44 chars: a valid label on its own, but the 63-char budget
+            // (Job name → `job-name` label value) must leave room for ALL
+            // derived names — the repro id `<id>-repro-<8 hex>` plus its
+            // own `-spec` ConfigMap (20 chars total) — so every launchable
+            // campaign stays reproducible.
+            &"a".repeat(44),
         ] {
             assert!(
                 validate_campaign_id(bad).is_err(),
@@ -2045,7 +2086,30 @@ mod tests {
             );
         }
         validate_campaign_id("replay-leaf-20260601-ab12").unwrap();
-        validate_campaign_id(&"a".repeat(58)).unwrap();
+        validate_campaign_id(&"a".repeat(43)).unwrap();
+
+        // The reserved budget is exactly the derived-suffix list, and the
+        // `-spec` entry is pinned to the live ConfigMap derivation (the
+        // repro entry is pinned in repro.rs, next to the derivation).
+        let reserved: usize = DERIVED_SUFFIXES.iter().map(|s| s.len()).sum();
+        assert_eq!(reserved, 20);
+        assert_eq!(
+            jobs::spec_configmap_name("").len(),
+            DERIVED_SUFFIXES[1].len(),
+            "the -spec suffix entry must match the live ConfigMap name derivation"
+        );
+
+        // A max-length campaign id's worst-case derived name (repro id +
+        // its spec ConfigMap) exactly fits the 63-char label budget.
+        let max_id = "a".repeat(43);
+        let derived = format!("{max_id}-repro-0123abcd");
+        validate_repro_campaign_id(&derived).unwrap();
+        assert_eq!(jobs::spec_configmap_name(&derived).len(), 63);
+
+        // Derived repro ids spend the repro suffix, so they are validated
+        // against the larger budget — but a repro-of-a-repro of a
+        // max-length id no longer fits and is refused.
+        assert!(validate_repro_campaign_id(&format!("{derived}-repro-0123abcd")).is_err());
     }
 
     #[test]
