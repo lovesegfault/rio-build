@@ -488,6 +488,20 @@ pub enum ExpectedOutcome {
 }
 
 impl ExpectedOutcome {
+    /// Every expected outcome, in the format specification's table order.
+    /// The vocabulary as data: totality tests over outcome-keyed policy
+    /// (the wire-string pin, the reader's collapse rank table) iterate
+    /// this instead of hand-listing variants.
+    pub const ALL: [ExpectedOutcome; 7] = [
+        ExpectedOutcome::Built,
+        ExpectedOutcome::Failed,
+        ExpectedOutcome::ResourceExhausted,
+        ExpectedOutcome::Cancelled,
+        ExpectedOutcome::Disconnected,
+        ExpectedOutcome::Indeterminate,
+        ExpectedOutcome::Unknown,
+    ];
+
     /// The wire string of this outcome — the kebab-case form written to
     /// `outcomes.jsonl` — for callers that need it without a serde round
     /// trip (log fields, golden assertions, report buckets).

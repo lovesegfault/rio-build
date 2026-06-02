@@ -248,7 +248,19 @@ Record schema:
 
 Duplicate `(session, drv)` keys: last record wins, as in v0.
 
-The session-aware lookup above serves consumers acting for a specific recorded request (the timed scheduler). The timeless engine resolves truth per workload *unit* — it has no request identity to probe with — through one canonical collapse over sessions: the session-less record when one exists (it explicitly applies to any request of the unit), otherwise the record of the highest-numbered session (sessions are opaque grouping keys, but recorders allocate them in capture order, matching the last-record-wins rule above). Scoped records that disagree with the chosen outcome are logged, since the collapse is then losing information the timeless engine cannot represent.
+The session-aware lookup above serves consumers acting for a specific recorded request (the timed scheduler). The timeless engine resolves truth per workload *unit* — it has no request identity to probe with — through one canonical collapse over sessions: the session-less record when one exists (it explicitly applies to any request of the unit), otherwise the scoped record of the highest **informativeness rank**, with the highest-numbered session breaking ties only *within* a rank class. Session ids never decide between rank classes: they are opaque grouping keys whose allocation order carries no truth ordering (recorders may allocate them out of capture order, and for overlapping sessions even capture order says nothing — the earlier session's build can complete after the later session's disconnect), so a collapse keyed on them would let a concurrent disconnect discard a recorded build, with the choice flipping under session relabeling.
+
+The informativeness rank, highest kept (the rank order is itself collapse policy — dispute it here, not in the engine):
+
+| rank | records | rationale |
+|---|---|---|
+| 4 | `built` with recorded output hashes | a deterministic success claim that also drives NAR comparison |
+| 3 | `built` without hashes | a deterministic success claim |
+| 2 | `failed`, `resource-exhausted` | deterministic failure claims |
+| 1 | `cancelled`, `disconnected`, `indeterminate` | interruption/infrastructure: no claim about the build |
+| 0 | `unknown` | the recorder looked and could not decide |
+
+Scoped records that disagree with the chosen outcome are logged, and the per-archive count of conflict-resolved units is surfaced in the report's comparability block (`truthCollapseConflicts`): the collapse is losing information the timeless engine cannot represent, and a campaign whose truth was partly chosen by rank is comparably different from one whose truth was plainly recorded.
 
 The neutral expected-outcome vocabulary:
 

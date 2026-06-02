@@ -247,11 +247,14 @@ fn unknown_truth(unit: &ManifestEntry) -> UnitTruth {
 /// Truth is baked into the archive when it is recorded, so this performs
 /// no outbound queries. Each unit's record is resolved by derivation alone
 /// through the reader's canonical collapse over sessions — the session-less
-/// record when one exists, otherwise the highest-numbered session's record
-/// (see `ReplayArchive::expected_outcome_across_sessions`) — so truth a
-/// recorder scoped to specific sessions is never invisible here. The
-/// recorded outcome is carried through verbatim in the archive's neutral
-/// vocabulary; how each value compares is the classifier's business.
+/// record when one exists, otherwise the scoped record of the highest
+/// informativeness rank with sessions breaking ties only within a rank
+/// class (see `ReplayArchive::expected_outcome_across_sessions`) — so
+/// truth a recorder scoped to specific sessions is never invisible here,
+/// and a built record cannot lose to a concurrent session's disconnect.
+/// The recorded outcome is carried through verbatim in the archive's
+/// neutral vocabulary; how each value compares is the classifier's
+/// business.
 ///
 /// The mapped [`ExpectedSide`] carries, for every output the unit declares,
 /// the expected NAR identity from the record when one was recorded for

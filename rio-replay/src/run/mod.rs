@@ -1466,6 +1466,12 @@ pub async fn run_with_backends(
             // and are merged — never overwritten — by the report-time refresh.
             record.comparability.excluded = archive_input::exclusion_counts(&archive);
             record.comparability.exclusions_recorded = archive_input::exclusions_recorded(&archive);
+            // Units whose cross-session truth disagreement the reader's
+            // collapse resolves by informativeness rank: recorded next to
+            // the exclusion counts so collapse-shaped truth travels with
+            // every report, not only engine logs.
+            record.comparability.truth_collapse_conflicts =
+                Some(archive.truth_collapse_conflicts());
             // Archive provenance: when the archive was recorded and how old
             // it was when this campaign started, both part of what makes two
             // reports comparable.
@@ -3154,6 +3160,10 @@ mod tests {
             campaign.comparability.archive_age_days
         );
         assert_eq!(campaign.comparability.exclusions_recorded, Some(1));
+        // The truth-collapse conflict count is measured (Some) at bootstrap
+        // — zero here, because the mini archive's per-unit truth never
+        // disagrees across sessions.
+        assert_eq!(campaign.comparability.truth_collapse_conflicts, Some(0));
         assert_eq!(
             campaign.comparability.scheduling_mode.as_deref(),
             Some("timeless")

@@ -467,6 +467,16 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
     if let Some(count) = block.exclusions_recorded {
         let _ = writeln!(out, "| exclusions recorded | {count} |");
     }
+    // Conflict-resolved truth is comparability context like the exclusion
+    // counts: nonzero means some units' expected outcomes were chosen by
+    // the collapse rank, not plainly recorded. `Some(0)` renders nothing
+    // (no conflicts to disclose); `None` is a campaign from before the
+    // count existed.
+    if let Some(count) = block.truth_collapse_conflicts
+        && count > 0
+    {
+        let _ = writeln!(out, "| truth collapse conflicts | {count} |");
+    }
     if !block.low_confidence.is_empty() {
         let _ = writeln!(
             out,
@@ -1839,17 +1849,20 @@ mod tests {
         assert!(!out.contains("| prefetch shortfall |"), "{out}");
         assert!(!out.contains("| timing degraded |"), "{out}");
         assert!(!out.contains("| exclusions recorded |"), "{out}");
+        assert!(!out.contains("| truth collapse conflicts |"), "{out}");
         assert!(!out.contains("low confidence"), "{out}");
 
         // Populate the archive provenance and confidence context: every row
         // renders, and the block-recorded shortfall/degradation also flag
-        // the report low-confidence.
+        // the report low-confidence. (A measured-zero conflict count stays
+        // unrendered — there is nothing to disclose.)
         drop(input);
         campaign.comparability.record_archive_provenance(
             "2026-05-01T00:00:00Z".parse().unwrap(),
             "2026-06-01T00:00:00Z",
         );
         campaign.comparability.exclusions_recorded = Some(3);
+        campaign.comparability.truth_collapse_conflicts = Some(2);
         campaign.comparability.prefetch_shortfall_pct = Some(2.5);
         campaign.comparability.timing_degraded = true;
         let input = ReportInput {
@@ -1876,10 +1889,30 @@ mod tests {
         assert!(out.contains("| prefetch shortfall | 2.50% |"), "{out}");
         assert!(out.contains("| timing degraded | true |"), "{out}");
         assert!(out.contains("| exclusions recorded | 3 |"), "{out}");
+        assert!(out.contains("| truth collapse conflicts | 2 |"), "{out}");
         assert!(
             out.contains("| **low confidence** | prefetch-shortfall, timing-degraded |"),
             "{out}"
         );
+
+        // Some(0) means measured-and-clean: no row to disclose.
+        drop(input);
+        campaign.comparability.truth_collapse_conflicts = Some(0);
+        let input = ReportInput {
+            campaign: &campaign,
+            records: &records,
+            suspension: &suspension,
+            generated_at: "2026-06-01T12:00:00Z".into(),
+            partial: false,
+            top_n: 5,
+            supply: None,
+            timed: None,
+            abort_recommended: false,
+            plan_rss_mib: None,
+            plan_rss_peak_mib: None,
+        };
+        let out = render_summary(&input);
+        assert!(!out.contains("| truth collapse conflicts |"), "{out}");
     }
 
     #[test]

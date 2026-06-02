@@ -833,6 +833,15 @@ pub struct ComparabilityBlock {
     /// completeness penalty applies; `Some(0)` means the recorder declared
     /// an empty exclusion set.
     pub exclusions_recorded: Option<usize>,
+    /// Workload units whose session-scoped truth records disagree on the
+    /// outcome with no session-less record to supersede them — the units
+    /// whose one truth slot the reader's cross-session collapse resolved
+    /// by informativeness rank, discarding recorded information (see
+    /// `ReplayArchive::truth_collapse_conflicts`). Part of comparability
+    /// because the headline's truth for these units is a policy choice,
+    /// not a plain recording. `None` for campaign records written before
+    /// the field existed.
+    pub truth_collapse_conflicts: Option<usize>,
     /// The supply stage's planned-but-missing prefetch percentage, recorded
     /// even when it stayed below the pause threshold (any nonzero shortfall
     /// changes what the headline measured).
@@ -1600,6 +1609,7 @@ mod tests {
         assert_eq!(block.archive_created_at, None);
         assert_eq!(block.archive_age_days, None);
         assert_eq!(block.exclusions_recorded, None);
+        assert_eq!(block.truth_collapse_conflicts, None);
         assert_eq!(block.prefetch_shortfall_pct, None);
         assert!(!block.timing_degraded);
         assert_eq!(block.scheduling_mode, None);
@@ -1609,6 +1619,7 @@ mod tests {
         block.archive_created_at = Some("2026-05-01T00:00:00Z".into());
         block.archive_age_days = Some(25.0);
         block.exclusions_recorded = Some(2);
+        block.truth_collapse_conflicts = Some(1);
         block.prefetch_shortfall_pct = Some(1.5);
         block.timing_degraded = true;
         block.scheduling_mode = Some("timed".into());
@@ -1618,6 +1629,7 @@ mod tests {
             "archiveCreatedAt",
             "archiveAgeDays",
             "exclusionsRecorded",
+            "truthCollapseConflicts",
             "prefetchShortfallPct",
             "timingDegraded",
             "schedulingMode",
