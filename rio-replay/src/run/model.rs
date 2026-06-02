@@ -710,6 +710,17 @@ pub fn supply_outcome_is_settlement(outcome: &str) -> bool {
             | SUPPLY_OUTCOME_FAILED
     )
 }
+/// [`SupplyEntry::detail`] value the supply stage writes (with outcome
+/// [`SUPPLY_OUTCOME_UNAVAILABLE`]) for each planned upload it deliberately
+/// defers to the per-submission inline top-up instead of delivering
+/// before execution. The inline-resume gate reads this back: a path whose
+/// LATEST journal row still carries the deferral was promised to a top-up
+/// that no longer exists once the stage's process is gone, so resuming
+/// past the completed stage with such paths outstanding (and jobs not yet
+/// covered by a delivered top-up) must refuse — the journal, not the
+/// current spec's wiring, is what survives a spec switch between
+/// processes.
+pub const SUPPLY_DETAIL_DEFERRED_INLINE: &str = "deferred to inline top-up";
 
 /// One line of supply.jsonl — per-path supply outcome from the supply stage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -931,6 +942,18 @@ pub struct BatchRecord {
     /// defect this field exists to fix), and they are not re-classified.
     #[serde(default)]
     pub confirmation_attempt: u32,
+    /// True when this batch's pre-submission supply top-up ran and
+    /// returned success before the submission (the inline-delivery
+    /// mechanism, or the prewarm-miss fallback). The inline-resume gate
+    /// reads this as the delivery proof for the batch's jobs: membership
+    /// in a batch submitted WITHOUT a successful top-up — no hook wired in
+    /// that process, or the top-up failed and the batch was submitted
+    /// anyway — proves nothing about the jobs' deferred uploads. Defaults
+    /// to false on records written before the field existed: those
+    /// campaigns re-prove delivery by re-running the supply stage on their
+    /// next inline resume instead of trusting bare batch membership.
+    #[serde(default)]
+    pub topup_delivered: bool,
 }
 
 /// Writer intent for one submission, recorded verbatim onto the
@@ -949,6 +972,10 @@ pub struct BatchIntent {
     /// re-confirmation submissions; 0 for every other writer (see
     /// [`BatchRecord::confirmation_attempt`]).
     pub confirmation_attempt: u32,
+    /// The batch's pre-submission supply top-up succeeded (see
+    /// [`BatchRecord::topup_delivered`]). Set by the submit loops from
+    /// the actual top-up outcome immediately before the submission.
+    pub topup_delivered: bool,
 }
 
 impl BatchIntent {
@@ -1349,6 +1376,10 @@ mod tests {
         assert_eq!(SUPPLY_OUTCOME_UNAVAILABLE, "unavailable");
         assert_eq!(SUPPLY_OUTCOME_FAILED, "failed");
         assert_eq!(SUPPLY_OUTCOME_SKIPPED, "skipped");
+        // The deferral detail is read back by the inline-resume gate from
+        // journals written by EARLIER engine versions, so it is frozen the
+        // same way the outcome vocabulary is.
+        assert_eq!(SUPPLY_DETAIL_DEFERRED_INLINE, "deferred to inline top-up");
 
         let entry = SupplyEntry {
             path: "/nix/store/x".into(),
@@ -1553,9 +1584,11 @@ mod tests {
             import_skipped_drvs: Vec::new(),
             probe: false,
             confirmation_attempt: 0,
+            topup_delivered: true,
         };
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains(r#""results":[{"drvPath":"#), "{json}");
+        assert!(json.contains(r#""topupDelivered":true"#), "{json}");
         assert!(json.contains(r#""status":"Built""#), "{json}");
         assert!(json.contains(r#""errorMsg":"""#), "{json}");
         assert!(json.contains(r#""startTime":1"#), "{json}");
@@ -1573,6 +1606,11 @@ mod tests {
         // full-wave submissions), and lines written before confirmation
         // intent existed lack `confirmationAttempt` (defaults to 0 —
         // their retry successes were belt-dropped and stay that way).
+        // Lines written before the delivery-proof bit existed lack
+        // `topupDelivered` the same way (defaults to false: bare batch
+        // membership stops counting as inline-delivery proof, so those
+        // campaigns re-run the supply stage on their next inline resume
+        // instead of submitting undelivered work).
         let old = r#"{"batchId":3,"kind":"submit","jobs":["x.x86_64-linux"],"rootDrvs":["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv"],"estNodes":1,"buildId":null,"startedAt":"2026-05-26T00:00:00Z","finishedAt":null,"exitCode":1,"reasons":{},"stderrTail":"tail","engineCancelled":false}"#;
         let parsed: BatchRecord = serde_json::from_str(old).unwrap();
         assert!(parsed.results.is_empty());
@@ -1583,6 +1621,7 @@ mod tests {
         assert!(parsed.import_skipped_drvs.is_empty());
         assert!(!parsed.probe);
         assert_eq!(parsed.confirmation_attempt, 0);
+        assert!(!parsed.topup_delivered);
         assert_eq!(parsed.batch_id, 3);
         assert_eq!(parsed.stderr_tail.as_deref(), Some("tail"));
     }

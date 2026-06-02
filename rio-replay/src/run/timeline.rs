@@ -968,15 +968,20 @@ async fn dispatch_one_request(
         .collect();
 
     // Inline top-up fallback (prewarm-miss / inline delivery): a failure
-    // degrades to a log line, never aborts the request.
-    if let Some(topup) = &shared.topup
-        && let Err(e) = topup.topup(&drvs).await
-    {
-        tracing::warn!(
-            request = scheduled.index,
-            error = %format!("{e:#}"),
-            "pre-submission supply top-up failed; dispatching the request anyway"
-        );
+    // degrades to a log line, never aborts the request. Whether it
+    // succeeded is recorded on the request's batch records (the
+    // inline-resume gate's delivery proof): a failed or absent top-up
+    // dispatches anyway but proves nothing.
+    let mut topup_delivered = false;
+    if let Some(topup) = &shared.topup {
+        match topup.topup(&drvs).await {
+            Ok(()) => topup_delivered = true,
+            Err(e) => tracing::warn!(
+                request = scheduled.index,
+                error = %format!("{e:#}"),
+                "pre-submission supply top-up failed; dispatching the request anyway"
+            ),
+        }
     }
 
     // Both candidate deadlines are anchored at the admission instant and
@@ -1049,7 +1054,10 @@ async fn dispatch_one_request(
         deadline,
         shared.cooldown,
         interruption_drvs.clone(),
-        BatchIntent::default(),
+        BatchIntent {
+            topup_delivered,
+            ..BatchIntent::default()
+        },
     )
     .await?;
     let mut batch_ids = vec![batch_id];
@@ -1144,8 +1152,14 @@ async fn dispatch_one_request(
                 // Writer intent travels on the batch record: collect's
                 // already-terminal belt admits this batch's successes as
                 // sanctioned superseding confirmation writes (attempt N
-                // of the confirm budget; total attempts = N + 1).
-                BatchIntent::confirmation(attempts),
+                // of the confirm budget; total attempts = N + 1). The
+                // retry resubmits a subset of the same roots inside the
+                // same dispatch: the initial top-up (or its failure) is
+                // this batch's delivery evidence too.
+                BatchIntent {
+                    topup_delivered,
+                    ..BatchIntent::confirmation(attempts)
+                },
             )
             .await?;
             attempts += 1;

@@ -66,7 +66,7 @@ use self::collect::{BatchView, JobContext, process_settled_batch};
 use self::grpc::{AdminApi, ClusterApi, GrpcAdminApi, GrpcStoreApi, StoreApi};
 use self::model::{
     BATCH_KIND_SUBMIT, BATCH_KIND_TIMED, Disposition, FailureKind, JobRecord, PauseState,
-    RioOutcome, SupplyEntry, Verdict, now_rfc3339, rfc3339_to_unix,
+    RioOutcome, SUPPLY_DETAIL_DEFERRED_INLINE, SupplyEntry, Verdict, now_rfc3339, rfc3339_to_unix,
 };
 use self::spec::{
     CampaignRecord, CampaignSpec, Knobs, Mode, PLAN_COUNT_RSS_BEFORE, PLAN_COUNT_RSS_PEAK,
@@ -425,26 +425,32 @@ fn require_mode_wiring(spec: &CampaignSpec) -> Result<ModeWiring> {
     })
 }
 
-/// In-scope attemptable jobs still awaiting their FIRST submission: no
-/// terminal record and never part of any recorded batch. On an
-/// inline-delivery resume these are exactly the jobs whose deferred supply
-/// cannot have been delivered — the per-batch top-up runs before every
-/// submission attempt, so a job in any recorded batch (even one whose
-/// submission failed or was later requeued) already had its gap delivery,
-/// while a job with a terminal record is never submitted again. Sorted for
+/// In-scope attemptable jobs still awaiting their first DELIVERED
+/// submission: no terminal record and never part of a recorded batch
+/// whose pre-submission top-up succeeded (`topup_delivered`). On an
+/// inline-delivery resume these are exactly the jobs whose deferred
+/// supply cannot be proven delivered — the per-batch top-up runs before
+/// every submission attempt, so a job in a `topup_delivered` batch (even
+/// one whose submission failed or was later requeued) already had its
+/// gap delivery, while a job with a terminal record is never submitted
+/// again. Bare batch membership is NOT delivery proof: batches recorded
+/// by a process running without the hook (a guard-bypassed resume), with
+/// a failed top-up, or by an engine version before the bit existed
+/// (serde-defaulted false) delivered nothing for the job. Sorted for
 /// stable error messages.
-fn jobs_awaiting_first_submission<'a>(
+fn jobs_awaiting_first_delivered_submission<'a>(
     candidates: impl IntoIterator<Item = &'a str>,
     records: &BTreeMap<String, JobRecord>,
     batches: &[model::BatchRecord],
 ) -> Vec<String> {
-    let submitted: HashSet<&str> = batches
+    let delivered: HashSet<&str> = batches
         .iter()
+        .filter(|batch| batch.topup_delivered)
         .flat_map(|batch| batch.jobs.iter().map(String::as_str))
         .collect();
     let mut jobs: Vec<String> = candidates
         .into_iter()
-        .filter(|job| !submitted.contains(job))
+        .filter(|job| !delivered.contains(job))
         .filter(|job| {
             !records.get(*job).is_some_and(|record| {
                 model::is_terminal_class(&record.verdict, &record.disposition)
@@ -454,6 +460,36 @@ fn jobs_awaiting_first_submission<'a>(
         .collect();
     jobs.sort_unstable();
     jobs
+}
+
+/// Store paths whose LATEST supply-journal row is the inline-delivery
+/// deferral ([`SUPPLY_DETAIL_DEFERRED_INLINE`]): planned uploads a
+/// completed supply stage handed to the per-submission top-up that no
+/// later arm has superseded. The journal is read latest-row-per-path
+/// (the same fold `refresh_outcome_counts` uses): a top-up that later
+/// delivered, refused, or failed the path — or a re-run stage that found
+/// it already present — overwrites the deferral, so the count converges
+/// to what is genuinely still owed. The residual conservatism is a path
+/// that became valid on the target through some other channel after the
+/// stage planned it (the live top-up skips valid paths without
+/// journaling); a resume then refuses until a supply re-run records it
+/// `already-present` — fail-closed, never fail-open.
+///
+/// This is the inline-resume gate's trigger evidence precisely because it
+/// is durable and substrate-independent: the current spec's wiring says
+/// what THIS process would do, while the journal says what the completed
+/// stage actually left undelivered — a spec switched from inline to
+/// prewarm between processes changes the former but not the latter.
+fn undelivered_inline_deferrals(entries: &[SupplyEntry]) -> Vec<&str> {
+    let mut latest: BTreeMap<&str, &SupplyEntry> = BTreeMap::new();
+    for entry in entries {
+        latest.insert(entry.path.as_str(), entry);
+    }
+    latest
+        .into_values()
+        .filter(|entry| entry.detail.as_deref() == Some(SUPPLY_DETAIL_DEFERRED_INLINE))
+        .map(|entry| entry.path.as_str())
+        .collect()
 }
 
 /// Resolve the SSH host-key policy every gateway pool the engine dials uses:
@@ -2180,11 +2216,12 @@ pub async fn run_with_backends(
         // there and the execute stage runs without the hook: under prewarm
         // that only loses the miss-fallback, while under inline the hook IS
         // the delivery mechanism, so the resume path (the else branch
-        // below) refuses to start while any in-scope job still awaits its
-        // first submission rather than fail those jobs on missing inputs.
-        // Re-running the stage's planning and probing on resume (resume
-        // costs re-probing, never correctness) would lift the refusal and
-        // restore the miss-fallback.
+        // below) refuses to start while the supply journal still owes
+        // inline-deferred uploads and any in-scope job awaits its first
+        // delivered submission, rather than fail those jobs on missing
+        // inputs. Re-running the stage's planning and probing on resume
+        // (resume costs re-probing, never correctness) would lift the
+        // refusal and restore the miss-fallback.
         let wire_topup = match wiring.topup {
             TopupRole::Primary => true,
             TopupRole::MissFallback => effective_dependencies != SupplyDependencies::None,
@@ -2199,45 +2236,99 @@ pub async fn run_with_backends(
             ));
             supply_topup = Some(topup);
         }
-    } else if wiring.topup == TopupRole::Primary {
-        // Resumed past a completed supply stage under inline delivery: the
-        // stage ran in an earlier process and took the ladder context the
-        // pre-submission top-up needs with it (see the TODO above). Jobs
-        // that process already submitted had their deferred uploads
-        // delivered by its top-up before submission, and jobs with terminal
-        // records are never submitted again, so a report-only resume
-        // proceeds. Any job still awaiting its first submission, however,
-        // would execute without its deferred supply and fail on missing
-        // inputs — false regressions in the parity report — so the resume
-        // refuses loudly before the execute stage instead.
-        let batches = state.load_jsonl::<model::BatchRecord>(StateFile::Batches)?;
-        let undelivered = jobs_awaiting_first_submission(
-            manifest
-                .iter()
-                .map(|m| m.job.as_str())
-                .filter(|job| in_scope.contains(job) && !plan_dispositions.contains_key(*job)),
-            &existing_records,
-            &batches,
-        );
-        if !undelivered.is_empty() {
-            let sample = undelivered
-                .iter()
-                .take(3)
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "campaign {campaign_id}: cannot resume with supply.delivery \"inline\": the \
-                 supply stage completed in an earlier process and the inline delivery context \
-                 (the supply ladder the pre-submission top-up replays) cannot be rebuilt on \
-                 resume yet, so the {count} in-scope job(s) not yet submitted (e.g. {sample}) \
-                 would run without their deferred uploads and fail on missing inputs; delete \
-                 {marker} to re-run the supply stage on the next start (resume costs \
-                 re-probing, never correctness), either keeping inline delivery or switching \
-                 the spec to supply.delivery \"prewarm\" to deliver supply before execution",
-                count = undelivered.len(),
-                marker = state.path("markers/supply.done").display(),
+    } else {
+        // Resumed past a completed supply stage: the stage ran in an
+        // earlier process and took the ladder context the pre-submission
+        // top-up needs with it (see the TODO above). Whether that is safe
+        // depends on what the COMPLETED stage did, not on what the current
+        // spec's wiring would do — so this gate reads the durable supply
+        // journal instead of `wiring.topup`. A prewarm stage delivered its
+        // planned supply before setting the marker (resuming only loses
+        // the miss-fallback); an inline stage only PROMISED delivery, and
+        // the unredeemed promise is exactly the journal's outstanding
+        // deferral rows. A spec switched from inline to prewarm between
+        // processes changes the wiring, but never what the completed stage
+        // left undelivered.
+        let supply_journal: Vec<SupplyEntry> = state.load_jsonl(StateFile::Supply)?;
+        let deferred = undelivered_inline_deferrals(&supply_journal);
+        if !deferred.is_empty() {
+            // Jobs already covered by an earlier process are safe: a job in
+            // a batch whose pre-submission top-up succeeded had its gap
+            // delivery, and jobs with terminal records are never submitted
+            // again — a report-only resume proceeds. Any job still awaiting
+            // its first delivered submission would execute without its
+            // deferred supply and fail on missing inputs — false
+            // regressions in the parity report — so the resume refuses
+            // loudly before the execute stage instead.
+            let batches = state.load_jsonl::<model::BatchRecord>(StateFile::Batches)?;
+            let undelivered = jobs_awaiting_first_delivered_submission(
+                manifest
+                    .iter()
+                    .map(|m| m.job.as_str())
+                    .filter(|job| in_scope.contains(job) && !plan_dispositions.contains_key(*job)),
+                &existing_records,
+                &batches,
             );
+            if !undelivered.is_empty() {
+                let sample = undelivered
+                    .iter()
+                    .take(3)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // The remediation must name the copy of the marker that
+                // actually controls the next start. With an artifact store
+                // wired, that is the DURABLE copy: the production Job runs
+                // each attempt on a fresh pod volume and
+                // download_state_if_missing re-materializes every synced
+                // file — this marker included — before this check, so the
+                // pod-local path both dies with the pod and is resurrected
+                // on the next one; deleting it can never lift the refusal.
+                //
+                // TODO: invalidate the durable marker here instead of
+                // bailing, so the next start re-runs the supply stage
+                // automatically (safe by the resume contract: re-probing,
+                // never correctness; s3:DeleteObject on the replay prefix
+                // is already provisioned in infra/eks/replay.tf). Deferred
+                // until the substrate-crossing resume e2e
+                // (`inline_resume_across_pod_reschedule_refuses_with_durable_remedy`)
+                // has soaked the manual remediation: an auto-delete on a
+                // spurious refusal would re-run supply fleet-wide with no
+                // operator in the loop, so the refusal predicate earns the
+                // self-modifying step only after the manual path has been
+                // exercised in anger.
+                let local_marker = state.path("markers/supply.done").display().to_string();
+                let marker_remedy = if backends.artifacts.is_some() {
+                    let durable = match &spec.s3.bucket {
+                        Some(bucket) => {
+                            format!("s3://{bucket}/{artifact_prefix}/markers/supply.done")
+                        }
+                        None => {
+                            format!("{artifact_prefix}/markers/supply.done in the artifact store")
+                        }
+                    };
+                    format!(
+                        "delete the durable supply marker {durable} (each replacement pod \
+                         restores it from the artifact store before this check, so deleting \
+                         only the pod-local {local_marker} cannot lift the refusal)"
+                    )
+                } else {
+                    format!("delete {local_marker}")
+                };
+                bail!(
+                    "campaign {campaign_id}: cannot resume past the completed supply stage: it \
+                     deferred {deferred} planned upload(s) to the per-submission top-up \
+                     (supply.delivery \"inline\") and that delivery context cannot be rebuilt \
+                     on resume yet, so the {count} in-scope job(s) not yet submitted with a \
+                     delivered top-up (e.g. {sample}) would run without their deferred uploads \
+                     and fail on missing inputs; {marker_remedy} to re-run the supply stage on \
+                     the next start (resume costs re-probing, never correctness), either \
+                     keeping inline delivery or switching the spec to supply.delivery \
+                     \"prewarm\" to deliver supply before execution",
+                    deferred = deferred.len(),
+                    count = undelivered.len(),
+                );
+            }
         }
     }
     // Supply summary for progress.json while the campaign executes (the
@@ -3725,29 +3816,22 @@ mod tests {
         );
     }
 
-    /// The inline-resume guard's job filter: only jobs with neither a
-    /// terminal record nor a recorded batch membership count as awaiting
-    /// their first submission — terminal jobs are never submitted again,
-    /// and a job in any recorded batch already had its pre-submission
-    /// top-up. A non-terminal record (a deadline backfill's not-attempted)
-    /// does not count as submitted, and the result is sorted.
+    /// The inline-resume guard's job filter, both directions: jobs in a
+    /// batch whose pre-submission top-up succeeded — and jobs with
+    /// terminal records — are admitted (terminal jobs are never submitted
+    /// again; a `topup_delivered` batch had its gap delivery before
+    /// submission), while a job whose only batch ran WITHOUT a successful
+    /// top-up still counts as awaiting delivery: bare membership is not
+    /// delivery proof, which is also how records written before the bit
+    /// existed (serde-defaulted false) re-enter the refusal. A
+    /// non-terminal record (a deadline backfill's not-attempted) does not
+    /// count either, and the result is sorted.
     #[test]
-    fn jobs_awaiting_first_submission_excludes_terminal_and_batched() {
-        let mut backfilled = terminal_record("backfilled.x86_64-linux");
-        backfilled.verdict = None;
-        backfilled.disposition = Some(Disposition::NotAttempted.as_str().into());
-        let records: BTreeMap<String, JobRecord> = [
-            (
-                "done.x86_64-linux".to_string(),
-                terminal_record("done.x86_64-linux"),
-            ),
-            ("backfilled.x86_64-linux".to_string(), backfilled),
-        ]
-        .into();
-        let batches = vec![model::BatchRecord {
-            batch_id: 1,
+    fn jobs_awaiting_first_delivered_submission_requires_topup_proof() {
+        let batch = |id: u64, job: &str, topup_delivered: bool| model::BatchRecord {
+            batch_id: id,
             kind: BATCH_KIND_SUBMIT.to_string(),
-            jobs: vec!["sent.x86_64-linux".to_string()],
+            jobs: vec![job.to_string()],
             root_drvs: vec![format!("/nix/store/{}-sent.drv", "a".repeat(32))],
             est_nodes: 1,
             build_id: None,
@@ -3762,10 +3846,33 @@ mod tests {
             import_skipped_drvs: Vec::new(),
             probe: false,
             confirmation_attempt: 0,
-        }];
-        let got = jobs_awaiting_first_submission(
+            topup_delivered,
+        };
+        let mut backfilled = terminal_record("backfilled.x86_64-linux");
+        backfilled.verdict = None;
+        backfilled.disposition = Some(Disposition::NotAttempted.as_str().into());
+        let records: BTreeMap<String, JobRecord> = [
+            (
+                "done.x86_64-linux".to_string(),
+                terminal_record("done.x86_64-linux"),
+            ),
+            ("backfilled.x86_64-linux".to_string(), backfilled),
+        ]
+        .into();
+        let batches = vec![
+            batch(1, "sent.x86_64-linux", true),
+            // Submitted by a process with no hook (or a failed top-up):
+            // membership without delivery proof.
+            batch(2, "undelivered.x86_64-linux", false),
+            // A later delivered batch supersedes an earlier unproven one.
+            batch(3, "retried.x86_64-linux", false),
+            batch(4, "retried.x86_64-linux", true),
+        ];
+        let got = jobs_awaiting_first_delivered_submission(
             [
                 "sent.x86_64-linux",
+                "undelivered.x86_64-linux",
+                "retried.x86_64-linux",
                 "fresh.x86_64-linux",
                 "done.x86_64-linux",
                 "backfilled.x86_64-linux",
@@ -3773,7 +3880,64 @@ mod tests {
             &records,
             &batches,
         );
-        assert_eq!(got, vec!["backfilled.x86_64-linux", "fresh.x86_64-linux"]);
+        assert_eq!(
+            got,
+            vec![
+                "backfilled.x86_64-linux",
+                "fresh.x86_64-linux",
+                "undelivered.x86_64-linux",
+            ]
+        );
+    }
+
+    /// The inline-resume gate's trigger evidence: a path's LATEST supply
+    /// journal row decides — a deferral row alone is owed, a deferral
+    /// superseded by a later top-up delivery (or a re-run stage's
+    /// already-present) is settled, and rows that never were deferrals
+    /// (prewarm deliveries, genuine unavailability) never trigger. The
+    /// detail string is the producer's own constant
+    /// ([`SUPPLY_DETAIL_DEFERRED_INLINE`]), not a re-typed literal.
+    #[test]
+    fn undelivered_inline_deferrals_reads_latest_row_per_path() {
+        let entry = |path: &str, outcome: &str, detail: Option<&str>| SupplyEntry {
+            path: path.to_string(),
+            source: "embedded".into(),
+            mechanism: "none".into(),
+            outcome: outcome.to_string(),
+            detail: detail.map(str::to_string),
+            batch_id: None,
+            bytes: None,
+            observed_at: now_rfc3339(),
+        };
+        let entries = vec![
+            // Deferred and never redeemed: owed.
+            entry(
+                "/nix/store/owed",
+                SUPPLY_OUTCOME_UNAVAILABLE,
+                Some(SUPPLY_DETAIL_DEFERRED_INLINE),
+            ),
+            // Deferred, then delivered by a per-batch top-up: settled.
+            entry(
+                "/nix/store/redeemed",
+                SUPPLY_OUTCOME_UNAVAILABLE,
+                Some(SUPPLY_DETAIL_DEFERRED_INLINE),
+            ),
+            entry("/nix/store/redeemed", SUPPLY_OUTCOME_DELIVERED, None),
+            // Prewarm delivery and genuine unavailability: never deferrals.
+            entry("/nix/store/prewarmed", SUPPLY_OUTCOME_DELIVERED, None),
+            entry(
+                "/nix/store/missing",
+                SUPPLY_OUTCOME_UNAVAILABLE,
+                Some(
+                    "no target substituter, archive member, or relay substituter can provide this path",
+                ),
+            ),
+        ];
+        assert_eq!(
+            undelivered_inline_deferrals(&entries),
+            vec!["/nix/store/owed"]
+        );
+        assert!(undelivered_inline_deferrals(&[]).is_empty());
     }
 
     #[test]
@@ -4184,13 +4348,21 @@ mod tests {
         outcomes.insert(app_b_drv.to_string(), outcome);
     }
 
-    /// Inline-delivery resume guard: once the supply stage has completed in
-    /// an earlier process, the inline delivery context (the ladder the
+    /// Inline-delivery resume guard on the LOCAL-VOLUME substrate (no
+    /// artifact store — the `--no-s3` flow, where the state dir survives
+    /// process restarts): once the supply stage has completed in an
+    /// earlier process, the inline delivery context (the ladder the
     /// pre-submission top-up replays) cannot be rebuilt, so resuming while
-    /// in-scope jobs still await their first submission refuses with the
-    /// campaign id and both remedies — and the error's own advice (delete
-    /// the supply marker to re-run the stage) genuinely lifts the refusal
-    /// and lets the campaign run to completion.
+    /// in-scope jobs still await their first delivered submission refuses
+    /// with the campaign id and both remedies — and the error's own advice
+    /// (here the pod-local marker delete: with no artifact store, the
+    /// local copy IS the copy that controls the next start) genuinely
+    /// lifts the refusal and lets the campaign run to completion. The
+    /// production substrate — fresh pod volume, marker re-materialized
+    /// from the artifact store before the check — is covered by
+    /// `inline_resume_across_pod_reschedule_refuses_with_durable_remedy`,
+    /// which performs the durable-key remediation the message prints
+    /// there.
     #[tokio::test(flavor = "multi_thread")]
     async fn inline_resume_refuses_while_unsubmitted_work_remains() {
         let (_archive_dir, archive, archive_id) = open_mini_archive();
@@ -4238,12 +4410,11 @@ mod tests {
         );
         let state = StateDir::new(state_dir.path()).unwrap();
         assert!(state.marker_done("supply"), "the supply stage completed");
-        let deferred = state
-            .load_jsonl::<SupplyEntry>(StateFile::Supply)
-            .unwrap()
-            .into_iter()
-            .any(|entry| entry.detail.as_deref() == Some("deferred to inline top-up"));
-        assert!(deferred, "inline delivery deferred the planned uploads");
+        let journal = state.load_jsonl::<SupplyEntry>(StateFile::Supply).unwrap();
+        assert!(
+            !undelivered_inline_deferrals(&journal).is_empty(),
+            "inline delivery deferred the planned uploads"
+        );
 
         // Process 2: the resume refuses loudly — both attemptable jobs were
         // never submitted, so their deferred uploads can no longer be
@@ -4262,7 +4433,21 @@ mod tests {
         assert!(msg.contains("supply.delivery \"inline\""), "{msg}");
         assert!(msg.contains("2 in-scope job(s) not yet submitted"), "{msg}");
         assert!(msg.contains("appA.x86_64-linux"), "{msg}");
-        assert!(msg.contains("markers/supply.done"), "{msg}");
+        // The remediation contract: the message names the marker copy that
+        // controls the next start. With no artifact store wired that is
+        // the pod-local path — and ONLY it: durable-key phrasing here
+        // would direct the operator at a store that does not exist.
+        assert!(
+            msg.contains(
+                state
+                    .path("markers/supply.done")
+                    .display()
+                    .to_string()
+                    .as_str()
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("artifact store"), "{msg}");
         assert!(msg.contains("\"prewarm\""), "{msg}");
         assert!(
             submitter.submitted.lock().unwrap().is_empty(),
@@ -4297,6 +4482,63 @@ mod tests {
         assert_eq!(
             records["appB.x86_64-linux"].verdict.as_deref(),
             Some("match-built")
+        );
+    }
+
+    /// The guard is keyed on the durable journal, not the current spec's
+    /// wiring: relaunching the SAME campaign with the spec switched to
+    /// supply.delivery "prewarm" (the relaunch guard's documented escape
+    /// hatch) must still refuse while the inline stage's deferred uploads
+    /// remain unredeemed — the switch changes the topup role to
+    /// miss-fallback, but the completed stage still delivered nothing, so
+    /// proceeding would submit every job without its supply and mint false
+    /// regressions. The remedy is the same marker delete (the re-run stage
+    /// then delivers under whichever delivery mode the spec now names).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prewarm_switched_resume_still_refuses_undelivered_inline_supply() {
+        let (_archive_dir, archive, archive_id) = open_mini_archive();
+        let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let mut narinfos = HashMap::new();
+        narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
+        let submitter = Arc::new(KeyedSubmitter::default());
+        let supply_transport = Arc::new(FakeSupplyTransport::default());
+        let state_dir = tempfile::tempdir().unwrap();
+
+        // Process 1: inline delivery, deadline already past — the supply
+        // stage completes by deferring every planned upload, nothing is
+        // submitted.
+        let mut args = run_args(state_dir.path());
+        args.deadline = Some("2000-01-01T00:00:00Z".into());
+        let mut inline_spec = leaf_spec(&archive_id);
+        inline_spec.supply.delivery = SupplyDelivery::Inline;
+        run_with_backends(
+            args,
+            inline_spec,
+            StateDir::new(state_dir.path()).unwrap(),
+            archive.clone(),
+            resume_backends(&submitter, &supply_transport, &narinfos),
+        )
+        .await
+        .unwrap();
+
+        // Process 2: the operator switched the spec to prewarm. The wiring
+        // is now miss-fallback, but the journal still owes the deferrals —
+        // the resume must refuse, not run the workload undelivered.
+        let err = run_with_backends(
+            run_args(state_dir.path()),
+            leaf_spec(&archive_id),
+            StateDir::new(state_dir.path()).unwrap(),
+            archive.clone(),
+            resume_backends(&submitter, &supply_transport, &narinfos),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("supply.delivery \"inline\""), "{msg}");
+        assert!(msg.contains("markers/supply.done"), "{msg}");
+        assert!(
+            submitter.submitted.lock().unwrap().is_empty(),
+            "a prewarm-switched resume must not submit undelivered work"
         );
     }
 
@@ -4478,6 +4720,7 @@ mod tests {
                     import_skipped_drvs: Vec::new(),
                     probe: false,
                     confirmation_attempt: 0,
+                    topup_delivered: false,
                 },
             )
             .unwrap();
@@ -4585,6 +4828,7 @@ mod tests {
                     import_skipped_drvs: Vec::new(),
                     probe: false,
                     confirmation_attempt: 0,
+                    topup_delivered: false,
                 },
             )
             .unwrap();
@@ -4697,6 +4941,7 @@ mod tests {
                     import_skipped_drvs: Vec::new(),
                     probe: false,
                     confirmation_attempt: 0,
+                    topup_delivered: false,
                 },
             )
             .unwrap();
@@ -4839,6 +5084,7 @@ mod tests {
                     import_skipped_drvs: Vec::new(),
                     probe: false,
                     confirmation_attempt: 0,
+                    topup_delivered: false,
                 },
             )
             .unwrap();
@@ -7119,6 +7365,7 @@ mod tests {
             import_skipped_drvs: Vec::new(),
             probe: false,
             confirmation_attempt: 0,
+            topup_delivered: false,
         };
         let backends = CollectBackends {
             admin: Arc::new(NoLogsAdmin),

@@ -59,12 +59,13 @@ use tokio::sync::RwLock;
 
 use crate::archive::reader::ReplayArchive;
 use crate::run::model::{
-    PathOutcome, SUPPLY_MECHANISM_DELEGATE, SUPPLY_MECHANISM_NONE, SUPPLY_MECHANISM_UPLOAD_BATCH,
-    SUPPLY_MECHANISM_UPLOAD_STREAM, SUPPLY_OUTCOME_ALREADY_PRESENT, SUPPLY_OUTCOME_DELEGATED,
-    SUPPLY_OUTCOME_DELIVERED, SUPPLY_OUTCOME_FAILED, SUPPLY_OUTCOME_REFUSED,
-    SUPPLY_OUTCOME_SKIPPED, SUPPLY_OUTCOME_UNAVAILABLE, SUPPLY_SOURCE_EMBEDDED, SUPPLY_SOURCE_NONE,
-    SUPPLY_SOURCE_RELAY, SUPPLY_SOURCE_TARGET_SUBSTITUTER, SupplyEntry, build_status_from_name,
-    now_rfc3339, path_outcomes_from_keyed, supply_outcome_is_settlement,
+    PathOutcome, SUPPLY_DETAIL_DEFERRED_INLINE, SUPPLY_MECHANISM_DELEGATE, SUPPLY_MECHANISM_NONE,
+    SUPPLY_MECHANISM_UPLOAD_BATCH, SUPPLY_MECHANISM_UPLOAD_STREAM, SUPPLY_OUTCOME_ALREADY_PRESENT,
+    SUPPLY_OUTCOME_DELEGATED, SUPPLY_OUTCOME_DELIVERED, SUPPLY_OUTCOME_FAILED,
+    SUPPLY_OUTCOME_REFUSED, SUPPLY_OUTCOME_SKIPPED, SUPPLY_OUTCOME_UNAVAILABLE,
+    SUPPLY_SOURCE_EMBEDDED, SUPPLY_SOURCE_NONE, SUPPLY_SOURCE_RELAY,
+    SUPPLY_SOURCE_TARGET_SUBSTITUTER, SupplyEntry, build_status_from_name, now_rfc3339,
+    path_outcomes_from_keyed, supply_outcome_is_settlement,
 };
 use crate::run::spec::{Knobs, SupplyDelivery, SupplyDependencies};
 use crate::run::state::{StateDir, StateFile};
@@ -2118,7 +2119,12 @@ async fn run_upload_ladder(
         SupplyDelivery::Inline => {
             // Inline delivery defers planned uploads to the per-submission
             // top-up; the deferral is recorded so the report shows what was
-            // deliberately not delivered before execution.
+            // deliberately not delivered before execution, and so the
+            // inline-resume gate can tell a stage that delivered (prewarm)
+            // from one that only promised (this arm) after the process —
+            // and with it the top-up context — is gone. A later top-up that
+            // delivers/refuses/fails the path supersedes the deferral under
+            // the journal's latest-row-per-path reading.
             for item in plan.large.iter().chain(plan.batch.iter()) {
                 append_supply_entry(
                     state,
@@ -2126,7 +2132,7 @@ async fn run_upload_ladder(
                     entry_source(item),
                     SUPPLY_MECHANISM_NONE,
                     SUPPLY_OUTCOME_UNAVAILABLE,
-                    Some("deferred to inline top-up".to_string()),
+                    Some(SUPPLY_DETAIL_DEFERRED_INLINE.to_string()),
                 )?;
                 report.unavailable += 1;
             }

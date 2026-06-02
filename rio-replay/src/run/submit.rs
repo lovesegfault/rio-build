@@ -180,6 +180,13 @@ pub fn pending_wave(
 /// cancellation under a [`BatchDeadline::Build`] deadline is the engine's
 /// own budget cut — classification reads the bit, never re-derives it.
 ///
+/// `topup_delivered` records whether this batch's pre-submission supply
+/// top-up ran and succeeded; the caller derives it from the top-up call it
+/// made (false when no hook is wired or the top-up failed). It is written
+/// verbatim onto the record — the inline-resume gate reads the bit as the
+/// batch's delivery proof, so bare batch membership never stands in for
+/// delivery.
+///
 /// A submitter `Err` (ssh/spawn/import failure) is evidence, not a fatal
 /// error: it is recorded on the batch record with no build id and the jobs
 /// are re-offered on a later wave; only state-dir I/O failures propagate.
@@ -223,6 +230,7 @@ pub async fn submit_one_batch(
         import_skipped_drvs: Vec::new(),
         probe: intent.probe,
         confirmation_attempt: intent.confirmation_attempt,
+        topup_delivered: intent.topup_delivered,
     };
     match outcome {
         Ok(o) => {
@@ -485,15 +493,19 @@ pub async fn run_submit_loop(
             // dispatcher's per-request call: a failure degrades to a
             // warning so a supply hiccup can never wedge the batch — a
             // truly undelivered input surfaces as the unit's build failure
-            // instead.
-            if let Some(topup) = &supply_topup
-                && let Err(e) = topup.topup(&batch.root_drvs).await
-            {
-                tracing::warn!(
-                    batch_id,
-                    error = %format!("{e:#}"),
-                    "pre-submission supply top-up failed; submitting the batch anyway"
-                );
+            // instead. Whether the top-up succeeded is recorded on the
+            // batch (the inline-resume gate's delivery proof): a failed or
+            // absent top-up submits the batch but proves nothing.
+            let mut topup_delivered = false;
+            if let Some(topup) = &supply_topup {
+                match topup.topup(&batch.root_drvs).await {
+                    Ok(()) => topup_delivered = true,
+                    Err(e) => tracing::warn!(
+                        batch_id,
+                        error = %format!("{e:#}"),
+                        "pre-submission supply top-up failed; submitting the batch anyway"
+                    ),
+                }
             }
             // The batch deadline is anchored when the submission starts
             // (after the top-up): an absolute instant, so the budget covers
@@ -510,7 +522,10 @@ pub async fn run_submit_loop(
                 BatchDeadline::Build(tokio::time::Instant::now() + timeout),
                 cooldown,
                 Vec::new(),
-                intent,
+                BatchIntent {
+                    topup_delivered,
+                    ..intent
+                },
             )
             .await
         });
@@ -858,6 +873,8 @@ mod tests {
         assert_eq!(total_jobs, 3);
         // Dual cap respected: no batch carries more than 2 jobs.
         assert!(records.iter().all(|r| r.jobs.len() <= 2));
+        // No top-up hook wired: no record may claim a delivered top-up.
+        assert!(records.iter().all(|r| !r.topup_delivered));
     }
 
     /// Scripted pre-submission supply hook: records each call's root drvs
@@ -911,7 +928,7 @@ mod tests {
         let submitted_view = submitter.clone();
         let ledger = test_ledger(&state, tracker);
         run_submit_loop(
-            state,
+            state.clone(),
             submitter.clone(),
             ledger,
             pause,
@@ -946,6 +963,88 @@ mod tests {
             assert_eq!(roots, &batch.root_drvs);
             assert_eq!(*prior, index);
         }
+        // A failed top-up submits the batch but proves no delivery: the
+        // records must not claim it.
+        let records: Vec<BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
+        assert!(
+            records.iter().all(|r| !r.topup_delivered),
+            "failed top-ups must not be recorded as delivered: {records:?}"
+        );
+    }
+
+    /// Scripted [`PreSubmitSupply`] whose outcomes pop from a list (front
+    /// first); calls beyond the script succeed.
+    struct ScriptedTopup {
+        outcomes: std::sync::Mutex<std::collections::VecDeque<anyhow::Result<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PreSubmitSupply for ScriptedTopup {
+        async fn topup(&self, _roots: &[String]) -> anyhow::Result<()> {
+            self.outcomes.lock().unwrap().pop_front().unwrap_or(Ok(()))
+        }
+    }
+
+    /// The batch record's `topup_delivered` bit is derived at this
+    /// chokepoint from the top-up call the loop actually made — both
+    /// directions: a successful top-up records true (the inline-resume
+    /// gate's delivery proof for the batch's jobs), a failed one records
+    /// false even though the batch is still submitted, and with no hook
+    /// wired every record stays false (bare membership proves nothing).
+    #[tokio::test]
+    async fn submit_loop_records_topup_delivery_proof_per_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        let submitter = Arc::new(FakeSubmitter::default());
+        for _ in 0..2 {
+            submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
+                build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into()),
+                ..BatchOutcome::default()
+            }));
+        }
+        // First batch's top-up fails, second succeeds; serial submission
+        // (concurrency 1) keeps the order deterministic.
+        let topup = Arc::new(ScriptedTopup {
+            outcomes: std::sync::Mutex::new(
+                [Err(anyhow::anyhow!("scripted top-up failure")), Ok(())].into(),
+            ),
+        });
+        let knobs = Knobs {
+            batch_max_jobs: 2,
+            submit_concurrency: 1,
+            ..Knobs::default()
+        };
+        let submitted_view = submitter.clone();
+        run_submit_loop(
+            state.clone(),
+            submitter.clone(),
+            test_ledger(&state, Arc::new(SubmitTracker::default())),
+            Arc::new(PauseState::default()),
+            vec![pj("a", 0), pj("b", 0), pj("c", 0)],
+            move || {
+                submitted_view
+                    .submitted
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|(_, b, _)| b.jobs.clone())
+                    .collect()
+            },
+            || false,
+            "ssh-ng://test".into(),
+            knobs,
+            Arc::new(AtomicU64::new(1)),
+            Some(topup as Arc<dyn PreSubmitSupply>),
+        )
+        .await
+        .unwrap();
+        let records: Vec<BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
+        let delivered: Vec<bool> = records.iter().map(|r| r.topup_delivered).collect();
+        assert_eq!(
+            delivered,
+            vec![false, true],
+            "the bit must mirror each batch's own top-up outcome: {records:?}"
+        );
     }
 
     /// The permit wait is a staleness window for the terminal set, not just

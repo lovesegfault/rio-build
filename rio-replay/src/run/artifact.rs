@@ -1216,13 +1216,13 @@ mod tests {
         assert!(records.contains_key("other"));
         let watchdog =
             std::sync::Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
-        let (ledger, stall_retries) = JobLedger::from_journals(state.clone(), watchdog).unwrap();
+        let (ledger, budgets) = JobLedger::from_journals(state.clone(), watchdog).unwrap();
         assert_eq!(ledger.tracker().resubmission_count("other").await, 1);
         assert_eq!(
             ledger.tracker().resubmission_count("batch7-member").await,
             0
         );
-        assert!(stall_retries.is_empty());
+        assert!(budgets.stall_retries.is_empty());
     }
 
     /// Resume-substrate pin: every file the resume path reads back — the
