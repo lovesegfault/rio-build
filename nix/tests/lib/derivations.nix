@@ -77,6 +77,7 @@ rec {
   # hashed-mirrors lookup ({mirror}/sha256/{hex}). Drives the
   # fetcher-split fod-dead-origin subtest.
   fodDeadOrigin = "${dir}/fod-dead-origin.nix";
+  ergOnDrv = "${dir}/erg-on-drv.nix";
 
   # Recursive-hash FOD whose output is a directory (`mkdir $out`).
   # Regression: whiteout-on-output → EIO on mkdir. fetcher-split fod-dir.

@@ -387,7 +387,16 @@ pub(super) async fn fetch_demanded_graph_drvs(
         return Ok(table);
     }
     metrics::counter!("rio_builder_graph_drv_fetch_total").increment(demanded.len() as u64);
-    tracing::debug!(
+    // info, not debug: this is the journal-observable half of
+    // `rio_builder_graph_drv_fetch_total` (expected ~0 fleet-wide; the
+    // VM suite asserts the line is ABSENT across a whole scenario, ERG
+    // builds included). Reaching here at all is rare even for ERG
+    // builds: Nix's drvPath context makes a declared graph's `.drv`s
+    // direct inputDrvs, whose texts the input-drv loop already
+    // retained — this fetch only fires for graphs whose closure
+    // reaches a `.drv` that is NOT an input drv (e.g. an output
+    // embedding a derivation path).
+    tracing::info!(
         n_demanded = demanded.len(),
         "fetching declaration-demanded graph .drv texts for the request glue"
     );

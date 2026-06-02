@@ -95,6 +95,7 @@ let
       ''${busybox}/bin/cat "$TMPDIR/scratch-file" > $out
     '';
   };
+  inherit (drvs) ergOnDrv;
   strayProbeDrv = drvs.mkCustom {
     name = "rio-test-proto-stray";
     script = ''
@@ -425,6 +426,44 @@ let
         client.fail(
             f"nix path-info --store '{store_url}' "
             "/nix/store/cccccccccccccccccccccccccccccccc-rio-proto-stray"
+        )
+
+    with subtest("erg-native: exportReferencesGraph through the scheduler path"):
+        # Two fresh builds (inner + the graph consumer). The consumer
+        # script greps the registration file for the inner .drv before
+        # copying it to $out — closure expansion is asserted by the
+        # build succeeding, not by trusting the file exists.
+        out_erg = client.succeed(
+            f"nix-build --no-out-link --store '{store_url}' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${ergOnDrv}"
+        ).strip()
+        assert "rio-test-erg-native" in out_erg, f"unexpected output: {out_erg!r}"
+        client.succeed(f"nix path-info --store '{store_url}' {out_erg}")
+
+    with subtest("erg-native demand observability: zero residual graph fetches"):
+        # The fleet-scale zero-residual property at VM level: across
+        # the WHOLE journal — the ERG build above included — no build
+        # performed a residual graph .drv fetch. The replaced
+        # closure-membership prefetch fetched on EVERY deep-closure
+        # build; the demand model fetches only what a declaration
+        # demands beyond the already-retained input-drv texts, and for
+        # the erg-native build that set is empty (drvPath context makes
+        # the graph .drv a direct inputDrv, so its text was retained at
+        # the input-drv loop). Demand UNDER-supply cannot hide here: it
+        # fails the erg-native build subtest itself with a glue error.
+        # journalctl|grep -c exits 1 on zero matches; execute()
+        # tolerates it so the count is honest either way.
+        rc, n = worker.execute(
+            "journalctl -u rio-builder --no-pager | "
+            "grep -c 'fetching declaration-demanded graph'"
+        )
+        n = int(n.strip() or "0")
+        assert n == 0, (
+            f"expected zero residual graph .drv fetches across the scenario, got {n} — "
+            "a build fetched graph texts beyond the retained input-drv set "
+            "(bug_081 closure-membership fetching returning, or input-drv "
+            "retention regressed)"
         )
   '';
 

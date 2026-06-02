@@ -302,6 +302,13 @@ in
 
   # r[verify gw.handshake.untrusted]
   # r[verify gw.hook.single-node-dag+2]
+  # r[verify builder.glue.drv-table-demand]
+  #   erg-native subtests: an exportReferencesGraph build succeeds
+  #   through the native scheduler path (registration content asserted
+  #   in-script — demand under-supply fails the build), and the journal
+  #   carries ZERO residual graph-fetch lines across the whole scenario,
+  #   the ERG build included (its demand is covered by retained
+  #   input-drv texts).
   vm-protocol-warm-standalone = protocol {
     inherit pkgs common;
     fixture = standalone {
