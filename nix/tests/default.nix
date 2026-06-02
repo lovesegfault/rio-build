@@ -290,6 +290,12 @@ in
   #   identity (nixbld / Nix build user) is byte-compared against the
   #   oracle's sandbox — the glue's single construction point feeds both
   #   request paths.
+  # r[verify sec.authz.ca-path-derived+9]
+  #   fod-nul-run entry: a flat FOD whose body is a 1 KiB NUL run —
+  #   the modulo sink's zeroing pattern — builds, registers, and
+  #   byte-compares identically on both sides, witnessing that the
+  #   declared-hash (plain-equality, no-modulo) verification path is
+  #   lossless at system scale.
   vm-differential-standalone = import ./scenarios/differential.nix {
     inherit pkgs rio-workspace;
   };

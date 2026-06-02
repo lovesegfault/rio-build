@@ -509,6 +509,26 @@ rec {
         outputHash = recursivePayloadNar;
       };
 
+  # Flat-mode FOD whose 1 KiB body is a single NUL run: the losslessness
+  # witness for the declared-hash verification path (merged_bug_076,
+  # sec.authz.ca-path-derived+9). The store's FOD arm is PLAIN hash
+  # equality — no modulo arithmetic — and the modulo sink's zeroing
+  # pattern is exactly a NUL run, so content that LOOKS like zeroed
+  # hash-part occurrences must round-trip byte-identically on both
+  # sides (build, register, byte-compare). A lossy or modulo-confused
+  # path would corrupt or mis-derive this entry on one side only.
+  # outputHash literal precomputed: sha256 of 1024 0x00 bytes.
+  fod-nul-run =
+    mkDrv "rio-diff-fod-nul-run"
+      ''
+        head -c 1024 /dev/zero > $out
+      ''
+      {
+        outputHashMode = "flat";
+        outputHashAlgo = "sha256";
+        outputHash = "5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef";
+      };
+
   # Flat-mode FOD whose bytes match the declared hash but which is made
   # executable: CppNix rejects a flat fixed-output that is not exactly
   # one NON-executable regular file even when the hash matches

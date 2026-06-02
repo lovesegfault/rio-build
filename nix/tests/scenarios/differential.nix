@@ -175,6 +175,9 @@ let
     fod-recursive = {
       expect = "parity";
     };
+    fod-nul-run = {
+      expect = "parity";
+    };
     fod-flat-executable = {
       # CppNix: "output path ... should be a non-executable regular
       # file" (flat CA shape rule); the native FOD gate enforces the
