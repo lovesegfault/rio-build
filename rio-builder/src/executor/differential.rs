@@ -135,12 +135,31 @@ pub struct Report {
 pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
     let drv_text = std::fs::read_to_string(&cfg.drv_path)
         .with_context(|| format!("reading {}", cfg.drv_path.display()))?;
-    let drv = Derivation::parse(&drv_text).context("parsing derivation")?;
     let drv_path_str = cfg
         .drv_path
         .to_str()
         .context("drv path is not valid UTF-8")?
         .to_owned();
+    // A main-drv parse rejection is an input rejection, not a driver
+    // fault: report it through `glue_error` (the "rejected before any
+    // build ran" channel) so corpus entries can pin parse-boundary
+    // divergences — e.g. the impure-output entry, whose oracle-emitted
+    // `"impure"` sentinel rio rejects at classification.
+    let drv = match Derivation::parse(&drv_text) {
+        Ok(drv) => drv,
+        Err(e) => {
+            return Ok(Report {
+                drv: drv_path_str,
+                plan: "none".to_string(),
+                glue_error: Some(format!("parsing derivation: {e}")),
+                classification: None,
+                error_msg: None,
+                outputs: Vec::new(),
+                fod_check: None,
+                log: LogReport::default(),
+            });
+        }
+    };
 
     // ---- Resolve inputDrvs → concrete store paths -----------------------
     //

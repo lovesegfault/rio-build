@@ -296,6 +296,13 @@ in
   #   byte-compares identically on both sides, witnessing that the
   #   declared-hash (plain-equality, no-modulo) verification path is
   #   lossless at system scale.
+  # r[verify nix.drv.output-typed]
+  #   impure-output entry: the oracle's own eval (per-entry feature
+  #   hook, instantiate-only) emits the real `"impure"` sentinel .drv;
+  #   the daemon at the default posture refuses it at realise and rio's
+  #   parse boundary rejects it with the oracle's disabled-feature
+  #   clause — the impure divergence pinned against emitter bytes, not
+  #   a hand-written fixture.
   vm-differential-standalone = import ./scenarios/differential.nix {
     inherit pkgs rio-workspace;
   };

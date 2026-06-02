@@ -938,4 +938,17 @@ rec {
           "dev"
         ];
       };
+
+  # Impure derivation, instantiated by the ORACLE'S OWN EMITTER: the
+  # entryMeta features hook enables `impure-derivations` for the
+  # nix-instantiate call only, so the .drv carries the real `"impure"`
+  # hash sentinel bytes the oracle eval produces — not a hand-written
+  # approximation. Both arms then reject at the DEFAULT feature
+  # posture: the VM daemon (no impure-derivations in nix.conf) refuses
+  # the .drv at realise, and rio's parse boundary rejects the sentinel
+  # before shape classification with the oracle's own first clause
+  # (output.rs module-doc divergence #3, derivations.cc:318-326).
+  impure-output = mkDrv "rio-diff-impure-output" ''
+    echo "never built on either arm" > $out
+  '' { __impure = true; };
 }

@@ -161,6 +161,19 @@ let
       # the driver reports the glue error instead of a classification.
       rio_glue_error = "outputHash";
     };
+    impure-output = {
+      expect = "both-fail";
+      # The oracle's eval (with the per-entry feature) emits the real
+      # `"impure"` sentinel .drv; the VM daemon at the DEFAULT posture
+      # then refuses it at realise, and rio's parse boundary rejects it
+      # with the oracle's disabled-feature clause — both failures name
+      # the feature.
+      rio_glue_error = "impure-derivations";
+      # instantiate()-only: the daemon and the native arm never see the
+      # feature enabled. ca-derivations is already in the VM's global
+      # nix.conf, so the sentinel-emitting eval needs only this one.
+      features = [ "impure-derivations" ];
+    };
     outputchecks-maxsize = {
       expect = "both-fail";
       rio_status = "OutputRejected";
@@ -386,6 +399,14 @@ pkgs.testers.runNixOSTest {
 
 
     def instantiate(attr, meta):
+        # Per-entry experimental features apply to the EVAL only — the
+        # daemon and the native arm keep the default posture, so an
+        # entry can be emitted by the oracle's own eval (real emitter
+        # bytes) while both build arms reject it.
+        features = ""
+        if meta.get("features"):
+            joined = " ".join(meta["features"])
+            features = f"--extra-experimental-features '{joined}' "
         if meta.get("corpus") == "stdenv":
             # The probe file does a pristine `import <nixpkgs>` itself;
             # instantiation takes a while the first time (full stdenv
@@ -393,12 +414,14 @@ pkgs.testers.runNixOSTest {
             # additionalPaths.
             return machine.succeed(
                 "nix-instantiate --impure "
-                f"--arg pkgsPath 'builtins.storePath \"{PKGS_PATH}\"' "
+                + features
+                + f"--arg pkgsPath 'builtins.storePath \"{PKGS_PATH}\"' "
                 f"-A {attr} {CORPUS_STDENV}"
             ).strip()
         return machine.succeed(
             "nix-instantiate --impure "
-            f"--arg busybox 'builtins.storePath \"{BUSYBOX}\"' "
+            + features
+            + f"--arg busybox 'builtins.storePath \"{BUSYBOX}\"' "
             f"--arg bash 'builtins.storePath \"{BASH}\"' "
             f"--arg busybox32 'builtins.storePath \"{BUSYBOX32}\"' "
             f"-A {attr} {CORPUS}"
