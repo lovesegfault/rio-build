@@ -83,10 +83,11 @@
 //!    The CAS token (the snapshot's resourceVersion) is NOT refreshed;
 //!    that is the part that must stay stale for the conflict path to be
 //!    reachable.
-//! 4. **`maybe_self_fence` measures `last_successful_renew.elapsed()`
-//!    against the real clock**, so the driver hands it a synthetic
-//!    *past* instant computed from the tick delta at call time rather
-//!    than a future instant derived from `base + ticks×TICK`.
+//! 4. **`maybe_self_fence` is clock-free**: it takes the blind DURATION
+//!    directly (the production loop measures it on the injected
+//!    suspend-aware fence clock — CLOCK_BOOTTIME in production), so the
+//!    driver maps the model's tick delta straight through. The
+//!    ambient-clock read that used to sit in the fence path is gone.
 //!
 //! # Determinism policy
 //!
@@ -429,22 +430,13 @@ impl MbtSystem {
     /// model fired it — a subset of both, sound for a safety check).
     fn self_fence(&mut self, n: &str) {
         let h = self.node(n);
-        // maybe_self_fence measures `last_successful_renew.elapsed()`
-        // against the real clock (finding 4 in the module header), so
-        // the anchor must be a real past instant: now minus the model's
-        // tick delta. checked_sub only fails if the host has been up for
-        // less time than the delta, which the model's clock ceiling
-        // bounds to a handful of TICKs. Qualified tokio path: the fence
-        // anchor is tokio's Instant (real time outside a paused test
-        // clock — same semantics as std here), while this file's
-        // file-wide `Instant` stays std for the election/`decide`
-        // observation clock.
+        // The fence predicate is clock-free since the boottime move
+        // (finding 4 in the module header): it takes the blind DURATION
+        // directly, so the driver maps the model's tick delta straight
+        // through — no synthetic-instant fabrication.
         let blind_for = TICK * u32::try_from(h.ticks - h.fence_tick).expect("tick delta fits u32");
-        let last_renew = tokio::time::Instant::now()
-            .checked_sub(blind_for)
-            .expect("host uptime exceeds the model's clock ceiling");
         let marks_dirty = std::sync::atomic::AtomicBool::new(false);
-        let fired = maybe_self_fence(&h.state, &mut h.was_leading, &marks_dirty, last_renew);
+        let fired = maybe_self_fence(&h.state, &mut h.was_leading, &marks_dirty, blind_for);
         // The model's selfFence precondition is `leading[n] ∧ deadline
         // passed`; the tick mapping guarantees the implementation agrees
         // the deadline passed. A non-firing fence here is a driver or

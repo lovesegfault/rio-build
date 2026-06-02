@@ -627,6 +627,11 @@
   ],
   "rio-lease": [
     {
+      "path": "clock.rs",
+      "depth": 0,
+      "doc": "The self-fence blind-time clock: suspend-aware time for the one"
+    },
+    {
       "path": "election.rs",
       "depth": 0,
       "doc": "In-house leader election on top of `kube::Api<Lease>`."

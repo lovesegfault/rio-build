@@ -31,6 +31,10 @@ rio-crds = { workspace = true }
 rio-common = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# clock_gettime(CLOCK_BOOTTIME) for the self-fence blind-time clock
+# (src/clock.rs) — std has no suspend-aware clock. Normal-dep precedent:
+# rio-gateway's EMFILE/ENFILE constants (rio-gateway/Cargo.toml).
+libc = { workspace = true }
 # `became_leader_at` RwLock<Option<Instant>> — Instant is 16B, not atomic.
 parking_lot = { workspace = true }
 # HOSTNAME-unset fallback in LeaseConfig::from_parts.

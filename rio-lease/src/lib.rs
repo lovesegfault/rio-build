@@ -60,6 +60,7 @@ use kube::api::{Api, ListParams, Patch, PatchParams};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+mod clock;
 mod election;
 pub use election::{Decision, ElectionResult, LeaderElection, Observed, decide};
 
@@ -106,14 +107,6 @@ pub trait LeaseHooks: Clone + Send + 'static {
     fn on_lose(&self);
 }
 
-// TODO: use CLOCK_BOOTTIME for the self-fence clock instead of
-// Instant::now() (= CLOCK_MONOTONIC on Linux). MONOTONIC does not advance
-// during host suspend; a suspend-and-resume leaves `last_successful_renew`
-// looking fresh while real time advanced past SELF_FENCE_AFTER — the leader
-// resumes still believing it leads, until the next failed apiserver
-// round-trip. BOOTTIME advances during suspend, so the self-fence fires
-// immediately on resume. Low priority for k8s nodes (they don't suspend);
-// worth doing before any bare-metal or laptop deployment of the scheduler.
 /// Lease TTL as written to the Lease object's `leaseDurationSeconds`.
 /// Documentation for `kubectl describe lease` and any client-go
 /// co-tenant — NOT the threshold either side of this protocol acts on.
@@ -171,8 +164,12 @@ const RENEW_SLOP: Duration = Duration::from_secs(2);
 /// SELF_FENCE_AFTER + RENEW_INTERVAL) the model assumes; that arithmetic
 /// premise is pinned by the const assert below. What remains of
 /// the separation is a 1.5s one-sided clock-skew budget — far above NTP
-/// drift on cloud nodes. A clock pause longer than that re-opens the
-/// window, which is the impossibility result the generation fence
+/// drift on cloud nodes. Host suspend is caught at the first post-resume
+/// fence check by the suspend-aware fence clock (`clock::suspend_aware_now`,
+/// CLOCK_BOOTTIME on Linux); the remaining pause classes — hypervisor-level
+/// VM pause (invisible to BOOTTIME too), long stop-the-world stalls, and
+/// the resume-to-first-tick gap — still re-open the window, which is the
+/// impossibility result the generation fence
 /// (r\[sched.lease.generation-fence+3\]) backstops. The model also shows
 /// the bound is tight: one tick less separation and a dual-belief state
 /// is reachable.
@@ -931,7 +928,15 @@ pub async fn run_lease_loop<H: LeaseHooks>(
         }
     };
 
-    run_lease_loop_with_client(client, cfg, state, hooks, shutdown).await;
+    run_lease_loop_with_client(
+        client,
+        cfg,
+        state,
+        hooks,
+        shutdown,
+        clock::suspend_aware_now,
+    )
+    .await;
 }
 
 /// The lease loop proper, with the [`kube::Client`] injected. Everything
@@ -940,12 +945,20 @@ pub async fn run_lease_loop<H: LeaseHooks>(
 /// loop against an in-process mock apiserver
 /// (`rio_test_support::kube_mock::MockApiServer`) under a paused clock —
 /// the fence-check-cadence test in `mod tests` is the consumer.
+///
+/// `fence_now`: the self-fence blind-time clock, injected like the kube
+/// client so tests control it. Production ([`run_lease_loop`]) passes
+/// [`clock::suspend_aware_now`] (CLOCK_BOOTTIME on Linux — advances
+/// across host suspend); paused-clock tests pass a tokio-Instant-anchored
+/// closure so the measurement follows the virtual clock; the fence-jump
+/// test adds a controlled offset to simulate suspend.
 pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     client: kube::Client,
     cfg: LeaseConfig,
     state: LeaderState,
     hooks: H,
     shutdown: rio_common::signal::Token,
+    fence_now: impl Fn() -> Duration + Send + 'static,
 ) {
     // Clone for leader-mark (pod-deletion-cost annotation + leader
     // label) patching. LeaderElection::new takes ownership (wraps the
@@ -999,7 +1012,10 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     // freed slot always means the flag already reflects that task's
     // outcome.
     let marks_patch_in_flight = Arc::new(AtomicBool::new(false));
-    let mut last_successful_renew = Instant::now();
+    // Blind-time stamp on the injected fence clock (production:
+    // CLOCK_BOOTTIME — advances across host suspend, so a suspend
+    // straddling SELF_FENCE_AFTER fences at the first post-resume tick).
+    let mut last_successful_renew: Duration = fence_now();
     let mut interval = tokio::time::interval(RENEW_INTERVAL);
     // Skip: if one renewal is slow (apiserver busy), don't fire
     // twice immediately. SELF_FENCE_AFTER is 11s; we have slack.
@@ -1024,7 +1040,9 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
             &state,
             &mut was_leading,
             &marks_dirty,
-            last_successful_renew,
+            // saturating_sub is purely defensive; both readings come from
+            // the same non-decreasing fence clock.
+            fence_now().saturating_sub(last_successful_renew),
         ) {
             hooks.on_lose();
         }
@@ -1042,7 +1060,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 // KNOW the apiserver state, we just don't hold the
                 // lease. The clock tracks "am I blind", not "am I
                 // leader".
-                last_successful_renew = Instant::now();
+                last_successful_renew = fence_now();
                 // Conflict on renew = someone stole since our GET
                 // → unambiguous lose. Conflict on steal = another
                 // standby raced us → we were never leading. Both
@@ -1281,7 +1299,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                     &state,
                     &mut was_leading,
                     &marks_dirty,
-                    last_successful_renew,
+                    fence_now().saturating_sub(last_successful_renew),
                 ) {
                     // Self-fence is a lose-transition: same on-lose
                     // hook as the explicit lose arm above.
@@ -1337,11 +1355,11 @@ fn maybe_self_fence(
     state: &LeaderState,
     was_leading: &mut bool,
     marks_dirty: &AtomicBool,
-    last_successful_renew: Instant,
+    blind_for: Duration,
 ) -> bool {
-    if *was_leading && last_successful_renew.elapsed() > SELF_FENCE_AFTER {
+    if *was_leading && blind_for > SELF_FENCE_AFTER {
         warn!(
-            blind_for = ?last_successful_renew.elapsed(),
+            blind_for = ?blind_for,
             self_fence_after_secs = SELF_FENCE_AFTER.as_secs(),
             "LOCAL SELF-FENCE: no successful renew in > SELF_FENCE_AFTER, stepping down locally"
         );
@@ -2125,11 +2143,11 @@ mod tests {
 
         let mut was_leading = true;
         let marks_dirty = AtomicBool::new(false);
-        // 20s ago > SELF_FENCE_AFTER (11s). Same back-dated Observed
-        // pre-seeding as election.rs's steal-test fixtures.
-        let last_renew = Instant::now() - Duration::from_secs(20);
+        // 20s blind > SELF_FENCE_AFTER (11s). The predicate is clock-free
+        // (takes the blind duration directly) since the boottime move.
+        let blind_for = Duration::from_secs(20);
 
-        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, last_renew);
+        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, blind_for);
 
         assert!(fired, "self-fence should fire past SELF_FENCE_AFTER");
         assert!(
@@ -2159,11 +2177,11 @@ mod tests {
 
         let mut was_leading = true;
         let marks_dirty = AtomicBool::new(false);
-        // 10s ago < SELF_FENCE_AFTER (11s). Two failed ticks, lease
+        // 10s blind < SELF_FENCE_AFTER (11s). Two failed ticks, lease
         // still validly held as far as we know.
-        let last_renew = Instant::now() - Duration::from_secs(10);
+        let blind_for = Duration::from_secs(10);
 
-        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, last_renew);
+        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, blind_for);
 
         assert!(!fired, "within SELF_FENCE_AFTER → no self-fence");
         assert!(
@@ -2171,6 +2189,29 @@ mod tests {
             "within SELF_FENCE_AFTER → still leader (transient blip)"
         );
         assert!(state.recovery_complete());
+        assert!(was_leading);
+    }
+
+    /// The fence predicate is strict `>`: blind-time EXACTLY at
+    /// SELF_FENCE_AFTER does not fire — the same boundary choice
+    /// `decide_pure` documents for the steal threshold. Trivially
+    /// expressible now that the predicate takes the duration directly.
+    #[test]
+    fn self_fence_does_not_fire_at_exact_deadline() {
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(2)));
+        state.is_leader.store(true, Ordering::Relaxed);
+        state.set_recovery_complete(state.acquired_transitions());
+
+        let mut was_leading = true;
+        let marks_dirty = AtomicBool::new(false);
+
+        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, SELF_FENCE_AFTER);
+
+        assert!(
+            !fired,
+            "blind_for == SELF_FENCE_AFTER must NOT fire (strict >)"
+        );
+        assert!(state.is_leader.load(Ordering::Relaxed));
         assert!(was_leading);
     }
 
@@ -2185,9 +2226,9 @@ mod tests {
 
         let mut was_leading = false;
         let marks_dirty = AtomicBool::new(false);
-        let last_renew = Instant::now() - Duration::from_secs(20);
+        let blind_for = Duration::from_secs(20);
 
-        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, last_renew);
+        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, blind_for);
 
         assert!(!fired, "not leading → no fence even past TTL");
         assert!(!state.is_leader.load(Ordering::Relaxed));
@@ -2214,9 +2255,9 @@ mod tests {
 
         let mut was_leading = true;
         let marks_dirty = AtomicBool::new(false);
-        let last_renew = Instant::now() - Duration::from_secs(20);
+        let blind_for = Duration::from_secs(20);
 
-        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, last_renew);
+        let fired = maybe_self_fence(&state, &mut was_leading, &marks_dirty, blind_for);
         assert!(fired);
         assert!(
             marks_dirty.load(Ordering::SeqCst),
@@ -2233,7 +2274,7 @@ mod tests {
             &standby,
             &mut was_leading,
             &marks_dirty,
-            Instant::now() - Duration::from_secs(20),
+            Duration::from_secs(20),
         );
         assert!(!fired);
         assert!(
@@ -2825,6 +2866,12 @@ mod tests {
             state,
             hooks.clone(),
             shutdown.clone(),
+            // tokio-Instant anchor: under start_paused this measurement
+            // follows the virtual clock exactly as the old ambient one did.
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
         ));
 
         // t=0: the interval's first tick fires immediately; the mock is
@@ -2907,6 +2954,89 @@ mod tests {
         // the steal-aging path that clock feeds.
     }
 
+    /// The suspend-blindness regression the boottime fence clock fixes:
+    /// a fence-clock jump (host suspend) past SELF_FENCE_AFTER must fence
+    /// at the FIRST post-resume tick-time check — before any hung renew
+    /// attempt resolves. With the old ambient (monotonic; tokio-virtual
+    /// here) measurement the jump is invisible and the zombie leader
+    /// persists until the hung attempt's error arm much later.
+    // r[verify sched.lease.self-fence+2]
+    #[tokio::test(start_paused = true)]
+    async fn fence_fires_at_first_tick_after_fence_clock_jump() {
+        let (client, mock) = MockApiServer::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = LeaseConfig {
+            lease_name: "rio-sched".into(),
+            namespace: "default".into(),
+            holder_id: "us".into(),
+            leader_pod_label: None,
+        };
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        // Injected fence clock: tokio-virtual base plus a controllable
+        // jump, simulating CLOCK_BOOTTIME advancing across a suspend the
+        // monotonic clock never sees.
+        let jump_ms = Arc::new(AtomicU64::new(0));
+        let fence_now = {
+            let a = Instant::now();
+            let jump_ms = jump_ms.clone();
+            move || a.elapsed() + Duration::from_millis(jump_ms.load(Ordering::SeqCst))
+        };
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            fence_now,
+        ));
+
+        // t=0: the immediate first tick acquires healthily.
+        settle().await;
+        assert!(
+            state.is_leader.load(Ordering::Relaxed),
+            "t=0 acquire must succeed"
+        );
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires lock").len(),
+            1,
+            "exactly one acquire at t=0"
+        );
+
+        // "Suspend": the apiserver becomes unreachable AND the fence
+        // clock jumps 12s (> SELF_FENCE_AFTER = 11s) while the tokio
+        // virtual clock — the monotonic view — advances only one tick.
+        mock.set_behavior(MockBehavior::Hang);
+        jump_ms.store(12_000, Ordering::SeqCst);
+        tokio::time::advance(RENEW_INTERVAL).await; // first post-resume tick
+        settle().await;
+
+        assert!(
+            !state.is_leader.load(Ordering::Relaxed),
+            "the first post-jump tick-time fence check must fence the zombie leader"
+        );
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "exactly one lose at the first post-jump tick (before the hung attempt resolves)"
+        );
+
+        // Let the hung attempt's deadline expire: the error-arm re-check
+        // sees was_leading already false — still exactly one lose.
+        tokio::time::advance(RENEW_INTERVAL - RENEW_SLOP).await;
+        settle().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
+        assert_eq!(
+            hooks.loses.lock().expect("loses lock").len(),
+            1,
+            "no second lose from the error-arm re-check"
+        );
+
+        shutdown.cancel();
+        loop_task.await.expect("lease loop task exits cleanly");
+    }
+
     /// The bump-confirmation wiring (`sched.recovery.bump-confirm`)
     /// rests on two loop-level properties: the round id is taken BEFORE
     /// the attempt's apiserver I/O starts, and only rounds that resolve
@@ -2934,6 +3064,10 @@ mod tests {
             state.clone(),
             hooks.clone(),
             shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
         ));
 
         // t=0: the immediate first tick creates the Lease and acquires;
@@ -3026,6 +3160,10 @@ mod tests {
             state.clone(),
             hooks.clone(),
             shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
         ));
 
         settle().await; // tick at t=0
@@ -3082,6 +3220,10 @@ mod tests {
             state.clone(),
             hooks.clone(),
             shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
         ));
 
         // t=0: the immediate first tick creates the Lease (creator:

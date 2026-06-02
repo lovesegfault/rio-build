@@ -3130,9 +3130,12 @@ budget. The formal model verifies this as `neverDual` over the
 `leaderElectionAsymmetric` module of `docs/spec/models/leaderElection.qnt`,
 with the boundary measured from both sides:
 one model tick less separation and a dual-belief state is reachable. The
-residual is a clock that pauses for longer than the budget (suspend, a long
-GC, a frozen VM) --- no fence/steal separation closes that, and
-#rref("sched.lease.generation-fence+2") is the backstop. The compile-time
+residual is a clock pause longer than the budget: host suspend is now caught
+at the first post-resume fence check (the blind-time measurement runs on a
+suspend-aware clock --- CLOCK_BOOTTIME on Linux), but hypervisor-level VM
+pause (invisible to BOOTTIME too), long stop-the-world stalls, and the
+resume-to-first-tick gap remain --- no fence/steal separation closes those,
+and #rref("sched.lease.generation-fence+2") is the backstop. The compile-time
 assertions on the rio-lease constants pin the derivations, the margin
 condition, and the response-anchoring premise (the renew attempt deadline
 keeps the response-anchored fence within the commit-anchored bound the
