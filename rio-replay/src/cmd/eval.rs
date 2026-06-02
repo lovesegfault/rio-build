@@ -6,7 +6,10 @@
 //! unpack, `nix store add-path`) → scoped nix-eval-jobs run → drvPath
 //! fidelity gate → closure adjacency + drv members → truth sweep
 //! (cache.nixos.org narinfo presence + Hydra buildstatus) → archive
-//! staging + mkdwarfs pack → S3 upload with by-recipe idempotency.
+//! staging + mkdwarfs pack → S3 upload. The by-recipe idempotency gate
+//! runs up front, the moment the recipe digest is computed: an
+//! already-recorded recipe exits in seconds instead of re-spending hours
+//! of evaluation only to skip the upload at the end.
 //! `--dry-run` stops after the fidelity gate: no closure pass, no truth
 //! sweep, no archive, no upload (fidelity.json and a dry-run-marked
 //! provenance.json are still written locally, so the run is auditable).
@@ -284,6 +287,68 @@ fn buildstatus_from_builds(builds: &[crate::hydra::HydraBuild]) -> BTreeMap<Stri
         .filter(|build| build.finished == Some(1))
         .filter_map(|build| build.buildstatus.map(|status| (build.job.clone(), status)))
         .collect()
+}
+
+/// Name prefix of the per-attempt archive staging scratch dirs created in
+/// the recording's output directory. Anything matching it is a dead
+/// previous attempt: live scratch is only ever owned by the running
+/// process (a `TempDir` guard), and the publish step renames it away.
+const STAGING_SCRATCH_PREFIX: &str = ".archive-staging-";
+
+/// Remove dead staging scratch dirs from a recording's output directory —
+/// attempts killed before their `TempDir` cleanup ran (SIGKILL, node
+/// loss). Without the sweep, repeated failed attempts on the surviving
+/// /work volume would accumulate one multi-GB staged tree each.
+fn sweep_staging_scratch(root: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", root.display())),
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read an entry of {}", root.display()))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(STAGING_SCRATCH_PREFIX) && entry.path().is_dir() {
+            tracing::info!(
+                scratch = %entry.path().display(),
+                "removing staging scratch left by a previous attempt"
+            );
+            std::fs::remove_dir_all(entry.path())
+                .with_context(|| format!("remove stale scratch {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Publish a fully staged archive scratch dir at its deterministic final
+/// path with an atomic rename, discarding whatever a previous attempt
+/// left there first (every attempt regenerates the full staging contents
+/// from in-memory state, so a leftover — half-written or finalized — is
+/// never worth keeping). The `TempDir` guard is disarmed only right
+/// before the rename: any earlier failure cleans the scratch up.
+fn publish_staged_dir(
+    scratch: tempfile::TempDir,
+    final_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    if final_dir.exists() {
+        std::fs::remove_dir_all(final_dir).with_context(|| {
+            format!(
+                "remove the previous attempt's staging dir {}",
+                final_dir.display()
+            )
+        })?;
+    }
+    let scratch = scratch.keep();
+    std::fs::rename(&scratch, final_dir).with_context(|| {
+        format!(
+            "rename staged archive {} to {}",
+            scratch.display(),
+            final_dir.display()
+        )
+    })
 }
 
 pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
@@ -571,6 +636,38 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
     };
     let recipe_digest = set_key.digest();
     let short_digest = set_key.short_digest();
+
+    // By-recipe idempotency, evaluated the moment the recipe digest exists:
+    // a recipe that already produced a published archive exits here, in
+    // seconds — before the evaluator, the closure pass, the truth sweep,
+    // and the pack spend hours (and a duplicate Hydra request budget) only
+    // to skip the upload at the very end. --force salts the recipe key, so
+    // a forced re-record reads a different pointer and never trips this
+    // skip; --dry-run never uploads, so the gate does not apply (a dry run
+    // of an already-recorded recipe is still a useful fidelity check).
+    if !args.dry_run
+        && !args.force
+        && let Some(bucket) = &args.s3_bucket
+    {
+        let client = rio_common::s3::default_client(rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS).await;
+        let layout = ArchiveS3::new(bucket, &args.s3_prefix);
+        if let Some(pointer) = layout
+            .read_by_recipe_pointer(&client, &recipe_digest)
+            .await?
+            && pointer.names_archive()
+            && layout
+                .archive_exists(&client, &pointer.archive_id_short)
+                .await?
+        {
+            tracing::info!(
+                archive_id = %pointer.archive_id,
+                archive_id_short = %pointer.archive_id_short,
+                "recipe already recorded; nothing to do (re-record under a fresh archive id with --force)"
+            );
+            return Ok(());
+        }
+    }
+
     let dir = EvalSetDir::create(
         &args
             .out_dir
@@ -798,7 +895,6 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
             Some(mkdwarfs_version.as_str()),
             false,
         );
-        let staging_dir = dir.path("archive");
         let stage_inputs = package::StageInputs {
             manifest: &manifest,
             eval_errors: &eval_errors,
@@ -811,9 +907,28 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
             truth_swept_at,
             drv_text_overrides: BTreeMap::new(),
         };
-        let staged = package::stage_archive(&staging_dir, &stage_inputs)
+        // Every attempt stages into a FRESH scratch dir and only an atomic
+        // rename publishes it at the deterministic path: the eval Job's
+        // retry (container restart on the surviving /work volume) re-runs
+        // this phase against whatever a failed attempt left behind, and
+        // staging must never die on a half-written or already-finalized
+        // leftover after hours of re-evaluation. Scratch from attempts that
+        // were killed before their cleanup ran is swept first so failed
+        // attempts cannot accumulate multi-GB staging trees.
+        sweep_staging_scratch(&dir.root)?;
+        let staging_dir = dir.path("archive");
+        let scratch = tempfile::Builder::new()
+            .prefix(STAGING_SCRATCH_PREFIX)
+            .tempdir_in(&dir.root)
+            .with_context(|| format!("create a staging scratch dir in {}", dir.root.display()))?;
+        let staged = package::stage_archive(scratch.path(), &stage_inputs)
             .await
             .context("stage the v1 replay archive from the evaluation outputs")?;
+        publish_staged_dir(scratch, &staging_dir)?;
+        let staged = package::StagedArchive {
+            dir: staging_dir.clone(),
+            ..staged
+        };
         tracing::info!(
             archive_id = %staged.archive_id,
             staging = %staged.dir.display(),
@@ -843,69 +958,45 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
         .with_context(|| format!("copy the staged manifest to {}", local_manifest.display()))?;
         tracing::info!(image = %image_path.display(), "archive packed");
 
-        // ── Phase 8: S3 upload with by-recipe idempotency (skipped when no bucket is configured) ──
+        // ── Phase 8: S3 upload (skipped when no bucket is configured) ──
+        // The by-recipe idempotency gate ran up front, right after the
+        // recipe digest was computed — by here the recipe was not recorded
+        // when this run started, so upload unconditionally. (A recorder
+        // racing this one to the same recipe publishes under a different
+        // archive id — the manifest's created_at differs — and the pointer
+        // is last-writer-wins, so the worst case is a duplicate archive,
+        // never a corrupted one.)
         if let Some(bucket) = &args.s3_bucket {
             let client =
                 rio_common::s3::default_client(rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS).await;
             let layout = ArchiveS3::new(bucket, &args.s3_prefix);
-            // Idempotency: a recipe that already produced a published
-            // archive is not re-uploaded. --force salts the recipe key, so
-            // a forced re-record looks up (and later writes) a different
-            // pointer and never trips this skip. A pointer that does not
-            // actually name an archive (drift-tolerated reads turn garbage
-            // into empty fields) is ignored and overwritten by re-recording.
-            let already_recorded = if args.force {
-                false
-            } else {
-                match layout
-                    .read_by_recipe_pointer(&client, &recipe_digest)
-                    .await?
-                {
-                    Some(pointer) if pointer.names_archive() => {
-                        let exists = layout
-                            .archive_exists(&client, &pointer.archive_id_short)
-                            .await?;
-                        if exists {
-                            tracing::info!(
-                                archive_id = %pointer.archive_id,
-                                archive_id_short = %pointer.archive_id_short,
-                                "recipe already recorded; skipping upload"
-                            );
-                        }
-                        exists
-                    }
-                    _ => false,
-                }
+            let uploader = format!("rio-replay-eval/{}", env!("CARGO_PKG_VERSION"));
+            let uploaded = layout
+                .upload_archive(
+                    &client,
+                    &dir.root,
+                    &staged.archive_id,
+                    &staged.archive_id_short,
+                    &uploader,
+                )
+                .await?;
+            tracing::info!(
+                objects = uploaded.len(),
+                bucket = %bucket,
+                archive_id_short = %staged.archive_id_short,
+                "archive uploaded"
+            );
+            // The pointer is written only after the publish succeeded:
+            // it must never name an archive whose complete.json is not
+            // in place.
+            let pointer = ByRecipePointer {
+                archive_id: staged.archive_id.clone(),
+                archive_id_short: staged.archive_id_short.clone(),
+                recorded_at: jiff::Timestamp::now().to_string(),
             };
-            if !already_recorded {
-                let uploader = format!("rio-replay-eval/{}", env!("CARGO_PKG_VERSION"));
-                let uploaded = layout
-                    .upload_archive(
-                        &client,
-                        &dir.root,
-                        &staged.archive_id,
-                        &staged.archive_id_short,
-                        &uploader,
-                    )
-                    .await?;
-                tracing::info!(
-                    objects = uploaded.len(),
-                    bucket = %bucket,
-                    archive_id_short = %staged.archive_id_short,
-                    "archive uploaded"
-                );
-                // The pointer is written only after the publish succeeded:
-                // it must never name an archive whose complete.json is not
-                // in place.
-                let pointer = ByRecipePointer {
-                    archive_id: staged.archive_id.clone(),
-                    archive_id_short: staged.archive_id_short.clone(),
-                    recorded_at: jiff::Timestamp::now().to_string(),
-                };
-                layout
-                    .write_by_recipe_pointer(&client, &recipe_digest, &pointer)
-                    .await?;
-            }
+            layout
+                .write_by_recipe_pointer(&client, &recipe_digest, &pointer)
+                .await?;
         } else {
             tracing::info!("no --s3-bucket configured; the archive is local-only");
         }
@@ -926,6 +1017,66 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    #[test]
+    fn staging_publish_discards_leftovers_and_renames_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let final_dir = root.path().join("archive");
+
+        // A previous attempt's leftover at the final path — even a
+        // FINALIZED one (manifest.json present, the exact state
+        // ArchiveWriter::create refuses to restage into) — is discarded by
+        // the publish step, so a retry can never die on "refusing to
+        // stage" after hours of re-evaluation.
+        std::fs::create_dir_all(&final_dir).unwrap();
+        std::fs::write(final_dir.join("manifest.json"), b"{\"old\":true}").unwrap();
+        std::fs::write(final_dir.join("stale-member.jsonl"), b"{}\n").unwrap();
+
+        let scratch = tempfile::Builder::new()
+            .prefix(STAGING_SCRATCH_PREFIX)
+            .tempdir_in(root.path())
+            .unwrap();
+        std::fs::write(scratch.path().join("manifest.json"), b"{\"new\":true}").unwrap();
+        let scratch_path = scratch.path().to_path_buf();
+        publish_staged_dir(scratch, &final_dir).unwrap();
+
+        // The final path holds exactly the fresh attempt's contents and
+        // the scratch is gone (renamed, not copied).
+        assert_eq!(
+            std::fs::read(final_dir.join("manifest.json")).unwrap(),
+            b"{\"new\":true}"
+        );
+        assert!(
+            !final_dir.join("stale-member.jsonl").exists(),
+            "the previous attempt's contents must not bleed into the published staging dir"
+        );
+        assert!(!scratch_path.exists());
+    }
+
+    #[test]
+    fn dead_staging_scratch_is_swept() {
+        let root = tempfile::tempdir().unwrap();
+        // Two dead scratch dirs (attempts killed before their TempDir
+        // cleanup ran) plus the published archive dir and an unrelated
+        // artifact, which must survive the sweep.
+        let dead_a = root.path().join(format!("{STAGING_SCRATCH_PREFIX}aaaa"));
+        std::fs::create_dir_all(dead_a.join("nix/store")).unwrap();
+        std::fs::write(dead_a.join("manifest.json"), b"{}").unwrap();
+        let dead_b = root.path().join(format!("{STAGING_SCRATCH_PREFIX}bbbb"));
+        std::fs::create_dir_all(&dead_b).unwrap();
+        let published = root.path().join("archive");
+        std::fs::create_dir_all(&published).unwrap();
+        std::fs::write(root.path().join("fidelity.json"), b"{}").unwrap();
+
+        sweep_staging_scratch(root.path()).unwrap();
+        assert!(!dead_a.exists());
+        assert!(!dead_b.exists());
+        assert!(published.exists());
+        assert!(root.path().join("fidelity.json").exists());
+
+        // A missing root is fine (nothing recorded yet).
+        sweep_staging_scratch(&root.path().join("nonexistent")).unwrap();
+    }
 
     #[test]
     fn parses_scopes() {

@@ -20405,6 +20405,10 @@
           "packageId": "sha2 0.11.0"
         },
         {
+          "name": "tempfile",
+          "packageId": "tempfile"
+        },
+        {
           "name": "thiserror",
           "packageId": "thiserror"
         },
@@ -20461,10 +20465,6 @@
         {
           "name": "rstest",
           "packageId": "rstest"
-        },
-        {
-          "name": "tempfile",
-          "packageId": "tempfile"
         },
         {
           "name": "tokio",

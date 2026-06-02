@@ -55,6 +55,10 @@ russh = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# Fresh per-attempt archive staging scratch dirs for the recorder
+# (auto-cleaned on failure; published at the deterministic path with an
+# atomic rename only once fully staged).
+tempfile = { workspace = true }
 # Error taxonomy of the supply-execution transport seam (a daemon refusal
 # is retried once on a fresh channel, anything else is a failure).
 thiserror = { workspace = true }
@@ -80,7 +84,6 @@ aws-smithy-mocks = { workspace = true }
 # Ephemeral ed25519 keys for the transport host-key policy tests.
 rand = { workspace = true }
 rstest = { workspace = true }
-tempfile = { workspace = true }
 # Politeness-budget spacing test uses paused-clock time (start_paused).
 tokio = { workspace = true, features = ["test-util"] }
 # Asserts the keyed-result mapping's count-mismatch warning is emitted.
