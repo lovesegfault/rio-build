@@ -123,6 +123,61 @@ sources to the operator-configured map. Accepted residual: per-attempt
 HTTP status log lines remain a status oracle for the explicitly
 opted-in `machine` hosts.
 
+= Transfer contract
+
+#r("fetcher.fetchurl.transfer-cap")[
+  Every byte path of a fetch attempt MUST be metered against the typed
+  per-attempt transfer budget --- the HTTP body on the plain path and
+  the DECOMPRESSED payload on the unpack path (the dimension a
+  decompression bomb amplifies). Budget exhaustion is a typed,
+  permanent-for-candidate failure: never silent truncation (which would
+  surface as a misleading FOD hash mismatch), and never a transient
+  retry (the same candidate serves the same over-budget payload every
+  time). A truncated body remains transient --- truncation is the
+  connection's fault and a retry can succeed; exhaustion is the
+  payload's nature.
+]
+
+The plain path is capped on purpose: the previous shape exempted it
+("the HTTP body bounds itself --- the server cannot amplify"), but the
+origin URL is tenant-controlled, so the server IS the adversary and
+can stream arbitrarily many body bytes regardless of any header.
+
+#r("fetcher.fetchurl.transfer-progress")[
+  Long transfers MUST emit a progress line on build stderr at a fixed
+  byte cadence (16 MiB), so the sandbox pty --- which feeds the
+  max-silent activity watch --- observes activity for as long as bytes
+  genuinely flow. Any transfer sustaining at least
+  #raw("PROGRESS_INTERVAL_BYTES / max_silent") (≈28 KiB/s at the 600s
+  default) survives the silence policy; a fully stalled connection is
+  partitioned off earlier by the HTTP client's idle read timeout
+  (transient, candidate retried).
+]
+
+This restores a property of the oracle rather than copying its
+mechanism: CppNix's curl layer drives its logger from the transfer's
+progress callback (`filetransfer.cc`'s `XFERINFOFUNCTION` feeding the
+JSON logger), so a slow `fetchurl` never trips its silence handling.
+rio's fetch runs inside the same sandbox contract as any build
+(#rref("fetcher.fetchurl.sandboxed")), so the equivalent signal is
+plain stderr lines feeding the activity watch
+(#rref("builder.exec.limits-isolated+1")). Transfers alive but slower
+than the cadence floor are deliberately treated as silent: at that
+rate a 100 MiB source takes over an hour, and the operator's
+max-silent policy --- not the fetcher --- owns that call.
+
+The cadence and the cap are pinned at the unit level (injected-writer
+cadence, over-cap permanence on both paths, bomb no-retry,
+truncated-transient). The end-to-end composition --- progress line →
+sandbox pty → activity watch → no silence kill during a slow genuine
+transfer --- needs a per-pool `max_silent` override that `Pool.spec`
+cannot express yet (worker pods get a fixed env list).
+// TODO: add Pool.spec worker-env (or maxSilentTime) override, then a
+// fetcher-split subtest: rate-limited ~192 MiB blob, pool max-silent
+// shorter than the transfer, structural success-assert with ≥3×
+// cadence headroom. Tracked as the C8c3 staged follow-up (round-15
+// plan §4.5).
+
 = Network isolation
 
 #r("builder.netpol.airgap")[

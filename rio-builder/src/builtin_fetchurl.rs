@@ -29,7 +29,6 @@
 //!   archive.
 //! - `s3://` URLs are not supported (documented divergence from Nix).
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -75,14 +74,32 @@ const RETRY_BACKOFF: Backoff = Backoff {
     jitter: Jitter::None,
 };
 
-/// Cap on the bytes restored from an unpacked (xz→NAR) payload.
-/// A decompression bomb otherwise turns a few KiB of download into an
-/// arbitrarily large write inside the build scratch. 64 GiB is far
-/// beyond any plausible single fetched source archive while still
+/// Cap on the bytes moved by ONE fetch attempt: the HTTP body on the
+/// plain path, the DECOMPRESSED payload on the unpack path. 64 GiB is
+/// far beyond any plausible single fetched source archive while still
 /// bounding the damage to roughly the disk headroom a large build
-/// already needs. (Plain, non-unpack downloads are bounded by the HTTP
-/// body itself — the server cannot amplify.)
-const MAX_RESTORED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// already needs.
+///
+/// Both paths are capped: the previous shape exempted plain downloads
+/// ("the server cannot amplify") — but the origin URL is
+/// tenant-controlled, so the server IS the adversary and can stream
+/// arbitrarily many body bytes regardless of what any header claims.
+// r[impl fetcher.fetchurl.transfer-cap]
+const MAX_TRANSFER_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Bytes between transfer progress lines on build stderr.
+///
+/// Liveness arithmetic: progress lines reach the sandbox pty, which is
+/// what feeds rio-exec's activity watch (the max-silent clock). At a
+/// 16 MiB cadence, any transfer sustaining ≥ ~28 KiB/s under the
+/// default `max_silent = 600s` emits at least one line per window and
+/// the build survives; a fully stalled connection is partitioned off
+/// earlier by the HTTP client's 300s idle `read_timeout` (transient,
+/// candidate retried). Transfers alive-but-slower than ~28 KiB/s are
+/// treated as silent by the build's own policy — deliberately: at that
+/// rate a 100 MiB source takes over an hour.
+// r[impl fetcher.fetchurl.transfer-progress]
+const PROGRESS_INTERVAL_BYTES: u64 = 16 * 1024 * 1024;
 
 /// In-sandbox path of the operator-configured CA bundle.
 ///
@@ -113,6 +130,12 @@ pub struct FetchurlParams {
     pub hash_algo: String,
     pub hash_b16: String,
     pub netrc: Option<PathBuf>,
+    /// Per-attempt transfer budget (bytes moved: HTTP body on the plain
+    /// path, decompressed payload on the unpack path). Always
+    /// [`MAX_TRANSFER_BYTES`] in production (`from_env` pins it; this
+    /// is NOT operator-configurable) — a field only so tests can
+    /// exercise exhaustion without 64 GiB fixtures.
+    pub transfer_cap: u64,
 }
 
 impl FetchurlParams {
@@ -134,6 +157,7 @@ impl FetchurlParams {
             hash_algo: var(env_vars::HASH_ALGO).unwrap_or_default(),
             hash_b16: var(env_vars::HASH_B16).unwrap_or_default(),
             netrc: var(env_vars::NETRC).map(PathBuf::from),
+            transfer_cap: MAX_TRANSFER_BYTES,
         })
     }
 
@@ -243,6 +267,97 @@ impl FetchError {
         match self {
             FetchError::Transient(e) | FetchError::PermanentForCandidate(e) => e,
         }
+    }
+}
+
+/// Typed per-attempt transfer budget: every byte path charges it, and
+/// it owns the progress cadence — there is no way to move payload
+/// bytes without metering them, because both copy loops read through
+/// it ([`download_to`] charges per chunk; the unpack restore reads
+/// through [`MeteredRead`]).
+///
+/// Exhaustion is a hard error the caller classifies
+/// `PermanentForCandidate`: the same candidate serves the same
+/// over-budget payload on every retry, so retrying is pure waste —
+/// typed exhaustion, never silent truncation (a truncated tarball
+/// would fail the FOD hash gate with a misleading "hash mismatch").
+struct TransferMeter {
+    /// What is being metered, for the progress line ("download" /
+    /// "unpack").
+    what: &'static str,
+    cap: u64,
+    total: u64,
+    next_mark: u64,
+    /// Progress sink: `(total_bytes)` at every
+    /// [`PROGRESS_INTERVAL_BYTES`] boundary. Production emits a line on
+    /// build stderr (the sandbox pty — what feeds the max-silent
+    /// activity watch); tests inject a recorder.
+    emit: Box<dyn FnMut(u64) + Send>,
+}
+
+impl TransferMeter {
+    fn new(what: &'static str, cap: u64) -> Self {
+        Self {
+            what,
+            cap,
+            total: 0,
+            next_mark: PROGRESS_INTERVAL_BYTES,
+            emit: Box::new(move |total| {
+                eprintln!(
+                    "builtin:fetchurl: {what}: {} MiB transferred",
+                    total / (1024 * 1024)
+                );
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_emit(what: &'static str, cap: u64, emit: Box<dyn FnMut(u64) + Send>) -> Self {
+        Self {
+            what,
+            cap,
+            total: 0,
+            next_mark: PROGRESS_INTERVAL_BYTES,
+            emit,
+        }
+    }
+
+    /// Charge `n` transferred bytes: emit any crossed progress marks,
+    /// fail when the budget is exhausted.
+    // r[impl fetcher.fetchurl.transfer-cap]
+    // r[impl fetcher.fetchurl.transfer-progress]
+    fn charge(&mut self, n: u64) -> anyhow::Result<()> {
+        self.total = self.total.saturating_add(n);
+        while self.total >= self.next_mark {
+            (self.emit)(self.total);
+            self.next_mark = self.next_mark.saturating_add(PROGRESS_INTERVAL_BYTES);
+        }
+        if self.total > self.cap {
+            bail!(
+                "{} exceeded the {}-byte per-attempt transfer cap \
+                 (decompression bomb or unbounded body?)",
+                self.what,
+                self.cap
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Synchronous read adapter charging a [`TransferMeter`] per read —
+/// the unpack path's restore loop cannot move a byte without metering
+/// it. Cap exhaustion surfaces as an `io::Error` and aborts the
+/// restore.
+struct MeteredRead<R> {
+    inner: R,
+    meter: TransferMeter,
+}
+
+impl<R: std::io::Read> std::io::Read for MeteredRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.meter.charge(n as u64).map_err(std::io::Error::other)?;
+        Ok(n)
     }
 }
 
@@ -493,10 +608,11 @@ async fn try_fetch_one(
     ));
     // An interrupted body is transient: the server already proved it
     // can answer, the stream just died.
-    let download_result = download_to(resp, &tmp).await;
+    let meter = TransferMeter::new("download", params.transfer_cap);
+    let download_result = download_to(resp, &tmp, meter).await;
     if let Err(e) = download_result {
         let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(FetchError::Transient(e));
+        return Err(e);
     }
 
     // Finalize failures (bad NAR / bad xz / chmod) are deterministic
@@ -511,17 +627,39 @@ async fn try_fetch_one(
 }
 
 /// Stream an HTTP response body to `dest`.
-async fn download_to(resp: reqwest::Response, dest: &Path) -> anyhow::Result<()> {
+/// Stream an HTTP response body to `dest`, charging every chunk
+/// against the transfer budget.
+///
+/// Classification at source: stream/file errors are transient (the
+/// connection died — retry can succeed); budget exhaustion is
+/// permanent for this candidate (the same payload exhausts it again).
+async fn download_to(
+    resp: reqwest::Response,
+    dest: &Path,
+    mut meter: TransferMeter,
+) -> Result<(), FetchError> {
     use tokio::io::AsyncWriteExt as _;
     let mut file = tokio::fs::File::create(dest)
         .await
-        .with_context(|| format!("creating {}", dest.display()))?;
+        .with_context(|| format!("creating {}", dest.display()))
+        .map_err(FetchError::Transient)?;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("reading response body")?;
-        file.write_all(&chunk).await.context("writing download")?;
+        let chunk = chunk
+            .context("reading response body")
+            .map_err(FetchError::Transient)?;
+        meter
+            .charge(chunk.len() as u64)
+            .map_err(FetchError::PermanentForCandidate)?;
+        file.write_all(&chunk)
+            .await
+            .context("writing download")
+            .map_err(FetchError::Transient)?;
     }
-    file.flush().await.context("flushing download")?;
+    file.flush()
+        .await
+        .context("flushing download")
+        .map_err(FetchError::Transient)?;
     Ok(())
 }
 
@@ -578,24 +716,20 @@ async fn restore_unpacked(tmp: &Path, params: &FetchurlParams) -> anyhow::Result
     };
 
     let dest = params.output.clone();
+    let meter = TransferMeter::new("unpack", params.transfer_cap);
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        // The restore reads through the meter, so it counts
+        // DECOMPRESSED bytes — the dimension a decompression bomb
+        // amplifies. Exhaustion aborts the restore mid-stream (typed,
+        // inside the read) instead of the old `take(cap+1)` shape,
+        // which surfaced as a misleading truncated-NAR parse error.
         let bridge = tokio_util::io::SyncIoBridge::new(reader);
-        // `take(cap + 1)`: if the payload decompresses to more than the
-        // cap the NAR restore hits a truncated stream and fails, rather
-        // than this process filling the disk. Same pattern as
-        // rio-store's substituter decode cap.
-        let mut limited = bridge.take(MAX_RESTORED_BYTES + 1);
-        let restore = rio_nix::nar::restore_path_streaming(&mut limited, &dest)
-            .with_context(|| format!("restoring NAR to {}", dest.display()))
-            .and_then(|()| {
-                if limited.limit() == 0 {
-                    bail!(
-                        "unpacked payload exceeds the {MAX_RESTORED_BYTES}-byte cap \
-                         (decompression bomb?)"
-                    );
-                }
-                Ok(())
-            });
+        let mut metered = MeteredRead {
+            inner: bridge,
+            meter,
+        };
+        let restore = rio_nix::nar::restore_path_streaming(&mut metered, &dest)
+            .with_context(|| format!("restoring NAR to {}", dest.display()));
         if restore.is_err() {
             // A half-restored tree at the output path would be scanned
             // (and rejected) as a stray on the next attempt, and a
@@ -698,6 +832,7 @@ mod tests {
             hash_algo: "sha256".into(),
             hash_b16: "ab".repeat(32),
             netrc: None,
+            transfer_cap: MAX_TRANSFER_BYTES,
         }
     }
 
@@ -947,6 +1082,190 @@ mod tests {
         p.output = out_dir.path().join("mirror-out");
         fetch(&p).await.expect("mirror fetch");
         assert_eq!(std::fs::read(&p.output).unwrap(), b"from-mirror");
+    }
+
+    /// Progress cadence with an injected writer: marks at every 16 MiB
+    /// boundary, none in between, totals reported.
+    // r[verify fetcher.fetchurl.transfer-progress]
+    #[test]
+    fn meter_emits_progress_at_fixed_cadence() {
+        use std::sync::{Arc, Mutex};
+        let marks = Arc::new(Mutex::new(Vec::new()));
+        let m = marks.clone();
+        let mut meter = TransferMeter::with_emit(
+            "download",
+            u64::MAX,
+            Box::new(move |total| m.lock().unwrap().push(total)),
+        );
+        // 40 MiB in 1 MiB chunks: marks when crossing 16 and 32 MiB.
+        for _ in 0..40 {
+            meter.charge(1024 * 1024).expect("under cap");
+        }
+        let marks = marks.lock().unwrap();
+        assert_eq!(marks.len(), 2, "exactly the 16 MiB and 32 MiB marks");
+        assert_eq!(marks[0], 16 * 1024 * 1024);
+        assert_eq!(marks[1], 32 * 1024 * 1024);
+    }
+
+    /// Plain-download budget: a body larger than the per-attempt cap is
+    /// permanent for the candidate — attempted exactly once, no retry
+    /// burned re-downloading an over-budget payload. (The old shape
+    /// exempted the plain path entirely: "the server cannot amplify" —
+    /// but the origin IS the tenant's server.)
+    // r[verify fetcher.fetchurl.transfer-cap]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plain_download_over_cap_is_permanent() {
+        use axum::{Router, routing::get};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let hits = Arc::new(AtomicU32::new(0));
+        let h = hits.clone();
+        let app = Router::new().route(
+            "/big",
+            get(move || {
+                let h = h.clone();
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    vec![0u8; 64 * 1024]
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let mut p = params(&format!("http://{addr}/big"), &[]);
+        p.mirrors.clear();
+        p.output = out_dir.path().join("big-out");
+        p.transfer_cap = 16 * 1024; // 16 KiB budget vs 64 KiB body
+        let err = fetch(&p).await.expect_err("over-cap must fail");
+        assert!(
+            format!("{err:#}").contains("transfer cap"),
+            "typed exhaustion, not a hash mismatch: {err:#}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "an over-budget payload must not be re-downloaded"
+        );
+        assert!(
+            !p.output.exists(),
+            "no partial output left behind by the aborted attempt"
+        );
+    }
+
+    /// Unpack budget counts DECOMPRESSED bytes: a small xz that
+    /// expands past the cap (a decompression bomb) is permanent for
+    /// the candidate and is not retried.
+    // r[verify fetcher.fetchurl.transfer-cap]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xz_bomb_is_permanent_not_retried() {
+        use axum::{Router, routing::get};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // A NAR of 1 MiB of zeros, xz-compressed to a few KiB.
+        let inner = tempfile::tempdir().unwrap();
+        std::fs::write(inner.path().join("file"), vec![0u8; 1024 * 1024]).unwrap();
+        let nar = rio_nix::nar::dump_path(&inner.path().join("file")).unwrap();
+        let mut xz_nar = Vec::new();
+        {
+            use async_compression::tokio::write::XzEncoder;
+            use tokio::io::AsyncWriteExt as _;
+            let mut enc = XzEncoder::new(&mut xz_nar);
+            enc.write_all(&nar).await.unwrap();
+            enc.shutdown().await.unwrap();
+        }
+        assert!(
+            xz_nar.len() < 64 * 1024,
+            "the bomb must be small on the wire"
+        );
+
+        let hits = Arc::new(AtomicU32::new(0));
+        let h = hits.clone();
+        let app = Router::new().route(
+            "/bomb.nar.xz",
+            get(move || {
+                let h = h.clone();
+                let body = xz_nar.clone();
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    body
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let mut p = params(&format!("http://{addr}/bomb.nar.xz"), &[]);
+        p.mirrors.clear();
+        p.output = out_dir.path().join("bomb-out");
+        p.unpack = true;
+        p.transfer_cap = 64 * 1024; // wire bytes fit; decompressed do not
+        let err = fetch(&p).await.expect_err("bomb must fail");
+        assert!(
+            format!("{err:#}").contains("transfer cap"),
+            "typed exhaustion names the cap: {err:#}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "bombs are not retried");
+        assert!(!p.output.exists(), "no half-restored tree left behind");
+    }
+
+    /// A truncated body (server closes mid-stream after promising
+    /// more) stays TRANSIENT — the documented asymmetry with the cap:
+    /// truncation is the connection's fault and a retry can genuinely
+    /// succeed; over-budget is the payload's nature.
+    // r[verify fetcher.fetchurl.transfer-cap]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn truncated_body_is_transient_and_retried() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::io::AsyncWriteExt as _;
+
+        let hits = Arc::new(AtomicU32::new(0));
+        let h = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let n = h.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    use tokio::io::AsyncReadExt as _;
+                    let _ = sock.read(&mut buf).await;
+                    if n == 0 {
+                        // Promise 100 bytes, deliver 10, slam the door.
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n0123456789")
+                            .await;
+                        let _ = sock.shutdown().await;
+                    } else {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nwhole")
+                            .await;
+                        let _ = sock.shutdown().await;
+                    }
+                });
+            }
+        });
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let mut p = params(&format!("http://{addr}/file"), &[]);
+        p.mirrors.clear();
+        p.output = out_dir.path().join("trunc-out");
+        fetch(&p)
+            .await
+            .expect("transient truncation retried to success");
+        assert_eq!(std::fs::read(&p.output).unwrap(), b"whole");
+        assert!(
+            hits.load(Ordering::SeqCst) >= 2,
+            "the truncated attempt must be retried"
+        );
     }
 
     /// A 404 candidate is attempted exactly ONCE: the closed
