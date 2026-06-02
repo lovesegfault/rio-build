@@ -185,6 +185,89 @@ pub trait DerivationLike {
     }
 }
 
+/// Whether dispatch must resolve this derivation's inputs before
+/// building — the ONE owner of the predicate the gateway stamps as
+/// proto `needs_resolve`, the scheduler's claims derivation recomputes
+/// from verified bytes, and recovery degrades from persisted state
+/// ([`should_resolve_from_expected_paths`]).
+///
+/// Mirrors CppNix `Derivation::shouldResolve` (pinned 2.34.7,
+/// derivations.cc:1125-1155), clause for clause:
+///
+/// 1. **No input drvs ⇒ `false`** — "nothing to resolve". A floating-CA
+///    leaf with no inputs builds unresolved on both sides (its
+///    realisation registers at completion via `is_ca`; the resolve walk
+///    would visit zero children — a proven no-op).
+/// 2. **Type clause** (oracle `typeNeedsResolve`):
+///    - input-addressed ⇒ resolve iff *deferred*;
+///    - floating-CA ⇒ always resolve;
+///    - fixed-output ⇒ **`false` by type**. DELIBERATE NARROWING: the
+///      oracle resolves fixed outputs only under
+///      `Xp::CaDerivations` ("optionally … good for avoiding
+///      unnecessary rebuilds" — an optimization, not a correctness
+///      need); rio's default experimental-feature posture keeps it
+///      off. Correctness is preserved by clause 3: a fixed drv whose
+///      env embeds a floating child's placeholder MUST resolve, and
+///      does.
+/// 3. **Unresolved-input clause**: any input drv whose outputs are not
+///    statically known (floating-CA or deferred-IA child) forces a
+///    resolve — the parent's env/args reference that child's
+///    placeholder path (ADR-018 Appendix B). The oracle reaches the
+///    same population structurally (`derivationStrict` marks every IA
+///    consumer of an unknown-path input as Deferred, caught by clause
+///    2; fixed consumers by `Xp::CaDerivations`); rio's parsed-.drv
+///    vantage checks the children directly. `lookup` returning `None`
+///    (child not available — BFS inconsistency, store miss) degrades
+///    to "not unknown", matching the gateway's documented skip.
+///
+/// The oracle's trailing dynamic-derivations clause
+/// (`hasDynamicInputs`) has no rio analog: rio's `input_drvs` model
+/// carries no child maps (dynamic derivations unsupported, default
+/// posture).
+///
+/// Ill-typed output sets are unreachable past the parse boundary; if
+/// one is met through a test escape hatch the predicate fails closed
+/// (`true` — a spurious resolve attempt is a no-op, a missed required
+/// one is a broken build).
+pub fn should_resolve(
+    drv: &Derivation,
+    mut child_has_unknown_output_paths: impl FnMut(&str) -> Option<bool>,
+) -> bool {
+    if drv.input_drvs().is_empty() {
+        return false;
+    }
+    let type_needs_resolve = match drv.derivation_type() {
+        Ok(DerivationType::InputAddressed { deferred }) => deferred,
+        Ok(DerivationType::Floating) => true,
+        Ok(DerivationType::Fixed) => false,
+        Err(_) => true,
+    };
+    type_needs_resolve
+        || drv
+            .input_drvs()
+            .keys()
+            .any(|child| child_has_unknown_output_paths(child).unwrap_or(false))
+}
+
+/// Recovery-side degrade of [`should_resolve`], owned in the same
+/// place as the full predicate: when the derivation bytes are gone
+/// (post-failover row hydration), an empty persisted expected output
+/// path means the path is unknown until placeholder resolution
+/// (floating-CA self, or deferred-IA whose floating input has not
+/// resolved) — exactly the population the gateway stamps.
+///
+/// Two documented asymmetries vs the full predicate, both
+/// consequence-free at the dispatch gate:
+/// - a FOD with a floating input is UNDER-approximated (its expected
+///   path is statically known) — the dispatch-unresolved degrade,
+///   covered by `is_ca` at the realisation gate;
+/// - a floating leaf with no inputs is OVER-approximated (clause 1
+///   needs `input_drvs`, which the row no longer carries) — the
+///   resolve walk visits zero children and is a no-op.
+pub fn should_resolve_from_expected_paths<S: AsRef<str>>(expected_output_paths: &[S]) -> bool {
+    expected_output_paths.iter().any(|p| p.as_ref().is_empty())
+}
+
 /// A full Nix derivation parsed from a `.drv` file.
 ///
 /// Contains `input_drvs` (dependency DAG edges) which are NOT present in the
@@ -504,6 +587,73 @@ impl DerivationLike for BasicDerivation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Oracle truth table for [`should_resolve`] (CppNix
+    /// `Derivation::shouldResolve`, pinned 2.34.7
+    /// derivations.cc:1125-1155), including the one deliberate
+    /// narrowing (fixed-output by type) and its correctness escape
+    /// (clause 3).
+    #[test]
+    fn should_resolve_oracle_truth_table() -> anyhow::Result<()> {
+        let dep = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep.drv";
+        let known = |_: &str| Some(false);
+        let floating_child = |_: &str| Some(true);
+        let missing_child = |_: &str| None;
+
+        // Clause 1: no input drvs ⇒ false, even floating-CA self.
+        let floating_leaf =
+            Derivation::parse(r#"Derive([("out","","r:sha256","")],[],[],"x","/bin/sh",[],[])"#)?;
+        assert!(
+            !should_resolve(&floating_leaf, known),
+            "oracle: empty inputDrvs short-circuits to false"
+        );
+
+        // Floating with inputs ⇒ true (type clause).
+        let floating = Derivation::parse(&format!(
+            r#"Derive([("out","","r:sha256","")],[("{dep}",["out"])],[],"x","/bin/sh",[],[])"#
+        ))?;
+        assert!(should_resolve(&floating, known));
+
+        // Deferred-IA with inputs ⇒ true (type clause).
+        let deferred = Derivation::parse(&format!(
+            r#"Derive([("out","","","")],[("{dep}",["out"])],[],"x","/bin/sh",[],[])"#
+        ))?;
+        assert!(should_resolve(&deferred, known));
+
+        // Concrete IA with concrete inputs ⇒ false.
+        let ia = Derivation::parse(&format!(
+            r#"Derive([("out","/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-out","","")],[("{dep}",["out"])],[],"x","/bin/sh",[],[])"#
+        ))?;
+        assert!(!should_resolve(&ia, known));
+        // …and true when the child's paths are unknown (the ADR-018
+        // ia.deferred propagation, checked directly off the child).
+        assert!(should_resolve(&ia, floating_child));
+
+        // Fixed-output: false by type (the deliberate narrowing — the
+        // oracle's `Xp::CaDerivations` optimization arm is off in rio)…
+        let fod = Derivation::parse(&format!(
+            r#"Derive([("out","/nix/store/cccccccccccccccccccccccccccccccc-fod","sha256","0123abcd")],[("{dep}",["out"])],[],"x","/bin/sh",[],[])"#
+        ))?;
+        assert!(
+            !should_resolve(&fod, known),
+            "fixed with concrete inputs: narrowing pinned"
+        );
+        // …but a FOD whose input is floating MUST resolve (its env
+        // embeds the child's placeholder) — the correctness pin.
+        assert!(
+            should_resolve(&fod, floating_child),
+            "FOD-with-floating-input resolves"
+        );
+        // Missing child (BFS inconsistency / store miss) degrades to
+        // not-unknown, like the gateway's documented skip.
+        assert!(!should_resolve(&fod, missing_child));
+
+        // Recovery degrade: any empty expected path ⇒ true.
+        assert!(should_resolve_from_expected_paths(&["", "x"]));
+        assert!(!should_resolve_from_expected_paths(&["x"]));
+        assert!(!should_resolve_from_expected_paths::<&str>(&[]));
+        Ok(())
+    }
 
     #[test]
     fn from_basic_round_trips_and_hashes_like_inputless_aterm() -> anyhow::Result<()> {

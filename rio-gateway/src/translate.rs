@@ -161,11 +161,11 @@ pub async fn reconstruct_dag(
     // worker-fail-on-placeholder + retry).
     populate_ca_modular_hashes(&mut nodes, drv_cache);
 
-    // Populate needs_resolve for the ia.deferred case: an IA (or
-    // fixed-CA) derivation whose inputDrvs include a floating-CA
-    // child has that child's placeholder path embedded in its
-    // env/args — it needs resolve even though it's not floating-CA
-    // itself. AFTER BFS so every child is in drv_cache.
+    // Stamp needs_resolve from the shared oracle predicate
+    // (rio_nix::derivation::should_resolve) — covers floating-CA
+    // self, deferred-IA, and the ia.deferred/FOD-with-floating-input
+    // propagation in one place. AFTER BFS so every child is in
+    // drv_cache.
     populate_needs_resolve(&mut nodes, drv_cache);
 
     // Populate wanted_output_names: the union of every consumer's
@@ -282,45 +282,36 @@ fn populate_ca_modular_hashes(
     }
 }
 
-/// Set `needs_resolve` for nodes with unresolved-path inputs (`ia.deferred`).
+/// Stamp `needs_resolve` from the shared oracle predicate
+/// [`rio_nix::derivation::should_resolve`] — the single owner of the
+/// clause set (oracle citation, the deliberate fixed-CA narrowing, and
+/// the ADR-018 Appendix B ia.deferred propagation rationale all live on
+/// the predicate; this pass only feeds it the BFS closure).
 ///
-/// ADR-018 Appendix B: Nix's `shouldResolve` returns true for IA
-/// derivations when they're "deferred" — i.e., they have an input whose
-/// output path is a placeholder at eval time. The parent's env/args
-/// reference that placeholder, so dispatch-time resolve must rewrite it
-/// to the realized path.
-///
-/// [`build_node`] already set `needs_resolve = has_ca_floating_outputs()`
-/// (self-floating always resolves). This pass ORs in the
-/// any-child-has-unknown-output-path case — that covers BOTH floating-CA
-/// children AND deferred-IA children. CppNix's `derivationStrict`
-/// propagates the deferred kind upward (every IA whose input has an
-/// unknown path becomes `DerivationOutput::Deferred{}` with empty path
-/// itself), so every node in a deferred chain has empty output paths and
-/// this propagates transitively in a single pass; no fixpoint needed.
-/// Concrete-IA and FOD children have non-empty paths so are unaffected.
-///
-/// AFTER BFS so every child drv is in `drv_cache`. Missing children
-/// (BFS inconsistency) → skip; the node keeps its self-computed value.
-/// Same degrade as `populate_ca_modular_hashes`.
+/// One post-BFS pass (every child drv is in `drv_cache` by then): each
+/// cached node's flag is COMPUTED — not OR-merged with [`build_node`]'s
+/// seed — so the gateway cannot drift from the predicate by re-deriving
+/// a clause locally (the round-15 merged_035 lesson). A node missing
+/// from the cache (BFS inconsistency) keeps the seed; a CHILD missing
+/// from the cache degrades to not-unknown inside the predicate — the
+/// same degrade as `populate_ca_modular_hashes`.
 fn populate_needs_resolve(
     nodes: &mut [types::DerivationNode],
     drv_cache: &HashMap<StorePath, Derivation>,
 ) {
-    let deferred: Vec<usize> = iter_cached_drvs(nodes, drv_cache, "populate_needs_resolve")
-        .filter(|(_, node, _)| !node.needs_resolve)
-        .filter(|(_, _, drv)| {
-            drv.input_drvs().keys().any(|child_path| {
+    let computed: Vec<(usize, bool)> = iter_cached_drvs(nodes, drv_cache, "populate_needs_resolve")
+        .map(|(idx, _, drv)| {
+            let flag = rio_nix::derivation::should_resolve(drv, |child_path| {
                 StorePath::parse(child_path)
                     .ok()
                     .and_then(|sp| drv_cache.get(&sp))
-                    .is_some_and(|child| child.has_unknown_output_paths())
-            })
+                    .map(|child| child.has_unknown_output_paths())
+            });
+            (idx, flag)
         })
-        .map(|(idx, _, _)| idx)
         .collect();
-    for idx in deferred {
-        nodes[idx].needs_resolve = true;
+    for (idx, flag) in computed {
+        nodes[idx].needs_resolve = flag;
     }
 }
 
@@ -1099,10 +1090,13 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
         // inline would be a partial-closure recurse (InputNotFound
         // for inputs the BFS hasn't visited yet).
         ca_modular_hash: Vec::new(),
-        // ADR-018 Appendix B: floating-CA self always resolves.
-        // populate_needs_resolve() ORs in the ia.deferred case
-        // (IA-with-floating-CA-input) AFTER BFS — needs the
-        // drv_cache to look up children's addressing mode.
+        // Seed only — populate_needs_resolve() recomputes every cached
+        // node from the shared oracle predicate
+        // (rio_nix::derivation::should_resolve) AFTER BFS, when the
+        // drv_cache can answer child lookups. The seed survives only
+        // for nodes the BFS failed to cache (inconsistency degrade);
+        // self-floating is the safe over-approximation there (a
+        // spurious resolve over zero known children is a no-op).
         needs_resolve: drv.has_ca_floating_outputs(),
     }
 }
@@ -3650,10 +3644,16 @@ mod tests {
     }
 
     // r[verify sched.ca.detect]
-    /// `populate_needs_resolve`: IA parent depending on a floating-CA
-    /// child gets `needs_resolve = true` (the ia.deferred case from
-    /// ADR-018 Appendix B). IA-on-IA stays false. Floating-CA self
-    /// stays true (set earlier by `build_node`, unchanged here).
+    /// `populate_needs_resolve` clause survival through the shared
+    /// oracle predicate: IA parent depending on a floating-CA child
+    /// gets `needs_resolve = true` (ia.deferred, ADR-018 Appendix B);
+    /// IA-on-IA stays false; a FOD with a floating input resolves
+    /// (the narrowing's correctness escape). KNOWINGLY-FLIPPED PIN
+    /// (round-15 C3c3, oracle derivations.cc:1125-1155 clause 1): a
+    /// floating-CA leaf with NO input drvs is now `false` — "no input
+    /// drvs means nothing to resolve"; the resolve walk over zero
+    /// children was a proven no-op and realisation registration is
+    /// gated by `is_ca`, not this flag.
     #[test]
     fn populate_needs_resolve_ia_deferred() {
         let ca_child_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ca.drv");
@@ -3700,7 +3700,10 @@ mod tests {
 
         populate_needs_resolve(&mut nodes, &drv_cache);
 
-        assert!(nodes[0].needs_resolve, "floating-CA unchanged");
+        assert!(
+            !nodes[0].needs_resolve,
+            "floating-CA leaf with no input drvs → false (oracle clause 1)"
+        );
         assert!(!nodes[1].needs_resolve, "IA leaf → still false");
         assert!(
             nodes[2].needs_resolve,
@@ -3709,6 +3712,26 @@ mod tests {
         assert!(
             !nodes[3].needs_resolve,
             "IA with only-IA inputs → still false"
+        );
+
+        // Clause survival: a FOD whose input is the floating-CA child
+        // must resolve (its env embeds the child's placeholder) — the
+        // population the deleted local OR-pass used to catch and the
+        // shared predicate's clause 3 now owns.
+        let fod_path = sp("/nix/store/gggggggggggggggggggggggggggggggg-fod.drv");
+        let fod_aterm = format!(
+            r#"Derive([("out","/nix/store/x265isadxs1xhsd5larxdal956cxmsk1-fodout","sha256","0123abcd")],[("{}",["out"])],[],"x86_64-linux","/bin/sh",[],[])"#,
+            ca_child_path.as_str()
+        );
+        let fod = Derivation::parse(&fod_aterm).unwrap();
+        let mut fod_cache = drv_cache.clone();
+        fod_cache.insert(fod_path.clone(), fod.clone());
+        let mut fod_nodes = vec![build_node(fod_path.as_str(), &fod)];
+        assert!(!fod_nodes[0].needs_resolve, "FOD seed → false pre-pass");
+        populate_needs_resolve(&mut fod_nodes, &fod_cache);
+        assert!(
+            fod_nodes[0].needs_resolve,
+            "FOD with floating-CA input → needs_resolve=true"
         );
     }
 
@@ -3775,7 +3798,14 @@ mod tests {
 
         populate_needs_resolve(&mut nodes, &drv_cache);
 
-        assert!(nodes[0].needs_resolve, "floating-CA leaf unchanged");
+        // KNOWINGLY-FLIPPED PIN (round-15 C3c3): no-input floating
+        // leaf → false under the shared oracle predicate's clause 1
+        // (derivations.cc:1125-1155 "no input drvs means nothing to
+        // resolve"); see populate_needs_resolve_ia_deferred.
+        assert!(
+            !nodes[0].needs_resolve,
+            "floating-CA leaf with no inputs → false (oracle clause 1)"
+        );
         assert!(
             nodes[1].needs_resolve,
             "IA-mid (child = floating-CA) → true"

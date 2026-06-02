@@ -1431,19 +1431,18 @@ impl DerivationState {
                 .and_then(|b| <[u8; 32]>::try_from(b).ok())
         };
         // r[impl sched.recovery.deferred-resolve]
-        // Re-derive the dispatch-time resolve flag from the persisted
-        // creation snapshot: an empty expected output path means the
-        // path is unknown until placeholder resolution (floating-CA
-        // self, or deferred-IA whose floating-CA input hasn't resolved)
-        // — exactly the population the gateway stamps `needs_resolve`
-        // for. Without this the flag was lost to `..Default::default()`
-        // and a post-failover completion of a deferred-IA node skipped
+        // Re-derive the dispatch-time resolve flag through the shared
+        // recovery degrade owned next to the full oracle predicate
+        // (`rio_nix::derivation::should_resolve` — see its doc for the
+        // two documented asymmetries, both consequence-free here:
+        // FOD-with-floating-input under-approximated and covered by
+        // `is_ca` at the realisation gate; no-input floating leaf
+        // over-approximated into a no-op resolve walk). Without this
+        // the flag was lost to `..Default::default()` and a
+        // post-failover completion of a deferred-IA node skipped
         // realisation registration even though its hash was persisted.
-        // FOD-with-floating-CA-input is under-approximated (its expected
-        // path is known), which keeps the documented dispatch-unresolved
-        // degrade and is already covered by `is_ca` at the realisation
-        // gate.
-        let needs_resolve = row.expected_output_paths.iter().any(|p| p.is_empty());
+        let needs_resolve =
+            rio_nix::derivation::should_resolve_from_expected_paths(&row.expected_output_paths);
         let recovered_input_srcs: Vec<String> = parsed_content
             .as_ref()
             .map(|d| d.input_srcs().iter().cloned().collect())
