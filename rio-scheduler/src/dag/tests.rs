@@ -4480,8 +4480,10 @@ fn test_heal_coverage_scales_to_wide_witness() -> anyhow::Result<()> {
         "full 10k re-supply covers the witness"
     );
     assert!(
-        !dag.nodes.get("wsx-x").unwrap().closure_hole.is_holed() || true,
-        "merge computes; the actor clears — see the actor-side heal test"
+        dag.nodes.get("wsx-x").unwrap().closure_hole.is_holed(),
+        "merge only computes the heal; the hole must stay stamped until \
+         the actor clears it with the witness — see the actor-side heal \
+         test"
     );
     Ok(())
 }
