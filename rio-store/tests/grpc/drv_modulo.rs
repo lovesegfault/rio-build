@@ -447,6 +447,72 @@ async fn duplicate_output_deriver_fails_proof_closed() -> TestResult {
 }
 
 // r[verify store.put.ia-deriver-proof+3]
+/// The residency clause end-to-end: after the deriver `.drv` is GC'd
+/// (narinfo gone) its proof row SURVIVES, and an IA upload claiming its
+/// output is still ACCEPTED — "previously verified against resident
+/// bytes" is durable, exactly as the gate doc and rejection text state.
+/// Only deleting the proof row itself (operator invalidation) makes the
+/// upload fail, and then with the NotResident wording that tells the
+/// worker what to upload.
+#[tokio::test]
+async fn ia_proof_survives_deriver_gc() -> TestResult {
+    let mut s =
+        StoreSession::new_with_service_hmac(TEST_KEY.to_vec(), SERVICE_KEY.to_vec()).await?;
+    assert!(upload_drv_at(&mut s, GOLDEN_LEAF_PATH, GOLDEN_LEAF, &[]).await?);
+    assert!(
+        cache_row(&s.db.pool, GOLDEN_LEAF_PATH).await?.is_some(),
+        "ingestion populated the proof row"
+    );
+
+    // Simulate deriver GC: narinfo (and CASCADE) gone, proof row kept —
+    // the exact state sweep_preserves_drv_modulo_rows pins at the unit
+    // level.
+    let key: Vec<u8> = {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(GOLDEN_LEAF_PATH.as_bytes()).to_vec()
+    };
+    sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
+        .bind(&key)
+        .execute(&s.db.pool)
+        .await?;
+
+    // The leaf's sole IA output, straight from the golden fixture.
+    let out_path = {
+        let drv = rio_nix::derivation::Derivation::parse(GOLDEN_LEAF.trim_end())
+            .expect("golden leaf parses");
+        drv.outputs()[0].path().to_string()
+    };
+    let (nar, _) = make_nar(b"post-gc output bytes");
+    let info = make_path_info_for_nar(&out_path, &nar);
+    let token = ia_claims_token(GOLDEN_LEAF_PATH, vec![out_path.clone()]);
+    assert!(
+        put_path_with_token(&mut s.client, info, nar.clone(), &token).await?,
+        "proof from the surviving row accepts the upload after deriver GC"
+    );
+
+    // Remove the upload AND the proof row (operator invalidation
+    // territory): now the proof has nothing to work from.
+    sqlx::query("DELETE FROM narinfo")
+        .execute(&s.db.pool)
+        .await?;
+    sqlx::query("DELETE FROM drv_modulo_cache WHERE drv_path_hash = $1")
+        .bind(&key)
+        .execute(&s.db.pool)
+        .await?;
+    let info = make_path_info_for_nar(&out_path, &nar);
+    let err = put_path_with_token(&mut s.client, info, nar, &token)
+        .await
+        .expect_err("no resident deriver and no proof row: fail closed");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied, "got: {err:?}");
+    assert!(
+        err.message().contains("not resident"),
+        "NotResident wording names the remediation: {}",
+        err.message()
+    );
+    Ok(())
+}
+
+// r[verify store.put.ia-deriver-proof+3]
 /// Database failure during the proof lookup is an INTERNAL error, never
 /// `PERMISSION_DENIED`: with the cache table dropped, the proof's own
 /// SELECT fails — pre-fix the `.ok()??` fold reported "deriver closure

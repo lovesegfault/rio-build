@@ -963,6 +963,54 @@ mod tests {
         );
     }
 
+    // r[verify store.put.ia-deriver-proof+3]
+    /// The sweep PRESERVES drv_modulo_cache rows by design: proofs
+    /// survive deriver GC ("resident or previously verified against
+    /// resident bytes" — the gate's residency clause). This is the
+    /// survival pin for bug_102's wrong-direction suggested fix: a
+    /// sweep-side DELETE of drv_modulo_cache rows would fail THIS test
+    /// instead of merging. Path-scoped purge belongs to operator
+    /// invalidation (store.admin.invalidate-total); growth is bounded
+    /// by the orphan TTL reclaim, not the sweep.
+    #[tokio::test]
+    async fn sweep_preserves_drv_modulo_rows() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let drv = test_store_path("swept-deriver.drv");
+        let hash = StoreSeed::raw_path(&drv).seed(&db.pool).await;
+        sqlx::query(
+            "INSERT INTO drv_modulo_cache \
+             (drv_path_hash, drv_path, modulo_hash, ia_output_paths, deferred) \
+             VALUES ($1, $2, $3, '[]'::jsonb, FALSE)",
+        )
+        .bind(&hash)
+        .bind(&drv)
+        .bind([0u8; 32].as_slice())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let stats = sweep(&db.pool, None, vec![hash.clone()], false, &no_shutdown())
+            .await
+            .unwrap();
+        assert_eq!(stats.paths_deleted, 1);
+
+        let narinfo: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM narinfo")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(narinfo, 0, "the deriver narinfo itself is swept");
+
+        let modulo: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM drv_modulo_cache")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            modulo, 1,
+            "the proof row must SURVIVE the sweep (ia-deriver-proof+3 residency clause)"
+        );
+    }
+
     /// merged_bug_019: dry-run must NOT increment any of the three
     /// sweep counters (swept/enqueued/resurrected). Before the fix,
     /// `_resurrected_total` was emitted inline pre-rollback, so
