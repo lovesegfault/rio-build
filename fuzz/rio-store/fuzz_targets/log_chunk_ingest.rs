@@ -12,16 +12,24 @@
 //! The async seams (`LogChunkStore::put`/`get` inside `read_chunk`) are
 //! resolved against `MemoryLogChunkStore`, whose futures never suspend —
 //! [`now_or_never`] polls them once and panics if one returns `Pending`.
-//! The PG-coupled halves of the layer (the manifest SELECT in
-//! `read_manifest_range`, the completeness fold in `gate.rs`, the cut's
-//! INSERT) are out of reach from a hermetic fuzz body; the harness
-//! replays their contracts instead: the chunk list is sorted by
-//! `(first_line, session_id)` exactly as `read_manifest_range`'s
-//! `ORDER BY` does, and the harness's cutter splits the accepted buffer
-//! at forward gaps exactly as `contiguous_prefix_len` does.
-//! TODO: once the chunk-range / dedup / gate kernels are extracted into
-//! pure `decide_*`/`fold_*` functions, point this target at them
-//! directly and drop the harness-side replays.
+//!
+//! The decision kernels live in the dependency-free `rio-log-kernel`
+//! crate (re-exported as `rio_store::logs::kernel`) and are fuzzed
+//! DIRECTLY by the sibling targets `log_accept_kernel` (the accept
+//! gate composed across a session lifetime) and `log_dedup_kernel`
+//! (the chunk walk + completeness fold at arbitrary manifest length);
+//! THIS harness remains the end-to-end integration oracle through the
+//! real `IngestSession::accept`/`read_chunk`/`LineCursor` store paths.
+//! Of the once-replayed PG-coupled contracts: the cutter replay is
+//! gone — `SessionHarness::cut` calls
+//! `rio_log_kernel::contiguous_prefix_len` for run discovery instead
+//! of reimplementing the loop — while the `(first_line, session_id)`
+//! sort below deliberately mirrors `read_manifest_range`'s `ORDER BY`,
+//! an SQL contract a hermetic harness must replay by construction.
+//! (The kernel targets share one corpus tree and lockfile with this
+//! one rather than a separate fuzz workspace: any kernel edit rebuilds
+//! this workspace's shared member drv anyway, so a third crate2nix
+//! instantiation would buy no rebuild isolation.)
 //!
 //! Properties (`docs/spec/models/logService.qnt` names in parens):
 //! - **No panic, no arithmetic overflow** anywhere in the accept or
@@ -290,16 +298,16 @@ impl SessionHarness {
     /// Drain the not-yet-chunked accepted lines into immutable chunks,
     /// one per contiguous run (a chunk's manifest row describes a
     /// gap-free `[first_line, first_line + line_count)`, so the cutter
-    /// never spans a forward gap). Mirrors the real cutter's
-    /// `contiguous_prefix_len` drain loop.
+    /// never spans a forward gap). Run discovery is the real cutter's
+    /// rule, called directly: `rio_log_kernel::contiguous_prefix_len`.
     fn cut(&mut self, store: &MemoryLogChunkStore, manifest: &mut Vec<(u64, Uuid, ChunkRef)>) {
         let pending = &self.expected[self.chunked_to..];
         let mut run_start = 0;
         while run_start < pending.len() {
-            let mut run_end = run_start + 1;
-            while run_end < pending.len() && pending[run_end].0 == pending[run_end - 1].0 + 1 {
-                run_end += 1;
-            }
+            let run_end = run_start
+                + rio_log_kernel::contiguous_prefix_len(
+                    pending[run_start..].iter().map(|(n, _)| *n),
+                );
             let run = &pending[run_start..run_end];
             let first_line = run[0].0;
             let lines: Vec<Vec<u8>> = run.iter().map(|(_, l)| l.clone()).collect();

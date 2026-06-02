@@ -21,6 +21,11 @@ rio-store = { path = "../../rio-store" }
 # direct edge.
 rio-proto = { path = "../../rio-proto" }
 uuid = "1"
+# log_accept_kernel / log_dedup_kernel hit the decision kernels
+# directly (and log_chunk_ingest's cutter reuses the kernel's
+# contiguous-prefix rule). Already in rio-store's dependency tree;
+# naming the kernel fns requires the direct edge.
+rio-log-kernel = { path = "../../rio-log-kernel" }
 
 [[bin]]
 name = "manifest_deserialize"
@@ -31,5 +36,17 @@ doc = false
 [[bin]]
 name = "log_chunk_ingest"
 path = "fuzz_targets/log_chunk_ingest.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "log_accept_kernel"
+path = "fuzz_targets/log_accept_kernel.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "log_dedup_kernel"
+path = "fuzz_targets/log_dedup_kernel.rs"
 test = false
 doc = false

@@ -13053,6 +13053,10 @@
           "packageId": "libfuzzer-sys"
         },
         {
+          "name": "rio-log-kernel",
+          "packageId": "rio-log-kernel"
+        },
+        {
           "name": "rio-proto",
           "packageId": "rio-proto"
         },
@@ -13067,8 +13071,16 @@
       ],
       "crateBin": [
         {
+          "name": "log_accept_kernel",
+          "path": "fuzz_targets/log_accept_kernel.rs"
+        },
+        {
           "name": "log_chunk_ingest",
           "path": "fuzz_targets/log_chunk_ingest.rs"
+        },
+        {
+          "name": "log_dedup_kernel",
+          "path": "fuzz_targets/log_dedup_kernel.rs"
         },
         {
           "name": "manifest_deserialize",

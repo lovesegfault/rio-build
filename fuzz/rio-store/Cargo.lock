@@ -4103,6 +4103,7 @@ name = "rio-store-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "rio-log-kernel",
  "rio-proto",
  "rio-store",
  "uuid",
