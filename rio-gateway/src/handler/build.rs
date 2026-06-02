@@ -1043,7 +1043,7 @@ enum RootEvidence {
 /// store check — the single chokepoint where per-root claims are minted,
 /// total over (evidence × store state).
 ///
-/// The honesty invariants (r[gw.opcode.build-results-honest]):
+/// The honesty invariants (r[gw.opcode.build-results-honest+2]):
 ///
 /// - An executed `Built` (`timesBuilt` ≥ 1) is reported only from the
 ///   root's OWN success terminal — the DAG-level Completed is an
