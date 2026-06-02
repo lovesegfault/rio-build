@@ -100,6 +100,11 @@ async fn test_watch_build_after_terminal_snapshot_reports_outcome(
                 !snap.error_message.is_empty(),
                 "failure payload populated: {snap:?}"
             );
+            assert_eq!(
+                snap.failure_status,
+                rio_proto::types::BuildResultStatus::PermanentFailure as i32,
+                "snapshot carries the worker's failure classification"
+            );
         }
         Terminalize::Cancel => {
             assert_eq!(

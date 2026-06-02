@@ -143,14 +143,25 @@ impl DagActor {
         // error_summary side-effect under keep_going=true if the node
         // has since transitioned out of a failed state.
         if let Some(failed_hash) = first_dep_failed
-            && self.dag.node(&failed_hash).is_some_and(|s| {
-                matches!(
-                    s.status(),
-                    DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
-                )
+            && let Some(node_status) = self.dag.node(&failed_hash).and_then(|s| {
+                match s.status() {
+                    // A within-TTL poisoned node is exactly a negative
+                    // cache entry ("Previously failed, result cached");
+                    // the original classification is not stored on the
+                    // DAG node, so CachedFailure is the honest wire
+                    // value for merging onto it.
+                    DerivationStatus::Poisoned => {
+                        Some(rio_proto::types::BuildResultStatus::CachedFailure)
+                    }
+                    DerivationStatus::DependencyFailed => {
+                        Some(rio_proto::types::BuildResultStatus::DependencyFailed)
+                    }
+                    _ => None,
+                }
             })
         {
-            self.handle_derivation_failure(build_id, &failed_hash).await;
+            self.handle_derivation_failure(build_id, &failed_hash, node_status)
+                .await;
             // handle_derivation_failure may have transitioned the build to
             // Failed. If so, don't dispatch.
             if self

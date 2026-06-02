@@ -2766,6 +2766,11 @@ async fn test_keep_going_build_failed_records_first_failure() -> TestResult {
                 "failed_derivation must name the first-failed drv: {f:?}"
             );
             assert!(!f.error_message.is_empty(), "error_message non-empty");
+            assert_eq!(
+                f.status(),
+                rio_proto::types::BuildResultStatus::PermanentFailure,
+                "BuildFailed carries the worker's classification"
+            );
         }
     }
     assert!(saw_failed, "keep_going build must emit BuildFailed");

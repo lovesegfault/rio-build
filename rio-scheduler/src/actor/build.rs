@@ -349,6 +349,7 @@ impl DagActor {
         let mut output_paths = Vec::new();
         let mut error_message = String::new();
         let mut failed_derivation = String::new();
+        let mut failure_status = 0i32;
         let mut cancel_reason = String::new();
         match state {
             BuildState::Succeeded => {
@@ -367,6 +368,7 @@ impl DagActor {
             BuildState::Failed => {
                 error_message = build.error_summary.clone().unwrap_or_default();
                 failed_derivation = build.failed_derivation.clone().unwrap_or_default();
+                failure_status = build.failure_status.map_or(0, |s| s as i32);
             }
             BuildState::Cancelled => {
                 cancel_reason = "build was cancelled".to_string();
@@ -392,11 +394,14 @@ impl DagActor {
             output_paths,
             error_message,
             failed_derivation,
-            // TODO: thread BuildResultStatus from the failing derivation
-            // (completion.rs receives it from the worker; build state
-            // needs a field to carry it). Same gap as the old
-            // terminal-resend's `status: 0`.
-            failure_status: 0,
+            // First failure's classification, recorded by
+            // handle_derivation_failure next to error_summary/
+            // failed_derivation (the timeout watchdog and the topdown
+            // fail-fast set their own); 0/Unspecified only for failures
+            // recovery synthesized without evidence — display-only, not
+            // persisted, same posture as failed_derivation. Failed-arm-
+            // only population mirrors the payload-arm discipline above.
+            failure_status,
             cancel_reason,
         };
 
@@ -531,13 +536,14 @@ impl DagActor {
         &mut self,
         build_id: Uuid,
     ) -> Result<(), ActorError> {
-        let (error_summary, failed_derivation) = self
+        let (error_summary, failed_derivation, failure_status) = self
             .builds
             .get(&build_id)
             .map(|b| {
                 (
                     b.error_summary.clone().unwrap_or_default(),
                     b.failed_derivation.clone().unwrap_or_default(),
+                    b.failure_status.map_or(0, |s| s as i32),
                 )
             })
             .unwrap_or_default();
@@ -554,7 +560,7 @@ impl DagActor {
             rio_proto::types::build_event::Event::Failed(rio_proto::types::BuildFailed {
                 error_message: error_summary,
                 failed_derivation,
-                status: 0,
+                status: failure_status,
             }),
         );
         metrics::counter!("rio_scheduler_builds_total", "outcome" => "failure").increment(1);

@@ -388,6 +388,12 @@ impl DagActor {
                 build
                     .failed_derivation
                     .get_or_insert_with(|| drv_hash.to_string());
+                // The message itself says "resubmit to re-probe or
+                // full-merge" — TransientFailure is the wire signal for
+                // "might work if retried".
+                build
+                    .failure_status
+                    .get_or_insert(rio_proto::types::BuildResultStatus::TransientFailure);
             }
             self.cancel_build_derivations(
                 build_id,

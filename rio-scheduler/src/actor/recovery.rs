@@ -936,6 +936,12 @@ impl DagActor {
                     "recovered with {} failed derivation(s)",
                     b.failed_count
                 ));
+                // failure_status deliberately stays None here (like
+                // failed_derivation, which this path never sets): the
+                // per-drv wire classification is not recoverable from
+                // PG, so a recovery-synthesized failure reports
+                // Unspecified → MiscFailure — byte-identical to the
+                // pre-threading behavior for this path.
             }
             self.check_build_completion(build_id).await;
         }

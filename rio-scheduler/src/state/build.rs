@@ -127,6 +127,19 @@ pub struct BuildInfo {
     pub error_summary: Option<String>,
     /// The derivation that caused the failure (if any).
     pub failed_derivation: Option<String>,
+    /// First failure's worker classification, paired with
+    /// `error_summary`/`failed_derivation` (first failure wins under
+    /// keep_going; the trio is recorded by the same
+    /// `handle_derivation_failure` block, so they cannot name different
+    /// failures — the timeout watchdog and the topdown fail-fast set
+    /// their own alongside their summaries). Names the classification
+    /// of the drv recorded in `failed_derivation`. In-memory only, the
+    /// SAME display-only durability posture as `failed_derivation`: a
+    /// build that went terminal-Failed before a failover is never
+    /// resident again (recovery loads only pending/active builds), and
+    /// recovery-synthesized failures deliberately leave this `None` —
+    /// `None` ⇒ wire `0`/`Unspecified` ⇒ nix `MiscFailure`.
+    pub failure_status: Option<rio_proto::types::BuildResultStatus>,
     /// When the build was submitted (for rio_scheduler_build_duration_seconds).
     pub submitted_at: Instant,
     /// When the orphan-watcher sweep first observed this build's
@@ -168,6 +181,7 @@ impl BuildInfo {
             failed_count: 0,
             error_summary: None,
             failed_derivation: None,
+            failure_status: None,
             submitted_at: Instant::now(),
             orphaned_since: None,
         }

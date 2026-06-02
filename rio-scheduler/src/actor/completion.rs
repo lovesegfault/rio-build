@@ -2461,7 +2461,8 @@ impl DagActor {
         // does not; that build must also get handle_derivation_failure
         // or it hangs Active forever.
         for build_id in self.union_interested_with_cascaded(drv_hash, &cascaded) {
-            self.handle_derivation_failure(build_id, drv_hash).await;
+            self.handle_derivation_failure(build_id, drv_hash, status)
+                .await;
         }
     }
 
@@ -3619,7 +3620,16 @@ impl DagActor {
         builds
     }
 
-    pub(super) async fn handle_derivation_failure(&mut self, build_id: Uuid, drv_hash: &DrvHash) {
+    /// `status` is the failing derivation's wire classification — every
+    /// caller must decide it at the call site (the parameter is the
+    /// forcing function: a future failure path cannot forget the
+    /// classification without failing to compile).
+    pub(super) async fn handle_derivation_failure(
+        &mut self,
+        build_id: Uuid,
+        drv_hash: &DrvHash,
+        status: rio_proto::types::BuildResultStatus,
+    ) {
         // r[impl sched.build.terminal-status-settled+2]
         // A build that already reached a terminal state keeps its
         // settled outcome: a shared node failing later (re-dispatched by
@@ -3656,6 +3666,13 @@ impl DagActor {
         build
             .failed_derivation
             .get_or_insert_with(|| drv_hash.to_string());
+        // Paired with the two fields above: the trio names the SAME
+        // first failure (union-only builds record the TRIGGER's status,
+        // matching the trigger hash failed_derivation records for
+        // them). If failed_derivation's semantics ever change to name
+        // the cascaded node instead, this mapping must change in
+        // lockstep.
+        build.failure_status.get_or_insert(status);
 
         if !build.keep_going {
             // Fail the entire build immediately. Cancel remaining

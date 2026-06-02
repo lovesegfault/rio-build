@@ -225,6 +225,10 @@ impl DagActor {
             // up for the BuildFailed event + DB error_summary column.
             if let Some(build) = self.builds.get_mut(&build_id) {
                 build.error_summary = Some(reason.clone());
+                // Direct assign (not get_or_insert), mirroring the
+                // overwrite semantics of the summary above so the
+                // status matches the overwritten message.
+                build.failure_status = Some(rio_proto::types::BuildResultStatus::TimedOut);
             }
             // Reuse the CancelBuild derivation-cancellation path (sends
             // CancelSignal, transitions drvs to Cancelled, removes build

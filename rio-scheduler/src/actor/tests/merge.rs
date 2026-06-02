@@ -2517,3 +2517,57 @@ async fn test_stale_skipped_output_reset() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.build.keep-going]
+/// Merging a build (keep_going=false) onto an at-resubmit-limit
+/// Poisoned node fail-fasts with the negative-cache classification:
+/// the WatchBuild snapshot reports Failed with failure_status ==
+/// CachedFailure — pins the compile-forced merge-site status mapping
+/// (the original classification is not stored on the DAG node; a
+/// within-TTL poisoned node is exactly a cached failure).
+#[tokio::test]
+async fn test_merge_onto_poisoned_at_limit_snapshot_reports_cached_failure() -> TestResult {
+    let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
+    let tag = "merge-poisoned-status";
+    let node = make_node(tag);
+
+    // Build #1: merge + force-poison at the limit (not retriable on
+    // resubmit; output neither in store nor substitutable, so the
+    // reprobe lane stays cold and reconcile_preexisting fail-fasts).
+    merge_dag(&handle, Uuid::new_v4(), vec![node.clone()], vec![], false).await?;
+    assert!(
+        handle
+            .debug_force_poisoned(tag, crate::state::POISON_RESUBMIT_RETRY_LIMIT)
+            .await?
+    );
+    barrier(&handle).await;
+
+    // Build #2 onto the same hash → merge-time fail-fast.
+    let build2 = Uuid::new_v4();
+    let _ev2 = merge_dag(&handle, build2, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::WatchBuild {
+            build_id: build2,
+            caller_tenant: None,
+            reply: reply_tx,
+        })
+        .await?;
+    let (_watch_rx, snapshot) = reply_rx.await??;
+    let Some(rio_proto::types::build_event::Event::Snapshot(snap)) = snapshot.event else {
+        panic!("expected a snapshot event, got {:?}", snapshot.event);
+    };
+    assert_eq!(
+        snap.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "merge onto poisoned-at-limit fail-fasts the build"
+    );
+    assert_eq!(
+        snap.failure_status,
+        rio_proto::types::BuildResultStatus::CachedFailure as i32,
+        "merge-onto-poisoned maps to the negative-cache classification"
+    );
+    Ok(())
+}
