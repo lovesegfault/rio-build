@@ -20,7 +20,7 @@ use rio_nix::derivation::Derivation;
 use serde::{Deserialize, Serialize};
 
 use crate::archive::reader::ReplayArchive;
-use crate::archive::schema::{ClosureRecord, UnitRecord};
+use crate::archive::schema::{Capability, ClosureRecord, UnitRecord};
 
 /// One workload unit in the shape the plan stage consumes: job name,
 /// system, derivation, declared outputs, and required features. Field
@@ -168,13 +168,14 @@ pub fn load_closures(
     units: &[ManifestEntry],
 ) -> Result<Vec<DepClosureEntry>> {
     let recovered: Vec<ClosureRecord>;
-    let records: &[ClosureRecord] = if archive.capabilities().dependency_closures {
-        archive.closures()
-    } else {
-        let roots: Vec<String> = units.iter().map(|unit| unit.drv_path.clone()).collect();
-        recovered = aterm_adjacency(archive, &roots)?;
-        &recovered
-    };
+    let records: &[ClosureRecord] =
+        if Capability::DependencyClosures.enabled_in(archive.capabilities()) {
+            archive.closures()
+        } else {
+            let roots: Vec<String> = units.iter().map(|unit| unit.drv_path.clone()).collect();
+            recovered = aterm_adjacency(archive, &roots)?;
+            &recovered
+        };
     let adjacency: HashMap<&str, &ClosureRecord> = records
         .iter()
         .map(|record| (record.drv.as_str(), record))

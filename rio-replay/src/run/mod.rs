@@ -53,7 +53,7 @@ use sha2::Digest as _;
 use crate::archive::reader::ReplayArchive;
 use crate::archive::s3::{ARCHIVE_IMAGE_OBJECT, ARCHIVE_MANIFEST_OBJECT};
 use crate::archive::schema::{
-    ExpectedOutcome, MemberDigest, OutcomeRecord, RequestRecord, SessionKey,
+    Capability, ExpectedOutcome, MemberDigest, OutcomeRecord, RequestRecord, SessionKey,
 };
 
 use self::artifact::{
@@ -1152,7 +1152,7 @@ pub async fn run_with_backends(
     let mut scheduling_low_confidence: Vec<String> = Vec::new();
     if spec.scheduling.mode == ScheduleMode::Timed {
         anyhow::ensure!(
-            archive.capabilities().timed,
+            Capability::Timed.enabled_in(archive.capabilities()),
             "scheduling.mode is \"timed\" but the archive does not declare the timed capability \
              (per-request offsets); record a timed archive or run the campaign timeless"
         );

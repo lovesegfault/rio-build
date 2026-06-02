@@ -76,25 +76,20 @@ pub struct MemberPresence {
 
 impl Capabilities {
     /// Error when a flag is set but the member backing it is absent; every
-    /// unbacked flag is reported in the one error message.
-    /// (`timed` has no backing member; `output_hashes` requires the
-    /// outcomes member because per-output hashes live there.)
+    /// unbacked flag is reported in the one error message. The flag →
+    /// backing-member relation is [`Capability::backing`]'s data, so the
+    /// reader and the writer cannot check different relations.
     pub fn require_backing_members(&self, present: &MemberPresence) -> anyhow::Result<()> {
         let mut missing: Vec<(&str, &str)> = Vec::new();
-        if self.expected_outcomes && !present.outcomes {
-            missing.push(("expected_outcomes", super::OUTCOMES_MEMBER));
-        }
-        if self.output_hashes && !present.outcomes {
-            missing.push(("output_hashes", super::OUTCOMES_MEMBER));
-        }
-        if self.impure_env && !present.impure_env {
-            missing.push(("impure_env", super::IMPURE_ENV_MEMBER));
-        }
-        if self.dependency_closures && !present.closures {
-            missing.push(("dependency_closures", super::CLOSURES_MEMBER));
-        }
-        if self.embedded_store_paths && !present.embedded_store_paths {
-            missing.push(("embedded_store_paths", "an embedded non-drv store path"));
+        for capability in Capability::ALL {
+            if !capability.enabled_in(self) {
+                continue;
+            }
+            if let Some((member, is_present)) = capability.backing(present)
+                && !is_present
+            {
+                missing.push((capability.flag(), member));
+            }
         }
         if missing.is_empty() {
             return Ok(());
@@ -108,6 +103,168 @@ impl Capabilities {
             .join("; ");
         anyhow::bail!("{detail}")
     }
+}
+
+/// The closed set of archive capabilities — one variant per
+/// [`Capabilities`] field, carrying everything the engine and the docs
+/// know about each flag as data: its wire name, whether a given manifest
+/// declares it, the staged data that must back it, and the design-doc
+/// table row describing what it means and what gates on it (including the
+/// absent-case behavior).
+///
+/// This is the single surface for capability decisions. Engine gate sites
+/// ask [`Capability::enabled_in`] instead of reading raw manifest booleans,
+/// the reader/writer backing checks iterate [`Capability::ALL`], and the
+/// design doc's capability table is rendered from
+/// [`capability_table_markdown`] and pinned by a test — so two consumers
+/// can no longer disagree about what an absent flag means, and adding a
+/// `Capabilities` field without deciding its absent-case behavior fails
+/// compilation in [`Capability::enabled_in`]'s exhaustive destructuring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    Timed,
+    ExpectedOutcomes,
+    OutputHashes,
+    EmbeddedStorePaths,
+    ImpureEnv,
+    DependencyClosures,
+}
+
+impl Capability {
+    /// Every capability, in the manifest's field order (also the design
+    /// doc's table order).
+    pub const ALL: [Capability; 6] = [
+        Capability::Timed,
+        Capability::ExpectedOutcomes,
+        Capability::OutputHashes,
+        Capability::EmbeddedStorePaths,
+        Capability::ImpureEnv,
+        Capability::DependencyClosures,
+    ];
+
+    /// The wire name: the `manifest.capabilities` field this variant
+    /// mirrors.
+    pub const fn flag(self) -> &'static str {
+        match self {
+            Capability::Timed => "timed",
+            Capability::ExpectedOutcomes => "expected_outcomes",
+            Capability::OutputHashes => "output_hashes",
+            Capability::EmbeddedStorePaths => "embedded_store_paths",
+            Capability::ImpureEnv => "impure_env",
+            Capability::DependencyClosures => "dependency_closures",
+        }
+    }
+
+    /// Whether `capabilities` declares this capability. The exhaustive
+    /// destructuring couples the enum to the struct at compile time:
+    /// adding a `Capabilities` field without a `Capability` variant (or
+    /// vice versa) fails here.
+    pub fn enabled_in(self, capabilities: &Capabilities) -> bool {
+        let Capabilities {
+            timed,
+            expected_outcomes,
+            output_hashes,
+            embedded_store_paths,
+            impure_env,
+            dependency_closures,
+        } = *capabilities;
+        match self {
+            Capability::Timed => timed,
+            Capability::ExpectedOutcomes => expected_outcomes,
+            Capability::OutputHashes => output_hashes,
+            Capability::EmbeddedStorePaths => embedded_store_paths,
+            Capability::ImpureEnv => impure_env,
+            Capability::DependencyClosures => dependency_closures,
+        }
+    }
+
+    /// The staged data that must back this flag when it is set, as
+    /// `(description, present)` against the given member presence. `None`
+    /// for `timed`, which asserts a property of `requests.jsonl` offsets
+    /// rather than a member's presence; `output_hashes` is backed by the
+    /// outcomes member because per-output hashes live in its records.
+    pub fn backing(self, present: &MemberPresence) -> Option<(&'static str, bool)> {
+        match self {
+            Capability::Timed => None,
+            Capability::ExpectedOutcomes => Some((super::OUTCOMES_MEMBER, present.outcomes)),
+            Capability::OutputHashes => Some((super::OUTCOMES_MEMBER, present.outcomes)),
+            Capability::EmbeddedStorePaths => Some((
+                "an embedded non-drv store path",
+                present.embedded_store_paths,
+            )),
+            Capability::ImpureEnv => Some((super::IMPURE_ENV_MEMBER, present.impure_env)),
+            Capability::DependencyClosures => Some((super::CLOSURES_MEMBER, present.closures)),
+        }
+    }
+
+    /// What the flag asserts about the archive (the design-doc table's
+    /// "Meaning" column).
+    pub const fn meaning(self) -> &'static str {
+        match self {
+            Capability::Timed => {
+                "`requests.jsonl` offsets are meaningful recorded times (and `outcomes.jsonl` \
+                 may carry `stop_offset_s`)."
+            }
+            Capability::ExpectedOutcomes => {
+                "`outcomes.jsonl` is present and is authoritative truth for the workload."
+            }
+            Capability::OutputHashes => {
+                "`built` expected outcomes carry per-output NAR hashes. The flag asserts that \
+                 every `built` outcome the recorder could hash carries `outputs`; readers treat \
+                 per-record absence as not-comparable, never as a format error."
+            }
+            Capability::EmbeddedStorePaths => {
+                "`nix/store/` contains embedded non-drv store paths, each with a narinfo sidecar."
+            }
+            Capability::ImpureEnv => "`impure-env.json` is present.",
+            Capability::DependencyClosures => {
+                "`closures.jsonl` is present and covers the full union closure of the workload."
+            }
+        }
+    }
+
+    /// What the engine gates on the flag, including what an absent flag
+    /// means (the design-doc table's "What it gates" column).
+    pub const fn gates(self) -> &'static str {
+        match self {
+            Capability::Timed => {
+                "The timed scheduling mode, cancellation/disconnect reproduction, \
+                 dispatch-lateness accounting (§9 Scheduling). Timeless archives can only run \
+                 in drain mode."
+            }
+            Capability::ExpectedOutcomes => {
+                "Verdict comparison (§7 Comparison model). Without it every unit ends in a \
+                 no-truth verdict; the campaign is a load/exercise run."
+            }
+            Capability::OutputHashes => "Output-divergence verdicts (§7 Comparison model).",
+            Capability::EmbeddedStorePaths => {
+                "The archive rung of the supply ladder (§8 Supply planning)."
+            }
+            Capability::ImpureEnv => "Impure demotion (§7, §8).",
+            Capability::DependencyClosures => {
+                "Plan-time closure computation (batching, overlap analysis, supply planning) \
+                 without parsing every embedded ATerm (§6 The replayer). When false the engine \
+                 falls back to walking the embedded `.drv` files."
+            }
+        }
+    }
+}
+
+/// Render the archive capability table exactly as the design doc's
+/// "Capabilities" section publishes it. The doc's table is a paste of this
+/// output and a test pins the two together, so the published flag
+/// semantics are derivable from — and cannot drift from — the enum's data.
+pub fn capability_table_markdown() -> String {
+    let mut table = String::from("| Flag | Meaning | What it gates |\n|---|---|---|\n");
+    for capability in Capability::ALL {
+        table.push_str(&format!(
+            "| `{}` | {} | {} |\n",
+            capability.flag(),
+            capability.meaning(),
+            capability.gates(),
+        ));
+    }
+    table
 }
 
 /// Informational counts so operators and tools can size a campaign without
@@ -585,6 +742,61 @@ mod tests {
         Capabilities::default()
             .require_backing_members(&MemberPresence::default())
             .unwrap();
+    }
+
+    /// [`Capability::flag`] and [`Capability::enabled_in`] agree with the
+    /// serde wire form bijectively: setting exactly the JSON field named by
+    /// a variant's flag enables exactly that variant.
+    #[test]
+    fn capability_enum_matches_the_wire_flags() {
+        for capability in Capability::ALL {
+            let mut value = serde_json::to_value(Capabilities::default()).unwrap();
+            value[capability.flag()] = serde_json::Value::Bool(true);
+            let parsed: Capabilities = serde_json::from_value(value).unwrap();
+            for other in Capability::ALL {
+                assert_eq!(
+                    other.enabled_in(&parsed),
+                    other == capability,
+                    "setting `{}` must enable {:?} and nothing else",
+                    capability.flag(),
+                    capability,
+                );
+            }
+        }
+    }
+
+    /// The design doc's capability table is a paste of
+    /// [`capability_table_markdown`]: the rendered block must appear in the
+    /// doc verbatim, so flag semantics cannot drift between code and doc.
+    ///
+    /// The doc lives at the workspace root, outside this crate's directory
+    /// — and the sandboxed CI test build stages each crate's own directory
+    /// only — so the verbatim pin runs where the doc is visible (dev-shell
+    /// `cargo nextest`/`cargo test` runs, which the repo's commit loop
+    /// requires) and reduces to the structural floor elsewhere.
+    #[test]
+    fn capability_table_pins_the_design_doc() {
+        let table = capability_table_markdown();
+        for capability in Capability::ALL {
+            assert!(
+                table.contains(&format!("| `{}` | ", capability.flag())),
+                "renderer must emit one row per capability:\n{table}"
+            );
+        }
+
+        let doc = crate::test_manifest_dir().join("../docs/dev/2026-05-28-build-replay-design.md");
+        let Ok(text) = std::fs::read_to_string(&doc) else {
+            eprintln!(
+                "design doc not present in this build's source tree; verbatim table pin not \
+                 checked here (dev-shell test runs check it)"
+            );
+            return;
+        };
+        assert!(
+            text.contains(&table),
+            "the design doc's capability table drifted from Capability's data — paste the \
+             rendered table over the doc's:\n{table}"
+        );
     }
 
     #[test]

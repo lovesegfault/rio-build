@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 
 use crate::archive::reader::ReplayArchive;
+use crate::archive::schema::Capability;
 
 use super::archive_input::ManifestEntry;
 use super::model::{
@@ -266,7 +267,7 @@ pub fn expected_outcomes_for_units(
     archive: &ReplayArchive,
     units: &[ManifestEntry],
 ) -> Result<BTreeMap<String, UnitTruth>> {
-    if !archive.capabilities().expected_outcomes {
+    if !Capability::ExpectedOutcomes.enabled_in(archive.capabilities()) {
         tracing::warn!(
             "archive lacks the expected_outcomes capability; treating every unit's truth as unknown"
         );

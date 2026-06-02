@@ -41,7 +41,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use crate::archive::reader::ReplayArchive;
-use crate::archive::schema::ClosureRecord;
+use crate::archive::schema::{Capability, ClosureRecord};
 use crate::narhash::NarHash;
 
 use super::spec::SupplyDependencies;
@@ -128,7 +128,7 @@ pub struct Closure {
 /// the backing source, naming both the missing path and the root that
 /// needed it.
 pub fn walk_closure(archive: &ReplayArchive, roots: &[String]) -> Result<Closure> {
-    if archive.capabilities().dependency_closures {
+    if Capability::DependencyClosures.enabled_in(archive.capabilities()) {
         closure_from_adjacency(archive.closures(), roots)
     } else {
         closure_from_drv_texts(archive, roots)

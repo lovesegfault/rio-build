@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use rio_replay::archive::reader::{ArchiveFormat, ReplayArchive};
+use rio_replay::archive::schema::Capability;
 use rio_replay::run::RunArgs;
 use rio_replay::run::spec::{
     ArchiveRef, CampaignSpec, ClusterEndpoints, Filters, Knobs, Mode as EngineMode, S3Target,
@@ -143,16 +144,16 @@ fn archive_header(path: &Path, archive: &ReplayArchive) -> String {
         .archive_id_short()
         .unwrap_or_else(|| "v0".to_string());
     let caps = archive.capabilities();
+    // One `flag=bool` pair per capability, derived from the closed enum so
+    // a new flag can never be silently missing from this header.
+    let flags = Capability::ALL
+        .iter()
+        .map(|capability| format!("{}={}", capability.flag(), capability.enabled_in(caps)))
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
-        "archive {} — format {format}, id {id}, capabilities: timed={} expected_outcomes={} \
-         output_hashes={} embedded_store_paths={} impure_env={} dependency_closures={}",
+        "archive {} — format {format}, id {id}, capabilities: {flags}",
         path.display(),
-        caps.timed,
-        caps.expected_outcomes,
-        caps.output_hashes,
-        caps.embedded_store_paths,
-        caps.impure_env,
-        caps.dependency_closures,
     )
 }
 

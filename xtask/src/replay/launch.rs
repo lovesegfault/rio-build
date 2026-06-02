@@ -30,7 +30,7 @@ use rio_replay::archive::s3::{
     ARCHIVE_COMPLETE_OBJECT, ARCHIVE_MANIFEST_OBJECT, ArchiveStore, CompleteMarker,
     PublishedArchive,
 };
-use rio_replay::archive::schema::{Capabilities, Manifest};
+use rio_replay::archive::schema::{Capabilities, Capability, Manifest};
 use rio_replay::archive::writer::pack_with_mkdwarfs;
 use rio_replay::run::spec::{
     ArchiveRef, CampaignSpec, ClusterEndpoints, FailOn, Filters, Knobs, Mode as EngineMode,
@@ -536,7 +536,7 @@ fn ensure_engine_readable_archive(
 /// here — the engine re-validates the same gate at bootstrap.
 fn ensure_timed_capability(schedule: Schedule, caps: &Capabilities) -> Result<()> {
     ensure!(
-        schedule != Schedule::Timed || caps.timed,
+        schedule != Schedule::Timed || Capability::Timed.enabled_in(caps),
         "--schedule timed requires an archive recorded with the `timed` capability \
          (per-request offsets), and this archive's manifest does not declare it — launch with \
          --schedule timeless, or record a timed archive"
