@@ -44,6 +44,15 @@ pub enum Lint {
     /// a misclassified site lets a finished build keep steering
     /// scheduling until the delayed cleanup.
     BookkeepingMarker,
+    /// Every xtask flow that creates a rio-replay engine Job
+    /// (`replay::jobs::{create_job,try_create_job}` call sites) also
+    /// runs the CiliumNetworkPolicy admission read-back
+    /// (`preflight::verify_cnp_admissions`), or carries an explicit
+    /// exemption with a reason. Catches a Job-creating command shipped
+    /// without the check — Cilium silently DROPS an unadmitted
+    /// engine's scheduler/store gRPC, hanging the run instead of
+    /// failing it.
+    ReplayCnpPreflight,
 }
 
 impl Lint {
@@ -61,6 +70,7 @@ impl Lint {
             Lint::HelmSla,
             Lint::SeccompAllowlist,
             Lint::BookkeepingMarker,
+            Lint::ReplayCnpPreflight,
         ]
     }
 }
@@ -72,6 +82,7 @@ pub fn run(lint: &Lint) -> Result<()> {
         Lint::HelmSla => helm_sla(),
         Lint::SeccompAllowlist => seccomp_allowlist(),
         Lint::BookkeepingMarker => bookkeeping_marker(),
+        Lint::ReplayCnpPreflight => replay_cnp_preflight(),
     }
 }
 
@@ -806,6 +817,219 @@ fn marker_annotates_call(lines: &[&str], marker_idx: usize, call_re: &regex::Reg
     false
 }
 
+/// CNP-admission pre-flight guard for rio-replay engine-Job creation.
+///
+/// The chart's CiliumNetworkPolicies admit the campaign engine's
+/// scheduler/store gRPC by namespace + pod label, and xtask creates
+/// every engine Job through exactly two helpers —
+/// `replay::jobs::{create_job,try_create_job}`, both hard-pinned to
+/// that namespace — so the helpers' call sites ARE the complete set of
+/// engine-Job creations. The admissions themselves are deployed chart
+/// state that can drift after setup verified them (a raw-helm
+/// `replay.namespace` override, an out-of-band CNP edit, a divergent
+/// older deployment), and an unadmitted engine does not fail: Cilium
+/// silently drops its gRPC and the run hangs. Whether a Job-creating
+/// flow re-reads the admissions first
+/// (`preflight::verify_cnp_admissions`) is a per-flow classification
+/// that compiles either way — launch's pre-flight gained the read-back
+/// while repro's create path shipped without it, because repro's
+/// skip-the-pre-flight rationale predated the check.
+///
+/// This lint turns the classification into a gate, in both directions:
+///
+/// - every file with a creator call site must also call
+///   `verify_cnp_admissions` in code (file scope, not line order:
+///   launch reaches it through a pre-flight helper defined after its
+///   create call), or be listed in `CNP_EXEMPT` with a reason;
+/// - every `CNP_EXEMPT` entry must still name a file that creates
+///   engine Jobs and still lacks the read-back — an entry gone stale
+///   either way fails, so the exemption list cannot accrete.
+///
+/// The creator-fn set is derived from the jobs.rs definitions at scan
+/// time, so a renamed or added creator joins the gate without editing
+/// this lint; floor guards on the creator count and the call-site
+/// count keep the scan from passing vacuously.
+fn replay_cnp_preflight() -> Result<()> {
+    // Files allowed to create engine Jobs WITHOUT the CNP read-back.
+    // Each entry MUST carry a rationale naming why the Job never needs
+    // the admissions.
+    const CNP_EXEMPT: &[(&str, &str)] = &[(
+        "xtask/src/replay/eval.rs",
+        "recorder Job: the eval engine talks only to Hydra, the nixpkgs tarball host, \
+         cache.nixos.org, and S3 — it never dials the scheduler/store gRPC ports the \
+         CNP admissions cover",
+    )];
+
+    let root = repo_root();
+    let def_rel = "xtask/src/replay/jobs.rs";
+    let def_path = root.join(def_rel);
+    let def_src =
+        fs::read_to_string(&def_path).with_context(|| format!("reading {}", def_path.display()))?;
+    let creators = extract_job_creators(&def_src);
+    // Floor guard: the helpers are `create_job` + `try_create_job`
+    // today. A shrunken set means they moved or were renamed — fail
+    // loud instead of scanning for nothing.
+    ensure!(
+        creators.len() >= 2,
+        "only {} `fn *create_job*` helper(s) found in {def_rel} — the engine-Job \
+         creators moved or were renamed; update `replay_cnp_preflight` in \
+         xtask/src/lint.rs",
+        creators.len(),
+    );
+    let call_re = creator_call_regex(&creators);
+    let verify_re = regex::Regex::new(r"\bverify_cnp_admissions\s*\(").unwrap();
+
+    let scan_root = root.join("xtask/src");
+    ensure!(
+        scan_root.is_dir(),
+        "replay-cnp-preflight scan root {} not found",
+        scan_root.display()
+    );
+    let mut sites = 0usize;
+    let mut violations: Vec<String> = Vec::new();
+    let mut exempt_seen: BTreeSet<&str> = BTreeSet::new();
+    walk_rs(&scan_root, &mut |p| {
+        let rel = p.strip_prefix(root).unwrap_or(p).display().to_string();
+        // Skipped, not exempt:
+        // - jobs.rs is the definition site: its `create_job` →
+        //   `try_create_job` delegation is the helpers' own internals,
+        //   not a campaign flow;
+        // - this file (basename match, same caveat as CORPUS_EXCLUDE):
+        //   the creator names appear in its regex literals and test
+        //   fixtures, which would self-trip the scan.
+        if rel == def_rel
+            || p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == "lint.rs")
+        {
+            return Ok(());
+        }
+        let src = fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+        let exempt = CNP_EXEMPT.iter().find(|(f, _)| *f == rel).map(|(f, _)| *f);
+        if let Some(f) = exempt {
+            exempt_seen.insert(f);
+        }
+        sites += check_cnp_preflight_file(
+            &src,
+            &rel,
+            &call_re,
+            &verify_re,
+            exempt.is_some(),
+            &mut violations,
+        );
+        Ok(())
+    })?;
+    for (f, _) in CNP_EXEMPT {
+        ensure!(
+            exempt_seen.contains(f),
+            "CNP_EXEMPT lists `{f}` but no such file was scanned — remove the entry \
+             (or fix the path)",
+        );
+    }
+    // Floor guard: 3 call sites today (eval, launch, repro). Near-zero
+    // means the call-site detection or the scan root regressed, not
+    // that xtask stopped creating Jobs.
+    ensure!(
+        sites >= 2,
+        "replay-cnp-preflight found only {sites} engine-Job-creating call site(s) \
+         under xtask/src — suspiciously few; the call-site detection or scan root \
+         has regressed",
+    );
+    if !violations.is_empty() {
+        bail!(
+            "{} replay-cnp-preflight violation(s):\n    {}\n  every flow that \
+             creates a rio-replay engine Job must first read the deployed \
+             CiliumNetworkPolicy admissions back (preflight::verify_cnp_admissions) \
+             — Cilium silently DROPS an unadmitted engine's scheduler/store gRPC, \
+             so a drifted admission hangs the run instead of failing it. Run the \
+             read-back before creating the Job (see `replay launch`'s pre-flight or \
+             `replay repro`), or — only for a Job that never dials scheduler/store \
+             — add a CNP_EXEMPT entry with a rationale in xtask/src/lint.rs",
+            violations.len(),
+            violations.join("\n    "),
+        );
+    }
+    tracing::info!(
+        creators = creators.len(),
+        call_sites = sites,
+        exemptions = CNP_EXEMPT.len(),
+        "replay-cnp-preflight ok"
+    );
+    Ok(())
+}
+
+/// Creator-fn set for [`replay_cnp_preflight`], derived from the
+/// `replay::jobs` source: every `fn` whose name contains `create_job`.
+/// Doc-comment cross-references don't match (no `fn` keyword);
+/// `BTreeSet` for deterministic regex alternation.
+fn extract_job_creators(src: &str) -> BTreeSet<String> {
+    let re = regex::Regex::new(r"\bfn\s+(\w*create_job\w*)\s*\(").unwrap();
+    re.captures_iter(src).map(|c| c[1].to_owned()).collect()
+}
+
+/// Free-function call regex for the creator set: `name(` with optional
+/// whitespace. Matches `jobs::create_job(…)` and a bare imported call
+/// alike; the leading `\b` keeps `create_job` from matching inside
+/// `try_create_job`.
+fn creator_call_regex(creators: &BTreeSet<String>) -> regex::Regex {
+    let alt: Vec<String> = creators.iter().map(|a| regex::escape(a)).collect();
+    regex::Regex::new(&format!(r"\b(?:{})\s*\(", alt.join("|"))).unwrap()
+}
+
+/// Scan one file for [`replay_cnp_preflight`]. Returns the number of
+/// creator call sites found; pushes a violation for every call site in
+/// an unexempt file with no code-level `verify_cnp_admissions` call,
+/// and for an exemption gone stale (no call site left, or the file now
+/// runs the read-back anyway).
+fn check_cnp_preflight_file(
+    src: &str,
+    rel: &str,
+    call_re: &regex::Regex,
+    verify_re: &regex::Regex,
+    exempt: bool,
+    violations: &mut Vec<String>,
+) -> usize {
+    let mut site_lines: Vec<usize> = Vec::new();
+    let mut has_verify = false;
+    for (i, line) in src.lines().enumerate() {
+        // Comment-only lines (and the comment tail of code lines) never
+        // count — neither as a call site nor as the read-back. A
+        // commented-out `verify_cnp_admissions(…)` is exactly the shape
+        // this lint exists to refuse.
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        let code = strip_line_comment(line);
+        if call_re.is_match(code) {
+            site_lines.push(i + 1);
+        }
+        if verify_re.is_match(code) {
+            has_verify = true;
+        }
+    }
+    if exempt {
+        if site_lines.is_empty() {
+            violations.push(format!(
+                "{rel}: CNP_EXEMPT lists this file but it has no engine-Job-creating \
+                 call site — remove the entry",
+            ));
+        } else if has_verify {
+            violations.push(format!(
+                "{rel}: CNP_EXEMPT lists this file but it DOES call \
+                 verify_cnp_admissions — the exemption is moot; remove the entry",
+            ));
+        }
+    } else if !has_verify {
+        for l in &site_lines {
+            violations.push(format!(
+                "{rel}:{l}: engine-Job-creating call with no verify_cnp_admissions \
+                 read-back anywhere in this flow",
+            ));
+        }
+    }
+    site_lines.len()
+}
+
 /// Recursive `.rs` walk via `std` (no `walkdir` dep). Follows symlinks
 /// — under the nix flake check, the corpus dirs are staged into a
 /// store-path source tree and may be symlinked.
@@ -1054,4 +1278,115 @@ mod tests {
     // which the per-member nextest sandbox doesn't stage (manifests +
     // stub targets only). The `xtask-lint` flake check runs it against
     // the real tree.
+
+    // ── replay-cnp-preflight ───────────────────────────────────────
+
+    /// Run [`check_cnp_preflight_file`] over a synthetic source with
+    /// the real creator set; returns (call_sites, violations).
+    fn cnp(src: &str, exempt: bool) -> (usize, Vec<String>) {
+        let creators = BTreeSet::from(["create_job".to_owned(), "try_create_job".to_owned()]);
+        let call_re = creator_call_regex(&creators);
+        let verify_re = regex::Regex::new(r"\bverify_cnp_admissions\s*\(").unwrap();
+        let mut violations = Vec::new();
+        let sites = check_cnp_preflight_file(
+            src,
+            "synthetic.rs",
+            &call_re,
+            &verify_re,
+            exempt,
+            &mut violations,
+        );
+        (sites, violations)
+    }
+
+    #[test]
+    fn job_creator_extraction_from_jobs_source() {
+        let src = "/// Create the Job in [`NS_REPLAY`] via [`try_create_job`].\n\
+                   pub async fn try_create_job(client: &Client, job: &Job) -> Result<Outcome> {\n\
+                   pub async fn create_job(client: &Client, job: &Job) -> Result<()> {\n\
+                   pub fn created_jobs_report() {}\n";
+        assert_eq!(
+            extract_job_creators(src),
+            BTreeSet::from(["create_job".to_owned(), "try_create_job".to_owned()]),
+            "fn definitions extracted; doc xrefs and near-miss names ignored"
+        );
+    }
+
+    #[test]
+    fn cnp_guarded_flow_passes_unguarded_fails() {
+        // The launch shape: creator call and read-back in the same
+        // file, but the read-back sits inside a pre-flight helper
+        // defined AFTER the create line — file scope, not line order,
+        // is what the gate demands.
+        let (sites, v) = cnp(
+            "ui::step(&format!(\"apply campaign Job {id}\"), || {\n\
+             \x20   jobs::create_job(&client, &job)\n\
+             })\n\
+             .await?;\n\
+             async fn preflight_checks(client: &Client) -> Result<()> {\n\
+             \x20   preflight::verify_cnp_admissions(client).await\n\
+             }\n",
+            false,
+        );
+        assert_eq!((sites, v.len()), (1, 0), "{v:?}");
+
+        // No read-back anywhere: every creator call flagged, file:line.
+        let (sites, v) = cnp(
+            "jobs::create_job(&client, &job).await?;\n\
+             jobs::try_create_job(&client, &job).await?;\n",
+            false,
+        );
+        assert_eq!(sites, 2);
+        assert_eq!(v.len(), 2, "{v:?}");
+        assert!(
+            v[0].contains("synthetic.rs:1") && v[1].contains("synthetic.rs:2"),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn cnp_commented_out_read_back_does_not_count() {
+        // The exact shape of removing the check: the call survives only
+        // as comments (whole-line and trailing) — the gate must refuse.
+        let (sites, v) = cnp(
+            "// preflight::verify_cnp_admissions(&client)\n\
+             jobs::create_job(&client, &job).await?; // verify_cnp_admissions(…) someday\n",
+            false,
+        );
+        assert_eq!((sites, v.len()), (1, 1), "{v:?}");
+
+        // …and a comment naming a creator is not a call site.
+        let (sites, v) = cnp(
+            "// launch applies the Job via jobs::create_job(&client, &job)\n\
+             let x = 1;\n",
+            false,
+        );
+        assert_eq!((sites, v.len()), (0, 0), "{v:?}");
+    }
+
+    #[test]
+    fn cnp_exemption_covers_and_goes_stale() {
+        // The exempt recorder shape: creator call, no read-back — clean.
+        let (sites, v) = cnp("jobs::try_create_job(&client, &job).await?;\n", true);
+        assert_eq!((sites, v.len()), (1, 0), "{v:?}");
+
+        // Stale: the exempt file no longer creates engine Jobs.
+        let (_, v) = cnp("let x = 1;\n", true);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].contains("remove the entry"), "{v:?}");
+
+        // Moot: the exempt file now runs the read-back anyway.
+        let (_, v) = cnp(
+            "preflight::verify_cnp_admissions(&client).await?;\n\
+             jobs::try_create_job(&client, &job).await?;\n",
+            true,
+        );
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].contains("moot"), "{v:?}");
+    }
+
+    // Same story as above for `replay_cnp_preflight` itself: the file
+    // walk needs the real repo layout, which the nextest sandbox
+    // doesn't guarantee. The pure pieces are tested here; the
+    // `xtask-lint` flake check runs the scan against the real tree.
 }
