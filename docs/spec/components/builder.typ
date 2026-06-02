@@ -812,6 +812,26 @@ previously froze alongside its enforcement --- reaching that state
 requires a worker bug, since the worker's own consumer is structurally
 non-stalling (#rref("builder.relay.log-shed")).
 
+#r("builder.exec.event-budget")[
+  The pending-event queue between the executor's supervision loop and the
+  caller's receiver MUST charge every queued event its full retained
+  footprint --- the fixed event-struct size plus the line buffer's heap
+  capacity --- against its byte budget, so the backpressure cascade
+  (queue → chunk channel → readers → pipe → the build's own writes)
+  engages for every input shape, including floods of empty or short
+  lines whose payload bytes alone never reach the cap.
+]
+
+Charging payload length only re-opened the bound the budget exists to
+provide: a zero-payload line retains a queue slot (the event struct)
+while charging nothing, so an empty-line flood grew the queue without
+limit under a stalled receiver. With the footprint charge the queue
+length is bounded at `cap / size_of::<ExecEvent>()` (65,536 events at
+the current sizes) and the retained memory at ≈ 2--5 MiB across all
+input classes --- strictly tighter, per class, than both the pre-FU1
+256-slot channel bound (whose max-line class allowed ≈ 256 MiB) and the
+payload-only byte cap (whose zero-payload class was unbounded).
+
 #r("builder.retry.infra-transient")[
   The build-spawn loop retries `execute_build` locally when the failure is a
   transient worker-local infrastructure failure --- sandbox setup

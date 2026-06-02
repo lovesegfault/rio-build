@@ -108,21 +108,39 @@ const FINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// of buffering without limit.
 const LOG_CHUNK_CHANNEL_CAPACITY: usize = 64;
 
-/// Byte budget of the pending-event queue between the supervision loop
-/// and the caller's receiver. Once the queued line bytes reach the cap
-/// the loop stops consuming chunks, which fills the chunk channel,
-/// parks the blocking readers, fills the pipe, and finally write-blocks
-/// the build itself — the same backpressure cascade as before, one
-/// queue deeper.
+/// Budget of the pending-event queue between the supervision loop and
+/// the caller's receiver, charged in *retained-footprint* units. Once
+/// the charged total reaches the cap the loop stops consuming chunks,
+/// which fills the chunk channel, parks the blocking readers, fills the
+/// pipe, and finally write-blocks the build itself — the same
+/// backpressure cascade as before, one queue deeper.
 ///
-/// The hard memory bound is slightly above the cap: the gate is checked
-/// before each chunk, so one chunk's worth of splitter output can land
-/// after the queue is already at the cap — up to one cap-forced
-/// fragment ([`MAX_PENDING_LINE_BYTES`]) plus the chunk remainder
-/// (≤ 8 KiB), for ≈ 3 MiB total per execution.
+/// Every queued event is charged its full retained footprint —
+/// `size_of::<ExecEvent>()` (the queue slot) plus the line buffer's
+/// heap capacity — so the cascade engages for *every* input shape.
+/// Charging payload bytes alone left the zero/short-line class
+/// unbounded: a flood of empty lines retained a queue slot each while
+/// charging nothing, so the gate never tripped (round-15
+/// merged_bug_001). With the footprint charge the queue length is
+/// bounded at `PENDING_BYTES_CAP / size_of::<ExecEvent>()` = 65,536
+/// events for zero-payload floods.
+///
+/// The hard memory bound: ≤ the cap in charged footprint, plus one
+/// chunk's worth of overshoot (the gate is checked before each chunk —
+/// up to one cap-forced fragment of [`MAX_PENDING_LINE_BYTES`] plus the
+/// chunk remainder ≤ 8 KiB), plus the `VecDeque`'s amortized ×2 slot
+/// over-allocation: ≈ 2–5 MiB per execution across all input classes.
+///
+/// Dominance over both prior bounds, per input class:
+/// - max-size lines: ≤ cap + 1 chunk ≈ 3 MiB (pre-FU1 256-slot channel
+///   allowed 256 × 1 MiB = 256 MiB);
+/// - zero-payload lines: 65,536 slots ≈ 2 MiB charged (the FU1
+///   payload-only charge allowed unbounded growth; pre-FU1 bounded at
+///   256 slots). Strictly tighter than each predecessor's worst class.
 const PENDING_BYTES_CAP: usize = 2 << 20;
 
-/// FIFO of events awaiting a receiver permit, with byte accounting.
+/// FIFO of events awaiting a receiver permit, with retained-footprint
+/// accounting.
 ///
 /// The queue is the *only* path to the caller: the supervision loop
 /// never awaits `events.send()` directly, so a stalled receiver can
@@ -140,13 +158,18 @@ impl PendingEvents {
         }
     }
 
-    /// Queued cost of one event: the log payload's length (`Started`
-    /// is metadata-only and effectively free).
+    /// Charged cost of one queued event: its full retained footprint.
+    /// The fixed struct size covers the `VecDeque` slot every event
+    /// occupies (what bounds zero-payload floods); the payload term is
+    /// the heap allocation actually retained — `capacity`, not `len`,
+    /// because the buffer's allocation is what the queue keeps alive.
+    // r[impl builder.exec.event-budget]
     fn cost(event: &ExecEvent) -> usize {
-        match event {
-            ExecEvent::Log { line, .. } => line.len(),
-            ExecEvent::Started { .. } => 0,
-        }
+        std::mem::size_of::<ExecEvent>()
+            + match event {
+                ExecEvent::Log { line, .. } => line.capacity(),
+                ExecEvent::Started { .. } => 0,
+            }
     }
 
     fn push(&mut self, event: ExecEvent) {
@@ -1827,38 +1850,96 @@ mod tests {
 
     /// FIFO order and byte accounting across push/pop, including the
     /// metadata-only `Started` event.
+    /// FIFO order and footprint accounting across push/pop: every
+    /// event is charged the fixed struct size plus its payload's
+    /// retained capacity, and pops return exactly what pushes charged.
+    // r[verify builder.exec.event-budget]
     #[test]
     fn pending_events_fifo_and_byte_accounting() {
+        let slot = std::mem::size_of::<ExecEvent>();
         let mut q = PendingEvents::new();
         assert!(q.is_empty());
-        q.push(log_event(b"abc"));
+        let abc = log_event(b"abc");
+        let abc_cost = slot
+            + match &abc {
+                ExecEvent::Log { line, .. } => line.capacity(),
+                ExecEvent::Started { .. } => unreachable!(),
+            };
+        q.push(abc);
         q.push(ExecEvent::Started { pid: 7 });
-        q.push(log_event(b"defgh"));
-        assert_eq!(q.bytes, 8, "Started costs nothing; lines cost their length");
+        let defgh = log_event(b"defgh");
+        let defgh_cost = slot
+            + match &defgh {
+                ExecEvent::Log { line, .. } => line.capacity(),
+                ExecEvent::Started { .. } => unreachable!(),
+            };
+        q.push(defgh);
+        assert_eq!(
+            q.bytes,
+            abc_cost + slot + defgh_cost,
+            "every event charges its slot; payloads charge their capacity"
+        );
         assert!(!q.at_cap());
 
         assert!(matches!(q.pop(), Some(ExecEvent::Log { line, .. }) if line == b"abc"));
-        assert_eq!(q.bytes, 5);
+        assert_eq!(q.bytes, slot + defgh_cost);
         assert!(matches!(q.pop(), Some(ExecEvent::Started { pid: 7 })));
         assert!(matches!(q.pop(), Some(ExecEvent::Log { line, .. }) if line == b"defgh"));
-        assert_eq!(q.bytes, 0);
+        assert_eq!(q.bytes, 0, "accounting returns to zero when drained");
         assert!(q.pop().is_none());
     }
 
-    /// The cap gate trips at the byte budget and clear() resets both
+    /// The cap gate trips at the charged budget and clear() resets both
     /// the queue and the accounting (the dropped-receiver path).
+    // r[verify builder.exec.event-budget]
     #[test]
     fn pending_events_cap_and_clear() {
+        let slot = std::mem::size_of::<ExecEvent>();
         let mut q = PendingEvents::new();
-        q.push(log_event(&vec![b'x'; PENDING_BYTES_CAP - 1]));
+        // One event whose charged cost lands exactly one byte short of
+        // the cap (slot + payload capacity = cap - 1).
+        q.push(log_event(&vec![b'x'; PENDING_BYTES_CAP - slot - 1]));
         assert!(!q.at_cap());
-        q.push(log_event(b"y"));
-        assert!(q.at_cap(), "the gate trips exactly at the cap");
+        // Any further event charges at least its slot, crossing the cap.
+        q.push(log_event(b""));
+        assert!(q.at_cap(), "the gate trips at the charged cap");
 
         q.clear();
         assert!(q.is_empty());
         assert_eq!(q.bytes, 0);
         assert!(!q.at_cap(), "a cleared queue accepts chunks again");
+    }
+
+    /// THE merged_bug_001 pin: a flood of zero-payload lines — which
+    /// charge nothing under payload-only accounting — trips the cap
+    /// after at most `PENDING_BYTES_CAP / size_of::<ExecEvent>()`
+    /// events (65,536 at the current sizes), bounding both the queue
+    /// length and the retained memory for the adversarial class.
+    // r[verify builder.exec.event-budget]
+    #[test]
+    fn pending_events_zero_payload_flood_is_bounded() {
+        let slot = std::mem::size_of::<ExecEvent>();
+        let bound = PENDING_BYTES_CAP.div_ceil(slot);
+        assert!(
+            bound <= 65_536,
+            "size_of::<ExecEvent>() shrank below 32 bytes; update the \
+             documented event bound (cap / slot = {bound})"
+        );
+        let mut q = PendingEvents::new();
+        let mut pushed = 0usize;
+        while !q.at_cap() {
+            q.push(log_event(b""));
+            pushed += 1;
+            assert!(
+                pushed <= bound,
+                "zero-payload events must charge their slot: the cap \
+                 never tripped within the computed bound"
+            );
+        }
+        assert_eq!(
+            pushed, bound,
+            "the flood trips exactly at cap / slot events"
+        );
     }
 
     // -- LimitWatchdog -------------------------------------------------------
