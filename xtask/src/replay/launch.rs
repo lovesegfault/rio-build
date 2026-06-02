@@ -1299,8 +1299,10 @@ async fn resolve_archive(
 /// last, so a prefix without it is an in-flight or interrupted upload (or
 /// an interrupted delete's leftovers), never a launchable archive.
 /// `Ok(None)` for such prefixes, and (with a warning) for prefixes whose
-/// marker is unparseable or inconsistent — junk must not brick the whole
-/// listing, and `replay delete`'s sweep can still remove it.
+/// fetched objects are junk in any shape — see [`candidate_from_objects`].
+/// The error channel carries S3 I/O failures only: junk *content* can
+/// hide a prefix from launch resolution, but never abort the surfaces
+/// (list/eval/delete) that exist to show and remove it.
 pub(super) async fn read_candidate(
     region: &str,
     bucket: &str,
@@ -1317,8 +1319,11 @@ pub(super) async fn read_candidate(
     };
     let manifest_key = format!("{prefix}/{ARCHIVE_MANIFEST_OBJECT}");
     let manifest_text = s3::get_text(region, bucket, &manifest_key).await?;
-    candidate_from_objects(archive_id_short, &marker_text, manifest_text.as_deref())
-        .with_context(|| format!("read archive candidate s3://{bucket}/{prefix}/"))
+    Ok(candidate_from_objects(
+        archive_id_short,
+        &marker_text,
+        manifest_text.as_deref(),
+    ))
 }
 
 /// Build a candidate from the objects fetched at one archive prefix: the
@@ -1326,19 +1331,30 @@ pub(super) async fn read_candidate(
 /// and the standalone `manifest.json` text when present. Pure so the
 /// predicate is unit-testable without S3.
 ///
-/// - An unparseable or inconsistent marker yields `Ok(None)` with a
-///   warning: the prefix is junk, invisible to launch/list but still
-///   removable by `replay delete`'s sweep.
+/// Classification is infallible by signature: every fallible step —
+/// marker parse/consistency, the manifest↔marker digest cross-check, the
+/// manifest parse — degrades to a warning plus `None`, so no corruption
+/// shape CAN abort the enumeration that exists to show junk, or the
+/// `replay delete` resolve step that exists to remove it. I/O failures
+/// belong to the fetching layer ([`read_candidate`] / [`read_entry`]).
+///
+/// - An unparseable or inconsistent marker yields `None` with a warning:
+///   the prefix is junk, never launchable, but [`entry_from_prefix`]
+///   keeps it enumerable (INCOMPLETE) and `replay delete` sweeps it.
 /// - A missing manifest yields a degraded candidate (provenance fields
 ///   empty, `manifest: Null`): visible and deletable, summaries render
 ///   `?`, and no `--eval` filter can match it.
 /// - A manifest that does not hash to the marker's archive id is treated
 ///   like a malformed marker: the prefix is corrupt, never a candidate.
+/// - A manifest that DOES hash to the marker's archive id but is not
+///   valid JSON is corrupt all the same (the published identity commits
+///   to junk bytes — the engine's own bootstrap parse would refuse it):
+///   warn plus `None`, like the mismatch arm.
 fn candidate_from_objects(
     archive_id_short: &str,
     marker_text: &str,
     manifest_text: Option<&str>,
-) -> Result<Option<ArchiveCandidate>> {
+) -> Option<ArchiveCandidate> {
     let published =
         match PublishedArchive::from_complete_json_at(marker_text.as_bytes(), archive_id_short) {
             Ok(published) => published,
@@ -1346,7 +1362,7 @@ fn candidate_from_objects(
                 tracing::warn!(
                     "skipping {archive_id_short}: malformed {ARCHIVE_COMPLETE_OBJECT} ({e:#})"
                 );
-                return Ok(None);
+                return None;
             }
         };
     let (archive_id, manifest) = match manifest_text {
@@ -1363,10 +1379,18 @@ fn candidate_from_objects(
                      {manifest_id} but {ARCHIVE_COMPLETE_OBJECT} says the archive id is {}",
                     published.archive_id()
                 );
-                return Ok(None);
+                return None;
             }
-            let manifest: serde_json::Value = serde_json::from_str(text)
-                .with_context(|| format!("parse {ARCHIVE_MANIFEST_OBJECT}"))?;
+            let manifest: serde_json::Value = match serde_json::from_str(text) {
+                Ok(manifest) => manifest,
+                Err(e) => {
+                    tracing::warn!(
+                        "skipping {archive_id_short}: {ARCHIVE_MANIFEST_OBJECT} hashes to the \
+                         marker's archive id but is not valid JSON ({e})"
+                    );
+                    return None;
+                }
+            };
             (manifest_id, manifest)
         }
         // Marker present, manifest missing: a corrupted upload. Keep it
@@ -1375,7 +1399,7 @@ fn candidate_from_objects(
         None => (published.archive_id().to_string(), serde_json::Value::Null),
     };
     let provenance = &manifest["provenance"];
-    Ok(Some(ArchiveCandidate {
+    Some(ArchiveCandidate {
         s3_prefix: s3::archive_prefix(archive_id_short),
         archive_id,
         recipe_digest: provenance["recipe_digest"]
@@ -1389,7 +1413,7 @@ fn candidate_from_objects(
             .to_string(),
         manifest,
         published,
-    }))
+    })
 }
 
 /// One per-archive prefix under `replay/archives/`, as the operator
@@ -1436,9 +1460,11 @@ pub(super) struct IncompletePrefix {
 
 /// Classify one per-archive prefix from everything fetched at it: the
 /// `complete.json` text when present, the `manifest.json` text when
-/// present, and the prefix's object listing (key + size). Pure so the
-/// classification is exhaustively testable: every NON-EMPTY object set
-/// yields an entry — published exactly when the marker is usable
+/// present, and the prefix's object listing (key + size). Pure and
+/// infallible — like [`candidate_from_objects`] it classifies fetched
+/// content, and content can only ever degrade — so the classification is
+/// exhaustively testable: every NON-EMPTY object set yields an entry —
+/// published exactly when the marker is usable
 /// ([`candidate_from_objects`]), incomplete otherwise — and only a prefix
 /// with no objects at all yields `None`. No state a publisher or deleter
 /// can leave behind is invisible.
@@ -1447,21 +1473,21 @@ fn entry_from_prefix(
     marker_text: Option<&str>,
     manifest_text: Option<&str>,
     objects: &[(String, u64)],
-) -> Result<Option<ListedArchive>> {
+) -> Option<ListedArchive> {
     if let Some(marker_text) = marker_text
         && let Some(candidate) =
-            candidate_from_objects(archive_id_short, marker_text, manifest_text)?
+            candidate_from_objects(archive_id_short, marker_text, manifest_text)
     {
-        return Ok(Some(ListedArchive::Published(Box::new(candidate))));
+        return Some(ListedArchive::Published(Box::new(candidate)));
     }
     if objects.is_empty() {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(ListedArchive::Incomplete(IncompletePrefix {
+    Some(ListedArchive::Incomplete(IncompletePrefix {
         archive_id_short: archive_id_short.to_string(),
         objects: objects.len(),
         bytes: objects.iter().map(|(_, size)| size).sum(),
-    })))
+    }))
 }
 
 /// Read one per-archive prefix into a listed entry: LIST its objects,
@@ -1500,13 +1526,12 @@ async fn read_entry(
     } else {
         None
     };
-    entry_from_prefix(
+    Ok(entry_from_prefix(
         archive_id_short,
         marker_text.as_deref(),
         manifest_text.as_deref(),
         &objects,
-    )
-    .with_context(|| format!("read archive prefix s3://{bucket}/{prefix}/"))
+    ))
 }
 
 /// Listing path: every per-archive prefix under `replay/archives/`
@@ -1571,8 +1596,9 @@ async fn by_recipe_candidates(
         .with_context(|| {
             format!(
                 "the by-recipe pointer s3://{bucket}/{pointer_key} names archive {short}, but \
-                 s3://{bucket}/{}/ is not a published archive (no usable {ARCHIVE_COMPLETE_OBJECT} \
-                 — its publish was interrupted or it was deleted) — re-record with \
+                 s3://{bucket}/{}/ is not a published archive (its {ARCHIVE_COMPLETE_OBJECT} or \
+                 {ARCHIVE_MANIFEST_OBJECT} is missing or unusable — the publish was interrupted \
+                 or corrupted, or the archive was deleted) — re-record with \
                  `cargo xtask replay record --eval {eval} … --force`",
                 s3::archive_prefix(short)
             )
@@ -2223,7 +2249,6 @@ mod tests {
             &serde_json::to_string(&real_marker).unwrap(),
             Some(&manifest_text),
         )
-        .unwrap()
         .expect("a marked prefix with a matching manifest is a candidate");
         assert_eq!(candidate.archive_id_short(), real_short);
         assert_eq!(candidate.archive_id, real_id);
@@ -2235,7 +2260,6 @@ mod tests {
         // no --eval filter can ever choose it.
         let degraded =
             candidate_from_objects(short, &serde_json::to_string(&marker).unwrap(), None)
-                .unwrap()
                 .expect("marker-only prefixes stay visible");
         assert_eq!(degraded.archive_id, archive_id);
         assert_eq!(degraded.hydra_eval_id, 0);
@@ -2247,19 +2271,15 @@ mod tests {
         );
 
         // A malformed or prefix-mismatched marker is junk, never a
-        // candidate (and never an error that bricks the whole listing).
-        assert!(
-            candidate_from_objects(short, "not json", Some(&manifest_text))
-                .unwrap()
-                .is_none()
-        );
+        // candidate (and — by signature — never an error that bricks the
+        // whole listing).
+        assert!(candidate_from_objects(short, "not json", Some(&manifest_text)).is_none());
         assert!(
             candidate_from_objects(
                 "bbbbbbbbbbbbbbbb",
                 &serde_json::to_string(&marker).unwrap(),
                 Some(&manifest_text),
             )
-            .unwrap()
             .is_none(),
             "a marker living under a foreign prefix is not a candidate"
         );
@@ -2272,7 +2292,6 @@ mod tests {
                 &serde_json::to_string(&marker).unwrap(),
                 Some(&manifest_text),
             )
-            .unwrap()
             .is_none(),
             "marker/manifest digest mismatch is a corrupted prefix"
         );
@@ -2338,8 +2357,7 @@ mod tests {
                         has_marker.then_some(marker_text.as_str()),
                         has_manifest.then_some(manifest_text.as_str()),
                         &objects,
-                    )
-                    .unwrap();
+                    );
                     let shape =
                         format!("image={has_image} manifest={has_manifest} marker={has_marker}");
                     if objects.is_empty() {
@@ -2373,38 +2391,100 @@ mod tests {
             }
         }
 
-        // Corruption falls back to Incomplete instead of vanishing: a
-        // marker that does not parse, and a marker whose manifest does not
-        // hash to its claimed id, are both rendered (and so deletable) —
-        // before this enumeration existed they were a debug log line.
-        let junk_objects = vec![(format!("{short}/{ARCHIVE_COMPLETE_OBJECT}"), 8u64)];
-        match entry_from_prefix(&short, Some("not json"), None, &junk_objects).unwrap() {
-            Some(ListedArchive::Incomplete(prefix)) => assert_eq!(prefix.objects, 1),
-            other => panic!("a corrupt-marker prefix must list as incomplete: {other:?}"),
-        }
-        let mismatched = json!({"created_at": "tampered"}).to_string();
-        let full_objects = vec![
-            (format!("{short}/{ARCHIVE_IMAGE_OBJECT}"), 4096u64),
+        // Corruption axis. Quantification domain: every fallible step of
+        // [`candidate_from_objects`], in evaluation order — the marker
+        // JSON parse, the marker's archive_id well-formedness check, the
+        // marker's internal short↔id consistency check (all three inside
+        // `PublishedArchive::from_complete_json`), the marker↔prefix pin
+        // (`from_complete_json_at`), the manifest↔marker digest
+        // cross-check, and the manifest JSON parse. Each row is built to
+        // pass every earlier step and fail exactly the named one, and
+        // every row must classify Incomplete: rendered, deletable, never
+        // Published, never invisible — and, by the classifier's infallible
+        // signature, never an error that bricks the surface. When the
+        // classifier (or a `PublishedArchive` constructor it delegates to)
+        // grows a new fallible step, add the row that fails exactly that
+        // step. The must-admit direction — uncorrupted objects classify
+        // Published — is the powerset loop above.
+        let garbage_manifest = "not json {".to_string();
+        let garbage_id = sha256_hex(garbage_manifest.as_bytes());
+        let garbage_short = garbage_id[..16].to_string();
+        let marker_with = |id: &str, claimed_short: &str| {
+            let mut tampered = marker.clone();
+            tampered.archive_id = id.to_string();
+            tampered.archive_id_short = claimed_short.to_string();
+            serde_json::to_string(&tampered).unwrap()
+        };
+        let corruption_axis: Vec<(&str, String, String, Option<String>)> = vec![
             (
-                format!("{short}/{ARCHIVE_MANIFEST_OBJECT}"),
-                mismatched.len() as u64,
+                "marker JSON parse",
+                short.clone(),
+                "not json".to_string(),
+                Some(manifest_text.clone()),
             ),
             (
-                format!("{short}/{ARCHIVE_COMPLETE_OBJECT}"),
-                marker_text.len() as u64,
+                "marker archive_id well-formedness",
+                short.clone(),
+                marker_with("abc", &short),
+                Some(manifest_text.clone()),
+            ),
+            (
+                "marker short↔id consistency",
+                short.clone(),
+                marker_with(&archive_id, "0000000000000000"),
+                Some(manifest_text.clone()),
+            ),
+            (
+                "marker↔prefix pin",
+                "bbbbbbbbbbbbbbbb".to_string(),
+                marker_text.clone(),
+                Some(manifest_text.clone()),
+            ),
+            (
+                "manifest↔marker digest cross-check",
+                short.clone(),
+                marker_text.clone(),
+                Some(json!({"created_at": "tampered"}).to_string()),
+            ),
+            (
+                "manifest JSON parse",
+                garbage_short.clone(),
+                marker_with(&garbage_id, &garbage_short),
+                Some(garbage_manifest.clone()),
             ),
         ];
-        match entry_from_prefix(&short, Some(&marker_text), Some(&mismatched), &full_objects)
-            .unwrap()
-        {
-            Some(ListedArchive::Incomplete(prefix)) => {
-                assert_eq!(prefix.objects, 3);
-                assert_eq!(
-                    prefix.bytes,
-                    4096 + mismatched.len() as u64 + marker_text.len() as u64
-                );
+        for (step, probe_short, marker_text, manifest_text) in corruption_axis {
+            let mut objects = vec![(format!("{probe_short}/{ARCHIVE_IMAGE_OBJECT}"), 4096u64)];
+            if let Some(manifest_text) = &manifest_text {
+                objects.push((
+                    format!("{probe_short}/{ARCHIVE_MANIFEST_OBJECT}"),
+                    manifest_text.len() as u64,
+                ));
             }
-            other => panic!("a digest-mismatched prefix must list as incomplete: {other:?}"),
+            objects.push((
+                format!("{probe_short}/{ARCHIVE_COMPLETE_OBJECT}"),
+                marker_text.len() as u64,
+            ));
+            match entry_from_prefix(
+                &probe_short,
+                Some(&marker_text),
+                manifest_text.as_deref(),
+                &objects,
+            ) {
+                Some(ListedArchive::Incomplete(prefix)) => {
+                    assert_eq!(prefix.archive_id_short, probe_short, "{step}");
+                    assert_eq!(prefix.objects, objects.len(), "{step}");
+                    assert_eq!(
+                        prefix.bytes,
+                        objects.iter().map(|(_, size)| size).sum::<u64>(),
+                        "{step}"
+                    );
+                }
+                other => panic!(
+                    "corruption at step {step:?} must classify Incomplete \
+                     (rendered and deletable), got: {other:?}"
+                ),
+            }
         }
     }
 
