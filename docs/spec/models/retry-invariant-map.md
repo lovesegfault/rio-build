@@ -2109,6 +2109,11 @@ What this phase records instead:
 
 The `// TODO:` at `load_retry_seed_in_tx` (db/derivations.rs) is the
 code-side anchor for this decision and now points at this subsection.
+*[2026-06-02, follow-up cleanup rider: that anchor no longer exists —
+the seed loader and its TODO were retired with the mirror-column drop
+(migration 075; the legacy seed itself removed in `186a253c8`), and
+the ledger fold is now the only seed path. The coda below records the
+full retirement; this sentence is kept as the decision-time record.]*
 
 **Status (retry-campaign coda): landed.** The drop shipped — as
 migration 075, not the reserved 069: 070–074 landed while the drop was
