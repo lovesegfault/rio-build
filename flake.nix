@@ -57,9 +57,10 @@
     # cargoLock outputHashes for its git deps, its own Rust 1.95 MSRV
     # toolchain via rust-overlay (our nixpkgs rustc is too old), and the
     # RUSTC_WRAPPER="" anti-self-bootstrap. With the follows below the lock
-    # graph only grows by kache + flake-utils + systems. Tag-pinned; bumps
-    # (`nix flake update kache`) may rotate kache's CACHE_KEY_VERSION —
-    # that's a cold cache, not breakage.
+    # graph only grows by kache + flake-utils + systems. Tag-pinned; to
+    # bump, edit the tag in this URL and run `nix flake lock` (`nix flake
+    # update kache` only re-resolves the same immutable tag). Bumps may
+    # rotate kache's CACHE_KEY_VERSION — a cold cache, not breakage.
     kache = {
       url = "github:kunobi-ninja/kache/v0.4.0";
       inputs = {
