@@ -522,85 +522,12 @@ impl DagActor {
                 }
             }
         }
-        // A parent can become children-all-produced without any node
-        // becoming Ready (it may already be Ready/Running),
-        // so the topdown_pruned re-evaluation runs BEFORE the
-        // newly_ready early-return below.
-        self.clear_topdown_pruned_for_produced_parents(completed)
-            .await;
         if newly_ready.is_empty() {
             return;
         }
         let refs: Vec<&str> = newly_ready.iter().map(DrvHash::as_str).collect();
         self.persist_status_batch(&refs, DerivationStatus::Ready)
             .await;
-    }
-
-    // r[impl sched.merge.substitute-topdown+12]
-    /// Completion-time `topdown_pruned` clear: walk the (deduped) DAG
-    /// parents of every hash in `completed` and drop the mark from any
-    /// flagged parent whose closure is now vouched for
-    /// (`closure_vouched` — the classifier criterion every stamp gate
-    /// and in-process clear site shares: at least one child, all of
-    /// them produced, no closure hole; the recovery-time gate applies a
-    /// strictly stronger per-child criterion: produced AND vouched for
-    /// by a still-live build that also owns the parent —
-    /// `load_parents_with_all_children_produced`). This is the
-    /// children-became-produced clearing
-    /// site the merge-time post-reconciliation pass cannot see: that
-    /// pass only sees the children already produced while a merge is
-    /// being ingested, but a pruned node's children are typically
-    /// produced later, by workers or by substitution. Without this
-    /// clear the persisted column would survive into a leader failover
-    /// and the restored mark would wrongly fail-fast a node whose
-    /// closure IS in the store. Parents carrying the `closure_hole`
-    /// breadcrumb are never Vouched and so are skipped: an un-produced
-    /// child was reaped out from under them, so their produced children
-    /// are a truncated view of the pruned closure — the fail-fast or a
-    /// later full merge re-declaring their edges resolves them instead.
-    /// Per-parent work is flag-gated (one node lookup) before the
-    /// children scan; the PG write is one batched best-effort statement
-    /// (warn-and-continue, same posture as the lazy and fail-fast
-    /// clears — the in-memory clear never depends on PG).
-    pub(super) async fn clear_topdown_pruned_for_produced_parents(
-        &mut self,
-        completed: &[DrvHash],
-    ) {
-        let mut candidates: HashSet<DrvHash> = HashSet::new();
-        for c in completed {
-            candidates.extend(self.dag.get_parents(c));
-        }
-        let mut cleared: Vec<String> = Vec::new();
-        for parent in candidates {
-            if self.dag.node(&parent).is_some_and(|s| s.topdown_pruned)
-                && self.closure_vouched(&parent)
-                && let Some(s) = self.dag.node_mut(&parent)
-            {
-                s.topdown_pruned = false;
-                cleared.push(parent.to_string());
-            }
-        }
-        if cleared.is_empty() {
-            return;
-        }
-        debug!(
-            cleared = cleared.len(),
-            "cleared topdown_pruned for parents whose children became produced at completion"
-        );
-        match self
-            .db
-            .clear_topdown_pruned_by_hashes(&cleared, self.serving_generation())
-            .await
-        {
-            Ok(crate::db::FencedWrite::Fenced) => {
-                self.note_fenced_evidence_write("completion-time topdown_pruned clear");
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!(count = cleared.len(), error = %e,
-                      "failed to clear persisted topdown_pruned after child completion (continuing)");
-            }
-        }
     }
 
     // r[impl sched.gc.path-tenants-upsert]
@@ -2652,62 +2579,23 @@ impl DagActor {
         // `handle_derivation_failure` keeps such builds on track to Fail
         // even after the node (and its `failed_count` contribution) is gone.
         //
-        // r[impl sched.merge.substitute-topdown+12]
-        // r[impl sched.evidence.closure-hole]
-        // Capture the parents BEFORE `remove_node` scrubs the edge maps:
-        // a Poisoned child is by definition un-produced, so removing it
-        // truncates each surviving parent's child set relative to the
-        // parent's declared closure — the same truncation the
-        // terminal-build reap breadcrumbs (`remove_build_interest_and_reap`
-        // + the survivor hook in `handle_cleanup_terminal_build`). The
-        // closure-hole stamp below keeps the parent's children-keyed
-        // `topdown_pruned` verdicts at Broken, so a truncated
-        // all-produced child set can never vouch for a from-source
-        // dispatch or launder a mark clear.
-        let holed_parents = self.dag.get_parents(drv_hash);
+        // Capture the parents BEFORE `remove_node` scrubs the edge maps
+        // — they are the survivor set the re-evaluation below wakes.
+        let surviving_parents = self.dag.get_parents(drv_hash);
         self.prune_interested_keep_going(drv_hash);
         self.dag.remove_node(drv_hash);
-        let mut holed: Vec<String> = Vec::new();
-        for parent in &holed_parents {
-            if let Some(state) = self.dag.node_mut(parent) {
-                state.closure_hole = true;
-                holed.push(parent.to_string());
-            }
-        }
-        if !holed.is_empty() {
-            // Best-effort PG counterpart of the in-memory stamp above
-            // (`migrations/064`). Leader-only by construction — the only
-            // production caller is the admin ClearPoison RPC, which is
-            // leader-guarded at the gRPC layer (`ensure_leader`), the
-            // same posture the `clear_poison` PG write above already
-            // relies on — so no redundant gate here. A lost write costs
-            // only the breadcrumb's durability across a failover; the
-            // in-memory stamp covers this tenure.
-            match self
-                .db
-                .set_closure_hole_by_hashes(&holed, self.serving_generation())
-                .await
-            {
-                Ok(crate::db::FencedWrite::Fenced) => {
-                    self.note_fenced_evidence_write("admin poison-clear closure_hole stamp");
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(drv_hash = %drv_hash, count = holed.len(), error = %e,
-                          "failed to persist closure_hole after admin poison clear (continuing)");
-                }
-            }
-        }
         // r[impl sched.poison.clear-survivor-reevaluation]
-        // Wake the surviving parents: settle marked-Broken survivors,
-        // promote Queued ones whose deps are now (vacuously) satisfied.
-        // Without this, a parent the recovery condemnation spared on
+        // Wake the surviving parents: promote Queued ones whose deps
+        // are now (vacuously) satisfied; survivors with an unresolved
+        // materialization job are armed by the job itself. Without
+        // this, a parent the recovery condemnation spared on
         // co-ownership grounds (it recovered Queued above this
         // non-co-owned poisoned child) waits forever — this removal is
         // its only wake-up edge, since `find_newly_ready` fires only on
-        // completions. Leader-only by the same construction as the PG
-        // writes above.
-        self.reevaluate_removal_survivors(&holed_parents).await;
+        // completions. Leader-only by construction — the only
+        // production caller is the admin ClearPoison RPC, which is
+        // leader-guarded at the gRPC layer (`ensure_leader`).
+        self.reevaluate_removal_survivors(&surviving_parents).await;
         info!(drv_hash = %drv_hash, "poison cleared by admin; node removed from DAG");
         true
     }

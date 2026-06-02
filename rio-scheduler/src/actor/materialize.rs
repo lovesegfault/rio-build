@@ -511,7 +511,7 @@ pub(crate) struct RoutingInputs<'a> {
     /// parameterization — design §9.4).
     pub reprobe: Option<ReprobeAnswer>,
     /// Whether the consumed job's `origin == 'pruned'` — the durable
-    /// successor of the topdown_pruned mark (design §4/A2/A13,
+    /// successor of the walk-era pruned mark (design §4/A2/A13,
     /// T-D2.1) and the arm-3 settlement discriminator (finding 11):
     /// only a pruned-origin job may fail-fast (the prune deliberately
     /// dropped the node's closure, so from-source is doomed); a
@@ -613,7 +613,7 @@ impl DagActor {
         // The unresolved job this attempt executes (PG is the
         // authority; the in-memory view is a cache). The row carries
         // the ORIGIN — `'pruned'` is the durable arm-3 settlement
-        // discriminator (T-D2.1; the topdown_pruned column's
+        // discriminator (T-D2.1; the walk-era pruned column's
         // successor).
         let job = self
             .db
@@ -654,9 +654,6 @@ impl DagActor {
                         .await;
                     }
                     self.materialization_jobs.remove(&drv_hash);
-                    // The §4 clear-mirror: a successful resolution
-                    // clears the node's own topdown_pruned mark (PD-B16).
-                    self.clear_pruned_mark_on_job_resolution(&drv_hash).await;
                     // The build-success path: outputs are present and
                     // verified in the store; complete the node for live
                     // interest through the same chokepoint the
@@ -762,9 +759,6 @@ impl DagActor {
                             .await;
                         }
                         self.materialization_jobs.remove(&drv_hash);
-                        // The §4 clear-mirror: the moot arm is a
-                        // resolved_success too (PD-B16).
-                        self.clear_pruned_mark_on_job_resolution(&drv_hash).await;
                         self.complete_ready_from_store_batch(std::slice::from_ref(&drv_hash))
                             .await;
                     }
@@ -782,11 +776,6 @@ impl DagActor {
                             .await;
                         }
                         self.materialization_jobs.remove(&drv_hash);
-                        // The §4 clear-mirror: from-source resolution
-                        // clears the mark so the dispatch that follows is
-                        // not poisoned by the stale prune verdict
-                        // (PD-B16; the from-source-clear half).
-                        self.clear_pruned_mark_on_job_resolution(&drv_hash).await;
                         // The node returns to its dep-derived status
                         // (the normal Ready path) — requeue it.
                         self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
@@ -977,52 +966,6 @@ impl DagActor {
                 warn!(drv_hash = %drv_hash, %exec_id, error = %e,
                       "materialization attempt close failed; the establishment sweep remains \
                        the backstop");
-            }
-        }
-    }
-
-    // r[impl sched.materialize.routing+2]
-    /// The §4 clear-mirror (Phase B / PD-B16): when a materialization
-    /// job resolves successfully (`resolved_success` — the
-    /// covered-success and moot arms) or from-source
-    /// (`resolved_from_source`), clear the node's OWN `topdown_pruned`
-    /// mark — in-memory plus the durable fenced helper — mirroring the
-    /// success-clear / from-source-clear design §4 makes normative for
-    /// the flag-on consumption transaction. Without this, the mark
-    /// outlives the successful materialization and a flag-off rollback
-    /// can wrongly fail-fast the node on the stale flag-on-era mark
-    /// (the FP-4(a) revert-with-state hazard).
-    ///
-    /// Same posture as the walk's lazy/fail-fast clears (warn and
-    /// continue, never fail the consumption); the recovery
-    /// produced-children gate stays the cross-restart backstop for a
-    /// lost durable write. Materialization-only path — unreachable
-    /// flag-off, so flag-off behavior is byte-identical by construction.
-    // D5-delete: the column (and this mirror) die with the evidence
-    // machinery (T-D5.1) — the mark's routing role moved to the job
-    // row's origin in T-D2.1; this clear keeps the legacy column
-    // coherent for flag-off-era readers until then.
-    async fn clear_pruned_mark_on_job_resolution(&mut self, drv_hash: &DrvHash) {
-        let marked = self.dag.node(drv_hash).is_some_and(|s| s.topdown_pruned);
-        if !marked {
-            return;
-        }
-        if let Some(state) = self.dag.node_mut(drv_hash) {
-            state.topdown_pruned = false;
-        }
-        match self
-            .db
-            .clear_topdown_pruned_by_hash(drv_hash, self.serving_generation())
-            .await
-        {
-            Ok(crate::db::FencedWrite::Fenced) => {
-                self.note_fenced_evidence_write("materialization-resolution topdown_pruned clear");
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!(drv_hash = %drv_hash, error = %e,
-                      "failed to clear persisted topdown_pruned after job resolution \
-                       (continuing; the recovery produced-children gate is the backstop)");
             }
         }
     }
@@ -1346,10 +1289,10 @@ impl DagActor {
                 continue;
             }
             // From-source is viable: resolve the job (no exec_id — the
-            // re-evaluation, not an execution, resolved it), clear any
-            // stale prune mark, and requeue the node. The spawn-intent
-            // filter and the admission table stop excluding the node
-            // the moment the job row is terminal.
+            // re-evaluation, not an execution, resolved it) and requeue
+            // the node. The spawn-intent filter and the admission table
+            // stop excluding the node the moment the job row is
+            // terminal.
             let serving_generation = self.serving_generation();
             self.resolve_materialization_job(
                 job_id,
@@ -1359,7 +1302,6 @@ impl DagActor {
             )
             .await;
             self.materialization_jobs.remove(&drv_hash);
-            self.clear_pruned_mark_on_job_resolution(&drv_hash).await;
             self.reassign_derivations(std::slice::from_ref(&drv_hash), None)
                 .await;
             still_parked -= 1;

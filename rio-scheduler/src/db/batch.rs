@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use super::{DerivationRow, FencedWrite, SchedulerDb, encode_pg_text_array};
+use super::{DerivationRow, SchedulerDb, encode_pg_text_array};
 
 impl SchedulerDb {
     /// Link a build to a derivation. Test-only singular form; production
@@ -36,9 +36,9 @@ impl SchedulerDb {
     /// Batch-upsert derivations. Returns a map
     /// `drv_hash -> (derivation_id, resource_floor)`.
     ///
-    /// Array parameters via `UNNEST`: 13 bind params total regardless of
-    /// row count (vs `push_values`' 13×N, which hits PG's 65535-param
-    /// limit at ~5041 rows). `RETURNING drv_hash` because PG doesn't
+    /// Array parameters via `UNNEST`: 11 bind params total regardless of
+    /// row count (vs `push_values`' 11×N, which hits PG's 65535-param
+    /// limit at ~5957 rows). `RETURNING drv_hash` because PG doesn't
     /// guarantee `RETURNING` order matches `UNNEST` input order either.
     ///
     /// `floor_*` columns are returned so merge can hydrate them onto
@@ -54,7 +54,7 @@ impl SchedulerDb {
             return Ok(HashMap::new());
         }
 
-        // Decompose struct-of-rows into row-of-arrays. Thirteen parallel
+        // Decompose struct-of-rows into row-of-arrays. Eleven parallel
         // Vecs, one per column. This IS a transpose — lives for the
         // duration of one INSERT, cheaper than N roundtrips.
         //
@@ -75,8 +75,6 @@ impl SchedulerDb {
         let mut is_fixed_output = Vec::with_capacity(rows.len());
         let mut is_ca = Vec::with_capacity(rows.len());
         let mut wanted_output_names = Vec::with_capacity(rows.len());
-        let mut topdown_pruned = Vec::with_capacity(rows.len());
-        let mut closure_hole = Vec::with_capacity(rows.len());
         for r in rows {
             drv_hash.push(r.drv_hash.as_str());
             drv_path.push(r.drv_path.as_str());
@@ -89,8 +87,6 @@ impl SchedulerDb {
             is_fixed_output.push(r.is_fixed_output);
             is_ca.push(r.is_ca);
             wanted_output_names.push(encode_pg_text_array(&r.wanted_output_names));
-            topdown_pruned.push(r.topdown_pruned);
-            closure_hole.push(r.closure_hole);
         }
 
         // ON CONFLICT: update the recovery columns too. For
@@ -113,57 +109,26 @@ impl SchedulerDb {
         // persistence/recovery fallback — classification reads the live
         // effective set (`effective_wanted`, in-memory per-build
         // contributions) and only falls back to this column.
-        //
-        // r[impl sched.evidence.durability+2]
-        // topdown_pruned is OR-combined on conflict for the same reason:
-        // an unrelated, non-pruned merge of the same drv elsewhere must
-        // never clear a prior pruned merge's marker through the upsert.
-        // Clearing happens elsewhere: `clear_topdown_pruned_by_hashes`
-        // from the post-reconciliation clear pass in `handle_merge_dag`,
-        // the completion-time `clear_topdown_pruned_for_produced_parents`,
-        // and the recovery-time gate in `load_dag_from_rows` (each keyed
-        // on the node's children being produced — see each caller's
-        // doc), and `clear_topdown_pruned_by_hash` for the lazy
-        // walk-failure clear and when the topdown fail-fast consumes
-        // the marker.
-        //
-        // closure_hole is OR-combined too, for the symmetric reason: the
-        // merge bind is ALWAYS false (the upsert is never a stamping
-        // site — the breadcrumb is set via `set_closure_hole_by_hashes`
-        // by the leader's reap hook, by the recovery-time stamp in
-        // `load_dag_from_rows`, and by the poison-clear paths — admin
-        // ClearPoison and the poison-TTL sweep), and a pruned /
-        // single-node re-merge of the same drv does not re-declare its
-        // edges, so it must not launder the persisted truncation
-        // evidence through the upsert. The only merge-side clear is
-        // the explicit heal in `handle_merge_dag`
-        // (`clear_closure_hole_by_hashes`, edge parents of a full
-        // merge); the batched mark-clear helper below drops it
-        // together with `topdown_pruned`, while the single-row
-        // `clear_topdown_pruned_by_hash` is mark-only (the fail-fast
-        // retains the breadcrumb for the directed resubmit).
         let result: Vec<(String, Uuid, i64, i64, i64)> = sqlx::query_as(
             r#"
             INSERT INTO derivations
                 (drv_hash, drv_path, pname, system, status, required_features,
                  expected_output_paths, output_names, is_fixed_output, is_ca,
-                 wanted_output_names, topdown_pruned, closure_hole)
+                 wanted_output_names)
             SELECT
                 drv_hash, drv_path, pname, system, status,
                 required_features::text[],
                 expected_output_paths::text[],
                 output_names::text[],
                 is_fixed_output, is_ca,
-                wanted_output_names::text[],
-                topdown_pruned, closure_hole
+                wanted_output_names::text[]
             FROM UNNEST(
                 $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
                 $6::text[], $7::text[], $8::text[], $9::bool[], $10::bool[],
-                $11::text[], $12::bool[], $13::bool[]
+                $11::text[]
             ) AS t(drv_hash, drv_path, pname, system, status,
                    required_features, expected_output_paths, output_names,
-                   is_fixed_output, is_ca, wanted_output_names, topdown_pruned,
-                   closure_hole)
+                   is_fixed_output, is_ca, wanted_output_names)
             -- is_ca UPDATE is idempotent-by-construction: drv_hash is
             -- deterministic (input-addressed=store path; CA=modular hash
             -- per rio-nix hashDerivationModulo). Same drv_hash → same
@@ -176,22 +141,6 @@ impl SchedulerDb {
             -- saturation. '{}' = "all wanted", so all ∪ X = all → '{}'
             -- if either side is empty; otherwise the sorted distinct
             -- union. Monotonically growing — never overwrite.
-            --
-            -- topdown_pruned: OR — set by pruned merges; this upsert
-            -- never clears it. Cleared by clear_topdown_pruned_by_hashes
-            -- (post-reconciliation pass, completion-time clear,
-            -- recovery-time gate — once the node's children are
-            -- produced) and by clear_topdown_pruned_by_hash (lazy
-            -- walk-failure clear; fail-fast consumed it).
-            --
-            -- closure_hole: OR — set by the leader's reap hook, the
-            -- recovery-time stamp in load_dag_from_rows, and the
-            -- poison-clear paths (merges always bind false); this
-            -- upsert never clears it.
-            -- Cleared by the merge-time heal
-            -- (clear_closure_hole_by_hashes) and alongside the mark by
-            -- the batched clear_topdown_pruned_by_hashes helper (the
-            -- single-row clear_topdown_pruned_by_hash is mark-only).
             ON CONFLICT (drv_hash) DO UPDATE SET
                 updated_at = now(),
                 expected_output_paths = EXCLUDED.expected_output_paths,
@@ -208,9 +157,7 @@ impl SchedulerDb {
                                 || EXCLUDED.wanted_output_names
                         ) ORDER BY 1
                     )
-                END,
-                topdown_pruned = derivations.topdown_pruned OR EXCLUDED.topdown_pruned,
-                closure_hole = derivations.closure_hole OR EXCLUDED.closure_hole
+                END
             RETURNING drv_hash, derivation_id,
                       floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
             "#,
@@ -226,8 +173,6 @@ impl SchedulerDb {
         .bind(&is_fixed_output)
         .bind(&is_ca)
         .bind(&wanted_output_names)
-        .bind(&topdown_pruned)
-        .bind(&closure_hole)
         .fetch_all(&mut *tx)
         .await?;
         Ok(result
@@ -294,215 +239,5 @@ impl SchedulerDb {
         .execute(&mut *tx)
         .await?;
         Ok(())
-    }
-
-    /// Best-effort batched `topdown_pruned` clear keyed by `drv_hash`,
-    /// as a generation-fenced single-statement transaction. Callers: the
-    /// post-reconciliation clear pass in `handle_merge_dag` (unique
-    /// parents whose children are all produced — and verified — after
-    /// `reconcile_merged_state`),
-    /// `clear_topdown_pruned_for_produced_parents` in completion.rs
-    /// (parents whose last child just became produced), and the
-    /// recovery-time gate in `load_dag_from_rows` (restored marks whose
-    /// persisted children are all produced and vouched for by a live
-    /// (`pending`/`active`) build that also owns the parent); each
-    /// clears its batch in one statement.
-    /// Also resets the `closure_hole` breadcrumb (`migrations/064`):
-    /// the breadcrumb only qualifies the mark, so it travels with it —
-    /// and the widened WHERE additionally mops up a markless leftover
-    /// hole (a heal whose best-effort PG write was lost after the mark
-    /// itself had already been cleared).
-    /// Returns [`FencedWrite::Applied`] with the number of rows actually
-    /// touched, or [`FencedWrite::Fenced`] (rolled back, nothing
-    /// written) when `serving_generation` sits below the durable claims
-    /// floor — a deposed tenure's late clear must not erase evidence a
-    /// newer tenure has since written (`sched.evidence.durability`).
-    /// Same ERROR posture as `clear_topdown_pruned_by_hash`: the caller
-    /// warns and continues — the in-memory clear already happened and
-    /// the merge outcome must not depend on this write.
-    // r[impl sched.evidence.closure-hole]
-    // r[impl sched.evidence.durability+2]
-    pub(crate) async fn clear_topdown_pruned_by_hashes(
-        &self,
-        drv_hashes: &[String],
-        serving_generation: i64,
-    ) -> Result<FencedWrite, sqlx::Error> {
-        if drv_hashes.is_empty() {
-            return Ok(FencedWrite::Applied(0));
-        }
-        let mut tx = self.pool.begin().await?;
-        let floor = Self::claims_floor(&mut tx).await?;
-        if !Self::at_or_above_floor(floor, serving_generation) {
-            tx.rollback().await?;
-            return Ok(FencedWrite::Fenced);
-        }
-        let result = sqlx::query(
-            r#"
-            UPDATE derivations
-            SET topdown_pruned = false, closure_hole = false, updated_at = now()
-            WHERE drv_hash = ANY($1) AND (topdown_pruned OR closure_hole)
-            "#,
-        )
-        .bind(drv_hashes)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(FencedWrite::Applied(result.rows_affected()))
-    }
-
-    /// Best-effort single-row, mark-only `topdown_pruned` clear, keyed
-    /// by `drv_hash`, as a generation-fenced single-statement
-    /// transaction. Never touches the
-    /// `closure_hole` breadcrumb (unlike `clear_topdown_pruned_by_hashes`,
-    /// whose callers are all keyed on produced/vouched children). Two
-    /// callers, and mark-only is correct at both:
-    ///  - the topdown fail-fast when it parks a node: the marker it
-    ///    just consumed must not survive in PG (or the next leader
-    ///    restores it onto a childless node and the fail-fast re-arms
-    ///    after every failover), but the breadcrumb is deliberately
-    ///    retained — the directed resubmit the fail-fast solicits goes
-    ///    through the resubmit-reset, which keeps the truncated child
-    ///    edges and carries the breadcrumb, so the re-pruning merge's
-    ///    stamp gates re-stamp the node instead of reading its produced
-    ///    survivors as Vouched (round-23 bug_006);
-    ///  - the lazy clear in `handle_substitute_complete` when the
-    ///    node's children are all already produced at walk-failure
-    ///    time: that arm fires only on `Vouched` closure evidence,
-    ///    which requires the in-memory hole to be false — there is no
-    ///    in-memory hole consumption to mirror, and a persisted-only
-    ///    leftover (a lost heal write) is the next full merge's heal to
-    ///    drop, not this helper's.
-    ///
-    /// Callers treat an error as warn-and-continue — the in-memory
-    /// clear already happened and the build verdict must not depend on
-    /// this write. A [`FencedWrite::Fenced`] outcome (serving
-    /// generation below the claims floor) likewise rolls back having
-    /// written nothing (`sched.evidence.durability`).
-    // r[impl sched.evidence.closure-hole]
-    // r[impl sched.evidence.durability+2]
-    pub(crate) async fn clear_topdown_pruned_by_hash(
-        &self,
-        drv_hash: &str,
-        serving_generation: i64,
-    ) -> Result<FencedWrite, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        let floor = Self::claims_floor(&mut tx).await?;
-        if !Self::at_or_above_floor(floor, serving_generation) {
-            tx.rollback().await?;
-            return Ok(FencedWrite::Fenced);
-        }
-        let result = sqlx::query(
-            r#"
-            UPDATE derivations
-            SET topdown_pruned = false, updated_at = now()
-            WHERE drv_hash = $1 AND topdown_pruned
-            "#,
-        )
-        .bind(drv_hash)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(FencedWrite::Applied(result.rows_affected()))
-    }
-
-    /// Best-effort batched `closure_hole` stamp keyed by `drv_hash`, as
-    /// a generation-fenced single-statement transaction. Four callers,
-    /// one per
-    /// production removal of an un-produced child out from under a
-    /// surviving parent: the leader-gated survivor hook in
-    /// `handle_cleanup_terminal_build`, for the parents the
-    /// terminal-build reap just holed (`ReapOutcome::holed_parents`);
-    /// the recovery-time stamp in `load_dag_from_rows`, for recovered
-    /// parents whose un-produced terminal children's edges the recovery
-    /// load dropped (the recovery-side analogue of the reap); and the
-    /// two poison-clear paths — admin ClearPoison
-    /// (`handle_clear_poison`) and the poison-TTL sweep
-    /// (`tick_process_expired_poisons`) — for the surviving parents of
-    /// the Poisoned (by definition un-produced) child they remove. All
-    /// four share the same posture: the write runs only on the leader
-    /// (hook gate, recovery, admin leader guard, standby tick no-op —
-    /// `r[sched.lease.standby-drops-writes]`) and the in-memory
-    /// breadcrumb is stamped at the removal site itself, independently
-    /// of this write.
-    /// Returns [`FencedWrite::Applied`] with the number of rows actually
-    /// stamped, or [`FencedWrite::Fenced`] (rolled back, nothing
-    /// written) when `serving_generation` sits below the durable claims
-    /// floor (`sched.evidence.durability`). The caller warns and
-    /// continues on ERROR — losing the write costs durability of the
-    /// breadcrumb across a failover (the already-accepted best-effort
-    /// window), never this tenure's correctness.
-    // r[impl sched.evidence.closure-hole]
-    // r[impl sched.evidence.durability+2]
-    pub(crate) async fn set_closure_hole_by_hashes(
-        &self,
-        drv_hashes: &[String],
-        serving_generation: i64,
-    ) -> Result<FencedWrite, sqlx::Error> {
-        if drv_hashes.is_empty() {
-            return Ok(FencedWrite::Applied(0));
-        }
-        let mut tx = self.pool.begin().await?;
-        let floor = Self::claims_floor(&mut tx).await?;
-        if !Self::at_or_above_floor(floor, serving_generation) {
-            tx.rollback().await?;
-            return Ok(FencedWrite::Fenced);
-        }
-        let result = sqlx::query(
-            r#"
-            UPDATE derivations SET closure_hole = true, updated_at = now()
-            WHERE drv_hash = ANY($1) AND NOT closure_hole
-            "#,
-        )
-        .bind(drv_hashes)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(FencedWrite::Applied(result.rows_affected()))
-    }
-
-    /// Best-effort batched `closure_hole` clear keyed by `drv_hash`, as
-    /// a generation-fenced single-statement transaction. Sole caller:
-    /// the merge-time
-    /// heal in `handle_merge_dag`, for EVERY edge parent of a full
-    /// merge (the heal clears the hole even when the `topdown_pruned`
-    /// mark stays, so it cannot ride the mark-clear helpers above; it
-    /// is total — not keyed on the in-memory bit — because the
-    /// persisted copy can be stale when the in-memory one was cleared
-    /// elsewhere or lost, and the `AND closure_hole` WHERE keeps the
-    /// statement a no-op for clean rows). Returns
-    /// [`FencedWrite::Applied`] with the number of rows
-    /// actually cleared, or [`FencedWrite::Fenced`] (rolled back,
-    /// nothing written) when `serving_generation` sits below the
-    /// durable claims floor (`sched.evidence.durability`). The caller
-    /// warns and continues on ERROR — a
-    /// stale persisted hole errs toward the bounded fail-fast after a
-    /// later failover, never the doomed from-source dispatch.
-    // r[impl sched.evidence.closure-hole]
-    // r[impl sched.evidence.durability+2]
-    pub(crate) async fn clear_closure_hole_by_hashes(
-        &self,
-        drv_hashes: &[String],
-        serving_generation: i64,
-    ) -> Result<FencedWrite, sqlx::Error> {
-        if drv_hashes.is_empty() {
-            return Ok(FencedWrite::Applied(0));
-        }
-        let mut tx = self.pool.begin().await?;
-        let floor = Self::claims_floor(&mut tx).await?;
-        if !Self::at_or_above_floor(floor, serving_generation) {
-            tx.rollback().await?;
-            return Ok(FencedWrite::Fenced);
-        }
-        let result = sqlx::query(
-            r#"
-            UPDATE derivations SET closure_hole = false, updated_at = now()
-            WHERE drv_hash = ANY($1) AND closure_hole
-            "#,
-        )
-        .bind(drv_hashes)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(FencedWrite::Applied(result.rows_affected()))
     }
 }

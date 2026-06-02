@@ -363,8 +363,8 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_evidence_write_fenced_total",
-        "Evidence writes (topdown_pruned/closure_hole stamps and clears, derivation \
-         status/poison persists, merge transactions) refused by the claims-floor \
+        "Evidence writes (materialization job creation/resolution, wanted-relation \
+         rows, derivation status/poison persists, merge transactions) refused by the claims-floor \
          generation fence: the writing replica's serving generation sat below the \
          durable floor (GREATEST over assignments.generation and \
          leader_generation_claims.generation). On a replica that just lost the lease \

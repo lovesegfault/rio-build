@@ -93,55 +93,30 @@ pub struct ReapOutcome {
     pub reaped_paths: Vec<String>,
     /// Deduped surviving parents of the reaped nodes: nodes still in the
     /// DAG that just lost at least one child to this reap. The caller
-    /// re-evaluates these (fail-fast a stranded topdown-pruned root,
-    /// promote a now-ready Queued parent) — nothing else would, because
-    /// `find_newly_ready` only fires on completions, never on removals.
+    /// re-evaluates these (promote a now-ready Queued parent; survivors
+    /// with an unresolved materialization job are armed by the job) —
+    /// nothing else would, because `find_newly_ready` only fires on
+    /// completions, never on removals.
     pub surviving_parents: Vec<DrvHash>,
-    /// The subset of `surviving_parents` that lost at least one
-    /// UN-PRODUCED child to this reap — exactly the nodes whose
-    /// in-memory `closure_hole` breadcrumb this reap just set. Reported
-    /// separately so the leader-gated survivor hook can persist the
-    /// breadcrumb (`migrations/064`, `set_closure_hole_by_hashes`)
-    /// without re-deriving "holed by THIS reap" from node state (which
-    /// would also re-fire for holes set by earlier reaps and miss
-    /// survivors the hook's verdict loop skips as terminal /
-    /// zero-interest).
-    pub holed_parents: Vec<DrvHash>,
 }
 
 /// Trust classification of a node's current DAG child set as evidence
-/// about its dependency closure — the single judgment behind every
-/// `topdown_pruned` stamp gate, clear site, and dispatch-time guard.
+/// about its dependency closure — the judgment behind the merge-time
+/// pruned-origin selection gate (`closure_vouched` in `merge.rs`).
 /// Computed by `DerivationDag::closure_evidence`.
 ///
 /// Re-exported from `rio_evidence_kernel`, the dependency-free
 /// CBMC-verified decision kernel: the variant semantics, the case
-/// analysis that produces them, and the predicates layered on them
-/// (`must_substitute` / `closure_vouched`) are owned and proven there;
-/// this DAG owns only the projection of its node/edge maps into the
-/// kernel's inputs.
+/// analysis that produces them, and the `closure_vouched` predicate
+/// are owned and proven there; this DAG owns only the projection of
+/// its node/edge maps into the kernel's inputs.
 ///
-/// In this DAG, `Broken`'s "closure-holed" input is the `closure_hole`
-/// breadcrumb — an un-produced child was removed out from under the
-/// node, by the terminal-build reap (see the breadcrumb loop in
-/// `DerivationDag::remove_build_interest_and_reap`), by a
-/// poison-clear removal (admin ClearPoison or the poison-TTL sweep), or
-/// by leader-failover recovery dropping the edge to one (the
-/// recovery-time stamp in `load_dag_from_rows`) — so whatever children
-/// survive are a truncated view of its input closure.
-///
-/// (The references above are intentionally not intra-doc links: rustdoc
-/// resolves links on a `pub use` in the defining crate's namespace,
-/// where the DAG types do not exist.)
-/// The breadcrumb survives the node's own completion or skip (those
-/// transitions do not repair the truncation), is carried across a
-/// resubmit-reset of the node (a `rollback_merge` restores the prior
-/// state wholesale), and is NOT consumed by the mark-clear / fail-fast
-/// handling of the `topdown_pruned` mark it qualifies (the fail-fast is
-/// mark-only, so the breadcrumb survives to re-stamp the directed
-/// resubmit); it is dropped only by the merge-time heal when a full
-/// merge re-declares the node's edges (the post-reconciliation pass in
-/// `handle_merge_dag`).
+/// The settlement-time judgments do NOT use this in-memory view: the
+/// consumption routing and the park re-evaluation classify over the
+/// durable relation (`SchedulerDb::classify_durable_evidence` — the
+/// strict three-part criterion with live co-owning build links), so a
+/// reap-truncated or post-failover in-memory child set never decides
+/// a routing verdict.
 pub use rio_evidence_kernel::ClosureEvidence;
 
 /// The global derivation DAG maintained by the actor.
@@ -394,10 +369,6 @@ impl DerivationDag {
             // Edges are NOT scrubbed: `children`/`parents` are keyed by hash
             // string, so they stay valid across the remove+reinsert. The merge's
             // own edge loop re-adds this submission's edges idempotently.
-            // Because the (possibly reap-truncated) child set survives the
-            // reset without being re-declared, the `closure_hole`
-            // breadcrumb that qualifies it must ride along in the carry
-            // below.
             //
             // Prior interested_builds are carried over so any OTHER build
             // that was stuck on this Cancelled node also benefits from the
@@ -405,18 +376,6 @@ impl DerivationDag {
             // Poisoned-resubmit bound (POISON_RESUBMIT_RETRY_LIMIT)
             // accumulates across resubmits — without this, every reset
             // would start at 0 and the bound would never fire (I-169).
-            // closure_hole is carried because the breadcrumb records the
-            // relation between the node's child set and its pruned input
-            // closure: the reset keeps the (possibly truncated) edges and
-            // does not re-declare them, so the truncation evidence must
-            // outlive the retry — dropped, a re-pruning merge of a holed
-            // node with produced survivors reads as Vouched and both stamp
-            // gates skip the mark, re-arming the doomed from-source
-            // dispatch. topdown_pruned is deliberately NOT carried: the
-            // incoming merge's own prune/stamp decision re-derives it (a
-            // re-pruning merge sees Broken evidence via the carried hole
-            // and re-stamps; a full merge re-declares the edges and the
-            // heal clears the carried hole).
             let prior = if self
                 .nodes
                 .get(&drv_hash)
@@ -428,7 +387,6 @@ impl DerivationDag {
                     old.retry.resubmit_cycles,
                     old.wanted_output_names.clone(),
                     old.wanted_by_build.clone(),
-                    old.closure_hole,
                 );
                 removed_retriable.push((drv_hash.clone(), old));
                 Some(carry)
@@ -551,17 +509,9 @@ impl DerivationDag {
                 // set with only the resubmitter's would shrink it. Their
                 // per-build contributions are carried alongside (they
                 // follow interest membership); `or_insert` keeps the
-                // resubmitter's own entry authoritative. The closure-hole
-                // breadcrumb rides along too — the kept edges were not
-                // re-declared by this reset (see the carry site above).
-                // r[impl sched.evidence.closure-hole]
-                if let Some((
-                    prior_interest,
-                    prior_cycles,
-                    prior_wanted,
-                    prior_contributions,
-                    prior_closure_hole,
-                )) = prior
+                // resubmitter's own entry authoritative.
+                if let Some((prior_interest, prior_cycles, prior_wanted, prior_contributions)) =
+                    prior
                 {
                     state.interested_builds.extend(prior_interest);
                     state.retry.resubmit_cycles = prior_cycles + 1;
@@ -569,7 +519,6 @@ impl DerivationDag {
                     for (b, w) in prior_contributions {
                         state.wanted_by_build.entry(b).or_insert(w);
                     }
-                    state.closure_hole = prior_closure_hole;
                     reset_on_resubmit.push(drv_hash.clone());
                 }
                 state.traceparent = submitter_traceparent.to_string();
@@ -892,33 +841,30 @@ impl DerivationDag {
     }
 
     /// Classify `drv_hash`'s current child set as closure evidence (see
-    /// [`ClosureEvidence`]): absent node → `Broken`; `closure_hole` set
-    /// → `Broken`; no children → `Broken`; at least one child and all
-    /// of them Completed/Skipped → `Vouched`; otherwise `Pending`.
+    /// [`ClosureEvidence`]): absent node → `Broken`; no children →
+    /// `Broken`; at least one child and all of them Completed/Skipped
+    /// → `Vouched`; otherwise `Pending`.
     ///
     /// Projection shim over [`rio_evidence_kernel::closure_evidence`] —
     /// the CBMC-verified kernel owns the case analysis and the
     /// child-set fold; this method gathers the kernel's inputs out of
-    /// the node/edge maps: presence, the breadcrumb bit, and one lazy
-    /// produced-ness bool per declared child (a child edge whose node
-    /// is missing from the DAG projects as un-produced, exactly as the
-    /// pre-extraction `is_some_and` lookup did).
+    /// the node/edge maps: presence and one lazy produced-ness bool per
+    /// declared child (a child edge whose node is missing from the DAG
+    /// projects as un-produced, exactly as the pre-extraction
+    /// `is_some_and` lookup did).
     ///
-    /// Every `topdown_pruned` decision site (the stamp gates in
-    /// `validate_and_ingest` / `persist_merge_to_db`, the
-    /// produced-children clear sites, and the dispatch-time / reap-time
-    /// guards) judges the child set through this one classifier so no
-    /// site can drift into trusting a removal-truncated child set. The
-    /// hole input is set by [`Self::remove_build_interest_and_reap`],
-    /// by the recovery-time stamp in `load_dag_from_rows` (an edge to
-    /// an un-produced terminal child dropped at load), and by the
-    /// poison-clear removals (admin `ClearPoison` and the poison-TTL
-    /// sweep), and healed by the merge-time edge re-declaration.
+    /// Sole consumer: the merge-time pruned-origin selection gate
+    /// (`closure_vouched`). The settlement-time judgments classify
+    /// over the durable relation instead
+    /// (`SchedulerDb::classify_durable_evidence`).
     pub fn closure_evidence(&self, drv_hash: &str) -> ClosureEvidence {
         let node = self.nodes.get(drv_hash);
         rio_evidence_kernel::closure_evidence(
             node.is_some(),
-            node.is_some_and(|n| n.closure_hole),
+            // The walk-era closure-hole breadcrumb is gone (T-D5.1);
+            // the kernel's hole parameter goes with the kernel
+            // reduction (T-D5.2).
+            false,
             self.children.get(drv_hash).map(|children| {
                 children.iter().map(|child_hash| {
                     self.nodes.get(child_hash).is_some_and(|n| {
@@ -1326,24 +1272,6 @@ impl DerivationDag {
     /// `sched.poison.clear-survivor-reevaluation`); putting collection in
     /// `remove_node` would double-collect for them.
     ///
-    /// Survivors that lost at least one UN-PRODUCED child (status not
-    /// Completed/Skipped at reap time) additionally get the in-memory
-    /// `closure_hole` breadcrumb set, and are reported back as
-    /// [`ReapOutcome::holed_parents`]: their remaining DAG children no
-    /// longer represent their pruned input closure, so the actor's
-    /// children-keyed `topdown_pruned` verdicts must not trust the
-    /// truncated set. The IN-MEMORY breadcrumb is set HERE (not in the
-    /// leader-gated survivor hook) so a standby's DAG — which loses the
-    /// children all the same — carries it too; the PG persistence of
-    /// the breadcrumb (`migrations/064`) is leader-class and lives in
-    /// the hook, fed by `holed_parents`. The poison-TTL sweep and admin
-    /// ClearPoison perform the same capture-stamp-persist sequence at
-    /// their own call sites when they delete a Poisoned (by definition
-    /// un-produced) child via [`Self::remove_node`] — `remove_node`
-    /// itself stays parent-agnostic. The one truncation still left
-    /// un-stamped is the expired-at-load poison shape at recovery (see
-    /// the field's doc).
-    ///
     /// This prevents unbounded DAG growth for long-running schedulers.
     /// Non-terminal orphaned nodes are preserved (they may be mid-build for
     /// a different code path, though this shouldn't happen in practice).
@@ -1366,26 +1294,18 @@ impl DerivationDag {
                 && state.status().is_terminal()
                 && state.status() != DerivationStatus::Poisoned
             {
-                let unproduced = !matches!(
-                    state.status(),
-                    DerivationStatus::Completed | DerivationStatus::Skipped
-                );
-                to_reap.push((hash.clone(), state.drv_path().to_string(), unproduced));
+                to_reap.push((hash.clone(), state.drv_path().to_string()));
             }
         }
 
         let mut surviving_parents: BTreeSet<DrvHash> = BTreeSet::new();
-        let mut holed_parents: BTreeSet<DrvHash> = BTreeSet::new();
         let mut reaped_paths = Vec::with_capacity(to_reap.len());
-        for (hash, path, unproduced) in to_reap {
+        for (hash, path) in to_reap {
             // Capture the parents BEFORE `remove_node` scrubs the edge maps —
             // afterwards neither the reaped hash nor its former parents are
             // recoverable from the DAG.
             if let Some(ps) = self.parents.get(&hash) {
                 surviving_parents.extend(ps.iter().cloned());
-                if unproduced {
-                    holed_parents.extend(ps.iter().cloned());
-                }
             }
             self.remove_node(&hash);
             reaped_paths.push(path);
@@ -1393,20 +1313,9 @@ impl DerivationDag {
         // Drop entries that were themselves reaped (or otherwise no longer
         // exist) so only true survivors are reported.
         surviving_parents.retain(|p| self.nodes.contains_key(p));
-        holed_parents.retain(|p| self.nodes.contains_key(p));
-        // r[impl sched.evidence.closure-hole]
-        // Breadcrumb the survivors whose reaped children include an
-        // un-produced one: their child set is no longer representative of
-        // their input closure (see `DerivationState::closure_hole`).
-        for parent in &holed_parents {
-            if let Some(state) = self.nodes.get_mut(parent) {
-                state.closure_hole = true;
-            }
-        }
         ReapOutcome {
             reaped_paths,
             surviving_parents: surviving_parents.into_iter().collect(),
-            holed_parents: holed_parents.into_iter().collect(),
         }
     }
 

@@ -405,7 +405,7 @@ impl SchedulerDb {
     /// consumption transaction's job lookup (PG is the authority; the
     /// actor's in-memory view is a cache). Carries the row's ORIGIN:
     /// `origin = 'pruned'` is the durable settlement discriminator
-    /// (the topdown_pruned mark's successor — design §4/A2/A13,
+    /// (the walk-era pruned mark's successor — design §4/A2/A13,
     /// T-D2.1).
     pub(crate) async fn unresolved_job_for_derivation(
         &self,

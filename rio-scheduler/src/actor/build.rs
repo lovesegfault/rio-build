@@ -723,45 +723,12 @@ impl DagActor {
         // Leader-gated like the `drain_phantoms` slice of the Heartbeat
         // arm: the rest of this handler stays ungated (in-memory build/
         // event-map removal and the DAG reap run on standby as before),
-        // but this block performs leader-class writes —
-        // the closure-hole stamp, `persist_status`, the fail-fast's PG
-        // mark clear, and terminal build failure — and
-        // `CleanupTerminalBuild` can be drained by an ex-leader (the
-        // delayed cleanup timer posts it via `self_tx` after lease loss).
-        // The new leader's recovery owns these survivors.
+        // but the survivor re-evaluation performs leader-class writes
+        // (`persist_status`) and `CleanupTerminalBuild` can be drained
+        // by an ex-leader (the delayed cleanup timer posts it via
+        // `self_tx` after lease loss). The new leader's recovery owns
+        // these survivors.
         if self.leader.is_leader() {
-            // r[impl sched.evidence.closure-hole]
-            // Persist the closure-hole breadcrumbs this reap just set
-            // (`migrations/064`), before the per-parent verdict loop. A
-            // survivor that loop immediately fail-fasts KEEPS the hole —
-            // the fail-fast's PG clear is mark-only — so the stamp's
-            // position relative to the loop no longer changes the
-            // outcome: the persisted hole stays set either way until a
-            // later full merge re-declares the parent's edges. That
-            // persistence is intended — the directed resubmit the
-            // fail-fast solicits re-prunes, and its stamp gates need the
-            // breadcrumb so the produced survivors cannot pass for
-            // Vouched. Best-effort: a lost write only costs the
-            // breadcrumb's durability across a failover (the in-memory
-            // hole — set by the reap above on leader and standby alike —
-            // still guards this tenure), never the cleanup itself.
-            if !reap.holed_parents.is_empty() {
-                let holed: Vec<String> = reap.holed_parents.iter().map(|h| h.to_string()).collect();
-                match self
-                    .db
-                    .set_closure_hole_by_hashes(&holed, self.serving_generation())
-                    .await
-                {
-                    Ok(crate::db::FencedWrite::Fenced) => {
-                        self.note_fenced_evidence_write("terminal-build reap closure_hole stamp");
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!(build_id = %build_id, count = holed.len(), error = %e,
-                              "failed to persist closure_hole for reap survivors (continuing)");
-                    }
-                }
-            }
             self.reevaluate_removal_survivors(&reap.surviving_parents)
                 .await;
         }

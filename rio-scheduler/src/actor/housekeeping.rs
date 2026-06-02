@@ -337,16 +337,10 @@ impl DagActor {
     /// meant a blip left in-mem gone → scan never finds it again →
     /// PG clear deferred to next scheduler restart).
     async fn tick_process_expired_poisons(&mut self, expired_poisons: Vec<DrvHash>) {
-        // r[impl sched.merge.substitute-topdown+12]
         // Surviving parents of the removed children, collected across
-        // the loop for one batched closure-hole stamp below — the
-        // TTL-sweep twin of the admin ClearPoison stamp and of the
-        // terminal-build reap's holed-parents hook: a Poisoned child is
-        // by definition un-produced, so its removal truncates each
-        // surviving parent's child set relative to the parent's declared
-        // closure, and children-keyed `topdown_pruned` verdicts must not
-        // trust the truncated set (see `DerivationState::closure_hole`).
-        let mut holed_parents: Vec<DrvHash> = Vec::new();
+        // the loop for the survivor re-evaluation below (the TTL-sweep
+        // twin of the admin ClearPoison wake).
+        let mut surviving_parents: Vec<DrvHash> = Vec::new();
         for drv_hash in expired_poisons {
             info!(drv_hash = %drv_hash, "poison TTL expired, removing from DAG");
             // 1a: the TTL expiry's `poison_cleared` reset row joins the
@@ -385,7 +379,7 @@ impl DagActor {
             // Capture the parents AFTER the PG clear succeeded (only
             // then is the child actually removed below) and BEFORE
             // `remove_node` scrubs the edge maps.
-            holed_parents.extend(self.dag.get_parents(&drv_hash));
+            surviving_parents.extend(self.dag.get_parents(&drv_hash));
             // r[impl sched.poison.ttl-persist]
             // Prune BEFORE remove_node (reads interested_builds from
             // the node). keep_going=true builds still Active would
@@ -396,41 +390,8 @@ impl DagActor {
             // Remove (not reset) — same rationale as handle_clear_poison.
             self.dag.remove_node(&drv_hash);
         }
-        // r[impl sched.evidence.closure-hole]
-        // Stamp the surviving parents (skipping any that were themselves
-        // removed above): in memory first, then one best-effort PG write.
-        holed_parents.sort();
-        holed_parents.dedup();
-        let mut holed: Vec<String> = Vec::new();
-        for parent in &holed_parents {
-            if let Some(state) = self.dag.node_mut(parent) {
-                state.closure_hole = true;
-                holed.push(parent.to_string());
-            }
-        }
-        if !holed.is_empty() {
-            // Best-effort PG counterpart (`migrations/064`). Leader-only
-            // by construction — `handle_tick` is a no-op on standby
-            // (`r[sched.lease.standby-tick-noop]`), the same posture the
-            // `clear_poison` PG write above already relies on — so no
-            // redundant gate here. A lost write costs only the
-            // breadcrumb's durability across a failover; the in-memory
-            // stamp covers this tenure.
-            match self
-                .db
-                .set_closure_hole_by_hashes(&holed, self.serving_generation())
-                .await
-            {
-                Ok(crate::db::FencedWrite::Fenced) => {
-                    self.note_fenced_evidence_write("poison-TTL sweep closure_hole stamp");
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(count = holed.len(), error = %e,
-                          "failed to persist closure_hole after poison-TTL sweep (continuing)");
-                }
-            }
-        }
+        surviving_parents.sort();
+        surviving_parents.dedup();
         // r[impl sched.poison.clear-survivor-reevaluation]
         // Wake the surviving parents (the TTL-sweep twin of the admin
         // ClearPoison hook): settle marked-Broken survivors, promote
@@ -440,7 +401,7 @@ impl DagActor {
         // sweep fires — without the re-evaluation it would sit there
         // forever (`find_newly_ready` fires only on completions) and its
         // build would hang. Leader-only: `handle_tick` no-ops on standby.
-        self.reevaluate_removal_survivors(&holed_parents).await;
+        self.reevaluate_removal_survivors(&surviving_parents).await;
     }
 
     /// DAG-state sweep for `dispatched_cells`. The arm-on-ack write

@@ -358,36 +358,14 @@ impl DagActor {
         // re-dispatch on the next Tick. cancel_build_derivations
         // strips interest below; with zero remaining interest the
         // node is reaped on the next sweep.
+        // The fail-fast's one-shot is the consumed JOB: the arm-3
+        // settlement resolves the pruned-origin job row terminally
+        // (resolved_unobtainable) before calling this helper, so a
+        // failover cannot re-arm the fail-fast from stale state — a
+        // resubmitted genuinely-pruned root re-prunes and gets a fresh
+        // pruned-origin job; a full merge re-declares the closure and
+        // creates none.
         let parked = if let Some(s) = self.dag.node_mut(drv_hash) {
-            // The fail-fast CONSUMES the pruned marker (here and, best-
-            // effort, in PG below). The flag can be stale: a merge
-            // transaction that committed but whose build activation
-            // failed leaves it on shared rows; a node stamped while its
-            // existing children were invisible (recovery drops edges to
-            // completed children) reads as "childless" again after the
-            // next failover; and a genuinely pruned leaf is never
-            // cleared by a children-adding merge. Left in place, a
-            // stale flag re-arms this fail-fast after EVERY failover
-            // and wrongfully terminal-fails builds for a node that
-            // could build from source. Clearing loses nothing: after
-            // the park there is no surviving interest, and a
-            // resubmitted genuinely-pruned root either re-prunes
-            // (re-stamped — the retained breadcrumb below keeps a
-            // reap-truncated survivor set from vouching) or full-merges
-            // (children all produced ⇒ cleared).
-            s.topdown_pruned = false;
-            // r[impl sched.evidence.closure-hole]
-            // Deliberately do NOT clear `closure_hole`: the directed
-            // resubmit this fail-fast solicits goes through the
-            // resubmit-reset, which keeps the (possibly truncated)
-            // child edges and carries the breadcrumb, and the
-            // re-pruning merge's stamp gates need it to avoid reading
-            // produced survivors as Vouched — erasing it here would
-            // launder that resubmit into the doomed from-source
-            // dispatch one lifecycle step later (round-23 bug_006). An
-            // unmarked node's hole has no consumer that can mis-fire
-            // (every consumer also requires the mark); a later full
-            // merge that re-declares the edges heals it.
             if let Err(e) = s.transition(DerivationStatus::Queued) {
                 warn!(%drv_hash, %e, "topdown fail-fast: transition to Queued rejected");
             }
@@ -395,32 +373,12 @@ impl DagActor {
         } else {
             false
         };
-        // Persist + PG flag clear only for a node the block above
-        // actually parked — never for one the early return skipped or
-        // that vanished between the check and the mutation.
+        // Persist only for a node the block above actually parked —
+        // never for one the early return skipped or that vanished
+        // between the check and the mutation.
         if parked {
             self.persist_status(drv_hash, DerivationStatus::Queued, None)
                 .await;
-            // Best-effort PG counterpart of the in-memory mark clear
-            // above (mark-only: the persisted closure_hole breadcrumb
-            // is deliberately left set, mirroring the retention above).
-            // A failure costs at most one more wrongful fail-fast cycle
-            // after a later failover — never fail the actor command
-            // over it.
-            match self
-                .db
-                .clear_topdown_pruned_by_hash(drv_hash, self.serving_generation())
-                .await
-            {
-                Ok(crate::db::FencedWrite::Fenced) => {
-                    self.note_fenced_evidence_write("fail-fast topdown_pruned clear");
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(%drv_hash, error = %e,
-                          "failed to clear persisted topdown_pruned after fail-fast (continuing)");
-                }
-            }
         }
         for build_id in self.get_interested_builds(drv_hash) {
             if let Some(build) = self.builds.get_mut(&build_id) {
@@ -637,14 +595,6 @@ impl DagActor {
         }
         let ready_refs: Vec<&str> = newly_ready.iter().map(|h| h.as_str()).collect();
         self.persist_status_batch(&ready_refs, DerivationStatus::Ready)
-            .await;
-
-        // Same completion-time topdown_pruned re-evaluation as the
-        // worker path (`promote_newly_ready_batch`): substitution
-        // success and dispatch-time store hits also turn parents'
-        // children produced, and this path promotes through its own
-        // inline loop above instead of that helper.
-        self.clear_topdown_pruned_for_produced_parents(&ok_hashes)
             .await;
 
         // Per-build (not per-drv): emit one cached event per (drv,

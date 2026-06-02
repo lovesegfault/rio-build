@@ -285,12 +285,6 @@ impl DagActor {
         // Build db_id → drv_hash map for edge + build_derivation
         // resolution below. Also build DerivationState nodes.
         let mut id_to_hash: HashMap<Uuid, DrvHash> = HashMap::with_capacity(drv_rows.len());
-        // Rows restored with `topdown_pruned = true` and NO restored
-        // closure-hole breadcrumb: candidates for the produced-children
-        // gate run after the edge load below (the recovered in-memory
-        // DAG alone cannot decide it — see that block's comment). Holed
-        // rows are never enrolled — see the push site.
-        let mut flagged: Vec<Uuid> = Vec::new();
         for row in drv_rows {
             let derivation_id = row.derivation_id;
             let Ok(status) = row.status.parse::<DerivationStatus>() else {
@@ -306,21 +300,6 @@ impl DagActor {
                 }
             };
             let hash = state.drv_hash.clone();
-            // r[impl sched.merge.substitute-topdown+12]
-            // The recovery-time consult of the persisted closure-hole
-            // breadcrumb (`migrations/064`): a holed flagged parent is
-            // never enrolled as a clear candidate, however produced its
-            // surviving persisted children look — an un-produced child
-            // was reaped out from under it (and its row may since have
-            // been GC'd), so that evidence is a truncated view of the
-            // pruned closure. Mirrors the in-memory predicate every
-            // other clear site judges through the closure classifier
-            // (a holed node is never Vouched). The kept mark routes the
-            // node to the dispatch-time carve-out / resubmit-directing
-            // fail-fast instead.
-            if state.topdown_pruned && !state.closure_hole {
-                flagged.push(derivation_id);
-            }
             id_to_hash.insert(derivation_id, hash.clone());
             self.dag.insert_recovered_node(state);
         }
@@ -362,6 +341,18 @@ impl DagActor {
                 info!(drv_hash = %row.drv_hash, elapsed_secs = row.elapsed_secs,
                       "poison already past TTL at recovery — clearing");
                 let hash: crate::state::DrvHash = row.drv_hash.into();
+                // r[impl sched.evidence.durability+2]
+                // Ordering tripwire: this recovery-time fenced write
+                // must run AFTER handle_leader_acquired's generation
+                // claim stamped serving_generation (the claims-floor
+                // fence prerequisite) — see the field doc on DagActor.
+                debug_assert!(
+                    self.recovery_claim_stamped,
+                    "recovery fenced write (expired-at-load poison clear) ran before the \
+                     generation claim stamped serving_generation (currently {}) — the \
+                     claim-before-recovery-writes ordering is broken",
+                    self.serving_generation
+                );
                 match self.db.clear_poison(&hash, self.serving_generation()).await {
                     Ok(crate::db::FencedWrite::Fenced) => {
                         self.note_fenced_evidence_write("expired-at-load poison clear");
@@ -454,17 +445,18 @@ impl DagActor {
         // fn) and pass through RecoveryLoad for seed_ready_queue to
         // short-circuit → DependencyFailed.
         //
-        // Evidence rule (shared with the produced-children gate below,
-        // in the failing direction here): a child's terminal failure
-        // counts against a recovered parent only when a LIVE build that
-        // also owns the parent vouches for that child — another build's
-        // dead/cancelled, never-wanted child must not condemn a healthy
-        // build's parent (bug_009). Parents excluded by the rule are not
-        // condemned: they keep whatever non-terminal children survive
-        // the edge load (possibly none) and are re-discovered at
-        // dispatch time; the closure-hole stamp below records the
-        // dropped un-produced children so later children-keyed verdicts
-        // never trust the truncated set.
+        // Evidence rule (the failing direction of the strict criterion
+        // the durable classifier shares — `classify_durable_evidence`):
+        // a child's terminal failure counts against a recovered parent
+        // only when a LIVE build that also owns the parent vouches for
+        // that child — another build's dead/cancelled, never-wanted
+        // child must not condemn a healthy build's parent (bug_009).
+        // Parents excluded by the rule are not condemned: they keep
+        // whatever non-terminal children survive the edge load
+        // (possibly none) and are re-discovered at dispatch time; the
+        // consumption routing classifies over the persisted graph, so
+        // the truncated in-memory child set never decides a routing
+        // verdict.
         let failed_dep_parents: HashSet<DrvHash> = self
             .db
             .load_parents_with_failed_deps(&drv_ids)
@@ -489,177 +481,6 @@ impl DagActor {
             }
         }
         info!(count = edge_rows.len(), "loaded edges");
-
-        // r[impl sched.merge.substitute-topdown+12]
-        // Produced-children gate on restored `topdown_pruned` marks:
-        // drop the mark from any flagged row whose persisted children
-        // are ALL produced (`completed`/`skipped`) and vouched for by
-        // a still-live build. The check MUST be
-        // PG-side: produced children are excluded from
-        // load_nonterminal_derivations and their edges were dropped
-        // above, so in the recovered in-memory DAG such a parent is
-        // indistinguishable from a genuine childless pruned root —
-        // which must KEEP its flag (its closure was never merged; a
-        // from-source dispatch would ENOENT). Unbuilt / failed /
-        // cancelled / poisoned / dependency_failed children fail the
-        // query's bool_and, so the must-substitute guard is also kept
-        // for them. Running here — before seed_ready_queue and before
-        // any dispatch (dispatch gates on recovery_complete) — means no
-        // dispatch-time probe can ever observe the stale flag and
-        // wrongly fail-fast a build whose closure IS produced. This
-        // also absorbs the PG-true/memory-false skew left behind when a
-        // best-effort clear (merge-, completion-, or fail-fast-time)
-        // lost its PG write: the next failover lands here and the row
-        // is re-evaluated against the same produced-children criterion.
-        //
-        // The produced evidence is additionally scoped to children
-        // vouched for by a LIVE ('pending'/'active') build that also
-        // owns the parent (the same evidence rule the failed-dep
-        // cascade above applies in the failing direction) — the
-        // recovery mirror of the merge-time decision to clear only
-        // after verify_preexisting_completed: a PG 'completed' row
-        // vouched for only by long-terminal builds is stale evidence
-        // (the previous-generation re-request shape — the store may
-        // have GC'd those outputs long ago), a row vouched for only by
-        // builds that never owned the parent is cross-build evidence
-        // (a pruning build links only its kept roots, so only a
-        // full-merge owner can vouch), and neither must launder a
-        // clear. The gate's purpose is absorbing live-flow skew (the
-        // lost best-effort clears above), and in those flows the
-        // produced children are linked to the still-live build that
-        // owns the parent too; parents whose only produced evidence is
-        // historical or cross-build keep the restored mark and the
-        // bounded fail-fast handles them instead. Rows restored with
-        // the closure-hole breadcrumb never reach this gate at all
-        // (vetoed at candidate collection above): their persisted child
-        // set is reap-truncated, so even live-vouched produced
-        // survivors must not clear the mark.
-        if !flagged.is_empty() {
-            let produced_parents = self
-                .db
-                .load_parents_with_all_children_produced(&flagged)
-                .await?;
-            let mut cleared: Vec<String> = Vec::new();
-            for parent_id in produced_parents {
-                let Some(hash) = id_to_hash.get(&parent_id) else {
-                    continue;
-                };
-                if let Some(state) = self.dag.node_mut(hash) {
-                    state.topdown_pruned = false;
-                    cleared.push(hash.to_string());
-                }
-            }
-            if !cleared.is_empty() {
-                info!(
-                    count = cleared.len(),
-                    "recovery: dropped restored topdown_pruned marks (persisted children all produced under live builds)"
-                );
-                // Best-effort persisted clear so later failovers don't
-                // re-evaluate the same rows; the in-memory clear above
-                // is what this tenure's correctness relies on.
-                // r[impl sched.evidence.durability+2]
-                // Ordering tripwire: this recovery evidence write must
-                // run AFTER handle_leader_acquired's generation claim
-                // stamped serving_generation (the claims-floor fence
-                // prerequisite) — see the field doc on DagActor.
-                debug_assert!(
-                    self.recovery_claim_stamped,
-                    "recovery evidence write (topdown_pruned clear) ran before the \
-                     generation claim stamped serving_generation (currently {}) — the \
-                     claim-before-recovery-writes ordering is broken",
-                    self.serving_generation
-                );
-                match self
-                    .db
-                    .clear_topdown_pruned_by_hashes(&cleared, self.serving_generation())
-                    .await
-                {
-                    Ok(crate::db::FencedWrite::Fenced) => {
-                        self.note_fenced_evidence_write("recovery-gate topdown_pruned clear");
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!(count = cleared.len(), error = %e,
-                              "failed to clear persisted topdown_pruned at recovery (best-effort; \
-                               next failover re-evaluates)");
-                    }
-                }
-            }
-        }
-
-        // r[impl sched.merge.substitute-topdown+12]
-        // r[impl sched.evidence.closure-hole]
-        // Closure-hole stamp for the edges this load dropped to
-        // UN-PRODUCED terminal children (`poisoned`/`dependency_failed`/
-        // `cancelled`): the recovery-side analogue of the reap, which
-        // breadcrumbs every removal of an un-produced child from a
-        // parent's child set. The edge load above dropped those edges,
-        // so the parent recovers with a silently truncated child set
-        // (NOT necessarily childless — non-terminal siblings keep their
-        // edges). The produced-children gate's refusal above is not
-        // enough on its own: its evidence never reaches the in-memory
-        // model, so when a surviving sibling later completes, the
-        // completion-time clear would judge the truncated set Vouched
-        // and launder the restored mark into a doomed from-source
-        // dispatch (the un-produced child's subtree was never built).
-        // Setting the breadcrumb keeps every children-keyed verdict at
-        // Broken instead — inert for unmarked nodes, exactly like the
-        // reap-time stamp. Disjoint from the gate's clear set by
-        // construction: a parent with ≥1 non-produced terminal child can
-        // never satisfy the gate's bool_and.
-        let unproduced_dropped = self
-            .db
-            .load_parents_with_unproduced_terminal_children(&drv_ids)
-            .await?;
-        let mut holed: Vec<String> = Vec::new();
-        for parent_id in unproduced_dropped {
-            let Some(hash) = id_to_hash.get(&parent_id) else {
-                continue;
-            };
-            if let Some(state) = self.dag.node_mut(hash) {
-                state.closure_hole = true;
-                holed.push(hash.to_string());
-            }
-        }
-        if !holed.is_empty() {
-            info!(
-                count = holed.len(),
-                "recovery: recorded closure holes for parents whose un-produced terminal children were dropped"
-            );
-            // Best-effort durable counterpart (this fn runs only on the
-            // just-acquired leader) so the breadcrumb survives later
-            // failovers even after the orphan-terminal GC deletes the
-            // dropped child's row; the in-memory stamp above is what
-            // this tenure's correctness relies on. A lost write means
-            // the next failover re-derives the hole from the same
-            // persisted children — or misses it if those rows are GC'd
-            // first, the already-accepted best-effort window.
-            // r[impl sched.evidence.durability+2]
-            // Ordering tripwire: same claim-before-recovery-writes
-            // invariant as the mark clear above.
-            debug_assert!(
-                self.recovery_claim_stamped,
-                "recovery evidence write (closure-hole stamp) ran before the \
-                 generation claim stamped serving_generation (currently {}) — the \
-                 claim-before-recovery-writes ordering is broken",
-                self.serving_generation
-            );
-            match self
-                .db
-                .set_closure_hole_by_hashes(&holed, self.serving_generation())
-                .await
-            {
-                Ok(crate::db::FencedWrite::Fenced) => {
-                    self.note_fenced_evidence_write("recovery closure_hole stamp");
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(count = holed.len(), error = %e,
-                          "failed to persist closure holes at recovery (best-effort; \
-                           in-memory breadcrumb covers this tenure)");
-                }
-            }
-        }
 
         // --- Load build_derivations + rebuild interested_builds ---
         let bd_rows = self.db.load_build_derivations(&build_ids).await?;

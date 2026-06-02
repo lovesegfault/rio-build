@@ -262,29 +262,6 @@ pub(crate) struct RecoveryDerivationRow {
     pub wanted_output_names: Vec<String>,
     pub is_fixed_output: bool,
     pub is_ca: bool,
-    /// Roots-only-prune marker (`migrations/063`): the node was kept by
-    /// a topdown prune and its dependency closure was never merged (or
-    /// never produced), so it MUST complete via substitution. Restored
-    /// verbatim by `from_recovery_row` — resetting it to false is what
-    /// allowed the post-failover doomed from-source dispatch.
-    /// `load_dag_from_rows` then drops the restored mark when the row's
-    /// persisted children are all produced and vouched for by a live
-    /// (`pending`/`active`) build that also owns the parent (see
-    /// `load_parents_with_all_children_produced`).
-    pub topdown_pruned: bool,
-    /// Closure-hole breadcrumb (`migrations/064`): an un-produced child
-    /// was removed out from under the node (a terminal build's cleanup
-    /// reap, a poison-clear removal, or a recovery-time edge drop), so
-    /// its persisted children are a truncated view of its pruned input
-    /// closure. Written best-effort via `set_closure_hole_by_hashes`
-    /// (the leader's reap hook, the recovery-time stamp, and the two
-    /// poison-clear paths), restored verbatim by `from_recovery_row`
-    /// (`from_poisoned_row` keeps `false`), and consulted by the
-    /// recovery-time gate: a flagged row that also carries the
-    /// breadcrumb is never enrolled as a clear candidate, so the
-    /// produced survivors cannot launder the mark away after a failover
-    /// (the un-produced child's own row may have been GC'd by then).
-    pub closure_hole: bool,
     /// D4: persisted reactive resource floor (`M_044`). All `bigint`
     /// (`i64`) — saturating-cast to `u64`/`u32` at hydration.
     pub floor_mem_bytes: i64,
@@ -318,8 +295,6 @@ impl RecoveryDerivationRow {
             wanted_output_names: vec![],
             is_fixed_output: false,
             is_ca: false,
-            topdown_pruned: false,
-            closure_hole: false,
             floor_mem_bytes: 0,
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,
@@ -388,38 +363,6 @@ pub(crate) struct DerivationRow {
     /// declared outputs wanted. UNIONED on conflict (with empty
     /// saturating to empty = "all") — see `batch_upsert_derivations`.
     pub wanted_output_names: Vec<String>,
-    /// Roots-only-prune marker (`migrations/063`): true for kept
-    /// (demanded) nodes of a topdown-fired merge whose dependency
-    /// closure the prune dropped and whose existing DAG children (if
-    /// any) the closure classifier does not vouch for at stamp time
-    /// (`DerivationDag::closure_evidence` via `closure_vouched`);
-    /// false otherwise (including dep-less demanded leaves, which
-    /// never had a closure to drop, and nodes whose children are all
-    /// Completed/Skipped with no closure hole). Childless kept
-    /// nodes ARE stamped; present-but-unbuilt children do not exempt
-    /// the node. OR-combined on conflict so an unrelated non-pruned
-    /// merge of the same drv never clears it; cleared only once its
-    /// children are all produced (the post-reconciliation pass in
-    /// `handle_merge_dag` via `clear_topdown_pruned_by_hashes`, the
-    /// completion-time `clear_topdown_pruned_for_produced_parents`,
-    /// the recovery-time gate in `load_dag_from_rows`, and the lazy
-    /// walk-failure clear in `handle_substitute_complete`) and when
-    /// the topdown fail-fast consumes it.
-    pub topdown_pruned: bool,
-    /// Closure-hole breadcrumb (`migrations/064`). Merge-time rows
-    /// always bind `false` — the upsert is never a stamping site for
-    /// the breadcrumb (the setters, all via
-    /// `set_closure_hole_by_hashes`, are the leader-gated reap hook,
-    /// the recovery-time stamp in `load_dag_from_rows`, and the
-    /// poison-clear paths — admin ClearPoison and the poison-TTL
-    /// sweep) — and the OR-on-conflict SET keeps any persisted hole,
-    /// so a later merge of the same drv can never launder it away.
-    /// Cleared together with `topdown_pruned` by the batched
-    /// Vouched-keyed `clear_topdown_pruned_by_hashes` helper and on
-    /// its own by the merge-time heal (`clear_closure_hole_by_hashes`);
-    /// the single-row `clear_topdown_pruned_by_hash` is mark-only, so
-    /// the topdown fail-fast retains the hole it leaves behind.
-    pub closure_hole: bool,
 }
 
 /// Shared SELECT / FROM clause for `list_builds` and

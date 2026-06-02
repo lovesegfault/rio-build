@@ -831,13 +831,10 @@ async fn test_topdown_explicit_target_substitutable_kept_in_prune() -> TestResul
         "both demanded nodes await their materialization jobs"
     );
 
-    // Both demanded nodes were stamped and routed to pruned-origin
-    // jobs riding the merge transaction (D3-retarget: the routed
-    // mechanism — the requested lib gets a REAL job, not a fabricated
-    // success).
+    // Both demanded nodes were routed to pruned-origin jobs riding the
+    // merge transaction (D3-retarget: the routed mechanism — the
+    // requested lib gets a REAL job, not a fabricated success).
     for hash in ["tdk-app", "tdk-lib"] {
-        let d = expect_drv(&handle, hash).await;
-        assert!(d.topdown_pruned, "{hash} kept by the prune gets stamped");
         let (origin, job_state): (String, String) =
             sqlx::query_as("SELECT origin, state FROM materialization_jobs WHERE drv_hash = $1")
                 .bind(hash)
@@ -865,15 +862,16 @@ async fn test_topdown_explicit_target_substitutable_kept_in_prune() -> TestResul
     Ok(())
 }
 
-// D5-retarget: selection-predicate pin — see test_topdown_stamp_only_nodes_*.
 // r[verify sched.merge.substitute-topdown+12]
 /// A kept (demanded) node whose existing DAG children are ALL already
-/// produced (Completed/Skipped) must NOT be stamped `topdown_pruned` —
-/// its dependency closure exists in the store, so a from-source
-/// dispatch is not doomed and the marker would only create the
-/// stale-flag inconsistency the fail-fast clear has to mop up. (A node
-/// whose children are still unbuilt IS stamped — see the sibling test
-/// below.)
+/// produced (Completed/Skipped) must NOT get the `origin = 'pruned'`
+/// classification (T-D5.1 re-target of the walk-era stamp pin: the
+/// selection predicate survives as the job-origin gate) — its
+/// dependency closure exists in the store, so a from-source dispatch
+/// is not doomed and the pruned classification would only arm the
+/// resubmit-directing fail-fast for a node that could build. (A node
+/// whose children are still unbuilt IS pruned-origin — see the sibling
+/// test below.)
 #[tokio::test]
 async fn test_topdown_stamp_skips_kept_node_whose_children_are_already_produced() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -937,36 +935,31 @@ async fn test_topdown_stamp_skips_kept_node_whose_children_are_already_produced(
         "fixture premise: B1 took the roots-only prune path"
     );
 
-    // R's children are all produced → it must NOT carry the marker,
-    // neither in memory nor in PG.
-    assert!(
-        !expect_drv(&handle, "tdc-r").await.topdown_pruned,
-        "a kept node whose DAG children are already produced must not be stamped in memory"
-    );
-    let (pg_pruned,): (bool,) =
-        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdc-r'")
+    // R's children are all produced (closure_vouched) → the pruned arm
+    // must skip it; the reprobe lane still queues its job, with the
+    // non-doomed origin.
+    let (origin,): (String,) =
+        sqlx::query_as("SELECT origin FROM materialization_jobs WHERE drv_hash = 'tdc-r'")
             .fetch_one(&db.pool)
             .await?;
-    assert!(
-        !pg_pruned,
-        "a kept node whose DAG children are already produced must not be persisted as pruned"
+    assert_eq!(
+        origin, "reprobe",
+        "a kept node whose DAG children are already produced must not be \
+         classified pruned-origin (its closure is in the store; from-source \
+         remains valid)"
     );
     Ok(())
 }
 
-// D5-retarget: selection-predicate pin — see test_topdown_stamp_only_nodes_*.
 // r[verify sched.merge.substitute-topdown+12]
 /// A kept (demanded) node whose existing DAG children are still UNBUILT
-/// must keep the `topdown_pruned` stamp. Those children can belong to a
-/// different build and be reaped unbuilt later (that build cancelled →
-/// its sole-interest deps cascade terminal → reaped → `children[R]`
-/// scrubbed); an unstamped R would then be childless with a never-
-/// produced closure, and a substitute failure would take the generic
-/// revert instead of the fail-fast — handing R to a worker from source
-/// for the doomed ENOENT dispatch this machinery exists to prevent.
-/// While the unbuilt children remain in the DAG, the stamp is inert
-/// (every consumption site requires childlessness or a reap-created
-/// closure hole).
+/// must get the `origin = 'pruned'` classification (T-D5.1 re-target of
+/// the walk-era stamp pin). Those children can belong to a different
+/// build and be reaped unbuilt later (that build cancelled → its
+/// sole-interest deps cascade terminal → reaped → `children[R]`
+/// scrubbed); a non-pruned origin would let the arm-3 settlement
+/// release R to from-source for the doomed ENOENT dispatch this
+/// classification exists to prevent.
 #[tokio::test]
 async fn test_topdown_stamp_kept_when_existing_children_unbuilt() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -1024,18 +1017,14 @@ async fn test_topdown_stamp_kept_when_existing_children_unbuilt() -> TestResult 
         "fixture premise: B1 took the roots-only prune path"
     );
 
-    assert!(
-        expect_drv(&handle, "tdu-r").await.topdown_pruned,
-        "a kept closure-dropped node whose existing children are unbuilt must \
-         keep the stamp in memory (the children can be reaped unbuilt later)"
-    );
-    let (pg_pruned,): (bool,) =
-        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdu-r'")
+    let (origin,): (String,) =
+        sqlx::query_as("SELECT origin FROM materialization_jobs WHERE drv_hash = 'tdu-r'")
             .fetch_one(&db.pool)
             .await?;
-    assert!(
-        pg_pruned,
-        "the stamp for a node with unbuilt children must also be persisted"
+    assert_eq!(
+        origin, "pruned",
+        "a kept closure-dropped node whose existing children are unbuilt must \
+         be classified pruned-origin (the children can be reaped unbuilt later)"
     );
 
     // Let B1's detached fetch settle before teardown.
@@ -1043,17 +1032,16 @@ async fn test_topdown_stamp_kept_when_existing_children_unbuilt() -> TestResult 
     Ok(())
 }
 
-// D5-retarget: the SELECTION predicate survives as the origin='pruned'
-// criterion (D2.1); the column-state assertions flip to job-row origin
-// assertions when the column machinery deletes.
 // r[verify sched.merge.substitute-topdown+12]
-/// The `topdown_pruned` marker must land only on kept nodes whose
-/// dependency closure the prune actually dropped. A dep-less demanded
-/// leaf (here: one target of a multi-target submission with no
-/// inputDrvs of its own) never had a closure to drop — a from-source
-/// dispatch of it would succeed — so marking it would only convert a
-/// routine substitute failure into a wrongful resubmit-directing
-/// terminal failure.
+/// The `origin = 'pruned'` classification must land only on kept nodes
+/// whose dependency closure the prune actually dropped (T-D5.1
+/// re-target of the walk-era stamp pin: the selection predicate IS the
+/// origin criterion now, D2.1). A dep-less demanded leaf (here: one
+/// target of a multi-target submission with no inputDrvs of its own)
+/// never had a closure to drop — a from-source dispatch of it would
+/// succeed — so classifying it pruned would only convert a routine
+/// substitute failure into a wrongful resubmit-directing terminal
+/// failure.
 #[tokio::test]
 async fn test_topdown_stamp_only_nodes_whose_closure_was_dropped() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -1094,31 +1082,27 @@ async fn test_topdown_stamp_only_nodes_whose_closure_was_dropped() -> TestResult
         "fixture premise: R's dep was dropped from the submission"
     );
 
-    // R lost its dependency closure → marked, in memory and in PG.
-    assert!(
-        expect_drv(&handle, "tdl-r").await.topdown_pruned,
-        "kept root whose closure was dropped must be stamped"
-    );
-    let (r_pruned,): (bool,) =
-        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdl-r'")
+    // R lost its dependency closure → pruned-origin job.
+    let (r_origin,): (String,) =
+        sqlx::query_as("SELECT origin FROM materialization_jobs WHERE drv_hash = 'tdl-r'")
             .fetch_one(&db.pool)
             .await?;
-    assert!(r_pruned, "kept root's stamp must be persisted");
+    assert_eq!(
+        r_origin, "pruned",
+        "kept root whose closure was dropped must be classified pruned-origin"
+    );
 
-    // L never had a closure to drop → NOT marked anywhere; building it
-    // from source stays a valid fallback.
-    assert!(
-        !expect_drv(&handle, "tdl-l").await.topdown_pruned,
-        "dep-less kept leaf must not be stamped in memory (it has no \
-         dropped closure; from-source dispatch of it is valid)"
-    );
-    let (l_pruned,): (bool,) =
-        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdl-l'")
+    // L never had a closure to drop → its job is the new_sub lane's
+    // cache_opportunity, never pruned; building it from source stays a
+    // valid fallback.
+    let (l_origin,): (String,) =
+        sqlx::query_as("SELECT origin FROM materialization_jobs WHERE drv_hash = 'tdl-l'")
             .fetch_one(&db.pool)
             .await?;
-    assert!(
-        !l_pruned,
-        "dep-less kept leaf must not be persisted as pruned"
+    assert_eq!(
+        l_origin, "cache_opportunity",
+        "dep-less kept leaf must not be classified pruned-origin (it has no \
+         dropped closure; from-source dispatch of it is valid)"
     );
 
     // Let the detached fetches settle before teardown.
@@ -1255,7 +1239,7 @@ async fn test_topdown_unresolvable_wanted_set_falls_through() -> TestResult {
 /// only `out`: against B's set alone every wanted root output is
 /// available, but post-merge classification evaluates R against the
 /// LIVE effective wanted set (A ∪ B = all), keeping R on the
-/// from-source path — no substitute fetch, no `topdown_pruned`
+/// from-source path — no substitute fetch, no pruned-origin
 /// fail-fast. Pruning B's deps would leave B's progress hostage to A
 /// staying alive: A's cancellation sweeps the sole-interest deps and B
 /// hangs on a Queued root. The prune criterion must therefore union
@@ -2273,7 +2257,7 @@ async fn suffix_classes(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<&'static str
 /// deps as Completed without fetching would poison later builds
 /// that actually need the dep NAR.
 #[tokio::test]
-async fn test_topdown_pruned_deps_not_in_global_dag() -> TestResult {
+async fn test_topdown_prune_deps_not_in_global_dag() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
 
     let hello_out = test_store_path("hello-shared");
@@ -2376,7 +2360,7 @@ enum GcState {
 // ===========================================================================
 
 /// The merge transaction (derivation upserts + build links + edges +
-/// Pending→Active activation, including the `topdown_pruned` stamps) is
+/// Pending→Active activation, including the in-tx job creation) is
 /// claims-floor fenced: a replica whose serving generation sits below
 /// the durable floor — a successor has claimed — must NOT commit it.
 /// The merge fails with `StaleGeneration` (mapped to gRPC

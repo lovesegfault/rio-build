@@ -419,8 +419,9 @@ pub struct DagActor {
     /// Ordering tripwire for the claim-before-recovery-writes invariant
     /// (`sched.evidence.durability`): false at `handle_leader_acquired`
     /// entry, true once the generation claim has stamped
-    /// `serving_generation`. The recovery evidence-write sites
-    /// `debug_assert!` it so a future re-ordering of
+    /// `serving_generation`. The recovery-time fenced-write site (the
+    /// expired-at-load poison clear in `load_dag_from_rows`)
+    /// `debug_assert!`s it so a future re-ordering of
     /// `handle_leader_acquired` (claim moved back after
     /// `recover_from_pg`) fails loudly in tests instead of silently
     /// re-introducing self-fenced recovery writes in the saturated-floor

@@ -209,7 +209,7 @@ impl SchedulerDb {
     /// path runs this as the LAST statement of `persist_merge_to_db`'s
     /// transaction so a committed merge implies an Active build: an
     /// activation failure aborts the whole merge — including the
-    /// `topdown_pruned` stamps and the build_derivations links — instead
+    /// pruned-origin job rows and the build_derivations links — instead
     /// of leaving committed side effects behind for a build the caller
     /// is about to reject and roll back in memory. Mirrors the
     /// `BuildState::Active` arm of [`Self::update_build_status`]; all

@@ -82,17 +82,6 @@ impl DagActor {
                 });
                 let _ = reply.send(ok);
             }
-            DebugCmd::SetTopdownPruned {
-                drv_hash,
-                value,
-                reply,
-            } => {
-                let ok = self.dag.node_mut(&drv_hash).is_some_and(|s| {
-                    s.topdown_pruned = value;
-                    true
-                });
-                let _ = reply.send(ok);
-            }
             DebugCmd::ClearDrvContent { drv_hash, reply } => {
                 let _ = reply.send(self.handle_debug_clear_drv_content(&drv_hash));
             }
@@ -166,8 +155,6 @@ impl DagActor {
             retry: s.retry.clone(),
             ca: s.ca.clone(),
             sched: s.sched.clone(),
-            topdown_pruned: s.topdown_pruned,
-            closure_hole: s.closure_hole,
         })
     }
 

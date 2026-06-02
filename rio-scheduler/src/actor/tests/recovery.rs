@@ -889,11 +889,12 @@ async fn test_recovery_seeds_generation_from_unpersisted_claim() -> TestResult {
 /// Saturated-floor regime (post-lease-deletion): a fresh leader whose
 /// lease-derived generation (1) sits far below the inherited PG floor
 /// (a foreign claim row at 200) must still land its OWN recovery
-/// evidence writes — the recovery exceeds the floor, claims 201,
-/// stamps `serving_generation` to it BEFORE `recover_from_pg` runs,
-/// and the recovery's evidence writes (the closure-hole stamp and the
-/// poisoned-dep DependencyFailed status persist exercised here) land
-/// under that claimed generation.
+/// writes — the recovery exceeds the floor, claims 201, stamps
+/// `serving_generation` to it BEFORE `recover_from_pg` runs, and the
+/// recovery's fenced writes (the poisoned-dep DependencyFailed status
+/// persist exercised here) land under that claimed generation. (The
+/// walk-era closure-hole stamp half of this test died with the
+/// recovery R-gates in T-D5.1.)
 ///
 /// TRIPWIRE for the claims-floor fence work
 /// (`sched.evidence.durability`): this test must stay green through
@@ -908,51 +909,13 @@ async fn test_recovery_seeds_generation_from_unpersisted_claim() -> TestResult {
 // r[verify sched.evidence.durability+2]
 #[tokio::test]
 async fn saturated_floor_recovery_evidence_writes_land() -> TestResult {
-    let out = test_store_path("satfloor-root-out");
-    let dbg = test_store_path("satfloor-root-debug");
-    let keep_out = test_store_path("satfloor-keep-out");
-
-    let b2 = Uuid::new_v4(); // full-merge owner of P, C1, C2 — cancelled at failover
-    let b_keep = Uuid::new_v4(); // live build keeping the surviving sibling C1 alive
-    let b1 = Uuid::new_v4(); // pruning build — owns only P
     let b_poison = Uuid::new_v4(); // owner of the poisoned-dep pair D→E
     let f = RecoveryFixture::run(async |handle, pool| {
-        // --- Shape 1: the recovery closure-hole stamp (W4) ---
-        // Same staging as
-        // test_failover_recovery_records_closure_hole_for_dropped_
-        // unproduced_terminal_child: a marked parent whose un-produced
-        // terminal child's edge the recovery load drops.
-        let mk_parent = || {
-            let mut n = make_node("satfloor-root");
-            n.output_names = vec!["out".into(), "debug".into()];
-            n.expected_output_paths = vec![out.clone(), dbg.clone()];
-            n.wanted_output_names = vec![];
-            n
-        };
-        let mk_keep = || {
-            let mut n = make_node("satfloor-keep");
-            n.expected_output_paths = vec![keep_out.clone()];
-            n
-        };
-        merge_dag(
-            &handle,
-            b2,
-            vec![mk_parent(), mk_keep(), make_node("satfloor-gone")],
-            vec![
-                make_test_edge("satfloor-root", "satfloor-keep"),
-                make_test_edge("satfloor-root", "satfloor-gone"),
-            ],
-            false,
-        )
-        .await?;
-        merge_dag(&handle, b_keep, vec![mk_keep()], vec![], false).await?;
-        merge_dag(&handle, b1, vec![mk_parent()], vec![], false).await?;
-
-        // --- Shape 2: the recovery DependencyFailed status persist ---
+        // --- The recovery DependencyFailed status persist ---
         // Same staging as
         // test_recovery_substituting_with_poisoned_dep_goes_dependency_
-        // failed: a Substituting parent over a within-TTL poisoned dep,
-        // both co-owned by one live build.
+        // failed: a legacy mid-substitution parent over a within-TTL
+        // poisoned dep, both co-owned by one live build.
         merge_dag(
             &handle,
             b_poison,
@@ -965,19 +928,6 @@ async fn saturated_floor_recovery_evidence_writes_land() -> TestResult {
         drop(handle);
 
         // Backdate AFTER the merges (a later merge re-upserts the rows).
-        sqlx::query("UPDATE derivations SET status = 'cancelled' WHERE drv_hash = 'satfloor-gone'")
-            .execute(&pool)
-            .await?;
-        sqlx::query(
-            "UPDATE derivations SET status = 'substituting', topdown_pruned = true \
-             WHERE drv_hash = 'satfloor-root'",
-        )
-        .execute(&pool)
-        .await?;
-        sqlx::query("UPDATE builds SET status = 'cancelled' WHERE build_id = $1")
-            .bind(b2)
-            .execute(&pool)
-            .await?;
         // Future-dated poisoned_at so the within-TTL load is
         // deterministic under the 100ms cfg(test) POISON_TTL.
         sqlx::query(
@@ -1020,29 +970,11 @@ async fn saturated_floor_recovery_evidence_writes_land() -> TestResult {
         "the generation recovery landed on ({g}) must be in the claims ledger, got {claimed:?}"
     );
 
-    // 2. The W4 recovery evidence write LANDED: the closure-hole
-    //    breadcrumb for the parent whose un-produced terminal child's
-    //    edge the load dropped is TRUE in PG. (Post-fence, this write
-    //    goes through the claims-floor fence carrying the claimed
-    //    generation 201 ≥ floor 201 — it must apply, never be fenced.)
-    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
-        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'satfloor-root'",
-    )
-    .fetch_one(&f.db.pool)
-    .await?;
-    assert!(
-        pg_pruned,
-        "fixture premise: the persisted topdown_pruned mark survives recovery"
-    );
-    assert!(
-        pg_hole,
-        "the recovery-time closure-hole stamp must LAND in the saturated-floor \
-         regime — the new leader's own evidence writes must never be fenced"
-    );
-
-    // 3. The recovery DependencyFailed status persist LANDED in PG for
-    //    the Substituting-over-poisoned-dep node. (Post-fence, same
-    //    argument as the hole stamp.)
+    // 2. The recovery DependencyFailed status persist LANDED in PG for
+    //    the legacy mid-substitution-over-poisoned-dep node.
+    //    (Post-fence: this write goes through the claims-floor fence
+    //    carrying the claimed generation 201 ≥ floor 201 — it must
+    //    apply, never be fenced.)
     let d = expect_drv(&f.handle, "satfloor-D").await;
     assert_eq!(
         d.status,
@@ -2736,250 +2668,22 @@ async fn test_recovery_restores_build_timeout_baseline() -> TestResult {
     Ok(())
 }
 
-// D5-delete: the keeps-half stale-evidence pin served as T-D2.2's gate
-// (stayed green at that boundary — the durable three-part classifier
-// preserves this behavior via the live-co-owning-build conjunct) and is
-// superseded by classify_durable_evidence_ignores_dead_voucher
-// (materialize.rs); it rides to D5 pinning the recovery R-gate until the
-// gate itself deletes there.
-// r[verify sched.merge.substitute-topdown+12]
-/// Live-build scoping of the recovery-time gate: a restored
-/// `topdown_pruned` mark must be KEPT when the parent's produced
-/// children are vouched for only by TERMINAL builds.
-///
-/// The previous-generation shape: build B0 fully merged parent→child
-/// long ago and went `succeeded` — its `derivation_edges` row, the
-/// child's `completed` row, and B0's `build_derivations` links persist
-/// in PG indefinitely (terminal builds are never deleted), while the
-/// store may have GC'd the actual outputs since. A later build B1
-/// re-requests the parent and the topdown prune fires: B1 links only
-/// the parent, merges no edges, and the post-prune persisted shape is
-/// `substituting` + `topdown_pruned = true`. On failover the gate sees
-/// the historical child row; if it trusted bare `completed` it would
-/// clear the restored mark (in memory and best-effort PG) and the
-/// parent would dispatch from source against a closure that was never
-/// merged for B1 — the doomed dispatch the mark exists to prevent
-/// (pre-fix red of this test: an Assignment reaches the worker and B1
-/// stays Active). With the gate scoped to live builds the stale
-/// evidence is ignored and the node takes the bounded fail-fast arm
-/// instead: no WorkAssignment is ever sent and B1 fails with the
-/// resubmit-directing error — the mirror of the childless fail-fast
-/// test above, with the historical edge present.
-///
-/// The kept mark is asserted DIRECTLY now that the walk-era dispatch
-/// sweep no longer consumes it (the settlement successor is the
-/// origin-keyed consumption fail-fast, T-D2.1); the SQL-level
-/// live-vs-terminal discrimination is pinned by the db-level test
-/// (`db::tests::recovery::test_load_parents_with_all_children_produced_requires_live_build_link`).
-///
-/// Staged shape (phase 1): `merge_dag(B0, [parent, child], [edge])`
-/// then `merge_dag(B1, [parent only], [])` — B1 owns no link to the
-/// child. After `drop(handle)`: backdate child→`completed`,
-/// parent→`substituting` + `topdown_pruned = true`, B0→`succeeded`;
-/// B1 stays `active`. Phase 2's store has `out` substitutable and
-/// `debug` missing / not substitutable.
-#[tokio::test]
-async fn test_failover_keeps_topdown_pruned_when_produced_children_belong_to_terminal_build()
--> TestResult {
-    let out = test_store_path("tdhist-root-out");
-    let dbg = test_store_path("tdhist-root-debug");
-
-    // Phase-2 store: `out` substitutable upstream; `debug` missing and
-    // NOT substitutable — substitution cannot satisfy the recovered
-    // all-declared wanted set, so the kept mark must route the node to
-    // the fail-fast arm, not to a from-source dispatch.
-    let (store, store_client, _store_task) =
-        rio_test_support::grpc::spawn_mock_store_with_client().await?;
-    store.state.substitutable.write().unwrap().push(out.clone());
-
-    let b0 = Uuid::new_v4(); // historical build — terminal at failover
-    let b1 = Uuid::new_v4(); // live re-request — owns only the parent
-    let f = RecoveryFixture::run_with_store(Some(store_client), async |handle, pool| {
-        let mk_parent = || {
-            let mut n = make_node("tdhist-root");
-            n.output_names = vec!["out".into(), "debug".into()];
-            n.expected_output_paths = vec![out.clone(), dbg.clone()];
-            n.wanted_output_names = vec![];
-            n
-        };
-        // B0: full merge parent→child WITH the edge persisted — the
-        // previous generation that actually built the closure.
-        merge_dag(
-            &handle,
-            b0,
-            vec![mk_parent(), make_node("tdhist-dep")],
-            vec![make_test_edge("tdhist-root", "tdhist-dep")],
-            false,
-        )
-        .await?;
-        // B1: the re-request — parent only, no edges, so
-        // batch_insert_build_derivations links B1 to the parent only.
-        merge_dag(&handle, b1, vec![mk_parent()], vec![], false).await?;
-        barrier(&handle).await;
-        drop(handle);
-        // Backdate AFTER the last merge (a later merge re-upserts the
-        // derivation row): the child finished under B0, B0 went
-        // terminal, and the parent is left mid-substitution with the
-        // mark set — the post-prune persisted shape for B1.
-        sqlx::query("UPDATE derivations SET status = 'completed' WHERE drv_hash = 'tdhist-dep'")
-            .execute(&pool)
-            .await?;
-        sqlx::query(
-            "UPDATE derivations SET status = 'substituting', topdown_pruned = true \
-             WHERE drv_hash = 'tdhist-root'",
-        )
-        .execute(&pool)
-        .await?;
-        sqlx::query("UPDATE builds SET status = 'succeeded' WHERE build_id = $1")
-            .bind(b0)
-            .execute(&pool)
-            .await?;
-        Ok(())
-    })
-    .await?;
-    let handle = f.handle;
-
-    // A puller is available — the doomed from-source delivery has
-    // somewhere to go if the kept mark fails to gate it.
-    tick(&handle).await?;
-
-    // The KEEPS half (the recovery R-gate's pin): the produced children
-    // belong to a terminal build, so the produced-children gate must
-    // NOT clear the restored mark. The walk-era settlement that used to
-    // CONSUME the kept mark (the dispatch-sweep fail-fast cell) died
-    // with the walk spawner; the settlement successor is the
-    // origin-keyed consumption fail-fast (T-D2.1), pinned by
-    // classify_durable_evidence_ignores_dead_voucher and the routing
-    // matrix. This pin retains the R-gate keeps assertion until the
-    // gate itself deletes.
-    let d = expect_drv(&handle, "tdhist-root").await;
-    assert!(
-        d.topdown_pruned,
-        "the recovery produced-children gate must keep the mark when the \
-         produced children belong to a terminal build (no live co-owning voucher)"
-    );
-    // (The walk-era must-substitute pull refusal died with the kinded
-    // collapse: a marked node WITHOUT a job is the documented FP-7
-    // transition residual and may be served from source. The flag-on
-    // pruned shape always carries an origin='pruned' job, whose
-    // JobView refusal is pinned by pull_refused_while_job_unresolved.)
-    let _ = b1;
-    Ok(())
-}
-
-// D5-delete: keeps-half pin — see
-// test_failover_keeps_topdown_pruned_when_produced_children_belong_to_terminal_build.
-// r[verify sched.merge.substitute-topdown+12]
-/// bug_006 regression (the recovery-time veto): a restored
-/// `topdown_pruned` mark whose row also carries the persisted
-/// `closure_hole` breadcrumb must be KEPT at recovery even when every
-/// surviving persisted child is produced and vouched for by a live
-/// build that co-owns the parent — the breadcrumb records that an
-/// un-produced child was reaped out from under the node, so whatever
-/// children remain in PG are a truncated view of its pruned input
-/// closure (the orphan-terminal GC may have deleted the un-produced
-/// child's row and edge entirely, which is exactly why the breadcrumb
-/// is persisted rather than re-derived from the children).
-///
-/// Staged shape: identical to
-/// `test_failover_clears_topdown_pruned_when_children_all_produced`
-/// above (full merge parent→child with the edge persisted, child
-/// backdated `completed`, parent backdated `substituting` +
-/// `topdown_pruned = true`, the owning build still live) plus
-/// `closure_hole = true` on the parent row. Pre-064 the gate cleared
-/// the mark on the strength of the produced survivor and the parent
-/// was dispatched from source (the doomed ENOENT dispatch). Post-064
-/// the holed parent is never enrolled as a clear candidate — the kept
-/// mark is asserted directly (the walk-era dispatch sweep that used to
-/// consume it is gone).
-#[tokio::test]
-async fn test_failover_keeps_topdown_pruned_when_closure_hole_recorded() -> TestResult {
-    let out = test_store_path("tdvh-root-out");
-    let dbg = test_store_path("tdvh-root-debug");
-
-    // Phase-2 store: `out` substitutable upstream; `debug` missing and
-    // NOT substitutable — substitution cannot satisfy the recovered
-    // all-declared wanted set, so the kept mark must route the node to
-    // the fail-fast arm, not to a from-source dispatch.
-    let (store, store_client, _store_task) =
-        rio_test_support::grpc::spawn_mock_store_with_client().await?;
-    store.state.substitutable.write().unwrap().push(out.clone());
-
-    let build_id = Uuid::new_v4();
-    let f = RecoveryFixture::run_with_store(Some(store_client), async |handle, pool| {
-        // Full merge: the parent depends on the child and the edge IS
-        // persisted, and the SAME live build owns both rows — the
-        // strongest possible produced-children evidence, defeated only
-        // by the breadcrumb.
-        let mut parent = make_node("tdvh-root");
-        parent.output_names = vec!["out".into(), "debug".into()];
-        parent.expected_output_paths = vec![out.clone(), dbg.clone()];
-        parent.wanted_output_names = vec![];
-        merge_dag(
-            &handle,
-            build_id,
-            vec![parent, make_node("tdvh-dep")],
-            vec![make_test_edge("tdvh-root", "tdvh-dep")],
-            false,
-        )
-        .await?;
-        barrier(&handle).await;
-        drop(handle);
-        // Backdate: the child finished under the old leader, but a
-        // SECOND (un-produced) child had been reaped out from under the
-        // parent before the crash — its row may since have been GC'd,
-        // so all that survives is the breadcrumb the leader persisted
-        // at reap time alongside the mark.
-        sqlx::query("UPDATE derivations SET status = 'completed' WHERE drv_hash = 'tdvh-dep'")
-            .execute(&pool)
-            .await?;
-        sqlx::query(
-            "UPDATE derivations SET status = 'substituting', topdown_pruned = true, \
-             closure_hole = true WHERE drv_hash = 'tdvh-root'",
-        )
-        .execute(&pool)
-        .await?;
-        Ok(())
-    })
-    .await?;
-    let handle = f.handle;
-
-    // A puller is available — the doomed from-source delivery has
-    // somewhere to go if the produced survivor launders the clear.
-    tick(&handle).await?;
-
-    // The KEEPS half (the recovery-time hole veto): the persisted
-    // closure-hole breadcrumb must keep the restored mark out of the
-    // produced-children clear gate, however produced the surviving
-    // persisted children look. The walk-era settlement that consumed
-    // the kept mark died with the walk spawner (see the terminal-build
-    // keep test above for the successor chain); this pin retains the
-    // veto assertion until the gate deletes.
-    let d = expect_drv(&handle, "tdvh-root").await;
-    assert!(
-        d.topdown_pruned,
-        "the persisted closure-hole breadcrumb must veto the produced-children \
-         clear — the surviving children are a truncated view of the pruned closure"
-    );
-    // (Same FP-7 residual note as the terminal-build keep test above —
-    // the mark-keyed pull refusal died with the kinded collapse.)
-    let _ = build_id;
-    Ok(())
-}
-
-/// Phase-1 staging shared by the three bug_009 regression tests below:
-/// build `b2` full-merges parent→child (the `derivation_edges` row and
-/// B2's `build_derivations` links to BOTH rows are persisted), build
-/// `b1` is the pruned re-request that links ONLY the parent (no edges).
-/// After the merges the phase-1 handle is dropped and the persisted
-/// rows are backdated to the bug_009 crash shape: the child went
-/// `cancelled` when `b2` was cancelled (`builds.status = 'cancelled'`),
-/// the parent is left mid-substitution (`substituting`, plus
-/// `topdown_pruned = true` when `mark_parent`), and `b1` stays
-/// `active`. The parent declares outputs `[out, debug]` with stored
-/// wanted `'{}'` (= all declared) and `expected_output_paths`
+/// Phase-1 staging for the bug_009 regression test below: build `b2`
+/// full-merges parent→child (the `derivation_edges` row and B2's
+/// `build_derivations` links to BOTH rows are persisted), build `b1`
+/// is the single-node re-request that links ONLY the parent (no
+/// edges). After the merges the phase-1 handle is dropped and the
+/// persisted rows are backdated to the bug_009 crash shape: the child
+/// went `cancelled` when `b2` was cancelled
+/// (`builds.status = 'cancelled'`), the parent is left in the legacy
+/// mid-substitution status (the PD-D3 decode arm absorbs it), and `b1`
+/// stays `active`. The parent declares outputs `[out, debug]` with
+/// stored wanted `'{}'` (= all declared) and `expected_output_paths`
 /// `[out_path, dbg_path]` so the phase-2 store staging decides the
-/// post-failover route (substitution / from-source / fail-fast).
+/// post-failover route. (The marked variants of this staging died with
+/// the keeps-half recovery pins in T-D5.1 — the durable classifier's
+/// stale-voucher direction is pinned by
+/// classify_durable_evidence_ignores_dead_voucher.)
 #[allow(clippy::too_many_arguments)] // test staging helper — a struct param would just rename the args
 async fn stage_parent_with_other_builds_cancelled_child(
     handle: ActorHandle,
@@ -2990,7 +2694,6 @@ async fn stage_parent_with_other_builds_cancelled_child(
     dep: &str,
     out_path: &str,
     dbg_path: &str,
-    mark_parent: bool,
 ) -> anyhow::Result<()> {
     let mk_parent = || {
         let mut n = make_node(root);
@@ -3022,20 +2725,10 @@ async fn stage_parent_with_other_builds_cancelled_child(
         .bind(dep)
         .execute(pool)
         .await?;
-    if mark_parent {
-        sqlx::query(
-            "UPDATE derivations SET status = 'substituting', topdown_pruned = true \
-             WHERE drv_hash = $1",
-        )
+    sqlx::query("UPDATE derivations SET status = 'substituting' WHERE drv_hash = $1")
         .bind(root)
         .execute(pool)
         .await?;
-    } else {
-        sqlx::query("UPDATE derivations SET status = 'substituting' WHERE drv_hash = $1")
-            .bind(root)
-            .execute(pool)
-            .await?;
-    }
     sqlx::query("UPDATE builds SET status = 'cancelled' WHERE build_id = $1")
         .bind(b2)
         .execute(pool)
@@ -3044,9 +2737,9 @@ async fn stage_parent_with_other_builds_cancelled_child(
 }
 
 // r[verify sched.recovery.failed-dep-cascade+2]
-/// The unflagged variant of the two tests above (no `topdown_pruned`
-/// backdate — the gateway single-node-fallback shape: B1 submitted just
-/// the parent, no prune involved). Another build's cancelled child must
+/// The bug_009 shape (the gateway single-node-fallback: B1 submitted
+/// just the parent, no prune involved). Another build's cancelled
+/// child must
 /// not condemn it either: the parent recovers childless, comes back
 /// Ready, and dispatches from source to the connected worker; B1 stays
 /// alive. Pre-fix the cascade short-circuited it to DependencyFailed at
@@ -3077,7 +2770,6 @@ async fn test_failover_unflagged_parent_with_other_builds_cancelled_child_dispat
             "bug9u-dep",
             &out,
             &dbg,
-            false,
         )
         .await
     })

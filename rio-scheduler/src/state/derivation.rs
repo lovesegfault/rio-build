@@ -1142,107 +1142,6 @@ pub struct DerivationState {
     /// inline `dispatch_ready` calls instead of re-probing the head.
     /// `probe_generation` advances once per `handle_tick` (1/s).
     pub probed_generation: u64,
-    /// Set when `check_roots_topdown` pruned this node's dep subgraph
-    /// from the submission. Carries the invariant "this node MUST
-    /// complete via substitution; building is invalid" — its
-    /// `inputDrvs` were never merged/built/substituted, so a
-    /// dispatched build would ENOENT on them. On
-    /// `SubstituteComplete{ok=false}`, `handle_substitute_complete`
-    /// fails every interested build instead of demoting to Ready
-    /// (which would dispatch a doomed build); the dispatch-time probes
-    /// take the same fail-fast arm via `must_substitute` — mark set
-    /// AND closure evidence `Broken`, i.e. childless OR carrying the
-    /// `closure_hole` breadcrumb (an un-produced child reaped out from
-    /// under it — see that field) — when the flagged node's wanted
-    /// outputs turn out missing and unsubstitutable; every
-    /// children-keyed verdict (the dispatch guards, the reap-time
-    /// hook, the walk-failure gate, and all clear sites) judges the
-    /// same `ClosureEvidence`, treating a closure-holed survivor as
-    /// childless-equivalent.
-    /// r[sched.merge.substitute-topdown+12]. Persisted (`migrations/063`,
-    /// stamped in the pruned merge's own transaction, OR-on-conflict,
-    /// cleared only on a `Vouched` verdict — ≥1 child, all produced,
-    /// no closure hole, and at recovery additionally a still-live
-    /// build co-owning the parent to vouch for each produced child —
-    /// or when the fail-fast consumes it) and restored by
-    /// `from_recovery_row` — losing it across failover would re-arm
-    /// the doomed from-source dispatch.
-    pub topdown_pruned: bool,
-    /// Closure-hole breadcrumb: an un-produced child of this node
-    /// (status not Completed/Skipped at removal time) was removed out
-    /// from under it — by a terminal build's cleanup reap
-    /// (`remove_build_interest_and_reap`), a poison-clear removal, or a
-    /// recovery-time edge drop — so its current DAG children no longer
-    /// represent its pruned input closure. Every
-    /// children-keyed `topdown_pruned` verdict treats this as
-    /// childless-equivalent: the reap-hook fail-fast arm fires for a
-    /// holed survivor, and the walk-failure children gate, the
-    /// completion-time clear, and the merge-time clear pass all refuse
-    /// to trust (clear over) the truncated child set — erring toward
-    /// the bounded resubmit-directing fail-fast, never the doomed
-    /// from-source dispatch of a node whose closure may not be in the
-    /// store.
-    ///
-    /// Persisted (`migrations/064`, OR-on-conflict — the merge-time row
-    /// bind is always `false`, so only the explicit clears below ever
-    /// drop the column): the in-memory breadcrumb is set by the reap on
-    /// leaders and standbys alike, and the leader's survivor hook then
-    /// writes it to PG best-effort (a crash or lease loss between the
-    /// reap and that write loses the persisted copy — the accepted
-    /// best-effort window). Recovery additionally sets it (in memory,
-    /// best-effort in PG) in `load_dag_from_rows` when the edge load
-    /// drops an un-produced terminal child of a recovered parent — the
-    /// recovery-side analogue of the reap, covering the reap-then-
-    /// failover window above. The poison-clear paths — admin
-    /// `ClearPoison` (`handle_clear_poison`) and the poison-TTL sweep
-    /// (`tick_process_expired_poisons`) — set it the same way (in
-    /// memory, best-effort in PG) for the surviving parents of the
-    /// Poisoned (by definition un-produced) child they remove; both run
-    /// only on the leader by construction (admin leader guard / standby
-    /// tick no-op). `from_recovery_row` restores it so the
-    /// recovery-time produced-children gate never clears a holed
-    /// flagged parent on the strength of the surviving produced
-    /// children (the un-produced child's own row and edge may have been
-    /// GC'd by `gc_orphan_terminal_derivations`, so the persisted
-    /// breadcrumb is the only durable record of the truncation);
-    /// `from_poisoned_row` keeps it false (poisoned restores are
-    /// TTL-tracking stubs, never children-judged).
-    ///
-    /// The breadcrumb's lifecycle is decoupled from the node's own
-    /// status: it records the relation between the node's child set
-    /// and its pruned input closure, and the node completing or being
-    /// skipped does not repair that relation — so terminal transitions
-    /// do NOT drop it. It stays set and dormant: the children-keyed
-    /// consumers either never evaluate a terminal node (the dispatch
-    /// guards and the walk/reap fail-fast arms only see non-terminal
-    /// ones) or err conservative on it (the stamp gates and the clear
-    /// passes judge the holed child set Broken — a completed node
-    /// later re-kept by a prune is stamped, not exempted), and the
-    /// breadcrumb still guards the node when an in-tenure
-    /// stale-Completed reset or a failover re-opens its lifecycle.
-    /// Carried across a resubmit-reset (the truncation outlives the
-    /// retry: the reset rebuilds the state via `try_from_node` but
-    /// keeps the truncated edges without re-declaring them, so the
-    /// breadcrumb rides along with the other carried fields); a
-    /// `rollback_merge` restores the prior state wholesale. Cleared
-    /// explicitly (memory + PG) only when a later full merge
-    /// re-declares the node's edges (its child set is representative
-    /// again; the heal pushes the PG clear for every re-declared edge
-    /// parent) and when a Vouched-keyed clear pass consumes the
-    /// `topdown_pruned` mark it qualifies (the batched
-    /// `clear_topdown_pruned_by_hashes` drops both bits; the singular
-    /// `clear_topdown_pruned_by_hash` — the lazy walk-failure clear and
-    /// the fail-fast consume — is mark-only, so the fail-fast retains
-    /// the breadcrumb for the directed resubmit it solicits). Known
-    /// residual: a poison row already past its TTL when a new leader
-    /// recovers is reset to `'created'` (and not loaded) before the
-    /// recovery stamp query runs, so a parent whose only truncation
-    /// evidence was that row recovers without the breadcrumb — the
-    /// expired-at-load shape, reachable only when no leader is up to
-    /// run the in-tenure sweep before the TTL lapses (same accepted
-    /// class as the GC residual; see
-    /// `load_parents_with_unproduced_terminal_children`).
-    pub closure_hole: bool,
 }
 
 impl DerivationState {
@@ -1322,8 +1221,6 @@ impl DerivationState {
             running_since: None,
             traceparent: String::new(),
             probed_generation: 0,
-            topdown_pruned: false,
-            closure_hole: false,
         })
     }
 
@@ -1447,18 +1344,6 @@ impl DerivationState {
             running_since: (status == DerivationStatus::Running).then_some(now),
             traceparent: String::new(), // recovered: no user trace
             probed_generation: 0,
-            // Persisted (`migrations/063`) precisely so it survives
-            // failover: a pruned root recovered childless MUST keep the
-            // "complete via substitution or fail fast" invariant — its
-            // inputDrvs were never merged, so a from-source dispatch on
-            // the new leader would ENOENT just like on the old one.
-            topdown_pruned: row.topdown_pruned,
-            // Persisted (`migrations/064`) for the same reason: the
-            // un-produced child whose reap set the breadcrumb may have
-            // been GC'd from PG since, so the surviving produced
-            // children would otherwise launder the recovery-time clear
-            // and re-arm the doomed from-source dispatch.
-            closure_hole: row.closure_hole,
         })
     }
 
@@ -1540,8 +1425,6 @@ impl DerivationState {
             running_since: None,
             traceparent: String::new(),
             probed_generation: 0,
-            topdown_pruned: false,
-            closure_hole: false,
         })
     }
 
@@ -2731,8 +2614,6 @@ mod tests {
             // mattered pre-restart. Prove it's false post-restart
             // regardless.
             is_ca: true,
-            topdown_pruned: false,
-            closure_hole: false,
             floor_mem_bytes: 0,
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,

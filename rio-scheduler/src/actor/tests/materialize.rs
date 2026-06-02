@@ -176,10 +176,6 @@ async fn flag_on_pruned_root_creates_job_at_merge() -> TestResult {
         DerivationStatus::Ready,
         "flag-on the pruned root stays Ready instead of going Substituting"
     );
-    assert!(
-        drv.topdown_pruned,
-        "the topdown_pruned stamp still applies (the job complements it in Phase A)"
-    );
     let qpi = store.calls.qpi_calls.read().unwrap();
     assert!(
         !qpi.contains(&root_out),
@@ -1411,14 +1407,13 @@ async fn flag_on_stale_unobtainable_two_build_dedup_never_fails() -> TestResult 
 /// the build. The node releases to from-source dispatch (Ready), the job
 /// resolves `resolved_from_source`, and the build stays Active.
 ///
-/// Flag-off oracle: the as-built walk's fail-fast
-/// (`fail_fast_pruned_root`) is reachable only for nodes carrying
-/// the `topdown_pruned` mark (`must_substitute` = marked AND Broken —
-/// "unmarked nodes are never affected, whatever their evidence"); an
-/// unmarked node whose walk fails reverts to Ready and falls through to
-/// from-source dispatch. Flag-on must produce the same client-visible
+/// Walk-era oracle (historical): the as-built walk's fail-fast was
+/// reachable only for nodes carrying the pruned mark ("unmarked nodes
+/// are never affected, whatever their evidence"); an unmarked node
+/// whose walk failed reverted to Ready and fell through to from-source
+/// dispatch. The job world must produce the same client-visible
 /// outcome (OQ7): the resubmit-directing fail-fast error class is
-/// reserved for deliberately-pruned roots.
+/// reserved for pruned-ORIGIN jobs.
 ///
 /// The reachable divergence this pins (finding 11's trace): probe-time
 /// blip says substitutable (job created per B3) → upstream entry vanishes
@@ -1476,10 +1471,12 @@ async fn flag_on_unmarked_leaf_confirmed_missing_releases_to_from_source() -> Te
     store.state.substitutable.write().unwrap().push(out.clone());
     tick(&handle).await?;
     barrier(&handle).await;
-    let drv = expect_drv(&handle, "unmarked-leaf").await;
-    assert!(
-        !drv.topdown_pruned,
-        "precondition: the leaf must be unmarked (never pruned)"
+    let origin: String = sqlx::query_scalar("SELECT origin FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        origin, "cache_opportunity",
+        "precondition: the probe blip created one NON-pruned job (the leaf was never pruned)"
     );
     let (jobs, _) = sdb(&db.pool).count_materialization_rows().await?;
     assert_eq!(jobs, 1, "precondition: the probe blip created one job");
@@ -2321,106 +2318,19 @@ async fn flag_on_stale_completed_demote_creates_stale_reset_job() -> TestResult 
     Ok(())
 }
 
-// ── T-1.7 (Phase B): the §4 consumption-transaction topdown_pruned clear-mirror ──
+// ── Pruned-origin consumption shapes (T-D5.1 re-frames of the walk-era
+// clear-mirror block: the mark died with the evidence columns; the
+// origin row is the only durable pruned fact and resolution itself is
+// the settlement) ──
 
 // r[verify sched.materialize.routing+2]
-/// PD-B16 / design §4 ("Which writers stay live — normative"): when a
-/// PRUNED-origin materialization job resolves ResolvedSuccess, the
-/// consumption clears the node's own topdown_pruned mark — in-memory
-/// and durably — mirroring the success-clear the flag-off walk path
-/// owns. Without the clear, the mark survives the successful
-/// materialization and a later flag-off rollback can wrongly fail-fast
-/// the node (the FP-4(a) revert-with-state hazard, pinned by the
-/// revert test below).
+/// Arm 2 at the actor level: a PRUNED-origin job whose node's
+/// re-declared child is NOT yet produced (durable evidence Pending)
+/// gets an Unobtainable report → the routing resolves from-source —
+/// the pruned origin alone never fail-fasts while the durable relation
+/// says the closure is buildable.
 #[tokio::test]
-async fn flag_on_resolved_job_clears_pruned_mark() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
-
-    // The canonical real-prune fixture: root output substitutable BEFORE
-    // merge, root → dep edge → the prune fires, keeps the root only
-    // (marked + job origin=pruned), drops the dep.
-    let root_out = test_store_path("clr-root-out");
-    store
-        .state
-        .substitutable
-        .write()
-        .unwrap()
-        .push(root_out.clone());
-    let mut root = make_node("clr-root");
-    root.expected_output_paths = vec![root_out.clone()];
-    root.wanted_output_names = vec!["out".into()];
-    let dep = make_node("clr-dep");
-    let build_id = Uuid::new_v4();
-    let _ev = merge_dag(
-        &handle,
-        build_id,
-        vec![root, dep],
-        vec![make_test_edge("clr-root", "clr-dep")],
-        false,
-    )
-    .await?;
-    barrier(&handle).await;
-
-    // Preconditions: marked root, pruned-origin job.
-    let drv = expect_drv(&handle, "clr-root").await;
-    assert!(drv.topdown_pruned, "the prune stamped the kept root");
-    let origin: String = sqlx::query_scalar("SELECT origin FROM materialization_jobs")
-        .fetch_one(&db.pool)
-        .await?;
-    assert_eq!(origin, "pruned");
-
-    // Claim → Success → consumption.
-    let assignment = match claim_materialization(&handle, "clr-root", "store-test-0").await {
-        Ok(PullOutcome::Deliver(a)) => *a,
-        other => panic!("the pruned root's job must be claimable, got {other:?}"),
-    };
-    let exec_id: Uuid = assignment.exec_id.parse()?;
-    store.seed_with_content(&root_out, b"materialized");
-    report_materialization_outcome(
-        &handle,
-        exec_id,
-        "clr-root",
-        mat_success_outcome(vec![root_out.clone()], vec![]),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
-    barrier(&handle).await;
-
-    // The node completed and the job resolved.
-    assert_eq!(
-        expect_drv(&handle, "clr-root").await.status,
-        DerivationStatus::Completed
-    );
-    let job_state: String = sqlx::query_scalar("SELECT state FROM materialization_jobs")
-        .fetch_one(&db.pool)
-        .await?;
-    assert_eq!(job_state, "resolved_success");
-
-    // THE clear-mirror (§4): the mark is cleared in-memory AND durably.
-    assert!(
-        !expect_drv(&handle, "clr-root").await.topdown_pruned,
-        "resolved_success must clear the node's own topdown_pruned mark (in-memory)"
-    );
-    let pg_mark: bool =
-        sqlx::query_scalar("SELECT topdown_pruned FROM derivations WHERE drv_hash = $1")
-            .bind("clr-root")
-            .fetch_one(&db.pool)
-            .await?;
-    assert!(
-        !pg_mark,
-        "resolved_success must clear the node's own topdown_pruned mark (durable)"
-    );
-    Ok(())
-}
-
-// r[verify sched.materialize.routing+2]
-/// The §4 clear-mirror's resolved_from_source half: a pruned root whose
-/// re-declared child is NOT yet produced (durable evidence Pending) gets
-/// an Unobtainable report → the routing resolves from-source → the mark
-/// is cleared (in-memory + durable) so the from-source dispatch is not
-/// poisoned by the stale prune verdict.
-#[tokio::test]
-async fn flag_on_from_source_resolution_clears_pruned_mark() -> TestResult {
+async fn pruned_origin_pending_evidence_resolves_from_source() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
 
     // Build #1: the prune fixture (root marked + job origin=pruned).
@@ -2445,7 +2355,10 @@ async fn flag_on_from_source_resolution_clears_pruned_mark() -> TestResult {
     )
     .await?;
     barrier(&handle).await;
-    assert!(expect_drv(&handle, "clrfs-root").await.topdown_pruned);
+    let origin: String = sqlx::query_scalar("SELECT origin FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(origin, "pruned", "premise: the prune classified the root");
 
     // The upstream loses the root's output (so build #2 does not
     // re-prune), then build #2 re-declares root → dep: the dep inserts
@@ -2490,43 +2403,26 @@ async fn flag_on_from_source_resolution_clears_pruned_mark() -> TestResult {
         job_state, "resolved_from_source",
         "Pending durable evidence routes from-source"
     );
-
-    // THE clear-mirror: the mark is gone (in-memory + durable) so the
-    // from-source path is not poisoned by the stale prune verdict.
-    assert!(
-        !expect_drv(&handle, "clrfs-root").await.topdown_pruned,
-        "resolved_from_source must clear the node's own topdown_pruned mark (in-memory)"
-    );
-    let pg_mark: bool =
-        sqlx::query_scalar("SELECT topdown_pruned FROM derivations WHERE drv_hash = $1")
-            .bind("clrfs-root")
-            .fetch_one(&db.pool)
-            .await?;
-    assert!(
-        !pg_mark,
-        "resolved_from_source must clear the node's own topdown_pruned mark (durable)"
-    );
     Ok(())
 }
 
 // r[verify sched.materialize.routing+2]
-/// THE FP-4(a) revert-with-state test (PD-B16's reason to exist): a
-/// node materialized successfully under flag-ON, then the deployment
-/// reverts to flag-OFF (actor re-created flag-off against the same PG).
-/// When the node's outputs are later GC'd and a flag-off build re-merges
-/// it, the node must dispatch from source normally — it must NOT be
-/// wrongly fail-fasted on a stale topdown_pruned mark left over from the
-/// flag-on era. The §4 clear-mirror (resolved_success clears the mark
-/// durably) is what closes this hazard.
+/// Resolution is terminal (the FP-4(a) class, re-framed for the
+/// origin-only world): a node whose pruned-origin job resolved
+/// SUCCESSFULLY, then lost its outputs to GC, must dispatch from source
+/// normally when a later build re-merges it — the resolved job's pruned
+/// classification must not survive into a wrongful fail-fast (a fresh
+/// actor against the same PG sees only the RESOLVED row; the arm-3
+/// discriminator reads unresolved-job origin, never history).
 #[tokio::test]
-async fn flag_on_job_success_then_flag_off_revert_no_wrongful_fail_fast() -> TestResult {
+async fn resolved_pruned_job_does_not_fail_fast_later_remerge() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (store, store_client, _store_task) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
 
     let root_out = test_store_path("revert-root-out");
 
-    // ── Phase 1 (flag-ON): prune → job → claim → Success → consume. ──
+    // ── Phase 1: prune → job → claim → Success → consume. ──
     {
         let (handle, task) =
             setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |_cfg, _| {});
@@ -2550,9 +2446,12 @@ async fn flag_on_job_success_then_flag_off_revert_no_wrongful_fail_fast() -> Tes
         )
         .await?;
         barrier(&handle).await;
-        assert!(
-            expect_drv(&handle, "revert-root").await.topdown_pruned,
-            "phase 1 precondition: the prune stamped the root (dual-written per §4)"
+        let origin: String = sqlx::query_scalar("SELECT origin FROM materialization_jobs")
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(
+            origin, "pruned",
+            "phase 1 precondition: the prune classified the root (in-tx job row)"
         );
 
         let assignment = match claim_materialization(&handle, "revert-root", "store-test-0").await {
@@ -2580,18 +2479,18 @@ async fn flag_on_job_success_then_flag_off_revert_no_wrongful_fail_fast() -> Tes
             rio_proto::types::BuildState::Succeeded as i32
         );
 
-        // The flag flips OFF: the deployment reverts (actor torn down).
+        // The deployment restarts (actor torn down — the failover/
+        // rollback shape; same PG).
         drop(handle);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
-    // ── Phase 2 (flag-OFF, same PG): recovery, GC, re-merge, dispatch. ──
+    // ── Phase 2 (fresh actor, same PG): recovery, GC, re-merge, dispatch. ──
     let leader = crate::lease::LeaderState::always_leader(std::sync::Arc::new(
         std::sync::atomic::AtomicU64::new(1),
     ));
     let _confirmations = spawn_leading_confirmations(leader.clone());
     let phase2_leader = leader.clone();
-    // Flag-off: the DEFAULT MaterializationConfig (enabled = false).
     let (handle, _task) =
         setup_actor_configured(db.pool.clone(), Some(store_client), move |_cfg, p| {
             p.leader = phase2_leader;
@@ -2604,7 +2503,7 @@ async fn flag_on_job_success_then_flag_off_revert_no_wrongful_fail_fast() -> Tes
     store.state.paths.write().unwrap().remove(&root_out);
     store.state.substitutable.write().unwrap().clear();
 
-    // A flag-off build re-merges the root (the resubmit shape).
+    // A later build re-merges the root (the resubmit shape).
     let mut root = make_node("revert-root");
     root.expected_output_paths = vec![root_out.clone()];
     root.wanted_output_names = vec!["out".into()];
@@ -2617,17 +2516,16 @@ async fn flag_on_job_success_then_flag_off_revert_no_wrongful_fail_fast() -> Tes
     tick(&handle).await?;
     barrier(&handle).await;
 
-    // THE FP-4(a) property: no wrongful fail-fast. The node dispatches
-    // from source (Ready — waiting for a builder) and the build stays
-    // Active. Without the §4 clear-mirror, the stale flag-on-era mark +
-    // childless (Broken) evidence + the confirmed-missing probe answer
-    // would take the fail-fast arm and FAIL the build.
+    // THE FP-4(a)-class property: no wrongful fail-fast. The node
+    // dispatches from source (Ready — waiting for a builder) and the
+    // build stays Active: the prior pruned-origin job is RESOLVED, so
+    // the arm-3 discriminator never fires for it.
     let st = query_status(&handle, b2).await?;
     assert_ne!(
         st.state,
         rio_proto::types::BuildState::Failed as i32,
-        "the flag-off build must NOT be wrongly fail-fasted on a stale flag-on-era mark \
-         (FP-4(a)); error: {:?}",
+        "the re-merged build must NOT be wrongly fail-fasted on a RESOLVED \
+         pruned-origin job (FP-4(a) class); error: {:?}",
         st.error_summary
     );
     assert_eq!(
@@ -2999,18 +2897,15 @@ async fn recovery_sweep_releases_orphaned_materialization_pins() -> TestResult {
 /// |                           | parked; re-claimable after expiry       |
 /// | zero live interest        | cancellation closer fires charge-free   |
 ///
-/// Plus the D16-shape probe: the exact D16 inputs (topdown_pruned mark
-/// + substitute_tried + output present in the store) exist on a node —
-/// flag-on its job completes normally, the T-1.7 clear-mirror clears
-/// the mark, and the limbo never forms. Protecting structure: (a) the
-/// job is always armed (this table), and (b) the consumption clear
-/// removes the mark when the job resolves, so mark-keyed refusals
-/// cannot outlive the job.
+/// (The walk-era D16-shape probe — mark + tried + output present —
+/// retired with the evidence machinery in T-D5.1: no mark-keyed
+/// refusal exists any more, so the limbo it probed is structurally
+/// unrepresentable; the job table above is the totality argument.)
 ///
 /// Pin, not red (plan T-4.2 / review RFB-5): the protecting mechanisms
-/// (listing, Queued claims, establishment, park, cancellation closer,
-/// the clear-mirror) all exist by this task — first-try pass recorded
-/// as a pin under commit rule 1's pure-addition clause.
+/// (listing, Queued claims, establishment, park, cancellation closer)
+/// all exist by this task — first-try pass recorded as a pin under
+/// commit rule 1's pure-addition clause.
 #[tokio::test]
 async fn flag_on_every_job_state_has_armed_action() -> TestResult {
     // Tight budget/backoff so the park arm is provable in-test:
@@ -3341,58 +3236,6 @@ async fn flag_on_every_job_state_has_armed_action() -> TestResult {
     );
     assert_eq!(charge_rows, 0, "state 6: the cancellation is charge-free");
 
-    // ════ The D16-shape probe: marked + tried + present → no limbo ════
-    let dout16 = test_store_path("tot-d16-out");
-    store
-        .state
-        .substitutable
-        .write()
-        .unwrap()
-        .push(dout16.clone());
-    let mut n16 = make_node("tot-d16");
-    n16.expected_output_paths = vec![dout16.clone()];
-    let b16 = Uuid::new_v4();
-    merge_dag(&handle, b16, vec![n16], vec![], false).await?;
-    barrier(&handle).await;
-    // Force the D16 inputs that still exist: the mark, plus the output
-    // present in the store. (The spent one-shot died with the walk —
-    // the walk-era D16 limbo's decision cells are deleted; the JOB is
-    // the armed action for a marked node with the output present:
-    // claim → Success → resolves; the clear-mirror removes the mark;
-    // the node completes.)
-    assert!(handle.debug_set_topdown_pruned("tot-d16", true).await?);
-    store.seed_with_content(&dout16, b"tot-d16-present-content");
-    let assignment = match claim_materialization(&handle, "tot-d16", "store-test-0").await {
-        Ok(PullOutcome::Deliver(a)) => *a,
-        other => panic!("D16 probe: the job must still be claimable, got {other:?}"),
-    };
-    let exec16: Uuid = assignment.exec_id.parse()?;
-    report_materialization_outcome(
-        &handle,
-        exec16,
-        "tot-d16",
-        mat_success_outcome(vec![dout16.clone()], vec![]),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("D16 probe report rejected: {e:?}"))?;
-    barrier(&handle).await;
-    let drv = expect_drv(&handle, "tot-d16").await;
-    assert_eq!(
-        drv.status,
-        DerivationStatus::Completed,
-        "D16 probe: the node completes — the limbo never forms flag-on"
-    );
-    assert!(
-        !drv.topdown_pruned,
-        "D16 probe: the T-1.7 clear-mirror cleared the mark on resolution \
-         (mark-keyed refusals cannot outlive the job)"
-    );
-    let st16 = query_status(&handle, b16).await?;
-    assert_eq!(
-        st16.state,
-        rio_proto::types::BuildState::Succeeded as i32,
-        "D16 probe: the build succeeds; no decision cell refused to act"
-    );
     Ok(())
 }
 
@@ -3600,15 +3443,15 @@ async fn flag_on_recovery_rebuilds_job_view_and_jobs_survive() -> TestResult {
 async fn flag_on_reap_survivor_with_unresolved_job_stays_armed() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
 
-    // The reap_survivor_settles_at_reap_time shape (build.rs), flag-on:
+    // The reap_survivor_settles_at_reap_time shape (build.rs):
     // a 2-output root where only the narrow output is substitutable.
     //   Build B (narrow want): the topdown prune fires → root kept
-    //   childless + MARKED + an origin=pruned JOB created in-tx.
+    //   childless + an origin=pruned JOB created in-tx.
     //   Build A (wide want): the wide want blocks the prune → full
     //   merge → dep enters the DAG under root with sole interest A.
     // Cancelling A reaps dep (sole interest) and makes root the
-    // removal-survivor whose child vanished (closure_hole → Broken
-    // evidence) — exactly the cell the reap hook's settlement targets.
+    // removal-survivor whose child vanished — exactly the cell the
+    // walk-era reap settlement used to target.
     let root_out = test_store_path("reapjob-root-out");
     let root_wide = test_store_path("reapjob-root-wide");
     store
@@ -3641,9 +3484,12 @@ async fn flag_on_reap_survivor_with_unresolved_job_stays_armed() -> TestResult {
     )
     .await?;
     barrier(&handle).await;
-    assert!(
-        expect_drv(&handle, "reapjob-root").await.topdown_pruned,
-        "precondition: B's pruned merge marks the root"
+    let origin: String = sqlx::query_scalar("SELECT origin FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        origin, "pruned",
+        "precondition: B's pruned merge classified the root (in-tx job row)"
     );
 
     // Build A (wide): full merge → dep enters the DAG under root.
@@ -4010,12 +3856,18 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
     )
     .await?;
     barrier(&handle).await;
-    let drv = expect_drv(&handle, "nofs-root").await;
-    assert!(
-        drv.topdown_pruned,
-        "precondition: the prune marked the root"
+    let origin: String = sqlx::query_scalar(
+        "SELECT mj.origin FROM materialization_jobs mj \
+           JOIN derivations d ON d.derivation_id = mj.derivation_id \
+          WHERE d.drv_hash = 'nofs-root'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        origin, "pruned",
+        "precondition: the prune classified the root"
     );
-    // BUILD pull refused: unresolved job + the must_substitute mark.
+    // BUILD pull refused: the unresolved job is the never-from-source gate.
     let pull = try_pull_attempt(&handle, "nofs-root").await;
     assert!(
         matches!(pull, Ok(PullOutcome::NotYetReady { .. })),
@@ -4050,8 +3902,7 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
     .await?;
     barrier(&handle).await;
 
-    // Resolve the root's job from-source (arm 2: durable Pending) and
-    // let the T-1.7 clear-mirror clear the mark.
+    // Resolve the root's job from-source (arm 2: durable Pending).
     let assignment = match claim_materialization(&handle, "nofs-root", "store-test-0").await {
         Ok(PullOutcome::Deliver(a)) => *a,
         other => panic!("the root's job claim must deliver, got {other:?}"),
@@ -4072,36 +3923,30 @@ async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
     .await
     .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
     barrier(&handle).await;
-    let drv = expect_drv(&handle, "nofs-root").await;
-    assert!(
-        !drv.topdown_pruned,
-        "the from-source resolution must clear the mark (T-1.7's clear-mirror)"
-    );
 
-    // The SAME pull now mints: with the job resolved AND the mark
-    // cleared, neither refusal predicate holds. Without T-1.7's clear
-    // this pull would park on NotYetReady forever (the stale-mark
-    // must_substitute refusal outliving the job).
+    // The SAME pull now mints: with the job resolved, the refusal
+    // predicate no longer holds (the unresolved job was the only
+    // never-from-source gate).
     let pull = try_pull_attempt(&handle, "nofs-root").await;
     assert!(
         matches!(pull, Ok(PullOutcome::Deliver(_))),
-        "after from-source resolution + the mark clear, the BUILD pull must \
-         mint (the stale-mark refusal must not outlive the job), got {pull:?}"
+        "after from-source resolution the BUILD pull must mint (no refusal \
+         outlives the job), got {pull:?}"
     );
     Ok(())
 }
 
 // r[verify sched.materialize.routing+2]
-/// T-4.4 test 3: arm 3's genuine fail-fast — a MARKED (topdown-pruned)
+/// T-4.4 test 3: arm 3's genuine fail-fast — a PRUNED-ORIGIN
 /// root whose live-wanted output the consumption re-probe confirms
 /// missing-and-unsubstitutable fails every live DAG-interested build
 /// with the resubmit-directing error (the shared wrapper format, NOT
 /// exact-string equality with the flag-off message — review eq-7: the
 /// cause clause names the deciding mechanism).
 ///
-/// The finding-11 mark discriminator makes the mark a REQUIRED conjunct
-/// of this verdict: the unmarked twin of this exact trace releases to
-/// from-source instead
+/// The finding-11 origin discriminator makes the pruned origin a
+/// REQUIRED conjunct of this verdict: the non-pruned twin of this
+/// exact trace releases to from-source instead
 /// (flag_on_unmarked_leaf_confirmed_missing_releases_to_from_source).
 /// The one-shot bound at the routing-core level is pinned by
 /// routing_broken_with_obtainable_reprobe_rearms_once (marked + spent →
@@ -4152,11 +3997,6 @@ async fn flag_on_genuine_unobtainable_fail_fasts_with_resubmit_error() -> TestRe
     )
     .await?;
     barrier(&handle).await;
-    let drv = expect_drv(&handle, "ff-root").await;
-    assert!(
-        drv.topdown_pruned,
-        "precondition: the prune marked the root"
-    );
     let origin: String = sqlx::query_scalar("SELECT origin FROM materialization_jobs")
         .fetch_one(&db.pool)
         .await?;
@@ -4765,12 +4605,13 @@ async fn job_lifecycle_metrics_count_claims_and_resolutions() -> TestResult {
 
 // r[verify sched.materialize.routing+2]
 /// The arm-3 settlement discriminator reads the consumed job's ORIGIN
-/// (the durable successor of the topdown_pruned mark — design §4/A2/
-/// A13), not the in-memory column. Both divergence directions:
-///   A. origin='pruned' + in-memory mark FALSE (the post-080 world)
+/// (the durable successor of the walk-era pruned mark — design §4/A2/
+/// A13) and nothing else. Both directions:
+///   A. a never-pruned node whose job origin is forced 'pruned'
 ///      → FailFast on the four-conjunct corner;
-///   B. origin='cache_opportunity' + in-memory mark TRUE
-///      → ResolveFromSource (the mark alone no longer fail-fasts).
+///   B. a really-pruned node whose job origin is forced
+///      'cache_opportunity' → ResolveFromSource (the prune history
+///      alone no longer fail-fasts).
 #[tokio::test]
 async fn routing_reads_origin_not_column() -> TestResult {
     use rio_auth::hmac::HmacSigner;
@@ -4814,10 +4655,16 @@ async fn routing_reads_origin_not_column() -> TestResult {
     )
     .await?;
     barrier(&handle).await;
-    let drv_a = expect_drv(&handle, "d21a").await;
-    assert!(!drv_a.topdown_pruned, "premise: A is UNMARKED in memory");
-    // Simulate the post-080 world: the durable fact lives in the job
-    // row's origin alone.
+    let origin_a: String =
+        sqlx::query_scalar("SELECT origin FROM materialization_jobs WHERE drv_hash = 'd21a'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        origin_a, "cache_opportunity",
+        "premise: A was never pruned (its job is the new_sub lane's)"
+    );
+    // The post-080 world: the durable fact lives in the job row's
+    // origin alone.
     sqlx::query("UPDATE materialization_jobs SET origin = 'pruned' WHERE drv_hash = 'd21a'")
         .execute(&db.pool)
         .await?;
@@ -4843,8 +4690,8 @@ async fn routing_reads_origin_not_column() -> TestResult {
         st_a.state,
         rio_proto::types::BuildState::Failed as i32,
         "A: a pruned-ORIGIN job's confirmed-missing settlement must \
-         fail-fast even with the in-memory mark false (the origin is \
-         the durable discriminator)"
+         fail-fast even though the node was never pruned (the origin \
+         is the durable discriminator)"
     );
     let job_a: String =
         sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = 'd21a'")
@@ -4852,7 +4699,7 @@ async fn routing_reads_origin_not_column() -> TestResult {
             .await?;
     assert_eq!(job_a, "resolved_unobtainable");
 
-    // ── Direction B: real prune (mark TRUE), origin forced back to
+    // ── Direction B: real prune, origin forced back to
     //    'cache_opportunity'. ──
     let out_b = test_store_path("d21b-out");
     store
@@ -4884,8 +4731,11 @@ async fn routing_reads_origin_not_column() -> TestResult {
     )
     .await?;
     barrier(&handle).await;
-    let drv_b = expect_drv(&handle, "d21b").await;
-    assert!(drv_b.topdown_pruned, "premise: the prune MARKED B");
+    let origin_b: String =
+        sqlx::query_scalar("SELECT origin FROM materialization_jobs WHERE drv_hash = 'd21b'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(origin_b, "pruned", "premise: the prune classified B");
     sqlx::query(
         "UPDATE materialization_jobs SET origin = 'cache_opportunity' WHERE drv_hash = 'd21b'",
     )
@@ -4915,7 +4765,7 @@ async fn routing_reads_origin_not_column() -> TestResult {
     assert_eq!(
         job_b, "resolved_from_source",
         "B: a non-pruned-origin job releases to from-source — the \
-         in-memory mark alone must no longer fail-fast"
+         prune history alone must not fail-fast"
     );
     let st_b = query_status(&handle, bb).await?;
     assert_ne!(
@@ -5010,8 +4860,11 @@ async fn unobtainable_on_upgraded_dedup_job_fail_fasts() -> TestResult {
     )
     .await?;
     barrier(&handle).await;
-    let drv = expect_drv(&handle, "d21c").await;
-    assert!(drv.topdown_pruned, "premise: b2's prune fired and marked R");
+    assert_eq!(
+        query_status(&handle, b2).await?.total_derivations,
+        1,
+        "premise: b2's prune fired (kept the demand set {{R}})"
+    );
 
     // THE UPGRADE (red-first): the dedup carried the pruned origin onto
     // the existing pending row.

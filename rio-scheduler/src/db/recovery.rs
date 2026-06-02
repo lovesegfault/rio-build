@@ -15,10 +15,9 @@ use super::{
     terminal_status_sql,
 };
 
-/// The per-child PRODUCED half of the strict criterion (shared by the
-/// recovery `topdown_pruned` gate and the durable routing classifier —
-/// ONE criterion, two callers; T-D2.2/PD-D4). `e`/`c` are the
-/// edge/child aliases of the enclosing queries.
+/// The per-child PRODUCED half of the strict criterion
+/// (T-D2.2/PD-D4). `e`/`c` are the edge/child aliases of the enclosing
+/// query.
 const CHILD_PRODUCED_SQL: &str = "c.status IN ('completed', 'skipped')";
 
 /// The per-child LIVE CO-OWNING VOUCHER half (the third conjunct —
@@ -35,20 +34,8 @@ const CHILD_LIVE_VOUCHER_SQL: &str = "EXISTS (SELECT 1 FROM build_derivations bd
      WHERE bd.derivation_id = c.derivation_id \
        AND b.status IN ('pending', 'active'))";
 
-/// The recovery-gate query, assembled once from the shared fragments
-/// (a `LazyLock` so sqlx sees a `'static` string).
-static ALL_CHILDREN_PRODUCED_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    format!(
-        "SELECT e.parent_id \
-         FROM derivation_edges e \
-         JOIN derivations c ON c.derivation_id = e.child_id \
-         WHERE e.parent_id = ANY($1) \
-         GROUP BY e.parent_id \
-         HAVING bool_and(({CHILD_PRODUCED_SQL}) AND ({CHILD_LIVE_VOUCHER_SQL}))",
-    )
-});
-
-/// The durable-classifier query (T-D2.2), same shared fragments.
+/// The durable-classifier query (T-D2.2), assembled once from the
+/// shared fragments (a `LazyLock` so sqlx sees a `'static` string).
 static CLASSIFY_EVIDENCE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "SELECT count(*), \
@@ -125,8 +112,7 @@ impl SchedulerDb {
                    d.required_features,
                    d.assigned_builder_id,
                    d.expected_output_paths, d.output_names,
-                   d.wanted_output_names, d.is_fixed_output,
-                   d.is_ca, d.topdown_pruned, d.closure_hole,
+                   d.wanted_output_names, d.is_fixed_output, d.is_ca,
                    d.floor_mem_bytes, d.floor_disk_bytes, d.floor_deadline_secs,
                    a.exec_id
             FROM derivations d
@@ -157,9 +143,10 @@ impl SchedulerDb {
     /// wrong `all_deps_completed() == true` promotion; the rest are not
     /// condemned — they keep whatever non-terminal children survive this
     /// load (possibly none) and are re-discovered at dispatch time (see
-    /// that query's doc for the evidence rule), and recovery records the
-    /// truncation as a closure hole via
-    /// [`Self::load_parents_with_unproduced_terminal_children`].
+    /// that query's doc for the evidence rule). The consumption
+    /// routing's classifier ([`Self::classify_durable_evidence`]) reads
+    /// the persisted graph directly, so the dropped in-memory edges
+    /// never launder a routing verdict.
     ///
     /// ANY($1): PG unnest-style array comparison. Scales to ~100k
     /// IDs before the planner starts preferring a temp table; recovery
@@ -226,9 +213,10 @@ impl SchedulerDb {
     /// it when the vouched child terminally failed), and an
     /// under-cascaded parent keeps only its surviving non-terminal
     /// children (possibly none) and is re-discovered at dispatch time —
-    /// the must-substitute guards keep a marked node off the doomed
-    /// from-source path, and an unmarked node's from-source dispatch is
-    /// exactly what its own live builds submitted it for.
+    /// a node still carrying an unresolved materialization job is
+    /// settled by the job's own consumption routing, and any other
+    /// node's from-source dispatch is exactly what its live builds
+    /// submitted it for.
     pub(crate) async fn load_parents_with_failed_deps(
         &self,
         derivation_ids: &[Uuid],
@@ -257,70 +245,18 @@ impl SchedulerDb {
         .await
     }
 
-    /// Recovered parents whose persisted children are ALL produced
-    /// (`'completed' | 'skipped'`) AND vouched for by a live build that
-    /// also owns the parent: each child must carry a
-    /// `build_derivations` link to a `'pending'`/`'active'` build that
-    /// ALSO links the parent. This is the PG mirror of the in-memory
-    /// closure-evidence judgment
-    /// ([`crate::dag::ClosureEvidence::Vouched`], computed by
-    /// [`crate::dag::DerivationDag::closure_evidence`] and surfaced to
-    /// the actor as `closure_vouched`) every other `topdown_pruned`
-    /// clear site routes through — that judgment is computed over the
-    /// live graph, so its PG mirror must not accept produced rows whose
-    /// only evidence is a long-terminal build or a build that never
-    /// owned the parent.
-    ///
-    /// Consumed by the recovery-time `topdown_pruned` gate in
-    /// `load_dag_from_rows`: produced children are excluded from
-    /// [`Self::load_nonterminal_derivations`] and their edges are
-    /// dropped by [`Self::load_edges_for_derivations`], so this check
-    /// can only be answered against the persisted graph. Childless rows
-    /// are never returned (no `derivation_edges` rows → no GROUP BY
-    /// group), so a genuine never-merged pruned root keeps its restored
-    /// flag. The live-build scoping exists for the previous-generation
-    /// case: a drv fully built by an old build keeps its edges, its
-    /// `completed` children and that build's `build_derivations` links
-    /// in PG indefinitely after the build goes terminal, while the
-    /// store may GC the actual outputs at any point — when a later
-    /// build re-requests the drv via the prune (no new edges, mark
-    /// stamped), those historical rows are stale evidence and must NOT
-    /// clear the restored mark. The co-ownership requirement closes the
-    /// cross-build half of the same hole: a pruning build links only
-    /// its kept roots, never the children, so only a full-merge owner
-    /// of the parent can vouch — produced children belonging to some
-    /// unrelated live build must not launder a clear for a parent that
-    /// build never owned. Such parents keep the flag and at worst take
-    /// the bounded resubmit-directing fail-fast — never the doomed
-    /// from-source dispatch of a closure that was never merged. Any
-    /// unbuilt / `failed` / `cancelled` / `poisoned` /
-    /// `dependency_failed` child — and any produced child without a
-    /// live co-owning voucher — fails the `bool_and`, so the
-    /// must-substitute guard is kept for those parents too.
-    pub(crate) async fn load_parents_with_all_children_produced(
-        &self,
-        derivation_ids: &[Uuid],
-    ) -> Result<Vec<Uuid>, sqlx::Error> {
-        if derivation_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        sqlx::query_scalar(ALL_CHILDREN_PRODUCED_SQL.as_str())
-            .bind(derivation_ids)
-            .fetch_all(&self.pool)
-            .await
-    }
-
     /// THE durable closure-evidence classifier (T-D2.2 / PD-D4): the
-    /// strict three-part criterion of
-    /// [`Self::load_parents_with_all_children_produced`] — pg.edges +
-    /// pg.status + LIVE co-owning build links — promoted to a tri-state
-    /// classification consumed by the §2.4 consumption routing and the
-    /// PD-20 park re-evaluation. ONE criterion, shared SQL fragments
-    /// ([`CHILD_PRODUCED_SQL`]/[`CHILD_LIVE_VOUCHER_SQL`]), two callers
-    /// (the recovery gate above until D5; the routing forever).
+    /// strict three-part criterion — pg.edges + pg.status + LIVE
+    /// co-owning build links — as a tri-state classification consumed
+    /// by the §2.4 consumption routing and the PD-20 park
+    /// re-evaluation. ONE criterion, shared SQL fragments
+    /// ([`CHILD_PRODUCED_SQL`]/[`CHILD_LIVE_VOUCHER_SQL`]). (The
+    /// walk-era recovery gate evaluated the same criterion as a
+    /// batched produced-parents query; it died with the evidence
+    /// columns — the classifier is the criterion's only home now.)
     ///
-    /// The cell map (design §4's `closure_hole` successor, all three
-    /// conjuncts):
+    /// The cell map (design §4's successor to the walk-era hole
+    /// breadcrumb, all three conjuncts):
     /// - `Vouched` — ≥1 child ∧ every child produced
     ///   (`completed`/`skipped`) ∧ vouched by a live co-owning build
     ///   (the `EXISTS` conjunct inside the `bool_and`, exactly as the
@@ -358,60 +294,6 @@ impl SchedulerDb {
         } else {
             ClosureEvidence::Pending
         })
-    }
-
-    /// Recovered parents with at least one persisted child whose status
-    /// is a non-produced terminal (`'poisoned'`/`'dependency_failed'`/
-    /// `'cancelled'`) — in the main the children whose edges
-    /// [`Self::load_edges_for_derivations`] drops without the child ever
-    /// having been produced (within-TTL `'poisoned'` children are the
-    /// over-approximation: they keep their edges yet still match — see
-    /// below). That drop is the recovery-side analogue of
-    /// a reap: the parent's recovered child set is silently truncated
-    /// relative to its persisted (and originally declared) closure, so
-    /// the caller stamps the `closure_hole` breadcrumb on these parents
-    /// (in memory, best-effort in PG) and children-keyed `topdown_pruned`
-    /// verdicts never trust the truncated set. `'failed'` is not in the
-    /// set: it is a transient retry status, not terminal — such a child
-    /// is loaded by [`Self::load_nonterminal_derivations`] and keeps its
-    /// edge. `'completed'`/`'skipped'` children are produced — their
-    /// dropped edge is the satisfied case, not a truncation. Within-TTL
-    /// `'poisoned'` children are loaded for TTL tracking and keep their
-    /// edges, yet still match here — conservative only (the breadcrumb
-    /// just keeps the un-produced child's parent off the from-source
-    /// path it could not take anyway); poison rows already expired at
-    /// load were reset to `'created'` before this query runs, so their
-    /// parents escape the stamp — the documented poison-TTL residual.
-    ///
-    /// Deliberately NO live-build / co-ownership scoping, unlike
-    /// [`Self::load_parents_with_failed_deps`]: that query CONDEMNS the
-    /// parent, so it demands a live co-owning voucher for the failure;
-    /// this one only records that the recovered child set under-states
-    /// the declared closure — a fact about the rows themselves, true
-    /// regardless of which build demanded the dropped child. The
-    /// breadcrumb is inert for unmarked parents and at worst routes a
-    /// marked parent to the bounded resubmit-directing fail-fast, so
-    /// over-recording errs conservative; failing to record it is what
-    /// let a surviving sibling's later completion launder the mark.
-    pub(crate) async fn load_parents_with_unproduced_terminal_children(
-        &self,
-        derivation_ids: &[Uuid],
-    ) -> Result<Vec<Uuid>, sqlx::Error> {
-        if derivation_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        sqlx::query_scalar(
-            r#"
-            SELECT DISTINCT e.parent_id
-            FROM derivation_edges e
-            JOIN derivations c ON c.derivation_id = e.child_id
-            WHERE e.parent_id = ANY($1)
-              AND c.status IN ('poisoned', 'dependency_failed', 'cancelled')
-            "#,
-        )
-        .bind(derivation_ids)
-        .fetch_all(&self.pool)
-        .await
     }
 
     /// Load (build_id, derivation_id) links for a set of builds.
