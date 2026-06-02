@@ -10,18 +10,21 @@
 //! - JSONL appends: the full serialized line (with trailing '\n') is written
 //!   with ONE `write_all` call on a file opened with `O_APPEND`. A process
 //!   crash can only lose the tail line, never interleave or tear earlier
-//!   lines; the loader skips a trailing partial line, and the next append
-//!   truncates it away first so the fragment can never merge with a new
-//!   record into one mid-file corrupt line. Appends are not fsynced —
-//!   node-loss/power-loss durability comes from the periodic S3 sync, not
-//!   from the local file.
+//!   lines. What survives a crash is decided by ONE byte-oriented rule
+//!   ([`split_torn_tail`]): a line is a record iff it ends in '\n'. The
+//!   loader ignores a newline-less tail (even when its bytes happen to
+//!   parse) and the next append truncates the same bytes away first, so
+//!   reader and repairer always agree and the fragment can never merge
+//!   with a new record into one mid-file corrupt line. Appends are not
+//!   fsynced — node-loss/power-loss durability comes from the periodic S3
+//!   sync, not from the local file.
 //! - JSON documents (campaign.json, progress.json): write to `<name>.tmp`,
 //!   fsync, rename over the target.
 //! - Stage done-markers: empty files under `markers/<stage>.done`.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -95,12 +98,13 @@ impl StateDir {
 
     /// Append one record as a single JSONL line (atomic at the line level).
     ///
-    /// When the file ends in a torn line (no trailing '\n' — a crash or
-    /// short write during an earlier append), the fragment is truncated away
-    /// first. It was never a complete record, so dropping it is exactly the
-    /// "a crash can only lose the tail line" model; appending after it
-    /// instead would merge fragment and record into one line that never
-    /// parses and, once another record follows, makes every load fail.
+    /// When the file ends in a torn line (no trailing '\n', per
+    /// [`split_torn_tail`] — a crash or short write during an earlier
+    /// append), the fragment is truncated away first. It was never a
+    /// complete record, so dropping it is exactly the "a crash can only
+    /// lose the tail line" model; appending after it instead would merge
+    /// fragment and record into one line that never parses and, once
+    /// another record follows, makes every load fail.
     pub fn append_jsonl<T: Serialize>(&self, file: StateFile, value: &T) -> Result<()> {
         let mut line = serde_json::to_string(value).context("serialize jsonl record")?;
         line.push('\n');
@@ -124,35 +128,45 @@ impl StateDir {
         Ok(())
     }
 
-    /// Load every well-formed record. A trailing partial line (crash during
-    /// append) is skipped with a warning; a malformed line in the middle is an
-    /// error (state corruption must be loud).
+    /// Load every record from the file's complete-record prefix.
+    ///
+    /// Torn-ness is decided by [`split_torn_tail`] — the same rule the
+    /// append-side repair applies. A final line without its '\n' was never
+    /// durably written, so it is ignored with a warning EVEN IF its bytes
+    /// happen to parse: the next append truncates those bytes away, and
+    /// acting on a record here that the repair then deletes would flip a
+    /// terminal job back to never-existed mid-campaign. Conversely, a
+    /// newline-terminated line that fails to parse is not a torn tail at
+    /// all (the appender terminates every line it writes) but real
+    /// corruption, and corruption must be loud: skipping it would silently
+    /// drop the newest record for some job today, and once the next append
+    /// lands after it the same line sits mid-file where every load fails.
     pub fn load_jsonl<T: DeserializeOwned>(&self, file: StateFile) -> Result<Vec<T>> {
         let path = self.path(file.file_name());
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let f = File::open(&path).with_context(|| format!("open {}", path.display()))?;
-        let reader = BufReader::new(f);
-        let mut out = Vec::new();
-        let mut lines: Vec<String> = Vec::new();
-        for l in reader.lines() {
-            lines.push(l.context("read jsonl line")?);
+        // Whole-file bytes, not a line-buffered text read: records carry
+        // relayed build output, so a crash can cut an append mid multi-byte
+        // character and the bytes after the last '\n' need not be valid
+        // UTF-8. Reaching the torn-tail decision must not require decoding
+        // the very bytes the decision exists to discard.
+        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let (complete, torn) = split_torn_tail(&bytes);
+        if !torn.is_empty() {
+            tracing::warn!(
+                file = file.file_name(),
+                dropped_bytes = torn.len(),
+                "ignoring torn trailing jsonl line"
+            );
         }
-        let n = lines.len();
-        for (i, line) in lines.into_iter().enumerate() {
-            if line.trim().is_empty() {
+        let mut out = Vec::new();
+        for (i, line) in complete.split(|&b| b == b'\n').enumerate() {
+            if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            match serde_json::from_str::<T>(&line) {
+            match serde_json::from_slice::<T>(line) {
                 Ok(v) => out.push(v),
-                Err(e) if i + 1 == n => {
-                    tracing::warn!(
-                        file = file.file_name(),
-                        error = %e,
-                        "skipping torn trailing jsonl line"
-                    );
-                }
                 Err(e) => {
                     anyhow::bail!("corrupt {} line {}: {e}", path.display(), i + 1);
                 }
@@ -238,52 +252,60 @@ impl StateDir {
     }
 }
 
-/// If `f` does not end in '\n', truncate it back to just past the last
-/// newline (to empty when there is none), so the next write starts on a
-/// fresh line. No-op for empty or newline-terminated files.
+/// Split a JSONL buffer at the torn-tail boundary: the complete-record
+/// prefix runs through the last `b'\n'` (empty when there is none), and
+/// any bytes after it are a torn tail — an append cut short by a crash,
+/// never part of any record.
+///
+/// THE single definition of "torn" for the campaign-state JSONL format.
+/// [`StateDir::load_jsonl`] ignores the tail this function reports,
+/// `truncate_torn_tail` (the append-side repair) cuts the file back to
+/// the boundary it reports, and out-of-process consumers of the S3-synced
+/// copies — which the artifact sync uploads byte-verbatim, torn tail and
+/// all — must apply it before parsing. Deliberately byte-oriented: a
+/// crash can cut an append mid multi-byte character, so the boundary must
+/// be decidable without the tail being valid UTF-8.
+pub fn split_torn_tail(bytes: &[u8]) -> (&[u8], &[u8]) {
+    let keep = bytes
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |pos| pos + 1);
+    bytes.split_at(keep)
+}
+
+/// Cut `f` back to its complete-record prefix (per [`split_torn_tail`]) so
+/// the next write starts on a fresh line. No-op for empty or
+/// newline-terminated files.
 fn truncate_torn_tail(f: &mut File, file: StateFile) -> Result<()> {
     let len = f.metadata().context("stat")?.len();
     if len == 0 {
         return Ok(());
     }
+    // Fast path for the every-append healthy case, without reading the
+    // file: the boundary is the last '\n', so whether the tail is empty is
+    // a property of the final byte alone, and feeding just that byte to
+    // the shared rule answers it.
     let mut last = [0u8; 1];
     f.seek(SeekFrom::Start(len - 1)).context("seek to tail")?;
     f.read_exact(&mut last).context("read last byte")?;
-    if last[0] == b'\n' {
+    if split_torn_tail(&last).1.is_empty() {
         return Ok(());
     }
-    let keep = match last_newline_position(f, len - 1)? {
-        Some(pos) => pos + 1,
-        None => 0,
-    };
+    // Torn: locate the boundary with the same rule the loader uses and
+    // truncate to it. Reading the whole file here is fine — repair runs at
+    // most once after a crash, and the loader reads the same bytes in full
+    // on every resume anyway.
+    f.seek(SeekFrom::Start(0)).context("seek to start")?;
+    let mut bytes = Vec::with_capacity(len as usize);
+    f.read_to_end(&mut bytes).context("read for tail repair")?;
+    let keep = split_torn_tail(&bytes).0.len() as u64;
     f.set_len(keep).context("truncate")?;
     tracing::warn!(
         file = file.file_name(),
-        dropped_bytes = len - keep,
+        dropped_bytes = bytes.len() as u64 - keep,
         "dropped torn trailing jsonl line before append"
     );
     Ok(())
-}
-
-/// Byte offset of the last '\n' in `f` before offset `end`, scanning
-/// backwards in chunks; `None` when the region holds no newline.
-fn last_newline_position(f: &mut File, end: u64) -> Result<Option<u64>> {
-    const CHUNK: usize = 4096;
-    let mut buf = [0u8; CHUNK];
-    let mut hi = end;
-    while hi > 0 {
-        let lo = hi.saturating_sub(CHUNK as u64);
-        let n = (hi - lo) as usize;
-        f.seek(SeekFrom::Start(lo))
-            .context("seek for newline scan")?;
-        f.read_exact(&mut buf[..n])
-            .context("read for newline scan")?;
-        if let Some(i) = buf[..n].iter().rposition(|&b| b == b'\n') {
-            return Ok(Some(lo + i as u64));
-        }
-        hi = lo;
-    }
-    Ok(None)
 }
 
 /// Reduce an append-only results stream to the latest record per job.
@@ -327,6 +349,22 @@ mod tests {
             evidence: None,
             updated_at: "2026-05-26T00:00:00Z".into(),
         }
+    }
+
+    #[test]
+    fn split_torn_tail_boundary_cases() {
+        // The one rule both the loader and the append-side repair consume:
+        // complete prefix through the last '\n', everything after is torn.
+        assert_eq!(split_torn_tail(b""), (&b""[..], &b""[..]));
+        assert_eq!(split_torn_tail(b"abc"), (&b""[..], &b"abc"[..]));
+        assert_eq!(split_torn_tail(b"\n"), (&b"\n"[..], &b""[..]));
+        assert_eq!(split_torn_tail(b"a\n"), (&b"a\n"[..], &b""[..]));
+        assert_eq!(split_torn_tail(b"a\nb"), (&b"a\n"[..], &b"b"[..]));
+        // Byte-defined: an invalid-UTF-8 tail must still be splittable.
+        assert_eq!(
+            split_torn_tail(b"a\n\xe2\x80"),
+            (&b"a\n"[..], &b"\xe2\x80"[..])
+        );
     }
 
     #[test]
@@ -386,6 +424,159 @@ mod tests {
         drop(f);
         let res: Result<Vec<JobRecord>> = state.load_jsonl(StateFile::Results);
         assert!(res.is_err(), "mid-file corruption must error");
+    }
+
+    #[test]
+    fn torn_mid_utf8_character_tail_loads_and_repairs() {
+        // The crash shape that wedges resume when torn-ness is judged on
+        // text instead of bytes: an append cut mid multi-byte character
+        // leaves an invalid-UTF-8 tail. Records carry relayed build stderr,
+        // so non-ASCII bytes in the final line are routine. The loader must
+        // never need the tail to be valid UTF-8 — resume loads the complete
+        // prefix, a byte-verbatim restored copy loads on every replacement
+        // pod, and the next append repairs the file on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        state
+            .append_jsonl(
+                StateFile::Results,
+                &rec("a", UnifiedClass::Verdict(Verdict::MatchBuilt), 1),
+            )
+            .unwrap();
+
+        // Producer-verbatim line for a record whose failure cause carries
+        // non-ASCII compiler output (U+2018 = e2 80 98), cut one byte into
+        // the character: exactly the prefix a crash can persist. The lost
+        // suffix includes the terminating '\n'.
+        let mut torn = rec("b", UnifiedClass::Verdict(Verdict::MatchBuilt), 1);
+        torn.failure_cause = Some("error: expected \u{2018};\u{2019} before token".into());
+        let mut line = serde_json::to_vec(&torn).unwrap();
+        let cut = line.iter().position(|&b| b == 0xe2).unwrap() + 1;
+        line.truncate(cut);
+        assert!(
+            std::str::from_utf8(&line).is_err(),
+            "fixture must end mid-character"
+        );
+        let path = state.path("results.jsonl");
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&line).unwrap();
+        drop(f);
+
+        // Resume must load the complete prefix instead of failing the read.
+        let loaded: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].job, "a");
+
+        // The S3 sync/restore cycle propagates the torn bytes verbatim to
+        // every replacement pod; each one must load too, or the campaign
+        // crash-loops until an operator hand-edits the file.
+        let dir2 = tempfile::tempdir().unwrap();
+        let restored = StateDir::new(dir2.path()).unwrap();
+        std::fs::copy(&path, restored.path("results.jsonl")).unwrap();
+        let reloaded: Vec<JobRecord> = restored.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(reloaded.len(), 1);
+
+        // The next append self-heals the file: fragment gone, bytes valid.
+        state
+            .append_jsonl(
+                StateFile::Results,
+                &rec("c", UnifiedClass::Verdict(Verdict::MatchBuilt), 1),
+            )
+            .unwrap();
+        let loaded: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        let jobs: Vec<&str> = loaded.iter().map(|r| r.job.as_str()).collect();
+        assert_eq!(jobs, ["a", "c"]);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            std::str::from_utf8(&bytes).is_ok(),
+            "repair must remove the mid-character fragment"
+        );
+        assert!(bytes.ends_with(b"\n"));
+    }
+
+    #[test]
+    fn unterminated_complete_record_is_torn_not_durable() {
+        // A crash can persist a record's bytes but not its terminating
+        // '\n'. The appender's repair truncates such a tail on the next
+        // append, so the loader must not honor it either — honoring it
+        // would let resume act on a record that the very next append
+        // deletes, flipping a terminal job back to never-existed
+        // mid-campaign. Loader and repair must make the same call on the
+        // same bytes: not newline-terminated, never durably written.
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        state
+            .append_jsonl(
+                StateFile::Results,
+                &rec("a", UnifiedClass::Verdict(Verdict::MatchBuilt), 1),
+            )
+            .unwrap();
+        state
+            .append_jsonl(
+                StateFile::Results,
+                &rec("b", UnifiedClass::Verdict(Verdict::MatchBuilt), 1),
+            )
+            .unwrap();
+        // Crash exactly between record "b"'s JSON bytes and its '\n'.
+        let path = state.path("results.jsonl");
+        let len = std::fs::metadata(&path).unwrap().len();
+        let f = OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(len - 1).unwrap();
+        drop(f);
+
+        let loaded: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        let jobs: Vec<&str> = loaded.iter().map(|r| r.job.as_str()).collect();
+        assert_eq!(
+            jobs,
+            ["a"],
+            "an unterminated record parses but was never durably written; \
+             the next append truncates it, so resume must not act on it"
+        );
+
+        // The append-side repair agrees byte-for-byte with what the loader
+        // skipped: after the append, the file holds exactly a + the new
+        // record and reloads as such.
+        state
+            .append_jsonl(
+                StateFile::Results,
+                &rec("c", UnifiedClass::Verdict(Verdict::MatchBuilt), 1),
+            )
+            .unwrap();
+        let loaded: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        let jobs: Vec<&str> = loaded.iter().map(|r| r.job.as_str()).collect();
+        assert_eq!(jobs, ["a", "c"]);
+    }
+
+    #[test]
+    fn newline_terminated_corrupt_last_line_errors_loudly() {
+        // The appender terminates every line it writes, so a
+        // newline-terminated line that fails to parse is not a torn tail —
+        // it is corruption (schema skew, disk damage, partial restore).
+        // Skipping it because it happens to be last would silently drop the
+        // newest record for some job, and one more append later the same
+        // line sits mid-file where every load fails forever. Corruption
+        // must be loud immediately, not after it becomes unrecoverable.
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        state
+            .append_jsonl(
+                StateFile::Results,
+                &rec("a", UnifiedClass::Verdict(Verdict::MatchBuilt), 1),
+            )
+            .unwrap();
+        let path = state.path("results.jsonl");
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"{\"not\":\"a job record\"}\n").unwrap();
+        drop(f);
+
+        let res: Result<Vec<JobRecord>> = state.load_jsonl(StateFile::Results);
+        let err = res
+            .expect_err("terminated corrupt line is not torn")
+            .to_string();
+        assert!(
+            err.contains("line 2"),
+            "error must name the corrupt line: {err}"
+        );
     }
 
     #[test]
@@ -460,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn append_repairs_torn_tail_longer_than_one_scan_chunk() {
+    fn append_repairs_multi_kilobyte_torn_tail() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
         state
@@ -469,8 +660,8 @@ mod tests {
                 &rec("a", UnifiedClass::Verdict(Verdict::MatchBuilt), 1),
             )
             .unwrap();
-        // A fragment longer than one backwards-scan chunk: the search for
-        // the previous newline must walk across chunk boundaries.
+        // A fragment far longer than any record: the boundary search must
+        // walk all the way back to the previous newline.
         let path = state.path("results.jsonl");
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(&vec![b'x'; 10_000]).unwrap();
