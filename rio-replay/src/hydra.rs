@@ -11,6 +11,8 @@ use std::time::Duration;
 use anyhow::Context as _;
 use serde::Deserialize;
 
+use crate::evalset::recipe::HydraName;
+
 /// `GET /eval/<id>` — note: there are NO `project`/`jobset` keys in
 /// this response (verified on eval 1824219); they come from a sampled
 /// build or an explicit `--jobset` flag.
@@ -193,7 +195,17 @@ impl HydraClient {
         self.get_json(&format!("eval/{id}")).await
     }
 
-    pub async fn get_jobset(&self, project: &str, jobset: &str) -> anyhow::Result<HydraJobset> {
+    /// `GET /jobset/<project>/<jobset>`. Both names are interpolated
+    /// into the URL path as-is — no percent-encoding — which is safe
+    /// only because [`HydraName`]'s constructor proved the charset:
+    /// `Url::join` would not reject a raw `#` or `?` but parse it as a
+    /// fragment/query that is never transmitted, silently fetching a
+    /// DIFFERENT jobset after the politeness budget was charged.
+    pub async fn get_jobset(
+        &self,
+        project: &HydraName,
+        jobset: &HydraName,
+    ) -> anyhow::Result<HydraJobset> {
         self.get_json(&format!("jobset/{project}/{jobset}")).await
     }
 
@@ -201,10 +213,10 @@ impl HydraClient {
     /// pattern allows for single jobs (fidelity samples, scoped sets).
     ///
     /// Job names are Nix attribute paths (e.g.
-    /// `nixpkgs.hello.x86_64-linux`) with no characters that need
-    /// percent-encoding, so the name is interpolated into the URL path
-    /// as-is.
-    pub async fn get_eval_job(&self, eval_id: u64, job: &str) -> anyhow::Result<HydraBuild> {
+    /// `nixpkgs.hello.x86_64-linux`) interpolated into the URL path
+    /// as-is; the [`HydraName`] parameter carries the proof that no
+    /// component needs percent-encoding (see [`Self::get_jobset`]).
+    pub async fn get_eval_job(&self, eval_id: u64, job: &HydraName) -> anyhow::Result<HydraBuild> {
         self.get_json(&format!("eval/{eval_id}/job/{job}")).await
     }
 
@@ -426,6 +438,11 @@ mod tests {
         .unwrap()
     }
 
+    /// Validated-name shorthand for test call sites.
+    fn name(s: &str) -> HydraName {
+        HydraName::parse(s).unwrap()
+    }
+
     #[tokio::test]
     async fn client_fetches_eval_jobset_and_job() {
         let (base, _srv) = spawn_fake_hydra().await;
@@ -434,13 +451,19 @@ mod tests {
         let eval = c.get_eval(1824219).await.unwrap();
         assert_eq!(eval.id, 1824219);
 
-        let js = c.get_jobset("nixos", "unstable").await.unwrap();
+        let js = c
+            .get_jobset(&name("nixos"), &name("unstable"))
+            .await
+            .unwrap();
         assert_eq!(
             js.nixexprpath.as_deref(),
             Some("nixos/release-combined.nix")
         );
 
-        let b = c.get_eval_job(1824219, "nixos.channel").await.unwrap();
+        let b = c
+            .get_eval_job(1824219, &name("nixos.channel"))
+            .await
+            .unwrap();
         assert_eq!(
             b.drvpath,
             "/nix/store/bim7019bg00n745ycf1zkyk0acchv76b-nixos-channel-26.05pre975402.68d8aa3d661f.drv"
@@ -453,7 +476,9 @@ mod tests {
         let (base, _srv) = spawn_fake_hydra().await;
         let c = test_client(&base, 2);
         c.get_eval(1824219).await.unwrap();
-        c.get_jobset("nixos", "unstable").await.unwrap();
+        c.get_jobset(&name("nixos"), &name("unstable"))
+            .await
+            .unwrap();
         let err = c.get_eval(1824219).await.unwrap_err();
         assert!(
             err.to_string().contains("politeness budget"),
@@ -503,7 +528,10 @@ mod tests {
         let (base, _srv) = spawn_fake_hydra().await;
         let c = test_client(&base, 10);
         // No fixture for this job → fake server returns 404.
-        let err = c.get_eval_job(1824219, "no.such.job").await.unwrap_err();
+        let err = c
+            .get_eval_job(1824219, &name("no.such.job"))
+            .await
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("404") && msg.contains("no.such.job"),

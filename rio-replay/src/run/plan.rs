@@ -48,16 +48,21 @@ pub struct ScopeResult {
 /// feature filters still apply to jobs named by the jobs file, so an
 /// explicit list cannot resurrect a job the spec's platform filters
 /// exclude.
+///
+/// The jobs file is parsed with the shared [`crate::jobsfile`] grammar
+/// — the same parse the recorder's `--scope jobs-file:` performs — so
+/// the file that drove a recording is, by construction, readable as
+/// the campaign allowlist (an engine-side grammar fork once glued
+/// trailing comments onto entries and refused the whole campaign over
+/// a file the recorder had just accepted).
 pub fn apply_filters(
     manifest: &[ManifestEntry],
     filters: &Filters,
     jobs_file_contents: Option<&str>,
 ) -> ScopeResult {
     let explicit: Option<HashSet<String>> = jobs_file_contents.map(|text| {
-        text.lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(String::from)
+        crate::jobsfile::parse_jobs_file_lines(text)
+            .into_iter()
             .collect()
     });
     // Jobs-file entries that name nothing in the manifest must not vanish
@@ -483,9 +488,16 @@ mod tests {
         assert_eq!(scope.skipped["appB.x86_64-linux"], SKIP_LIMIT);
         assert_eq!(scope.skipped["divergentC.x86_64-linux"], SKIP_LIMIT);
 
-        // Explicit jobs file overrides globs.
+        // Explicit jobs file overrides globs. The shared jobs-file
+        // grammar applies: a trailing comment is stripped, not glued
+        // onto the entry — the same file the recorder's
+        // `--scope jobs-file:` accepts must select (not refuse) here.
         filters.limit = None;
-        let scope = apply_filters(&manifest, &filters, Some("appB.x86_64-linux\n# comment\n"));
+        let scope = apply_filters(
+            &manifest,
+            &filters,
+            Some("appB.x86_64-linux  # the one we keep\n# whole-line comment\n"),
+        );
         assert_eq!(scope.in_scope, vec!["appB.x86_64-linux"]);
         assert_eq!(scope.skipped["appA.x86_64-linux"], SKIP_JOBS_FILE);
         assert!(scope.unmatched_jobs_file.is_empty());
@@ -678,8 +690,9 @@ mod tests {
             "matched entries must not be listed as unmatched: {msg}"
         );
 
-        // The same file with only real jobs plans normally.
-        std::fs::write(&jobs_file, "appB.x86_64-linux\n").unwrap();
+        // The same file with only real jobs plans normally — including a
+        // trailing comment, which the shared jobs-file grammar strips.
+        std::fs::write(&jobs_file, "appB.x86_64-linux  # keep\n").unwrap();
         let ok = run_plan(&spec, &archive, &store, false).await.unwrap();
         assert_eq!(ok.output.in_scope, vec!["appB.x86_64-linux"]);
     }

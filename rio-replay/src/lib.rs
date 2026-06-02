@@ -8,6 +8,7 @@ pub mod archive;
 pub mod cmd;
 pub mod evalset;
 pub mod hydra;
+pub mod jobsfile;
 pub mod narhash;
 pub mod nixcache;
 pub mod run;

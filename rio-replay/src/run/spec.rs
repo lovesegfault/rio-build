@@ -132,7 +132,11 @@ pub struct Filters {
     pub exclude_features: Vec<String>,
     /// Keep only the first N in-scope jobs (after deterministic sort).
     pub limit: Option<usize>,
-    /// Path to a newline-separated explicit job list (overrides include_globs).
+    /// Path to an explicit job list (overrides include_globs): one job
+    /// name per line, `#` starting a whole-line or trailing comment —
+    /// the shared [`crate::jobsfile`] grammar, identical to what the
+    /// recorder's `--scope jobs-file:` accepts, so one file serves both
+    /// record and replay.
     pub jobs_file: Option<PathBuf>,
 }
 

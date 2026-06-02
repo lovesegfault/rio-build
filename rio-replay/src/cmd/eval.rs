@@ -86,16 +86,11 @@ pub fn parse_scope(s: &str) -> anyhow::Result<Scope> {
     if let Some(path) = s.strip_prefix("jobs-file:") {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("read jobs file {path}: {e}"))?;
-        let mut jobs: Vec<String> = text
-            .lines()
-            // Everything from the first `#` on is a comment — whole-line
-            // or trailing. Job names can never contain `#` (validated
-            // below), so this never splits a legitimate name.
-            .map(|line| line.split_once('#').map_or(line, |(name, _comment)| name))
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(String::from)
-            .collect();
+        // The shared jobs-file grammar ([`crate::jobsfile`]) — the same
+        // parse the campaign engine's `filters.jobs_file` allowlist
+        // uses, so a file this recorder accepts can never be refused at
+        // the plan stage over comment handling.
+        let mut jobs = crate::jobsfile::parse_jobs_file_lines(&text);
         anyhow::ensure!(!jobs.is_empty(), "jobs file {path} contains no job names");
         jobs.sort();
         jobs.dedup();
@@ -126,6 +121,84 @@ fn validate_version_job(version_job: Option<&str>) -> anyhow::Result<()> {
     }
 }
 
+/// Parse and validate `--jobset <project>/<jobset>` at the argument
+/// boundary. Both components are interpolated verbatim into the
+/// `jobset/<project>/<jobset>` Hydra request path, so each must carry
+/// the same charset proof as every other Hydra-bound name
+/// ([`recipe::HydraName`]; dots stay legal — real jobset names like
+/// `release-25.05` contain them). Without the gate, a `#` or `?` (an
+/// easy slip given flake-style `attr#output` syntax) would not fail
+/// the request: `Url::join` parses the rest as a fragment/query that
+/// is never transmitted, so Hydra silently serves a DIFFERENT jobset
+/// whose configuration then seeds the recipe and is recorded in
+/// provenance under the operator-typed name.
+fn parse_jobset_spec(spec: &str) -> anyhow::Result<(recipe::HydraName, recipe::HydraName)> {
+    use anyhow::Context as _;
+    let (project, jobset) = spec
+        .split_once('/')
+        .context("--jobset must be <project>/<jobset>")?;
+    let parse = |what: &str, component: &str| {
+        recipe::HydraName::parse(component)
+            .with_context(|| format!("--jobset {what} component {component:?}"))
+    };
+    Ok((parse("project", project)?, parse("jobset", jobset)?))
+}
+
+/// The constituents arm's receipt-time split of Hydra's response:
+/// the in-scope constituent builds plus the constituents the recorder
+/// must exclude because their names cannot be embedded.
+struct ResolvedConstituents {
+    /// Constituent builds kept in scope, in response order.
+    in_scope: Vec<crate::hydra::HydraBuild>,
+    /// `(job, why)` for in-system constituents whose names fail the
+    /// Hydra-name charset rule; recorded as `unsupported` exclusions.
+    unsupported: Vec<(String, String)>,
+}
+
+/// Filter the Hydra-returned constituent list of `aggregate_job` down
+/// to the in-scope builds, validating every constituent name AT
+/// RECEIPT: Hydra job names can legitimately contain quoted attribute
+/// components (`nodePackages."@angular/cli".x86_64-linux`) that the
+/// recorder can embed in neither a request path nor the generated
+/// selection expression. Validating here — before any name reaches
+/// `ground_truth` or the per-job request loop — turns what was a
+/// deterministic Phase-3 selection-expression failure (after the
+/// politeness budget and the multi-minute source prep were spent, on
+/// every retry) into an exclusion record: an operator cannot edit an
+/// aggregate's constituent list, so bailing would make the aggregate
+/// permanently unrecordable with no workaround, while excluding keeps
+/// it recordable with the gap accounted for in `exclusions.jsonl`.
+///
+/// The system filter runs first (builds without a system field are
+/// kept) and the aggregate itself is excluded: Hydra rewrites
+/// aggregate derivations after evaluation, so it could never pass the
+/// fidelity gate as a plain job. Off-system constituents are skipped
+/// without name validation — they are out of scope regardless.
+fn resolve_constituents(
+    aggregate_job: &str,
+    constituents: Vec<crate::hydra::HydraBuild>,
+    systems: &[String],
+) -> ResolvedConstituents {
+    let mut resolved = ResolvedConstituents {
+        in_scope: Vec::new(),
+        unsupported: Vec::new(),
+    };
+    for b in constituents {
+        let sys_ok = b
+            .system
+            .as_deref()
+            .is_none_or(|s| systems.iter().any(|w| w == s));
+        if b.job == *aggregate_job || !sys_ok {
+            continue;
+        }
+        match recipe::validate_job_name(&b.job) {
+            Ok(()) => resolved.in_scope.push(b),
+            Err(e) => resolved.unsupported.push((b.job, format!("{e:#}"))),
+        }
+    }
+    resolved
+}
+
 #[derive(Debug, Args)]
 pub struct EvalArgs {
     /// Hydra evaluation id (e.g. 1824219).
@@ -144,7 +217,9 @@ pub struct EvalArgs {
     pub scope: String,
 
     /// `<project>/<jobset>` override; default: derived from the first
-    /// build of the eval (one extra Hydra request).
+    /// build of the eval (one extra Hydra request). Both components are
+    /// charset-validated at the parse boundary (`parse_jobset_spec`)
+    /// before they can reach a Hydra request path.
     #[arg(long)]
     pub jobset: Option<String>,
 
@@ -430,20 +505,22 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
 
     // project/jobset: --jobset wins; otherwise sample the eval's first
     // build (one extra Hydra request), since the eval JSON itself
-    // carries no project/jobset keys.
+    // carries no project/jobset keys. Both sources produce validated
+    // [`recipe::HydraName`]s — the sampled build's values are an API
+    // response, and the URL chokepoint demands the same proof of them
+    // as of operator input.
     let (project, jobset_name) = match &args.jobset {
-        Some(spec) => {
-            let (p, j) = spec
-                .split_once('/')
-                .context("--jobset must be <project>/<jobset>")?;
-            (p.to_string(), j.to_string())
-        }
+        Some(spec) => parse_jobset_spec(spec)?,
         None => {
             let first = *eval.builds.first().context("eval has no builds")?;
             let b = hydra.get_build(first).await?;
+            let project = b.project.clone().context("build JSON has no project")?;
+            let jobset = b.jobset.clone().context("build JSON has no jobset")?;
             (
-                b.project.clone().context("build JSON has no project")?,
-                b.jobset.clone().context("build JSON has no jobset")?,
+                recipe::HydraName::parse(&project)
+                    .with_context(|| format!("project name reported by sampled build {first}"))?,
+                recipe::HydraName::parse(&jobset)
+                    .with_context(|| format!("jobset name reported by sampled build {first}"))?,
             )
         }
     };
@@ -451,8 +528,8 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
     // Snapshot of the jobset configuration the recipe was derived from,
     // recorded verbatim in the archive provenance for auditability.
     let jobset_config = serde_json::json!({
-        "project": project,
-        "name": jobset_name,
+        "project": project.as_str(),
+        "name": jobset_name.as_str(),
         "nixexprinput": jobset.nixexprinput,
         "nixexprpath": jobset.nixexprpath,
         "inputs": jobset
@@ -466,40 +543,53 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
     // truth (job → drvpath) for the fidelity gate, and the builds whose
     // names can be mined for versionSuffix recovery (the same builds
     // later feed the per-job buildstatus half of the truth sweep).
+    // `unsupported_constituents` collects Hydra-returned constituent
+    // names the recorder cannot embed; they are staged as `unsupported`
+    // exclusions so the aggregate stays recordable with the gap
+    // accounted for.
     let mut ground_truth: BTreeMap<String, String> = BTreeMap::new();
     let mut sampled_builds: Vec<crate::hydra::HydraBuild> = Vec::new();
+    let mut unsupported_constituents: Vec<(String, String)> = Vec::new();
     let in_scope_jobs: Vec<String> = match &scope {
         Scope::Constituents { aggregate_job } => {
-            let agg = hydra.get_eval_job(args.hydra_eval, aggregate_job).await?;
+            // parse_scope validated the aggregate name; the chokepoint
+            // type re-proves it where the URL is built.
+            let aggregate = recipe::HydraName::parse(aggregate_job)?;
+            let agg = hydra.get_eval_job(args.hydra_eval, &aggregate).await?;
             let constituents = hydra.get_constituents(agg.id).await?;
+            let resolved = resolve_constituents(aggregate_job, constituents, &systems);
+            for (job, why) in &resolved.unsupported {
+                tracing::warn!(
+                    job = %job,
+                    why = %why,
+                    "constituent name cannot be embedded; recording it as an unsupported exclusion"
+                );
+            }
+            unsupported_constituents = resolved.unsupported;
             let mut jobs = Vec::new();
-            for b in constituents {
-                // Constituent lists span systems; keep only the
-                // requested ones (builds without a system field are
-                // kept). The aggregate itself is excluded: Hydra
-                // rewrites aggregate derivations after evaluation, so
-                // it could never pass the fidelity gate as a plain job.
-                let sys_ok = b
-                    .system
-                    .as_deref()
-                    .is_none_or(|s| systems.iter().any(|w| w == s));
-                if b.job != *aggregate_job && sys_ok {
-                    ground_truth.insert(b.job.clone(), b.drvpath.clone());
-                    jobs.push(b.job.clone());
-                    sampled_builds.push(b);
-                }
+            for b in resolved.in_scope {
+                ground_truth.insert(b.job.clone(), b.drvpath.clone());
+                jobs.push(b.job.clone());
+                sampled_builds.push(b);
             }
             jobs.sort();
             jobs.dedup();
             anyhow::ensure!(
                 !jobs.is_empty(),
-                "aggregate {aggregate_job} has no in-scope constituents"
+                "aggregate {aggregate_job} has no in-scope constituents{}",
+                if unsupported_constituents.is_empty() {
+                    ""
+                } else {
+                    " (every in-system constituent has an unsupported name; see the warnings above)"
+                }
             );
             jobs
         }
         Scope::Jobs { jobs } => {
             for job in jobs {
-                let b = hydra.get_eval_job(args.hydra_eval, job).await?;
+                // Validated at parse_scope; re-proved at the chokepoint.
+                let name = recipe::HydraName::parse(job)?;
+                let b = hydra.get_eval_job(args.hydra_eval, &name).await?;
                 ground_truth.insert(b.job.clone(), b.drvpath.clone());
                 sampled_builds.push(b);
             }
@@ -561,7 +651,10 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
         Some(v) => Some(v),
         None => match &args.version_job {
             Some(job) => {
-                let b = hydra.get_eval_job(args.hydra_eval, job).await?;
+                // Validated by validate_version_job at the argument
+                // boundary; re-proved at the chokepoint.
+                let name = recipe::HydraName::parse(job)?;
+                let b = hydra.get_eval_job(args.hydra_eval, &name).await?;
                 b.releasename
                     .as_deref()
                     .and_then(recipe::recover_version_suffix)
@@ -642,8 +735,8 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
     };
     let set_key = key::EvalSetKey {
         hydra_eval_id: args.hydra_eval,
-        project: project.clone(),
-        jobset: jobset_name.clone(),
+        project: project.to_string(),
+        jobset: jobset_name.to_string(),
         systems: systems.clone(),
         scope: scope.clone(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -775,8 +868,8 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
             "source": {
                 "kind": "hydra",
                 "hydra_eval_id": args.hydra_eval,
-                "project": &project,
-                "jobset": &jobset_name,
+                "project": project.as_str(),
+                "jobset": jobset_name.as_str(),
                 "nixpkgs_revision": &revision,
                 "rev_count": rev_count,
                 "short_rev": &short_rev,
@@ -799,6 +892,7 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
                 "manifest_records": manifest_records,
                 "eval_errors": eval_errors.len(),
                 "aggregates_excluded": aggregates.len(),
+                "constituents_unsupported": unsupported_constituents.len(),
                 "closure_drvs": closure_drvs,
                 "ca_outputs": ca_outputs,
                 "hydra_requests_used": hydra_requests_used,
@@ -917,6 +1011,7 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
             manifest: &manifest,
             eval_errors: &eval_errors,
             aggregates: &aggregates,
+            unsupported: &unsupported_constituents,
             adjacency: &adjacency,
             outcomes: outcome_records,
             fidelity: &report,
@@ -1308,6 +1403,89 @@ mod tests {
             releasename: None,
             jobsetevals: Vec::new(),
         }
+    }
+
+    #[test]
+    fn jobset_spec_components_are_validated_at_the_boundary() {
+        // Real shapes pass — dots stay legal in jobset names.
+        let (p, j) = parse_jobset_spec("nixos/trunk-combined").unwrap();
+        assert_eq!((p.as_str(), j.as_str()), ("nixos", "trunk-combined"));
+        let (_, j) = parse_jobset_spec("nixpkgs/release-25.05").unwrap();
+        assert_eq!(j.as_str(), "release-25.05");
+
+        // Missing separator.
+        assert!(
+            parse_jobset_spec("nixos")
+                .unwrap_err()
+                .to_string()
+                .contains("<project>/<jobset>")
+        );
+
+        // A '#' would not fail the request: Url::join parses the rest
+        // as a fragment that is never transmitted, so Hydra would
+        // silently serve jobset `trunk` instead. The boundary names the
+        // offending component instead.
+        let err = parse_jobset_spec("nixos/trunk#combined").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("jobset component") && msg.contains("trunk#combined"),
+            "got: {msg}"
+        );
+
+        // '?' (query) and an extra '/' (a different Hydra path) are
+        // rejected the same way, as are empty components and dot
+        // traversal.
+        assert!(parse_jobset_spec("nixos/trunk?official").is_err());
+        assert!(parse_jobset_spec("nixos/release/25.05").is_err());
+        assert!(parse_jobset_spec("/trunk").is_err());
+        assert!(parse_jobset_spec("nixos/").is_err());
+        assert!(parse_jobset_spec("nixos/..").is_err());
+    }
+
+    #[test]
+    fn constituent_names_are_validated_at_receipt() {
+        let systems = vec!["x86_64-linux".to_string()];
+        let mut off_system = build("nixos.iso_minimal.aarch64-linux", Some(0), Some(1));
+        off_system.system = Some("aarch64-linux".to_string());
+        // Off-system AND non-embeddable: out of scope regardless of the
+        // name, so it must not surface as unsupported either.
+        let mut off_system_bad = build("nodePackages.\"@scope/x\".aarch64-linux", Some(0), Some(1));
+        off_system_bad.system = Some("aarch64-linux".to_string());
+        let mut no_system = build("nixos.systemless", Some(0), Some(1));
+        no_system.system = None;
+        let constituents = vec![
+            // The aggregate itself is excluded (Hydra rewrites
+            // aggregate derivations after evaluation).
+            build("tested", Some(0), Some(1)),
+            build("nixos.iso_minimal.x86_64-linux", Some(0), Some(1)),
+            // A legitimate Hydra job name with a quoted attr component:
+            // the recorder cannot embed it in a request path or the
+            // selection expression, and an operator cannot drop it from
+            // the aggregate — so it becomes an unsupported exclusion at
+            // receipt instead of a deterministic Phase-3 failure after
+            // the budget and source prep are spent.
+            build(
+                "nodePackages.\"@angular/cli\".x86_64-linux",
+                Some(0),
+                Some(1),
+            ),
+            off_system,
+            off_system_bad,
+            no_system,
+        ];
+        let resolved = resolve_constituents("tested", constituents, &systems);
+        let kept: Vec<&str> = resolved.in_scope.iter().map(|b| b.job.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["nixos.iso_minimal.x86_64-linux", "nixos.systemless"]
+        );
+        assert_eq!(resolved.unsupported.len(), 1);
+        let (job, why) = &resolved.unsupported[0];
+        assert_eq!(job, "nodePackages.\"@angular/cli\".x86_64-linux");
+        assert!(
+            why.contains("characters outside"),
+            "the exclusion detail must say why: {why}"
+        );
     }
 
     #[test]

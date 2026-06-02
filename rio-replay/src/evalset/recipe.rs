@@ -225,6 +225,47 @@ pub fn validate_job_name(job: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A project, jobset, or job name proven safe for verbatim embedding in
+/// a Hydra URL path: the only constructor runs [`validate_job_name`],
+/// so a value of this type cannot carry `#`, `?`, `/`, `%`, whitespace,
+/// or a dot-traversal component.
+///
+/// [`crate::hydra::HydraClient`]'s name-interpolating request
+/// formatters demand this type instead of `&str`. That makes the
+/// charset rule a property of the consumption chokepoint rather than a
+/// convention every producer must remember: a new source of
+/// Hydra-bound names (a CLI flag, an API-response field) cannot reach
+/// the URL join — where a stray `#` or `?` would not fail the request
+/// but silently truncate it to a different resource after the
+/// politeness budget was charged — without passing validation at
+/// construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HydraName(String);
+
+impl HydraName {
+    /// Validate and wrap. The rule is exactly [`validate_job_name`]'s:
+    /// `.`-separated components, each non-empty and within
+    /// `[A-Za-z0-9_+-]`. The same rule fits every real Hydra project
+    /// (`nixos`, `nixpkgs`) and jobset (`trunk-combined`,
+    /// `release-25.05`) name — dots stay legal — while the non-empty
+    /// component requirement structurally rejects `.`/`..` segments,
+    /// which a URL join would resolve as path traversal.
+    pub fn parse(name: &str) -> anyhow::Result<Self> {
+        validate_job_name(name)?;
+        Ok(Self(name.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for HydraName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Generate the scoped selection expression: one shared evaluation of
 /// the jobset entry point, exposing exactly the requested jobs as a
 /// flat attrset keyed by Hydra job name.

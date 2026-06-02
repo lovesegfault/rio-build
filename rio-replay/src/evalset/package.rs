@@ -19,8 +19,9 @@ use anyhow::Context as _;
 
 use crate::archive::identity;
 use crate::archive::schema::{
-    Capabilities, EXCLUSION_REASON_AGGREGATE, EXCLUSION_REASON_EVAL_ERROR, ExclusionRecord,
-    ImpureEnv, OutcomeRecord, RequestRecord, RequestTarget, Substituters, UnitRecord,
+    Capabilities, EXCLUSION_REASON_AGGREGATE, EXCLUSION_REASON_EVAL_ERROR,
+    EXCLUSION_REASON_UNSUPPORTED, ExclusionRecord, ImpureEnv, OutcomeRecord, RequestRecord,
+    RequestTarget, Substituters, UnitRecord,
 };
 use crate::archive::writer::{ArchiveWriter, ManifestSeed};
 use crate::evalset::artifacts::FIDELITY_FILE;
@@ -44,6 +45,12 @@ pub struct StageInputs<'a> {
     /// `(attr, drvPath)` of aggregate jobs excluded from the build scope;
     /// staged as `aggregate` exclusions.
     pub aggregates: &'a [(String, String)],
+    /// `(job, why)` of in-scope items the recorder cannot process —
+    /// today, Hydra-returned constituent names that fail the
+    /// embeddable-charset rule at receipt; staged as `unsupported`
+    /// exclusions so the scope stays recordable with the gap accounted
+    /// for.
+    pub unsupported: &'a [(String, String)],
     /// Union closure adjacency over every workload unit (records become
     /// `closures.jsonl`; the impure-env map, restricted to workload
     /// units, becomes `impure-env.json`).
@@ -96,7 +103,8 @@ pub struct StagedArchive {
 /// - `closures.jsonl` / `impure-env.json`: straight from the closure
 ///   adjacency (the impure-env map restricted to workload units, and
 ///   only written when that restriction is non-empty);
-/// - `exclusions.jsonl`: eval errors and excluded aggregates;
+/// - `exclusions.jsonl`: eval errors, excluded aggregates, and
+///   unsupported (non-embeddable) constituent names;
 /// - `outcomes.jsonl`: the swept expected outcomes, verbatim;
 /// - `nix/store/*.drv`: the ATerm text of every closure derivation, read
 ///   from the local store unless overridden;
@@ -164,10 +172,12 @@ pub async fn stage_archive(dir: &Path, inputs: &StageInputs<'_>) -> anyhow::Resu
     writer.write_closures(&closures)?;
 
     // exclusions.jsonl — scope items that produced no workload unit:
-    // attributes that failed to evaluate and aggregates excluded from the
-    // build scope.
-    let mut exclusions: Vec<ExclusionRecord> =
-        Vec::with_capacity(inputs.eval_errors.len() + inputs.aggregates.len());
+    // attributes that failed to evaluate, aggregates excluded from the
+    // build scope, and constituents whose names the recorder cannot
+    // embed.
+    let mut exclusions: Vec<ExclusionRecord> = Vec::with_capacity(
+        inputs.eval_errors.len() + inputs.aggregates.len() + inputs.unsupported.len(),
+    );
     for error in inputs.eval_errors {
         exclusions.push(ExclusionRecord {
             label: Some(error.attr.clone()),
@@ -182,6 +192,14 @@ pub async fn stage_archive(dir: &Path, inputs: &StageInputs<'_>) -> anyhow::Resu
             drv: Some(drv_path.clone()),
             reason: EXCLUSION_REASON_AGGREGATE.to_string(),
             detail: None,
+        });
+    }
+    for (job, why) in inputs.unsupported {
+        exclusions.push(ExclusionRecord {
+            label: Some(job.clone()),
+            drv: None,
+            reason: EXCLUSION_REASON_UNSUPPORTED.to_string(),
+            detail: Some(why.clone()),
         });
     }
     writer.write_exclusions(&exclusions)?;
@@ -396,6 +414,7 @@ mod tests {
         manifest: Vec<ManifestRecord>,
         eval_errors: Vec<EvalErrorRecord>,
         aggregates: Vec<(String, String)>,
+        unsupported: Vec<(String, String)>,
         adjacency: ClosureAdjacency,
         outcomes: Vec<OutcomeRecord>,
         fidelity: FidelityReport,
@@ -413,6 +432,7 @@ mod tests {
                 manifest: &self.manifest,
                 eval_errors: &self.eval_errors,
                 aggregates: &self.aggregates,
+                unsupported: &self.unsupported,
                 adjacency: &self.adjacency,
                 outcomes: self.outcomes.clone(),
                 fidelity: &self.fidelity,
@@ -425,9 +445,10 @@ mod tests {
     }
 
     /// Two workload units (one identity divergent), one eval error, one
-    /// excluded aggregate, a three-derivation closure with synthetic ATerm
-    /// texts, one built-with-hashes and one failed outcome, impure env on
-    /// one unit, and a recorder-shaped provenance block.
+    /// excluded aggregate, one unsupported constituent name, a
+    /// three-derivation closure with synthetic ATerm texts, one
+    /// built-with-hashes and one failed outcome, impure env on one unit,
+    /// and a recorder-shaped provenance block.
     fn test_inputs() -> TestInputs {
         let manifest = vec![
             ManifestRecord {
@@ -452,6 +473,12 @@ mod tests {
             error: "attribute 'missing' not found".to_string(),
         }];
         let aggregates = vec![("tested.x86_64-linux".to_string(), AGG_DRV.to_string())];
+        // A constituent whose Hydra-returned name the recorder cannot
+        // embed (quoted attr component): excluded at receipt.
+        let unsupported = vec![(
+            "nodePackages.\"@angular/cli\".x86_64-linux".to_string(),
+            "job name component contains characters outside [A-Za-z0-9_+-]".to_string(),
+        )];
 
         let mut adjacency = ClosureAdjacency::default();
         for (drv, out, inputs) in [
@@ -596,6 +623,7 @@ mod tests {
             manifest,
             eval_errors,
             aggregates,
+            unsupported,
             adjacency,
             outcomes,
             fidelity,
@@ -669,11 +697,21 @@ mod tests {
         assert!(!app_a.identity_divergent);
         // closures: one record per closure drv, adjacency form
         assert_eq!(archive.closures().len(), 3);
-        // exclusions: eval error + aggregate with the fixed reasons
+        // exclusions: eval error + aggregate + unsupported constituent
+        // with the fixed reasons
         let excl = archive.exclusions();
-        assert_eq!(excl.len(), 2);
+        assert_eq!(excl.len(), 3);
         assert!(excl.iter().any(|e| e.reason == "eval-error"));
         assert!(excl.iter().any(|e| e.reason == "aggregate"));
+        let unsupported = excl
+            .iter()
+            .find(|e| e.reason == "unsupported")
+            .expect("the non-embeddable constituent is staged as an unsupported exclusion");
+        assert_eq!(
+            unsupported.label.as_deref(),
+            Some("nodePackages.\"@angular/cli\".x86_64-linux")
+        );
+        assert!(unsupported.detail.is_some());
         // outcomes parse and the built record carries hashes; the recorder
         // is session-less, so the synthesized session-0 request resolves
         // its unit's truth through the session-less fallback

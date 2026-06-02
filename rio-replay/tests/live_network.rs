@@ -8,6 +8,7 @@
 //! Politeness: this file issues 4 hydra.nixos.org requests and 1
 //! cache.nixos.org request total.
 
+use rio_replay::evalset::recipe::HydraName;
 use rio_replay::hydra::HydraClient;
 use rio_replay::narhash::NarHash;
 use rio_replay::nixcache::NixCacheClient;
@@ -35,7 +36,10 @@ async fn live_hydra_eval_jobset_and_constituents_shape() {
     );
 
     let js = c
-        .get_jobset("nixos", "unstable")
+        .get_jobset(
+            &HydraName::parse("nixos").unwrap(),
+            &HydraName::parse("unstable").unwrap(),
+        )
         .await
         .expect("GET /jobset");
     assert_eq!(
@@ -47,7 +51,7 @@ async fn live_hydra_eval_jobset_and_constituents_shape() {
     // Hydra endpoint without a recorded fixture (see the
     // `HydraClient::get_constituents` TODO).
     let agg = c
-        .get_eval_job(EVAL_ID, "tested")
+        .get_eval_job(EVAL_ID, &HydraName::parse("tested").unwrap())
         .await
         .expect("GET /eval/<id>/job/tested");
     let constituents = c
