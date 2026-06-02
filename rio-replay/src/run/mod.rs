@@ -742,12 +742,92 @@ fn plan_time_dispositions(
     dispositions
 }
 
-/// Plan-time excluded jobs carry their exclusion as `rio.outcome` with no
-/// build/exec fields: write their terminal records right after planning,
-/// one record per job, straight from the [`plan_time_dispositions`] map
-/// (which already settled precedence through the classifier). Both fields
-/// are written via [`Disposition::as_str`] (never hand-typed literals).
-fn write_plan_time_records(
+/// Roll per-path supply outcomes up to unit-level dispositions, per the
+/// supply design: a unit whose closure needs a dependency output the
+/// target REFUSED to accept (after the fresh-channel retry) takes
+/// upload-rejected; one whose required delivery FAILED engine-side takes
+/// supply-failed. Either way the unit is retired before submission —
+/// dispatching it would charge a guaranteed missing-input failure to the
+/// parity headline, the exact misattribution these dispositions exist to
+/// prevent.
+///
+/// Scope is deliberately the engine's own upload mechanisms: prefetch
+/// (delegate) failures stay with the prefetch-shortfall gate, and inline
+/// delivery's policy-deferred rows are recorded unavailable, not failures.
+/// The journal's LAST row per path is its settled outcome, so a path a
+/// later arm or top-up delivered never retires anyone. Precedence between
+/// the two dispositions is the classifier's, like every other disposition.
+fn supply_rollup_dispositions(
+    entries: &[SupplyEntry],
+    dep_closure: &[archive_input::DepClosureEntry],
+    in_scope: &HashSet<&str>,
+    already_excluded: &BTreeMap<String, Disposition>,
+) -> BTreeMap<String, Disposition> {
+    let mut latest: HashMap<&str, (&str, &str)> = HashMap::new();
+    for entry in entries {
+        latest.insert(
+            entry.path.as_str(),
+            (entry.mechanism.as_str(), entry.outcome.as_str()),
+        );
+    }
+    let mut refused: HashSet<&str> = HashSet::new();
+    let mut failed: HashSet<&str> = HashSet::new();
+    for (path, (mechanism, outcome)) in latest {
+        if mechanism != model::SUPPLY_MECHANISM_UPLOAD_BATCH
+            && mechanism != model::SUPPLY_MECHANISM_UPLOAD_STREAM
+        {
+            continue;
+        }
+        match outcome {
+            model::SUPPLY_OUTCOME_REFUSED => {
+                refused.insert(path);
+            }
+            model::SUPPLY_OUTCOME_FAILED => {
+                failed.insert(path);
+            }
+            _ => {}
+        }
+    }
+    let mut dispositions = BTreeMap::new();
+    if refused.is_empty() && failed.is_empty() {
+        return dispositions;
+    }
+    for entry in dep_closure {
+        if !in_scope.contains(entry.job.as_str()) || already_excluded.contains_key(&entry.job) {
+            continue;
+        }
+        let mut flags = AuxFlags::default();
+        for dep in &entry.deps {
+            for path in &dep.output_paths {
+                flags.upload_rejected |= refused.contains(path.as_str());
+                flags.supply_failed |= failed.contains(path.as_str());
+            }
+        }
+        if !flags.upload_rejected && !flags.supply_failed {
+            continue;
+        }
+        let class = classify(
+            &model::ExpectedOutcome::Unknown,
+            &RioOutcome::NotAttempted,
+            &flags,
+        );
+        let disposition = class
+            .class
+            .disposition()
+            .expect("a not-attempted unit always classifies into a disposition");
+        dispositions.insert(entry.job.clone(), disposition);
+    }
+    dispositions
+}
+
+/// Excluded jobs (plan-time exclusions, supply-stage retirements) carry
+/// their exclusion as `rio.outcome` with no build/exec fields: write their
+/// terminal records, one per job, straight from a disposition map whose
+/// precedence the classifier already settled ([`plan_time_dispositions`] /
+/// [`supply_rollup_dispositions`]). Jobs with an existing record keep it
+/// (resume idempotence). Both fields are written via
+/// [`Disposition::as_str`] (never hand-typed literals).
+fn write_exclusion_records(
     state: &StateDir,
     manifest: &[archive_input::ManifestEntry],
     dispositions: &BTreeMap<String, Disposition>,
@@ -1347,7 +1427,7 @@ pub async fn run_with_backends(
         plan_time_dispositions(&plan_output, &divergent_in_scope, &demoted_in_scope);
     let existing_records = latest_per_job(state.load_jsonl(StateFile::Results)?);
     if !state.marker_done("plan") {
-        write_plan_time_records(
+        write_exclusion_records(
             &state,
             &manifest,
             &plan_dispositions,
@@ -1514,6 +1594,33 @@ pub async fn run_with_backends(
     // the persisted report from the run that completed the stage is used.
     let supply_summary = load_supply_summary(&state)?;
 
+    // Supply-failure rollup: units whose required dependency uploads the
+    // target refused (upload-rejected) or whose delivery failed engine-side
+    // (supply-failed) are retired here, before the execute stage, with
+    // terminal disposition records — never dispatched to fail on missing
+    // inputs and pollute the parity headline. Recomputed from the journal
+    // on every start (resume re-derives the same set; existing records win).
+    let supply_retired = supply_rollup_dispositions(
+        &state.load_jsonl::<SupplyEntry>(StateFile::Supply)?,
+        &dep_closure,
+        &in_scope,
+        &plan_dispositions,
+    );
+    if !supply_retired.is_empty() {
+        tracing::warn!(
+            units = supply_retired.len(),
+            "retiring units whose required supply was refused or failed; they are excluded              from submission and recorded under the upload-rejected / supply-failed dispositions"
+        );
+        let existing = latest_per_job(state.load_jsonl(StateFile::Results)?);
+        write_exclusion_records(
+            &state,
+            &manifest,
+            &supply_retired,
+            spec.mode.as_str(),
+            &existing,
+        )?;
+    }
+
     // ── Main loop: submit ∥ collect ∥ watchdog ∥ sync ───────────────────────
     let job_closures = plan::job_closures(&dep_closure);
     let cached_prior_jobs: HashSet<&str> = plan_output
@@ -1563,7 +1670,9 @@ pub async fn run_with_backends(
                 plan_snapshot_valid: cached_prior_jobs.contains(m.job.as_str()),
             },
         );
-        if !plan_dispositions.contains_key(m.job.as_str()) {
+        if !plan_dispositions.contains_key(m.job.as_str())
+            && !supply_retired.contains_key(m.job.as_str())
+        {
             attemptable.push(batch::PendingJob {
                 job: m.job.clone(),
                 drv_path: target_drv,
@@ -4089,7 +4198,7 @@ mod tests {
             Some(Disposition::NotAttemptable),
             "not-attemptable outranks cached-prior in the documented precedence"
         );
-        write_plan_time_records(&state, &manifest, &dispositions, "leaf", &BTreeMap::new())
+        write_exclusion_records(&state, &manifest, &dispositions, "leaf", &BTreeMap::new())
             .unwrap();
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1, "exactly one record per excluded job");
@@ -4129,7 +4238,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
-        write_plan_time_records(&state, &manifest, &dispositions, "leaf", &BTreeMap::new())
+        write_exclusion_records(&state, &manifest, &dispositions, "leaf", &BTreeMap::new())
             .unwrap();
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
         for job in &demoted {
@@ -4138,6 +4247,118 @@ mod tests {
                 Some(Disposition::DemotedImpure.as_str())
             );
         }
+    }
+
+    /// The supply rollup turns per-path journal outcomes into unit-level
+    /// retirements: a refused required upload retires dependents under
+    /// upload-rejected, an engine-side delivery failure under
+    /// supply-failed, refused outranks failed (the classifier's
+    /// precedence), the journal's LAST row per path wins (a top-up that
+    /// delivered the path un-poisons it), prefetch (delegate) failures
+    /// stay with the shortfall gate, and already-excluded units are not
+    /// re-recorded.
+    #[test]
+    fn supply_rollup_retires_dependents_of_refused_and_failed_paths() {
+        let path = |seed: &str| format!("/nix/store/{}-{seed}", "c".repeat(32 - seed.len()));
+        let dep = |seed: &str, outputs: &[String]| archive_input::DepDrvOutputs {
+            drv_path: format!("/nix/store/{}-{seed}.drv", "d".repeat(32 - seed.len())),
+            output_paths: outputs.to_vec(),
+        };
+        let entry =
+            |job: &str, deps: Vec<archive_input::DepDrvOutputs>| archive_input::DepClosureEntry {
+                job: job.to_string(),
+                drv_path: format!("/nix/store/{}-{job}.drv", "e".repeat(32)),
+                deps,
+            };
+        let refused_path = path("refused");
+        let failed_path = path("failed");
+        let delegated_path = path("delegated");
+        let recovered_path = path("recovered");
+        let supply_row = |p: &str, mechanism: &str, outcome: &str| SupplyEntry {
+            path: p.to_string(),
+            source: model::SUPPLY_SOURCE_EMBEDDED.to_string(),
+            mechanism: mechanism.to_string(),
+            outcome: outcome.to_string(),
+            detail: None,
+            batch_id: None,
+            bytes: None,
+            observed_at: now_rfc3339(),
+        };
+        let entries = vec![
+            supply_row(
+                &refused_path,
+                model::SUPPLY_MECHANISM_UPLOAD_STREAM,
+                model::SUPPLY_OUTCOME_REFUSED,
+            ),
+            supply_row(
+                &failed_path,
+                model::SUPPLY_MECHANISM_UPLOAD_BATCH,
+                model::SUPPLY_OUTCOME_FAILED,
+            ),
+            // A prefetch (delegate) failure is the shortfall gate's domain,
+            // never a unit retirement.
+            supply_row(
+                &delegated_path,
+                model::SUPPLY_MECHANISM_DELEGATE,
+                model::SUPPLY_OUTCOME_FAILED,
+            ),
+            // Refused first, then delivered by a later arm: the settled
+            // outcome is the LAST row, so nothing retires.
+            supply_row(
+                &recovered_path,
+                model::SUPPLY_MECHANISM_UPLOAD_STREAM,
+                model::SUPPLY_OUTCOME_REFUSED,
+            ),
+            supply_row(
+                &recovered_path,
+                model::SUPPLY_MECHANISM_UPLOAD_STREAM,
+                model::SUPPLY_OUTCOME_DELIVERED,
+            ),
+        ];
+        let closures = vec![
+            entry(
+                "rejected.x",
+                vec![dep("d1", std::slice::from_ref(&refused_path))],
+            ),
+            entry(
+                "starved.x",
+                vec![dep("d2", std::slice::from_ref(&failed_path))],
+            ),
+            // Both a refused and a failed dependency: refused wins.
+            entry(
+                "both.x",
+                vec![
+                    dep("d1", std::slice::from_ref(&refused_path)),
+                    dep("d2", std::slice::from_ref(&failed_path)),
+                ],
+            ),
+            entry(
+                "prefetchy.x",
+                vec![dep("d3", std::slice::from_ref(&delegated_path))],
+            ),
+            entry(
+                "recovered.x",
+                vec![dep("d4", std::slice::from_ref(&recovered_path))],
+            ),
+            entry("clean.x", vec![dep("d5", &[path("fine")])]),
+            entry(
+                "excluded.x",
+                vec![dep("d1", std::slice::from_ref(&refused_path))],
+            ),
+        ];
+        let in_scope: HashSet<&str> = closures.iter().map(|c| c.job.as_str()).collect();
+        let already_excluded =
+            BTreeMap::from([("excluded.x".to_string(), Disposition::NotAttemptable)]);
+        let rollup = supply_rollup_dispositions(&entries, &closures, &in_scope, &already_excluded);
+        assert_eq!(
+            rollup,
+            BTreeMap::from([
+                ("rejected.x".to_string(), Disposition::UploadRejected),
+                ("starved.x".to_string(), Disposition::SupplyFailed),
+                ("both.x".to_string(), Disposition::UploadRejected),
+            ]),
+            "{rollup:?}"
+        );
     }
 
     /// SHARED dry-run == live-plan parity invariant over the same archive
