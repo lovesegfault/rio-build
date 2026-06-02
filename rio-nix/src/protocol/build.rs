@@ -115,6 +115,23 @@ impl BuildResult {
         }
     }
 
+    /// Create a substituted result: every requested output is present
+    /// without this build executing — `times_built` stays 0.
+    ///
+    /// This is the honest status when success is concluded from store
+    /// presence (a substituter fetch, a cache hit, or another build's
+    /// upload of the same outputs) rather than from an executed build.
+    /// `Built` with `times_built = 1` ([`BuildResult::success`]) is an
+    /// execution claim; presence-derived results must use this
+    /// constructor so consumers that distinguish "executed" from
+    /// "completed without execution" stay truthful.
+    pub fn substituted() -> Self {
+        Self {
+            status: BuildStatus::Substituted,
+            ..Default::default()
+        }
+    }
+
     /// Create a failure result.
     pub fn failure(status: BuildStatus, error_msg: impl Into<String>) -> Self {
         Self {
@@ -477,6 +494,32 @@ mod tests {
         assert!(BuildStatus::ResolvesToAlreadyValid.is_success());
         assert!(!BuildStatus::PermanentFailure.is_success());
         assert!(!BuildStatus::TimedOut.is_success());
+    }
+
+    /// The two success constructors encode different claims and must not
+    /// drift into each other: `success()` claims an executed build
+    /// (`Built`, `times_built = 1`), `substituted()` claims presence
+    /// without execution (`Substituted`, `times_built = 0`). Both are
+    /// success statuses on the wire.
+    #[test]
+    fn success_constructors_distinguish_execution_from_presence() {
+        let executed = BuildResult::success();
+        assert_eq!(executed.status, BuildStatus::Built);
+        assert_eq!(executed.times_built, 1);
+        assert!(executed.status.is_success());
+        assert!(executed.error_msg.is_empty());
+
+        let present = BuildResult::substituted();
+        assert_eq!(present.status, BuildStatus::Substituted);
+        assert_eq!(
+            present.times_built, 0,
+            "a substituted result must not claim an execution"
+        );
+        assert!(
+            present.status.is_success(),
+            "substituted is a success status to stock clients"
+        );
+        assert!(present.error_msg.is_empty());
     }
 
     #[tokio::test]
