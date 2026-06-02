@@ -27,26 +27,37 @@
 //! the data objects by size + SHA-256 (every PUT attaches an
 //! `x-amz-checksum-sha256`, so a later HEAD can return the digest), the
 //! small control objects by fetching and comparing. Only verified-foreign
-//! or unattributable content refuses. AWS S3 and MinIO store and return
-//! header-supplied SHA-256 checksums; on a backend that does not, the
-//! image conflict is unattributable and the refusal stands — exactly the
-//! pre-disambiguation behavior, never worse.
+//! or unattributable content refuses. The stored checksum is load-bearing
+//! substrate for that attribution: AWS S3 and MinIO store and return
+//! header-supplied SHA-256 checksums, while a backend that does not
+//! leaves every at-rest data object unattributable — which refuses both
+//! at the lost-conditional checks and at the pre-marker re-observation
+//! below, so archives cannot be published to a checksum-less backend at
+//! all. That loss is deliberate, the same honesty in both places: the
+//! completion marker vouches for content, and a substrate that cannot
+//! attribute content cannot be vouched on.
 //!
 //! Deletion can race publication, and S3 has no cross-key transactions
 //! for the two sides to linearize on: `replay delete` sweeps whatever a
 //! LIST returned, and a mid-publish prefix carries no marker to exclude
 //! it. The race is narrowed, not closed. On this side, publish
 //! re-observes every object its marker lists immediately before the
-//! conditional marker PUT and refuses ("swept mid-publish — re-run")
-//! when one is missing or replaced; the delete sweep, for its part,
-//! re-lists until the prefix is empty. The residual window — a sweep
-//! passing entirely between those revalidation HEADs and the marker PUT,
-//! then finishing before the marker lands — is milliseconds wide, and
-//! what it leaves is a marker-only prefix: still listed by the operator
-//! tooling (summaries degrade to `?`), still removable by
-//! `replay delete`, and rejected loudly by any fetch (every object is
-//! digest-verified at download). Every interrupted state stays nameable
-//! and converges; none is silently consumed.
+//! conditional marker PUT and continues only when each one is verified
+//! identical to what this publish uploaded — a missing object refuses
+//! ("swept mid-publish — re-run"), and so do a replaced or
+//! unattributable one; the delete sweep, for its part, re-lists until
+//! the prefix is empty. The residual window — a sweep passing entirely
+//! between those revalidation HEADs and the marker PUT, then finishing
+//! before the marker lands — is milliseconds wide, and it can leave two
+//! states. A marker-only prefix (the sweep simply won): still listed by
+//! the operator tooling (summaries degrade to `?`), still removable by
+//! `replay delete`. Or, when a same-archive-id rival's data PUTs also
+//! land entirely inside that window, a falsely-complete prefix whose
+//! marker vouches for image bytes this publish never verified (mkdwarfs
+//! packs nondeterministically, so the rival's image differs). Both end
+//! states are loud, never silently consumed: every fetch digest-verifies
+//! each object against the marker and rejects the mismatch; recovery for
+//! both is `replay delete`, then re-publish.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -378,6 +389,85 @@ impl ArchiveStore {
         }
     }
 
+    /// HEAD one object this publish has a digest in hand for and settle
+    /// whether the publish may continue over what is at rest. This is the
+    /// single decision point for every consultation of
+    /// [`Self::remote_object_match`] — its only caller, pinned by the
+    /// `remote_object_match_feeds_only_the_policy_table` lint test —
+    /// written as one exhaustive (site × verdict) table: a new verdict
+    /// variant or consultation site cannot compile without an explicit
+    /// decision per new cell, and the lattice test drives the real
+    /// publish flow through every cell. The decision column is the
+    /// [`RemoteObjectMatch`] contract — only a verified-identical object
+    /// continues, at every site — while the refusal text is each site's
+    /// own (what it observed, and the recovery). The manifest's
+    /// lost-conditional check is the one at-rest comparison not in this
+    /// table: it attributes by fetching and re-hashing the bytes
+    /// (strictly stronger than checksum attribution, no HEAD substrate
+    /// involved) and likewise continues only on identity.
+    async fn observe_for_publish(
+        &self,
+        client: &aws_sdk_s3::Client,
+        archive_id_short: &str,
+        object: &str,
+        expected: &MemberDigest,
+        site: ObservationSite,
+    ) -> anyhow::Result<()> {
+        let key = self.object_key(archive_id_short, object);
+        match (
+            site,
+            self.remote_object_match(client, &key, expected).await?,
+        ) {
+            (ObservationSite::LostDataConditional, RemoteObjectMatch::Identical) => {
+                tracing::info!(
+                    key = %key,
+                    "lost the write-once conditional to an object holding exactly the \
+                     bytes being uploaded (a replayed PUT whose response was lost \
+                     collides with itself); the claim is won"
+                );
+                Ok(())
+            }
+            (ObservationSite::PreMarkerReObserve, RemoteObjectMatch::Identical) => Ok(()),
+            (ObservationSite::LostDataConditional, RemoteObjectMatch::Absent) => {
+                Err(self.swept_mid_publish(archive_id_short, object))
+            }
+            (ObservationSite::PreMarkerReObserve, RemoteObjectMatch::Absent) => {
+                Err(self.swept_mid_publish(archive_id_short, object))
+            }
+            (ObservationSite::LostDataConditional, RemoteObjectMatch::Foreign(detail)) => Err(self
+                .data_object_conflict(client, archive_id_short, object, &detail)
+                .await),
+            (ObservationSite::LostDataConditional, RemoteObjectMatch::Unverifiable(detail)) => {
+                Err(self
+                    .data_object_conflict(client, archive_id_short, object, &detail)
+                    .await)
+            }
+            (ObservationSite::PreMarkerReObserve, RemoteObjectMatch::Foreign(detail)) => {
+                anyhow::bail!(
+                    "archive prefix s3://{}/{} was swept and re-claimed mid-publish: the \
+                     {object} at rest is not the one this publish uploaded ({detail}) — \
+                     re-run the publish and let the write-once conditionals settle the claim",
+                    self.bucket,
+                    self.prefix(archive_id_short)
+                )
+            }
+            (ObservationSite::PreMarkerReObserve, RemoteObjectMatch::Unverifiable(detail)) => {
+                anyhow::bail!(
+                    "archive prefix s3://{}/{} cannot be claimed complete: the {object} at \
+                     rest is unattributable ({detail}), and the completion marker must never \
+                     vouch for bytes nothing verified. On a backend that does not store and \
+                     return the SHA-256 checksum every publish PUT attaches (AWS S3 and MinIO \
+                     do), no publish can pass this check — archives cannot be published \
+                     there; on a checksum-storing backend, this object was re-claimed by \
+                     another writer after a concurrent sweep — re-run the publish and let \
+                     the write-once conditionals settle the claim",
+                    self.bucket,
+                    self.prefix(archive_id_short)
+                )
+            }
+        }
+    }
+
     /// GET one small control object's bytes; `Ok(None)` when the key does
     /// not exist (a concurrent delete removed it).
     async fn get_object_bytes(
@@ -413,9 +503,11 @@ impl ArchiveStore {
 
     /// Publish a packed archive: upload `archive.dwarfs`, the standalone
     /// `manifest.json` (the exact bytes passed in), and finally
-    /// `complete.json` strictly last — after re-HEADing every object the
-    /// marker lists, so completeness is never claimed over state a
-    /// concurrent `replay delete` swept mid-upload. EVERY PUT carries
+    /// `complete.json` strictly last — after re-observing every object
+    /// the marker lists and refusing unless each is verifiably the one
+    /// this publish uploaded, so completeness is never claimed over
+    /// state a concurrent `replay delete` swept (or a rival re-claimed)
+    /// mid-upload. EVERY PUT carries
     /// `If-None-Match: *`: the marker so two racing uploads cannot both
     /// claim completeness, and the data objects so a racing publisher of
     /// the same archive id (same manifest bytes, but mkdwarfs packing is
@@ -524,33 +616,14 @@ impl ArchiveStore {
             Err(e) if put_lost_conditional(&e) => {
                 // The image is multi-gigabyte, so the self-write check is
                 // a HEAD against the stored checksum, never a re-download.
-                match self
-                    .remote_object_match(client, &image_key, &image_digest)
-                    .await?
-                {
-                    RemoteObjectMatch::Identical => {
-                        tracing::info!(
-                            key = %image_key,
-                            "lost the write-once conditional to an object holding exactly the \
-                             bytes being uploaded (a replayed PUT whose response was lost \
-                             collides with itself); the claim is won"
-                        );
-                    }
-                    RemoteObjectMatch::Absent => {
-                        return Err(self.swept_mid_publish(&archive_id_short, ARCHIVE_IMAGE_OBJECT));
-                    }
-                    RemoteObjectMatch::Foreign(detail)
-                    | RemoteObjectMatch::Unverifiable(detail) => {
-                        return Err(self
-                            .data_object_conflict(
-                                client,
-                                &archive_id_short,
-                                ARCHIVE_IMAGE_OBJECT,
-                                &detail,
-                            )
-                            .await);
-                    }
-                }
+                self.observe_for_publish(
+                    client,
+                    &archive_id_short,
+                    ARCHIVE_IMAGE_OBJECT,
+                    &image_digest,
+                    ObservationSite::LostDataConditional,
+                )
+                .await?;
             }
             Err(e) => {
                 return Err(
@@ -646,28 +719,22 @@ impl ArchiveStore {
         // so each object it lists is re-HEADed immediately before the
         // conditional marker PUT — the HEAD set is derived from the marker
         // itself, so an object the marker lists can never escape this.
-        // Existence (and size) is the load-bearing check; the stored
-        // checksum hardens it where the backend returns one. Unverifiable
-        // passes here — unlike in the lost-conditional arms — because this
-        // publish itself just uploaded or digest-verified these objects;
-        // the fetch path re-verifies every digest at consume time either
-        // way. See the module doc for the residual race this narrows but
-        // cannot close.
+        // Only a verified-identical object continues, even though this
+        // publish uploaded these objects moments ago: after a sweep the
+        // key may hold a same-archive-id rival's re-upload (mkdwarfs packs
+        // nondeterministically, so the rival's image differs), and an
+        // object the substrate cannot attribute is refused rather than
+        // vouched for. See the module doc for the residual race this
+        // narrows but cannot close.
         for (object, expected) in &marker.objects {
-            let key = self.object_key(&archive_id_short, object);
-            match self.remote_object_match(client, &key, expected).await? {
-                RemoteObjectMatch::Identical | RemoteObjectMatch::Unverifiable(_) => {}
-                RemoteObjectMatch::Absent => {
-                    return Err(self.swept_mid_publish(&archive_id_short, object));
-                }
-                RemoteObjectMatch::Foreign(detail) => anyhow::bail!(
-                    "archive prefix s3://{}/{} was swept and re-claimed mid-publish: the \
-                     {object} at rest is not the one this publish uploaded ({detail}) — \
-                     re-run the publish and let the write-once conditionals settle the claim",
-                    self.bucket,
-                    self.prefix(&archive_id_short)
-                ),
-            }
+            self.observe_for_publish(
+                client,
+                &archive_id_short,
+                object,
+                expected,
+                ObservationSite::PreMarkerReObserve,
+            )
+            .await?;
         }
 
         let mut marker_bytes =
@@ -1023,9 +1090,13 @@ impl ArchiveStore {
 }
 
 /// How an at-rest object compares against the digest a publish has in hand
-/// for it — the verdict of the self-write check after a lost conditional.
-/// Only [`Self::Identical`] may continue a publish: the completion marker
-/// must never vouch for content that was not verified.
+/// for it — the verdict consulted after a lost data conditional and at the
+/// pre-marker re-observation. Only [`Self::Identical`] may continue a
+/// publish, at every consultation site: the completion marker must never
+/// vouch for content that was not verified. The single decision point is
+/// the (site × verdict) table in `ArchiveStore::observe_for_publish`, this
+/// enum's only consumer, so a per-site policy fork cannot ride in as an
+/// unmatched arm somewhere else.
 #[derive(Debug)]
 enum RemoteObjectMatch {
     /// Size and stored SHA-256 both match: the object holds exactly the
@@ -1037,10 +1108,29 @@ enum RemoteObjectMatch {
     Foreign(String),
     /// The object exists but the backend returned nothing that can
     /// attribute it (no comparable checksum, or no size). Refused like
-    /// foreign content: unverified bytes must never be vouched for.
+    /// foreign content at every site: unverified bytes must never be
+    /// vouched for. On a backend that never stores the checksums publish
+    /// PUTs attach, every publish ends here at the pre-marker
+    /// re-observation — publishing requires a checksum-storing backend
+    /// (AWS S3 and MinIO are).
     Unverifiable(String),
     /// No object at the key.
     Absent,
+}
+
+/// Where a publish consults the at-rest comparison — the row axis of the
+/// publish-continuation table in `ArchiveStore::observe_for_publish`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservationSite {
+    /// A data PUT lost its `If-None-Match: *` conditional: the at-rest
+    /// object must be attributed before any refusal, because the SDK
+    /// replays PUTs whose responses were lost and the replay collides
+    /// with the publisher's own committed object.
+    LostDataConditional,
+    /// The pre-marker re-observation: every object the completion marker
+    /// is about to vouch for, re-checked immediately before the
+    /// conditional marker PUT.
+    PreMarkerReObserve,
 }
 
 /// Did this PUT lose its `If-None-Match: *` conditional write? Covers both
@@ -1362,6 +1452,7 @@ mod tests {
     async fn publish_maps_a_lost_conditional_put_to_the_write_once_refusal() {
         let dir = tempfile::TempDir::new().unwrap();
         let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+        let image_bytes = std::fs::read(&image).unwrap();
         let archive_id = identity::archive_id_from_manifest_bytes(&manifest_bytes);
         let short = identity::short_id(&archive_id);
 
@@ -1399,12 +1490,19 @@ mod tests {
         let head_marker_404 = mock!(aws_sdk_s3::Client::head_object)
             .match_requests(move |req| req.key().is_some_and(|k| k.ends_with(&head_marker_suffix)))
             .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
-        // The pre-marker revalidation HEADs find the data objects in place
-        // (a bare 200 — existence is what it needs).
-        let head_data_suffix = complete_suffix.clone();
-        let head_data_present = mock!(aws_sdk_s3::Client::head_object)
-            .match_requests(move |req| !req.key().is_some_and(|k| k.ends_with(&head_data_suffix)))
-            .then_output(|| HeadObjectOutput::builder().build());
+        // The pre-marker revalidation finds both data objects in place
+        // holding exactly this publish's bytes (size + stored checksum):
+        // only verified-identical objects let the marker PUT proceed.
+        let reval_image = head_object_rule(
+            format!("replay/archives/{short}/{ARCHIVE_IMAGE_OBJECT}"),
+            &identity::sha256_hex(&image_bytes),
+            image_bytes.len() as u64,
+        );
+        let reval_manifest = head_object_rule(
+            format!("replay/archives/{short}/{ARCHIVE_MANIFEST_OBJECT}"),
+            &archive_id,
+            manifest_bytes.len() as u64,
+        );
         let data_suffix = complete_suffix.clone();
         let put_data = mock!(aws_sdk_s3::Client::put_object)
             .match_requests(move |req| !req.key().is_some_and(|k| k.ends_with(&data_suffix)))
@@ -1423,7 +1521,8 @@ mod tests {
             RuleMode::MatchAny,
             &[
                 &head_marker_404,
-                &head_data_present,
+                &reval_image,
+                &reval_manifest,
                 &put_data,
                 &put_complete_412,
                 &get_foreign_marker
@@ -2614,5 +2713,316 @@ mod tests {
         let store = ArchiveStore::new("rio-chunks", "replay");
         let err = store.list(&client).await.unwrap_err();
         assert!(format!("{err:#}").contains("lives under"), "got: {err:#}");
+    }
+
+    /// One witness per [`RemoteObjectMatch`] variant — the column axis of
+    /// the publish-continuation lattice test. The inner match is
+    /// exhaustive over the enum, so adding a variant fails compilation
+    /// here until the new variant gets a witness in this list, a mock
+    /// shape in `drive_publish_cell`, and an expected outcome per site in
+    /// `expected_cell`.
+    fn verdict_columns() -> Vec<(&'static str, RemoteObjectMatch)> {
+        let columns = vec![
+            ("identical", RemoteObjectMatch::Identical),
+            ("foreign", RemoteObjectMatch::Foreign(String::new())),
+            (
+                "unverifiable",
+                RemoteObjectMatch::Unverifiable(String::new()),
+            ),
+            ("absent", RemoteObjectMatch::Absent),
+        ];
+        for (_, witness) in &columns {
+            match witness {
+                RemoteObjectMatch::Identical
+                | RemoteObjectMatch::Foreign(_)
+                | RemoteObjectMatch::Unverifiable(_)
+                | RemoteObjectMatch::Absent => {}
+            }
+        }
+        columns
+    }
+
+    /// One row per [`ObservationSite`] — the row axis of the lattice
+    /// test. Same forcing shape as [`verdict_columns`]: a new
+    /// consultation site fails compilation here until it gets a row, a
+    /// drive script, and an expected outcome per verdict column.
+    fn site_rows() -> Vec<(&'static str, ObservationSite)> {
+        let rows = vec![
+            (
+                "lost-data-conditional",
+                ObservationSite::LostDataConditional,
+            ),
+            ("pre-marker-re-observe", ObservationSite::PreMarkerReObserve),
+        ];
+        for (_, witness) in &rows {
+            match witness {
+                ObservationSite::LostDataConditional | ObservationSite::PreMarkerReObserve => {}
+            }
+        }
+        rows
+    }
+
+    /// The publish-continuation contract, cell by cell. The decision
+    /// column derives from the [`RemoteObjectMatch`] doc contract — only
+    /// a verified-identical object may continue a publish, at every
+    /// consultation site — and each `Err` needle is the load-bearing
+    /// phrase of that site's refusal. The `panic!` default keeps the
+    /// table total over both axes: a new variant or site reaches it
+    /// through the axis walk and fails loudly until its cells are
+    /// decided here.
+    fn expected_cell(site: &str, column: &str) -> Result<(), &'static str> {
+        match (site, column) {
+            ("lost-data-conditional", "identical") => Ok(()),
+            ("lost-data-conditional", "foreign") => Err("bytes at rest vs"),
+            ("lost-data-conditional", "unverifiable") => Err("no SHA-256 checksum to attribute"),
+            ("lost-data-conditional", "absent") => Err("swept mid-publish"),
+            ("pre-marker-re-observe", "identical") => Ok(()),
+            ("pre-marker-re-observe", "foreign") => Err("swept and re-claimed mid-publish"),
+            ("pre-marker-re-observe", "unverifiable") => {
+                Err("must never vouch for bytes nothing verified")
+            }
+            ("pre-marker-re-observe", "absent") => Err("swept mid-publish"),
+            cell => panic!("no expected outcome declared for publish-continuation cell {cell:?}"),
+        }
+    }
+
+    /// Drive one (site × verdict) cell of the publish-continuation table
+    /// through the real publish flow: the mock script makes the at-rest
+    /// image classify as `column` exactly at `site`, every other observed
+    /// object is verified-identical, and `complete.json` never
+    /// pre-exists. Returns the publish outcome and how many marker PUTs
+    /// were issued.
+    async fn drive_publish_cell(
+        site: &str,
+        column: &str,
+        image: &Path,
+        manifest_bytes: &[u8],
+    ) -> (anyhow::Result<CompleteMarker>, usize) {
+        let image_bytes = std::fs::read(image).unwrap();
+        let image_sha = identity::sha256_hex(&image_bytes);
+        let archive_id = identity::archive_id_from_manifest_bytes(manifest_bytes);
+        let short = identity::short_id(&archive_id);
+        let image_key = format!("replay/archives/{short}/{ARCHIVE_IMAGE_OBJECT}");
+        let manifest_key = format!("replay/archives/{short}/{ARCHIVE_MANIFEST_OBJECT}");
+        let complete_suffix = format!("/{ARCHIVE_COMPLETE_OBJECT}");
+
+        // complete.json never exists in these histories: the write-once
+        // pre-check and the conflict-classifying probe both see 404, and
+        // the marker PUT (when a cell reaches it) wins its conditional.
+        let head_marker_404 = {
+            let suffix = complete_suffix.clone();
+            mock!(aws_sdk_s3::Client::head_object)
+                .match_requests(move |req| req.key().is_some_and(|k| k.ends_with(&suffix)))
+                .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()))
+        };
+        // Entering the cell: at the lost-data-conditional site the image
+        // PUT loses its `If-None-Match: *` (the SDK replayed a committed
+        // PUT, or a rival landed first); at the re-observation site the
+        // upload lands cleanly and the cell is reached through the
+        // pre-marker HEAD.
+        let put_image = {
+            let key = image_key.clone();
+            let rule = mock!(aws_sdk_s3::Client::put_object)
+                .match_requests(move |req| req.key() == Some(key.as_str()));
+            match site {
+                "lost-data-conditional" => rule.then_error(|| {
+                    PutObjectError::generic(
+                        ErrorMetadata::builder().code("PreconditionFailed").build(),
+                    )
+                }),
+                "pre-marker-re-observe" => rule.then_output(|| PutObjectOutput::builder().build()),
+                other => panic!("no drive script for site {other}"),
+            }
+        };
+        // The HEAD on the image at `site`, shaped to classify as `column`.
+        let head_image = {
+            let key = image_key.clone();
+            let size = image_bytes.len() as i64;
+            let rule = mock!(aws_sdk_s3::Client::head_object)
+                .match_requests(move |req| req.key() == Some(key.as_str()));
+            match column {
+                "identical" => {
+                    let stored = sha256_base64(&image_sha).unwrap();
+                    rule.then_output(move || {
+                        HeadObjectOutput::builder()
+                            .content_length(size)
+                            .checksum_sha256(stored.clone())
+                            .build()
+                    })
+                }
+                // A different size is verifiably not this publish's bytes.
+                "foreign" => rule.then_output(move || {
+                    HeadObjectOutput::builder().content_length(size + 1).build()
+                }),
+                // The size matches but no stored checksum came back —
+                // nothing can attribute the bytes.
+                "unverifiable" => rule
+                    .then_output(move || HeadObjectOutput::builder().content_length(size).build()),
+                "absent" => {
+                    rule.then_error(|| HeadObjectError::NotFound(NotFound::builder().build()))
+                }
+                other => panic!("no drive script for verdict column {other}"),
+            }
+        };
+        let put_manifest = {
+            let key = manifest_key.clone();
+            mock!(aws_sdk_s3::Client::put_object)
+                .match_requests(move |req| req.key() == Some(key.as_str()))
+                .then_output(|| PutObjectOutput::builder().build())
+        };
+        let head_manifest =
+            head_object_rule(manifest_key, &archive_id, manifest_bytes.len() as u64);
+        let put_marker = {
+            let suffix = complete_suffix.clone();
+            mock!(aws_sdk_s3::Client::put_object)
+                .match_requests(move |req| req.key().is_some_and(|k| k.ends_with(&suffix)))
+                .then_output(|| PutObjectOutput::builder().build())
+        };
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[
+                &head_marker_404,
+                &head_image,
+                &head_manifest,
+                &put_image,
+                &put_manifest,
+                &put_marker
+            ]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        let outcome = store
+            .publish(&client, image, manifest_bytes, "rio-replay/test")
+            .await;
+        (outcome, put_marker.num_calls())
+    }
+
+    #[tokio::test]
+    async fn publish_continuation_decides_every_site_x_verdict_cell() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+        let mut cells = 0;
+        for (site, _) in site_rows() {
+            for (column, _) in verdict_columns() {
+                cells += 1;
+                let (outcome, marker_puts) =
+                    drive_publish_cell(site, column, &image, &manifest_bytes).await;
+                match expected_cell(site, column) {
+                    Ok(()) => {
+                        let marker = outcome.unwrap_or_else(|e| {
+                            panic!("cell ({site}, {column}) must continue the publish: {e:#}")
+                        });
+                        assert_eq!(
+                            marker.archive_id,
+                            identity::archive_id_from_manifest_bytes(&manifest_bytes),
+                            "cell ({site}, {column})"
+                        );
+                        assert_eq!(
+                            marker_puts, 1,
+                            "cell ({site}, {column}) claims completeness exactly once"
+                        );
+                    }
+                    Err(needle) => {
+                        let err = match outcome {
+                            Err(err) => format!("{err:#}"),
+                            Ok(_) => panic!("cell ({site}, {column}) must refuse the publish"),
+                        };
+                        assert!(
+                            err.contains(needle),
+                            "cell ({site}, {column}) refusal must carry {needle:?}: {err}"
+                        );
+                        assert_eq!(
+                            marker_puts, 0,
+                            "cell ({site}, {column}): completeness must never be claimed \
+                             after a refusal"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            cells,
+            site_rows().len() * verdict_columns().len(),
+            "the walk visited the full lattice"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_refuses_a_sizeless_object_at_completeness_time() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+
+        // The worst unattributable shape at the pre-marker re-observation:
+        // the HEAD returns no Content-Length, so NOTHING about the at-rest
+        // object was compared — not even its size. The marker must not
+        // vouch for it; before the continuation table this shape passed
+        // and the marker could claim completeness over a wholly unobserved
+        // object.
+        let head_404_precheck = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let put_data = mock!(aws_sdk_s3::Client::put_object)
+            .sequence()
+            .output(|| PutObjectOutput::builder().build())
+            .times(2)
+            .build();
+        let reval_image_sizeless = mock!(aws_sdk_s3::Client::head_object)
+            .then_output(|| HeadObjectOutput::builder().build());
+        let put_marker = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().build());
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[
+                &head_404_precheck,
+                &put_data,
+                &reval_image_sizeless,
+                &put_marker
+            ]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        let err = store
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("no Content-Length to compare"),
+            "the refusal names what could not be compared: {message}"
+        );
+        assert!(
+            message.contains("cannot be claimed complete"),
+            "the refusal is the completeness-time one: {message}"
+        );
+        assert_eq!(
+            put_marker.num_calls(),
+            0,
+            "the marker must not vouch for an object nothing measured"
+        );
+    }
+
+    /// Every consultation of the at-rest comparison must route through
+    /// `observe_for_publish`'s (site × verdict) table — a second raw call
+    /// site would fork the continuation policy outside the table and
+    /// outside the lattice test above. Domain: call-shaped
+    /// `.remote_object_match(` occurrences in this file's production code
+    /// (the file's own bytes, truncated at this test module — the same
+    /// shape as the SLA metrics source lint in rio-scheduler).
+    #[test]
+    fn remote_object_match_feeds_only_the_policy_table() {
+        let src = include_str!("s3.rs");
+        let prod = src
+            .split_once("#[cfg(test)]\nmod tests")
+            .map(|(prod, _)| prod)
+            .unwrap_or(src);
+        // Built at runtime so this test's own source cannot match it.
+        let needle = format!(".{}{}", "remote_object_match", "(");
+        assert_eq!(
+            prod.matches(needle.as_str()).count(),
+            1,
+            "the at-rest comparison has exactly one consumer: the (site x verdict) \
+             continuation table in observe_for_publish"
+        );
     }
 }
