@@ -92,6 +92,20 @@ pub struct DepDrvOutputs {
 ///
 /// The returned entries are sorted by job then drv path so plan-time
 /// iteration order is deterministic.
+///
+/// Job-key uniqueness is enforced here, at the engine's ingest boundary:
+/// one job key naming two distinct workload derivations is a hard error
+/// listing every collision. The job name is the engine's reporting
+/// identity — contexts, truth, the pending/terminal pools, and
+/// latest-record-per-job results are all job-keyed, last-writer-wins maps
+/// — so a collision would silently collapse two workload units into one:
+/// one derivation never submitted yet retired "terminal", the other
+/// judged against the wrong expected outcomes, and the report denominator
+/// counting units that produced no record. (The drv direction needs no
+/// check here: entries are built one per workload derivation, so drv
+/// paths are unique by construction; duplicate `units.jsonl` records for
+/// one drv are resolved at archive open — see the reader's units
+/// supersession rule.)
 pub fn load_units(archive: &ReplayArchive) -> Result<Vec<ManifestEntry>> {
     let units = archive.units();
     let mut entries = Vec::with_capacity(archive.workload_units().len());
@@ -99,6 +113,25 @@ pub fn load_units(archive: &ReplayArchive) -> Result<Vec<ManifestEntry>> {
         entries.push(workload_entry(archive, drv, units.get(drv))?);
     }
     entries.sort_by(|a, b| a.job.cmp(&b.job).then_with(|| a.drv_path.cmp(&b.drv_path)));
+    let mut by_job: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for entry in &entries {
+        by_job
+            .entry(entry.job.as_str())
+            .or_default()
+            .push(entry.drv_path.as_str());
+    }
+    let collisions: Vec<String> = by_job
+        .iter()
+        .filter(|(_, drvs)| drvs.len() > 1)
+        .map(|(job, drvs)| format!("{job:?} -> [{}]", drvs.join(", ")))
+        .collect();
+    anyhow::ensure!(
+        collisions.is_empty(),
+        "units.jsonl maps one job key to multiple workload derivations; the job key is the \
+         engine's reporting identity, so each collision would silently drop all but one of its \
+         units from scheduling and accounting:\n  {}",
+        collisions.join("\n  ")
+    );
     Ok(entries)
 }
 

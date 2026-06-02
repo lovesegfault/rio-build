@@ -185,7 +185,16 @@ impl ReplayArchive {
 
         // Per-unit metadata; records for derivations outside the workload are
         // dropped with a warning (they cannot be scheduled, so keeping them
-        // would only mislead filters and reports).
+        // would only mislead filters and reports). Duplicate records for one
+        // derivation keep the last — the same supersession rule as duplicate
+        // outcome keys — but loudly: aliased source jobs (two attr paths
+        // evaluating to one derivation, a routine Hydra shape) arrive as two
+        // records here, and the shadowed label leaves the campaign's
+        // reporting entirely.
+        // TODO: the shadowed label is absent from results AND exclusions, so
+        // scope-item completeness accounting cannot name it; making the
+        // accounting total needs the recorder to emit an alias exclusion
+        // record for every shadowed label at archive-creation time.
         let mut units: HashMap<String, UnitRecord> = HashMap::new();
         if let Some(bytes) = staged.get(UNITS_MEMBER) {
             for record in super::parse_jsonl::<UnitRecord>(bytes, UNITS_MEMBER)? {
@@ -197,7 +206,17 @@ impl ReplayArchive {
                     );
                     continue;
                 }
-                units.insert(record.drv.clone(), record);
+                if let Some(shadowed) = units.insert(record.drv.clone(), record) {
+                    let kept = &units[&shadowed.drv];
+                    tracing::warn!(
+                        drv = %shadowed.drv,
+                        kept_label = ?kept.label,
+                        shadowed_label = ?shadowed.label,
+                        "duplicate {UNITS_MEMBER} records for one workload derivation; keeping \
+                         the later record — the shadowed label will not appear in campaign \
+                         results or exclusions"
+                    );
+                }
             }
         }
 
@@ -598,6 +617,9 @@ impl ReplayArchive {
     }
 
     /// Per-unit metadata keyed by drv path (empty when units.jsonl absent).
+    /// Duplicate records for one derivation kept the last at open time —
+    /// the supersession rule shared with duplicate outcome keys — with a
+    /// warning naming the shadowed label.
     pub fn units(&self) -> &HashMap<String, UnitRecord> {
         &self.units
     }
@@ -1506,6 +1528,80 @@ mod tests {
                 .unwrap()
                 .outcome,
             crate::archive::schema::ExpectedOutcome::Failed
+        );
+    }
+
+    /// One job key naming two distinct workload derivations is refused at
+    /// the engine's ingest boundary with an error listing the colliders:
+    /// every downstream structure (contexts, truth, the pending/terminal
+    /// pools, latest-record-per-job results) is a job-keyed last-wins map,
+    /// so admitting the collision would silently drop one unit from
+    /// scheduling and accounting. The unedited archive — distinct labels
+    /// for distinct derivations — must keep loading.
+    #[test]
+    fn load_units_refuses_one_job_key_naming_two_derivations() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        // Must-admit: distinct labels load one entry per workload drv.
+        let archive = ReplayArchive::open(&root).unwrap();
+        let entries = crate::run::archive_input::load_units(&archive).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // A foreign or windowed recorder labels two derivations with one
+        // job name (e.g. the same attr at two source revisions).
+        rewrite_member(
+            &root,
+            UNITS_MEMBER,
+            "pkgs.app.x86_64-linux",
+            "pkgs.dep.x86_64-linux",
+        );
+        refresh_files_entry(&root, UNITS_MEMBER);
+
+        let archive = ReplayArchive::open(&root).unwrap();
+        let err = format!(
+            "{:#}",
+            crate::run::archive_input::load_units(&archive).unwrap_err()
+        );
+        assert!(err.contains("one job key"), "got: {err}");
+        assert!(
+            err.contains("pkgs.dep.x86_64-linux") && err.contains(DEP_DRV) && err.contains(APP_DRV),
+            "the error must name the colliding job key and every derivation it claims: {err}"
+        );
+    }
+
+    /// Duplicate units.jsonl records for ONE derivation (aliased source
+    /// jobs: two attr paths evaluating to the same drv) keep the last
+    /// record — the supersession rule duplicate outcome keys already use —
+    /// and the workload itself is unaffected: still one entry per
+    /// derivation, under the surviving label.
+    #[test]
+    fn duplicate_drv_unit_records_keep_the_last() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        let path = root.join(UNITS_MEMBER);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(&format!(
+            "{{\"drv\":\"{APP_DRV}\",\"label\":\"pkgs.appAlias.x86_64-linux\"}}\n"
+        ));
+        std::fs::write(&path, text).unwrap();
+        refresh_files_entry(&root, UNITS_MEMBER);
+
+        let archive = ReplayArchive::open(&root).unwrap();
+        assert_eq!(archive.units().len(), 2, "one record per derivation");
+        assert_eq!(
+            archive.units()[APP_DRV].label.as_deref(),
+            Some("pkgs.appAlias.x86_64-linux"),
+            "the later record supersedes"
+        );
+        let entries = crate::run::archive_input::load_units(&archive).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.job == "pkgs.appAlias.x86_64-linux"),
+            "{entries:?}"
         );
     }
 
