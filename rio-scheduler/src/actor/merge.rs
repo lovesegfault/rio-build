@@ -32,7 +32,7 @@ use super::{ActorError, DagActor, MergeDagRequest};
 /// `node_index` is NOT carried (it borrows from `nodes`, which would
 /// make this self-referential) — `reconcile_merged_state` rebuilds it
 /// in one pass over `nodes`.
-/// INVARIANT (sched.merge.heal-accepted-edges): no field of this struct
+/// INVARIANT (sched.merge.heal-accepted-edges+1): no field of this struct
 /// may derive from the raw request edge list. Everything downstream of
 /// the merge — the closure-hole heal, the `topdown_pruned`
 /// clear-candidate seeding, the PG edge persist, metrics — must read
@@ -882,7 +882,7 @@ impl DagActor {
         // drops it (with the lazy clear in `handle_substitute_complete`
         // as the walk-failure backstop).
         //
-        // r[impl sched.merge.heal-accepted-edges]
+        // r[impl sched.merge.heal-accepted-edges+1]
         // Closure-hole healing comes FIRST: a full merge that
         // re-declares a node's edges AND has every one of them accepted
         // re-supplies its inputDrvs, so its child set is representative
@@ -916,19 +916,32 @@ impl DagActor {
         // earlier heal's best-effort write may simply have failed. The
         // helper's `AND closure_hole` WHERE keeps the statement a
         // no-op for rows that never carried the hole.
-        for hash in &ingest.merge_result.healed_parents {
+        for (hash, witness) in &ingest.merge_result.healed_parents {
             if let Some(s) = self.dag.node_mut(hash) {
-                // C6c2 gates this behind the HealWitness token; the
-                // narrow mutation surface is what the witness-set type
-                // gives us today.
-                s.closure_hole.clear_for_heal();
+                // The witness proves the merge's positive-coverage
+                // check ran for THIS parent (missing ⊆ post-insert
+                // children) — sched.evidence.positive-witness.
+                s.closure_hole.clear_for_heal(witness);
             }
+        }
+        if !ingest.merge_result.heal_refused_parents.is_empty() {
+            // Accepted trigger but the re-declared set does not cover
+            // the witness set: the hole survives, fail-fast routing
+            // intact. Expected for subset re-declarations after a reap;
+            // hostile junk top-ups land here too.
+            metrics::counter!("rio_scheduler_closure_heal_refused_total")
+                .increment(ingest.merge_result.heal_refused_parents.len() as u64);
+            tracing::debug!(
+                build_id = %build_id,
+                refused = ingest.merge_result.heal_refused_parents.len(),
+                "closure-hole heal refused: re-supply does not cover the witness set"
+            );
         }
         let heal_parents: Vec<String> = ingest
             .merge_result
             .healed_parents
             .iter()
-            .map(|h| h.to_string())
+            .map(|(h, _)| h.to_string())
             .collect();
         if !heal_parents.is_empty()
             && let Err(e) = self.db.clear_closure_hole_by_hashes(&heal_parents).await
@@ -936,8 +949,17 @@ impl DagActor {
             warn!(build_id = %build_id, count = heal_parents.len(), error = %e,
                   "failed to clear persisted closure_hole after merge heal (continuing)");
         }
-        let mut clear_candidates: HashSet<DrvHash> =
-            ingest.merge_result.healed_parents.iter().cloned().collect();
+        // Seeded from the accepted TRIGGER set (not the coverage-gated
+        // heal set): the topdown clear is independently gated on
+        // closure_vouched below, and a holed parent is never Vouched —
+        // so the wider seed keeps today's reach without re-opening the
+        // laundering channel.
+        let mut clear_candidates: HashSet<DrvHash> = ingest
+            .merge_result
+            .accepted_edge_parents
+            .iter()
+            .cloned()
+            .collect();
         for child in ingest.cached_hits.keys() {
             clear_candidates.extend(self.dag.get_parents(child));
         }
@@ -1417,7 +1439,7 @@ impl DagActor {
                 return Err(ActorError::Dag(e));
             }
         };
-        // r[impl sched.merge.heal-accepted-edges]
+        // r[impl sched.merge.heal-accepted-edges+1]
         // The raw request edge list is dead from here on: every consumer
         // of "what this submission's edges did" must read `merge_result`
         // (computed by the same loop that enforces edge admission), so an
@@ -1448,7 +1470,7 @@ impl DagActor {
         // full-closure rejoin after a reap truncated the parent's
         // children. Not hostile; counted separately (debug-level) and
         // the parent's hole deliberately stays set until a submission
-        // re-creates the node (sched.merge.heal-accepted-edges).
+        // re-creates the node (sched.merge.heal-accepted-edges+1).
         if !merge_result.rejoin_parent_edges_skipped.is_empty() {
             let count = merge_result.rejoin_parent_edges_skipped.len() as u64;
             metrics::counter!("rio_scheduler_merge_rejoin_edge_skipped_total").increment(count);

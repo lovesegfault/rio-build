@@ -957,10 +957,11 @@ impl ClosureHole {
         self.missing = rows.into_iter().collect();
     }
 
-    /// Clear on positive coverage. The ONLY legitimate caller is the
-    /// merge heal (C6c2 gates this behind `HealWitness`); everything
-    /// else extends or carries.
-    pub fn clear_for_heal(&mut self) {
+    /// Clear on positive coverage. Requires a [`crate::dag::HealWitness`]
+    /// — mintable only by the coverage branch in `DerivationDag::merge`
+    /// (`sched.evidence.positive-witness`), so an absence-of-objection
+    /// clear is unwritable outside tests.
+    pub fn clear_for_heal(&mut self, _witness: &crate::dag::HealWitness) {
         self.missing.clear();
     }
 }
@@ -1253,7 +1254,7 @@ pub struct DerivationState {
     /// re-declares the node's edges AND the merge ACCEPTS every one of
     /// them (`MergeResult::healed_parents` — its child set is
     /// representative again; a gate-skipped declared edge vetoes the
-    /// heal, sched.merge.heal-accepted-edges) and when a Vouched-keyed
+    /// heal, sched.merge.heal-accepted-edges+1) and when a Vouched-keyed
     /// clear pass consumes the
     /// `topdown_pruned` mark it qualifies (the batched
     /// `clear_topdown_pruned_by_hashes` drops both bits; the singular

@@ -4214,9 +4214,12 @@ async fn test_recovery_restores_closure_hole_and_heal_clears_persisted_breadcrum
         .await?;
         // The 069 witness row the transactional writers always pair
         // with the flag (recovery hydration debug-asserts the pairing).
+        // The missing child is `chrec-dep` — the one the post-failover
+        // covering merge below re-supplies; heal-accepted-edges+1
+        // demands the re-declaration cover exactly this set.
         sqlx::query(
             "INSERT INTO derivation_closure_missing (drv_hash, missing_child) \
-             VALUES ('chrec-root', 'chrec-reaped')",
+             VALUES ('chrec-root', 'chrec-dep')",
         )
         .execute(&pool)
         .await?;
@@ -4253,10 +4256,10 @@ async fn test_recovery_restores_closure_hole_and_heal_clears_persisted_breadcrum
         "fixture premise: the backdated mark + breadcrumb are still persisted after recovery"
     );
 
-    // A post-failover FULL merge re-declares the node's edges: its child
-    // set is representative of its closure again, so the heal drops the
-    // breadcrumb in memory and pushes the PG clear for every edge parent
-    // it re-declares (total — not keyed on the restored in-memory value).
+    // A post-failover FULL merge re-declares the node's edges AND
+    // re-supplies the recorded missing child: coverage met, so the heal
+    // drops the breadcrumb in memory and pushes the PG clear (total —
+    // not keyed on the restored in-memory value).
     merge_dag(
         &handle,
         Uuid::new_v4(),
@@ -4490,6 +4493,89 @@ async fn stage_parent_with_other_builds_cancelled_child(
         .bind(b2)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+// r[verify sched.merge.heal-accepted-edges+1]
+/// Failover-durability of a REFUSED heal: the witness set survives
+/// recovery (hydrated from 069), a post-failover subset re-declaration
+/// is refused, and BOTH halves of the persisted breadcrumb (M_064 flag
+/// + 069 witness rows) remain for the next failover. The laundering
+/// channel must not re-open across leader changes.
+#[tokio::test]
+async fn test_refused_heal_keeps_witness_durable_across_failover() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let f = RecoveryFixture::run(async |handle, pool| {
+        let mut parent = make_node("rhw-root");
+        parent.expected_output_paths = vec![test_store_path("rhw-root-out")];
+        merge_dag(
+            &handle,
+            build_id,
+            vec![parent, make_node("rhw-s")],
+            vec![make_test_edge("rhw-root", "rhw-s")],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        // Old leader reaped an un-produced second child: pruned-parked
+        // root, flag + witness persisted in one transaction.
+        sqlx::query(
+            "UPDATE derivations SET status = 'substituting', topdown_pruned = true, \
+             closure_hole = true WHERE drv_hash = 'rhw-root'",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO derivation_closure_missing (drv_hash, missing_child) \
+             VALUES ('rhw-root', 'rhw-reaped')",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+    let pool = f.db.pool.clone();
+
+    // Recovery hydrated the witness set (not the LOST_WITNESS sentinel).
+    let d = expect_drv(&handle, "rhw-root").await;
+    assert!(d.closure_hole, "hole restored at recovery");
+    assert_eq!(d.closure_missing_count, 1, "witness hydrated from 069");
+
+    // Post-failover SUBSET re-declaration (the surviving child only,
+    // through the pruned-root carve-out): accepted trigger, refused
+    // heal.
+    let b2 = Uuid::new_v4();
+    let mut parent = make_node("rhw-root");
+    parent.expected_output_paths = vec![test_store_path("rhw-root-out")];
+    merge_dag(
+        &handle,
+        b2,
+        vec![parent, make_node("rhw-s")],
+        vec![make_test_edge("rhw-root", "rhw-s")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let d = expect_drv(&handle, "rhw-root").await;
+    assert!(
+        d.closure_hole,
+        "subset re-declaration must not heal across a failover"
+    );
+    assert_eq!(d.closure_missing_count, 1, "witness set intact in memory");
+    let (flag,): (bool,) =
+        sqlx::query_as("SELECT closure_hole FROM derivations WHERE drv_hash = 'rhw-root'")
+            .fetch_one(&pool)
+            .await?;
+    assert!(flag, "persisted flag survives the refused heal");
+    let (rows,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM derivation_closure_missing WHERE drv_hash = 'rhw-root'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(rows, 1, "persisted witness rows survive the refused heal");
     Ok(())
 }
 

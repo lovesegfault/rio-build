@@ -248,7 +248,7 @@ impl DagActor {
     /// child was reaped out from under them, so their produced children
     /// are a truncated view of the pruned closure — the fail-fast or a
     /// later full merge whose re-declared edges are all accepted
-    /// (sched.merge.heal-accepted-edges) resolves them instead.
+    /// (sched.merge.heal-accepted-edges+1) resolves them instead.
     /// Per-parent work is flag-gated (one node lookup) before the
     /// children scan; the PG write is one batched best-effort statement
     /// (warn-and-continue, same posture as the lazy and fail-fast

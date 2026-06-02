@@ -90,6 +90,7 @@
     "rio_scheduler_cancel_signal_dropped_total",
     "rio_scheduler_cancel_signals_total",
     "rio_scheduler_cleanup_dropped_total",
+    "rio_scheduler_closure_heal_refused_total",
     "rio_scheduler_completions_rejected_total",
     "rio_scheduler_critical_path_accuracy",
     "rio_scheduler_derivations_gc_deleted_total",
@@ -682,6 +683,11 @@
         "help": "Terminal-build cleanup commands dropped due to channel backpressure; alert if rate > 0"
       },
       {
+        "name": "rio_scheduler_closure_heal_refused_total",
+        "kind": "counter",
+        "help": "Closure-hole heals refused at merge: the parent's full declared edge set was accepted, but the re-declaration does not cover the recorded witness set (sched.merge.heal-accepted-edges+1) — subset re-declaration after a reap (expected), junk top-up, or a lost-witness sentinel. The hole and its fail-fast routing survive."
+      },
+      {
         "name": "rio_scheduler_completions_rejected_total",
         "kind": "counter",
         "help": "CompletionReport dropped at the recv arm before reaching the actor. A real store path is ≤259 bytes, so path_too_long can only fire for a report that could never have matched a live assignment — the drop moves the actor's inevitable \"unknown derivation\" discard off the single-threaded event loop. Labeled by reason: path_too_long."
@@ -879,7 +885,7 @@
       {
         "name": "rio_scheduler_merge_rejoin_edge_skipped_total",
         "kind": "counter",
-        "help": "Submitted dependency edges skipped at merge whose parent is a resident closure-holed node not (re)created by the submission — the legitimate full-closure rejoin signature after a reap truncated the parent's children (sched.merge.heal-accepted-edges). The parent's hole stays set until a submission re-creates the node."
+        "help": "Submitted dependency edges skipped at merge whose parent is a resident closure-holed node not (re)created by the submission — the legitimate full-closure rejoin signature after a reap truncated the parent's children (sched.merge.heal-accepted-edges+1). The parent's hole stays set until a submission re-creates the node and re-supplies every recorded missing child."
       },
       {
         "name": "rio_scheduler_merge_store_evidence_total",

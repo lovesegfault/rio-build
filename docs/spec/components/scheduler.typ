@@ -933,7 +933,7 @@ future gateway-consistency cross-check for nodes that carry inline content),
 and a topdown-pruned root accepts dependency top-ups from any submitter
 while the flag is set.
 
-#r("sched.merge.heal-accepted-edges")[
+#r("sched.merge.heal-accepted-edges+1")[
   Every post-merge consumer of "what this submission's edges did" --- the
   closure-hole heal, the `topdown_pruned` clear-candidate seeding, the
   persisted edge rows, and the edge-skip metrics --- MUST be derived from the
@@ -941,9 +941,13 @@ while the flag is set.
   submitter's raw declared edge list. The closure-hole breadcrumb of a
   resident node MUST be cleared by a merge only when that node's *entire*
   declared edge set was accepted (each declared edge either attached or an
-  exact re-declaration of an existing edge); a declared edge skipped by the
-  creation-scoped gate or naming an unresolvable child MUST veto the heal
-  for its parent.
+  exact re-declaration of an existing edge) AND the merge positively covers
+  the recorded truncation: every missing child on the node's closure-hole
+  witness set MUST be among the node's post-merge children. A declared edge
+  skipped by the creation-scoped gate or naming an unresolvable child MUST
+  veto the heal for its parent; an accepted re-declaration that does not
+  cover the witness set MUST leave the hole (and its fail-fast routing)
+  intact and MUST be surfaced rather than silently retried.
 ]
 
 The closure-hole breadcrumb is reap-truncation *evidence*: it records that a
@@ -1097,10 +1101,11 @@ submitted after the failover record contributions as usual).
   DAG and no un-produced child has been reaped out from under it since
   (the closure-hole breadcrumb is recorded in memory and persisted
   alongside the mark, is carried across a resubmit retry of the node, and is
-  dropped only when a later full merge re-declares its edges *and the merge
-  accepts every one of them* --- a declared edge skipped by the
-  creation-scoped gate or naming an unresolvable child vetoes the heal,
-  #rref("sched.merge.heal-accepted-edges")), or
+  dropped only when a later full merge re-declares its edges, *the merge
+  accepts every one of them*, and the re-supply covers the recorded
+  witness set --- a skipped edge, an unresolvable child, or an uncovered
+  missing child vetoes the heal,
+  #rref("sched.merge.heal-accepted-edges+1")), or
   when the fail-fast below consumes it --- a merge that gives it only
   unbuilt children leaves the mark in place. The scheduler MUST
   fall through to the full merge and the bottom-up `check_cached_outputs`

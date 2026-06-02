@@ -3665,7 +3665,7 @@ async fn test_unmarked_closure_holed_node_still_dispatches_from_source() -> Test
     Ok(())
 }
 
-// r[verify sched.merge.heal-accepted-edges]
+// r[verify sched.merge.heal-accepted-edges+1]
 /// End-to-end: a join whose declared edge is GATE-SKIPPED must not heal
 /// the closure hole — in memory or in PG — and the surviving hole must
 /// still do its protective job (a later prune that keeps the node
@@ -4085,31 +4085,93 @@ async fn test_topdown_pruned_kept_after_closure_hole_until_full_remerge_heals() 
     );
 
     // Phase B — the heal. B4 full-merges R with its real edge set
-    // (app2 → R → dep2; app2's output is not substitutable, so no
-    // prune). Re-declaring R's edges makes its child set representative
-    // again: the post-reconciliation pass heals the breadcrumb and,
-    // with dep2 produced, clears the mark in memory and PG.
+    // (app2 → R → {dep1, dep2}). Round-15 heal-accepted-edges+1: the
+    // re-declaration must POSITIVELY COVER the witness set — dep1 is
+    // what the reap removed, so the heal demands dep1 back among R's
+    // children (a dep2-only re-declaration is the subset shape
+    // merged_bug_073 exploited and is now refused; see
+    // test_subset_redeclaration_does_not_heal_closure_hole). With the
+    // full set re-supplied and dep2 produced, the post-reconciliation
+    // pass heals the breadcrumb and clears the mark in memory and PG.
     let mut app2 = make_node("tdch-app2");
     app2.expected_output_paths = vec![test_store_path("tdch-app2-out")];
     let b4 = Uuid::new_v4();
     let _ev4 = merge_dag(
         &handle,
         b4,
-        vec![app2, mk_r(), mk_dep2()],
+        vec![app2, mk_r(), mk_dep1(), mk_dep2()],
         vec![
             make_test_edge("tdch-app2", "tdch-r"),
+            make_test_edge("tdch-r", "tdch-dep1"),
             make_test_edge("tdch-r", "tdch-dep2"),
         ],
         false,
     )
     .await?;
     barrier(&handle).await;
+    // The covering re-declaration heals the HOLE (witness set covered:
+    // dep1 is back among R's children) — but the topdown mark is a
+    // SEPARATE gate keyed on closure_vouched, and the re-supplied dep1
+    // is unbuilt, so the mark must survive. Pre-round-15 this test
+    // asserted the mark cleared here — that pass was the
+    // merged_bug_073 laundering itself (the dep2-only subset made the
+    // truncated child set look Vouched).
     let healed = expect_drv(&handle, "tdch-r").await;
+    assert_eq!(
+        healed.closure_missing_count, 0,
+        "the covering re-declaration heals the hole (witness set covered)"
+    );
     assert!(
-        !healed.topdown_pruned,
-        "a full merge that re-declares R's edges heals the closure hole, and \
-         with its (now representative) children all produced the mark must be \
-         cleared in memory"
+        !healed.closure_hole,
+        "in-memory hole cleared by the witnessed heal"
+    );
+    let (pg_hole_after_heal,): (bool,) =
+        sqlx::query_as("SELECT closure_hole FROM derivations WHERE drv_hash = 'tdch-r'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        !pg_hole_after_heal,
+        "the heal clears the persisted hole too"
+    );
+    assert!(
+        healed.topdown_pruned,
+        "the mark does NOT ride the heal: dep1 was re-supplied unbuilt, so R \
+         is not Vouched and the from-source guard must hold"
+    );
+
+    // Produce the re-supplied child: seed its output and run a second
+    // covering merge — the merge-time cache probe completes dep1, and
+    // the SAME merge's post-reconciliation pass now sees a genuinely
+    // Vouched (all-produced, un-holed) child set and drops the mark in
+    // memory and PG.
+    store.seed_with_content(&test_store_path("tdch-dep1-out"), b"dep1-out");
+    let mut app3 = make_node("tdch-app2");
+    app3.expected_output_paths = vec![test_store_path("tdch-app2-out")];
+    let b5 = Uuid::new_v4();
+    let _ev5 = merge_dag(
+        &handle,
+        b5,
+        vec![app3, mk_r(), mk_dep1(), mk_dep2()],
+        vec![
+            make_test_edge("tdch-app2", "tdch-r"),
+            make_test_edge("tdch-r", "tdch-dep1"),
+            make_test_edge("tdch-r", "tdch-dep2"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert!(
+        matches!(
+            expect_drv(&handle, "tdch-dep1").await.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "fixture premise: dep1 cache-hits on the covering re-merge"
+    );
+    let cleared = expect_drv(&handle, "tdch-r").await;
+    assert!(
+        !cleared.topdown_pruned,
+        "with the witness covered AND every child produced, the mark clears"
     );
     let (pg_marked_after_heal,): (bool,) =
         sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdch-r'")
@@ -4117,7 +4179,7 @@ async fn test_topdown_pruned_kept_after_closure_hole_until_full_remerge_heals() 
             .await?;
     assert!(
         !pg_marked_after_heal,
-        "the post-reconciliation clear must reach PG as well, so a failover \
+        "the post-completion clear must reach PG as well, so a failover \
          cannot resurrect the mark after the heal"
     );
     Ok(())

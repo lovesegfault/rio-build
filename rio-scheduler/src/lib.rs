@@ -170,8 +170,17 @@ pub fn describe_metrics() {
         "Submitted dependency edges skipped at merge whose parent is a resident \
          closure-holed node not (re)created by the submission — the legitimate \
          full-closure rejoin signature after a reap truncated the parent's children \
-         (sched.merge.heal-accepted-edges). The parent's hole stays set until a \
-         submission re-creates the node."
+         (sched.merge.heal-accepted-edges+1). The parent's hole stays set until a \
+         submission re-creates the node and re-supplies every recorded missing \
+         child."
+    );
+    describe_counter!(
+        "rio_scheduler_closure_heal_refused_total",
+        "Closure-hole heals refused at merge: the parent's full declared edge \
+         set was accepted, but the re-declaration does not cover the recorded \
+         witness set (sched.merge.heal-accepted-edges+1) — subset re-declaration \
+         after a reap (expected), junk top-up, or a lost-witness sentinel. The \
+         hole and its fail-fast routing survive."
     );
     describe_counter!(
         "rio_scheduler_merge_store_evidence_total",

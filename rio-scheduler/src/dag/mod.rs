@@ -334,21 +334,37 @@ pub struct MergeResult {
     /// because this shape is expected traffic, not hostility — and the
     /// vetoed parent deliberately stays OUT of `healed_parents`.
     pub rejoin_parent_edges_skipped: Vec<(DrvHash, DrvHash)>,
-    // r[impl sched.merge.heal-accepted-edges]
+    // r[impl sched.merge.heal-accepted-edges+1]
     /// Parents whose ENTIRE declared edge set was accepted by this
-    /// merge: every declared edge with this parent was either attached
-    /// (`new_edges`) or already present (silent re-declaration). Any
-    /// gate-skipped edge (foreign or rejoin) and any edge whose child
-    /// endpoint did not resolve vetoes its parent. This — not the raw
-    /// request edge list — is the only legitimate key for the
-    /// closure-hole heal and the `topdown_pruned` clear-candidate
-    /// seeding: a parent whose declared set was only PARTIALLY accepted
-    /// has a child set that is not representative of its closure, so
-    /// healing it would launder reap-truncation evidence into Vouched
-    /// closure evidence. Computed by the same loop that enforces edge
-    /// admission, so any future tightening of the gate automatically
-    /// propagates here.
-    pub healed_parents: Vec<DrvHash>,
+    /// merge (every declared edge attached or an exact re-declaration;
+    /// any gate-skipped or unresolvable-child edge vetoes). This is the
+    /// heal TRIGGER and the `topdown_pruned` clear-candidate seed — but
+    /// acceptance alone no longer heals (round-15 merged_bug_073:
+    /// "every declared edge accepted" is satisfiable by a SUBSET
+    /// re-declaration of the surviving children, which would launder
+    /// reap-truncation evidence into Vouched). The heal itself is
+    /// `healed_parents`.
+    pub accepted_edge_parents: Vec<DrvHash>,
+    // r[impl sched.merge.heal-accepted-edges+1]
+    /// Parents this merge may HEAL: accepted trigger ∧ positive
+    /// re-supply coverage — every recorded missing child
+    /// (`ClosureHole::missing`, the 069 witness set) is among the
+    /// parent's post-insert children. Un-holed parents are trivially
+    /// covered (subset over the empty set), preserving the stale-PG
+    /// total-clear semantics: the persisted bit can outlive the
+    /// in-memory hole (reap+reinsert, poisoned-stub recovery, lost
+    /// best-effort heal write), so an un-holed accepted parent still
+    /// clears the column. The paired [`HealWitness`] is constructible
+    /// ONLY by the coverage branch in `merge()` — possession proves
+    /// the subset check ran (`sched.evidence.positive-witness`).
+    pub healed_parents: Vec<(DrvHash, HealWitness)>,
+    /// Accepted-trigger parents REFUSED the heal: holed, and the
+    /// re-declared set does not cover the witness set (subset
+    /// re-declaration, junk top-up, or the recovery LOST_WITNESS
+    /// sentinel — uncoverable by construction). Surfaced via
+    /// `rio_scheduler_closure_heal_refused_total`; the hole (and its
+    /// fail-fast routing) survives.
+    pub heal_refused_parents: Vec<DrvHash>,
     /// Hashes of pre-existing nodes whose empty `traceparent` was
     /// upgraded to `submitter_traceparent` by this merge. Rollback
     /// clears it back to `""` so a rejected build's trace ID does not
@@ -409,6 +425,16 @@ pub(crate) struct DisplacementBookkeeping<'a> {
     pub(crate) displaced_scrubbed_edges: &'a mut Vec<(DrvHash, HashSet<DrvHash>)>,
     pub(crate) displaced: &'a mut Vec<DrvHash>,
 }
+
+/// Zero-size proof that the positive re-supply coverage check ran for
+/// a healed parent: `missing(p) ⊆ post-insert children(p)`. The only
+/// constructor is the coverage branch in [`DerivationDag::merge`] —
+/// holding one (even by reference) is what authorizes
+/// [`crate::state::ClosureHole::clear_for_heal`]
+/// (`sched.evidence.positive-witness`); no other code path can mint
+/// the token, so an absence-of-objection heal is unwritable.
+#[derive(Debug)]
+pub struct HealWitness(());
 
 /// Result of [`DerivationDag::remove_build_interest_and_reap`].
 #[derive(Debug, Default)]
@@ -796,7 +822,7 @@ impl DerivationDag {
         let mut foreign_parent_edges_skipped: Vec<(DrvHash, DrvHash)> = Vec::new();
         let mut rejoin_parent_edges_skipped: Vec<(DrvHash, DrvHash)> = Vec::new();
         // Per-parent edge-admission bookkeeping for healed_parents
-        // (sched.merge.heal-accepted-edges): a parent is healed iff every
+        // (sched.merge.heal-accepted-edges+1): the TRIGGER is computed iff every
         // declared edge naming it was accepted (attached or already
         // present). Vetoes: gate-skipped edge (either kind) or an edge
         // whose child endpoint did not resolve.
@@ -1382,7 +1408,7 @@ impl DerivationDag {
                     .get(&parent_hash)
                     .is_some_and(|s| s.topdown_pruned);
             if !parent_creation_scoped && !already_present {
-                // r[impl sched.merge.heal-accepted-edges]
+                // r[impl sched.merge.heal-accepted-edges+1]
                 // A gate-skipped edge vetoes its parent's heal either way;
                 // the split below only decides observability. A parent
                 // carrying the closure_hole breadcrumb is the legitimate
@@ -1432,17 +1458,39 @@ impl DerivationDag {
             }
         }
 
-        // r[impl sched.merge.heal-accepted-edges]
-        // healed_parents = declared − vetoed: parents whose every declared
-        // edge was accepted (attached or already present). Computed here —
-        // by the same loop that enforces admission — and never from the
-        // raw request edge list, so edge-gate tightening can never diverge
-        // from the heal. merge() only COMPUTES this set; the closure_hole
-        // mutation itself happens actor-side (no new rollback obligation).
-        let healed_parents: Vec<DrvHash> = edge_parents_declared
+        // r[impl sched.merge.heal-accepted-edges+1]
+        // accepted = declared − vetoed (the TRIGGER); healed = accepted
+        // ∧ witness-set coverage. The subset check runs over the
+        // post-insert children map — both operands scheduler-owned
+        // (sched.evidence.positive-witness): the witness set was
+        // recorded by the truncation that removed the children, and
+        // the children map reflects what THIS merge actually attached.
+        let accepted_edge_parents: Vec<DrvHash> = edge_parents_declared
             .into_iter()
             .filter(|p| !edge_parents_vetoed.contains(p))
             .collect();
+        let mut healed_parents: Vec<(DrvHash, HealWitness)> = Vec::new();
+        let mut heal_refused_parents: Vec<DrvHash> = Vec::new();
+        for p in &accepted_edge_parents {
+            let covered = match self.nodes.get(p).map(|s| s.closure_hole.missing()) {
+                // Un-holed (or no longer resident): trivially covered —
+                // the stale-PG total-clear semantics (see the field doc).
+                None => true,
+                Some(missing) if missing.is_empty() => true,
+                Some(missing) => {
+                    let children = self.children.get(p);
+                    missing
+                        .iter()
+                        .all(|c| children.is_some_and(|cs| cs.contains(c)))
+                }
+            };
+            if covered {
+                // The ONLY HealWitness constructor (see the type doc).
+                healed_parents.push((p.clone(), HealWitness(())));
+            } else {
+                heal_refused_parents.push(p.clone());
+            }
+        }
 
         // Cycle check: DFS from each newly-inserted node AND from each parent
         // endpoint of new edges. The latter catches cycles formed by new edges
@@ -1488,7 +1536,9 @@ impl DerivationDag {
             displaced_scrubbed_edges,
             foreign_parent_edges_skipped,
             rejoin_parent_edges_skipped,
+            accepted_edge_parents,
             healed_parents,
+            heal_refused_parents,
             traceparent_upgraded,
             wanted_grown,
             contributions_recorded,
