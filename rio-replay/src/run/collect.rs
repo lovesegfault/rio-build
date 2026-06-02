@@ -54,6 +54,13 @@ pub struct JobContext {
     pub expected_outputs: BTreeMap<String, super::model::ExpectedOutput>,
     pub plan_not_attemptable: bool,
     pub plan_snapshot_valid: bool,
+    /// Fixed-output derivations (outputHash present in the drv ATerm)
+    /// among the campaign's targets and dependencies, derived once from
+    /// the archive at plan time and shared across contexts. Membership is
+    /// a plain fact, never an Option whose disabling default every caller
+    /// passes: it feeds the source-rot attribution for both the target
+    /// itself and a failing dependency trigger.
+    pub fixed_output_drvs: std::sync::Arc<HashSet<String>>,
 }
 
 /// What collect decided for one job after looking at one settled batch.
@@ -80,14 +87,17 @@ pub enum CollectDecision {
     Requeue { why: &'static str },
 }
 
-/// Failure-kind resolution from the two signals (+ optional fixed-output
-/// knowledge and a log tail). Ambiguous or contradictory evidence defaults
-/// to [`FailureKind::Genuine`] — an unexplained failure is charged to rio,
-/// never excused as infrastructure.
+/// Failure-kind resolution from the two signals (+ fixed-output knowledge
+/// and a log tail). Ambiguous or contradictory evidence defaults to
+/// [`FailureKind::Genuine`] — an unexplained failure is charged to rio,
+/// never excused as infrastructure. `is_fixed_output` is a plain bool on
+/// purpose: the source-rot arm is reachable exactly when the caller's
+/// derivation facts say so, not gated behind an optional default that
+/// silently disables it.
 pub fn resolve_failure_kind(
     reason: Option<&str>,
     failed_builders: Option<&[String]>,
-    is_fixed_output: Option<bool>,
+    is_fixed_output: bool,
     log_tail: Option<&str>,
 ) -> (FailureKind, Option<String>) {
     let signal1 = reason.map(classify_reason);
@@ -108,7 +118,7 @@ pub fn resolve_failure_kind(
         .iter()
         .any(|n| text.contains(n))
     };
-    if is_fixed_output == Some(true) {
+    if is_fixed_output {
         let evidence_text = format!(
             "{} {}",
             reason.unwrap_or_default(),
@@ -269,7 +279,7 @@ pub fn decide(
         let (kind, _) = resolve_failure_kind(
             signal1,
             poisoned.get(&ctx.drv_path).map(Vec::as_slice),
-            None,
+            ctx.fixed_output_drvs.contains(&ctx.drv_path),
             log_tail,
         );
         return CollectDecision::Terminal {
@@ -322,7 +332,11 @@ pub fn decide(
         let (kind, evidence) = resolve_failure_kind(
             trigger_signal1,
             poisoned.get(&trigger).map(Vec::as_slice),
-            None,
+            // The trigger may be the target itself or any closure member;
+            // the shared fixed-output set covers both, so a 404'd
+            // fixed-output dependency cascades as source rot instead of a
+            // genuine dependency failure.
+            ctx.fixed_output_drvs.contains(&trigger),
             None,
         );
         let root = match kind {
@@ -346,7 +360,7 @@ pub fn decide(
     let (kind, evidence) = resolve_failure_kind(
         signal1,
         poisoned.get(&ctx.drv_path).map(Vec::as_slice),
-        None,
+        ctx.fixed_output_drvs.contains(&ctx.drv_path),
         log_tail,
     );
     if kind == FailureKind::Infra && prior_requeues < knobs.max_auto_retries {
@@ -935,6 +949,7 @@ mod tests {
             expected_outputs: BTreeMap::new(),
             plan_not_attemptable: false,
             plan_snapshot_valid: false,
+            fixed_output_drvs: std::sync::Arc::new(HashSet::new()),
         }
     }
 
@@ -1029,7 +1044,7 @@ mod tests {
             resolve_failure_kind(
                 Some("max_infra_retries=3 exhausted after infrastructure failures: x"),
                 Some(&[]),
-                None,
+                false,
                 None
             )
             .0,
@@ -1041,7 +1056,7 @@ mod tests {
             resolve_failure_kind(
                 Some("max_infra_retries=3 exhausted after infrastructure failures: x"),
                 Some(&["b1".to_string()]),
-                None,
+                false,
                 None
             )
             .0,
@@ -1049,16 +1064,16 @@ mod tests {
         );
         // No signal1, poisoned with empty failed_builders → Infra.
         assert_eq!(
-            resolve_failure_kind(None, Some(&[]), None, None).0,
+            resolve_failure_kind(None, Some(&[]), false, None).0,
             FailureKind::Infra
         );
         // No signal1, failed_builders present → Genuine.
         assert_eq!(
-            resolve_failure_kind(None, Some(&["b1".to_string()]), None, None).0,
+            resolve_failure_kind(None, Some(&["b1".to_string()]), false, None).0,
             FailureKind::Genuine
         );
         // Both signals lost (evidence decayed) → Genuine + log-tail-only flag.
-        let (kind, flag) = resolve_failure_kind(None, None, None, Some("error: whatever"));
+        let (kind, flag) = resolve_failure_kind(None, None, false, Some("error: whatever"));
         assert_eq!(kind, FailureKind::Genuine);
         assert_eq!(flag.as_deref(), Some("log-tail-only"));
         // Timeout / resource ceiling get their own kinds.
@@ -1066,7 +1081,7 @@ mod tests {
             resolve_failure_kind(
                 Some("max_timeout_retries=2 exhausted (DeadlineExceeded backstop)"),
                 Some(&[]),
-                None,
+                false,
                 None
             )
             .0,
@@ -1076,7 +1091,7 @@ mod tests {
             resolve_failure_kind(
                 Some("max_infra_retries=3 exhausted at resource ceiling (OomKilled)"),
                 Some(&[]),
-                None,
+                false,
                 None
             )
             .0,
@@ -1087,7 +1102,7 @@ mod tests {
             resolve_failure_kind(
                 Some("builder failed: unable to download 'https://example.com/src.tar.gz'"),
                 Some(&["b1".to_string()]),
-                Some(true),
+                true,
                 None
             )
             .0,
@@ -1098,7 +1113,7 @@ mod tests {
             resolve_failure_kind(
                 Some("builder failed: hash mismatch"),
                 Some(&["b1".to_string()]),
-                Some(true),
+                true,
                 None
             )
             .0,
@@ -1305,6 +1320,156 @@ mod tests {
                 evidence,
             } => assert_eq!(evidence.as_deref(), Some("no-inband-result")),
             other => panic!("expected terminal infra, got {other:?}"),
+        }
+    }
+
+    /// Source-rot reachability through the production decide() path: a
+    /// fixed-output derivation (member of the campaign's fixed-output set)
+    /// whose failure evidence carries a fetch-error signature classifies
+    /// SourceRot — terminal immediately, never the infra auto-retry — and
+    /// the same failure on a non-fixed-output drv stays Genuine. The
+    /// classifier then keys the verdict on the recorded expectation: an
+    /// expected build becomes source-unavailable (excluded from the
+    /// headline as ambient decay), an expected failure matches as
+    /// match-failed.
+    #[test]
+    fn fixed_output_fetch_failures_classify_source_rot_end_to_end() {
+        let knobs = Knobs::default();
+        let no_poison: HashMap<String, Vec<String>> = HashMap::new();
+        let fetch_failure = po(
+            T,
+            BuildStatus::PermanentFailure,
+            "builder failed: unable to download 'https://example.com/src.tar.gz'",
+        );
+        let fixed: std::sync::Arc<HashSet<String>> =
+            std::sync::Arc::new([T.to_string()].into_iter().collect());
+
+        let mut fod_ctx = ctx("src.x86_64-linux", T, &[], ExpectedOutcome::Built);
+        fod_ctx.fixed_output_drvs = fixed.clone();
+        let decision = decide(
+            &fod_ctx,
+            Some(&fetch_failure),
+            &BatchView::default(),
+            &no_poison,
+            0,
+            &knobs,
+            None,
+        );
+        assert_eq!(
+            decision,
+            CollectDecision::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::SourceRot
+                },
+                evidence: None,
+            }
+        );
+        // Expected built → the record carries the source-unavailable
+        // verdict (excluded from the parity headline).
+        let record = build_record(
+            &fod_ctx,
+            &RioOutcome::TargetFailed {
+                kind: FailureKind::SourceRot,
+            },
+            None,
+            Some(&fetch_failure),
+            &BatchView::default(),
+            &no_poison,
+            &HashMap::new(),
+            "leaf",
+            "c1",
+            1,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            record.verdict.as_deref(),
+            Some(Verdict::SourceUnavailable.as_str())
+        );
+        assert_eq!(record.failure_cause.as_deref(), Some("source-rot"));
+
+        // Expected FAILED + the same source-rot failure agrees with the
+        // recording: match-failed, not source-unavailable (design 7.1).
+        let mut expected_failed_ctx = ctx("src.x86_64-linux", T, &[], ExpectedOutcome::Failed);
+        expected_failed_ctx.fixed_output_drvs = fixed;
+        let record = build_record(
+            &expected_failed_ctx,
+            &RioOutcome::TargetFailed {
+                kind: FailureKind::SourceRot,
+            },
+            None,
+            Some(&fetch_failure),
+            &BatchView::default(),
+            &no_poison,
+            &HashMap::new(),
+            "leaf",
+            "c1",
+            1,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            record.verdict.as_deref(),
+            Some(Verdict::MatchFailed.as_str())
+        );
+
+        // The same fetch-shaped failure on a NON-fixed-output drv stays a
+        // genuine rio failure: the set membership is the only thing that
+        // can excuse it, and absence is conservative.
+        let plain_ctx = ctx("app.x86_64-linux", T, &[], ExpectedOutcome::Built);
+        assert!(matches!(
+            decide(
+                &plain_ctx,
+                Some(&fetch_failure),
+                &BatchView::default(),
+                &no_poison,
+                0,
+                &knobs,
+                None
+            ),
+            CollectDecision::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::Genuine
+                },
+                ..
+            }
+        ));
+    }
+
+    /// A failing dependency trigger in the fixed-output set cascades as
+    /// source rot: the dependent is excluded from the headline instead of
+    /// being charged an unexpected dependency failure.
+    #[test]
+    fn fixed_output_dependency_trigger_cascades_source_rot() {
+        let knobs = Knobs::default();
+        let mut c = ctx("app.x86_64-linux", T, &[DEP], ExpectedOutcome::Built);
+        c.fixed_output_drvs = std::sync::Arc::new([DEP.to_string()].into_iter().collect());
+        let batch = BatchView {
+            reasons: BTreeMap::from([(
+                DEP.to_string(),
+                "builder failed: unable to download 'https://example.com/dep.tar.gz'".to_string(),
+            )]),
+            ..BatchView::default()
+        };
+        let target = po(
+            T,
+            BuildStatus::DependencyFailed,
+            &format!(
+                "dependency '{DEP}' failed: builder failed: unable to download \
+                 'https://example.com/dep.tar.gz'"
+            ),
+        );
+        match decide(&c, Some(&target), &batch, &HashMap::new(), 0, &knobs, None) {
+            CollectDecision::Terminal {
+                rio: RioOutcome::DependencyFailed { root, failing_drv },
+                ..
+            } => {
+                assert_eq!(root, RootCauseKind::SourceRot);
+                assert_eq!(failing_drv, DEP);
+            }
+            other => panic!("expected a source-rot dependency failure, got {other:?}"),
         }
     }
 

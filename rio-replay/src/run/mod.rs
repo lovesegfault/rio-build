@@ -684,6 +684,58 @@ fn demoted_impure_jobs(
         .collect()
 }
 
+/// Fixed-output derivations (outputHash present in the drv ATerm) among
+/// the in-scope targets and their dependency closures, parsed once from
+/// the archive's embedded drv texts at the campaign boundary. Collect's
+/// failure attribution consults the set for both the failing target and a
+/// failing dependency trigger, so a 404'd fixed-output fetch classifies
+/// as upstream source rot instead of a genuine rio failure. A drv text the
+/// archive lacks (or that fails to parse) is conservatively treated as
+/// not fixed-output: its failures stay charged to rio, never excused.
+fn fixed_output_drvs(
+    archive: &ReplayArchive,
+    manifest: &[archive_input::ManifestEntry],
+    dep_closure: &[archive_input::DepClosureEntry],
+    in_scope: &HashSet<&str>,
+) -> HashSet<String> {
+    use rio_nix::derivation::{Derivation, DerivationLike as _};
+    let mut candidates: BTreeSet<&str> = manifest
+        .iter()
+        .filter(|m| in_scope.contains(m.job.as_str()))
+        .map(|m| m.drv_path.as_str())
+        .collect();
+    for entry in dep_closure
+        .iter()
+        .filter(|entry| in_scope.contains(entry.job.as_str()))
+    {
+        for dep in &entry.deps {
+            candidates.insert(dep.drv_path.as_str());
+        }
+    }
+    let mut fixed = HashSet::new();
+    for drv_path in candidates {
+        let parsed = archive
+            .read_drv(drv_path)
+            .and_then(|text| Derivation::parse(&text).map_err(anyhow::Error::msg));
+        match parsed {
+            Ok(drv) => {
+                if drv.is_fixed_output() {
+                    fixed.insert(drv_path.to_string());
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    drv = drv_path,
+                    error = %format!("{error:#}"),
+                    "cannot read the derivation text; treating it as not fixed-output \
+                     (its failures will be charged to rio, never excused as source rot)"
+                );
+            }
+        }
+    }
+    fixed
+}
+
 /// One disposition per plan-time-excluded job, derived through
 /// [`classify`] — the single precedence owner — over the union of each
 /// job's plan-time facts. A `BTreeMap` cannot hold two dispositions for
@@ -1633,6 +1685,12 @@ pub async fn run_with_backends(
         .iter()
         .map(String::as_str)
         .collect();
+    let fixed_output = Arc::new(fixed_output_drvs(
+        &archive,
+        &manifest,
+        &dep_closure,
+        &in_scope,
+    ));
     let mut contexts: HashMap<String, JobContext> = HashMap::new();
     let mut attemptable: Vec<batch::PendingJob> = Vec::new();
     for m in manifest
@@ -1668,6 +1726,7 @@ pub async fn run_with_backends(
                 expected_outputs: unit_truth.side.outputs.clone(),
                 plan_not_attemptable: not_attemptable.contains(m.job.as_str()),
                 plan_snapshot_valid: cached_prior_jobs.contains(m.job.as_str()),
+                fixed_output_drvs: fixed_output.clone(),
             },
         );
         if !plan_dispositions.contains_key(m.job.as_str())
@@ -3123,6 +3182,7 @@ mod tests {
                 expected_outputs: BTreeMap::new(),
                 plan_not_attemptable: false,
                 plan_snapshot_valid: false,
+                fixed_output_drvs: Arc::new(HashSet::new()),
             },
         )]);
         let backends = CollectBackends {
@@ -3219,6 +3279,7 @@ mod tests {
             expected_outputs: BTreeMap::new(),
             plan_not_attemptable: false,
             plan_snapshot_valid: false,
+            fixed_output_drvs: Arc::new(HashSet::new()),
         };
         let contexts: HashMap<String, JobContext> = HashMap::from([
             (done_job.to_string(), mk_ctx(done_job, &done_drv)),
@@ -4025,6 +4086,7 @@ mod tests {
             expected_outputs: BTreeMap::new(),
             plan_not_attemptable: false,
             plan_snapshot_valid: false,
+            fixed_output_drvs: Arc::new(HashSet::new()),
         };
         let mut contexts = HashMap::new();
         contexts.insert(
@@ -4366,6 +4428,36 @@ mod tests {
                 ("both.x".to_string(), Disposition::UploadRejected),
             ]),
             "{rollup:?}"
+        );
+    }
+
+    /// Fixed-output-ness is derived from the archive's drv ATerms at the
+    /// campaign boundary: the fixed-output unit (outputHash present) is in
+    /// the set, ordinary derivations are not, and the set feeds every
+    /// in-scope context — so the source-rot attribution is reachable from
+    /// production inputs instead of being permanently disabled by a
+    /// hard-coded None.
+    #[test]
+    fn fixed_output_set_derives_from_the_archive_drv_aterms() {
+        let tmp = tempfile::tempdir().unwrap();
+        archive_input::write_mini_impure_archive(tmp.path());
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let manifest = load_units(&archive).unwrap();
+        let dep_closure = load_closures(&archive, &manifest).unwrap();
+        let in_scope: HashSet<&str> = manifest.iter().map(|m| m.job.as_str()).collect();
+        let fixed = fixed_output_drvs(&archive, &manifest, &dep_closure, &in_scope);
+        let drv_of = |job: &str| {
+            manifest
+                .iter()
+                .find(|m| m.job == job)
+                .unwrap()
+                .drv_path
+                .clone()
+        };
+        assert_eq!(
+            fixed,
+            [drv_of("fetchSrc.x86_64-linux")].into_iter().collect(),
+            "exactly the outputHash-carrying derivation is fixed-output"
         );
     }
 

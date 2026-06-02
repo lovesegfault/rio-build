@@ -1866,6 +1866,7 @@ mod tests {
             expected_outputs: BTreeMap::new(),
             plan_not_attemptable: false,
             plan_snapshot_valid: false,
+            fixed_output_drvs: Arc::new(HashSet::new()),
         }
     }
 

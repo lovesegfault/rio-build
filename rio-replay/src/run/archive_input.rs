@@ -881,12 +881,13 @@ pub(crate) fn write_mini_timed_archive(
 }
 
 /// Write a tiny synthetic directory-form v1 replay archive into `dir`
-/// whose recording declares the impure-env capability: two workload units
-/// (`pureApp.x86_64-linux`, `impureApp.x86_64-linux`), both with recorded
-/// `built` outcomes and requests, and `impure-env.json` listing impure
-/// environment variables for impureApp's derivation — the shape the
-/// impure-demotion policy (live planner and offline dry-run alike) keys
-/// on.
+/// exercising the policy-relevant derivation shapes: three workload units
+/// (`pureApp.x86_64-linux`, `impureApp.x86_64-linux`, and the fixed-output
+/// `fetchSrc.x86_64-linux` whose ATerm carries an outputHash), all with
+/// recorded `built` outcomes and requests, and `impure-env.json` listing
+/// impure environment variables for impureApp's derivation — the shapes
+/// the impure-demotion policy and the fixed-output (source-rot)
+/// attribution key on.
 #[cfg(test)]
 pub(crate) fn write_mini_impure_archive(dir: &std::path::Path) -> MiniArchive {
     use crate::archive::schema::{
@@ -906,6 +907,8 @@ pub(crate) fn write_mini_impure_archive(dir: &std::path::Path) -> MiniArchive {
     let pure_out = out("pureApp-1.0");
     let impure_drv = drv("impureApp-1.0");
     let impure_out = out("impureApp-1.0");
+    let fod_drv = drv("fetchSrc-1.0");
+    let fod_out = out("fetchSrc-1.0");
 
     let writer = ArchiveWriter::create(dir).unwrap();
     writer
@@ -918,6 +921,18 @@ pub(crate) fn write_mini_impure_archive(dir: &std::path::Path) -> MiniArchive {
         .add_drv(
             &impure_drv,
             &synth_aterm(&[("out", impure_out.as_str())], &[], "x86_64-linux"),
+        )
+        .unwrap();
+    // Fixed-output derivation: the single `out` output carries hashAlgo
+    // AND hash, the ATerm shape `is_fixed_output()` keys on.
+    writer
+        .add_drv(
+            &fod_drv,
+            &format!(
+                "Derive([(\"out\",\"{fod_out}\",\"sha256\",\"{hash}\")],[],[],\
+                 \"x86_64-linux\",\"/bin/sh\",[\"-c\",\"true\"],[(\"out\",\"{fod_out}\")])\n",
+                hash = "ab".repeat(32),
+            ),
         )
         .unwrap();
     writer
@@ -938,11 +953,19 @@ pub(crate) fn write_mini_impure_archive(dir: &std::path::Path) -> MiniArchive {
                 required_features: Vec::new(),
                 identity_divergent: false,
             },
+            UnitRecord {
+                drv: fod_drv.clone(),
+                label: Some("fetchSrc.x86_64-linux".to_string()),
+                system: Some("x86_64-linux".to_string()),
+                outputs: BTreeMap::from([("out".to_string(), fod_out.clone())]),
+                required_features: Vec::new(),
+                identity_divergent: false,
+            },
         ])
         .unwrap();
     writer
         .write_requests(
-            &[&pure_drv, &impure_drv]
+            &[&pure_drv, &impure_drv, &fod_drv]
                 .into_iter()
                 .map(|unit_drv| RequestRecord {
                     session: 0,
@@ -957,7 +980,7 @@ pub(crate) fn write_mini_impure_archive(dir: &std::path::Path) -> MiniArchive {
         .unwrap();
     writer
         .write_outcomes(
-            &[&pure_drv, &impure_drv]
+            &[&pure_drv, &impure_drv, &fod_drv]
                 .into_iter()
                 .map(|unit_drv| OutcomeRecord {
                     session: None,
@@ -984,6 +1007,12 @@ pub(crate) fn write_mini_impure_archive(dir: &std::path::Path) -> MiniArchive {
                 inputs: Vec::new(),
                 srcs: Vec::new(),
                 outputs: BTreeMap::from([("out".to_string(), Some(impure_out.clone()))]),
+            },
+            ClosureRecord {
+                drv: fod_drv.clone(),
+                inputs: Vec::new(),
+                srcs: Vec::new(),
+                outputs: BTreeMap::from([("out".to_string(), Some(fod_out.clone()))]),
             },
         ])
         .unwrap();

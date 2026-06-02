@@ -185,14 +185,20 @@ pub fn classify(expected: &ExpectedOutcome, rio: &RioOutcome, flags: &AuxFlags) 
     if not_attempted {
         return disposition(Disposition::NotAttempted);
     }
-    // 10. infra / source-rot (incl. cascaded dependents per the cascade rule).
+    // 10. infra / source-rot (incl. cascaded dependents per the cascade
+    // rule). Infrastructure failures are expectation-independent — the
+    // build never got a fair attempt whatever was recorded. Source rot is
+    // not: an upstream source that has rotted away only contradicts an
+    // expected BUILD; a recording that expected a failure is matched by
+    // any replayed failure shape, so non-built expectations fall through
+    // to the expectation-keyed cross product below.
     match rio {
         RioOutcome::TargetFailed {
             kind: FailureKind::Infra,
         } => return verdict(Verdict::InfraIndeterminate),
         RioOutcome::TargetFailed {
             kind: FailureKind::SourceRot,
-        } => {
+        } if *expected == ExpectedOutcome::Built => {
             return verdict(Verdict::SourceUnavailable);
         }
         RioOutcome::DependencyFailed {
@@ -207,7 +213,7 @@ pub fn classify(expected: &ExpectedOutcome, rio: &RioOutcome, flags: &AuxFlags) 
         RioOutcome::DependencyFailed {
             root: RootCauseKind::SourceRot,
             ..
-        } => {
+        } if *expected == ExpectedOutcome::Built => {
             return Classification {
                 class: UnifiedClass::Verdict(Verdict::SourceUnavailable),
                 cascaded: true,
@@ -478,6 +484,39 @@ mod tests {
         flags(),
         v(Verdict::SourceUnavailable),
         true
+    )]
+    // source rot is keyed on the expectation (design 7.1): an expected
+    // failure is matched by ANY replayed failure shape, source rot
+    // included; only an expected build makes the rot a source-unavailable
+    // exclusion. Recordings with no deterministic expectation keep their
+    // usual no-truth / truth-indeterminate classes.
+    #[case(
+        ExpectedOutcome::Failed,
+        failed(FailureKind::SourceRot),
+        flags(),
+        v(Verdict::MatchFailed),
+        false
+    )]
+    #[case(
+        ExpectedOutcome::Failed,
+        dep(RootCauseKind::SourceRot),
+        flags(),
+        v(Verdict::MatchFailed),
+        false
+    )]
+    #[case(
+        ExpectedOutcome::Unknown,
+        failed(FailureKind::SourceRot),
+        flags(),
+        v(Verdict::NoTruth),
+        false
+    )]
+    #[case(
+        ExpectedOutcome::Cancelled,
+        failed(FailureKind::SourceRot),
+        flags(),
+        v(Verdict::TruthIndeterminate),
+        false
     )]
     // cross product, keyed by the expected outcome first
     #[case(ExpectedOutcome::Unknown, RioOutcome::Built { executed: true }, flags(), v(Verdict::NoTruth), false)]
