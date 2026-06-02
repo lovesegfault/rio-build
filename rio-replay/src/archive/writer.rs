@@ -17,6 +17,7 @@ use anyhow::Context as _;
 use serde::Serialize;
 use sha2::Digest as _;
 
+use super::backend::Backend;
 use super::identity;
 use super::schema::{
     Capabilities, ClosureRecord, ContentDigests, Counts, ExclusionRecord, ImpureEnv, Manifest,
@@ -269,18 +270,6 @@ impl ArchiveWriter {
                 embedded_trees.insert(store_path, entry.path());
             }
         }
-        let narinfo_dir = self.root.join(super::NARINFO_DIR);
-        let mut sidecar_paths: Vec<PathBuf> = Vec::new();
-        for entry in std::fs::read_dir(&narinfo_dir)
-            .with_context(|| format!("list {}", narinfo_dir.display()))?
-        {
-            let path = entry?.path();
-            if path.extension().and_then(|ext| ext.to_str()) == Some("narinfo") {
-                sidecar_paths.push(path);
-            }
-        }
-        sidecar_paths.sort();
-
         // Capability flags and staged members must agree in both directions:
         // a set flag needs its backing member, and a staged optional member
         // needs its flag (a recorder that stages data it does not claim is a
@@ -377,27 +366,39 @@ impl ArchiveWriter {
             }
         }
 
+        // The staged narinfo/ tree is validated by THE shared sidecar
+        // enumeration (`super::index_narinfos`, Strict) — the same function
+        // `ReplayArchive::open` recomputes the listing digest with — so
+        // finalize structurally cannot bless a sidecar set open would
+        // refuse: per-file stem↔content identity, duplicate resolutions
+        // (both supported spellings staged for one path), and listing
+        // cardinality (one digest line per FILE) are decided once, there.
+        let staging = Backend::open(&self.root)
+            .with_context(|| format!("open the staging tree {}", self.root.display()))?;
+        let sidecars =
+            super::index_narinfos(&staging, super::RecordPolicy::Strict).with_context(|| {
+                format!(
+                    "narinfo sidecars staged under {}",
+                    self.root.join(super::NARINFO_DIR).display()
+                )
+            })?;
+
         // Every embedded non-drv path needs a sidecar, and the sidecar must
-        // agree with the tree actually staged (NarHash and NarSize over the
-        // uncompressed NAR serialization).
-        let mut sidecar_records: BTreeMap<String, (rio_nix::narinfo::NarInfo, PathBuf)> =
-            BTreeMap::new();
-        for sidecar_path in sidecar_paths {
-            let text = std::fs::read_to_string(&sidecar_path)
-                .with_context(|| format!("read {}", sidecar_path.display()))?;
-            let stem = sidecar_path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or_default();
-            let narinfo = super::parse_narinfo_sidecar(&text, stem)
-                .with_context(|| format!("parse narinfo sidecar {}", sidecar_path.display()))?;
-            sidecar_records.insert(narinfo.store_path.clone(), (narinfo, sidecar_path));
-        }
+        // agree with the tree actually staged: the exact store path, and
+        // NarHash/NarSize over the uncompressed NAR serialization.
         let mut embedded_nar_digests: Vec<(String, String)> = Vec::new();
         for (store_path, tree) in &embedded_trees {
-            let Some((narinfo, _)) = sidecar_records.get(store_path) else {
+            let Some(narinfo) = sidecars.by_hash.get(super::hash_part(store_path)) else {
                 anyhow::bail!("embedded store path {store_path} has no narinfo sidecar");
             };
+            anyhow::ensure!(
+                &narinfo.store_path == store_path,
+                "the narinfo sidecar for store hash {} describes {} but the embedded tree is \
+                 {store_path} — same store hash, different name; the sidecar must describe the \
+                 embedded path exactly",
+                super::hash_part(store_path),
+                narinfo.store_path
+            );
             let mut hasher = Sha256Writer::default();
             let nar_size = rio_nix::nar::dump_path_streaming(tree, &mut hasher)
                 .with_context(|| format!("NAR-serialize {}", tree.display()))?;
@@ -460,16 +461,14 @@ impl ArchiveWriter {
                 .with_context(|| format!("read {}", member_path.display()))?;
             drv_digests.push((store_path.clone(), identity::sha256_hex(&bytes)));
         }
-        let mut narinfo_digests: Vec<(String, String)> = Vec::new();
-        for (store_path, (_, sidecar_path)) in &sidecar_records {
-            let bytes = std::fs::read(sidecar_path)
-                .with_context(|| format!("read {}", sidecar_path.display()))?;
-            narinfo_digests.push((store_path.clone(), identity::sha256_hex(&bytes)));
-        }
         let content_digests = ContentDigests {
             drvs: identity::listing_digest(&drv_digests),
             embedded_store_paths: identity::listing_digest(&embedded_nar_digests),
-            narinfo: identity::listing_digest(&narinfo_digests),
+            // The narinfo listing is the shared enumeration's per-file
+            // digest list — by construction the same listing open
+            // recomputes, so the recorded digest and the recomputation
+            // cannot disagree on cardinality or keying.
+            narinfo: identity::listing_digest(&sidecars.digests),
         };
 
         // Assemble and write the manifest. The archive id is computed over
@@ -954,6 +953,191 @@ mod tests {
         let root2 = dir2.path().join("archive");
         let finalized2 = tiny_archive(&root2);
         assert_eq!(finalized2.archive_id, finalized.archive_id);
+    }
+
+    /// One store path, one sidecar file: a staging tree carrying BOTH
+    /// supported spellings (`<hash>.narinfo` and `<hash>-<name>.narinfo`)
+    /// for one embedded path is refused at finalize, naming both files.
+    /// The reader refuses this shape (the lookup map would shadow one
+    /// file while the listing digest counts two lines), so blessing it
+    /// here would pack an archive that every open — including the one
+    /// inside publish — then rejects.
+    #[test]
+    fn finalize_refuses_duplicate_sidecar_spellings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        let writer = ArchiveWriter::create(&root).unwrap();
+        let trees = tempfile::TempDir::new().unwrap();
+        let src_tree = trees.path().join("src");
+        stage_tiny_archive(&writer, &src_tree);
+
+        // The mirror spelling of the already-staged canonical sidecar,
+        // byte-identical content — the shape a foreign recorder or a
+        // hand-edited staging tree can produce (finalize deliberately
+        // re-enumerates narinfo/ from disk rather than trusting API calls).
+        let hash = crate::archive::hash_part(SRC_PATH);
+        let canonical = format!("{hash}.narinfo");
+        let mirror = format!("{hash}-src.narinfo");
+        std::fs::copy(
+            root.join(NARINFO_DIR).join(&canonical),
+            root.join(NARINFO_DIR).join(&mirror),
+        )
+        .unwrap();
+
+        let err = format!("{:#}", writer.finalize(tiny_seed()).unwrap_err());
+        assert!(
+            err.contains(&canonical) && err.contains(&mirror),
+            "the refusal must name both sidecar files: {err}"
+        );
+        assert!(err.contains("exactly one sidecar"), "got: {err}");
+    }
+
+    /// A sidecar whose filename names one store hash while its content
+    /// describes another is refused at finalize — the same identity rule
+    /// the reader enforces at open. Keying the writer's check on the
+    /// content alone (as it historically did) blessed exactly the
+    /// mis-assembled trees open then refused.
+    #[test]
+    fn finalize_refuses_misnamed_sidecar() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        let writer = ArchiveWriter::create(&root).unwrap();
+        let trees = tempfile::TempDir::new().unwrap();
+        stage_tiny_archive(&writer, &trees.path().join("src"));
+
+        // A second sidecar file, named for a DIFFERENT store hash, whose
+        // content still describes the embedded src path.
+        let src_sidecar = root
+            .join(NARINFO_DIR)
+            .join(format!("{}.narinfo", crate::archive::hash_part(SRC_PATH)));
+        let misnamed = root
+            .join(NARINFO_DIR)
+            .join("h9999999999999999999999999999999.narinfo");
+        std::fs::copy(&src_sidecar, &misnamed).unwrap();
+        // Drop the canonical file so the duplicate-resolution rule cannot
+        // fire first; only the misnaming is left to catch.
+        std::fs::remove_file(&src_sidecar).unwrap();
+
+        let err = format!("{:#}", writer.finalize(tiny_seed()).unwrap_err());
+        assert!(
+            err.contains("is named for store hash h9999999999999999999999999999999"),
+            "got: {err}"
+        );
+        assert!(err.contains(SRC_PATH), "got: {err}");
+    }
+
+    /// Agreement forcing function for the sidecar contract: finalize must
+    /// never bless a staging tree that `ReplayArchive::open` refuses. Both
+    /// sides now derive their view from the one shared enumeration
+    /// (`archive::index_narinfos`), and this property pins the agreement
+    /// itself, so it fails on a divergence regardless of which side a
+    /// future change lands in — unlike a one-sided refusal test, which is
+    /// structurally blind to drift on the other side.
+    ///
+    /// The battery enumerates producer-side staging shapes (the directory
+    /// form is the documented foreign-recorder/hand-staging seam, and
+    /// finalize deliberately re-enumerates `narinfo/` from disk): the
+    /// conformant baseline, an extra sidecar for a non-embedded path, and
+    /// the three mis-assembly shapes that historically split the two sides
+    /// — duplicate spellings, a misnamed sidecar, and swapped sidecars.
+    #[test]
+    fn finalize_never_blesses_a_staging_tree_open_refuses() {
+        const EXTRA_PATH: &str = "/nix/store/h2222222222222222222222222222222-extra";
+
+        type Mutation = Box<dyn Fn(&std::path::Path, &ArchiveWriter)>;
+        let shapes: Vec<(&str, Mutation)> = vec![
+            ("conformant baseline", Box::new(|_root, _writer| {})),
+            (
+                "extra sidecar for a non-embedded path",
+                Box::new(|root, _writer| {
+                    // Valid content describing a path the archive does not
+                    // embed: legal on both sides (the completeness rule is
+                    // embedded → sidecar, not the reverse).
+                    let tree = root.join("extra-tree");
+                    std::fs::create_dir_all(&tree).unwrap();
+                    std::fs::write(tree.join("data.txt"), "non-embedded extra\n").unwrap();
+                    let text = sidecar_text(EXTRA_PATH, &tree);
+                    std::fs::write(
+                        root.join(NARINFO_DIR)
+                            .join(format!("{}.narinfo", crate::archive::hash_part(EXTRA_PATH))),
+                        text,
+                    )
+                    .unwrap();
+                    std::fs::remove_dir_all(&tree).unwrap();
+                }),
+            ),
+            (
+                "duplicate sidecar spellings for one path",
+                Box::new(|root, _writer| {
+                    let hash = crate::archive::hash_part(SRC_PATH);
+                    std::fs::copy(
+                        root.join(NARINFO_DIR).join(format!("{hash}.narinfo")),
+                        root.join(NARINFO_DIR).join(format!("{hash}-src.narinfo")),
+                    )
+                    .unwrap();
+                }),
+            ),
+            (
+                "misnamed sidecar",
+                Box::new(|root, _writer| {
+                    let src = root
+                        .join(NARINFO_DIR)
+                        .join(format!("{}.narinfo", crate::archive::hash_part(SRC_PATH)));
+                    let misnamed = root
+                        .join(NARINFO_DIR)
+                        .join("h9999999999999999999999999999999.narinfo");
+                    std::fs::copy(&src, &misnamed).unwrap();
+                    std::fs::remove_file(&src).unwrap();
+                }),
+            ),
+            (
+                "swapped sidecars between two embedded paths",
+                Box::new(|root, writer| {
+                    // A second embedded path so there are two sidecars to
+                    // swap; the swap leaves the (content, bytes) listing
+                    // identical, which is exactly why only the shared
+                    // identity rule can catch it.
+                    let tree = root.join("second-tree");
+                    std::fs::create_dir_all(&tree).unwrap();
+                    std::fs::write(tree.join("data.txt"), "second embedded tree\n").unwrap();
+                    writer
+                        .embed_store_path(EXTRA_PATH, &tree, &sidecar_text(EXTRA_PATH, &tree))
+                        .unwrap();
+                    std::fs::remove_dir_all(&tree).unwrap();
+                    let a = root
+                        .join(NARINFO_DIR)
+                        .join(format!("{}.narinfo", crate::archive::hash_part(SRC_PATH)));
+                    let b = root
+                        .join(NARINFO_DIR)
+                        .join(format!("{}.narinfo", crate::archive::hash_part(EXTRA_PATH)));
+                    let a_bytes = std::fs::read(&a).unwrap();
+                    let b_bytes = std::fs::read(&b).unwrap();
+                    std::fs::write(&a, &b_bytes).unwrap();
+                    std::fs::write(&b, &a_bytes).unwrap();
+                }),
+            ),
+        ];
+
+        for (name, mutate) in shapes {
+            let dir = tempfile::TempDir::new().unwrap();
+            let root = dir.path().join("archive");
+            let writer = ArchiveWriter::create(&root).unwrap();
+            let trees = tempfile::TempDir::new().unwrap();
+            stage_tiny_archive(&writer, &trees.path().join("src"));
+            mutate(&root, &writer);
+            // Blessed → the packaged contract holds end to end: every open
+            // consumer (publish included) accepts the result. Refused →
+            // agreement holds at the producer gate (the refusal shapes are
+            // pinned by the targeted tests above).
+            if writer.finalize(tiny_seed()).is_ok() {
+                crate::archive::reader::ReplayArchive::open(&root).unwrap_or_else(|err| {
+                    panic!(
+                        "[{name}] finalize blessed a staging tree its own reader refuses \
+                         to open: {err:#}"
+                    )
+                });
+            }
+        }
     }
 
     #[test]

@@ -16,16 +16,16 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, ensure};
 use rio_nix::narinfo::NarInfo;
 
-use super::backend::{Backend, EntryKind, WalkEntry};
+use super::backend::{Backend, WalkEntry};
 use super::schema::{
     Capabilities, ClosureRecord, Counts, ExclusionRecord, ImpureEnv, Manifest, MemberPresence,
     OutcomeRecord, RequestRecord, SessionKey, Substituters, UnitRecord,
 };
 use super::{
     CLOSURES_MEMBER, EXCLUSIONS_MEMBER, IMPURE_ENV_MEMBER, MANIFEST_MEMBER, METADATA_MEMBERS,
-    NARINFO_DIR, OUTCOMES_MEMBER, REQUESTS_MEMBER, STORE_DIR, UNITS_MEMBER,
+    OUTCOMES_MEMBER, REQUESTS_MEMBER, STORE_DIR, UNITS_MEMBER,
 };
-use super::{identity, schema, v0};
+use super::{RecordPolicy, identity, schema, v0};
 
 /// Which on-disk contract an opened archive was written to. The in-memory
 /// model is always v1; v0 archives are upgraded on open.
@@ -230,7 +230,10 @@ impl ReplayArchive {
             None => Vec::new(),
         };
 
-        let (narinfos, narinfo_digests) = index_narinfos(&backend, RecordPolicy::Strict)?;
+        // THE shared sidecar enumeration (`super::index_narinfos`) — the
+        // same function the writer's finalize validates a staging tree
+        // with, so the two ends of the sidecar contract cannot drift.
+        let sidecars = super::index_narinfos(&backend, RecordPolicy::Strict)?;
         let store_entries = index_store_entries(&backend, RecordPolicy::Strict)?;
 
         // The narinfo listing digest covers the sidecars' load-bearing
@@ -239,7 +242,7 @@ impl ReplayArchive {
         // commits to its ATerm, so corruption surfaces at import time) and
         // embedded store paths are verified against their sidecars when they
         // are NAR-serialized for upload.
-        let recomputed_narinfo_digest = identity::listing_digest(&narinfo_digests);
+        let recomputed_narinfo_digest = identity::listing_digest(&sidecars.digests);
         ensure!(
             recomputed_narinfo_digest == manifest.content_digests.narinfo,
             "narinfo listing digest mismatch (manifest records {}, the archive's sidecars hash \
@@ -303,7 +306,7 @@ impl ReplayArchive {
                 continue;
             }
             ensure!(
-                narinfos.contains_key(super::hash_part(&entry.name)),
+                sidecars.by_hash.contains_key(super::hash_part(&entry.name)),
                 "embedded store path {}{} has no narinfo sidecar",
                 rio_nix::store_path::STORE_PREFIX,
                 entry.name
@@ -348,7 +351,7 @@ impl ReplayArchive {
             closures,
             impure_env,
             exclusions,
-            narinfos,
+            narinfos: sidecars.by_hash,
             store_entries,
         })
     }
@@ -423,12 +426,13 @@ impl ReplayArchive {
             None => ImpureEnv::new(),
         };
 
-        // Sidecars and the store index are read exactly as for v1 (including
-        // the URL-synthesis fallback); only the defective-record policy
-        // differs — see [`RecordPolicy`]. The v1 narinfo listing digest has
+        // Sidecars and the store index are read exactly as for v1 (the
+        // shared `super::index_narinfos`, including the URL-synthesis
+        // fallback); only the defective-record policy differs — see
+        // [`RecordPolicy`]. The v1 narinfo listing digest has
         // nothing to be checked against, so the recomputed digests are
         // dropped.
-        let (narinfos, _) = index_narinfos(&backend, RecordPolicy::WarnAndSkip)?;
+        let sidecars = super::index_narinfos(&backend, RecordPolicy::WarnAndSkip)?;
         let store_entries = index_store_entries(&backend, RecordPolicy::WarnAndSkip)?;
 
         let output_hashes_present = outcomes
@@ -473,7 +477,7 @@ impl ReplayArchive {
             closures: Vec::new(),
             impure_env,
             exclusions: Vec::new(),
-            narinfos,
+            narinfos: sidecars.by_hash,
             store_entries,
         })
     }
@@ -756,123 +760,6 @@ fn warn_unusable_relay_substituters(substituters: &Substituters) {
     }
 }
 
-/// What to do with one defective record of a per-record archive member —
-/// a narinfo sidecar that fails to parse or whose filename names a
-/// different store hash than its content describes, two `nix/store/`
-/// members colliding on hash part, or a request record with no targets —
-/// the axis on which the v0 and v1 open paths deliberately differ. Every
-/// per-record validity site on the open paths takes this policy, so
-/// adding a new per-record check forces an explicit v0/v1 decision at
-/// compile time. Structural corruption is NOT covered and stays loud on
-/// both paths: a malformed JSONL line or member document is handled where
-/// it is parsed (see [`ReplayArchive::open_v0`] for why).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecordPolicy {
-    /// v1: a hard open error naming the offending record. The v1 writer
-    /// enforces per-record validity at stage time (`write_requests`
-    /// rejects empty targets; finalize digests the sidecar listing), so a
-    /// reader-side hit means tampering or corruption worth refusing.
-    /// Skipping an unparseable sidecar could never help a v1 archive
-    /// anyway — a skipped sidecar would be missing from the recomputed
-    /// narinfo listing digest, so open would still fail, just with a far
-    /// less actionable message. A filename↔content identity mismatch, by
-    /// contrast, is invisible to that digest (it hashes content store
-    /// paths and bytes, independent of filenames), so the open-time
-    /// identity check is the only thing standing between a mis-assembled
-    /// archive and a wrong-sidecar verification failure at
-    /// NAR-serialization time, mid-campaign.
-    Strict,
-    /// v0: warn and skip the record. v0 archives are digest-less,
-    /// irreplaceable recordings of past production windows produced by an
-    /// external recorder that never enforced these rules; one defective
-    /// record must cost only itself (a bad sidecar makes one path
-    /// non-uploadable, an empty request schedules nothing), never the
-    /// whole recording.
-    WarnAndSkip,
-}
-
-/// `(store path, sidecar sha256)` listing entries, in the shape
-/// [`identity::listing_digest`] consumes.
-type SidecarDigestListing = Vec<(String, String)>;
-
-/// Index the `narinfo/` sidecar directory: store-path hash part → parsed
-/// sidecar, plus the `(store path, sidecar sha256)` listing the v1 integrity
-/// check recomputes its narinfo digest from. Sidecars without a `URL:` line
-/// get one synthesized (see [`super::parse_narinfo_sidecar`]); sidecars that
-/// fail to parse, or whose filename disagrees with their content's
-/// `StorePath:` about which store hash they describe, are handled per
-/// `policy`.
-fn index_narinfos(
-    backend: &Backend,
-    policy: RecordPolicy,
-) -> Result<(HashMap<String, NarInfo>, SidecarDigestListing)> {
-    let mut narinfos: HashMap<String, NarInfo> = HashMap::new();
-    let mut narinfo_digests: SidecarDigestListing = Vec::new();
-    for entry in backend.list_dir(NARINFO_DIR)?.unwrap_or_default() {
-        if entry.kind != EntryKind::Regular {
-            continue;
-        }
-        let Some(stem) = entry.name.strip_suffix(".narinfo") else {
-            continue;
-        };
-        let rel = format!("{NARINFO_DIR}/{}", entry.name);
-        let bytes = backend
-            .read_file(&rel)?
-            .ok_or_else(|| anyhow!("{rel}: listed but unreadable"))?;
-        let parsed = std::str::from_utf8(&bytes)
-            .map_err(anyhow::Error::from)
-            .and_then(|text| super::parse_narinfo_sidecar(text, stem));
-        let narinfo = match (parsed, policy) {
-            (Ok(narinfo), _) => narinfo,
-            (Err(err), RecordPolicy::Strict) => {
-                return Err(err.context(format!("unparseable narinfo sidecar {rel}")));
-            }
-            (Err(err), RecordPolicy::WarnAndSkip) => {
-                tracing::warn!("skipping unparseable narinfo sidecar {rel}: {err:#}");
-                continue;
-            }
-        };
-        // The sidecar carries its identity twice: the filename stem (the
-        // locator — it keys the lookup map below, and through it the v1
-        // sidecar-completeness loop) and the content's `StorePath:` (what
-        // the writer's finalize check keys on, and what every consumer of
-        // the parsed sidecar trusts). Conformant producers write them in
-        // agreement (`ArchiveWriter::embed_store_path` checks the text
-        // against the embedded path), and the listing digest cannot catch a
-        // disagreement — it hashes content identities and bytes, never
-        // filenames, so e.g. swapping two sidecar files recomputes the
-        // identical digest. Cross-check the two here so a mis-assembled or
-        // edited archive is refused (or the sidecar dropped, per policy) at
-        // open time, instead of supplying paths described by the wrong
-        // sidecar and failing NAR verification mid-campaign.
-        let stem_hash = super::hash_part(stem);
-        let content_hash = super::hash_part(&narinfo.store_path);
-        if stem_hash != content_hash {
-            let mismatch = anyhow!(
-                "narinfo sidecar {rel} is named for store hash {stem_hash} but its StorePath \
-                 describes {} — sidecar lookups key on the filename, so this sidecar would be \
-                 served for the wrong store path",
-                narinfo.store_path
-            );
-            match policy {
-                RecordPolicy::Strict => return Err(mismatch),
-                RecordPolicy::WarnAndSkip => {
-                    tracing::warn!("skipping mismatched narinfo sidecar: {mismatch:#}");
-                    continue;
-                }
-            }
-        }
-        narinfo_digests.push((narinfo.store_path.clone(), identity::sha256_hex(&bytes)));
-        // Key by the hash part so `<hash>-<name>.narinfo` sidecar naming
-        // resolves the same as the canonical `<hash>.narinfo`. The identity
-        // cross-check above guarantees this key equals the content
-        // StorePath's hash part — the key the writer enforces completeness
-        // with.
-        narinfos.insert(stem_hash.to_string(), narinfo);
-    }
-    Ok((narinfos, narinfo_digests))
-}
-
 /// Index `nix/store/`: hash part → entry. Drives the store-path keyed
 /// lookups; contents stay in the backend until asked for.
 ///
@@ -980,7 +867,7 @@ mod tests {
     use super::*;
     use crate::archive::writer::pack_with_mkdwarfs;
     use crate::archive::writer::test_support::{APP_DRV, DEP_DRV, SRC_PATH, tiny_archive};
-    use crate::archive::{FORMAT_VERSION, hash_part};
+    use crate::archive::{FORMAT_VERSION, NARINFO_DIR, hash_part};
 
     /// Stage and finalize the tiny archive in `dir`, returning the staged
     /// root and the writer's view of the identity.
@@ -1498,6 +1385,33 @@ mod tests {
             err.contains("-src") && err.contains(&collider) && err.contains(hash_part(SRC_PATH)),
             "got: {err}"
         );
+    }
+
+    /// Two sidecar files resolving to one store path (the canonical
+    /// `<hash>.narinfo` plus the mirror `<hash>-<name>.narinfo`) are
+    /// refused at open with an error naming both files. The writer's
+    /// finalize refuses the same shape pre-pack (shared enumeration); this
+    /// pins the post-finalize-damage path, where the named refusal is what
+    /// stands between an operator and a bare "listing digest mismatch".
+    #[test]
+    fn duplicate_sidecar_spellings_are_an_open_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        let canonical = format!("{}.narinfo", hash_part(SRC_PATH));
+        let mirror = format!("{}-src.narinfo", hash_part(SRC_PATH));
+        std::fs::copy(
+            root.join(NARINFO_DIR).join(&canonical),
+            root.join(NARINFO_DIR).join(&mirror),
+        )
+        .unwrap();
+
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(
+            err.contains(&canonical) && err.contains(&mirror),
+            "the refusal must name both sidecar files: {err}"
+        );
+        assert!(err.contains("exactly one sidecar"), "got: {err}");
     }
 
     /// A v1 archive whose RELAY list carries an entry the admission screen

@@ -105,3 +105,174 @@ pub(crate) fn parse_narinfo_sidecar(
         }
     }
 }
+
+/// What to do with one defective record of a per-record archive member —
+/// a narinfo sidecar that fails to parse, whose filename names a different
+/// store hash than its content describes, or that resolves to a store hash
+/// another sidecar file already claimed; two `nix/store/` members
+/// colliding on hash part; or a request record with no targets — the axis
+/// on which the v0 and v1 paths deliberately differ. Every per-record
+/// validity site on the open paths (and the writer's finalize, which
+/// shares the sidecar enumeration) takes this policy, so adding a new
+/// per-record check forces an explicit v0/v1 decision at compile time.
+/// Structural corruption is NOT covered and stays loud on both paths: a
+/// malformed JSONL line or member document is handled where it is parsed
+/// (see [`reader::ReplayArchive::open_v0`] for why).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordPolicy {
+    /// v1 (and the writer's finalize, which enumerates the same way): a
+    /// hard error naming the offending record. The v1 writer enforces
+    /// per-record validity at stage time (`write_requests` rejects empty
+    /// targets; finalize digests the sidecar listing), so a reader-side
+    /// hit means tampering or corruption worth refusing. Skipping an
+    /// unparseable sidecar could never help a v1 archive anyway — a
+    /// skipped sidecar would be missing from the recomputed narinfo
+    /// listing digest, so open would still fail, just with a far less
+    /// actionable message. A filename↔content identity mismatch, by
+    /// contrast, is invisible to that digest (it hashes content store
+    /// paths and bytes, independent of filenames), so this identity check
+    /// is the only thing standing between a mis-assembled archive and a
+    /// wrong-sidecar verification failure at NAR-serialization time,
+    /// mid-campaign. Duplicate resolutions (the canonical
+    /// `<hash>.narinfo` plus the mirror `<hash>-<name>.narinfo` for one
+    /// path) are refused for the same reason: lookups key on the hash, so
+    /// one of the two files would be silently shadowed, and the per-file
+    /// listing would carry two lines for one store path.
+    Strict,
+    /// v0: warn and skip the record. v0 archives are digest-less,
+    /// irreplaceable recordings of past production windows produced by an
+    /// external recorder that never enforced these rules; one defective
+    /// record must cost only itself (a bad sidecar makes one path
+    /// non-uploadable, an empty request schedules nothing), never the
+    /// whole recording. For duplicate sidecar resolutions the first file
+    /// in name order wins, deterministically.
+    WarnAndSkip,
+}
+
+/// The indexed `narinfo/` directory of an archive (or a writer staging
+/// tree): every consumer's view of the sidecar set, derived once.
+#[derive(Debug, Default)]
+pub(crate) struct SidecarIndex {
+    /// Store-path hash part → parsed sidecar (the lookup map). The
+    /// identity cross-check guarantees the key equals the hash part of
+    /// the sidecar's content `StorePath:`.
+    pub(crate) by_hash: std::collections::HashMap<String, rio_nix::narinfo::NarInfo>,
+    /// `(content store path, sidecar-bytes sha256)`, one entry per sidecar
+    /// FILE in filename order — the exact listing `identity::listing_digest`
+    /// consumes. Under [`RecordPolicy::Strict`] duplicate resolutions are
+    /// refused, so this is also one entry per store path: the per-file and
+    /// per-store-path views coincide by construction.
+    pub(crate) digests: Vec<(String, String)>,
+}
+
+/// Index an archive's `narinfo/` sidecar directory — THE one enumeration
+/// of the v1 sidecar contract, shared by `ReplayArchive::open` (which
+/// recomputes the narinfo listing digest from it) and
+/// `ArchiveWriter::finalize` (which validates a staging tree with it
+/// before computing that digest). Both sides deriving their view from
+/// this single function is what keeps the contract's two ends agreeing:
+/// finalize structurally cannot bless a `narinfo/` tree that open would
+/// refuse, because per-file identity, duplicate resolution, and listing
+/// cardinality are decided here, once.
+///
+/// Per file: sidecars without a `URL:` line get one synthesized (see
+/// [`parse_narinfo_sidecar`]); sidecars that fail to parse, whose filename
+/// disagrees with their content's `StorePath:` about which store hash they
+/// describe, or whose store hash another sidecar file already claimed are
+/// handled per `policy`. Files are visited in name order so the listing —
+/// and the v0 first-file-wins choice — is deterministic regardless of
+/// backend iteration order.
+pub(crate) fn index_narinfos(
+    backend: &backend::Backend,
+    policy: RecordPolicy,
+) -> anyhow::Result<SidecarIndex> {
+    use anyhow::anyhow;
+
+    use crate::archive::backend::EntryKind;
+
+    let mut index = SidecarIndex::default();
+    // Hash part → the sidecar file (rel path) that claimed it, for the
+    // duplicate-resolution check.
+    let mut claimed_by: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut entries = backend.list_dir(NARINFO_DIR)?.unwrap_or_default();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    for entry in entries {
+        if entry.kind != EntryKind::Regular {
+            continue;
+        }
+        let Some(stem) = entry.name.strip_suffix(".narinfo") else {
+            continue;
+        };
+        let rel = format!("{NARINFO_DIR}/{}", entry.name);
+        let bytes = backend
+            .read_file(&rel)?
+            .ok_or_else(|| anyhow!("{rel}: listed but unreadable"))?;
+        let parsed = std::str::from_utf8(&bytes)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| parse_narinfo_sidecar(text, stem));
+        let narinfo = match (parsed, policy) {
+            (Ok(narinfo), _) => narinfo,
+            (Err(err), RecordPolicy::Strict) => {
+                return Err(err.context(format!("unparseable narinfo sidecar {rel}")));
+            }
+            (Err(err), RecordPolicy::WarnAndSkip) => {
+                tracing::warn!("skipping unparseable narinfo sidecar {rel}: {err:#}");
+                continue;
+            }
+        };
+        // The sidecar carries its identity twice: the filename stem (the
+        // locator — it keys the lookup map, and through it the v1
+        // sidecar-completeness check and the supply path) and the
+        // content's `StorePath:` (what every consumer of the parsed
+        // sidecar trusts). Conformant producers write them in agreement
+        // (`ArchiveWriter::embed_store_path` checks the text against the
+        // embedded path), and the listing digest cannot catch a
+        // disagreement — it hashes content identities and bytes, never
+        // filenames, so e.g. swapping two sidecar files recomputes the
+        // identical digest. Cross-check the two here so a mis-assembled
+        // or edited tree is refused (or the sidecar dropped, per policy)
+        // at index time, instead of supplying paths described by the
+        // wrong sidecar and failing NAR verification mid-campaign.
+        let stem_hash = hash_part(stem);
+        let content_hash = hash_part(&narinfo.store_path);
+        if stem_hash != content_hash {
+            let mismatch = anyhow!(
+                "narinfo sidecar {rel} is named for store hash {stem_hash} but its StorePath \
+                 describes {} — sidecar lookups key on the filename, so this sidecar would be \
+                 served for the wrong store path",
+                narinfo.store_path
+            );
+            match policy {
+                RecordPolicy::Strict => return Err(mismatch),
+                RecordPolicy::WarnAndSkip => {
+                    tracing::warn!("skipping mismatched narinfo sidecar: {mismatch:#}");
+                    continue;
+                }
+            }
+        }
+        // One store path, one sidecar file. Both supported spellings
+        // (`<hash>.narinfo` and `<hash>-<name>.narinfo`) resolve to the
+        // same hash, so two files for one path would shadow each other in
+        // the lookup map while still contributing two listing lines.
+        if let Some(first) = claimed_by.get(stem_hash) {
+            let duplicate = anyhow!(
+                "narinfo sidecars {first} and {rel} both describe store hash {stem_hash}; \
+                 each embedded store path must have exactly one sidecar"
+            );
+            match policy {
+                RecordPolicy::Strict => return Err(duplicate),
+                RecordPolicy::WarnAndSkip => {
+                    tracing::warn!("skipping duplicate narinfo sidecar: {duplicate:#}");
+                    continue;
+                }
+            }
+        }
+        claimed_by.insert(stem_hash.to_string(), rel);
+        index
+            .digests
+            .push((narinfo.store_path.clone(), identity::sha256_hex(&bytes)));
+        index.by_hash.insert(stem_hash.to_string(), narinfo);
+    }
+    Ok(index)
+}
