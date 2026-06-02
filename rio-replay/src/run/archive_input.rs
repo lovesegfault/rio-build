@@ -1365,6 +1365,41 @@ mod tests {
     use super::*;
     use crate::archive::reader::ReplayArchive;
 
+    /// Re-point `manifest.content_digests.drvs` at the listing recomputed
+    /// from the `.drv` members currently staged under `nix/store/`. Tests
+    /// that exercise downstream missing-derivation handling delete a
+    /// member after finalize; without this refresh the open-time drvs
+    /// listing digest (correctly) refuses the archive before the code
+    /// under test runs. Refreshing the digest turns the fixture into the
+    /// one shape that still reaches that code: a foreign-producer archive
+    /// whose manifest honestly describes a gapped member set.
+    fn refresh_drv_listing_digest(root: &std::path::Path) {
+        let store_dir = root.join("nix/store");
+        let mut drv_digests: Vec<(String, String)> = Vec::new();
+        for entry in std::fs::read_dir(&store_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if !name.ends_with(".drv") {
+                continue;
+            }
+            let bytes = std::fs::read(entry.path()).unwrap();
+            drv_digests.push((
+                format!("{}{name}", rio_nix::store_path::STORE_PREFIX),
+                crate::archive::identity::sha256_hex(&bytes),
+            ));
+        }
+        let manifest_path = root.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["content_digests"]["drvs"] =
+            serde_json::Value::String(crate::archive::identity::listing_digest(&drv_digests));
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn mini_archive_loads_units_closures_and_exclusions() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1799,10 +1834,16 @@ mod tests {
         // A workload unit with neither a units.jsonl record nor a readable
         // embedded derivation cannot say what it produces; that is a
         // per-unit hard error naming the derivation, never a silent skip.
+        // The gap is staged the only way it can still reach this code: as
+        // a foreign-producer archive whose manifest HONESTLY digests the
+        // gapped member set (rio's writer refuses to finalize one, and a
+        // post-finalize deletion is now refused at open by the drvs
+        // listing digest).
         let tmp = tempfile::tempdir().unwrap();
         write_units_subset_archive(tmp.path(), &[]);
         let lib_b_drv_name = format!("{}-libB-2.0.drv", fake_hash("libB-drv"));
         std::fs::remove_file(tmp.path().join("nix/store").join(&lib_b_drv_name)).unwrap();
+        refresh_drv_listing_digest(tmp.path());
 
         let archive = ReplayArchive::open(tmp.path()).unwrap();
         let err = format!("{:#}", load_units(&archive).unwrap_err());
@@ -2229,11 +2270,14 @@ mod tests {
         // The fallback walk reads real derivations; a dependency the
         // archive does not embed is a hard error naming the derivation and
         // the unit whose closure needed it — never a silently shallower
-        // closure.
+        // closure. The gap is staged as a foreign-producer archive whose
+        // manifest honestly digests the gapped member set (a post-finalize
+        // deletion is refused at open by the drvs listing digest).
         let tmp = tempfile::tempdir().unwrap();
         write_capabilityless_chain_archive(tmp.path());
         let lib_c_drv_name = format!("{}-libC-1.0.drv", fake_hash("chain-libC-drv"));
         std::fs::remove_file(tmp.path().join("nix/store").join(&lib_c_drv_name)).unwrap();
+        refresh_drv_listing_digest(tmp.path());
 
         let archive = ReplayArchive::open(tmp.path()).unwrap();
         let units = load_units(&archive).unwrap();

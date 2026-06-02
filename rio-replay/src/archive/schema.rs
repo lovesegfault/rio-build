@@ -310,16 +310,69 @@ pub struct MemberDigest {
 
 /// Aggregate digests over the bulk content and narinfo sidecars; together
 /// with `files` they make `archive_id` a content address over the archive.
+///
+/// Every field has a designated verification site — a digest no consumer
+/// recomputes is a write-only witness that protects nothing.
+/// [`ContentDigests::verify_at_open`] destructures the whole struct, so a
+/// new digest field cannot be added without deciding its verification
+/// story (recompute at open, or an explicit named waiver) at compile time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentDigests {
-    /// Digest of the canonical embedded-derivation listing.
+    /// Digest of the canonical embedded-derivation listing (per-member
+    /// digest = SHA-256 of the ATerm bytes). Verified at archive open by
+    /// recomputation over the staged `.drv` members.
     pub drvs: String,
     /// Digest of the canonical embedded-store-path listing (per-path digest =
-    /// SHA-256 of the uncompressed NAR serialization).
+    /// SHA-256 of the uncompressed NAR serialization). Verified per path at
+    /// NAR-serialization time (`ReplayArchive::dump_nar` checks the produced
+    /// NAR against the sidecar's NarHash/NarSize).
     pub embedded_store_paths: String,
     /// Digest of the canonical narinfo-sidecar listing (per-sidecar digest =
-    /// SHA-256 of the sidecar file's bytes).
+    /// SHA-256 of the sidecar file's bytes). Verified at archive open by
+    /// recomputation over the staged sidecars.
     pub narinfo: String,
+}
+
+impl ContentDigests {
+    /// Open-time verification of the content digests against listings
+    /// recomputed from the archive's actual members.
+    ///
+    /// The exhaustive destructuring is the field-totality guard: adding a
+    /// `ContentDigests` field refuses to compile until this method either
+    /// verifies it or names its waiver.
+    ///
+    /// `embedded_store_paths` is the one deliberate waiver at open:
+    /// recomputing its listing would NAR-serialize every embedded tree
+    /// (arbitrarily large), so each path is verified lazily instead — the
+    /// moment its bytes are produced for upload, `dump_nar` checks the NAR
+    /// against the sidecar whose own bytes the (open-verified) `narinfo`
+    /// listing digest covers. Both mismatch arms cover membership as well
+    /// as content: a member missing from the archive is missing from the
+    /// recomputed listing, and an extra member is an extra line — either
+    /// way the digests differ.
+    pub fn verify_at_open(
+        &self,
+        recomputed_drvs: &str,
+        recomputed_narinfo: &str,
+    ) -> anyhow::Result<()> {
+        let ContentDigests {
+            drvs,
+            embedded_store_paths: _embedded_store_paths_verified_per_path_at_dump_nar,
+            narinfo,
+        } = self;
+        anyhow::ensure!(
+            recomputed_drvs == drvs,
+            "embedded-derivation listing digest mismatch (manifest records {drvs}, the \
+             archive's .drv members hash to {recomputed_drvs}) — a derivation member was \
+             corrupted, removed, or added after finalize"
+        );
+        anyhow::ensure!(
+            recomputed_narinfo == narinfo,
+            "narinfo listing digest mismatch (manifest records {narinfo}, the archive's \
+             sidecars hash to {recomputed_narinfo})"
+        );
+        Ok(())
+    }
 }
 
 /// One `requests.jsonl` record: a recorded client submission.

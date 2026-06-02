@@ -4,11 +4,12 @@
 //! Metadata (manifest, requests, outcomes, units, closures, impure-env,
 //! exclusions, narinfo sidecars, the `nix/store/` entry index) is parsed
 //! eagerly at [`ReplayArchive::open`], which also verifies the manifest's
-//! `files` digests and the narinfo listing digest (see
-//! `docs/dev/2026-05-28-build-replay-design.md`, "Identity, integrity, and
-//! content addressing"). Derivation text and NAR payloads are read lazily;
-//! embedded store paths are verified against their narinfo sidecars when
-//! they are NAR-serialized ([`ReplayArchive::dump_nar`]), not at open time.
+//! `files` digests, the narinfo listing digest, and the embedded-derivation
+//! listing digest (see `docs/dev/2026-05-28-build-replay-design.md`,
+//! "Identity, integrity, and content addressing"). Derivation text and NAR
+//! payloads are read lazily; embedded store paths are verified against
+//! their narinfo sidecars when they are NAR-serialized
+//! ([`ReplayArchive::dump_nar`]), not at open time.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -255,19 +256,44 @@ impl ReplayArchive {
         let sidecars = super::index_narinfos(&backend, RecordPolicy::Strict)?;
         let store_entries = index_store_entries(&backend, RecordPolicy::Strict)?;
 
-        // The narinfo listing digest covers the sidecars' load-bearing
-        // References lines; verify it at open time (sidecars are small).
-        // The drvs digest is not verified here (an input-addressed .drv path
-        // commits to its ATerm, so corruption surfaces at import time) and
-        // embedded store paths are verified against their sidecars when they
-        // are NAR-serialized for upload.
-        let recomputed_narinfo_digest = identity::listing_digest(&sidecars.digests);
-        ensure!(
-            recomputed_narinfo_digest == manifest.content_digests.narinfo,
-            "narinfo listing digest mismatch (manifest records {}, the archive's sidecars hash \
-             to {recomputed_narinfo_digest})",
-            manifest.content_digests.narinfo
-        );
+        // Open-time content-digest verification, one decision surface per
+        // field (`ContentDigests::verify_at_open`):
+        // - narinfo: the sidecar listing covers the load-bearing
+        //   References/NarHash lines; sidecars are small, so the listing is
+        //   recomputed here.
+        // - drvs: the embedded-derivation listing is recomputed here too —
+        //   .drv members are small ATerm text (the same argument as the
+        //   sidecars), and NOTHING downstream re-checks them: the import
+        //   path reads the bytes raw, derives the upload path-info FROM
+        //   them, and registers them under the recorded store path, so a
+        //   corrupted-but-parseable ATerm would replay a semantically
+        //   different derivation with the divergence charged to the wrong
+        //   side. (An input-addressed .drv path does commit to its ATerm,
+        //   but no import-time check ever recomputes that commitment.)
+        //   Recomputation also catches membership damage — a .drv member
+        //   removed or added after finalize changes the listing.
+        // - embedded store paths: deliberately NOT recomputed at open
+        //   (that would NAR-serialize every embedded tree); each path is
+        //   verified against its sidecar when its bytes are produced for
+        //   upload (dump_nar).
+        let mut drv_digests: Vec<(String, String)> = Vec::new();
+        for entry in store_entries.values() {
+            if !entry.name.ends_with(".drv") {
+                continue;
+            }
+            let rel = format!("{STORE_DIR}/{}", entry.name);
+            let bytes = backend
+                .read_file(&rel)?
+                .ok_or_else(|| anyhow!("{rel}: listed in the archive index but unreadable"))?;
+            drv_digests.push((
+                format!("{}{}", rio_nix::store_path::STORE_PREFIX, entry.name),
+                identity::sha256_hex(&bytes),
+            ));
+        }
+        manifest.content_digests.verify_at_open(
+            &identity::listing_digest(&drv_digests),
+            &identity::listing_digest(&sidecars.digests),
+        )?;
 
         // Capability flags must be backed by the data they claim. The
         // reverse direction (member present, flag false) is only a warning:
@@ -1286,6 +1312,73 @@ mod tests {
         let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
         assert!(
             err.contains("narinfo listing digest mismatch"),
+            "got: {err}"
+        );
+    }
+
+    /// The embedded-derivation listing digest is recomputed at open, so a
+    /// `.drv` member whose bytes changed after finalize refuses the
+    /// archive — the check the import path depends on, because nothing
+    /// downstream re-derives the .drv path↔ATerm commitment: the importer
+    /// reads the embedded bytes raw and registers them under the recorded
+    /// store path (`run/drv_import.rs`), so a corrupted-but-parseable
+    /// ATerm would otherwise replay a semantically different derivation
+    /// charged to the wrong side. Contract: design doc "Identity,
+    /// integrity, and content addressing" — `content_digests.drvs` is
+    /// checked when the archive is opened. The tampered ATerm here stays
+    /// parseable on purpose (a changed builder argument): the layers that
+    /// do exist (UTF-8 check, ATerm parse) cannot catch it, only the
+    /// digest can.
+    #[test]
+    fn drv_listing_digest_mismatch_is_detected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        // nix/store members are not covered by manifest.files (only
+        // metadata members are), so this edit reaches exactly the drvs
+        // listing digest — there is no other line of defense at open.
+        let member = format!("{STORE_DIR}/{}", DEP_DRV.rsplit('/').next().unwrap());
+        rewrite_member(&root, &member, "cp -r $src $out", "cp -r $src $oux");
+
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(
+            err.contains("embedded-derivation listing digest mismatch"),
+            "got: {err}"
+        );
+    }
+
+    /// Membership damage is caught by the same recomputation: a `.drv`
+    /// member REMOVED after finalize (post-finalize member loss, the
+    /// absence half of the integrity story) and a member ADDED (a
+    /// mis-assembled archive) both change the recomputed listing.
+    #[test]
+    fn drv_member_absence_and_addition_are_open_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+        let dep_member = root
+            .join(STORE_DIR)
+            .join(DEP_DRV.rsplit('/').next().unwrap());
+
+        // Removed member: the recomputed listing is missing a line.
+        let dep_bytes = std::fs::read(&dep_member).unwrap();
+        std::fs::remove_file(&dep_member).unwrap();
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(
+            err.contains("embedded-derivation listing digest mismatch"),
+            "got: {err}"
+        );
+
+        // Restored + an extra member finalize never saw: an extra line.
+        std::fs::write(&dep_member, &dep_bytes).unwrap();
+        std::fs::write(
+            root.join(STORE_DIR)
+                .join("e9999999999999999999999999999999-extra.drv"),
+            "Derive([],[],[],\"x86_64-linux\",\"/bin/sh\",[],[])\n",
+        )
+        .unwrap();
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(
+            err.contains("embedded-derivation listing digest mismatch"),
             "got: {err}"
         );
     }
