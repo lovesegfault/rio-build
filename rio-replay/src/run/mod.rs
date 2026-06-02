@@ -3190,8 +3190,8 @@ mod tests {
             .drv_path
             .clone();
         // The lookup key comes from the recorded request itself (the only
-        // place a session id should ever originate): the typed SessionKey
-        // is mintable only from a recorded request.
+        // place a session id should ever originate), not a literal: the
+        // typed SessionKey is mintable only from a recorded request.
         let app_b_request = archive
             .requests()
             .iter()

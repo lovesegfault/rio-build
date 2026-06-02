@@ -221,10 +221,12 @@ pub struct ScheduledRequest {
 /// dry-run numbers match a live run by construction.
 //
 // TODO: timing lookups key off the recorded (session, drv) identity as a
-// loose i64 + &str pair here and at the truth seam
-// (run/truth.rs::expected_outcomes_for_units). Once a typed session key is
-// minted at that seam, thread it through this signature so schedule
-// construction and truth resolution share one identity type.
+// loose i64 + &str pair. The typed SessionKey minted at the archive
+// boundary (constructible only from a RequestRecord or as the sessionless
+// key) is the one identity resolution for that pair; swap
+// SharedTimingLookup and this signature over to it so schedule
+// construction and truth resolution share the key type instead of
+// re-pairing i64 + &str at each call site.
 pub fn build_schedule(
     requests: &[RecordedRequest],
     timing: &dyn Fn(i64, &str) -> Option<RecordedTiming>,
