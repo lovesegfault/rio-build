@@ -49,6 +49,35 @@ pub const FORMAT_VERSION: &str = "1.0";
 /// refused; any minor of a known major is accepted (additive evolution).
 pub const SUPPORTED_MAJOR: u64 = 1;
 
+/// AWS S3's hard limit on a single-PUT object upload: 5 GiB (the documented
+/// PutObject maximum; larger objects require multipart upload). Archive
+/// publication uploads the DwarFS image as exactly one `PutObject` — and
+/// the publish flow's lost-conditional self-write attribution RELIES on
+/// single-part PUTs (a multipart composite checksum is unattributable, see
+/// `s3::ArchiveStore::remote_object_match`) — so an image above this cap
+/// deterministically fails at publish time with an opaque backend error.
+/// [`ensure_single_put_size`] turns that into a loud refusal at pack and
+/// publish time. Lifting the cap means a multipart path with FULL_OBJECT
+/// checksums and reworked self-write attribution, not deleting this check.
+pub(crate) const S3_SINGLE_PUT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Refuse `bytes` above [`S3_SINGLE_PUT_MAX_BYTES`], naming the cap, the
+/// single-part constraint, and the remediation. Enforced at BOTH ends of
+/// the image lifecycle: when `mkdwarfs` produces an image (so the operator
+/// learns at staging time, not after the multi-hour pipeline that follows)
+/// and again at publish (covering images that reached publish without
+/// passing through this tree's packer).
+pub(crate) fn ensure_single_put_size(bytes: u64, what: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bytes <= S3_SINGLE_PUT_MAX_BYTES,
+        "{what} is {bytes} bytes, above the {S3_SINGLE_PUT_MAX_BYTES}-byte (5 GiB) S3 \
+         single-PUT cap — archive publication uploads the image as one PutObject (the \
+         write-once attribution requires single-part uploads), so this image cannot be \
+         published; reduce the archive's embedded scope or split the campaign",
+    );
+    Ok(())
+}
+
 /// The hash part of a store path: the basename characters before the first
 /// `-`. Accepts a full `/nix/store/...` path, a basename, or a bare hash.
 pub(crate) fn hash_part(path_or_name: &str) -> &str {
@@ -275,4 +304,34 @@ pub(crate) fn index_narinfos(
         index.by_hash.insert(stem_hash.to_string(), narinfo);
     }
     Ok(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The single-PUT precondition admits exactly the documented AWS cap
+    /// and refuses one byte more (limit / limit+1), naming the cap and the
+    /// single-part constraint. The expectation derives from AWS S3's
+    /// PutObject contract — 5 GiB maximum for a single-PUT upload — which
+    /// the publish flow is structurally tied to (single-part PUTs are what
+    /// make the write-once self-write attribution's checksums comparable).
+    #[test]
+    fn single_put_size_boundary() {
+        assert_eq!(
+            S3_SINGLE_PUT_MAX_BYTES,
+            5 * 1024 * 1024 * 1024,
+            "the cap is AWS S3's documented 5 GiB single-PUT maximum"
+        );
+        ensure_single_put_size(S3_SINGLE_PUT_MAX_BYTES, "image at the cap")
+            .expect("an image at exactly the cap is publishable");
+        let err = format!(
+            "{:#}",
+            ensure_single_put_size(S3_SINGLE_PUT_MAX_BYTES + 1, "oversized image").unwrap_err()
+        );
+        assert!(
+            err.contains("5 GiB") && err.contains("single-PUT") && err.contains("PutObject"),
+            "the refusal names the cap and the single-part constraint: {err}"
+        );
+    }
 }

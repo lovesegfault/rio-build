@@ -568,6 +568,18 @@ impl ArchiveStore {
                  (pack a staged directory with mkdwarfs first)",
                 image.display()
             );
+            // Backend-limit precondition, BEFORE the expensive open + hash:
+            // the image PUT below is single-part by design, so an image
+            // above the S3 single-PUT cap can never land — refuse it here,
+            // naming the cap, instead of surfacing an opaque EntityTooLarge
+            // after uploading for an hour.
+            let image_bytes = std::fs::metadata(&image)
+                .with_context(|| format!("stat {}", image.display()))?
+                .len();
+            super::ensure_single_put_size(
+                image_bytes,
+                &format!("DwarFS image {}", image.display()),
+            )?;
             let archive = ReplayArchive::open(&image)
                 .with_context(|| format!("open {} for publishing", image.display()))?;
             match archive.archive_id() {
@@ -1446,6 +1458,41 @@ mod tests {
             "expected the write-once refusal, got: {err:#}"
         );
         assert_eq!(put.num_calls(), 0, "no object may be uploaded");
+    }
+
+    /// An image above the S3 single-PUT cap is refused BEFORE any S3
+    /// traffic — the upload would deterministically die at the backend's
+    /// 5 GiB PutObject limit with an opaque, unretryable error after
+    /// uploading for an hour, so publish names the cap up front instead.
+    /// The fixture is a sparse file: only the size matters because the
+    /// precondition runs before the image is even opened.
+    #[tokio::test]
+    async fn publish_refuses_an_image_above_the_single_put_cap_before_any_s3_call() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let image = dir.path().join("oversized.dwarfs");
+        let file = std::fs::File::create(&image).unwrap();
+        file.set_len(crate::archive::S3_SINGLE_PUT_MAX_BYTES + 1)
+            .unwrap();
+        drop(file);
+
+        let head = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let put = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().build());
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&head, &put]);
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        let err = store
+            .publish(&client, &image, b"{}", "rio-replay/test")
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("single-PUT") && msg.contains("5 GiB"),
+            "the refusal names the cap and the constraint: {msg}"
+        );
+        assert_eq!(head.num_calls(), 0, "no S3 request may be issued");
+        assert_eq!(put.num_calls(), 0, "no upload may start");
     }
 
     #[tokio::test]

@@ -572,6 +572,23 @@ pub fn pack_with_mkdwarfs(staging: &Path, image: &Path) -> anyhow::Result<()> {
             crate::body_snippet(std::str::from_utf8(&out.stderr).unwrap_or("<non-utf8 stderr>")),
         );
     }
+    // Publishability gate at staging time: an image above the S3 single-PUT
+    // cap cannot be published (the publish PUT is single-part by design),
+    // so fail the pack loudly NOW — when the operator can still reduce the
+    // embedded scope — instead of letting the multi-hour pipeline that
+    // follows discover it at the final upload. Same failure contract as a
+    // mkdwarfs error: the temporary output is removed and nothing lands at
+    // the final path.
+    let packed_bytes = std::fs::metadata(&tmp_image)
+        .with_context(|| format!("stat packed image {}", tmp_image.display()))?
+        .len();
+    if let Err(err) = super::ensure_single_put_size(
+        packed_bytes,
+        &format!("packed DwarFS image {}", tmp_image.display()),
+    ) {
+        let _ = std::fs::remove_file(&tmp_image);
+        return Err(err);
+    }
     std::fs::rename(&tmp_image, image).with_context(|| {
         format!(
             "rename packed image {} to {}",
