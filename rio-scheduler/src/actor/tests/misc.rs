@@ -234,6 +234,56 @@ async fn test_ex_leader_housekeeping_is_noop_after_lose() -> TestResult {
     Ok(())
 }
 
+// r[verify obs.metric.scheduler-leader-gate+4]
+/// `LeaderLost` must zero `rio_scheduler_open_attempts` like the rest
+/// of the leader-state gauge family. Unlike the DAG gauges it is set
+/// from a durable view (the establishment sweep), so the new leader
+/// republishes the same number — but the DEPOSED leader's frozen
+/// series would otherwise sit in Prometheus until that pod restarts,
+/// and `sum(rio_scheduler_open_attempts)` consumers (the store
+/// ScaledObject's builders-per-replica trigger) would double-count
+/// the fleet after every failover.
+#[tokio::test]
+async fn leader_lost_zeroes_open_attempts_gauge() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task, leader) = spawn_actor_with_leader(db.pool.clone(), true, true);
+
+    // Merge + pull-mint one attempt: the durable open-attempt view is
+    // non-empty, so the leader's sweep publishes a NON-zero gauge —
+    // without this the zero-on-lose assertion below would be vacuous
+    // (the gauge already reads 0.0 from the first Tick).
+    merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "oa-gauge-drv",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let _assignment = pull_attempt(&handle, "oa-gauge-drv").await;
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        recorder.gauge_value("rio_scheduler_open_attempts{}"),
+        Some(1.0),
+        "leader's sweep must publish the minted open attempt"
+    );
+
+    leader.on_lose();
+    handle.send_unchecked(ActorCommand::LeaderLost).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        recorder.gauge_value("rio_scheduler_open_attempts{}"),
+        Some(0.0),
+        "LeaderLost must zero open_attempts — a deposed leader's frozen \
+         series double-counts the fleet for sum() consumers (the KEDA \
+         builders trigger)"
+    );
+    Ok(())
+}
+
 // r[verify sec.boundary.grpc-hmac]
 /// When `with_hmac_signer` is set, dispatched assignments carry a
 /// signed token that the store can verify. Token must contain the

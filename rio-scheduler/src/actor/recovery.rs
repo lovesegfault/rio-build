@@ -997,11 +997,19 @@ impl DagActor {
         // would otherwise export its frozen backlog forever — exactly
         // the duplicate-series hazard the leader gate exists for, and
         // worse here because KEDA scales the store on this series.
+        //
+        // open_attempts too: the rule names it in the leader-gated
+        // family, and although its VALUE is durable-backed (the new
+        // leader republishes the same number from the same rows), the
+        // deposed pod's frozen series would persist until restart —
+        // sum() consumers (the store ScaledObject's builders trigger)
+        // would double-count the fleet after every failover.
         for g in [
             "rio_scheduler_derivations_queued",
             "rio_scheduler_builds_active",
             "rio_scheduler_derivations_running",
             "rio_scheduler_substituting_derivations",
+            "rio_scheduler_open_attempts",
         ] {
             metrics::gauge!(g).set(0.0);
         }
