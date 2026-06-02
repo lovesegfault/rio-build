@@ -96,12 +96,8 @@ spec:
             - name: RIO_SUBSTITUTE_ADMISSION_PERMITS
               value: {{ $s.substituteAdmissionPermits | quote }}
             {{- end }}
-            # Substitution-replacement campaign (Phase A: dormant —
-            # enabled=false everywhere; the executor spawns nothing).
-            # No `default` filter on the boolean: helm's `default`
-            # treats `false` as empty and would silently flip it.
-            - name: RIO_MATERIALIZATION__ENABLED
-              value: {{ $s.materialization.enabled | quote }}
+            # Materialization executor (PD-D2: spawns iff schedulerAddr
+            # is configured — the env below is the spawn condition).
             - name: RIO_MATERIALIZATION__EXECUTOR_CONCURRENCY
               value: {{ $s.materialization.executorConcurrency | quote }}
             - name: RIO_MATERIALIZATION__SCHEDULER_ADDR

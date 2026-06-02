@@ -496,21 +496,17 @@ let
             "journalctl -u rio-scheduler --no-pager"
             " | grep -q 'materialization pins released'"
         )
-        # Walk unreachability over the WHOLE scenario is structural now
-        # (the walk spawner and its metric were deleted).
-        # The flags really are ON in the units' environment (the
-        # deployment-layer cutover this scenario proves). Asserted against
-        # the units' real environment via systemd, mirroring the dormant
-        # oracle's inverse guard.
-        for unit in ["rio-scheduler", "rio-store"]:
-            env = ${gatewayHost}.succeed(f"systemctl show {unit} --property=Environment")
-            assert "RIO_MATERIALIZATION__ENABLED=true" in env, (
-                f"{unit} not flag-on: {env}"
-            )
+        # Walk unreachability is structural (the walk spawner, its
+        # metric, and the coexistence flag are all deleted); the store's
+        # executor spawn condition is the scheduler address (PD-D2).
+        env = ${gatewayHost}.succeed("systemctl show rio-store --property=Environment")
+        assert "RIO_MATERIALIZATION__SCHEDULER_ADDR=" in env, (
+            f"rio-store has no scheduler_addr (the executor would not spawn): {env}"
+        )
         print(
             f"materialization-active PASS: {total} jobs all resolved, "
             f"{wanted_total} wanted rows, {n_mat} materialization execution(s), "
-            f"pins released, flags on"
+            f"pins released"
         )
   '';
 in

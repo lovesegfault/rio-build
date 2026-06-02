@@ -304,21 +304,13 @@ store:
   # (pgMaxConnections × 3).clamp(64, 128). Override only when the
   # derived value mis-tracks the upstream-fetch bottleneck.
   # substituteAdmissionPermits: 128
-  # Substitution-replacement campaign (design §8, Phase B: ACTIVE).
-  # The store-side materialization-job executor: poll → claim → execute
-  # → report against the scheduler's ExecutorService, presenting the
-  # store-service credential minted from the serviceHmac mount.
-  #
-  # Phase B cutover (design §8-B): the store-owned materialization job
-  # is the ACTIVE substitution mechanism. Set BOTH this and
-  # scheduler.materialization.enabled to false to fall back to the
-  # scheduler-side walk (the as-built path, kept through Phase C').
-  # The AS-6 deployment ordering (executor flag first ON, last OFF) is
-  # enforced by the scheduler template's AND-guard — see
-  # templates/scheduler.yaml and templates/NOTES.txt for the rollback
-  # procedure.
+  # The store-side materialization-job executor — THE substitution
+  # mechanism (design §8): poll → claim → execute → report against the
+  # scheduler's ExecutorService, presenting the store-service
+  # credential minted from the serviceHmac mount. The executor spawns
+  # iff schedulerAddr is set (PD-D2); rollback below the cutover is
+  # binary-version rollback, not a values flip.
   materialization:
-    enabled: true
     # Concurrent jobs per replica (design §2.2 item 1).
     executorConcurrency: 8
     # The scheduler ExecutorService address — the store→scheduler edge
@@ -382,15 +374,6 @@ scheduler:
   # always-leader mode, WRONG with replicas>1).
   leaseName: rio-scheduler-leader
   storeAddr: rio-store.rio-store:9002
-  # Substitution-replacement campaign (design §8, Phase B: ACTIVE).
-  # Master switch for scheduler-side materialization-job creation, the
-  # kind-aware pull-admission table, and outcome consumption.
-  # Effective only when store.materialization.enabled is also true —
-  # the chart-level AS-6 ordering guard renders the AND (see
-  # templates/scheduler.yaml), so the persistent mixed state (creation
-  # on, executor off) is unrenderable from values.
-  materialization:
-    enabled: true
   # I-204: requiredSystemFeatures values that are CAPABILITY HINTS, not
   # hardware gates. Stripped at DAG-insert so spawn/dispatch ignore them.
   # nixpkgs convention: big-parallel = "uses many cores", benchmark =

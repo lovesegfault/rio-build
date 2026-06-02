@@ -90,30 +90,22 @@ scope: with scope; ''
           f"non-build_input pin_kind for builder traffic"
       )
 
-      # The flag really is ON in the deployed PODS' environment: the
-      # helm chart renders RIO_MATERIALIZATION__ENABLED from values
-      # (Phase B default true in values.yaml, inherited by every values
-      # file that does not override it — the default-plumb proof). The
-      # env-spec check also catches the plumb being silently dropped —
-      # the env entry must EXIST and must be "true". Same
-      # kubectl-jsonpath pattern as jwt-mount-present (the pod spec is
-      # what the kubelet used to build the container).
-      for dep, dep_ns in [("rio-scheduler", "${ns}"), ("rio-store", "${nsStore}")]:
-          envs = kubectl(
-              f"get deploy {dep} -o jsonpath="
-              f"'{{.spec.template.spec.containers[0].env}}'",
-              ns=dep_ns,
-          )
-          assert "RIO_MATERIALIZATION__ENABLED" in envs, (
-              f"{dep} env spec is missing RIO_MATERIALIZATION__ENABLED — "
-              f"the helm env plumb was dropped: {envs!r}"
-          )
-          flag_on = '"name":"RIO_MATERIALIZATION__ENABLED","value":"true"'
-          assert flag_on in envs.replace(" ", ""), (
-              f"{dep} is not flag-on (the Phase B cutover default did not "
-              f"reach the deployment): {envs!r}"
-          )
+      # The executor spawn condition reaches the deployed STORE pod:
+      # the chart renders RIO_MATERIALIZATION__SCHEDULER_ADDR from
+      # values (PD-D2 — the env IS the spawn condition; the coexistence
+      # ENABLED flag is gone). The env-spec check catches the plumb
+      # being silently dropped. Same kubectl-jsonpath pattern as
+      # jwt-mount-present (the pod spec is what the kubelet used to
+      # build the container).
+      envs = kubectl(
+          "get deploy rio-store -o jsonpath="
+          "'{.spec.template.spec.containers[0].env}'",
+          ns="${nsStore}",
+      )
+      assert "RIO_MATERIALIZATION__SCHEDULER_ADDR" in envs, (
+          f"rio-store env spec is missing RIO_MATERIALIZATION__SCHEDULER_ADDR — "
+          f"the helm env plumb was dropped: {envs!r}"
+      )
       print(f"materialization-boundary PASS: {wanted} wanted row(s) written, "
-            f"zero materialization rows, all {execs} executions build-kind, "
-            f"flags on in both deployments")
+            f"all {execs} executions build-kind, scheduler_addr plumbed")
 ''

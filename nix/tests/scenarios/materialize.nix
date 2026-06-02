@@ -804,16 +804,9 @@ let
         )
         print("gc-pin PASS: pin held under live interest, released at terminal, then swept")
 
-    # ══════════════════════════════════════════════════════════════════
-    # Flag-on deployment posture (criterion 3 is structural now: the
-    # walk spawner and its rio_scheduler_substitute_spawned_total
-    # metric were deleted — there is no walk to observe)
-    # ══════════════════════════════════════════════════════════════════
-    with subtest("materialize-no-walks: flag-on posture in both units"):
-        for unit in ["rio-scheduler", "rio-store"]:
-            env = ${gatewayHost}.succeed(f"systemctl show {unit} --property=Environment")
-            assert "RIO_MATERIALIZATION__ENABLED=true" in env, f"{unit} not flag-on: {env}"
-        print("materialize-no-walks PASS: flags on (walk spawner structurally absent)")
+    # (The walk-unreachability and flag-posture subtest is gone: the
+    # walk spawner, its metric, and the coexistence flag were all
+    # deleted — criterion 3 is structural.)
   '';
 in
 pkgs.testers.runNixOSTest {

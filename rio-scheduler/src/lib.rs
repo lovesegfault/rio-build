@@ -262,9 +262,7 @@ pub fn describe_metrics() {
         "Materialization jobs created (substitution-replacement campaign), \
          labeled by origin (pruned|cache_opportunity|stale_reset|reprobe). \
          Dedup-found existing jobs do not count; origin upgrades are counted \
-         by ..._origin_upgraded_total. Always zero while \
-         scheduler.materialization.enabled = false (the Phase A deployed \
-         state) — a nonzero value flag-off is a dormancy violation."
+         by ..._origin_upgraded_total."
     );
     describe_counter!(
         "rio_scheduler_materialization_jobs_origin_upgraded_total",
