@@ -1609,7 +1609,9 @@ Cross-campaign coordination record for harden-store work item I
 ratification), following the C4-deletion precedent ("Track B invariant
 map coordinated"). Written by the item-I executor; docs-only —
 counter-signature of the landed form remains to be collected (the 1b
-precedent: collected at landing review).
+precedent: collected at landing review). *(Superseded: collected
+2026-06-02 at the follow-up-ledger close-out — see the SIGNED block at
+the end of this entry.)*
 
 - **What changed that touches this map's subjects.** The `store`
   ComponentScaler CR is removed from the chart
