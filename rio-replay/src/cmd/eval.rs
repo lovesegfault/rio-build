@@ -24,19 +24,29 @@ use std::path::PathBuf;
 
 use clap::Args;
 
-use crate::evalset::Scope;
+use crate::evalset::{Scope, recipe};
 
 /// Parse `--scope`:
 ///   `full`
 ///   `constituents:<aggregate-job>`   (e.g. constituents:tested)
 ///   `jobs:<job1,job2,…>`
-///   `jobs-file:<path>`               (one job name per line, `#` comments)
+///   `jobs-file:<path>`               (one job name per line; `#` starts
+///                                     a whole-line or trailing comment)
 ///
 /// Explicit job lists (`jobs:`/`jobs-file:`) are sorted and
 /// deduplicated here, so listing the same jobs in a different order or
 /// with repetitions cannot fork the recipe key digest, issue duplicate
 /// per-job Hydra requests, or define the same selection.nix attribute
 /// twice (a Nix "attribute already defined" eval failure).
+///
+/// Every job name accepted here — list members and the `constituents:`
+/// aggregate alike — is charset-validated at this input boundary
+/// ([`recipe::validate_job_name`]), so a stray character fails in
+/// milliseconds with the offending component named, instead of mangling
+/// a politeness-budgeted `eval/<id>/job/<name>` request in Phase 1 (a
+/// `#` truncates the URL at the fragment, silently querying a different
+/// job) and only being rejected by the Phase-3 selection-expression
+/// gate after the multi-minute source prep.
 ///
 /// Aggregate jobs (e.g. `tested`) must be requested via
 /// `constituents:<job>`, never listed under `jobs:`/`jobs-file:`:
@@ -50,6 +60,7 @@ pub fn parse_scope(s: &str) -> anyhow::Result<Scope> {
     }
     if let Some(job) = s.strip_prefix("constituents:") {
         anyhow::ensure!(!job.is_empty(), "constituents: needs an aggregate job name");
+        recipe::validate_job_name(job)?;
         return Ok(Scope::Constituents {
             aggregate_job: job.to_string(),
         });
@@ -64,6 +75,9 @@ pub fn parse_scope(s: &str) -> anyhow::Result<Scope> {
         anyhow::ensure!(!jobs.is_empty(), "jobs: needs at least one job name");
         jobs.sort();
         jobs.dedup();
+        for job in &jobs {
+            recipe::validate_job_name(job)?;
+        }
         return Ok(Scope::Jobs { jobs });
     }
     if let Some(path) = s.strip_prefix("jobs-file:") {
@@ -71,13 +85,20 @@ pub fn parse_scope(s: &str) -> anyhow::Result<Scope> {
             .map_err(|e| anyhow::anyhow!("read jobs file {path}: {e}"))?;
         let mut jobs: Vec<String> = text
             .lines()
+            // Everything from the first `#` on is a comment — whole-line
+            // or trailing. Job names can never contain `#` (validated
+            // below), so this never splits a legitimate name.
+            .map(|line| line.split_once('#').map_or(line, |(name, _comment)| name))
             .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter(|l| !l.is_empty())
             .map(String::from)
             .collect();
         anyhow::ensure!(!jobs.is_empty(), "jobs file {path} contains no job names");
         jobs.sort();
         jobs.dedup();
+        for job in &jobs {
+            recipe::validate_job_name(job)?;
+        }
         return Ok(Scope::Jobs { jobs });
     }
     anyhow::bail!(
@@ -269,7 +290,7 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
     use crate::evalset::artifacts::{EvalSetDir, FIDELITY_FILE};
-    use crate::evalset::{depclosure, evaluator, fidelity, key, outcomes, package, recipe};
+    use crate::evalset::{depclosure, evaluator, fidelity, key, outcomes, package};
     use crate::s3::{ARCHIVE_IMAGE_OBJECT, ARCHIVE_MANIFEST_OBJECT, ArchiveS3, ByRecipePointer};
 
     let scope = parse_scope(&args.scope)?;
@@ -948,6 +969,74 @@ mod tests {
         std::fs::write(
             &f,
             "nixpkgs.jq.x86_64-linux\nnixpkgs.hello.x86_64-linux\nnixpkgs.jq.x86_64-linux\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_scope(&format!("jobs-file:{}", f.display())).unwrap(),
+            Scope::Jobs {
+                jobs: vec![
+                    "nixpkgs.hello.x86_64-linux".into(),
+                    "nixpkgs.jq.x86_64-linux".into()
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn scope_job_names_are_charset_validated_at_parse_time() {
+        // A bad job name must fail here, at the input boundary, in
+        // milliseconds — not by mangling the politeness-budgeted
+        // `eval/<id>/job/<name>` request URL in Phase 1 (a `#` truncates
+        // it at the fragment) and only being rejected by the Phase-3
+        // selection-expression gate after the multi-minute source prep.
+        let err = parse_scope("jobs:nixpkgs.hello.x86_64-linux,nixpkgs.bad job.x86_64-linux")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("\"bad job\"") && msg.contains("characters outside"),
+            "the offending component must be named; got: {msg}"
+        );
+
+        // Empty attr-path components are caught at the boundary too.
+        let err = parse_scope("jobs:nixpkgs..hello").unwrap_err();
+        assert!(
+            err.to_string().contains("empty attr-path component"),
+            "got: {err:#}"
+        );
+
+        // The constituents aggregate is an operator-supplied job name
+        // that feeds a Hydra request path: same boundary, same rule.
+        let err = parse_scope("constituents:tested#oops").unwrap_err();
+        assert!(
+            err.to_string().contains("characters outside"),
+            "got: {err:#}"
+        );
+
+        // jobs-file entries go through the same validation.
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("jobs.txt");
+        std::fs::write(&f, "nixpkgs.hello@x86_64-linux\n").unwrap();
+        let err = parse_scope(&format!("jobs-file:{}", f.display())).unwrap_err();
+        assert!(
+            err.to_string().contains("characters outside"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn jobs_file_supports_trailing_comments() {
+        // `#` starts a comment anywhere on a jobs-file line, as the
+        // scope syntax documents: a trailing comment must not become
+        // part of the job name.
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("jobs.txt");
+        std::fs::write(
+            &f,
+            "# whole-line comment\n\
+             nixpkgs.hello.x86_64-linux  # canary job\n\
+             nixpkgs.jq.x86_64-linux#no-space\n\
+             \n\
+                # indented whole-line comment\n",
         )
         .unwrap();
         assert_eq!(

@@ -187,16 +187,55 @@ pub fn evaluator_argv_scoped(
     ]
 }
 
+/// Whether `s` can be embedded verbatim where the recorder writes bare
+/// words into generated Nix source or Hydra request paths: non-empty
+/// and within `[A-Za-z0-9_+-]`.
+fn is_embeddable_word(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
+}
+
+/// Validate a Hydra job name: at least one `.`-separated component,
+/// each non-empty and within `[A-Za-z0-9_+-]` (every job name observed
+/// in the nixos jobsets is).
+///
+/// The rule guards both places a job name is embedded verbatim — the
+/// generated selection expression and the `eval/<id>/job/<name>` Hydra
+/// request path, which does no percent-encoding (a `#` would truncate
+/// the URL at the fragment and silently query a different job). The
+/// `--scope` parser applies it at the input boundary, so a bad name
+/// fails in milliseconds — before any politeness-budgeted Hydra request
+/// or the multi-minute source prep — and [`selection_expr`] re-checks
+/// before generating Nix.
+pub fn validate_job_name(job: &str) -> anyhow::Result<()> {
+    let components: Vec<&str> = job.split('.').collect();
+    anyhow::ensure!(
+        !components.is_empty() && components.iter().all(|c| !c.is_empty()),
+        "job name {job:?} has an empty attr-path component"
+    );
+    for component in components {
+        anyhow::ensure!(
+            is_embeddable_word(component),
+            "job name {job:?} component {component:?} contains characters outside \
+             [A-Za-z0-9_+-]; such attribute names cannot be embedded in the generated \
+             selection expression or a Hydra request path"
+        );
+    }
+    Ok(())
+}
+
 /// Generate the scoped selection expression: one shared evaluation of
 /// the jobset entry point, exposing exactly the requested jobs as a
 /// flat attrset keyed by Hydra job name.
 ///
-/// Job names and the nixpkgs rev/shortRev are interpolated into the
-/// generated Nix source, so they are validated first: each `.`-separated
-/// job component must stay within `[A-Za-z0-9_+-]` (every Hydra job name
-/// observed in the nixos jobsets does) and the revisions must be bare
-/// lowercase hex, otherwise the generated expression could mean
-/// something other than the requested selection.
+/// Job names, jobset input names, and the nixpkgs rev/shortRev are
+/// interpolated into the generated Nix source, so they are validated
+/// first: each `.`-separated job component and each input name must
+/// stay within `[A-Za-z0-9_+-]` (every job and input name observed in
+/// the nixos jobsets does) and the revisions must be bare lowercase
+/// hex, otherwise the generated expression could mean something other
+/// than the requested selection.
 pub fn selection_expr(
     entry_point: &Path,
     nixpkgs: &NixpkgsArg,
@@ -230,6 +269,11 @@ pub fn selection_expr(
     writeln!(expr, "  release = import {} {{", entry_point.display())?;
     writeln!(expr, "    nixpkgs = {};", nixpkgs.to_nix_expr())?;
     for (name, literal) in extra_args {
+        anyhow::ensure!(
+            is_embeddable_word(name),
+            "jobset input name {name:?} is empty or contains characters outside \
+             [A-Za-z0-9_+-]; it cannot be embedded in the generated selection expression"
+        );
         writeln!(expr, "    {name} = {literal};")?;
     }
     writeln!(expr, "  }};")?;
@@ -240,23 +284,9 @@ pub fn selection_expr(
     writeln!(expr, "in")?;
     writeln!(expr, "{{")?;
     for job in jobs {
-        let components: Vec<&str> = job.split('.').collect();
-        anyhow::ensure!(
-            !components.is_empty() && components.iter().all(|c| !c.is_empty()),
-            "job name {job:?} has an empty attr-path component"
-        );
-        for component in &components {
-            anyhow::ensure!(
-                component
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+')),
-                "job name {job:?} component {component:?} contains characters outside \
-                 [A-Za-z0-9_+-]; such attribute names cannot be embedded in the generated \
-                 selection expression"
-            );
-        }
-        let path_list = components
-            .iter()
+        validate_job_name(job)?;
+        let path_list = job
+            .split('.')
             .map(|c| format!("\"{c}\""))
             .collect::<Vec<_>>()
             .join(" ");
@@ -631,6 +661,60 @@ in
         )
         .unwrap_err();
         assert!(err.to_string().contains("nixpkgs..hello"));
+    }
+
+    #[test]
+    fn job_name_validation_accepts_observed_hydra_shapes() {
+        // The shapes the nixos jobsets actually produce (dots as
+        // separators; `-`, `_`, `+`, digits inside components) all pass.
+        for good in [
+            "tested",
+            "nixpkgs.hello.x86_64-linux",
+            "nixpkgs.gnupg24+libusb.x86_64-linux",
+            "nixos.tests.systemd-networkd.x86_64-linux",
+            "nixpkgs.haskellPackages.aeson_2_2_3_0.x86_64-linux",
+        ] {
+            validate_job_name(good).unwrap_or_else(|e| panic!("{good:?} must pass: {e:#}"));
+        }
+        // Empty names/components and characters that would mangle a
+        // Hydra request path or the generated Nix are rejected.
+        for bad in [
+            "",
+            ".",
+            "a..b",
+            ".a",
+            "a.",
+            "a b.c",
+            "a.b#c",
+            "a.b/c",
+            "a.\"b\".c",
+        ] {
+            assert!(validate_job_name(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn selection_expression_rejects_unsupported_input_name_characters() {
+        // Jobset input names come from the Hydra API and are interpolated
+        // verbatim as `<name> = <literal>;` bindings, so a name outside
+        // [A-Za-z0-9_+-] would make the generated expression malformed or
+        // mean something other than the requested selection. Real Hydra
+        // input names are bare identifiers, so nothing legitimate is
+        // rejected.
+        for bad_name in ["weird name", "x = true; y", "ha;sh", "inj=ect", ""] {
+            let err = selection_expr(
+                std::path::Path::new("/e.nix"),
+                &sample_arg(),
+                &[(bad_name.to_string(), "true".to_string())],
+                &["nixpkgs.hello.x86_64-linux".to_string()],
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("jobset input name") && msg.contains(&format!("{bad_name:?}")),
+                "the offending input name must be named; got: {msg}"
+            );
+        }
     }
 
     #[test]
