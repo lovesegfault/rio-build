@@ -1446,8 +1446,8 @@ to complete; if it cannot finish within the grace period, it is reassigned.
   strip legalizes (#rref("sched.merge.ingress-inline-drv-binding+1"))
   — the consumer MUST surface the skip with a warning naming the node
   and consumer and an increment of
-  `rio_scheduler_ca_bookkeeping_skipped_total{consumer}`, never skip
-  silently.
+  #(refs.metric)("rio_scheduler_ca_bookkeeping_skipped_total") (labeled
+  by consumer), never skip silently.
 ]
 The strip turned `ca.modular_hash = None` into a legal state for
 CA/resolve nodes, and three `if let Some` consumers absorbed it

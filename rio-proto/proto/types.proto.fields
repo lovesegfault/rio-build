@@ -112,6 +112,7 @@ uint64 bytes_expected = 2;
 uint64 bytes_freed = 3;
 uint64 disk_total_bytes = 5;
 uint64 disk_used_bytes = 4;
+uint64 drv_modulo_deleted = 7;
 uint64 manifest_existed = 3;
 uint64 memory_total_bytes = 3;
 uint64 memory_used_bytes = 2;

@@ -520,6 +520,13 @@
     },
     {
       "enum": "DerivationError",
+      "name": "NonDeferredFill",
+      "crate": "rio-nix",
+      "msg": "internal: fill_deferred refused non-deferred output '{0}' (deferred-filter/fill drift — report this)",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
       "name": "NotInputAddressed",
       "crate": "rio-nix",
       "msg": "derivation '{0}' is not plain input-addressed (fixed-output and floating-CA outputs derive their paths from content, not from the derivation hash)",

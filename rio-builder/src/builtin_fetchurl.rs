@@ -132,7 +132,7 @@ pub struct FetchurlParams {
     pub netrc: Option<PathBuf>,
     /// Per-attempt transfer budget (bytes moved: HTTP body on the plain
     /// path, decompressed payload on the unpack path). Always
-    /// [`MAX_TRANSFER_BYTES`] in production (`from_env` pins it; this
+    /// `MAX_TRANSFER_BYTES` in production (`from_env` pins it; this
     /// is NOT operator-configurable) — a field only so tests can
     /// exercise exhaustion without 64 GiB fixtures.
     pub transfer_cap: u64,

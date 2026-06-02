@@ -957,7 +957,7 @@ impl ClosureHole {
         self.missing = rows.into_iter().collect();
     }
 
-    /// Clear on positive coverage. Requires a [`crate::dag::HealWitness`]
+    /// Clear on positive coverage. Requires a `crate::dag::HealWitness`
     /// — mintable only by the coverage branch in `DerivationDag::merge`
     /// (`sched.evidence.positive-witness`), so an absence-of-objection
     /// clear is unwritable outside tests.
