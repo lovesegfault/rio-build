@@ -478,6 +478,13 @@
     },
     {
       "enum": "DerivationError",
+      "name": "ImpureUnsupported",
+      "crate": "rio-nix",
+      "msg": "experimental Nix feature 'impure-derivations' is disabled (output '{0}')",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
       "name": "InputNotFound",
       "crate": "rio-nix",
       "msg": "input derivation not found: {0}",

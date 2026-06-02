@@ -22,10 +22,15 @@
 //!    (derivations.cc:346 reads the pair only under a non-empty algo),
 //!    which would break rio's byte-faithful round-trip guarantee. No
 //!    honest producer emits this shape.
-//! 3. **`impure` outputs are not special-cased** — an `"impure"` hash
-//!    sentinel classifies as Fixed with an undecodable hash and is
-//!    rejected by the downstream decode gates (default experimental-
-//!    feature posture: `Xp::ImpureDerivations` is off).
+//! 3. **`impure` outputs are rejected at classification** — the oracle
+//!    checks the `"impure"` sentinel first inside the non-empty-algo
+//!    branch (derivations.cc:318-326) and, with `Xp::ImpureDerivations`
+//!    disabled (rio's fixed posture), throws there. rio mirrors the
+//!    ordering and the posture: both path shapes reject with the
+//!    oracle's first clause verbatim
+//!    ([`DerivationError::ImpureUnsupported`]), and no `Impure` variant
+//!    exists. The divergence from an oracle WITH the feature enabled is
+//!    fail-closed and carries no enabling knob.
 //! 4. **Duplicate output names are rejected** at classification
 //!    ([`DerivationTypeError::DuplicateOutputName`], the oracle EVAL's
 //!    posture and verbatim wording, primops.cc:1529). The oracle's
@@ -114,6 +119,9 @@ impl DerivationOutput {
     /// - `hash_algo` without `hash` but WITH a path (floating outputs
     ///   must not declare paths)
     /// - `hash` without `hash_algo`
+    /// - the `"impure"` hash sentinel (rejected before the
+    ///   fixed/floating split, in the oracle's order, with the
+    ///   oracle's disabled-feature wording)
     // r[impl nix.drv.output-typed]
     // r[impl nix.divergence.output-path-parse]
     // r[impl nix.divergence.hash-without-algo]
@@ -136,6 +144,22 @@ impl DerivationOutput {
         }
 
         let repr = if !hash_algo.is_empty() {
+            // Oracle ordering (derivations.cc:318-326): the `"impure"`
+            // sentinel is checked FIRST inside the non-empty-algo
+            // branch — before the fixed/floating split and before any
+            // path validation — so both path shapes (declared and
+            // empty) reject identically. rio's posture is the oracle's
+            // own with the feature disabled (`xpSettings.require(
+            // Xp::ImpureDerivations)` throws); the message's first
+            // clause is verbatim, with no flag-suggestion tail — rio
+            // has no experimental-feature knob to point at.
+            // `('', "impure")` never reaches here: the
+            // hash-without-algo gate above already rejected it
+            // (do-not-conflate — that shape is an orphan hash, not an
+            // impure declaration).
+            if hash == "impure" {
+                return Err(DerivationError::ImpureUnsupported(name));
+            }
             if !hash.is_empty() {
                 // Oracle: CAFixed — validatePath(pathS) (an empty path
                 // is "bad path '' in derivation").
@@ -398,14 +422,47 @@ mod tests {
         assert!(floating.store_path().is_none());
     }
 
-    /// The `"impure"` hash sentinel is NOT special-cased: it
-    /// classifies as Fixed with an undecodable digest (rejected by the
-    /// decode gates downstream), matching the default experimental-
-    /// feature posture.
+    /// The `"impure"` hash sentinel rejects BEFORE the fixed/floating
+    /// split, in the oracle's order (derivations.cc:318-326) and with
+    /// the oracle's first clause verbatim — for BOTH path shapes. The
+    /// previous pin here asserted the sentinel classified as Fixed with
+    /// a junk digest: a fixture CppNix can never produce (its parser
+    /// returns `Impure` or throws before `CAFixed` is reachable), which
+    /// is fix-discipline R6's prose-outruns-mechanism shape — a test
+    /// pinning behavior the oracle contradicts. Parents: FU2-C2
+    /// (ac5e41cd1) introduced the classification; pattern R6.
     #[test]
-    fn impure_sentinel_is_a_fixed_output_with_junk_hash() {
-        let o = DerivationOutput::new("out", P, "sha256", "impure").unwrap();
-        assert!(matches!(o.kind(), OutputKind::Fixed { hash: "impure", .. }));
+    fn impure_sentinel_rejects_before_shape_classification() {
+        // Declared path: the oracle would reject the path AFTER the
+        // feature check; the impure error wins.
+        let with_path = DerivationOutput::new("out", P, "sha256", "impure").unwrap_err();
+        assert!(matches!(
+            &with_path,
+            DerivationError::ImpureUnsupported(name) if name == "out"
+        ));
+        assert!(
+            with_path
+                .to_string()
+                .starts_with("experimental Nix feature 'impure-derivations' is disabled"),
+            "first clause must be oracle-verbatim: {with_path}"
+        );
+        assert!(
+            !with_path
+                .to_string()
+                .contains("--extra-experimental-features"),
+            "no flag-suggestion tail — rio has no knob"
+        );
+        // Empty path: same rejection (oracle checks impure before path).
+        assert!(matches!(
+            DerivationOutput::new("out", "", "r:sha256", "impure"),
+            Err(DerivationError::ImpureUnsupported(_))
+        ));
+        // Do-not-conflate: ('', "impure") is an orphan hash, not an
+        // impure declaration — the hash-without-algo gate owns it.
+        assert!(matches!(
+            DerivationOutput::new("out", P, "", "impure"),
+            Err(DerivationError::HashWithoutAlgo(_))
+        ));
     }
 
     /// Junk algo names and junk digests remain representable — the

@@ -498,6 +498,19 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
+    /// The ATerm parser surfaces the impure-sentinel rejection from the
+    /// output classification untouched — the parser adds no wrapping
+    /// and no shape of its own.
+    #[test]
+    fn impure_sentinel_passes_through_the_aterm_parser() {
+        let aterm = r#"Derive([("out","","r:sha256","impure")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","imp"),("out",""),("outputHash","impure"),("outputHashAlgo","r:sha256"),("system","x86_64-linux")])"#;
+        let err = Derivation::parse(aterm).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::derivation::DerivationError::ImpureUnsupported(ref name) if name == "out"
+        ));
+    }
+
     #[test]
     fn parse_simple_derivation() -> anyhow::Result<()> {
         let aterm = r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-simple-test","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello > $out"],[("builder","/bin/sh"),("name","simple-test"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-simple-test"),("system","x86_64-linux")])"#;

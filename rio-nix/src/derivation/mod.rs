@@ -73,6 +73,9 @@ pub enum DerivationError {
     )]
     HashWithoutAlgo(String),
 
+    #[error("experimental Nix feature 'impure-derivations' is disabled (output '{0}')")]
+    ImpureUnsupported(String),
+
     #[error("ill-typed derivation outputs: {0}")]
     IllTypedOutputs(#[from] output::DerivationTypeError),
     #[error(
