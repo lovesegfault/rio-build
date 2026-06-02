@@ -366,7 +366,7 @@ fn parse_fixed_ca_descriptor(s: &str, ctx_label: &str) -> Result<FixedCaDescript
     Ok(FixedCaDescriptor { recursive, hash })
 }
 
-// r[impl sec.authz.ca-path-derived+8]
+// r[impl sec.authz.ca-path-derived+9]
 /// Content-address authorization gate. Workers are untrusted, so the
 /// store — not the builder — is the authority on whether a claimed
 /// store path is actually derivable from the uploaded bytes. The gate
@@ -421,11 +421,15 @@ fn parse_fixed_ca_descriptor(s: &str, ctx_label: &str) -> Result<FixedCaDescript
 /// buffered NAR (no extraction copy, no artificial size ceiling).
 ///
 /// When a `fixed:` descriptor is present but disagrees with the plain
-/// hash, the gate retries once with the hash modulo the claimed path's
-/// own hash part before rejecting: structured-attrs
-/// `unsafeDiscardReferences` legitimately produces uploads whose bytes
-/// embed their own path while declaring no self-reference, and CppNix
-/// mints those paths from exactly that modulo hash.
+/// hash **on a floating-CA token** (`claims.is_ca`), the gate retries
+/// once with the hash modulo the claimed path's own hash part before
+/// rejecting: structured-attrs `unsafeDiscardReferences` legitimately
+/// produces floating uploads whose bytes embed their own path while
+/// declaring no self-reference, and CppNix mints those paths from
+/// exactly that modulo hash. Declared-hash uploads (fixed-output, or an
+/// input-addressed claim volunteering a descriptor) get NO modulo
+/// retry — their paths derive from the declared hash, so the retry
+/// would admit spliced content whose plain hash differs from it.
 ///
 /// `None` claims (dev mode / service-token bypass) → no-op: the
 /// trusted control plane (gateway `nix copy` ingestion, store-added
@@ -554,17 +558,29 @@ pub(in crate::grpc) fn verify_ca_store_path(
                 })?;
                 w.finish()
             };
-            // Descriptor-gated fallback for *unrecorded* self-references:
-            // CppNix's structured-attrs `unsafeDiscardReferences` mints
-            // paths whose bytes embed their own hash while declaring no
-            // self-reference, and the `fixed:` descriptor then carries the
-            // hash *modulo* those occurrences. If the descriptor disagrees
-            // with the plain hash, re-hash modulo the claimed path's own
-            // hash before concluding anything — still self-certifying (the
-            // modulus is the claimed path itself), and the extra pass is
-            // only paid when the plain hash already failed to match.
+            // Descriptor-gated fallback for *unrecorded* self-references —
+            // FLOATING-CA TOKENS ONLY. CppNix's structured-attrs
+            // `unsafeDiscardReferences` mints floating-CA paths whose bytes
+            // embed their own hash while declaring no self-reference, and
+            // the `fixed:` descriptor then carries the hash *modulo* those
+            // occurrences. For a floating token the claimed path is
+            // content-derived FROM that modulo hash, so the retry stays
+            // self-certifying: a forgery needs a path whose hash part,
+            // zeroed in the content, hashes back to exactly that path.
+            //
+            // The same arithmetic is UNSOUND for declared-hash uploads
+            // (`is_ca = false`, fixed-output): there the path derives from
+            // the derivation's DECLARED hash H, so accepting
+            // `modulo_P(B') == H` admits content `B'` whose plain hash is
+            // NOT H — splice P's own hash part into attacker-chosen bytes,
+            // pick H = modulo_P(B'), and the path check still re-derives
+            // (the splice forgery, merged_bug_076; parent fix d6c083a1a
+            // re-routed declared-hash FODs through this arm without
+            // re-deriving its floating-only soundness theorem — pattern R5).
+            // Restricting on `claims.is_ca` (trusted-plane bit), not the
+            // descriptor shape, keeps the trigger out of worker control.
             match &descriptor {
-                Some(d) if d.hash != plain => {
+                Some(d) if claims.is_ca && d.hash != plain => {
                     let mut sink =
                         rio_nix::ca::HashModuloSink::new(algo, &info.store_path.hash_part());
                     sink.write_all(nar_data).map_err(|e| {
@@ -604,18 +620,20 @@ pub(in crate::grpc) fn verify_ca_store_path(
         w.write_all(file_bytes)
             .map_err(|e| Status::internal(format!("{ctx_label}: flat hash ({algo}): {e}")))?;
         let plain = w.finish();
-        // Same descriptor-gated fallback as the recursive branch:
-        // structured-attrs `unsafeDiscardReferences` flat outputs whose
-        // bytes embed their own path are minted (by CppNix and the
-        // native builder alike) from the hash *modulo* those
-        // occurrences, with no self-reference declared. If the
-        // descriptor disagrees with the plain flat hash, re-hash the
-        // file bytes modulo the claimed path's own hash part before
-        // concluding anything — still self-certifying (the modulus is
-        // the claimed path itself), and only paid when the plain hash
-        // already failed to match.
+        // Same descriptor-gated fallback as the recursive branch, and the
+        // same FLOATING-CA-ONLY restriction: structured-attrs
+        // `unsafeDiscardReferences` flat outputs whose bytes embed their
+        // own path are minted (by CppNix and the native builder alike)
+        // from the hash *modulo* those occurrences, with no
+        // self-reference declared — sound because a floating path derives
+        // FROM the modulo hash. For declared-hash uploads the modulo
+        // retry would admit the flat splice forgery (file bytes embedding
+        // the claimed path's hash part, `modulo_P(file) == declared H`,
+        // plain hash ≠ H) — see the recursive arm's soundness note. Gated
+        // on `claims.is_ca` (trusted-plane bit), only paid when the plain
+        // hash already failed to match.
         match &descriptor {
-            Some(d) if d.hash != plain => {
+            Some(d) if claims.is_ca && d.hash != plain => {
                 let mut sink = rio_nix::ca::HashModuloSink::new(algo, &info.store_path.hash_part());
                 sink.write_all(file_bytes).map_err(|e| {
                     Status::internal(format!("{ctx_label}: flat hash-modulo fallback: {e}"))
@@ -1678,7 +1696,7 @@ mod verify_nar_tests {
         c
     }
 
-    // r[verify sec.authz.ca-path-derived+8]
+    // r[verify sec.authz.ca-path-derived+9]
     /// A fixed-output assignment (signed `is_fixed_output = true`) may
     /// not skip content verification by omitting the descriptor: the
     /// store rejects rather than falling back to membership-only
@@ -1723,7 +1741,7 @@ mod verify_nar_tests {
         (path, nar, descriptor)
     }
 
-    // r[verify sec.authz.ca-path-derived+8]
+    // r[verify sec.authz.ca-path-derived+9]
     /// Fixed-output uploads (is_ca = false, `fixed:` descriptor present)
     /// are content-verified server-side: the descriptor must match the
     /// uploaded bytes AND the claimed path must re-derive from it. A
@@ -1769,7 +1787,7 @@ mod verify_nar_tests {
         );
     }
 
-    // r[verify sec.authz.ca-path-derived+8]
+    // r[verify sec.authz.ca-path-derived+9]
     /// Flat-mode fixed-output uploads get the same binding, using the
     /// file-bytes hash instead of the NAR hash.
     #[test]
@@ -1807,7 +1825,7 @@ mod verify_nar_tests {
         );
     }
 
-    // r[verify sec.authz.ca-path-derived+8]
+    // r[verify sec.authz.ca-path-derived+9]
     /// Method confusion on the fixed-output arm: the descriptor honestly
     /// matches the bytes under the WRONG method (flat) while the claimed
     /// path was minted recursively — the path re-derivation rejects, the
@@ -1830,6 +1848,169 @@ mod verify_nar_tests {
         assert!(
             err.message().contains("content-derived"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// Build the splice-forgery shape (merged_bug_076): bytes that embed
+    /// the claimed path's own hash part with NO declared self-reference,
+    /// plus a descriptor carrying the hash MODULO those occurrences. For
+    /// a floating-CA token this is the legitimate discarded-self shape
+    /// (the path derives FROM the modulo hash); for a declared-hash
+    /// token it is a forgery (content whose PLAIN hash differs from the
+    /// hash the path was minted from). Returns
+    /// `(path, nar, modulo_descriptor, modulo_hash, plain_hash)`.
+    fn build_spliced_modulo_upload(
+        name: &str,
+        recursive: bool,
+    ) -> (
+        rio_nix::store_path::StorePath,
+        Vec<u8>,
+        String,
+        rio_nix::hash::NixHash,
+        rio_nix::hash::NixHash,
+    ) {
+        use std::io::Write as _;
+        let drv = rio_nix::store_path::StorePath::parse(&test_drv_path(name)).unwrap();
+        let scratch =
+            rio_nix::store_path::StorePath::make_scratch_output_path(&drv, "out").unwrap();
+        let content_at_scratch = format!("I live at {}\n", scratch.as_str()).into_bytes();
+        let hashed_at_scratch = if recursive {
+            nar_of_file(&content_at_scratch)
+        } else {
+            content_at_scratch.clone()
+        };
+        let mut sink =
+            rio_nix::ca::HashModuloSink::new(rio_nix::hash::HashAlgo::SHA256, &scratch.hash_part());
+        sink.write_all(&hashed_at_scratch).unwrap();
+        let (modulo, _) = sink.finish();
+        let path = rio_nix::store_path::StorePath::make_fixed_output_with_self(
+            name,
+            &modulo,
+            recursive,
+            &[],
+            false,
+        )
+        .unwrap();
+        let final_content = String::from_utf8(content_at_scratch)
+            .unwrap()
+            .replace(&scratch.hash_part(), &path.hash_part())
+            .into_bytes();
+        let nar = nar_of_file(&final_content);
+        let plain_input: &[u8] = if recursive { &nar } else { &final_content };
+        let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+        w.write_all(plain_input).unwrap();
+        let plain = w.finish();
+        let method = if recursive { "r:" } else { "" };
+        let descriptor = format!("fixed:{method}{}", modulo.to_colon());
+        (path, nar, descriptor, modulo, plain)
+    }
+
+    // r[verify sec.authz.ca-path-derived+9]
+    /// THE splice forgery (merged_bug_076, fix-child of d6c083a1a /
+    /// 79c68a4ca): under a declared-hash (fixed-output) token, content
+    /// embedding the claimed path's own hash part — chosen so the hash
+    /// MODULO the path equals the descriptor while the PLAIN hash does
+    /// not — must be rejected. Pre-fix, the discarded-self fallback
+    /// (sound only for floating-CA, where the path derives from the
+    /// modulo) accepted exactly this shape and registered content whose
+    /// plain hash differs from the hash the path was minted from.
+    #[test]
+    fn fod_spliced_self_hash_descriptor_rejected() {
+        use std::io::Write as _;
+        let (path, nar, descriptor, modulo, plain) =
+            build_spliced_modulo_upload("fod-splice", true);
+
+        // Tripwire: the pre-fix acceptance conditions all hold — the
+        // modulo recompute over the uploaded bytes EQUALS the descriptor
+        // hash, the plain hash does NOT, and the claimed path re-derives
+        // from the modulo. If any of these stops holding, the test has
+        // gone vacuous (it would reject for fixture reasons, not because
+        // the fallback is gated).
+        let mut sink =
+            rio_nix::ca::HashModuloSink::new(rio_nix::hash::HashAlgo::SHA256, &path.hash_part());
+        sink.write_all(&nar).unwrap();
+        let (modulo_recomputed, _) = sink.finish();
+        assert_eq!(modulo_recomputed, modulo, "tripwire: modulo_P(B') == H");
+        assert_ne!(plain, modulo, "tripwire: plain(B') != H");
+        let rederived = rio_nix::store_path::StorePath::make_fixed_output_with_self(
+            "fod-splice",
+            &modulo,
+            true,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            rederived.as_str(),
+            path.as_str(),
+            "tripwire: P derives from H"
+        );
+
+        let mut info = ca_info(&path, &[], &nar);
+        info.content_address = Some(descriptor.clone());
+        let err = verify_ca_store_path(&info, &nar, Some(&fod_claims()), "t")
+            .expect_err("spliced modulo descriptor under a FOD token must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied, "got: {err:?}");
+        assert!(
+            err.message().contains("descriptor does not match"),
+            "rejection must be the descriptor mismatch (no modulo retry), got: {}",
+            err.message()
+        );
+
+        // Companion: the SAME NAR + descriptor under a floating-CA token
+        // is the legitimate discarded-self shape and must stay accepted —
+        // the fix gates the retry on the token class, it does not remove
+        // it.
+        let mut info = ca_info(&path, &[], &nar);
+        info.content_address = Some(descriptor);
+        verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t")
+            .expect("same upload under a floating-CA token must keep passing");
+    }
+
+    // r[verify sec.authz.ca-path-derived+9]
+    /// Flat sibling of the splice forgery: the verbatim-copied flat
+    /// fallback arm (79c68a4ca) gets the same floating-only restriction.
+    #[test]
+    fn fod_flat_spliced_self_hash_descriptor_rejected() {
+        let (path, nar, descriptor, _modulo, _plain) =
+            build_spliced_modulo_upload("fod-flat-splice", false);
+
+        let mut info = ca_info(&path, &[], &nar);
+        info.content_address = Some(descriptor.clone());
+        let err = verify_ca_store_path(&info, &nar, Some(&fod_claims()), "t")
+            .expect_err("flat spliced modulo descriptor under a FOD token must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied, "got: {err:?}");
+        assert!(
+            err.message().contains("descriptor does not match"),
+            "got: {}",
+            err.message()
+        );
+
+        // Floating-CA companion (flat discarded-self stays legitimate).
+        let mut info = ca_info(&path, &[], &nar);
+        info.content_address = Some(descriptor);
+        verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t")
+            .expect("flat discarded-self under a floating-CA token must keep passing");
+    }
+
+    // r[verify sec.authz.ca-path-derived+9]
+    /// An input-addressed token volunteering a descriptor gets the same
+    /// no-modulo-retry verification as the fixed-output class: the
+    /// spliced shape is rejected at the descriptor mismatch, never
+    /// rescued by the floating-only fallback.
+    #[test]
+    fn ia_voluntary_descriptor_no_modulo_retry() {
+        let (path, nar, descriptor, _modulo, _plain) =
+            build_spliced_modulo_upload("ia-splice", true);
+        let mut info = ca_info(&path, &[], &nar);
+        info.content_address = Some(descriptor);
+        let err = verify_ca_store_path(&info, &nar, Some(&ia_claims()), "t")
+            .expect_err("spliced descriptor under an IA token must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied, "got: {err:?}");
+        assert!(
+            err.message().contains("descriptor does not match"),
+            "got: {}",
+            err.message()
         );
     }
 

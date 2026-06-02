@@ -313,47 +313,59 @@ the `pending_s3_deletes` table.
   via a service token --- see #rref("sec.authz.service-token").
 ]
 
-#r("sec.authz.ca-path-derived+8")[
+#r("sec.authz.ca-path-derived+9")[
   Workers are untrusted: builder-side hash checks are defense-in-depth, and
   the store is the authority on whether a claimed path is derivable from the
   uploaded bytes. The store MUST verify every worker upload that makes a
-  content-address claim, in both token shapes. For floating-CA derivations
-  (`AssignmentClaims.is_ca = true`),
-  `expected_outputs` is unknown at dispatch time. Instead of skipping
-  authorization, the store recomputes the CA store path *server-side* from the
-  buffered NAR using the ingestion method declared by the upload's `fixed:`
-  content-address descriptor — recursive (NAR) or flat (a single
-  non-executable regular file), sha1/sha256/sha512, hash-modulo when a
-  self-reference is declared (via `StorePath::make_fixed_output_with_self`);
-  when the descriptor's declared hash disagrees with that plain recompute the
-  store retries exactly once with the hash taken modulo the claimed path's own
-  hash part (the discarded-self-reference shape structured-attrs
-  `unsafeDiscardReferences` produces), so acceptance always requires the
-  descriptor to equal the store's own recompute and the claimed path to
-  re-derive from it; uploads without a descriptor are
-  verified as recursive SHA-256 --- and rejects with `PERMISSION_DENIED` if it
-  does not match the uploaded `store_path`. For fixed-output uploads
-  (`is_ca = false` with a `fixed:` content-address descriptor, as the builder
-  records from the derivation's declared hash), the same server-side
-  recompute, descriptor cross-check, and path re-derivation MUST run in
-  addition to the `expected_outputs` membership check, so a compromised
-  worker cannot register content at a fixed-output path that the content does
-  not derive; a non-`fixed:` descriptor on a worker upload is rejected. The
-  trigger for that verification is trusted-plane data, not the worker's own
-  claim: the scheduler signs `is_fixed_output` into the assignment token for
-  every fixed-output assignment, and the store MUST reject a descriptor-less
-  upload under a fixed-output-flagged token with `PERMISSION_DENIED` — a
-  worker cannot opt out of content verification by omitting its descriptor.
-  Descriptor-less `is_ca = false` uploads under a token that does not mark
-  the assignment fixed-output (input-addressed outputs and daemon-era
-  workers) remain authorized by membership alone. The server-side CA-path recompute MUST run BEFORE the
-  `'uploading'` placeholder is claimed (#rref("store.put.wal-manifest") step
-  1), so a worker holding an `is_ca` token cannot squat placeholders for paths
-  it has not content-proven (it would otherwise drip-feed chunks while
-  heartbeating an arbitrary path's placeholder fresh, forcing legitimate
-  uploaders into `Aborted`). A worker holding an `is_ca=true` token therefore
-  cannot upload to (or squat the placeholder for) any path other than the
-  content-derived path of the NAR it actually sent.
+  content-address claim, with the required outcome fixed PER UPLOAD CLASS,
+  the class derived from trusted-plane token bits plus the descriptor ---
+  never from worker-controlled shape alone:
+
+  - *Floating-CA* (`AssignmentClaims.is_ca = true`): `expected_outputs` is
+    unknown at dispatch time. Instead of skipping authorization, the store
+    MUST recompute the CA store path *server-side* from the buffered NAR
+    using the ingestion method declared by the upload's `fixed:`
+    content-address descriptor --- recursive (NAR) or flat (a single
+    non-executable regular file), sha1/sha256/sha512, hash-modulo when a
+    self-reference is declared (via
+    `StorePath::make_fixed_output_with_self`). When the descriptor's
+    declared hash disagrees with the plain recompute, the store MUST retry
+    exactly once with the hash taken modulo the claimed path's own hash part
+    (the discarded-self-reference shape structured-attrs
+    `unsafeDiscardReferences` produces) --- and that modulo retry MUST be
+    confined to this floating-CA class, where it is self-certifying because
+    the claimed path derives FROM the modulo hash. Acceptance always
+    requires the descriptor to equal the store's own recompute and the
+    claimed path to re-derive from it; uploads without a descriptor are
+    verified as recursive SHA-256. Mismatch ⇒ `PERMISSION_DENIED`.
+  - *Fixed-output* (`is_ca = false`, token flagged `is_fixed_output`): the
+    builder records the derivation's declared hash as a `fixed:` descriptor;
+    the same server-side recompute, descriptor cross-check, and path
+    re-derivation MUST run in addition to the `expected_outputs` membership
+    check --- and the discarded-self modulo retry MUST NOT apply. A
+    declared-hash path derives from the declared hash itself, so accepting a
+    modulo match would register spliced content whose plain hash differs
+    from the declared hash (bytes embedding the claimed path's own hash
+    part, chosen so the modulo --- not the content --- equals it). The store
+    MUST reject a descriptor-less upload under a fixed-output-flagged token
+    with `PERMISSION_DENIED`: the verification trigger is the
+    scheduler-signed bit, never the worker's own claim, so a worker cannot
+    opt out of content verification by omitting its descriptor.
+  - *Input-addressed* (`is_ca = false`, not fixed-output-flagged): authorized
+    by `expected_outputs` membership (plus
+    #rref("store.put.ia-deriver-proof")); a voluntarily attached `fixed:`
+    descriptor is verified with the same no-modulo-retry semantics as the
+    fixed-output class, a non-`fixed:` descriptor on any worker upload is
+    rejected, and daemon-era descriptor-less uploads remain membership-only.
+
+  The server-side CA-path recompute MUST run BEFORE the `'uploading'`
+  placeholder is claimed (#rref("store.put.wal-manifest") step 1), so a
+  worker holding an `is_ca` token cannot squat placeholders for paths it has
+  not content-proven (it would otherwise drip-feed chunks while heartbeating
+  an arbitrary path's placeholder fresh, forcing legitimate uploaders into
+  `Aborted`). A worker holding an `is_ca=true` token therefore cannot upload
+  to (or squat the placeholder for) any path other than the content-derived
+  path of the NAR it actually sent.
 ]
 
 #r("sec.authz.service-token")[

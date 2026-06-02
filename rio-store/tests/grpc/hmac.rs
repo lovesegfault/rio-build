@@ -444,7 +444,7 @@ fn ca_path_for(name: &str, nar: &[u8]) -> String {
         .to_string()
 }
 
-// r[verify sec.authz.ca-path-derived+8]
+// r[verify sec.authz.ca-path-derived+9]
 #[tokio::test]
 async fn hmac_is_ca_correct_path_accepted() -> TestResult {
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
@@ -462,7 +462,7 @@ async fn hmac_is_ca_correct_path_accepted() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+8]
+// r[verify sec.authz.ca-path-derived+9]
 #[tokio::test]
 async fn hmac_is_ca_wrong_path_rejected() -> TestResult {
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
@@ -486,7 +486,7 @@ async fn hmac_is_ca_wrong_path_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+8]
+// r[verify sec.authz.ca-path-derived+9]
 /// bug_094: pre-fix, `claim_placeholder` ran BEFORE `verify_ca_store_path`
 /// for is_ca tokens, so a compromised worker could open a PutPath stream
 /// to ANY path, send one chunk (no trailer), and hold the `'uploading'`
@@ -587,7 +587,7 @@ async fn hmac_is_ca_wrong_hash_part_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+8]
+// r[verify sec.authz.ca-path-derived+9]
 /// `PutPathBatch` is the multi-output endpoint builders use; the CA
 /// path-derivation gate must apply there too. Same attack as
 /// [`hmac_is_ca_wrong_path_rejected`] but via the batch RPC.
@@ -661,7 +661,7 @@ fn fod_upload_for(name: &str, nar: &[u8]) -> (String, String) {
     (path, format!("fixed:r:{}", h.to_colon()))
 }
 
-// r[verify sec.authz.ca-path-derived+8]
+// r[verify sec.authz.ca-path-derived+9]
 /// A worker holding a FOD-flagged token cannot skip content
 /// verification by omitting its `fixed:` descriptor: the membership
 /// check alone is not enough for a content-bound output.
@@ -685,7 +685,70 @@ async fn hmac_fod_descriptorless_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+8]
+// r[verify sec.authz.ca-path-derived+9]
+/// End-to-end splice forgery (merged_bug_076): a FOD-flagged worker
+/// uploads bytes embedding the claimed path's own hash part with a
+/// descriptor carrying the hash MODULO those occurrences (plain hash ≠
+/// descriptor). The gate must reject at the descriptor mismatch — the
+/// discarded-self modulo retry is floating-CA-only — and the rejection
+/// must leave NO manifest row behind (neither `'uploading'` placeholder
+/// nor complete).
+#[tokio::test]
+async fn hmac_fod_spliced_modulo_rejected_and_no_row_persists() -> TestResult {
+    use std::io::Write as _;
+    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+
+    fn nar_of(contents: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+        let node = rio_nix::nar::NarNode::Regular {
+            executable: false,
+            contents,
+        };
+        let mut buf = Vec::new();
+        rio_nix::nar::serialize(&mut buf, &node)?;
+        Ok(buf)
+    }
+
+    // Splice construction (mirrors the unit fixture): content minted at
+    // a scratch path, hashed modulo it, final path derived from the
+    // modulo, scratch occurrences rewritten to the final hash part.
+    let drv = rio_nix::store_path::StorePath::parse(&format!(
+        "/nix/store/{}-fod-splice-e2e.drv",
+        "b".repeat(32)
+    ))?;
+    let scratch = rio_nix::store_path::StorePath::make_scratch_output_path(&drv, "out")?;
+    let content_at_scratch = format!("I live at {}\n", scratch.as_str()).into_bytes();
+    let nar_at_scratch = nar_of(content_at_scratch.clone())?;
+    let mut sink =
+        rio_nix::ca::HashModuloSink::new(rio_nix::hash::HashAlgo::SHA256, &scratch.hash_part());
+    sink.write_all(&nar_at_scratch)?;
+    let (modulo, _) = sink.finish();
+    let path = rio_nix::store_path::StorePath::make_fixed_output_with_self(
+        "fod-splice-e2e",
+        &modulo,
+        true,
+        &[],
+        false,
+    )?;
+    let final_content = String::from_utf8(content_at_scratch)?
+        .replace(&scratch.hash_part(), &path.hash_part())
+        .into_bytes();
+    let nar = nar_of(final_content)?;
+
+    let mut info = make_path_info_for_nar(path.as_str(), &nar);
+    info.content_address = Some(format!("fixed:r:{}", modulo.to_colon()));
+    let token = sign_claims_fod("test-worker", vec![path.as_str().to_owned()], 60);
+    let err = put_path_with_token(&mut s.client, info, nar, &token)
+        .await
+        .expect_err("spliced FOD upload must be rejected end-to-end");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // No manifest row of ANY status persists for the forged path.
+    let n = poll_scalar_until::<i64>(&s.db.pool, "SELECT count(*)::bigint FROM manifests", 0).await;
+    assert_eq!(n, 0, "rejected splice upload must leave no manifest row");
+    Ok(())
+}
+
+// r[verify sec.authz.ca-path-derived+9]
 /// The honest FOD flow is unaffected: descriptor present, content
 /// matches it, path re-derives from it → accepted.
 #[tokio::test]
@@ -704,7 +767,7 @@ async fn hmac_fod_with_descriptor_accepted() -> TestResult {
     Ok(())
 }
 
-// r[verify sec.authz.ca-path-derived+8]
+// r[verify sec.authz.ca-path-derived+9]
 /// Same enforcement on the batch ingestion path.
 #[tokio::test]
 async fn hmac_fod_batch_descriptorless_rejected() -> TestResult {

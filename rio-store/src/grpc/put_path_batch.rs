@@ -158,7 +158,7 @@ impl StoreServiceImpl {
             if let Err(e) = verify_drv_text_path(info, &accum.nar_data, &ctx) {
                 bail!(e);
             }
-            // r[impl sec.authz.ca-path-derived+8]
+            // r[impl sec.authz.ca-path-derived+9]
             if let Err(e) =
                 verify_ca_store_path(info, &accum.nar_data, auth.hmac_claims.as_ref(), &ctx)
             {
