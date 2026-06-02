@@ -204,7 +204,7 @@ do what the rule says it MUST; recorded in the contradiction table below.
 |---|---|---|
 | `ctrl.nodeclaim.lease-edge-polarity` *(new)* | **COVERS** (the dedup half) | `recorded_boot` suppress-class semantics. |
 | `ctrl.nodeclaim.ice-mark-clear` *(new)* | **COVERS** (the stale-registration half) | Stale registrations are recorded without emitting a clear. |
-| — | as-built deviation | The "no sample lost solely due to scheduler unreachability" half is not fully met by the as-built code: ⊥ ticks before the consolidate-only switch early-return without running the kube-only observation block (documented TODO in `reconcile_once`'s ⊥ arm), so a Registered edge inside that ≤4-tick window is lost. Pre-registered as an expected Stage-B falsification (below), not silently modeled around. |
+| — | as-built deviation — **RESOLVED 2026-06-02 (this commit)** | ~~The "no sample lost solely due to scheduler unreachability" half is not fully met by the as-built code: ⊥ ticks before the consolidate-only switch early-return without running the kube-only observation block, so a Registered edge inside that ≤4-tick window is lost.~~ The ⊥-arm fix runs the shared kube-only observation block on every pre-threshold failed-poll tick (`ctrl.nodeclaim.consolidate-only-degraded+2`); the half now holds unconditionally. |
 
 #### `SingleEffectiveProvisioner` (I11)
 
@@ -260,29 +260,26 @@ A Stage-B model run that falsifies one of these is confirming a documented
 as-built deviation; a falsification NOT on this list is a stop-and-report
 (model-encoding bug or new defect — triaged before Stage C starts).
 
-1. **The ⊥-tick early-return skip** (documented TODO in
-   `mod.rs::reconcile_once`'s ⊥ arm): ticks 1..4 of a ⊥ streak return
-   before the kube-only observation block, so `prev_idle` is not pruned on
-   idle→busy edges and `observe_registered` samples in that window are
-   lost (bounded by the streak ceiling: ≤ 4 ticks ≈ 40 s).
-   - Expected to falsify, in the `fault-rpc` regime:
-     `IdleReapCorrectness` / `IdleBasisCurrentTenure` (a `prev_idle` entry
-     conflates two idle spells across an unobserved busy period — the
-     falsifying trace needs the stale entry already near the threshold,
-     since the 40 s skew alone is below every configured floor), and
-     `BootRecordedOnce`'s no-loss-under-unreachability clause (a
-     Registered edge inside the window is never recorded and never emits
-     its clear).
-   - If Stage B's bucketed idle-age cannot express the near-threshold
-     composition for the first half, that half is recorded as a
-     NOT-ENCODED bound in the model header instead — this is the only
-     entry on this list permitted to downgrade rather than reproduce.
+1. ~~**The ⊥-tick early-return skip**~~ — **RESOLVED 2026-06-02 (this
+   commit)**: the ⊥ arm now runs the shared kube-only observation block
+   on every pre-threshold failed-poll tick (idle→busy pruning +
+   Registered-edge recording, clears discarded; no effect beyond the
+   observations). Both predicted falsifications were confirmed by Stage
+   B exactly as pre-registered, then flipped per the protocol below
+   when the fix landed: `idleReapSafety` and `bootSampleNotLost` are
+   HOLD invariants in the fault-rpc regime check, the expect-violation
+   checks are deleted, and the reproducer traces persist as passing
+   runs (`idlePruneAcrossBotRun`, `bootRecordedAcrossBotRun`). The
+   suite-side red-first evidence (the lost edge and the conflated
+   spell, demonstrated on the pre-fix tree) is quoted in the fix
+   commit's body.
 
 No other as-built falsification is expected: C1 and C2 are spec-text
 findings whose adjudication keeps the code as-is, so the as-built model is
 expected to satisfy every F1–F5 invariant in `base` and in every fault
-regime except the entry above. An empty remainder is itself the claim
-Stage B tests.
+regime. With the entry above resolved the list's live remainder is EMPTY —
+the empty-remainder claim now holds unconditionally, and any future
+falsification in any regime is a stop-and-report by construction.
 
 ## Out-of-model invariants (recorded so the omission is deliberate)
 
@@ -536,6 +533,22 @@ are re-checked with the heartbeat-authority assumptions removed (design
 §6) — additional value, but the calibration table then needs a delta
 pass.
 
+**Delta re-validation executed 2026-06-02 (this commit), trigger #1:**
+the ⊥-arm fix is a behavior-relevant change to a modeled tick body
+(`reconcile_once`'s pre-threshold ⊥ arm only). Contained delta per the
+protocol: the audit was re-run over that decision site (the fixed arm
+performs the two consolidate-only LISTs + the shared observation block,
+no effects — verifier-pinned by the suite's wire test), the
+`BootRecordedOnce` deviation row and the Model-N verdict rows were
+updated, the expected-falsifications list emptied, and the model
+(`tickBotEarlyWith` with the latch prelude — the pre-fix no-latch
+simplification is unsound once observations run) re-checked in all
+four regimes plus the six calibration overrides. Pinned-rule delta:
+`ctrl.nodeclaim.consolidate-only-degraded` +2,
+`ctrl.nodeclaim.lease-edge-polarity` +2,
+`ctrl.nodeclaim.inflight-conservation` +2 (the lifecycle-suite and
+⊥-fix commits, this integration).
+
 ## Stage B — the tick-level models and their verdicts
 
 Stage B builds the two models this map promised and wires them into the
@@ -564,11 +577,14 @@ behavior-relevant drift, no rule-version drift, so Stage A stands.
   regimes: base / fault-rpc / fault-lease / fault-karpenter.
 
 Checks live in `nix/quint.nix` (`quint-spawn-coherence-*`,
-`quint-nodeclaim-*`): one exhaustive TLC check per regime, one
-expect-violation check per witness, two expect-violation checks plus a
-named-run check for the pre-registered falsifications. State counts,
-depths and wall-clocks are in the introducing commit messages and the
-checks' transcripts, not here.
+`quint-nodeclaim-*`): one exhaustive TLC check per regime and one
+expect-violation check per witness. The two expect-violation checks
+that pinned the pre-registered ⊥-skip falsifications were retired by
+the executed 2026-06-02 flip (their invariants moved into the
+fault-rpc HOLD list); the named-run check survives with the reproducer
+traces rewritten as passing runs. State counts, depths and wall-clocks
+are in the introducing commit messages and the checks' transcripts,
+not here.
 
 ### Verdict table (exhaustive TLC, per regime)
 
@@ -591,9 +607,9 @@ Model N:
 | Invariant | Family | base | fault-rpc | fault-lease | fault-karpenter |
 |---|---|---|---|---|---|
 | `boundsOK` | — | HOLDS | HOLDS | HOLDS | HOLDS |
-| `idleReapSafety` | F4/I9 | HOLDS | **VIOLATED (pre-registered)** | HOLDS | HOLDS |
+| `idleReapSafety` | F4/I9 | HOLDS | HOLDS (post-fix flip, 2026-06-02; was VIOLATED pre-registered) | HOLDS | HOLDS |
 | `iceMarkSoundness` | F3+F4/I7+I8 | HOLDS | HOLDS | HOLDS | HOLDS |
-| `bootSampleNotLost` | F4 BootRecordedOnce | HOLDS | **VIOLATED (pre-registered)** | HOLDS | HOLDS |
+| `bootSampleNotLost` | F4 BootRecordedOnce | HOLDS | HOLDS (post-fix flip, 2026-06-02; was VIOLATED pre-registered) | HOLDS | HOLDS |
 | `noMassClearAfterFailover` | F3 | HOLDS | HOLDS | HOLDS | HOLDS |
 | `reloadLatchRespected` | F4 | HOLDS | HOLDS | HOLDS | HOLDS |
 | `singleEffectiveProvisioner` | F4/I11 | HOLDS | HOLDS | HOLDS | HOLDS |
@@ -602,27 +618,27 @@ Model N:
 | `coverRespectsMask` | F3 mask-before-cover | HOLDS | HOLDS | HOLDS | HOLDS |
 | `degradedCoverPolarity` | F2 | HOLDS | HOLDS | HOLDS | HOLDS |
 
-The two VIOLATED cells are exactly the pre-registered
+The two formerly-VIOLATED cells were exactly the pre-registered
 expected-as-built-falsifications entry (the ⊥-tick early-return
-observation skip) — confirmed, not new defects. They are excluded from
-the fault-rpc HOLD check and pinned by
+observation skip) — confirmed by Stage B as predicted, not new
+defects. **Flip executed 2026-06-02 (this commit)**, per the protocol
+this paragraph pre-wired: the ⊥-arm fix landed with red-first suite
+evidence; `idleReapSafety` and `bootSampleNotLost` moved into the
+fault-rpc regime check's HOLD invariant list;
 `quint-nodeclaim-falsification-{idle-conflation,boot-sample-lost}`
-(expect-violation) plus the deterministic reproducer runs
-`idleConflationRun` / `bootSampleLostRun`
-(`quint-nodeclaim-runs-fault-rpc`). When the early-return skip is
-fixed, those checks flip to HOLD invariants in the fault-rpc regime
-check — the same flip protocol the retry campaign used. As
-pre-registered, the bucketed idle-age over-approximates the first
-half: the model falsifies at one skipped tick, where the real code
-additionally needs the stale entry's skew to cross the per-cell
-consolidation floor (≥300 s builders / ≥600 s fetchers vs the ≤40 s
-early-return window) — the real-world severity is bounded by that
-floor; the model's violation is the structural shape, not the
-magnitude.
+(expect-violation) were deleted; the deterministic reproducer traces
+were rewritten as passing runs (`idlePruneAcrossBotRun`,
+`bootRecordedAcrossBotRun`) under the surviving
+`quint-nodeclaim-runs-fault-rpc`. The pre-fix over-approximation note
+(the bucketed idle-age falsifying at one skipped tick where the real
+code also needs the per-cell floor crossed) is retained for the
+record; post-fix it is moot — there is no skipped tick.
 
 No falsification outside the pre-registered list appeared in any
-regime — the empty-remainder claim of the Stage-A list survived its
-first executable test.
+regime before the flip, and the post-flip regime checks hold with the
+list's live remainder EMPTY — both empty-remainder statements
+(Stage-A's claim and this section's confirmation) now hold
+unconditionally.
 
 ### Witness results
 
@@ -1001,7 +1017,7 @@ tests.
 
 | Commit | Class | Coverage |
 |---|---|---|
-| `d0c858955` | ENC-A (the kube-only-observations sharing half) / NOT-ENC (the trailing-zero gauge half) | the shared observation block is the as-built consolidate-only encoding; the residual unobserved window (the ⊥ early-return) is exactly the pre-registered as-built falsification already wired (`quint-nodeclaim-falsification-boot-sample-lost`); gauges are observability |
+| `d0c858955` | ENC-A (the kube-only-observations sharing half) / NOT-ENC (the trailing-zero gauge half) | the shared observation block is the as-built consolidate-only encoding; the residual unobserved window (the ⊥ early-return) was closed 2026-06-02 by the ⊥-arm fix and its falsification checks flipped per protocol (this commit); gauges are observability |
 | `cab0d2d46`, `d4184cf2b`, `e0d504321` | NOT-ENC | observability only (the model carries no cleanup-set / gauge state — recorded as a deviation from the design's "polarity classification encodable" pre-registration); gauge_universe / emit_live_gauges unit tests; since 2026-06-02 the cleanup-set polarity rows (M5/M6) carry their only automated end-to-end coverage in the lifecycle-invariants suite (`lifecycle_tests::acquire_keeps_cleanup_sets_one_trailing_write_then_drop` — survives-acquire + consumed-exactly-once via a local DebuggingRecorder through the real tick) |
 
 ### FFD/cover ⇄ scheduler-config parity (16)
@@ -1123,11 +1139,12 @@ scope it leaves unchanged:
   removal would reintroduce; they are exactly the design's §4
   non-candidates, now with machine-checked evidence attached.
 - **Carry-forward observations for Phase-1/2 work:**
-  - The ⊥-tick early-return observation skip (the one pre-registered
-    as-built falsification) remains open; when its fix lands, the two
-    `quint-nodeclaim-falsification-*` checks flip to HOLD invariants in
-    the fault-rpc regime per the Stage-B flip protocol — Phase 1 should
-    schedule that fix or explicitly defer it.
+  - ~~The ⊥-tick early-return observation skip (the one pre-registered
+    as-built falsification) remains open~~ — **RESOLVED 2026-06-02
+    (this commit)**: scheduled-and-landed per the schedule-or-defer
+    demand (owner decision: FIX). The fix + the executed check flip +
+    the suite's red-first evidence are recorded at the
+    expected-falsifications entry and the verdict table above.
   - ~~The `inflight_created` mutator-list comment in
     `nodeclaim_pool/mod.rs` still names a config-reload clear that has
     no call site (the Stage-B encoding note); whoever touches that
@@ -1136,8 +1153,10 @@ scope it leaves unchanged:
     **RESOLVED 2026-06-02** (follow-up cleanup rider): the comment was
     reconciled to the code (mutator 2 = the lease-acquire Ok arm,
     `mod.rs:995`); see the dated correction at the encoding-notes nit.
-    The normative rule sentence in `controller.typ` still carries the
-    config-reload wording — that half stays open (tracey-bump change).
+    ~~The normative rule sentence in `controller.typ` still carried the
+    config-reload wording~~ — **RESOLVED 2026-06-02**:
+    `ctrl.nodeclaim.inflight-conservation+2` replaced it with the
+    lease-acquire reload `Ok` arm (lifecycle-suite spec amendment A1).
   - `ctrl.pool.spawn-once` still carries no verify marker (the Stage-B
     encoding note); a Phase-2 code-level dedupe test remains the
     cheapest way to close it.

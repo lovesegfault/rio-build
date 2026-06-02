@@ -224,14 +224,21 @@ fn consolidate_tick_scenario(
 }
 
 /// Pre-threshold ⊥ tick (streak 1..4): the THIRD per-tick-mode
-/// builder. As built, the early-return arm makes ZERO kube requests —
-/// the empty queue pins exactly that (any request fails the verifier's
-/// "client dropped before request" arm... by hanging into the guard
-/// timeout, while an unexpected request panics the scenario match).
-/// T10/T11 route every pre-threshold ⊥ tick through this ONE builder
-/// so the disposition-dependent request shape lives in one place.
-fn bot_tick_scenario() -> Vec<Scenario> {
-    Vec::new()
+/// builder. The fixed ⊥ arm runs the shared kube-only observation
+/// block — exactly `[Pods LIST, NodeClaims LIST]`, no effects (an
+/// unexpected reap DELETE or ack panics the scenario match; a missing
+/// LIST trips the guard's join timeout). Every pre-threshold ⊥ tick
+/// in the suite routes through this ONE builder, so the
+/// disposition-dependent request shape lives in exactly one place.
+fn bot_tick_scenario(pods: Vec<Value>, ncs: Vec<Value>) -> Vec<Scenario> {
+    vec![
+        Scenario::ok(Method::GET, "/api/v1/pods", pod_list(pods)),
+        Scenario::ok(
+            Method::GET,
+            "/apis/karpenter.sh/v1/nodeclaims",
+            nc_list(ncs),
+        ),
+    ]
 }
 
 // ───────────────────────────── the Lab ───────────────────────────────
@@ -764,13 +771,13 @@ async fn standby_tick_no_effect_and_frozen_counters() {
 /// R8 `consecutive_bot_ticks` (retain-safe class): frozen across
 /// loss/standby/acquire, advanced only by leader ⊥ ticks, threshold 5
 /// pinned structurally, reset on the first successful poll.
-// r[verify ctrl.nodeclaim.consolidate-only-degraded]
+// r[verify ctrl.nodeclaim.consolidate-only-degraded+2]
 #[tokio::test]
 async fn bot_streak_frozen_across_acquire_resets_on_success() {
     let mut lab = Lab::new().await;
     lab.r.admin = admin_client(dead_channel());
     for t in [0u64, 10, 20] {
-        lab.tick(t, bot_tick_scenario()).await;
+        lab.tick(t, bot_tick_scenario(vec![], vec![])).await;
     }
     assert_eq!(lab.r.consecutive_bot_ticks, 3);
 
@@ -785,7 +792,7 @@ async fn bot_streak_frozen_across_acquire_resets_on_success() {
     // consolidate-only on that same tick.
     lab.leader_flag.store(true, Ordering::SeqCst);
     lab.r.hooks.on_acquire();
-    lab.tick(40, bot_tick_scenario()).await;
+    lab.tick(40, bot_tick_scenario(vec![], vec![])).await;
     assert_eq!(
         lab.r.consecutive_bot_ticks, 4,
         "frozen across acquire, then +1"
@@ -855,7 +862,7 @@ async fn wedge_evidence_survives_acquire() {
 /// observation block — idle→busy pruning with the uncensored gap,
 /// in-window Registered samples with the clear DISCARDED — and reaps
 /// idle past threshold with `placeable` empty.
-// r[verify ctrl.nodeclaim.consolidate-only-degraded]
+// r[verify ctrl.nodeclaim.consolidate-only-degraded+2]
 #[tokio::test]
 async fn consolidate_only_runs_kube_observations_and_reaps_with_empty_placeable() {
     let mut lab = Lab::new().await;
@@ -903,4 +910,127 @@ async fn consolidate_only_runs_kube_observations_and_reaps_with_empty_placeable(
         lab.ack_calls().is_empty(),
         "clears DISCARDED in consolidate-only (no admin traffic at all)"
     );
+}
+
+/// FIX-T13 (⊥-tick close, boot half): a Registered edge INSIDE a
+/// pre-threshold outage window is observed on the ⊥ tick (5s ≤ the
+/// 30s recency gate) and its sample recorded; an edge first observed
+/// only at recovery (35s stale) stays record-only — both boundary
+/// sides pinned in one test. RED pre-fix: the ⊥ arm skips all
+/// observations, so c1's edge ages past the gate and the sample is
+/// lost (`boot_samples == 0`).
+// r[verify ctrl.nodeclaim.consolidate-only-degraded+2]
+#[tokio::test]
+async fn bot_tick_records_registered_edge_inside_window() {
+    let mut lab = Lab::new().await;
+    // t=0: c1 in-flight, listed.
+    lab.tick(
+        0,
+        full_tick_scenario(vec![], vec![nc_json("c1", 0, None)], vec![]),
+    )
+    .await;
+    lab.r.admin = admin_client(dead_channel());
+
+    // c1 registers at t=15; the ⊥ ticks at 20/30/40 can observe it.
+    let c1 = || nc_json("c1", 0, Some(15));
+    for t in [20u64, 30, 40] {
+        lab.tick(t, bot_tick_scenario(vec![], vec![c1()])).await;
+    }
+    assert_eq!(
+        lab.boot_samples(),
+        1,
+        "the in-window edge (5s ≤ 3×TICK gate) records ON the ⊥ tick"
+    );
+    assert!(lab.r.recorded_boot.contains("c1"));
+
+    // Recovery at t=50: c2's edge (also t=15) is first observed 35s
+    // stale → record-only, no second sample; no clears ship at any
+    // point (the ⊥ arm discards them; recovery has no fresh edge).
+    lab.r.admin = admin_client(lab.admin_channel.clone());
+    lab.tick(
+        50,
+        full_tick_scenario(vec![], vec![c1(), nc_json("c2", 0, Some(15))], vec![]),
+    )
+    .await;
+    assert_eq!(lab.boot_samples(), 1, "stale edge stays record-only");
+    assert!(lab.r.recorded_boot.contains("c2"));
+    assert!(
+        lab.ack_calls()
+            .iter()
+            .all(|a| a.registered_cells.is_empty()),
+        "no ICE-clear shipped during or after the outage"
+    );
+}
+
+/// FIX-T14 (⊥-tick close, idle half — the idleConflationRun trace):
+/// an idle→busy→idle cycle DURING a pre-threshold outage prunes and
+/// re-seeds `prev_idle` on the ⊥ ticks, so the threshold-crossing
+/// recovery tick does NOT over-reap the fresh idle spell (no DELETE
+/// is scripted — an over-reap fails the scenario match). RED pre-fix:
+/// the cycle is unobserved, `prev_idle` keeps the t=0 seed
+/// (over-estimate), and the assertions on the re-seeded timestamp and
+/// the uncensored gap fail.
+// r[verify ctrl.nodeclaim.consolidate-only-degraded+2]
+#[tokio::test]
+async fn bot_tick_prunes_idle_to_busy() {
+    let mut lab = Lab::new().await;
+    let n = || nc_json("n-i", 0, Some(1)); // stale edge: record-only
+    // t=0: n-i idle → seeded.
+    lab.tick(0, full_tick_scenario(vec![], vec![n()], vec![]))
+        .await;
+    assert_eq!(lab.r.prev_idle.get("n-i").copied(), Some((T0) as f64));
+
+    lab.r.admin = admin_client(dead_channel());
+    // ⊥ t=10: busy → prune + uncensored 10s gap.
+    lab.tick(
+        10,
+        bot_tick_scenario(vec![pod_json("p1", "node-n-i", 4)], vec![n()]),
+    )
+    .await;
+    // ⊥ t=20: idle again → re-seeded at t=20.
+    lab.tick(20, bot_tick_scenario(vec![], vec![n()])).await;
+
+    // Recovery at t=310: idle basis is t=20 (290s < the 300s floor) —
+    // NO DELETE scripted; a pre-fix over-reap (basis t=0, 310s) would
+    // issue one and fail the scenario match.
+    lab.r.admin = admin_client(lab.admin_channel.clone());
+    lab.tick(310, full_tick_scenario(vec![], vec![n()], vec![]))
+        .await;
+
+    assert_eq!(
+        lab.r.prev_idle.get("n-i").copied(),
+        Some((T0 + 20) as f64),
+        "re-seeded on the ⊥ tick (fresh spell, not the pre-outage one)"
+    );
+    let gaps = lab.idle_gaps();
+    assert!(
+        gaps.iter()
+            .any(|g| !g.censored && (g.gap_secs - 10.0).abs() < 1.0),
+        "uncensored busy-edge gap recorded on the ⊥ tick; got {gaps:?}"
+    );
+    assert!(gaps.iter().all(|g| !g.censored), "no reap, no censored gap");
+}
+
+/// FIX-T15: the fixed ⊥ arm performs exactly `[Pods LIST, NodeClaims
+/// LIST]` — no create/reap/ack/publish — pinning the fix's wire cost
+/// forever (the verifier rejects anything else).
+// r[verify ctrl.nodeclaim.consolidate-only-degraded+2]
+#[tokio::test]
+async fn bot_tick_makes_exactly_two_lists_no_effects() {
+    let mut lab = Lab::new().await;
+    lab.r.admin = admin_client(dead_channel());
+    // An idle registered node + a stale-ish prev_idle entry: even so,
+    // a ⊥ tick must not reap (observations only, no effects).
+    lab.r.prev_idle.insert("n-i".into(), (T0) as f64);
+    lab.tick(
+        400,
+        bot_tick_scenario(vec![], vec![nc_json("n-i", 0, Some(1))]),
+    )
+    .await;
+    assert!(
+        !lab.gate.retain(&mut Vec::new()),
+        "placeable gate not (re)published on a ⊥ tick"
+    );
+    assert!(lab.ack_calls().is_empty(), "no ack attempted");
+    assert_eq!(lab.r.consecutive_bot_ticks, 1);
 }

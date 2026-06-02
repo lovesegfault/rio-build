@@ -28,10 +28,12 @@
 //                     ceilings/config-gated cover with global /
 //                     per-class / per-tick budgets, the
 //                     unfulfillable/registered ack, idle reap, persist.
-//   tickBotEarly      a ⊥ tick below the streak threshold: streak
-//                     increment and an early return — NO kube-only
-//                     observations (the documented as-built TODO; see
-//                     the pre-registered falsifications below).
+//   tickBotEarly      a ⊥ tick below the streak threshold: the reload
+//                     latch runs, then the kube-only observation block
+//                     (idle→busy pruning, Registered-edge recording
+//                     with the clear discarded) — NO reap, prune,
+//                     create, publish, or ack (effects stay
+//                     threshold-gated; the 2026-06-02 ⊥-arm fix).
 //   tickConsolidateOnly  the streak at/over threshold: kube-only
 //                     observations, idle/unhealthy reaps and the
 //                     inflight prune run; no create, no publish, no ack.
@@ -122,20 +124,17 @@
 //   boundsOK              the ⊥-streak counter stays at or below its
 //                         threshold ceiling
 //
-// PRE-REGISTERED AS-BUILT FALSIFICATIONS (controller-invariant-map.md)
-//   The ⊥-tick early-return skip (the documented TODO in
-//   reconcile_once's ⊥ arm): in the fault-rpc regime
-//   idleReapSafety and bootSampleNotLost are EXPECTED to be violated —
-//   prev_idle is not pruned across an unobserved busy period, and a
-//   Registered edge inside the early-return window ages past the
-//   recency gate before any observation runs. Both are wired as
-//   expect-violation checks plus deterministic reproducer runs
-//   (idleConflationRun, bootSampleLostRun); the fault-rpc HOLD check
-//   carries every other invariant. Note the bucketed model
-//   over-approximates the first half: it cannot express "the stale
-//   entry must already be near the threshold", so the model violates at
-//   one skipped tick where the real code needs the skew to cross a
-//   per-cell floor — the invariant map records that bound.
+// PRE-REGISTERED AS-BUILT FALSIFICATIONS — RESOLVED 2026-06-02
+//   The ⊥-tick early-return skip (entry 1, the list's ONLY entry) was
+//   FIXED: pre-threshold ⊥ ticks now run the shared kube-only
+//   observation block (see tickBotEarlyWith). idleReapSafety and
+//   bootSampleNotLost moved from expect-violation checks into the
+//   fault-rpc HOLD invariant list, and the reproducer traces were
+//   rewritten as passing runs (idlePruneAcrossBotRun,
+//   bootRecordedAcrossBotRun). The expected-as-built-falsifications
+//   list is now EMPTY — the empty-remainder claim holds
+//   unconditionally (controller-invariant-map.md records the executed
+//   flip and the fix commit).
 //
 // WITNESSES (must be VIOLATED — wired as expect-violation checks)
 //   canReachIdleReap, canReachVanishMark, canReachClearAfterMark,
@@ -344,8 +343,9 @@ module nodeclaimLifecycle {
     }
 
   /// Aging applied by ticks that do NOT run the kube-only observation
-  /// block (standby ticks and the ⊥ early return): an unrecorded Fresh
-  /// registration's recency window expires before anyone records it.
+  /// block (standby ticks; controllerRestarts also applies it for the
+  /// restart-gap recency expiry): an unrecorded Fresh registration's
+  /// recency window expires before anyone records it.
   pure def ageBootNonObserving(c: ClaimRec): ClaimRec =
     if (c.phase != CRegistered) c
     else {
@@ -413,28 +413,65 @@ module nodeclaimLifecycle {
     violations' = violations,
   }
 
-  /// A ⊥ tick below the streak threshold: count it and return before
-  /// the kube-only observation block (the as-built early return).
-  action tickBotEarly = all {
-    isLeader,
-    ENABLE_RPC_FAULT,
-    botStreak + 1 < BOT_THRESHOLD,
-    // The reload latch still runs ahead of reconcile_once; modeling the
-    // load attempt here adds nothing the consolidate-only and full
-    // ticks do not already cover, so the latch state is left untouched
-    // (the early return happens either way).
-    claims' = CLAIMS.mapBy(k => ageBootNonObserving(ageWallclock(claims.get(k)))),
-    placeableArmed' = if (losePending) false else placeableArmed,
-    losePending' = false,
-    isLeader' = isLeader,
-    reloadPending' = reloadPending,
-    botStreak' = botStreak + 1,
-    iceMasked' = iceMasked,
-    configuredCells' = configuredCells,
-    ceilingsKnown' = ceilingsKnown,
-    hadAcquire' = hadAcquire,
-    effects' = Set(),
-    violations' = violations,
+  /// A ⊥ tick below the streak threshold (the 2026-06-02 fix): the
+  /// reload latch runs ahead of the body on EVERY leader tick, then
+  /// the SHARED kube-only observation block — idle→busy pruning and
+  /// Registered-edge recording with the clear component discarded —
+  /// and nothing else: no reap, no inflight prune, no vanish
+  /// detection, no create, no publish, no ack. The pre-fix early
+  /// return skipped the latch as a documented no-op simplification;
+  /// with observations present the latch/observe ordering is real
+  /// (acquire-during-outage), so the prelude mirrors
+  /// tickConsolidateOnlyWith exactly. Parameterized so deterministic
+  /// runs can pin the PG-load outcome.
+  action tickBotEarlyWith(pgLoadFails: bool): bool = all {
+      isLeader,
+      ENABLE_RPC_FAULT,
+      botStreak + 1 < BOT_THRESHOLD,
+      val aged = CLAIMS.mapBy(k => ageWallclock(claims.get(k)))
+      // Reload-latch processing (run loop, before the body): prev_idle
+      // clears unconditionally; the load may fail and leave the latch.
+      val loadOk = reloadPending and not(pgLoadFails)
+      val afterLatch = CLAIMS.mapBy(k =>
+        if (reloadPending)
+          { ...aged.get(k), pIdle: INotTracked,
+            inflightTracked: if (loadOk) false else aged.get(k).inflightTracked }
+        else aged.get(k))
+      val reloadStillPending = reloadPending and not(loadOk)
+      // Kube-only observations (shared with reconcile_once and
+      // consolidate_only — the whole point of the fix).
+      val observed = CLAIMS.mapBy(k => observeIdleToBusy(afterLatch.get(k)))
+      val obsReg = CLAIMS.mapBy(k => observeRegistered(observed.get(k)))
+      val afterObs = CLAIMS.mapBy(k => obsReg.get(k)._1)
+      val staleRecordOnly = CLAIMS.filter(k => obsReg.get(k)._3).size() > 0
+      val lostSamples = CLAIMS.filter(k => obsReg.get(k)._4).size() > 0
+      all {
+        claims' = afterObs,
+        placeableArmed' = if (losePending) false else placeableArmed,
+        losePending' = false,
+        isLeader' = isLeader,
+        reloadPending' = reloadStillPending,
+        botStreak' = botStreak + 1,
+        iceMasked' = iceMasked,
+        configuredCells' = configuredCells,
+        ceilingsKnown' = ceilingsKnown,
+        hadAcquire' = hadAcquire,
+        effects' = Set()
+          .union(if (staleRecordOnly) Set(EStaleRecordOnly) else Set())
+          .union(if (reloadStillPending) Set(EDegradedReloadTick) else Set())
+          .union(if (reloadPending and CLAIMS.filter(k => claims.get(k).inflightTracked).size() > 0)
+                   Set(EAcquireWithInflight) else Set()),
+        // lostSamples retained as the latch: with observations on every
+        // leader tick it is structurally unreachable in fault-rpc (the
+        // bootSampleNotLost HOLD invariant pins exactly that).
+        violations' = violations
+          .union(if (lostSamples) Set(VBootSampleLost) else Set()),
+      }
+  }
+
+  action tickBotEarly = {
+    nondet pgLoadFails = boolChoices(ENABLE_LEASE_FAULT).oneOf()
+    tickBotEarlyWith(pgLoadFails)
   }
 
   /// The consolidate-only tick: kube-only observations, idle/unhealthy
@@ -970,36 +1007,37 @@ module nodeclaimLifecycleFaultRpc {
     START_CEILINGS_KNOWN = false
   ).*
 
-  /// Pre-registered falsification, half 1 (the ⊥-tick early-return
-  /// prune skip): the claim is observed idle, goes busy and idle again
-  /// across an unobserved ⊥ tick, and the stale prev_idle entry reaps
-  /// the fresh idle spell — IdleReapCorrectness / IdleBasisCurrentTenure
-  /// falsified on the as-built code.
-  run idleConflationRun =
+  /// The conflation trace, post-fix: the claim is observed idle, goes
+  /// busy and idle again across ⊥ ticks — the busy edge IS observed on
+  /// the ⊥ tick (prune + re-seed), so the threshold-crossing full tick
+  /// never over-reaps the fresh spell. The documented trace HOLDS
+  /// end-to-end (it falsified VIdleOverReap on the pre-fix encoding).
+  run idlePruneAcrossBotRun =
     init
       .then(ceilingsLoad)
       .then(tickFullWith(false, false, false, 1, 0, Set()))
       .then(claimRegisters("c1"))
       .then(tickFullWith(false, false, false, 0, 0, Set()))
       .then(claimGoesBusy("c1"))
-      .then(tickBotEarly)
+      .then(tickBotEarlyWith(false))
       .then(claimGoesIdle("c1"))
       .then(tickFullWith(false, false, false, 0, 0, Set()))
-      .expect(violations.contains(VIdleOverReap))
+      .expect(not(violations.contains(VIdleOverReap)))
+      .expect(claims.get("c1").pIdle != INotTracked)
 
-  /// Pre-registered falsification, half 2 (the same skip, boot-sample
-  /// side): a Registered edge inside the early-return window ages past
-  /// the recency gate before any observation runs — the boot sample and
-  /// its ICE clear are lost although the edge happened under this
-  /// tenure (BootRecordedOnce's no-loss clause falsified as-built).
-  run bootSampleLostRun =
+  /// The boot half of the same trace, post-fix: a Registered edge
+  /// inside the pre-threshold window is recorded ON the ⊥ tick (clear
+  /// discarded), so the recency gate never expires it and
+  /// BootRecordedOnce's no-loss clause HOLDS.
+  run bootRecordedAcrossBotRun =
     init
       .then(ceilingsLoad)
       .then(tickFullWith(false, false, false, 1, 0, Set()))
       .then(claimRegisters("c1"))
-      .then(tickBotEarly)
+      .then(tickBotEarlyWith(false))
       .then(tickFullWith(false, false, false, 0, 0, Set()))
-      .expect(violations.contains(VBootSampleLost))
+      .expect(not(violations.contains(VBootSampleLost)))
+      .expect(claims.get("c1").boot == BRecorded)
 }
 
 /// Lease faults: lose/acquire edges, PG reload failure, controller

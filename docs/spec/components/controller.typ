@@ -1147,7 +1147,7 @@ fleet-wide learning.
   here.
 ]
 
-#r("ctrl.nodeclaim.consolidate-only-degraded")[
+#r("ctrl.nodeclaim.consolidate-only-degraded+2")[
   After `BOT_TICKS_BEFORE_CONSOLIDATE_ONLY` (5) consecutive failed
   `GetSpawnIntents` polls the NodeClaim-pool reconciler MUST run in
   consolidate-only mode until a poll succeeds. A consolidate-only tick MAY
@@ -1158,7 +1158,13 @@ fleet-wide learning.
   #rref("ctrl.nodeclaim.placeable-gate")), and MUST NOT send ICE marks or
   clears (locally detected ICE cells are dropped, not queued). Idle reaping
   in this mode treats the placeable set as empty --- no FFD reservation is
-  honored during the outage.
+  honored during the outage. During a `GetSpawnIntents` outage EVERY
+  leader tick --- failed-poll ticks before the threshold and
+  consolidate-only ticks after it --- MUST run the kube-only observation
+  block (idle→busy pruning and Registered-edge recording); a
+  pre-threshold failed-poll tick MUST take no effect beyond those
+  observations (no create, reap, ack, or publish), and samples recorded
+  during an outage are clear-free (`registered_cells` discarded).
 ]
 
 #r("ctrl.nodeclaim.wedge-cluster")[

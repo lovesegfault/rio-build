@@ -2526,15 +2526,15 @@ in
       ];
     };
 
-    # Per-RPC ⊥ faults: the ⊥-streak's early-return window and
-    # consolidate-only mode (reap + prune, no create / republish / ack),
-    # ack and create failures (failed creates consume no budget), the
-    # ceilings-not-loaded fail-closed gate and the unknown-cell drop.
-    # idleReapSafety and bootSampleNotLost are deliberately NOT in this
-    # list: their falsification on this regime is the pre-registered
-    # as-built defect (the early-return observation skip) and is pinned
-    # by the expect-violation checks below.
-    # r[verify ctrl.nodeclaim.consolidate-only-degraded]
+    # Per-RPC ⊥ faults: every leader tick during an outage runs the
+    # shared kube-only observation block (the 2026-06-02 ⊥-arm fix) —
+    # pre-threshold ticks observe-and-return, consolidate-only mode
+    # reaps + prunes; no create / republish / ack on either. Includes
+    # idleReapSafety and bootSampleNotLost as HOLD invariants: their
+    # pre-fix falsification was the corpus's only pre-registered
+    # as-built defect, flipped per the invariant map's protocol when
+    # the skip was fixed.
+    # r[verify ctrl.nodeclaim.consolidate-only-degraded+2]
     # r[verify ctrl.nodeclaim.budget.per-class+2]
     quint-nodeclaim-lifecycle-fault-rpc = mkQuintCheck {
       name = "nodeclaim-lifecycle-fault-rpc";
@@ -2550,6 +2550,8 @@ in
         "provisioningBudget"
         "coverRespectsMask"
         "degradedCoverPolarity"
+        "idleReapSafety"
+        "bootSampleNotLost"
       ];
     };
 
@@ -2606,37 +2608,11 @@ in
       ];
     };
 
-    # ---- Model N: pre-registered as-built falsifications -------------
-    # The ⊥-tick early-return observation skip (the documented TODO in
-    # reconcile_once's ⊥ arm; entry 1 of the invariant map's
-    # expected-as-built-falsifications list). Each check passes only
-    # while the checker still falsifies the invariant on the as-built
-    # encoding — when the skip is fixed, these flip to HOLD invariants
-    # in the fault-rpc regime check above (the same flip protocol the
-    # retry campaign used). The deterministic reproducer traces are
-    # pinned by the named-run check below.
-
-    # prev_idle is not pruned across an unobserved busy period: a stale
-    # entry conflates two idle spells and reaps a freshly-idle claim.
-    quint-nodeclaim-falsification-idle-conflation = mkQuintWitnessCheck {
-      name = "nodeclaim-falsification-idle-conflation";
-      spec = "nodeclaimLifecycle";
-      main = "nodeclaimLifecycleFaultRpc";
-      witness = "idleReapSafety";
-    };
-    # A Registered edge inside the early-return window ages past the
-    # recency gate before any observation runs: the boot sample and its
-    # ICE clear are lost although the edge happened under this tenure.
-    quint-nodeclaim-falsification-boot-sample-lost = mkQuintWitnessCheck {
-      name = "nodeclaim-falsification-boot-sample-lost";
-      spec = "nodeclaimLifecycle";
-      main = "nodeclaimLifecycleFaultRpc";
-      witness = "bootSampleNotLost";
-    };
-    # The deterministic reproducer runs for both falsifications
-    # (idleConflationRun, bootSampleLostRun) — the precise documented
-    # traces stay pinned even though TLC's BFS may report a different
-    # counterexample first.
+    # The deterministic ⊥-window reproducer traces, post-fix
+    # (idlePruneAcrossBotRun, bootRecordedAcrossBotRun): the documented
+    # conflation and boot-loss traces now HOLD end-to-end through the
+    # fixed pre-threshold observation arm — kept as named runs so the
+    # precise traces stay pinned alongside the regime check's BFS.
     quint-nodeclaim-runs-fault-rpc = mkQuintRunCheck {
       name = "nodeclaim-runs-fault-rpc";
       spec = "nodeclaimLifecycle";

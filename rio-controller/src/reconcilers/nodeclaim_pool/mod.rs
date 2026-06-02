@@ -1143,19 +1143,31 @@ impl NodeClaimPoolReconciler {
 
         let Some(mut intents) = intents else {
             self.consecutive_bot_ticks = self.consecutive_bot_ticks.saturating_add(1);
-            // r[impl ctrl.nodeclaim.consolidate-only-degraded]
+            // r[impl ctrl.nodeclaim.consolidate-only-degraded+2]
             if self.consecutive_bot_ticks >= BOT_TICKS_BEFORE_CONSOLIDATE_ONLY {
                 return self.consolidate_only(now_sys).await;
             }
-            // TODO(r43 merged_bug_016/bug_023): ticks 1..BOT_TICKS_BEFORE_
-            // CONSOLIDATE_ONLY take this early exit and skip ALL kube-only
-            // observations — `prev_idle` stays un-pruned (≤4×TICK ≈ 40s
-            // over-estimate, below the 300s builder floor) and
-            // `observe_registered` boot samples in that window are lost
-            // (~20s after a Registered transition). Fixing both requires
-            // fetching `live` here (extra kube round-trip every outage
-            // tick). Defer to the lifecycle-invariants test (see TODO at
-            // the top of this `impl` block), which is the structural close.
+            // Pre-threshold ⊥ tick (streak 1..4): run the SAME shared
+            // kube-only observation block as `consolidate_only` and
+            // `reconcile_once` — the r43 merged_bug_016/bug_023 close.
+            // Without it, `prev_idle` stays un-pruned across unobserved
+            // busy periods (a stale entry conflates two idle spells)
+            // and Registered edges age past the 3×TICK recency gate
+            // (boot sample + ICE-clear lost permanently). Returns are
+            // discarded: `registered_cells`/`observed_types` need the
+            // scheduler (same shape as `consolidate_only`'s discard).
+            // NO reap/create/ack/publish before the threshold — growth
+            // and destructive actions stay threshold-gated; cost is the
+            // two consolidate-only LISTs on ≤4 ticks per outage, both
+            // label-selected. A kube LIST failure propagates via `?`
+            // (tick warned + retried by `run`, identical to
+            // `consolidate_only`'s fail-closed posture); the streak
+            // increment already happened above, so a kube failure
+            // cannot stall the threshold.
+            // r[impl ctrl.nodeclaim.consolidate-only-degraded+2]
+            let pod_snapshot = self.list_pool_pods().await?;
+            let live = self.list_live_nodeclaims(&pod_snapshot).await?;
+            let _ = self.kube_only_observations(&live, epoch_secs(now_sys), now_sys);
             return Ok(());
         };
         self.consecutive_bot_ticks = 0;
@@ -1472,7 +1484,7 @@ impl NodeClaimPoolReconciler {
             health::reap_unhealthy(&self.nodeclaims, &live, &[], &self.sketches, &self.cfg, now)
                 .await?;
         // r[impl ctrl.nodeclaim.inflight-conservation+2]
-        // r[impl ctrl.nodeclaim.consolidate-only-degraded]
+        // r[impl ctrl.nodeclaim.consolidate-only-degraded+2]
         // r40 bug_012: prune inflight_created against this tick's `live`
         // so the controller's own reaps below aren't later misread by
         // reconcile_once's detect_vanished as Karpenter GC. The
