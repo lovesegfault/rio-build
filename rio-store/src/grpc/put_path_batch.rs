@@ -173,6 +173,12 @@ impl StoreServiceImpl {
                     // retry signal for rows whose original population
                     // skipped on then-missing inputs. Bytes are in hand;
                     // push them into the same post-commit fixpoint.
+                    // TODO: F3 (round-15 C4 follow-up) — this branch keys on the
+                    // `.drv` NAME SUFFIX, not a parsed upload type. After UploadClass
+                    // (C4c2) the gate arms are typed, but the .drv detection sites
+                    // remain suffix-keyed; F3 unifies them on a typed PathKind so a
+                    // source path NAMED `*.drv` and a real derivation cannot diverge
+                    // by call-site discipline. See store.put.drv-text-ca+2.
                     if info.store_path.ends_with(".drv")
                         && let Ok(bytes) = rio_nix::nar::extract_single_file(&accum.nar_data)
                     {
@@ -212,6 +218,12 @@ impl StoreServiceImpl {
             // Capture .drv file bytes BEFORE staging consumes the NAR
             // (store.ingest.drv-modulo-cache+2); populated only after the
             // batch commit succeeds.
+            // TODO: F3 (round-15 C4 follow-up) — this branch keys on the
+            // `.drv` NAME SUFFIX, not a parsed upload type. After UploadClass
+            // (C4c2) the gate arms are typed, but the .drv detection sites
+            // remain suffix-keyed; F3 unifies them on a typed PathKind so a
+            // source path NAMED `*.drv` and a real derivation cannot diverge
+            // by call-site discipline. See store.put.drv-text-ca+2.
             if info.store_path.ends_with(".drv")
                 && let Ok(bytes) = rio_nix::nar::extract_single_file(&nar_data)
             {

@@ -320,6 +320,12 @@ impl StoreServiceImpl {
                 // store.ingest.drv-modulo-cache+2: probe-first heal for
                 // complete .drvs whose cache row is missing (spawned;
                 // best-effort; no-op when the row exists).
+                // TODO: F3 (round-15 C4 follow-up) — this branch keys on the
+                // `.drv` NAME SUFFIX, not a parsed upload type. After UploadClass
+                // (C4c2) the gate arms are typed, but the .drv detection sites
+                // remain suffix-keyed; F3 unifies them on a typed PathKind so a
+                // source path NAMED `*.drv` and a real derivation cannot diverge
+                // by call-site discipline. See store.put.drv-text-ca+2.
                 if store_path.ends_with(".drv") {
                     let pool = self.pool.clone();
                     let chunks = self.chunk_cache.clone();

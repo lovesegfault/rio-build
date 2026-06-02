@@ -114,6 +114,11 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
 
     // .drv files are small (typically <10KB, max ~10MB observed). Buffer
     // them so try_cache_drv can parse the ATerm. Everything else streams.
+    // TODO: F3 (round-15 C4 follow-up) — drv_cache admission keys on
+    // `StorePath::is_derivation()` (a name-suffix check). A source path
+    // NAMED `*.drv` is cached as if it were derivation text; harmless
+    // today (resolve fails on parse) but part of the suffix-keyed family
+    // F3 unifies on a typed PathKind. See store.put.drv-text-ca+2.
     if path.is_derivation() && nar_size <= DRV_NAR_BUFFER_LIMIT {
         let mut nar_data = vec![0u8; nar_size as usize];
         if let Err(e) = framed.read_exact(&mut nar_data).await {

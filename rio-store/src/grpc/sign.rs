@@ -237,6 +237,12 @@ impl StoreServiceImpl {
             // (mirrors gateway-side `jwt_unless_drv`). Without this,
             // `wopQueryValidPaths` reports a .drv missing while
             // `wopIsValidPath` reports it valid for the same path/JWT.
+            // TODO: F3 (round-15 C4 follow-up) — this branch keys on the
+            // `.drv` NAME SUFFIX, not a parsed upload type. After UploadClass
+            // (C4c2) the gate arms are typed, but the .drv detection sites
+            // remain suffix-keyed; F3 unifies them on a typed PathKind so a
+            // source path NAMED `*.drv` and a real derivation cannot diverge
+            // by call-site discipline. See store.put.drv-text-ca+2.
             if p.ends_with(".drv") || owned_hashes.contains(h) {
                 visible.insert(p.clone());
             } else if built_not_owned.contains(h) {

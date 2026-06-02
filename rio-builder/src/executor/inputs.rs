@@ -393,6 +393,11 @@ pub(super) async fn prefetch_graph_drvs(
 
     let residual: Vec<String> = input_paths
         .iter()
+        // TODO: F3 (round-15 C4 follow-up) — graph-.drv prefetch keys on
+        // the `.drv` name suffix; a source path named `*.drv` in an
+        // input closure is prefetched as derivation text (parse simply
+        // fails downstream). Part of the suffix-keyed family F3 unifies
+        // on a typed PathKind. See store.put.drv-text-ca+2.
         .filter(|p| p.ends_with(".drv") && !table.contains_key(p.as_str()))
         .cloned()
         .collect();

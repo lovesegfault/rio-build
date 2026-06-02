@@ -366,34 +366,140 @@ fn parse_fixed_ca_descriptor(s: &str, ctx_label: &str) -> Result<FixedCaDescript
     Ok(FixedCaDescriptor { recursive, hash })
 }
 
+/// The worker-upload classes this gate distinguishes, derived ONCE at
+/// gate entry from the **scheduler-signed token kind** crossed with the
+/// upload's own descriptor (pattern R5: the population × producer cross
+/// product is decided here, per arm, at compile-forced exhaustiveness —
+/// not rediscovered shape-by-shape inside the verification flow).
+///
+/// The obligation set is selected by the CLASS, never by incidental
+/// shape: the hash-modulo arithmetic ([`rio_nix::ca::HashModuloSink`])
+/// is constructible only inside the floating-CA arm, because its
+/// soundness theorem ("the claimed path derives FROM the modulo hash")
+/// holds for floating tokens only — re-routing a declared-hash class
+/// through it is the splice forgery (merged_bug_076).
+enum UploadClass {
+    /// `claims.is_ca`: the path is content-derived; membership was
+    /// skipped at sign time. Descriptor optional (descriptor-less
+    /// floating uploads keep the historical recursive-SHA256
+    /// assumption).
+    FloatingCa {
+        descriptor: Option<FixedCaDescriptor>,
+    },
+    /// `claims.is_fixed_output`: the path derives from the derivation's
+    /// DECLARED hash. The `fixed:` descriptor is mandatory (the trigger
+    /// is the trusted-plane bit, never the worker's own claim).
+    FixedOutput { descriptor: FixedCaDescriptor },
+    /// Plain input-addressed: the path is not content-derived;
+    /// authorization is `expected_outputs` membership plus the deriver
+    /// proof. A volunteered descriptor is verified against the bytes
+    /// (the persisted/served `CA:` field must not lie) but NEVER used
+    /// to re-derive the path.
+    InputAddressed {
+        descriptor: Option<FixedCaDescriptor>,
+    },
+}
+
+/// Classify a signed worker upload into its [`UploadClass`].
+///
+/// `is_ca ∧ is_fixed_output` is a malformed token (the scheduler signs
+/// exactly one kind; `AssignmentClaims::is_ca` is documented as
+/// `is_ca && !is_fixed_output` at the signer) and is rejected loudly
+/// instead of silently resolving to whichever class the old
+/// shape-dispatch happened to reach first.
+fn classify_upload(
+    claims: &rio_auth::hmac::AssignmentClaims,
+    info: &ValidatedPathInfo,
+    ctx_label: &str,
+) -> Result<UploadClass, Status> {
+    if claims.is_ca && claims.is_fixed_output {
+        warn!(
+            store_path = %info.store_path,
+            executor_id = %claims.executor_id,
+            drv_hash = %claims.drv_hash,
+            "{ctx_label}: assignment claims mark the upload both floating-CA and fixed-output"
+        );
+        metrics::counter!(
+            "rio_store_hmac_rejected_total",
+            "reason" => "claims_kind_conflict"
+        )
+        .increment(1);
+        return Err(Status::invalid_argument(format!(
+            "{ctx_label}: assignment claims mark the upload both floating-CA and \
+             fixed-output; the token kind is trusted-plane data and must name \
+             exactly one class"
+        )));
+    }
+    let descriptor = info
+        .content_address
+        .as_deref()
+        .map(|s| parse_fixed_ca_descriptor(s, ctx_label))
+        .transpose()?;
+    if claims.is_ca {
+        Ok(UploadClass::FloatingCa { descriptor })
+    } else if claims.is_fixed_output {
+        match descriptor {
+            Some(descriptor) => Ok(UploadClass::FixedOutput { descriptor }),
+            None => {
+                // The expected output is content-bound by the
+                // derivation's declared hash, so a descriptor-less
+                // upload would skip the only server-side content⇔path
+                // verification a FOD gets. Workers are untrusted — the
+                // trigger for verification must be the signed claims,
+                // not the worker's own descriptor — so reject instead
+                // of falling back to membership-only acceptance.
+                warn!(
+                    store_path = %info.store_path,
+                    executor_id = %claims.executor_id,
+                    drv_hash = %claims.drv_hash,
+                    "{ctx_label}: fixed-output upload without a content-address descriptor"
+                );
+                metrics::counter!(
+                    "rio_store_hmac_rejected_total",
+                    "reason" => "fod_descriptor_missing"
+                )
+                .increment(1);
+                Err(Status::permission_denied(format!(
+                    "{ctx_label}: fixed-output upload must carry a `fixed:` \
+                     content-address descriptor so the store can verify the \
+                     content against the path"
+                )))
+            }
+        }
+    } else {
+        Ok(UploadClass::InputAddressed { descriptor })
+    }
+}
+
 // r[impl sec.authz.ca-path-derived+9]
 /// Content-address authorization gate. Workers are untrusted, so the
 /// store — not the builder — is the authority on whether a claimed
 /// store path is actually derivable from the uploaded bytes. The gate
-/// covers two upload shapes:
+/// dispatches on [`UploadClass`] — the obligation set is selected by
+/// the signed token kind, per arm:
 ///
-/// - **Floating-CA** (`claims.is_ca = true`): [`validate_put_metadata`]
-///   skipped the `store_path ∈ expected_outputs` check (the path isn't
-///   known at sign time). This is the replacement gate: recompute the
-///   CA store path SERVER-SIDE from the NAR that [`verify_nar`] just
-///   confirmed, and reject if it doesn't match `info.store_path`. A
-///   worker holding an `is_ca=true` token therefore cannot upload to
-///   any path that isn't the content-derived path of the NAR it sent.
-/// - **Fixed-output / any descriptor-carrying worker upload**
-///   (`claims.is_ca = false`, `info.content_address = Some("fixed:…")`):
-///   the path already passed the `expected_outputs` membership check,
-///   but membership only proves the *scheduler* expected this path —
-///   not that the bytes match the derivation's declared hash. The same
-///   recompute runs here, so a compromised worker cannot register
-///   arbitrary content at a legitimate fixed-output path: the claimed
-///   path must re-derive from the (server-recomputed) descriptor hash.
-///   The builder-side `verify_fod_hashes` / declared-path binding are
-///   defense-in-depth only.
-///
-/// Descriptor-less `is_ca = false` uploads (input-addressed outputs and
-/// daemon-era / legacy workers) keep the membership-only behavior: an
-/// input-addressed path is not content-derived, so there is no
-/// content-address claim to verify.
+/// - **Floating-CA** ([`UploadClass::FloatingCa`]):
+///   [`validate_put_metadata`] skipped the `store_path ∈
+///   expected_outputs` check (the path isn't known at sign time). This
+///   is the replacement gate: recompute the CA store path SERVER-SIDE
+///   from the NAR that [`verify_nar`] just confirmed, and reject if it
+///   doesn't match `info.store_path`. A worker holding an `is_ca=true`
+///   token therefore cannot upload to any path that isn't the
+///   content-derived path of the NAR it sent.
+/// - **Fixed-output** ([`UploadClass::FixedOutput`]): the path already
+///   passed the `expected_outputs` membership check, but membership
+///   only proves the *scheduler* expected this path — not that the
+///   bytes match the derivation's declared hash. The descriptor hash is
+///   cross-checked against the server recompute by PLAIN equality (no
+///   modulo arithmetic — see [`UploadClass`]) and the claimed path must
+///   re-derive from it. The builder-side `verify_fod_hashes` /
+///   declared-path binding are defense-in-depth only.
+/// - **Input-addressed** ([`UploadClass::InputAddressed`]): an
+///   input-addressed path is not content-derived, so there is no path
+///   claim to verify here (membership + the deriver proof own
+///   authorization). A volunteered descriptor is still verified against
+///   the bytes so the persisted/served `CA:` field can never lie, but
+///   the path is NEVER re-derived from it.
 ///
 /// The ingestion method comes from the upload's own `fixed:` content
 /// address descriptor (`info.content_address`), exactly as the
@@ -458,62 +564,32 @@ pub(in crate::grpc) fn verify_ca_store_path(
     let Some(claims) = hmac_claims else {
         return Ok(());
     };
-
-    // The upload's own content-address claim, if any. Parsed before the
-    // token-kind branch because the descriptor is what extends this gate
-    // beyond floating-CA tokens: workers are untrusted, so ANY worker
-    // upload that claims a content address (fixed-output outputs carry
-    // their declared-hash `fixed:` descriptor since the builder records
-    // it) must have that claim verified server-side. A worker upload
-    // carrying a non-`fixed:` descriptor (e.g. `text:`) is rejected by
-    // the parse — workers never legitimately upload store-added text
-    // paths (the gateway does, via a service token, which never reaches
-    // this gate).
-    let descriptor = info
-        .content_address
-        .as_deref()
-        .map(|s| parse_fixed_ca_descriptor(s, ctx_label))
-        .transpose()?;
-
-    if !claims.is_ca && descriptor.is_none() {
-        // Fixed-output assignment (scheduler-signed bit): the expected
-        // output is content-bound by the derivation's declared hash, so
-        // a descriptor-less upload would skip the only server-side
-        // content⇔path verification a FOD gets. Workers are untrusted —
-        // the trigger for verification must be the signed claims, not
-        // the worker's own descriptor — so reject instead of falling
-        // back to membership-only acceptance.
-        if claims.is_fixed_output {
-            warn!(
-                store_path = %info.store_path,
-                executor_id = %claims.executor_id,
-                drv_hash = %claims.drv_hash,
-                "{ctx_label}: fixed-output upload without a content-address descriptor"
-            );
-            metrics::counter!(
-                "rio_store_hmac_rejected_total",
-                "reason" => "fod_descriptor_missing"
-            )
-            .increment(1);
-            return Err(Status::permission_denied(format!(
-                "{ctx_label}: fixed-output upload must carry a `fixed:` \
-                 content-address descriptor so the store can verify the \
-                 content against the path"
-            )));
+    match classify_upload(claims, info, ctx_label)? {
+        UploadClass::FloatingCa { descriptor } => {
+            verify_floating_ca(info, nar_data, descriptor, claims, ctx_label)
         }
-        // Input-addressed (or daemon-era descriptor-less) worker upload:
-        // path authorization is the `store_path ∈ expected_outputs`
-        // membership check in `validate_put_metadata`, and there is no
-        // content-address claim to verify — an input-addressed path is
-        // not content-derived. Descriptor-less non-FOD uploads MUST keep
-        // working exactly like this (legacy workers / daemon-era
-        // replays).
-        return Ok(());
+        UploadClass::FixedOutput { descriptor } => {
+            verify_fixed_output(info, nar_data, descriptor, claims, ctx_label)
+        }
+        UploadClass::InputAddressed {
+            descriptor: Some(descriptor),
+        } => verify_ia_volunteered_descriptor(info, nar_data, descriptor, claims, ctx_label),
+        // Descriptor-less input-addressed (and daemon-era / legacy
+        // worker) uploads: path authorization is the `store_path ∈
+        // expected_outputs` membership check in `validate_put_metadata`
+        // plus the deriver proof, and there is no content-address claim
+        // to verify — an input-addressed path is not content-derived.
+        // Descriptor-less non-FOD uploads MUST keep working exactly
+        // like this (legacy workers / daemon-era replays).
+        UploadClass::InputAddressed { descriptor: None } => Ok(()),
     }
+}
 
-    // The path under construction may appear in its own reference set
-    // (declared self-reference). It is expressed via the `:self`
-    // fingerprint token, never as an ordinary reference.
+/// References split shared by every descriptor-verifying arm: the path
+/// under construction may appear in its own reference set (declared
+/// self-reference). It is expressed via the `:self` fingerprint token,
+/// never as an ordinary reference.
+fn split_self_reference(info: &ValidatedPathInfo) -> (Vec<rio_nix::store_path::StorePath>, bool) {
     let refs: Vec<rio_nix::store_path::StorePath> = info
         .references
         .iter()
@@ -521,158 +597,105 @@ pub(in crate::grpc) fn verify_ca_store_path(
         .cloned()
         .collect();
     let has_self_reference = refs.len() != info.references.len();
+    (refs, has_self_reference)
+}
 
-    // Ingestion method: from the upload's own `fixed:` descriptor when
-    // present (the native builder records one for every floating-CA and
-    // fixed-output output); absent → the historical recursive-SHA256
-    // assumption (only reachable for `is_ca` tokens — see above).
-    let (recursive, algo) = match &descriptor {
-        Some(d) => (d.recursive, d.hash.algo()),
-        None => (true, rio_nix::hash::HashAlgo::SHA256),
-    };
+/// Locate the single regular file inside a flat-ingestion NAR. Shared
+/// by the flat verification arms; hashes nothing itself.
+fn flat_file_bytes<'a>(nar_data: &'a [u8], ctx_label: &str) -> Result<&'a [u8], Status> {
+    let (off, len) = single_file_nar_content_range(nar_data).map_err(|e| {
+        Status::invalid_argument(format!(
+            "{ctx_label}: flat content-addressed upload is not a single-file NAR: {e}"
+        ))
+    })?;
+    let len = usize::try_from(len).map_err(|_| {
+        Status::invalid_argument(format!(
+            "{ctx_label}: flat content length does not fit this platform"
+        ))
+    })?;
+    Ok(&nar_data[off..off + len])
+}
 
+/// Plain (non-modulo) content hash for a recursive (NAR) ingestion.
+/// SHA-256 reuses the server-computed `info.nar_hash` (already verified
+/// equal to the stream); other algorithms re-hash the buffered NAR.
+fn recursive_plain_hash(
+    info: &ValidatedPathInfo,
+    nar_data: &[u8],
+    algo: rio_nix::hash::HashAlgo,
+    ctx_label: &str,
+) -> Result<rio_nix::hash::NixHash, Status> {
     use std::io::Write as _;
-    let content_hash = if recursive {
-        if has_self_reference {
-            // Hash modulo self-references: zero every occurrence of the
-            // claimed path's hash part, then hash. O(nar) — only paid
-            // by self-referencing uploads.
-            let mut sink = rio_nix::ca::HashModuloSink::new(algo, &info.store_path.hash_part());
-            sink.write_all(nar_data)
-                .map_err(|e| Status::internal(format!("{ctx_label}: hash-modulo: {e}")))?;
-            sink.finish().0
-        } else {
-            let plain = if algo == rio_nix::hash::HashAlgo::SHA256 {
-                // info.nar_hash is the SERVER-COMPUTED hash here (verify_nar
-                // has already confirmed it equals SHA-256(stream)).
-                rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, info.nar_hash.to_vec())
-                    .map_err(|e| {
-                        Status::internal(format!("{ctx_label}: nar_hash construct: {e}"))
-                    })?
-            } else {
-                // Non-SHA-256 recursive ingestion: re-hash the buffered NAR
-                // with the declared algorithm.
-                let mut w = rio_nix::ca::HashWriter::new(algo);
-                w.write_all(nar_data).map_err(|e| {
-                    Status::internal(format!("{ctx_label}: nar hash ({algo}): {e}"))
-                })?;
-                w.finish()
-            };
-            // Descriptor-gated fallback for *unrecorded* self-references —
-            // FLOATING-CA TOKENS ONLY. CppNix's structured-attrs
-            // `unsafeDiscardReferences` mints floating-CA paths whose bytes
-            // embed their own hash while declaring no self-reference, and
-            // the `fixed:` descriptor then carries the hash *modulo* those
-            // occurrences. For a floating token the claimed path is
-            // content-derived FROM that modulo hash, so the retry stays
-            // self-certifying: a forgery needs a path whose hash part,
-            // zeroed in the content, hashes back to exactly that path.
-            //
-            // The same arithmetic is UNSOUND for declared-hash uploads
-            // (`is_ca = false`, fixed-output): there the path derives from
-            // the derivation's DECLARED hash H, so accepting
-            // `modulo_P(B') == H` admits content `B'` whose plain hash is
-            // NOT H — splice P's own hash part into attacker-chosen bytes,
-            // pick H = modulo_P(B'), and the path check still re-derives
-            // (the splice forgery, merged_bug_076; parent fix d6c083a1a
-            // re-routed declared-hash FODs through this arm without
-            // re-deriving its floating-only soundness theorem — pattern R5).
-            // Restricting on `claims.is_ca` (trusted-plane bit), not the
-            // descriptor shape, keeps the trigger out of worker control.
-            match &descriptor {
-                Some(d) if claims.is_ca && d.hash != plain => {
-                    let mut sink =
-                        rio_nix::ca::HashModuloSink::new(algo, &info.store_path.hash_part());
-                    sink.write_all(nar_data).map_err(|e| {
-                        Status::internal(format!("{ctx_label}: hash-modulo fallback: {e}"))
-                    })?;
-                    sink.finish().0
-                }
-                _ => plain,
-            }
-        }
+    if algo == rio_nix::hash::HashAlgo::SHA256 {
+        rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, info.nar_hash.to_vec())
+            .map_err(|e| Status::internal(format!("{ctx_label}: nar_hash construct: {e}")))
     } else {
-        // Flat ingestion: the content hash is over the bytes of the
-        // single regular file the NAR must contain. Self-references are
-        // unrepresentable for flat outputs (the path derivation rejects
-        // them), so a declared one can never verify.
-        if has_self_reference {
-            return Err(Status::permission_denied(format!(
-                "{ctx_label}: flat content-addressed upload declares a self-reference"
-            )));
-        }
-        // Hash the file bytes in place from the already-buffered NAR: no
-        // copy of the contents, and no size ceiling beyond the store's own
-        // upload limit (the general-purpose NAR parser's 256 MiB
-        // single-content cap does not apply to flat verification).
-        let (off, len) = single_file_nar_content_range(nar_data).map_err(|e| {
-            Status::invalid_argument(format!(
-                "{ctx_label}: flat content-addressed upload is not a single-file NAR: {e}"
-            ))
-        })?;
-        let len = usize::try_from(len).map_err(|_| {
-            Status::invalid_argument(format!(
-                "{ctx_label}: flat content length does not fit this platform"
-            ))
-        })?;
-        let file_bytes = &nar_data[off..off + len];
         let mut w = rio_nix::ca::HashWriter::new(algo);
-        w.write_all(file_bytes)
-            .map_err(|e| Status::internal(format!("{ctx_label}: flat hash ({algo}): {e}")))?;
-        let plain = w.finish();
-        // Same descriptor-gated fallback as the recursive branch, and the
-        // same FLOATING-CA-ONLY restriction: structured-attrs
-        // `unsafeDiscardReferences` flat outputs whose bytes embed their
-        // own path are minted (by CppNix and the native builder alike)
-        // from the hash *modulo* those occurrences, with no
-        // self-reference declared — sound because a floating path derives
-        // FROM the modulo hash. For declared-hash uploads the modulo
-        // retry would admit the flat splice forgery (file bytes embedding
-        // the claimed path's hash part, `modulo_P(file) == declared H`,
-        // plain hash ≠ H) — see the recursive arm's soundness note. Gated
-        // on `claims.is_ca` (trusted-plane bit), only paid when the plain
-        // hash already failed to match.
-        match &descriptor {
-            Some(d) if claims.is_ca && d.hash != plain => {
-                let mut sink = rio_nix::ca::HashModuloSink::new(algo, &info.store_path.hash_part());
-                sink.write_all(file_bytes).map_err(|e| {
-                    Status::internal(format!("{ctx_label}: flat hash-modulo fallback: {e}"))
-                })?;
-                sink.finish().0
-            }
-            _ => plain,
-        }
-    };
-
-    // The descriptor is persisted and served to substituting clients
-    // (narinfo `CA:`); a descriptor whose hash does not match the bytes
-    // actually sent is rejected even if the claimed path is otherwise
-    // consistent.
-    if let Some(d) = &descriptor
-        && d.hash != content_hash
-    {
-        warn!(
-            store_path = %info.store_path,
-            declared = %d.hash.to_colon(),
-            computed = %content_hash.to_colon(),
-            executor_id = %claims.executor_id,
-            "{ctx_label}: content-address descriptor does not match the uploaded NAR"
-        );
-        metrics::counter!(
-            "rio_store_hmac_rejected_total",
-            "reason" => "ca_descriptor_mismatch"
-        )
-        .increment(1);
-        return Err(Status::permission_denied(format!(
-            "{ctx_label}: content-address descriptor does not match the uploaded content"
-        )));
+        w.write_all(nar_data)
+            .map_err(|e| Status::internal(format!("{ctx_label}: nar hash ({algo}): {e}")))?;
+        Ok(w.finish())
     }
+}
 
+/// Plain content hash over the bytes of a flat ingestion's single file.
+fn flat_plain_hash(
+    file_bytes: &[u8],
+    algo: rio_nix::hash::HashAlgo,
+    ctx_label: &str,
+) -> Result<rio_nix::hash::NixHash, Status> {
+    use std::io::Write as _;
+    let mut w = rio_nix::ca::HashWriter::new(algo);
+    w.write_all(file_bytes)
+        .map_err(|e| Status::internal(format!("{ctx_label}: flat hash ({algo}): {e}")))?;
+    Ok(w.finish())
+}
+
+/// Reject a well-formed descriptor whose hash does not match the bytes
+/// actually sent. The descriptor is persisted and served to
+/// substituting clients (narinfo `CA:`), so it must not lie even when
+/// the claimed path is otherwise consistent.
+fn descriptor_mismatch(
+    info: &ValidatedPathInfo,
+    declared: &rio_nix::hash::NixHash,
+    computed: &rio_nix::hash::NixHash,
+    claims: &rio_auth::hmac::AssignmentClaims,
+    ctx_label: &str,
+) -> Status {
+    warn!(
+        store_path = %info.store_path,
+        declared = %declared.to_colon(),
+        computed = %computed.to_colon(),
+        executor_id = %claims.executor_id,
+        "{ctx_label}: content-address descriptor does not match the uploaded NAR"
+    );
+    metrics::counter!(
+        "rio_store_hmac_rejected_total",
+        "reason" => "ca_descriptor_mismatch"
+    )
+    .increment(1);
+    Status::permission_denied(format!(
+        "{ctx_label}: content-address descriptor does not match the uploaded content"
+    ))
+}
+
+/// Derive the expected CA path from the verified content hash and
+/// compare it to the claimed path. Shared by the two content-derived
+/// arms (floating-CA and fixed-output) — never called for
+/// input-addressed uploads.
+fn require_content_derived_path(
+    info: &ValidatedPathInfo,
+    content_hash: &rio_nix::hash::NixHash,
+    recursive: bool,
+    refs: &[rio_nix::store_path::StorePath],
+    has_self_reference: bool,
+    claims: &rio_auth::hmac::AssignmentClaims,
+    ctx_label: &str,
+) -> Result<(), Status> {
     let expected = rio_nix::store_path::StorePath::make_fixed_output_with_self(
         info.store_path.name(),
-        &content_hash,
+        content_hash,
         recursive,
-        &refs,
+        refs,
         has_self_reference,
     )
     .map_err(|e| Status::invalid_argument(format!("{ctx_label}: CA path derive: {e}")))?;
@@ -693,6 +716,219 @@ pub(in crate::grpc) fn verify_ca_store_path(
         return Err(Status::permission_denied(format!(
             "{ctx_label}: store_path does not match content-derived CA path"
         )));
+    }
+    Ok(())
+}
+
+/// Floating-CA arm. The ONLY production constructor of
+/// [`rio_nix::ca::HashModuloSink`] in this gate: the modulo arithmetic
+/// is sound here because a floating path derives FROM the modulo hash —
+/// a forged claim would need a path whose hash part, once zeroed in the
+/// content, hashes back to exactly that path (self-certifying).
+fn verify_floating_ca(
+    info: &ValidatedPathInfo,
+    nar_data: &[u8],
+    descriptor: Option<FixedCaDescriptor>,
+    claims: &rio_auth::hmac::AssignmentClaims,
+    ctx_label: &str,
+) -> Result<(), Status> {
+    use std::io::Write as _;
+    let (refs, has_self_reference) = split_self_reference(info);
+
+    // Ingestion method: from the upload's own `fixed:` descriptor when
+    // present (the native builder records one for every floating-CA
+    // output); absent → the historical recursive-SHA256 assumption.
+    let (recursive, algo) = match &descriptor {
+        Some(d) => (d.recursive, d.hash.algo()),
+        None => (true, rio_nix::hash::HashAlgo::SHA256),
+    };
+
+    let content_hash = if recursive {
+        if has_self_reference {
+            // Hash modulo self-references: zero every occurrence of the
+            // claimed path's hash part, then hash. O(nar) — only paid
+            // by self-referencing uploads.
+            let mut sink = rio_nix::ca::HashModuloSink::new(algo, &info.store_path.hash_part());
+            sink.write_all(nar_data)
+                .map_err(|e| Status::internal(format!("{ctx_label}: hash-modulo: {e}")))?;
+            sink.finish().0
+        } else {
+            let plain = recursive_plain_hash(info, nar_data, algo, ctx_label)?;
+            // Descriptor-gated fallback for *unrecorded* self-references.
+            // CppNix's structured-attrs `unsafeDiscardReferences` mints
+            // floating-CA paths whose bytes embed their own hash while
+            // declaring no self-reference, and the `fixed:` descriptor
+            // then carries the hash *modulo* those occurrences. The
+            // claimed path is content-derived FROM that modulo hash, so
+            // the retry stays self-certifying. (Declared-hash classes
+            // never reach this arm — see [`UploadClass`] and the splice
+            // forgery note, merged_bug_076.)
+            match &descriptor {
+                Some(d) if d.hash != plain => {
+                    let mut sink =
+                        rio_nix::ca::HashModuloSink::new(algo, &info.store_path.hash_part());
+                    sink.write_all(nar_data).map_err(|e| {
+                        Status::internal(format!("{ctx_label}: hash-modulo fallback: {e}"))
+                    })?;
+                    sink.finish().0
+                }
+                _ => plain,
+            }
+        }
+    } else {
+        // Flat ingestion: the content hash is over the bytes of the
+        // single regular file the NAR must contain. Self-references are
+        // unrepresentable for flat outputs (the path derivation rejects
+        // them), so a declared one can never verify.
+        if has_self_reference {
+            return Err(Status::permission_denied(format!(
+                "{ctx_label}: flat content-addressed upload declares a self-reference"
+            )));
+        }
+        let file_bytes = flat_file_bytes(nar_data, ctx_label)?;
+        let plain = flat_plain_hash(file_bytes, algo, ctx_label)?;
+        // Same descriptor-gated fallback as the recursive branch:
+        // `unsafeDiscardReferences` flat outputs whose bytes embed their
+        // own path are minted (by CppNix and the native builder alike)
+        // from the hash *modulo* those occurrences, with no
+        // self-reference declared — sound because a floating path
+        // derives FROM the modulo hash. Only paid when the plain hash
+        // already failed to match.
+        match &descriptor {
+            Some(d) if d.hash != plain => {
+                let mut sink = rio_nix::ca::HashModuloSink::new(algo, &info.store_path.hash_part());
+                sink.write_all(file_bytes).map_err(|e| {
+                    Status::internal(format!("{ctx_label}: flat hash-modulo fallback: {e}"))
+                })?;
+                sink.finish().0
+            }
+            _ => plain,
+        }
+    };
+
+    if let Some(d) = &descriptor
+        && d.hash != content_hash
+    {
+        return Err(descriptor_mismatch(
+            info,
+            &d.hash,
+            &content_hash,
+            claims,
+            ctx_label,
+        ));
+    }
+
+    require_content_derived_path(
+        info,
+        &content_hash,
+        recursive,
+        &refs,
+        has_self_reference,
+        claims,
+        ctx_label,
+    )
+}
+
+/// Fixed-output arm: PLAIN hash equality only. The path derives from
+/// the derivation's DECLARED hash, so accepting any modulo arithmetic
+/// here would admit spliced content whose plain hash differs from the
+/// declared one (the splice forgery, merged_bug_076; parent fix
+/// d6c083a1a re-routed declared-hash FODs through the floating arm
+/// without re-deriving its floating-only soundness theorem — pattern
+/// R5).
+fn verify_fixed_output(
+    info: &ValidatedPathInfo,
+    nar_data: &[u8],
+    descriptor: FixedCaDescriptor,
+    claims: &rio_auth::hmac::AssignmentClaims,
+    ctx_label: &str,
+) -> Result<(), Status> {
+    let (refs, has_self_reference) = split_self_reference(info);
+
+    // A fixed-output path exists BEFORE its content (it derives from
+    // the declared hash), so a self-reference can never legitimately
+    // occur — CppNix's `makeFixedOutputPath` has no self-reference
+    // parameter at all. A declared one is an authorization lie, not a
+    // hashing mode.
+    if has_self_reference {
+        warn!(
+            store_path = %info.store_path,
+            executor_id = %claims.executor_id,
+            drv_hash = %claims.drv_hash,
+            "{ctx_label}: fixed-output upload declares a self-reference"
+        );
+        metrics::counter!(
+            "rio_store_hmac_rejected_total",
+            "reason" => "fod_self_reference"
+        )
+        .increment(1);
+        return Err(Status::permission_denied(format!(
+            "{ctx_label}: fixed-output upload declares a self-reference;              fixed-output paths derive from the declared hash and cannot              reference themselves"
+        )));
+    }
+
+    let content_hash = if descriptor.recursive {
+        recursive_plain_hash(info, nar_data, descriptor.hash.algo(), ctx_label)?
+    } else {
+        let file_bytes = flat_file_bytes(nar_data, ctx_label)?;
+        flat_plain_hash(file_bytes, descriptor.hash.algo(), ctx_label)?
+    };
+
+    if descriptor.hash != content_hash {
+        return Err(descriptor_mismatch(
+            info,
+            &descriptor.hash,
+            &content_hash,
+            claims,
+            ctx_label,
+        ));
+    }
+
+    require_content_derived_path(
+        info,
+        &content_hash,
+        descriptor.recursive,
+        &refs,
+        false,
+        claims,
+        ctx_label,
+    )
+}
+
+/// Input-addressed arm for a VOLUNTEERED descriptor: verify the
+/// descriptor against the bytes (the persisted/served `CA:` field must
+/// not lie) but never re-derive the path — an input-addressed path is
+/// not content-derived, and authorization is membership + the deriver
+/// proof. Honest producers do not currently volunteer descriptors on IA
+/// uploads (the builder records them for floating-CA and fixed-output
+/// outputs only); this arm makes the cell's decision explicit instead
+/// of letting it fall through whichever content-derived arm the old
+/// shape-dispatch reached (which rejected it with an unsatisfiable
+/// path-derivation comparison).
+fn verify_ia_volunteered_descriptor(
+    info: &ValidatedPathInfo,
+    nar_data: &[u8],
+    descriptor: FixedCaDescriptor,
+    claims: &rio_auth::hmac::AssignmentClaims,
+    ctx_label: &str,
+) -> Result<(), Status> {
+    // IA outputs may legitimately self-reference; the descriptor hash
+    // for them is over the plain bytes (modulo arithmetic is
+    // floating-CA-only — see [`UploadClass`]).
+    let content_hash = if descriptor.recursive {
+        recursive_plain_hash(info, nar_data, descriptor.hash.algo(), ctx_label)?
+    } else {
+        let file_bytes = flat_file_bytes(nar_data, ctx_label)?;
+        flat_plain_hash(file_bytes, descriptor.hash.algo(), ctx_label)?
+    };
+    if descriptor.hash != content_hash {
+        return Err(descriptor_mismatch(
+            info,
+            &descriptor.hash,
+            &content_hash,
+            claims,
+            ctx_label,
+        ));
     }
     Ok(())
 }
@@ -803,6 +1039,12 @@ impl StoreServiceImpl {
         if claims.is_ca || claims.is_fixed_output {
             return Ok(()); // descriptor gates own CA/FOD verification
         }
+        // TODO: F3 (round-15 C4 follow-up) — this branch keys on the
+        // `.drv` NAME SUFFIX, not a parsed upload type. After UploadClass
+        // (C4c2) the gate arms are typed, but the .drv detection sites
+        // remain suffix-keyed; F3 unifies them on a typed PathKind so a
+        // source path NAMED `*.drv` and a real derivation cannot diverge
+        // by call-site discipline. See store.put.drv-text-ca+2.
         if info.store_path.is_derivation() {
             return Ok(()); // .drv text-CA gate owns derivation uploads
         }
@@ -1028,6 +1270,12 @@ impl StoreServiceImpl {
         // NAR (store.ingest.drv-modulo-cache+2): the modulo-cache hook
         // runs only after the persist succeeds, but the bytes are gone
         // by then. ~KBs for any real .drv; non-derivations skip.
+        // TODO: F3 (round-15 C4 follow-up) — this branch keys on the
+        // `.drv` NAME SUFFIX, not a parsed upload type. After UploadClass
+        // (C4c2) the gate arms are typed, but the .drv detection sites
+        // remain suffix-keyed; F3 unifies them on a typed PathKind so a
+        // source path NAMED `*.drv` and a real derivation cannot diverge
+        // by call-site discipline. See store.put.drv-text-ca+2.
         let drv_bytes_for_cache: Option<Vec<u8>> = if info.store_path.ends_with(".drv") {
             rio_nix::nar::extract_single_file(&nar_data).ok()
         } else {
@@ -2058,6 +2306,83 @@ mod verify_nar_tests {
             "got: {}",
             err.message()
         );
+    }
+
+    // r[verify sec.authz.ca-path-derived+9]
+    /// A token marked both floating-CA and fixed-output is malformed
+    /// trusted-plane data: rejected loudly at classification instead of
+    /// silently resolving to whichever class the old shape-dispatch
+    /// reached first (R5 — the population cross product is decided per
+    /// cell).
+    #[test]
+    fn claims_kind_conflict_rejected() {
+        let (path, nar, descriptor) = build_fod_recursive_upload("conflict-out", b"bytes\n");
+        let mut claims = fod_claims();
+        claims.is_ca = true; // conflict: also fixed-output
+        let mut info = ca_info(&path, &[], &nar);
+        info.content_address = Some(descriptor);
+        let err = verify_ca_store_path(&info, &nar, Some(&claims), "t")
+            .expect_err("kind-conflicted claims must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "got: {err:?}");
+        assert!(
+            err.message().contains("exactly one class"),
+            "got: {}",
+            err.message()
+        );
+    }
+
+    // r[verify sec.authz.ca-path-derived+9]
+    /// A fixed-output upload declaring a self-reference is an
+    /// authorization lie, not a hashing mode: fixed-output paths derive
+    /// from the declared hash and exist before their content, so the
+    /// gate rejects instead of switching to modulo arithmetic (which is
+    /// floating-CA-only — merged_bug_076's splice surface).
+    #[test]
+    fn fod_declared_self_reference_rejected() {
+        let (path, nar, descriptor) = build_fod_recursive_upload("selfish-out", b"bytes\n");
+        let mut info = ca_info(&path, std::slice::from_ref(&path), &nar);
+        info.content_address = Some(descriptor);
+        let err = verify_ca_store_path(&info, &nar, Some(&fod_claims()), "t")
+            .expect_err("self-referencing fixed-output upload must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied, "got: {err:?}");
+        assert!(
+            err.message().contains("declares a self-reference"),
+            "got: {}",
+            err.message()
+        );
+    }
+
+    // r[verify sec.authz.ca-path-derived+9]
+    /// An input-addressed upload volunteering an HONEST descriptor is
+    /// accepted with the descriptor verified against the bytes — and
+    /// the path is NEVER re-derived from the content (an IA path is not
+    /// content-derived; under the old shape-dispatch this cell fell
+    /// through the content-derived arm and failed an unsatisfiable
+    /// path comparison).
+    #[test]
+    fn ia_honest_voluntary_descriptor_accepted_without_rederive() {
+        use std::io::Write as _;
+        let nar = nar_of_file(b"ia bytes\n");
+        let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+        w.write_all(&nar).unwrap();
+        let hash = w.finish();
+        // A plausible input-addressed path: NOT derivable from the
+        // content hash (that is the point of the test).
+        let ia_path = rio_nix::store_path::StorePath::parse(
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-ia-out",
+        )
+        .unwrap();
+        let mut info = ca_info(&ia_path, &[], &nar);
+        info.content_address = Some(format!("fixed:r:{}", hash.to_colon()));
+        verify_ca_store_path(&info, &nar, Some(&ia_claims()), "t")
+            .expect("honest volunteered descriptor on an IA upload is accepted");
+
+        // Self-referencing IA uploads stay legitimate (IA outputs
+        // routinely embed their own path) — plain hash, no modulo.
+        let mut self_ref = ca_info(&ia_path, std::slice::from_ref(&ia_path), &nar);
+        self_ref.content_address = Some(format!("fixed:r:{}", hash.to_colon()));
+        verify_ca_store_path(&self_ref, &nar, Some(&ia_claims()), "t")
+            .expect("self-referencing IA upload with honest descriptor is accepted");
     }
 
     // r[verify store.put.ia-deriver-proof+3]
