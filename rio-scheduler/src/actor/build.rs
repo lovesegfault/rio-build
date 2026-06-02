@@ -720,8 +720,8 @@ impl DagActor {
         // (`sched.poison.clear-survivor-reevaluation`).
         //
         // r[impl sched.lease.standby-drops-writes+3]
-        // Leader-gated like the `drain_phantoms` slice of the Heartbeat
-        // arm: the rest of this handler stays ungated (in-memory build/
+        // Leader-gated (the standby-drops-writes discipline): the
+        // rest of this handler stays ungated (in-memory build/
         // event-map removal and the DAG reap run on standby as before),
         // but the survivor re-evaluation performs leader-class writes
         // (`persist_status`) and `CleanupTerminalBuild` can be drained

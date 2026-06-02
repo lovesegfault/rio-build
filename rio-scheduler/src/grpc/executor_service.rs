@@ -346,7 +346,7 @@ impl ExecutorService for SchedulerGrpc {
         // Identity gates, per work class:
         //
         // BUILD pulls (the as-built path, byte-identical): the executor
-        // token↔intent binding the stream/heartbeat path enforces,
+        // token↔intent binding the stream-era session enforced,
         // applied per-unary. The token may arrive in metadata
         // (x-rio-executor-token) or in the request body (the unary is
         // self-contained for clients that cannot set per-call metadata);

@@ -608,8 +608,7 @@ impl DagActor {
     /// pre-existing nodes for cached/failed counting.
     ///
     /// DB write failures are log-and-continue (build is already Active;
-    /// DB sync catches up on next status update or heartbeat
-    /// reconciliation).
+    /// DB sync catches up on the next status update).
     // r[impl sched.merge.reconcile-order+2]
     async fn reconcile_merged_state(&mut self, ingest: &MergeIngest) -> MergeReconcile {
         let MergeIngest {
@@ -2621,7 +2620,7 @@ impl DagActor {
         }
 
         // Wrap in a timeout: this is a synchronous call inside the
-        // single-threaded actor event loop. If the store hangs, NO heartbeats,
+        // single-threaded actor event loop. If the store hangs, NO pulls,
         // completions, or dispatches are processed until this returns.
         //
         // This call is ALSO the half-open probe: if the breaker is open, we

@@ -956,10 +956,11 @@ impl IceBackoff {
 
     /// Reset `cell`'s backoff (first success after a mark). Called via
     /// `AckSpawnedIntents.registered_cells` (controller's NodeClaim
-    /// `Registered=True` edge — §13b) or on first heartbeat for a pod
-    /// spawned on `cell` (§13a interim path; heartbeat ⇒ pod scheduled
-    /// ⇒ node existed). NEVER from `spawned` (Pending ack) — that's
-    /// the wrong edge and defeats backoff doubling.
+    /// `Registered=True` edge — §13b) or on the first successful pull
+    /// for a pod spawned on `cell` (§13a interim path; a delivered
+    /// pull ⇒ pod scheduled ⇒ node existed). NEVER from `spawned`
+    /// (Pending ack) — that's the wrong edge and defeats backoff
+    /// doubling.
     pub fn clear(&self, cell: &Cell) {
         self.cells.remove(cell);
     }

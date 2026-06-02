@@ -85,13 +85,11 @@ pub struct Config {
     /// Default: 2 retries, 5s→300s exponential with 20% jitter. No CLI
     /// override for the same reason as `poison`.
     pub retry: crate::RetryPolicy,
-    /// Substitution-replacement campaign (design §8): store-owned
-    /// materialization jobs. `[materialization]` table in
-    /// scheduler.toml. Env: `RIO_MATERIALIZATION__*` (nested keys —
-    /// double underscore). Phase B activated the mechanism at the
-    /// deployment layer: the helm values default the flag ON (the
-    /// cutover switch), while this struct's default stays `false` —
-    /// a bare binary without deployment config runs the as-built walk.
+    /// Substitution-replacement (design §8): store-owned
+    /// materialization jobs — the only substitution path since the
+    /// Phase D′ flag collapse retired the walk-era machinery.
+    /// `[materialization]` table in scheduler.toml. Env:
+    /// `RIO_MATERIALIZATION__*` (nested keys — double underscore).
     pub materialization: MaterializationConfig,
     /// gRPC-Web / CORS config for the dashboard SPA. `[dashboard]`
     /// table in scheduler.toml. Env: `RIO_DASHBOARD__*`.
@@ -385,9 +383,10 @@ impl rio_common::config::ValidateConfig for Config {
         // zero backoff base makes a parked job instantly re-claimable
         // (park becomes a hot-loop). The cap must not sit below the
         // base — backoff_duration-style curves degenerate otherwise.
-        // All three checked even while `enabled = false` (Phase A's
-        // deployed state) so a bad value fails at config load, not at
-        // the Phase B flag flip.
+        // All three checked at config load so a bad value fails at
+        // startup, not mid-flight (a discipline kept from the
+        // Phase A/B staged rollout, which validated even while the
+        // since-removed cutover flag was off).
         anyhow::ensure!(
             cfg.materialization.max_attempts >= 1,
             "materialization.max_attempts must be >= 1, got {} \

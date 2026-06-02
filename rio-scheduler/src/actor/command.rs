@@ -201,7 +201,8 @@ pub enum ActorCommand {
         /// `Registered=True` this tick — the success signal that
         /// resets ICE backoff. `vec![]` until the controller's
         /// NodeClaim watcher (A18) populates it; the §13a interim
-        /// clear path is first-heartbeat instead.
+        /// clear path is the first successful pull instead (see the
+        /// mint's ICE-clear in `actor/pull.rs`).
         registered_cells: Vec<String>,
         /// `r[sched.sla.cost-instance-type-feedback]`: per-cell
         /// instance types Karpenter resolved this tick. Folded into
@@ -791,7 +792,7 @@ impl GenerationReader {
 
     /// Current leader generation — the raw (not recovery-gated) value.
     /// For callers that genuinely need the ungated value (currently
-    /// tests only); the worker-visible heartbeat payload reads
+    /// tests only); the recovery-gated view is
     /// [`advertised`](Self::advertised) instead.
     pub fn get(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
@@ -805,11 +806,11 @@ impl GenerationReader {
     /// the SeqCst `set_recovery_complete()` call on the actor task, so
     /// a reader that observes `recovery_complete()` true here also
     /// observes the seeded generation. The loads are NOT one atomic
-    /// snapshot — a reply composed exactly across a lose→re-acquire
+    /// snapshot — a read composed exactly across a lose→re-acquire
     /// edge, or across a rebound (`LeaderState::on_rebound` clears the
     /// completion stamp first, then raises the generation), can pair
-    /// them inconsistently for one heartbeat; that exposure is no worse
-    /// than the pre-gating default for every heartbeat. A
+    /// them inconsistently for one read; that exposure is no worse
+    /// than the pre-gating default for every read. A
     /// TOCTOU-discarded recovery never stamps a completion — and a
     /// completion racing a rebound or a re-acquire at a different count
     /// is stamped with an epoch the recorded count no longer matches —

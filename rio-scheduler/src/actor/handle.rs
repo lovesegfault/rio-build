@@ -32,11 +32,12 @@ pub struct ActorHandle {
     /// simple threshold -> flapping under load near 80%.
     pub(super) backpressure: BackpressureReader,
     /// Leader generation reader. The lease task and recovery's
-    /// PG-floor seed write the underlying Arc; the gRPC layer reads
-    /// the recovery-gated view via `advertised_generation()` for
-    /// `HeartbeatResponse`, and `leader_generation()` exposes the raw
-    /// (not recovery-gated) value. See [`GenerationReader`] for
-    /// ordering semantics.
+    /// PG-floor seed write the underlying Arc;
+    /// `advertised_generation()` exposes the recovery-gated view
+    /// (tests/debug — the stale-assignment fence itself is
+    /// transaction-side at the pull mint), and `leader_generation()`
+    /// exposes the raw (not recovery-gated) value. See
+    /// [`GenerationReader`] for ordering semantics.
     pub(super) generation: GenerationReader,
     /// Cached [`ClusterSnapshot`], refreshed each `Tick`. See
     /// [`ActorHandle::cluster_snapshot_cached`].
@@ -119,7 +120,7 @@ impl ActorHandle {
     }
 
     /// Current leader generation — the raw (not recovery-gated) value.
-    /// NOT what the heartbeat reply carries (that is
+    /// NOT the recovery-gated view (that is
     /// [`advertised_generation`](Self::advertised_generation)); this
     /// serves tests and any future debug surface that wants the value
     /// without the recovery gate.
@@ -127,15 +128,15 @@ impl ActorHandle {
         self.generation.get()
     }
 
-    /// The worker-visible generation for `HeartbeatResponse.generation`:
-    /// carries 0 (the proto-unset sentinel) until the leader's recovery
-    /// completes, then the post-recovery generation. Workers compare it
-    /// against `WorkAssignment.generation` to detect stale assignments
-    /// after leader failover; both ultimately read the same
-    /// `Arc<AtomicU64>` (actor for WorkAssignment, handle for
-    /// heartbeat), and both are gated on the same recovery condition
-    /// (`dispatch_ready` for assignments, this accessor for the
-    /// heartbeat payload).
+    /// The recovery-gated advertised generation: 0 (the proto-unset
+    /// sentinel) until the leader's recovery completes
+    /// (claim-before-advertise), then the post-recovery generation.
+    /// The stream-era heartbeat reply that carried this to workers is
+    /// gone — the stale-assignment fence is transaction-side now (the
+    /// pull mint checks the durable claims floor;
+    /// `WorkAssignment.generation` is observability-only) — so this
+    /// serves tests/debug surfaces, gated on the same recovery
+    /// condition as dispatch (`dispatch_ready`).
     pub fn advertised_generation(&self) -> u64 {
         self.generation.advertised()
     }

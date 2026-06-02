@@ -122,7 +122,7 @@
         }
       },
       "materialization": {
-        "description": "Substitution-replacement campaign (design §8): store-owned\nmaterialization jobs. `[materialization]` table in\nscheduler.toml. Env: `RIO_MATERIALIZATION__*` (nested keys —\ndouble underscore). Phase B activated the mechanism at the\ndeployment layer: the helm values default the flag ON (the\ncutover switch), while this struct's default stays `false` —\na bare binary without deployment config runs the as-built walk.",
+        "description": "Substitution-replacement (design §8): store-owned\nmaterialization jobs — the only substitution path since the\nPhase D′ flag collapse retired the walk-era machinery.\n`[materialization]` table in scheduler.toml. Env:\n`RIO_MATERIALIZATION__*` (nested keys — double underscore).",
         "$ref": "#/$defs/MaterializationConfig",
         "default": {
           "max_attempts": 3,

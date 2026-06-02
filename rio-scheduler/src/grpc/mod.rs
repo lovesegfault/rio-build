@@ -4,11 +4,11 @@
 //! DAG actor via the `ActorHandle`.
 //!
 //! The actual `impl` blocks live in submodules — `scheduler_service`
-//! (client-facing RPCs) and `worker_service` (worker streaming +
-//! heartbeat). This file holds only the shared [`SchedulerGrpc`] state
+//! (client-facing RPCs) and `executor_service` (the pull-protocol
+//! unaries). This file holds only the shared [`SchedulerGrpc`] state
 //! struct, constructors, and common helpers. Split from a single 1087L
 //! file (P0356) after collision count hit 33 — SubmitBuild/WatchBuild
-//! changes no longer conflict with heartbeat/stream-dispatch changes.
+//! changes no longer conflict with executor-surface changes.
 
 pub(crate) mod actor_guards;
 mod executor_service;
@@ -62,8 +62,8 @@ pub struct SchedulerGrpc {
     /// Assignment-HMAC key, reused as the executor-identity verifier
     /// (`r[sec.executor.identity-token]`). `None` = dev mode
     /// (token-less ExecutorService calls accepted). When `Some`,
-    /// [`Self::require_executor`] rejects `BuildExecution` /
-    /// `Heartbeat` without a valid `x-rio-executor-token`.
+    /// [`Self::require_executor`] rejects `ExecutorService` unaries
+    /// without a valid `x-rio-executor-token`.
     pub(super) hmac_key: Option<Arc<HmacKey>>,
     /// Service-HMAC verifier (the `x-rio-service-token` family — the
     /// SEPARATE key the admin surfaces verify). Verifies the store's
@@ -240,9 +240,10 @@ impl SchedulerGrpc {
     /// `Unauthenticated`; when no key is configured (dev mode),
     /// `Ok(None)`.
     ///
-    /// Called by `build_execution` (binds the stream to the intent the
-    /// pod was spawned for) and `heartbeat` (binds the body's
-    /// `intent_id` AND `kind` to the token's). A compromised builder
+    /// Called per-unary by the `ExecutorService` handlers
+    /// (`PullAssignment` binds the body's `intent_id` AND `kind` to
+    /// the token's; `ReportOutcome` verifies the same identity before
+    /// consuming the attempt). A compromised builder
     /// holds a token for ITS OWN intent+kind only — it cannot mint one
     /// for another pod's, and cannot self-promote `kind` to receive
     /// work routed past its CNP airgap boundary.

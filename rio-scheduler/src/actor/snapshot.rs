@@ -474,11 +474,11 @@ impl DagActor {
             // r[impl sched.sla.intent-from-solve]
             // ADR-023: per-derivation SpawnIntent. intent_id is the
             // drv_hash itself — the controller stamps it on the pod
-            // annotation, the builder echoes it on heartbeat, dispatch
-            // matches `worker.intent_id == drv_hash`. No separate
-            // intent→drv map to keep in sync; if the drv leaves Ready
-            // before the pod heartbeats, the match misses and dispatch
-            // falls through to pick-from-queue.
+            // annotation, the builder presents it on `PullAssignment`,
+            // and the pull mint resolves `intent_id == drv_hash`. No
+            // separate intent→drv map to keep in sync; if the drv
+            // leaves Ready before the pod pulls, the mint answers
+            // Gone/NotYetReady instead.
             let intent = self.solve_intent_for(state, &hw, &cost, inputs_gen);
             // gap (d): debit Ready cores from the tenant's forecast
             // budget. A negative balance is fine — the forecast pass
@@ -796,7 +796,7 @@ impl DagActor {
     /// ICE backoff; `unfulfillable_cells` (NodeClaim `Launched=False`
     /// or `Registered` timeout) are ICE-marked with exponential
     /// backoff. `spawned` ("the controller created a Job for these")
-    /// arms `dispatched_cells` so the §13a heartbeat-edge ICE clear
+    /// arms `dispatched_cells` so the §13a first-pull ICE clear
     /// has a cell to clear — this is the **commit** path; the emit
     /// path (`compute_spawn_intents`) stays read-only so dashboard /
     /// CLI / ComponentScaler polls don't mutate scheduler state.
@@ -860,7 +860,7 @@ impl DagActor {
         // hw-agnostic intents (empty `node_affinity`) skip — no cell
         // to arm. Recording only `cells[0]` (bug_030) is the §1-of-N
         // approximation: the pod's affinity is OR-of-A', so the
-        // heartbeat-edge consumer needs the whole set.
+        // first-pull consumer needs the whole set.
         for i in spawned {
             let cells: smallvec::SmallVec<[crate::sla::config::Cell; 4]> = i
                 .hw_class_names
@@ -1592,8 +1592,8 @@ impl DagActor {
         // fitted-path `q99×5` is FLOORED at the probe deadline: a
         // sub-second fit (trivial-builders) would otherwise yield
         // `activeDeadlineSeconds≈3`, killing the Job before the pod
-        // ever heartbeats — and with no heartbeat there's no
-        // `recently_disconnected` entry, so `bump_floor_or_count`
+        // ever pulls — with no pull there's no attempt row to
+        // classify, so `bump_floor_or_count`
         // never runs and the next solve emits the same 3s. Clamp
         // order: floor first (D4 — a `bump_floor_or_count
         // (DeadlineExceeded)` doubles `floor.deadline_secs`; the next

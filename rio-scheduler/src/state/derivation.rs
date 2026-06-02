@@ -486,8 +486,9 @@ pub struct RetryState {
     /// on each resubmit-reset (the carried prior + 1 — the documented
     /// in-memory seed of the new cycle); the `resubmit_reset` ledger row
     /// then carries the same index durably, so the bound survives leader
-    /// failover via the fold (the legacy `M_051` column is frozen and
-    /// only floors pre-ledger history). Distinct from [`Self::count`]: a
+    /// failover via the fold (the legacy `M_051` mirror column is gone
+    /// — dropped by `M_075`; the ledger is the sole durable source).
+    /// Distinct from [`Self::count`]: a
     /// single counter cannot be both per-cycle-reset and
     /// cross-cycle-accumulated — when `count` served both roles, the
     /// `max_retries=2` cap was the permanent ceiling and the resubmit
@@ -526,7 +527,7 @@ pub struct RetryState {
     /// Workers that have failed building this derivation. Drives
     /// `best_executor()` exclusion + poison threshold in distinct mode.
     /// Durable via the attempt ledger (the legacy `failed_builders`
-    /// column is frozen and only floors pre-ledger history).
+    /// mirror column is gone — dropped by `M_075`).
     pub failed_builders: HashSet<ExecutorId>,
     /// Total TransientFailure/disconnect count (same-worker repeats
     /// counted). Drives poison threshold when
@@ -604,8 +605,10 @@ db_str_enum! {
         /// E8 — the scheduler-side backstop timer fired for a Running
         /// build with no report.
         Backstop = "backstop",
-        /// E5 — stream disconnect / heartbeat timeout / force-drain
-        /// released the execution; classification not yet established
+        /// E5 — executor loss released the execution (pull-era: the
+        /// charge-free synthesized-verdict / establishment-sweep
+        /// closure; stream-era: disconnect / heartbeat timeout /
+        /// force-drain); classification not yet established
         /// (first installment of a two-installment attempt).
         Disconnected = "disconnected",
         /// A `disconnected` attempt whose classifying report never
@@ -1107,14 +1110,14 @@ pub struct DerivationState {
     /// When the derivation entered Running state. For the backstop
     /// timeout: handle_tick checks this + est_duration × 3 (clamped
     /// to daemon_timeout + slack). A build that's been Running far
-    /// longer than expected is likely stuck (worker heartbeating
-    /// but daemon wedged, or the worker's clock jumped).
+    /// longer than expected is likely stuck (worker pod alive but
+    /// daemon wedged, or the worker's clock jumped).
     pub(crate) running_since: Option<Instant>,
     /// W3C traceparent of the submitting gRPC handler's span, captured
     /// at DAG-merge time. Embedded into `WorkAssignment.traceparent` at
     /// dispatch so the worker's build span chains back to the gateway's
     /// trace regardless of which code path (immediate merge, deferred
-    /// completion/heartbeat) triggers dispatch. Empty for recovered
+    /// completion) triggers dispatch. Empty for recovered
     /// derivations (no user trace). First submitter wins on dedup.
     pub traceparent: String,
     /// `DagActor.probe_generation` at the time of the last dispatch-
@@ -1973,8 +1976,9 @@ impl PoisonConfig {
 /// explicit resubmit. At/above this, the node stays `Poisoned` and the
 /// build fail-fasts (24h TTL or `ClearPoison` to override).
 /// `resubmit_cycles` is incremented on each reset and persisted
-/// (`M_051`) so this accumulates across re-submissions and scheduler
-/// restarts: two poison cycles before the node sticks. See
+/// (the `resubmit_reset` ledger row — the `M_051` mirror column was
+/// dropped by `M_075`) so this accumulates across re-submissions and
+/// scheduler restarts: two poison cycles before the node sticks. See
 /// [`DerivationState::is_retriable_on_resubmit`].
 pub const POISON_RESUBMIT_RETRY_LIMIT: u32 = 2;
 

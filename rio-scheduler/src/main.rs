@@ -67,10 +67,11 @@ async fn main() -> anyhow::Result<()> {
     // acquires. Standby replicas merge DAGs (state warm) but
     // don't dispatch (dispatch_ready early-returns). On acquire,
     // the lease loop derives the generation from the Lease's
-    // transition count and flips is_leader; heartbeat replies keep
-    // advertising 0 until recovery completes (claim-before-advertise),
-    // then carry the post-recovery generation, and workers reject
-    // the old leader's stale-gen assignments once it reaches them.
+    // transition count and flips is_leader; the advertised generation
+    // stays 0 until recovery completes (claim-before-advertise), then
+    // carries the post-recovery value — the stale-leader fence on
+    // assignments is transaction-side (the pull mint checks the
+    // durable claims floor).
     //
     // The generation Arc is constructed HERE (not inside the
     // actor) so both the actor and the lease task share the same

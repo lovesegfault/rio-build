@@ -2,8 +2,9 @@
 //!
 //! Both are `Arc<str>`-backed: the DAG clones `DrvHash` ~40×/merge for
 //! edge storage, priority-queue entries, and cascade walks; `ExecutorId`
-//! is cloned per-heartbeat into reconciled sets. Arc makes those clones
-//! a single atomic refcount bump instead of an allocation + memcpy.
+//! is cloned into per-attempt bookkeeping (open-attempt tracking,
+//! completion routing). Arc makes those clones a single atomic
+//! refcount bump instead of an allocation + memcpy.
 //!
 //! These types are scheduler-local. rio-builder and rio-proto translation
 //! use raw strings on the wire; the newtype boundary is at the scheduler's

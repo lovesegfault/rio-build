@@ -1895,8 +1895,8 @@ impl DagActor {
     /// loop; such a loop also cannot renew, so the lease is lost
     /// shortly after. The wait runs on the actor task — a bounded stall
     /// on non-vouched paths only (dispatch is gated during recovery
-    /// anyway, and heartbeat replies read the shared atomics in the
-    /// gRPC layer, not through the actor). The cap path is
+    /// anyway, and the advertised-generation readers use the shared
+    /// atomics, not the actor). The cap path is
     /// intentionally untested: it requires a wedged-but-believing loop,
     /// and the loop-level wiring that matters is covered by rio-lease's
     /// round tests.

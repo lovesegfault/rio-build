@@ -185,9 +185,9 @@ impl DagActor {
         // hit it → 12-30s actor stall → heartbeats missed → live workers
         // reaped.
         let mut locally_present = Vec::new();
-        // Nodes routed to a materialization job (creation itself stays
-        // flag-gated inside `create_materialization_job`
-        // until the flag collapse).
+        // Nodes routed to a materialization job (creation itself is
+        // owned by `create_materialization_job` — leader-gated,
+        // fenced, and dedup'd there).
         let mut to_create_job: Vec<DrvHash> = Vec::new();
         for (drv_hash, paths) in candidates {
             checked.insert(drv_hash.clone());

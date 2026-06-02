@@ -388,10 +388,10 @@ pub struct DagActor {
     /// `SeqCst`/`Acquire` reads. See [`LeaderState`] for the
     /// multi-field ordering rationale.
     ///
-    /// u64 generation, not i64: the proto is `uint64` (WorkAssignment,
-    /// Heartbeat). PG's `assignments.generation` is BIGINT (signed);
-    /// cast `u64 as i64` at THAT single boundary instead of at every
-    /// proto-encode site.
+    /// u64 generation, not i64: the proto is `uint64`
+    /// (`WorkAssignment.generation`). PG's `assignments.generation` is
+    /// BIGINT (signed); cast `u64 as i64` at THAT single boundary
+    /// instead of at every proto-encode site.
     leader: LeaderState,
     // r[impl sched.evidence.durability+3]
     /// The lease generation of the tenure that built the CURRENT
@@ -916,8 +916,8 @@ impl DagActor {
         // counters are meaningless (and would slowly leak) here.
         attempt_record_retries.clear();
         // `dispatched_cells` is keyed on the previous generation's drv
-        // hashes; a stale entry would let a heartbeat for a re-spawned
-        // pod clear the wrong cell.
+        // hashes; a stale entry would let a re-spawned pod's first
+        // pull clear the wrong cell.
         dispatched_cells.clear();
         // Snapshot of THIS generation's pod bindings (controller-
         // reported). Stale entries would let the pull mint or the
@@ -1082,8 +1082,8 @@ impl DagActor {
 
             // I-140: per-command latency. The actor is single-threaded
             // — one slow handler head-of-line blocks every queued
-            // command (admin RPCs timeout, heartbeats pile up, dispatch
-            // stalls). Export as a histogram + WARN over 1s so the next
+            // command (admin RPCs time out, pulls and reports queue
+            // up, dispatch stalls). Export as a histogram + WARN over 1s so the next
             // "actor wedged" report self-localizes from `kubectl logs`
             // instead of needing a debugger attach.
             let cmd_name = cmd.name();

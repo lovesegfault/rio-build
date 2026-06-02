@@ -793,7 +793,8 @@ impl DagActor {
         // when the breaker is already open. Read-only on the breaker:
         // completion.rs trusts the merge-time probe rather than
         // re-feeding `record_*` (merge.rs half-open-probe model already
-        // covers recovery). `&mut self` is for the heartbeat credit.
+        // covers recovery). `&mut self` is for the cascade bookkeeping
+        // below, not the breaker.
         if self.cache_breaker.is_open() {
             debug!("CA cutoff verify: cache breaker open; skipping cascade");
             return HashMap::new();
@@ -973,17 +974,15 @@ impl DagActor {
             h
         } else {
             // Drv not in DAG (reaped after build-terminal, or truly
-            // unknown). running_build holds the drv_hash which we
-            // can't recover from drv_key here — but the heartbeat
-            // reconcile drops entries whose DAG node is gone (executor.rs
-            // still_inflight check). The next heartbeat (~10s) frees
-            // any such phantom. The WARN includes executor_id so the
-            // race is traceable in logs.
+            // unknown). Nothing to free here in pull mode: there is no
+            // per-executor in-memory entry, and the durable open
+            // attempt was already consumed on the ReportOutcome path.
+            // The WARN includes executor_id so the race is traceable
+            // in logs.
             warn!(
                 executor_id = %executor_id,
                 key = drv_key,
-                "completion for unknown derivation, ignoring \
-                 (running_build entry, if any, freed by next heartbeat reconcile)"
+                "completion for unknown derivation, ignoring"
             );
             return;
         };
@@ -1070,11 +1069,8 @@ impl DagActor {
 
         // r[impl sched.completion.idempotent]
         // Stale-report guard: if this completion is from a worker that no
-        // longer owns the derivation (reassigned after disconnect/timeout),
+        // longer owns the derivation (reassigned after executor loss),
         // drop it. The current assigned_executor's report is authoritative.
-        // running_build was already freed above — for the stale executor
-        // that's correct (it doesn't own the drv); for the current owner
-        // this branch doesn't fire.
         if let Some(assigned) = &state.assigned_executor
             && assigned != executor_id
         {
@@ -1237,12 +1233,11 @@ impl DagActor {
                 // The early-return at :661 checks the DAG status, NOT
                 // the worker-reported result.status. An untrusted
                 // worker sending status=Cancelled while the DAG is
-                // Assigned/Running falls through here; running_build
-                // was cleared above, so neither disconnect-reassign
-                // nor the housekeeping backstop would recover it.
-                // Treat as infra (worker-protocol violation, bounded
-                // by infra_count) — not transient (NOT a
-                // build-determinism signal).
+                // Assigned/Running falls through here; this report
+                // consumes the attempt, so nothing else would recover
+                // the derivation. Treat as infra (worker-protocol
+                // violation, bounded by infra_count) — not transient
+                // (NOT a build-determinism signal).
                 warn!(
                     drv_hash = %drv_hash, executor_id = %executor_id,
                     "unsolicited Cancelled from worker (DAG not Cancelled) \
@@ -1341,7 +1336,7 @@ impl DagActor {
             if let Err(e) = state.transition(DerivationStatus::Completed) {
                 // Worker reported success but the in-memory state machine rejected
                 // the transition (e.g., derivation was cascaded to DependencyFailed
-                // or reset by heartbeat reconciliation in a race). The build result
+                // or reset by the establishment sweep in a race). The build result
                 // is lost; downstream derivations will never be released.
                 error!(
                     drv_hash = %drv_hash,
@@ -2848,10 +2843,10 @@ impl DagActor {
     ///
     /// InfrastructureFailure is the worker saying "I can't right now."
     /// If it's still broken, it'll fail again. If it's recovered
-    /// (circuit closed), it'll succeed. P0211's `store_degraded`
-    /// heartbeat → `has_capacity()` false already excludes persistently-
-    /// broken workers from assignment upstream, so per-worker capping
-    /// isn't needed.
+    /// (circuit closed), it'll succeed. Pull-mode executors are
+    /// one-shot pods — a worker with a broken store fails its single
+    /// build and exits; there is no persistent worker to cap, so
+    /// per-worker capping isn't needed.
     ///
     /// BUT: `infra_retry_count` IS incremented and checked against
     /// `max_infra_retries` (a separate, higher bound than `max_retries`).

@@ -1,12 +1,12 @@
 //! Periodic Tick housekeeping: orphan-watcher sweep, poison-TTL
-//! expiry, per-build timeouts, event-log GC, derivation-row GC, gauge
-//! publish, SLA estimator refresh, and the open pull-attempt
-//! establishment sweep — the single scheduler-side time-based repair
-//! the pull path keeps.
+//! expiry, per-build timeouts, derivation-row GC, gauge publish, SLA
+//! estimator refresh, and the open pull-attempt establishment sweep —
+//! the single scheduler-side time-based repair the pull path keeps.
 //!
-//! Split from `executor.rs` — that module is the executor lifecycle
-//! (connect/disconnect/heartbeat); the `tick_*` fns here are periodic
-//! maintenance that happens to run from the same actor loop.
+//! Split from `executor.rs` — that module is now the requeue
+//! chokepoint for derivations whose executor is gone (the stream-era
+//! lifecycle it once held was deleted); the `tick_*` fns here are
+//! periodic maintenance that happens to run from the same actor loop.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -103,8 +103,8 @@ impl DagActor {
         // r[impl sched.lease.standby-tick-noop+2]
         // Standby keeps stale self.builds/dag until LeaderLost lands;
         // every tick_* below either writes PG (orphan-cancel, build-
-        // timeout, establishment, poison-clear, derivations-gc,
-        // event-log sweep) or reads stale state. dispatch_ready (:108)
+        // timeout, establishment, poison-clear, derivations-gc) or
+        // reads stale state. dispatch_ready (:108)
         // and gRPC (r[sched.grpc.leader-guard]) already gate; this
         // closes the Tick path. A 2-replica deploy with one lease flap
         // would otherwise let the ex-leader cancel every Active build
@@ -419,11 +419,11 @@ impl DagActor {
     /// DAG-state sweep for `dispatched_cells`. The arm-on-ack write
     /// (`handle_ack_spawned_intents`) can't fire for a drv that was
     /// acked then cancelled / substituted / dependency-failed before
-    /// its pod heartbeated, so the heartbeat-edge / disconnect remove
-    /// paths never run for it. Retain only entries whose DAG node is
-    /// still in a pre-terminal state where a heartbeat is plausible.
-    /// Cheap: `dispatched_cells` is bounded by acked-but-not-yet-
-    /// heartbeated drvs (≪ DAG size).
+    /// its pod's first pull, so the pull-mint remove path (the §13a
+    /// ICE-clear in `actor/pull.rs`) never runs for it. Retain only
+    /// entries whose DAG node is still in a pre-terminal state where
+    /// a pull is plausible. Cheap: `dispatched_cells` is bounded by
+    /// acked-but-not-yet-pulled drvs (≪ DAG size).
     fn tick_sweep_dispatched_cells(&self) {
         use DerivationStatus::{Assigned, Ready, Running};
         self.dispatched_cells.retain(|k, _| {
