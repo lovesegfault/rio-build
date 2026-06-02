@@ -795,13 +795,16 @@ fn plan_time_dispositions(
 }
 
 /// Roll per-path supply outcomes up to unit-level dispositions, per the
-/// supply design: a unit whose closure needs a dependency output the
-/// target REFUSED to accept (after the fresh-channel retry) takes
-/// upload-rejected; one whose required delivery FAILED engine-side takes
-/// supply-failed. Either way the unit is retired before submission —
-/// dispatching it would charge a guaranteed missing-input failure to the
-/// parity headline, the exact misattribution these dispositions exist to
-/// prevent.
+/// supply design: a unit whose closure needs a path the target REFUSED to
+/// accept (after the fresh-channel retry) takes upload-rejected; one whose
+/// required delivery FAILED engine-side takes supply-failed. A required
+/// path is a dependency's declared output OR an input source (a store
+/// path with no producing derivation — patches, builder scripts); source
+/// uploads write the same upload-mechanism journal rows, and a unit
+/// missing a source fails exactly like one missing a dep output. Either
+/// way the unit is retired before submission — dispatching it would
+/// charge a guaranteed missing-input failure to the parity headline, the
+/// exact misattribution these dispositions exist to prevent.
 ///
 /// Scope is deliberately the engine's own upload mechanisms: prefetch
 /// (delegate) failures stay with the prefetch-shortfall gate, and inline
@@ -854,6 +857,10 @@ fn supply_rollup_dispositions(
                 flags.upload_rejected |= refused.contains(path.as_str());
                 flags.supply_failed |= failed.contains(path.as_str());
             }
+        }
+        for src in &entry.srcs {
+            flags.upload_rejected |= refused.contains(src.as_str());
+            flags.supply_failed |= failed.contains(src.as_str());
         }
         if !flags.upload_rejected && !flags.supply_failed {
             continue;
@@ -1646,12 +1653,13 @@ pub async fn run_with_backends(
     // the persisted report from the run that completed the stage is used.
     let supply_summary = load_supply_summary(&state)?;
 
-    // Supply-failure rollup: units whose required dependency uploads the
-    // target refused (upload-rejected) or whose delivery failed engine-side
-    // (supply-failed) are retired here, before the execute stage, with
-    // terminal disposition records — never dispatched to fail on missing
-    // inputs and pollute the parity headline. Recomputed from the journal
-    // on every start (resume re-derives the same set; existing records win).
+    // Supply-failure rollup: units whose required uploads (dependency
+    // outputs or input sources) the target refused (upload-rejected) or
+    // whose delivery failed engine-side (supply-failed) are retired here,
+    // before the execute stage, with terminal disposition records — never
+    // dispatched to fail on missing inputs and pollute the parity headline.
+    // Recomputed from the journal on every start (resume re-derives the
+    // same set; existing records win).
     let supply_retired = supply_rollup_dispositions(
         &state.load_jsonl::<SupplyEntry>(StateFile::Supply)?,
         &dep_closure,
@@ -4367,7 +4375,11 @@ mod tests {
     /// precedence), the journal's LAST row per path wins (a top-up that
     /// delivered the path un-poisons it), prefetch (delegate) failures
     /// stay with the shortfall gate, and already-excluded units are not
-    /// re-recorded.
+    /// re-recorded. Input sources (store paths with no producing
+    /// derivation — patches, builder scripts) are required paths exactly
+    /// like dependency outputs: a refused or failed source upload retires
+    /// the units whose closures need it, and a delivered source retires
+    /// nobody.
     #[test]
     fn supply_rollup_retires_dependents_of_refused_and_failed_paths() {
         let path = |seed: &str| format!("/nix/store/{}-{seed}", "c".repeat(32 - seed.len()));
@@ -4380,11 +4392,22 @@ mod tests {
                 job: job.to_string(),
                 drv_path: format!("/nix/store/{}-{job}.drv", "e".repeat(32)),
                 deps,
+                srcs: Vec::new(),
             };
+        let src_entry = |job: &str, deps: Vec<archive_input::DepDrvOutputs>, srcs: &[String]| {
+            archive_input::DepClosureEntry {
+                job: job.to_string(),
+                drv_path: format!("/nix/store/{}-{job}.drv", "e".repeat(32)),
+                deps,
+                srcs: srcs.to_vec(),
+            }
+        };
         let refused_path = path("refused");
         let failed_path = path("failed");
         let delegated_path = path("delegated");
         let recovered_path = path("recovered");
+        let refused_src = path("refused-src");
+        let failed_src = path("failed-src");
         let supply_row = |p: &str, mechanism: &str, outcome: &str| SupplyEntry {
             path: p.to_string(),
             source: model::SUPPLY_SOURCE_EMBEDDED.to_string(),
@@ -4425,6 +4448,18 @@ mod tests {
                 model::SUPPLY_MECHANISM_UPLOAD_STREAM,
                 model::SUPPLY_OUTCOME_DELIVERED,
             ),
+            // Input-source uploads write the same upload-mechanism rows as
+            // dependency outputs; the rollup must treat them alike.
+            supply_row(
+                &refused_src,
+                model::SUPPLY_MECHANISM_UPLOAD_BATCH,
+                model::SUPPLY_OUTCOME_REFUSED,
+            ),
+            supply_row(
+                &failed_src,
+                model::SUPPLY_MECHANISM_UPLOAD_STREAM,
+                model::SUPPLY_OUTCOME_FAILED,
+            ),
         ];
         let closures = vec![
             entry(
@@ -4456,6 +4491,32 @@ mod tests {
                 "excluded.x",
                 vec![dep("d1", std::slice::from_ref(&refused_path))],
             ),
+            // A unit whose ONLY refused required path is an input source:
+            // no dep output matches anything, the source alone retires it.
+            src_entry(
+                "src-rejected.x",
+                vec![dep("d6", &[path("fine2")])],
+                std::slice::from_ref(&refused_src),
+            ),
+            src_entry(
+                "src-starved.x",
+                Vec::new(),
+                std::slice::from_ref(&failed_src),
+            ),
+            // A failed dep output AND a refused source: the classifier's
+            // refused-outranks-failed precedence holds across both views.
+            src_entry(
+                "src-and-dep.x",
+                vec![dep("d2", std::slice::from_ref(&failed_path))],
+                std::slice::from_ref(&refused_src),
+            ),
+            // The recovered (refused-then-delivered) path as a source:
+            // a delivered source retires nobody, like a delivered output.
+            src_entry(
+                "src-recovered.x",
+                Vec::new(),
+                std::slice::from_ref(&recovered_path),
+            ),
         ];
         let in_scope: HashSet<&str> = closures.iter().map(|c| c.job.as_str()).collect();
         let already_excluded =
@@ -4467,6 +4528,9 @@ mod tests {
                 ("rejected.x".to_string(), Disposition::UploadRejected),
                 ("starved.x".to_string(), Disposition::SupplyFailed),
                 ("both.x".to_string(), Disposition::UploadRejected),
+                ("src-rejected.x".to_string(), Disposition::UploadRejected),
+                ("src-starved.x".to_string(), Disposition::SupplyFailed),
+                ("src-and-dep.x".to_string(), Disposition::UploadRejected),
             ]),
             "{rollup:?}"
         );

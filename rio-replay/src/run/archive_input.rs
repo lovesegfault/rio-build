@@ -42,7 +42,8 @@ pub struct ManifestEntry {
 }
 
 /// One workload unit's proper transitive dependency closure in adjacency
-/// form: each dependency derivation with its declared output paths.
+/// form: each dependency derivation with its declared output paths, plus
+/// the input sources the closure requires.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepClosureEntry {
     pub job: String,
@@ -50,6 +51,16 @@ pub struct DepClosureEntry {
     pub drv_path: String,
     #[serde(default)]
     pub deps: Vec<DepDrvOutputs>,
+    /// Input sources required by this unit's closure: the union of the
+    /// unit's own direct `inputSrcs` and those of every dependency in
+    /// `deps`, deduplicated and sorted. Sources are store paths with no
+    /// producing derivation (patches, builder scripts, vendored
+    /// tarballs), so they appear here rather than under any dependency's
+    /// declared outputs — but the supply stage must deliver them all the
+    /// same. Defaulted on deserialization so entries persisted before the
+    /// field existed still load.
+    #[serde(default)]
+    pub srcs: Vec<String>,
 }
 
 /// One dependency derivation and the output paths it declares.
@@ -154,7 +165,13 @@ fn workload_entry(
 /// Per-unit proper transitive dependency closures: for each unit, walk the
 /// direct-adjacency `inputs` edges breadth-first and emit every reachable
 /// derivation (the unit itself excluded) with its statically declared
-/// output paths (floating content-addressed outputs are skipped).
+/// output paths (floating content-addressed outputs are skipped), plus
+/// the union of the input sources the walked records declare — the unit's
+/// own direct `inputSrcs` and each reachable dependency's. Sources are
+/// required paths of the closure exactly like dependency outputs, so
+/// consumers matching "paths this unit needs" (the supply-failure rollup
+/// in particular) must see them; dropping them here would silently exempt
+/// source-only supply failures from per-unit accounting.
 ///
 /// The adjacency comes from `closures.jsonl` when the archive declares the
 /// `dependency_closures` capability; otherwise it is recovered by walking
@@ -185,10 +202,17 @@ pub fn load_closures(
     for unit in units {
         // Breadth-first walk over direct inputs; the visited set keeps a
         // cyclic or duplicated edge from looping, and the unit itself never
-        // counts as its own dependency.
+        // counts as its own dependency. Input sources accumulate from the
+        // unit's own record and every visited dependency record (a
+        // dependency without a record contributes none — it has nothing
+        // to declare).
         let mut deps: BTreeSet<&str> = BTreeSet::new();
-        let mut queue: VecDeque<&str> = adjacency
-            .get(unit.drv_path.as_str())
+        let mut srcs: BTreeSet<&str> = BTreeSet::new();
+        let unit_record = adjacency.get(unit.drv_path.as_str());
+        if let Some(record) = unit_record {
+            srcs.extend(record.srcs.iter().map(String::as_str));
+        }
+        let mut queue: VecDeque<&str> = unit_record
             .map(|record| record.inputs.iter().map(String::as_str).collect())
             .unwrap_or_default();
         while let Some(drv) = queue.pop_front() {
@@ -199,6 +223,7 @@ pub fn load_closures(
                 continue;
             }
             if let Some(record) = adjacency.get(drv) {
+                srcs.extend(record.srcs.iter().map(String::as_str));
                 for input in &record.inputs {
                     if !deps.contains(input.as_str()) {
                         queue.push_back(input);
@@ -223,6 +248,7 @@ pub fn load_closures(
             job: unit.job.clone(),
             drv_path: unit.drv_path.clone(),
             deps,
+            srcs: srcs.into_iter().map(String::from).collect(),
         });
     }
     Ok(entries)
@@ -345,6 +371,20 @@ fn synth_aterm_with_env(
     system: &str,
     extra_env: &[(&str, &str)],
 ) -> String {
+    synth_aterm_full(outputs, input_drvs, &[], system, extra_env)
+}
+
+/// The fully general synthetic ATerm: [`synth_aterm_with_env`] plus input
+/// sources (`inputSrcs` store paths — patches, builder scripts) for tests
+/// exercising source-path handling.
+#[cfg(test)]
+fn synth_aterm_full(
+    outputs: &[(&str, &str)],
+    input_drvs: &[&str],
+    input_srcs: &[&str],
+    system: &str,
+    extra_env: &[(&str, &str)],
+) -> String {
     let outs = outputs
         .iter()
         .map(|(name, path)| format!(r#"("{name}","{path}","","")"#))
@@ -355,13 +395,19 @@ fn synth_aterm_with_env(
         .map(|drv| format!(r#"("{drv}",["out"])"#))
         .collect::<Vec<_>>()
         .join(",");
+    let srcs = input_srcs
+        .iter()
+        .map(|src| format!(r#""{src}""#))
+        .collect::<Vec<_>>()
+        .join(",");
     let env = outputs
         .iter()
         .chain(extra_env)
         .map(|(name, path)| format!(r#"("{name}","{path}")"#))
         .collect::<Vec<_>>()
         .join(",");
-    format!(r#"Derive([{outs}],[{inputs}],[],"{system}","/bin/sh",["-c","true"],[{env}])"#) + "\n"
+    format!(r#"Derive([{outs}],[{inputs}],[{srcs}],"{system}","/bin/sh",["-c","true"],[{env}])"#)
+        + "\n"
 }
 
 /// Write a tiny synthetic directory-form v1 replay archive into `dir`,
@@ -1320,7 +1366,10 @@ mod tests {
     /// One-unit archive with the dependency chain app → libC → stdenv in
     /// the embedded ATerms only: no `units.jsonl`, no `closures.jsonl`,
     /// `dependency_closures` false — the minimal capability surface a v0
-    /// archive (or a recorder that skips the ATerm pass) presents.
+    /// archive (or a recorder that skips the ATerm pass) presents. The
+    /// ATerms also declare input sources (app a builder script directly,
+    /// libC a patch), so the fallback walk's per-unit source view is
+    /// exercised alongside the dependency edges.
     fn write_capabilityless_chain_archive(dir: &std::path::Path) {
         use crate::archive::schema::{
             Capabilities, ExpectedOutcome, OutcomeRecord, RequestRecord, RequestTarget,
@@ -1330,8 +1379,10 @@ mod tests {
 
         let app_drv = format!("/nix/store/{}-app-3.0.drv", fake_hash("chain-app-drv"));
         let app_out = format!("/nix/store/{}-app-3.0", fake_hash("chain-app-out"));
+        let app_src = format!("/nix/store/{}-builder.sh", fake_hash("chain-app-src"));
         let lib_c_drv = format!("/nix/store/{}-libC-1.0.drv", fake_hash("chain-libC-drv"));
         let lib_c_out = format!("/nix/store/{}-libC-1.0", fake_hash("chain-libC-out"));
+        let lib_c_src = format!("/nix/store/{}-fix.patch", fake_hash("chain-libC-src"));
         let stdenv_drv = format!("/nix/store/{}-stdenv-9.drv", fake_hash("chain-stdenv-drv"));
         let stdenv_out = format!("/nix/store/{}-stdenv-9", fake_hash("chain-stdenv-out"));
 
@@ -1339,20 +1390,24 @@ mod tests {
         writer
             .add_drv(
                 &app_drv,
-                &synth_aterm(
+                &synth_aterm_full(
                     &[("out", app_out.as_str())],
                     &[lib_c_drv.as_str()],
+                    &[app_src.as_str()],
                     "x86_64-linux",
+                    &[],
                 ),
             )
             .unwrap();
         writer
             .add_drv(
                 &lib_c_drv,
-                &synth_aterm(
+                &synth_aterm_full(
                     &[("out", lib_c_out.as_str())],
                     &[stdenv_drv.as_str()],
+                    &[lib_c_src.as_str()],
                     "x86_64-linux",
+                    &[],
                 ),
             )
             .unwrap();
@@ -1433,6 +1488,126 @@ mod tests {
             app.deps.iter().all(|d| !d.output_paths.is_empty()),
             "declared output paths recovered from the ATerms"
         );
+        // Input sources recovered from the ATerms reach the per-unit view:
+        // the unit's own builder script and the patch declared by a
+        // dependency both count as required paths of this unit's closure.
+        assert_eq!(app.srcs.len(), 2, "got: {:?}", app.srcs);
+        assert!(app.srcs.iter().any(|s| s.ends_with("-builder.sh")));
+        assert!(app.srcs.iter().any(|s| s.ends_with("-fix.patch")));
+    }
+
+    #[test]
+    fn load_closures_carries_closures_jsonl_sources_into_the_per_unit_view() {
+        // A `dependency_closures` archive whose adjacency records carry
+        // input sources: app's record declares a builder script, libC's a
+        // vendored tarball PLUS the same builder script (a source shared
+        // by both derivations). The embedded ATerms deliberately declare
+        // NO inputSrcs, so any source in the per-unit view can only have
+        // come from `closures.jsonl` — and the shared source appears once
+        // (the view is a set, not a concatenation).
+        use crate::archive::schema::{
+            Capabilities, ExpectedOutcome, OutcomeRecord, RequestRecord, RequestTarget,
+            Substituters,
+        };
+        use crate::archive::writer::{ArchiveWriter, ManifestSeed};
+
+        let app_drv = format!("/nix/store/{}-app-4.0.drv", fake_hash("srcv-app-drv"));
+        let app_out = format!("/nix/store/{}-app-4.0", fake_hash("srcv-app-out"));
+        let app_src = format!("/nix/store/{}-builder.sh", fake_hash("srcv-app-src"));
+        let lib_c_drv = format!("/nix/store/{}-libC-2.0.drv", fake_hash("srcv-libC-drv"));
+        let lib_c_out = format!("/nix/store/{}-libC-2.0", fake_hash("srcv-libC-out"));
+        let lib_c_src = format!("/nix/store/{}-vendor.tar.gz", fake_hash("srcv-libC-src"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = ArchiveWriter::create(tmp.path()).unwrap();
+        writer
+            .add_drv(
+                &app_drv,
+                &synth_aterm(
+                    &[("out", app_out.as_str())],
+                    &[lib_c_drv.as_str()],
+                    "x86_64-linux",
+                ),
+            )
+            .unwrap();
+        writer
+            .add_drv(
+                &lib_c_drv,
+                &synth_aterm(&[("out", lib_c_out.as_str())], &[], "x86_64-linux"),
+            )
+            .unwrap();
+        writer
+            .write_requests(&[RequestRecord {
+                session: 0,
+                offset_s: 0.0,
+                targets: vec![RequestTarget {
+                    drv: app_drv.clone(),
+                    outputs: vec!["*".to_string()],
+                }],
+            }])
+            .unwrap();
+        writer
+            .write_outcomes(&[OutcomeRecord {
+                session: None,
+                drv: app_drv.clone(),
+                outcome: ExpectedOutcome::Built,
+                detail: None,
+                duration_s: None,
+                stop_offset_s: None,
+                outputs: BTreeMap::new(),
+            }])
+            .unwrap();
+        writer
+            .write_closures(&[
+                ClosureRecord {
+                    drv: app_drv.clone(),
+                    inputs: vec![lib_c_drv.clone()],
+                    srcs: vec![app_src.clone()],
+                    outputs: BTreeMap::from([("out".to_string(), Some(app_out.clone()))]),
+                },
+                ClosureRecord {
+                    drv: lib_c_drv.clone(),
+                    inputs: Vec::new(),
+                    srcs: vec![lib_c_src.clone(), app_src.clone()],
+                    outputs: BTreeMap::from([("out".to_string(), Some(lib_c_out.clone()))]),
+                },
+            ])
+            .unwrap();
+        let stamp: jiff::Timestamp = "2026-05-28T00:00:00Z".parse().unwrap();
+        writer
+            .finalize(ManifestSeed {
+                created_at: stamp,
+                from: stamp,
+                to: stamp,
+                capabilities: Capabilities {
+                    timed: false,
+                    expected_outcomes: true,
+                    output_hashes: false,
+                    embedded_store_paths: false,
+                    impure_env: false,
+                    dependency_closures: true,
+                },
+                substituters: Substituters::default(),
+                fat: false,
+                provenance: serde_json::Map::new(),
+            })
+            .unwrap();
+
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let units = load_units(&archive).unwrap();
+        let closures = load_closures(&archive, &units).unwrap();
+        assert_eq!(closures.len(), 1);
+        let app = &closures[0];
+        let mut expected = vec![app_src.clone(), lib_c_src.clone()];
+        expected.sort();
+        assert_eq!(
+            app.srcs, expected,
+            "own + dependency sources, deduplicated and sorted"
+        );
+        // The dependency view itself is unchanged by carrying sources.
+        assert_eq!(app.deps.len(), 1);
+        assert_eq!(app.deps[0].drv_path, lib_c_drv);
+        assert_eq!(app.deps[0].output_paths, vec![lib_c_out]);
     }
 
     #[test]

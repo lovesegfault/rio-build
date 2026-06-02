@@ -564,6 +564,7 @@ mod tests {
                 job: "depUnit.x86_64-linux".to_string(),
                 drv_path: dep_drv.to_string(),
                 deps: vec![],
+                srcs: vec![],
             },
             DepClosureEntry {
                 job: "topUnit.x86_64-linux".to_string(),
@@ -572,6 +573,7 @@ mod tests {
                     drv_path: dep_drv.to_string(),
                     output_paths: vec![dep_out.to_string()],
                 }],
+                srcs: vec![],
             },
         ];
         let in_scope = vec![
