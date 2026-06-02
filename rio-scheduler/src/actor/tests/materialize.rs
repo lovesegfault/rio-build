@@ -21,7 +21,7 @@ fn sdb(pool: &sqlx::PgPool) -> crate::db::SchedulerDb {
 /// Substituting.
 #[tokio::test]
 async fn flag_on_probe_partition_creates_job_instead_of_walk() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let out = test_store_path("maton-probe-out");
     let mut n = make_node("maton-probe");
@@ -77,7 +77,7 @@ async fn flag_on_probe_partition_creates_job_instead_of_walk() -> TestResult {
 /// while both builds' wanted relations are recorded.
 #[tokio::test]
 async fn flag_on_concurrent_interest_creates_one_job() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let out = test_store_path("maton-dedup-out");
     // Substitutable BEFORE the first merge: build A's merge classifies
@@ -129,7 +129,7 @@ async fn flag_on_concurrent_interest_creates_one_job() -> TestResult {
 /// fence stamp.
 #[tokio::test]
 async fn flag_on_pruned_root_creates_job_at_merge() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // The canonical real-prune setup (test_topdown_root_substitutable_
     // prunes_deps): root output substitutable BEFORE merge, root → dep
@@ -553,7 +553,7 @@ async fn build_attempt_with_materialization_payload_acked_and_ignored() -> TestR
 /// and the node returns to Ready.
 #[tokio::test]
 async fn flag_on_infra_failure_charges_and_rearms() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // Job via the merge new_sub lane (substitutable before merge).
     let out = test_store_path("maton-infra-out");
@@ -662,7 +662,7 @@ async fn flag_on_infra_failure_charges_and_rearms() -> TestResult {
 /// budgets by the kernel kind partition.
 #[tokio::test]
 async fn establishment_writes_materialization_infra_never_adopts() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // Job via the merge new_sub lane + a store-replica claim.
     let out = test_store_path("maton-est-out");
@@ -740,7 +740,7 @@ async fn establishment_writes_materialization_infra_never_adopts() -> TestResult
 /// class is appended (BC-2's no-controller closer).
 #[tokio::test]
 async fn cancellation_closes_open_attempt_charge_free() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let out = test_store_path("maton-cancel-out");
     store.state.substitutable.write().unwrap().push(out.clone());
@@ -934,7 +934,7 @@ async fn list_materialization_jobs(
 /// proves they compose.
 #[tokio::test]
 async fn flag_on_materialization_job_end_to_end() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // 1. Merge a 1-node build; the wanted output becomes substitutable
     //    only AFTER merge so the dispatch-probe partition (not the
@@ -1108,7 +1108,7 @@ async fn flag_on_materialization_job_end_to_end() -> TestResult {
 /// design's trace has it.
 #[tokio::test]
 async fn flag_on_moot_unobtainable_never_fail_fasts() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // One 2-output node; two builds with different wants:
     //   b1 wants out1 only; b2 wants out1 + out2.
@@ -1259,7 +1259,7 @@ async fn flag_on_moot_unobtainable_never_fail_fasts() -> TestResult {
 /// recorded as a PIN; a failure would be a Phase A consumption bug.
 #[tokio::test]
 async fn flag_on_stale_unobtainable_two_build_dedup_never_fails() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // One 2-output node; the narrow build wants `out`, the wide build
     // wants `out` + `wide`.
@@ -1565,7 +1565,7 @@ async fn flag_on_unmarked_leaf_confirmed_missing_releases_to_from_source() -> Te
 /// in `running_derivations` by construction.
 #[tokio::test]
 async fn flag_on_pending_jobs_count_as_substituting_bucket() -> TestResult {
-    let (_db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // 3-node chain root → mid → leaf where mid and leaf are
     // substitutable but the demanded root is NOT (so the topdown prune
@@ -1659,7 +1659,7 @@ async fn substituting_gauge_published_from_snapshot_bucket() -> TestResult {
     let recorder = CountingRecorder::default();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
-    let (_db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // Same fixture as the snapshot-bucket test above: root → mid →
     // leaf, mid+leaf substitutable, root demanded → 2 pending
@@ -1739,7 +1739,7 @@ fn drain_derivation_kinds(
 #[tokio::test]
 async fn flag_on_claim_emits_substituting_event_and_consumption_stops_it() -> TestResult {
     use rio_proto::types::DerivationEventKind as K;
-    let (_db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // Substitutable BEFORE merge → the merge new_sub lane creates the job.
     let out = test_store_path("bc4-claim-out");
@@ -1816,7 +1816,7 @@ async fn flag_on_claim_emits_substituting_event_and_consumption_stops_it() -> Te
 /// pin flipped red-first per the PDQ-6 amendment.)
 #[tokio::test]
 async fn flag_on_queued_node_accepts_materialization_claim() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // 3-node chain root → mid → leaf where only MID's output is
     // substitutable:
@@ -2059,7 +2059,7 @@ async fn flag_on_queued_mint_crash_between_commit_and_transition_recovers() -> T
 /// 6d correction runs before 6e's seeding) — never DependencyFailed.
 #[tokio::test]
 async fn flag_on_reprobe_poisoned_node_creates_job_with_reset() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
     let tag = "pd17-poisoned";
     let out = test_store_path("pd17-poisoned-out");
     let mut node = make_node(tag);
@@ -2171,7 +2171,7 @@ async fn flag_on_reprobe_poisoned_node_creates_job_with_reset() -> TestResult {
 /// single resolution path for BOTH builds.
 #[tokio::test]
 async fn flag_on_reprobe_job_orphan_no_longer_forms() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
     let tag = "pd17-orphan";
     let out = test_store_path("pd17-orphan-out");
     // Substitutable BEFORE merge → build #1's merge creates the job
@@ -2270,7 +2270,7 @@ async fn flag_on_reprobe_job_orphan_no_longer_forms() -> TestResult {
 ///   resolves build #2.
 #[tokio::test]
 async fn flag_on_stale_completed_demote_creates_stale_reset_job() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
     let tag = "pd18-stale";
     let out = test_store_path("pd18-stale-out");
     store.state.substitutable.write().unwrap().push(out.clone());
@@ -2394,7 +2394,7 @@ async fn flag_on_stale_completed_demote_creates_stale_reset_job() -> TestResult 
 /// says the closure is buildable.
 #[tokio::test]
 async fn pruned_origin_pending_evidence_resolves_from_source() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // Build #1: the prune fixture (root marked + job origin=pruned).
     let root_out = test_store_path("clrfs-root-out");
@@ -2626,7 +2626,7 @@ async fn mat_pin_count(pool: &sqlx::PgPool, drv: &str) -> anyhow::Result<i64> {
 /// pinned forever (the store GC roots on every scheduler_live_pins row).
 #[tokio::test]
 async fn pins_release_when_job_resolved_and_interest_terminal() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
     let tag = "pin-rel";
     let out = test_store_path("pin-rel-out");
     store.state.substitutable.write().unwrap().push(out.clone());
@@ -2692,7 +2692,7 @@ async fn pins_release_when_job_resolved_and_interest_terminal() -> TestResult {
 /// one stays live → held; the second goes terminal → released.
 #[tokio::test]
 async fn pins_survive_while_any_interest_live() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
     let tag = "pin-hold";
     let out = test_store_path("pin-hold-out");
     store.state.substitutable.write().unwrap().push(out.clone());
@@ -3505,7 +3505,7 @@ async fn flag_on_recovery_rebuilds_job_view_and_jobs_survive() -> TestResult {
 /// racing the job that is already armed to do the same work.
 #[tokio::test]
 async fn flag_on_reap_survivor_with_unresolved_job_stays_armed() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // The reap_survivor_settles_at_reap_time shape (build.rs):
     // a 2-output root where only the narrow output is substitutable.
@@ -3681,7 +3681,7 @@ async fn flag_on_reap_survivor_with_unresolved_job_stays_armed() -> TestResult {
 /// Pin (plan T-4.4 / RFB-5): all four cells are Phase A mechanisms.
 #[tokio::test]
 async fn flag_on_probe_matrix_routes_to_jobs() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let out_present = test_store_path("matrix-present-out");
     let out_sub = test_store_path("matrix-sub-out");
@@ -4140,7 +4140,7 @@ async fn flag_on_genuine_unobtainable_fail_fasts_with_resubmit_error() -> TestRe
 /// not declared outputs).
 #[tokio::test]
 async fn flag_on_success_coverage_ignores_unwanted_outputs() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // A 2-output node where the build wants only `out`; `extra` is
     // declared but never wanted by anyone.
@@ -4596,7 +4596,7 @@ async fn job_lifecycle_metrics_count_claims_and_resolutions() -> TestResult {
     let snap = rec.snapshotter();
     let _guard = metrics::set_default_local_recorder(&rec);
 
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // ── Job 1: claim → Success consumption. ──
     let out1 = test_store_path("lcm-success-out");
@@ -5718,7 +5718,7 @@ async fn unknown_contribution_saturates_conservatively() -> TestResult {
 /// produces when the union is narrow.
 #[tokio::test]
 async fn consumption_coverage_saturates_on_missing_relation_rows() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let out1 = test_store_path("d23c-out1");
     let out2 = test_store_path("d23c-out2");

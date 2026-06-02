@@ -230,20 +230,6 @@ pub(crate) async fn setup_with_mock_store() -> anyhow::Result<(
     Ok((db, store, handle, (store_task, actor_task)))
 }
 
-/// Alias of [`setup_with_mock_store`] since the substitution-
-/// replacement cutover (materialization is unconditional — the flag
-/// this fixture used to set is gone). Kept so the large flag-on
-/// battery did not churn; fold into the plain fixture in a later
-/// cleanup.
-pub(crate) async fn setup_with_mock_store_materialization_enabled() -> anyhow::Result<(
-    TestDb,
-    rio_test_support::grpc::MockStore,
-    ActorHandle,
-    (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>),
-)> {
-    setup_with_mock_store().await
-}
-
 /// Send `ActorCommand::Tick` and barrier on it. For tests driving the
 /// `dispatch_dirty` → dispatch path or refreshing the cached
 /// `ClusterSnapshot` without faking a heartbeat.

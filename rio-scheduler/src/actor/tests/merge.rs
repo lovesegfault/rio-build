@@ -389,7 +389,7 @@ async fn test_ca_cache_miss(#[case] seed_stale: bool) -> TestResult {
 ///    from-source fall-through.
 #[tokio::test]
 async fn missing_unwanted_output_is_still_a_cache_hit() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // --- Case 1: missing output is unwanted → cache hit -------------
     let out_1 = test_store_path("wo-hit-out");
@@ -520,7 +520,7 @@ async fn test_substitutable_probe_matrix(
     #[case] substitutable: bool,
     #[case] expect_job: bool,
 ) -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let out_path = test_store_path(out_tag);
     if substitutable {
@@ -573,7 +573,7 @@ async fn test_substitutable_probe_matrix(
 // r[verify sched.merge.substitute-probe-indeterminate+2]
 #[tokio::test]
 async fn test_indeterminate_probe_tries_substitute_not_build() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let out = test_store_path("indet-out");
     // Probe says indeterminate (NOT in `substitutable`). Mirrors the
@@ -625,7 +625,7 @@ async fn test_indeterminate_probe_tries_substitute_not_build() -> TestResult {
 /// just the root NAR, prune deps from the DAG.
 #[tokio::test]
 async fn test_topdown_root_substitutable_prunes_deps() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // Seed: root output substitutable. Dep outputs NOT seeded (not
     // needed — top-down should never check them).
@@ -787,7 +787,7 @@ async fn test_topdown_explicit_target_unavailable_blocks_prune() -> TestResult {
 /// target is fetched, not fabricated.
 #[tokio::test]
 async fn test_topdown_explicit_target_substitutable_kept_in_prune() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let app_out = test_store_path("tdk-app-out");
     let lib_out = test_store_path("tdk-lib-out");
@@ -1117,7 +1117,7 @@ async fn test_topdown_stamp_only_nodes_whose_closure_was_dropped() -> TestResult
 /// full bottom-up check. All nodes merged, deps processed normally.
 #[tokio::test]
 async fn test_topdown_root_missing_falls_through() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // Seed: dep output substitutable, root NOT. Top-down sees root
     // missing → falls through → bottom-up finds glibc substitutable.
@@ -1352,7 +1352,7 @@ async fn test_topdown_prune_gated_on_live_effective_wanted_of_preexisting_root()
 /// completes via the detached substitute fetch.
 #[tokio::test]
 async fn test_topdown_prune_fires_when_preexisting_roots_live_wanted_satisfiable() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let r_out = test_store_path("tds-r-out");
     let r_debug = test_store_path("tds-r-debug");
@@ -1702,7 +1702,7 @@ async fn test_resubmit_poisoned_retry_limit_bound(
 async fn test_resubmit_poisoned_at_limit_substitutable(
     #[case] locally_present: bool,
 ) -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
     let tag = "i094-sub-poison";
     let out = test_store_path("i094-sub-poison-out");
     let mut node = make_node(tag);
@@ -2178,7 +2178,7 @@ async fn verify_preexisting_with_poisoned_dep_goes_dependency_failed() -> TestRe
 #[tokio::test]
 async fn merge_probe_whole_dag_substituting() -> TestResult {
     const N: usize = 5000;
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // 5000 IA leaves, each with a known expected_output_path. Seed
     // ALL outputs as substitutable in the mock store so
@@ -2259,7 +2259,7 @@ async fn suffix_classes(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<&'static str
 /// that actually need the dep NAR.
 #[tokio::test]
 async fn test_topdown_prune_deps_not_in_global_dag() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let hello_out = test_store_path("hello-shared");
     let glibc_out = test_store_path("glibc-shared");

@@ -381,7 +381,7 @@ async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
 #[case::non_fod(false)]
 #[tokio::test]
 async fn dispatch_time_substitutable_routes_to_job(#[case] is_fod: bool) -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
     let out = test_store_path("dispatch-sub-out");
     let mut n = make_node("dispatch-sub-drv");
     n.is_fixed_output = is_fod;
