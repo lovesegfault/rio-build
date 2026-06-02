@@ -667,16 +667,19 @@ mod tests {
         #[case] declare_correct: bool,
     ) -> anyhow::Result<()> {
         let content = format!("fod test content for {algo}").into_bytes();
-        let (_tmp, store_dir) = seed_output(basename, &content)?;
+        // Declared output paths must parse as store paths (typed
+        // boundary), so the on-disk name carries a valid hash prefix.
+        let store_name = format!("gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-{basename}");
+        let (_tmp, store_dir) = seed_output(&store_name, &content)?;
 
         let declared = if declare_correct {
-            correct_fod_hash(&store_dir, basename, &content, algo)?
+            correct_fod_hash(&store_dir, &store_name, &content, algo)?
         } else {
             // Wrong hash: all-zero digest of the correct width.
-            let width = correct_fod_hash(&store_dir, basename, &content, algo)?.len();
+            let width = correct_fod_hash(&store_dir, &store_name, &content, algo)?.len();
             "0".repeat(width)
         };
-        let drv = make_fod_drv(&format!("/nix/store/{basename}"), algo, &declared);
+        let drv = make_fod_drv(&format!("/nix/store/{store_name}"), algo, &declared);
 
         let result = verify_fod_hashes(&drv, &store_dir);
         assert_eq!(

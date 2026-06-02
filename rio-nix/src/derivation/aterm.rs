@@ -164,8 +164,10 @@ impl<'a> ATermParser<'a> {
             p.expect(")")?;
             let i = idx;
             idx += 1;
-            DerivationOutput::new(name, path, hash_algo, hash)
-                .map_err(|_| DerivationError::EmptyOutputName(i))
+            DerivationOutput::new(name, path, hash_algo, hash).map_err(|e| match e {
+                DerivationError::EmptyOutputName(_) => DerivationError::EmptyOutputName(i),
+                other => other,
+            })
         })
     }
 
@@ -320,7 +322,7 @@ impl Derivation {
         // Collect output names into a small set for the env-key lookup.
         // &str borrows from self.outputs, valid for write_aterm_tail's scope.
         let mask_env: Option<std::collections::HashSet<&str>> = if mask_outputs {
-            Some(self.outputs.iter().map(|o| o.name.as_str()).collect())
+            Some(self.outputs.iter().map(|o| o.name()).collect())
         } else {
             None
         };
@@ -381,13 +383,13 @@ fn write_aterm_outputs(out: &mut String, outputs: &[DerivationOutput], mask_path
             out.push(',');
         }
         out.push('(');
-        write_aterm_string(out, &o.name);
+        write_aterm_string(out, o.name());
         out.push(',');
-        write_aterm_string(out, if mask_paths { "" } else { &o.path });
+        write_aterm_string(out, if mask_paths { "" } else { o.path() });
         out.push(',');
-        write_aterm_string(out, &o.hash_algo);
+        write_aterm_string(out, o.hash_algo());
         out.push(',');
-        write_aterm_string(out, &o.hash);
+        write_aterm_string(out, o.hash());
         out.push(')');
     }
     out.push(']');
@@ -618,7 +620,7 @@ mod tests {
         // Non-trivial body: inputSrcs, args, env all populated so
         // write_aterm_tail is fully exercised. inputDrvs empty by
         // construction (the case BasicDerivation represents).
-        let aterm = r#"Derive([("dev","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-dev","",""),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-out","sha256","")],[],["/nix/store/v2nxzjj53jrp4yik4a9g9wyk9hfg1cii-a","/nix/store/v2nxzjj53jrp4yik4a9g9wyk9hfg1cii-b"],"x86_64-linux","/bin/sh",["-c","build"],[("name","t"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-out"),("system","x86_64-linux")])"#;
+        let aterm = r#"Derive([("dev","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-dev","",""),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-out","","")],[],["/nix/store/v2nxzjj53jrp4yik4a9g9wyk9hfg1cii-a","/nix/store/v2nxzjj53jrp4yik4a9g9wyk9hfg1cii-b"],"x86_64-linux","/bin/sh",["-c","build"],[("name","t"),("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-out"),("system","x86_64-linux")])"#;
         let drv = Derivation::parse(aterm)?;
         assert!(drv.input_drvs().is_empty());
 
@@ -636,7 +638,7 @@ mod tests {
     /// source `Derivation` carried.
     #[test]
     fn from_resolved_merges_extra_srcs_sorted() -> anyhow::Result<()> {
-        let aterm = r#"Derive([("out","/nix/store/abc","","")],[("/nix/store/jsgmnakmssnxxajxi2n5lld58c9mcly3.drv",["out"])],["/nix/store/zzz"],"x86_64-linux","/bin/sh",[],[("name","t")])"#;
+        let aterm = r#"Derive([("out","/nix/store/jsgmnakmssnxxajxi2n5lld58c9mcly3-t","","")],[("/nix/store/jsgmnakmssnxxajxi2n5lld58c9mcly3.drv",["out"])],["/nix/store/zzz"],"x86_64-linux","/bin/sh",[],[("name","t")])"#;
         let drv = Derivation::parse(aterm)?;
         assert_eq!(drv.input_drvs().len(), 1);
 

@@ -61,6 +61,18 @@ pub enum DerivationError {
     #[error("computed output path is invalid: {0}")]
     InvalidOutputPath(#[from] crate::store_path::StorePathError),
 
+    #[error("content-addressing derivation output should not specify output path (output '{0}')")]
+    FloatingCaDeclaredPath(String),
+
+    #[error("bad path '' in derivation (fixed output '{0}' must specify its output path)")]
+    FixedOutputNoPath(String),
+
+    #[error(
+        "derivation output '{0}' specifies a hash without outputHashAlgo (the reference \
+         parser silently drops such hashes on unparse, breaking byte-faithful round-trips)"
+    )]
+    HashWithoutAlgo(String),
+
     #[error(
         "derivation '{0}' is not plain input-addressed (fixed-output and floating-CA \
          outputs derive their paths from content, not from the derivation hash)"
@@ -71,74 +83,8 @@ pub enum DerivationError {
 /// Maximum number of items in any ATerm list (DoS prevention).
 const MAX_ATERM_LIST_ITEMS: usize = 1_048_576;
 
-/// A single derivation output.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DerivationOutput {
-    /// Output name (e.g., "out", "dev", "lib").
-    name: String,
-    /// Store path for this output.
-    path: String,
-    /// Hash algorithm for fixed-output derivations (empty for input-addressed).
-    hash_algo: String,
-    /// Expected hash for fixed-output derivations (empty for input-addressed).
-    hash: String,
-}
-
-impl DerivationOutput {
-    /// Create a new derivation output.
-    ///
-    /// Returns an error if `name` is empty.
-    pub fn new(
-        name: impl Into<String>,
-        path: impl Into<String>,
-        hash_algo: impl Into<String>,
-        hash: impl Into<String>,
-    ) -> Result<Self, DerivationError> {
-        let name = name.into();
-        if name.is_empty() {
-            return Err(DerivationError::EmptyOutputName(0));
-        }
-        Ok(DerivationOutput {
-            name,
-            path: path.into(),
-            hash_algo: hash_algo.into(),
-            hash: hash.into(),
-        })
-    }
-
-    /// The output name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The output store path.
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-
-    /// Hash algorithm (empty for input-addressed).
-    pub fn hash_algo(&self) -> &str {
-        &self.hash_algo
-    }
-
-    /// Expected hash (empty for input-addressed).
-    pub fn hash(&self) -> &str {
-        &self.hash
-    }
-
-    /// Whether this output has a `hash_algo` set.
-    ///
-    /// Returns true for *any* content-addressed output — both
-    /// fixed-output (hash_algo AND hash set) and floating-CA
-    /// (hash_algo set, hash empty). To distinguish FOD from
-    /// floating-CA, check `!hash().is_empty()`.
-    ///
-    /// See [`DerivationLike::is_fixed_output`] for the strict FOD
-    /// predicate (single `out` output with both fields set).
-    pub fn has_hash_algo(&self) -> bool {
-        !self.hash_algo.is_empty()
-    }
-}
+pub mod output;
+pub use output::{DerivationOutput, OutputKind};
 
 /// Common accessor surface for [`Derivation`] and [`BasicDerivation`].
 ///
@@ -453,7 +399,7 @@ impl BasicDerivation {
             .outputs
             .iter()
             .enumerate()
-            .filter(|(_, o)| o.path.is_empty() && o.hash_algo.is_empty())
+            .filter(|(_, o)| matches!(o.kind(), OutputKind::Deferred))
             .map(|(i, _)| i)
             .collect();
         if deferred.is_empty() {
@@ -466,9 +412,10 @@ impl BasicDerivation {
 
         let mut filled = Vec::with_capacity(deferred.len());
         for i in deferred {
-            let out_name = self.outputs[i].name.clone();
-            let path = StorePath::make_output(&out_name, &drv_hash, drv_name)?.to_string();
-            self.outputs[i].path = path.clone();
+            let out_name = self.outputs[i].name().to_string();
+            let typed = StorePath::make_output(&out_name, &drv_hash, drv_name)?;
+            let path = typed.to_string();
+            self.outputs[i].fill_deferred(typed);
             self.env.insert(out_name.clone(), path.clone());
             filled.push((out_name, path));
         }

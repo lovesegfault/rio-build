@@ -1224,8 +1224,16 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         Err(e) => stderr_err!(stderr, "wopBuildDerivation: {e}"),
     };
     tracing::Span::current().record("path", drv_path_str.as_str());
-    let Ok(basic_drv) = read_basic_derivation(reader).await else {
-        stderr_err!(stderr, "wopBuildDerivation: failed to read BasicDerivation");
+    // The wire parser now classifies output shapes at construction
+    // (typed parse boundary): a malformed declared output path, a
+    // floating output with a declared path, or a hash without an algo
+    // fails HERE, mid-payload. STDERR_ERROR-then-close posture is
+    // mandatory — the payload is partially consumed, so continuing
+    // the opcode loop would desync the stream (protocol-wire.md).
+    // r[impl gw.reject.floating-ca-declared-path+1]
+    let basic_drv = match read_basic_derivation(reader).await {
+        Ok(drv) => drv,
+        Err(e) => stderr_err!(stderr, "wopBuildDerivation: invalid BasicDerivation: {e}"),
     };
     read_build_mode_normal_only(reader, stderr, "wopBuildDerivation").await?;
 

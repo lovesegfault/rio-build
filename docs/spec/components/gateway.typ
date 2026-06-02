@@ -1165,20 +1165,22 @@ to prevent — and the rejection's remediation (upload the `.drv`, or copy
 the already-realized outputs directly) restores the exemption on the
 cached-DAG path.
 
-#r("gw.reject.floating-ca-declared-path")[
-  The gateway MUST reject at submission any derivation output that sets
-  `outputHashAlgo` with an empty `outputHash` (floating content-addressed
-  shape) while declaring a non-empty output path. CppNix refuses to parse
-  this shape ("content-addressing derivation output should not specify
-  output path"), and accepting it would exempt the declared path from both
-  the input-addressed and the declared-hash output-path bindings. The
-  rejection applies both in `validate_dag` over cached derivations and
-  inline on `wopBuildDerivation`'s `BasicDerivation`, for every output
-  regardless of whether its hash algorithm is otherwise verifiable.
+#r("gw.reject.floating-ca-declared-path+1")[
+  A floating content-addressed output (`outputHashAlgo` set, `outputHash`
+  empty) declaring a non-empty output path MUST be rejected, and the
+  enforcement point is the typed parse boundary
+  (#rref("nix.drv.output-typed")): the shape fails `Derivation` /
+  `BasicDerivation` construction with CppNix's own wording
+  ("content-addressing derivation output should not specify output path"),
+  so neither the session derivation cache nor the inline
+  `wopBuildDerivation` payload can ever contain it. The gateway MUST
+  surface the parse failure as a rejection — `STDERR_ERROR` then close for
+  the mid-payload inline case — rather than masking it.
 ]
 No legitimate client can produce this shape, so the rule rejects only
 crafted submissions; proper floating-CA outputs (empty declared path) are
-unaffected.
+unaffected. Accepting it would have exempted the declared path from both
+the input-addressed and the declared-hash output-path bindings.
 
 #r("gw.reject.output-path-mismatch+2")[
   The gateway MUST NOT trust declared output paths. For input-addressed

@@ -756,6 +756,11 @@
       "doc": "Modular derivation hashing (Nix `hashDerivationModulo`)."
     },
     {
+      "path": "derivation/output.rs",
+      "depth": 1,
+      "doc": "Typed derivation outputs — the parse-boundary chokepoint."
+    },
+    {
       "path": "derivation/structured.rs",
       "depth": 1,
       "doc": "`__structuredAttrs`-aware attribute lookup."

@@ -1132,7 +1132,7 @@ async fn test_submit_build_rejects_authoritative_multi_output_fixed() {
     let aterm = format!(
         r#"Derive([("out","/nix/store/{p1}-multi","r:sha256","{h}"),("dev","/nix/store/{p2}-multi-dev","r:sha256","{h}")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[])"#,
         p1 = "f".repeat(32),
-        p2 = "e".repeat(32),
+        p2 = "g".repeat(32),
     );
     let mut node = make_node("auth-multi-fixed");
     node.drv_content = aterm.into_bytes();

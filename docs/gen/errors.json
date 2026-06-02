@@ -450,6 +450,27 @@
     },
     {
       "enum": "DerivationError",
+      "name": "FixedOutputNoPath",
+      "crate": "rio-nix",
+      "msg": "bad path '' in derivation (fixed output '{0}' must specify its output path)",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
+      "name": "FloatingCaDeclaredPath",
+      "crate": "rio-nix",
+      "msg": "content-addressing derivation output should not specify output path (output '{0}')",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
+      "name": "HashWithoutAlgo",
+      "crate": "rio-nix",
+      "msg": "derivation output '{0}' specifies a hash without outputHashAlgo (the reference parser silently drops such hashes on unparse, breaking byte-faithful round-trips)",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
       "name": "InputNotFound",
       "crate": "rio-nix",
       "msg": "input derivation not found: {0}",

@@ -644,7 +644,7 @@ mod hash_derivation_modulo_tests {
     fn ca_floating_masks_output_paths() -> anyhow::Result<()> {
         // CA floating: hash_algo set, hash empty
         let ca_drv = Derivation::parse(
-            r#"Derive([("out","/nix/store/yybiyabxfnjrmn69rna94qxr881rwqfv-ca","sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","ca-test"),("out","/nix/store/yybiyabxfnjrmn69rna94qxr881rwqfv-ca"),("system","x86_64-linux")])"#,
+            r#"Derive([("out","","sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","ca-test"),("out","/nix/store/yybiyabxfnjrmn69rna94qxr881rwqfv-ca"),("system","x86_64-linux")])"#,
         )?;
 
         assert!(ca_drv.has_ca_floating_outputs());
@@ -659,10 +659,12 @@ mod hash_derivation_modulo_tests {
             &mut cache,
         )?;
 
-        // Verify the hash uses masked ATerm (empty output path AND empty
-        // env value for the `out` key — Nix C++ masks both; missing the
-        // env mask produces a hash that nix-build's wopQueryRealisation
-        // will never match).
+        // Verify the hash uses masked ATerm: the floating tuple path is
+        // structurally empty (the typed model forbids declared paths on
+        // floating outputs — oracle parity), so the load-bearing mask is
+        // the ENV value for the `out` key. Nix C++ masks both; missing
+        // the env mask produces a hash that nix-build's
+        // wopQueryRealisation will never match.
         use sha2::{Digest, Sha256};
         let masked_aterm = ca_drv.to_aterm_modulo(&BTreeMap::new(), true)?;
         assert!(masked_aterm.contains(r#"("out","","sha256","")"#));

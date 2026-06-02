@@ -1396,19 +1396,21 @@ async fn test_build_derivation_squatted_path_rejected_and_cache_restored() -> an
 /// `outputHash`) that nevertheless declares an output path — a shape
 /// CppNix refuses to parse and the gateway rejects at submission
 /// (`gw.reject.floating-ca-declared-path`).
-const FLOATING_CA_DECLARED_PATH_DRV_ATERM: &str = r#"Derive([("out","/nix/store/ffffffffffffffffffffffffffffffff-victim","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/ffffffffffffffffffffffffffffffff-victim")])"#;
-
-/// wopBuildDerivation (36): a cached derivation with a floating-CA-shaped
-/// output that declares a non-empty path is rejected by `validate_dag`'s
-/// shape rule before SubmitBuild.
-// r[verify gw.reject.floating-ca-declared-path]
+/// wopBuildDerivation (36): an inline BasicDerivation whose floating-CA-
+/// shaped output declares a non-empty path fails AT THE WIRE PARSE — the
+/// typed boundary classifies the output triple during
+/// `read_basic_derivation`, so the malformed value never exists in the
+/// gateway. The handler answers STDERR_ERROR (mid-payload failure, so
+/// the connection closes; protocol-wire.md desync rule) carrying the
+/// oracle's wording, and SubmitBuild is never reached.
+// r[verify gw.reject.floating-ca-declared-path+1]
 #[tokio::test]
 async fn test_build_derivation_floating_ca_declared_path_rejected() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
 
+    // The store seed is irrelevant — the rejection happens while READING
+    // the payload, before any resolve. Keep the store empty to prove it.
     let drv_path = "/nix/store/00000000000000000000000000000007-fca.drv";
-    h.store
-        .seed_with_content(drv_path, FLOATING_CA_DECLARED_PATH_DRV_ATERM.as_bytes());
 
     wire_send!(&mut h.stream;
         u64: 36,                                 // wopBuildDerivation
@@ -1427,15 +1429,13 @@ async fn test_build_derivation_floating_ca_declared_path_rejected() -> anyhow::R
         string: "/nix/store/ffffffffffffffffffffffffffffffff-victim",
         u64: 0,                                  // build_mode
     );
-    drain_stderr_until_last(&mut h.stream).await?;
-    let status = wire::read_u64(&mut h.stream).await?;
-    assert_ne!(status, 0, "floating-CA-with-path must be rejected");
-    let error_msg = wire::read_string(&mut h.stream).await?;
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
     assert!(
-        error_msg.contains("floating content-addressed"),
-        "errorMsg should name the shape violation: {error_msg:?}"
+        err.message
+            .contains("content-addressing derivation output should not specify output path"),
+        "errorMsg should carry the oracle's shape wording: {:?}",
+        err.message
     );
-    drain_build_result_tail(&mut h.stream).await?;
 
     assert_eq!(
         h.scheduler.submit_calls.read().unwrap().len(),
@@ -1514,6 +1514,133 @@ async fn test_build_derivation_after_drv_upload_submitted() -> anyhow::Result<()
         h.scheduler.submit_calls.read().unwrap().len(),
         1,
         "the resolved full-DAG path must be submitted"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36), behavior deltas (b)+(c) of the typed parse
+/// boundary: a CACHED .drv whose text is newly unparseable (here a
+/// floating-CA output declaring a path) fails resolve like any
+/// truncated ATerm — and when the client's INLINE BasicDerivation is
+/// well-formed and content-bound, the adversary-chooses-branch
+/// fall-through lands on the authoritative single-node fallback, which
+/// SUBMITS. The fallback is content-bound and scheduler-ingress-bound,
+/// so this is a fall-through to a GATED path, not a bypass.
+#[tokio::test]
+async fn test_build_derivation_unparseable_cached_drv_falls_back_to_inline() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    // Seed the .drv with a floating-with-path body: parseable before the
+    // typed boundary, rejected at parse now.
+    let drv_path = "/nix/store/0000000000000000000000000000000d-newly-bad.drv";
+    let bad_aterm = r#"Derive([("out","/nix/store/ffffffffffffffffffffffffffffffff-victim","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/ffffffffffffffffffffffffffffffff-victim")])"#;
+    h.store.seed_with_content(drv_path, bad_aterm.as_bytes());
+
+    // Well-formed content-bound inline: honest FOD declaration.
+    let digest = hex::decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")?;
+    let nix_hash = rio_nix::hash::NixHash::new("sha256".parse().unwrap(), digest)?;
+    let honest_path =
+        rio_nix::store_path::StorePath::make_fixed_output("newly-bad", &nix_hash, false, &[])?
+            .as_str()
+            .to_owned();
+    h.store.seed_with_content(&honest_path, b"fod-out");
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: &honest_path,
+        string: "sha256",                        // fixed-output shape
+        string: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: &honest_path,
+        u64: 0,                                  // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(status, 0, "content-bound fallback must build, got {status}");
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert!(error_msg.is_empty(), "no error expected: {error_msg:?}");
+    drain_build_result_tail(&mut h.stream).await?;
+
+    {
+        let submits = h.scheduler.submit_calls.read().unwrap();
+        assert_eq!(
+            submits.len(),
+            1,
+            "the unparseable cached drv must fall through to the \
+             authoritative content-bound fallback, not a rejection"
+        );
+        let node = &submits[0].nodes[0];
+        assert!(
+            !node.drv_content.is_empty() && node.drv_content_authoritative,
+            "fallback node is content-bound"
+        );
+    }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// The IA-inline variant of the fall-through above: the cached .drv is
+/// newly unparseable, and the inline BasicDerivation is INPUT-ADDRESSED
+/// — the existing inline-IA refusal still fires (STDERR_LAST + failure
+/// result, no submit). The unparseable cache entry buys the adversary
+/// nothing.
+#[tokio::test]
+async fn test_build_derivation_unparseable_cached_drv_ia_inline_still_rejected()
+-> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    let drv_path = "/nix/store/0000000000000000000000000000000f-newly-bad-ia.drv";
+    let bad_aterm = r#"Derive([("out","/nix/store/ffffffffffffffffffffffffffffffff-victim","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/ffffffffffffffffffffffffffffffff-victim")])"#;
+    h.store.seed_with_content(drv_path, bad_aterm.as_bytes());
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
+        string: "",                              // input-addressed
+        string: "",
+        strings: wire::NO_STRINGS,
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,
+        string: "out",
+        string: "/nix/store/pjj5bj65zjx7hfdbhsxgml23xhjzxl51-output",
+        u64: 0,                                  // build_mode
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("input-addressed"),
+        "rejection names the IA refusal: {:?}",
+        err.message
+    );
+    assert!(
+        err.message
+            .contains("content-addressing derivation output should not specify output path"),
+        "remediation context names WHY the cached .drv failed to parse: {:?}",
+        err.message
+    );
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "no submit for the IA inline"
     );
 
     h.finish().await;

@@ -806,7 +806,7 @@ pub(crate) fn validate_output_path_bindings(
         // content-hash rules and deferred (empty) paths have
         // nothing to validate. (A floating-CA output that DOES
         // declare a path is rejected earlier by validate_dag's
-        // gw.reject.floating-ca-declared-path shape rule, so it can
+        // gw.reject.floating-ca-declared-path+1 shape rule, so it can
         // never reach — let alone exempt itself from — this gate.)
         // The derivation-level fast path
         // therefore applies only when EVERY output is
@@ -917,7 +917,7 @@ pub(crate) fn validate_output_path_bindings(
 /// own error message).
 ///
 /// Also enforces the floating-CA shape rule
-/// (`gw.reject.floating-ca-declared-path`): an output with an algo but
+/// (`gw.reject.floating-ca-declared-path+1`): an output with an algo but
 /// no hash must not declare an output path — see the inline comment.
 pub(crate) fn validate_declared_hash_outputs<'a>(
     drv_path: &str,
@@ -1009,17 +1009,14 @@ pub(crate) fn validate_declared_hash_outputs<'a>(
     Ok(())
 }
 
-/// Floating-CA shape rule (`gw.reject.floating-ca-declared-path`): an
-/// output that sets `outputHashAlgo` with an EMPTY `outputHash`
-/// (floating content-addressed) must not declare an output path —
-/// CppNix refuses to even parse that shape ("content-addressing
-/// derivation output should not specify output path"), so no
-/// legitimate client can produce it, and accepting it would exempt the
-/// declared path from both the input-addressed and the declared-hash
-/// bindings. Checked for every output — including unverifiable-algo
-/// offenders, which skip the rest of the declared-hash binding — and
-/// independent of the realization exemption.
-// r[impl gw.reject.floating-ca-declared-path]
+/// Floating-CA shape rule (`gw.reject.floating-ca-declared-path+1`):
+/// an output that sets `outputHashAlgo` with an EMPTY `outputHash`
+/// (floating content-addressed) must not declare an output path. The
+/// AUTHORITATIVE enforcement is the typed parse boundary
+/// (`nix.drv.output-typed` — the shape is unrepresentable past
+/// `DerivationOutput::new`); this validator is residual defense in
+/// depth over the legacy string view and is slated for deletion once
+/// the gateway gates dispatch on the typed model.
 pub(crate) fn validate_floating_ca_shape<'a>(
     drv_path: &str,
     outputs: impl Iterator<Item = (&'a str, &'a str, &'a str, &'a str)>,
@@ -1551,12 +1548,14 @@ mod tests {
 
     /// Same as make_basic_drv but with a configurable single output.
     fn make_basic_drv_with_output(hash_algo: &str, hash: &str) -> anyhow::Result<BasicDerivation> {
-        let output = DerivationOutput::new(
-            "out",
-            "/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-out",
-            hash_algo,
-            hash,
-        )?;
+        // Floating-CA outputs (algo set, hash empty) must not declare a
+        // path — the typed constructor enforces the oracle's shape rule.
+        let path = if !hash_algo.is_empty() && hash.is_empty() {
+            ""
+        } else {
+            "/nix/store/gywi7jcdg67ms6vxnypxpn2rp2jm7ydi-out"
+        };
+        let output = DerivationOutput::new("out", path, hash_algo, hash)?;
         Ok(BasicDerivation::new(
             vec![output],
             BTreeSet::new(),
@@ -1598,9 +1597,15 @@ mod tests {
         assert_eq!(node.is_content_addressed, want_ca, "basic: is_ca");
         assert_eq!(node.is_fixed_output, want_fod, "basic: strict is_fod");
 
-        // Full Derivation path (via ATerm parse).
+        // Full Derivation path (via ATerm parse). Floating shapes carry
+        // an empty declared path (typed-boundary parity with the helper).
+        let out_path = if !aterm_algo.is_empty() && hash.is_empty() {
+            ""
+        } else {
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-out"
+        };
         let aterm = format!(
-            r#"Derive([("out","/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-out","{aterm_algo}","{hash}")],[],[],"x86_64-linux","/bin/sh",[],[])"#
+            r#"Derive([("out","{out_path}","{aterm_algo}","{hash}")],[],[],"x86_64-linux","/bin/sh",[],[])"#
         );
         let node = build_node(&test_drv_path("ca-test"), &Derivation::parse(&aterm)?);
         assert_eq!(node.is_content_addressed, want_ca, "full: is_ca");
@@ -1807,19 +1812,15 @@ mod tests {
         );
         assert!(err.contains(victim), "error names the declared path: {err}");
 
-        // Malformed declared path (not a store path) → rejected fail-closed.
-        // The trusted plane must not forward a tenant-controlled
-        // non-store-path string to untrusted workers.
-        let mut cache = HashMap::new();
-        cache.insert(key.clone(), aterm_with("/nix/store/zzz-output"));
-        let err = validate_output_path_bindings(std::slice::from_ref(&node), &cache).unwrap_err();
+        // Malformed declared path (not a store path): formerly this
+        // gate's fail-closed arm, now unrepresentable — the typed parse
+        // boundary rejects it before the drv cache is ever populated,
+        // so a tenant-controlled non-store-path string has no route to
+        // untrusted workers.
+        let aterm = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",[],[("name","mine"),("out","/nix/store/zzz-output")])"#;
         assert!(
-            err.contains("not a valid store path"),
-            "malformed declared path must be rejected naming the reason: {err}"
-        );
-        assert!(
-            err.contains("/nix/store/zzz-output"),
-            "error names the offending path: {err}"
+            Derivation::parse(aterm).is_err(),
+            "malformed declared path must fail at the parse boundary"
         );
 
         // Deferred IA (EMPTY declared path) stays out of scope — nothing
@@ -2081,10 +2082,16 @@ mod tests {
     /// path from every output-path binding. Proper floating-CA (empty
     /// path) stays accepted; the rule applies to any declared path
     /// string, parseable or not, and to mixed multi-output shapes.
-    // r[verify gw.reject.floating-ca-declared-path]
+    // r[verify gw.reject.floating-ca-declared-path+1]
     #[test]
     fn validate_dag_rejects_floating_ca_with_declared_path() {
-        let drv_with_outputs = |outs: &[(&str, &str, &str, &str)]| -> Derivation {
+        // The shape is now UNREPRESENTABLE: the typed parse boundary
+        // rejects a floating-CA output declaring a path with the
+        // oracle's wording (derivations.cc:339-340), so validate_dag
+        // can never see one. These pins witness the boundary at the
+        // gateway's own input channel (the session drv cache is
+        // populated via Derivation::parse).
+        let parse_with_outputs = |outs: &[(&str, &str, &str, &str)]| {
             let rendered: Vec<String> = outs
                 .iter()
                 .map(|(n, p, a, h)| format!(r#"("{n}","{p}","{a}","{h}")"#))
@@ -2093,13 +2100,24 @@ mod tests {
                 .iter()
                 .map(|(n, p, _, _)| format!(r#"("{n}","{p}")"#))
                 .collect();
-            let aterm = format!(
+            Derivation::parse(&format!(
                 r#"Derive([{}],[],[],"x86_64-linux","/bin/sh",[],[{}])"#,
                 rendered.join(","),
                 env.join(",")
-            );
-            Derivation::parse(&aterm).expect("test ATerm parses")
+            ))
         };
+        let victim = "/nix/store/cccccccccccccccccccccccccccccccc-victim";
+
+        // (a) single floating-CA output declaring a path → unparseable,
+        // with the oracle's message.
+        let err = parse_with_outputs(&[("out", victim, "r:sha256", "")]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("content-addressing derivation output should not specify output path"),
+            "oracle wording: {err}"
+        );
+
+        // (b) proper floating-CA (empty path) parses and passes the gate.
         let drv_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-src.drv";
         let node = types::DerivationNode {
             drv_path: drv_path.into(),
@@ -2107,46 +2125,40 @@ mod tests {
             ..Default::default()
         };
         let key = StorePath::parse(drv_path).unwrap();
-        let victim = "/nix/store/cccccccccccccccccccccccccccccccc-victim";
-
-        // (a) single floating-CA output declaring a path → rejected,
-        // naming the output and the declared path.
         let mut cache = HashMap::new();
         cache.insert(
             key.clone(),
-            drv_with_outputs(&[("out", victim, "r:sha256", "")]),
-        );
-        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
-        assert!(err.contains("floating content-addressed"), "{err}");
-        assert!(err.contains(victim), "{err}");
-
-        // (b) proper floating-CA (empty path) → accepted.
-        let mut cache = HashMap::new();
-        cache.insert(
-            key.clone(),
-            drv_with_outputs(&[("out", "", "r:sha256", "")]),
+            parse_with_outputs(&[("out", "", "r:sha256", "")]).expect("legal floating shape"),
         );
         assert!(validate_dag(std::slice::from_ref(&node), &cache).is_ok());
 
-        // (c) mixed multi-output shape: the offending floating-CA-with-
-        // path output is rejected even with an innocent sibling.
-        let mut cache = HashMap::new();
-        cache.insert(
-            key.clone(),
-            drv_with_outputs(&[("out", victim, "r:sha256", ""), ("doc", "", "", "")]),
+        // (c) mixed multi-output: the offending output rejects the whole
+        // parse even with an innocent sibling.
+        assert!(
+            parse_with_outputs(&[("out", victim, "r:sha256", ""), ("doc", "", "", "")]).is_err()
         );
-        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
-        assert!(err.contains("floating content-addressed"), "{err}");
 
-        // (d) the declared path need not parse as a store path — the
-        // shape itself is the violation.
+        // (d) the declared "path" need not parse as a store path — the
+        // SHAPE is the violation, checked before path syntax.
+        let err = parse_with_outputs(&[("out", "not-a-store-path", "sha256", "")]).unwrap_err();
+        assert!(
+            err.to_string().contains("should not specify output path"),
+            "{err}"
+        );
+
+        // (e) the squat-binding protection survives over representable
+        // shapes: an IA output declaring the victim's path is rejected by
+        // the binding gate (declared != derived), not silently accepted.
         let mut cache = HashMap::new();
         cache.insert(
-            key.clone(),
-            drv_with_outputs(&[("out", "not-a-store-path", "sha256", "")]),
+            key,
+            parse_with_outputs(&[("out", victim, "", "")]).expect("legal IA shape"),
         );
-        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
-        assert!(err.contains("floating content-addressed"), "{err}");
+        let err = validate_output_path_bindings(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(
+            err.contains("must match the derivation"),
+            "IA squat must still be rejected by the binding gate: {err}"
+        );
     }
 
     /// Unverifiable outputHashAlgo values are CLASSIFIED (returned as
@@ -2246,20 +2258,15 @@ mod tests {
         }
 
         // An offender that ALSO violates the floating-CA shape rule
-        // (algo set, hash empty, path declared) is still rejected
-        // outright — the shape rule is independent of the realization
-        // exemption.
-        let mut cache = HashMap::new();
-        cache.insert(
-            key.clone(),
-            fod_drv_at(
-                "md5",
-                "",
-                "/nix/store/cccccccccccccccccccccccccccccccc-squat",
-            ),
+        // (algo set, hash empty, path declared) never reaches the gate:
+        // the typed parse boundary rejects the shape outright, so the
+        // realization exemption cannot apply to it by construction.
+        let aterm = r#"Derive([("out","/nix/store/cccccccccccccccccccccccccccccccc-squat","md5","")],[],[],"x86_64-linux","/bin/sh",[],[("out","/nix/store/cccccccccccccccccccccccccccccccc-squat")])"#;
+        let err = Derivation::parse(aterm).unwrap_err();
+        assert!(
+            err.to_string().contains("should not specify output path"),
+            "{err}"
         );
-        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
-        assert!(err.contains("floating content-addressed"), "{err}");
 
         // Input-addressed output (no hash, no algo) → never checked by
         // the ALGO gate. The IA path gate does apply, so give the
@@ -2678,13 +2685,15 @@ mod tests {
             "{err}"
         );
 
-        // Empty declared path → out of scope for this gate.
-        let mut cache = HashMap::new();
-        cache.insert(key.clone(), fod_at("sha256", &hex_hash, ""));
-        assert!(
-            validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
-            "deferred/empty declared paths are not this gate's concern"
-        );
+        // Empty declared path on a hash-declaring output: formerly this
+        // gate's "deferred FOD" carve-out, now unrepresentable — the
+        // typed boundary rejects it at parse (oracle validatePath
+        // analog), so the gate has no carve-out to maintain.
+        let err = Derivation::parse(&format!(
+            r#"Derive([("out","","sha256","{hex_hash}")],[],[],"x86_64-linux","/bin/sh",[],[("out","")])"#
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("bad path ''"), "{err}");
     }
 
     /// CppNix's shape rule for fixed-output derivations, enforced at
@@ -2713,8 +2722,11 @@ mod tests {
         assert!(err.contains("cannot be mixed"), "{err}");
 
         // Two declared-hash outputs → rejected (only one allowed).
+        // (Fixed outputs must declare paths under the typed boundary.)
+        let p_out = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fetch";
+        let p_src = "/nix/store/dddddddddddddddddddddddddddddddd-src";
         let two = Derivation::parse(&format!(
-            r#"Derive([("out","","sha256","{hex_hash}"),("src","","sha256","{hex_hash}")],[],[],"x86_64-linux","/bin/sh",[],[("out",""),("src","")])"#
+            r#"Derive([("out","{p_out}","sha256","{hex_hash}"),("src","{p_src}","sha256","{hex_hash}")],[],[],"x86_64-linux","/bin/sh",[],[("out","{p_out}"),("src","{p_src}")])"#
         ))
         .expect("test ATerm parses");
         let mut cache = HashMap::new();
@@ -2724,7 +2736,7 @@ mod tests {
 
         // Single declared-hash output not named "out" → rejected.
         let misnamed = Derivation::parse(&format!(
-            r#"Derive([("src","","sha256","{hex_hash}")],[],[],"x86_64-linux","/bin/sh",[],[("src","")])"#
+            r#"Derive([("src","{p_src}","sha256","{hex_hash}")],[],[],"x86_64-linux","/bin/sh",[],[("src","{p_src}")])"#
         ))
         .expect("test ATerm parses");
         let mut cache = HashMap::new();

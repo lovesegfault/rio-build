@@ -1429,25 +1429,31 @@ mod tests {
     // r[verify builder.exec.declared-path-validated]
     #[test]
     fn plan_outputs_rejects_malformed_declared_path() {
+        // The typed parse boundary makes a malformed declared output
+        // path UNREPRESENTABLE: `DerivationOutput::new` (and therefore
+        // both untrusted parsers feeding the glue) rejects it, so
+        // `plan_outputs` can never see one and the raw-string
+        // `Path::join` flow has no remaining data source. This pin is
+        // the builder-side witness of that boundary; the gateway and
+        // scheduler gates remain authoritative.
         for bad in ["/build/exfil", "/nix/store", "/nix/store/zzz-evil"] {
-            let drv = mk_drv(
-                vec![DerivationOutput::new("out", bad, "", "").unwrap()],
-                &[("name", "demo"), ("out", bad)],
-            );
-            let (input_paths, input_meta) = closure();
-            let err = derivation_into_request(
-                DRV,
-                &drv,
-                &input_paths,
-                &input_meta,
-                &drv_table(),
-                &paths(),
-                &opts(),
-            )
-            .unwrap_err();
+            let err = rio_nix::derivation::DerivationOutput::new("out", bad, "", "")
+                .expect_err("malformed declared path must be unrepresentable");
             assert!(
-                matches!(err, GlueError::MalformedOutputPath { .. }),
-                "path {bad:?} must be rejected as malformed, got: {err}"
+                matches!(
+                    err,
+                    rio_nix::derivation::DerivationError::InvalidOutputPath(_)
+                ),
+                "path {bad:?} must be rejected at construction, got: {err}"
+            );
+            // And the ATerm parser inherits the same rejection — the
+            // glue's own input channel.
+            let aterm = format!(
+                r#"Derive([("out","{bad}","","")],[],[],"x86_64-linux","/bin/sh",[],[("out","{bad}")])"#
+            );
+            assert!(
+                rio_nix::derivation::Derivation::parse(&aterm).is_err(),
+                "ATerm with malformed declared path {bad:?} must not parse"
             );
         }
     }
