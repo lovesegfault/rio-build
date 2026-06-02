@@ -57,10 +57,14 @@ use tokio::sync::{OnceCell, OwnedSemaphorePermit, RwLock, Semaphore};
 /// exceeding it TERMINATES the whole connection rather than rejecting the
 /// open; the gateway's real admission control is its global session cap,
 /// applied per exec. This constant must therefore stay well below the
-/// deployed gateway's bound — a compile-time assertion next to
-/// `DEFAULT_MAX_CHANNELS_PER_CONNECTION` pins the gateway default above
-/// this fan-out — but it is otherwise free to move independently of the
-/// gateway.
+/// deployed gateway's bound. What is machine-checked: rio-gateway's
+/// `replay_fan_out_headroom` test (rio-replay is a dev-dependency there)
+/// imports THIS constant and pins the gateway default at ≥ 2× its value,
+/// so raising it past half that default — or lowering the default below
+/// twice this fan-out — fails rio-gateway's test suite. What is not:
+/// a deployed gateway whose operator set `max_channels_per_connection`
+/// below the default. Within the pinned headroom, this value is free to
+/// move without touching the gateway.
 pub const CHANNELS_PER_CONNECTION: usize = 4;
 
 /// The exec command the gateway expects (it requires the command string to

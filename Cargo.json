@@ -19969,6 +19969,10 @@
           "packageId": "rio-migrations"
         },
         {
+          "name": "rio-replay",
+          "packageId": "rio-replay"
+        },
+        {
           "name": "rio-store",
           "packageId": "rio-store"
         },

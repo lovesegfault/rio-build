@@ -90,31 +90,21 @@ pub const DEFAULT_MAX_SESSIONS: usize = 4096;
 /// ChannelSession) from growing without bound — a connection that
 /// tries to exceed it is terminated. Configurable via
 /// `gateway.toml max_channels_per_connection`.
-pub const DEFAULT_MAX_CHANNELS_PER_CONNECTION: usize = 512;
-
-/// Channels the replay engine's gateway transport multiplexes onto one
-/// SSH connection (`CHANNELS_PER_CONNECTION` in
-/// `rio-replay/src/run/transport.rs`) — a client-side fan-out choice
-/// rio-replay is free to tune, duplicated here because rio-replay is
-/// not a dependency of this crate.
 ///
-/// Exceeding `max_channels_per_connection` TERMINATES the whole SSH
-/// connection — killing every sibling channel on it — so the default
-/// bound must keep clear headroom above the largest legitimate client
-/// fan-out, not merely equal it: the gateway's open-channel count can
-/// transiently exceed a client's steady-state fan-out while client-side
-/// closes (especially abandoned channels, which send no graceful close)
-/// are still being torn down. The assertion below enforces that
-/// headroom at compile time; if it fires, either keep the default at or
-/// above twice the replay fan-out or lower rio-replay's
-/// `CHANNELS_PER_CONNECTION` in the same change.
-const REPLAY_CLIENT_FAN_OUT: usize = 4;
-const _: () = assert!(
-    DEFAULT_MAX_CHANNELS_PER_CONNECTION >= 2 * REPLAY_CLIENT_FAN_OUT,
-    "the default per-connection channel bound must keep headroom above the replay engine's \
-     per-connection channel fan-out (CHANNELS_PER_CONNECTION in rio-replay/src/run/transport.rs); \
-     a connection at the bound is terminated, not refused"
-);
+/// Exceeding the bound TERMINATES the whole SSH connection — killing
+/// every sibling channel on it — so this default must keep clear
+/// headroom above the largest legitimate client fan-out (the replay
+/// engine's `CHANNELS_PER_CONNECTION` in
+/// `rio-replay/src/run/transport.rs`), not merely equal it: the
+/// gateway's open-channel count can transiently exceed a client's
+/// steady-state fan-out while client-side closes (especially abandoned
+/// channels, which send no graceful close) are still being torn down.
+/// The `replay_fan_out_headroom` test below pins this default at ≥ 2×
+/// rio-replay's real constant (rio-replay is a dev-dependency), so the
+/// build goes red whichever side drifts — lowering this default or
+/// raising the replay fan-out. The deployed, operator-configured
+/// `max_channels_per_connection` is NOT machine-checked.
+pub const DEFAULT_MAX_CHANNELS_PER_CONNECTION: usize = 512;
 
 /// Grace period a connection may have zero active protocol sessions —
 /// measured from authentication (established, nothing exec'd yet) or
@@ -1197,6 +1187,35 @@ impl russh::server::Server for GatewayServer {
             ))),
             force_close,
         }
+    }
+}
+
+#[cfg(test)]
+mod replay_headroom_tests {
+    use super::*;
+
+    /// Pins the channel-headroom invariant against rio-replay's REAL
+    /// fan-out constant — both values are imported, not copied, so this
+    /// test fails whichever side drifts: lowering the gateway default
+    /// below 2× the fan-out, or raising the fan-out above half the
+    /// default. (A previous compile-time assert checked a hand copy of
+    /// the fan-out, which only the gateway-lowering direction could
+    /// trip.) What is NOT machine-checked, here or anywhere: an
+    /// operator-configured `max_channels_per_connection` on a deployed
+    /// gateway — the pin covers defaults only.
+    #[test]
+    fn replay_fan_out_headroom() {
+        let fan_out = rio_replay::run::transport::CHANNELS_PER_CONNECTION;
+        assert!(
+            DEFAULT_MAX_CHANNELS_PER_CONNECTION >= 2 * fan_out,
+            "the gateway's default per-connection channel bound \
+             ({DEFAULT_MAX_CHANNELS_PER_CONNECTION}) must keep ≥2× headroom above rio-replay's \
+             per-connection channel fan-out (CHANNELS_PER_CONNECTION = {fan_out} in \
+             rio-replay/src/run/transport.rs): a connection at the bound is TERMINATED — killing \
+             every sibling in-flight submission — and teardown of abandoned channels transiently \
+             overshoots the steady-state fan-out. Lower the fan-out or raise the default in the \
+             same change."
+        );
     }
 }
 

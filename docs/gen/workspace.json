@@ -130,6 +130,7 @@
       "optional": [],
       "dev": [
         "rio-migrations",
+        "rio-replay",
         "rio-store",
         "rio-test-support"
       ]

@@ -71,6 +71,12 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 # Embedded MIGRATOR re-exported by tests/functional/mod.rs for the
 # RioStack fixture's `TestDb::new(&MIGRATOR)`.
 rio-migrations = { workspace = true }
+# Cross-crate pin of the channel-headroom invariant
+# (replay_fan_out_headroom in src/server/mod.rs): the test compares
+# DEFAULT_MAX_CHANNELS_PER_CONNECTION against rio-replay's real
+# CHANNELS_PER_CONNECTION instead of a hand copy. No dep cycle:
+# rio-replay reaches the gateway over SSH, never as a crate dependency.
+rio-replay = { workspace = true }
 rio-test-support = { workspace = true }
 rstest = { workspace = true }
 # tests/functional/: RioStack fixture runs REAL StoreServiceImpl (not
