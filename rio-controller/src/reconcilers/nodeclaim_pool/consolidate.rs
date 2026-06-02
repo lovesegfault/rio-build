@@ -953,10 +953,12 @@ mod tests {
     ///
     /// NOTE: this test does NOT validate the `mod.rs` hoist — it pins
     /// the `or_insert` precondition the bug depends on. The hoist itself
-    /// has no automated test (the lease-acquire edge needs kube/PG
-    /// clients the test module can't construct); see the
-    /// lifecycle-invariants TODO at the top of `impl
-    /// NodeClaimPoolReconciler`.
+    /// is validated end-to-end by the lifecycle-invariants suite:
+    /// `lifecycle_tests::acquire_ok_clears_prev_idle_and_suppress_fields`
+    /// (Ok arm) and
+    /// `lifecycle_tests::acquire_err_still_clears_prev_idle_keeps_suppress`
+    /// (the merged_bug_016 Err arm) drive the real acquire edge through
+    /// `tick()` and assert the unconditional clear.
     #[test]
     fn observe_idle_to_busy_keeps_pre_existing_seed() {
         let mut sk = CellSketches::default();

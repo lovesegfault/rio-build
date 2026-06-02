@@ -444,6 +444,11 @@
       "doc": "Unhealthy-node reaping + ICE detection."
     },
     {
+      "path": "reconcilers/nodeclaim_pool/lifecycle_tests.rs",
+      "depth": 2,
+      "doc": "Lifecycle-invariants suite: drives the REAL `tick()` /"
+    },
+    {
       "path": "reconcilers/nodeclaim_pool/pods.rs",
       "depth": 2,
       "doc": "Per-tick Pod snapshot: `requested` sums + bound-intent index from"

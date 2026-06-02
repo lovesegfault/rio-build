@@ -1002,7 +1002,7 @@ tests.
 | Commit | Class | Coverage |
 |---|---|---|
 | `d0c858955` | ENC-A (the kube-only-observations sharing half) / NOT-ENC (the trailing-zero gauge half) | the shared observation block is the as-built consolidate-only encoding; the residual unobserved window (the ⊥ early-return) is exactly the pre-registered as-built falsification already wired (`quint-nodeclaim-falsification-boot-sample-lost`); gauges are observability |
-| `cab0d2d46`, `d4184cf2b`, `e0d504321` | NOT-ENC | observability only (the model carries no cleanup-set / gauge state — recorded as a deviation from the design's "polarity classification encodable" pre-registration); gauge_universe / emit_live_gauges unit tests |
+| `cab0d2d46`, `d4184cf2b`, `e0d504321` | NOT-ENC | observability only (the model carries no cleanup-set / gauge state — recorded as a deviation from the design's "polarity classification encodable" pre-registration); gauge_universe / emit_live_gauges unit tests; since 2026-06-02 the cleanup-set polarity rows (M5/M6) carry their only automated end-to-end coverage in the lifecycle-invariants suite (`lifecycle_tests::acquire_keeps_cleanup_sets_one_trailing_write_then_drop` — survives-acquire + consumed-exactly-once via a local DebuggingRecorder through the real tick) |
 
 ### FFD/cover ⇄ scheduler-config parity (16)
 

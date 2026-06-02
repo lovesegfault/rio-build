@@ -34,6 +34,8 @@ mod consolidate;
 mod cover;
 pub(crate) mod ffd;
 mod health;
+#[cfg(test)]
+mod lifecycle_tests;
 mod pods;
 pub mod sketch;
 mod wedge;
@@ -763,7 +765,7 @@ pub struct NodeClaimPoolReconciler {
     ///    `delete()`d; both callers `remove()` them BEFORE
     ///    `detect_vanished` so the controller's own reaps aren't
     ///    misread as Karpenter GC.
-    // r[impl ctrl.nodeclaim.inflight-conservation]
+    // r[impl ctrl.nodeclaim.inflight-conservation+2]
     inflight_created: HashMap<String, Cell>,
     /// Count of consecutive ticks where `GetSpawnIntents` returned ⊥
     /// (RPC error). Saturates at `u8::MAX`; reset on first success.
@@ -843,13 +845,13 @@ fn unknown_cell_intents<'m>(
     (n, unknown)
 }
 
-// TODO: extract a lifecycle-invariants test suite that drives
-// `reconcile_once`/`consolidate_only`/lease-acquire/lease-loss edges
-// through a fake clock and asserts the per-field stale-state polarity
-// table above. Three rounds (r40 bug_012/020, r42 bug_023, r43 bug_023/
-// merged_016) found `consolidate_only`/`observe_*`/lease-edge interaction
-// bugs that single-path verifiers missed. Requires extracting the kube/PG
-// clients behind a trait so the test can drive the loop without a cluster.
+// The per-field stale-state polarity table
+// (`#r("ctrl.nodeclaim.lease-edge-polarity")`) is asserted end-to-end
+// by `lifecycle_tests`: real `tick()`/`reconcile_once`/
+// `consolidate_only` bodies driven through lease-acquire/loss, standby,
+// ⊥-streak, and consolidate-only edges via the existing seams
+// (ApiServerVerifier scenario queues, MockAdmin/dead_channel, TestDb,
+// the threaded `tick(now)` clock) — no trait extraction needed.
 impl NodeClaimPoolReconciler {
     /// Construct + load persisted [`CellSketches`] from PG. Called once
     /// at startup AFTER PG connect; the loaded state survives controller
@@ -996,7 +998,7 @@ impl NodeClaimPoolReconciler {
         // pre-lapse timestamp over-reaps. Clearing here makes the
         // `Err` arm under-reap by one cycle (the documented SAFE
         // direction) instead of unboundedly over-reaping.
-        // r[impl ctrl.nodeclaim.lease-edge-polarity]
+        // r[impl ctrl.nodeclaim.lease-edge-polarity+2]
         if self.reload_pending() {
             self.prev_idle.clear();
             let halflife = Duration::from_secs(self.cfg.sketch_halflife_secs);
@@ -1342,7 +1344,7 @@ impl NodeClaimPoolReconciler {
             now,
         )
         .await?;
-        // r[impl ctrl.nodeclaim.inflight-conservation]
+        // r[impl ctrl.nodeclaim.inflight-conservation+2]
         // r40 bug_020: drop the controller's own reaps from inflight_created
         // BEFORE detect_vanished scans, so they're not misread as Karpenter
         // GC on the next tick. (reap_idle only reaps registered claims —
@@ -1469,7 +1471,7 @@ impl NodeClaimPoolReconciler {
         let (_, reaped) =
             health::reap_unhealthy(&self.nodeclaims, &live, &[], &self.sketches, &self.cfg, now)
                 .await?;
-        // r[impl ctrl.nodeclaim.inflight-conservation]
+        // r[impl ctrl.nodeclaim.inflight-conservation+2]
         // r[impl ctrl.nodeclaim.consolidate-only-degraded]
         // r40 bug_012: prune inflight_created against this tick's `live`
         // so the controller's own reaps below aren't later misread by

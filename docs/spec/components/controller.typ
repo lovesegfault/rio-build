@@ -1073,7 +1073,7 @@ defines no store CR.) The controller's `/scale` patches use field-manager
   is the raw scheduler count and needs no FFD gate to be authoritative.
 ]
 
-#r("ctrl.nodeclaim.lease-edge-polarity")[
+#r("ctrl.nodeclaim.lease-edge-polarity+2")[
   Every cross-tick in-memory field of the NodeClaim-pool reconciler is
   classified by its stale-state polarity, and its clear-or-keep MUST sit on
   the matching lease edge. The classes and the per-field classification:
@@ -1089,11 +1089,20 @@ defines no store CR.) The controller's `/scale` patches use field-manager
   acquire; *reload-latch* --- `sketches`, reloaded from PG on acquire with
   the latch cleared only on a successful load and `persist()` gated off
   while the reload is pending, so a stale in-memory copy cannot overwrite
-  the previous leader's rows. On the lease-loss edge the reconciler MUST
-  unarm the placeable gate (#rref("ctrl.nodeclaim.placeable-gate")) and,
-  while not leader, MUST take no create, delete, ack, or publish effect.
-  Any new cross-tick field MUST be classified into one of these classes and
-  its clear (or deliberate not-clear) placed on the matching edge.
+  the previous leader's rows; *retain-safe* (a stale entry only biases
+  toward the conservative or degraded action and is deliberately kept
+  across BOTH edges) --- `consecutive_bot_ticks` (a re-acquiring ex-leader
+  carrying a high streak enters consolidate-only on its first post-acquire
+  ⊥ tick: strictly more observation, no growth) and the wedge tracker
+  (expiry evidence is event-shaped and ages out of its window; a fresh
+  process under-detects for at most one window, the same safe direction as
+  the detector it succeeded). Pure cursors with no stale-state semantics
+  (`tick_counter`) are exempt from classification. On the lease-loss edge
+  the reconciler MUST unarm the placeable gate
+  (#rref("ctrl.nodeclaim.placeable-gate")) and, while not leader, MUST take
+  no create, delete, ack, or publish effect. Any new cross-tick field MUST
+  be classified into one of these classes and its clear (or deliberate
+  not-clear) placed on the matching edge.
 ]
 
 The polarity classes are the distilled lesson of the lease-edge fix history:
@@ -1103,12 +1112,13 @@ cleanup-class field cleared too eagerly orphans a paging gauge series at its
 last value; a stale sketch persisted over the previous leader's rows resets
 fleet-wide learning.
 
-#r("ctrl.nodeclaim.inflight-conservation")[
+#r("ctrl.nodeclaim.inflight-conservation+2")[
   `inflight_created` tracks every NodeClaim `cover_deficit` created until it
   is observed `Registered`, observed terminating, deleted by this
   controller, or detected vanished --- and each tracked claim MUST resolve
   to exactly one of those outcomes. Its mutators are exactly: extending with
-  the names created this tick; clearing on config reload; `detect_vanished`'s
+  the names created this tick; clearing on the lease-acquire reload `Ok`
+  arm; `detect_vanished`'s
   retain rules (drop registered/terminating/absent, KEEP still-in-flight),
   which MUST run on consolidate-only ticks as well as full ticks; and
   removal of the names this controller itself reaped, which MUST happen

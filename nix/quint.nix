@@ -2558,7 +2558,7 @@ in
     # unconditional prev_idle clear, the Ok-arm-only suppress clears,
     # the reload latch gating persist) and the producer-side gate
     # guarantee (unarmed on loss before the consumer's next tick).
-    # r[verify ctrl.nodeclaim.lease-edge-polarity]
+    # r[verify ctrl.nodeclaim.lease-edge-polarity+2]
     # r[verify ctrl.nodeclaim.placeable-gate+5]
     # r[verify ctrl.nodeclaim.ice-mark-clear]
     quint-nodeclaim-lifecycle-fault-lease = mkQuintCheck {
@@ -2585,7 +2585,7 @@ in
     # controller's own reaps are removed from inflight_created before
     # detect_vanished, so an ICE mark is only ever emitted for a claim
     # that genuinely vanished or launch-failed).
-    # r[verify ctrl.nodeclaim.inflight-conservation]
+    # r[verify ctrl.nodeclaim.inflight-conservation+2]
     # r[verify ctrl.nodeclaim.ice-mark-clear]
     quint-nodeclaim-lifecycle-fault-karpenter = mkQuintCheck {
       name = "nodeclaim-lifecycle-fault-karpenter";

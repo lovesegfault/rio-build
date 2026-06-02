@@ -123,6 +123,16 @@ test-group = 'postgres'
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
+# The nodeclaim-pool lifecycle-invariants suite drives real reconciler
+# ticks against TestDb (one ephemeral postgres per test), and
+# sketch.rs's persist_load_round_trip is the previously-uncovered
+# TestDb caller in this package — both go through the postgres group
+# per its "every test that calls TestDb::new" contract.
+filter = 'package(rio-controller) and (test(/lifecycle_tests::/) or test(/persist_load_round_trip/))'
+test-group = 'postgres'
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.default.overrides]]
 # tests/migrations.rs is the checksum-freeze + schema-contract suite;
 # every test bootstraps an ephemeral PG via TestDb. The whole crate is
 # PG-only, so package() alone is the right filter.
