@@ -98,6 +98,31 @@ scheduler knows the expected hash before dispatch; the fetcher re-derives
   the worker as `RIO_HASHED_MIRRORS`; an empty list disables the lookup.
 ]
 
+= netrc credential scope
+
+#r("fetcher.fetchurl.netrc-origin-scope")[
+  netrc credential resolution MUST consume each fetch candidate's
+  provenance: an exact `machine` entry (matching the candidate URL's
+  host) MAY authenticate any candidate, but the `default` entry MUST
+  only ever authenticate operator-configured mirror candidates ---
+  never the derivation's tenant-controlled origin URL. An origin with
+  no exact `machine` match is fetched unauthenticated.
+]
+
+The origin URL is attacker-chosen in a multi-tenant deployment: with
+curl-style optional-netrc semantics (the oracle's
+`CURL_NETRC_OPTIONAL`, `filetransfer.cc:566-567`, which applies
+machine-and-default matching to every URL), a tenant submits a FOD
+pointing at their own server and reads the operator's catch-all
+credentials out of the `Authorization` header. Scoping the `default`
+entry to mirrors keeps the catch-all secret inside operator-configured
+infrastructure while exact `machine` entries remain a per-host opt-in
+for authenticated origins. This is a deliberate, recorded divergence
+from the oracle, in the same trust split that narrows `impureEnvVars`
+sources to the operator-configured map. Accepted residual: per-attempt
+HTTP status log lines remain a status oracle for the explicitly
+opted-in `machine` hosts.
+
 = Network isolation
 
 #r("builder.netpol.airgap")[

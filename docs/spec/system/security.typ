@@ -489,7 +489,10 @@ tracey rule or phase deferral.
 rio-build requires several secrets: SSH host keys, signing keys, database
 credentials, and HMAC signing keys (assignment tokens + service tokens). There
 are no application-level TLS certificates --- transport encryption is at the
-Cilium overlay layer.
+Cilium overlay layer. Operator fetch credentials (the worker netrc) are
+provenance-scoped inside the fetcher: the catch-all `default` entry never
+travels to tenant-controlled origin URLs
+(#rref("fetcher.fetchurl.netrc-origin-scope")).
 
 === Recommended Patterns (by maturity)
 

@@ -137,21 +137,33 @@ impl FetchurlParams {
         })
     }
 
-    /// Candidate URLs in fetch order: each hashed mirror as
+    /// Fetch candidates in order: each hashed mirror as
     /// `<mirror>/<algo>/<base16-hash>`, then the origin URL. Mirrors
     /// are skipped when either hash component is missing (the glue
     /// only passes them for flat-mode FODs).
+    ///
+    /// Every candidate carries its provenance: mirrors are
+    /// operator-configured (pool spec), the origin is
+    /// tenant-controlled (the derivation's `url`). Credential
+    /// resolution consumes the provenance — there is no plain URL
+    /// list to flatten it away.
     // r[impl fetcher.mirrors.hashed+2]
-    pub fn candidate_urls(&self) -> Vec<String> {
-        let mut urls = Vec::new();
+    pub fn candidates(&self) -> Vec<Candidate> {
+        let mut candidates = Vec::new();
         if !self.hash_algo.is_empty() && !self.hash_b16.is_empty() {
             for mirror in &self.mirrors {
                 let base = mirror.trim_end_matches('/');
-                urls.push(format!("{base}/{}/{}", self.hash_algo, self.hash_b16));
+                candidates.push(Candidate {
+                    url: format!("{base}/{}/{}", self.hash_algo, self.hash_b16),
+                    kind: CandidateKind::Mirror,
+                });
             }
         }
-        urls.push(self.url.clone());
-        urls
+        candidates.push(Candidate {
+            url: self.url.clone(),
+            kind: CandidateKind::Origin,
+        });
+        candidates
     }
 
     /// Whether the payload should be xz-decoded before NAR restore.
@@ -159,6 +171,26 @@ impl FetchurlParams {
     pub fn is_xz(&self) -> bool {
         self.url.ends_with(".xz")
     }
+}
+
+/// Where a fetch candidate came from — the security boundary for
+/// credential attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateKind {
+    /// Operator-configured hashed mirror (pool spec): trusted to
+    /// receive the operator's `default` netrc credentials.
+    Mirror,
+    /// The derivation's own URL: tenant-controlled. Receives
+    /// credentials only on an exact netrc `machine` match — the
+    /// operator opted that specific host in.
+    Origin,
+}
+
+/// One fetch candidate: the URL plus its provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub url: String,
+    pub kind: CandidateKind,
 }
 
 /// Subcommand entry point. Never returns control to the normal builder
@@ -204,10 +236,11 @@ async fn fetch(params: &FetchurlParams) -> anyhow::Result<()> {
     }
 
     let (client, tls_roots_available) = build_client(Path::new(SANDBOX_CA_BUNDLE))?;
-    let candidates = params.candidate_urls();
+    let candidates = params.candidates();
     let mut last_err: Option<anyhow::Error> = None;
 
-    for url in &candidates {
+    for candidate in &candidates {
+        let url = &candidate.url;
         for attempt in 0..ATTEMPTS_PER_URL {
             if attempt > 0 {
                 tokio::time::sleep(RETRY_BACKOFF.duration(attempt - 1)).await;
@@ -216,7 +249,7 @@ async fn fetch(params: &FetchurlParams) -> anyhow::Result<()> {
                 "builtin:fetchurl: fetching {url} (attempt {}/{ATTEMPTS_PER_URL})",
                 attempt + 1
             );
-            match try_fetch_one(&client, url, params, tls_roots_available).await {
+            match try_fetch_one(&client, candidate, params, tls_roots_available).await {
                 Ok(()) => {
                     eprintln!("builtin:fetchurl: fetched {url}");
                     return Ok(());
@@ -235,9 +268,10 @@ async fn fetch(params: &FetchurlParams) -> anyhow::Result<()> {
             }
         }
     }
+    let tried: Vec<&str> = candidates.iter().map(|c| c.url.as_str()).collect();
     Err(last_err
         .unwrap_or_else(|| anyhow::anyhow!("no candidate URLs (empty mirror list and URL)")))
-    .with_context(|| format!("all candidates failed (tried {})", candidates.join(", ")))
+    .with_context(|| format!("all candidates failed (tried {})", tried.join(", ")))
 }
 
 /// Build the HTTP client. rustls; netrc credentials (if provided) are
@@ -359,10 +393,11 @@ fn no_trust_tls_config() -> rustls::ClientConfig {
 /// leaves a partial output behind.
 async fn try_fetch_one(
     client: &reqwest::Client,
-    url: &str,
+    candidate: &Candidate,
     params: &FetchurlParams,
     tls_roots_available: bool,
 ) -> anyhow::Result<()> {
+    let url = candidate.url.as_str();
     let parent = params
         .output
         .parent()
@@ -372,7 +407,7 @@ async fn try_fetch_one(
         .with_context(|| format!("creating {}", parent.display()))?;
 
     let mut req = client.get(url);
-    if let Some((user, pass)) = netrc_credentials(params.netrc.as_deref(), url)? {
+    if let Some((user, pass)) = netrc_credentials(params.netrc.as_deref(), candidate)? {
         req = req.basic_auth(user, Some(pass));
     }
     let resp = req.send().await.with_context(|| {
@@ -530,14 +565,34 @@ async fn restore_unpacked(tmp: &Path, params: &FetchurlParams) -> anyhow::Result
     Ok(())
 }
 
-/// Minimal netrc lookup: returns the `(login, password)` for the host
-/// of `url`, preferring an exact `machine` match and falling back to a
-/// `default` entry. Only the token forms emitted by real netrc writers
-/// are recognized (`machine X login Y password Z`, one or more per
-/// file, whitespace/newline separated).
-fn netrc_credentials(netrc: Option<&Path>, url: &str) -> anyhow::Result<Option<(String, String)>> {
+/// Minimal netrc lookup, scoped by candidate provenance: an exact
+/// `machine` match (the URL's host) applies to any candidate; the
+/// `default` entry applies to operator-configured mirrors ONLY. A
+/// tenant-controlled origin URL with no exact `machine` entry gets no
+/// credentials — the operator's catch-all secret must never travel to
+/// a host the tenant chose. Only the token forms emitted by real netrc
+/// writers are recognized (`machine X login Y password Z`, one or more
+/// per file, whitespace/newline separated).
+///
+/// Deliberate divergence from CppNix, recorded: the oracle hands its
+/// netrc to curl with `CURL_NETRC_OPTIONAL`
+/// (`filetransfer.cc:566-567`), which applies machine *and default*
+/// matching to every URL it fetches — including tenant origins. In a
+/// multi-tenant deployment that is a credential-exfiltration channel
+/// (a tenant submits a FOD pointing at their own server and reads the
+/// Authorization header), so rio scopes the default entry to mirror
+/// candidates, the same way the operator-vs-tenant trust split already
+/// narrows `impureEnvVars` sources to the operator-configured map.
+/// Residual, accepted (owner Q2): per-attempt `HTTP {status} from
+/// {url}` log lines remain a status oracle for hosts the operator
+/// explicitly listed as exact `machine` entries — a per-host opt-in.
+// r[impl fetcher.fetchurl.netrc-origin-scope]
+fn netrc_credentials(
+    netrc: Option<&Path>,
+    candidate: &Candidate,
+) -> anyhow::Result<Option<(String, String)>> {
     let Some(path) = netrc else { return Ok(None) };
-    let host = reqwest::Url::parse(url)
+    let host = reqwest::Url::parse(&candidate.url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned));
     let Some(host) = host else { return Ok(None) };
@@ -545,7 +600,7 @@ fn netrc_credentials(netrc: Option<&Path>, url: &str) -> anyhow::Result<Option<(
         .with_context(|| format!("reading netrc {}", path.display()))?;
 
     let tokens: Vec<&str> = contents.split_whitespace().collect();
-    let mut best: Option<(String, String)> = None;
+    let mut default_entry: Option<(String, String)> = None;
     let mut i = 0;
     while i < tokens.len() {
         let (machine, start) = match tokens[i] {
@@ -571,13 +626,16 @@ fn netrc_credentials(netrc: Option<&Path>, url: &str) -> anyhow::Result<Option<(
         if let (Some(l), Some(p)) = (login, password) {
             match machine {
                 Some(m) if m == host => return Ok(Some((l, p))),
-                None if best.is_none() => best = Some((l, p)),
+                None if default_entry.is_none() => default_entry = Some((l, p)),
                 _ => {}
             }
         }
         i = start;
     }
-    Ok(best)
+    match candidate.kind {
+        CandidateKind::Mirror => Ok(default_entry),
+        CandidateKind::Origin => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -598,24 +656,53 @@ mod tests {
         }
     }
 
+    /// Candidate order AND provenance: mirrors first (tagged Mirror),
+    /// origin last (tagged Origin) — the tags are what the credential
+    /// scope keys on, so they are pinned alongside the order.
+    // r[verify fetcher.mirrors.hashed+2]
+    // r[verify fetcher.fetchurl.netrc-origin-scope]
     #[test]
     fn mirrors_are_tried_before_origin_and_origin_is_last() {
         let p = params(
             "https://example.org/src.tar.gz",
             &["http://m1/", "http://m2"],
         );
-        let urls = p.candidate_urls();
-        assert_eq!(urls.len(), 3);
-        assert_eq!(urls[0], format!("http://m1/sha256/{}", "ab".repeat(32)));
-        assert_eq!(urls[1], format!("http://m2/sha256/{}", "ab".repeat(32)));
-        assert_eq!(urls[2], "https://example.org/src.tar.gz");
+        let candidates = p.candidates();
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(
+            candidates[0],
+            Candidate {
+                url: format!("http://m1/sha256/{}", "ab".repeat(32)),
+                kind: CandidateKind::Mirror,
+            }
+        );
+        assert_eq!(
+            candidates[1],
+            Candidate {
+                url: format!("http://m2/sha256/{}", "ab".repeat(32)),
+                kind: CandidateKind::Mirror,
+            }
+        );
+        assert_eq!(
+            candidates[2],
+            Candidate {
+                url: "https://example.org/src.tar.gz".into(),
+                kind: CandidateKind::Origin,
+            }
+        );
     }
 
     #[test]
     fn mirrors_skipped_without_hash() {
         let mut p = params("https://example.org/src", &["http://m1/"]);
         p.hash_b16 = String::new();
-        assert_eq!(p.candidate_urls(), vec!["https://example.org/src"]);
+        assert_eq!(
+            p.candidates(),
+            vec![Candidate {
+                url: "https://example.org/src".into(),
+                kind: CandidateKind::Origin,
+            }]
+        );
     }
 
     #[test]
@@ -656,8 +743,27 @@ mod tests {
         assert_eq!(p.netrc.as_deref(), Some(Path::new("/build/.netrc")));
     }
 
+    fn origin(url: &str) -> Candidate {
+        Candidate {
+            url: url.into(),
+            kind: CandidateKind::Origin,
+        }
+    }
+
+    fn mirror(url: &str) -> Candidate {
+        Candidate {
+            url: url.into(),
+            kind: CandidateKind::Mirror,
+        }
+    }
+
+    /// THE bug_095 pin (flipped from the old default-fallback test): a
+    /// tenant-controlled origin URL receives credentials only on an
+    /// exact `machine` match. The operator's `default` entry — a
+    /// catch-all secret — never travels to a host the tenant chose.
+    // r[verify fetcher.fetchurl.netrc-origin-scope]
     #[test]
-    fn netrc_exact_machine_beats_default() {
+    fn netrc_origin_requires_exact_machine_match() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             f,
@@ -665,10 +771,32 @@ mod tests {
              machine example.org login alice password s3cret"
         )
         .unwrap();
-        let got = netrc_credentials(Some(f.path()), "https://example.org/x").unwrap();
-        assert_eq!(got, Some(("alice".into(), "s3cret".into())));
-        let fallback = netrc_credentials(Some(f.path()), "https://other.net/x").unwrap();
+        let exact = netrc_credentials(Some(f.path()), &origin("https://example.org/x")).unwrap();
+        assert_eq!(exact, Some(("alice".into(), "s3cret".into())));
+        let unmatched = netrc_credentials(Some(f.path()), &origin("https://other.net/x")).unwrap();
+        assert_eq!(
+            unmatched, None,
+            "the default entry must never reach a tenant-controlled origin"
+        );
+    }
+
+    /// The `default` entry still works where it is safe: operator-
+    /// configured mirrors (and an exact machine match still wins on a
+    /// mirror too).
+    // r[verify fetcher.fetchurl.netrc-origin-scope]
+    #[test]
+    fn netrc_mirror_default_preserved() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "default login dlogin password dpass\n\
+             machine mirror.example login alice password s3cret"
+        )
+        .unwrap();
+        let fallback = netrc_credentials(Some(f.path()), &mirror("https://cache.other/x")).unwrap();
         assert_eq!(fallback, Some(("dlogin".into(), "dpass".into())));
+        let exact = netrc_credentials(Some(f.path()), &mirror("https://mirror.example/x")).unwrap();
+        assert_eq!(exact, Some(("alice".into(), "s3cret".into())));
     }
 
     #[test]
@@ -825,7 +953,7 @@ mod tests {
 
         let mut p = params(&format!("https://{addr}/file"), &[]);
         p.output = dir.path().join("out");
-        let err = try_fetch_one(&client, &p.url, &p, roots)
+        let err = try_fetch_one(&client, &origin(&p.url), &p, roots)
             .await
             .expect_err("https without roots must fail");
         let chain = format!("{err:#}");

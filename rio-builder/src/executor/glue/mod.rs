@@ -281,7 +281,11 @@ pub(crate) struct SandboxOptions {
     /// makes builtin derivations fail with a typed error.
     pub builder_binary: Option<PathBuf>,
     /// Operator-provided netrc contents for authenticated fetchurl
-    /// sources, written into the sandbox as an inline file.
+    /// sources, written into the sandbox as an inline file. Credential
+    /// scope inside the fetcher: an exact `machine` entry applies to
+    /// any candidate URL; the `default` entry applies to
+    /// operator-configured mirrors only, never to the tenant-
+    /// controlled origin (`fetcher.fetchurl.netrc-origin-scope`).
     pub netrc: Option<Vec<u8>>,
 }
 
