@@ -394,7 +394,15 @@ async fn test_concurrent_putpath_same_path_one_wins() -> TestResult {
 /// A young placeholder (live concurrent uploader) still aborts.
 #[tokio::test]
 async fn test_putpath_reclaims_stale_uploading() -> TestResult {
-    let mut s = StoreSession::new().await?;
+    // Tiny concurrent-wait budget: the young-placeholder arm seeds a
+    // placeholder with NO live uploader behind it, so the bounded wait
+    // (`store.put.concurrent-wait`) would otherwise park that call for
+    // the full default budget before surfacing Aborted. The stale arm
+    // is unaffected (reclaim happens on the first claim, no wait).
+    let mut s = StoreSession::build(|pool| {
+        StoreServiceImpl::new(pool).with_concurrent_put_wait(std::time::Duration::from_millis(100))
+    })
+    .await?;
     let store_path = test_store_path("i207-stale");
     let nar = make_nar(b"i207 stale-reclaim").0;
     let info = make_path_info_for_nar(&store_path, &nar);

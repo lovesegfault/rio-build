@@ -237,6 +237,11 @@ pub(super) async fn grpc_is_valid_path(
 /// margin rather than tightened. Shared with rio-builder's PutPath
 /// retry (`upload.rs`): both hit the same store-side placeholder
 /// contention, so they use the same curve+budget.
+///
+/// The store now fronts each attempt with its own bounded wait on the
+/// in-flight uploader (`store.put.concurrent-wait`, default 60 s), so
+/// an Aborted reaching this loop means the winner outlived that
+/// budget — each retry here buys another store-side wait window.
 // pub(crate): the alert-seed axis pin in lib.rs
 // (putpath_retry_attempt_axis_matches_the_emit_law) derives the seeded
 // label product from this bound.
@@ -425,7 +430,10 @@ pub(super) async fn grpc_put_path(
 /// concurrent uploader's path exists. The retry budget and the
 /// `rio_gateway_putpath_aborted_retries_total{attempt}` emit are
 /// shared with the buffered lane (single-axis schema; same
-/// store-side contention, same curve, same dashboard cell).
+/// store-side contention, same curve, same dashboard cell). The store
+/// also fronts the race server-side (`store.put.concurrent-wait`),
+/// resolving as `created: false` once the in-flight winner commits;
+/// an Aborted only escapes when the winner outlives BOTH wait budgets.
 // r[impl gw.put.aborted-retry]
 pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     store_client: &mut StoreServiceClient<Channel>,

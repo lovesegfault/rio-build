@@ -653,6 +653,14 @@ pub fn describe_metrics() {
          fetcher pods (see I-208)."
     );
     describe_counter!(
+        "rio_store_putpath_concurrent_wait_total",
+        "Concurrent same-path PutPath/PutPathChunked waits resolved, labeled \
+         by outcome: completed (winner committed; waiter took the idempotent \
+         skip), takeover (winner aborted; waiter claimed the freed \
+         placeholder), timeout (budget exhausted; ABORTED surfaced to the \
+         client's own retry logic)."
+    );
+    describe_counter!(
         "rio_store_substitute_probe_cache_hits_total",
         "check_available HEAD-probe cache hits (positive or negative cached \
          result; no upstream HEAD made for this path)."

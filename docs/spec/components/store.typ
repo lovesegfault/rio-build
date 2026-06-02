@@ -591,6 +591,29 @@ unreferenced age past grace and are collected by a later collect cycle
   re-uploading. This makes concurrent uploads of the same path safe.
 ]
 
+#r("store.put.concurrent-wait")[
+  When the write-ahead claim (#rref("store.put.placeholder-claim")) finds a
+  live concurrent uploader for the same path, `PutPath` and `PutPathChunked`
+  MUST wait --- bounded by a server-side budget (default 60 s, well under the
+  client RPC deadline) --- for the in-flight upload to resolve, then take the
+  idempotent-skip path (#rref("store.put.idempotent"), winner committed) or
+  claim the freed placeholder (winner aborted). Only when the budget expires
+  with the uploader still live does the call surface `ABORTED`.
+]
+
+Without the wait, the loser of a same-path race got `ABORTED "concurrent
+PutPath in progress … retry"` immediately --- and for the gateway's
+`wopAddMultipleToStore` leg the "retry" was a lie. The gateway's buffered
+re-send retry has a \~6 s budget tuned for KB-sized `.drv` NARs and cannot
+cover a winner streaming a chunked NAR for tens of seconds; the gateway's
+streaming path (oversize entries) cannot retry at all because the NAR bytes
+were already consumed off the wire. Either way the client's whole upload died
+over a race whose outcome it didn't need to win: the loser's optimal result is
+the idempotent skip, which requires no bytes. The store is the only layer that
+can observe the winner's placeholder directly, so it waits there; client-side
+retry budgets stay as the fallback for winners that outlive the server-side
+budget.
+
 #r("store.put.tenant-junction")[
   Every upload RPC (`PutPath`, `PutPathBatch`, `PutPathChunked`) MUST record
   the caller's resolved tenant (the same resolution the castore read side
