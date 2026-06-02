@@ -64,10 +64,19 @@ pub(super) const MAX_TARGET_LEN: u64 = 4096;
 /// at ~2048, but no real store path approaches 256 components.
 /// Each level costs ~300 bytes of stack; 256 * 300 = 77 KiB, well within
 /// the 2 MiB thread stack.
-pub(super) const MAX_NAR_DEPTH: usize = 256;
+///
+/// Exported (`pub`) deliberately: every walker over the recursive NAR
+/// structure — in this crate and out of it (e.g. archive backends that
+/// build [`NarNode`] trees from their own storage primitives) — must
+/// enforce THIS cap rather than re-implement the traversal unguarded;
+/// a sibling walker without it stack-overflows (aborts, not unwinds) on
+/// a deep tree from untrusted input.
+pub const MAX_NAR_DEPTH: usize = 256;
 
-/// Maximum number of directory entries (DoS prevention for unbounded allocation).
-pub(super) const MAX_DIRECTORY_ENTRIES: usize = 1_048_576;
+/// Maximum number of directory entries (DoS prevention for unbounded
+/// allocation). Exported for the same reason as [`MAX_NAR_DEPTH`]: every
+/// producer or consumer of NAR directory listings shares one cap.
+pub const MAX_DIRECTORY_ENTRIES: usize = 1_048_576;
 
 /// Errors from NAR operations.
 #[derive(Debug, Error)]

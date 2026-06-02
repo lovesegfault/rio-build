@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow, bail};
 use dwarfs::AsChunks as _;
-use rio_nix::nar::{NarEntry, NarNode};
+use rio_nix::nar::{MAX_DIRECTORY_ENTRIES, MAX_NAR_DEPTH, NarEntry, NarNode};
 
 /// Where the archive bytes live. Everything above this enum goes through
 /// [`Backend::read_file`] and [`Backend::list_dir`]; NAR packing of embedded
@@ -151,7 +151,28 @@ impl Backend {
     /// Build the [`NarNode`] tree for `rel` (described by `entry`) by walking
     /// the backend. Used for the DwarFS side of NAR dumping; the directory
     /// backend streams via [`rio_nix::nar::dump_path_streaming`] instead.
+    ///
+    /// Enforces rio-nix's [`MAX_NAR_DEPTH`] / [`MAX_DIRECTORY_ENTRIES`]
+    /// caps, with the same depth accounting as `dump_path_streaming` (the
+    /// walked root is depth 0), so the two backends agree on which trees
+    /// are representable. Archive store trees are walked BEFORE any digest
+    /// verification, the dwarfs format itself imposes no depth bound, and
+    /// this walk recurses per directory level on a default 2 MiB blocking
+    /// thread — without the cap, a deep tree in a hostile or foreign image
+    /// stack-overflows (an abort, not an unwind) instead of erroring.
     pub(crate) fn nar_node(&self, rel: &str, entry: &WalkEntry) -> Result<NarNode> {
+        self.nar_node_at(rel, entry, 0)
+    }
+
+    /// [`nar_node`](Self::nar_node) with the depth threaded through the
+    /// recursion.
+    fn nar_node_at(&self, rel: &str, entry: &WalkEntry, depth: usize) -> Result<NarNode> {
+        if depth > MAX_NAR_DEPTH {
+            bail!(
+                "{rel}: directory nesting depth {depth} exceeds the NAR walker limit \
+                 {MAX_NAR_DEPTH}"
+            );
+        }
         match entry.kind {
             EntryKind::Regular => {
                 let contents = self
@@ -173,6 +194,15 @@ impl Backend {
                 let mut children = self
                     .list_dir(rel)?
                     .ok_or_else(|| anyhow!("{rel}: listed but unreadable"))?;
+                // `>=`, matching every rio-nix walker's comparison exactly,
+                // so the backends stay boundary-identical on the entry cap.
+                if children.len() >= MAX_DIRECTORY_ENTRIES {
+                    bail!(
+                        "{rel}: {} directory entries exceed the NAR walker limit \
+                         {MAX_DIRECTORY_ENTRIES}",
+                        children.len()
+                    );
+                }
                 // NAR requires directory entries sorted by name (byte order);
                 // rio-nix's writer serializes in the order given.
                 children.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
@@ -181,7 +211,7 @@ impl Backend {
                     let child_rel = format!("{rel}/{}", child.name);
                     entries.push(NarEntry {
                         name: child.name.clone(),
-                        node: self.nar_node(&child_rel, child)?,
+                        node: self.nar_node_at(&child_rel, child, depth + 1)?,
                     });
                 }
                 Ok(NarNode::Directory { entries })
@@ -330,6 +360,93 @@ mod tests {
         assert_eq!(
             nar_of_embedded_tree(&dir_backend),
             nar_of_embedded_tree(&image_backend)
+        );
+    }
+
+    /// Append a chain of `nested_dirs` single-child directories under
+    /// `root`, with one file in the deepest one. With the chain root at
+    /// NAR depth 0, the file sits at depth `nested_dirs + 1`.
+    fn deep_tree(root: &std::path::Path, nested_dirs: usize) {
+        let mut path = root.to_path_buf();
+        for _ in 0..nested_dirs {
+            path.push("d");
+        }
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("f"), b"leaf").unwrap();
+    }
+
+    /// Resource-limit parity at the depth boundary: a tree whose deepest
+    /// node sits at exactly rio-nix's `MAX_NAR_DEPTH` walks through BOTH
+    /// backends (must-admit, byte-identically — and identically to the
+    /// directory backend's production streaming dump), while one level
+    /// deeper is REFUSED by both backends and by the streaming dump
+    /// (must-block). The expectation universe is rio-nix's exported caps —
+    /// the same constants every guarded NAR walker enforces; before the
+    /// DwarFS walk shared them, it recursed unguarded and a deep tree in an
+    /// untrusted image stack-overflowed (aborted) the engine while the
+    /// directory backend errored cleanly.
+    #[test]
+    fn backends_agree_on_the_nar_depth_limit() {
+        use rio_nix::nar::MAX_NAR_DEPTH;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        let store = root.join(STORE_DIR);
+        // File at depth MAX_NAR_DEPTH (the limit): tree root depth 0 +
+        // (MAX-1) nested dirs + the file.
+        deep_tree(&store.join("tree-at-limit"), MAX_NAR_DEPTH - 1);
+        // File at depth MAX_NAR_DEPTH + 1: one past the limit.
+        deep_tree(&store.join("tree-too-deep"), MAX_NAR_DEPTH);
+        let image = dir.path().join("archive.dwarfs");
+        pack_with_mkdwarfs(&root, &image).unwrap();
+
+        let dir_backend = Backend::open(&root).unwrap();
+        let image_backend = Backend::open(&image).unwrap();
+        let entry_named = |backend: &Backend, name: &str| {
+            backend
+                .list_dir(STORE_DIR)
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("fixture tree {name} missing"))
+        };
+
+        // Must-admit: at the limit, both backends produce the same bytes,
+        // and the directory backend's production path (the guarded
+        // streaming dump) agrees byte-for-byte — three walkers, one cap.
+        let rel = format!("{STORE_DIR}/tree-at-limit");
+        let nar_via = |backend: &Backend| {
+            let entry = entry_named(backend, "tree-at-limit");
+            let node = backend.nar_node(&rel, &entry).unwrap();
+            let mut nar = Vec::new();
+            rio_nix::nar::serialize(&mut nar, &node).unwrap();
+            nar
+        };
+        let from_dir = nar_via(&dir_backend);
+        let from_image = nar_via(&image_backend);
+        assert_eq!(from_dir, from_image);
+        let mut streamed = Vec::new();
+        rio_nix::nar::dump_path_streaming(&store.join("tree-at-limit"), &mut streamed).unwrap();
+        assert_eq!(from_dir, streamed);
+
+        // Must-block: one level past the limit, every walker refuses —
+        // an error naming the depth, never an abort.
+        let rel = format!("{STORE_DIR}/tree-too-deep");
+        for backend in [&dir_backend, &image_backend] {
+            let entry = entry_named(backend, "tree-too-deep");
+            let err = format!("{:#}", backend.nar_node(&rel, &entry).unwrap_err());
+            assert!(
+                err.contains(&MAX_NAR_DEPTH.to_string()),
+                "the refusal names the shared cap: {err}"
+            );
+        }
+        let streamed_err =
+            rio_nix::nar::dump_path_streaming(&store.join("tree-too-deep"), &mut Vec::new())
+                .unwrap_err();
+        assert!(
+            matches!(streamed_err, rio_nix::nar::NarError::NestingTooDeep(_)),
+            "the streaming dump refuses the same tree: {streamed_err:?}"
         );
     }
 }

@@ -64,29 +64,71 @@ fn reject_regular_without_contents() {
 
 /// A malicious NAR with ~300 levels of nested directories must be rejected
 /// with NestingTooDeep, not crash with a stack overflow.
+///
+/// The bytes are hand-rolled iteratively: hostile NARs come from outside,
+/// and `serialize` itself now refuses over-deep trees (see
+/// `serialize_rejects_overdeep_tree_at_the_shared_cap`), so it can no
+/// longer be used to produce this input.
 #[test]
 fn reject_deeply_nested_nar() {
-    // Build inside-out: each level wraps the previous in a one-entry dir.
-    let mut node = NarNode::Regular {
-        executable: false,
-        contents: vec![],
-    };
-    for _ in 0..(MAX_NAR_DEPTH + 10) {
-        node = NarNode::Directory {
-            entries: vec![NarEntry {
-                name: "a".to_string(),
-                node,
-            }],
-        };
+    let levels = MAX_NAR_DEPTH + 10;
+    let mut buf = Vec::new();
+    write_str(&mut buf, NAR_MAGIC).unwrap();
+    for _ in 0..levels {
+        for token in ["(", "type", "directory", "entry", "(", "name", "a", "node"] {
+            write_str(&mut buf, token).unwrap();
+        }
+    }
+    // Innermost node: an empty regular file.
+    for token in ["(", "type", "regular", "contents"] {
+        write_str(&mut buf, token).unwrap();
+    }
+    write_bytes(&mut buf, b"").unwrap();
+    write_str(&mut buf, ")").unwrap();
+    // Close every entry and directory production so the input is a
+    // well-formed NAR — the parser must fail on DEPTH, not on truncation.
+    for _ in 0..levels {
+        write_str(&mut buf, ")").unwrap();
+        write_str(&mut buf, ")").unwrap();
     }
 
-    // serialize() recurses too — at 266 levels it's fine on a default
-    // 2 MiB test stack. If this ever blows the test stack, switch to
-    // hand-rolling bytes with write_str.
-    let mut buf = Vec::new();
-    serialize(&mut buf, &node).expect("serialize succeeds");
-
     let result = parse(&mut Cursor::new(&buf));
+    assert!(
+        matches!(result, Err(NarError::NestingTooDeep(d)) if d > MAX_NAR_DEPTH),
+        "expected NestingTooDeep, got {result:?}"
+    );
+}
+
+/// `serialize` enforces the shared depth cap itself: a hand-built tree
+/// whose deepest node sits at exactly MAX_NAR_DEPTH serializes (must-admit
+/// — the same boundary the parser and the fs walkers accept), one level
+/// deeper is refused with NestingTooDeep (must-block) instead of recursing
+/// toward a stack overflow. Every other in-tree NarNode producer is
+/// depth-capped at construction; this guard covers hand-built trees.
+#[test]
+fn serialize_rejects_overdeep_tree_at_the_shared_cap() {
+    let nested = |levels: usize| {
+        let mut node = NarNode::Regular {
+            executable: false,
+            contents: b"leaf".to_vec(),
+        };
+        for _ in 0..levels {
+            node = NarNode::Directory {
+                entries: vec![NarEntry {
+                    name: "a".to_string(),
+                    node,
+                }],
+            };
+        }
+        node
+    };
+
+    // Deepest node (the file) at depth MAX_NAR_DEPTH: admitted.
+    let mut buf = Vec::new();
+    serialize(&mut buf, &nested(MAX_NAR_DEPTH)).expect("a tree at the depth limit serializes");
+
+    // One level deeper: refused at the cap.
+    let result = serialize(&mut Vec::new(), &nested(MAX_NAR_DEPTH + 1));
     assert!(
         matches!(result, Err(NarError::NestingTooDeep(d)) if d > MAX_NAR_DEPTH),
         "expected NestingTooDeep, got {result:?}"
