@@ -3442,7 +3442,7 @@ in
       main = "materializationJobBase";
       witness = "noParkReevalResolve";
     };
-    # A legacy (flag-off-era) build's relation is backfilled at
+    # A legacy (pre-relation-era) build's relation is backfilled at
     # creation (delta 2b, the B4 fix's contended state).
     quint-materialization-witness-legacy-backfill = mkQuintSimWitnessCheck {
       name = "materialization-witness-legacy-backfill";

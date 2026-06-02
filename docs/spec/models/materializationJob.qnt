@@ -1,22 +1,33 @@
 // -*- mode: Bluespec; -*-
 //
-// Substitution-replacement Phase C-prime model (re-targeted from the
-// Phase A draft, T-5.3 -> C-prime step 1): the store-owned
-// materialization-job lifecycle AS BUILT at the Phase B tip — the six
-// Phase-B behavior deltas the draft predated are encoded here (the
-// stage record's "C-prime handoff" delta list,
-// substitution-replacement-invariant-map.md):
+// Substitution-replacement model (Phase C-prime, re-targeted to the
+// post-deletion system at Phase D-prime T-D7.2): the store-owned
+// materialization-job lifecycle AS BUILT at the D-prime tip — the ONLY
+// substitution mechanism (the walk machinery, the Substituting status,
+// the coexistence flag and both evidence columns were deleted in Waves
+// D3-D6; migration 080). The six Phase-B behavior deltas are encoded
+// here (the stage record's "C-prime handoff" delta list,
+// substitution-replacement-invariant-map.md), with the D-prime
+// adjustment recorded per affected delta:
 //
-//   Delta 1 — the finding-11 mark discriminator (c952e5a51,
-//     sched.materialize.routing+2) + the §4 clear-mirror (7c9b9f949):
-//     a per-drv `topdownPruned` ghost set by pruned-origin creation,
-//     consumed by every resolution arm (success / from-source / the
-//     fail-fast itself — dispatch.rs:1126 clears on fail-fast too);
-//     arm-3 FailFast requires the FOUR-conjunct corner (Broken evidence
-//     AND the mark AND a live-wanted path missing AND
+//   Delta 1 — the pruned-origin discriminator (c952e5a51,
+//     sched.materialize.routing; post-D-prime form): the 063 mark
+//     column is DROPPED (migration 080) — the durable fact is
+//     `materialization_jobs.origin = 'pruned'` on the unresolved row
+//     (Wave D2.1 keyed the settlement fail-fast on it, with the PD-D1
+//     pruned-wins dedup upgrade). The per-drv `topdownPruned` ghost is
+//     the model image of "an unresolved-or-parked pruned-origin job
+//     exists": set by pruned-origin creation AND by the dedup upgrade
+//     (`dedupPrunedUpgrade` — an OPruned creation landing on a live
+//     job upgrades its origin in place, armament preserved); ended by
+//     RESOLUTION ITSELF (there is no column to clear: success,
+//     from-source, the fail-fast, cancellation and obsolescence all
+//     resolve the row, and the pruned fact dies with the row's
+//     unresolved state — the §4 clear-mirror is structural now).
+//     arm-3 FailFast requires the FOUR-conjunct corner (Broken
+//     evidence AND pruned-origin AND a live-wanted path missing AND
 //     confirmed-missing-or-spent-one-shot); an UNMARKED node's arm 3
-//     resolves from source (the walk-equivalent disposition,
-//     materialize.rs route_unobtainable :576).
+//     resolves from source (materialize.rs route_unobtainable).
 //   Delta 2a — the finding-18 transport (ce17c6445,
 //     store.materialize.executor+2): per-replica channel-staleness
 //     state; failover pins every executor channel to the deposed
@@ -27,12 +38,14 @@
 //     dead-end (no redial: claims blocked forever) is the
 //     witness-flip calibration (canReachPostFailoverClaim).
 //   Delta 2b — the finding-18 wanted backfill (056bfc9b6): legacy
-//     (flag-off-era) interest is representable (`legacyInterest`:
-//     in-memory interest with NO wanted rows); probe-partition and
-//     stale-reset creation BACKFILL the relation for every live
-//     legacy-interested build (materialize.rs:184-217, the
-//     create_materialization_job_if_enabled live_interested loop);
-//     the new invariant `creationLeavesTenantResolvable` pins it.
+//     interest is representable (`legacyInterest`: in-memory interest
+//     with NO wanted rows — post-D-prime this is the PRE-RELATION-era
+//     build population, the DQ-2 wanted-width transition residual,
+//     not a flag state; the coexistence flag is gone); probe-partition
+//     and stale-reset creation BACKFILL the relation for every live
+//     legacy-interested build (materialize.rs, the
+//     create_materialization_job live_interested loop); the invariant
+//     `creationLeavesTenantResolvable` pins it.
 //   Delta 3 — the park re-evaluation split (642fe9fb7, T-6.1/PD-20):
 //     `parkReevaluate` resolves Vouched/Pending-evidence parked jobs
 //     from source per tick (materialize.rs
@@ -66,13 +79,21 @@
 //     re-encoded as view-faithfulness (view == projection of the
 //     durable state), which the F10/L1 view-drop and B5a
 //     refeed-overwrite calibrations falsify.
-//   Delta 6 — Queued claims + the must_substitute claim upgrade
-//     (8d5caee2d + 7c9b9f949/B1): `claimJob` admits NQueued|NReady
-//     and carries NO mark conjunct (the claim IS the substitution —
-//     pull.rs admit_pull_kinded:790-810, the two upgraded cells);
-//     `builderPull` (kind=Build, JobView::None) DOES carry the A11
-//     must_substitute refusal (marked AND Broken => refused). The B1
-//     regression guard is the canReachMarkedClaim witness.
+//   Delta 6 — Queued claims (8d5caee2d + 7c9b9f949/B1): `claimJob`
+//     admits NQueued|NReady and carries NO mark conjunct (the claim IS
+//     the substitution — the B1 upgrade). D-prime adjustment: the
+//     builderPull must_substitute refusal arm is DELETED with the
+//     kernel arm it modeled (Wave D4.1 collapsed the kinded admission;
+//     D5.2 reduced the kernel to the durable child relation). The
+//     dual-predicate window is EMPTY post-D-prime — the equivalence:
+//     the pruned fact lives only on an unresolved-or-parked job row
+//     (delta 1), any unresolved job projects a non-None JobView
+//     (VPending carries parked too), and builderPull already requires
+//     JobView::None — so the dropped conjunct was vacuous. The
+//     equivalence holds in-model because EVERY resolution arm (incl.
+//     cancellation and obsolescence) ends the ghost with the row; the
+//     B1 regression guard is the canReachMarkedClaim witness (claims
+//     on pruned-origin nodes stay reachable).
 //
 // WHAT THIS MODELS (design §2, §9.1) — unchanged from the draft:
 // job creation at the scheduler's classification sites; the durable
@@ -92,10 +113,10 @@
 //
 // WHAT IS NOT MODELED (priced omissions; each cites its out-of-model
 // owner):
-//   - Walk machinery and the Substituting status: fresh flag-on work
-//     never reaches them (the T-5.3 six-site zero-walk audit +
-//     flag_on_fresh_work_never_walks); legacy-state absorption is
-//     VM-tested. The F14 calibration family is by-construction here.
+//   - Walk machinery and the Substituting status: DELETED from
+//     production (D-prime Waves D3-D6; the predecessor record is
+//     closureEvidence.qnt and its survivors core). The F14 calibration
+//     family is by-construction here.
 //   - DAG edges / multi-node closures: the closure walk is "ingest
 //     the wanted set path by path" (closure incompleteness surfaces
 //     as a wanted path still missing); parent/child soundness stays
@@ -230,7 +251,7 @@ module materializationJob {
   const MAX_GEN: int
   /// Ceiling on upstream-availability flips.
   const MAX_UPSTREAM_FLIPS: int
-  /// Ceiling on legacy (flag-off-era) interest arrivals (delta 2b).
+  /// Ceiling on legacy (pre-relation-era) interest arrivals (delta 2b).
   const MAX_LEGACY: int
   /// Regime switches.
   const ENABLE_FAILOVER: bool
@@ -276,11 +297,9 @@ module materializationJob {
       else VNone
   }
 
-  /// The as-built A11 judgment (rio-evidence-kernel must_substitute):
-  /// marked AND Broken closure evidence — the from-source-build
-  /// refusal (delta 6: it gates builderPull, never the claim).
-  pure def mustSubstitute(marked: bool, rel: DurableRelation): bool =
-    marked and rel == RBroken
+  // (The as-built A11 mustSubstitute judgment was deleted here at
+  // T-D7.2 with the kernel arm it modeled — see delta 6 in the header:
+  // the JobView::None requirement subsumes it post-D-prime.)
 
   // --- 4. state variables ----------------------------------------------------
 
@@ -304,7 +323,8 @@ module materializationJob {
   /// impossible); the F5 overwrite override diverges them.
   var lastWritten: (str, str) -> Set[str]
   /// Delta 2b: build b holds in-memory interest in d WITHOUT wanted
-  /// rows (the flag-off-era build). Cleared by the build's own merge
+  /// rows (the pre-relation-era build, the DQ-2 residual population).
+  /// Cleared by the build's own merge
   /// (recordWantedRelation) or by a creation-site backfill.
   var legacyInterest: (str, str) -> bool
   /// Delta 2b ceiling: legacy arrivals left.
@@ -316,10 +336,13 @@ module materializationJob {
   /// Node status per derivation.
   var nodeStatus: str -> NodeStatus
 
-  /// Delta 1: the topdown-pruned mark per derivation. Set by
-  /// pruned-origin creation (the merge stamp rides the same tx);
-  /// consumed by success / from-source resolution (the §4
-  /// clear-mirror) and by the fail-fast itself (dispatch.rs:1126).
+  /// Delta 1 (post-D-prime form): the pruned-origin fact per
+  /// derivation — the model image of "an unresolved-or-parked
+  /// pruned-origin job exists" (production:
+  /// materialization_jobs.origin = 'pruned'; the 063 mark column is
+  /// dropped, migration 080). Set by pruned-origin creation and the
+  /// PD-D1 dedup upgrade; ended by every resolution arm — the row's
+  /// unresolved state is the fact's only carrier.
   var topdownPruned: str -> bool
 
   /// Store presence per (derivation, output).
@@ -827,7 +850,7 @@ module materializationJob {
     tenureUnchanged, ghostsUnchanged,
   }
 
-  /// Delta 2b: a flag-off-era build's in-memory interest surfaces —
+  /// Delta 2b: a pre-relation-era build's in-memory interest surfaces —
   /// live interest with NO wanted rows (the FP-4(b) transition-window
   /// shape). Bounded by MAX_LEGACY.
   action legacyBuildArrives(b: str, d: str): bool = all {
@@ -933,6 +956,37 @@ module materializationJob {
     },
     legacyBudget' = legacyBudget,
     jobCoreUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged, ghostsUnchanged,
+  }
+
+  /// PD-D1 (Wave D2.1, encoded at T-D7.2): a pruned merge's creation
+  /// dedups onto d's existing unresolved job — the fenced in-place
+  /// pruned-wins origin upgrade (`ON CONFLICT` on the partial-unique
+  /// index; the C3 index forecloses a second unresolved row, so the
+  /// upgrade is the only way the pruned fact can land on a node that
+  /// already has a job). Armament is PRESERVED (the DQ-1 adjudication:
+  /// the upgrade touches origin only — never state, parked, the claim
+  /// holder, or the view), and production observes it via
+  /// rio_scheduler_materialization_origin_upgraded_total. Guards
+  /// mirror createJob's OPruned arm (live tenant whose same-tx merge
+  /// batch wrote its wanted rows; node not locally covered) minus the
+  /// no-unresolved-job guard this action inverts; fires only when it
+  /// changes state (an already-pruned job needs no upgrade — economy).
+  action dedupPrunedUpgrade(d: str, tenant: str): bool = all {
+    BUILDS.contains(tenant),
+    buildLive.get(tenant),
+    wanted.get((tenant, d)) != Set(),
+    hasUnresolvedJob(d),
+    not(topdownPruned.get(d)),
+    not(memLiveWanted(d).forall(o => present.get((d, o)))),
+    jobs' = jobs.put(d, match jobs.get(d) {
+      | NoJob => NoJob
+      | SomeJob(j) => SomeJob({ ...j, origin: OPruned })
+    }),
+    topdownPruned' = topdownPruned.put(d, true),
+    dupJob' = dupJob, view' = view, attempts' = attempts,
+    nodeStatus' = nodeStatus, execsMinted' = execsMinted,
+    relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
     tenureUnchanged, ghostsUnchanged,
   }
 
@@ -1226,9 +1280,10 @@ module materializationJob {
   }
 
   /// §2.4 / BC-2: zero live in-memory interest cancels the job and
-  /// closes any open attempt charge-free. The mark is NOT cleared
-  /// (cancellation is not a resolution — only the §4 clear sites
-  /// consume it).
+  /// closes any open attempt charge-free. Cancellation RESOLVES the
+  /// row, and post-D-prime the pruned fact has no other carrier — the
+  /// ghost ends with the row's unresolved state (delta 1: production
+  /// has no mark column to outlive the row, migration 080).
   action cancelOnZeroInterest(d: str): bool = all {
     hasUnresolvedJob(d),
     memInterest(d) == Set(),
@@ -1239,13 +1294,16 @@ module materializationJob {
     view' = view.put(d, VNone),
     attempts' = attempts.put(d, NoAttempt),
     nodeStatus' = nodeStatus,
-    dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
+    topdownPruned' = topdownPruned.put(d, false),
+    dupJob' = dupJob, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
     tenureUnchanged, ghostsUnchanged,
   }
 
   /// §2.4: the node was Produced by other means: the job goes
-  /// obsolete (no clear — obsolete is not a §4 clear site).
+  /// obsolete. Obsolescence resolves the row, so the pruned fact ends
+  /// with it (delta 1 — the same structural clear as every other
+  /// resolution arm).
   action obsoleteOnProduced(d: str): bool = all {
     hasUnresolvedJob(d),
     nodeStatus.get(d) == NCompleted,
@@ -1256,7 +1314,8 @@ module materializationJob {
     view' = view.put(d, VNone),
     attempts' = attempts.put(d, NoAttempt),
     nodeStatus' = nodeStatus,
-    dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
+    topdownPruned' = topdownPruned.put(d, false),
+    dupJob' = dupJob, execsMinted' = execsMinted,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
     tenureUnchanged, ghostsUnchanged,
   }
@@ -1329,16 +1388,17 @@ module materializationJob {
     tenureUnchanged, ghostsUnchanged,
   }
 
-  /// §2.3 / delta 6: a builder pull for d — the BUILD column of the
-  /// kinded table. The kernel reads the VIEW (JobView::None required
-  /// for DeliverNew) AND the as-built A11 must_substitute refusal
-  /// stays active for job-less nodes (marked AND Broken => refused —
-  /// the dual-predicate window, pull.rs:706-714).
+  /// §2.3 / delta 6 (post-D-prime): a builder pull for d — the BUILD
+  /// column of the kinded table. The kernel reads the VIEW:
+  /// JobView::None is required for DeliverNew, and that requirement
+  /// SUBSUMES the deleted must_substitute refusal (the pruned fact
+  /// implies an unresolved-or-parked job implies a non-None view —
+  /// the delta-6 equivalence in the header; the kernel arm died in
+  /// Waves D4.1/D5.2).
   action builderPull(d: str, builder: str): bool = all {
     BUILDERS.contains(builder),
     execsMinted < MAX_EXECS,
     view.get(d) == VNone,
-    not(mustSubstitute(topdownPruned.get(d), durableRel.get(d))),
     nodeStatus.get(d) == NReady,
     attempts.get(d) == NoAttempt,
     val newExec = execsMinted + 1
@@ -1572,6 +1632,7 @@ module materializationJob {
       legacyBuildArrives(b, d),
       createJob(d, origin, b),
       dedupRefeed(d),
+      dedupPrunedUpgrade(d, b),
       claimJob(d, replica),
       executeStep(d, o),
       consumeSuccess(d),
@@ -1710,9 +1771,11 @@ module materializationJob {
       .expect(nodeStatus.get("d1") == NCompleted)
   }
 
-  /// Delta 6 / B1: a MARKED Ready node with an unparked pending job is
-  /// claimable (the must_substitute upgrade) while the builder pull of
-  /// the same node is refused (the A11 arm holds for the build kind).
+  /// Delta 6 / B1: a MARKED (pruned-origin) Ready node with an
+  /// unparked pending job is claimable (the B1 claim upgrade); the
+  /// builder pull of the same node is blocked by the JobView arm
+  /// (VPending != VNone — post-D-prime the view IS the refusal; the
+  /// kernel's A11 arm is deleted).
   run markedClaimUpgradeRun = {
     init
       .then(recordWantedRelation("b1", "d1", Set("o1")))
@@ -1727,7 +1790,7 @@ module materializationJob {
       })
   }
 
-  /// Delta 2b: a legacy (flag-off-era) build's interest is backfilled
+  /// Delta 2b: a legacy (pre-relation-era) build's interest is backfilled
   /// into the relation by the probe-partition creation; the job is
   /// tenant-resolvable at creation commit.
   run legacyBackfillRun = {

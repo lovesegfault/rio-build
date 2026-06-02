@@ -212,9 +212,12 @@ module spawnCoherence {
   /// materialization job, and GetSpawnIntents FILTERS such intents
   /// from the served set (the spawn-intent gate's job conjunct —
   /// design §9.2: "spawnCoherence's intent-emission precondition
-  /// gains the job filter"). false = the var stays constant-false and
-  /// the regime's reachable state space is unchanged (the dormancy
-  /// posture of every pre-existing regime).
+  /// gains the job filter"). false = the var stays constant-false:
+  /// the JOB-FREE trace subspace, which post-D-prime is NOT a flag
+  /// state (the coexistence flag was deleted, Wave D4) but the still-
+  /// reachable runs where no intent's node ever carries an unresolved
+  /// job — builds with no substitutable nodes (PD-D8: the six
+  /// job-free regimes keep verifying that subspace).
   const ENABLE_MAT_JOBS: bool
 
   pure val INTENTS: Set[IntentId] = Set("i1", "i2")
