@@ -652,16 +652,23 @@ pkgs.testers.runNixOSTest {
             f"progress events would be skipped (cache-hit lane)"
         )
 
-        # Submit via ssh-ng with internal-json on stderr → cap.json. The
-        # tee preserves the capture even if nom/nix exits oddly. The
-        # build SUCCEEDS without any worker — all 4 drvs' outputs are
-        # in upstream → walk_substitute_closure → Cached.
+        # Submit via ssh-ng with internal-json on stderr → cap.json via
+        # a plain SYNCHRONOUS redirect. Do not switch this to a
+        # `2> >(tee ...)` process substitution: bash does not wait for
+        # procsubs, so the next command (the cat below) races the tee
+        # and reads a truncated capture under load — observed as the
+        # stderr tail (which holds the stop events) missing while the
+        # build exited 0. On failure, tail the capture so the serial
+        # console still gets the relevant context. The build SUCCEEDS
+        # without any worker — all 4 drvs' outputs are in upstream →
+        # walk_substitute_closure → Cached.
         client.succeed(
             "nix build --impure --no-link "
             "${bbArg} -f ${progressClosure} "
             "  --store 'ssh-ng://${gatewayHost}' --eval-store auto "
             "  --log-format internal-json -v "
-            "  2> >(tee /tmp/cap.json >&2)"
+            "  2> /tmp/cap.json "
+            "  || { tail -c 65536 /tmp/cap.json >&2; exit 1; }"
         )
         cap = client.succeed("cat /tmp/cap.json")
         events = []
