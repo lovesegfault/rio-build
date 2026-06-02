@@ -24,15 +24,54 @@ else
     --secret-binary fileb:///tmp/service-hmac
 fi
 
-# Guard on BOTH halves. With one guard and two creates, a Job
-# retry after dying between the two creates (or a rotation by
-# deleting only the private half) left a permanently mismatched
-# pair while the Job reported success — every client signature
-# check then fails. Guarding both + create||put converges from
-# any partial state.
-if aws secretsmanager describe-secret --secret-id rio/signing-key >/dev/null 2>&1 \
-  && aws secretsmanager describe-secret --secret-id rio/signing-key-pub >/dev/null 2>&1; then
+# Fail-closed state probe for the signing-key pair. The signing key
+# is the one secret here where a wrong "missing" verdict is
+# DESTRUCTIVE: the recovery path mints a fresh keypair, and rotating
+# the live key invalidates every narinfo `Sig:` made under the old
+# one. So "missing" must mean the API SAID ResourceNotFoundException
+# — never a throttle, an IAM hiccup, or a network blip (all of which
+# also exit nonzero). Anything else aborts the Job; the Job retries.
+secret_state() {
+  _ss_id=$1
+  if _ss_err=$(aws secretsmanager describe-secret --secret-id "$_ss_id" 2>&1 >/dev/null); then
+    echo present
+  elif printf '%s' "$_ss_err" | grep -q ResourceNotFoundException; then
+    echo missing
+  else
+    printf '[bootstrap] describe-secret %s failed without ResourceNotFoundException; refusing to guess:\n%s\n' \
+      "$_ss_id" "$_ss_err" >&2
+    return 1
+  fi
+}
+
+# Probe BOTH halves and dispatch on the pair state. With one guard
+# and two creates, a Job retry after dying between the two creates
+# (or a rotation by deleting only the private half) left a
+# permanently mismatched pair while the Job reported success — every
+# client signature check then fails.
+sec_state=$(secret_state rio/signing-key)
+pub_state=$(secret_state rio/signing-key-pub)
+if [ "$sec_state" = present ] && [ "$pub_state" = present ]; then
   echo "[bootstrap] rio/signing-key{,-pub} already exist, skipping"
+elif [ "$sec_state" = present ]; then
+  # Pub half missing, private half alive: the pub is DERIVED data —
+  # the tail 32 bytes of the 64-byte expanded secret (the
+  # name:base64(seed++pubkey) format; pinned by rio-cli keygen's
+  # round_trip_format test). Re-derive it; never regenerate the
+  # private half here — that would be a silent key rotation. A
+  # corrupt secret value fails the base64 pipeline and aborts
+  # (set -o pipefail), which is the correct posture: operator
+  # intervention beats minting a key that doesn't match the data.
+  echo "[bootstrap] rio/signing-key-pub missing; re-deriving from rio/signing-key"
+  sec_val=$(aws secretsmanager get-secret-value --secret-id rio/signing-key \
+    --query SecretString --output text)
+  key_name=${sec_val%%:*}
+  pub_b64=$(printf '%s' "${sec_val#*:}" | base64 -d | tail -c 32 | base64 -w0)
+  printf '%s:%s\n' "$key_name" "$pub_b64" > /tmp/signing-key-pub
+  aws secretsmanager create-secret --name rio/signing-key-pub \
+    --secret-string "file:///tmp/signing-key-pub"
+  echo "[bootstrap] public key (add to nix.conf trusted-public-keys):"
+  cat /tmp/signing-key-pub
 else
   echo "[bootstrap] generating rio/signing-key"
   tmp=$(mktemp -d)
@@ -43,10 +82,12 @@ else
   # Nix closure (or its LocalStore-init-under-readOnlyRootFilesystem
   # workaround) in the bootstrap image.
   rio-cli keygen "rio-$CHUNK_BUCKET" "$tmp/key.sec" "$tmp/key.pub"
-  # Pub FIRST, create||put: a half-done prior run or a delete-
-  # private-only rotation converges instead of leaving a stale
-  # pub. If we die after pub-create, retry's guard fails (private
-  # missing) → regenerate both → pub overwritten via put.
+  # Pub FIRST, create||put: in this branch the private half is
+  # MISSING, so a leftover pub from a half-done prior run is stale
+  # and must be overwritten. The private half is CREATE-ONLY — if
+  # it exists, the state probe was wrong, and letting create-secret
+  # fail (ResourceExistsException → set -e) is exactly the no-
+  # silent-rotation refusal rio-cli keygen applies to local files.
   # Public half stored separately so operators can `get-secret-
   # value` it for their nix.conf trusted-public-keys without
   # access to the private half.
@@ -55,9 +96,7 @@ else
     || aws secretsmanager put-secret-value --secret-id rio/signing-key-pub \
       --secret-string "file://$tmp/key.pub"
   aws secretsmanager create-secret --name rio/signing-key \
-    --secret-string "file://$tmp/key.sec" 2>/dev/null \
-    || aws secretsmanager put-secret-value --secret-id rio/signing-key \
-      --secret-string "file://$tmp/key.sec"
+    --secret-string "file://$tmp/key.sec"
   echo "[bootstrap] public key (add to nix.conf trusted-public-keys):"
   cat "$tmp/key.pub"
 fi
