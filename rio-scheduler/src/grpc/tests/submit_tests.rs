@@ -1129,15 +1129,19 @@ async fn test_submit_build_rejects_authoritative_input_addressed_content() {
 async fn test_submit_build_rejects_authoritative_multi_output_fixed() {
     let (_db, grpc, _handle, _task) = setup_grpc().await;
     let h = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    // Second output named to sort AFTER "out": classification runs over
+    // the name-sorted domain (nix.drv.type-classify+1), so a name
+    // sorting before "out" would surface FixedNotNamedOut instead of
+    // the MultipleFixed constraint this test pins.
     let aterm = format!(
-        r#"Derive([("out","/nix/store/{p1}-multi","r:sha256","{h}"),("dev","/nix/store/{p2}-multi-dev","r:sha256","{h}")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[])"#,
+        r#"Derive([("out","/nix/store/{p1}-multi","r:sha256","{h}"),("zzz","/nix/store/{p2}-multi-zzz","r:sha256","{h}")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[])"#,
         p1 = "f".repeat(32),
         p2 = "g".repeat(32),
     );
     let mut node = make_node("auth-multi-fixed");
     node.drv_content = aterm.into_bytes();
     node.drv_content_authoritative = true;
-    node.output_names = vec!["out".into(), "dev".into()];
+    node.output_names = vec!["out".into(), "zzz".into()];
     // 2-output fixed shape: rio-nix's strict predicates report
     // is_fixed_output=false / is_content_addressed=false for it, so the
     // node flags must agree to reach the shape rule.

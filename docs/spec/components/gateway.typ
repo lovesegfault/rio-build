@@ -1185,7 +1185,7 @@ the input-addressed and the declared-hash output-path bindings.
 The binding gates dispatch on the typed output model: shape rules
 (malformed paths, floating-with-path, fixed-without-path, mixed sets) are
 enforced once at the parse boundary (#rref("nix.drv.output-typed"),
-#rref("nix.drv.type-classify")), and the gateway's validators retain only
+#rref("nix.drv.type-classify+1")), and the gateway's validators retain only
 the SEMANTIC half — deriving paths from derivation or declared-hash
 contents and comparing. Re-introducing a divergent shape classification in
 the gateway would require re-adding data the types no longer carry.

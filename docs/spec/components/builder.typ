@@ -673,7 +673,7 @@ hand-rolled walk can reintroduce the hang.
   A derivation in which a floating content-addressed output coexists with
   an output of any other kind MUST be unrepresentable in the glue's and
   the result pipeline's input types: the drv-level classifier
-  (#rref("nix.drv.type-classify")) rejects the mix at construction with
+  (#rref("nix.drv.type-classify+1")) rejects the mix at construction with
   CppNix's wording ("can't mix derivation output types"), so neither
   component carries a re-check.
 ]

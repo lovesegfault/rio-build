@@ -693,6 +693,31 @@ mod tests {
         ));
     }
 
+    /// Duplicate output names die at the ATerm surface. The oracle's
+    /// parser would first-wins-collapse them into its `std::map`
+    /// (`outputs.emplace`, derivations.cc:473); rio's parse boundary
+    /// rejects with the oracle EVAL's wording (`output.rs` module doc,
+    /// divergence 4).
+    #[test]
+    fn parse_rejects_duplicate_output_name() {
+        let aterm = r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-test","",""),("out","/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-test2","","")],[],[],"x86_64-linux","/bin/sh",[],[("name","test"),("system","x86_64-linux")])"#;
+        let err = Derivation::parse(aterm).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                DerivationError::IllTypedOutputs(
+                    crate::derivation::DerivationTypeError::DuplicateOutputName(n)
+                ) if n == "out"
+            ),
+            "got: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("duplicate derivation output 'out'"),
+            "oracle eval wording surfaces: {err}"
+        );
+    }
+
     #[test]
     fn parse_rejects_invalid_escape() {
         let aterm = r#"Derive([("out","/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-test","","")],[],[],"x86_64-linux","/bin/sh",[],[("name","tes\x")])"#;

@@ -11,7 +11,7 @@
 //! a floating output with a declared path (derivations.cc:339-340), or
 //! a fixed output without one (`validatePath`, derivations.cc:271-275).
 //!
-//! Three deliberate divergences from the oracle, all fail-closed:
+//! Four deliberate divergences from the oracle, all fail-closed:
 //!
 //! 1. **Path validation is full `StorePath::parse`**, not the oracle's
 //!    leading-`/` check — rio's trust model forwards declared output
@@ -26,6 +26,17 @@
 //!    sentinel classifies as Fixed with an undecodable hash and is
 //!    rejected by the downstream decode gates (default experimental-
 //!    feature posture: `Xp::ImpureDerivations` is off).
+//! 4. **Duplicate output names are rejected** at classification
+//!    ([`DerivationTypeError::DuplicateOutputName`], the oracle EVAL's
+//!    posture and verbatim wording, primops.cc:1529). The oracle's
+//!    *parsers* instead first-wins-collapse duplicates into their
+//!    `std::map` (`outputs.emplace`, derivations.cc:473 ATerm /
+//!    derivations.cc:1001 wire) — but no honest `.drv` carries them
+//!    (the eval refuses to emit one), and accepting a collapse would
+//!    leave every downstream name-keyed view (validator zips, dispatch
+//!    `position()` lookups, env-mask sets) silently partial over the
+//!    positional storage. Rejecting makes name-keyed totality a parse
+//!    fact.
 //!
 //! Junk hash *values* and junk algo *names* remain representable (raw
 //! `String` fields) — the gateway's realized-offender exemption flow
@@ -438,6 +449,12 @@ pub enum DerivationTypeError {
     /// Empty output set.
     #[error("must have at least one output")]
     NoOutputs,
+    /// Two outputs share a name. The oracle's eval refuses to construct
+    /// this set (primops.cc:1529, wording verbatim); its parsers would
+    /// first-wins-collapse it (module doc, divergence 4) — rio rejects
+    /// fail-closed so name-keyed views stay total.
+    #[error("duplicate derivation output '{0}'")]
+    DuplicateOutputName(String),
 }
 
 /// The oracle's `hashAlgo` view of a floating algo string: the `r:`
@@ -449,11 +466,39 @@ fn floating_algo(raw: &str) -> &str {
     raw.strip_prefix("r:").unwrap_or(raw)
 }
 
-/// Classify an output set, mirroring the oracle's `decide` fold.
-// r[impl nix.drv.type-classify]
+/// Classify an output set, mirroring the oracle's `decide` fold over
+/// its classification domain.
+///
+/// The oracle's `BasicDerivation::type()` iterates
+/// `std::map<std::string, DerivationOutput>` — **byte-lexicographic
+/// name order** — so *which* error an ill-typed set raises depends on
+/// that order, not on wire/ATerm field order. rio stores outputs
+/// positionally (byte-faithful round-trips are load-bearing), so the
+/// fold here runs over a sorted *borrowed view*: same storage, same
+/// classification domain as the oracle, variant selection independent
+/// of input order.
+///
+/// Duplicate names are rejected before the kind fold (module doc,
+/// divergence 4).
+// r[impl nix.drv.type-classify+1]
 pub fn classify_outputs(
     outputs: &[DerivationOutput],
 ) -> Result<DerivationType, DerivationTypeError> {
+    // Sorted borrowed view == the oracle's std::map iteration order
+    // (std::less<std::string> is a byte compare; Rust's str Ord is
+    // too).
+    let mut sorted: Vec<&DerivationOutput> = outputs.iter().collect();
+    sorted.sort_by(|a, b| a.name().cmp(b.name()));
+    // Window-scan duplicates over the sorted view BEFORE classifying:
+    // a duplicate set has no oracle classification at all (the eval
+    // never constructs one), so no kind error may win over this one.
+    for w in sorted.windows(2) {
+        if w[0].name() == w[1].name() {
+            return Err(DerivationTypeError::DuplicateOutputName(
+                w[0].name().to_owned(),
+            ));
+        }
+    }
     let mut ty: Option<DerivationType> = None;
     let mut floating: Option<&str> = None;
     let decide = |new_ty: DerivationType, ty: &mut Option<DerivationType>| match *ty {
@@ -465,7 +510,7 @@ pub fn classify_outputs(
         Some(DerivationType::Fixed) => Err(DerivationTypeError::MultipleFixed),
         Some(_) => Ok(()),
     };
-    for o in outputs {
+    for o in sorted {
         match o.kind() {
             OutputKind::InputAddressed(_) => {
                 decide(DerivationType::InputAddressed { deferred: false }, &mut ty)?;
@@ -519,7 +564,7 @@ mod classify_tests {
     /// Every legal uniform shape, including the `r:`-strip floating
     /// pair (same algorithm under different methods — the
     /// false-rejection trap).
-    // r[verify nix.drv.type-classify]
+    // r[verify nix.drv.type-classify+1]
     #[test]
     fn legal_shapes() {
         assert_eq!(
@@ -540,11 +585,14 @@ mod classify_tests {
         );
     }
 
-    /// Every error variant, with the oracle's verbatim wording.
-    // r[verify nix.drv.type-classify]
+    /// Every error variant, with the oracle's verbatim wording, over
+    /// the oracle's truth table: error SELECTION follows the
+    /// name-sorted classification domain (`std::map` order), not input
+    /// order.
+    // r[verify nix.drv.type-classify+1]
     #[test]
     fn error_matrix() {
-        let cases: [(&[DerivationOutput], DerivationTypeError, &str); 6] = [
+        let cases: [(&[DerivationOutput], DerivationTypeError, &str); 7] = [
             (
                 &[ia("out", P1), floating("dev", "sha256")],
                 DerivationTypeError::Mixed,
@@ -557,8 +605,21 @@ mod classify_tests {
                 DerivationTypeError::Mixed,
                 "can't mix derivation output types",
             ),
+            // Sorted-domain truth table: "dev" < "out", so the oracle's
+            // map fold sees the mis-named fixed output FIRST and throws
+            // FixedNotNamedOut before it ever counts a second fixed
+            // output. (rio's pre-sorted-domain fold over input order
+            // returned MultipleFixed here — the merged_018 divergence.)
             (
                 &[fixed("out", P1), fixed("dev", P2)],
+                DerivationTypeError::FixedNotNamedOut,
+                "single fixed output must be named \"out\"",
+            ),
+            // "out" < "zzz": the correctly-named fixed output decides
+            // first, the second fixed output is the violation —
+            // MultipleFixed, oracle-identical.
+            (
+                &[fixed("out", P1), fixed("zzz", P2)],
                 DerivationTypeError::MultipleFixed,
                 "only one fixed output is allowed for now",
             ),
@@ -588,5 +649,92 @@ mod classify_tests {
             classify_outputs(&[floating("out", "text:sha256"), floating("dev", "sha256")]),
             Err(DerivationTypeError::FloatingAlgoMismatch)
         ));
+    }
+
+    /// Duplicate names are rejected with the oracle EVAL's verbatim
+    /// wording (primops.cc:1529), and the rejection wins over every
+    /// kind error: a duplicate set has no classification.
+    ///
+    /// `[fixed("out"), fixed("out")]` is the divergence-bearing shape:
+    /// the oracle's PARSERS would first-wins-collapse it into a single
+    /// legal fixed output (`outputs.emplace`, derivations.cc:473/1001)
+    /// — accepted — while its eval refuses to construct it. rio sides
+    /// with the eval, fail-closed (module doc, divergence 4).
+    // r[verify nix.drv.type-classify+1]
+    #[test]
+    fn duplicate_matrix() {
+        // Same shape twice (the parser-collapse divergence shape).
+        let err = classify_outputs(&[fixed("out", P1), fixed("out", P2)]).unwrap_err();
+        assert_eq!(err, DerivationTypeError::DuplicateOutputName("out".into()));
+        assert_eq!(
+            err.to_string(),
+            "duplicate derivation output 'out'",
+            "oracle eval verbatim wording"
+        );
+        // Duplicate beats Mixed.
+        assert!(matches!(
+            classify_outputs(&[ia("out", P1), floating("out", "sha256")]),
+            Err(DerivationTypeError::DuplicateOutputName(n)) if n == "out"
+        ));
+        // Duplicate beats FloatingAlgoMismatch.
+        assert!(matches!(
+            classify_outputs(&[floating("out", "sha256"), floating("out", "sha512")]),
+            Err(DerivationTypeError::DuplicateOutputName(n)) if n == "out"
+        ));
+        // Duplicate detected regardless of separation in input order.
+        assert!(matches!(
+            classify_outputs(&[ia("dev", P1), ia("out", P2), deferred("dev")]),
+            Err(DerivationTypeError::DuplicateOutputName(n)) if n == "dev"
+        ));
+    }
+
+    /// Variant selection is a function of the output SET — every
+    /// permutation of the same outputs yields the identical `Result`
+    /// (the fold domain is name-sorted, oracle `std::map` parity).
+    /// Pins the sorted domain against an "optimization" that folds in
+    /// input order again.
+    // r[verify nix.drv.type-classify+1]
+    #[test]
+    fn classification_is_permutation_invariant() {
+        fn permutations(n: usize) -> Vec<Vec<usize>> {
+            if n == 0 {
+                return vec![vec![]];
+            }
+            let mut out = Vec::new();
+            for p in permutations(n - 1) {
+                for i in 0..=p.len() {
+                    let mut q = p.clone();
+                    q.insert(i, n - 1);
+                    out.push(q);
+                }
+            }
+            out
+        }
+        const P3: &str = "/nix/store/vfhik20db6k5ff75sf3dbf6i3jymbnir-c";
+        let sets: Vec<Vec<DerivationOutput>> = vec![
+            // Legal uniform shapes.
+            vec![ia("out", P1), ia("dev", P2), ia("lib", P3)],
+            vec![floating("out", "r:sha256"), floating("dev", "sha256")],
+            // Ill-typed: fixed not-named-out wins under sorted domain.
+            vec![fixed("out", P1), fixed("dev", P2)],
+            // Ill-typed: mixed kinds.
+            vec![ia("out", P1), floating("dev", "sha256"), fixed("bin", P2)],
+            // Duplicates.
+            vec![fixed("out", P1), fixed("out", P2)],
+            // Floating algo mismatch.
+            vec![floating("out", "sha256"), floating("dev", "sha512")],
+        ];
+        for set in sets {
+            let baseline = classify_outputs(&set);
+            for perm in permutations(set.len()) {
+                let reordered: Vec<DerivationOutput> =
+                    perm.iter().map(|&i| set[i].clone()).collect();
+                assert_eq!(
+                    classify_outputs(&reordered),
+                    baseline,
+                    "order-dependent classification for permutation {perm:?}"
+                );
+            }
+        }
     }
 }

@@ -1214,6 +1214,12 @@ mod tests {
         let zeros = "00".repeat(32);
         let ones = "11".repeat(32);
         // Unrepresentable past construction (oracle type() parity).
+        // Second name chosen to sort AFTER "out" (classification runs
+        // over the name-sorted domain, nix.drv.type-classify+1): the
+        // correctly-named fixed output decides first, the second fixed
+        // output is the MultipleFixed violation this test pins. With a
+        // name sorting before "out" the oracle truth table yields
+        // FixedNotNamedOut instead (pinned in rio-nix output.rs).
         let err = BasicDerivation::new(
             vec![
                 DerivationOutput::new(
@@ -1224,7 +1230,7 @@ mod tests {
                 )
                 .unwrap(),
                 DerivationOutput::new(
-                    "lib",
+                    "zzz",
                     fod_path("sha256", &ones).as_str(),
                     "sha256",
                     ones.as_str(),

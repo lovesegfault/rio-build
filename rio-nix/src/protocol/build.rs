@@ -553,6 +553,44 @@ mod tests {
         Ok(())
     }
 
+    /// Duplicate output names die at the wire surface: the field
+    /// quadruples are individually legal (so they pass
+    /// `DerivationOutput::new`), and the set-level rejection comes
+    /// from `BasicDerivation::new`'s classification — first-wins
+    /// collapse (the oracle parser's `outputs.emplace`,
+    /// derivations.cc:1001) is not representable on rio's side of the
+    /// wire.
+    #[tokio::test]
+    async fn read_basic_derivation_rejects_duplicate_output_name() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        // outputs: two quadruples sharing the name "out".
+        wire::write_u64(&mut buf, 2).await?;
+        for path in [
+            "/nix/store/1a4dmaqd1jgkj2kk6azvzqlvk8qvpq31-a",
+            "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-b",
+        ] {
+            wire::write_string(&mut buf, "out").await?;
+            wire::write_string(&mut buf, path).await?;
+            wire::write_string(&mut buf, "").await?;
+            wire::write_string(&mut buf, "").await?;
+        }
+        // input_srcs, platform, builder, args, env — all empty/minimal.
+        wire::write_strings::<_, &str>(&mut buf, &[]).await?;
+        wire::write_string(&mut buf, "x86_64-linux").await?;
+        wire::write_string(&mut buf, "/bin/sh").await?;
+        wire::write_strings::<_, &str>(&mut buf, &[]).await?;
+        wire::write_string_pairs::<_, &str, &str>(&mut buf, &[]).await?;
+
+        let mut reader = Cursor::new(buf);
+        let err = read_basic_derivation(&mut reader).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("duplicate derivation output 'out'"),
+            "oracle eval wording surfaces through the wire error: {err}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn basic_derivation_roundtrip() -> anyhow::Result<()> {
         let outputs = vec![

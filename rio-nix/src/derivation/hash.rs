@@ -1312,7 +1312,14 @@ mod classify_first_tests {
     /// `hash_derivation_modulo` classifies before hashing: an ill-typed
     /// subject (two fixed outputs, built via the test escape hatch — no
     /// production path can construct one) is an error, never a hash.
-    // r[verify nix.drv.type-classify]
+    ///
+    /// Names chosen so `out` sorts FIRST in the classification domain
+    /// (`out` < `zzz`): the correctly-named fixed output decides, the
+    /// second fixed output is the violation — `MultipleFixed`. (With
+    /// the pre-sorted-domain names `out`/`dev`, the sorted fold sees
+    /// the mis-named output first and the error flips to
+    /// `FixedNotNamedOut` — pinned in `output.rs::error_matrix`.)
+    // r[verify nix.drv.type-classify+1]
     #[test]
     fn modulo_rejects_ill_typed_subject() {
         let h = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -1325,7 +1332,7 @@ mod classify_first_tests {
             )
             .unwrap(),
             DerivationOutput::new(
-                "dev",
+                "zzz",
                 "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-b",
                 "sha256",
                 h,
@@ -1350,5 +1357,39 @@ mod classify_first_tests {
                 .contains("only one fixed output is allowed for now"),
             "oracle wording surfaces: {err}"
         );
+    }
+
+    /// Duplicate output names (test escape hatch — both parsers reject
+    /// the shape) are an error from `hash_derivation_modulo`, never a
+    /// hash: the oracle's parser-collapsed map would hash a DIFFERENT
+    /// output multiset for these bytes, so producing any digest here
+    /// would be a silent divergence.
+    #[test]
+    fn modulo_rejects_duplicate_output_names() {
+        let p = "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-a";
+        let drv = Derivation::new_unchecked_for_tests(vec![
+            DerivationOutput::new("out", p, "", "").unwrap(),
+            DerivationOutput::new(
+                "out",
+                "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-b",
+                "",
+                "",
+            )
+            .unwrap(),
+        ]);
+        let resolve = |_: &str| -> Option<&Derivation> { None };
+        let mut cache = HashMap::new();
+        let err = hash_derivation_modulo(
+            &drv,
+            "/nix/store/vfhik20db6k5ff75sf3dbf6i3jymbnir-x.drv",
+            &resolve,
+            &mut cache,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &err,
+            DerivationError::IllTypedOutputs(DerivationTypeError::DuplicateOutputName(n))
+                if n == "out"
+        ));
     }
 }
