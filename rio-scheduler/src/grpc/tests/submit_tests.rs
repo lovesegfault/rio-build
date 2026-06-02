@@ -1307,7 +1307,7 @@ async fn test_submit_build_accepts_authoritative_fod_fallback() {
 /// CppNix accepts `outputHash` in nixbase32/base64 too — an authoritative
 /// FOD fallback whose ATerm declares the hash in nixbase32 must be accepted,
 /// and must derive to the same fixed-output path as its base16 spelling.
-// r[verify nix.hash.fod-decode]
+// r[verify nix.hash.fod-decode+1]
 #[tokio::test]
 async fn test_submit_build_accepts_nixbase32_authoritative_fod() {
     let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;

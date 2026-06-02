@@ -147,10 +147,26 @@ Notable edges:
     )[`NixHash::parse_sri`/`to_sri` handle the SRI form (`sha256-BASE64=`); `parse_colon`/`to_colon` handle the Nix colon form (`sha256:nixbase32`). `NixHash::parse` auto-detects by separator.]
 
     #r(
-      "nix.hash.fod-decode",
-    )[`NixHash::parse_nonsri_unprefixed(algo, s)` MUST be the only decoder for declared `outputHash` values (fixed-output derivations): it discriminates base16 / nixbase32 / base64 by encoded length for the given algorithm and decodes strictly with the discriminated codec, exactly like CppNix `Hash::parseNonSRIUnprefixed` (`hash.cc`). Every consumer of a declared hash — the gateway declared-hash gate, the scheduler's authoritative-content validation, the worker glue's FOD declaration check, the result pipeline's descriptor stamping, the fetcher's hash verification, the hashed-mirror env, and the modulo-hash FOD fingerprint — calls this one function, so no two components can decode the same declaration differently.]
+      "nix.hash.fod-decode+1",
+    )[`NixHash::parse_nonsri_unprefixed(algo, s)` MUST be the only decoder for declared `outputHash` values (fixed-output derivations), and it MUST discriminate the encoding — base16 / nixbase32 / base64 — by encoded length for the given algorithm, the same selection as CppNix `baseFromSize` (`hash.cc:123-143`), rejecting every other length. Every consumer of a declared hash — the gateway declared-hash gate, the scheduler's authoritative-content validation, the worker glue's FOD declaration check, the result pipeline's descriptor stamping, the fetcher's hash verification, the hashed-mirror env, and the modulo-hash FOD fingerprint — calls this one function, so no two components can decode the same declaration differently.]
 
-    Wire `narHash` fields are deliberately excluded from `nix.hash.fod-decode`: the Nix worker protocol sends them hex-only (`gw.wire.narhash-hex`), so those sites keep `hex::decode` + `NixHash::new`. The modulo fingerprint and the hashed-mirror env additionally re-encode the decoded hash to canonical lowercase base16 (CppNix `derivations.cc:904` / `fetchurl.cc` parity); undecodable hashes (unsupported algorithm, junk digest) fall back to the raw declared string there, preserving the gateway's realized-offender exemption flow. Unit-level oracle parity is the test evidence — `nix-instantiate` always emits base16, so the differential corpus cannot exercise the other encodings.
+    Within the discriminated codec rio decodes *strictly*; the deltas from the oracle's lax base64 are the registered divergence #rref("nix.divergence.fod-base64-strict"), and the undecodable-hash fallback at the fingerprint/mirror sites is #rref("nix.divergence.fod-fallback-fingerprint"). Wire `narHash` fields are deliberately excluded from `nix.hash.fod-decode+1`: the Nix worker protocol sends them hex-only (`gw.wire.narhash-hex`), so those sites keep `hex::decode` + `NixHash::new`. The modulo fingerprint and the hashed-mirror env additionally re-encode the decoded hash to canonical lowercase base16 (CppNix `derivations.cc:904` / `fetchurl.cc` parity). Unit-level oracle parity is the test evidence — `nix-instantiate` always emits base16, so the differential corpus cannot exercise the other encodings.
+
+    #r(
+      "nix.divergence.fod-base64-strict",
+    )[rio's base64 arm MUST reject what the oracle's `base64::decode` (`base-n.cc:75-112`) tolerates. The load-bearing case: non-zero trailing bits in the final data symbol — the oracle silently discards leftover bits (`base-n.cc:103-107`), so two distinct 44-character spellings decode to one digest; rio rejects the non-canonical spelling, because a declared hash names immutable content and an aliased spelling is an equivocation surface, not a convenience. Embedded newlines (skipped, `base-n.cc:96-97`) and data after the first `=` (decode stops there, `base-n.cc:94-95`) are rejected by BOTH sides at this entry point — the oracle's skip/stop shortens the payload and fails its length check (and `parseLowLevel`'s catch block, `hash.cc:145-166`, swallows the decoder's `FormatError` into that length error) — so for those two only the error class diverges. `nix-instantiate` emits canonical base16; no honest producer reaches any of these arms.]
+
+    #r(
+      "nix.divergence.fod-fallback-fingerprint",
+    )[The modulo-hash FOD fingerprint and the hashed-mirror env MUST fall back to the raw declared string when the declared hash is undecodable by rio (unsupported algorithm — the oracle's `parseHashAlgo` accepts `md5` and `blake3`, `hash.cc:468-490`, where rio's `HashAlgo` does not — or a junk digest), keeping the fallback stable across versions and never erroring. The fallback preserves the gateway's realized-offender exemption flow. Closing this divergence (decoding the oracle's full algorithm set) would change every fingerprint derived through the fallback and therefore reprices as a frozen-fingerprint migration over the persisted `drv_modulo_cache` (M_068) — close-vs-document is a recorded follow-up decision, not a default.]
+
+    #r(
+      "nix.divergence.output-path-parse",
+    )[Declared output paths MUST get full `StorePath::parse` where the oracle's `validatePath` checks only the leading `/` (`derivations.cc:271-275`): rio forwards declared paths to workers and joins them against the overlay upper store, so "parses as a store path" is the load-bearing property, fail-closed.]
+
+    #r(
+      "nix.divergence.hash-without-algo",
+    )[A declared `hash` without a `hashAlgo` MUST be rejected at the parse boundary where the oracle silently drops the orphan hash on unparse (`derivations.cc:346` reads the pair only under a non-empty algo): byte-faithful round-trips are load-bearing in rio, and no honest producer emits the shape.]
 
     #r(
       "nix.narinfo.verify-sig",

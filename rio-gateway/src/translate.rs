@@ -901,7 +901,7 @@ pub(crate) fn validate_declared_hash_outputs(
     })?;
     // Length-discriminated decode (base16 / nixbase32 / base64) — CppNix
     // accepts all three encodings for outputHash, so the gate must too.
-    // r[impl nix.hash.fod-decode]
+    // r[impl nix.hash.fod-decode+1]
     let hash = NixHash::parse_nonsri_unprefixed(algo, raw_hash).map_err(|e| {
         format!(
             "derivation {drv_path} output '{name}': outputHash is not a valid base16, \
@@ -2536,7 +2536,7 @@ mod tests {
 
         // Honest flat-sha256 and r:sha256 declarations → accepted, in
         // every encoding CppNix accepts (base16 / nixbase32 / base64).
-        // r[verify nix.hash.fod-decode]
+        // r[verify nix.hash.fod-decode+1]
         use base64::Engine;
         let encodings = [
             hex_hash.clone(),

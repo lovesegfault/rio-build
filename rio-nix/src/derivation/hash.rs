@@ -82,7 +82,8 @@ pub fn hash_derivation_modulo_input_form<'c>(
 /// FODs whose hashes rio cannot verify, and their fingerprints must stay
 /// stable — failing here would turn an admission-policy decision into a
 /// hash error deep inside the modulo walk.
-// r[impl nix.hash.fod-decode]
+// r[impl nix.hash.fod-decode+1]
+// r[impl nix.divergence.fod-fallback-fingerprint]
 fn canonical_fod_hash(raw_algo: &str, raw_hash: &str) -> String {
     use crate::hash::{HashAlgo, NixHash};
 
@@ -400,7 +401,7 @@ mod hash_derivation_modulo_tests {
     /// `HashFormat::Base16`), so the same digest declared in base16,
     /// nixbase32, or base64 yields the SAME modulo hash — and therefore
     /// the same realisation keys.
-    // r[verify nix.hash.fod-decode]
+    // r[verify nix.hash.fod-decode+1]
     #[test]
     fn fod_hash_canonicalizes_declared_encoding() -> anyhow::Result<()> {
         use base64::Engine;
@@ -449,7 +450,8 @@ mod hash_derivation_modulo_tests {
     /// An undecodable declared hash (unsupported algo, junk digest) keeps
     /// the raw string in the fingerprint — stable across versions, never an
     /// error. The gateway's offender-exemption flow depends on this.
-    // r[verify nix.hash.fod-decode]
+    // r[verify nix.hash.fod-decode+1]
+    // r[verify nix.divergence.fod-fallback-fingerprint]
     #[test]
     fn fod_hash_undecodable_falls_back_to_raw() -> anyhow::Result<()> {
         use sha2::{Digest, Sha256};

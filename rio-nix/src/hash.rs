@@ -199,7 +199,8 @@ impl NixHash {
     ///
     /// NOT for wire `narHash` fields — those are hex-only by protocol
     /// (`gw.wire.narhash-hex`) and keep using `hex::decode` + `NixHash::new`.
-    // r[impl nix.hash.fod-decode]
+    // r[impl nix.hash.fod-decode+1]
+    // r[impl nix.divergence.fod-base64-strict]
     pub fn parse_nonsri_unprefixed(algo: HashAlgo, s: &str) -> Result<Self, HashError> {
         let digest = if s.len() == algo.base16_len() {
             hex::decode(s)
@@ -351,7 +352,7 @@ mod tests {
     /// CppNix `Hash::parseNonSRIUnprefixed` parity: every algorithm accepts
     /// its digest in all three encodings, discriminated by length, and the
     /// three decode to the same digest.
-    // r[verify nix.hash.fod-decode]
+    // r[verify nix.hash.fod-decode+1]
     #[test]
     fn test_parse_nonsri_unprefixed_encoding_matrix() -> anyhow::Result<()> {
         use base64::Engine;
@@ -382,7 +383,7 @@ mod tests {
     /// The decode for each discriminated encoding is strict: a string of the
     /// right LENGTH but invalid alphabet for that encoding is rejected, never
     /// reinterpreted as another encoding.
-    // r[verify nix.hash.fod-decode]
+    // r[verify nix.hash.fod-decode+1]
     #[test]
     fn test_parse_nonsri_unprefixed_strict_per_encoding() {
         // 64 chars (sha256 base16 length) but not valid hex.
@@ -407,7 +408,7 @@ mod tests {
 
     /// A digest whose length matches none of the three encodings for the
     /// algorithm is rejected with the oracle's "wrong length" error shape.
-    // r[verify nix.hash.fod-decode]
+    // r[verify nix.hash.fod-decode+1]
     #[test]
     fn test_parse_nonsri_unprefixed_wrong_length_rejected() {
         for len in [0usize, 1, 43, 45, 51, 53, 63, 65, 129] {
@@ -423,7 +424,7 @@ mod tests {
     /// Round-trip: parse each encoding then re-render canonical hex — the
     /// canonicalization every consumer (modulo fingerprint, hashed-mirror
     /// env) relies on.
-    // r[verify nix.hash.fod-decode]
+    // r[verify nix.hash.fod-decode+1]
     #[test]
     fn test_parse_nonsri_unprefixed_canonical_hex() -> anyhow::Result<()> {
         let reference = NixHash::compute(HashAlgo::SHA256, b"canonical");
@@ -472,7 +473,7 @@ mod tests {
 
             /// Any digest round-trips through all three non-SRI encodings via
             /// the length-discriminated parser.
-            // r[verify nix.hash.fod-decode]
+            // r[verify nix.hash.fod-decode+1]
             #[test]
             fn nonsri_unprefixed_roundtrip_all_encodings(h in arb_nixhash()) {
                 use base64::Engine;
@@ -507,5 +508,70 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// ADVERSARIAL pins (not oracle-derived — `nix-instantiate` emits
+    /// canonical base16 only, so no oracle emitter produces these).
+    /// Each input is built at the exact sha256 base64 length (44) so it
+    /// reaches the base64 arm, and each pins a divergence from CppNix
+    /// `base64::decode` (`base-n.cc:75-112`):
+    ///
+    /// - trailing-bit garbage: the oracle DISCARDS leftover bits
+    ///   (`base-n.cc:103-107`), so `…A=` and `…B=` alias one digest —
+    ///   the oracle ACCEPTS the non-canonical spelling, rio rejects it.
+    /// - embedded newline: the oracle SKIPS `\n` (`base-n.cc:96-97`),
+    ///   shortening the payload; its own length check then rejects, so
+    ///   both sides reject — only the error class diverges (rio: base64
+    ///   decode error; oracle: BadHash length, with the decoder's
+    ///   FormatError swallowed by `parseLowLevel`'s catch,
+    ///   `hash.cc:145-166`).
+    /// - data after `=`: the oracle STOPS at the first `=`
+    ///   (`base-n.cc:94-95`); same both-reject, error-class-only delta.
+    // r[verify nix.divergence.fod-base64-strict]
+    #[test]
+    fn base64_arm_pins_oracle_lax_divergences() {
+        use base64::Engine;
+        let canonical = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        assert_eq!(canonical.len(), 44);
+        assert!(canonical.ends_with("AA=")); // 4 unused trailing bits
+
+        // Canonical spelling decodes.
+        assert!(NixHash::parse_nonsri_unprefixed(HashAlgo::SHA256, &canonical).is_ok());
+
+        // Trailing-bit garbage: flip the final data symbol 'A'→'B'
+        // (low bits 000001 land in the discarded region). Oracle:
+        // same digest as canonical. rio: rejected.
+        let trailing = format!("{}B=", &canonical[..42]);
+        assert!(matches!(
+            NixHash::parse_nonsri_unprefixed(HashAlgo::SHA256, &trailing),
+            Err(HashError::InvalidBase64)
+        ));
+
+        // Embedded newline at base64 length.
+        let newline = format!("{}\n{}", &canonical[..20], &canonical[21..]);
+        assert_eq!(newline.len(), 44);
+        assert!(matches!(
+            NixHash::parse_nonsri_unprefixed(HashAlgo::SHA256, &newline),
+            Err(HashError::InvalidBase64)
+        ));
+
+        // Early '=' with data after it, still 44 chars.
+        let early_eq = format!("{}={}", &canonical[..20], &canonical[21..]);
+        assert_eq!(early_eq.len(), 44);
+        assert!(matches!(
+            NixHash::parse_nonsri_unprefixed(HashAlgo::SHA256, &early_eq),
+            Err(HashError::InvalidBase64)
+        ));
+    }
+
+    /// ADVERSARIAL pin: the oracle's `parseHashAlgo` accepts `md5`
+    /// (`hash.cc:468-490`); rio's `HashAlgo` does not — an md5
+    /// declaration is undecodable here and survives only through the
+    /// raw-string fingerprint fallback
+    /// (`nix.divergence.fod-fallback-fingerprint`).
+    // r[verify nix.divergence.fod-fallback-fingerprint]
+    #[test]
+    fn md5_spelling_is_a_registered_divergence() {
+        assert!("md5".parse::<HashAlgo>().is_err());
     }
 }

@@ -470,7 +470,7 @@ fn populate_fixed_output_descriptors(
                     message: format!("unsupported outputHashAlgo '{raw_algo}'"),
                 })?;
         // Shared length-discriminated decode (base16 / nixbase32 / base64).
-        // r[impl nix.hash.fod-decode]
+        // r[impl nix.hash.fod-decode+1]
         let hash = NixHash::parse_nonsri_unprefixed(algo, o.hash()).map_err(|e| {
             OutputRejection::FodDeclaredHashInvalid {
                 output: o.name().to_owned(),

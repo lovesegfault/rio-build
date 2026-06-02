@@ -115,6 +115,8 @@ impl DerivationOutput {
     ///   must not declare paths)
     /// - `hash` without `hash_algo`
     // r[impl nix.drv.output-typed]
+    // r[impl nix.divergence.output-path-parse]
+    // r[impl nix.divergence.hash-without-algo]
     pub fn new(
         name: impl Into<String>,
         path: impl Into<String>,
@@ -290,6 +292,8 @@ mod tests {
     /// Constructor rejection matrix: every banned shape, with the
     /// oracle's wording where the oracle has one.
     // r[verify nix.drv.output-typed]
+    // r[verify nix.divergence.output-path-parse]
+    // r[verify nix.divergence.hash-without-algo]
     #[test]
     fn rejection_matrix() {
         // empty name

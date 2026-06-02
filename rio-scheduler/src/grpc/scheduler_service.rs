@@ -638,7 +638,7 @@ fn validate_fixed_output_binding(
     // Shared length-discriminated decode (base16 / nixbase32 / base64) —
     // identical to the gateway gate and the worker glue, so no component
     // can decode the same declaration differently.
-    // r[impl nix.hash.fod-decode]
+    // r[impl nix.hash.fod-decode+1]
     let nix_hash = NixHash::parse_nonsri_unprefixed(parsed_algo, hash).map_err(|e| {
         Status::invalid_argument(format!(
             "{context} output '{out_name}': outputHash is not a valid base16, nixbase32, or \

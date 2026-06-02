@@ -172,7 +172,7 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
         // parser (base16 / nixbase32 / base64) — the same function every
         // other component uses, so a declaration accepted at submission
         // can never fail to decode here.
-        // r[impl nix.hash.fod-decode]
+        // r[impl nix.hash.fod-decode+1]
         let expected =
             rio_nix::hash::NixHash::parse_nonsri_unprefixed(algo.as_nix_hash_algo(), output.hash())
                 .with_context(|| {

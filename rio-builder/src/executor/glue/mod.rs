@@ -603,7 +603,7 @@ fn validate_fixed_output_declarations(
         // Length-discriminated decode (base16 / nixbase32 / base64) — the
         // shared CppNix-parity parser. Defense-in-depth: the gateway gate
         // already decoded the same declaration with the same function.
-        // r[impl nix.hash.fod-decode]
+        // r[impl nix.hash.fod-decode+1]
         let hash = NixHash::parse_nonsri_unprefixed(algo, o.hash()).map_err(|e| {
             GlueError::FixedOutputHashInvalid {
                 output: o.name().to_owned(),
@@ -1062,7 +1062,7 @@ mod tests {
     /// derived output path. (The full three-encoding matrix is pinned in
     /// rio-nix's own tests; base64 is omitted here so rio-builder needs no
     /// base64 dependency.)
-    // r[verify nix.hash.fod-decode]
+    // r[verify nix.hash.fod-decode+1]
     #[test]
     fn fixed_output_nixbase32_declaration_is_accepted() {
         let digest = vec![0u8; 32];
