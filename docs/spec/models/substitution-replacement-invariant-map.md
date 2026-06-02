@@ -218,8 +218,8 @@ orchestrator ratification:
 
 | ID | Deviation | Status |
 |---|---|---|
-| **PD-15b** (proposed, Wave 2) | T-2.1's two new RPCs force tonic-generated REQUIRED trait methods on `executor_service.rs` — the tonic-service analog of dormancy-1/RB-1/RB-2 that the adversarial review enumerated for three mechanisms but missed for the fourth. Resolution: both handlers implemented as the dormant Phase-A arms the plan's own proto comments specify (list → empty; progress → ack-and-drop), in the forcing commit (`319050570`). T-3.3 later replaced the listing stub with the real handler per its task spec. | Ratified by execution (the orchestrator accepted Wave 2's record; the resolution is what the plan's wire-contract text requires). |
-| **PD-21** (proposed, Wave 5) | The plan-literal quint wiring (extend `quint-retry-policy-pull`'s own step + invariant list) is arithmetically incompatible with stop-condition 8: the materialization counters multiply the 39.7M-state space ≥6× (minimum ceilings) vs the 2× threshold. Adaptation: ENABLE_MATERIALIZATION regime split — the existing check's attr/list/space stay untouched (stricter dormancy than the plan's exception clause); the 16-invariant list lives in the NEW coexistence-regime check where the partition invariants are non-vacuous. | Ratified by execution (Wave 5's record; preserves every Wave-5 acceptance obligation within budget; the literal form cannot meet stop-condition 8 as written). |
+| **PD-15b** (proposed, Wave 2) | T-2.1's two new RPCs force tonic-generated REQUIRED trait methods on `executor_service.rs` — the tonic-service analog of dormancy-1/RB-1/RB-2 that the adversarial review enumerated for three mechanisms but missed for the fourth. Resolution: both handlers implemented as the dormant Phase-A arms the plan's own proto comments specify (list → empty; progress → ack-and-drop), in the forcing commit (`319050570`). T-3.3 later replaced the listing stub with the real handler per its task spec. | Ratified by execution (the orchestrator accepted Wave 2's record; the resolution is what the plan's wire-contract text requires). **Counter-signed: owner, 2026-06-01 (round-2 final decision gate; signature line applied at the A6 close-out).** |
+| **PD-21** (proposed, Wave 5) | The plan-literal quint wiring (extend `quint-retry-policy-pull`'s own step + invariant list) is arithmetically incompatible with stop-condition 8: the materialization counters multiply the 39.7M-state space ≥6× (minimum ceilings) vs the 2× threshold. Adaptation: ENABLE_MATERIALIZATION regime split — the existing check's attr/list/space stay untouched (stricter dormancy than the plan's exception clause); the 16-invariant list lives in the NEW coexistence-regime check where the partition invariants are non-vacuous. | Ratified by execution (Wave 5's record; preserves every Wave-5 acceptance obligation within budget; the literal form cannot meet stop-condition 8 as written). **Counter-signed: owner, 2026-06-01 (round-2 final decision gate; signature line applied at the A6 close-out).** |
 
 Plan-recorded decisions exercised with notable in-execution detail:
 
@@ -634,6 +634,15 @@ plan-text artifact, not a design decision); implemented + spec-bumped in
 `c952e5a51`; T-3.1 re-verified green in both branches post-fix. The ruling
 record rides this map **pending owner counter-signature** (the design
 §10/§2.4 text is owner-controlled).
+
+> **Counter-signed: owner, 2026-06-01 (round-2 final decision gate).**
+> The mark-discriminator ruling stands as written — no overrule; the B2
+> fix and `sched.materialize.routing+2` are final. This signature
+> satisfies C′ entry criterion 2, and the C′ record's GO condition 1
+> below is resolved by it. Post-D′ the discriminator is carried in the
+> pruned-ORIGIN form (`sched.materialize.routing+3`, PD-D1) — the same
+> ruling re-keyed when migration 080 deleted the mark column. Signature
+> line applied at the A6 close-out.
 
 ### The findings/deviations ledger (all 21, with dispositions)
 
@@ -1089,6 +1098,10 @@ outside this phase's authority:
    still pending) — the model encodes the orchestrator's ruling
    (`sched.materialize.routing+2`); an overrule re-opens Δ1's
    encoding and the F8/F9/B1 calibration rows together with B2.
+   **Resolved: counter-signed, owner, 2026-06-01 (round-2 final
+   decision gate — the same decision authorized D′).** No overrule;
+   Δ1's encoding and the F8/F9/B1 rows stand. Signature line applied
+   at the A6 close-out (the Phase B record's finding-11 note above).
 2. **The orchestrator's full-gate run at integration** (criterion 5's
    gate half) — every new check built green individually at this tip
    (43/43), tracey-validate and treefmt are green, and zero existing

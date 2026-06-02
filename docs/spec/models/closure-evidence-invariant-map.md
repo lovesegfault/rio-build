@@ -2312,7 +2312,7 @@ Every owner decision this campaign executed under, with date and Phase-1 outcome
 | 2026-05-30 (Wave-2b checkpoint) | The Wave-2 residual finding takes disposition (b): spec-conformance fix, both halves together (co-ownership scoping AND poison-clear survivor re-evaluation) | FIXED Wave 2b red-first; new rule `sched.poison.clear-survivor-reevaluation`; the red-half TLC run (scoping without promotion re-finds the strand) is the recorded proof the halves are jointly load-bearing. |
 | 2026-05-30 (Phase-0 checkpoint, decision 2) | FENCE EVERYTHING — uniform claims-floor on every evidence write (~10 statements), not just the merge tx + W2/W5 | Implemented Wave 3: 10 statements + the merge tx + 8 owning transactions (the execution found 5 more owning transactions than the plan's enumeration — the Phase-1b failure-classification handlers; identical fence pattern). A17/A18 flipped to HOLDS, Wave 4. |
 | 2026-05-30 (Phase-0 checkpoint, decision 3) | RAISE THE MERGE-GATE BUDGET — 15–30 min checks allowed; wire every exhaustive conjunction that converges at 30 min; the rest stay documented manual targets | **The "wire every converging conjunction" set is empty — by physics, not by omission.** All seven candidates were measured at 35 min / 60 workers; none converges (Wave-4 §5). The pre-registered contingency (adjudication OQ6) applied: the `longChecks` Tier-2 mechanism is implemented, verified end-to-end, and ships empty; all seven conjunctions are documented manual targets with zero-violation bounded-prefix records. The owner counter-signs this as the accepted decision-3 residual, or commissions the Track E bare-metal formal-long lane. |
-| 2026-05-30 (Phase-0 checkpoint, decision 4) | A17 and L2 MUST be wired CI checks before close-out (long-budget TLC, or the rust-simulator constructor) | Delivered Wave 4 via the rust-simulator route the decision's text authorizes: holdsInSim + expect-violation-pin pairs (`stale-fence-holds` + `calib-a17-unfenced` for A17/A18; `settlement-holds` + `calib-c3-no-reprobe` for C3/L2). **L2 is wired in the ARMED form** — an orchestrator call within decision-4 intent (the 0b state form is unsatisfiable under the owner's own chosen fix design — findings RT-3/MCI-1/FC-3); flagged for owner counter-signature. |
+| 2026-05-30 (Phase-0 checkpoint, decision 4) | A17 and L2 MUST be wired CI checks before close-out (long-budget TLC, or the rust-simulator constructor) | Delivered Wave 4 via the rust-simulator route the decision's text authorizes: holdsInSim + expect-violation-pin pairs (`stale-fence-holds` + `calib-a17-unfenced` for A17/A18; `settlement-holds` + `calib-c3-no-reprobe` for C3/L2). **L2 is wired in the ARMED form** — an orchestrator call within decision-4 intent (the 0b state form is unsatisfiable under the owner's own chosen fix design — findings RT-3/MCI-1/FC-3); flagged for owner counter-signature. **Counter-signed: owner, 2026-06-01 (round-2 final decision gate; signature line applied at the substitution-replacement A6 close-out).** |
 
 Orchestrator calls made within owner-decision intent, flagged for counter-signature at
 the Phase-2 / campaign close-out: (1) the L2 armed form (above); (2) the Wave-1 battery
@@ -2320,6 +2320,12 @@ enumeration correction (8 tests / 9 cases updated vs the plan's 5, all sharing t
 pre-fix-pinning signature); (3) the Wave-3 fence enumeration correction (+5 owning
 transactions); (4) the Wave-4 C3-pin scope deviation (Duo constants instead of C3Duo,
 on measured hit rates).
+
+**Counter-signed: owner, 2026-06-01 (round-2 final decision gate)** — all four
+orchestrator calls above, as flagged (the L2 armed form additionally carries its
+per-ruling signature at the decision-4 row). Signature lines applied at the
+substitution-replacement A6 close-out; see
+`substitution-replacement-invariant-map.md` § "Campaign close-out".
 
 ### What Phase 1 does NOT claim
 
