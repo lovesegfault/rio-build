@@ -514,6 +514,17 @@ pub async fn execute(
         let tree = Arc::clone(&tree);
         tokio::task::spawn_blocking(move || observe_then_reap(&tree, intermediate))
     };
+    // The status reader exists from the moment a forked child can
+    // write a setup report — BEFORE the first abortable step — so the
+    // teardown path below can surface a typed failure instead of
+    // discarding it with the dropped read end.
+    // r[impl builder.exec.setup-error-surfaced]
+    let status_task = tokio::task::spawn_blocking(move || read_status_pipe(status_r));
+    let sandbox = SpawnedSandbox {
+        tree_guard,
+        wait_task,
+        status_task,
+    };
 
     // ---- Cgroup attach, then the go byte ----------------------------------
     // The intermediate (and through fork inheritance the whole sandbox
@@ -527,21 +538,35 @@ pub async fn execute(
             format!("{}\n", intermediate.as_raw()),
         )
     {
-        return abort_spawn(e, "attach the sandbox to the cgroup", tree_guard, wait_task).await;
+        return Err(sandbox
+            .abort(
+                e,
+                "attach the sandbox to the cgroup",
+                &bind_targets,
+                &special_targets,
+            )
+            .await);
     }
     if let Err(e) = nix::unistd::write(&go_w, &[1u8]) {
-        return abort_spawn(
-            std::io::Error::from(e),
-            "signal the sandbox to proceed",
-            tree_guard,
-            wait_task,
-        )
-        .await;
+        return Err(sandbox
+            .abort(
+                std::io::Error::from(e),
+                "signal the sandbox to proceed",
+                &bind_targets,
+                &special_targets,
+            )
+            .await);
     }
     drop(go_w);
 
     // ---- Readers -----------------------------------------------------------
-    let status_task = tokio::task::spawn_blocking(move || read_status_pipe(status_r));
+    // Past the last abortable step: the supervision loop owns the
+    // parts from here (the guard stays alive to the end of execute()).
+    let SpawnedSandbox {
+        tree_guard: _tree_guard,
+        wait_task,
+        status_task,
+    } = sandbox;
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<LogChunk>(LOG_CHUNK_CHANNEL_CAPACITY);
     let (meter, meter_bytes, activity_rx) = ActivityMeter::new();
     spawn_log_readers(parent_capture, &chunk_tx, &meter);
@@ -727,23 +752,7 @@ pub async fn execute(
     // ---- Interpret ----------------------------------------------------------
     match status_report {
         Some(StatusReport::SetupFailed(err)) => {
-            // Resolve indexed phases back to the path they were
-            // operating on so the operator-facing log names it.
-            let entry = match err.phase {
-                SetupPhase::Bind | SetupPhase::BindRemount => {
-                    bind_targets.get(usize::from(err.detail))
-                }
-                SetupPhase::MountSpecial => special_targets.get(usize::from(err.detail)),
-                _ => None,
-            };
-            tracing::warn!(
-                phase = err.phase.describe(),
-                errno = err.errno,
-                detail = err.detail,
-                path = entry.map(|p| p.display().to_string()),
-                "sandbox setup failed"
-            );
-            return Err(ExecError::Setup(err));
+            return Err(setup_failure_to_error(err, &bind_targets, &special_targets));
         }
         Some(StatusReport::Corrupt) => {
             return Err(ExecError::Spawn(std::io::Error::other(
@@ -1337,23 +1346,89 @@ fn spawn_err<E: Into<std::io::Error>>(what: &'static str) -> impl FnOnce(E) -> E
     }
 }
 
-/// Early-error path between fork and the supervision loop: kill the
-/// just-forked tree, reap it, and return a `Spawn` error.
-async fn abort_spawn(
-    error: std::io::Error,
-    what: &'static str,
+/// Resolve an indexed setup phase to the path it was operating on and
+/// emit the structured warn plus the typed error. Shared by the
+/// post-go interpret arm and the pre-go abort path, so a setup failure
+/// is reported identically wherever it surfaces.
+// r[impl builder.exec.setup-error-surfaced]
+fn setup_failure_to_error(
+    err: SetupError,
+    bind_targets: &[PathBuf],
+    special_targets: &[PathBuf],
+) -> ExecError {
+    let entry = match err.phase {
+        SetupPhase::Bind | SetupPhase::BindRemount => bind_targets.get(usize::from(err.detail)),
+        SetupPhase::MountSpecial => special_targets.get(usize::from(err.detail)),
+        _ => None,
+    };
+    tracing::warn!(
+        phase = err.phase.describe(),
+        errno = err.errno,
+        detail = err.detail,
+        path = entry.map(|p| p.display().to_string()),
+        "sandbox setup failed"
+    );
+    ExecError::Setup(err)
+}
+
+/// The triplet that exists from the moment the sandbox is forked: the
+/// RAII kill guard, the reaper task, and the status-pipe reader. Built
+/// atomically at fork time, so every teardown path owns all three —
+/// there is no pre-go window in which a setup failure can be reported
+/// but nothing is positioned to read it.
+// r[impl builder.exec.setup-error-surfaced]
+struct SpawnedSandbox {
     tree_guard: ProcessTreeGuard,
     wait_task: tokio::task::JoinHandle<Result<i32, std::io::Error>>,
-) -> Result<ExecutionOutcome, ExecError> {
-    // Dropping the guard kills the adopted tree; the attached wait
-    // task then reaps it (awaited so the tree is fully gone before the
-    // error propagates).
-    drop(tree_guard);
-    let _ = wait_task.await;
-    Err(ExecError::Spawn(std::io::Error::new(
-        error.kind(),
-        format!("failed to {what}: {error}"),
-    )))
+    status_task: tokio::task::JoinHandle<StatusReport>,
+}
+
+impl SpawnedSandbox {
+    /// Early-error teardown between fork and the supervision loop:
+    /// kill the tree, reap it, then drain the status pipe and prefer a
+    /// decoded setup failure over the generic abort cause — the child
+    /// usually died of a reportable setup error first, and that error
+    /// (not the cgroup/go-pipe symptom it caused) is the diagnosis.
+    /// The error classification is unchanged either way (both arms are
+    /// worker-local infrastructure failures); this is diagnosis
+    /// fidelity, not routing.
+    ///
+    /// The drain is bounded: by the time the reap completes, every
+    /// write end of the status pipe is closed (the parent's copy
+    /// dropped inside the fork closure; the children's copies died
+    /// with the tree), so the reader sees a full report or EOF — it
+    /// cannot block.
+    // r[impl builder.exec.setup-error-surfaced]
+    async fn abort(
+        self,
+        error: std::io::Error,
+        what: &'static str,
+        bind_targets: &[PathBuf],
+        special_targets: &[PathBuf],
+    ) -> ExecError {
+        let SpawnedSandbox {
+            tree_guard,
+            wait_task,
+            status_task,
+        } = self;
+        // Dropping the guard kills the adopted tree; the attached wait
+        // task then reaps it (awaited so the tree is fully gone before
+        // the error propagates).
+        drop(tree_guard);
+        let _ = wait_task.await;
+        match status_task.await.unwrap_or(StatusReport::Corrupt) {
+            StatusReport::SetupFailed(err) => {
+                setup_failure_to_error(err, bind_targets, special_targets)
+            }
+            // EOF is the "exec'd" convention on the happy path; here it
+            // only means the child died without reporting (usually from
+            // our own kill). Keep the generic abort cause for it and
+            // for undecodable reports.
+            StatusReport::ExecStarted | StatusReport::Corrupt => ExecError::Spawn(
+                std::io::Error::new(error.kind(), format!("failed to {what}: {error}")),
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2320,6 +2395,94 @@ mod tests {
             !tree.kill_tree(),
             "a reaped tree is unkillable; no signal may chase the pid"
         );
+    }
+
+    /// Build a [`SpawnedSandbox`] over a sleeper child plus a
+    /// hand-fed status pipe (the write end stays with the test).
+    fn sandbox_parts() -> (SpawnedSandbox, OwnedFd) {
+        let tree = TreeState::new(None);
+        let (_child, pid) = spawn_sleeper();
+        tree.adopt(pid).expect("adopt");
+        tree.attach_reaper();
+        let tree_guard = ProcessTreeGuard {
+            state: Arc::clone(&tree),
+        };
+        let wait_task = {
+            let tree = Arc::clone(&tree);
+            tokio::task::spawn_blocking(move || observe_then_reap(&tree, pid))
+        };
+        let (status_r, status_w) = make_pipe().expect("status pipe");
+        let status_task = tokio::task::spawn_blocking(move || read_status_pipe(status_r));
+        (
+            SpawnedSandbox {
+                tree_guard,
+                wait_task,
+                status_task,
+            },
+            status_w,
+        )
+    }
+
+    /// THE bug_101 pin: a typed setup failure written before the abort
+    /// (the child died of a reportable error; the cgroup attach then
+    /// failed as a symptom) surfaces as `ExecError::Setup` with the
+    /// failing phase and errno — not as the generic abort cause.
+    // r[verify builder.exec.setup-error-surfaced]
+    #[tokio::test]
+    async fn abort_surfaces_typed_setup_error() {
+        let (sandbox, status_w) = sandbox_parts();
+        let report = SetupError {
+            phase: SetupPhase::FdSweep,
+            errno: libc::EPERM,
+            detail: 0,
+        };
+        nix::unistd::write(&status_w, &report.to_bytes()).expect("write report");
+        drop(status_w);
+
+        let got = sandbox
+            .abort(
+                std::io::Error::from_raw_os_error(libc::ESRCH),
+                "attach the sandbox to the cgroup",
+                &[],
+                &[],
+            )
+            .await;
+        match got {
+            ExecError::Setup(err) => {
+                assert_eq!(err.phase, SetupPhase::FdSweep);
+                assert_eq!(err.errno, libc::EPERM);
+            }
+            other => panic!("expected the typed setup error, got {other:?}"),
+        }
+    }
+
+    /// EOF on the status pipe (the child died without reporting —
+    /// normally from the abort's own kill) keeps the generic abort
+    /// cause naming the step that failed.
+    // r[verify builder.exec.setup-error-surfaced]
+    #[tokio::test]
+    async fn abort_eof_keeps_generic_spawn_error() {
+        let (sandbox, status_w) = sandbox_parts();
+        drop(status_w); // EOF, no report
+
+        let got = sandbox
+            .abort(
+                std::io::Error::from_raw_os_error(libc::ESRCH),
+                "attach the sandbox to the cgroup",
+                &[],
+                &[],
+            )
+            .await;
+        match got {
+            ExecError::Spawn(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("attach the sandbox to the cgroup"),
+                    "the abort cause must name the failed step: {msg}"
+                );
+            }
+            other => panic!("expected the generic spawn error, got {other:?}"),
+        }
     }
 
     /// Readers gone + tree settled = nothing left to enforce: the

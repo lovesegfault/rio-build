@@ -858,6 +858,30 @@ input classes --- strictly tighter, per class, than both the pre-FU1
 256-slot channel bound (whose max-line class allowed ≈ 256 MiB) and the
 payload-only byte cap (whose zero-payload class was unbounded).
 
+#r("builder.exec.setup-error-surfaced")[
+  A sandbox-setup failure reported on the status pipe MUST reach the
+  caller as the typed setup error (failing phase, errno, and resolved
+  path for indexed phases) even when the supervisor abandons the spawn
+  before the go signal: the abort path MUST kill and reap the tree,
+  then drain the status pipe, and prefer a decoded setup report over
+  the generic abort cause.
+]
+
+The status reader exists from the instant the fork can produce a
+report --- before the first abortable step --- so there is no pre-go
+window in which a child can report a failure that nothing is positioned
+to read. The drain is bounded by construction: once the reap has
+completed, every write end of the status pipe is closed (the parent's
+copy drops inside the fork closure; the children's copies die with the
+tree), so the reader sees a full report or EOF. The pre-go report
+producers are real since the fd-sweep landed as the forked children's
+first setup step; before this rule, their typed reports were discarded
+and the caller saw only the downstream symptom (a cgroup attach failing
+`ESRCH` against a child that had already died of the actual error).
+Classification is unchanged --- both the typed and the generic arm are
+worker-local infrastructure failures; the rule is about diagnosis
+fidelity.
+
 #r("builder.retry.infra-transient")[
   The build-spawn loop retries `execute_build` locally when the failure is a
   transient worker-local infrastructure failure --- sandbox setup
