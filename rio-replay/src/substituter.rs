@@ -80,9 +80,11 @@ impl Substituter {
     /// at a non-public address or a non-https scheme aborts the fetch —
     /// spec- and archive-provided caches must not be able to steer the
     /// engine at internal endpoints via `Location` headers. Narinfo `URL:`
-    /// fields cannot steer it either: the object join refuses values that
-    /// leave the cache's origin (see [`NormalizedCacheBase::object_url`]),
-    /// so cross-origin handoffs only happen via those screened redirects.
+    /// fields cannot steer it either, with a per-arm screen: the HTTP arm
+    /// joins object names through [`NormalizedCacheBase::object_url`],
+    /// which refuses values that leave the cache's origin, and the S3 arm
+    /// derives its object keys through [`s3_object_key`], which refuses
+    /// names that do not stay strictly under the cache's key prefix.
     pub async fn parse(url: &str) -> Result<Self> {
         let parsed =
             reqwest::Url::parse(url).with_context(|| format!("invalid substituter URL {url:?}"))?;
@@ -224,7 +226,7 @@ impl Substituter {
                 bucket,
                 prefix,
             } => {
-                let key = format!("{prefix}{object}");
+                let key = s3_object_key(bucket, prefix, &object)?;
                 let send = client.get_object().bucket(bucket).key(&key).send();
                 let resp = match tokio::time::timeout(NARINFO_TIMEOUT, send).await {
                     Err(_) => bail!(
@@ -310,10 +312,16 @@ impl Substituter {
     /// returns the expected decompressed size (`info.nar_size`) and a reader
     /// of the decompressed bytes.
     ///
-    /// `info.url` comes from a narinfo body the cache served, so it is
-    /// joined through [`NormalizedCacheBase::object_url`], which refuses
-    /// values that leave the cache's origin — a hostile narinfo cannot
-    /// steer this fetch at another endpoint.
+    /// `info.url` comes from a narinfo body the cache served, so each
+    /// transport arm screens it before fetching: the HTTP arm joins it
+    /// through [`NormalizedCacheBase::object_url`], which refuses values
+    /// that leave the cache's origin (absolute SAME-origin spellings stay
+    /// fetchable), and the S3 arm derives the object key through
+    /// [`s3_object_key`], which refuses names that do not stay strictly
+    /// under the cache's key prefix (no absolute spellings at all — keys
+    /// have no origin to compare against). Either way a hostile narinfo
+    /// cannot steer this fetch outside the cache the substituter URL
+    /// admitted.
     ///
     /// No client-side hash verification — the daemon verifies on ingest and
     /// the caller knows the expected length.
@@ -353,7 +361,7 @@ impl Substituter {
                 bucket,
                 prefix,
             } => {
-                let key = format!("{prefix}{}", info.url);
+                let key = s3_object_key(bucket, prefix, &info.url)?;
                 let object = client
                     .get_object()
                     .bucket(bucket)
@@ -367,6 +375,59 @@ impl Substituter {
         let reader = decompress(raw, &info.compression, &self.url())?;
         Ok((info.nar_size, reader))
     }
+}
+
+/// Derive the S3 object key for one cache-relative object name under the
+/// cache's key prefix — the S3 arm's screen on untrusted object names, the
+/// equivalent of the HTTP arm's [`NormalizedCacheBase::object_url`]
+/// same-origin refusal.
+///
+/// Object names are cache-relative paths by convention (`<hash>.narinfo`,
+/// `nar/<hash>.nar.xz` — the same convention `object_url` documents, from
+/// the Nix binary-cache format where a narinfo's `URL:` field names an
+/// object relative to the cache root). Narinfo bodies come from the cache
+/// server, so the name is untrusted input. An S3 GET is *keyed* rather
+/// than URL-resolved, which changes what a hostile name can buy compared
+/// to the HTTP arm: a `..` segment escapes the configured key prefix on
+/// S3-compatible backends and proxies that normalize key paths (the
+/// engine's ambient credentials would then read same-bucket objects the
+/// substituter URL never admitted), and an absolute-URL spelling splices
+/// into a garbage key that fails as a mystifying `NoSuchKey` instead of an
+/// anomaly-naming refusal. Refuse every name that does not stay strictly
+/// under the prefix: scheme-carrying values, backslashes, and empty, `.`,
+/// or `..` path segments (which also covers leading `/`).
+///
+/// Unlike the HTTP join there is no absolute same-origin leniency: keys
+/// have no origin to compare against, so no absolute spelling can be
+/// proven to stay on the admitted cache.
+fn s3_object_key(bucket: &str, prefix: &str, object: &str) -> Result<String> {
+    let refuse = |why: &str| {
+        anyhow!(
+            "refusing cache object {object:?} on s3://{bucket}/{prefix}: {why}; object names \
+             (a narinfo's URL field included) are cache-relative paths like \
+             \"nar/<hash>.nar.xz\" and must resolve under the cache's key prefix"
+        )
+    };
+    if object.is_empty() {
+        return Err(refuse("the name is empty"));
+    }
+    if object.contains("://") {
+        return Err(refuse(
+            "the name is an absolute URL, not a cache-relative path",
+        ));
+    }
+    if object.contains('\\') {
+        return Err(refuse("the name contains a backslash"));
+    }
+    if object
+        .split('/')
+        .any(|segment| matches!(segment, "" | "." | ".."))
+    {
+        return Err(refuse(
+            "the name has a leading separator or an empty, `.`, or `..` path segment",
+        ));
+    }
+    Ok(format!("{prefix}{object}"))
 }
 
 /// Wrap a raw (still-compressed) NAR body reader in a streaming decoder for
@@ -797,41 +858,150 @@ References:
         server.abort();
     }
 
+    /// The transport arm of a [`Substituter`], for tests that must
+    /// enumerate the variant axis. Exhaustive on purpose: a new transport
+    /// variant fails this match at compile time, forcing the hostile-name
+    /// suite below to grow an arm for it before anything builds — the
+    /// narinfo `URL:` screen is per-arm, so a per-entry-point test alone
+    /// cannot prove a new arm is covered.
+    fn arm_label(sub: &Substituter) -> &'static str {
+        match sub {
+            Substituter::Http { .. } => "http",
+            Substituter::S3 { .. } => "s3",
+        }
+    }
+
     #[tokio::test]
-    async fn fetch_nar_refuses_cross_origin_narinfo_url() {
+    async fn fetch_nar_refuses_hostile_narinfo_url_on_every_arm() {
         // A cache that passed the admission screen can still serve hostile
-        // narinfo BODIES. An absolute cross-origin `URL:` field must not
-        // steer the NAR GET off the cache's origin (RFC 3986 resolution
-        // would otherwise replace the base wholesale) — for an internal
-        // target or a public one alike, on both fetch paths.
+        // narinfo BODIES, and the screen on the `URL:` field lives in each
+        // transport arm of the fetch match — so the refusal is asserted
+        // per (transport arm × hostile name × entry point), not just per
+        // entry point over one hardcoded transport.
+        //
+        // Contract (Nix binary-cache format, as pinned by
+        // `NormalizedCacheBase::object_url` and `s3_object_key`): a
+        // narinfo `URL:` names an object relative to the cache root, like
+        // "nar/<hash>.nar.xz". On the HTTP arm a violation steers the GET
+        // off the admitted origin (RFC 3986 resolution replaces the base
+        // wholesale); on the S3 arm it splices into the GetObject key,
+        // escaping the admitted prefix on dot-normalizing backends.
         let (base, server) = spawn_test_server(HashMap::new()).await;
-        let sub = Substituter::parse(&base).await.unwrap();
-        let nar: Vec<u8> = b"cross-origin fixture".repeat(8);
-        for hostile in [
+        let http = Substituter::parse(&base).await.unwrap();
+        // Parsing s3:// needs no credentials and no network; the screen
+        // fires before any request is built, so neither do the fetches.
+        let s3 = Substituter::parse("s3://test-cache/some/prefix?region=us-east-1")
+            .await
+            .unwrap();
+
+        // Absolute URLs at foreign endpoints are hostile on every arm.
+        let common = [
             "https://10.96.0.1/x.nar.zst",
             "https://evil.example.org/nar/x.nar.zst",
-        ] {
-            let info = narinfo_for(&nar, hostile, "zstd");
-            let err = format!("{:#}", sub.fetch_nar(&info).await.unwrap_err());
-            assert!(
-                err.contains(hostile) && err.contains("narinfo"),
-                "fetch_nar of {hostile} must be refused naming the URL and the narinfo \
-                 field: {err}"
-            );
-            let err = format!(
-                "{:#}",
-                sub.fetch_nar_streaming(&info)
-                    .await
-                    .map(|_| ())
-                    .unwrap_err()
-            );
-            assert!(
-                err.contains(hostile) && err.contains("narinfo"),
-                "fetch_nar_streaming of {hostile} must be refused naming the URL and the \
-                 narinfo field: {err}"
-            );
+        ];
+        // Key splices the HTTP origin comparison cannot see: traversal out
+        // of the prefix, absolute paths/spellings (the HTTP arm's
+        // same-origin leniency has no keyed equivalent — `s3_object_key`
+        // refuses ALL absolute spellings, its own bucket included),
+        // backslashes, and empty segments.
+        let s3_only = [
+            "nar/../../other-prefix/x.nar.zst",
+            "/nar/x.nar.zst",
+            "s3://test-cache/some/prefix/nar/x.nar.zst",
+            "nar\\x.nar.zst",
+            "nar//x.nar.zst",
+        ];
+
+        let nar: Vec<u8> = b"hostile-name fixture".repeat(8);
+        let arms: [(&Substituter, Vec<&str>); 2] = [
+            (&http, common.to_vec()),
+            (&s3, common.iter().chain(&s3_only).copied().collect()),
+        ];
+        // The refusal must name the offending value (verbatim or in its
+        // Debug spelling — backslashes render escaped) and the narinfo
+        // field the convention binds.
+        let names_value = |err: &str, hostile: &str| {
+            (err.contains(hostile) || err.contains(&format!("{hostile:?}")))
+                && err.contains("narinfo")
+        };
+        for (sub, hostile_names) in arms {
+            let arm = arm_label(sub);
+            for hostile in hostile_names {
+                let info = narinfo_for(&nar, hostile, "zstd");
+                let err = format!("{:#}", sub.fetch_nar(&info).await.unwrap_err());
+                assert!(
+                    names_value(&err, hostile),
+                    "[{arm}] fetch_nar of {hostile} must be refused naming the value and \
+                     the narinfo field: {err}"
+                );
+                let err = format!(
+                    "{:#}",
+                    sub.fetch_nar_streaming(&info)
+                        .await
+                        .map(|_| ())
+                        .unwrap_err()
+                );
+                assert!(
+                    names_value(&err, hostile),
+                    "[{arm}] fetch_nar_streaming of {hostile} must be refused naming the \
+                     value and the narinfo field: {err}"
+                );
+            }
         }
         server.abort();
+    }
+
+    #[test]
+    fn s3_object_key_admits_relative_names_and_refuses_escapes() {
+        // Both directions of the S3 arm's screen, over the key derivation
+        // itself (the arm is `s3_object_key` + an SDK call, so the key
+        // shape IS the decision; no live S3 needed).
+        //
+        // Must-admit: the convention shapes the Nix binary-cache format
+        // produces — `<hash>.narinfo` probes and `nar/…` objects — resolve
+        // to exactly prefix + name, with and without a configured prefix.
+        // Dots inside a segment are content, not traversal.
+        for (prefix, object, want) in [
+            ("some/prefix/", "abcd.narinfo", "some/prefix/abcd.narinfo"),
+            (
+                "some/prefix/",
+                "nar/abcd.nar.xz",
+                "some/prefix/nar/abcd.nar.xz",
+            ),
+            ("", "nar/abcd.nar.zst", "nar/abcd.nar.zst"),
+            ("p/", "nar/x..y.nar.zst", "p/nar/x..y.nar.zst"),
+        ] {
+            assert_eq!(
+                s3_object_key("test-cache", prefix, object).unwrap(),
+                want,
+                "cache-relative {object:?} under prefix {prefix:?}"
+            );
+        }
+
+        // Must-block: anything that does not stay strictly under the
+        // prefix, each refusal naming the value and the convention.
+        for hostile in [
+            "",
+            "https://evil.example.org/x.nar.zst",
+            "s3://test-cache/some/prefix/x.nar.zst",
+            "/nar/x.nar.zst",
+            "nar/../../escape.nar.zst",
+            "..",
+            ".",
+            "nar/./x.nar.zst",
+            "nar//x.nar.zst",
+            "nar\\x.nar.zst",
+            "nar/x.nar.zst/",
+        ] {
+            let err = format!(
+                "{:#}",
+                s3_object_key("test-cache", "some/prefix/", hostile).unwrap_err()
+            );
+            assert!(
+                err.contains(&format!("{hostile:?}")) && err.contains("cache-relative"),
+                "{hostile:?} must be refused naming the value and the convention: {err}"
+            );
+        }
     }
 
     #[tokio::test]
