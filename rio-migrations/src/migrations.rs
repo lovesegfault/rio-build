@@ -1769,6 +1769,36 @@ pub const M_079: () = ();
 /// terminal statuses only, so no index DDL rides this migration.
 pub const M_080: () = ();
 
+/// `migrations/081_manifests_substitute_progress.sql`
+///
+/// Per-path download-progress evidence for the substitution ingest
+/// path (harden-store reconciliation memo, work item S — the design's
+/// migration 064 renumbered). Four additive columns on `manifests`,
+/// written only for substitution-claimed `'uploading'` placeholders:
+///
+/// - `fetched_bytes` / `last_progress_at`: the placeholder guard's
+///   30s heartbeat carries the owner's decompressed-byte count; the
+///   single UPDATE advances `last_progress_at` only when the count
+///   changed. Together they discriminate **stuck ≠ slow**: a slow
+///   owner advances `last_progress_at`; a wedged one does not.
+///   PutPath/PutPathBatch claims never write them (`fetched_bytes`
+///   stays NULL → structurally exempt from every stall rule).
+/// - `stall_count`: durable per-path stall evidence. Incremented
+///   exactly once per stall event (claim-guarded: the owner-side
+///   abort's release-in-place and a competing stall-reclaim race on
+///   the same `claim_id` — whichever lands first wins). Survives
+///   in-place ownership handoffs; reset by row deletion
+///   (heartbeat-death and guard-drop reaps DELETE, so benign churn —
+///   deploys, scale-in, crashes — never accrues strikes).
+/// - `claimed_by`: owner attribution (pod name) for operator-side
+///   stall/takeover diagnosis.
+///
+/// Nullable/default-only, no backfill, no index changes (every
+/// consumer reaches the row by the `store_path_hash` PK). Old
+/// binaries ignore the columns: a mixed-version window degrades to
+/// the pre-081 heartbeat-death-only reclaim, never misbehaves.
+pub const M_081: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
