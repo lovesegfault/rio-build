@@ -873,9 +873,16 @@ impl ArchiveStore {
 
     /// List every complete archive under `<root>/archives/`. Archives are
     /// discovered through their `complete.json` objects only, so incomplete
-    /// or in-flight uploads are invisible. Each marker's `archive_id_short`
-    /// is cross-checked against the prefix segment it was found under.
-    /// Returns [`PublishedArchive`]s sorted by short id.
+    /// or in-flight uploads are invisible. A marker that vanishes between
+    /// the LIST and its GET is skipped, not an error: deletion removes
+    /// `complete.json` strictly first, so the race means the prefix was
+    /// just unpublished. Marker *content* is strict: each marker must
+    /// parse and its `archive_id_short` is cross-checked against the
+    /// prefix segment it was found under — this engine-facing listing
+    /// refuses junk loudly, while the operator tooling's enumeration
+    /// (`xtask replay list`) is the surface that degrades junk to
+    /// renderable, deletable rows. Returns [`PublishedArchive`]s sorted
+    /// by short id.
     pub async fn list(&self, client: &aws_sdk_s3::Client) -> anyhow::Result<Vec<PublishedArchive>> {
         let prefix = self.archives_prefix();
         let complete_suffix = format!("/{ARCHIVE_COMPLETE_OBJECT}");
@@ -916,13 +923,30 @@ impl ArchiveStore {
 
         let mut archives = Vec::with_capacity(complete_keys.len());
         for (short, key) in complete_keys {
-            let resp = client
+            let resp = match client
                 .get_object()
                 .bucket(&self.bucket)
                 .key(&key)
                 .send()
                 .await
-                .with_context(|| format!("GET s3://{}/{key}", self.bucket))?;
+            {
+                Ok(resp) => resp,
+                // Deleted between the LIST and this GET: a delete removes
+                // complete.json strictly first, so the prefix was just
+                // unpublished — skip it, exactly as `get_object_bytes`
+                // maps the same race to `Ok(None)`.
+                Err(err) if err.as_service_error().is_some_and(|e| e.is_no_such_key()) => {
+                    tracing::debug!(
+                        "skipping {short}: {ARCHIVE_COMPLETE_OBJECT} deleted between LIST and GET"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    return Err(
+                        anyhow::Error::new(e).context(format!("GET s3://{}/{key}", self.bucket))
+                    );
+                }
+            };
             let bytes = resp
                 .body
                 .collect()
@@ -2492,6 +2516,69 @@ mod tests {
         assert_eq!(archives[1].archive_id(), "b".repeat(64));
         assert_eq!(get_a.num_calls(), 1);
         assert_eq!(get_b.num_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_skips_a_prefix_swept_between_list_and_get() {
+        // `replay delete` unpublishes a prefix by removing complete.json
+        // strictly first, and the LIST→GET window here is unbounded: a
+        // listed marker can be gone by the time it is read. That is the
+        // deletion order doing its job — the prefix is no longer published
+        // — so the entry is skipped and every other archive still lists
+        // (the same race `get_object_bytes` maps to `Ok(None)`). Junk
+        // marker *content*, by contrast, stays a hard error here: see
+        // `list_cross_checks_the_marker_against_its_prefix`.
+        use aws_sdk_s3::operation::get_object::GetObjectError;
+        use aws_sdk_s3::types::error::NoSuchKey;
+
+        let short_a = "aaaaaaaaaaaaaaaa";
+        let short_b = "bbbbbbbbbbbbbbbb";
+        let marker_a = CompleteMarker {
+            archive_id: "a".repeat(64),
+            archive_id_short: short_a.to_string(),
+            objects: BTreeMap::new(),
+            uploaded_at: test_stamp(),
+            uploader: "rio-replay/test".to_string(),
+        };
+        let list_page = mock!(aws_sdk_s3::Client::list_objects_v2)
+            .match_requests(|req| req.prefix() == Some("replay/archives/"))
+            .then_output(move || {
+                ListObjectsV2Output::builder()
+                    .contents(
+                        Object::builder()
+                            .key(format!("replay/archives/{short_a}/complete.json"))
+                            .build(),
+                    )
+                    .contents(
+                        Object::builder()
+                            .key(format!("replay/archives/{short_b}/complete.json"))
+                            .build(),
+                    )
+                    .build()
+            });
+        let get_a = get_rule(
+            format!("replay/archives/{short_a}/complete.json"),
+            serde_json::to_vec(&marker_a).unwrap(),
+        );
+        let swept_key = format!("replay/archives/{short_b}/complete.json");
+        let get_b_swept = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(move |req| req.key() == Some(swept_key.as_str()))
+            .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[&list_page, &get_a, &get_b_swept]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        let archives = store.list(&client).await.unwrap();
+        assert_eq!(
+            archives.len(),
+            1,
+            "the concurrently-deleted prefix is skipped, not a listing error"
+        );
+        assert_eq!(archives[0].archive_id_short(), short_a);
+        assert_eq!(get_b_swept.num_calls(), 1);
     }
 
     #[tokio::test]
