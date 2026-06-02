@@ -397,13 +397,21 @@ pkgs.testers.runNixOSTest {
         # forwards pinned to a now-standby pod (every sample reads 0 —
         # the standby publishes NO gauge series, the leader gate).
         # Store metrics too: admission utilization is sampled from the
-        # store's Prometheus surface (single replica, svc forward).
+        # store's Prometheus surface. The POD, not svc/rio-store — the
+        # component Services expose only their data-plane port (the
+        # servicemonitor.yaml rationale); :9092 lives on the pod.
+        # Single replica in this fixture → items[0] is deterministic.
         pf_close("pf-sched")
         pf_close("pf-sched-metrics")
         leader = leader_pod()
         pf_open(leader, 19001, 9001, tag="pf-sched")
         pf_open(leader, 19091, 9091, tag="pf-sched-metrics")
-        pf_open("svc/rio-store", 19092, 9092, ns="${nsStore}", tag="pf-store-metrics")
+        store_pod = kubectl(
+            "get pod -l app.kubernetes.io/name=rio-store "
+            "-o jsonpath='{.items[0].metadata.name}'",
+            ns="${nsStore}",
+        ).strip()
+        pf_open(store_pod, 19092, 9092, ns="${nsStore}", tag="pf-store-metrics")
 
         # ── Slow the upstream so the cascade outlives one scheduler
         # housekeeping tick (10s — the gauge publication cadence).
