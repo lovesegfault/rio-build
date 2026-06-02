@@ -100,7 +100,7 @@ let
   # upstream_v6, the root (49) is NOT — so r[sched.merge.substitute-
   # topdown] does NOT prune (root unsubstitutable → fall through), the
   # full DAG is merged, and check_cached_outputs probes all 50 in one
-  # FindMissingPaths → 49 enter Substituting in one merge-time burst.
+  # FindMissingPaths → 49 materialization jobs in one merge burst.
   # Without eager-probe, only the depth-0 leaf is Ready at merge →
   # cascade promotes ~BECAME_IDLE_INLINE_CAP=4 per tick.
   chainDepth = 50;
@@ -320,7 +320,8 @@ pkgs.testers.runNixOSTest {
         # client's nix runs its OWN wopEnsurePath substitution loop
         # (store ingests all 30 store-side) BEFORE wopBuildDerivation
         # → scheduler receives root.drv with inputs already-present →
-        # zero Substituting (observed: 90 consecutive (0,1) samples).
+        # zero SUBSTITUTING events (observed: 90 consecutive (0,1)
+        # samples).
         # `--option substitute false` doesn't help — that's a client-
         # store option; the substitution decision is the REMOTE store's
         # answer to wopQueryMissing.
@@ -328,8 +329,8 @@ pkgs.testers.runNixOSTest {
         # gRPC-direct is the only deterministic way to make the
         # SCHEDULER own the substitution decision: hand it the 30 leaf
         # nodes, its dispatch.rs FindMissingPaths sees them
-        # substitutable, enters Substituting — the state P1 wires into
-        # the ComponentScaler signal.
+        # substitutable, creates materialization jobs — the bucket P1
+        # wires into the ComponentScaler signal.
         #
         # First: instantiate leaf .drvs on client + resolve each drv's
         # output path. expectedOutputPaths MUST be in the proto node:
@@ -373,7 +374,8 @@ pkgs.testers.runNixOSTest {
         # 30 independent nodes, no edges. drvHash=drvPath (input-
         # addressed; gateway translate.rs:361 does the same). The
         # scheduler walks each node Ready → FindMissingPaths(out-path)
-        # → store says substitutable → DerivationStatus::Substituting.
+        # → store says substitutable → a materialization job (the
+        # SUBSTITUTING build event fires at claim intake).
         nodes = [
             {"drvPath": d, "drvHash": d,
              "system": "${pkgs.stdenv.hostPlatform.system}",
@@ -425,7 +427,7 @@ pkgs.testers.runNixOSTest {
         # netem 200ms + admission=1 the cascade lasts ~24s, so both
         # the 1s poll here AND the controller's 10s reconcile reliably
         # observe sub>0. prost-serde keeps Rust snake_case. The
-        # STRUCTURAL proof of Substituting is the WatchBuild event
+        # STRUCTURAL proof is the WatchBuild SUBSTITUTING event
         # count below; sub_peak from this poll drives the (5)
         # monotone-non-decreasing check.
         samples = []
@@ -467,11 +469,11 @@ pkgs.testers.runNixOSTest {
         print(f"substitute-cascade: samples (sub,desired) = {samples}")
         print(f"substitute-cascade: sub_peak={sub_peak} (best-effort)")
 
-        # ── (1 structural) scheduler entered Substituting ────────────
+        # ── (1 structural) scheduler emitted SUBSTITUTING per leaf ──
         # Count DERIVATION_EVENT_KIND_SUBSTITUTING in the WatchBuild
         # stream. The grpcurl JSON event is one-per-transition;
         # journalctl captures the systemd-run stdout. ==30 means EVERY
-        # leaf went Ready→Substituting (not Ready→Queued). Structural
+        # leaf took the materialization lane (job claimed). Structural
         # — independent of poll timing (ci-failure-patterns
         # "structural > retry > widen").
         # The 30 events fire at materialization-claim intake (BC-4,
@@ -503,8 +505,8 @@ pkgs.testers.runNixOSTest {
             )[1])
         assert sub_events == 30, (
             f"WatchBuild reported {sub_events} SUBSTITUTING events, "
-            f"expected 30 — scheduler did NOT enter Substituting for "
-            f"every leaf. Either expectedOutputPaths missing from "
+            f"expected 30 — scheduler did NOT take the materialization "
+            f"lane for every leaf. Either expectedOutputPaths missing from "
             f"SubmitBuild (output_paths_probeable()→false skips the "
             f"probe), OR FindMissingPaths returned "
             f"substitutable_paths=[] (tenant_id not propagated / "
@@ -516,7 +518,7 @@ pkgs.testers.runNixOSTest {
         assert max_desired > 1, (
             f"ComponentScaler never scaled store above min=1 during the "
             f"substitute cascade. P1 (signal-substituting) regressed: "
-            f"decide.rs builders-signal isn't counting Substituting. "
+            f"decide.rs builders-signal isn't counting the substituting bucket. "
             f"samples={samples}"
         )
 
@@ -623,7 +625,7 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # Tracey: sched.substitute.eager-probe — verify marker at the
     # default.nix wiring per the convention.
-    with subtest("substitute-deep-chain: 49 links enter Substituting at merge"):
+    with subtest("substitute-deep-chain: 49 links take the materialization lane at merge"):
         # ── seed all 50 chain outputs on upstream_v6 ──────────────────
         # Same mechanism as the fanout seed above (busybox already
         # registered, signing key already at /tmp/sec). netem was
@@ -833,7 +835,7 @@ pkgs.testers.runNixOSTest {
             f"ccf Δ={ccf_delta} ✓"
         )
 
-        # ── (2) all 49 links entered Substituting ─────────────────────
+        # ── (2) all 49 links took the materialization lane ──────────
         # The root is NOT substitutable (not seeded) so it will dispatch
         # to a builder; we don't wait for that — the eager-probe proof
         # is the 49-link merge-time verdict, not root completion. Poll

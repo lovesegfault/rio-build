@@ -423,11 +423,12 @@ impl DagActor {
     ///   found in the store for a drv whose worker never reconnected:
     ///   the execution ran to completion while the scheduler was down)
     /// - `terminal_failure_epilogue` — `"failed"` (covers `Poisoned` via
-    ///   `poison_and_cascade`/`handle_permanent_failure`, timeout-exhausted
-    ///   `Cancelled` via `handle_timeout_failure`, and `DependencyFailed`
-    ///   via `handle_substitute_complete`'s revert arm — the epilogue
-    ///   self-gates on [`Self::exec_id_for_terminal`] and skips
-    ///   never-dispatched drvs entirely)
+    ///   `poison_and_cascade`/`handle_permanent_failure` and
+    ///   timeout-exhausted `Cancelled` via `handle_timeout_failure`; the
+    ///   walk-era `DependencyFailed` revert caller died with Phase
+    ///   D-prime — the epilogue self-gates on
+    ///   [`Self::exec_id_for_terminal`] and skips never-dispatched drvs
+    ///   entirely)
     /// - `cancel_build_derivations` (`to_cancel` arm) — `"cancelled"`
     ///   (build-level cancellation/failure of an `Assigned`/`Running`
     ///   drv: `handle_cancel_build`, per-build wall-clock timeout,

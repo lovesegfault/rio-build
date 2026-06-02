@@ -652,10 +652,11 @@ pub struct ClusterSnapshot {
     /// `DerivationStatus::{Assigned|Running}` across the DAG. Workers
     /// currently occupied.
     pub running_derivations: u32,
-    /// `DerivationStatus::Substituting` across the DAG. Upstream fetch
-    /// in flight (store-side `try_substitute` closure walk + NAR
-    /// ingest). Counted as store load for the ComponentScaler
-    /// predictive signal (`ctrl.scaler.signal-substituting`).
+    /// Derivations carrying an unresolved, unclaimed materialization
+    /// job (wire-stable bucket name; the upstream fetch the store
+    /// executor has pending or in flight). Counted as store load for
+    /// the ComponentScaler predictive signal
+    /// (`ctrl.scaler.signal-substituting`).
     pub substituting_derivations: u32,
     /// Per-system breakdown of `queued_derivations` (Ready-only). Sum
     /// across keys == `queued_derivations`. Populated from

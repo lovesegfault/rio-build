@@ -209,15 +209,10 @@ let
   # (the as-built "outputs already in store; skipping dispatch" lane).
   # This subtest submits DIRECTLY to the scheduler via gRPC — the same
   # pattern as substitute-scale.nix — so the SCHEDULER owns the
-  # substitution decision:
-  #   flag-off: merge probe → 4 detached walks → SubstituteComplete
-  #   flag-on:  merge probe → 4 materialization jobs → store-executor
-  #             claim/fetch/report → consumption (Wave 1's T-1.1/T-1.2/
-  #             T-1.8 mechanisms at deployment level)
-  # The submission, completion wait, WatchBuild activity count, and
-  # store end-state assertions are IDENTICAL text in both branches (the
-  # client-visible outcome equivalence); only the mechanism block at the
-  # end selects on the flag.
+  # substitution decision: merge probe → 4 materialization jobs →
+  # store-executor claim/fetch/report → consumption (Wave 1's
+  # T-1.1/T-1.2/T-1.8 mechanisms at deployment level; the walk-era
+  # flag-off twin retired with Phase D-prime).
   schedulerOwned = ''
     # ══════════════════════════════════════════════════════════════════
     # substitute-scheduler-owned — the scheduler's own substitution path
@@ -1077,8 +1072,9 @@ pkgs.testers.runNixOSTest {
             f"starts={copy_starts} stops={all_stops}"
         )
         assert len(copy_starts) >= 1, (
-            "expected ≥1 actCopyPath start (one per Substituting drv); "
-            "got 0 — did walk_substitute_closure run? events:\n"
+            "expected ≥1 actCopyPath start (one per SUBSTITUTING-event "
+            "drv); got 0 — did the materialization claim relay emit? "
+            "events:\n"
             + "\n".join(str(e) for e in events[:50])
         )
 

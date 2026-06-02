@@ -558,11 +558,10 @@ pub(super) fn substitute_status(e: SubstituteError) -> Status {
         // `Unavailable` here would surface a hard error where the
         // pre-substitute behaviour was a benign `valid=false`. Map to
         // `NotFound` instead: gateway treats it as miss (caller
-        // re-probes later); scheduler `walk_substitute_closure` treats
-        // it as `ok=false → revert with substitute_tried` and the next
-        // dispatch pass falls through to a build (the partial-closure
-        // gate at `batch_probe_cached_ready` refuses to mark Completed
-        // on output-present-only). Moka didn't cache `Err` either way.
+        // re-probes later). The walk-era scheduler caller died with
+        // Phase D-prime; the materialization executor's walk runs
+        // in-process against the substituter and never crosses this
+        // gRPC mapping. Moka didn't cache `Err` either way.
         SubstituteError::Raced => Status::not_found("substitution in progress on another replica"),
         // Upstream-429: genuinely transient — `Unavailable` so the
         // scheduler's 8-attempt backoff retries. A bare 429 (no

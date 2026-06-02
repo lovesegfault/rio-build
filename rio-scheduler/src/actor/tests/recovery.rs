@@ -982,7 +982,7 @@ async fn saturated_floor_recovery_evidence_writes_land() -> TestResult {
     assert_eq!(
         d.status,
         DerivationStatus::DependencyFailed,
-        "Substituting with a co-owned poisoned dep must recompute to DependencyFailed"
+        "a queued node with a co-owned poisoned dep must recompute to DependencyFailed"
     );
     let (pg_d_status,): (String,) =
         sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'satfloor-D'")
