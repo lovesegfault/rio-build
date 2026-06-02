@@ -278,8 +278,10 @@ pub struct ClassifiedSubstituters {
     /// to use; never scheme-checked at archive open, so any entry here may
     /// be unusable.
     pub target: Vec<ArchiveSubstituterUrl>,
-    /// Caches the engine may relay from (https/s3 enforced at open; the
-    /// public-host screen is applied here).
+    /// Caches the engine may relay from. The v1 writer refuses non-https/s3
+    /// entries at finalize (and v1 open re-checks), but v0 recordings carry
+    /// their recorded list verbatim, so any entry here may be unusable —
+    /// the screen (scheme and public host) is applied per entry, here.
     pub relay: Vec<ArchiveSubstituterUrl>,
 }
 

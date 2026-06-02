@@ -355,10 +355,14 @@ impl ReplayArchive {
     /// capability flags, and no content-addressed identity, so the v1
     /// digest, sidecar-presence, and capability cross-checks do not apply;
     /// capabilities are inferred from member presence (and are therefore
-    /// consistent by construction). The relay-substituter scheme rule does
-    /// apply: a cleartext relay is just as unusable at campaign time in a v0
-    /// recording as in a v1 archive. Units, closures, and exclusions do not
-    /// exist in v0 and load as empty.
+    /// consistent by construction). The recorded `src_substituters` list
+    /// maps to the relay list verbatim — including entries the admission
+    /// screen rejects (the original v0 consumer accepted plain http
+    /// caches). Such entries classify `Unusable` per entry at the campaign
+    /// bootstrap and are skipped at use; open only warns about them,
+    /// because a v0 recording of a past production window is irreplaceable
+    /// and must never become unreadable over a list entry. Units,
+    /// closures, and exclusions do not exist in v0 and load as empty.
     fn open_v0(path: &Path, backend: Backend, manifest_bytes: &[u8]) -> Result<Self> {
         let v0_manifest: v0::V0Manifest = serde_json::from_slice(manifest_bytes)
             .with_context(|| format!("{}: malformed {MANIFEST_MEMBER}", path.display()))?;
@@ -433,7 +437,7 @@ impl ReplayArchive {
             .map(|by_session| by_session.len() as u64)
             .sum();
 
-        ensure_relay_substituter_schemes(&manifest.substituters)?;
+        warn_unusable_relay_substituters(&manifest.substituters);
 
         Ok(Self {
             format: ArchiveFormat::V0,
@@ -710,8 +714,10 @@ impl ReplayArchive {
 }
 
 /// Relay substituters are campaign-time fetch sources; refuse plain http://
-/// (the engine never relays over cleartext). Applies to both archive
-/// formats — for v0 the list comes from the mapped `src_substituters`.
+/// (the engine never relays over cleartext). Applies to v1 archives only —
+/// a v0 recording is irreplaceable, so its mapped `src_substituters`
+/// entries go through [`warn_unusable_relay_substituters`] instead and are
+/// judged per entry at use.
 fn ensure_relay_substituter_schemes(substituters: &Substituters) -> Result<()> {
     for relay in &substituters.relay {
         ensure!(
@@ -720,6 +726,29 @@ fn ensure_relay_substituter_schemes(substituters: &Substituters) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Surface screen-rejected relay entries at open time, without judging
+/// them: judgment over archive list entries belongs to
+/// [`crate::nixcache::classify_substituter`] — total, per entry, at the
+/// campaign bootstrap — so an archive stays openable no matter what its
+/// recorded lists carry. Consumers skip `Unusable` entries; an error
+/// surfaces only at a point of use with no usable alternative. The warning
+/// here just gives list/inspect/dry-run callers (which never reach the
+/// bootstrap classification) the same early signal.
+fn warn_unusable_relay_substituters(substituters: &Substituters) {
+    for entry in &substituters.relay {
+        if let crate::nixcache::ArchiveSubstituterUrl::Unusable { url, reason } =
+            crate::nixcache::classify_substituter(entry)
+        {
+            tracing::warn!(
+                url = %url,
+                reason = %reason,
+                "archive relay substituter entry is unusable; campaign-time consumers \
+                 will skip it"
+            );
+        }
+    }
 }
 
 /// What to do with a defective narinfo sidecar — one that fails to parse,
@@ -1771,25 +1800,50 @@ mod tests {
         );
     }
 
+    /// A v0 recording whose `src_substituters` (the mapped relay list)
+    /// carries an entry the admission screen rejects still OPENS. The
+    /// original v0 consumer accepted plain-http internal caches, so real
+    /// recordings of past production windows can carry one — and they are
+    /// irreplaceable: open performs no fetches, judgment over list entries
+    /// is the campaign bootstrap's per-entry classification, and an error
+    /// surfaces only at a point of use with no usable alternative.
     #[test]
-    fn v0_cleartext_relay_substituter_is_rejected_on_open() {
+    fn v0_cleartext_relay_substituter_opens_and_classifies_unusable() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("archive");
         copy_v0_fixture_to(&root);
 
-        // The relay-scheme rule applies to v0 archives too: rewrite the
-        // recorded src_substituters entry to plain http://.
+        // The recorded src_substituters entry becomes plain http — the
+        // population the retired open-time scheme gate used to brick.
         let manifest_path = root.join(MANIFEST_MEMBER);
         let text = std::fs::read_to_string(&manifest_path).unwrap();
         let rewritten = text.replace("https://cache.example.org", "http://cache.example.org");
         assert_ne!(rewritten, text, "manifest has a relay entry to rewrite");
         std::fs::write(&manifest_path, rewritten).unwrap();
 
-        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
-        assert!(
-            err.contains("only https:// and s3:// are allowed"),
-            "got: {err}"
+        let archive =
+            ReplayArchive::open(&root).expect("an irreplaceable v0 recording must stay openable");
+        // The recording is fully usable, not merely opened.
+        assert_eq!(archive.requests().len(), 4);
+        assert!(archive.narinfo(V0_SRC_PATH).is_some());
+        // The entry survives verbatim and is judged at the bootstrap's
+        // classification chokepoint: Unusable, skipped — and with no
+        // probeable entry left, only a campaign shape that needs the probe
+        // fails, at that point of use.
+        assert_eq!(
+            archive.manifest().substituters.relay,
+            vec!["http://cache.example.org".to_string()]
         );
+        let classified =
+            crate::nixcache::ClassifiedSubstituters::classify(&archive.manifest().substituters);
+        assert!(
+            matches!(
+                &classified.relay[0],
+                crate::nixcache::ArchiveSubstituterUrl::Unusable { .. }
+            ),
+            "the cleartext relay entry classifies Unusable per entry"
+        );
+        assert!(classified.first_probeable().is_none());
     }
 
     #[test]
