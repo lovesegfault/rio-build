@@ -167,7 +167,7 @@ impl ReplayArchive {
             .get(REQUESTS_MEMBER)
             .ok_or_else(|| anyhow!("{}: no {REQUESTS_MEMBER}", path.display()))?;
         let mut requests: Vec<RequestRecord> = super::parse_jsonl(requests_bytes, REQUESTS_MEMBER)?;
-        let workload_units = normalize_requests(&mut requests)?;
+        let workload_units = normalize_requests(&mut requests, RecordPolicy::Strict)?;
 
         // Expected outcomes keyed by (session, drv); duplicate keys keep the
         // last record (a re-recorded outcome supersedes the earlier one).
@@ -230,8 +230,8 @@ impl ReplayArchive {
             None => Vec::new(),
         };
 
-        let (narinfos, narinfo_digests) = index_narinfos(&backend, SidecarPolicy::Strict)?;
-        let store_entries = index_store_entries(&backend, SidecarPolicy::Strict)?;
+        let (narinfos, narinfo_digests) = index_narinfos(&backend, RecordPolicy::Strict)?;
+        let store_entries = index_store_entries(&backend, RecordPolicy::Strict)?;
 
         // The narinfo listing digest covers the sidecars' load-bearing
         // References lines; verify it at open time (sidecars are small).
@@ -369,6 +369,20 @@ impl ReplayArchive {
     /// because a v0 recording of a past production window is irreplaceable
     /// and must never become unreadable over a list entry. Units,
     /// closures, and exclusions do not exist in v0 and load as empty.
+    ///
+    /// The same never-refuse-over-one-record posture governs every
+    /// per-record validity check on this path via
+    /// [`RecordPolicy::WarnAndSkip`]: defective narinfo sidecars,
+    /// store members colliding on hash part, and empty-target request
+    /// records (all of which the v1 writer would have refused to stage,
+    /// and v0's external recorder never screened) cost only themselves. Structural corruption stays a loud open
+    /// error, deliberately: a malformed JSONL line or member document is
+    /// refused with member + line, exactly as the original v0 consumer
+    /// refused it — no recording that ever worked becomes unreadable —
+    /// and warn-skipping a torn truth (`builds.jsonl`) record would
+    /// silently flip parity verdicts from "expected outcome" to "no
+    /// recorded truth", trading a loud, nameable refusal for wrong
+    /// answers.
     fn open_v0(path: &Path, backend: Backend, manifest_bytes: &[u8]) -> Result<Self> {
         let v0_manifest: v0::V0Manifest = serde_json::from_slice(manifest_bytes)
             .with_context(|| format!("{}: malformed {MANIFEST_MEMBER}", path.display()))?;
@@ -383,7 +397,7 @@ impl ReplayArchive {
                 .into_iter()
                 .map(v0::map_request)
                 .collect();
-        let workload_units = normalize_requests(&mut requests)?;
+        let workload_units = normalize_requests(&mut requests, RecordPolicy::WarnAndSkip)?;
 
         // builds.jsonl is the v0 truth member; each record maps into the
         // neutral outcome vocabulary, keyed like v1 with the last record
@@ -410,12 +424,12 @@ impl ReplayArchive {
         };
 
         // Sidecars and the store index are read exactly as for v1 (including
-        // the URL-synthesis fallback); only the unparseable-sidecar policy
-        // differs — see [`SidecarPolicy`]. The v1 narinfo listing digest has
+        // the URL-synthesis fallback); only the defective-record policy
+        // differs — see [`RecordPolicy`]. The v1 narinfo listing digest has
         // nothing to be checked against, so the recomputed digests are
         // dropped.
-        let (narinfos, _) = index_narinfos(&backend, SidecarPolicy::WarnAndSkip)?;
-        let store_entries = index_store_entries(&backend, SidecarPolicy::WarnAndSkip)?;
+        let (narinfos, _) = index_narinfos(&backend, RecordPolicy::WarnAndSkip)?;
+        let store_entries = index_store_entries(&backend, RecordPolicy::WarnAndSkip)?;
 
         let output_hashes_present = outcomes
             .values()
@@ -742,25 +756,37 @@ fn warn_unusable_relay_substituters(substituters: &Substituters) {
     }
 }
 
-/// What to do with a defective archive member observation — a narinfo
-/// sidecar that fails to parse or misnames its store hash, or two
-/// `nix/store/` members colliding on hash part — the one axis on which
-/// the v0 and v1 open paths deliberately differ.
+/// What to do with one defective record of a per-record archive member —
+/// a narinfo sidecar that fails to parse or whose filename names a
+/// different store hash than its content describes, two `nix/store/`
+/// members colliding on hash part, or a request record with no targets —
+/// the axis on which the v0 and v1 open paths deliberately differ. Every
+/// per-record validity site on the open paths takes this policy, so
+/// adding a new per-record check forces an explicit v0/v1 decision at
+/// compile time. Structural corruption is NOT covered and stays loud on
+/// both paths: a malformed JSONL line or member document is handled where
+/// it is parsed (see [`ReplayArchive::open_v0`] for why).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SidecarPolicy {
-    /// v1: a hard open error naming the offending file. Skipping an
-    /// unparseable sidecar could never help a v1 archive anyway — a skipped
-    /// sidecar would be missing from the recomputed narinfo listing digest,
-    /// so open would still fail, just with a far less actionable message.
-    /// A filename↔content identity mismatch, by contrast, is invisible to
-    /// that digest (it hashes content store paths and bytes, independent of
-    /// filenames), so the open-time identity check is the only thing
-    /// standing between a mis-assembled archive and a wrong-sidecar
-    /// verification failure at NAR-serialization time, mid-campaign.
+enum RecordPolicy {
+    /// v1: a hard open error naming the offending record. The v1 writer
+    /// enforces per-record validity at stage time (`write_requests`
+    /// rejects empty targets; finalize digests the sidecar listing), so a
+    /// reader-side hit means tampering or corruption worth refusing.
+    /// Skipping an unparseable sidecar could never help a v1 archive
+    /// anyway — a skipped sidecar would be missing from the recomputed
+    /// narinfo listing digest, so open would still fail, just with a far
+    /// less actionable message. A filename↔content identity mismatch, by
+    /// contrast, is invisible to that digest (it hashes content store
+    /// paths and bytes, independent of filenames), so the open-time
+    /// identity check is the only thing standing between a mis-assembled
+    /// archive and a wrong-sidecar verification failure at
+    /// NAR-serialization time, mid-campaign.
     Strict,
-    /// v0: warn and skip. v0 archives are digest-less, irreplaceable
-    /// recordings of past production windows; one bad sidecar only makes
-    /// that path non-uploadable from the archive and must not refuse the
+    /// v0: warn and skip the record. v0 archives are digest-less,
+    /// irreplaceable recordings of past production windows produced by an
+    /// external recorder that never enforced these rules; one defective
+    /// record must cost only itself (a bad sidecar makes one path
+    /// non-uploadable, an empty request schedules nothing), never the
     /// whole recording.
     WarnAndSkip,
 }
@@ -778,7 +804,7 @@ type SidecarDigestListing = Vec<(String, String)>;
 /// `policy`.
 fn index_narinfos(
     backend: &Backend,
-    policy: SidecarPolicy,
+    policy: RecordPolicy,
 ) -> Result<(HashMap<String, NarInfo>, SidecarDigestListing)> {
     let mut narinfos: HashMap<String, NarInfo> = HashMap::new();
     let mut narinfo_digests: SidecarDigestListing = Vec::new();
@@ -798,10 +824,10 @@ fn index_narinfos(
             .and_then(|text| super::parse_narinfo_sidecar(text, stem));
         let narinfo = match (parsed, policy) {
             (Ok(narinfo), _) => narinfo,
-            (Err(err), SidecarPolicy::Strict) => {
+            (Err(err), RecordPolicy::Strict) => {
                 return Err(err.context(format!("unparseable narinfo sidecar {rel}")));
             }
-            (Err(err), SidecarPolicy::WarnAndSkip) => {
+            (Err(err), RecordPolicy::WarnAndSkip) => {
                 tracing::warn!("skipping unparseable narinfo sidecar {rel}: {err:#}");
                 continue;
             }
@@ -829,8 +855,8 @@ fn index_narinfos(
                 narinfo.store_path
             );
             match policy {
-                SidecarPolicy::Strict => return Err(mismatch),
-                SidecarPolicy::WarnAndSkip => {
+                RecordPolicy::Strict => return Err(mismatch),
+                RecordPolicy::WarnAndSkip => {
                     tracing::warn!("skipping mismatched narinfo sidecar: {mismatch:#}");
                     continue;
                 }
@@ -863,7 +889,7 @@ fn index_narinfos(
 /// makes it loud.
 fn index_store_entries(
     backend: &Backend,
-    policy: SidecarPolicy,
+    policy: RecordPolicy,
 ) -> Result<HashMap<String, WalkEntry>> {
     let mut store_entries: HashMap<String, WalkEntry> = HashMap::new();
     for entry in backend.list_dir(STORE_DIR)?.unwrap_or_default() {
@@ -881,8 +907,8 @@ fn index_store_entries(
                     slot.key(),
                 );
                 match policy {
-                    SidecarPolicy::Strict => return Err(collision),
-                    SidecarPolicy::WarnAndSkip => {
+                    RecordPolicy::Strict => return Err(collision),
+                    RecordPolicy::WarnAndSkip => {
                         tracing::warn!("skipping colliding store member: {collision:#}");
                     }
                 }
@@ -893,20 +919,46 @@ fn index_store_entries(
 }
 
 /// Request post-processing shared by both open paths: every request must
-/// name at least one target, negative offsets are clamped to 0 (clock skew
-/// at capture time can produce slightly negative values; rejecting the whole
-/// archive for that would be overkill), `[]` output lists are normalized to
-/// `["*"]` (both spellings mean "all outputs"), and the records are sorted
-/// by offset ascending (recorded lines are not guaranteed globally ordered —
-/// per-session buffers get flushed independently — and the replay timeline
-/// wants ascending offsets). Returns the distinct workload-unit drv paths.
-fn normalize_requests(requests: &mut [RequestRecord]) -> Result<BTreeSet<String>> {
+/// name at least one target (per `policy` — the v1 writer stages only
+/// non-empty targets, so a v1 reader hit is tamper detection; v0's
+/// producer never enforced the rule, and an empty request schedules
+/// nothing, so the record is dropped with a warning), negative offsets
+/// are clamped to 0 (clock skew at capture time can produce slightly
+/// negative values; rejecting the whole archive for that would be
+/// overkill), `[]` output lists are normalized to `["*"]` (both spellings
+/// mean "all outputs"), and the records are sorted by offset ascending
+/// (recorded lines are not guaranteed globally ordered — per-session
+/// buffers get flushed independently — and the replay timeline wants
+/// ascending offsets). Returns the distinct workload-unit drv paths.
+fn normalize_requests(
+    requests: &mut Vec<RequestRecord>,
+    policy: RecordPolicy,
+) -> Result<BTreeSet<String>> {
+    match policy {
+        RecordPolicy::Strict => {
+            for record in requests.iter() {
+                ensure!(
+                    !record.targets.is_empty(),
+                    "{REQUESTS_MEMBER}: request record (session {}) must have non-empty targets",
+                    record.session
+                );
+            }
+        }
+        RecordPolicy::WarnAndSkip => {
+            requests.retain(|record| {
+                if record.targets.is_empty() {
+                    tracing::warn!(
+                        session = record.session,
+                        "skipping {REQUESTS_MEMBER} record with no targets (an empty request \
+                         schedules nothing)"
+                    );
+                    return false;
+                }
+                true
+            });
+        }
+    }
     for record in requests.iter_mut() {
-        ensure!(
-            !record.targets.is_empty(),
-            "{REQUESTS_MEMBER}: request record (session {}) must have non-empty targets",
-            record.session
-        );
         record.offset_s = record.offset_s.max(0.0);
         for target in &mut record.targets {
             if target.outputs.is_empty() {
@@ -1491,6 +1543,13 @@ mod tests {
         assert!(classified.first_probeable().is_none());
     }
 
+    /// v1 requests must carry non-empty `targets` (design doc §4.5,
+    /// requests.jsonl table): `ArchiveWriter::write_requests` refuses to
+    /// stage a violating record, so meeting one at open time means the
+    /// archive was tampered with or corrupted — refuse loudly. The v0
+    /// path deliberately diverges
+    /// (`v0_empty_targets_request_is_skipped_not_fatal`): its producer
+    /// never enforced the rule and the recordings are irreplaceable.
     #[test]
     fn empty_request_targets_are_rejected_on_open() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1764,6 +1823,14 @@ mod tests {
         assert_eq!(archive.requests().len(), 4);
     }
 
+    /// Structural corruption stays a loud v0 open error, deliberately:
+    /// the original v0 consumer hard-failed a malformed JSONL line with
+    /// the same member + line message, so no recording that ever worked
+    /// becomes unreadable through this refusal — and warn-skipping torn
+    /// records (especially of the truth member) would silently change
+    /// what the archive claims happened. Per-record SEMANTIC junk is the
+    /// lenient axis (see [`RecordPolicy`] and
+    /// `v0_empty_targets_request_is_skipped_not_fatal`).
     #[test]
     fn v0_malformed_request_line_reports_member_and_line() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1796,6 +1863,36 @@ mod tests {
         // Clamped to 0.0 it sorts before the 0.25 request.
         assert_eq!(archive.requests()[0].session, 14);
         assert_eq!(archive.requests()[0].offset_s, 0.0);
+    }
+
+    /// A v0 request record with an empty `paths` list is dropped with a
+    /// warning instead of refusing the open. The v0 contract never
+    /// required non-empty targets — the design doc's v0-compatibility
+    /// table maps `paths` by field rename only, and the original v0
+    /// consumer accepted such records — the non-emptiness rule is v1's,
+    /// enforced by `ArchiveWriter::write_requests` at stage time and
+    /// re-checked by the v1 reader as tamper detection
+    /// (`empty_request_targets_are_rejected_on_open`). An empty request
+    /// schedules nothing, so dropping it is semantically exact, while
+    /// refusing would make an irreplaceable recording unopenable on
+    /// every surface.
+    #[test]
+    fn v0_empty_targets_request_is_skipped_not_fatal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        copy_v0_fixture_to(&root);
+        let path = root.join(REQUESTS_MEMBER);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("{\"ssh_session_id\":15,\"offset_s\":1.0,\"paths\":[]}\n");
+        std::fs::write(&path, text).unwrap();
+
+        let archive = ReplayArchive::open(&root).unwrap();
+        // The vacuous record costs only itself: the four real requests
+        // load, sort, and count exactly as without it.
+        assert_eq!(archive.requests().len(), 4);
+        assert!(archive.requests().iter().all(|record| record.session != 15));
+        assert_eq!(archive.manifest().counts.requests, 4);
+        assert_eq!(archive.manifest().counts.workload_units, 4);
     }
 
     #[test]
