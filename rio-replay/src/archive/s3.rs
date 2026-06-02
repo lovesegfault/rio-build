@@ -217,10 +217,49 @@ impl ArchiveStore {
         )
     }
 
+    /// Classify a lost `If-None-Match: *` PUT on a DATA object (`object`
+    /// already exists at the prefix). With `complete.json` present the
+    /// prefix is a published archive and another publisher simply won: the
+    /// standard write-once refusal. Without it the prefix holds partial
+    /// objects from an interrupted (or still-running) publish, which
+    /// write-once refuses to overwrite — a DISTINCT error naming the
+    /// recovery path, since "already published" would be a lie and the
+    /// retry can never succeed in place.
+    async fn data_object_conflict(
+        &self,
+        client: &aws_sdk_s3::Client,
+        archive_id_short: &str,
+        object: &str,
+    ) -> anyhow::Error {
+        match self.is_complete(client, archive_id_short).await {
+            Ok(true) => anyhow::anyhow!(self.write_once_refusal(archive_id_short)),
+            Ok(false) => anyhow::anyhow!(
+                "archive prefix s3://{}/{} has partial objects from an interrupted publish \
+                 ({object} exists but {ARCHIVE_COMPLETE_OBJECT} does not), and archive objects \
+                 are write-once — if no other publisher is currently uploading this prefix, run \
+                 `cargo xtask replay delete {archive_id_short}` (its sweep tolerates the missing \
+                 marker), then retry",
+                self.bucket,
+                self.prefix(archive_id_short)
+            ),
+            Err(probe) => probe.context(format!(
+                "PUT s3://{}/{} lost its write-once conditional (the object already exists), and \
+                 probing {ARCHIVE_COMPLETE_OBJECT} to classify the conflict failed too",
+                self.bucket,
+                self.object_key(archive_id_short, object)
+            )),
+        }
+    }
+
     /// Publish a packed archive: upload `archive.dwarfs`, the standalone
     /// `manifest.json` (the exact bytes passed in), and finally
-    /// `complete.json` with `If-None-Match: *` so two racing uploads cannot
-    /// both claim completeness.
+    /// `complete.json` strictly last. EVERY PUT carries `If-None-Match: *`:
+    /// the marker so two racing uploads cannot both claim completeness, and
+    /// the data objects so a racing publisher of the same archive id (same
+    /// manifest bytes, but mkdwarfs packing is not deterministic, so
+    /// different image bytes) can never overwrite an object that already
+    /// landed — a winner's published image stays exactly the bytes its
+    /// marker hashes.
     ///
     /// `manifest_bytes` must be byte-identical to the `manifest.json`
     /// member inside the image (the archive's identity bytes): the image is
@@ -234,9 +273,10 @@ impl ArchiveStore {
     /// is the authoritative write-once claim.
     ///
     /// A failure mid-upload leaves partial objects WITHOUT `complete.json`
-    /// at the prefix — the prefix never looks complete, and a retry of the
-    /// same archive overwrites those partial objects before writing
-    /// `complete.json` last.
+    /// at the prefix — the prefix never looks complete, and the write-once
+    /// data PUTs mean a retry of the same archive is refused with a
+    /// recovery path (delete the partial prefix, then retry) instead of
+    /// silently overwriting objects another publisher may be mid-claiming.
     pub async fn publish(
         &self,
         client: &aws_sdk_s3::Client,
@@ -287,32 +327,59 @@ impl ArchiveStore {
             anyhow::bail!(self.write_once_refusal(&archive_id_short));
         }
 
-        // Data first: the image, then the standalone manifest.
+        // Data first: the image, then the standalone manifest — each PUT
+        // write-once, so nothing already at the prefix (a racing or
+        // interrupted publisher's objects) is ever overwritten.
         let image_key = self.object_key(&archive_id_short, ARCHIVE_IMAGE_OBJECT);
         let body = ByteStream::from_path(image_path)
             .await
             .with_context(|| format!("read {}", image_path.display()))?;
-        client
+        match client
             .put_object()
             .bucket(&self.bucket)
             .key(&image_key)
             .content_type("application/octet-stream")
+            .if_none_match("*")
             .body(body)
             .send()
             .await
-            .with_context(|| format!("PUT s3://{}/{image_key}", self.bucket))?;
+        {
+            Ok(_) => {}
+            Err(e) if put_is_precondition_failed(&e) => {
+                return Err(self
+                    .data_object_conflict(client, &archive_id_short, ARCHIVE_IMAGE_OBJECT)
+                    .await);
+            }
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("PUT s3://{}/{image_key}", self.bucket))
+                );
+            }
+        }
         tracing::info!(key = %image_key, "uploaded");
 
         let manifest_key = self.object_key(&archive_id_short, ARCHIVE_MANIFEST_OBJECT);
-        client
+        match client
             .put_object()
             .bucket(&self.bucket)
             .key(&manifest_key)
             .content_type("application/json")
+            .if_none_match("*")
             .body(ByteStream::from(manifest_bytes.to_vec()))
             .send()
             .await
-            .with_context(|| format!("PUT s3://{}/{manifest_key}", self.bucket))?;
+        {
+            Ok(_) => {}
+            Err(e) if put_is_precondition_failed(&e) => {
+                return Err(self
+                    .data_object_conflict(client, &archive_id_short, ARCHIVE_MANIFEST_OBJECT)
+                    .await);
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("PUT s3://{}/{manifest_key}", self.bucket)));
+            }
+        }
         tracing::info!(key = %manifest_key, "uploaded");
 
         // The completion marker goes strictly last; the conditional PUT makes
@@ -726,7 +793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_uploads_in_order_and_claims_completeness_conditionally() {
+    async fn publish_uploads_in_order_and_every_put_is_write_once() {
         let dir = tempfile::TempDir::new().unwrap();
         let (image, manifest_bytes) = packed_tiny_archive(dir.path());
         let archive_id = identity::archive_id_from_manifest_bytes(&manifest_bytes);
@@ -735,27 +802,24 @@ mod tests {
         // Sequential rules: the write-once existence probe (NotFound), then
         // one PUT per object — image, manifest, complete.json strictly last.
         // Each PUT rule pins the object's key, its Content-Type, and that
-        // ONLY the final complete.json PUT is conditional (If-None-Match: *).
+        // EVERY PUT is conditional (If-None-Match: *): the data objects so a
+        // racing publisher can never overwrite a landed object, the marker
+        // so only one publisher can claim completeness.
         let head_404 = mock!(aws_sdk_s3::Client::head_object)
             .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
         let puts: Vec<_> = [
-            (ARCHIVE_IMAGE_OBJECT, "application/octet-stream", false),
-            (ARCHIVE_MANIFEST_OBJECT, "application/json", false),
-            (ARCHIVE_COMPLETE_OBJECT, "application/json", true),
+            (ARCHIVE_IMAGE_OBJECT, "application/octet-stream"),
+            (ARCHIVE_MANIFEST_OBJECT, "application/json"),
+            (ARCHIVE_COMPLETE_OBJECT, "application/json"),
         ]
         .iter()
-        .map(|&(object, ctype, conditional)| {
+        .map(|&(object, ctype)| {
             let key = format!("replay/archives/{short}/{object}");
             mock!(aws_sdk_s3::Client::put_object)
                 .match_requests(move |req| {
-                    let conditional_ok = if conditional {
-                        req.if_none_match() == Some("*")
-                    } else {
-                        req.if_none_match().is_none()
-                    };
                     req.key() == Some(key.as_str())
                         && req.content_type() == Some(ctype)
-                        && conditional_ok
+                        && req.if_none_match() == Some("*")
                 })
                 .then_output(|| PutObjectOutput::builder().build())
         })
@@ -839,11 +903,13 @@ mod tests {
         // error.
         let head_404 = mock!(aws_sdk_s3::Client::head_object)
             .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let complete_suffix = format!("/{ARCHIVE_COMPLETE_OBJECT}");
+        let data_suffix = complete_suffix.clone();
         let put_data = mock!(aws_sdk_s3::Client::put_object)
-            .match_requests(|req| req.if_none_match().is_none())
+            .match_requests(move |req| !req.key().is_some_and(|k| k.ends_with(&data_suffix)))
             .then_output(|| PutObjectOutput::builder().build());
         let put_complete_412 = mock!(aws_sdk_s3::Client::put_object)
-            .match_requests(|req| req.if_none_match() == Some("*"))
+            .match_requests(move |req| req.key().is_some_and(|k| k.ends_with(&complete_suffix)))
             .then_error(|| {
                 PutObjectError::generic(ErrorMetadata::builder().code("PreconditionFailed").build())
             });
@@ -868,6 +934,93 @@ mod tests {
             "the raw SDK error must not surface: {message}"
         );
         assert_eq!(put_complete_412.num_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn racing_publishers_leave_one_winner_and_a_lost_data_put_backs_off() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+
+        // Loser's view of a race it lost AFTER the winner finished: the
+        // HEAD pre-check raced past (404), the conditional image PUT comes
+        // back 412, and the classifying probe finds complete.json present —
+        // the winner's claim stands, nothing of the winner's prefix was
+        // overwritten, and the loser gets the standard write-once refusal.
+        let head_404 = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let put_image_412 = mock!(aws_sdk_s3::Client::put_object).then_error(|| {
+            PutObjectError::generic(ErrorMetadata::builder().code("PreconditionFailed").build())
+        });
+        let head_200 = mock!(aws_sdk_s3::Client::head_object)
+            .then_output(|| HeadObjectOutput::builder().build());
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&head_404, &put_image_412, &head_200]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        let err = store
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("write-once"),
+            "a complete prefix maps to the write-once refusal: {err:#}"
+        );
+        assert_eq!(
+            put_image_412.num_calls(),
+            1,
+            "the loser stops after its first lost PUT — no overwrite, no further uploads"
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_data_put_without_a_marker_names_the_partial_prefix_recovery() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+        let archive_id = identity::archive_id_from_manifest_bytes(&manifest_bytes);
+        let short = identity::short_id(&archive_id);
+
+        // The image PUT loses its conditional while complete.json is ABSENT:
+        // these are partial objects from an interrupted publish (or a
+        // publisher still mid-upload), NOT a published archive — claiming
+        // "already published" would be a lie and an in-place retry can never
+        // succeed. The error must name the real state and the recovery path
+        // (replay delete, whose sweep tolerates the missing marker; then
+        // retry).
+        let head_404_precheck = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let put_image_412 = mock!(aws_sdk_s3::Client::put_object).then_error(|| {
+            PutObjectError::generic(ErrorMetadata::builder().code("PreconditionFailed").build())
+        });
+        let head_404_classify = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&head_404_precheck, &put_image_412, &head_404_classify]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        let err = store
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("partial objects from an interrupted publish"),
+            "got: {message}"
+        );
+        assert!(
+            message.contains(&format!("replay delete {short}")),
+            "the recovery path must name the delete command: {message}"
+        );
+        assert!(
+            !message.contains("already published"),
+            "a partial prefix must not be reported as already published: {message}"
+        );
+        assert_eq!(put_image_412.num_calls(), 1);
     }
 
     #[tokio::test]
