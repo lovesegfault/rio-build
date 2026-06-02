@@ -505,6 +505,32 @@ fn archive_input(
     }
 }
 
+/// Refuse an `--archive s3://…` reference outside what the campaign
+/// engine's provisioned IAM role can read: s3:GetObject is granted on the
+/// chunk bucket's `replay/` prefix only (infra/eks/replay.tf, the
+/// rio_replay_s3 policy). Launch validates the reference with the
+/// operator's credentials, so this chokepoint — before resolve and any
+/// cluster mutation — is what keeps the accepted-input set inside the
+/// provisioned-capability set; without it the failure is an AccessDenied
+/// crash-loop at archive bootstrap, after every cluster mutation.
+fn ensure_engine_readable_archive(
+    archive_bucket: &str,
+    prefix: &str,
+    chunk_bucket: &str,
+) -> Result<()> {
+    let readable_root = format!("{}/", super::S3_PREFIX);
+    ensure!(
+        archive_bucket == chunk_bucket && prefix.starts_with(&readable_root),
+        "--archive s3://{archive_bucket}/{prefix} is outside what the campaign engine can read: \
+         its IAM role (infra/eks/replay.tf) grants s3:GetObject only under \
+         s3://{chunk_bucket}/{readable_root} — copy the archive objects there (`aws s3 cp \
+         --recursive s3://{archive_bucket}/{prefix}/ s3://{chunk_bucket}/{readable_root}…`) and \
+         pass that prefix, or re-publish it into the canonical layout by passing the local \
+         packed image or archive directory to --archive instead"
+    );
+    Ok(())
+}
+
 /// Refuse `--schedule timed` against an archive that was not recorded with
 /// the `timed` capability (per-request offsets). Launch only fails fast
 /// here — the engine re-validates the same gate at bootstrap.
@@ -645,6 +671,21 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     let ecr = tf.get("ecr_registry")?;
     let bucket = tf.get("chunk_bucket_name")?;
     let role_arn = tf.get("replay_iam_role_arn")?;
+
+    // An --archive s3://… reference must already live where the ENGINE can
+    // read it: the campaign pod's IRSA policy grants s3:GetObject only
+    // under the chunk bucket's `replay/` prefix (infra/eks/replay.tf), and
+    // launch resolves the reference with the OPERATOR's credentials — so
+    // without this chokepoint a foreign bucket or prefix passes every
+    // launch-side check, mutates the cluster, and then crash-loops the Job
+    // on AccessDenied at archive bootstrap.
+    if let ArchiveInput::S3 {
+        bucket: archive_bucket,
+        prefix,
+    } = &input
+    {
+        ensure_engine_readable_archive(archive_bucket, prefix, &bucket)?;
+    }
 
     // The campaign Job pulls <ecr>/rio-replay:<tag> for the CURRENT tree;
     // refuse before creating anything if that tag was never pushed.
@@ -2628,6 +2669,39 @@ mod tests {
         );
         let err = spec.validate().unwrap_err().to_string();
         assert!(err.contains("speedup") && err.contains("timed"), "{err}");
+    }
+
+    #[test]
+    fn s3_archive_refs_must_be_engine_readable() {
+        let chunk = "rio-build-chunks-deadbeef";
+
+        // The canonical published location and any other replay/-rooted
+        // prefix in the chunk bucket are inside the engine's IRSA grant.
+        ensure_engine_readable_archive(chunk, "replay/archives/0123456789abcdef", chunk).unwrap();
+        ensure_engine_readable_archive(chunk, "replay/imported/foo", chunk).unwrap();
+
+        // A foreign bucket — even with the right prefix — is refused with
+        // the copy/re-publish recovery path.
+        let err = ensure_engine_readable_archive(
+            "someone-elses-bucket",
+            "replay/archives/0123456789abcdef",
+            chunk,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("outside what the campaign engine can read"),
+            "{err}"
+        );
+        assert!(err.contains("infra/eks/replay.tf"), "{err}");
+        assert!(err.contains("aws s3 cp"), "{err}");
+        assert!(err.contains(&format!("s3://{chunk}/replay/")), "{err}");
+
+        // Same bucket but a non-replay/ prefix is equally unreadable by the
+        // engine role; "replay" must be a path segment, not a substring.
+        assert!(ensure_engine_readable_archive(chunk, "archives/0123456789abcdef", chunk).is_err());
+        assert!(ensure_engine_readable_archive(chunk, "replays/archives/x", chunk).is_err());
+        assert!(ensure_engine_readable_archive(chunk, "replay", chunk).is_err());
     }
 
     #[test]
