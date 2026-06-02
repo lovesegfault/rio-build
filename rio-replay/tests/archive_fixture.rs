@@ -406,7 +406,10 @@ fn committed_fixture_identity_golden() {
     // The committed fixture pins the `resource-exhausted` wire value
     // end-to-end: a vocabulary rename would fail here on the committed bytes.
     assert_eq!(
-        archive.expected_outcome(0, OOM_DRV).unwrap().outcome,
+        archive
+            .expected_outcome_across_sessions(OOM_DRV)
+            .unwrap()
+            .outcome,
         ExpectedOutcome::ResourceExhausted
     );
 
@@ -497,7 +500,10 @@ fn committed_fixture_round_trips_through_a_dwarfs_image() {
     assert_eq!(from_image.archive_id(), Some(V1_BASIC_ARCHIVE_ID));
     assert_eq!(from_dir.archive_id(), from_image.archive_id());
     assert_eq!(from_dir.requests().len(), from_image.requests().len());
-    assert_eq!(from_dir.outcomes().len(), from_image.outcomes().len());
+    assert_eq!(
+        from_dir.outcome_records().count(),
+        from_image.outcome_records().count()
+    );
     assert_eq!(from_dir.units().len(), from_image.units().len());
     assert_eq!(from_dir.closures().len(), from_image.closures().len());
 

@@ -243,6 +243,55 @@ pub struct OutputHash {
     pub nar_size: u64,
 }
 
+/// The session half of the `(session, drv)` key that scopes archive truth:
+/// the one resolution of recorded session identity onto engine lookups.
+///
+/// # Design note — one identity, two consumers
+///
+/// Archive records are keyed per recorded session ([`OutcomeRecord::session`]),
+/// while the engine reads them from two places with different granularity:
+///
+/// - **Campaign truth** (`run/truth.rs::expected_outcomes_for_units`)
+///   resolves one truth slot per workload *unit*. The timeless engine has
+///   no per-request identity there, so it does not probe with a session at
+///   all — it goes through the reader's canonical collapse-over-sessions
+///   helper (`ReplayArchive::expected_outcome_across_sessions`).
+/// - **Timed scheduling** (`run/mod.rs` wiring, consumed by
+///   `run/timeline.rs`) resolves per-request timing truth — and any
+///   per-target job keying layered on top — at the wiring point, where the
+///   recorded [`RequestRecord`] is in hand: mint the key with
+///   [`SessionKey::of_request`] there and carry the resolution (or
+///   [`SessionKey::recorded`]'s echo of the grouping id) downstream; never
+///   re-derive it from a bare integer later.
+///
+/// There are exactly two ways to obtain a key — from a recorded request,
+/// or the explicit session-less identity ([`SessionKey::SESSIONLESS`]).
+/// There is deliberately no integer constructor: a hard-coded probe
+/// session (the bug shape this type retires) is unrepresentable, and a
+/// consumer that thinks it needs one actually needs either the request it
+/// is acting for or the collapse helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionKey(Option<i64>);
+
+impl SessionKey {
+    /// The explicit session-less identity: resolves only truth recorded
+    /// without a session scope (the form session-less recorders write).
+    pub const SESSIONLESS: SessionKey = SessionKey(None);
+
+    /// The session a recorded request was captured under.
+    pub fn of_request(record: &RequestRecord) -> Self {
+        SessionKey(Some(record.session))
+    }
+
+    /// The recorded session id this key resolves to (`None` for
+    /// [`SessionKey::SESSIONLESS`]). Read-only by design: the id can be
+    /// displayed, logged, or used as a grouping echo, but never turned
+    /// back into a `SessionKey`.
+    pub fn recorded(self) -> Option<i64> {
+        self.0
+    }
+}
+
 /// The neutral expected-outcome vocabulary. Recorders map their native
 /// status codes into these values at archive-creation time; the engine
 /// never sees a native code.

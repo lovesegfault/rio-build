@@ -244,10 +244,11 @@ fn unknown_truth(unit: &ManifestEntry) -> UnitTruth {
 /// archive's recorded truth, keyed by job name.
 ///
 /// Truth is baked into the archive when it is recorded, so this performs
-/// no outbound queries. Each unit's record is looked up by derivation
-/// through the reader's session fallback — the exact `(session, drv)`
-/// entry first, then the session-less `(null, drv)` form that session-less
-/// recorders write; duplicate records keep the last occurrence. The
+/// no outbound queries. Each unit's record is resolved by derivation alone
+/// through the reader's canonical collapse over sessions — the session-less
+/// record when one exists, otherwise the highest-numbered session's record
+/// (see `ReplayArchive::expected_outcome_across_sessions`) — so truth a
+/// recorder scoped to specific sessions is never invisible here. The
 /// recorded outcome is carried through verbatim in the archive's neutral
 /// vocabulary; how each value compares is the classifier's business.
 ///
@@ -276,13 +277,14 @@ pub fn expected_outcomes_for_units(
     }
     let mut truth = BTreeMap::new();
     for unit in units {
-        // The timeless engine treats the whole archive as one session-less
-        // workload, so the probe session is 0; the reader falls back to the
-        // session-less record, which is the form session-less recorders
-        // write for every unit. This lookup is the one place where archive
-        // record identity (session, drv) is resolved onto engine units —
-        // any richer typed session identity belongs at exactly this seam.
-        let entry = match archive.expected_outcome(0, &unit.drv_path) {
+        // The timeless engine has one truth slot per unit and no per-request
+        // identity to probe with, so this is deliberately NOT a SessionKey
+        // lookup: the reader's collapse-over-sessions helper owns the rule
+        // for resolving (session, drv)-scoped truth onto a session-less
+        // unit. Session-aware consumers (the timed wiring) mint a
+        // `SessionKey` from the recorded request instead — see the design
+        // note on `archive::schema::SessionKey`.
+        let entry = match archive.expected_outcome_across_sessions(&unit.drv_path) {
             None => unknown_truth(unit),
             Some(record) => UnitTruth {
                 outcome: record.outcome,
@@ -534,6 +536,110 @@ mod tests {
         assert_eq!(kvm.outcome, ExpectedOutcome::Unknown);
         assert!(!kvm.side.outputs["out"].narinfo_present);
         assert!(kvm.side.outputs["out"].nar_hash.is_none());
+    }
+
+    /// Truth scoped to a recorded session must reach the campaign: an
+    /// archive whose outcome records carry `session: Some(N)` (N ≠ 0, the
+    /// shape the v1 schema defines and the v0 shim produces for every
+    /// record) resolves through the collapse-over-sessions lookup instead
+    /// of silently classifying the whole campaign against no truth.
+    #[test]
+    fn session_scoped_truth_reaches_campaign_units() {
+        use crate::archive::schema::{
+            Capabilities, ExpectedOutcome as ArchiveOutcome, OutcomeRecord, OutputHash,
+            RequestRecord, RequestTarget, Substituters, UnitRecord,
+        };
+        use crate::archive::writer::{ArchiveWriter, ManifestSeed};
+        use std::collections::BTreeMap;
+
+        let app_drv = format!("/nix/store/{}-app-1.0.drv", fake_hash("app-drv"));
+        let app_out = format!("/nix/store/{}-app-1.0", fake_hash("app-out"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = ArchiveWriter::create(tmp.path()).unwrap();
+        writer
+            .add_drv(
+                &app_drv,
+                &format!(
+                    r#"Derive([("out","{app_out}","","")],[],[],"x86_64-linux","/bin/sh",["-c","true"],[("out","{app_out}")])"#
+                ),
+            )
+            .unwrap();
+        writer
+            .write_units(&[UnitRecord {
+                drv: app_drv.clone(),
+                label: Some("app.x86_64-linux".to_string()),
+                system: Some("x86_64-linux".to_string()),
+                outputs: BTreeMap::from([("out".to_string(), app_out.clone())]),
+                required_features: Vec::new(),
+                identity_divergent: false,
+            }])
+            .unwrap();
+        writer
+            .write_requests(&[RequestRecord {
+                session: 7,
+                offset_s: 0.0,
+                targets: vec![RequestTarget {
+                    drv: app_drv.clone(),
+                    outputs: vec!["*".to_string()],
+                }],
+            }])
+            .unwrap();
+        // The truth record is scoped to recorded session 7 — there is no
+        // session-less form anywhere in this archive.
+        writer
+            .write_outcomes(&[OutcomeRecord {
+                session: Some(7),
+                drv: app_drv.clone(),
+                outcome: ArchiveOutcome::Built,
+                detail: None,
+                duration_s: None,
+                stop_offset_s: None,
+                outputs: BTreeMap::from([(
+                    "out".to_string(),
+                    OutputHash {
+                        nar_hash: crate::narhash::NarHash::parse(&"cd".repeat(32)).unwrap(),
+                        nar_size: 4242,
+                    },
+                )]),
+            }])
+            .unwrap();
+        let stamp: jiff::Timestamp = "2026-05-28T00:00:00Z".parse().unwrap();
+        writer
+            .finalize(ManifestSeed {
+                created_at: stamp,
+                from: stamp,
+                to: stamp,
+                capabilities: Capabilities {
+                    timed: false,
+                    expected_outcomes: true,
+                    output_hashes: true,
+                    embedded_store_paths: false,
+                    impure_env: false,
+                    dependency_closures: false,
+                },
+                substituters: Substituters::default(),
+                fat: false,
+                provenance: serde_json::Map::new(),
+            })
+            .unwrap();
+
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let units = crate::run::archive_input::load_units(&archive).unwrap();
+        let truth = expected_outcomes_for_units(&archive, &units).unwrap();
+
+        let app = &truth["app.x86_64-linux"];
+        assert_eq!(
+            app.outcome,
+            ExpectedOutcome::Built,
+            "session-scoped truth must not collapse to Unknown"
+        );
+        let out = app.side.outputs.get("out").unwrap();
+        assert!(out.narinfo_present);
+        assert_eq!(
+            out.nar_hash,
+            Some(crate::narhash::NarHash::parse(&"cd".repeat(32)).unwrap())
+        );
     }
 
     /// Archive-sourced truth must reach a real comparison: the expected

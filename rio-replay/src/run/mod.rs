@@ -52,7 +52,9 @@ use sha2::Digest as _;
 
 use crate::archive::reader::ReplayArchive;
 use crate::archive::s3::{ARCHIVE_IMAGE_OBJECT, ARCHIVE_MANIFEST_OBJECT};
-use crate::archive::schema::{ExpectedOutcome, MemberDigest, OutcomeRecord, RequestRecord};
+use crate::archive::schema::{
+    ExpectedOutcome, MemberDigest, OutcomeRecord, RequestRecord, SessionKey,
+};
 
 use self::artifact::{
     ArtifactStore, S3ArtifactStore, SyncTracker, download_state_if_missing, sync_state,
@@ -1099,6 +1101,30 @@ fn recorded_timing_from(record: &OutcomeRecord) -> RecordedTiming {
     }
 }
 
+/// Pre-resolved per-`(session, target)` timing truth for the timed paths:
+/// every recorded request's targets are resolved through the typed
+/// [`SessionKey`] lookup once, here at the wiring point where the recorded
+/// requests are in hand. The `i64` in the key is the timeline's grouping
+/// echo of `RecordedRequest::session` — downstream schedule code keys on
+/// it, but the archive probe itself only ever happens through the session
+/// key minted from the request (see the design note on
+/// [`SessionKey`]).
+fn timing_index(archive: &ReplayArchive) -> HashMap<(i64, String), RecordedTiming> {
+    let mut index = HashMap::new();
+    for request in archive.requests() {
+        let key = SessionKey::of_request(request);
+        for target in &request.targets {
+            if let Some(record) = archive.expected_outcome(key, &target.drv) {
+                index.insert(
+                    (request.session, target.drv.clone()),
+                    recorded_timing_from(record),
+                );
+            }
+        }
+    }
+    index
+}
+
 /// The orchestrator: plan → truth load → supply → (execute ∥
 /// collect ∥ watchdog ∥ sync) → report, with stage done-markers and resume.
 /// The execute stage is the timeless submit loop or the timed dispatcher,
@@ -1131,7 +1157,7 @@ pub async fn run_with_backends(
              (per-request offsets); record a timed archive or run the campaign timeless"
         );
         if replay_interruptions
-            && !archive.outcomes().values().any(|record| {
+            && !archive.outcome_records().any(|record| {
                 matches!(
                     record.outcome,
                     ExpectedOutcome::Cancelled | ExpectedOutcome::Disconnected
@@ -1823,12 +1849,8 @@ pub async fn run_with_backends(
                 .map(recorded_request_from)
                 .collect();
             let timing: SharedTimingLookup = {
-                let archive = archive.clone();
-                Arc::new(move |session, drv| {
-                    archive
-                        .expected_outcome(session, drv)
-                        .map(recorded_timing_from)
-                })
+                let index = timing_index(&archive);
+                Arc::new(move |session, drv| index.get(&(session, drv.to_string())).cloned())
             };
             let schedule = build_schedule(
                 &requests,

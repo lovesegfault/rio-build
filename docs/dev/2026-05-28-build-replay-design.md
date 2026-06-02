@@ -248,6 +248,8 @@ Record schema:
 
 Duplicate `(session, drv)` keys: last record wins, as in v0.
 
+The session-aware lookup above serves consumers acting for a specific recorded request (the timed scheduler). The timeless engine resolves truth per workload *unit* — it has no request identity to probe with — through one canonical collapse over sessions: the session-less record when one exists (it explicitly applies to any request of the unit), otherwise the record of the highest-numbered session (sessions are opaque grouping keys, but recorders allocate them in capture order, matching the last-record-wins rule above). Scoped records that disagree with the chosen outcome are logged, since the collapse is then losing information the timeless engine cannot represent.
+
 The neutral expected-outcome vocabulary:
 
 | `outcome` | Meaning | How a campaign can use it |

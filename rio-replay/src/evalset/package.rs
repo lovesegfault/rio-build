@@ -361,7 +361,7 @@ mod tests {
 
     use super::*;
     use crate::archive::reader::ReplayArchive;
-    use crate::archive::schema::{ClosureRecord, ExpectedOutcome, OutputHash};
+    use crate::archive::schema::{ClosureRecord, ExpectedOutcome, OutputHash, SessionKey};
     use crate::evalset::Scope;
     use crate::evalset::fidelity::{FidelityMismatch, MODE_EXHAUSTIVE};
     use crate::evalset::key::EvalSetKey;
@@ -674,10 +674,14 @@ mod tests {
         assert_eq!(excl.len(), 2);
         assert!(excl.iter().any(|e| e.reason == "eval-error"));
         assert!(excl.iter().any(|e| e.reason == "aggregate"));
-        // outcomes parse and the built record carries hashes
-        let outs = archive.outcomes();
-        assert_eq!(outs.len(), 2);
-        let built = archive.expected_outcome(0, APP_A_DRV).unwrap();
+        // outcomes parse and the built record carries hashes; the recorder
+        // is session-less, so the synthesized session-0 request resolves
+        // its unit's truth through the session-less fallback
+        assert_eq!(archive.outcome_records().count(), 2);
+        let app_a_request = reqs.iter().find(|r| r.targets[0].drv == APP_A_DRV).unwrap();
+        let built = archive
+            .expected_outcome(SessionKey::of_request(app_a_request), APP_A_DRV)
+            .unwrap();
         assert_eq!(built.outcome, ExpectedOutcome::Built);
         assert_eq!(built.outputs["out"].nar_size, 226_504);
         // impure-env restricted to workload units: the dependency-only drv

@@ -115,7 +115,7 @@ async fn eval_scoped_two_plain_jobs_end_to_end() {
     // cache.nixos.org (and green on Hydra) for this recorded eval, so
     // its expected outcome is `built` with per-output NAR identity.
     let hello_outcome = archive
-        .expected_outcome(0, HELLO_DRV)
+        .expected_outcome_across_sessions(HELLO_DRV)
         .expect("hello has an expected outcome");
     assert_eq!(hello_outcome.outcome.as_str(), "built");
     assert!(!hello_outcome.outputs.is_empty());

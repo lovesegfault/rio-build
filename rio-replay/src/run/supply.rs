@@ -70,7 +70,7 @@ pub fn workload_set(archive: &ReplayArchive) -> WorkloadSet {
     let impure = archive.impure_env();
     let mut drvs = BTreeSet::new();
     let mut demoted_impure = BTreeSet::new();
-    for record in archive.outcomes().values() {
+    for record in archive.outcome_records() {
         if impure.contains_key(&record.drv) {
             demoted_impure.insert(record.drv.clone());
         } else {

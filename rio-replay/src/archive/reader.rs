@@ -19,7 +19,7 @@ use rio_nix::narinfo::NarInfo;
 use super::backend::{Backend, EntryKind, WalkEntry};
 use super::schema::{
     Capabilities, ClosureRecord, Counts, ExclusionRecord, ImpureEnv, Manifest, MemberPresence,
-    OutcomeRecord, RequestRecord, Substituters, UnitRecord,
+    OutcomeRecord, RequestRecord, SessionKey, Substituters, UnitRecord,
 };
 use super::{
     CLOSURES_MEMBER, EXCLUSIONS_MEMBER, IMPURE_ENV_MEMBER, MANIFEST_MEMBER, METADATA_MEMBERS,
@@ -49,7 +49,10 @@ pub struct ReplayArchive {
     archive_id: Option<String>,
     requests: Vec<RequestRecord>,
     workload_units: BTreeSet<String>,
-    outcomes: HashMap<(Option<i64>, String), OutcomeRecord>,
+    /// Truth records, drv → per-session map. The inner `BTreeMap` keeps the
+    /// session-less record (`None`) first and scoped sessions ascending,
+    /// which is exactly the order the typed lookups walk.
+    outcomes: HashMap<String, BTreeMap<Option<i64>, OutcomeRecord>>,
     units: HashMap<String, UnitRecord>,
     closures: Vec<ClosureRecord>,
     impure_env: ImpureEnv,
@@ -162,12 +165,15 @@ impl ReplayArchive {
 
         // Expected outcomes keyed by (session, drv); duplicate keys keep the
         // last record (a re-recorded outcome supersedes the earlier one).
-        let mut outcomes: HashMap<(Option<i64>, String), OutcomeRecord> = HashMap::new();
+        let mut outcomes: HashMap<String, BTreeMap<Option<i64>, OutcomeRecord>> = HashMap::new();
         let mut outcome_records: u64 = 0;
         if let Some(bytes) = staged.get(OUTCOMES_MEMBER) {
             for record in super::parse_jsonl::<OutcomeRecord>(bytes, OUTCOMES_MEMBER)? {
                 outcome_records += 1;
-                outcomes.insert((record.session, record.drv.clone()), record);
+                outcomes
+                    .entry(record.drv.clone())
+                    .or_default()
+                    .insert(record.session, record);
             }
         }
 
@@ -374,11 +380,14 @@ impl ReplayArchive {
         // winning (a re-recorded outcome supersedes the earlier one).
         let builds_bytes = backend.read_file(v0::V0_BUILDS_MEMBER)?;
         let has_builds = builds_bytes.is_some();
-        let mut outcomes: HashMap<(Option<i64>, String), OutcomeRecord> = HashMap::new();
+        let mut outcomes: HashMap<String, BTreeMap<Option<i64>, OutcomeRecord>> = HashMap::new();
         if let Some(bytes) = &builds_bytes {
             for record in super::parse_jsonl::<v0::V0BuildRecord>(bytes, v0::V0_BUILDS_MEMBER)? {
                 let mapped = v0::map_build_record(record);
-                outcomes.insert((mapped.session, mapped.drv.clone()), mapped);
+                outcomes
+                    .entry(mapped.drv.clone())
+                    .or_default()
+                    .insert(mapped.session, mapped);
             }
         }
 
@@ -398,7 +407,10 @@ impl ReplayArchive {
         let (narinfos, _) = index_narinfos(&backend, SidecarPolicy::WarnAndSkip)?;
         let store_entries = index_store_entries(&backend)?;
 
-        let output_hashes_present = outcomes.values().any(|record| !record.outputs.is_empty());
+        let output_hashes_present = outcomes
+            .values()
+            .flat_map(|by_session| by_session.values())
+            .any(|record| !record.outputs.is_empty());
         let has_embedded_paths = store_entries
             .values()
             .any(|entry| !entry.name.ends_with(".drv"));
@@ -416,7 +428,10 @@ impl ReplayArchive {
         // parsed members so the exposed counts always describe what was
         // actually loaded.
         manifest.counts.requests = requests.len() as u64;
-        manifest.counts.expected_outcomes = outcomes.len() as u64;
+        manifest.counts.expected_outcomes = outcomes
+            .values()
+            .map(|by_session| by_session.len() as u64)
+            .sum();
 
         ensure_relay_substituter_schemes(&manifest.substituters)?;
 
@@ -497,17 +512,61 @@ impl ReplayArchive {
         &self.workload_units
     }
 
-    /// Expected outcomes keyed by `(session, drv)`; duplicate keys keep the
-    /// last record. Empty when the archive has no truth member.
-    pub fn outcomes(&self) -> &HashMap<(Option<i64>, String), OutcomeRecord> {
-        &self.outcomes
+    /// Every expected-outcome record (order unspecified; one record per
+    /// distinct `(session, drv)` key, duplicates keep the last). Empty when
+    /// the archive has no truth member.
+    pub fn outcome_records(&self) -> impl Iterator<Item = &OutcomeRecord> {
+        self.outcomes
+            .values()
+            .flat_map(|by_session| by_session.values())
     }
 
-    /// Lookup order: exact `(Some(session), drv)`, then `(None, drv)`.
-    pub fn expected_outcome(&self, session: i64, drv: &str) -> Option<&OutcomeRecord> {
-        self.outcomes
-            .get(&(Some(session), drv.to_string()))
-            .or_else(|| self.outcomes.get(&(None, drv.to_string())))
+    /// Session-resolved truth lookup. For a key minted from a recorded
+    /// request, the order is exact `(session, drv)`, then the session-less
+    /// `(null, drv)` record; [`SessionKey::SESSIONLESS`] resolves only the
+    /// session-less record.
+    pub fn expected_outcome(&self, session: SessionKey, drv: &str) -> Option<&OutcomeRecord> {
+        let by_session = self.outcomes.get(drv)?;
+        match session.recorded() {
+            Some(session) => by_session
+                .get(&Some(session))
+                .or_else(|| by_session.get(&None)),
+            None => by_session.get(&None),
+        }
+    }
+
+    /// THE canonical collapse over sessions, for consumers that resolve
+    /// truth by derivation alone (the timeless engine has one truth slot
+    /// per workload unit, whatever sessions requested it).
+    ///
+    /// Rule: the session-less record when one exists (it explicitly applies
+    /// to any request of the unit); otherwise the record of the
+    /// highest-numbered session — sessions are opaque grouping keys, but
+    /// recorders allocate them in capture order, so this matches the
+    /// reader's last-record-wins rule for duplicate keys. Scoped records
+    /// that disagree with the chosen outcome are logged, since the collapse
+    /// is then losing information the timeless engine cannot represent.
+    pub fn expected_outcome_across_sessions(&self, drv: &str) -> Option<&OutcomeRecord> {
+        let by_session = self.outcomes.get(drv)?;
+        if let Some(record) = by_session.get(&None) {
+            return Some(record);
+        }
+        let (chosen_session, record) = by_session.last_key_value()?;
+        let disagreeing: Vec<i64> = by_session
+            .iter()
+            .filter(|(_, other)| other.outcome != record.outcome)
+            .filter_map(|(session, _)| *session)
+            .collect();
+        if !disagreeing.is_empty() {
+            tracing::warn!(
+                drv,
+                chosen_session = chosen_session.unwrap_or_default(),
+                chosen_outcome = record.outcome.as_str(),
+                ?disagreeing,
+                "collapsing session-scoped truth over sessions that recorded a different outcome"
+            );
+        }
+        Some(record)
     }
 
     /// Per-unit metadata keyed by drv path (empty when units.jsonl absent).
@@ -782,6 +841,20 @@ mod tests {
         (root, finalized)
     }
 
+    /// The session key of the archive's recorded request on `session` —
+    /// how every session-scoped probe is minted (a `SessionKey` is only
+    /// constructible from a recorded request, so tests resolve sessions
+    /// the way the engine does: from the requests that exist).
+    fn key_of_session(archive: &ReplayArchive, session: i64) -> SessionKey {
+        SessionKey::of_request(
+            archive
+                .requests()
+                .iter()
+                .find(|record| record.session == session)
+                .unwrap_or_else(|| panic!("fixture records a request on session {session}")),
+        )
+    }
+
     /// Rewrite one textual occurrence inside a staged member file.
     fn rewrite_member(root: &Path, member: &str, from: &str, to: &str) {
         let path = root.join(member);
@@ -882,14 +955,33 @@ mod tests {
             vec![DEP_DRV, APP_DRV],
         );
 
-        // Session 7 recorded nothing for dep.drv: the lookup falls back to
-        // the session-less truth record.
-        let dep = archive.expected_outcome(7, DEP_DRV).unwrap();
+        // Session 1's request asked for dep.drv but no scoped record
+        // exists for it: the lookup falls back to the session-less truth
+        // record.
+        let dep = archive
+            .expected_outcome(key_of_session(&archive, 1), DEP_DRV)
+            .unwrap();
         assert_eq!(dep.outcome, crate::archive::schema::ExpectedOutcome::Built);
+        // The explicit session-less identity resolves the same record.
+        assert_eq!(
+            archive
+                .expected_outcome(SessionKey::SESSIONLESS, DEP_DRV)
+                .unwrap()
+                .outcome,
+            dep.outcome
+        );
         // Session 0's app.drv expectation is session-scoped.
-        let app = archive.expected_outcome(0, APP_DRV).unwrap();
+        let app = archive
+            .expected_outcome(key_of_session(&archive, 0), APP_DRV)
+            .unwrap();
         assert_eq!(app.outcome, crate::archive::schema::ExpectedOutcome::Failed);
         assert_eq!(app.session, Some(0));
+        // ... so the session-less identity does not see it.
+        assert!(
+            archive
+                .expected_outcome(SessionKey::SESSIONLESS, APP_DRV)
+                .is_none()
+        );
 
         assert_eq!(archive.units().len(), 2);
         assert!(
@@ -932,7 +1024,10 @@ mod tests {
         assert_eq!(from_image.format(), ArchiveFormat::V1);
         assert_eq!(from_dir.archive_id(), from_image.archive_id());
         assert_eq!(from_dir.requests().len(), from_image.requests().len());
-        assert_eq!(from_dir.outcomes().len(), from_image.outcomes().len());
+        assert_eq!(
+            from_dir.outcome_records().count(),
+            from_image.outcome_records().count()
+        );
         assert_eq!(from_dir.units().len(), from_image.units().len());
         assert_eq!(from_dir.closures().len(), from_image.closures().len());
         assert_eq!(
@@ -1222,10 +1317,68 @@ mod tests {
         refresh_files_entry(&root, OUTCOMES_MEMBER);
 
         let archive = ReplayArchive::open(&root).unwrap();
-        assert_eq!(archive.outcomes().len(), 2, "duplicate keys collapse");
         assert_eq!(
-            archive.expected_outcome(7, DEP_DRV).unwrap().outcome,
+            archive.outcome_records().count(),
+            2,
+            "duplicate keys collapse"
+        );
+        assert_eq!(
+            archive
+                .expected_outcome(key_of_session(&archive, 1), DEP_DRV)
+                .unwrap()
+                .outcome,
             crate::archive::schema::ExpectedOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn collapse_over_sessions_prefers_sessionless_then_highest_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        // dep.drv has only the session-less record: the collapse picks it.
+        let archive = ReplayArchive::open(&root).unwrap();
+        assert_eq!(
+            archive
+                .expected_outcome_across_sessions(DEP_DRV)
+                .unwrap()
+                .outcome,
+            crate::archive::schema::ExpectedOutcome::Built
+        );
+        // app.drv has only the (session 0)-scoped record: a by-drv consumer
+        // still sees it (the bug shape this helper retires was a constant
+        // probe that could only reach session 0 by accident — scoped truth
+        // on any other session vanished).
+        assert_eq!(
+            archive
+                .expected_outcome_across_sessions(APP_DRV)
+                .unwrap()
+                .outcome,
+            crate::archive::schema::ExpectedOutcome::Failed
+        );
+        assert!(
+            archive
+                .expected_outcome_across_sessions("/nix/store/x-unrecorded.drv")
+                .is_none()
+        );
+
+        // Add a later session's record for app.drv: with no session-less
+        // form, the collapse takes the highest-numbered session (recorders
+        // allocate session ids in capture order, matching last-wins).
+        let path = root.join(OUTCOMES_MEMBER);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(&format!(
+            "{{\"session\":5,\"drv\":\"{APP_DRV}\",\"outcome\":\"built\"}}\n"
+        ));
+        std::fs::write(&path, text).unwrap();
+        refresh_files_entry(&root, OUTCOMES_MEMBER);
+
+        let archive = ReplayArchive::open(&root).unwrap();
+        let collapsed = archive.expected_outcome_across_sessions(APP_DRV).unwrap();
+        assert_eq!(collapsed.session, Some(5));
+        assert_eq!(
+            collapsed.outcome,
+            crate::archive::schema::ExpectedOutcome::Built
         );
     }
 
@@ -1313,21 +1466,31 @@ mod tests {
         assert_eq!(last.targets[1].outputs, vec!["*".to_string()]);
 
         // Truth records arrive through the native-status mapping.
-        let dep = archive.expected_outcome(10, V0_DEP_DRV).unwrap();
+        let dep = archive
+            .expected_outcome(key_of_session(&archive, 10), V0_DEP_DRV)
+            .unwrap();
         assert_eq!(dep.outcome, schema::ExpectedOutcome::Built);
         assert_eq!(dep.outputs["out"].nar_size, 120);
-        let app = archive.expected_outcome(11, V0_APP_DRV).unwrap();
+        let app = archive
+            .expected_outcome(key_of_session(&archive, 11), V0_APP_DRV)
+            .unwrap();
         assert_eq!(app.outcome, schema::ExpectedOutcome::Failed);
         // detail keeps the native code alongside the recorder's message.
         assert_eq!(
             app.detail.as_deref(),
             Some("status=1: builder failed with exit code 1")
         );
-        let impure = archive.expected_outcome(12, V0_IMPURE_DRV).unwrap();
+        let impure = archive
+            .expected_outcome(key_of_session(&archive, 12), V0_IMPURE_DRV)
+            .unwrap();
         assert_eq!(impure.outcome, schema::ExpectedOutcome::Disconnected);
         assert_eq!(impure.stop_offset_s, Some(11.0));
         // The cached drv was a cache hit at record time: no truth record.
-        assert!(archive.expected_outcome(12, V0_CACHED_DRV).is_none());
+        assert!(
+            archive
+                .expected_outcome(key_of_session(&archive, 12), V0_CACHED_DRV)
+                .is_none()
+        );
 
         assert_eq!(archive.impure_env().len(), 1);
         assert!(archive.units().is_empty());
@@ -1389,7 +1552,7 @@ mod tests {
         std::fs::remove_file(root.join(IMPURE_ENV_MEMBER)).unwrap();
 
         let archive = ReplayArchive::open(&root).unwrap();
-        assert!(archive.outcomes().is_empty());
+        assert_eq!(archive.outcome_records().count(), 0);
         assert!(archive.impure_env().is_empty());
         assert!(!archive.capabilities().expected_outcomes);
         assert!(!archive.capabilities().impure_env);

@@ -360,17 +360,15 @@ pub fn plan_timed_dry_run(
     limit: Option<usize>,
 ) -> Result<TimedDryRunPlan> {
     // Recorded requests and per-(session, drv) timing truth, through the
-    // same sanitizing conversions the timed wiring applies.
+    // same sanitizing conversions (and the same wiring-point session
+    // resolution) the timed wiring applies.
     let requests: Vec<RecordedRequest> = archive
         .requests()
         .iter()
         .map(super::recorded_request_from)
         .collect();
-    let timing = |session: i64, drv: &str| {
-        archive
-            .expected_outcome(session, drv)
-            .map(super::recorded_timing_from)
-    };
+    let timing_index = super::timing_index(archive);
+    let timing = |session: i64, drv: &str| timing_index.get(&(session, drv.to_string())).cloned();
     let schedule = build_schedule(
         &requests,
         &timing,
