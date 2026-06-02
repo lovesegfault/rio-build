@@ -318,6 +318,41 @@ impl Disposition {
             Disposition::TargetSubstituted => true,
         }
     }
+
+    /// Whether records carrying this disposition describe jobs INSIDE the
+    /// plan's post-filter in-scope set — the population every report ratio
+    /// divides by (`completeness_pct`, progress `remaining`).
+    ///
+    /// results.jsonl is a single stream mixing two populations: in-scope
+    /// outcomes/exclusions, and out-of-scope bookkeeping records. `filtered`
+    /// is the one disposition recorded for jobs OUTSIDE the in-scope set
+    /// (`plan_time_dispositions` classifies every `plan.skipped` job as
+    /// filtered); every other producer is restricted to `plan.in_scope`
+    /// before it classifies (the not-attemptable/cached-prior scans, the
+    /// divergent/demoted filters, the supply rollup, the deadline
+    /// backfill). A ratio numerator must therefore drop the
+    /// out-of-population classes or it counts records its denominator
+    /// never could — >100% completeness on any filtered campaign.
+    ///
+    /// Deliberately an exhaustive match with no wildcard, like
+    /// [`Disposition::attempted`]: adding a disposition refuses to compile
+    /// until its population membership is decided here.
+    pub fn in_scope_population(self) -> bool {
+        match self {
+            // Recorded at plan time for every scope-filtered job — the
+            // exact set the in-scope denominator excludes.
+            Disposition::Filtered => false,
+            Disposition::EvalError
+            | Disposition::IdentityDivergent
+            | Disposition::NotAttemptable
+            | Disposition::DemotedImpure
+            | Disposition::CachedPrior
+            | Disposition::UploadRejected
+            | Disposition::SupplyFailed
+            | Disposition::TargetSubstituted
+            | Disposition::NotAttempted => true,
+        }
+    }
 }
 
 /// The single classification a workload unit ends a campaign with:

@@ -155,11 +155,18 @@ fn fmt_pct(v: Option<f64>) -> String {
     }
 }
 
-/// Number of jobs whose latest record carries a terminal class — the one
-/// "terminal" definition the report path uses (completeness, progress
-/// remaining-work): every verdict and every disposition except
-/// `not-attempted` is terminal; a record with neither field set entered
-/// neither count map and so never counts.
+/// Number of IN-SCOPE jobs whose latest record carries a terminal class —
+/// the one "terminal" definition the report path uses (completeness,
+/// progress remaining-work). Every verdict counts (verdicts only ever come
+/// from submitted, in-scope jobs); a disposition counts when it is
+/// terminal (`not-attempted` may still be attempted by a resume) AND its
+/// records describe in-scope jobs ([`Disposition::in_scope_population`] —
+/// `filtered` records are plan-time bookkeeping for jobs the in-scope
+/// denominator excludes, so counting them yields >100% completeness on
+/// any filtered campaign). A record with neither field set entered
+/// neither count map and so never counts; a disposition string outside
+/// the engine's vocabulary is counted defensively (it cannot be proven
+/// out of population).
 fn terminal_job_count(
     verdict_counts: &BTreeMap<String, usize>,
     disposition_counts: &BTreeMap<String, usize>,
@@ -167,9 +174,43 @@ fn terminal_job_count(
     verdict_counts.values().sum::<usize>()
         + disposition_counts
             .iter()
-            .filter(|(class, _)| class.as_str() != Disposition::NotAttempted.as_str())
+            .filter(|(class, _)| {
+                match Disposition::ALL
+                    .iter()
+                    .find(|d| d.as_str() == class.as_str())
+                {
+                    Some(d) => *d != Disposition::NotAttempted && d.in_scope_population(),
+                    None => true,
+                }
+            })
             .map(|(_, count)| *count)
             .sum::<usize>()
+}
+
+/// The completeness ratio: in-scope terminal jobs over the in-scope
+/// denominator, as a percentage.
+///
+/// Population invariant: [`terminal_job_count`] counts only records whose
+/// class belongs to the in-scope population, so on engine-written state
+/// the numerator can never exceed the denominator. The clamp makes a
+/// figure above 100% unrepresentable in every emitted artifact even over
+/// state this engine did not write (foreign or hand-edited results.jsonl,
+/// records for jobs a re-plan no longer scopes); a violation is loud, not
+/// silent, because it means some record class leaked across populations.
+fn completeness_pct(terminal: usize, in_scope: usize) -> f64 {
+    if in_scope == 0 {
+        return 0.0;
+    }
+    if terminal > in_scope {
+        tracing::warn!(
+            terminal,
+            in_scope,
+            "more in-scope terminal records than in-scope jobs; a record class has leaked \
+             across the scope populations — clamping completeness to 100%"
+        );
+        return 100.0;
+    }
+    100.0 * terminal as f64 / in_scope as f64
 }
 
 /// Low-confidence flag: the infra-indeterminate rate exceeded
@@ -273,11 +314,7 @@ pub fn comparability_with_counts(
     }
     block.excluded = excluded;
     let terminal = terminal_job_count(&agg.verdict_counts, &agg.disposition_counts);
-    block.completeness_pct = if block.in_scope > 0 {
-        100.0 * terminal as f64 / block.in_scope as f64
-    } else {
-        0.0
-    };
+    block.completeness_pct = completeness_pct(terminal, block.in_scope);
     // Supply/timing context: copied into the block so the low-confidence
     // derivation below (and anyone reading campaign.json or progress.json)
     // sees them without chasing the per-stage reports. A missing stage
@@ -862,10 +899,13 @@ pub fn build_progress(
         infra_rate_pct: agg.infra_rate_pct,
         no_truth_rate_pct: agg.no_truth_rate_pct,
         jobs_per_hour,
-        // ETA is undefined when the plan has no in-scope work at all — a
-        // "0h remaining" figure for an empty campaign would be misleading.
+        // ETA is an estimate of remaining work, so it exists only while
+        // in-scope work remains: an empty campaign and a fully terminal one
+        // both report `None` rather than a "0h remaining" figure. With
+        // `remaining` derived from the in-scope-only terminal count, a
+        // zero-hour ETA is unrepresentable while work is outstanding.
         eta_hours: jobs_per_hour
-            .filter(|jph| *jph > 0.0 && block.in_scope > 0)
+            .filter(|jph| *jph > 0.0 && block.in_scope > 0 && remaining > 0)
             .map(|jph| remaining as f64 / jph),
         suspension: suspension.clone(),
         comparability: block,
@@ -1007,6 +1047,188 @@ mod tests {
         // 11 records total; only match-built and target-substituted were
         // ever submitted.
         assert_eq!(agg.attempted, 2, "{agg:?}");
+    }
+
+    /// Completeness population membership, decided per disposition over the
+    /// whole vocabulary. The expected column derives from the producers'
+    /// scope contract (run/mod.rs): `plan_time_dispositions` classifies
+    /// every `plan.skipped` (out-of-scope) job as `filtered`, and every
+    /// other disposition producer filters to `plan.in_scope` first — so
+    /// `filtered` is the single class whose records the in-scope
+    /// denominator's population cannot contain. `not-attempted` is in
+    /// population but NOT terminal (a resume may still attempt it). The
+    /// exhaustiveness guard makes a new disposition fail here until its
+    /// row is added alongside its `in_scope_population()` decision.
+    #[test]
+    fn completeness_counts_only_in_scope_terminal_dispositions() {
+        let expected: &[(Disposition, bool)] = &[
+            (Disposition::Filtered, false),
+            (Disposition::EvalError, true),
+            (Disposition::IdentityDivergent, true),
+            (Disposition::NotAttemptable, true),
+            (Disposition::DemotedImpure, true),
+            (Disposition::CachedPrior, true),
+            (Disposition::UploadRejected, true),
+            (Disposition::SupplyFailed, true),
+            (Disposition::TargetSubstituted, true),
+            (Disposition::NotAttempted, true),
+        ];
+        assert_eq!(
+            expected.len(),
+            Disposition::ALL.len(),
+            "every disposition needs a population row"
+        );
+        for disposition in Disposition::ALL {
+            let in_population = expected
+                .iter()
+                .find(|(d, _)| *d == disposition)
+                .unwrap_or_else(|| panic!("no population row for {disposition:?}"))
+                .1;
+            assert_eq!(
+                disposition.in_scope_population(),
+                in_population,
+                "{disposition:?}"
+            );
+            // One record of this class against a 1-job in-scope plan: it
+            // contributes to completeness exactly when it is in population
+            // AND terminal.
+            let counts = BTreeMap::from([(disposition.as_str().to_string(), 1usize)]);
+            let terminal = terminal_job_count(&BTreeMap::new(), &counts);
+            let counted = in_population && disposition != Disposition::NotAttempted;
+            assert_eq!(terminal, usize::from(counted), "{disposition:?}");
+            assert_eq!(
+                completeness_pct(terminal, 1),
+                if counted { 100.0 } else { 0.0 },
+                "{disposition:?}"
+            );
+        }
+    }
+
+    /// The filtered-campaign shape every prior fixture missed (their
+    /// skipped sets were empty, making the record population coincide with
+    /// the in-scope set): plan-time `filtered` exclusion records for
+    /// out-of-scope jobs must not inflate completeness past 100% or melt
+    /// the ETA to zero while in-scope work remains.
+    #[test]
+    fn filtered_records_stay_out_of_completeness_and_eta() {
+        let spec: crate::run::spec::CampaignSpec =
+            serde_json::from_str(r#"{"mode":"leaf"}"#).unwrap();
+        let mut campaign = CampaignRecord::new(
+            "c-filtered".into(),
+            "2026-05-26T00:00:00Z".into(),
+            spec,
+            crate::run::spec::ArchivePin::default(),
+        );
+        // --limit 2 of 5: three jobs leave scope and get plan-time
+        // `filtered` records; the in-scope denominator is 2.
+        campaign.plan = Some(crate::run::spec::PlanOutput {
+            counts: BTreeMap::from([
+                ("inScope".to_string(), 2usize),
+                ("attemptable".to_string(), 2usize),
+            ]),
+            ..Default::default()
+        });
+        let mut records = BTreeMap::new();
+        for i in 0..3 {
+            records.insert(
+                format!("skipped{i}"),
+                rec(
+                    &format!("skipped{i}"),
+                    d(Disposition::Filtered),
+                    0,
+                    None,
+                    false,
+                ),
+            );
+        }
+        records.insert(
+            "done".into(),
+            rec("done", v(Verdict::MatchBuilt), 1, None, false),
+        );
+        let p = build_progress(
+            &campaign,
+            &records,
+            &SuspensionSummary::default(),
+            "submit+collect",
+            "2026-05-26T01:00:00Z".into(),
+            Some(2.0),
+            None,
+            None,
+            false,
+        );
+        // 1 of 2 in-scope jobs is terminal; the 3 filtered records are
+        // bookkeeping for jobs outside the denominator's population.
+        assert_eq!(p.comparability.in_scope, 2);
+        assert!(
+            (p.comparability.completeness_pct - 50.0).abs() < 1e-9,
+            "completeness must be in-scope only: {}",
+            p.comparability.completeness_pct
+        );
+        // 1 in-scope job remains at 2 jobs/hour.
+        assert!(
+            (p.eta_hours.unwrap() - 0.5).abs() < 1e-9,
+            "{:?}",
+            p.eta_hours
+        );
+        // The filtered records still appear where they belong: the
+        // excluded-but-reported map, not the completeness numerator.
+        assert_eq!(p.comparability.excluded.get("filtered"), Some(&3));
+    }
+
+    /// Both directions of the completeness population invariant: a
+    /// consistent state reports the exact (unclamped) ratio, and state this
+    /// engine did not write — more in-scope terminal records than in-scope
+    /// jobs — clamps to 100% instead of reporting an impossible figure.
+    #[test]
+    fn completeness_is_exact_in_population_and_clamps_above_it() {
+        // Must-admit: a half-terminal campaign reads exactly 50%.
+        assert!((completeness_pct(5, 10) - 50.0).abs() < 1e-9);
+        assert!((completeness_pct(10, 10) - 100.0).abs() < 1e-9);
+        // Must-block: >100% is unrepresentable even over foreign state.
+        assert!((completeness_pct(11, 10) - 100.0).abs() < 1e-9);
+        // No work planned: no ratio to report.
+        assert!((completeness_pct(3, 0) - 0.0).abs() < 1e-9);
+    }
+
+    /// A fully terminal campaign reports no ETA (there is nothing left to
+    /// estimate), so a "0h remaining" figure cannot appear: the ETA either
+    /// covers real remaining work or is absent.
+    #[test]
+    fn eta_is_none_when_no_in_scope_work_remains() {
+        let spec: crate::run::spec::CampaignSpec =
+            serde_json::from_str(r#"{"mode":"leaf"}"#).unwrap();
+        let mut campaign = CampaignRecord::new(
+            "c-done".into(),
+            "2026-05-26T00:00:00Z".into(),
+            spec,
+            crate::run::spec::ArchivePin::default(),
+        );
+        campaign.plan = Some(crate::run::spec::PlanOutput {
+            counts: BTreeMap::from([("inScope".to_string(), 1usize)]),
+            ..Default::default()
+        });
+        let mut records = BTreeMap::new();
+        records.insert(
+            "done".into(),
+            rec("done", v(Verdict::MatchBuilt), 1, None, false),
+        );
+        let p = build_progress(
+            &campaign,
+            &records,
+            &SuspensionSummary::default(),
+            "report",
+            "2026-05-26T01:00:00Z".into(),
+            Some(2.0),
+            None,
+            None,
+            false,
+        );
+        assert!(
+            (p.comparability.completeness_pct - 100.0).abs() < 1e-9,
+            "{}",
+            p.comparability.completeness_pct
+        );
+        assert_eq!(p.eta_hours, None);
     }
 
     #[test]
