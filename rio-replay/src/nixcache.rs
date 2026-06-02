@@ -118,6 +118,172 @@ impl CacheUrl {
     }
 }
 
+/// One archive-manifest substituter entry, classified once against the
+/// admission screen. This is the archive trust level: the lists are
+/// external input, so what each entry may be used for is decided here —
+/// by [`classify_substituter`], the only mint — and nowhere else.
+///
+/// Classification is total: a rejected entry becomes [`Unusable`] instead
+/// of an error, so an already-published (write-once) archive whose lists
+/// carry an entry the screen rejects still opens and replays — the entry
+/// is skipped, and an error surfaces only at a point of use that has no
+/// usable alternative.
+///
+/// [`Unusable`]: ArchiveSubstituterUrl::Unusable
+#[derive(Debug, Clone)]
+pub enum ArchiveSubstituterUrl {
+    /// Public-HTTPS cache: usable for live narinfo probing (and supply).
+    Https(HttpsSubstituter),
+    /// `s3://bucket[/prefix]` cache: usable by the supply stage's relay
+    /// fetches (object access goes through the AWS endpoint), but not
+    /// probeable over HTTP.
+    S3(S3Substituter),
+    /// An entry the screen rejected (unsupported scheme, non-public host,
+    /// unparseable URL), kept with the reason so consumers can log or
+    /// report it without re-deriving the verdict.
+    Unusable {
+        /// The entry as the manifest spelled it.
+        url: String,
+        /// Why the screen rejected it.
+        reason: String,
+    },
+}
+
+/// A public-HTTPS substituter minted by [`classify_substituter`] — the only
+/// thing [`NixCacheClient::for_substituter`] accepts, so an archive-supplied
+/// URL cannot reach the engine's probe client without passing the screen.
+#[derive(Debug, Clone)]
+pub struct HttpsSubstituter {
+    base: NormalizedCacheBase,
+}
+
+impl HttpsSubstituter {
+    /// The screened, normalized cache base.
+    pub fn base(&self) -> &NormalizedCacheBase {
+        &self.base
+    }
+}
+
+/// An `s3://` substituter minted by [`classify_substituter`]: bucket-name
+/// screened; the supply stage's client does its own parameter handling.
+#[derive(Debug, Clone)]
+pub struct S3Substituter {
+    url: String,
+}
+
+impl S3Substituter {
+    /// The entry as the manifest spelled it (for the supply admission).
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+impl ArchiveSubstituterUrl {
+    /// The entry's URL for logs and reports (normalized for the https
+    /// variant, verbatim otherwise).
+    pub fn url(&self) -> &str {
+        match self {
+            Self::Https(https) => https.base.as_str(),
+            Self::S3(s3) => &s3.url,
+            Self::Unusable { url, .. } => url,
+        }
+    }
+}
+
+/// Classify one archive-manifest substituter entry against the admission
+/// screen: `https://` entries must pass [`validate_probe_substituter`]
+/// (public host) and normalize cleanly; `s3://` entries must pass
+/// [`validate_supply_substituter`]'s bucket screen; everything else is
+/// [`ArchiveSubstituterUrl::Unusable`] with the screen's reason. Total —
+/// never an error — so archive open/bootstrap cannot fail on a list entry.
+pub fn classify_substituter(url: &str) -> ArchiveSubstituterUrl {
+    let unusable = |reason: anyhow::Error| ArchiveSubstituterUrl::Unusable {
+        url: url.to_string(),
+        reason: format!("{reason:#}"),
+    };
+    let scheme = match reqwest::Url::parse(url) {
+        Ok(parsed) => parsed.scheme().to_string(),
+        Err(e) => {
+            return unusable(anyhow::anyhow!(
+                "substituter {url:?} is not a valid URL: {e}"
+            ));
+        }
+    };
+    match scheme.as_str() {
+        "https" => {
+            match validate_probe_substituter(url).and_then(|()| NormalizedCacheBase::parse(url)) {
+                Ok(base) => ArchiveSubstituterUrl::Https(HttpsSubstituter { base }),
+                Err(err) => unusable(err),
+            }
+        }
+        "s3" => match validate_supply_substituter(url) {
+            Ok(()) => ArchiveSubstituterUrl::S3(S3Substituter {
+                url: url.to_string(),
+            }),
+            Err(err) => unusable(err),
+        },
+        _ => match validate_supply_substituter(url) {
+            Err(err) => unusable(err),
+            // The supply validator admits only https/s3, so reaching here
+            // would mean the two screens disagree — refuse rather than mint.
+            Ok(()) => unusable(anyhow::anyhow!(
+                "substituter {url:?} uses unsupported scheme {scheme:?}"
+            )),
+        },
+    }
+}
+
+/// The archive manifest's substituter lists, classified entry by entry
+/// (see [`classify_substituter`]). Built once at campaign bootstrap from
+/// [`crate::archive::schema::Substituters`].
+#[derive(Debug, Clone)]
+pub struct ClassifiedSubstituters {
+    /// Advisory list of caches the recorder expected the target's tenants
+    /// to use; never scheme-checked at archive open, so any entry here may
+    /// be unusable.
+    pub target: Vec<ArchiveSubstituterUrl>,
+    /// Caches the engine may relay from (https/s3 enforced at open; the
+    /// public-host screen is applied here).
+    pub relay: Vec<ArchiveSubstituterUrl>,
+}
+
+impl ClassifiedSubstituters {
+    /// Classify every entry of the manifest's lists. Total: unusable
+    /// entries are carried as [`ArchiveSubstituterUrl::Unusable`].
+    pub fn classify(substituters: &crate::archive::schema::Substituters) -> Self {
+        Self {
+            target: substituters
+                .target
+                .iter()
+                .map(|url| classify_substituter(url))
+                .collect(),
+            relay: substituters
+                .relay
+                .iter()
+                .map(|url| classify_substituter(url))
+                .collect(),
+        }
+    }
+
+    /// Every entry, target list first then relay — the probe-selection
+    /// precedence (the target list describes what the recorded clients'
+    /// own substituters served, so it is the better coverage signal).
+    pub fn iter(&self) -> impl Iterator<Item = &ArchiveSubstituterUrl> {
+        self.target.iter().chain(self.relay.iter())
+    }
+
+    /// The first probeable (public-HTTPS) entry across target then relay,
+    /// skipping s3 and unusable entries instead of failing on them. `None`
+    /// when no entry is probeable — the caller decides whether that matters
+    /// (only the warm-set coverage probe needs one).
+    pub fn first_probeable(&self) -> Option<&HttpsSubstituter> {
+        self.iter().find_map(|entry| match entry {
+            ArchiveSubstituterUrl::Https(https) => Some(https),
+            _ => None,
+        })
+    }
+}
+
 /// cache.nixos.org (or any Nix binary cache) narinfo reader.
 pub struct NixCacheClient {
     http: reqwest::Client,
@@ -129,6 +295,18 @@ impl NixCacheClient {
     /// recorder's `--cache-url`, test fixtures).
     pub fn new(cache: &CacheUrl, user_agent: &str) -> anyhow::Result<Self> {
         Self::with_base(cache.base.clone(), user_agent)
+    }
+
+    /// Build a narinfo client for an archive-nominated substituter. Accepts
+    /// only the screened [`HttpsSubstituter`] (minted by
+    /// [`classify_substituter`]), so "validated URL" and "constructed
+    /// client" can never disagree: an archive entry that did not pass the
+    /// public-HTTPS screen has no way to reach this constructor.
+    pub fn for_substituter(
+        substituter: &HttpsSubstituter,
+        user_agent: &str,
+    ) -> anyhow::Result<Self> {
+        Self::with_base(substituter.base.clone(), user_agent)
     }
 
     /// Shared construction: every [`NixCacheClient`] — whatever trust level
@@ -600,6 +778,87 @@ mod tests {
                 "cache URL spelling {spelling:?}"
             );
         }
+    }
+
+    #[test]
+    fn substituter_classification_screens_per_entry() {
+        // Public HTTPS → probeable, carrying the normalized base (prefix
+        // kept, parameters stripped).
+        match classify_substituter("https://cache.example.org/prefix?priority=10") {
+            ArchiveSubstituterUrl::Https(https) => {
+                assert_eq!(https.base().as_str(), "https://cache.example.org/prefix/");
+            }
+            other => panic!("expected Https, got {other:?}"),
+        }
+        // s3 → supply-only, never probeable.
+        match classify_substituter("s3://nix-cache-bucket/prefix?region=eu-central-1") {
+            ArchiveSubstituterUrl::S3(s3) => {
+                assert_eq!(s3.url(), "s3://nix-cache-bucket/prefix?region=eu-central-1");
+            }
+            other => panic!("expected S3, got {other:?}"),
+        }
+        // Everything the screen rejects becomes Unusable with a reason —
+        // classification is total, so a published archive carrying such an
+        // entry stays openable and replayable.
+        for bad in [
+            "http://internal-cache:8080",
+            "https://10.0.0.1",
+            "https://169.254.169.254/latest/meta-data",
+            "ssh://build-cache.internal",
+            "s3://",
+            "not-a-url",
+        ] {
+            match classify_substituter(bad) {
+                ArchiveSubstituterUrl::Unusable { url, reason } => {
+                    assert_eq!(url, bad);
+                    assert!(
+                        reason.contains(bad) || reason.contains("not a valid URL"),
+                        "reason for {bad} must name the entry: {reason}"
+                    );
+                }
+                other => panic!("{bad} must classify as Unusable, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn probe_selection_takes_first_usable_https_across_target_then_relay() {
+        use crate::archive::schema::Substituters;
+        // A bad target[0] (or an s3 target) with a good https relay must
+        // select the relay instead of failing the campaign: format-valid
+        // archives stay replayable, and every SELECTED entry still passed
+        // the screen.
+        let classified = ClassifiedSubstituters::classify(&Substituters {
+            target: vec![
+                "http://internal-cache:8080".into(),
+                "s3://team-bucket".into(),
+            ],
+            relay: vec!["https://cache.nixos.org".into()],
+        });
+        let probe = classified
+            .first_probeable()
+            .expect("the https relay entry is probeable");
+        assert_eq!(probe.base().as_str(), "https://cache.nixos.org/");
+
+        // Target-list precedence: a usable target entry wins over the relay.
+        let classified = ClassifiedSubstituters::classify(&Substituters {
+            target: vec!["https://target.example.org".into()],
+            relay: vec!["https://relay.example.org".into()],
+        });
+        assert_eq!(
+            classified.first_probeable().unwrap().base().as_str(),
+            "https://target.example.org/"
+        );
+
+        // s3-only relay (a format-valid archive shape): nothing is
+        // probeable, but classification still succeeds — the probe is
+        // simply absent and only its point of use may complain.
+        let classified = ClassifiedSubstituters::classify(&Substituters {
+            target: vec![],
+            relay: vec!["s3://my-cache".into()],
+        });
+        assert!(classified.first_probeable().is_none());
+        assert!(matches!(classified.relay[0], ArchiveSubstituterUrl::S3(_)));
     }
 
     #[test]

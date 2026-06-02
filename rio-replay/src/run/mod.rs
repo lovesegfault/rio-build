@@ -162,7 +162,12 @@ pub struct Backends {
     /// is kept alive past the supply stage for the dispatcher's
     /// pre-submission top-up ([`LadderTopup`]).
     pub supply_transport: Option<Arc<dyn SupplyTransport>>,
-    pub narinfo: Arc<dyn NarinfoSource>,
+    /// Live narinfo source for the warm-set upstream-coverage probe.
+    /// `None` when the archive's substituter lists carry no probeable
+    /// (public-HTTPS) entry — only leaf-mode campaigns with a non-empty
+    /// warm set need the probe, and they error at that point of use; every
+    /// other campaign shape runs without it.
+    pub narinfo: Option<Arc<dyn NarinfoSource>>,
     pub artifacts: Option<Arc<dyn ArtifactStore>>,
 }
 
@@ -270,24 +275,39 @@ pub async fn run(args: RunArgs) -> Result<()> {
         "gateway transport configured"
     );
     // The supply stage's absent-upstream coverage probe is pointed at the
-    // archive's declared substituters (target-side first, else the relay the
-    // recorder observed): truth never comes from this client, only
-    // prefetch-path upstream coverage does.
-    let substituters = &archive.manifest().substituters;
-    let probe_substituter = substituters
-        .target
-        .first()
-        .or_else(|| substituters.relay.first())
-        .cloned()
-        .context(
-            "archive lists no substituters; cannot probe upstream coverage for the supply stage",
-        )?;
-    // The substituter list is archive-supplied input: refuse to point the
-    // live narinfo probe at anything but a public HTTPS cache (no
-    // http/s3/file schemes, no loopback/link-local/private IP literals)
-    // before any client is constructed, so a hostile or misbuilt archive
-    // fails here instead of driving requests at internal endpoints.
-    crate::nixcache::validate_probe_substituter(&probe_substituter)?;
+    // archive's declared substituters (target list first, then relay):
+    // truth never comes from this client, only prefetch-path upstream
+    // coverage does. The lists are archive-supplied input, so every entry
+    // is classified once against the admission screen (public HTTPS =
+    // probeable; s3 = supply-only; anything else unusable) and the probe
+    // takes the FIRST probeable entry — a hostile or misbuilt entry is
+    // skipped, never dialed, and a format-valid archive with no probeable
+    // entry (e.g. an s3-only relay) still bootstraps: the probe is absent,
+    // which only the leaf-mode warm-set probe actually requires.
+    let classified =
+        crate::nixcache::ClassifiedSubstituters::classify(&archive.manifest().substituters);
+    for entry in classified.iter() {
+        if let crate::nixcache::ArchiveSubstituterUrl::Unusable { url, reason } = entry {
+            tracing::warn!(
+                url = %url,
+                reason = %reason,
+                "skipping unusable archive substituter entry"
+            );
+        }
+    }
+    let narinfo: Option<Arc<dyn NarinfoSource>> = match classified.first_probeable() {
+        Some(https) => Some(Arc::new(crate::nixcache::NixCacheClient::for_substituter(
+            https,
+            &crate::user_agent(None),
+        )?)),
+        None => {
+            tracing::warn!(
+                "archive lists no probeable public-HTTPS substituter; the warm-set \
+                 upstream-coverage probe is unavailable for this campaign"
+            );
+            None
+        }
+    };
     let backends = Backends {
         store: Arc::new(GrpcStoreApi::new(
             spec.cluster.store_addr.clone(),
@@ -305,10 +325,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         // resumed campaign whose supply marker is already set never dials
         // the supply pools).
         supply_transport: None,
-        narinfo: Arc::new(crate::nixcache::NixCacheClient::new(
-            &crate::nixcache::CacheUrl::parse(&probe_substituter)?,
-            &crate::user_agent(None),
-        )?),
+        narinfo,
         artifacts,
     };
     run_with_backends(args, spec, state, archive, backends).await
@@ -1293,9 +1310,19 @@ pub async fn run_with_backends(
         // never correctness.
         let target_coverage: BTreeSet<String> =
             if spec.mode == Mode::Leaf && !plan_output.warm_set.is_empty() {
+                // The probe's single point of use: only here does a missing
+                // probeable substituter become an error, so campaigns that
+                // never probe (non-leaf, empty warm set, resumed past
+                // supply) are not held to a requirement they don't have.
+                let narinfo = backends.narinfo.as_ref().context(
+                    "the warm-set upstream-coverage probe needs a public-HTTPS substituter, but \
+                     the archive's substituter lists (target, then relay) contain no usable \
+                     entry; a leaf-mode campaign with a non-empty warm set cannot run against \
+                     this archive",
+                )?;
                 truth::probe_warm_upstream_coverage(
                     &state,
-                    backends.narinfo.as_ref(),
+                    narinfo.as_ref(),
                     &plan_output.warm_set,
                     spec.knobs.narinfo_concurrency,
                     NARINFO_SWEEP_ATTEMPTS,
@@ -2477,7 +2504,7 @@ mod tests {
             cluster: Arc::new(HealthyCluster),
             submitter: submitter.clone(),
             supply_transport: Some(supply_transport.clone()),
-            narinfo: Arc::new(MapNarinfo(narinfos.clone())),
+            narinfo: Some(Arc::new(MapNarinfo(narinfos.clone()))),
             artifacts: None,
         };
         // The campaign also requests the regression-gate report policy so
@@ -2923,7 +2950,7 @@ mod tests {
             cluster: Arc::new(HealthyCluster),
             submitter: Arc::new(FakeSubmitter::default()),
             supply_transport: Some(Arc::new(FakeSupplyTransport::default())),
-            narinfo: Arc::new(MapNarinfo(HashMap::new())),
+            narinfo: Some(Arc::new(MapNarinfo(HashMap::new()))),
             artifacts: None,
         };
         let err = run_with_backends(
@@ -2951,6 +2978,45 @@ mod tests {
                 .is_none(),
             "no campaign record is written before the refusal"
         );
+    }
+
+    /// A missing narinfo probe (no probeable public-HTTPS substituter in
+    /// the archive) fails only at its single point of use — the leaf-mode
+    /// warm-set coverage probe — with an error naming the requirement.
+    /// Bootstrap and the plan stage run normally first: the archive itself
+    /// is valid, only this campaign shape needs the probe.
+    #[tokio::test]
+    async fn leaf_campaign_without_probeable_substituter_errors_at_the_probe() {
+        let (_archive_dir, archive, archive_id) = open_mini_archive();
+        let state_dir = tempfile::tempdir().unwrap();
+        let backends = Backends {
+            store: Arc::new(FakeStoreApi::default()),
+            admin: Arc::new(NoLogsAdmin),
+            cluster: Arc::new(HealthyCluster),
+            submitter: Arc::new(FakeSubmitter::default()),
+            supply_transport: Some(Arc::new(FakeSupplyTransport::default())),
+            narinfo: None,
+            artifacts: None,
+        };
+        let err = run_with_backends(
+            run_args(state_dir.path()),
+            leaf_spec(&archive_id),
+            StateDir::new(state_dir.path()).unwrap(),
+            archive,
+            backends,
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("warm-set upstream-coverage probe") && msg.contains("no usable entry"),
+            "{msg}"
+        );
+        // The plan stage completed (the archive is fine); only the supply
+        // stage's probe was unable to run.
+        let state = StateDir::new(state_dir.path()).unwrap();
+        assert!(state.marker_done("plan"));
+        assert!(!state.marker_done("supply"));
     }
 
     /// A timed campaign over a timed-capable archive with no recorded
@@ -3008,7 +3074,7 @@ mod tests {
             cluster: Arc::new(HealthyCluster),
             submitter: submitter.clone(),
             supply_transport: Some(Arc::new(FakeSupplyTransport::default())),
-            narinfo: Arc::new(MapNarinfo(narinfos)),
+            narinfo: Some(Arc::new(MapNarinfo(narinfos))),
             artifacts: None,
         };
         run_with_backends(
@@ -3120,7 +3186,7 @@ mod tests {
             cluster: Arc::new(HealthyCluster),
             submitter: submitter.clone(),
             supply_transport: Some(supply_transport.clone()),
-            narinfo: Arc::new(MapNarinfo(narinfos)),
+            narinfo: Some(Arc::new(MapNarinfo(narinfos))),
             artifacts: None,
         };
         run_with_backends(
@@ -3298,7 +3364,7 @@ mod tests {
                 cluster: Arc::new(HealthyCluster),
                 submitter: submitter.clone(),
                 supply_transport: Some(Arc::new(FakeSupplyTransport::default())),
-                narinfo: Arc::new(MapNarinfo(HashMap::new())),
+                narinfo: Some(Arc::new(MapNarinfo(HashMap::new()))),
                 artifacts: None,
             },
         )

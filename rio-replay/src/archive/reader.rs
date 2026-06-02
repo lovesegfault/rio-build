@@ -810,6 +810,51 @@ mod tests {
         .unwrap();
     }
 
+    /// A write-once archive whose substituter lists carry entries the
+    /// engine's admission screen rejects must still OPEN: the target list
+    /// is never scheme-checked (it is advisory recorder input, copied
+    /// verbatim by the v0 shim), and rejection is the campaign bootstrap's
+    /// per-entry classification — which skips to the next usable entry
+    /// instead of refusing the archive.
+    #[test]
+    fn archive_with_unusable_substituter_entries_opens_and_classifies() {
+        use crate::archive::writer::test_support::{stage_tiny_archive, tiny_seed};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        let writer = crate::archive::writer::ArchiveWriter::create(&root).unwrap();
+        let src_tree = tempfile::TempDir::new().unwrap();
+        stage_tiny_archive(&writer, &src_tree.path().join("src"));
+        let mut seed = tiny_seed();
+        // Production nix.conf shapes the screen rejects (internal http,
+        // ssh) ahead of a perfectly usable https entry; the relay keeps an
+        // s3 entry (format-valid) before the https one.
+        seed.substituters.target = vec![
+            "http://internal-cache:8080".to_string(),
+            "ssh://build-cache.internal".to_string(),
+        ];
+        seed.substituters.relay = vec![
+            "s3://team-bucket".to_string(),
+            "https://cache.nixos.org".to_string(),
+        ];
+        writer.finalize(seed).unwrap();
+
+        let archive = ReplayArchive::open(&root).expect("rejected entries must not block open");
+        let classified =
+            crate::nixcache::ClassifiedSubstituters::classify(&archive.manifest().substituters);
+        assert!(
+            classified.target.iter().all(|entry| matches!(
+                entry,
+                crate::nixcache::ArchiveSubstituterUrl::Unusable { .. }
+            )),
+            "both target entries fail the screen"
+        );
+        let probe = classified
+            .first_probeable()
+            .expect("the https relay entry is selected past the unusable/s3 ones");
+        assert_eq!(probe.base().as_str(), "https://cache.nixos.org/");
+    }
+
     #[test]
     fn opens_a_v1_directory_archive_and_exposes_the_model() {
         let dir = tempfile::TempDir::new().unwrap();
