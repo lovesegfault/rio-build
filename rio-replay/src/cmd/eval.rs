@@ -758,7 +758,11 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
             .iter()
             .flat_map(|rec| rec.outputs.values().cloned())
             .collect();
-        let cache_client = crate::nixcache::NixCacheClient::new(&args.cache_url, &ua)?;
+        let cache_client = crate::nixcache::NixCacheClient::new(
+            &crate::nixcache::CacheUrl::parse(&args.cache_url)
+                .with_context(|| format!("--cache-url {:?}", args.cache_url))?,
+            &ua,
+        )?;
         let truth_swept_at = jiff::Timestamp::now();
         tracing::info!(
             paths = output_paths.len(),

@@ -67,7 +67,11 @@ async fn live_hydra_eval_jobset_and_constituents_shape() {
 #[ignore = "live network: cache.nixos.org (manual smoke, never in CI)"]
 async fn live_cache_narinfo_for_a_known_hydra_output() {
     let ua = rio_replay::user_agent(None);
-    let c = NixCacheClient::new("https://cache.nixos.org", &ua).unwrap();
+    let c = NixCacheClient::new(
+        &rio_replay::nixcache::CacheUrl::parse("https://cache.nixos.org").unwrap(),
+        &ua,
+    )
+    .unwrap();
     // Output path of nixpkgs.hello.x86_64-linux from the recorded
     // job fixture (eval 1824219, build 324433458).
     let info = c

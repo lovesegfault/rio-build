@@ -13,27 +13,135 @@ use futures_util::StreamExt;
 use rio_nix::narinfo::NarInfo;
 use rio_nix::store_path::StorePath;
 
-/// cache.nixos.org (or any Nix binary cache) narinfo reader.
-pub struct NixCacheClient {
-    http: reqwest::Client,
+/// One normalized binary-cache base URL: parsed once, query/fragment
+/// stripped, and the path slash-terminated. Owns the single narinfo/object
+/// join implementation every cache client in this crate uses.
+///
+/// nix.conf substituter strings often carry parameters (`?priority=40`,
+/// `?trusted=1`); they tune client-side substituter selection, not how
+/// objects are fetched, so they are stripped here (with one log line saying
+/// so). The trailing slash matters because RFC 3986 relative resolution
+/// replaces the last path segment of a base that lacks one — exactly how a
+/// `/prefix?priority=10` cache URL used to lose its prefix when the slash
+/// was appended to the raw string and landed inside the query.
+///
+/// Construction performs no trust screening; the trust levels live above
+/// it: [`CacheUrl`] (operator-supplied, normalized only) and the
+/// archive-screened substituter types minted by the validators.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedCacheBase {
+    /// Invariant: hierarchical, no query, no fragment, path ends with `/`.
     base: reqwest::Url,
 }
 
+impl NormalizedCacheBase {
+    /// Parse and normalize a cache URL. Errors when the URL does not parse
+    /// or is not hierarchical (object names cannot be joined onto it).
+    pub(crate) fn parse(url: &str) -> anyhow::Result<Self> {
+        let mut base =
+            reqwest::Url::parse(url).with_context(|| format!("parse cache URL {url:?}"))?;
+        anyhow::ensure!(
+            !base.cannot_be_a_base(),
+            "cache URL {url:?} is not a hierarchical URL; object names cannot be joined onto it"
+        );
+        let ignored = match (base.query(), base.fragment()) {
+            (None, None) => None,
+            (query, fragment) => Some(format!(
+                "{}{}",
+                query.map(|q| format!("?{q}")).unwrap_or_default(),
+                fragment.map(|f| format!("#{f}")).unwrap_or_default()
+            )),
+        };
+        base.set_query(None);
+        base.set_fragment(None);
+        if !base.path().ends_with('/') {
+            let path = format!("{}/", base.path());
+            base.set_path(&path);
+        }
+        if let Some(ignored) = ignored {
+            tracing::warn!(
+                cache = %base,
+                ignored = %ignored,
+                "ignoring cache URL parameters; they do not affect how objects are fetched"
+            );
+        }
+        Ok(Self { base })
+    }
+
+    /// `<base><hash-part>.narinfo` for a full store path — THE narinfo join.
+    pub fn narinfo_url(&self, store_path: &str) -> anyhow::Result<reqwest::Url> {
+        let parsed = StorePath::parse(store_path)
+            .map_err(|e| anyhow::anyhow!("not a store path: {store_path}: {e}"))?;
+        self.object_url(&format!("{}.narinfo", parsed.hash_part()))
+    }
+
+    /// Join a cache-relative object name (`<hash>.narinfo`, `nar/….nar.zst`)
+    /// onto the base. The base's trailing slash guarantees the join appends
+    /// to the path instead of replacing its last segment.
+    pub fn object_url(&self, object: &str) -> anyhow::Result<reqwest::Url> {
+        self.base
+            .join(object.trim_start_matches('/'))
+            .with_context(|| format!("join object {object:?} onto cache base {}", self.base))
+    }
+
+    /// The normalized base URL string (slash-terminated, parameter-free).
+    pub fn as_str(&self) -> &str {
+        self.base.as_str()
+    }
+}
+
+impl std::fmt::Display for NormalizedCacheBase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.base, f)
+    }
+}
+
+/// Operator-trust cache URL: the recorder's `--cache-url` and loopback
+/// fixtures in tests. Normalized through [`NormalizedCacheBase`] but NOT
+/// screened — the operator chose the endpoint, so internal mirrors and
+/// plain-http dev caches are legitimate here.
+///
+/// This is one of the two trust levels a [`NixCacheClient`] can be built
+/// from; the other is an archive-nominated substituter, which additionally
+/// passes the public-HTTPS screen before the engine will probe it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheUrl {
+    base: NormalizedCacheBase,
+}
+
+impl CacheUrl {
+    /// Parse and normalize an operator-supplied cache URL (no screening).
+    pub fn parse(url: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            base: NormalizedCacheBase::parse(url)?,
+        })
+    }
+}
+
+/// cache.nixos.org (or any Nix binary cache) narinfo reader.
+pub struct NixCacheClient {
+    http: reqwest::Client,
+    base: NormalizedCacheBase,
+}
+
 impl NixCacheClient {
-    /// Build a narinfo client for `base_url`.
+    /// Build a narinfo client for an operator-supplied [`CacheUrl`] (the
+    /// recorder's `--cache-url`, test fixtures).
+    pub fn new(cache: &CacheUrl, user_agent: &str) -> anyhow::Result<Self> {
+        Self::with_base(cache.base.clone(), user_agent)
+    }
+
+    /// Shared construction: every [`NixCacheClient`] — whatever trust level
+    /// minted its base — gets the same hardened HTTP client.
     ///
     /// Deliberately not built on `crate::http_client` (the recorder-side
     /// constructor for Hydra and tarball downloads, which legitimately
     /// follow redirects wherever they lead): cache base URLs come from
-    /// replay archives, so this client re-screens every redirect hop
-    /// through `substituter_redirect_policy` — a screened cache must not
-    /// be able to 302 the engine at an endpoint the screen would have
-    /// rejected.
-    pub fn new(base_url: &str, user_agent: &str) -> anyhow::Result<Self> {
-        let mut base = base_url.to_string();
-        if !base.ends_with('/') {
-            base.push('/');
-        }
+    /// replay archives and operator flags, so this client re-screens every
+    /// redirect hop through `substituter_redirect_policy` — a screened
+    /// cache must not be able to 302 the engine at an endpoint the screen
+    /// would have rejected.
+    fn with_base(base: NormalizedCacheBase, user_agent: &str) -> anyhow::Result<Self> {
         // Same construction shape as `crate::http_client`: try the
         // platform trust store first, fall back to an explicit empty root
         // store when none is available (the hermetic test sandbox); see
@@ -51,19 +159,13 @@ impl NixCacheClient {
                 .build()
                 .context("build cache HTTP client")?,
         };
-        Ok(Self {
-            http,
-            base: reqwest::Url::parse(&base).with_context(|| format!("parse cache URL {base}"))?,
-        })
+        Ok(Self { http, base })
     }
 
-    /// `<base>/<hash-part>.narinfo` for a full store path.
+    /// `<base><hash-part>.narinfo` for a full store path (the one join,
+    /// via [`NormalizedCacheBase::narinfo_url`]).
     pub fn narinfo_url(&self, store_path: &str) -> anyhow::Result<reqwest::Url> {
-        let parsed = StorePath::parse(store_path)
-            .map_err(|e| anyhow::anyhow!("not a store path: {store_path}: {e}"))?;
-        self.base
-            .join(&format!("{}.narinfo", parsed.hash_part()))
-            .context("join narinfo URL")
+        self.base.narinfo_url(store_path)
     }
 
     /// Fetch a narinfo as raw text. 404 ⇒ `Ok(None)` (path not upstream);
@@ -464,15 +566,40 @@ mod tests {
 
     const HELLO_PATH: &str = "/nix/store/10s5j3mfdg22k1597x580qrhprnzcjwb-hello-2.12.3";
 
+    /// Operator-trust client for a test base URL.
+    fn client(base: &str) -> NixCacheClient {
+        NixCacheClient::new(&CacheUrl::parse(base).unwrap(), &crate::user_agent(None)).unwrap()
+    }
+
     #[test]
     fn narinfo_url_uses_hash_part() {
-        let c = NixCacheClient::new("https://cache.nixos.org", &crate::user_agent(None)).unwrap();
+        let c = client("https://cache.nixos.org");
         let url = c.narinfo_url(HELLO_PATH).unwrap();
         assert_eq!(
             url.as_str(),
             "https://cache.nixos.org/10s5j3mfdg22k1597x580qrhprnzcjwb.narinfo"
         );
         assert!(c.narinfo_url("not-a-store-path").is_err());
+    }
+
+    #[test]
+    fn narinfo_url_preserves_path_prefix_and_strips_query() {
+        // The idiomatic nix.conf substituter shape: path prefix plus
+        // parameters (`?priority=N`). The parameters tune substituter
+        // selection, not object fetching, so they are stripped — and the
+        // prefix must survive the join instead of being replaced by it.
+        for spelling in [
+            "https://cache.example.org/prefix?priority=10",
+            "https://cache.example.org/prefix",
+            "https://cache.example.org/prefix/",
+        ] {
+            let c = client(spelling);
+            assert_eq!(
+                c.narinfo_url(HELLO_PATH).unwrap().as_str(),
+                "https://cache.example.org/prefix/10s5j3mfdg22k1597x580qrhprnzcjwb.narinfo",
+                "cache URL spelling {spelling:?}"
+            );
+        }
     }
 
     #[test]
@@ -657,7 +784,7 @@ NarSize: 4242
     #[tokio::test]
     async fn fetch_narinfo_present_and_absent() {
         let (base, _srv) = spawn_fake_cache().await;
-        let c = NixCacheClient::new(&base, &crate::user_agent(None)).unwrap();
+        let c = client(&base);
 
         let info = c.fetch_narinfo(HELLO_PATH).await.unwrap().expect("present");
         assert_eq!(info.store_path, HELLO_PATH);
@@ -678,7 +805,7 @@ NarSize: 4242
     #[tokio::test]
     async fn http_errors_name_the_url_and_include_a_body_snippet() {
         let (base, _srv) = spawn_fake_cache().await;
-        let c = NixCacheClient::new(&base, &crate::user_agent(None)).unwrap();
+        let c = client(&base);
         let err = c
             .fetch_narinfo("/nix/store/cccccccccccccccccccccccccccccccc-broken-1.0")
             .await
@@ -694,7 +821,7 @@ NarSize: 4242
     #[tokio::test]
     async fn sweep_collects_facts_and_dedupes_paths() {
         let (base, _srv) = spawn_fake_cache().await;
-        let c = NixCacheClient::new(&base, &crate::user_agent(None)).unwrap();
+        let c = client(&base);
         let absent = "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-nope-1.0".to_string();
         let paths = vec![
             HELLO_PATH.to_string(),
@@ -715,7 +842,7 @@ NarSize: 4242
     #[tokio::test]
     async fn sweep_records_unusable_narhash_as_found_without_hash() {
         let (base, _srv) = spawn_fake_cache().await;
-        let c = NixCacheClient::new(&base, &crate::user_agent(None)).unwrap();
+        let c = client(&base);
         let unusable = "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-md5hashed-1.0".to_string();
         let facts = sweep_narinfos(&c, std::slice::from_ref(&unusable), 1, 2)
             .await
@@ -736,7 +863,7 @@ NarSize: 4242
         // NAR identity at all, which keeps the recorder's outcome mapping
         // at `built` without an output-hash entry rather than `unknown`.
         let (base, _srv) = spawn_fake_cache().await;
-        let c = NixCacheClient::new(&base, &crate::user_agent(None)).unwrap();
+        let c = client(&base);
         let garbled = "/nix/store/gggggggggggggggggggggggggggggggg-garbled-1.0".to_string();
         let facts = sweep_narinfos(&c, std::slice::from_ref(&garbled), 1, 2)
             .await
@@ -750,7 +877,7 @@ NarSize: 4242
     #[tokio::test]
     async fn sweep_propagates_persistent_errors() {
         let (base, _srv) = spawn_fake_cache().await;
-        let c = NixCacheClient::new(&base, &crate::user_agent(None)).unwrap();
+        let c = client(&base);
         let broken = "/nix/store/cccccccccccccccccccccccccccccccc-broken-1.0".to_string();
         let err = sweep_narinfos(&c, &[broken], 2, 2).await.unwrap_err();
         assert!(
@@ -913,7 +1040,7 @@ NarSize: 7777
     #[tokio::test]
     async fn same_origin_narinfo_redirect_is_followed() {
         let (base, _srv) = spawn_redirecting_cache().await;
-        let c = NixCacheClient::new(&base, &crate::user_agent(None)).unwrap();
+        let c = client(&base);
         let info = c
             .fetch_narinfo("/nix/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-relocated-1.0")
             .await
@@ -925,7 +1052,7 @@ NarSize: 7777
     #[tokio::test]
     async fn redirect_to_non_public_address_is_refused() {
         let (base, _srv) = spawn_redirecting_cache().await;
-        let c = NixCacheClient::new(&base, &crate::user_agent(None)).unwrap();
+        let c = client(&base);
         let err = c
             .fetch_narinfo("/nix/store/ssssssssssssssssssssssssssssssss-redirector-1.0")
             .await
@@ -947,7 +1074,7 @@ NarSize: 7777
         // the policy's own hop cap (a custom reqwest policy replaces the
         // built-in one).
         let (base, _srv) = spawn_redirecting_cache().await;
-        let c = NixCacheClient::new(&base, &crate::user_agent(None)).unwrap();
+        let c = client(&base);
         let err = c
             .fetch_narinfo("/nix/store/llllllllllllllllllllllllllllllll-loop-1.0")
             .await

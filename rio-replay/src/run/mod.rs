@@ -306,7 +306,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         // the supply pools).
         supply_transport: None,
         narinfo: Arc::new(crate::nixcache::NixCacheClient::new(
-            &probe_substituter,
+            &crate::nixcache::CacheUrl::parse(&probe_substituter)?,
             &crate::user_agent(None),
         )?),
         artifacts,

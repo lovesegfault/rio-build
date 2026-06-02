@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::narhash::NarHash;
+use crate::nixcache::NormalizedCacheBase;
 
 /// TCP/TLS connect timeout for HTTP substituters. There is deliberately no
 /// overall request timeout: NAR bodies can be multi-GB and legitimately
@@ -46,8 +47,9 @@ const NARINFO_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum Substituter {
     /// An HTTP(S) cache, e.g. `https://cache.nixos.org`.
     Http {
-        /// Cache base URL; object names are appended to its path.
-        base: reqwest::Url,
+        /// Normalized cache base; object names are joined onto its path
+        /// through the shared [`NormalizedCacheBase`] join.
+        base: NormalizedCacheBase,
         /// Pooled client for this cache.
         client: reqwest::Client,
     },
@@ -84,29 +86,13 @@ impl Substituter {
         match parsed.scheme() {
             "http" | "https" => {
                 let https = parsed.scheme() == "https";
-                // Substituter strings copied out of nix.conf can carry
-                // parameters (`?priority=40`, `?trusted=1`); they tune
-                // client-side substituter selection, not how objects are
-                // fetched, so strip them from the base (object names are
-                // appended to its path) and say so once.
-                let ignored = match (parsed.query(), parsed.fragment()) {
-                    (None, None) => None,
-                    (query, fragment) => Some(format!(
-                        "{}{}",
-                        query.map(|q| format!("?{q}")).unwrap_or_default(),
-                        fragment.map(|f| format!("#{f}")).unwrap_or_default()
-                    )),
-                };
-                let mut base = parsed;
-                base.set_query(None);
-                base.set_fragment(None);
-                if let Some(ignored) = ignored {
-                    tracing::warn!(
-                        substituter = %base,
-                        ignored = %ignored,
-                        "ignoring substituter URL parameters; they do not affect how objects are fetched"
-                    );
-                }
+                // Normalization (parameter stripping, trailing slash, the
+                // object-URL join) is shared with every other cache client
+                // via NormalizedCacheBase, so the two clients can never
+                // again disagree on how a substituter string becomes an
+                // object URL. nix.conf-style parameters (`?priority=40`)
+                // are stripped there with a log line saying so.
+                let base = NormalizedCacheBase::parse(url)?;
                 let mut builder = reqwest::Client::builder()
                     .user_agent(crate::user_agent(None))
                     .connect_timeout(CONNECT_TIMEOUT)
@@ -205,7 +191,7 @@ impl Substituter {
         let object = format!("{hash_part}.narinfo");
         match self {
             Self::Http { base, client } => {
-                let url = object_url(base, &object)?;
+                let url = base.object_url(&object)?;
                 let resp = client
                     .get(url.clone())
                     .timeout(NARINFO_TIMEOUT)
@@ -335,7 +321,7 @@ impl Substituter {
     ) -> Result<(u64, Box<dyn AsyncRead + Send + Unpin>)> {
         let raw: Box<dyn AsyncRead + Send + Unpin> = match self {
             Self::Http { base, client } => {
-                let url = object_url(base, &info.url)?;
+                let url = base.object_url(&info.url)?;
                 let resp = client
                     .get(url.clone())
                     .send()
@@ -373,18 +359,6 @@ impl Substituter {
         let reader = decompress(raw, &info.compression, &self.url())?;
         Ok((info.nar_size, reader))
     }
-}
-
-/// Join a cache-relative object name (`<hash>.narinfo`, `nar/….nar.zst`)
-/// onto the cache base URL.
-fn object_url(base: &reqwest::Url, object: &str) -> Result<reqwest::Url> {
-    let joined = format!(
-        "{}/{}",
-        base.as_str().trim_end_matches('/'),
-        object.trim_start_matches('/')
-    );
-    reqwest::Url::parse(&joined)
-        .with_context(|| format!("invalid substituter object URL {joined:?}"))
 }
 
 /// Wrap a raw (still-compressed) NAR body reader in a streaming decoder for
