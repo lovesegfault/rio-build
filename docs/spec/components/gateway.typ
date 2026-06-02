@@ -1147,16 +1147,12 @@ fetch). The optimization:
   failure once downstream tenant authz lands).
 ]
 
-#r("gw.jwt.anon-drv-lookup")[
-  Read-path opcodes (`wopIsValidPath`, `wopEnsurePath`, `wopQueryPathInfo`,
-  `wopQueryValidPaths`) MUST send the JWT to the store *except for `.drv`
-  paths*, which are looked up anonymously (`jwt_unless_drv`). `.drv` files are
-  build INPUTS, not tenant-owned OUTPUTS: a `.drv` uploaded under one identity
-  then queried under another has no `path_tenants` row for the querying tenant,
-  so a tenant-filtered `QueryPathInfo` would return NotFound for a `.drv` the
-  client just uploaded. Output paths keep tenant-scoped visibility
-  (#rref("store.tenant.narinfo-filter")); only the `.drv` lookup is exempt.
-]
+Read-path opcodes (`wopIsValidPath`, `wopEnsurePath`, `wopQueryPathInfo`,
+`wopQueryValidPaths`, `wopNarFromPath`) send the session JWT for *all* paths,
+`.drv` included --- there is deliberately no anonymous-`.drv` carve-out. Tenant
+visibility for validity answers is the store's decision
+(#rref("store.tenant.valid-paths-filter") documents why a carve-out is
+forbidden); the gateway only propagates identity per #rref("gw.jwt.propagate").
 
 = Connection Lifecycle
 

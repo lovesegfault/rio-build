@@ -356,3 +356,133 @@ async fn put_path_deleted_tenant_skips_junction() -> TestResult {
     );
     Ok(())
 }
+
+/// The cross-tenant brick: tenant A uploads a `.drv`; tenant B's
+/// validity check (`FindMissingPaths`, what `wopQueryValidPaths`
+/// inverts) must NOT report it valid, because B cannot read it through
+/// the castore surface. A `.drv` exemption here means B's nix client
+/// skips the upload, B's builder gets `NotFound` → EIO from
+/// castore-FUSE, and the build dies after `max_infra_retries` —
+/// reproduced live on a 2-tenant cluster (`qa --only iso03`).
+///
+/// The healing half: B re-uploads (idempotent skip), the skip arm
+/// writes B's junction row (`r[store.put.tenant-junction]`), and the
+/// same path becomes both valid and readable for B.
+// r[verify store.tenant.valid-paths-filter]
+#[tokio::test]
+async fn find_missing_paths_drv_tenant_scoped() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let tenant_a = seed_tenant(&db.pool, "tenancy-fmp-a").await;
+    let tenant_b = seed_tenant(&db.pool, "tenancy-fmp-b").await;
+
+    // One store per caller identity (the fake-JWT interceptor pins a
+    // single tenant), both on the same pool — the production split
+    // where one PG backs every gateway session.
+    let (mut client_a, server_a) =
+        spawn_store_with_fake_jwt(StoreServiceImpl::new(db.pool.clone()), tenant_a).await?;
+    let _guard_a = scopeguard::guard(server_a, |h| h.abort());
+    let (mut client_b, server_b) =
+        spawn_store_with_fake_jwt(StoreServiceImpl::new(db.pool.clone()), tenant_b).await?;
+    let _guard_b = scopeguard::guard(server_b, |h| h.abort());
+
+    // Castore read side, HMAC-authenticated like a real builder.
+    let dir_svc = DirectoryServiceImpl::new(
+        db.pool.clone(),
+        Some(Arc::new(HmacVerifier::from_key(KEY.to_vec()))),
+        None,
+    );
+    let router = Server::builder().add_service(DirectoryServiceServer::new(dir_svc));
+    let (addr, dir_server) = rio_test_support::grpc::spawn_grpc_server_layered(router).await;
+    let _dir_guard = scopeguard::guard(dir_server, |h| h.abort());
+    let channel = Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut dir_client = DirectoryServiceClient::new(channel);
+
+    // Tenant A uploads the .drv (the gateway leg of A's build).
+    let drv_body: &[u8] = b"Derive([(\"out\",\"/nix/store/fmp\",\"\",\"\")],[],[],\"x86_64\")";
+    let (nar, _) = make_nar(drv_body);
+    let path = test_drv_path("tenancy-fmp");
+    let info = make_path_info_for_nar(&path, &nar);
+    assert!(put_path(&mut client_a, info.clone(), nar.clone()).await?);
+    assert_eq!(junction_tenants(&db.pool, &path).await, vec![tenant_a]);
+
+    // A's own validity check: present.
+    let missing_for_a = client_a
+        .find_missing_paths(FindMissingPathsRequest {
+            store_paths: vec![path.clone()],
+        })
+        .await?
+        .into_inner()
+        .missing_paths;
+    assert!(
+        missing_for_a.is_empty(),
+        "the uploader's own validity check must report the .drv present"
+    );
+
+    // B's validity check: MUST be missing — B cannot read it, so
+    // reporting it valid would brick B's build.
+    let missing_for_b = client_b
+        .find_missing_paths(FindMissingPathsRequest {
+            store_paths: vec![path.clone()],
+        })
+        .await?
+        .into_inner()
+        .missing_paths;
+    assert_eq!(
+        missing_for_b,
+        vec![path.clone()],
+        ".drv built by another tenant must be reported missing (valid-but-unreadable is forbidden)"
+    );
+
+    // Single-path agreement: wopIsValidPath goes through QueryPathInfo.
+    let qpi_b = client_b
+        .query_path_info(QueryPathInfoRequest {
+            store_path: path.clone(),
+        })
+        .await;
+    assert_eq!(
+        qpi_b
+            .expect_err("B's QueryPathInfo must not see A's .drv")
+            .code(),
+        tonic::Code::NotFound,
+        "single-path lookup must agree with the batch answer"
+    );
+
+    // B re-uploads → idempotent skip writes B's junction row → the
+    // path is now valid AND readable for B (self-healing ownership).
+    assert!(!put_path(&mut client_b, info, nar).await?);
+    let mut expected = vec![tenant_a, tenant_b];
+    expected.sort();
+    assert_eq!(junction_tenants(&db.pool, &path).await, expected);
+
+    let missing_for_b = client_b
+        .find_missing_paths(FindMissingPathsRequest {
+            store_paths: vec![path.clone()],
+        })
+        .await?
+        .into_inner()
+        .missing_paths;
+    assert!(
+        missing_for_b.is_empty(),
+        "after B's idempotent-skip upload the .drv is valid for B"
+    );
+
+    let digest = blake3::hash(drv_body);
+    let resp = dir_client
+        .read_blob(with_token(
+            ReadBlobRequest {
+                file_digest: digest.as_bytes().to_vec(),
+            },
+            &token_for(tenant_b, vec![]),
+        ))
+        .await
+        .context("B's castore ReadBlob must succeed once B owns a junction row")?;
+    let mut body = Vec::new();
+    let mut stream = resp.into_inner();
+    while let Some(frame) = stream.next().await {
+        body.extend_from_slice(&frame?.data);
+    }
+    assert_eq!(body, drv_body, "valid-for-B now implies readable-by-B");
+    Ok(())
+}

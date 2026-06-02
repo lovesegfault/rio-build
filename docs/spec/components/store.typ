@@ -652,6 +652,31 @@ unique chunks.
   results for backward compatibility.
 ]
 
+#r("store.tenant.valid-paths-filter")[
+  Validity and missing-path checks (`QueryPathInfo` presence,
+  `FindMissingPaths` --- what `wopIsValidPath` and `wopQueryValidPaths`
+  consume) MUST apply the same tenant visibility as the castore read surface,
+  with no `.drv` exemption: an authenticated caller is told a path is valid
+  only if a `path_tenants` row grants its tenant read access, or the path is
+  substitution-only and signature-visible
+  (#rref("store.substitute.tenant-sig-visibility")). A path MUST NOT be
+  reported valid to a caller whose castore reads of it would fail.
+]
+
+Valid-but-unreadable is the failure mode this rule forbids. A `.drv` exemption
+("build inputs, not tenant-owned outputs") once made a `.drv` uploaded by
+tenant A count as valid for tenant B: B's nix client skipped the upload, B's
+builder then opened the `.drv` through castore-FUSE, and the tenant-scoped
+read (#rref("store.castore.tenant-scope")) returned `NotFound` → `EIO` → the
+build died after exhausting its infrastructure retries --- reproduced live with
+two tenants sharing one busybox `.drv`. Reporting the path missing instead is
+self-healing: the client re-uploads, the idempotent-skip arm of
+#rref("store.put.tenant-junction") writes the caller's junction row, and the
+path becomes both valid and readable for that tenant. The same re-upload flow
+covers `.drv`s uploaded under one identity and queried under another (the case
+that motivated the exemption): the second identity re-uploads instead of
+receiving a stale "valid" answer it cannot use.
+
 == Key Rotation
 
 + Generate a new ed25519 signing key with a NEW key name (e.g., `rio-prod-2` if
