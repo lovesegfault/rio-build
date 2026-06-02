@@ -157,6 +157,8 @@ async fn pull_unbuilt_deps_returns_not_yet_ready() -> TestResult {
     Ok(())
 }
 
+// D4-retarget: flips when the must_substitute arm dies (T-D4.1) — refusal
+// becomes the JobView arm; re-assert NotYetReady-while-job-unresolved.
 // r[verify sched.merge.substitute-topdown+12]
 /// A Ready node that may only complete via substitution (topdown-pruned
 /// with Broken closure evidence — childless here) is never served from

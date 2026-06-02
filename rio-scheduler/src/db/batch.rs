@@ -296,36 +296,6 @@ impl SchedulerDb {
         Ok(())
     }
 
-    /// Tx-scoped batched `topdown_pruned` clear keyed by
-    /// `derivation_id`. No production caller today: the merge-time
-    /// clear that ran here in the edge-insert transaction was replaced
-    /// by the post-reconciliation clear pass in `handle_merge_dag`
-    /// (`clear_topdown_pruned_by_hashes`), which decides per unique
-    /// parent only after `verify_preexisting_completed` has re-verified
-    /// stale Completed children. Retained (test-only, like
-    /// `insert_build_derivation` above) for the DB test pinning the
-    /// OR-on-conflict + clear interplay and for potential future
-    /// tx-scoped use.
-    #[cfg(test)]
-    pub(crate) async fn clear_topdown_pruned_for_parents(
-        tx: &mut PgConnection,
-        derivation_ids: &[Uuid],
-    ) -> Result<(), sqlx::Error> {
-        if derivation_ids.is_empty() {
-            return Ok(());
-        }
-        sqlx::query(
-            r#"
-            UPDATE derivations SET topdown_pruned = false, updated_at = now()
-            WHERE derivation_id = ANY($1) AND topdown_pruned
-            "#,
-        )
-        .bind(derivation_ids)
-        .execute(&mut *tx)
-        .await?;
-        Ok(())
-    }
-
     /// Best-effort batched `topdown_pruned` clear keyed by `drv_hash`,
     /// as a generation-fenced single-statement transaction. Callers: the
     /// post-reconciliation clear pass in `handle_merge_dag` (unique

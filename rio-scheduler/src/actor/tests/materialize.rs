@@ -1844,42 +1844,6 @@ async fn flag_on_claim_emits_substituting_event_and_consumption_stops_it() -> Te
 }
 
 // r[verify sched.materialize.job]
-/// BC-4 flag-off invariance pin: the as-built walk's SUBSTITUTING
-/// emission at spawn time is byte-identical — flag-off, the event still
-/// fires when the walk spawns (NOT at any claim; no claims exist), and
-/// the walk completion emits the terminal stop. This pins criterion 2
-/// for the event surface and must never change.
-#[tokio::test]
-async fn flag_off_walk_substituting_events_unchanged() -> TestResult {
-    use rio_proto::types::DerivationEventKind as K;
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?; // flag-off
-
-    let out = test_store_path("bc4-off-out");
-    // Substitutable BEFORE merge → the as-built merge classification
-    // spawns the walk (Substituting status + the SUBSTITUTING event).
-    store.state.substitutable.write().unwrap().push(out.clone());
-    let mut n = make_node("bc4-off");
-    n.expected_output_paths = vec![out.clone()];
-    let build_id = Uuid::new_v4();
-    let mut ev = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
-    barrier(&handle).await;
-    settle_substituting(&handle, &["bc4-off"]).await;
-    barrier(&handle).await;
-
-    let kinds = drain_derivation_kinds(&mut ev);
-    assert!(
-        kinds.contains(&K::Substituting),
-        "flag-off the walk-spawn SUBSTITUTING emission is unchanged; got {kinds:?}"
-    );
-    // The walk completed the node → the terminal event closed the pair.
-    assert!(
-        kinds.contains(&K::Cached) || kinds.contains(&K::Completed),
-        "flag-off the walk completion emits the terminal event; got {kinds:?}"
-    );
-    Ok(())
-}
-
-// r[verify sched.materialize.job]
 // r[verify sched.state.machine+2]
 /// PD-6 (Phase B, the PDQ-6 amendment's prescribed flip): a Queued node
 /// (a parent behind an unproduced dep) with a pending job ACCEPTS a
@@ -4575,6 +4539,9 @@ async fn flag_on_probe_job_backfills_wanted_relation_for_flag_off_era_builds() -
 
 // ── T-5.3 (Phase B): the OQ7 zero-walk coexistence boundary audit ──────────
 
+// D3-delete: deleted with the spawner in T-D3.1 (its legacy-state arm
+// asserts the D16 verification walk SPAWNS — red the moment the spawner
+// dies; disposition: superseded by the structural absence of the spawner).
 // r[verify sched.materialize.job]
 // r[verify sched.materialize.routing+2]
 /// T-5.3 (OQ7 close-out / equivalence criterion 3, scoped per PD-B19):

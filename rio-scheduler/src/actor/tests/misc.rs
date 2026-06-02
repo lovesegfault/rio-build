@@ -1272,6 +1272,8 @@ async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
     );
 }
 
+// D3-retarget: bucket re-derivation (T-D3.3) — re-assert that the bucket
+// counts pending-unclaimed jobs; the status arm dies.
 /// `substituting_derivations` counts DAG nodes in `Substituting` and is
 /// disjoint from queued/running. Regression: the previous `_ => {}`
 /// match arm dropped Substituting on the floor → ComponentScaler saw

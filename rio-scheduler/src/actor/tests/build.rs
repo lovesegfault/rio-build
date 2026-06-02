@@ -356,6 +356,8 @@ async fn test_watch_build_receives_events() -> TestResult {
     Ok(())
 }
 
+// D5-retarget: the open-attempt reap guard survives; the marked/holed
+// parametrization retires with the evidence fields.
 // r[verify sched.merge.substitute-topdown+12]
 /// The reap-time survivor re-evaluation must NOT fail-fast a marked,
 /// holed, walk-spent survivor that is Assigned/Running — an open
@@ -501,6 +503,9 @@ async fn cleanup_reap_skips_marked_holed_survivor_with_open_attempt() -> TestRes
     Ok(())
 }
 
+// D3-retarget: the reap survivor pass survives (jobs-armed gate, B5); the
+// tried/holed parametrizations retire with their state fields (D3/D5);
+// promotion-arm cases stay.
 /// Reap-survivor settlement (third C3/D16 site): when a terminal
 /// build's reap leaves a marked survivor holed but the survivor's
 /// live-wanted outputs ARE obtainable, the reap hook itself must
