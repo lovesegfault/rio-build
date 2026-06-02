@@ -240,28 +240,172 @@ impl ArtifactStore for S3ArtifactStore {
     }
 }
 
-/// Files synced from the state dir to the store on every sync tick. The
-/// per-bucket JSONL written by the report stage and the per-job
-/// `logs/*.log.zst` tails written by collect are picked up by the dynamic
-/// enumerations in [`sync_state`] (so the uploaded campaign prefix carries
-/// the complete artifact set). Log tails are uploaded by collect at capture
-/// time already; re-enumerating them here retries any upload that failed at
-/// capture.
-const SYNCED_FILES: &[&str] = &[
-    "campaign.json",
-    "progress.json",
-    "results.jsonl",
-    "supply.jsonl",
-    "dispatch.jsonl",
-    "batches.jsonl",
-    "supply-report.json",
-    "timed-stats.json",
-    "report/summary.md",
-    "report/gate.json",
-    "markers/plan.done",
-    "markers/supply.done",
-    "markers/report.done",
+/// Sync/restore disposition of one state-dir file (or file family).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncPolicy {
+    /// Uploaded on every sync tick AND restored after a pod reschedule:
+    /// the file is part of the campaign's resume substrate. Everything the
+    /// resume path reads back MUST carry this policy — a synced-but-not-
+    /// restored resume input silently degrades the restored campaign.
+    Synced,
+    /// Uploaded by a dynamic directory enumeration in [`sync_state`] but
+    /// deliberately NOT restored; the reason documents why the restored
+    /// campaign does not need the local copy back.
+    UploadOnly { reason: &'static str },
+    /// Never uploaded; the reason documents why losing the file on a pod
+    /// reschedule is correct.
+    LocalOnly { reason: &'static str },
+}
+
+/// One classification for EVERY file the engine writes (or reads) under
+/// the state dir: the single source of truth the synced/restored set is
+/// derived from.
+///
+/// Patterns are exact relative paths or single-`*` families (the wildcard
+/// matches one slash-free name segment). The completeness pin is
+/// [`assert_state_dir_files_classified`]: the end-to-end campaign tests
+/// walk their final state dir and fail on any file this table does not
+/// classify, so a new engine-written file cannot ship without an explicit
+/// sync/restore decision — the omission that silently dropped
+/// collected.json from the restore set (resume re-processed every settled
+/// batch) is structurally unrepresentable.
+const STATE_DIR_MANIFEST: &[(&str, SyncPolicy)] = &[
+    // The campaign identity document doubles as the restore-complete
+    // sentinel; download_state_if_missing writes it last.
+    ("campaign.json", SyncPolicy::Synced),
+    ("progress.json", SyncPolicy::Synced),
+    // The processed-batch dedup set: resume reads it so settled batches
+    // are never re-processed (a re-process would re-burn retry budgets
+    // and re-decide jobs against decayed evidence).
+    ("collected.json", SyncPolicy::Synced),
+    ("results.jsonl", SyncPolicy::Synced),
+    ("supply.jsonl", SyncPolicy::Synced),
+    ("dispatch.jsonl", SyncPolicy::Synced),
+    ("batches.jsonl", SyncPolicy::Synced),
+    ("supply-report.json", SyncPolicy::Synced),
+    ("timed-stats.json", SyncPolicy::Synced),
+    ("report/summary.md", SyncPolicy::Synced),
+    ("report/gate.json", SyncPolicy::Synced),
+    ("markers/plan.done", SyncPolicy::Synced),
+    ("markers/supply.done", SyncPolicy::Synced),
+    ("markers/report.done", SyncPolicy::Synced),
+    (
+        "logs/*.log.zst",
+        SyncPolicy::UploadOnly {
+            reason: "uploaded by collect at capture time and re-enumerated by sync_state as the \
+                     retry; job records carry the S3 log keys, so the local copies are only an \
+                     upload staging area and a restored campaign never reads them back",
+        },
+    ),
+    (
+        "buckets/*.jsonl",
+        SyncPolicy::UploadOnly {
+            reason: "per-class report files regenerated wholesale from results.jsonl by the \
+                     report stage; uploaded for downstream consumers, re-derived (never read \
+                     back) on resume",
+        },
+    ),
+    (
+        "PAUSE",
+        SyncPolicy::LocalOnly {
+            reason: "operator pause signal polled from the local volume; pausing is a live \
+                     operator action on THIS pod, not campaign state to re-impose on a \
+                     replacement pod",
+        },
+    ),
+    (
+        "archive/*",
+        SyncPolicy::LocalOnly {
+            reason: "the multi-GB replay-archive payload; a fresh pod re-fetches it from the \
+                     archive's own S3 prefix against the spec's digest pin (ensure_archive), \
+                     so syncing it under the campaign prefix would only duplicate it",
+        },
+    ),
 ];
+
+/// Files synced from the state dir to the store on every sync tick AND
+/// restored by [`download_state_if_missing`]: derived from
+/// [`STATE_DIR_MANIFEST`] (the [`SyncPolicy::Synced`] entries), never
+/// hand-enumerated, so the upload set, the restore set, and the
+/// classification table cannot drift apart. The per-bucket JSONL written
+/// by the report stage and the per-job `logs/*.log.zst` tails written by
+/// collect are picked up by the dynamic enumerations in [`sync_state`]
+/// (so the uploaded campaign prefix carries the complete artifact set);
+/// their upload-only policies are documented in the manifest.
+fn synced_files() -> impl Iterator<Item = &'static str> {
+    STATE_DIR_MANIFEST
+        .iter()
+        .filter_map(|(pattern, policy)| (*policy == SyncPolicy::Synced).then_some(*pattern))
+}
+
+/// Match one manifest pattern against a state-dir-relative path. Exact
+/// patterns compare equal; a single-`*` pattern matches when the wildcard
+/// covers exactly one slash-free segment (`logs/*.log.zst` matches
+/// `logs/a.log.zst`, never `logs/sub/a.log.zst`). Test-only consumer: the
+/// production sync paths read the derived [`synced_files`] list; per-file
+/// policy lookup exists for the completeness walk.
+#[cfg(test)]
+fn pattern_matches(pattern: &str, rel: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == rel,
+        Some((prefix, suffix)) => {
+            let Some(middle) = rel
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_suffix(suffix))
+            else {
+                return false;
+            };
+            !middle.contains('/')
+        }
+    }
+}
+
+/// The sync/restore policy for one state-dir-relative path; `None` means
+/// the engine has no classification for it (the completeness walk treats
+/// that as an error).
+#[cfg(test)]
+pub(crate) fn sync_policy(rel: &str) -> Option<SyncPolicy> {
+    STATE_DIR_MANIFEST
+        .iter()
+        .find(|(pattern, _)| pattern_matches(pattern, rel))
+        .map(|(_, policy)| *policy)
+}
+
+/// Completeness pin for [`STATE_DIR_MANIFEST`]: walk `state`'s directory
+/// recursively and fail on any file the manifest does not classify. The
+/// end-to-end campaign tests call this on their final state dirs, so the
+/// classified set is derived from what the engine ACTUALLY writes — a new
+/// state file fails the walk until it carries an explicit sync/restore
+/// decision.
+#[cfg(test)]
+pub(crate) fn assert_state_dir_files_classified(state: &StateDir) {
+    fn walk(root: &Path, dir: &Path, unclassified: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read state dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, unclassified);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("walked path under root")
+                    .to_str()
+                    .expect("engine-written names are UTF-8")
+                    .to_string();
+                if sync_policy(&rel).is_none() {
+                    unclassified.push(rel);
+                }
+            }
+        }
+    }
+    let mut unclassified = Vec::new();
+    walk(state.root(), state.root(), &mut unclassified);
+    assert!(
+        unclassified.is_empty(),
+        "state-dir files without a sync/restore classification: {unclassified:?} — add each to \
+         STATE_DIR_MANIFEST in artifact.rs as Synced (part of the resume substrate), UploadOnly, \
+         or LocalOnly with the reason"
+    );
+}
 
 /// Tracks the last-synced `(length, mtime)` signature per file so
 /// unchanged files are not re-uploaded. The JSONL streams are
@@ -284,7 +428,7 @@ pub async fn sync_state(
     campaign_id: &str,
     tracker: &mut SyncTracker,
 ) -> Result<usize> {
-    let mut rels: Vec<String> = SYNCED_FILES.iter().map(|s| s.to_string()).collect();
+    let mut rels: Vec<String> = synced_files().map(str::to_string).collect();
     // buckets/<bucket>.jsonl exist only after the report stage; enumerate them
     // dynamically rather than hardcoding the bucket list.
     if let Ok(entries) = std::fs::read_dir(state.path("buckets")) {
@@ -365,7 +509,7 @@ pub async fn download_state_if_missing(
     else {
         return Ok(false);
     };
-    for rel in SYNCED_FILES.iter().filter(|r| **r != "campaign.json") {
+    for rel in synced_files().filter(|r| *r != "campaign.json") {
         if let Some(bytes) = store
             .get_bytes(&format!("{prefix}/{campaign_id}/{rel}"))
             .await?
@@ -845,5 +989,117 @@ mod tests {
             .await
             .unwrap();
         assert!(!again);
+    }
+
+    /// The processed-batch dedup set survives a pod reschedule: the sync
+    /// uploads collected.json and the restore brings it back, so a resumed
+    /// campaign skips every already-processed batch instead of re-deciding
+    /// settled batches against decayed evidence and re-burning per-job
+    /// retry budgets.
+    #[tokio::test]
+    async fn collected_json_round_trips_through_sync_and_restore() {
+        let sdir = tempfile::tempdir().unwrap();
+        let adir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(sdir.path()).unwrap();
+        let store = LocalDirArtifactStore::new(adir.path());
+        let mut tracker = SyncTracker::default();
+
+        state
+            .write_json_atomic("campaign.json", &serde_json::json!({"campaignId": "c1"}))
+            .unwrap();
+        state
+            .write_json_atomic("collected.json", &vec![1u64, 2, 7])
+            .unwrap();
+        sync_state(&state, &store, "replay/campaigns", "c1", &mut tracker)
+            .await
+            .unwrap();
+
+        // Pod reschedule: empty volume, restore from the store.
+        let sdir2 = tempfile::tempdir().unwrap();
+        let state2 = StateDir::new(sdir2.path()).unwrap();
+        let restored = download_state_if_missing(&state2, &store, "replay/campaigns", "c1")
+            .await
+            .unwrap();
+        assert!(restored);
+        assert_eq!(
+            state2.read_json::<Vec<u64>>("collected.json").unwrap(),
+            Some(vec![1, 2, 7]),
+            "the restored campaign must see the processed-batch set"
+        );
+    }
+
+    /// Resume-substrate pin: every file the resume path reads back — the
+    /// JSONL streams, the processed-batch set, and the JSON documents the
+    /// restored campaign loads — must classify Synced, and the synced set
+    /// is exact names only (the dynamic upload families are UploadOnly by
+    /// construction, so a Synced family would silently never restore).
+    #[test]
+    fn resume_read_files_are_synced_and_synced_entries_are_exact() {
+        for stream in StateFile::ALL {
+            assert_eq!(
+                sync_policy(stream.file_name()),
+                Some(SyncPolicy::Synced),
+                "JSONL stream {} must be synced and restored",
+                stream.file_name()
+            );
+        }
+        for doc in [
+            "campaign.json",
+            "collected.json",
+            "progress.json",
+            "supply-report.json",
+            "timed-stats.json",
+        ] {
+            assert_eq!(
+                sync_policy(doc),
+                Some(SyncPolicy::Synced),
+                "resume-read document {doc} must be synced and restored"
+            );
+        }
+        for synced in synced_files() {
+            assert!(
+                !synced.contains('*'),
+                "Synced entries must be exact names ({synced:?} is a family): sync_state and \
+                 download_state_if_missing fetch them by literal key, so a family here would \
+                 upload nothing and restore nothing"
+            );
+        }
+        // Every deliberate exclusion carries its rationale.
+        for (pattern, policy) in STATE_DIR_MANIFEST {
+            match policy {
+                SyncPolicy::Synced => {}
+                SyncPolicy::UploadOnly { reason } | SyncPolicy::LocalOnly { reason } => {
+                    assert!(
+                        !reason.trim().is_empty(),
+                        "{pattern}: an unsynced classification needs its reason"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Family patterns match exactly one slash-free segment; unclassified
+    /// names stay unclassified (the completeness walk fails on them).
+    #[test]
+    fn sync_policy_pattern_matching() {
+        assert!(matches!(
+            sync_policy("logs/appA.x86_64-linux.log.zst"),
+            Some(SyncPolicy::UploadOnly { .. })
+        ));
+        assert_eq!(sync_policy("logs/sub/a.log.zst"), None);
+        assert!(matches!(
+            sync_policy("buckets/match-built.jsonl"),
+            Some(SyncPolicy::UploadOnly { .. })
+        ));
+        assert!(matches!(
+            sync_policy("archive/archive.dwarfs"),
+            Some(SyncPolicy::LocalOnly { .. })
+        ));
+        assert!(matches!(
+            sync_policy("PAUSE"),
+            Some(SyncPolicy::LocalOnly { .. })
+        ));
+        assert_eq!(sync_policy("markers/unknown-stage.done"), None);
+        assert_eq!(sync_policy("scratch.bin"), None);
     }
 }

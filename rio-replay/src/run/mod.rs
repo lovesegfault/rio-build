@@ -3253,6 +3253,12 @@ mod tests {
             err.to_string().contains("campaign.json pins archive"),
             "{err:#}"
         );
+
+        // Sync-classification completeness: every file this full timeless
+        // campaign actually wrote must carry an explicit sync/restore
+        // policy, so a new state file cannot ship while silently missing
+        // from (or undocumented outside) the S3 restore set.
+        artifact::assert_state_dir_files_classified(&StateDir::new(state_dir.path()).unwrap());
     }
 
     /// Backends over the standard fakes for the resume tests; the captured
@@ -4469,6 +4475,11 @@ mod tests {
         assert!(summary.contains("Build-outcome parity"));
         assert!(summary.contains("## Supply"), "{summary}");
         assert!(summary.contains("## Timed dispatch"), "{summary}");
+
+        // Sync-classification completeness over the timed-mode file set
+        // (dispatch.jsonl, timed-stats.json, …): every file this campaign
+        // wrote must carry an explicit sync/restore policy.
+        artifact::assert_state_dir_files_classified(&state);
     }
 
     /// Transport-error path end to end: the first submission fails
