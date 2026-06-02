@@ -1646,6 +1646,69 @@ async fn flag_on_pending_jobs_count_as_substituting_bucket() -> TestResult {
     Ok(())
 }
 
+// r[verify obs.metric.scheduler-substituting]
+/// The materialization backlog is scrapeable: each housekeeping tick
+/// the leader publishes `rio_scheduler_substituting_derivations` with
+/// EXACTLY the snapshot's substituting bucket (the §2.6 job-derived
+/// count `ClusterStatus.substituting_derivations` reports). Without
+/// the gauge the backlog exists only behind the admin RPC — invisible
+/// to Prometheus, so the KEDA store-scaling trigger reads nothing
+/// (item I, WT-1).
+#[tokio::test]
+async fn substituting_gauge_published_from_snapshot_bucket() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (_db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    // Same fixture as the snapshot-bucket test above: root → mid →
+    // leaf, mid+leaf substitutable, root demanded → 2 pending
+    // unclaimed jobs after the merge (leaf Ready, mid Queued).
+    let mid_out = test_store_path("sub-gauge-mid-out");
+    let leaf_out = test_store_path("sub-gauge-leaf-out");
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.push(mid_out.clone());
+        subs.push(leaf_out.clone());
+    }
+    let root = make_node("sub-gauge-root");
+    let mut mid = make_node("sub-gauge-mid");
+    mid.expected_output_paths = vec![mid_out.clone()];
+    let mut leaf = make_node("sub-gauge-leaf");
+    leaf.expected_output_paths = vec![leaf_out.clone()];
+    let nodes = vec![root, mid, leaf];
+    let edges = vec![
+        make_test_edge("sub-gauge-root", "sub-gauge-mid"),
+        make_test_edge("sub-gauge-mid", "sub-gauge-leaf"),
+    ];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, edges, false).await?;
+    barrier(&handle).await;
+
+    tick(&handle).await?;
+    let snap = handle.cluster_snapshot_cached();
+    assert_eq!(snap.substituting_derivations, 2, "fixture precondition");
+    assert_eq!(
+        recorder.gauge_value("rio_scheduler_substituting_derivations{}"),
+        Some(2.0),
+        "tick must publish the substituting bucket as a gauge — the KEDA \
+         backlog trigger scrapes Prometheus, not the admin RPC"
+    );
+
+    // Claim drains the bucket → the next tick publishes the drop. The
+    // gauge tracks the SAME quantity as the proto field at every tick.
+    let claim = claim_materialization(&handle, "sub-gauge-leaf", "store-test-0").await;
+    assert!(matches!(claim, Ok(PullOutcome::Deliver(_))), "{claim:?}");
+    tick(&handle).await?;
+    let snap = handle.cluster_snapshot_cached();
+    assert_eq!(snap.substituting_derivations, 1, "fixture precondition");
+    assert_eq!(
+        recorder.gauge_value("rio_scheduler_substituting_derivations{}"),
+        Some(1.0),
+        "the gauge follows the bucket down as jobs are claimed"
+    );
+    Ok(())
+}
+
 // ── T-1.2 (Phase B): BC-4 — SUBSTITUTING at claim, stop at consumption ──
 
 /// Drain every Derivation event currently in the ring, returning the

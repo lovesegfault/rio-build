@@ -212,6 +212,24 @@ the stream session was deleted, kept only as the deletion-gate recording
 series, and removed with the proto sweep once that role ended.
 `_open_attempts` is the busy-fleet gauge.
 
+#r("obs.metric.scheduler-substituting")[
+  The scheduler MUST publish
+  #(refs.metric)("rio_scheduler_substituting_derivations") (gauge): the count
+  of derivations carrying an unresolved, unclaimed materialization job ---
+  the same quantity `ClusterStatus.substituting_derivations` reports
+  (#rref("sched.admin.snapshot-substituting")) --- set by the leader at every
+  housekeeping tick from the freshly computed cluster snapshot, and zeroed
+  once on leadership loss.
+]
+This gauge is the *leading* rio-store autoscaling signal: the backlog is
+known at merge time,
+minutes before the store feels the ingest load, and the underlying jobs are
+durable PG rows --- the count survives leader failover instead of resetting
+with leader memory. It follows the leader-gate posture above (a state gauge,
+published only by the serving leader); publishing from the snapshot
+computation makes the scrape surface and the admin RPC agree by
+construction.
+
 #r("obs.metric.materialization-stalled")[
   When materialization dispatch is enabled, the scheduler MUST publish
   #(refs.metric)("rio_scheduler_materialization_stalled") (gauge): the count

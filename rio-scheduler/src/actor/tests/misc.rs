@@ -80,6 +80,7 @@ fn spawn_actor_with_flags(
 }
 
 // r[verify obs.metric.scheduler-leader-gate+4]
+// r[verify obs.metric.scheduler-substituting]
 /// When is_leader=false, handle_tick must NOT set state gauges.
 /// Standby actor is warm (DAGs merge for takeover) but its counts are
 /// stale/zero. Publishing them creates a second Prometheus series that
@@ -113,12 +114,15 @@ async fn test_not_leader_does_not_set_gauges() -> TestResult {
     handle.send_unchecked(ActorCommand::Tick).await?;
     barrier(&handle).await;
 
-    // The four handle_tick gauges must NOT appear.
+    // The handle_tick gauges must NOT appear (substituting_derivations
+    // is published from the same gated tick — the snapshot site — so a
+    // standby publishing it would feed KEDA a duplicate stale series).
     for name in [
         "rio_scheduler_derivations_queued",
         "rio_scheduler_workers_active",
         "rio_scheduler_builds_active",
         "rio_scheduler_derivations_running",
+        "rio_scheduler_substituting_derivations",
     ] {
         assert!(
             !recorder.gauge_touched(name),
@@ -132,6 +136,7 @@ async fn test_not_leader_does_not_set_gauges() -> TestResult {
 
 // r[verify sched.lease.standby-tick-noop+2]
 // r[verify obs.metric.scheduler-leader-gate+4]
+// r[verify obs.metric.scheduler-substituting]
 /// Was-leader → standby: `LeaderLost` clears in-memory state and zeros
 /// gauges; subsequent `Tick` early-returns so the orphan-watcher does
 /// NOT write `Cancelled` to PG for builds the new leader is running.
@@ -194,6 +199,7 @@ async fn test_ex_leader_housekeeping_is_noop_after_lose() -> TestResult {
         "rio_scheduler_derivations_queued",
         "rio_scheduler_builds_active",
         "rio_scheduler_derivations_running",
+        "rio_scheduler_substituting_derivations",
     ] {
         assert_eq!(
             recorder.gauge_value(&format!("{g}{{}}")),

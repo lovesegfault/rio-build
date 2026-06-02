@@ -284,6 +284,14 @@ pub fn describe_metrics() {
          still live; the population shrinks to zero as they terminate."
     );
     describe_gauge!(
+        "rio_scheduler_substituting_derivations",
+        "Derivations carrying an unresolved, unclaimed materialization job — the \
+         substitution backlog (the same quantity ClusterStatus.substituting_derivations \
+         reports). Leader-published every housekeeping tick from the freshly computed \
+         cluster snapshot. The leading rio-store KEDA scaling signal: backlog is known \
+         at merge time, minutes before the store feels the ingest load."
+    );
+    describe_gauge!(
         "rio_scheduler_materialization_stalled",
         "Parked materialization jobs (infra budget exhausted; waiting on upstream \
          recovery or park-backoff expiry). Leader-published every housekeeping tick \

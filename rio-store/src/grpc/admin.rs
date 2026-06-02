@@ -696,6 +696,50 @@ mod tests {
         drop((c1, c2));
     }
 
+    /// The PG-pool gauge is self-published by the periodic in-process
+    /// tick — NOT only as a GetLoad side-effect. After the store
+    /// ComponentScaler CR removal nothing polls GetLoad periodically,
+    /// so without self-publication the gauge would freeze at its last
+    /// value (blanking the store dashboard's PG-pool panel and
+    /// `xtask k8s status`). The test never constructs the admin
+    /// service or calls GetLoad: the spawned tick alone must publish.
+    // r[verify obs.metric.store-pg-pool]
+    #[tokio::test]
+    async fn pg_pool_gauge_tick_publishes_without_get_load() {
+        let recorder = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // Hold a connection so the published value is provably a real
+        // computation (>0), not the pre-registered 0.0.
+        let _held = db.pool.acquire().await.expect("acquire");
+
+        let shutdown = rio_common::signal::Token::new();
+        let _task = spawn_pg_pool_gauge_tick(db.pool.clone(), shutdown.clone());
+
+        // spawn_periodic fires its first tick immediately; on the
+        // current-thread test runtime the task runs at our next await
+        // points. Bounded yield loop, no wall-clock sleep.
+        let mut published = None;
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+            published = recorder.gauge_value("rio_store_pg_pool_utilization{}");
+            if published.is_some() {
+                break;
+            }
+        }
+        let v = published.expect(
+            "the periodic tick must publish rio_store_pg_pool_utilization \
+             without any GetLoad traffic",
+        );
+        assert!(
+            v > 0.0 && v <= 1.0,
+            "tick must publish the live (size − idle)/max computation \
+             (one connection held → >0); got {v}"
+        );
+        shutdown.cancel();
+    }
+
     /// `GetLoad.substitute_admission_utilization` reflects permits held
     /// on the SHARED gate. The store-service side (which acquires) and
     /// the admin-service side (which reports) MUST be the same

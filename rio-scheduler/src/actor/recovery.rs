@@ -991,10 +991,17 @@ impl DagActor {
         self.clear_persisted_state();
         // (The stream-era workers_active gauge is gone; nothing
         // registration-shaped needs zeroing here.)
+        // r[impl obs.metric.scheduler-substituting]
+        // substituting_derivations is in the list: it is published
+        // from the tick snapshot (leader-only), so a deposed leader
+        // would otherwise export its frozen backlog forever — exactly
+        // the duplicate-series hazard the leader gate exists for, and
+        // worse here because KEDA scales the store on this series.
         for g in [
             "rio_scheduler_derivations_queued",
             "rio_scheduler_builds_active",
             "rio_scheduler_derivations_running",
+            "rio_scheduler_substituting_derivations",
         ] {
             metrics::gauge!(g).set(0.0);
         }

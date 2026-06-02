@@ -138,6 +138,7 @@
     "rio_scheduler_stale_completed_reset_total",
     "rio_scheduler_stale_completed_substituted_total",
     "rio_scheduler_stale_realisation_filtered_total",
+    "rio_scheduler_substituting_derivations",
     "rio_scheduler_topdown_prune_total",
     "rio_scheduler_topdown_substitute_fail_total",
     "rio_scheduler_transition_rejected_total",
@@ -908,6 +909,11 @@
         "name": "rio_scheduler_stale_realisation_filtered_total",
         "kind": "counter",
         "help": "CA realisations dropped from cache-hit set because the realized path was GC'd from store. Same operator signal as stale_completed_reset; this counts the newly-inserted-CA path, that one counts the pre-existing-completed path."
+      },
+      {
+        "name": "rio_scheduler_substituting_derivations",
+        "kind": "gauge",
+        "help": "Derivations carrying an unresolved, unclaimed materialization job — the substitution backlog (the same quantity ClusterStatus.substituting_derivations reports). Leader-published every housekeeping tick from the freshly computed cluster snapshot. The leading rio-store KEDA scaling signal: backlog is known at merge time, minutes before the store feels the ingest load."
       },
       {
         "name": "rio_scheduler_topdown_prune_total",

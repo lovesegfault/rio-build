@@ -156,8 +156,20 @@ impl DagActor {
         // send_replace: single-slot overwrite, never blocks, returns
         // the previous Arc (dropped). No-receiver is fine —
         // watch::Sender holds the value regardless.
-        self.snapshot_tx
-            .send_replace(Arc::new(self.compute_cluster_snapshot()));
+        let snapshot = Arc::new(self.compute_cluster_snapshot());
+        // r[impl obs.metric.scheduler-substituting]
+        // The materialization backlog, scrapeable: the SAME quantity
+        // `ClusterStatus.substituting_derivations` reports
+        // (sched.admin.snapshot-substituting), published from the
+        // snapshot just computed so gauge and proto field can never
+        // disagree. This is the leading KEDA store-scaling signal —
+        // pending-job backlog is visible to Prometheus before any
+        // store replica claims the work. Leader-gated like every
+        // state gauge here (the handle_tick early-return above);
+        // zeroed once by handle_leader_lost.
+        metrics::gauge!("rio_scheduler_substituting_derivations")
+            .set(f64::from(snapshot.substituting_derivations));
+        self.snapshot_tx.send_replace(snapshot);
     }
 
     // -----------------------------------------------------------------------
