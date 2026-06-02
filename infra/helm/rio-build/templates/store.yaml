@@ -32,6 +32,23 @@ spec:
       nodeSelector:
         rio.build/node-role: general
       {{- end }}
+      # One replica per node (decision 5). All three store load
+      # classes — substitution ingest, builder read-serving, builder
+      # upload ingest — share the pod's NIC, NAR buffer memory, and PG
+      # pool, so a replica only adds capacity when it lands on its own
+      # node: N replicas must mean N NICs, or scale-out merely
+      # re-partitions one node's bandwidth. SOFT (ScheduleAnyway) so
+      # scale-out is never blocked when the pool is momentarily full —
+      # a stacked replica is slower, never wrong. The general node
+      # pool must be able to supply maxReplicas distinct nodes (its
+      # BASELINE — not burst — bandwidth is what each replica gets).
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "rio.selectorLabels" "rio-store" | nindent 14 }}
       # ≥ RIO_DRAIN_GRACE_SECS(6) + streamDrainSecs + slack. kubelet
       # SIGKILLs at this deadline; the store's own stream_drain timeout
       # fires first and exits cleanly, so SIGKILL is a backstop for a
