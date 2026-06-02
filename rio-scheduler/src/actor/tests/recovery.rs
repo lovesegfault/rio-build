@@ -937,7 +937,10 @@ async fn saturated_floor_recovery_evidence_writes_land() -> TestResult {
         )
         .execute(&pool)
         .await?;
-        sqlx::query("UPDATE derivations SET status = 'substituting' WHERE drv_hash = 'satfloor-D'")
+        // Post-080 the walk-era status is unrepresentable; 'queued' is
+        // the exact image the 080 data step (and the transitional
+        // decode arm before it) gave such rows.
+        sqlx::query("UPDATE derivations SET status = 'queued' WHERE drv_hash = 'satfloor-D'")
             .execute(&pool)
             .await?;
 
@@ -2418,7 +2421,9 @@ async fn seed_cross_build_poisoned_dep(
     )
     .execute(&pool)
     .await?;
-    sqlx::query("UPDATE derivations SET status = 'substituting' WHERE drv_hash = 'xrc-parent'")
+    // Post-080 image of the legacy mid-substitution shape (the 080
+    // data step rewrote such rows to 'queued').
+    sqlx::query("UPDATE derivations SET status = 'queued' WHERE drv_hash = 'xrc-parent'")
         .execute(&pool)
         .await?;
     sqlx::query("UPDATE builds SET status = 'failed' WHERE build_id = $1")
@@ -2725,7 +2730,9 @@ async fn stage_parent_with_other_builds_cancelled_child(
         .bind(dep)
         .execute(pool)
         .await?;
-    sqlx::query("UPDATE derivations SET status = 'substituting' WHERE drv_hash = $1")
+    // Post-080 image of the legacy mid-substitution shape (the 080
+    // data step rewrote such rows to 'queued').
+    sqlx::query("UPDATE derivations SET status = 'queued' WHERE drv_hash = $1")
         .bind(root)
         .execute(pool)
         .await?;

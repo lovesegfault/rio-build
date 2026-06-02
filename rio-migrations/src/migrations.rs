@@ -1046,6 +1046,13 @@ pub const M_061: () = ();
 /// `DerivationState::union_wanted`.
 ///
 /// Read/written by **rio-scheduler** only.
+///
+/// **Retired by `M_080`** (substitution-replacement Phase D′): the
+/// stored union was the walk world's persistence/recovery fallback.
+/// Successor: the `build_wanted_outputs` relation (`M_078`) — exact
+/// per-(build, derivation) interest, joined live at classification
+/// (`effective_wanted` over the rebuilt per-build contributions, with
+/// conservative-absent saturation for relation-less live builds).
 pub const M_062: () = ();
 
 /// `migrations/063_derivation_topdown_pruned.sql`
@@ -1090,6 +1097,13 @@ pub const M_062: () = ();
 /// `rio-scheduler/src/db/batch.rs` and `actor/merge.rs`.
 ///
 /// Read/written by **rio-scheduler** only.
+///
+/// **Retired by `M_080`** (substitution-replacement Phase D′): the
+/// mark's job moved to `materialization_jobs.origin = 'pruned'`
+/// (`M_078`/`M_079`), written in the same merge transaction that
+/// prunes (with the pruned-wins origin upgrade on dedup) and consumed
+/// by the arm-3 settlement discriminator at job consumption — a
+/// durable per-decision fact instead of a clearable per-row bit.
 pub const M_063: () = ();
 
 /// `migrations/064_derivation_closure_hole.sql`
@@ -1166,6 +1180,14 @@ pub const M_063: () = ();
 /// column-naming INSERTs keep working during a rolling deploy.
 ///
 /// Read/written by **rio-scheduler** only.
+///
+/// **Retired by `M_080`** (substitution-replacement Phase D′): the
+/// breadcrumb protected children-keyed verdicts from reap-truncated
+/// in-memory child sets. Successor: settlement-time judgments classify
+/// over the persisted graph instead (`classify_durable_evidence` — the
+/// strict three-part criterion: pg.edges + pg.status + a LIVE
+/// co-owning build voucher per produced child), which a truncated
+/// in-memory view cannot launder.
 pub const M_064: () = ();
 
 /// `migrations/065_leader_generation_claims.sql`
@@ -1704,6 +1726,48 @@ pub const M_078: () = ();
 /// transaction (Wave 3) and the establishment-sweep materialization
 /// branch (Wave 3) are the only writers, both flag-gated.
 pub const M_079: () = ();
+
+/// `migrations/080_drop_walk_evidence.sql`
+///
+/// Substitution-replacement Phase D′.2 (design §4/§8; owner GO
+/// 2026-06-01): retires the walk-era evidence surface after D′.1
+/// deleted every binary reader/writer — the `'substituting'` status
+/// (added by `M_038` for the detached walk fetch), the
+/// `topdown_pruned` mark (`M_063`), the `closure_hole` breadcrumb
+/// (`M_064`), and the stored wanted union (`M_062`). Each retirement
+/// note on those consts names the durable successor.
+///
+/// **The data step before the CHECK narrowing:** leftover
+/// `'substituting'` rows are only possible when upgrading from a
+/// pre-Phase-B era in one hop (a walk-era leader crashed
+/// mid-substitution and no later binary rewrote the row). The D′.1
+/// binaries carried a transitional decode arm (`"substituting"` →
+/// `Queued` + warn, PD-D3) so they could recover against a pre-080
+/// database; the UPDATE here makes that absorption durable, and the
+/// narrowed CHECK makes the state unrepresentable. The decode arm was
+/// removed in the same commit as this migration: both scheduler and
+/// store run `rio_migrations::migrate::run` at startup BEFORE any
+/// derivation-status read (scheduler recovery runs only on
+/// LeaderAcquired, after boot), so a post-080 binary can never see the
+/// legacy string.
+///
+/// **Idempotent failure mode (risk R4):** the UPDATE and the
+/// ADD CONSTRAINT run in one migration transaction. A not-yet-rolled
+/// pre-D′.1 replica writing `'substituting'` between them fails the
+/// ADD — re-running the deploy retries the whole migration. Deployment
+/// order is therefore: roll the D′.1 binaries everywhere FIRST, then
+/// ship the 080-carrying release.
+///
+/// **Roll-forward only (FP-7):** a pre-D′ binary against a post-080
+/// database fails (it SELECTs the dropped columns); a post-D′ binary
+/// against a pre-080 database works (no column reads; the decode arm
+/// only existed in the transitional D′.1 window). Rollback to walk
+/// behavior = rollback to a pre-D′ BINARY, and only before this
+/// migration is applied to a persistent database.
+///
+/// The 038 partial index (`derivations_status_idx`) predicates on
+/// terminal statuses only, so no index DDL rides this migration.
+pub const M_080: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,

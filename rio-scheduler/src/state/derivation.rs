@@ -206,13 +206,13 @@ db_str_enum! {
     }
 }
 
-// Hand-rolled (not the macro's `parse_err` form) so the decode can
-// carry the PD-D3 legacy arm: pre-080 databases can hold
-// flag-off-era 'substituting' rows, and the recovery reset that used
-// to absorb them died with the walk. Decoding them to Queued (with a
-// warn) lets a post-walk binary boot against such a database; the
-// probe partition re-classifies the absorbed node. Removed by
-// migration 080's data step (T-D6.1).
+// Hand-rolled (not the macro's `parse_err` form) — kept in this shape
+// from the PD-D3 transitional window so the alphabet is explicit at
+// the decode boundary. The walk-era 'substituting' decode arm was
+// removed with migration 080: the migration's data step rewrites any
+// leftover row to 'queued' BEFORE the narrowed CHECK lands, and both
+// services migrate at startup before any status read, so the legacy
+// string is unreachable post-080 (see `M_080`).
 impl ::std::str::FromStr for DerivationStatus {
     type Err = TransitionError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -228,14 +228,6 @@ impl ::std::str::FromStr for DerivationStatus {
             "dependency_failed" => Ok(Self::DependencyFailed),
             "cancelled" => Ok(Self::Cancelled),
             "skipped" => Ok(Self::Skipped),
-            // The PD-D3 legacy decode arm (see the impl comment).
-            "substituting" => {
-                tracing::warn!(
-                    "legacy 'substituting' derivation row absorbed; reset to queued \
-                     — the walk-era status is removed by migration 080"
-                );
-                Ok(Self::Queued)
-            }
             other => Err(TransitionError::UnknownStatus(other.to_string())),
         }
     }
@@ -2300,21 +2292,14 @@ mod tests {
         }
     }
 
-    /// PD-D3 legacy decode arm (T-D3.3): a flag-off-era 'substituting'
-    /// PG row decodes to Queued instead of erroring — DECODE-LEVEL
-    /// (no DB round-trip; stays constructible after migration 080
-    /// narrows the CHECK). Removed (or kept, if migrate-before-recovery
-    /// does not verify) alongside the arm in T-D6.1.
+    /// The decode boundary rejects unknown literals (the PD-D3
+    /// transitional 'substituting' arm was removed with migration 080
+    /// — the state is unrepresentable post-080, so the legacy literal
+    /// is an unknown like any other now).
     #[test]
-    fn legacy_substituting_row_decodes_to_queued() {
-        assert_eq!(
-            "substituting".parse::<DerivationStatus>().unwrap(),
-            DerivationStatus::Queued,
-            "legacy rows must absorb to Queued, not error"
-        );
-        // The arm is reserved for the legacy literal: everything else
-        // unknown still errors.
+    fn unknown_status_literal_errors() {
         assert!("bogus-status".parse::<DerivationStatus>().is_err());
+        assert!("substituting".parse::<DerivationStatus>().is_err());
     }
 
     #[test]
