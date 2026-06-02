@@ -293,6 +293,18 @@ let
         extraStoreConfig = {
           signingKeyFile = "${rioSigningKey}";
           extraConfig = ''
+            # substitute-stall-abort fixture: shrink the owner-side
+            # stall window (default 180 s) so the netem-wedged subtest
+            # aborts in seconds. 15 s is ≫ the per-read cadence under
+            # the 8mbit throttle and ≪ the detached fetch's
+            # -max-time 240. TOP-LEVEL key — it must precede the [jwt]
+            # table header or TOML parses it as jwt.substitute_stall_secs
+            # and store config load fails at boot. Scenario-wide: this
+            # window also governs every other subtest's NAR
+            # response-header wait and per-read clock — safe on the
+            # VM-local network (ms-scale reads), but a future
+            # heavyweight subtest in this scenario inherits it.
+            substitute_stall_secs = 15
             [jwt]
             key_path = "${jwtPubkey}"
           '';
@@ -586,6 +598,23 @@ in
   #   substitutable (probe-indeterminate) nodes and routes them to
   #   materialization jobs created in the merge transaction (zero
   #   walks) — the indeterminate→job disposition at deployment level.
+  # r[verify store.substitute.progress-heartbeat]
+  #   substitute-stall-abort: psql observes durable fetched_bytes>0
+  #   mid-transfer through the 30s placeholder heartbeat (the
+  #   cross-process progress witness); the netem wedge freezing it
+  #   while the connection stays alive is the stuck≠slow
+  #   discrimination.
+  # r[verify store.substitute.stall-abort]
+  #   substitute-stall-abort: loss-100% wedge on a live ~96MiB
+  #   transfer → owner-side abort at the 15s fixture window — journal
+  #   warn pair, stale_reclaimed_total{reason="stall_abort"} == 1, row
+  #   released in place (claim/progress NULL, stall_count=1,
+  #   status='uploading' preserved).
+  # r[verify store.substitute.stale-reclaim+2]
+  #   substitute-stall-abort: the post-heal re-claim completes
+  #   (status='complete' far below the 300s heartbeat-death threshold
+  #   proves the released-in-place arm), with the stall_count=1 strike
+  #   surviving the handoff and finalize.
   vm-substitute-standalone = substituteStandaloneTest;
 
   # ── materialization routing/park/gc-pin (T-3.1) ─────────────────────

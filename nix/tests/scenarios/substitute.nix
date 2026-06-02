@@ -504,6 +504,202 @@ let
             f"pins released"
         )
   '';
+
+  # ── substitute-stall-abort (Item S forced-stall subtest) ─────────────
+  # tc-netem wedge on a live transfer: rate-throttle so the fetch is
+  # reliably mid-flight, then loss-100% so the connection survives but
+  # fetched_bytes freezes — the stuck≠slow case the per-read stall clock
+  # exists for. The owner aborts at the 15 s fixture window
+  # (default.nix injects substitute_stall_secs = 15), releases the claim
+  # IN PLACE (strike recorded), and the post-heal re-claim completes the
+  # path with the strike preserved.
+  #
+  # Placement: LAST subtest — netem on client eth1 shapes ALL client
+  # egress (including http.server responses other subtests rely on); a
+  # leaked qdisc must not be able to poison earlier subtests, and the
+  # heal lands immediately after the abort assertions, before the
+  # re-claim phase.
+  stallAbort = ''
+    with subtest("substitute-stall-abort: netem wedge → owner abort at threshold → released-in-place re-claim"):
+        # Dedicated large payload: ~96 MiB so the 8mbit-throttled fetch
+        # has a ~100 s floor — the wedge lands mid-transfer (~30-45 s
+        # in, at the first durable heartbeat write), never after
+        # completion. rio-stall- prefix keeps it out of every other
+        # subtest's SQL filter. Fixed content → deterministic path.
+        client.succeed(
+            "head -c 100663296 /dev/zero > /tmp/sub/rio-stall-payload && "
+            "echo rio-stall-fixture-v1 >> /tmp/sub/rio-stall-payload"
+        )
+        stall_path = client.succeed(
+            "nix-store --add /tmp/sub/rio-stall-payload"
+        ).strip()
+        stall_hash = stall_path.removeprefix("/nix/store/").split("-", 1)[0]
+        client.succeed(f"nix store sign --key-file /tmp/sub/sec {stall_path}")
+        client.succeed(
+            f"nix copy --no-check-sigs "
+            f"--to 'file:///srv/cache?compression=none' {stall_path}"
+        )
+        # Free the source copy (the payload now lives in /nix/store and
+        # /srv/cache; three resident copies is the budget ceiling).
+        client.succeed("rm /tmp/sub/rio-stall-payload")
+        # True NAR size from the SERVED narinfo — the DB narinfo row is
+        # a placeholder (nar_size=0) until finalize, so the mid-transfer
+        # bound cannot come from the database.
+        stall_nar_size = int(client.succeed(
+            f"grep '^NarSize:' /srv/cache/{stall_hash}.narinfo"
+        ).split(":")[1].strip())
+        print(f"stall-abort: payload {stall_path} nar_size={stall_nar_size}")
+
+        # Throttle BEFORE the fetch: 96 MiB @ 8mbit ≈ 100 s floor.
+        client.succeed("tc qdisc replace dev eth1 root netem rate 8mbit")
+
+        # Detached fetch (tenant A). -max-time 240 must outlive the
+        # whole wedged phase: a client-side cancel would drop the sole
+        # singleflight caller and exercise the drop-guard DELETE instead
+        # of the owner-side stall release (caller-cancel masquerade).
+        ${gatewayHost}.succeed(
+            f"cat > /tmp/stall-q.json <<'EOF'\n{{\"store_path\":\"{stall_path}\"}}\nEOF"
+        )
+        ${gatewayHost}.succeed(
+            "systemd-run --unit=stall-fetch "
+            "sh -c "
+            f"'${grpcurl} -plaintext -max-time 240 "
+            "-protoset ${protoset}/rio.protoset "
+            f'-H "x-rio-tenant-token: {jwt_a}" '
+            "-d @ "
+            "localhost:9002 rio.store.StoreService/QueryPathInfo "
+            "< /tmp/stall-q.json'"
+        )
+
+        # Mid-transfer witness: the first durable fetched_bytes write
+        # lands at the ~30 s placeholder-heartbeat tick (first tick is
+        # skipped; the 30 s constant is cfg(test)-gated, NOT
+        # config-overridable in production builds — budget, don't
+        # shrink).
+        ${gatewayHost}.wait_until_succeeds(
+            "sudo -u postgres psql rio -qtAc "
+            "\"SELECT count(*) FROM manifests m"
+            " JOIN narinfo n USING (store_path_hash)"
+            f" WHERE n.store_path = '{stall_path}'"
+            " AND m.fetched_bytes > 0\""
+            " | grep -qx 1",
+            timeout=90,
+        )
+        fetched = int(psql(
+            ${gatewayHost},
+            "SELECT m.fetched_bytes FROM manifests m "
+            "JOIN narinfo n USING (store_path_hash) "
+            f"WHERE n.store_path = '{stall_path}'",
+        ))
+        assert 0 < fetched < stall_nar_size, (
+            f"mid-transfer non-vacuity FAIL: fetched_bytes={fetched}, "
+            f"nar_size={stall_nar_size} — the throttled transfer outran "
+            "the wedge; raise the payload size / lower the netem rate"
+        )
+
+        # Wedge: loss 100% — packets silently dropped, no RST; the
+        # connection stays alive while fetched_bytes freezes. The
+        # throttled-but-advancing phase above already proved slow≠stuck
+        # (per-read clock restarted on every read).
+        client.succeed("tc qdisc replace dev eth1 root netem loss 100%")
+
+        # Owner-side abort at the 15 s window (+ slack for the in-flight
+        # read to drain): journal warn pair → metric → row state.
+        ${gatewayHost}.wait_until_succeeds(
+            "journalctl -u rio-store --no-pager | "
+            "grep -q 'claim released in place'",
+            timeout=60,
+        )
+        ${gatewayHost}.succeed(
+            "journalctl -u rio-store --no-pager | "
+            "grep -q 'download stalled, stopping'"
+        )
+        assert_metric_exact(
+            ${gatewayHost}, 9092,
+            "rio_store_substitute_stale_reclaimed_total", 1.0,
+            labels='{reason="stall_abort"}',
+        )
+        state = psql(
+            ${gatewayHost},
+            "SELECT m.status, m.claim_id IS NULL, m.claimed_by IS NULL, "
+            "m.fetched_bytes IS NULL, m.last_progress_at IS NULL, "
+            "m.stall_count "
+            "FROM manifests m JOIN narinfo n USING (store_path_hash) "
+            f"WHERE n.store_path = '{stall_path}'",
+        )
+        assert state == "uploading|t|t|t|t|1", (
+            f"released-in-place row state mismatch: {state!r} — want "
+            "status=uploading, claim/claimed_by/fetched/progress all "
+            "NULL, stall_count=1"
+        )
+        # Wire-contract pin: the wedged caller saw the release status
+        # (drop without ceremony if it proves flaky under TCG).
+        ${gatewayHost}.wait_until_succeeds(
+            "journalctl -u stall-fetch --no-pager | "
+            "grep -q 'upstream download stalled; claim released'",
+            timeout=30,
+        )
+        ${gatewayHost}.execute(
+            "systemctl reset-failed stall-fetch 2>/dev/null || true"
+        )
+
+        # Heal FIRST (mandatory cleanup: client-egress shaping also
+        # degrades coverage collection if leaked).
+        client.succeed("tc qdisc del dev eth1 root || true")
+
+        # Post-abort claim behavior (stale-reclaim+2 arm 1): a DEDICATED
+        # re-fetch with its own -max-time 180 — QueryPathInfo blocks on
+        # the full re-download + finalize from byte 0 (the release
+        # NULLed fetched_bytes); a 30 s budget would client-cancel under
+        # the builder-variance tail and DELETE the strike evidence.
+        ${gatewayHost}.succeed(
+            "systemd-run --unit=stall-reclaim "
+            "sh -c "
+            f"'${grpcurl} -plaintext -max-time 180 "
+            "-protoset ${protoset}/rio.protoset "
+            f'-H "x-rio-tenant-token: {jwt_a}" '
+            "-d @ "
+            "localhost:9002 rio.store.StoreService/QueryPathInfo "
+            "< /tmp/stall-q.json'"
+        )
+        # Structural immediacy gate: ANY completion proves arm 1 — arm 2
+        # (heartbeat death) needs the fixed 300 s stale threshold and
+        # resets strikes via DELETE+re-insert, so stall_count=1
+        # surviving to 'complete' pins the released-in-place handoff.
+        ${gatewayHost}.wait_until_succeeds(
+            "sudo -u postgres psql rio -qtAc "
+            "\"SELECT count(*) FROM manifests m"
+            " JOIN narinfo n USING (store_path_hash)"
+            f" WHERE n.store_path = '{stall_path}'"
+            " AND m.status = 'complete'\""
+            " | grep -qx 1",
+            timeout=200,
+        )
+        final = psql(
+            ${gatewayHost},
+            f"SELECT (SELECT count(*) FROM narinfo"
+            f" WHERE store_path = '{stall_path}'), "
+            "m.stall_count, n.nar_size "
+            "FROM manifests m JOIN narinfo n USING (store_path_hash) "
+            f"WHERE n.store_path = '{stall_path}'",
+        )
+        n_rows, strikes, nar_sz_db = final.split("|")
+        assert (
+            n_rows == "1" and strikes == "1"
+            and int(nar_sz_db) == stall_nar_size
+        ), (
+            f"post-re-claim state mismatch: rows={n_rows} "
+            f"stall_count={strikes} nar_size={nar_sz_db} (want 1, 1, "
+            f"{stall_nar_size}) — the arm-1 handoff must preserve the "
+            "strike and finalize must fill the real narinfo"
+        )
+        print(
+            f"substitute-stall-abort PASS: wedged at "
+            f"{fetched}/{stall_nar_size} bytes, owner abort at the 15 s "
+            "window, released in place (strike=1), post-heal re-claim "
+            "completed with the strike preserved"
+        )
+  '';
 in
 pkgs.testers.runNixOSTest {
   name = "rio-substitute";
@@ -512,8 +708,11 @@ pkgs.testers.runNixOSTest {
   # ~60s boot + cache setup ~10s + grpcurl round-trips + ssh-ng build
   # for substitute-progress-e2e (~40s) + the scheduler-owned direct
   # submission (~30s: local build + publish + submit + mechanism wait +
-  # NAR round-trip copies). No worker builds, no k3s.
-  globalTimeout = 600 + common.covTimeoutHeadroom;
+  # NAR round-trip copies) + the stall-abort subtest (60-90s typical:
+  # ~35s heartbeat wait + 15s stall window + assertions + the
+  # unthrottled ~96MiB re-fetch, tail-budgeted up to its own
+  # -max-time 180 re-claim). No worker builds, no k3s.
+  globalTimeout = 900 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 
@@ -1106,6 +1305,7 @@ pkgs.testers.runNixOSTest {
     ${storeEndState}
     ${schedulerOwned}
     ${materializationActive}
+    ${stallAbort}
     client.execute("systemctl stop test-cache 2>/dev/null || true")
     ${gatewayHost}.execute("systemctl stop matjob-submit 2>/dev/null || true")
 
