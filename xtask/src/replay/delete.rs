@@ -256,8 +256,9 @@ pub async fn run(a: DeleteArgs) -> Result<()> {
     // Driven by what exists, NOT by the completion marker: an interrupted
     // delete already removed the marker, and an interrupted publish never
     // wrote it — both leave objects this command must still remove
-    // (`replay list`/`replay launch` hide such prefixes, so this is the
-    // in-tool way out the write-once publisher's refusal points at).
+    // (`replay list` flags such prefixes INCOMPLETE, and this command is
+    // the in-tool way out that the write-once publisher's refusal and the
+    // listing's removal hint both point at).
     let keys = s3::list_keys(&region, &bucket, &format!("{prefix}/")).await?;
     ensure!(
         !keys.is_empty(),

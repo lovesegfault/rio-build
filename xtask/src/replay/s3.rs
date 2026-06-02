@@ -83,6 +83,18 @@ pub async fn list_subprefixes(region: &str, bucket: &str, prefix: &str) -> Resul
 /// with it so the deletion is driven by what exists, not by a marker
 /// object an earlier interrupted run may already have removed.
 pub async fn list_keys(region: &str, bucket: &str, prefix: &str) -> Result<Vec<String>> {
+    Ok(list_objects(region, bucket, prefix)
+        .await?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect())
+}
+
+/// [`list_keys`] with each object's size: one `(key, bytes)` pair per
+/// object, sorted by key. `replay list` renders marker-less prefixes
+/// (interrupted publishes or deletes) from this — their object count and
+/// total size are the only facts S3 has about them.
+pub async fn list_objects(region: &str, bucket: &str, prefix: &str) -> Result<Vec<(String, u64)>> {
     let s3 = aws_sdk_s3::Client::new(crate::aws::config(Some(region)).await);
     let mut out = Vec::new();
     let mut pages = s3
@@ -95,7 +107,7 @@ pub async fn list_keys(region: &str, bucket: &str, prefix: &str) -> Result<Vec<S
         let page = page.with_context(|| format!("ListObjectsV2 s3://{bucket}/{prefix}"))?;
         for object in page.contents() {
             if let Some(key) = object.key() {
-                out.push(key.to_string());
+                out.push((key.to_string(), object.size().unwrap_or(0).max(0) as u64));
             }
         }
     }

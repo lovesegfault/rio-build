@@ -222,9 +222,12 @@ pub async fn run(a: EvalArgs) -> Result<()> {
 /// ("recipe already recorded") — in both cases the newest archive whose
 /// provenance names this eval is the one this run produced or reused.
 async fn archive_summary(region: &str, bucket: &str, eval: u64) -> Result<String> {
-    let candidates = launch::listed_candidates(region, bucket).await?;
-    let latest = candidates
+    let entries = launch::listed_archives(region, bucket).await?;
+    let latest = entries
         .into_iter()
+        // The summary names what this run published: published archives
+        // only (an INCOMPLETE prefix has no provenance to match anyway).
+        .filter_map(launch::ListedArchive::into_published)
         .filter(|c| c.hydra_eval_id == eval)
         .max_by(|a, b| a.created_at.cmp(&b.created_at))
         .with_context(|| {

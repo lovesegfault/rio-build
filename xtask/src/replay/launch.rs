@@ -1257,7 +1257,13 @@ async fn resolve_archive(
         Some(digest) if is_full_recipe_digest(digest) => {
             by_recipe_candidates(region, bucket, eval, digest).await?
         }
-        _ => listed_candidates(region, bucket).await?,
+        // Launch resolution consumes published archives only; incomplete
+        // prefixes (no usable completion marker) are never launchable.
+        _ => listed_archives(region, bucket)
+            .await?
+            .into_iter()
+            .filter_map(ListedArchive::into_published)
+            .collect(),
     };
     let chosen = pick_candidate(&candidates, eval, requested_digest).with_context(|| {
         format!(
@@ -1386,23 +1392,145 @@ fn candidate_from_objects(
     }))
 }
 
-/// Listing path: every per-archive prefix under `replay/archives/` whose
-/// standalone manifest is already uploaded becomes a candidate.
-pub(super) async fn listed_candidates(region: &str, bucket: &str) -> Result<Vec<ArchiveCandidate>> {
+/// One per-archive prefix under `replay/archives/`, as the operator
+/// tooling enumerates it. Candidacy is [`read_candidate`]'s predicate
+/// (the parsed `complete.json` proof, shared with `replay delete`, the
+/// by-recipe fast path, and the engine): a prefix with a usable marker is
+/// [`Self::Published`]. A prefix holding objects WITHOUT one — the
+/// leftovers of an interrupted publish or delete, or a corrupted marker —
+/// is [`Self::Incomplete`]: never launchable, but enumerated so
+/// `replay delete <short id>` is reachable for it. The recorder never
+/// retries an archive id (ids hash the manifest's `created_at`), so a
+/// crashed upload's prefix would otherwise be undiscoverable garbage.
+#[derive(Debug)]
+pub(super) enum ListedArchive {
+    /// Boxed: a candidate carries the parsed marker and full manifest
+    /// document, dwarfing the incomplete variant.
+    Published(Box<ArchiveCandidate>),
+    Incomplete(IncompletePrefix),
+}
+
+impl ListedArchive {
+    /// The published candidate, if this entry is one — launch resolution
+    /// and the record summary only ever consume published archives.
+    pub(super) fn into_published(self) -> Option<ArchiveCandidate> {
+        match self {
+            Self::Published(candidate) => Some(*candidate),
+            Self::Incomplete(_) => None,
+        }
+    }
+}
+
+/// A per-archive prefix that holds objects but no usable completion
+/// marker. The object count and total size are the only facts S3 has
+/// about it; the prefix segment (`archive_id_short`) is the handle
+/// `replay delete` accepts.
+#[derive(Debug)]
+pub(super) struct IncompletePrefix {
+    pub(super) archive_id_short: String,
+    /// Objects currently at the prefix.
+    pub(super) objects: usize,
+    /// Total size of those objects.
+    pub(super) bytes: u64,
+}
+
+/// Classify one per-archive prefix from everything fetched at it: the
+/// `complete.json` text when present, the `manifest.json` text when
+/// present, and the prefix's object listing (key + size). Pure so the
+/// classification is exhaustively testable: every NON-EMPTY object set
+/// yields an entry — published exactly when the marker is usable
+/// ([`candidate_from_objects`]), incomplete otherwise — and only a prefix
+/// with no objects at all yields `None`. No state a publisher or deleter
+/// can leave behind is invisible.
+fn entry_from_prefix(
+    archive_id_short: &str,
+    marker_text: Option<&str>,
+    manifest_text: Option<&str>,
+    objects: &[(String, u64)],
+) -> Result<Option<ListedArchive>> {
+    if let Some(marker_text) = marker_text
+        && let Some(candidate) =
+            candidate_from_objects(archive_id_short, marker_text, manifest_text)?
+    {
+        return Ok(Some(ListedArchive::Published(Box::new(candidate))));
+    }
+    if objects.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ListedArchive::Incomplete(IncompletePrefix {
+        archive_id_short: archive_id_short.to_string(),
+        objects: objects.len(),
+        bytes: objects.iter().map(|(_, size)| size).sum(),
+    })))
+}
+
+/// Read one per-archive prefix into a listed entry: LIST its objects,
+/// fetch `complete.json` and `manifest.json` when the listing shows them,
+/// and classify with [`entry_from_prefix`]. `Ok(None)` only when the
+/// prefix lists no objects (it vanished between the subprefix walk and
+/// this read — a concurrent delete finished).
+async fn read_entry(
+    region: &str,
+    bucket: &str,
+    archive_id_short: &str,
+) -> Result<Option<ListedArchive>> {
+    let prefix = s3::archive_prefix(archive_id_short);
+    let objects = s3::list_objects(region, bucket, &format!("{prefix}/")).await?;
+    let has = |object: &str| {
+        let key = format!("{prefix}/{object}");
+        objects.iter().any(|(listed, _)| *listed == key)
+    };
+    let marker_text = if has(ARCHIVE_COMPLETE_OBJECT) {
+        s3::get_text(
+            region,
+            bucket,
+            &format!("{prefix}/{ARCHIVE_COMPLETE_OBJECT}"),
+        )
+        .await?
+    } else {
+        None
+    };
+    let manifest_text = if marker_text.is_some() && has(ARCHIVE_MANIFEST_OBJECT) {
+        s3::get_text(
+            region,
+            bucket,
+            &format!("{prefix}/{ARCHIVE_MANIFEST_OBJECT}"),
+        )
+        .await?
+    } else {
+        None
+    };
+    entry_from_prefix(
+        archive_id_short,
+        marker_text.as_deref(),
+        manifest_text.as_deref(),
+        &objects,
+    )
+    .with_context(|| format!("read archive prefix s3://{bucket}/{prefix}/"))
+}
+
+/// Listing path: every per-archive prefix under `replay/archives/`
+/// becomes a [`ListedArchive`] entry. Candidacy (which entries are
+/// published) is [`read_candidate`]'s `complete.json` predicate — the
+/// same one `replay delete`, the by-recipe fast path, and the engine
+/// apply — and prefixes that hold objects without a usable marker are
+/// first-class [`ListedArchive::Incomplete`] entries rather than being
+/// silently skipped.
+pub(super) async fn listed_archives(region: &str, bucket: &str) -> Result<Vec<ListedArchive>> {
     let archives_prefix = s3::archives_prefix();
     let shorts = s3::list_subprefixes(region, bucket, &archives_prefix).await?;
-    let mut candidates = Vec::new();
+    let mut entries = Vec::new();
     for short in shorts {
         // The recorder-owned idempotency pointers live under by-recipe/;
         // they are not archive prefixes.
         if short == rio_replay::s3::BY_RECIPE_SEGMENT {
             continue;
         }
-        if let Some(candidate) = read_candidate(region, bucket, &short).await? {
-            candidates.push(candidate);
+        if let Some(entry) = read_entry(region, bucket, &short).await? {
+            entries.push(entry);
         }
     }
-    Ok(candidates)
+    Ok(entries)
 }
 
 /// By-recipe fast path: a full recipe digest names the recorder's
@@ -2144,6 +2272,136 @@ mod tests {
             .is_none(),
             "marker/manifest digest mismatch is a corrupted prefix"
         );
+    }
+
+    #[test]
+    fn every_nonempty_prefix_state_is_enumerable() {
+        use rio_replay::archive::s3::{
+            ARCHIVE_COMPLETE_OBJECT, ARCHIVE_IMAGE_OBJECT, ARCHIVE_MANIFEST_OBJECT,
+        };
+
+        // The prefix layout has exactly three object names, written in
+        // publish order (image, manifest, marker) and removed in sweep
+        // order (marker, then data) — so an interruption of either can
+        // leave ANY subset behind. Enumeration must be total over them:
+        // every non-empty subset yields a listed entry — Published exactly
+        // when the marker is present and usable, Incomplete otherwise — so
+        // no residue a publisher or deleter can leave is invisible to the
+        // operator, and `replay delete <short id>` is reachable for all of
+        // it. (Round-trip context: the recorder never retries an archive
+        // id — ids hash created_at — so an interrupted upload's prefix is
+        // permanent until deleted by name.)
+        let manifest_text = json!({
+            "created_at": "2026-05-01T00:00:00Z",
+            "provenance": {
+                "recipe_digest": "11".repeat(32),
+                "source": {"kind": "hydra", "hydra_eval_id": 1824219},
+            },
+        })
+        .to_string();
+        let archive_id = sha256_hex(manifest_text.as_bytes());
+        let short = archive_id[..16].to_string();
+        let marker = CompleteMarker {
+            archive_id: archive_id.clone(),
+            archive_id_short: short.clone(),
+            objects: BTreeMap::new(),
+            uploaded_at: "2026-06-01T11:00:00Z".parse().unwrap(),
+            uploader: "rio-replay-eval/test".to_string(),
+        };
+        let marker_text = serde_json::to_string(&marker).unwrap();
+
+        for has_image in [false, true] {
+            for has_manifest in [false, true] {
+                for has_marker in [false, true] {
+                    let mut objects: Vec<(String, u64)> = Vec::new();
+                    if has_image {
+                        objects.push((format!("{short}/{ARCHIVE_IMAGE_OBJECT}"), 4096));
+                    }
+                    if has_manifest {
+                        objects.push((
+                            format!("{short}/{ARCHIVE_MANIFEST_OBJECT}"),
+                            manifest_text.len() as u64,
+                        ));
+                    }
+                    if has_marker {
+                        objects.push((
+                            format!("{short}/{ARCHIVE_COMPLETE_OBJECT}"),
+                            marker_text.len() as u64,
+                        ));
+                    }
+                    let entry = entry_from_prefix(
+                        &short,
+                        has_marker.then_some(marker_text.as_str()),
+                        has_manifest.then_some(manifest_text.as_str()),
+                        &objects,
+                    )
+                    .unwrap();
+                    let shape =
+                        format!("image={has_image} manifest={has_manifest} marker={has_marker}");
+                    if objects.is_empty() {
+                        assert!(entry.is_none(), "an empty prefix is no entry ({shape})");
+                        continue;
+                    }
+                    match entry {
+                        Some(ListedArchive::Published(candidate)) => {
+                            assert!(
+                                has_marker,
+                                "published without a marker is impossible ({shape})"
+                            );
+                            assert_eq!(candidate.archive_id_short(), short);
+                        }
+                        Some(ListedArchive::Incomplete(prefix)) => {
+                            assert!(
+                                !has_marker,
+                                "a usable marker must classify as published ({shape})"
+                            );
+                            assert_eq!(prefix.archive_id_short, short);
+                            assert_eq!(prefix.objects, objects.len(), "{shape}");
+                            assert_eq!(
+                                prefix.bytes,
+                                objects.iter().map(|(_, size)| size).sum::<u64>(),
+                                "{shape}"
+                            );
+                        }
+                        None => panic!("non-empty prefix shape is invisible: {shape}"),
+                    }
+                }
+            }
+        }
+
+        // Corruption falls back to Incomplete instead of vanishing: a
+        // marker that does not parse, and a marker whose manifest does not
+        // hash to its claimed id, are both rendered (and so deletable) —
+        // before this enumeration existed they were a debug log line.
+        let junk_objects = vec![(format!("{short}/{ARCHIVE_COMPLETE_OBJECT}"), 8u64)];
+        match entry_from_prefix(&short, Some("not json"), None, &junk_objects).unwrap() {
+            Some(ListedArchive::Incomplete(prefix)) => assert_eq!(prefix.objects, 1),
+            other => panic!("a corrupt-marker prefix must list as incomplete: {other:?}"),
+        }
+        let mismatched = json!({"created_at": "tampered"}).to_string();
+        let full_objects = vec![
+            (format!("{short}/{ARCHIVE_IMAGE_OBJECT}"), 4096u64),
+            (
+                format!("{short}/{ARCHIVE_MANIFEST_OBJECT}"),
+                mismatched.len() as u64,
+            ),
+            (
+                format!("{short}/{ARCHIVE_COMPLETE_OBJECT}"),
+                marker_text.len() as u64,
+            ),
+        ];
+        match entry_from_prefix(&short, Some(&marker_text), Some(&mismatched), &full_objects)
+            .unwrap()
+        {
+            Some(ListedArchive::Incomplete(prefix)) => {
+                assert_eq!(prefix.objects, 3);
+                assert_eq!(
+                    prefix.bytes,
+                    4096 + mismatched.len() as u64 + marker_text.len() as u64
+                );
+            }
+            other => panic!("a digest-mismatched prefix must list as incomplete: {other:?}"),
+        }
     }
 
     fn outcome() -> PreflightOutcome {

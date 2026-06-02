@@ -1,14 +1,17 @@
-//! `cargo xtask replay list` — list the recorded replay archives in S3.
+//! `cargo xtask replay list` — list the replay archive prefixes in S3.
 //!
-//! One row per published archive under `replay/archives/` in the chunk
-//! bucket, newest first. "Published" means the prefix carries
-//! `complete.json` (the recorder uploads it last): prefixes without it
-//! are in-flight or interrupted uploads, invisible to `replay launch`
-//! and to this listing alike. The candidate listing itself applies that
-//! predicate (candidacy is the marker), so this command, launch, and the
-//! engine cannot disagree on what "a recording" is. `replay delete`
-//! deliberately tolerates more: its sweep also removes the marker-less
-//! leftovers of an interrupted publish or delete.
+//! One row per archive prefix under `replay/archives/` in the chunk
+//! bucket, newest first. "Published" means the prefix carries a usable
+//! `complete.json` (the recorder uploads it last): candidacy is the
+//! marker, the same predicate `replay launch`, `replay delete`, and the
+//! engine apply, so the surfaces cannot disagree on what "a recording"
+//! is. Prefixes that hold objects WITHOUT a usable marker — the
+//! leftovers of an interrupted publish or delete; the recorder never
+//! retries an archive id, so nothing ever completes them — are rendered
+//! as flagged INCOMPLETE rows (object count + total size) instead of
+//! being invisible: that makes `cargo xtask replay delete <short id>`
+//! reachable for exactly the residue its sweep exists to remove.
+//! `replay launch` still refuses them — flagged is not launchable.
 
 use anyhow::Result;
 use clap::Args;
@@ -68,6 +71,40 @@ fn row(candidate: &launch::ArchiveCandidate) -> Row {
     }
 }
 
+/// Build one flagged row for a marker-less prefix: the short id (the
+/// handle `replay delete` accepts), the INCOMPLETE flag with the object
+/// count, and the total size. Everything else is unknowable — there is
+/// no marker or manifest to read — and renders `-`. The empty `created`
+/// sorts these rows after every dated recording.
+fn incomplete_row(prefix: &launch::IncompletePrefix) -> Row {
+    Row {
+        short_id: prefix.archive_id_short.clone(),
+        hydra_eval: "-".to_string(),
+        scope: format!(
+            "INCOMPLETE ({} object{})",
+            prefix.objects,
+            if prefix.objects == 1 { "" } else { "s" }
+        ),
+        created: String::new(),
+        size: s3::human_bytes(prefix.bytes),
+        fidelity: "-".to_string(),
+    }
+}
+
+/// The footer under the table: the published count, plus — only when
+/// interrupted-publish/delete residue exists — the incomplete count and
+/// the command that removes it. Pure for testability.
+fn footer(published: usize, incomplete: usize, bucket: &str, archives_prefix: &str) -> String {
+    let mut out = format!("\n{published} recording(s) under s3://{bucket}/{archives_prefix}");
+    if incomplete > 0 {
+        out.push_str(&format!(
+            "\n{incomplete} INCOMPLETE prefix(es) — leftovers of an interrupted publish or \
+             delete; remove with `cargo xtask replay delete <short id>`"
+        ));
+    }
+    out
+}
+
 /// Render rows as a column-aligned table with a header, newest row first
 /// (the caller sorts). Pure for testability.
 fn render_table(rows: &[Row]) -> String {
@@ -107,16 +144,27 @@ pub async fn run(_a: ListArgs) -> Result<()> {
     let region = tf.get("region")?;
     let bucket = tf.get("chunk_bucket_name")?;
 
-    // Candidacy is keyed on the completion marker (uploaded strictly
-    // last), so every candidate IS a published recording — and its marker
-    // already carries the image size the table shows.
-    let candidates = ui::step("list recorded archives", || {
-        launch::listed_candidates(&region, &bucket)
+    // Every prefix becomes an entry: published recordings (candidacy is
+    // the completion marker, whose document carries the image size the
+    // table shows) and flagged INCOMPLETE residue alike.
+    let entries = ui::step("list recorded archives", || {
+        launch::listed_archives(&region, &bucket)
     })
     .await?;
-    let mut rows: Vec<(String, Row)> = candidates
+    let mut published = 0usize;
+    let mut incomplete = 0usize;
+    let mut rows: Vec<(String, Row)> = entries
         .iter()
-        .map(|candidate| (candidate.created_at.clone(), row(candidate)))
+        .map(|entry| match entry {
+            launch::ListedArchive::Published(candidate) => {
+                published += 1;
+                (candidate.created_at.clone(), row(candidate))
+            }
+            launch::ListedArchive::Incomplete(prefix) => {
+                incomplete += 1;
+                (String::new(), incomplete_row(prefix))
+            }
+        })
         .collect();
 
     if rows.is_empty() {
@@ -127,14 +175,13 @@ pub async fn run(_a: ListArgs) -> Result<()> {
         return Ok(());
     }
     // Newest first: created_at is RFC3339, so the lexicographic order is
-    // the chronological order.
+    // the chronological order; INCOMPLETE rows (no created_at) sort last.
     rows.sort_by(|(a, _), (b, _)| b.cmp(a));
     let rows: Vec<Row> = rows.into_iter().map(|(_, r)| r).collect();
     println!("{}", render_table(&rows));
     println!(
-        "\n{} recording(s) under s3://{bucket}/{}",
-        rows.len(),
-        s3::archives_prefix()
+        "{}",
+        footer(published, incomplete, &bucket, &s3::archives_prefix())
     );
     Ok(())
 }
@@ -231,5 +278,48 @@ mod tests {
         assert_eq!(r.scope, "?");
         assert_eq!(r.size, "?");
         assert_eq!(r.fidelity, "?");
+    }
+
+    #[test]
+    fn incomplete_prefixes_render_flagged_rows_and_a_removal_hint() {
+        // A marker-less prefix (interrupted publish or delete) renders its
+        // short id — the handle `replay delete` accepts — an INCOMPLETE
+        // flag with the object count, and the total size; everything a
+        // marker would carry is "-". The empty `created` cell makes these
+        // rows sort after every dated recording in the newest-first table.
+        let prefix = launch::IncompletePrefix {
+            archive_id_short: "8b919129046e0f60".to_string(),
+            objects: 2,
+            bytes: 3 * 1024 * 1024 * 1024,
+        };
+        let r = incomplete_row(&prefix);
+        assert_eq!(r.short_id, "8b919129046e0f60");
+        assert_eq!(r.hydra_eval, "-");
+        assert_eq!(r.scope, "INCOMPLETE (2 objects)");
+        assert_eq!(r.created, "");
+        assert_eq!(r.size, "3.0 GiB");
+        assert_eq!(r.fidelity, "-");
+        let single = launch::IncompletePrefix {
+            archive_id_short: "8b919129046e0f60".to_string(),
+            objects: 1,
+            bytes: 1024,
+        };
+        assert_eq!(incomplete_row(&single).scope, "INCOMPLETE (1 object)");
+
+        // The footer names the removal command only when residue exists —
+        // the discoverable path from a flagged row to its cleanup.
+        let with_residue = footer(3, 2, "rio-chunks", "replay/archives/");
+        assert!(with_residue.contains("3 recording(s)"), "{with_residue}");
+        assert!(
+            with_residue.contains("2 INCOMPLETE prefix(es)"),
+            "{with_residue}"
+        );
+        assert!(
+            with_residue.contains("cargo xtask replay delete <short id>"),
+            "{with_residue}"
+        );
+        let clean = footer(3, 0, "rio-chunks", "replay/archives/");
+        assert!(!clean.contains("INCOMPLETE"), "{clean}");
+        assert!(!clean.contains("delete"), "{clean}");
     }
 }
