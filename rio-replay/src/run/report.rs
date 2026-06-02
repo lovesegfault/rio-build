@@ -612,13 +612,14 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
             let _ = writeln!(
                 out,
                 "- delivered: {} | delegated: {} | already-present: {} | refused: {} | \
-                 unavailable: {} | failed: {}",
+                 unavailable: {} | failed: {} | skipped: {}",
                 supply.delivered,
                 supply.delegated,
                 supply.already_present,
                 supply.refused,
                 supply.unavailable,
-                supply.failed
+                supply.failed,
+                supply.skipped
             );
             let _ = writeln!(
                 out,
@@ -1549,6 +1550,7 @@ mod tests {
             refused: 1,
             unavailable: 3,
             failed: 1,
+            skipped: 2,
             uploaded_bytes: 10 * 1024 * 1024,
             upload_secs: 5.0,
             upload_mib_per_s: Some(2.0),
@@ -1587,7 +1589,7 @@ mod tests {
         assert!(
             out.contains(
                 "delivered: 2 | delegated: 1 | already-present: 4 | refused: 1 | unavailable: 3 \
-                 | failed: 1"
+                 | failed: 1 | skipped: 2"
             ),
             "{out}"
         );

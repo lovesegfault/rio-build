@@ -62,9 +62,9 @@ use crate::run::model::{
     PathOutcome, SUPPLY_MECHANISM_DELEGATE, SUPPLY_MECHANISM_NONE, SUPPLY_MECHANISM_UPLOAD_BATCH,
     SUPPLY_MECHANISM_UPLOAD_STREAM, SUPPLY_OUTCOME_ALREADY_PRESENT, SUPPLY_OUTCOME_DELEGATED,
     SUPPLY_OUTCOME_DELIVERED, SUPPLY_OUTCOME_FAILED, SUPPLY_OUTCOME_REFUSED,
-    SUPPLY_OUTCOME_UNAVAILABLE, SUPPLY_SOURCE_EMBEDDED, SUPPLY_SOURCE_NONE, SUPPLY_SOURCE_RELAY,
-    SUPPLY_SOURCE_TARGET_SUBSTITUTER, SupplyEntry, build_status_from_name, now_rfc3339,
-    path_outcomes_from_keyed,
+    SUPPLY_OUTCOME_SKIPPED, SUPPLY_OUTCOME_UNAVAILABLE, SUPPLY_SOURCE_EMBEDDED, SUPPLY_SOURCE_NONE,
+    SUPPLY_SOURCE_RELAY, SUPPLY_SOURCE_TARGET_SUBSTITUTER, SupplyEntry, build_status_from_name,
+    now_rfc3339, path_outcomes_from_keyed, supply_outcome_is_settlement,
 };
 use crate::run::spec::{Knobs, SupplyDelivery, SupplyDependencies};
 use crate::run::state::{StateDir, StateFile};
@@ -81,9 +81,19 @@ use super::{
 /// legitimately needs longer.
 const LARGE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Failure detail recorded for uploads abandoned after the gateway circuit
-/// breaker trips.
-const GATEWAY_UNREACHABLE: &str = "gateway unreachable; not retried";
+/// Skip detail recorded for uploads this invocation did not attempt because
+/// the gateway circuit breaker was open. Recorded under
+/// [`SUPPLY_OUTCOME_SKIPPED`], never as a failure: no transport call was
+/// made, so nothing about the path's delivery settled here.
+const GATEWAY_UNREACHABLE: &str = "gateway unreachable; not attempted";
+
+/// Skip detail recorded when another request still holds a path's upload
+/// claim (after the bounded `claim_wait_mins` wait and the single re-claim,
+/// per the cross-request claims contract) and this invocation proceeds
+/// without the path. The claim HOLDER settles the path — its eventual
+/// `delivered`/`refused`/`failed` row is the authoritative outcome — so
+/// this row is per-request evidence of the gap, not a settlement.
+const CLAIM_STILL_HELD: &str = "upload claim still held by another request; proceeded without it";
 
 /// One store-path payload ready to send (path info plus materialized bytes
 /// or a streaming reader).
@@ -240,6 +250,11 @@ pub struct SupplyStageReport {
     pub unavailable: usize,
     /// Delivery attempts that failed (transport, relay fetch, prefetch build).
     pub failed: usize,
+    /// Planned uploads skipped without an attempt (circuit breaker open, or
+    /// the path's upload claim still held by another request). Nothing
+    /// settled for these paths in the recording invocation: they remain
+    /// deliverable by a later top-up or run, and they retire nobody.
+    pub skipped: usize,
     /// Total uncompressed NAR bytes uploaded by the engine.
     pub uploaded_bytes: u64,
     /// Wall-clock seconds spent in the upload arms.
@@ -633,8 +648,12 @@ impl SupplyTransport for PoolSupplyTransport {
 /// remaining sub-batch would burn another connect timeout on a doomed
 /// attempt. Any success (including a clean refusal, which proves the gateway
 /// answered) resets the count; once tripped it stays tripped for the rest of
-/// the run and remaining work is marked failed without further transport
-/// calls.
+/// the invocation and remaining work is recorded `skipped` without further
+/// transport calls — bookkeeping, never settled `failed` rows: a breaker
+/// skip is not a delivery attempt, so it must neither retire dependents nor
+/// contradict a delivery another request already made. The per-submission
+/// top-up gets a fresh breaker per invocation, so skipped paths stay
+/// re-attemptable once the gateway returns.
 struct GatewayBreaker {
     /// Consecutive transport failures since the last success.
     consecutive_failures: AtomicUsize,
@@ -685,8 +704,12 @@ struct UploadTotals {
     delivered: usize,
     /// Paths refused even after the fresh-channel retry.
     refused: usize,
-    /// Paths that failed (transport, materialization, breaker).
+    /// Paths whose delivery attempt failed (transport, materialization,
+    /// failed reference).
     failed: usize,
+    /// Paths skipped without an attempt (breaker open, claim held
+    /// elsewhere) — nothing settled for them in this invocation.
+    skipped: usize,
     /// Uncompressed NAR bytes of the delivered paths.
     uploaded_bytes: u64,
 }
@@ -736,6 +759,12 @@ fn entry_source(item: &UploadItem) -> &'static str {
 
 /// Append one supply.jsonl line for an upload item and fold it into the
 /// shared totals (refused/failed paths also poison their dependents).
+///
+/// `skipped` rows are bookkeeping, not settlements: they count under their
+/// own total and never poison dependents — the path's delivery was not
+/// resolved here (the claim holder, a later top-up, or a re-run settles
+/// it), so pre-failing its referrers would mint settled `failed` rows for
+/// paths nothing actually attempted.
 fn record_settlement(
     env: &UploadEnv<'_>,
     item: &UploadItem,
@@ -765,6 +794,8 @@ fn record_settlement(
     if outcome == SUPPLY_OUTCOME_DELIVERED {
         totals.delivered += 1;
         totals.uploaded_bytes += bytes.unwrap_or(0);
+    } else if outcome == SUPPLY_OUTCOME_SKIPPED {
+        totals.skipped += 1;
     } else {
         if outcome == SUPPLY_OUTCOME_REFUSED {
             totals.refused += 1;
@@ -785,12 +816,20 @@ enum ClaimDecision {
     Upload,
     /// The path landed elsewhere; treat it as valid and record nothing.
     SkipLanded,
-    /// Another request still holds the claim; proceed without the path.
+    /// Another request still holds the claim; proceed without the path,
+    /// recording a `skipped` bookkeeping row — the holder's own settlement
+    /// is the path's authoritative outcome.
     SkipHeld,
 }
 
 /// Claim `path` for upload, waiting (bounded) for another holder's claim and
 /// re-claiming exactly once if that claim is released without landing.
+///
+/// This is the cross-request claims contract: claim, wait up to the
+/// configured `claim_wait_mins`, re-claim exactly once, then proceed
+/// without the path. The wait is the ONLY blocking step and it is
+/// deadline-bounded — settlement of a held path is always the holder's job,
+/// never an open-ended wait here.
 async fn claim_for_upload(env: &UploadEnv<'_>, path: &str) -> ClaimDecision {
     match env.claims.claim(path) {
         ClaimOutcome::Won => ClaimDecision::Upload,
@@ -805,6 +844,21 @@ async fn claim_for_upload(env: &UploadEnv<'_>, path: &str) -> ClaimDecision {
                 ClaimOutcome::MustWait => ClaimDecision::SkipHeld,
             }
         }
+    }
+}
+
+/// Non-blocking [`ClaimDecision`] for arms that must not wait (the breaker
+/// is open and the invocation is wrapping up): the claims table is still
+/// consulted — it is the one place that knows whether another request
+/// already delivered or is still uploading the path — but a held claim is
+/// skipped immediately instead of waited on. A `Upload` decision here means
+/// this invocation won the claim; the caller releases it after recording
+/// its skip so a later top-up can re-claim the path.
+fn claim_decision_nowait(env: &UploadEnv<'_>, path: &str) -> ClaimDecision {
+    match env.claims.claim(path) {
+        ClaimOutcome::Won => ClaimDecision::Upload,
+        ClaimOutcome::AlreadyDone => ClaimDecision::SkipLanded,
+        ClaimOutcome::MustWait => ClaimDecision::SkipHeld,
     }
 }
 
@@ -908,21 +962,27 @@ async fn materialize_stream_payload(
 
 /// Stream one item to the target individually, with the single
 /// refusal-retry on a fresh channel.
+///
+/// The cross-request claims table is consulted FIRST, before any
+/// breaker-based skip: the table (and the validity set it feeds) is the one
+/// place that knows whether another request already delivered the path, so
+/// any row recorded before consulting it could contradict the journal's
+/// settled truth — a `failed` row appended after a sibling request's
+/// `delivered` row would become the path's last settlement and falsely
+/// retire every dependent on the next rollup. Settled rows are minted only
+/// through claim resolution; skips (breaker open, claim held) record
+/// `skipped` bookkeeping rows that settle nothing.
 async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()> {
     let batch_id = env.sub_batch_ids.fetch_add(1, Ordering::SeqCst);
     let mechanism = SUPPLY_MECHANISM_UPLOAD_STREAM;
-    if env.breaker.is_tripped() {
-        return record_settlement(
-            env,
-            item,
-            mechanism,
-            SUPPLY_OUTCOME_FAILED,
-            Some(GATEWAY_UNREACHABLE.to_string()),
-            batch_id,
-            None,
-        );
-    }
-    match claim_for_upload(env, &item.store_path).await {
+    let decision = if env.breaker.is_tripped() {
+        // No waiting on held claims while the gateway is gone — but landed
+        // paths must still be recognized, never re-recorded as anything.
+        claim_decision_nowait(env, &item.store_path)
+    } else {
+        claim_for_upload(env, &item.store_path).await
+    };
+    match decision {
         ClaimDecision::Upload => {}
         ClaimDecision::SkipLanded => {
             env.ctx
@@ -933,12 +993,37 @@ async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()>
             return Ok(());
         }
         ClaimDecision::SkipHeld => {
-            tracing::debug!(
-                path = %item.store_path,
-                "skipping streamed upload; another request still holds its claim"
+            // The bounded wait (or the breaker fast path) expired with the
+            // claim still held: proceed without the path, leaving a
+            // bookkeeping row so the gap is attributable per request. The
+            // holder settles the path.
+            return record_settlement(
+                env,
+                item,
+                mechanism,
+                SUPPLY_OUTCOME_SKIPPED,
+                Some(CLAIM_STILL_HELD.to_string()),
+                batch_id,
+                None,
             );
-            return Ok(());
         }
+    }
+    // Claim won. The breaker may be open (it was open before the
+    // non-blocking claim, or tripped while a bounded claim wait ran): skip
+    // without a transport attempt and release the claim so a later top-up
+    // can re-claim. Skipped, not failed — no attempt was made, so nothing
+    // about the path's delivery settled.
+    if env.breaker.is_tripped() {
+        env.claims.release(&item.store_path);
+        return record_settlement(
+            env,
+            item,
+            mechanism,
+            SUPPLY_OUTCOME_SKIPPED,
+            Some(GATEWAY_UNREACHABLE.to_string()),
+            batch_id,
+            None,
+        );
     }
     if let Some(reference) = failed_reference_of(env, item) {
         env.claims.release(&item.store_path);
@@ -1184,26 +1269,26 @@ fn settle_batch_undelivered(
 /// Upload one sub-batch: claims, failed-reference pre-skip, one wire
 /// attempt, and exactly one retry on a fresh channel when the daemon
 /// refused.
+///
+/// As in [`upload_stream_one`], the cross-request claims table is consulted
+/// FIRST, before any breaker-based skip: settled rows are minted only
+/// through claim resolution, so a path another request already delivered
+/// can never receive a contradicting row from this arm, and skips record
+/// `skipped` bookkeeping rows that settle nothing.
 async fn upload_sub_batch(env: &UploadEnv<'_>, items: Vec<&UploadItem>) -> Result<()> {
     let batch_id = env.sub_batch_ids.fetch_add(1, Ordering::SeqCst);
-    if env.breaker.is_tripped() {
-        for item in &items {
-            record_settlement(
-                env,
-                item,
-                SUPPLY_MECHANISM_UPLOAD_BATCH,
-                SUPPLY_OUTCOME_FAILED,
-                Some(GATEWAY_UNREACHABLE.to_string()),
-                batch_id,
-                None,
-            )?;
-        }
-        return Ok(());
-    }
     // Cross-request claims: only paths this invocation wins are sent here.
+    // Under an open breaker the table is read without waiting on held
+    // claims — the invocation is wrapping up, not coordinating.
+    let tripped_at_claims = env.breaker.is_tripped();
     let mut kept: Vec<&UploadItem> = Vec::with_capacity(items.len());
     for item in items {
-        match claim_for_upload(env, &item.store_path).await {
+        let decision = if tripped_at_claims {
+            claim_decision_nowait(env, &item.store_path)
+        } else {
+            claim_for_upload(env, &item.store_path).await
+        };
+        match decision {
             ClaimDecision::Upload => kept.push(item),
             ClaimDecision::SkipLanded => {
                 env.ctx
@@ -1213,12 +1298,36 @@ async fn upload_sub_batch(env: &UploadEnv<'_>, items: Vec<&UploadItem>) -> Resul
                     .insert(item.store_path.clone());
             }
             ClaimDecision::SkipHeld => {
-                tracing::debug!(
-                    path = %item.store_path,
-                    "skipping batch upload; another request still holds its claim"
-                );
+                record_settlement(
+                    env,
+                    item,
+                    SUPPLY_MECHANISM_UPLOAD_BATCH,
+                    SUPPLY_OUTCOME_SKIPPED,
+                    Some(CLAIM_STILL_HELD.to_string()),
+                    batch_id,
+                    None,
+                )?;
             }
         }
+    }
+    // Breaker check for the claim winners — including a re-check after the
+    // bounded claim waits above, which can outlast a gateway collapse:
+    // release each claim and record a `skipped` bookkeeping row. No
+    // transport attempt was made for these paths, so nothing settled.
+    if env.breaker.is_tripped() {
+        for item in &kept {
+            env.claims.release(&item.store_path);
+            record_settlement(
+                env,
+                item,
+                SUPPLY_MECHANISM_UPLOAD_BATCH,
+                SUPPLY_OUTCOME_SKIPPED,
+                Some(GATEWAY_UNREACHABLE.to_string()),
+                batch_id,
+                None,
+            )?;
+        }
+        return Ok(());
     }
     // An item whose reference already failed to upload would only be refused
     // by the daemon; skip it up front naming the real culprit. Levels run in
@@ -1406,6 +1515,7 @@ pub async fn prewarm_uploads(
         delivered = totals.delivered,
         refused = totals.refused,
         failed = totals.failed,
+        skipped = totals.skipped,
         uploaded_mib = totals.uploaded_bytes / (1024 * 1024),
         elapsed_s = upload_secs,
         "prewarm uploads finished"
@@ -1414,6 +1524,7 @@ pub async fn prewarm_uploads(
         delivered: totals.delivered,
         refused: totals.refused,
         failed: totals.failed,
+        skipped: totals.skipped,
         uploaded_bytes: totals.uploaded_bytes,
         upload_secs,
         upload_mib_per_s,
@@ -1671,6 +1782,7 @@ pub async fn topup_for_roots(
         delivered = totals.delivered,
         refused = totals.refused,
         failed = totals.failed,
+        skipped = totals.skipped,
         "top-up finished"
     );
     Ok(())
@@ -1986,6 +2098,7 @@ async fn run_upload_ladder(
             report.delivered = upload.delivered;
             report.refused = upload.refused;
             report.failed += upload.failed;
+            report.skipped = upload.skipped;
             report.uploaded_bytes = upload.uploaded_bytes;
             report.upload_secs = upload.upload_secs;
             report.upload_mib_per_s = upload.upload_mib_per_s;
@@ -2202,25 +2315,41 @@ pub async fn run_supply_stage(
 }
 
 /// Re-derive the per-path outcome counts of a [`SupplyStageReport`] from the
-/// supply journal, keeping only the latest record per path.
+/// supply journal, keeping only the latest SETTLEMENT record per path.
 ///
 /// The journal legitimately carries more than one row for a path — the
 /// upstream-coverage probe records `unavailable` before the supply stage
 /// runs, and a path one arm could not provide can be delivered by a later
-/// arm or a top-up — so counting raw rows would double-count. The last row
-/// per path is its settled disposition. Throughput, prefetch-shortfall
-/// (including the prefetch-scoped unavailable tally — the journal cannot
-/// distinguish prefetch-wanted unavailability from ordinary ladder
-/// unavailability), and probe-error figures are not per-path counts and
-/// stay as the stage reported them. An empty journal leaves the report
-/// untouched.
+/// arm or a top-up — so counting raw rows would double-count. The last
+/// settlement row per path is its settled disposition; bookkeeping rows
+/// (`unavailable`, `skipped` — see
+/// [`supply_outcome_is_settlement`](crate::run::model::supply_outcome_is_settlement))
+/// count only for paths that never settled, because they assert nothing
+/// about delivery: a skip-held row appended after the claim holder's
+/// `delivered` row must leave the path counted delivered, and a breaker
+/// skip after a real failure must leave it counted failed. Throughput,
+/// prefetch-shortfall (including the prefetch-scoped unavailable tally —
+/// the journal cannot distinguish prefetch-wanted unavailability from
+/// ordinary ladder unavailability), and probe-error figures are not
+/// per-path counts and stay as the stage reported them. An empty journal
+/// leaves the report untouched.
 pub fn refresh_outcome_counts(report: &mut SupplyStageReport, entries: &[SupplyEntry]) {
     if entries.is_empty() {
         return;
     }
     let mut latest: BTreeMap<&str, &str> = BTreeMap::new();
     for entry in entries {
-        latest.insert(entry.path.as_str(), entry.outcome.as_str());
+        let outcome = entry.outcome.as_str();
+        latest
+            .entry(entry.path.as_str())
+            .and_modify(|current| {
+                // A settlement always supersedes; bookkeeping supersedes
+                // only bookkeeping.
+                if supply_outcome_is_settlement(outcome) || !supply_outcome_is_settlement(current) {
+                    *current = outcome;
+                }
+            })
+            .or_insert(outcome);
     }
     let count = |outcome: &str| latest.values().filter(|got| **got == outcome).count();
     report.delivered = count(SUPPLY_OUTCOME_DELIVERED);
@@ -2229,6 +2358,7 @@ pub fn refresh_outcome_counts(report: &mut SupplyStageReport, entries: &[SupplyE
     report.refused = count(SUPPLY_OUTCOME_REFUSED);
     report.unavailable = count(SUPPLY_OUTCOME_UNAVAILABLE);
     report.failed = count(SUPPLY_OUTCOME_FAILED);
+    report.skipped = count(SUPPLY_OUTCOME_SKIPPED);
 }
 
 /// Resident-set size of this process in MiB, read from `/proc/self/status`
@@ -2560,6 +2690,15 @@ mod tests {
         }
     }
 
+    /// The breaker stops transport calls, and what it skips is BOOKKEEPING,
+    /// not settlement: settled `failed` rows exist only for paths with an
+    /// actual claim-resolved transport attempt (the supply rollup retires
+    /// dependents from settled rows only, and the wired per-submission
+    /// top-up's documented one-more-attempt covers exactly the paths the
+    /// prewarm pass skipped — see `LadderTopup`). Pre-trip paths really
+    /// were attempted and settle `failed`; post-trip paths are recorded
+    /// `skipped` with the gateway detail and their claims are released so
+    /// a later top-up can re-claim them.
     #[tokio::test]
     async fn circuit_breaker_latches_after_consecutive_open_failures() {
         let (_dir, state) = state();
@@ -2592,21 +2731,212 @@ mod tests {
             .unwrap();
 
         // Six consecutive channel-level failures latch the breaker; the
-        // remaining six planned paths are recorded failed without any
-        // further transport calls.
+        // remaining six planned paths are skipped without any further
+        // transport calls.
         assert_eq!(fake.upload_calls.load(Ordering::SeqCst), 6);
-        assert_eq!(report.failed, total_items);
+        assert_eq!(report.failed, 6);
+        assert_eq!(report.skipped, total_items - 6);
         assert_eq!(report.delivered, 0);
         let entries = entries(&state);
-        let mut not_retried = 0usize;
-        for path in &paths {
+        for path in &paths[..6] {
             let entry = entry_for(&entries, path);
-            assert_eq!(entry.outcome, SUPPLY_OUTCOME_FAILED);
-            if entry.detail.as_deref() == Some(GATEWAY_UNREACHABLE) {
-                not_retried += 1;
+            assert_eq!(entry.outcome, SUPPLY_OUTCOME_FAILED, "{path}");
+            assert_ne!(entry.detail.as_deref(), Some(GATEWAY_UNREACHABLE));
+        }
+        for path in &paths[6..] {
+            let entry = entry_for(&entries, path);
+            assert_eq!(entry.outcome, SUPPLY_OUTCOME_SKIPPED, "{path}");
+            assert_eq!(entry.detail.as_deref(), Some(GATEWAY_UNREACHABLE));
+            // The claim was won and released, not leaked: a later top-up
+            // (fresh breaker) can claim the path again.
+            assert_eq!(claims.claim(path), ClaimOutcome::Won, "{path}");
+        }
+    }
+
+    /// One planned upload item per [`UploadPayload`] family. The `match`
+    /// below is the totality tripwire: a new payload variant fails to
+    /// compile here until this corpus (and therefore every test deriving
+    /// its path vocabulary from it) covers the new family — the journal's
+    /// producer vocabulary is enumerated from the producing enum, never
+    /// hand-copied.
+    fn item_per_payload_family(tag: &str) -> Vec<UploadItem> {
+        let path = |family: &str| format!("/nix/store/{:0>32}-{tag}-{family}", family.len());
+        let nar = vec![7u8; 16];
+        let drv_text = item(&path("drvtext"), nar.clone(), &[]);
+        let mut archive_path = item(&path("archive"), nar.clone(), &[]);
+        archive_path.payload = UploadPayload::ArchivePath;
+        let relay_path = path("relay");
+        let mut relay = item(&relay_path, nar, &[]);
+        relay.payload = UploadPayload::Relay {
+            substituter_url: "https://cache.example.org".into(),
+            narinfo: rio_nix::narinfo::NarInfo {
+                store_path: relay_path,
+                url: "nar/x.nar.zst".into(),
+                compression: "zstd".into(),
+                nar_hash: "sha256:0000000000000000000000000000000000000000000000000000".into(),
+                nar_size: 16,
+                references: Vec::new(),
+                deriver: None,
+                sigs: Vec::new(),
+                ca: None,
+                file_hash: None,
+                file_size: None,
+            },
+        };
+        let all = vec![drv_text, archive_path, relay];
+        for member in &all {
+            match &member.payload {
+                UploadPayload::DrvText(_)
+                | UploadPayload::ArchivePath
+                | UploadPayload::Relay { .. } => {}
             }
         }
-        assert_eq!(not_retried, total_items - 6);
+        all
+    }
+
+    /// The upload arms can never contradict the cross-request claims table,
+    /// whatever the breaker state: settled rows (`delivered`/`refused`/
+    /// `failed`) are minted only through claim resolution, landed paths get
+    /// no row at all, and skips (breaker open, claim held) record `skipped`
+    /// bookkeeping rows.
+    ///
+    /// Quantification domain: every (arm × claim-state × breaker-state)
+    /// cell — arm ∈ {stream, batch} from the two upload entry points,
+    /// claim-state ∈ {free, done-elsewhere, held-elsewhere} from
+    /// [`ClaimOutcome`]'s three variants, breaker ∈ {closed, open} — with
+    /// the path corpus of each cell spanning every [`UploadPayload`] family
+    /// (via [`item_per_payload_family`]'s compile-time tripwire). The
+    /// binding cross-component invariant of the supply rollup ("the
+    /// journal's last settlement per path is its truth") is asserted over
+    /// the union journal: no settled refused/failed row may exist for any
+    /// path the claims table says landed.
+    #[tokio::test]
+    async fn upload_arms_never_contradict_the_claims_table() {
+        for arm in ["stream", "batch"] {
+            for breaker_open in [false, true] {
+                let (_dir, state) = state();
+                let fake = FakeSupplyTransport::default();
+                let ctx = SupplyContext::new(SupplyDependencies::Substituters);
+                let claims = UploadClaims::new();
+                // claim_wait_mins = 0 keeps the held-claim bounded wait
+                // instant: wait expires, the single re-claim still loses,
+                // and the arm proceeds without the path (the claims
+                // contract: claim / bounded wait / re-claim once / proceed).
+                let knobs = Knobs {
+                    upload_workers: 1,
+                    upload_batch_max_entries: 1,
+                    claim_wait_mins: 0,
+                    ..Knobs::default()
+                };
+
+                // Trip the breaker (when this cell wants it open) with real
+                // transport failures on sacrificial items, so the arms under
+                // test run against a genuinely latched breaker.
+                let trip_items: Vec<UploadItem> = if breaker_open {
+                    fake.fail_uploads.store(true, Ordering::SeqCst);
+                    (0..6)
+                        .map(|index| {
+                            item(
+                                &format!("/nix/store/{:0>32}-trip-{index}", index),
+                                vec![1u8; 8],
+                                &[],
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                // Cell corpus: one item per payload family per claim state.
+                let free = item_per_payload_family("free");
+                let done = item_per_payload_family("done");
+                let held = item_per_payload_family("held");
+                // A sibling request already delivered the `done` paths and
+                // still holds the `held` paths.
+                for member in &done {
+                    assert_eq!(claims.claim(&member.store_path), ClaimOutcome::Won);
+                    claims.complete(&member.store_path);
+                }
+                for member in &held {
+                    assert_eq!(claims.claim(&member.store_path), ClaimOutcome::Won);
+                }
+
+                let mut all: Vec<UploadItem> = trip_items;
+                all.extend(free.iter().cloned());
+                all.extend(done.iter().cloned());
+                all.extend(held.iter().cloned());
+                let plan = match arm {
+                    "stream" => UploadPlan {
+                        large: all,
+                        batch: Vec::new(),
+                        skipped: Vec::new(),
+                    },
+                    _ => batch_plan(all),
+                };
+                prewarm_uploads(&fake, None, &ctx, &plan, &knobs, &state, &claims)
+                    .await
+                    .unwrap();
+
+                let journal = entries(&state);
+                let cell = format!("arm={arm} breaker_open={breaker_open}");
+
+                // Landed-elsewhere paths: NO row of any kind, and the
+                // validity set learned them.
+                let valid = ctx.target_valid.read().await.clone();
+                for member in &done {
+                    assert!(
+                        !journal.iter().any(|e| e.path == member.store_path),
+                        "{cell}: landed path must get no row: {journal:?}"
+                    );
+                    assert!(valid.contains(&member.store_path), "{cell}");
+                }
+                // Held-elsewhere paths: exactly one `skipped` bookkeeping
+                // row naming the held claim — never a settlement.
+                for member in &held {
+                    let rows: Vec<&SupplyEntry> = journal
+                        .iter()
+                        .filter(|e| e.path == member.store_path)
+                        .collect();
+                    assert_eq!(rows.len(), 1, "{cell}: {rows:?}");
+                    assert_eq!(rows[0].outcome, SUPPLY_OUTCOME_SKIPPED, "{cell}");
+                    assert_eq!(rows[0].detail.as_deref(), Some(CLAIM_STILL_HELD), "{cell}");
+                }
+                // Free paths: with the breaker open they are skipped without
+                // an attempt (and their claims released for a later top-up);
+                // with it closed they settle through a real attempt.
+                for member in &free {
+                    let row = entry_for(&journal, &member.store_path);
+                    if breaker_open {
+                        assert_eq!(row.outcome, SUPPLY_OUTCOME_SKIPPED, "{cell}");
+                        assert_eq!(row.detail.as_deref(), Some(GATEWAY_UNREACHABLE), "{cell}");
+                        assert_eq!(
+                            claims.claim(&member.store_path),
+                            ClaimOutcome::Won,
+                            "{cell}"
+                        );
+                    } else {
+                        assert!(
+                            supply_outcome_is_settlement(&row.outcome),
+                            "{cell}: a claim-won attempt must settle: {row:?}"
+                        );
+                    }
+                }
+
+                // The binding invariant, over the whole cell journal: no
+                // settled undelivered row contradicts a landed path, and
+                // `skipped` is never a settlement.
+                let landed: BTreeSet<&str> = done.iter().map(|m| m.store_path.as_str()).collect();
+                for row in &journal {
+                    if row.outcome == SUPPLY_OUTCOME_REFUSED || row.outcome == SUPPLY_OUTCOME_FAILED
+                    {
+                        assert!(
+                            !landed.contains(row.path.as_str()) && !valid.contains(&row.path),
+                            "{cell}: settled undelivered row for a landed path: {row:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -2840,6 +3170,80 @@ mod tests {
         };
         refresh_outcome_counts(&mut untouched, &[]);
         assert_eq!(untouched.delivered, 3);
+    }
+
+    /// Bookkeeping rows never displace settlements in the outcome fold —
+    /// in BOTH directions of the must-not-shadow contract: a `skipped` row
+    /// appended after the claim holder's `delivered` leaves the path
+    /// counted delivered (a skip-held racer must not erase a delivery),
+    /// and one appended after a real `failed` leaves it counted failed (a
+    /// later breaker skip must not launder a genuine failure). Settlements
+    /// still supersede anything earlier, bookkeeping supersedes only
+    /// bookkeeping, and a path with nothing but bookkeeping keeps its
+    /// bookkeeping count.
+    ///
+    /// Quantification domain: the outcome split is [`SUPPLY_OUTCOMES`] via
+    /// `supply_outcome_is_settlement` (the closed vocabulary as data) —
+    /// the final sweep drives one path per outcome through the fold so a
+    /// new outcome constant cannot ship without a counted (or explicitly
+    /// bookkeeping) disposition here.
+    #[test]
+    fn journal_outcome_counts_let_settlements_beat_bookkeeping() {
+        let entry = |path: &str, outcome: &str| SupplyEntry {
+            path: path.into(),
+            source: SUPPLY_SOURCE_EMBEDDED.into(),
+            mechanism: SUPPLY_MECHANISM_UPLOAD_BATCH.into(),
+            outcome: outcome.into(),
+            detail: None,
+            batch_id: None,
+            bytes: None,
+            observed_at: now_rfc3339(),
+        };
+        const PATH_C: &str = "/nix/store/cccccccccccccccccccccccccccccccc-supply-c";
+        const PATH_D: &str = "/nix/store/dddddddddddddddddddddddddddddddd-supply-d";
+        let entries = vec![
+            // Holder delivered, then a sibling's skip-held row landed late.
+            entry(PATH_A, SUPPLY_OUTCOME_DELIVERED),
+            entry(PATH_A, SUPPLY_OUTCOME_SKIPPED),
+            // Real failure, then a breaker skip on a later invocation.
+            entry(PATH_B, SUPPLY_OUTCOME_FAILED),
+            entry(PATH_B, SUPPLY_OUTCOME_SKIPPED),
+            // Bookkeeping only: deferred, then skipped — counted skipped.
+            entry(PATH_C, SUPPLY_OUTCOME_UNAVAILABLE),
+            entry(PATH_C, SUPPLY_OUTCOME_SKIPPED),
+            // Skipped first, then a real attempt delivered it.
+            entry(PATH_D, SUPPLY_OUTCOME_SKIPPED),
+            entry(PATH_D, SUPPLY_OUTCOME_DELIVERED),
+        ];
+        let mut report = SupplyStageReport::default();
+        refresh_outcome_counts(&mut report, &entries);
+        assert_eq!(report.delivered, 2, "{report:?}");
+        assert_eq!(report.failed, 1, "{report:?}");
+        assert_eq!(report.skipped, 1, "{report:?}");
+        assert_eq!(report.unavailable, 0, "{report:?}");
+
+        // Vocabulary sweep: one path per outcome — every outcome in the
+        // closed set lands in exactly the count its settlement class says.
+        let per_outcome: Vec<SupplyEntry> = crate::run::model::SUPPLY_OUTCOMES
+            .iter()
+            .enumerate()
+            .map(|(index, outcome)| entry(&format!("/nix/store/{index:0>32}-sweep"), outcome))
+            .collect();
+        let mut sweep = SupplyStageReport::default();
+        refresh_outcome_counts(&mut sweep, &per_outcome);
+        assert_eq!(
+            (
+                sweep.delivered,
+                sweep.already_present,
+                sweep.delegated,
+                sweep.refused,
+                sweep.unavailable,
+                sweep.failed,
+                sweep.skipped
+            ),
+            (1, 1, 1, 1, 1, 1, 1),
+            "{sweep:?}"
+        );
     }
 
     #[test]

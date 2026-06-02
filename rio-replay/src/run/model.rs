@@ -661,6 +661,56 @@ pub const SUPPLY_OUTCOME_UNAVAILABLE: &str = "unavailable";
 /// (transport error, relay fetch failure, failed prefetch build).
 pub const SUPPLY_OUTCOME_FAILED: &str = "failed";
 
+/// [`SupplyEntry::outcome`] value for a planned delivery this invocation
+/// skipped without making an attempt: the upload circuit breaker was open
+/// (no transport call was made for the path), or another request still
+/// held the path's upload claim — that holder's own settlement row is the
+/// authoritative outcome. A skipped row is per-request bookkeeping, never
+/// a settlement: it asserts nothing about whether the path is, or will
+/// be, present on the target (see [`supply_outcome_is_settlement`]).
+pub const SUPPLY_OUTCOME_SKIPPED: &str = "skipped";
+
+/// Every [`SupplyEntry::outcome`] value, as data: tests iterate this array
+/// instead of hand-copying the vocabulary, so a new outcome constant that
+/// is not added here (and classified by
+/// [`supply_outcome_is_settlement`]) fails the vocabulary tests rather
+/// than silently splitting the journal's readers from its writers.
+pub const SUPPLY_OUTCOMES: [&str; 7] = [
+    SUPPLY_OUTCOME_DELIVERED,
+    SUPPLY_OUTCOME_ALREADY_PRESENT,
+    SUPPLY_OUTCOME_DELEGATED,
+    SUPPLY_OUTCOME_REFUSED,
+    SUPPLY_OUTCOME_UNAVAILABLE,
+    SUPPLY_OUTCOME_FAILED,
+    SUPPLY_OUTCOME_SKIPPED,
+];
+
+/// Whether a supply outcome SETTLES its path — i.e. records the result of
+/// an actual delivery resolution (delivered / already-present / delegated,
+/// or a claim-resolved refusal/failure) rather than per-request
+/// bookkeeping (`unavailable`: nothing could provide the path when it was
+/// planned; `skipped`: this invocation made no attempt at all).
+///
+/// Journal folds that derive a path's settled truth (the supply rollup,
+/// the report's outcome counts) keep the LAST settlement row per path and
+/// let bookkeeping rows count only for paths that never settled:
+/// a bookkeeping row appended after a settlement (a skip-held row landing
+/// after the claim holder's `delivered`, a breaker skip after an earlier
+/// real failure) must never displace the settled outcome in either
+/// direction. Unknown outcome strings (a newer engine's vocabulary read
+/// by an older one) classify as bookkeeping, so they can neither retire
+/// units nor displace a settled truth — new vocabulary falls through.
+pub fn supply_outcome_is_settlement(outcome: &str) -> bool {
+    matches!(
+        outcome,
+        SUPPLY_OUTCOME_DELIVERED
+            | SUPPLY_OUTCOME_ALREADY_PRESENT
+            | SUPPLY_OUTCOME_DELEGATED
+            | SUPPLY_OUTCOME_REFUSED
+            | SUPPLY_OUTCOME_FAILED
+    )
+}
+
 /// One line of supply.jsonl — per-path supply outcome from the supply stage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1298,6 +1348,7 @@ mod tests {
         assert_eq!(SUPPLY_OUTCOME_REFUSED, "refused");
         assert_eq!(SUPPLY_OUTCOME_UNAVAILABLE, "unavailable");
         assert_eq!(SUPPLY_OUTCOME_FAILED, "failed");
+        assert_eq!(SUPPLY_OUTCOME_SKIPPED, "skipped");
 
         let entry = SupplyEntry {
             path: "/nix/store/x".into(),
@@ -1325,6 +1376,35 @@ mod tests {
         assert_eq!(back.batch_id, entry.batch_id);
         assert_eq!(back.bytes, entry.bytes);
         assert_eq!(back.observed_at, entry.observed_at);
+    }
+
+    /// The supply-outcome vocabulary is closed over [`SUPPLY_OUTCOMES`]
+    /// (the class definition as data — folds and tests iterate it, never a
+    /// hand-copied list), every value is unique, and the
+    /// settlement/bookkeeping split is exactly the documented one: a
+    /// settlement records a delivery resolution (delivered,
+    /// already-present, delegated, refused, failed), bookkeeping records a
+    /// per-request non-attempt (unavailable, skipped). Quantification
+    /// domain: the SUPPLY_OUTCOME_* constants in this module via
+    /// [`SUPPLY_OUTCOMES`]. Unknown (future) vocabulary must classify as
+    /// bookkeeping so it can neither retire units nor displace a settled
+    /// truth when an older reader folds a newer journal.
+    #[test]
+    fn supply_outcome_vocabulary_is_closed_and_split_into_settlement_vs_bookkeeping() {
+        let unique: std::collections::BTreeSet<&str> = SUPPLY_OUTCOMES.iter().copied().collect();
+        assert_eq!(unique.len(), SUPPLY_OUTCOMES.len());
+        for outcome in SUPPLY_OUTCOMES {
+            let is_settlement = supply_outcome_is_settlement(outcome);
+            let is_bookkeeping =
+                outcome == SUPPLY_OUTCOME_UNAVAILABLE || outcome == SUPPLY_OUTCOME_SKIPPED;
+            assert!(
+                is_settlement != is_bookkeeping,
+                "{outcome} must be exactly one of settlement/bookkeeping"
+            );
+        }
+        // Forward-compatibility direction: vocabulary this build does not
+        // know falls through as bookkeeping.
+        assert!(!supply_outcome_is_settlement("some-future-outcome"));
     }
 
     #[test]
