@@ -915,8 +915,12 @@ impl DagActor {
             // hole — set by the reap above on leader and standby alike —
             // still guards this tenure), never the cleanup itself.
             if !reap.holed_parents.is_empty() {
-                let holed: Vec<String> = reap.holed_parents.iter().map(|h| h.to_string()).collect();
-                if let Err(e) = self.db.set_closure_hole_by_hashes(&holed).await {
+                let holed: Vec<(String, Vec<String>)> = reap
+                    .holed_parents
+                    .iter()
+                    .map(|(p, cs)| (p.to_string(), cs.iter().map(|c| c.to_string()).collect()))
+                    .collect();
+                if let Err(e) = self.db.set_closure_holes(&holed).await {
                     warn!(build_id = %build_id, count = holed.len(), error = %e,
                           "failed to persist closure_hole for reap survivors (continuing)");
                 }

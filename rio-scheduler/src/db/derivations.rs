@@ -421,7 +421,7 @@ impl SchedulerDb {
         // terminal_status_sql! for why it isn't a bind param.
         let result = sqlx::query(terminal_status_sql!(
             "WITH victims AS (
-                 SELECT d.derivation_id FROM derivations d
+                 SELECT d.derivation_id, d.drv_hash FROM derivations d
                  WHERE d.status IN ",
             "
                    AND NOT EXISTS (SELECT 1 FROM build_derivations bd
@@ -435,6 +435,11 @@ impl SchedulerDb {
                  DELETE FROM derivation_edges e
                  WHERE e.parent_id IN (SELECT derivation_id FROM victims)
                     OR e.child_id  IN (SELECT derivation_id FROM victims)
+                 RETURNING 1
+             ),
+             del_closure_missing AS (
+                 DELETE FROM derivation_closure_missing m
+                 WHERE m.drv_hash IN (SELECT drv_hash FROM victims)
                  RETURNING 1
              )
              DELETE FROM derivations d USING victims v

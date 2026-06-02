@@ -918,7 +918,10 @@ impl DagActor {
         // no-op for rows that never carried the hole.
         for hash in &ingest.merge_result.healed_parents {
             if let Some(s) = self.dag.node_mut(hash) {
-                s.closure_hole = false;
+                // C6c2 gates this behind the HealWitness token; the
+                // narrow mutation surface is what the witness-set type
+                // gives us today.
+                s.closure_hole.clear_for_heal();
             }
         }
         let heal_parents: Vec<String> = ingest
@@ -3102,7 +3105,7 @@ impl DagActor {
                         && !self.closure_vouched(&node.drv_hash),
                     // Always false: a merge never creates a closure hole
                     // (holes are stamped in PG via
-                    // `set_closure_hole_by_hashes` by the leader's reap
+                    // `set_closure_holes` by the leader's reap
                     // hook, the recovery-time stamp in
                     // `load_dag_from_rows`, and the poison-clear paths —
                     // admin ClearPoison and the poison-TTL sweep), and

@@ -650,7 +650,8 @@ impl DagActor {
         // surviving parent's child set relative to the parent's declared
         // closure, and children-keyed `topdown_pruned` verdicts must not
         // trust the truncated set (see `DerivationState::closure_hole`).
-        let mut holed_parents: Vec<DrvHash> = Vec::new();
+        let mut holed_parents: std::collections::BTreeMap<DrvHash, Vec<DrvHash>> =
+            std::collections::BTreeMap::new();
         for drv_hash in expired_poisons {
             info!(drv_hash = %drv_hash, "poison TTL expired, removing from DAG");
             // r[impl sched.poison.clear-failure-evidence]
@@ -670,7 +671,12 @@ impl DagActor {
             // Capture the parents AFTER the PG clear succeeded (only
             // then is the child actually removed below) and BEFORE
             // `remove_node` scrubs the edge maps.
-            holed_parents.extend(self.dag.get_parents(&drv_hash));
+            for parent in self.dag.get_parents(&drv_hash) {
+                holed_parents
+                    .entry(parent)
+                    .or_default()
+                    .push(drv_hash.clone());
+            }
             // r[impl sched.poison.ttl-persist]
             // Prune BEFORE remove_node (reads interested_builds from
             // the node). keep_going=true builds still Active would
@@ -691,14 +697,16 @@ impl DagActor {
             self.dag.remove_node(&drv_hash);
         }
         // Stamp the surviving parents (skipping any that were themselves
-        // removed above): in memory first, then one best-effort PG write.
-        holed_parents.sort();
-        holed_parents.dedup();
-        let mut holed: Vec<String> = Vec::new();
-        for parent in &holed_parents {
+        // removed above): in memory first, then one best-effort PG write
+        // — recording WHICH expired children went missing (069).
+        let mut holed: Vec<(String, Vec<String>)> = Vec::new();
+        for (parent, missing) in &holed_parents {
             if let Some(state) = self.dag.node_mut(parent) {
-                state.closure_hole = true;
-                holed.push(parent.to_string());
+                state.closure_hole.stamp(missing.iter().cloned());
+                holed.push((
+                    parent.to_string(),
+                    missing.iter().map(|c| c.to_string()).collect(),
+                ));
             }
         }
         if !holed.is_empty() {
@@ -709,7 +717,7 @@ impl DagActor {
             // redundant gate here. A lost write costs only the
             // breadcrumb's durability across a failover; the in-memory
             // stamp covers this tenure.
-            if let Err(e) = self.db.set_closure_hole_by_hashes(&holed).await {
+            if let Err(e) = self.db.set_closure_holes(&holed).await {
                 warn!(count = holed.len(), error = %e,
                       "failed to persist closure_hole after poison-TTL sweep (continuing)");
             }

@@ -311,6 +311,19 @@ async fn test_gc_orphan_terminal_derivations() -> anyhow::Result<()> {
     .execute(&test_db.pool)
     .await?;
 
+    // (f) 069 witness rows: one keyed by a victim's drv_hash (must be
+    // deleted by the del_closure_missing CTE — keyed by drv_hash, no
+    // FK, otherwise permanent orphans, the bug_102 class) and one
+    // keyed by a kept row (must survive).
+    sqlx::query(
+        "INSERT INTO derivation_closure_missing (drv_hash, missing_child)
+         VALUES ($1, 'gc-witness-child'), ($2, 'gc-witness-child')",
+    )
+    .bind(format!("gc-orphan-{}", TERMINAL_STATUSES[0]))
+    .bind("gc-linked")
+    .execute(&test_db.pool)
+    .await?;
+
     // Sweep with generous limit.
     let deleted = db.gc_orphan_terminal_derivations(1000).await?;
     assert_eq!(
@@ -353,6 +366,18 @@ async fn test_gc_orphan_terminal_derivations() -> anyhow::Result<()> {
         remaining_edges,
         vec![(linked_id, live_id)],
         "edges referencing victims deleted; non-victim edge kept"
+    );
+
+    // (f) Victim-keyed 069 witness rows deleted in the same statement;
+    // kept-row witness survives.
+    let witness: Vec<String> =
+        sqlx::query_scalar("SELECT drv_hash FROM derivation_closure_missing")
+            .fetch_all(&test_db.pool)
+            .await?;
+    assert_eq!(
+        witness,
+        vec!["gc-linked".to_string()],
+        "del_closure_missing CTE removes victims' witness rows only"
     );
 
     // Second sweep: nothing left to delete.

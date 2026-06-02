@@ -433,7 +433,7 @@ async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyho
 
 // r[verify sched.merge.substitute-topdown+11]
 /// `closure_hole` (`migrations/064`) column semantics: stamped only via
-/// `set_closure_hole_by_hashes` (the leader's reap hook, the
+/// `set_closure_holes` (the leader's reap hook, the
 /// recovery-time stamp in `load_dag_from_rows`, and the poison-clear
 /// paths; merge upserts always bind false), preserved across a later
 /// re-upsert by the
@@ -487,6 +487,14 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
         .await?)
     };
     let hashes = vec![drv_hash.to_string()];
+    let witness_rows = async || -> anyhow::Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM derivation_closure_missing WHERE drv_hash = $1",
+        )
+        .bind(drv_hash)
+        .fetch_one(&test_db.pool)
+        .await?)
+    };
 
     // 1. A pruned merge sets the mark but never the breadcrumb.
     upsert(mk(true)).await?;
@@ -499,11 +507,26 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
     // 2. The stamp helper (shared by the reap hook, the recovery-time
     //    stamp, and the poison-clear paths) sets it.
     assert_eq!(
-        db.set_closure_hole_by_hashes(&hashes).await?,
+        db.set_closure_holes(&[(hashes[0].clone(), vec!["m-child".into()])])
+            .await?,
         1,
         "stamp helper must report the row it stamped"
     );
     assert_eq!(read().await?, (true, true));
+    assert_eq!(
+        witness_rows().await?,
+        1,
+        "the stamp writes its 069 witness row in the same transaction"
+    );
+    // A second truncation of the SAME parent appends its child instead
+    // of being filtered by the bool (the dropped AND NOT closure_hole).
+    db.set_closure_holes(&[(hashes[0].clone(), vec!["m-child-2".into()])])
+        .await?;
+    assert_eq!(
+        witness_rows().await?,
+        2,
+        "a second truncation appends to the witness set"
+    );
 
     // 3. A later re-upsert of the same drv (breadcrumb bound false, the
     //    merge-time bind) must clear neither bit: OR-on-conflict.
@@ -526,21 +549,35 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
         "recovery SELECT must carry closure_hole alongside topdown_pruned"
     );
 
-    // 5. The merge-heal helper clears the breadcrumb but not the mark.
+    // 5. The merge-heal helper clears the breadcrumb but not the mark —
+    //    and DELETEs the witness rows in the same transaction (a healed
+    //    parent's stale missing-set must not poison the next hole's
+    //    coverage check).
     assert_eq!(db.clear_closure_hole_by_hashes(&hashes).await?, 1);
     assert_eq!(
         read().await?,
         (true, false),
         "the heal clears only the breadcrumb"
     );
+    assert_eq!(
+        witness_rows().await?,
+        0,
+        "the heal deletes the 069 witness rows with the flag"
+    );
 
     // 6. The extended batched mark clear drops both bits.
-    db.set_closure_hole_by_hashes(&hashes).await?;
+    db.set_closure_holes(&[(hashes[0].clone(), vec!["m-child".into()])])
+        .await?;
     assert_eq!(db.clear_topdown_pruned_by_hashes(&hashes).await?, 1);
     assert_eq!(
         read().await?,
         (false, false),
         "clearing the mark must drop the breadcrumb that qualifies it"
+    );
+    assert_eq!(
+        witness_rows().await?,
+        0,
+        "the batched mark clear deletes the 069 witness rows too"
     );
 
     // 7. The single-row clear is mark-only: it consumes the mark but
@@ -550,13 +587,19 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
     //    hole either (lost-heal residue waits for the next full-merge
     //    heal).
     upsert(mk(true)).await?;
-    db.set_closure_hole_by_hashes(&hashes).await?;
+    db.set_closure_holes(&[(hashes[0].clone(), vec!["m-child".into()])])
+        .await?;
     assert_eq!(read().await?, (true, true));
     db.clear_topdown_pruned_by_hash(drv_hash).await?;
     assert_eq!(
         read().await?,
         (false, true),
         "the single-row clear must consume the mark and retain the breadcrumb"
+    );
+    assert_eq!(
+        witness_rows().await?,
+        1,
+        "mark-only clear retains the witness set with the breadcrumb"
     );
     db.clear_topdown_pruned_by_hash(drv_hash).await?;
     assert_eq!(

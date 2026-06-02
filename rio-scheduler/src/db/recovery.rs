@@ -323,13 +323,16 @@ impl SchedulerDb {
     pub(crate) async fn load_parents_with_unproduced_terminal_children(
         &self,
         derivation_ids: &[Uuid],
-    ) -> Result<Vec<Uuid>, sqlx::Error> {
+    ) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
         if derivation_ids.is_empty() {
             return Ok(Vec::new());
         }
-        sqlx::query_scalar(
+        // (parent_id, child drv_hash) pairs — the recovery edge-drop
+        // stamp records WHICH child went missing (069 witness set),
+        // not just that one did.
+        sqlx::query_as(
             r#"
-            SELECT DISTINCT e.parent_id
+            SELECT DISTINCT e.parent_id, c.drv_hash
             FROM derivation_edges e
             JOIN derivations c ON c.derivation_id = e.child_id
             WHERE e.parent_id = ANY($1)
@@ -337,6 +340,26 @@ impl SchedulerDb {
             "#,
         )
         .bind(derivation_ids)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Load the 069 closure-hole witness rows for a set of holed
+    /// parents (recovery hydration).
+    pub(crate) async fn load_closure_missing(
+        &self,
+        drv_hashes: &[String],
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        if drv_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as(
+            r#"
+            SELECT drv_hash, missing_child FROM derivation_closure_missing
+            WHERE drv_hash = ANY($1)
+            "#,
+        )
+        .bind(drv_hashes)
         .fetch_all(&self.pool)
         .await
     }

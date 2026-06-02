@@ -68,6 +68,9 @@ pub struct DebugDerivationInfo {
     pub substitute_tried: bool,
     pub topdown_pruned: bool,
     pub closure_hole: bool,
+    /// Size of the 069 witness set (the recorded missing children) —
+    /// nonzero ⇔ `closure_hole` by construction.
+    pub closure_missing_count: usize,
 }
 
 /// Handle for sending commands to the actor.

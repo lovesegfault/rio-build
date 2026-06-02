@@ -240,7 +240,7 @@ impl DagActor {
             // (a holed node is never Vouched). The kept mark routes the
             // node to the dispatch-time carve-out / resubmit-directing
             // fail-fast instead.
-            if state.topdown_pruned && !state.closure_hole {
+            if state.topdown_pruned && !state.closure_hole.is_holed() {
                 flagged.push(derivation_id);
             }
             id_to_hash.insert(derivation_id, hash.clone());
@@ -333,6 +333,45 @@ impl DagActor {
             // stays empty → check_build_completion sees 0/0 → Succeeded.
             id_to_hash.insert(derivation_id, hash);
             self.dag.insert_recovered_node(state);
+        }
+
+        // --- Hydrate the 069 closure-hole witness sets ---
+        // Both row loops restored the persisted FLAG (a holed row gets
+        // the fail-closed sentinel until hydrated). The transactional
+        // writers guarantee flag ⇔ side-rows; the debug_assert checks
+        // exactly that, and a release-mode inconsistency leaves the
+        // sentinel — uncoverable by any re-supply, so the heal stays
+        // refused (fail-closed).
+        let holed_hashes: Vec<String> = self
+            .dag
+            .iter_nodes()
+            .filter(|(_, st)| st.closure_hole.is_holed())
+            .map(|(h, _)| h.to_string())
+            .collect();
+        if !holed_hashes.is_empty() {
+            let witness_rows = self.db.load_closure_missing(&holed_hashes).await?;
+            let mut by_parent: std::collections::BTreeMap<String, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for (parent, child) in witness_rows {
+                by_parent.entry(parent).or_default().push(child);
+            }
+            for hash in &holed_hashes {
+                let rows = by_parent.remove(hash.as_str()).unwrap_or_default();
+                debug_assert!(
+                    !rows.is_empty(),
+                    "holed row {hash} has no 069 witness rows — the \
+                     transactional writers cannot produce this"
+                );
+                if let Some(state) = self.dag.node_mut(hash)
+                    && !rows.is_empty()
+                {
+                    state.closure_hole.hydrate(rows.into_iter().map(Into::into));
+                }
+            }
+            info!(
+                count = holed_hashes.len(),
+                "hydrated closure-hole witness sets"
+            );
         }
 
         // --- Load edges + add to DAG ---
@@ -483,16 +522,21 @@ impl DagActor {
             .db
             .load_parents_with_unproduced_terminal_children(&drv_ids)
             .await?;
-        let mut holed: Vec<String> = Vec::new();
-        for parent_id in unproduced_dropped {
+        let mut holed_map: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (parent_id, child_hash) in unproduced_dropped {
             let Some(hash) = id_to_hash.get(&parent_id) else {
                 continue;
             };
             if let Some(state) = self.dag.node_mut(hash) {
-                state.closure_hole = true;
-                holed.push(hash.to_string());
+                state.closure_hole.stamp([child_hash.clone().into()]);
+                holed_map
+                    .entry(hash.to_string())
+                    .or_default()
+                    .push(child_hash);
             }
         }
+        let holed: Vec<(String, Vec<String>)> = holed_map.into_iter().collect();
         if !holed.is_empty() {
             info!(
                 count = holed.len(),
@@ -506,7 +550,7 @@ impl DagActor {
             // the next failover re-derives the hole from the same
             // persisted children — or misses it if those rows are GC'd
             // first, the already-accepted best-effort window.
-            if let Err(e) = self.db.set_closure_hole_by_hashes(&holed).await {
+            if let Err(e) = self.db.set_closure_holes(&holed).await {
                 warn!(count = holed.len(), error = %e,
                       "failed to persist closure holes at recovery (best-effort; \
                        in-memory breadcrumb covers this tenure)");

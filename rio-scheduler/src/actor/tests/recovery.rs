@@ -4212,6 +4212,14 @@ async fn test_recovery_restores_closure_hole_and_heal_clears_persisted_breadcrum
         )
         .execute(&pool)
         .await?;
+        // The 069 witness row the transactional writers always pair
+        // with the flag (recovery hydration debug-asserts the pairing).
+        sqlx::query(
+            "INSERT INTO derivation_closure_missing (drv_hash, missing_child) \
+             VALUES ('chrec-root', 'chrec-reaped')",
+        )
+        .execute(&pool)
+        .await?;
         Ok(())
     })
     .await?;
@@ -4347,6 +4355,15 @@ async fn test_failover_keeps_topdown_pruned_when_closure_hole_recorded() -> Test
         sqlx::query(
             "UPDATE derivations SET status = 'substituting', topdown_pruned = true, \
              closure_hole = true WHERE drv_hash = 'tdvh-root'",
+        )
+        .execute(&pool)
+        .await?;
+        // The 069 witness row the transactional writers always pair
+        // with the flag (the recovery hydration debug-asserts the
+        // pairing).
+        sqlx::query(
+            "INSERT INTO derivation_closure_missing (drv_hash, missing_child) \
+             VALUES ('tdvh-root', 'tdvh-reaped')",
         )
         .execute(&pool)
         .await?;

@@ -1334,6 +1334,38 @@ pub const M_067: () = ();
 /// the mechanism.
 pub const M_068: () = ();
 
+/// `069_derivation_closure_missing.sql` — the closure-hole WITNESS
+/// SET: `derivation_closure_missing(drv_hash, missing_child, PK
+/// both)`, the relational record of WHICH children a truncation
+/// removed from a parent whose remaining DAG children no longer
+/// represent its input closure.
+///
+/// Why a side table and not a column: the M_064 `closure_hole` BOOLEAN
+/// stays as the cheap recovery-scan flag (row-level "is holed"), but a
+/// bool cannot answer the only question that makes healing SOUND —
+/// "has everything that went missing been re-supplied?". Round-15
+/// merged_bug_073 (pattern R3, fix-child of 606390ea7): the heal
+/// upgraded closure evidence on the ABSENCE of objection (a full merge
+/// re-declaring whatever edges happen to remain), so a subset
+/// re-declaration of already-present edges laundered reap-truncation
+/// evidence into Vouched. With the witness set, the heal demands
+/// positive coverage: missing(p) ⊆ post-merge children(p)
+/// (`sched.evidence.positive-witness`).
+///
+/// Write discipline: rows are appended by the same call sites that set
+/// the bool (reap survivor hook, poison-TTL sweep, admin ClearPoison,
+/// recovery edge-drop), in ONE transaction with the bool update —
+/// `INSERT … ON CONFLICT DO NOTHING`, so a SECOND truncation of the
+/// same parent appends new children instead of being filtered by the
+/// bool's `AND NOT closure_hole` (that filter is dropped in the same
+/// change). Clears (the token-gated heal) DELETE the parent's side
+/// rows in the same transaction as the bool clear. Recovery hydrates
+/// the set alongside the flag and debug-asserts bool ⇔ nonempty;
+/// rows whose parent row is gone are inert (the PK is keyed by the
+/// parent's drv_hash; the parent row's deletion paths delete these
+/// too via the per-path registry — see the store-side equivalent).
+pub const M_069: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

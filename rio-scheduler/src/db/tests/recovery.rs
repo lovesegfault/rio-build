@@ -315,11 +315,17 @@ async fn test_load_parents_with_unproduced_terminal_children_ignores_produced_an
     let holed = db
         .load_parents_with_unproduced_terminal_children(&[a, b, c])
         .await?;
+    let holed_parents: Vec<uuid::Uuid> = holed.iter().map(|(p, _)| *p).collect();
     assert_eq!(
-        holed,
+        holed_parents,
         vec![a],
         "only parents with ≥1 non-produced terminal child are returned; produced \
          and unbuilt children alone never mark a truncation"
+    );
+    assert_eq!(
+        holed.len(),
+        1,
+        "exactly one (parent, missing-child) pair: the cancelled child"
     );
     Ok(())
 }

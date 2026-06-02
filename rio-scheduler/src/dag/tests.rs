@@ -4237,7 +4237,11 @@ fn test_healed_parents_creation_scoped_parents_included() -> anyhow::Result<()> 
         )?;
         dag.nodes.get_mut("hcs-r").unwrap().topdown_pruned = true;
         // Simulate the truncation breadcrumb the top-up is healing.
-        dag.nodes.get_mut("hcs-r").unwrap().closure_hole = true;
+        dag.nodes
+            .get_mut("hcs-r")
+            .unwrap()
+            .closure_hole
+            .stamp(["hcs-reaped-child".into()]);
         let res = dag.merge(
             Uuid::new_v4(),
             &[
@@ -4252,7 +4256,7 @@ fn test_healed_parents_creation_scoped_parents_included() -> anyhow::Result<()> 
             "topdown-pruned resident parent taking its top-up is healed"
         );
         assert!(
-            dag.nodes.get("hcs-r").unwrap().closure_hole,
+            dag.nodes.get("hcs-r").unwrap().closure_hole.is_holed(),
             "merge() only COMPUTES healed_parents; the closure_hole \
              mutation itself is actor-side"
         );
@@ -4343,7 +4347,11 @@ fn test_foreign_skip_classified_by_parent_hole() -> anyhow::Result<()> {
         &[],
         "",
     )?;
-    dag.nodes.get_mut("cls-holed").unwrap().closure_hole = true;
+    dag.nodes
+        .get_mut("cls-holed")
+        .unwrap()
+        .closure_hole
+        .stamp(["cls-reaped-child".into()]);
 
     // A later join tries to attach a child to each.
     let res = dag.merge(
@@ -4378,7 +4386,7 @@ fn test_foreign_skip_classified_by_parent_hole() -> anyhow::Result<()> {
         "both skip shapes veto the heal"
     );
     assert!(
-        dag.nodes.get("cls-holed").unwrap().closure_hole,
+        dag.nodes.get("cls-holed").unwrap().closure_hole.is_holed(),
         "the rejoin-shaped skip does not clear the hole (only a \
          re-creation can)"
     );

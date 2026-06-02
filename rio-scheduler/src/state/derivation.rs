@@ -893,6 +893,78 @@ pub struct SchedHint {
     pub priority: f64,
 }
 
+/// The closure-hole breadcrumb as a WITNESS SET (round-15 C6c1,
+/// migration 069): which children a truncation removed from this
+/// parent. `is_holed()` ⇔ the set is nonempty BY CONSTRUCTION — the
+/// bool the M_064 column persists is derived, never stored separately
+/// in memory, so "holed with no record of what is missing" is
+/// unrepresentable except through the explicit fail-closed sentinel
+/// ([`ClosureHole::LOST_WITNESS`], used only when recovery finds the
+/// persisted flag set but the side rows missing — a state the
+/// transactional writers cannot produce; the sentinel can never be
+/// covered by a re-supply, so the heal stays refused and the node
+/// keeps the bounded fail-fast path).
+///
+/// Mutation surface is deliberately narrow: [`ClosureHole::stamp`]
+/// (truncation sites append what they removed), the resubmit-carry
+/// clone, and [`ClosureHole::clear_for_heal`] — whose only legitimate
+/// caller is the merge heal branch holding a `HealWitness` (token-gated
+/// in the C6c2 follow-on; `sched.evidence.positive-witness`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClosureHole {
+    missing: std::collections::BTreeSet<DrvHash>,
+}
+
+impl ClosureHole {
+    /// Fail-closed sentinel for a persisted hole whose witness rows
+    /// are gone (see the type doc). Not a valid drv hash, so it can
+    /// never be covered by a real child re-supply.
+    pub const LOST_WITNESS: &'static str = "<lost-witness>";
+
+    /// Whether this node's remaining children under-represent its
+    /// declared input closure.
+    pub fn is_holed(&self) -> bool {
+        !self.missing.is_empty()
+    }
+
+    /// The recorded missing children.
+    pub fn missing(&self) -> &std::collections::BTreeSet<DrvHash> {
+        &self.missing
+    }
+
+    /// Record children a truncation removed. Appending — a second
+    /// truncation of the same parent extends the witness set.
+    pub fn stamp<I: IntoIterator<Item = DrvHash>>(&mut self, removed: I) {
+        self.missing.extend(removed);
+    }
+
+    /// Recovery-side constructor from the persisted flag: an un-holed
+    /// row is empty; a holed row starts from the sentinel and is
+    /// replaced by the hydrated side rows when they exist (the
+    /// transactional writers guarantee they do; the sentinel survives
+    /// only the impossible-by-construction inconsistency, failing
+    /// closed).
+    pub fn from_recovery_flag(holed: bool) -> Self {
+        let mut h = Self::default();
+        if holed {
+            h.missing.insert(Self::LOST_WITNESS.into());
+        }
+        h
+    }
+
+    /// Replace the sentinel/contents with the hydrated witness rows.
+    pub fn hydrate(&mut self, rows: impl IntoIterator<Item = DrvHash>) {
+        self.missing = rows.into_iter().collect();
+    }
+
+    /// Clear on positive coverage. The ONLY legitimate caller is the
+    /// merge heal (C6c2 gates this behind `HealWitness`); everything
+    /// else extends or carries.
+    pub fn clear_for_heal(&mut self) {
+        self.missing.clear();
+    }
+}
+
 /// In-memory state for a single derivation node in the global DAG.
 #[derive(Debug, Clone)]
 pub struct DerivationState {
@@ -1196,7 +1268,7 @@ pub struct DerivationState {
     /// run the in-tenure sweep before the TTL lapses (same accepted
     /// class as the GC residual; see
     /// `load_parents_with_unproduced_terminal_children`).
-    pub closure_hole: bool,
+    pub closure_hole: ClosureHole,
     /// Output paths that have already triggered a forgiven-seed-became-
     /// wanted DOWNGRADE of a substitute completion for this node
     /// (`handle_substitute_complete`) **within the current substitution
@@ -1313,7 +1385,7 @@ impl DerivationState {
             probed_generation: 0,
             substitute_tried: false,
             topdown_pruned: false,
-            closure_hole: false,
+            closure_hole: ClosureHole::default(),
             never_forgive_paths: HashSet::new(),
         })
     }
@@ -1577,7 +1649,12 @@ impl DerivationState {
             // been GC'd from PG since, so the surviving produced
             // children would otherwise launder the recovery-time clear
             // and re-arm the doomed from-source dispatch.
-            closure_hole: row.closure_hole,
+            // The witness SET is hydrated by the recovery loader from
+            // `derivation_closure_missing` (069) after rows are built;
+            // a row flagged holed whose side rows are missing gets the
+            // fail-closed sentinel there. Restoring `false` here keeps
+            // bool⇔nonempty structural for un-holed rows.
+            closure_hole: ClosureHole::from_recovery_flag(row.closure_hole),
             never_forgive_paths: HashSet::new(),
         })
     }

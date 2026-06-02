@@ -427,12 +427,12 @@ pub struct ReapOutcome {
     /// UN-PRODUCED child to this reap — exactly the nodes whose
     /// in-memory `closure_hole` breadcrumb this reap just set. Reported
     /// separately so the leader-gated survivor hook can persist the
-    /// breadcrumb (`migrations/064`, `set_closure_hole_by_hashes`)
+    /// breadcrumb (`migrations/064`+`069`, `set_closure_holes`)
     /// without re-deriving "holed by THIS reap" from node state (which
     /// would also re-fire for holes set by earlier reaps and miss
     /// survivors the hook's verdict loop skips as terminal /
     /// zero-interest).
-    pub holed_parents: Vec<DrvHash>,
+    pub holed_parents: Vec<(DrvHash, Vec<DrvHash>)>,
 }
 
 /// Trust classification of a node's current DAG child set as evidence
@@ -1132,7 +1132,7 @@ impl DerivationDag {
                     old.retry.resubmit_cycles,
                     old.wanted_output_names.clone(),
                     old.wanted_by_build.clone(),
-                    old.closure_hole,
+                    old.closure_hole.clone(),
                     authority_flip,
                 );
                 removed_retriable.push((drv_hash.clone(), old));
@@ -1390,7 +1390,10 @@ impl DerivationDag {
                 // of a node whose children were reaped); anything else is
                 // a hostile direct submitter or a gateway bug.
                 edge_parents_vetoed.insert(parent_hash.clone());
-                let parent_holed = self.nodes.get(&parent_hash).is_some_and(|s| s.closure_hole);
+                let parent_holed = self
+                    .nodes
+                    .get(&parent_hash)
+                    .is_some_and(|s| s.closure_hole.is_holed());
                 if parent_holed {
                     tracing::debug!(
                         parent_path = %edge.parent_drv_path,
@@ -1763,7 +1766,7 @@ impl DerivationDag {
         let Some(node) = self.nodes.get(drv_hash) else {
             return ClosureEvidence::Broken;
         };
-        if node.closure_hole {
+        if node.closure_hole.is_holed() {
             return ClosureEvidence::Broken;
         }
         let Some(children) = self.children.get(drv_hash) else {
@@ -2168,7 +2171,8 @@ impl DerivationDag {
         }
 
         let mut surviving_parents: BTreeSet<DrvHash> = BTreeSet::new();
-        let mut holed_parents: BTreeSet<DrvHash> = BTreeSet::new();
+        let mut holed_parents: std::collections::BTreeMap<DrvHash, Vec<DrvHash>> =
+            std::collections::BTreeMap::new();
         let mut reaped_paths = Vec::with_capacity(to_reap.len());
         for (hash, path, unproduced) in to_reap {
             // Capture the parents BEFORE `remove_node` scrubs the edge maps —
@@ -2177,7 +2181,12 @@ impl DerivationDag {
             if let Some(ps) = self.parents.get(&hash) {
                 surviving_parents.extend(ps.iter().cloned());
                 if unproduced {
-                    holed_parents.extend(ps.iter().cloned());
+                    for p in ps {
+                        holed_parents
+                            .entry(p.clone())
+                            .or_default()
+                            .push(hash.clone());
+                    }
                 }
             }
             self.remove_node(&hash);
@@ -2186,13 +2195,15 @@ impl DerivationDag {
         // Drop entries that were themselves reaped (or otherwise no longer
         // exist) so only true survivors are reported.
         surviving_parents.retain(|p| self.nodes.contains_key(p));
-        holed_parents.retain(|p| self.nodes.contains_key(p));
+        holed_parents.retain(|p, _| self.nodes.contains_key(p));
         // Breadcrumb the survivors whose reaped children include an
-        // un-produced one: their child set is no longer representative of
-        // their input closure (see `DerivationState::closure_hole`).
-        for parent in &holed_parents {
+        // un-produced one — recording WHICH children went missing
+        // (round-15 C6c1): their child set is no longer representative
+        // of their input closure, and the witness set is what a later
+        // heal must positively cover (sched.evidence.positive-witness).
+        for (parent, missing) in &holed_parents {
             if let Some(state) = self.nodes.get_mut(parent) {
-                state.closure_hole = true;
+                state.closure_hole.stamp(missing.iter().cloned());
             }
         }
         ReapOutcome {
