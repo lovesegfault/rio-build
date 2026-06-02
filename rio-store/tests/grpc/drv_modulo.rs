@@ -306,3 +306,103 @@ async fn text_ca_gate_runs_before_population_and_garbage_skips() -> TestResult {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// C1c1 (merged_bug_015): error classes never fold into the absent verdict
+// ---------------------------------------------------------------------------
+
+/// IA assignment claims naming `deriver` (not fixed-output, not CA) —
+/// the shape that triggers the deriver-proof gate.
+fn ia_claims_token(deriver: &str, outputs: Vec<String>) -> String {
+    let claims = rio_auth::hmac::AssignmentClaims {
+        executor_id: "w-test".into(),
+        drv_hash: deriver.into(),
+        expected_outputs: outputs,
+        expiry_unix: now_unix() + 60,
+        is_ca: false,
+        is_fixed_output: false,
+        tenant: None,
+    };
+    HmacSigner::from_key(TEST_KEY.to_vec()).sign(&claims)
+}
+
+// r[verify store.put.ia-deriver-proof]
+/// Row corruption is an INTERNAL error, never an authorization verdict:
+/// a `status='complete'` deriver `.drv` whose inline NAR does not parse
+/// (text-CA-gated at ingestion, so this is row corruption) must surface
+/// as `INTERNAL` — pre-fix, the `.ok()??` fold reported it as
+/// `PERMISSION_DENIED` "deriver closure unverifiable", telling an
+/// honest worker its deriver doesn't derive its path because a database
+/// row rotted.
+#[tokio::test]
+async fn corrupt_inline_drv_nar_yields_internal_not_permission_denied() -> TestResult {
+    let mut s =
+        StoreSession::new_with_service_hmac(TEST_KEY.to_vec(), SERVICE_KEY.to_vec()).await?;
+    // Resident deriver, then corrupt its inline NAR and drop its cache
+    // row so the proof must read the (now corrupt) own bytes.
+    assert!(upload_drv_at(&mut s, GOLDEN_LEAF_PATH, GOLDEN_LEAF, &[]).await?);
+    let key: Vec<u8> = {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(GOLDEN_LEAF_PATH.as_bytes()).to_vec()
+    };
+    sqlx::query("DELETE FROM drv_modulo_cache WHERE drv_path_hash = $1")
+        .bind(&key)
+        .execute(&s.db.pool)
+        .await?;
+    let n = sqlx::query(
+        "UPDATE manifests SET inline_blob = $2 WHERE store_path_hash = \
+         (SELECT store_path_hash FROM narinfo WHERE store_path = $1)",
+    )
+    .bind(GOLDEN_LEAF_PATH)
+    .bind(b"garbage, not a NAR".as_slice())
+    .execute(&s.db.pool)
+    .await?
+    .rows_affected();
+    assert_eq!(
+        n, 1,
+        "fixture: corrupted exactly the deriver's manifest row"
+    );
+
+    // IA upload claiming an output of the (corrupt) deriver.
+    let (nar, _) = make_nar(b"ia output bytes");
+    let out_path = test_store_path("c1c1-out");
+    let info = make_path_info_for_nar(&out_path, &nar);
+    let token = ia_claims_token(GOLDEN_LEAF_PATH, vec![out_path.clone()]);
+    let err = put_path_with_token(&mut s.client, info, nar, &token)
+        .await
+        .expect_err("corrupt deriver row must fail the upload");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Internal,
+        "row corruption is INTERNAL, not an authorization verdict: {err:?}"
+    );
+    Ok(())
+}
+
+// r[verify store.put.ia-deriver-proof]
+/// Database failure during the proof lookup is an INTERNAL error, never
+/// `PERMISSION_DENIED`: with the cache table dropped, the proof's own
+/// SELECT fails — pre-fix the `.ok()??` fold reported "deriver closure
+/// unverifiable" for what was an infrastructure failure.
+#[tokio::test]
+async fn proof_db_error_yields_internal_not_permission_denied() -> TestResult {
+    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    sqlx::query("DROP TABLE drv_modulo_cache CASCADE")
+        .execute(&s.db.pool)
+        .await?;
+
+    let (nar, _) = make_nar(b"ia output bytes 2");
+    let out_path = test_store_path("c1c1-dberr-out");
+    let deriver = format!("/nix/store/{}-absent.drv", "c".repeat(32));
+    let info = make_path_info_for_nar(&out_path, &nar);
+    let token = ia_claims_token(&deriver, vec![out_path.clone()]);
+    let err = put_path_with_token(&mut s.client, info, nar, &token)
+        .await
+        .expect_err("DB failure must fail the upload");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Internal,
+        "infrastructure failure is INTERNAL, not an authorization verdict: {err:?}"
+    );
+    Ok(())
+}

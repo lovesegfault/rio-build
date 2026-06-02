@@ -238,9 +238,13 @@ pub(crate) async fn populate_on_ingest(pool: &PgPool, drv_path: &str, drv_bytes:
     let seeds = match load_drv_modulo_batch(pool, &inputs).await {
         Ok(s) => s,
         Err(e) => {
+            // A DB failure is not "the inputs are absent" — labeling it
+            // `skipped_missing_input` told operators reading the metric
+            // that uploads were merely out of order when the database
+            // was failing (merged_bug_015 sibling site, pattern R1).
             metrics::counter!(
                 "rio_store_drv_modulo_cache_total",
-                "event" => "skipped_missing_input"
+                "event" => "seed_load_failed"
             )
             .increment(1);
             warn!(drv_path, error = %e, "drv modulo population skipped: seed load failed");
@@ -292,11 +296,37 @@ pub(crate) const READ_THROUGH_MAX_DEPTH: usize = 32;
 
 /// Fetch a `.drv`'s raw text bytes from the store's OWN backend.
 /// `.drv`s are KB-sized and therefore inline; a chunked or absent
-/// manifest returns `None` (unverifiable).
-async fn own_drv_bytes(pool: &PgPool, drv_path: &str) -> Option<Vec<u8>> {
-    match super::get_manifest(pool, drv_path).await.ok()?? {
-        super::ManifestKind::Inline(nar) => rio_nix::nar::extract_single_file(&nar).ok(),
-        super::ManifestKind::Chunked(_) => None,
+/// manifest returns `Ok(None)` (not resident in usable form).
+///
+/// Error classes are PROPAGATED, never folded into the absent verdict
+/// (merged_bug_015 — pattern R1: the old `.ok()??` collapsed DB
+/// failures and row corruption into "unverifiable", which the proof
+/// gate then served as `PERMISSION_DENIED`, telling an honest worker
+/// its deriver doesn't derive its path because the store's database
+/// hiccuped):
+/// - `get_manifest` errors (connection, serialization, corrupt chunk
+///   list) → `Err` — the caller maps to `INTERNAL`/retriable, never an
+///   authorization verdict.
+/// - a `status='complete'` `.drv` whose inline NAR does not parse as a
+///   single regular file → `Err(InvariantViolation)`: the text-CA gate
+///   (`store.put.drv-text-ca`) proved single-file shape at ingestion,
+///   so failure here is row-level corruption, not absence.
+async fn own_drv_bytes(
+    pool: &PgPool,
+    drv_path: &str,
+) -> Result<Option<Vec<u8>>, super::MetadataError> {
+    match super::get_manifest(pool, drv_path).await? {
+        None => Ok(None),
+        Some(super::ManifestKind::Inline(nar)) => rio_nix::nar::extract_single_file(&nar)
+            .map(Some)
+            .map_err(|e| {
+                super::MetadataError::InvariantViolation(format!(
+                    "complete .drv manifest for {drv_path} holds a NAR that is not a \
+                     single regular file (text-CA-gated at ingestion; this is row \
+                     corruption): {e}"
+                ))
+            }),
+        Some(super::ManifestKind::Chunked(_)) => Ok(None),
     }
 }
 
@@ -309,7 +339,7 @@ async fn own_drv_bytes(pool: &PgPool, drv_path: &str) -> Option<Vec<u8>> {
 pub(crate) async fn load_or_compute_drv_modulo(
     pool: &PgPool,
     drv_path: &str,
-) -> Result<Option<DrvModuloRow>, sqlx::Error> {
+) -> Result<Option<DrvModuloRow>, super::MetadataError> {
     if let Some(row) = load_drv_modulo(pool, drv_path).await? {
         return Ok(Some(row));
     }
@@ -337,7 +367,7 @@ pub(crate) async fn load_or_compute_drv_modulo(
             return Ok(None);
         }
         fetches += 1;
-        let Some(bytes) = own_drv_bytes(pool, &path).await else {
+        let Some(bytes) = own_drv_bytes(pool, &path).await? else {
             metrics::counter!("rio_store_ia_proof_total", "result" => "unverifiable").increment(1);
             return Ok(None);
         };
@@ -388,7 +418,7 @@ pub(crate) async fn load_or_compute_drv_modulo(
         }
         remaining = next;
     }
-    load_drv_modulo(pool, drv_path).await
+    Ok(load_drv_modulo(pool, drv_path).await?)
 }
 
 #[cfg(test)]
