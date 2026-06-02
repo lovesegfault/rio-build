@@ -473,7 +473,7 @@ Everything operational about the campaign engine survives unchanged in role, and
 
 | Kept | Where it lives today | Notes after convergence |
 |---|---|---|
-| k8s Job runtime, pod sizing, labels/annotations, ServiceAccount/IRSA | `xtask/src/replay/jobs.rs`, `infra/eks/replay.tf` | Unchanged. The campaign Job remains `backoffLimit: 6`, `restartPolicy: OnFailure`, no `activeDeadlineSeconds`. |
+| k8s Job runtime, pod sizing, labels/annotations, ServiceAccount/IRSA | `xtask/src/replay/jobs.rs`, `infra/eks/replay.tf` | Largely unchanged; the campaign Job keeps `backoffLimit: 6` and no `activeDeadlineSeconds`, but uses `restartPolicy: Never` — under `OnFailure` every in-place container restart counted toward `backoffLimit` and reaching the limit deleted the still-running pod mid-campaign, so retries are pod-level: each failed pod is replaced and the replacement resumes from the synced S3 state (at the cost of a fresh-volume resume — archive re-download — per crash). |
 | Spec ConfigMap input (`<campaign-id>-spec`, mounted at `/etc/rio/replay/spec.json`) | `xtask/src/replay/launch.rs`, `rio-replay/src/run/spec.rs` | `CampaignSpec` gains an `archive` reference, a `scheduling` block, and a `supply` block; the `hydra` block leaves the campaign spec (§6.8, §7.4). |
 | S3 state/artifact sync, append-only JSONL state dir, atomic JSON rewrites, `markers/<stage>.done` | `rio-replay/src/run/state.rs`, `artifact.rs` | Unchanged mechanism. New artifacts: `supply.jsonl`, `dispatch.jsonl` (timed mode), `gate.json`. |
 | Resume across pod restarts (`download_state_if_missing`, terminal-record skip, `collected.json`) | `rio-replay/src/run/mod.rs` | Extended for in-band collection and timed mode (§6.7). |

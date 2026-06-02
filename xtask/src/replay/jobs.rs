@@ -196,11 +196,24 @@ fn container_security() -> serde_json::Value {
 ///   the engine (deadline → explicitly-partial report, exit 0); a
 ///   pod-level deadline would kill the pod mid-drain instead of letting
 ///   the partial report render.
-/// - `restartPolicy: OnFailure` restarts the container in the SAME pod,
-///   so the /work emptyDir (state dir, downloaded replay archive, caches)
-///   survives engine crashes; only a reschedule loses it, and the S3
-///   sync plus the pinned campaign id cover that. The generous
-///   `backoffLimit` keeps node loss from failing the Job outright.
+/// - `restartPolicy: Never`, so every retry is pod-level. Under
+///   `OnFailure`, Kubernetes counts each in-place container restart of a
+///   Running pod toward `backoffLimit` and, on reaching the limit, marks
+///   the Job BackoffLimitExceeded and DELETES the still-running pod — a
+///   multi-day campaign accumulating its sixth engine crash would be
+///   killed mid-run, destroying /work and skipping the deadline-partial
+///   report (the very outcomes the no-`activeDeadlineSeconds` choice
+///   exists to prevent). With `Never` each crash fails its pod, the Job
+///   controller starts a replacement, and the replacement resumes from
+///   the synced S3 state via the campaign id pinned in the spec.
+///   Operational cost, deliberate: every crash now pays the fresh-volume
+///   resume (multi-GB archive re-download, cache rebuild) instead of an
+///   in-place /work reuse — correctness over speed, since the in-place
+///   path is exactly what the controller killed at the limit. Failed
+///   pods are retained, so crash logs stay readable.
+/// - `backoffLimit: 6` is therefore a true budget of crash-resume
+///   attempts (engine crashes and node loss alike consume it), not a
+///   free in-place-restart allowance.
 /// - `karpenter.sh/do-not-disrupt` + the general node role keep
 ///   Karpenter from consolidating the node under a multi-day pod.
 pub fn campaign_job(c: &EngineJobCommon, campaign_id: &str, args: &[String]) -> Result<Job> {
@@ -213,9 +226,10 @@ pub fn campaign_job(c: &EngineJobCommon, campaign_id: &str, args: &[String]) -> 
             "labels": labels("replay-campaign"),
         },
         "spec": {
-            // Container restarts resume in place (same emptyDir); pod
-            // reschedules resume from the synced S3 state. A generous
-            // backoffLimit keeps node loss from failing the Job.
+            // Pod-level retries only (restartPolicy: Never below): every
+            // failed pod is replaced and the replacement resumes from the
+            // synced S3 state. backoffLimit budgets those crash-resume
+            // attempts — engine crashes and node loss alike.
             "backoffLimit": 6,
             "template": {
                 "metadata": {
@@ -226,7 +240,7 @@ pub fn campaign_job(c: &EngineJobCommon, campaign_id: &str, args: &[String]) -> 
                 },
                 "spec": {
                     "serviceAccountName": SA_REPLAY,
-                    "restartPolicy": "OnFailure",
+                    "restartPolicy": "Never",
                     "nodeSelector": {"rio.build/node-role": "general"},
                     "securityContext": pod_security(),
                     "containers": [{
@@ -278,9 +292,14 @@ pub fn campaign_job(c: &EngineJobCommon, campaign_id: &str, args: &[String]) -> 
 ///
 /// One-shot semantics: TTL after finished + a small backoffLimit (eval
 /// is expensive and has no resume — retry once, then let the operator
-/// read the logs). The eval engine only talks to Hydra, the nixpkgs
-/// tarball host, cache.nixos.org and S3 — it mounts no campaign
-/// Secrets.
+/// read the logs). `restartPolicy: Never` is what makes both halves of
+/// that promise real: under `OnFailure` the first crash's in-place
+/// restart already counted `1 >= backoffLimit`, so the controller
+/// killed and deleted the restarted pod within a sync — no retry ever
+/// completed and the logs died with the pod. With `Never` the failed
+/// pod is retained for log inspection and the retry runs as a fresh
+/// pod. The eval engine only talks to Hydra, the nixpkgs tarball host,
+/// cache.nixos.org and S3 — it mounts no campaign Secrets.
 pub fn eval_job(c: &EngineJobCommon, job_name: &str, args: &[String]) -> Result<Job> {
     // Full-scale sizing: the ephemeral-storage request stays at 400Gi,
     // under the 500Gi root volume of the node class it targets.
@@ -294,9 +313,11 @@ pub fn eval_job(c: &EngineJobCommon, job_name: &str, args: &[String]) -> Result<
             "labels": labels("replay-eval"),
         },
         "spec": {
-            // Eval is expensive and has no resume — retry once, then let
-            // the operator look at the logs. Finished Jobs clean
-            // themselves up after a day (the artifacts live in S3).
+            // Eval is expensive and has no resume — one pod-level retry
+            // (restartPolicy: Never below keeps the failed pod and its
+            // logs around), then let the operator look at the logs.
+            // Finished Jobs clean themselves up after a day (the
+            // artifacts live in S3).
             "backoffLimit": 1,
             "ttlSecondsAfterFinished": 86400,
             "template": {
@@ -308,7 +329,7 @@ pub fn eval_job(c: &EngineJobCommon, job_name: &str, args: &[String]) -> Result<
                 },
                 "spec": {
                     "serviceAccountName": SA_REPLAY,
-                    "restartPolicy": "OnFailure",
+                    "restartPolicy": "Never",
                     "nodeSelector": {"rio.build/node-role": "general"},
                     "securityContext": pod_security(),
                     "containers": [{
@@ -462,6 +483,8 @@ mod tests {
         // The engine owns the deadline (partial report at deadline, exit
         // 0); a pod-level deadline would kill it mid-drain.
         assert_eq!(spec.active_deadline_seconds, None);
+        // Six pod-level crash-resume attempts (see the retry-posture test
+        // for why the pairing with restartPolicy: Never is load-bearing).
         assert_eq!(spec.backoff_limit, Some(6));
 
         let tmpl_meta = spec.template.metadata.clone().unwrap();
@@ -473,7 +496,7 @@ mod tests {
 
         let pod = pod_spec(&j);
         assert_eq!(pod.service_account_name.as_deref(), Some(SA_REPLAY));
-        assert_eq!(pod.restart_policy.as_deref(), Some("OnFailure"));
+        assert_eq!(pod.restart_policy.as_deref(), Some("Never"));
         assert_eq!(
             pod.node_selector
                 .as_ref()
@@ -579,6 +602,7 @@ mod tests {
         assert_eq!(spec.ttl_seconds_after_finished, Some(86400));
         assert_eq!(spec.backoff_limit, Some(1));
         assert_eq!(spec.active_deadline_seconds, None);
+        assert_eq!(pod_spec(&job).restart_policy.as_deref(), Some("Never"));
 
         // Same node-role pin and Karpenter disruption opt-out as the
         // campaign Job: a full-scope eval holds a large node for 1-2h.
@@ -654,6 +678,34 @@ mod tests {
                 Some(vec!["ALL".to_string()])
             );
             assert_eq!(pod.containers[0].working_dir.as_deref(), Some(WORK_DIR));
+        }
+    }
+
+    /// Retry-posture pin for BOTH Job shapes: `restartPolicy: Never`
+    /// paired with each shape's `backoffLimit`, asserted together because
+    /// the pairing is what carries the semantics. Kubernetes counts every
+    /// in-place container restart of a Running pod toward `backoffLimit`
+    /// under `OnFailure` and, at the limit (a `>=` comparison), marks the
+    /// Job BackoffLimitExceeded and deletes the still-running pod — so an
+    /// `OnFailure` pairing turns the limit into a mid-run kill switch (and
+    /// deletes the logs the eval shape promises the operator). Under
+    /// `Never`, backoffLimit is a true budget of pod-level retries, failed
+    /// pods are retained for log inspection, and each campaign replacement
+    /// pod resumes from the synced S3 state. Anyone flipping either knob
+    /// must revisit the other and this rule.
+    #[test]
+    fn both_job_shapes_use_pod_level_retries() {
+        let campaign =
+            campaign_job(&common(), "replay-leaf-20260601-ab12", &["run".into()]).unwrap();
+        let eval = eval_job(&common(), "replay-eval-1824219-ab12cd34", &["eval".into()]).unwrap();
+        for (job, limit) in [(&campaign, 6), (&eval, 1)] {
+            assert_eq!(
+                pod_spec(job).restart_policy.as_deref(),
+                Some("Never"),
+                "in-place restarts consume backoffLimit and the limit kills the running pod; \
+                 retries must be pod-level"
+            );
+            assert_eq!(job.spec.clone().unwrap().backoff_limit, Some(limit));
         }
     }
 
