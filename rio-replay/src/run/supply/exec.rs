@@ -220,6 +220,13 @@ pub struct SupplyStageReport {
     pub planned_prefetch: usize,
     /// Planned prefetch paths whose prefetch did not settle as delegated.
     pub prefetch_missing: usize,
+    /// Prefetch-wanted paths that could not be planned for prefetch at all
+    /// AND that no ladder source could provide either (no upstream
+    /// coverage / no producing derivation / nothing on the ladder): part
+    /// of the shortfall denominators alongside the planned set, so a
+    /// largely-undeliverable prefetch set (an aged-out upstream) reads as
+    /// a shortfall instead of silently shrinking what the gate measures.
+    pub prefetch_unavailable: usize,
     /// Paths delivered by an engine upload (batch or streamed).
     pub delivered: usize,
     /// Paths the target cluster supplied itself (prefetch substitution or
@@ -242,8 +249,10 @@ pub struct SupplyStageReport {
     pub upload_mib_per_s: Option<f64>,
     /// Substituter narinfo-probe failure counts by cache URL.
     pub probe_errors: BTreeMap<String, u64>,
-    /// Prefetch shortfall percentage (missing / planned × 100); `None` when
-    /// nothing was planned for prefetch.
+    /// Prefetch shortfall percentage:
+    /// (missing + unavailable) / (planned + unavailable) × 100. `None`
+    /// when the prefetch policy wanted nothing at all; an all-unavailable
+    /// wanted set yields 100, never a skipped gate.
     pub shortfall_pct: Option<f64>,
 }
 
@@ -1773,6 +1782,7 @@ async fn run_upload_ladder(
     inputs: &SupplyInputs,
     knobs: &Knobs,
     report: &mut SupplyStageReport,
+    prefetch_unavailable: &mut BTreeSet<String>,
 ) -> Result<Option<SupplyContext>> {
     let roots: Vec<String> = inputs.workload_drvs.iter().cloned().collect();
     if roots.is_empty() {
@@ -1925,18 +1935,27 @@ async fn run_upload_ladder(
             &ctx.relay_narinfos,
             ctx.dependencies,
         );
-        if source == (PathSource::NotSupplied { workload: false })
-            // Prefetch-set paths already carry their own bookkeeping (the
-            // upstream-coverage probe and the prefetch classification).
-            && !inputs.prefetch_paths.contains_key(path)
-        {
-            let detail = if inputs.dependencies == SupplyDependencies::None
-                && !input_srcs.contains(path)
-            {
-                "dependency output withheld by the supply policy (dependencies = \"none\")"
-            } else {
-                "no target substituter, archive member, or relay substituter can provide this path"
-            };
+        if inputs.prefetch_paths.contains_key(path) {
+            // Prefetch-wanted paths carry their own journal bookkeeping
+            // (the upstream-coverage probe and the prefetch
+            // classification); here the ladder only settles their
+            // shortfall membership: a path the ladder CAN source
+            // (embedded / relay / target substituter) is deliverable
+            // after all and leaves the unavailable side of the
+            // denominators, while a NotSupplied one stays — the
+            // mostly-uncoverable warm set is exactly the case the
+            // pre-execution gate exists for.
+            if source != (PathSource::NotSupplied { workload: false }) {
+                prefetch_unavailable.remove(path);
+            }
+        } else if source == (PathSource::NotSupplied { workload: false }) {
+            let detail =
+                if inputs.dependencies == SupplyDependencies::None && !input_srcs.contains(path) {
+                    "dependency output withheld by the supply policy (dependencies = \"none\")"
+                } else {
+                    "no target substituter, archive member, or relay substituter can provide \
+                     this path"
+                };
             append_supply_entry(
                 state,
                 path,
@@ -2042,6 +2061,11 @@ pub async fn run_supply_stage(
         .context("probe target validity for the prefetch set")?;
 
     let mut prefetch_roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Prefetch-wanted paths that cannot be prefetched OR ladder-sourced —
+    // the shortfall denominators' unavailable side. A set (not a counter)
+    // because the classification arms here and the ladder's resolve loop
+    // can both see the same path; it must count once.
+    let mut prefetch_unavailable: BTreeSet<String> = BTreeSet::new();
     for (path, producer) in &inputs.prefetch_paths {
         if inputs.prior_valid.contains(path) || probe_valid.contains(path) {
             append_supply_entry(
@@ -2059,8 +2083,13 @@ pub async fn run_supply_stage(
         match (covered, producer) {
             // Not covered upstream: a prefetch submission could not
             // substitute it. With a producer the upload ladder below may
-            // still deliver it; without one nothing can.
-            (false, Some(_)) => {}
+            // still deliver it — the path enters the unavailable side of
+            // the shortfall denominators provisionally and leaves it again
+            // if the ladder finds a source; without a ladder pass nothing
+            // can deliver it and it stays.
+            (false, Some(_)) => {
+                prefetch_unavailable.insert(path.clone());
+            }
             (false, None) => {
                 append_supply_entry(
                     &state,
@@ -2075,6 +2104,7 @@ pub async fn run_supply_stage(
                     ),
                 )?;
                 report.unavailable += 1;
+                prefetch_unavailable.insert(path.clone());
             }
             // Covered but with no static producing derivation
             // (content-addressed / floating outputs): there is no drv to
@@ -2089,6 +2119,7 @@ pub async fn run_supply_stage(
                     Some("no static producing derivation to prefetch".to_string()),
                 )?;
                 report.unavailable += 1;
+                prefetch_unavailable.insert(path.clone());
             }
             (true, Some(drv)) => {
                 prefetch_roots
@@ -2123,13 +2154,26 @@ pub async fn run_supply_stage(
             &inputs,
             knobs,
             &mut report,
+            &mut prefetch_unavailable,
         )
         .await?;
     }
 
     // ── Prefetch shortfall gate ─────────────────────────────────────────
-    if report.planned_prefetch > 0 {
-        let shortfall_pct = report.prefetch_missing as f64 / report.planned_prefetch as f64 * 100.0;
+    // The denominator is the whole wanted-but-not-yet-present set: planned
+    // prefetches plus the paths that could not be planned (or ladder-
+    // sourced) at all. Without the unavailable side, a wanted set that is
+    // MOSTLY undeliverable (aged-out upstream, floating CA outputs — the
+    // durability case this gate exists for) would shrink the denominator
+    // toward zero and the campaign would start execution silently
+    // under-supplied, with neither the pause nor the low-confidence flag
+    // able to fire.
+    report.prefetch_unavailable = prefetch_unavailable.len();
+    let prefetch_wanted = report.planned_prefetch + report.prefetch_unavailable;
+    if prefetch_wanted > 0 {
+        let shortfall_pct = (report.prefetch_missing + report.prefetch_unavailable) as f64
+            / prefetch_wanted as f64
+            * 100.0;
         report.shortfall_pct = Some(shortfall_pct);
         if shortfall_pct > knobs.prefetch_shortfall_pause_pct {
             let pause = state.path("PAUSE");
@@ -2137,6 +2181,7 @@ pub async fn run_supply_stage(
                 .with_context(|| format!("write {}", pause.display()))?;
             tracing::error!(
                 prefetch_missing = report.prefetch_missing,
+                prefetch_unavailable = report.prefetch_unavailable,
                 planned_prefetch = report.planned_prefetch,
                 shortfall_pct,
                 threshold_pct = knobs.prefetch_shortfall_pause_pct,
@@ -2163,9 +2208,12 @@ pub async fn run_supply_stage(
 /// upstream-coverage probe records `unavailable` before the supply stage
 /// runs, and a path one arm could not provide can be delivered by a later
 /// arm or a top-up — so counting raw rows would double-count. The last row
-/// per path is its settled disposition. Throughput, prefetch-shortfall, and
-/// probe-error figures are not per-path counts and stay as the stage
-/// reported them. An empty journal leaves the report untouched.
+/// per path is its settled disposition. Throughput, prefetch-shortfall
+/// (including the prefetch-scoped unavailable tally — the journal cannot
+/// distinguish prefetch-wanted unavailability from ordinary ladder
+/// unavailability), and probe-error figures are not per-path counts and
+/// stay as the stage reported them. An empty journal leaves the report
+/// untouched.
 pub fn refresh_outcome_counts(report: &mut SupplyStageReport, entries: &[SupplyEntry]) {
     if entries.is_empty() {
         return;
@@ -2867,9 +2915,11 @@ mod tests {
             ..Knobs::default()
         };
         let mut inputs = prefetch_only_inputs(&paths);
-        // One extra path already valid at the plan snapshot and one covered
-        // path with no producing derivation: both are bookkeeping-only and
-        // never join the planned prefetch set.
+        // One extra path already valid at the plan snapshot (bookkeeping
+        // only — never part of the wanted-set arithmetic) and one covered
+        // path with no producing derivation: the latter cannot be planned
+        // for prefetch, so it joins the shortfall denominators as
+        // unavailable instead of silently shrinking what the gate measures.
         let prior = "/nix/store/pppppppppppppppppppppppppppppppp-prior".to_string();
         let no_producer = "/nix/store/qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq-noproducer".to_string();
         inputs.prior_valid.insert(prior.clone());
@@ -2894,13 +2944,20 @@ mod tests {
 
         assert_eq!(report.planned_prefetch, 10);
         assert_eq!(report.prefetch_missing, 2);
-        assert_eq!(report.shortfall_pct, Some(20.0));
+        assert_eq!(report.prefetch_unavailable, 1);
+        // (2 missing + 1 unavailable) / (10 planned + 1 unavailable).
+        let expected_pct = 3.0 / 11.0 * 100.0;
+        assert!(
+            (report.shortfall_pct.unwrap() - expected_pct).abs() < 1e-9,
+            "{:?}",
+            report.shortfall_pct
+        );
         assert_eq!(report.delegated, 8);
         assert_eq!(report.already_present, 1);
         assert_eq!(report.unavailable, 1);
         assert!(
             state.path("PAUSE").exists(),
-            "a 20% shortfall above the 10% threshold must create the PAUSE file"
+            "a shortfall above the 10% threshold must create the PAUSE file"
         );
         let entries = entries(&state);
         assert_eq!(
@@ -2933,6 +2990,59 @@ mod tests {
             !state2.path("PAUSE").exists(),
             "no shortfall, no PAUSE file"
         );
+    }
+
+    /// The durability scenario the gate exists for: every prefetch-wanted
+    /// path is unavailable (not coverable upstream, or covered with no
+    /// producing derivation), so NOTHING can be planned for prefetch. The
+    /// shortfall must read 100% — pausing the campaign before its
+    /// execution clock starts — instead of the planned-set guard skipping
+    /// the gate, leaving shortfall_pct None, and starting a silently
+    /// under-supplied measurement no low-confidence flag can reach.
+    #[tokio::test]
+    async fn run_supply_stage_pauses_when_the_whole_wanted_set_is_unavailable() {
+        let (_dir, state) = state();
+        let state = Arc::new(state);
+        let fake = Arc::new(FakeSupplyTransport::default());
+        let uncovered: Vec<String> = (0..3)
+            .map(|i| format!("/nix/store/{:0>32}-uncovered{i}", i))
+            .collect();
+        let no_producer = "/nix/store/qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq-noproducer".to_string();
+        let mut inputs = prefetch_only_inputs(&[]);
+        for path in &uncovered {
+            // Producer known, but no upstream coverage and no ladder
+            // source: unprefetchable and undeliverable.
+            inputs
+                .prefetch_paths
+                .insert(path.clone(), Some(producing_drv(path)));
+        }
+        inputs.prefetch_paths.insert(no_producer.clone(), None);
+        inputs.target_coverage.insert(no_producer.clone());
+        let knobs = Knobs {
+            prefetch_shortfall_pause_pct: 10.0,
+            ..Knobs::default()
+        };
+        let report = run_supply_stage(
+            state.clone(),
+            fake,
+            inputs,
+            &knobs,
+            Arc::new(AtomicU64::new(1)),
+            false,
+        )
+        .await
+        .unwrap()
+        .report;
+        assert_eq!(report.planned_prefetch, 0, "{report:?}");
+        assert_eq!(report.prefetch_unavailable, 4);
+        assert_eq!(report.shortfall_pct, Some(100.0));
+        assert!(
+            state.path("PAUSE").exists(),
+            "an all-unavailable wanted set must pause, not skip the gate"
+        );
+        // The low-confidence flag derives from shortfall_pct > 0, so the
+        // report side can also see the degraded measurement.
+        assert!(report.shortfall_pct.is_some_and(|pct| pct > 0.0));
     }
 
     /// Second state-dir helper for tests that need two independent campaigns.

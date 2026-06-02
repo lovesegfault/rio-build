@@ -187,10 +187,12 @@ pub struct Knobs {
     /// Channels held for validity probing. Reserved for the supply planner;
     /// nothing reads it yet — the submitter probes on its own channel.
     pub probe_concurrency: usize,
-    /// Planned-but-missing prefetch paths above this percentage of the
-    /// planned prefetch set pause the campaign before execution starts;
-    /// below it the shortfall is recorded as a low-confidence flag. The
-    /// default is a starting point, not a calibrated value.
+    /// Prefetch shortfall — missing plus unavailable paths, as a
+    /// percentage of the whole wanted set (planned plus unavailable) —
+    /// above this threshold pauses the campaign before execution starts;
+    /// below it the shortfall is recorded as a low-confidence flag. An
+    /// entirely undeliverable wanted set reads as 100%, never as a skipped
+    /// gate. The default is a starting point, not a calibrated value.
     pub prefetch_shortfall_pause_pct: f64,
     /// Concurrently admitted requests in timed mode (= concurrently held
     /// build channels under the dispatcher's FIFO admission).

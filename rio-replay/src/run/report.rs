@@ -179,8 +179,8 @@ pub const FLAG_INFRA_INDETERMINATE_RATE: &str = "infra-indeterminate-rate";
 /// `knobs.no_truth_threshold_pct`.
 pub const FLAG_NO_TRUTH_RATE: &str = "no-truth-rate";
 /// Low-confidence flag: the supply stage recorded a nonzero prefetch
-/// shortfall (planned-but-missing prefetch paths), so the headline measured
-/// something other than what was planned.
+/// shortfall (missing or unavailable prefetch-wanted paths), so the
+/// headline measured something other than what was planned.
 pub const FLAG_PREFETCH_SHORTFALL: &str = "prefetch-shortfall";
 /// Low-confidence flag: a timed run's recorded cadence was not honored
 /// (resume re-anchoring or a suspension window during timed execution).
@@ -584,10 +584,11 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
             );
             let _ = writeln!(
                 out,
-                "- prefetch shortfall: {} (planned {}, missing {})",
+                "- prefetch shortfall: {} (planned {}, missing {}, unavailable {})",
                 fmt_pct(supply.shortfall_pct),
                 supply.planned_prefetch,
-                supply.prefetch_missing
+                supply.prefetch_missing,
+                supply.prefetch_unavailable
             );
         }
         None => {
@@ -647,12 +648,34 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
     out
 }
 
+/// Coverage witness of one gate evaluation: what an untripped gate's
+/// "pass" is actually worth.
+///
+/// Absence of counter-evidence is not positive verification — a gate
+/// evaluated over zero classified units observed nothing, so its pass is
+/// vacuous. The witness makes that distinction structural: a meaningful
+/// pass carries the non-zero count of classified units the trip sets were
+/// evaluated over, and the zero-coverage case is its own variant that no
+/// consumer can conflate with verified coverage. `NothingInScope` is
+/// CLEAN here by design — an empty-scope campaign legitimately reports an
+/// untripped gate — but a consumer that requires coverage (CI wiring, a
+/// publish step) can demand `Checked(_)` instead of trusting
+/// `tripped == false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateCoverage {
+    /// The gate was evaluated over zero classified units: nothing was
+    /// checked, so the pass asserts nothing (and a trip is impossible).
+    NothingInScope,
+    /// The gate was evaluated over this many classified units.
+    Checked(std::num::NonZeroUsize),
+}
+
 /// Regression-gate result, written to `report/gate.json` and mirrored in
 /// progress.json when the campaign requested the regression-gate report
 /// policy. The gate is data for the operator CLI (`report --check` maps it
 /// to an exit code); the engine's own exit code never depends on it. The
 /// field names are the wire keys verbatim (snake_case), so the JSON reads
-/// `{"policy":…,"fail_on":…,"tripped":…,"counts":{…}}`.
+/// `{"policy":…,"fail_on":…,"tripped":…,"checked":…,"counts":{…}}`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GateResult {
     /// Always the regression-gate policy name.
@@ -661,9 +684,27 @@ pub struct GateResult {
     pub fail_on: String,
     /// Whether any contributing class had a nonzero count.
     pub tripped: bool,
+    /// Coverage witness: how many classified units (verdicts and
+    /// dispositions alike) the trip sets were evaluated over. An untripped
+    /// gate with `checked: 0` passed vacuously — see
+    /// [`GateResult::coverage`]. Defaulted on reload so gate.json written
+    /// before the witness existed still parses (as zero coverage, the
+    /// honest reading of a record that never carried one).
+    #[serde(default)]
+    pub checked: usize,
     /// The contributing classes with nonzero counts (empty when nothing in
     /// the trip set was observed).
     pub counts: BTreeMap<String, usize>,
+}
+
+impl GateResult {
+    /// The typed coverage witness for this evaluation.
+    pub fn coverage(&self) -> GateCoverage {
+        match std::num::NonZeroUsize::new(self.checked) {
+            None => GateCoverage::NothingInScope,
+            Some(checked) => GateCoverage::Checked(checked),
+        }
+    }
 }
 
 /// Evaluate the regression gate over the final per-class counts.
@@ -672,6 +713,11 @@ pub struct GateResult {
 /// upload-rejected, infra-indeterminate); `divergence` adds the
 /// informational divergence classes on top (output-divergence,
 /// unexpected-success, interruption-not-reproduced); `none` never trips.
+///
+/// The result always carries its coverage witness: the total classified
+/// units the counts describe. The denominator is an explicit part of the
+/// evaluation, not an incidentally-incremented counter, so a pass over an
+/// empty classification cannot masquerade as a verified one.
 pub fn evaluate_gate(
     fail_on: FailOn,
     verdict_counts: &BTreeMap<String, usize>,
@@ -710,10 +756,13 @@ pub fn evaluate_gate(
             counts.insert(class.to_string(), count);
         }
     }
+    let checked =
+        verdict_counts.values().sum::<usize>() + disposition_counts.values().sum::<usize>();
     GateResult {
         policy: ReportPolicy::RegressionGate.as_str().to_string(),
         fail_on: fail_on.as_str().to_string(),
         tripped: !counts.is_empty(),
+        checked,
         counts,
     }
 }
@@ -1312,7 +1361,7 @@ mod tests {
         );
         assert!(out.contains("uploaded: 10.0 MiB at 2.00 MiB/s"), "{out}");
         assert!(
-            out.contains("prefetch shortfall: 7.50% (planned 40, missing 3)"),
+            out.contains("prefetch shortfall: 7.50% (planned 40, missing 3, unavailable 0)"),
             "{out}"
         );
         assert!(
@@ -1378,6 +1427,49 @@ mod tests {
         let counts = BTreeMap::new();
         assert!(evaluate_gate(FailOn::Regression, &counts, &dispositions).tripped);
         assert!(!evaluate_gate(FailOn::None, &counts, &dispositions).tripped);
+    }
+
+    /// Every gate result carries its coverage witness: an untripped gate
+    /// over zero classified units is NothingInScope (a vacuous pass no
+    /// consumer can mistake for verified coverage — though it is CLEAN
+    /// here: an empty-scope campaign legitimately reports an untripped
+    /// gate), while a real evaluation carries the non-zero classified
+    /// total. Old gate.json files without the field reload as zero
+    /// coverage, the honest reading of a record that never carried one.
+    #[test]
+    fn gate_passes_carry_a_coverage_witness() {
+        let empty = BTreeMap::new();
+        let vacuous = evaluate_gate(FailOn::Regression, &empty, &empty);
+        assert!(!vacuous.tripped);
+        assert_eq!(vacuous.checked, 0);
+        assert_eq!(vacuous.coverage(), GateCoverage::NothingInScope);
+
+        let mut verdicts = BTreeMap::new();
+        verdicts.insert(Verdict::MatchBuilt.as_str().to_string(), 7);
+        let mut dispositions = BTreeMap::new();
+        dispositions.insert(Disposition::CachedPrior.as_str().to_string(), 3);
+        let checked = evaluate_gate(FailOn::Regression, &verdicts, &dispositions);
+        assert!(!checked.tripped);
+        assert_eq!(checked.checked, 10, "verdicts and dispositions both count");
+        assert_eq!(
+            checked.coverage(),
+            GateCoverage::Checked(std::num::NonZeroUsize::new(10).unwrap())
+        );
+        // The witness rides the wire and reloads.
+        let json = serde_json::to_value(&checked).unwrap();
+        assert_eq!(json["checked"], 10, "{json}");
+        let back: GateResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back, checked);
+        // A pre-witness gate.json (no "checked" key) reloads as zero
+        // coverage instead of failing to parse.
+        let legacy: GateResult = serde_json::from_value(serde_json::json!({
+            "policy": "regression-gate",
+            "fail_on": "regression",
+            "tripped": false,
+            "counts": {}
+        }))
+        .unwrap();
+        assert_eq!(legacy.coverage(), GateCoverage::NothingInScope);
     }
 
     #[test]

@@ -2525,6 +2525,14 @@ mod tests {
         spec.knobs.collect_poll_secs = 1;
         spec.knobs.cluster_status_poll_secs = 1;
         spec.knobs.s3_sync_interval_secs = 1;
+        // The mini fixtures deliberately leave part of the warm set
+        // uncoverable (no upstream narinfo, nothing on the ladder), which
+        // the shortfall gate now counts. Accept any shortfall here — the
+        // pre-execution pause has its own focused supply tests; these
+        // end-to-end tests exercise submit/collect/report, and a paused
+        // campaign would simply hang them. The shortfall still lands in
+        // the report as the prefetch-shortfall low-confidence flag.
+        spec.knobs.prefetch_shortfall_pause_pct = 100.0;
         spec
     }
 
