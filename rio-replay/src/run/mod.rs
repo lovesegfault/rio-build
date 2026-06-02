@@ -417,6 +417,37 @@ fn require_mode_wiring(spec: &CampaignSpec) -> Result<ModeWiring> {
     })
 }
 
+/// In-scope attemptable jobs still awaiting their FIRST submission: no
+/// terminal record and never part of any recorded batch. On an
+/// inline-delivery resume these are exactly the jobs whose deferred supply
+/// cannot have been delivered — the per-batch top-up runs before every
+/// submission attempt, so a job in any recorded batch (even one whose
+/// submission failed or was later requeued) already had its gap delivery,
+/// while a job with a terminal record is never submitted again. Sorted for
+/// stable error messages.
+fn jobs_awaiting_first_submission<'a>(
+    candidates: impl IntoIterator<Item = &'a str>,
+    records: &BTreeMap<String, JobRecord>,
+    batches: &[model::BatchRecord],
+) -> Vec<String> {
+    let submitted: HashSet<&str> = batches
+        .iter()
+        .flat_map(|batch| batch.jobs.iter().map(String::as_str))
+        .collect();
+    let mut jobs: Vec<String> = candidates
+        .into_iter()
+        .filter(|job| !submitted.contains(job))
+        .filter(|job| {
+            !records.get(*job).is_some_and(|record| {
+                model::is_terminal_class(&record.verdict, &record.disposition)
+            })
+        })
+        .map(str::to_string)
+        .collect();
+    jobs.sort_unstable();
+    jobs
+}
+
 /// Resolve the SSH host-key policy every gateway pool the engine dials uses:
 /// the spec's pinned `cluster.gateway_host_key` is required — an absent or
 /// empty pin is an explicit error here, never an empty value passed
@@ -1624,15 +1655,17 @@ pub async fn run_with_backends(
         // results instead of re-admitting or re-probing what is already
         // known valid.
         //
-        // TODO: rebuild the ladder context when resuming an inline-delivery
-        // campaign. A resumed campaign whose supply marker is already set
-        // ran the stage in an earlier process, so no context exists here
-        // and the execute stage runs without the hook: under prewarm that
-        // only loses the miss-fallback, but under inline the deferred
-        // uploads of jobs the earlier process never submitted are not
-        // delivered, and those jobs fail on missing inputs. Re-running the
-        // stage's planning and probing on resume (resume costs re-probing,
-        // never correctness) would restore delivery.
+        // TODO: rebuild the ladder context when resuming past a completed
+        // supply stage. A resumed campaign whose supply marker is already
+        // set ran the stage in an earlier process, so no context exists
+        // there and the execute stage runs without the hook: under prewarm
+        // that only loses the miss-fallback, while under inline the hook IS
+        // the delivery mechanism, so the resume path (the else branch
+        // below) refuses to start while any in-scope job still awaits its
+        // first submission rather than fail those jobs on missing inputs.
+        // Re-running the stage's planning and probing on resume (resume
+        // costs re-probing, never correctness) would lift the refusal and
+        // restore the miss-fallback.
         let wire_topup = match wiring.topup {
             TopupRole::Primary => true,
             TopupRole::MissFallback => effective_dependencies != SupplyDependencies::None,
@@ -1646,6 +1679,46 @@ pub async fn run_with_backends(
                 state.clone(),
             ));
             supply_topup = Some(topup);
+        }
+    } else if wiring.topup == TopupRole::Primary {
+        // Resumed past a completed supply stage under inline delivery: the
+        // stage ran in an earlier process and took the ladder context the
+        // pre-submission top-up needs with it (see the TODO above). Jobs
+        // that process already submitted had their deferred uploads
+        // delivered by its top-up before submission, and jobs with terminal
+        // records are never submitted again, so a report-only resume
+        // proceeds. Any job still awaiting its first submission, however,
+        // would execute without its deferred supply and fail on missing
+        // inputs — false regressions in the parity report — so the resume
+        // refuses loudly before the execute stage instead.
+        let batches = state.load_jsonl::<model::BatchRecord>(StateFile::Batches)?;
+        let undelivered = jobs_awaiting_first_submission(
+            manifest
+                .iter()
+                .map(|m| m.job.as_str())
+                .filter(|job| in_scope.contains(job) && !plan_dispositions.contains_key(*job)),
+            &existing_records,
+            &batches,
+        );
+        if !undelivered.is_empty() {
+            let sample = undelivered
+                .iter()
+                .take(3)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "campaign {campaign_id}: cannot resume with supply.delivery \"inline\": the \
+                 supply stage completed in an earlier process and the inline delivery context \
+                 (the supply ladder the pre-submission top-up replays) cannot be rebuilt on \
+                 resume yet, so the {count} in-scope job(s) not yet submitted (e.g. {sample}) \
+                 would run without their deferred uploads and fail on missing inputs; delete \
+                 {marker} to re-run the supply stage on the next start (resume costs \
+                 re-probing, never correctness), either keeping inline delivery or switching \
+                 the spec to supply.delivery \"prewarm\" to deliver supply before execution",
+                count = undelivered.len(),
+                marker = state.path("markers/supply.done").display(),
+            );
         }
     }
     // Supply summary for progress.json while the campaign executes (the
@@ -2789,6 +2862,54 @@ mod tests {
         );
     }
 
+    /// The inline-resume guard's job filter: only jobs with neither a
+    /// terminal record nor a recorded batch membership count as awaiting
+    /// their first submission — terminal jobs are never submitted again,
+    /// and a job in any recorded batch already had its pre-submission
+    /// top-up. A non-terminal record (a deadline backfill's not-attempted)
+    /// does not count as submitted, and the result is sorted.
+    #[test]
+    fn jobs_awaiting_first_submission_excludes_terminal_and_batched() {
+        let mut backfilled = terminal_record("backfilled.x86_64-linux");
+        backfilled.verdict = None;
+        backfilled.disposition = Some(Disposition::NotAttempted.as_str().into());
+        let records: BTreeMap<String, JobRecord> = [
+            (
+                "done.x86_64-linux".to_string(),
+                terminal_record("done.x86_64-linux"),
+            ),
+            ("backfilled.x86_64-linux".to_string(), backfilled),
+        ]
+        .into();
+        let batches = vec![model::BatchRecord {
+            batch_id: 1,
+            kind: BATCH_KIND_SUBMIT.to_string(),
+            jobs: vec!["sent.x86_64-linux".to_string()],
+            root_drvs: vec![format!("/nix/store/{}-sent.drv", "a".repeat(32))],
+            est_nodes: 1,
+            build_id: None,
+            started_at: now_rfc3339(),
+            finished_at: Some(now_rfc3339()),
+            results: Vec::new(),
+            reasons: BTreeMap::new(),
+            stderr_tail: None,
+            engine_cancelled: false,
+            disconnect_deadline_fired: false,
+            interruption_drvs: Vec::new(),
+        }];
+        let got = jobs_awaiting_first_submission(
+            [
+                "sent.x86_64-linux",
+                "fresh.x86_64-linux",
+                "done.x86_64-linux",
+                "backfilled.x86_64-linux",
+            ],
+            &records,
+            &batches,
+        );
+        assert_eq!(got, vec!["backfilled.x86_64-linux", "fresh.x86_64-linux"]);
+    }
+
     #[test]
     fn malformed_deadline_is_rejected_naming_the_value() {
         assert_eq!(parse_deadline(None).unwrap(), None);
@@ -3140,6 +3261,312 @@ mod tests {
         assert!(
             err.to_string().contains("campaign.json pins archive"),
             "{err:#}"
+        );
+    }
+
+    /// Backends over the standard fakes for the resume tests; the captured
+    /// Arcs keep the script and call records visible across processes. The
+    /// submitter is the root-keyed fake: re-offered batches (the collect
+    /// loop racing the post-settlement cool-down) replay the same scripted
+    /// outcome instead of exhausting a pop-once script, so the tests are
+    /// deterministic under that benign race.
+    fn resume_backends(
+        submitter: &Arc<KeyedSubmitter>,
+        supply_transport: &Arc<FakeSupplyTransport>,
+        narinfos: &HashMap<String, String>,
+    ) -> Backends {
+        Backends {
+            store: Arc::new(FakeStoreApi::default()),
+            admin: Arc::new(NoLogsAdmin),
+            cluster: Arc::new(HealthyCluster),
+            submitter: submitter.clone(),
+            supply_transport: Some(supply_transport.clone()),
+            narinfo: Some(Arc::new(MapNarinfo(narinfos.clone()))),
+            artifacts: None,
+        }
+    }
+
+    /// Script `submitter` so any batch rooted at either app unit settles
+    /// with Built results for both drvs (collect matches results to the
+    /// batch's own members, extra entries are ignored), making every
+    /// submission interleaving converge on match-built.
+    fn script_apps_built(submitter: &KeyedSubmitter, app_a_drv: &str, app_b_drv: &str) {
+        let built_result = |drv: &str| PathOutcome {
+            drv_path: drv.to_string(),
+            status: build_status_name(BuildStatus::Built).into(),
+            error_msg: String::new(),
+            start_time: 0,
+            stop_time: 0,
+        };
+        let outcome = BatchOutcome {
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-00000000cccc".into()),
+            results: vec![built_result(app_a_drv), built_result(app_b_drv)],
+            ..BatchOutcome::default()
+        };
+        let mut outcomes = submitter.outcomes.lock().unwrap();
+        outcomes.insert(app_a_drv.to_string(), outcome.clone());
+        outcomes.insert(app_b_drv.to_string(), outcome);
+    }
+
+    /// Inline-delivery resume guard: once the supply stage has completed in
+    /// an earlier process, the inline delivery context (the ladder the
+    /// pre-submission top-up replays) cannot be rebuilt, so resuming while
+    /// in-scope jobs still await their first submission refuses with the
+    /// campaign id and both remedies — and the error's own advice (delete
+    /// the supply marker to re-run the stage) genuinely lifts the refusal
+    /// and lets the campaign run to completion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inline_resume_refuses_while_unsubmitted_work_remains() {
+        let (_archive_dir, archive, archive_id) = open_mini_archive();
+        let manifest = load_units(&archive).unwrap();
+        let app_a = manifest
+            .iter()
+            .find(|m| m.job == "appA.x86_64-linux")
+            .unwrap()
+            .clone();
+        let app_b = manifest
+            .iter()
+            .find(|m| m.job == "appB.x86_64-linux")
+            .unwrap()
+            .clone();
+        let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let mut narinfos = HashMap::new();
+        narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
+        let submitter = Arc::new(KeyedSubmitter::default());
+        let supply_transport = Arc::new(FakeSupplyTransport::default());
+        let state_dir = tempfile::tempdir().unwrap();
+        let inline_spec = || {
+            let mut spec = leaf_spec(&archive_id);
+            spec.supply.delivery = SupplyDelivery::Inline;
+            spec
+        };
+
+        // Process 1: the deadline is already past, so the supply stage runs
+        // (deferring every planned upload to the inline top-up) but the
+        // submit loop stops before submitting anything — the shape of an
+        // interrupted inline campaign with all of its workload pending.
+        let mut args = run_args(state_dir.path());
+        args.deadline = Some("2000-01-01T00:00:00Z".into());
+        run_with_backends(
+            args,
+            inline_spec(),
+            StateDir::new(state_dir.path()).unwrap(),
+            archive.clone(),
+            resume_backends(&submitter, &supply_transport, &narinfos),
+        )
+        .await
+        .unwrap();
+        assert!(
+            submitter.submitted.lock().unwrap().is_empty(),
+            "the deadline-stopped first process submits nothing"
+        );
+        let state = StateDir::new(state_dir.path()).unwrap();
+        assert!(state.marker_done("supply"), "the supply stage completed");
+        let deferred = state
+            .load_jsonl::<SupplyEntry>(StateFile::Supply)
+            .unwrap()
+            .into_iter()
+            .any(|entry| entry.detail.as_deref() == Some("deferred to inline top-up"));
+        assert!(deferred, "inline delivery deferred the planned uploads");
+
+        // Process 2: the resume refuses loudly — both attemptable jobs were
+        // never submitted, so their deferred uploads can no longer be
+        // delivered — and the error names the campaign and the remedies.
+        let err = run_with_backends(
+            run_args(state_dir.path()),
+            inline_spec(),
+            StateDir::new(state_dir.path()).unwrap(),
+            archive.clone(),
+            resume_backends(&submitter, &supply_transport, &narinfos),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("campaign c-e2e"), "{msg}");
+        assert!(msg.contains("supply.delivery \"inline\""), "{msg}");
+        assert!(msg.contains("2 in-scope job(s) not yet submitted"), "{msg}");
+        assert!(msg.contains("appA.x86_64-linux"), "{msg}");
+        assert!(msg.contains("markers/supply.done"), "{msg}");
+        assert!(msg.contains("\"prewarm\""), "{msg}");
+        assert!(
+            submitter.submitted.lock().unwrap().is_empty(),
+            "the refusal precedes the execute stage"
+        );
+
+        // The error's first remedy: deleting the supply marker re-runs the
+        // stage on the next start (resume costs re-probing, never
+        // correctness), which rebuilds the delivery context and lets the
+        // campaign finish.
+        std::fs::remove_file(state.path("markers/supply.done")).unwrap();
+        script_apps_built(&submitter, &app_a.drv_path, &app_b.drv_path);
+        run_with_backends(
+            run_args(state_dir.path()),
+            inline_spec(),
+            StateDir::new(state_dir.path()).unwrap(),
+            archive.clone(),
+            resume_backends(&submitter, &supply_transport, &narinfos),
+        )
+        .await
+        .unwrap();
+        let records = latest_per_job(
+            StateDir::new(state_dir.path())
+                .unwrap()
+                .load_jsonl(StateFile::Results)
+                .unwrap(),
+        );
+        assert_eq!(
+            records["appA.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+        assert_eq!(
+            records["appB.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+    }
+
+    /// The inline-resume guard never blocks a report-only resume: when every
+    /// in-scope job already reached a terminal record (and was submitted by
+    /// the process that ran the supply stage), resuming proceeds and submits
+    /// nothing new.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inline_resume_with_all_work_terminal_proceeds() {
+        let (_archive_dir, archive, archive_id) = open_mini_archive();
+        let manifest = load_units(&archive).unwrap();
+        let app_a = manifest
+            .iter()
+            .find(|m| m.job == "appA.x86_64-linux")
+            .unwrap()
+            .clone();
+        let app_b = manifest
+            .iter()
+            .find(|m| m.job == "appB.x86_64-linux")
+            .unwrap()
+            .clone();
+        let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let mut narinfos = HashMap::new();
+        narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
+        let submitter = Arc::new(KeyedSubmitter::default());
+        let supply_transport = Arc::new(FakeSupplyTransport::default());
+        let state_dir = tempfile::tempdir().unwrap();
+        let inline_spec = || {
+            let mut spec = leaf_spec(&archive_id);
+            spec.supply.delivery = SupplyDelivery::Inline;
+            spec
+        };
+        script_apps_built(&submitter, &app_a.drv_path, &app_b.drv_path);
+
+        // Process 1 runs the inline campaign to completion: the top-up hook
+        // built by the supply stage delivers per batch, both units settle
+        // terminal.
+        run_with_backends(
+            run_args(state_dir.path()),
+            inline_spec(),
+            StateDir::new(state_dir.path()).unwrap(),
+            archive.clone(),
+            resume_backends(&submitter, &supply_transport, &narinfos),
+        )
+        .await
+        .unwrap();
+        let submitted_before = submitter.submitted.lock().unwrap().len();
+        assert!(submitted_before > 0, "the first process submitted the work");
+
+        // Resume: everything terminal, so the guard lets the report-only
+        // resume through and nothing new is submitted.
+        run_with_backends(
+            run_args(state_dir.path()),
+            inline_spec(),
+            StateDir::new(state_dir.path()).unwrap(),
+            archive.clone(),
+            resume_backends(&submitter, &supply_transport, &narinfos),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            submitter.submitted.lock().unwrap().len(),
+            submitted_before,
+            "the terminal-only resume submits nothing"
+        );
+        let records = latest_per_job(
+            StateDir::new(state_dir.path())
+                .unwrap()
+                .load_jsonl(StateFile::Results)
+                .unwrap(),
+        );
+        assert_eq!(
+            records["appB.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+    }
+
+    /// Prewarm resume is unaffected by the inline-resume guard: a prewarm
+    /// campaign that stopped before submitting (deadline) resumes straight
+    /// into the execute stage — losing only the miss-fallback top-up — and
+    /// runs to completion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prewarm_resume_with_unsubmitted_work_proceeds() {
+        let (_archive_dir, archive, archive_id) = open_mini_archive();
+        let manifest = load_units(&archive).unwrap();
+        let app_a = manifest
+            .iter()
+            .find(|m| m.job == "appA.x86_64-linux")
+            .unwrap()
+            .clone();
+        let app_b = manifest
+            .iter()
+            .find(|m| m.job == "appB.x86_64-linux")
+            .unwrap()
+            .clone();
+        let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let mut narinfos = HashMap::new();
+        narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
+        let submitter = Arc::new(KeyedSubmitter::default());
+        let supply_transport = Arc::new(FakeSupplyTransport::default());
+        let state_dir = tempfile::tempdir().unwrap();
+
+        // Process 1: prewarm delivery, deadline already past — supply runs
+        // (uploads delivered before execution), nothing submitted.
+        let mut args = run_args(state_dir.path());
+        args.deadline = Some("2000-01-01T00:00:00Z".into());
+        run_with_backends(
+            args,
+            leaf_spec(&archive_id),
+            StateDir::new(state_dir.path()).unwrap(),
+            archive.clone(),
+            resume_backends(&submitter, &supply_transport, &narinfos),
+        )
+        .await
+        .unwrap();
+        assert!(submitter.submitted.lock().unwrap().is_empty());
+
+        // Process 2: the resume proceeds into the submit loop (no inline
+        // guard for prewarm) and finishes the pending work.
+        script_apps_built(&submitter, &app_a.drv_path, &app_b.drv_path);
+        run_with_backends(
+            run_args(state_dir.path()),
+            leaf_spec(&archive_id),
+            StateDir::new(state_dir.path()).unwrap(),
+            archive.clone(),
+            resume_backends(&submitter, &supply_transport, &narinfos),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !submitter.submitted.lock().unwrap().is_empty(),
+            "the prewarm resume submitted the pending work"
+        );
+        let records = latest_per_job(
+            StateDir::new(state_dir.path())
+                .unwrap()
+                .load_jsonl(StateFile::Results)
+                .unwrap(),
+        );
+        assert_eq!(
+            records["appA.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+        assert_eq!(
+            records["appB.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
         );
     }
 
