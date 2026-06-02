@@ -160,6 +160,23 @@ pub struct ClusterCounts {
     pub substituting_derivations: u32,
 }
 
+impl ClusterCounts {
+    /// Derivations the cluster is actively working on: occupying an
+    /// executor slot (assigned or running) plus being fetched from
+    /// upstream by one of the scheduler's detached substitution tasks.
+    ///
+    /// This is the single definition of occupancy that the suspension
+    /// predicates share — "queued work while occupancy is zero" is the
+    /// cluster-idle condition. Consumers must call this rather than
+    /// re-derive the sum from the raw counts: two predicates that derive
+    /// "is the cluster progressing" independently can (and once did)
+    /// disagree about which counts constitute progress.
+    pub fn occupied_derivations(&self) -> u32 {
+        self.running_derivations
+            .saturating_add(self.substituting_derivations)
+    }
+}
+
 /// Capacity-health snapshot from `GetSpawnIntents`: cells the scheduler has
 /// masked as ICE-infeasible and nodes it considers dead.
 #[derive(Debug, Clone, Default, PartialEq)]

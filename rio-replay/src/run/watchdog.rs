@@ -11,16 +11,22 @@
 //!   operator pause or backpressure pause), so queued work is expected to
 //!   sit still.
 //! - [`COMPONENT_IDLE`]: the cluster reports queued derivations but nothing
-//!   running or substituting for several consecutive polls — the scheduler
-//!   is not dispatching at all, which is a cluster problem, not a per-job
-//!   one.
+//!   occupied — running on an executor or substituting — for several
+//!   consecutive polls; the scheduler is not dispatching at all, which is a
+//!   cluster problem, not a per-job one.
 //! - [`COMPONENT_ICE`]: capacity provisioning is failing broadly (at least
 //!   the configured number of spawn cells are masked after capacity errors).
-//! - [`COMPONENT_DISPATCH`]: executors sit idle while work is queued (the
-//!   active-executors minus running-derivations gap stays above the
-//!   threshold for several consecutive polls). The run loop also pauses
-//!   submission on this component, so the engine stops piling more work
-//!   onto a scheduler that is not dispatching what it already has.
+//! - [`COMPONENT_DISPATCH`]: executors sit idle while work is queued and
+//!   substitution is quiescent (the active-executors minus
+//!   running-derivations gap stays above the threshold for several
+//!   consecutive polls with no derivation substituting). Substitutions run
+//!   as detached scheduler→store fetches that occupy no executor slot, and
+//!   a substitution cascade legitimately keeps the ready queue non-empty
+//!   with deferrals waiting on the next probe pass — so an idle fleet next
+//!   to queued work indicts the dispatcher only once nothing is
+//!   substituting. The run loop also pauses submission on this component,
+//!   so the engine stops piling more work onto a scheduler that is not
+//!   dispatching what it already has.
 //!
 //! While no component holds, the clocks run: a job Active for
 //! `active_stall_hours` is reported as an active stall (the run loop
@@ -62,8 +68,8 @@ pub const COMPONENT_IDLE: &str = "idle";
 pub const COMPONENT_ICE: &str = "ice";
 
 /// Suspension-component value for the dispatch-gap condition: idle
-/// executors while work is queued, sustained for `dispatch_gap_polls`
-/// consecutive polls. Also pauses submission.
+/// executors while work is queued and substitution is quiescent, sustained
+/// for `dispatch_gap_polls` consecutive polls. Also pauses submission.
 pub const COMPONENT_DISPATCH: &str = "dispatch";
 
 /// Engine-side phase of one campaign job, as fed by the run loop.
@@ -252,24 +258,48 @@ impl Watchdog {
             components.push(COMPONENT_PAUSE);
         }
         if let Some(cluster) = &tick.cluster {
-            if cluster.queued_derivations > 0
-                && cluster.running_derivations + cluster.substituting_derivations == 0
-            {
+            if cluster.queued_derivations > 0 && cluster.occupied_derivations() == 0 {
                 self.idle_streak += 1;
             } else {
                 self.idle_streak = 0;
             }
             // Idle executors are a dispatch failure only while work is
-            // queued (the documented contract, mirroring the idle predicate
-            // above). The queued guard is also what keeps this pause
-            // self-clearing: the run loop stops submission on this component,
-            // so the predicate must only persist on state that can still
-            // change while paused. Queued work can drain while paused; an
-            // empty queue cannot refill itself — without the guard, a drained
-            // cluster would hold the pause, the pause would keep the queue
-            // empty, and the campaign would wedge until its deadline.
+            // queued AND substitution is quiescent — both guards keep this
+            // predicate consistent with what the idle predicate above
+            // counts as occupancy, so one snapshot can never be classified
+            // as progress by one sibling and failure by the other.
+            //
+            // Substitution gates as a quiescence conjunct, not as gap
+            // arithmetic, because of how the scheduler executes it:
+            // substitutions run as detached scheduler→store fetch tasks
+            // (`spawn_substitute_fetches`), never on executor slots, and
+            // ClusterStatus's running_derivations counts only worker slots
+            // (Assigned|Running). A cascade therefore looks exactly like a
+            // dispatch failure from the slot side — running 0, every
+            // executor idle — while the ready queue legitimately stays
+            // non-empty: each dispatch pass re-queues substitution-lane
+            // deferrals (probe-no-verdict nodes, the truncated batch-probe
+            // tail) that wait on the next probe, not on an executor.
+            // Subtracting substituting from the gap would misread slot
+            // accounting; while fetches are in flight the queue's
+            // composition (dispatchable vs deferral) is unknowable from
+            // these counts, so the gap is evidence of nothing. Once nothing
+            // is substituting, queued entries can only be waiting on slots
+            // and the gap indicts the dispatcher again.
+            //
+            // The queued guard is also what keeps this pause self-clearing:
+            // the run loop stops submission on this component, so the
+            // predicate must only persist on state that can still change
+            // while paused. Queued work can drain and in-flight
+            // substitutions can complete while paused; an empty queue
+            // cannot refill itself — without the guard, a drained cluster
+            // would hold the pause, the pause would keep the queue empty,
+            // and the campaign would wedge until its deadline.
             let gap = i64::from(cluster.active_executors) - i64::from(cluster.running_derivations);
-            if cluster.queued_derivations > 0 && gap > self.knobs.dispatch_gap_threshold {
+            if cluster.queued_derivations > 0
+                && cluster.substituting_derivations == 0
+                && gap > self.knobs.dispatch_gap_threshold
+            {
                 self.dispatch_streak += 1;
             } else {
                 self.dispatch_streak = 0;
@@ -688,51 +718,107 @@ mod tests {
 
     #[test]
     fn suspension_components_match_documented_predicates() {
-        // Truth table over (queued × running × executors), checked against
-        // the documented predicate sentences (module doc):
-        //   idle:     queued derivations but nothing running or substituting
-        //   dispatch: executors sit idle WHILE WORK IS QUEUED (gap above
-        //             threshold), sustained over consecutive polls
+        // Truth table over (queued × running × substituting × executors),
+        // checked against the documented predicate sentences (module doc):
+        //   idle:     queued derivations but nothing occupied (running or
+        //             substituting)
+        //   dispatch: executors sit idle WHILE WORK IS QUEUED AND
+        //             SUBSTITUTION IS QUIESCENT (gap above threshold),
+        //             sustained over consecutive polls
         // Each combination is held steady long enough to saturate both
         // streaks (idle needs 3 polls, dispatch 5), then the saturated
         // tick's components must match the sentences exactly.
+        //
+        // Axis completeness: every ClusterCounts field is an iterated axis
+        // of this table. The destructuring below has no `..` rest pattern,
+        // so adding a field to ClusterCounts fails compilation HERE — the
+        // new axis (and its expected effect on both predicates) must be
+        // added to the table explicitly instead of being silently pinned
+        // to one fixture value.
+        let ClusterCounts {
+            active_executors: _,
+            queued_derivations: _,
+            running_derivations: _,
+            substituting_derivations: _,
+        } = cluster(0, 0, 0, 0);
         let k = knobs();
         for queued in [0u32, 1, 100] {
             for running in [0u32, 49, 50, 100] {
-                for executors in [0u32, 50, 51, 100, 151] {
-                    let expect_idle = queued > 0 && running == 0;
-                    let expect_dispatch = queued > 0
-                        && i64::from(executors) - i64::from(running) > k.dispatch_gap_threshold;
-                    let mut wd = Watchdog::new(k.clone());
-                    let mut last = TickOutcome::default();
-                    for i in 0..6 {
-                        last = wd.on_tick(&tick(i * 60, cluster(queued, running, 0, executors)));
+                for substituting in [0u32, 1, 300] {
+                    for executors in [0u32, 50, 51, 100, 151] {
+                        let expect_idle = queued > 0 && running + substituting == 0;
+                        let expect_dispatch = queued > 0
+                            && substituting == 0
+                            && i64::from(executors) - i64::from(running) > k.dispatch_gap_threshold;
+                        let mut wd = Watchdog::new(k.clone());
+                        let mut last = TickOutcome::default();
+                        for i in 0..6 {
+                            last = wd.on_tick(&tick(
+                                i * 60,
+                                cluster(queued, running, substituting, executors),
+                            ));
+                        }
+                        let state = format!(
+                            "queued={queued} running={running} substituting={substituting} \
+                             executors={executors}"
+                        );
+                        assert_eq!(
+                            last.components.contains(&COMPONENT_IDLE),
+                            expect_idle,
+                            "idle predicate for {state}: {:?}",
+                            last.components
+                        );
+                        assert_eq!(
+                            last.components.contains(&COMPONENT_DISPATCH),
+                            expect_dispatch,
+                            "dispatch predicate for {state}: {:?}",
+                            last.components
+                        );
+                        assert_eq!(
+                            last.dispatch_pause, expect_dispatch,
+                            "dispatch_pause mirrors the component for {state}"
+                        );
+                        assert_eq!(
+                            last.suspended,
+                            expect_idle || expect_dispatch,
+                            "suspension is the OR of the active components for {state}"
+                        );
                     }
-                    let state = format!("queued={queued} running={running} executors={executors}");
-                    assert_eq!(
-                        last.components.contains(&COMPONENT_IDLE),
-                        expect_idle,
-                        "idle predicate for {state}: {:?}",
-                        last.components
-                    );
-                    assert_eq!(
-                        last.components.contains(&COMPONENT_DISPATCH),
-                        expect_dispatch,
-                        "dispatch predicate for {state}: {:?}",
-                        last.components
-                    );
-                    assert_eq!(
-                        last.dispatch_pause, expect_dispatch,
-                        "dispatch_pause mirrors the component for {state}"
-                    );
-                    assert_eq!(
-                        last.suspended,
-                        expect_idle || expect_dispatch,
-                        "suspension is the OR of the active components for {state}"
-                    );
                 }
             }
         }
+    }
+
+    #[test]
+    fn substitution_cascade_is_progress_not_a_dispatch_failure() {
+        // The substitution-heavy phase of a leaf campaign: the scheduler
+        // has routed the closure to its detached substitution lane —
+        // hundreds substituting, nothing running, every executor idle —
+        // while the ready queue legitimately holds substitution-lane
+        // deferrals that each dispatch pass re-queues. The idle predicate
+        // classifies this snapshot as progress (occupancy > 0); the
+        // dispatch predicate must agree: however long the cascade runs,
+        // the streak must not build.
+        let mut wd = Watchdog::new(knobs());
+        for i in 0..8 {
+            let o = wd.on_tick(&tick(i * 60, cluster(120, 0, 300, 60)));
+            assert!(!o.suspended, "poll {i}: cascade is progress, not failure");
+            assert!(!o.dispatch_pause, "poll {i}: no submission pause");
+        }
+        // The cascade ends with work still queued, one build running,
+        // executors otherwise idle, and substitution quiescent: now the
+        // gap IS evidence of a dispatch failure — and the streak starts
+        // from zero, needing its full 5 polls.
+        for i in 8..12 {
+            let o = wd.on_tick(&tick(i * 60, cluster(120, 1, 0, 60)));
+            assert!(!o.dispatch_pause, "poll {i}: streak still building");
+        }
+        let o = wd.on_tick(&tick(12 * 60, cluster(120, 1, 0, 60)));
+        assert!(
+            o.dispatch_pause,
+            "sustained gap with quiescent substitution is a real dispatch failure"
+        );
+        assert_eq!(o.components, vec![COMPONENT_DISPATCH]);
     }
 
     #[test]
