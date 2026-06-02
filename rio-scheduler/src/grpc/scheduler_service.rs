@@ -1017,9 +1017,10 @@ fn validate_inline_drv_content(
     let sibling_seed: std::collections::HashMap<String, [u8; 32]> = nodes_ro
         .iter()
         .filter(|n| {
-            n.ca_modular_hash.len() == 32
-                && n.drv_content.is_empty()
-                && !(n.is_content_addressed && !n.is_fixed_output)
+            // "Not a floating-CA node": floating published forms are
+            // masked and must never seed the input-form cache.
+            let not_floating = n.is_fixed_output || !n.is_content_addressed;
+            n.ca_modular_hash.len() == 32 && n.drv_content.is_empty() && not_floating
         })
         .map(|n| {
             let mut h = [0u8; 32];
