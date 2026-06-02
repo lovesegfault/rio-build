@@ -40,7 +40,11 @@ use crate::nixcache::NarinfoFact;
 ///   determinism check, and unknown or retired codes follow Hydra's own
 ///   API contract, which presents every undocumented code as failed
 ///   (`* : failed`). `8` CachedFailure and `13` Resolved are step-only
-///   statuses a build's `buildstatus` never carries.
+///   statuses a build's `buildstatus` never carries, and `100` Busy marks
+///   an in-progress build the recorder structurally never samples (it
+///   filters on `finished == 1` before reading `buildstatus`); all three
+///   would fall to `failed` here if they ever appeared, matching the
+///   wildcard contract.
 ///
 /// Every non-zero code keeps the raw numeric value verbatim in the
 /// returned detail string (`hydra buildstatus=<code>`), so the native

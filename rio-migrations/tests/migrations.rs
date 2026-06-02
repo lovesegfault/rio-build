@@ -291,6 +291,17 @@ fn migration_prose_lives_in_doc_consts() {
             m.version
         );
         let sql = m.sql.as_str();
+        // `/* */` block comments are prose by the same rule as `--` lines:
+        // there is no pointer form for them, so any occurrence is a
+        // violation outright.
+        assert!(
+            !sql.contains("/*"),
+            "\n  migration {:03}: `/* */` block comment in a migration .sql.\n  \
+             Move the prose to rio-migrations/src/migrations.rs (M_{:03}); the\n  \
+             file is checksum-frozen once it ships.",
+            m.version,
+            m.version,
+        );
         for (idx, line) in sql.lines().enumerate() {
             let trimmed = line.trim();
             if !trimmed.contains("--") {

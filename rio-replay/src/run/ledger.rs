@@ -48,7 +48,12 @@
 //! Journal-then-increment keeps the invariant `in-memory counters ==
 //! fold(requeues.jsonl)` under append failures and batch re-processing
 //! alike; the equivalence test in `super::tests` pins it at every batch
-//! boundary.
+//! boundary. One residual asymmetry is deliberate: a crash after the
+//! journal append but before the batch lands in collected.json re-processes
+//! that settle on resume and may journal the same decision again — a
+//! one-unit budget over-charge in the conservative direction (a job can be
+//! retired one retry early, never granted an extra retry or spun), and it
+//! converges because the fold and the in-memory counters inflate together.
 //!
 //! Lock discipline: every method takes its locks strictly sequentially
 //! (acquire, update, release — never two at once), so the ledger can be
