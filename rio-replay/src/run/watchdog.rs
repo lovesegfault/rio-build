@@ -33,10 +33,13 @@
 //! polling cadence, feeds the observations, and acts on the verdicts.
 //!
 //! Scope: only campaign jobs registered via [`Watchdog::observe_job`] are
-//! tracked. Warm-stage batches are deliberately NOT under this watchdog —
-//! the warm stage never registers its roots; a wedged warm batch is bounded
-//! by the per-batch child timeout (`batch_timeout_hours`) instead, and every
-//! warm root receives a terminal disposition as soon as its batch settles.
+//! tracked — the job ledger emits those observations at the transition
+//! sites (batch commitment, requeue, retirement), so a job is tracked
+//! from its first offer and never before. Warm-stage batches are
+//! deliberately NOT under this watchdog — the warm stage never registers
+//! its roots; a wedged warm batch is bounded by the per-batch child
+//! timeout (`batch_timeout_hours`) instead, and every warm root receives
+//! a terminal disposition as soon as its batch settles.
 
 use std::collections::BTreeMap;
 
@@ -204,9 +207,10 @@ impl Watchdog {
         }
     }
 
-    /// The run loop reports each non-terminal job's phase. A phase change
-    /// resets the clock (but keeps the requeue count); terminal jobs are
-    /// removed via [`Self::remove_job`].
+    /// The job ledger reports phases at the transition sites (batch
+    /// commitment → Active, collect/stall requeue → Queued). A phase
+    /// change resets the clock (but keeps the requeue count); terminal
+    /// jobs are removed via [`Self::remove_job`].
     pub fn observe_job(&mut self, job: &str, phase: JobPhase) {
         match self.jobs.get_mut(job) {
             Some(clock) if clock.phase == phase => {}

@@ -2,9 +2,9 @@
 //! batched gateway submissions. Runs concurrently with collect; the
 //! two stages communicate only through results.jsonl/batches.jsonl and
 //! the in-memory scheduling state behind the
-//! [`JobLedger`](super::ledger::JobLedger) (the [`SubmitTracker`] plus the
-//! watchdog's phase view — batch commitment goes through the ledger so the
-//! watchdog observes every submission). Per-job requeue decisions belong to
+//! [`JobLedger`] (the [`SubmitTracker`] plus the watchdog's phase view —
+//! batch commitment goes through the ledger so the watchdog observes
+//! every submission). Per-job requeue decisions belong to
 //! collect — this loop simply re-offers any job whose latest record is
 //! non-terminal, that is not currently in flight, and whose
 //! post-settlement cool-down has expired (the cool-down gives the collect
