@@ -24,6 +24,62 @@ use super::model::{PathOutcome, path_outcomes_from_keyed};
 use super::stderrparse::{ParsedStderr, parse_line};
 use super::transport::{DaemonChannel, GatewayPool, TransportError};
 
+/// The deadline governing one batch submission, typed by the logical clock
+/// it encodes and carried as an absolute instant.
+///
+/// Absolute instants make "time elapses between computing a relative
+/// timeout and consuming it" unrepresentable: however long the channel
+/// open, drv-closure import, and uploads take inside a submitter, the build
+/// op's budget is recomputed from the same fixed instant at the final await
+/// ([`remaining_from`](Self::remaining_from)), so the effective deadline
+/// never stretches. The variant names WHICH logical deadline this is, so
+/// the submission chokepoint
+/// ([`submit_one_batch`](super::submit::submit_one_batch)) can record which
+/// one fired — an engine build-budget cut and a replayed recorded
+/// disconnect must never be conflated downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchDeadline {
+    /// The engine's own build budget for this submission, anchored at the
+    /// moment the submission was committed (the timed dispatcher anchors at
+    /// admission; the timeless loop at batch start).
+    Build(tokio::time::Instant),
+    /// A replayed recorded interruption: the channel must be abandoned at
+    /// this instant (admission plus the recorded disconnect gap).
+    DisconnectReplay(tokio::time::Instant),
+}
+
+impl BatchDeadline {
+    /// Smallest budget the build op is ever given: a deadline that expired
+    /// while the import phase ran still issues the build — reproducing a
+    /// recorded interruption requires the build to actually start — and the
+    /// timeout then fires through the normal path. Also the floor on the
+    /// scheduled disconnect delay itself, so a tiny recorded gap or a high
+    /// speedup cannot turn the replay into a no-op.
+    pub const MIN_BUILD_BUDGET: Duration = Duration::from_secs(1);
+
+    /// The absolute instant this deadline fires at.
+    pub fn instant(&self) -> tokio::time::Instant {
+        match self {
+            Self::Build(at) | Self::DisconnectReplay(at) => *at,
+        }
+    }
+
+    /// Remaining budget from `now`: saturating, never below
+    /// [`MIN_BUILD_BUDGET`](Self::MIN_BUILD_BUDGET). Submitters call this
+    /// immediately before the build op — never earlier — so import time
+    /// cannot leak into the effective deadline.
+    pub fn remaining_from(&self, now: tokio::time::Instant) -> Duration {
+        self.instant()
+            .saturating_duration_since(now)
+            .max(Self::MIN_BUILD_BUDGET)
+    }
+
+    /// True when this deadline replays a recorded interruption.
+    pub fn is_disconnect_replay(&self) -> bool {
+        matches!(self, Self::DisconnectReplay(_))
+    }
+}
+
 /// Result of one batch submission attempt.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BatchOutcome {
@@ -51,12 +107,12 @@ pub struct BatchOutcome {
 #[async_trait]
 pub trait Submitter: Send + Sync {
     /// Submit one batch under the given store URL and wait for it to settle
-    /// (or for `timeout` to cancel it).
+    /// (or for `deadline` to cancel it).
     async fn submit_batch(
         &self,
         store_url: &str,
         batch: &Batch,
-        timeout: Duration,
+        deadline: BatchDeadline,
     ) -> Result<BatchOutcome>;
 }
 
@@ -124,7 +180,9 @@ pub struct ClientOpsSubmitter {
     /// Open replay archive the drv texts are imported from.
     pub archive: Arc<DrvArchive>,
     /// Per-op deadline for the probe and upload calls
-    /// (`knobs.op_timeout_secs`); the build call uses the batch timeout.
+    /// (`knobs.op_timeout_secs`); the build call's budget is whatever
+    /// remains of the submission's [`BatchDeadline`] once the import phase
+    /// is done.
     pub op_timeout: Duration,
     /// Store paths per `QueryValidPaths` probe call (`knobs.probe_chunk`).
     pub probe_chunk: usize,
@@ -205,7 +263,7 @@ impl Submitter for ClientOpsSubmitter {
         &self,
         _store_url: &str,
         batch: &Batch,
-        timeout: Duration,
+        deadline: BatchDeadline,
     ) -> Result<BatchOutcome> {
         // One submission = one daemon channel: the protocol is sequential per
         // channel, and any error that desyncs the wire means switching to a
@@ -250,6 +308,10 @@ impl Submitter for ClientOpsSubmitter {
         let derived: Vec<String> = batch.root_drvs.iter().map(|d| format!("{d}!*")).collect();
         let mut parsed = ParsedStderr::default();
         let mut tail: VecDeque<String> = VecDeque::new();
+        // The wire still wants a relative timeout: convert HERE, after the
+        // import phase, so the time the probes and uploads took is charged
+        // against the absolute deadline instead of silently extending it.
+        let timeout = deadline.remaining_from(tokio::time::Instant::now());
         let build_result = {
             let mut observer = |line: &str| observe_line(&mut parsed, &mut tail, line);
             chan.build_paths_with_results_observed(&derived, timeout, &mut observer)
@@ -322,9 +384,9 @@ pub(crate) mod test_support {
         /// engine-side submission failures (spawn/import/ssh errors). An
         /// exhausted script yields `Ok(BatchOutcome::default())`.
         pub outcomes: Mutex<Vec<Result<BatchOutcome>>>,
-        /// `(store_url, batch, timeout)` of every `submit_batch` call, in
+        /// `(store_url, batch, deadline)` of every `submit_batch` call, in
         /// call order.
-        pub submitted: Mutex<Vec<(String, Batch, Duration)>>,
+        pub submitted: Mutex<Vec<(String, Batch, BatchDeadline)>>,
     }
 
     #[async_trait]
@@ -333,12 +395,12 @@ pub(crate) mod test_support {
             &self,
             store_url: &str,
             batch: &Batch,
-            timeout: Duration,
+            deadline: BatchDeadline,
         ) -> Result<BatchOutcome> {
             self.submitted
                 .lock()
                 .unwrap()
-                .push((store_url.to_string(), batch.clone(), timeout));
+                .push((store_url.to_string(), batch.clone(), deadline));
             self.outcomes
                 .lock()
                 .unwrap()
@@ -388,7 +450,7 @@ mod tests {
     /// stage-level tests rely on: results pop from the BACK (push the last
     /// batch's result first), `Err` entries script engine-side submission
     /// failures, an exhausted script yields a default outcome, and every
-    /// submission is recorded in call order together with the timeout it
+    /// submission is recorded in call order together with the deadline it
     /// was given.
     #[tokio::test]
     async fn fake_submitter_pops_outcomes_from_the_back() {
@@ -405,14 +467,14 @@ mod tests {
             }));
         }
         let b = batch();
-        let timeout = Duration::from_secs(1);
-        let first = fake.submit_batch("ssh-ng://x", &b, timeout).await.unwrap();
-        let second = fake.submit_batch("ssh-ng://x", &b, timeout).await.unwrap();
+        let deadline = BatchDeadline::Build(tokio::time::Instant::now() + Duration::from_secs(1));
+        let first = fake.submit_batch("ssh-ng://x", &b, deadline).await.unwrap();
+        let second = fake.submit_batch("ssh-ng://x", &b, deadline).await.unwrap();
         let err = fake
-            .submit_batch("ssh-ng://x", &b, timeout)
+            .submit_batch("ssh-ng://x", &b, deadline)
             .await
             .unwrap_err();
-        let drained = fake.submit_batch("ssh-ng://x", &b, timeout).await.unwrap();
+        let drained = fake.submit_batch("ssh-ng://x", &b, deadline).await.unwrap();
         assert_eq!(first.build_id.as_deref(), Some("first"));
         assert_eq!(second.build_id.as_deref(), Some("second"));
         assert!(err.to_string().contains("scripted submission failure"));
@@ -421,7 +483,40 @@ mod tests {
         assert_eq!(submitted.len(), 4);
         assert_eq!(submitted[0].0, "ssh-ng://x");
         assert_eq!(submitted[0].1, b);
-        assert!(submitted.iter().all(|(_, _, t)| *t == timeout));
+        assert!(submitted.iter().all(|(_, _, d)| *d == deadline));
+    }
+
+    /// The typed deadline's wire conversion: the remaining budget is
+    /// measured from the instant the BUILD op is issued (not when the
+    /// deadline was computed), saturates instead of underflowing once the
+    /// import phase has eaten past it, and never drops below the 1 s
+    /// minimum build budget — the recorded interruption can only be
+    /// reproduced if the build actually starts.
+    #[tokio::test(start_paused = true)]
+    async fn batch_deadline_remaining_is_anchored_and_floored() {
+        let anchor = tokio::time::Instant::now();
+        let deadline = BatchDeadline::DisconnectReplay(anchor + Duration::from_secs(30));
+        assert!(deadline.is_disconnect_replay());
+        assert_eq!(deadline.instant(), anchor + Duration::from_secs(30));
+        // Converted at the anchor: the full budget.
+        assert_eq!(deadline.remaining_from(anchor), Duration::from_secs(30));
+        // 12s of import work later, the same deadline yields 18s — the
+        // elapsed time is charged, not appended.
+        tokio::time::advance(Duration::from_secs(12)).await;
+        let now = tokio::time::Instant::now();
+        assert_eq!(deadline.remaining_from(now), Duration::from_secs(18));
+        // A deadline the import phase already blew past floors at the
+        // minimum build budget instead of underflowing to zero.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            deadline.remaining_from(now),
+            BatchDeadline::MIN_BUILD_BUDGET
+        );
+
+        let build = BatchDeadline::Build(anchor + Duration::from_secs(5));
+        assert!(!build.is_disconnect_replay());
+        assert_eq!(build.remaining_from(now), BatchDeadline::MIN_BUILD_BUDGET);
     }
 
     /// The positional mapping from the daemon's keyed results to in-band

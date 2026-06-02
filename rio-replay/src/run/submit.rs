@@ -20,7 +20,7 @@ use super::batch::{Batch, PendingJob, assemble_batches};
 use super::model::{BATCH_KIND_SUBMIT, BatchRecord, PauseState, now_rfc3339};
 use super::spec::Knobs;
 use super::state::{StateDir, StateFile};
-use super::submitter::Submitter;
+use super::submitter::{BatchDeadline, Submitter};
 use super::supply::exec::PreSubmitSupply;
 
 /// How long the loop sleeps between re-checks while submission is paused
@@ -140,7 +140,12 @@ pub fn pending_wave(
 ///
 /// `interruption_drvs` names the root drvs for which the timed dispatcher
 /// armed a recorded interruption; it is written verbatim onto the batch
-/// record (timeless callers pass an empty vector).
+/// record (timeless callers pass an empty vector). This chokepoint also
+/// records WHICH deadline a cancellation came from: `engine_cancelled`
+/// under a [`BatchDeadline::DisconnectReplay`] deadline is the recorded
+/// interruption reproduced (`disconnect_deadline_fired`), while the same
+/// cancellation under a [`BatchDeadline::Build`] deadline is the engine's
+/// own budget cut — classification reads the bit, never re-derives it.
 ///
 /// A submitter `Err` (ssh/spawn/import failure) is evidence, not a fatal
 /// error: it is recorded on the batch record with no build id and the jobs
@@ -156,12 +161,12 @@ pub async fn submit_one_batch(
     kind: &str,
     batch_id: u64,
     batch: Batch,
-    timeout: Duration,
+    deadline: BatchDeadline,
     cooldown: Duration,
     interruption_drvs: Vec<String>,
 ) -> Result<BatchRecord> {
     let started_at = now_rfc3339();
-    let outcome = submitter.submit_batch(store_url, &batch, timeout).await;
+    let outcome = submitter.submit_batch(store_url, &batch, deadline).await;
     let mut record = BatchRecord {
         batch_id,
         kind: kind.to_string(),
@@ -175,6 +180,7 @@ pub async fn submit_one_batch(
         reasons: BTreeMap::new(),
         stderr_tail: None,
         engine_cancelled: false,
+        disconnect_deadline_fired: false,
         interruption_drvs,
     };
     match outcome {
@@ -184,6 +190,12 @@ pub async fn submit_one_batch(
             record.reasons = o.reasons;
             record.stderr_tail = Some(o.stderr_tail);
             record.engine_cancelled = o.engine_cancelled;
+            // The submitter has exactly one cancellation source: the
+            // deadline it was handed. Which logical deadline that was is
+            // this call's knowledge, so the cause bit is derived here, at
+            // the single point both halves are in scope.
+            record.disconnect_deadline_fired =
+                o.engine_cancelled && deadline.is_disconnect_replay();
             tracing::info!(
                 batch_id,
                 kind,
@@ -191,6 +203,7 @@ pub async fn submit_one_batch(
                 build_id = record.build_id.as_deref().unwrap_or(""),
                 results = record.results.len(),
                 engine_cancelled = record.engine_cancelled,
+                disconnect_deadline_fired = record.disconnect_deadline_fired,
                 reasons = record.reasons.len(),
                 "batch settled"
             );
@@ -363,6 +376,10 @@ pub async fn run_submit_loop(
                     "pre-submission supply top-up failed; submitting the batch anyway"
                 );
             }
+            // The batch deadline is anchored when the submission starts
+            // (after the top-up): an absolute instant, so the budget covers
+            // the whole submission and cannot stretch across the
+            // submitter's import phase.
             submit_one_batch(
                 &state,
                 submitter.as_ref(),
@@ -371,7 +388,7 @@ pub async fn run_submit_loop(
                 BATCH_KIND_SUBMIT,
                 batch_id,
                 batch,
-                timeout,
+                BatchDeadline::Build(tokio::time::Instant::now() + timeout),
                 cooldown,
                 Vec::new(),
             )
@@ -460,7 +477,7 @@ mod tests {
             BATCH_KIND_SUBMIT,
             7,
             batch,
-            Duration::from_secs(60),
+            BatchDeadline::Build(tokio::time::Instant::now() + Duration::from_secs(60)),
             Duration::from_secs(60),
             Vec::new(),
         )
@@ -484,7 +501,7 @@ mod tests {
 
     /// A submitter `Err` (engine-side submission failure) is evidence, not a
     /// loop-fatal error: the batch record carries it, no build id is set, the
-    /// in-flight reservation is released, and the batch timeout the loop
+    /// in-flight reservation is released, and the batch deadline the loop
     /// chose was passed through to the submitter.
     #[tokio::test]
     async fn submit_one_batch_records_engine_submission_errors() {
@@ -507,7 +524,7 @@ mod tests {
             .lock()
             .await
             .insert("x.x86_64-linux".into());
-        let timeout = Duration::from_secs(60);
+        let deadline = BatchDeadline::Build(tokio::time::Instant::now() + Duration::from_secs(60));
         let rec = submit_one_batch(
             &state,
             &submitter,
@@ -516,7 +533,7 @@ mod tests {
             BATCH_KIND_SUBMIT,
             1,
             batch,
-            timeout,
+            deadline,
             Duration::from_secs(60),
             Vec::new(),
         )
@@ -534,7 +551,101 @@ mod tests {
         assert!(!tracker.in_flight.lock().await.contains("x.x86_64-linux"));
         let on_disk: Vec<BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
         assert_eq!(on_disk.len(), 1);
-        assert_eq!(submitter.submitted.lock().unwrap()[0].2, timeout);
+        assert_eq!(submitter.submitted.lock().unwrap()[0].2, deadline);
+    }
+
+    /// The deadline-cause bit is derived at this chokepoint, from the typed
+    /// deadline the caller handed in: a cancellation under a
+    /// disconnect-replay deadline records `disconnect_deadline_fired`, the
+    /// SAME scripted cancellation under a build deadline does not, and an
+    /// uncancelled outcome never does — no submitter implementation can set
+    /// or forget the bit on its own.
+    #[tokio::test]
+    async fn submit_one_batch_records_which_deadline_fired() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let tracker = SubmitTracker::default();
+        let submitter = FakeSubmitter::default();
+        let batch = || Batch {
+            jobs: vec!["x.x86_64-linux".into()],
+            root_drvs: vec!["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".into()],
+            est_nodes: 1,
+        };
+        let in_one_min = || tokio::time::Instant::now() + Duration::from_secs(60);
+        let cancelled = || {
+            Ok(BatchOutcome {
+                engine_cancelled: true,
+                ..BatchOutcome::default()
+            })
+        };
+
+        // Scripts pop from the back: build-cut, then settled, then replay.
+        submitter.outcomes.lock().unwrap().push(cancelled());
+        submitter
+            .outcomes
+            .lock()
+            .unwrap()
+            .push(Ok(BatchOutcome::default()));
+        submitter.outcomes.lock().unwrap().push(cancelled());
+
+        let replay = submit_one_batch(
+            &state,
+            &submitter,
+            &tracker,
+            "ssh-ng://x",
+            BATCH_KIND_SUBMIT,
+            1,
+            batch(),
+            BatchDeadline::DisconnectReplay(in_one_min()),
+            Duration::from_secs(60),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(replay.engine_cancelled);
+        assert!(replay.disconnect_deadline_fired);
+
+        let settled = submit_one_batch(
+            &state,
+            &submitter,
+            &tracker,
+            "ssh-ng://x",
+            BATCH_KIND_SUBMIT,
+            2,
+            batch(),
+            BatchDeadline::DisconnectReplay(in_one_min()),
+            Duration::from_secs(60),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!settled.engine_cancelled);
+        assert!(!settled.disconnect_deadline_fired);
+
+        let build_cut = submit_one_batch(
+            &state,
+            &submitter,
+            &tracker,
+            "ssh-ng://x",
+            BATCH_KIND_SUBMIT,
+            3,
+            batch(),
+            BatchDeadline::Build(in_one_min()),
+            Duration::from_secs(60),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(build_cut.engine_cancelled);
+        assert!(!build_cut.disconnect_deadline_fired);
+
+        // The bits round-trip through batches.jsonl.
+        let on_disk: Vec<BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
+        let fired: Vec<bool> = on_disk
+            .iter()
+            .map(|r| r.disconnect_deadline_fired)
+            .collect();
+        assert_eq!(fired, vec![true, false, false]);
     }
 
     #[tokio::test]

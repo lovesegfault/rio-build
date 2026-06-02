@@ -160,6 +160,11 @@ pub struct BatchView {
     /// budget.
     pub stderr_tail: Option<String>,
     pub engine_cancelled: bool,
+    /// True when the cancellation was the armed disconnect-replay deadline
+    /// firing (from the batch record's bit, set by the submission
+    /// chokepoint) — the only evidence that distinguishes a reproduced
+    /// recorded interruption from the engine's own build-budget cut.
+    pub disconnect_deadline_fired: bool,
     /// Root drvs for which the timed dispatcher armed a recorded
     /// interruption (empty for every non-timed batch).
     pub interruption_drvs: Vec<String>,
@@ -168,12 +173,14 @@ pub struct BatchView {
 
 /// Derive the timed-interruption flag for one root of a settled batch:
 /// `Some(Replayed)` when an interruption was armed for the drv and the
-/// engine cancelled the submission (the channel was abandoned at the
+/// armed disconnect-replay deadline fired (the channel was abandoned at the
 /// recorded offset), `Some(NotReproduced)` when an interruption was armed
 /// but the root completed successfully in band before the abandon deadline,
-/// `None` otherwise — including for every batch that is not a
-/// timed-dispatcher submission, so the flag can never leak into timeless
-/// classification.
+/// `None` otherwise — including for an engine cancellation by the BUILD
+/// deadline (the engine cut the request short before the recorded offset;
+/// nothing about the recording was reproduced or refuted), and for every
+/// batch that is not a timed-dispatcher submission, so the flag can never
+/// leak into timeless classification.
 pub fn timed_interruption_for(
     batch: &BatchView,
     drv: &str,
@@ -183,7 +190,7 @@ pub fn timed_interruption_for(
     if !armed {
         return None;
     }
-    if batch.engine_cancelled {
+    if batch.disconnect_deadline_fired {
         return Some(TimedInterruption::Replayed);
     }
     if in_band_success == Some(true) {
@@ -556,7 +563,9 @@ pub async fn process_settled_batch(
         // any result arrived). Members of a timed batch are simply left to
         // the timed dispatcher, which owns its own retries. (A timed batch
         // the engine cancelled with no results falls through instead, so
-        // its armed interruptions are still recorded below.)
+        // armed interruptions whose disconnect-replay deadline fired are
+        // still recorded below; a build-deadline cut leaves its members to
+        // the end-of-run backfill like any other unsettled timed member.)
         if timed {
             tracing::info!(
                 jobs = batch_jobs.len(),
@@ -729,11 +738,13 @@ pub async fn process_settled_batch(
             CollectDecision::Requeue { why } => {
                 if timed {
                     // Never re-offered (the timed dispatcher owns retries).
-                    // An armed interruption the engine did cancel is the
-                    // recorded outcome reproduced, so it still gets its
-                    // terminal record here; every other requeue-shaped
-                    // member stays outstanding for a later
-                    // confirmation-retry batch or the end-of-run backfill.
+                    // An armed interruption whose disconnect-replay
+                    // deadline fired is the recorded outcome reproduced,
+                    // so it still gets its terminal record here; every
+                    // other requeue-shaped member — including one the
+                    // engine's own build deadline cut — stays outstanding
+                    // for a later confirmation-retry batch or the
+                    // end-of-run backfill.
                     if timed_interruption_for(batch, &ctx.drv_path, None)
                         == Some(TimedInterruption::Replayed)
                     {
@@ -1545,12 +1556,14 @@ mod tests {
             )
         };
 
-        // Armed + engine-cancelled (the channel was abandoned at the recorded
-        // offset): Replayed, and the record classifies interruption-replayed.
+        // Armed + the disconnect-replay deadline fired (the channel was
+        // abandoned at the recorded offset): Replayed, and the record
+        // classifies interruption-replayed.
         let cancelled = BatchView {
             kind: BATCH_KIND_TIMED.to_string(),
             interruption_drvs: vec![T.to_string()],
             engine_cancelled: true,
+            disconnect_deadline_fired: true,
             ..BatchView::default()
         };
         assert_eq!(
@@ -1563,6 +1576,19 @@ mod tests {
             Some(Verdict::InterruptionReplayed.as_str())
         );
         assert_eq!(rec.disposition, None);
+
+        // Armed + engine-cancelled by the BUILD deadline (the engine cut
+        // the request short before the recorded offset): no flag — the
+        // recorded interruption was neither reproduced nor out-raced, so
+        // claiming Replayed would fabricate a fidelity signal.
+        let build_cut = BatchView {
+            kind: BATCH_KIND_TIMED.to_string(),
+            interruption_drvs: vec![T.to_string()],
+            engine_cancelled: true,
+            disconnect_deadline_fired: false,
+            ..BatchView::default()
+        };
+        assert_eq!(timed_interruption_for(&build_cut, T, None), None);
 
         // Armed + in-band success (the build out-raced the recorded
         // interruption): NotReproduced.
@@ -1646,10 +1672,12 @@ mod tests {
         ]
         .into();
         // The channel was abandoned at the interruption deadline: no in-band
-        // results, no observed build id, engine_cancelled set.
+        // results, no observed build id, the disconnect-replay deadline
+        // fired.
         let batch = BatchView {
             kind: BATCH_KIND_TIMED.to_string(),
             engine_cancelled: true,
+            disconnect_deadline_fired: true,
             interruption_drvs: vec![T.to_string()],
             ..BatchView::default()
         };
@@ -1959,6 +1987,7 @@ mod tests {
             ]),
             stderr_tail: None,
             engine_cancelled: false,
+            disconnect_deadline_fired: false,
             interruption_drvs: Vec::new(),
             submitted_at: Some("2026-05-26T01:00:00Z".into()),
         };

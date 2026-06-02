@@ -55,7 +55,7 @@ use super::model::{
 use super::spec::{Knobs, SupplyDependencies};
 use super::state::{StateDir, StateFile};
 use super::submit::{SubmitTracker, submit_one_batch};
-use super::submitter::Submitter;
+use super::submitter::{BatchDeadline, Submitter};
 use super::supply::exec::PreSubmitSupply;
 use super::supply::{PathSource, resolve_source, walk_closure, workload_set};
 
@@ -66,7 +66,9 @@ const DEFAULT_DISCONNECT_DELAY_S: f64 = 60.0;
 /// Lower bound on the scheduled disconnect delay, so the interrupted build
 /// is always actually submitted before the channel is dropped (a high
 /// speedup or a tiny recorded gap cannot turn the replay into a no-op).
-const DISCONNECT_FLOOR: Duration = Duration::from_secs(1);
+/// The same 1 s invariant the wire conversion enforces — single-sourced
+/// from the deadline type.
+const DISCONNECT_FLOOR: Duration = BatchDeadline::MIN_BUILD_BUDGET;
 
 /// One recorded client submission, as loaded from the archive at the wiring
 /// point.
@@ -958,9 +960,14 @@ async fn dispatch_one_request(
         );
     }
 
-    // Build deadline from recorded durations; the interruption deadline is
-    // anchored at the admission instant so supply/top-up time never shifts
-    // the recorded disconnect offset.
+    // Both candidate deadlines are anchored at the admission instant and
+    // carried as absolute instants: neither the supply/top-up time above
+    // nor the import phase inside the submitter can shift the recorded
+    // disconnect offset (the submitter converts to a wire timeout only at
+    // the final build call). Which deadline binds is decided HERE, before
+    // the race starts, and travels in the type — so a later timeout's
+    // cause is structurally fixed: a binding build deadline is an engine
+    // cut, never a replayed interruption.
     let timing_fn = |session: i64, drv: &str| (shared.timing)(session, drv);
     let build_deadline = build_timeout_for(
         &scheduled,
@@ -968,15 +975,22 @@ async fn dispatch_one_request(
         shared.config.build_timeout_floor,
         shared.config.build_timeout_cap,
     );
-    let timeout = match scheduled.interruption.as_ref() {
+    let (deadline, deadline_budget) = match scheduled.interruption.as_ref() {
         Some(plan) => {
-            let remaining = plan
-                .disconnect_after()
-                .saturating_sub(admitted_at.elapsed())
-                .max(DISCONNECT_FLOOR);
-            build_deadline.min(remaining)
+            let after = plan.disconnect_after();
+            if after <= build_deadline {
+                (BatchDeadline::DisconnectReplay(admitted_at + after), after)
+            } else {
+                (
+                    BatchDeadline::Build(admitted_at + build_deadline),
+                    build_deadline,
+                )
+            }
         }
-        None => build_deadline,
+        None => (
+            BatchDeadline::Build(admitted_at + build_deadline),
+            build_deadline,
+        ),
     };
     let armed = scheduled.interruption.is_some();
     let interruption_drvs: Vec<String> = scheduled
@@ -1001,7 +1015,7 @@ async fn dispatch_one_request(
         batch_id,
         targets = drvs.len(),
         lateness_ms,
-        timeout_secs = timeout.as_secs(),
+        timeout_secs = deadline_budget.as_secs(),
         interruption_armed = armed,
         "dispatching timed request"
     );
@@ -1017,7 +1031,7 @@ async fn dispatch_one_request(
             root_drvs: drvs.clone(),
             est_nodes: drvs.len(),
         },
-        timeout,
+        deadline,
         shared.cooldown,
         interruption_drvs.clone(),
     )
@@ -1027,11 +1041,14 @@ async fn dispatch_one_request(
     let mut submission_failures = usize::from(engine_side_submission_failure(&record));
 
     // Interruption accounting per armed unit, mirroring how collect buckets
-    // them: an engine cancellation reproduces the recorded interruption; a
-    // unit that settled with any in-band success status out-raced it.
-    let fired = armed && record.engine_cancelled;
+    // them: the disconnect-replay deadline firing reproduces the recorded
+    // interruption; a unit that settled with any in-band success status
+    // out-raced it. A cancellation by the BUILD deadline is the engine's
+    // own cut — neither bucket moves (the recording was neither reproduced
+    // nor out-raced).
+    let fired = armed && record.disconnect_deadline_fired;
     let (replayed, not_reproduced) = if let Some(plan) = scheduled.interruption.as_ref() {
-        if record.engine_cancelled {
+        if record.disconnect_deadline_fired {
             (plan.unit_count(), 0)
         } else {
             let succeeded = plan
@@ -1108,7 +1125,9 @@ async fn dispatch_one_request(
                     root_drvs: failing_drvs.clone(),
                     est_nodes: failing_drvs.len(),
                 },
-                build_deadline,
+                // Each confirmation retry gets a fresh full build budget,
+                // anchored when the retry starts.
+                BatchDeadline::Build(tokio::time::Instant::now() + build_deadline),
                 shared.cooldown,
                 Vec::new(),
             )
@@ -1130,7 +1149,7 @@ async fn dispatch_one_request(
             due_offset_s: scheduled.due.as_secs_f64(),
             dispatched_at,
             dispatch_lateness_ms: lateness_ms,
-            deadline_secs: timeout.as_secs(),
+            deadline_secs: deadline_budget.as_secs(),
             interruption_armed: armed,
             interruption_fired: fired,
             attempts,
@@ -1752,9 +1771,11 @@ mod tests {
         inner: FakeSubmitter,
         delay: Duration,
         started: tokio::time::Instant,
-        /// `(elapsed at call, root drvs, timeout)` per submission, in call
-        /// order.
-        calls: std::sync::Mutex<Vec<(Duration, Vec<String>, Duration)>>,
+        /// `(elapsed at call, root drvs, deadline)` per submission, in call
+        /// order. The call instant is `started + elapsed`, so tests can
+        /// assert the deadline's remaining budget at the moment the
+        /// submitter received it.
+        calls: std::sync::Mutex<Vec<(Duration, Vec<String>, BatchDeadline)>>,
     }
 
     impl InstrumentedSubmitter {
@@ -1774,17 +1795,17 @@ mod tests {
             &self,
             store_url: &str,
             batch: &Batch,
-            timeout: Duration,
+            deadline: BatchDeadline,
         ) -> anyhow::Result<BatchOutcome> {
             self.calls.lock().unwrap().push((
                 self.started.elapsed(),
                 batch.root_drvs.clone(),
-                timeout,
+                deadline,
             ));
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
-            self.inner.submit_batch(store_url, batch, timeout).await
+            self.inner.submit_batch(store_url, batch, deadline).await
         }
     }
 
@@ -1939,6 +1960,7 @@ mod tests {
             reasons: record.reasons.clone(),
             stderr_tail: record.stderr_tail.clone(),
             engine_cancelled: record.engine_cancelled,
+            disconnect_deadline_fired: record.disconnect_deadline_fired,
             interruption_drvs: record.interruption_drvs.clone(),
             submitted_at: Some(record.started_at.clone()),
         };
@@ -2260,19 +2282,26 @@ mod tests {
         )
         .await;
 
-        // The submitter saw the 2s disconnect deadline, not the 30-minute
-        // build-deadline floor, and an armed request never
-        // confirmation-retries.
+        // The submitter saw the typed disconnect-replay deadline 2s from
+        // admission, not the 30-minute build-deadline floor, and an armed
+        // request never confirmation-retries.
         let calls = submitter.calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].2, Duration::from_secs(2));
+        let (elapsed, _, deadline) = calls[0].clone();
+        assert!(deadline.is_disconnect_replay());
+        assert_eq!(
+            deadline.remaining_from(submitter.started + elapsed),
+            Duration::from_secs(2)
+        );
 
-        // The settled batch is a timed batch carrying the armed drv.
+        // The settled batch is a timed batch carrying the armed drv, and
+        // the record names the disconnect-replay deadline as what fired.
         let batches: Vec<BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].kind, BATCH_KIND_TIMED);
         assert_eq!(batches[0].interruption_drvs, vec![DRV_A.to_string()]);
         assert!(batches[0].engine_cancelled);
+        assert!(batches[0].disconnect_deadline_fired);
 
         let entries: Vec<DispatchEntry> = state.load_jsonl(StateFile::Dispatch).unwrap();
         assert_eq!(entries.len(), 1);
@@ -2359,6 +2388,163 @@ mod tests {
             records["a"].verdict.as_deref(),
             Some(Verdict::InterruptionNotReproduced.as_str())
         );
+    }
+
+    /// An armed request whose recorded disconnect gap exceeds the build
+    /// deadline is submitted under the BUILD deadline, and a cancellation
+    /// is then the engine's own budget cut: nothing counts as replayed,
+    /// dispatch.jsonl records the armed-but-not-fired state, and the
+    /// production collect path writes no interruption-replayed record —
+    /// the recorded interruption was neither reproduced nor out-raced.
+    #[tokio::test(start_paused = true)]
+    async fn build_deadline_cut_on_armed_request_is_not_a_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        // Recorded disconnect at offset 4000s for a request at offset 0:
+        // the 4000s gap exceeds the 30-minute build-deadline floor (the
+        // interrupted record carries no duration, so the floor is the
+        // build deadline).
+        let requests = vec![request(7, 0.0, DRV_A)];
+        let mut map = HashMap::new();
+        map.insert((7_i64, DRV_A.to_string()), interrupted(Some(4000.0)));
+        let jobs = BTreeMap::from([(DRV_A.to_string(), "a".to_string())]);
+        let schedule = build_schedule(
+            &requests,
+            &timing_in(&map),
+            &jobs_in(&jobs),
+            &all_workload,
+            1.0,
+            None,
+            true,
+        );
+        assert_eq!(timer(&schedule[0]), Some(Duration::from_secs(4000)));
+
+        // The scripted outcome is an engine cancellation — under the BUILD
+        // deadline, since the disconnect gap lies beyond it.
+        let fake = FakeSubmitter::default();
+        fake.outcomes.lock().unwrap().push(Ok(BatchOutcome {
+            engine_cancelled: true,
+            ..BatchOutcome::default()
+        }));
+        let submitter = Arc::new(InstrumentedSubmitter::new(fake, Duration::ZERO));
+        let stats = drive_dispatch(
+            &state,
+            submitter.clone(),
+            schedule,
+            timing_arc(map),
+            TimelineConfig::from_knobs(&Knobs::default()),
+            HashSet::new(),
+        )
+        .await;
+
+        // The submitter received the build deadline (30-minute floor from
+        // admission), not the disconnect-replay deadline.
+        let calls = submitter.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        let (elapsed, _, deadline) = calls[0].clone();
+        assert!(!deadline.is_disconnect_replay());
+        assert_eq!(
+            deadline.remaining_from(submitter.started + elapsed),
+            Duration::from_secs(30 * 60)
+        );
+
+        // Nothing was replayed: the engine cut the request, the recorded
+        // interruption fired neither bucket.
+        assert_eq!(stats.interruptions_replayed, 0);
+        assert_eq!(stats.interruptions_not_reproduced, 0);
+        let entries: Vec<DispatchEntry> = state.load_jsonl(StateFile::Dispatch).unwrap();
+        assert!(entries[0].interruption_armed);
+        assert!(!entries[0].interruption_fired);
+        let batches: Vec<BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
+        assert!(batches[0].engine_cancelled);
+        assert!(!batches[0].disconnect_deadline_fired);
+
+        // The production collect path writes NO record for the armed unit:
+        // it stays outstanding for the end-of-run backfill instead of
+        // being claimed as a reproduced interruption.
+        let contexts = HashMap::from([("a".to_string(), job_ctx("a", DRV_A))]);
+        collect_settled_batch(&state, &batches[0], &contexts).await;
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        assert!(
+            !records.contains_key("a"),
+            "a build-deadline cut must not classify the armed unit: {records:?}"
+        );
+    }
+
+    /// Slow pre-submission work cannot shift the recorded disconnect
+    /// offset: the disconnect-replay deadline is anchored at ADMISSION as
+    /// an absolute instant, so by the time the submitter receives it after
+    /// a slow top-up, only the remainder of the recorded gap is left.
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_deadline_is_anchored_at_admission_across_topup() {
+        /// Top-up that takes 6s of (paused) clock before succeeding.
+        struct SlowTopup;
+        #[async_trait::async_trait]
+        impl PreSubmitSupply for SlowTopup {
+            async fn topup(&self, _roots: &[String]) -> anyhow::Result<()> {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        // Recorded disconnect 10s after the request offset.
+        let requests = vec![request(7, 0.0, DRV_A)];
+        let mut map = HashMap::new();
+        map.insert((7_i64, DRV_A.to_string()), interrupted(Some(10.0)));
+        let jobs = BTreeMap::from([(DRV_A.to_string(), "a".to_string())]);
+        let schedule = build_schedule(
+            &requests,
+            &timing_in(&map),
+            &jobs_in(&jobs),
+            &all_workload,
+            1.0,
+            None,
+            true,
+        );
+        let fake = FakeSubmitter::default();
+        fake.outcomes.lock().unwrap().push(Ok(BatchOutcome {
+            engine_cancelled: true,
+            ..BatchOutcome::default()
+        }));
+        let submitter = Arc::new(InstrumentedSubmitter::new(fake, Duration::ZERO));
+        let stats = run_timed_dispatch(
+            state.clone(),
+            submitter.clone(),
+            Arc::new(SubmitTracker::default()),
+            schedule,
+            timing_arc(map),
+            "ssh-ng://test".into(),
+            TimelineConfig::from_knobs(&Knobs::default()),
+            Knobs::default(),
+            Arc::new(AtomicU64::new(1)),
+            || false,
+            Some(Arc::new(SlowTopup) as Arc<dyn PreSubmitSupply>),
+            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        )
+        .await
+        .unwrap();
+
+        // The submitter was called 6s after admission (the top-up), and the
+        // deadline it received still fires 10s after ADMISSION — only 4s
+        // remain. Were the gap re-anchored at submission (or converted to a
+        // relative duration early), the full 10s would remain here.
+        let calls = submitter.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        let (elapsed, _, deadline) = calls[0].clone();
+        assert_eq!(elapsed, Duration::from_secs(6));
+        assert!(deadline.is_disconnect_replay());
+        assert_eq!(
+            deadline.remaining_from(submitter.started + elapsed),
+            Duration::from_secs(4)
+        );
+        // The full recorded gap is what dispatch.jsonl reports as the
+        // governing budget, and the cancellation counts as replayed.
+        let entries: Vec<DispatchEntry> = state.load_jsonl(StateFile::Dispatch).unwrap();
+        assert_eq!(entries[0].deadline_secs, 10);
+        assert!(entries[0].interruption_fired);
+        assert_eq!(stats.interruptions_replayed, 1);
     }
 
     /// A unit expected to build whose replayed result is a failure is

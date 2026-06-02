@@ -774,6 +774,17 @@ pub struct BatchRecord {
     /// True when the engine itself killed/cancelled this batch (timeout, abort).
     #[serde(default)]
     pub engine_cancelled: bool,
+    /// True when the cancellation came from an armed disconnect-replay
+    /// deadline (the channel was abandoned at the recorded relative
+    /// instant) rather than the engine's own build budget. Set only by the
+    /// submission chokepoint, which knows which typed deadline it handed
+    /// the submitter; classification reads this bit so a build-budget cut
+    /// on an interruption-armed request can never masquerade as the
+    /// recorded interruption being reproduced. Defaults to false on records
+    /// written before the bit existed (their armed cancellations predate
+    /// the distinction and are not re-classified).
+    #[serde(default)]
+    pub disconnect_deadline_fired: bool,
     /// Root drvs in this submission for which a recorded interruption
     /// (cancellation or client disconnect) was armed by the timed
     /// dispatcher. Empty for every non-timed batch.
@@ -1057,6 +1068,7 @@ mod tests {
             reasons: BTreeMap::new(),
             stderr_tail: None,
             engine_cancelled: false,
+            disconnect_deadline_fired: false,
             interruption_drvs: Vec::new(),
         };
         let json = serde_json::to_string(&rec).unwrap();
@@ -1071,11 +1083,14 @@ mod tests {
         // `results` key, a stale `exitCode` key) still deserializes: the
         // array defaults to empty and the unknown key is ignored. Lines
         // written before timed scheduling existed lack `interruptionDrvs`
-        // the same way; it defaults to empty.
+        // the same way (defaults to empty), and lines written before the
+        // deadline-cause bit existed lack `disconnectDeadlineFired`
+        // (defaults to false).
         let old = r#"{"batchId":3,"kind":"submit","jobs":["x.x86_64-linux"],"rootDrvs":["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv"],"estNodes":1,"buildId":null,"startedAt":"2026-05-26T00:00:00Z","finishedAt":null,"exitCode":1,"reasons":{},"stderrTail":"tail","engineCancelled":false}"#;
         let parsed: BatchRecord = serde_json::from_str(old).unwrap();
         assert!(parsed.results.is_empty());
         assert!(parsed.interruption_drvs.is_empty());
+        assert!(!parsed.disconnect_deadline_fired);
         assert_eq!(parsed.batch_id, 3);
         assert_eq!(parsed.stderr_tail.as_deref(), Some("tail"));
     }

@@ -2165,6 +2165,7 @@ async fn collect_pass_with(
             reasons: batch.reasons.clone(),
             stderr_tail: batch.stderr_tail.clone(),
             engine_cancelled: batch.engine_cancelled,
+            disconnect_deadline_fired: batch.disconnect_deadline_fired,
             interruption_drvs: batch.interruption_drvs.clone(),
             submitted_at: Some(batch.started_at.clone()),
         };
@@ -2310,7 +2311,7 @@ mod tests {
             &self,
             _store_url: &str,
             batch: &batch::Batch,
-            _timeout: Duration,
+            _deadline: submitter::BatchDeadline,
         ) -> Result<BatchOutcome> {
             self.submitted.lock().unwrap().push(batch.clone());
             Ok(self
@@ -2920,6 +2921,7 @@ mod tests {
                     reasons: BTreeMap::new(),
                     stderr_tail: None,
                     engine_cancelled: true,
+                    disconnect_deadline_fired: true,
                     interruption_drvs: vec![drv.clone()],
                 },
             )
@@ -3510,11 +3512,9 @@ mod tests {
         let batches: Vec<model::BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
         assert!(!batches.is_empty());
         assert!(batches.iter().all(|b| b.kind == BATCH_KIND_TIMED));
-        assert!(
-            batches
-                .iter()
-                .any(|b| b.engine_cancelled && b.interruption_drvs == vec![app_b.drv_path.clone()])
-        );
+        assert!(batches.iter().any(|b| b.engine_cancelled
+            && b.disconnect_deadline_fired
+            && b.interruption_drvs == vec![app_b.drv_path.clone()]));
         // Exactly one unit matched its recorded build and one reproduced its
         // recorded interruption.
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
