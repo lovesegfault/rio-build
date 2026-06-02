@@ -18,10 +18,21 @@ use async_trait::async_trait;
 use super::state::{StateDir, StateFile};
 
 /// Byte-level campaign artifact storage keyed by S3-style object keys.
+///
+/// Two object classes, two read methods: `get_bytes` is for small
+/// metadata documents (campaign.json, markers, JSONL state) that are fine
+/// to buffer; `get_to_file` is the ONLY way to fetch bulk payloads
+/// (archive members reach tens-to-hundreds of GiB and must never transit
+/// memory as one buffer). Every implementation must stream `get_to_file`.
 #[async_trait]
 pub trait ArtifactStore: Send + Sync {
     async fn put_bytes(&self, key: &str, bytes: Vec<u8>) -> Result<()>;
     async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    /// Stream one object to `dest` (created/truncated), returning its
+    /// SHA-256 (lowercase hex) and byte length so callers verify without a
+    /// second pass; `Ok(None)` — with no file created — when the key does
+    /// not exist.
+    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<Option<(String, u64)>>;
     async fn exists(&self, key: &str) -> Result<bool>;
 }
 
@@ -62,6 +73,45 @@ impl ArtifactStore for LocalDirArtifactStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
         }
+    }
+
+    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<Option<(String, u64)>> {
+        use sha2::Digest as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let path = self.key_path(key);
+        let mut src = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("open {}", path.display())),
+        };
+        let file = tokio::fs::File::create(dest)
+            .await
+            .with_context(|| format!("create {}", dest.display()))?;
+        let mut writer = tokio::io::BufWriter::new(file);
+        let mut hasher = sha2::Sha256::new();
+        let mut size: u64 = 0;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = src
+                .read(&mut buf)
+                .await
+                .with_context(|| format!("read {}", path.display()))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            size += n as u64;
+            writer
+                .write_all(&buf[..n])
+                .await
+                .with_context(|| format!("write {}", dest.display()))?;
+        }
+        writer
+            .flush()
+            .await
+            .with_context(|| format!("flush {}", dest.display()))?;
+        Ok(Some((hex::encode(hasher.finalize()), size)))
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
@@ -122,6 +172,52 @@ impl ArtifactStore for S3ArtifactStore {
                 Err(err).with_context(|| format!("s3 get s3://{}/{key}", self.bucket))
             }
         }
+    }
+
+    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<Option<(String, u64)>> {
+        use sha2::Digest as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        let resp = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) if err.as_service_error().is_some_and(|e| e.is_no_such_key()) => {
+                return Ok(None);
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("s3 get s3://{}/{key}", self.bucket));
+            }
+        };
+        let mut body = resp.body;
+        let file = tokio::fs::File::create(dest)
+            .await
+            .with_context(|| format!("create {}", dest.display()))?;
+        let mut writer = tokio::io::BufWriter::new(file);
+        let mut hasher = sha2::Sha256::new();
+        let mut size: u64 = 0;
+        while let Some(chunk) = body
+            .try_next()
+            .await
+            .with_context(|| format!("read s3://{}/{key}", self.bucket))?
+        {
+            hasher.update(&chunk);
+            size += chunk.len() as u64;
+            writer
+                .write_all(&chunk)
+                .await
+                .with_context(|| format!("write {}", dest.display()))?;
+        }
+        writer
+            .flush()
+            .await
+            .with_context(|| format!("flush {}", dest.display()))?;
+        Ok(Some((hex::encode(hasher.finalize()), size)))
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
@@ -424,6 +520,88 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn get_to_file_streams_and_reports_digest_and_size() {
+        use sha2::Digest as _;
+
+        let adir = tempfile::tempdir().unwrap();
+        let store = LocalDirArtifactStore::new(adir.path());
+        let body = vec![7u8; 200 * 1024]; // larger than one 64 KiB chunk
+        store
+            .put_bytes("replay/archives/aa/archive.dwarfs", body.clone())
+            .await
+            .unwrap();
+
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("archive.dwarfs");
+        let (sha256, size) = store
+            .get_to_file("replay/archives/aa/archive.dwarfs", &dest)
+            .await
+            .unwrap()
+            .expect("the object exists");
+        assert_eq!(size, body.len() as u64);
+        assert_eq!(sha256, hex::encode(sha2::Sha256::digest(&body)));
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+
+        // A missing key is a miss — and no destination file is created.
+        let missing_dest = dest_dir.path().join("missing");
+        assert!(
+            store
+                .get_to_file("replay/archives/aa/nope", &missing_dest)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!missing_dest.exists());
+    }
+
+    #[tokio::test]
+    async fn s3_get_to_file_streams_and_maps_misses() {
+        use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
+        use aws_sdk_s3::primitives::ByteStream;
+        use aws_sdk_s3::types::error::NoSuchKey;
+        use aws_smithy_mocks::{RuleMode, mock, mock_client};
+        use sha2::Digest as _;
+
+        let body = b"dwarfs-image-bytes".to_vec();
+        let get_hit = {
+            let body = body.clone();
+            mock!(aws_sdk_s3::Client::get_object)
+                .match_requests(|req| req.key() == Some("replay/archives/aa/archive.dwarfs"))
+                .then_output(move || {
+                    GetObjectOutput::builder()
+                        .body(ByteStream::from(body.clone()))
+                        .build()
+                })
+        };
+        let get_miss = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(|req| req.key() == Some("replay/archives/aa/nope"))
+            .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&get_hit, &get_miss]);
+        let store = S3ArtifactStore::from_client(client, "rio-chunks".into());
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("archive.dwarfs");
+        let (sha256, size) = store
+            .get_to_file("replay/archives/aa/archive.dwarfs", &dest)
+            .await
+            .unwrap()
+            .expect("the object exists");
+        assert_eq!(size, body.len() as u64);
+        assert_eq!(sha256, hex::encode(sha2::Sha256::digest(&body)));
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+
+        let missing_dest = dir.path().join("missing");
+        assert!(
+            store
+                .get_to_file("replay/archives/aa/nope", &missing_dest)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!missing_dest.exists());
+    }
+
     /// [`ArtifactStore`] wrapper that records the order of uploaded keys.
     struct RecordingStore {
         inner: LocalDirArtifactStore,
@@ -439,6 +617,10 @@ mod tests {
 
         async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>> {
             self.inner.get_bytes(key).await
+        }
+
+        async fn get_to_file(&self, key: &str, dest: &Path) -> Result<Option<(String, u64)>> {
+            self.inner.get_to_file(key, dest).await
         }
 
         async fn exists(&self, key: &str) -> Result<bool> {
@@ -565,6 +747,10 @@ mod tests {
                 }
             }
             self.inner.get_bytes(key).await
+        }
+
+        async fn get_to_file(&self, key: &str, dest: &Path) -> Result<Option<(String, u64)>> {
+            self.inner.get_to_file(key, dest).await
         }
 
         async fn exists(&self, key: &str) -> Result<bool> {

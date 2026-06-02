@@ -51,7 +51,7 @@ use clap::Args;
 use sha2::Digest as _;
 
 use crate::archive::reader::ReplayArchive;
-use crate::archive::s3::{ARCHIVE_IMAGE_OBJECT, ARCHIVE_MANIFEST_OBJECT, CompleteMarker};
+use crate::archive::s3::{ARCHIVE_IMAGE_OBJECT, ARCHIVE_MANIFEST_OBJECT};
 use crate::archive::schema::{ExpectedOutcome, MemberDigest, OutcomeRecord, RequestRecord};
 
 use self::artifact::{
@@ -498,6 +498,13 @@ fn file_sha256_and_size(path: &Path) -> Result<(String, u64)> {
 /// Download one object listed by the completion marker into `target`,
 /// verifying its SHA-256 and size against the marker entry. An existing
 /// local file that already matches is kept (resume on the same volume).
+///
+/// The download streams to disk through [`ArtifactStore::get_to_file`] —
+/// archive members include the multi-gigabyte (fat archives: tens-to-
+/// hundreds of GiB) `archive.dwarfs` image, which must never be buffered
+/// in memory against the campaign pod's limit. The bytes land in a
+/// `.partial` sibling and are renamed into place only after the digest
+/// verified, so `target` never holds unverified bytes.
 async fn fetch_archive_object(
     store: &dyn ArtifactStore,
     prefix: &str,
@@ -517,20 +524,36 @@ async fn fetch_archive_object(
         );
     }
     let key = format!("{prefix}/{object}");
-    let bytes = store
-        .get_bytes(&key)
+    let partial = {
+        let mut name = target
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("archive target {} has no file name", target.display()))?
+            .to_os_string();
+        name.push(".partial");
+        target.with_file_name(name)
+    };
+    let (sha256, size) = store
+        .get_to_file(&key, &partial)
         .await?
         .ok_or_else(|| anyhow::anyhow!("archive object missing in S3: {key}"))?;
-    let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
-    anyhow::ensure!(
-        sha256 == expected.sha256 && bytes.len() as u64 == expected.size,
-        "archive object {object} does not match its completion marker (marker sha256 {} size {}, \
-         downloaded sha256 {sha256} size {})",
-        expected.sha256,
-        expected.size,
-        bytes.len()
-    );
-    std::fs::write(target, bytes).with_context(|| format!("write {}", target.display()))?;
+    if !(sha256 == expected.sha256 && size == expected.size) {
+        // Best effort: a failed verification should not strand the
+        // unverified download next to the archive.
+        let _ = std::fs::remove_file(&partial);
+        anyhow::bail!(
+            "archive object {object} does not match its completion marker (marker sha256 {} \
+             size {}, downloaded sha256 {sha256} size {size})",
+            expected.sha256,
+            expected.size,
+        );
+    }
+    std::fs::rename(&partial, target).with_context(|| {
+        format!(
+            "rename verified download {} to {}",
+            partial.display(),
+            target.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -577,8 +600,13 @@ pub async fn ensure_archive(
                      it last, so the archive is still uploading or the upload failed"
                 )
             })?;
-            let marker: CompleteMarker = serde_json::from_slice(&marker_bytes)
-                .with_context(|| format!("parse {marker_key}"))?;
+            // The marker is the proof of publication; the prefix may be a
+            // copied location whose last segment is not the short id, so
+            // only internal consistency is checked here — the spec's digest
+            // pin below is the authority.
+            let marker = crate::archive::s3::PublishedArchive::from_complete_json(&marker_bytes)
+                .with_context(|| marker_key.clone())?
+                .into_marker();
             for (object, digest) in &marker.objects {
                 // The marker is remote input: only plain basenames may be
                 // joined onto the local archive directory.
@@ -2318,6 +2346,96 @@ mod tests {
         let built = write_mini_archive(dir.path());
         let archive = Arc::new(ReplayArchive::open(dir.path()).unwrap());
         (dir, archive, built.archive_id)
+    }
+
+    #[tokio::test]
+    async fn fetch_archive_object_streams_verifies_and_resumes() {
+        use crate::run::artifact::{ArtifactStore as _, LocalDirArtifactStore};
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = LocalDirArtifactStore::new(store_dir.path());
+        let body = vec![42u8; 100 * 1024];
+        let expected = MemberDigest {
+            sha256: hex::encode(sha2::Sha256::digest(&body)),
+            size: body.len() as u64,
+        };
+        store
+            .put_bytes("replay/archives/aa/archive.dwarfs", body.clone())
+            .await
+            .unwrap();
+
+        let dest_dir = tempfile::tempdir().unwrap();
+        let target = dest_dir.path().join("archive.dwarfs");
+        fetch_archive_object(
+            &store,
+            "replay/archives/aa",
+            "archive.dwarfs",
+            &expected,
+            &target,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+        assert!(
+            !dest_dir.path().join("archive.dwarfs.partial").exists(),
+            "the verified download is renamed into place"
+        );
+
+        // A matching local file is kept (resume on the same volume): the
+        // store can disappear entirely and the fetch still succeeds.
+        let empty_store = LocalDirArtifactStore::new(tempfile::tempdir().unwrap().path());
+        fetch_archive_object(
+            &empty_store,
+            "replay/archives/aa",
+            "archive.dwarfs",
+            &expected,
+            &target,
+        )
+        .await
+        .unwrap();
+
+        // A stored object that does not match the marker is refused, the
+        // partial download is cleaned up, and the target is untouched.
+        let mut wrong = expected.clone();
+        wrong.sha256 = "0".repeat(64);
+        let target_bad = dest_dir.path().join("manifest.json");
+        store
+            .put_bytes("replay/archives/aa/manifest.json", b"{}".to_vec())
+            .await
+            .unwrap();
+        let err = fetch_archive_object(
+            &store,
+            "replay/archives/aa",
+            "manifest.json",
+            &wrong,
+            &target_bad,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not match its completion marker"),
+            "got: {err:#}"
+        );
+        assert!(!target_bad.exists());
+        assert!(
+            !dest_dir.path().join("manifest.json.partial").exists(),
+            "a failed verification must not strand the unverified download"
+        );
+
+        // A missing object names the key.
+        let err = fetch_archive_object(
+            &store,
+            "replay/archives/aa",
+            "nope.bin",
+            &expected,
+            &dest_dir.path().join("nope.bin"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("archive object missing in S3"),
+            "got: {err:#}"
+        );
     }
 
     /// Minimal terminal (match-built) record for tests that only need a

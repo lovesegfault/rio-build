@@ -952,6 +952,13 @@ mod tests {
         async fn get_bytes(&self, _key: &str) -> Result<Option<Vec<u8>>> {
             Ok(None)
         }
+        async fn get_to_file(
+            &self,
+            _key: &str,
+            _dest: &std::path::Path,
+        ) -> Result<Option<(String, u64)>> {
+            Ok(None)
+        }
         async fn exists(&self, _key: &str) -> Result<bool> {
             Ok(false)
         }
