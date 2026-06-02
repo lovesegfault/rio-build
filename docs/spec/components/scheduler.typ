@@ -2286,7 +2286,7 @@ refresh for free.
   expected output path, or a byte-equal CA modular hash) --- MUST be
   rejected with `FAILED_PRECONDITION`, unless the conflicting
   re-creation was approved by the store-evidence check
-  (#rref("sched.merge.store-evidence-displacement")). The persistence
+  (#rref("sched.merge.store-evidence-displacement+1")). The persistence
   layer MUST additionally refuse to update a settled row whose public
   identity conflicts with the incoming re-creation, independent of the
   pre-merge check, admitting only the per-merge hash list that check
@@ -2316,7 +2316,7 @@ and empty for every other writer --- the freeze stays unconditional
 except where the store's own bytes (or strictly higher ingress-bound
 evidence) proved the settled record is the impostor.
 
-#r("sched.merge.store-evidence-displacement")[
+#r("sched.merge.store-evidence-displacement+1")[
   When a store-backed submission's declared identity conflicts with a
   SETTLED content-bound record --- a resident settled authoritative node,
   or a settled row whose lineage rank is `content_bound_claim` --- the
@@ -2331,14 +2331,26 @@ evidence) proved the settled record is the impostor.
   per-merge approved-hash carve-out of the settled-row freeze (with the
   old row's persisted parent-side dependency edges scrubbed in the same
   transaction) for row-only victims. A contradiction MUST reject the
-  submission with `FAILED_PRECONDITION`. Store silence --- fetch failure,
-  absent path, non-canonical or non-text-CA-consistent bytes, or
-  unresolvable declared-IA inputs --- MUST NOT count as evidence in
-  either direction: the existing rejection stands. A row-only victim
-  whose persisted rank is `path_bound_bytes` or higher MUST NOT be
-  displaced by this check. An ingress-byte-bound submission
-  (`path_bound_bytes`) outranks a `content_bound_claim` row directly and
-  MUST be approved with no store fetch.
+  submission with `FAILED_PRECONDITION`. The row-level decision MUST be
+  an exhaustive arbitration over every (row rank, incoming rank) pair:
+  byte-anchored rows (`path_bound_bytes`, `verified_built`) refuse every
+  claim class; a `content_bound_claim` row is displaced by strictly
+  higher ingress-byte-bound evidence with no store fetch, or by a bare
+  store-verified resubmission; an `unverified_claim` row is displaced by
+  ingress-byte-bound evidence or a bare store-verified resubmission, and
+  MUST NOT be displaced by `content_bound_claim` rank alone (an
+  authoritative claim's bytes are bound to themselves, not to the
+  declared path). Every refusal's remediation text MUST be generated
+  from its arbitration arm. Store silence --- fetch failure, absent
+  path, or non-canonical / non-text-CA-consistent bytes --- MUST NOT
+  count as evidence in either direction AND MUST surface as
+  `UNAVAILABLE`, never hardening into the conflict's permanent
+  `FAILED_PRECONDITION`; permanent unprovability (an unseedable
+  declared-IA input, an undecodable declared hash over otherwise
+  verified bytes, or content-bound non-derivation bytes) keeps
+  `FAILED_PRECONDITION` with the generated remediation. Exhaustion of
+  the per-merge fetch budget MUST fail the merge with
+  `RESOURCE_EXHAUSTED` and no partial displacement persisted.
 ]
 This is the self-service path for `bug_076`-class squats: the victim of a
 content-bound squat on its predictable `drv_path` uploads the genuine
@@ -2351,11 +2363,21 @@ the declared path as their text content-address before anything is
 believed, so a confused or hostile store answer cannot smuggle unrelated
 bytes into the comparison. The fetch budget (8 per merge) bounds the
 single-threaded actor's exposure to a submission manufactured to carry
-many settled conflicts; conflicts past the budget keep the fail-closed
-rejection and are observable (`over_budget` on the
-#(refs.metric)("rio_scheduler_merge_store_evidence_total") counter). The rank gate on
-row-only victims is uniform with the displacement primitive's settled
-rule (#rref("sched.merge.evidence-ranked-displacement")); it is also
+many settled conflicts; exhaustion fails the whole merge with
+`RESOURCE_EXHAUSTED` and split-the-submission guidance, observable
+(`over_budget` on the
+#(refs.metric)("rio_scheduler_merge_store_evidence_total") counter) ---
+a load condition must never be reported through the conflict's permanent
+code, and partial displacement is rejected by design
+(#rref("sched.persist.atomic-activation+2")). The `unverified_claim`
+arbitration arm restores the advertised self-service for store-backed
+victims whose row was squatted by a bare echo --- the previous
+categorical refusal of that rank contradicted the remediation text the
+rejection itself emitted --- while the reverse-squat guard keeps
+hook-fallback-shaped forgeries from erasing genuine store-backed history
+by rank alone. The rank gate on byte-anchored row-only victims is
+uniform with the displacement primitive's settled rule
+(#rref("sched.merge.evidence-ranked-displacement")); it is also
 unreachable in honest operation --- store bytes cannot contradict an
 identity that was itself derived from byte-bound evidence --- which is
 exactly why it is enforced in code rather than argued. The displaced

@@ -165,13 +165,18 @@ fn settled_row_identity_matches(
 }
 
 /// Per-merge budget for store-evidence `.drv` fetches
-/// (`sched.merge.store-evidence-displacement`): settled-conflict
+/// (`sched.merge.store-evidence-displacement+1`): settled-conflict
 /// resolution is a remediation path, not a bulk operation, and an
 /// unbounded fetch loop would let a submission filled with manufactured
 /// conflicts stall the single-threaded actor on store round-trips.
-/// Conflicts past the budget keep the fail-closed rejection (counted
-/// `over_budget`); the client retries with fewer conflicts or after the
-/// earlier ones resolve.
+/// Exhaustion fails the merge with `RESOURCE_EXHAUSTED` (counted
+/// `over_budget`) and actionable guidance — split the submission —
+/// rather than hardening a load condition into the conflict's permanent
+/// `FAILED_PRECONDITION`. The failure is atomic: Steps 0.5/0.6 run
+/// before any state is written, so displacements approved earlier in
+/// the same submission are discarded with it
+/// (`sched.persist.atomic-activation` — persisting partial
+/// displacements is rejected by design).
 const MERGE_STORE_EVIDENCE_BUDGET: u32 = 8;
 
 /// Input-form modular-hash seeds for store-evidence verification.
@@ -515,18 +520,125 @@ pub(super) fn classify_store_evidence(
     }
 }
 
-/// Shared consequence of a settled-conflict store-evidence verdict —
-/// the SINGLE arbiter for merge Steps 0.5 (settled rows) and 0.6
-/// (resident settled squats), so the two steps cannot drift on what a
-/// verdict means. Returns `Ok(true)` when the claim was verified (the
-/// hash joins the approved displacement set), `Ok(false)` when the
-/// existing rejection stands, `Err` on a contradiction.
+/// Verdict of [`arbitrate_settled_row`]: what a conflicting
+/// re-creation of a settled derivation row may do, decided
+/// EXHAUSTIVELY over the row's persisted evidence rank and the
+/// incoming submission's shape-derived rank. No `!=` catch-all: every
+/// (row, incoming) cell of the 4x4 matrix is an explicit decision
+/// (fix-discipline R5), pinned by the matrix test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SettledArbitration {
+    /// The incoming rank strictly outranks the row's content binding:
+    /// displace with no store fetch.
+    DisplaceByRank,
+    /// A bare store-backed echo against a displaceable row: the
+    /// budgeted store-evidence fetch decides.
+    NeedsStoreEvidence,
+    /// Refused, with remediation GENERATED from the refusing arm.
+    Refuse(String),
+}
+
+/// Exhaustive settled-row displacement arbitration
+/// (`sched.merge.store-evidence-displacement+1`).
+///
+/// Soundness arguments per row rank:
+/// - `VerifiedBuilt` / `PathBoundBytes`: byte-anchored — the recorded
+///   identity was derived from bytes text-CA-bound to the declared
+///   path; store bytes cannot contradict it, so nothing displaces it.
+/// - `ContentBoundClaim` (settled authoritative record): displaced by
+///   strictly higher byte-bound evidence (ingress path-bound bytes),
+///   or by a bare echo whose claim the STORE proves; an authoritative
+///   claim of equal rank proves nothing about the path and refuses.
+/// - `UnverifiedClaim` (settled bare echo — the merged_bug_043 row
+///   population): the store outranks every claim ABOUT it, but it is
+///   itself the LOWEST evidence class: byte-bound submissions
+///   (>= `path_bound_bytes`) displace by rank, and a bare resubmission
+///   may prove its claim through store evidence. It is NEVER displaced
+///   by `ContentBoundClaim` rank alone (the reverse-squat guard:
+///   authoritative bytes are bound to themselves, not to the declared
+///   path — rank-alone displacement would let a hook-fallback-shaped
+///   forgery erase genuine store-backed history).
+pub(super) fn arbitrate_settled_row(
+    row_rank: crate::state::DefinitionEvidence,
+    incoming_rank: crate::state::DefinitionEvidence,
+    incoming_is_bare: bool,
+) -> SettledArbitration {
+    use crate::state::DefinitionEvidence as E;
+    match (row_rank, incoming_rank) {
+        // Byte-anchored rows: immutable to every claim class.
+        (E::VerifiedBuilt | E::PathBoundBytes, _) => SettledArbitration::Refuse(
+            "the settled record's identity is byte-anchored (derived from \
+             bytes content-bound to the declared path) and cannot be \
+             displaced by any claim; if you believe it is wrong, ask an \
+             operator to investigate"
+                .to_string(),
+        ),
+        // Content-bound rows: strictly higher evidence displaces.
+        (E::ContentBoundClaim, E::PathBoundBytes | E::VerifiedBuilt) => {
+            SettledArbitration::DisplaceByRank
+        }
+        (E::ContentBoundClaim, E::UnverifiedClaim) if incoming_is_bare => {
+            SettledArbitration::NeedsStoreEvidence
+        }
+        (E::ContentBoundClaim, E::ContentBoundClaim | E::UnverifiedClaim) => {
+            SettledArbitration::Refuse(
+                "an inline claim of equal or lower evidence cannot displace \
+                 it. If your .drv is uploaded to the store, resubmit \
+                 store-backed (the scheduler verifies the store derivation \
+                 and displaces a squatting record automatically); or \
+                 resubmit with inline non-authoritative bytes (ingress \
+                 binds them to the declared path); otherwise ask an \
+                 operator to clear the record"
+                    .to_string(),
+            )
+        }
+        // Bare-echo rows (merged_bug_043): byte-bound submissions
+        // displace by rank...
+        (E::UnverifiedClaim, E::PathBoundBytes | E::VerifiedBuilt) => {
+            SettledArbitration::DisplaceByRank
+        }
+        // ...a bare resubmission may prove its claim via the store...
+        (E::UnverifiedClaim, E::UnverifiedClaim) if incoming_is_bare => {
+            SettledArbitration::NeedsStoreEvidence
+        }
+        // ...and the reverse-squat guard: never by ContentBoundClaim
+        // rank alone.
+        (E::UnverifiedClaim, E::ContentBoundClaim | E::UnverifiedClaim) => {
+            SettledArbitration::Refuse(
+                "an authoritative inline claim cannot displace a settled \
+                 store-backed record by rank alone (its bytes are bound to \
+                 themselves, not to the declared path). Resubmit with \
+                 inline non-authoritative bytes or store-backed so the \
+                 claim can be verified against the declared path"
+                    .to_string(),
+            )
+        }
+    }
+}
+
+/// Post-fetch consequence of a settled-conflict store-evidence
+/// verdict — the SINGLE arbiter for merge Steps 0.5 (settled rows) and
+/// 0.6 (resident settled squats), so the two steps cannot drift on
+/// what a verdict means. Wire-code consequences are DERIVED from the
+/// verdict's typed permanence (`store-evidence-displacement+1`):
+/// silence is the only transient verdict and surfaces UNAVAILABLE;
+/// permanent unprovability carries generated remediation back to the
+/// refusing caller.
+enum EvidenceVerdict {
+    /// The claim verified: the hash joined the approved set.
+    Approved,
+    /// The claim is permanently unprovable as submitted (carries the
+    /// generated remediation). Step 0.5 refuses with it; Step 0.6
+    /// leaves the merge gate's own refusal in place.
+    Unprovable(String),
+}
+
 fn settle_evidence_verdict(
     build_id: Uuid,
     node: &crate::domain::DerivationNode,
     outcome: StoreEvidenceOutcome,
     store_evidence: &mut std::collections::HashSet<crate::state::DrvHash>,
-) -> Result<bool, ActorError> {
+) -> Result<EvidenceVerdict, ActorError> {
     match outcome {
         StoreEvidenceOutcome::Verified(_) => {
             metrics::counter!(
@@ -535,7 +647,7 @@ fn settle_evidence_verdict(
             )
             .increment(1);
             store_evidence.insert(node.drv_hash.as_str().into());
-            Ok(true)
+            Ok(EvidenceVerdict::Approved)
         }
         StoreEvidenceOutcome::Contradicts(detail) => {
             metrics::counter!(
@@ -554,16 +666,12 @@ fn settle_evidence_verdict(
                 drv_path: node.drv_path.clone(),
             })
         }
-        // Consequence-neutral split (C2c1): silence, structural
-        // impossibility, an unverifiable declared hash, and verified
-        // garbage all keep today's fail-closed "unavailable" outcome —
-        // the rejection stands. The per-variant consequences
-        // (UNAVAILABLE wire code, budget code, strip remediation) land
-        // with the arbitration commit.
-        StoreEvidenceOutcome::StoreSilence(_)
-        | StoreEvidenceOutcome::StructurallyUnverifiable(_)
-        | StoreEvidenceOutcome::VerifiedExceptDeclaredHash(_)
-        | StoreEvidenceOutcome::UnparseableVerified => {
+        // r[impl sched.merge.store-evidence-displacement+1]
+        // TRANSIENT: silence must never harden into the conflict's
+        // permanent FAILED_PRECONDITION — surface UNAVAILABLE so the
+        // client retries when the store recovers (bug_055's inversion,
+        // merge form).
+        StoreEvidenceOutcome::StoreSilence(reason) => {
             metrics::counter!(
                 "rio_scheduler_merge_store_evidence_total",
                 "result" => "unavailable"
@@ -572,15 +680,57 @@ fn settle_evidence_verdict(
             debug!(
                 build_id = %build_id,
                 drv_hash = %node.drv_hash,
-                "store evidence unavailable; existing rejection stands"
+                reason = reason.as_str(),
+                "store silent while resolving a settled conflict"
             );
-            Ok(false)
+            Err(ActorError::SettledConflictEvidenceUnavailable {
+                drv_path: node.drv_path.clone(),
+                reason: reason.as_str(),
+            })
+        }
+        // PERMANENT unprovability: remediation generated from the
+        // typed reason (R6).
+        StoreEvidenceOutcome::StructurallyUnverifiable(reason) => {
+            metrics::counter!(
+                "rio_scheduler_merge_store_evidence_total",
+                "result" => "unavailable"
+            )
+            .increment(1);
+            Ok(EvidenceVerdict::Unprovable(reason.remediation()))
+        }
+        StoreEvidenceOutcome::VerifiedExceptDeclaredHash(_) => {
+            metrics::counter!(
+                "rio_scheduler_merge_store_evidence_total",
+                "result" => "unavailable"
+            )
+            .increment(1);
+            Ok(EvidenceVerdict::Unprovable(
+                "the store bytes verify the claimed identity EXCEPT the \
+                 declared modular hash, which cannot be recomputed from \
+                 here; resubmit WITHOUT the declared ca_modular_hash (an \
+                 unverifiable claim is treated as no claim)"
+                    .to_string(),
+            ))
+        }
+        StoreEvidenceOutcome::UnparseableVerified => {
+            metrics::counter!(
+                "rio_scheduler_merge_store_evidence_total",
+                "result" => "unavailable"
+            )
+            .increment(1);
+            Ok(EvidenceVerdict::Unprovable(
+                "the bytes at the declared path are content-bound (the \
+                 store provably holds them) but do not parse as a \
+                 derivation; the declared drv_path does not name a .drv — \
+                 fix the submission"
+                    .to_string(),
+            ))
         }
     }
 }
 
 impl DagActor {
-    // r[impl sched.merge.store-evidence-displacement]
+    // r[impl sched.merge.store-evidence-displacement+1]
     /// Verify a bare store-backed submission node against the store's
     /// OWN copy of the `.drv` its declared `drv_path` names: fetch,
     /// then classify through [`classify_store_evidence`].
@@ -980,7 +1130,7 @@ impl DagActor {
         // the upsert is covered by the upsert's own settled-row WHERE
         // guard (defense in depth).
         //
-        // r[impl sched.merge.store-evidence-displacement]
+        // r[impl sched.merge.store-evidence-displacement+1]
         // The rejection is no longer unconditional: a conflicting
         // re-creation of a row whose lineage is CONTENT-BOUND (the
         // row-level mirror of the displacement primitive's verdicts)
@@ -1016,70 +1166,102 @@ impl DagActor {
                     if settled_row_identity_matches(row, node) {
                         continue;
                     }
-                    // Conflict. Row-level mirror of displace(): only a
-                    // content-bound lineage is displaceable —
-                    // store-backed lineages (unverified_claim: the
-                    // store outranks every claim about them) and
-                    // byte-anchored lineages (path_bound_bytes /
-                    // verified_built: nothing outranks them) refuse
-                    // categorically.
+                    // Conflict. The row-level mirror of displace() is
+                    // decided by the exhaustive 4x4 arbitration — every
+                    // (row rank, incoming rank) cell is an explicit
+                    // decision, and a refusal carries remediation
+                    // GENERATED from its arm, so the error can never
+                    // promise a path the verdict does not support.
                     let row_rank =
                         crate::state::DefinitionEvidence::parse_lossy(&row.evidence_rank);
                     let incoming_rank = crate::state::DefinitionEvidence::from_node_shape(node);
-                    let approved = if row_rank
-                        != crate::state::DefinitionEvidence::ContentBoundClaim
-                    {
-                        false
-                    } else if incoming_rank > row_rank {
-                        // Ingress-byte-bound submission: its bytes were
-                        // text-CA-bound to the declared path at
-                        // SubmitBuild admission — strictly higher
-                        // evidence, no store fetch needed (the R7
-                        // consequence, row form).
-                        metrics::counter!(
-                            "rio_scheduler_merge_store_evidence_total",
-                            "result" => "displaced"
-                        )
-                        .increment(1);
-                        true
-                    } else if node.drv_content.is_empty() && !node.drv_content_authoritative {
-                        // Bare store-backed echo: fetch the proof.
-                        if evidence_budget == 0 {
+                    let incoming_is_bare =
+                        node.drv_content.is_empty() && !node.drv_content_authoritative;
+                    match arbitrate_settled_row(row_rank, incoming_rank, incoming_is_bare) {
+                        SettledArbitration::DisplaceByRank => {
+                            // Ingress-byte-bound submission: its bytes
+                            // were text-CA-bound to the declared path at
+                            // SubmitBuild admission — strictly higher
+                            // evidence, no store fetch needed.
                             metrics::counter!(
                                 "rio_scheduler_merge_store_evidence_total",
-                                "result" => "over_budget"
+                                "result" => "displaced"
                             )
                             .increment(1);
-                            false
-                        } else {
+                            settled_evidence_displaced.push(row.drv_hash.clone());
+                            continue;
+                        }
+                        SettledArbitration::NeedsStoreEvidence => {
+                            // Bare store-backed echo: fetch the proof.
+                            if evidence_budget == 0 {
+                                metrics::counter!(
+                                    "rio_scheduler_merge_store_evidence_total",
+                                    "result" => "over_budget"
+                                )
+                                .increment(1);
+                                // RESOURCE_EXHAUSTED, not a silent
+                                // refusal: budget exhaustion is a load
+                                // condition, and hardening it into the
+                                // conflict's permanent
+                                // FAILED_PRECONDITION is the bug_055
+                                // inversion. Nothing has been persisted
+                                // (Steps 0.5/0.6 run before Step 1), so
+                                // the merge stays atomic
+                                // (sched.persist.atomic-activation) —
+                                // earlier approved displacements in this
+                                // submission are discarded with it.
+                                return Err(ActorError::SettledConflictEvidenceBudget {
+                                    drv_path: node.drv_path.clone(),
+                                });
+                            }
                             evidence_budget -= 1;
                             let outcome = self.check_store_evidence(node, &submission_seed).await;
-                            settle_evidence_verdict(build_id, node, outcome, &mut store_evidence)?
+                            match settle_evidence_verdict(
+                                build_id,
+                                node,
+                                outcome,
+                                &mut store_evidence,
+                            )? {
+                                EvidenceVerdict::Approved => {
+                                    settled_evidence_displaced.push(row.drv_hash.clone());
+                                    continue;
+                                }
+                                EvidenceVerdict::Unprovable(remediation) => {
+                                    warn!(
+                                        build_id = %build_id,
+                                        drv_hash = %row.drv_hash,
+                                        drv_path = %row.drv_path,
+                                        "rejecting re-creation of a settled derivation row: \
+                                         claim unprovable as submitted"
+                                    );
+                                    return Err(ActorError::SettledIdentityConflict {
+                                        drv_path: node.drv_path.clone(),
+                                        remediation,
+                                    });
+                                }
+                            }
                         }
-                    } else {
-                        false
-                    };
-                    if approved {
-                        settled_evidence_displaced.push(row.drv_hash.clone());
-                        continue;
+                        SettledArbitration::Refuse(remediation) => {
+                            warn!(
+                                build_id = %build_id,
+                                drv_hash = %row.drv_hash,
+                                drv_path = %row.drv_path,
+                                "rejecting re-creation of a settled derivation row \
+                                 with conflicting identity"
+                            );
+                            return Err(ActorError::SettledIdentityConflict {
+                                drv_path: node.drv_path.clone(),
+                                remediation,
+                            });
+                        }
                     }
-                    warn!(
-                        build_id = %build_id,
-                        drv_hash = %row.drv_hash,
-                        drv_path = %row.drv_path,
-                        "rejecting re-creation of a settled derivation row \
-                         with conflicting identity"
-                    );
-                    return Err(ActorError::SettledIdentityConflict {
-                        drv_path: node.drv_path.clone(),
-                    });
                 }
             }
         }
         phase!("0.5-settled-identity-freeze");
 
         // === Step 0.6: Resident settled-squat store evidence ==========
-        // r[impl sched.merge.store-evidence-displacement]
+        // r[impl sched.merge.store-evidence-displacement+1]
         // The DAG-resident form of the same remediation: a bare
         // store-backed echo whose identity conflicts with a SETTLED
         // authoritative node would be rejected by the merge gate
@@ -1116,11 +1298,29 @@ impl DagActor {
                     "result" => "over_budget"
                 )
                 .increment(1);
-                continue;
+                // Same consequence as Step 0.5: this scan only reaches
+                // nodes whose alternative is the merge gate's permanent
+                // FAILED_PRECONDITION, so letting exhaustion fall
+                // through would harden a load condition into a
+                // permanent rejection (bug_055's inversion). Atomic:
+                // nothing is persisted before Step 1.
+                return Err(ActorError::SettledConflictEvidenceBudget {
+                    drv_path: node.drv_path.clone(),
+                });
             }
             evidence_budget -= 1;
             let outcome = self.check_store_evidence(node, &submission_seed).await;
-            settle_evidence_verdict(build_id, node, outcome, &mut store_evidence)?;
+            match settle_evidence_verdict(build_id, node, outcome, &mut store_evidence)? {
+                EvidenceVerdict::Approved => {}
+                EvidenceVerdict::Unprovable(_) => {
+                    // The merge gate's own refusal stands for resident
+                    // squats — it carries the conflict's
+                    // FAILED_PRECONDITION and its message already names
+                    // the store-backed resubmission path; the generated
+                    // remediation here would describe a fetch the gate
+                    // never demanded.
+                }
+            }
         }
         phase!("0.6-store-evidence");
 
@@ -1147,7 +1347,7 @@ impl DagActor {
         // Production entry into the merge gate: hashes in the
         // store-evidence set were verified by Step 0.5/0.6 against the
         // store's own text-CA `.drv` bytes
-        // (sched.merge.store-evidence-displacement); the gate's
+        // (sched.merge.store-evidence-displacement+1); the gate's
         // displacement primitive still owns every decision.
         let merge_result = match self.dag.merge_with_evidence(
             build_id,
@@ -3091,7 +3291,7 @@ impl DagActor {
         // r[impl sched.merge.displaced-edge-scrub+2]
         //
         // Row-only store-evidence displacements
-        // (sched.merge.store-evidence-displacement) chain in for the same
+        // (sched.merge.store-evidence-displacement+1) chain in for the same
         // reason: the displaced SETTLED row had no DAG node (reaped), so
         // the gate never scrubbed anything in memory, but its persisted
         // parent-side dependency edges still describe the OLD lineage —

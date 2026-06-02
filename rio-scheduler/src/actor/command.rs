@@ -924,23 +924,52 @@ pub enum ActorError {
     /// (re)create a derivation whose persisted row is SETTLED
     /// (completed/skipped — the durable record of a successful build,
     /// possibly already reaped from the DAG) under a conflicting
-    /// identity, or without the content-bound evidence needed to prove
-    /// it is the same derivation. Maps to FAILED_PRECONDITION
-    /// (client-actionable conflict): if the settled record is a squat on
-    /// this derivation's hash, ask an operator to clear it; if this is a
-    /// legitimate rebuild, resubmit with the same declared identity the
-    /// original carried.
+    /// identity. Maps to FAILED_PRECONDITION (client-actionable
+    /// conflict). The `remediation` is GENERATED from the arbitration
+    /// verdict's refuse arm (`sched.merge.store-evidence-displacement+1`,
+    /// fix-discipline R6) — a refused class structurally cannot emit a
+    /// remediation its verdict does not support.
     #[error(
         "derivation {drv_path} has a settled (successfully built) record \
          with a different identity; re-creating it would erase that \
-         record. If your .drv is uploaded to the store, resubmit \
-         store-backed: the scheduler verifies the store derivation and \
-         displaces a squatting record automatically. Otherwise upload \
-         the .drv first, or ask an operator to clear the record"
+         record. {remediation}"
     )]
-    SettledIdentityConflict { drv_path: String },
+    SettledIdentityConflict {
+        drv_path: String,
+        remediation: String,
+    },
 
-    /// `r[sched.merge.store-evidence-displacement]`: the merge-time
+    /// `r[sched.merge.store-evidence-displacement+1]`: a settled-conflict
+    /// resolution needed store evidence and the store stayed SILENT
+    /// (fetch failure, absent path, transport-grade noise). TRANSIENT:
+    /// maps to UNAVAILABLE so clients retry when the store recovers —
+    /// silence must never harden into the permanent
+    /// FAILED_PRECONDITION the conflict itself would carry.
+    #[error(
+        "store evidence unavailable ({reason}) while resolving a settled \
+         identity conflict for {drv_path}; retry when the store recovers"
+    )]
+    SettledConflictEvidenceUnavailable {
+        drv_path: String,
+        reason: &'static str,
+    },
+
+    /// `r[sched.merge.store-evidence-displacement+1]`: the per-merge
+    /// store-evidence fetch budget was exhausted before this settled
+    /// conflict could be verified. Maps to RESOURCE_EXHAUSTED with
+    /// actionable guidance (split the submission); partial
+    /// displacements from earlier conflicts in the SAME submission are
+    /// not persisted — the merge is atomic
+    /// (`sched.persist.atomic-activation`).
+    #[error(
+        "the per-merge store-evidence budget was exhausted before the \
+         settled conflict for {drv_path} could be verified; split the \
+         submission into smaller batches or retry after earlier \
+         conflicts resolve"
+    )]
+    SettledConflictEvidenceBudget { drv_path: String },
+
+    /// `r[sched.merge.store-evidence-displacement+1]`: the merge-time
     /// store-evidence check fetched the `.drv` the submission's
     /// declared `drv_path` names, verified its text content-address,
     /// and the parsed derivation CONTRADICTS the submission's claimed

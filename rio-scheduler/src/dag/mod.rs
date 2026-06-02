@@ -76,7 +76,7 @@ pub enum DagError {
     /// bare-resubmission claimant hitting this against a settled squat
     /// is self-service: upload the genuine `.drv` to the store and
     /// resubmit — the merge-time store-evidence check
-    /// (`sched.merge.store-evidence-displacement`) verifies the claim
+    /// (`sched.merge.store-evidence-displacement+1`) verifies the claim
     /// against the store's text-CA-bound bytes and raises it past the
     /// squat's rank.
     #[error(
@@ -766,7 +766,7 @@ impl DerivationDag {
     /// [`Self::merge`] with merge-time STORE evidence: hashes in
     /// `store_evidence` were verified by the actor against the store's
     /// own text-CA-enforced `.drv` bytes
-    /// (`sched.merge.store-evidence-displacement`), so their incoming
+    /// (`sched.merge.store-evidence-displacement+1`), so their incoming
     /// nodes displace with `PathBoundBytes` standing instead of their
     /// bare ingress shape rank. The set only ever RAISES a displacer's
     /// rank — victims' protection ranks are read from their own state.
@@ -891,7 +891,7 @@ impl DerivationDag {
             // Per-node displacer standing: the ingress shape rank,
             // raised to PathBoundBytes when the actor verified this
             // hash against the store's own text-CA-enforced bytes
-            // (sched.merge.store-evidence-displacement). Computed once
+            // (sched.merge.store-evidence-displacement+1). Computed once
             // per node, consumed by every displace() call in the arms.
             let displacer_evidence = {
                 let shape = DefinitionEvidence::from_node_shape(node);

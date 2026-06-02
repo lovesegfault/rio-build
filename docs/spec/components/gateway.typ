@@ -709,7 +709,16 @@ clients (and CI retry wrappers) into a retry loop against a deterministic
 rejection. The producer half closes the one known way the gateway itself
 could manufacture such a rejection: an inline fallback node for a
 non-content-bound derivation, which the scheduler's authoritative-content
-validation always refuses.
+validation always refuses. The contract's load-bearing inverse is pinned
+scheduler-side
+(#rref("sched.merge.store-evidence-displacement+1")): conditions that are
+NOT deterministic content refusals --- store silence while resolving a
+settled conflict, or store-evidence fetch-budget exhaustion --- carry
+`UNAVAILABLE` / `RESOURCE_EXHAUSTED` precisely so they flow through this
+classifier's transient arm untouched; the gateway needs no knowledge of
+those variants, and widening the permanent set here without a
+scheduler-side code pin would re-create the inversion this pairing
+exists to prevent.
 
 === BuildResult Wire Format
 

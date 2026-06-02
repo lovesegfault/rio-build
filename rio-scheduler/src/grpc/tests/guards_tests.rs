@@ -27,6 +27,8 @@ fn _actor_error_exhaustive(e: &ActorError) {
         | ActorError::PermissionDenied { .. }
         | ActorError::NotLeader
         | ActorError::SettledIdentityConflict { .. }
+        | ActorError::SettledConflictEvidenceUnavailable { .. }
+        | ActorError::SettledConflictEvidenceBudget { .. }
         | ActorError::StoreEvidenceContradicts { .. } => {}
     }
 }
@@ -81,12 +83,35 @@ fn test_actor_error_to_status_all_arms() {
             // r[verify sched.persist.settled-identity-freeze+1]
             ActorError::SettledIdentityConflict {
                 drv_path: "/nix/store/x".into(),
+                remediation: "resubmit store-backed".into(),
             },
             Code::FailedPrecondition,
             "settled",
         ),
         (
-            // r[verify sched.merge.store-evidence-displacement]
+            // r[verify sched.merge.store-evidence-displacement+1]
+            // Wire codes derived per variant: silence is transient and
+            // must surface UNAVAILABLE (bug_055's inversion, merge
+            // form) ...
+            ActorError::SettledConflictEvidenceUnavailable {
+                drv_path: "/nix/store/x".into(),
+                reason: "fetch_failed",
+            },
+            Code::Unavailable,
+            "retry when the store recovers",
+        ),
+        (
+            // r[verify sched.merge.store-evidence-displacement+1]
+            // ... and budget exhaustion is load-shaped, never the
+            // conflict's permanent FAILED_PRECONDITION.
+            ActorError::SettledConflictEvidenceBudget {
+                drv_path: "/nix/store/x".into(),
+            },
+            Code::ResourceExhausted,
+            "split the submission",
+        ),
+        (
+            // r[verify sched.merge.store-evidence-displacement+1]
             ActorError::StoreEvidenceContradicts {
                 drv_path: "/nix/store/x".into(),
             },

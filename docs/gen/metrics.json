@@ -877,7 +877,7 @@
       {
         "name": "rio_scheduler_merge_store_evidence_total",
         "kind": "counter",
-        "help": "Merge-time store-evidence checks for settled identity conflicts (sched.merge.store-evidence-displacement), labeled by result: displaced (claim verified — by ingress-byte-bound rank or against the store's text-CA .drv bytes — and the settled squat erased), mismatch (the store derivation contradicts the claim; submission rejected), unavailable (store silent — fetch failed, path absent, or bytes unverifiable; fail-closed rejection stands), over_budget (per-merge fetch budget exhausted; rejection stands)"
+        "help": "Merge-time store-evidence checks for settled identity conflicts (sched.merge.store-evidence-displacement+1), labeled by result: displaced (claim verified — by ingress-byte-bound rank or against the store's text-CA .drv bytes — and the settled squat erased), mismatch (the store derivation contradicts the claim; submission rejected FAILED_PRECONDITION), unavailable (store silent — fetch failed, path absent, or bytes unverifiable — surfaced UNAVAILABLE; or permanently unprovable as submitted — refused with generated remediation), over_budget (per-merge fetch budget exhausted; merge fails RESOURCE_EXHAUSTED, nothing displaced)"
       },
       {
         "name": "rio_scheduler_orphan_builds_cancelled_total",
