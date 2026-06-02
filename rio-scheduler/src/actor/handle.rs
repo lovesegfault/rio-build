@@ -402,6 +402,17 @@ impl ActorHandle {
         self.debug(|reply| DebugCmd::Counters { reply }).await
     }
 
+    /// Pin the BuildProgress debounce window. Perf-gate tests set it
+    /// wide (hours) so `build_summary`-scan budgets are exact instead
+    /// of varying with how slowly a loaded builder paces the events.
+    pub async fn debug_set_progress_debounce(
+        &self,
+        window: std::time::Duration,
+    ) -> Result<(), ActorError> {
+        self.debug(|reply| DebugCmd::SetProgressDebounce { window, reply })
+            .await
+    }
+
     pub async fn debug_trip_breaker(&self, n: u32) -> Result<bool, ActorError> {
         self.debug(|reply| DebugCmd::TripBreaker { n, reply }).await
     }

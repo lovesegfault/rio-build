@@ -178,6 +178,17 @@ pub struct DerivationDag {
     /// SLA `solve_intent_for` + `resource_floor` clamp own initial
     /// sizing now. Strip-only.
     soft_features: Vec<String>,
+    /// Test-only invocation counter for [`Self::build_summary`].
+    /// `build_summary` is the actor's O(dag_nodes) aggregation
+    /// primitive — the I-140 dispatch stall was per-event calls
+    /// compounding under ephemeral-builder churn. Counting at this
+    /// chokepoint (rather than at actor call sites) means any FUTURE
+    /// per-event call site is counted automatically, so the churn
+    /// perf-gate's scan budget catches it without new instrumentation.
+    /// Atomic because `build_summary` takes `&self`; `Relaxed` is fine
+    /// for a single-threaded-actor test counter.
+    #[cfg(test)]
+    build_summary_calls: std::sync::atomic::AtomicU64,
 }
 
 impl DerivationDag {
@@ -1473,6 +1484,9 @@ impl DerivationDag {
     ///   Assigned/Running derivation in this build. BTreeSet for
     ///   sorted iteration → deterministic proto wire order.
     pub fn build_summary(&self, build_id: Uuid) -> BuildSummary {
+        #[cfg(test)]
+        self.build_summary_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut summary = BuildSummary::default();
         let mut workers: BTreeSet<String> = BTreeSet::new();
 
@@ -1525,6 +1539,16 @@ impl DerivationDag {
 
         summary.assigned_executors = workers.into_iter().collect();
         summary
+    }
+
+    /// Total [`Self::build_summary`] invocations on this DAG. Read by
+    /// the `DebugCmd::Counters` snapshot so perf-gate tests can assert
+    /// scan COUNTS (load-invariant) instead of wall-clock (flaky on a
+    /// loaded builder). See the field doc for the chokepoint rationale.
+    #[cfg(test)]
+    pub(crate) fn build_summary_call_count(&self) -> u64 {
+        self.build_summary_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

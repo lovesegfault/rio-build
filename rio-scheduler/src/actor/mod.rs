@@ -653,9 +653,11 @@ impl TestCounters {
             dispatch_ready_calls: self.dispatch_ready_calls.load(SeqCst),
             persist_status_calls: self.persist_status_calls.load(SeqCst),
             solve_inputs_calls: self.solve_inputs_calls.load(SeqCst),
-            // Filled by the `DebugCmd::Counters` handler — `substitute_sem`
-            // lives on `DagActor`, not here.
+            // Filled by the `DebugCmd::Counters` handler —
+            // `substitute_sem` and the DAG's build_summary counter
+            // live on `DagActor`, not here.
             substitute_sem_permits: 0,
+            build_summary_calls: 0,
         }
     }
 }
@@ -675,6 +677,14 @@ pub struct TestCountersSnapshot {
     /// [`TestCounters::snapshot`] — the semaphore lives on the actor).
     /// For r[sched.substitute.fanout-bound]'s no-permit-leak assertion.
     pub substitute_sem_permits: usize,
+    /// `DerivationDag::build_summary` invocations since actor start.
+    /// Filled by the [`DebugCmd::Counters`] handler (the counter lives
+    /// on the DAG — chokepoint counting, see
+    /// `DerivationDag::build_summary_call_count`). The I-140 churn
+    /// perf gate budgets this instead of wall-clock: per-event
+    /// O(dag_nodes) scans were the dispatch-stall mechanism, and a
+    /// scan COUNT cannot flake under CPU contention.
+    pub build_summary_calls: u64,
 }
 
 impl DagActor {

@@ -127,8 +127,13 @@ impl DagActor {
             DebugCmd::Counters { reply } => {
                 let _ = reply.send(super::TestCountersSnapshot {
                     substitute_sem_permits: self.substitute_sem.available_permits(),
+                    build_summary_calls: self.dag.build_summary_call_count(),
                     ..self.test_counters.snapshot()
                 });
+            }
+            DebugCmd::SetProgressDebounce { window, reply } => {
+                self.events.set_progress_debounce(window);
+                let _ = reply.send(());
             }
             DebugCmd::SeedSchedHint {
                 drv_hash,

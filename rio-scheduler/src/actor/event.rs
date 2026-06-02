@@ -60,6 +60,15 @@ pub(super) struct BuildEventBus {
     /// large-DAG × ephemeral-churn scale head-of-line blocks the actor
     /// (I-140). Cleared on build terminal/cleanup with the other maps.
     progress_at: HashMap<Uuid, Instant>,
+    /// Debounce window consulted by [`Self::progress_debounced`].
+    /// Always [`PROGRESS_DEBOUNCE`] in production. Tests pin it wide
+    /// via `set_progress_debounce` (cfg(test)) so scan-count
+    /// assertions stay deterministic: with the real 250ms window, how
+    /// many emits escape the debounce depends on how slowly events
+    /// arrive (a loaded builder re-opens the window mid-burst), which
+    /// is exactly the timing dependence a structural perf gate must
+    /// not have.
+    progress_debounce: std::time::Duration,
     /// Channel to the event-log persister task. [`emit`](Self::emit)
     /// try_sends (build_id, seq, prost-encoded BuildEvent) here AFTER
     /// the broadcast. Event::Log is filtered out — those flood PG
@@ -89,6 +98,7 @@ impl BuildEventBus {
             log_channels: HashMap::new(),
             sequences: HashMap::new(),
             progress_at: HashMap::new(),
+            progress_debounce: PROGRESS_DEBOUNCE,
             persist_tx,
             flush_tx,
         }
@@ -150,12 +160,21 @@ impl BuildEventBus {
     }
 
     /// `true` if a Progress event for `build_id` was emitted within
-    /// [`PROGRESS_DEBOUNCE`]. The `mark_progress` half is folded into
+    /// the debounce window ([`PROGRESS_DEBOUNCE`] unless a test pinned
+    /// it). The `mark_progress` half is folded into
     /// [`emit_progress_with`].
     pub(super) fn progress_debounced(&self, build_id: Uuid) -> bool {
         self.progress_at
             .get(&build_id)
-            .is_some_and(|t| t.elapsed() < PROGRESS_DEBOUNCE)
+            .is_some_and(|t| t.elapsed() < self.progress_debounce)
+    }
+
+    /// Override the BuildProgress debounce window. See the
+    /// [`Self::progress_debounce`] field doc — perf-gate tests pin it
+    /// wide so debounced-emit counts cannot vary with wave pacing.
+    #[cfg(test)]
+    pub(super) fn set_progress_debounce(&mut self, window: std::time::Duration) {
+        self.progress_debounce = window;
     }
 
     /// Core emit: bump sequence, persist (if wired + non-Log), broadcast.

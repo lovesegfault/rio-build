@@ -7706,22 +7706,67 @@ async fn test_large_dag_completion_dispatch_perf_bound() -> TestResult {
 /// I-140: many-worker churn on a large DAG. The single-completion test
 /// above is fast because `build_summary` (O(N) full-DAG scan) is only
 /// called a handful of times. The production stall was COMPOUNDED:
-/// `emit_progress` and `update_build_counts` each call `build_summary`
-/// per-assignment + per-completion + per-disconnect, and ephemeral
-/// builders churn at scale (controller spawns up to `replicas.max`
-/// pods when `queued_derivations` is large).
+/// `emit_progress` and `update_build_counts` each used to run their own
+/// `build_summary` per-assignment + per-completion + per-disconnect,
+/// and ephemeral builders churn at scale (controller spawns up to
+/// `replicas.max` pods when `queued_derivations` is large).
 ///
 /// This test connects 30 workers, dispatches 30, completes 30,
-/// disconnects 30 — one full ephemeral-churn wave. Before the fix, each
-/// of the ~90 per-event `build_summary` calls walks the full 50k-node
-/// DAG (~25ms debug each ≈ 2.2s total); after the fix the per-event
-/// cost is O(1) counts + debounced O(N) progress.
+/// disconnects 30 — one full ephemeral-churn wave — and asserts the
+/// fix STRUCTURALLY, with counts that cannot flake under CPU
+/// contention (a previous form bounded the wave at 1.5s wall-clock and
+/// flaked on loaded shared builders with the code byte-identical to
+/// its green baseline; structural > retry > widen):
+///
+/// - `build_summary` invocations over the wave (chokepoint counter on
+///   `DerivationDag`, read via `debug_counters`). Expected = W + 1:
+///   one shared scan per completion (`release_downstream` computes ONE
+///   summary for counts-persist + progress-emit) plus one for the
+///   first assignment's progress (every later assign/disconnect emit
+///   is debounced — the debounce window is pinned wide below, so this
+///   arithmetic is exact regardless of wave pacing). Regression
+///   signatures: un-debounced per-assign emits ⇒ +W−1 (≥61 total);
+///   un-shared completion scans ⇒ +W (≈61); any new per-event call
+///   site ⇒ +W or more. Budget W+5 sits ≥1.7× below all of them.
+/// - PG transactions over the wave (server-side `xact_commit` delta,
+///   same guard as the dispatch test above): per-event DB work must
+///   stay O(1) — an O(N) per-event round-trip regression shows up as
+///   ≥50k extra transactions against a ≤2000 budget.
+///
+/// Deliberately NOT bounded: wave wall-clock. The residual class it
+/// covered — per-event O(N) in-memory work that neither calls
+/// `build_summary` nor touches PG — costs ~120 events × ~20ms ≈ 2.4s
+/// (debug, 50k nodes), indistinguishable from healthy-under-load
+/// variance on a shared builder, so any non-flaky ceiling is too loose
+/// to catch it. nextest's slow-timeout (60s × terminate-after 2 for
+/// the postgres group) remains the catastrophe backstop.
 #[tokio::test]
 async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
     const N: usize = 50_000;
     const W: usize = 30;
 
-    let (_db, handle, _task) = setup().await;
+    let (db, handle, _task) = setup().await;
+
+    async fn xact_commit(pool: &sqlx::PgPool) -> i64 {
+        sqlx::query_scalar(
+            "SELECT xact_commit FROM pg_stat_database WHERE datname = current_database()",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("pg_stat_database")
+    }
+
+    // Pin the BuildProgress debounce wide open BEFORE any emit. With
+    // the production 250ms window, the number of per-assign emits that
+    // escape the debounce depends on how slowly the wave runs (a
+    // loaded builder re-opens the window mid-wave) — pinned, exactly
+    // the FIRST assign-side emit scans and every later assign/
+    // disconnect emit is debounced. Completion-side emits bypass the
+    // gate by design (they reuse the completion's shared scan), so
+    // they stay counted: one per completion.
+    handle
+        .debug_set_progress_debounce(std::time::Duration::from_secs(3600))
+        .await?;
 
     // Flat DAG: W independent leaves + (N-W) chained-on-top. The W
     // leaves are all Ready post-merge, so W workers each get one.
@@ -7743,6 +7788,11 @@ async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
     let build_id = Uuid::new_v4();
     let _rx = merge_dag(&handle, build_id, nodes, edges, false).await?;
     barrier(&handle).await;
+
+    // Window start: post-merge (the merge's own update_build_counts
+    // scan is setup, not churn).
+    let scans_before = handle.debug_counters().await?.build_summary_calls;
+    let xact_before = xact_commit(&db.pool).await;
 
     let t = std::time::Instant::now();
     // --- wave: connect W → dispatch W → complete W → disconnect W ----
@@ -7772,24 +7822,47 @@ async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
     }
     barrier(&handle).await;
     let wave_elapsed = t.elapsed();
+    let wave_scans = handle.debug_counters().await?.build_summary_calls - scans_before;
+    let wave_xacts = xact_commit(&db.pool).await - xact_before;
     eprintln!(
         "I-140 churn bench: {N} nodes, {W} workers — connect+assign+complete+disconnect \
-         wave {wave_elapsed:?} ({:.1}ms/event)",
+         wave {wave_elapsed:?} ({:.1}ms/event), {wave_scans} build_summary scans, \
+         {wave_xacts} PG xacts",
         wave_elapsed.as_secs_f64() * 1000.0 / (4 * W) as f64
     );
 
-    // 1.5s bound: 4×W=120 events. Pre-fix ≈ 90 build_summary scans
-    // (per-assign + 2×per-complete + per-disconnect) × ~20ms each ≈
-    // 1.8s debug. Post-fix: per-assign/disconnect emit_progress is
-    // debounced (→ ~2 scans total), per-complete shares ONE summary
-    // between counts+progress (→ 30 scans) = ~32×20ms ≈ 0.6s. Loose
-    // 1.5s bound for CI variance — the point is "doesn't degrade
-    // super-linearly with N×W".
+    // Scan budget: W completions (one SHARED scan each — counts +
+    // progress reuse it) + 1 first-assignment progress emit; later
+    // assign/disconnect emits hit the pinned-wide debounce. Expected
+    // exactly W+1 = 31; ≤ W+5 absorbs benign one-off additions while
+    // staying ≥1.7× below every regression signature (un-debounced
+    // assigns ≈ 61, un-shared completion scans ≈ 61, any new per-event
+    // call site ≥ 60). Per-event O(N) scans were the I-140 stall:
+    // they compound with ephemeral-builder churn rate until the actor
+    // mailbox grows unboundedly.
     assert!(
-        wave_elapsed.as_millis() < 1500,
-        "I-140: {W}-worker churn wave on {N}-node DAG took {wave_elapsed:?} (>1.5s); \
-         per-event O(N) build_summary scan compounds with ephemeral-builder \
-         churn rate — actor mailbox grows unboundedly under load"
+        wave_scans <= (W + 5) as u64,
+        "I-140: {W}-worker churn wave on {N}-node DAG ran {wave_scans} \
+         build_summary scans (> {} budget); a per-event O(N) scan is back",
+        W + 5
+    );
+    // Counter-wiring sanity: the W completion scans MUST be visible —
+    // a silently-dead counter would make the budget above vacuous.
+    assert!(
+        wave_scans >= W as u64,
+        "I-140: only {wave_scans} build_summary scans counted for {W} \
+         completions; the chokepoint counter is no longer wired"
+    );
+
+    // DB budget: per-event work must stay O(1) PG round-trips. Healthy
+    // wave ≈ 200 commits (W assignments + W completions + W disconnect
+    // requeues at a few commits each, plus best-effort writes). 2000
+    // gives ~10× headroom for schema/persistence drift while sitting
+    // 25× under the O(N) per-event regression signature (≥50k).
+    assert!(
+        wave_xacts < 2_000,
+        "I-140: {W}-worker churn wave on {N}-node DAG issued {wave_xacts} \
+         PG transactions; O(N) per-event round-trip regression"
     );
 
     // Correctness: completed_count must reflect the W completions

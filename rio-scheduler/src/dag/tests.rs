@@ -1364,18 +1364,51 @@ fn test_merge_large_dag_perf_bound() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// I-140: time the per-completion / per-admin-RPC hot operations at the
-/// 153k-node scale that stalled dispatch in prod. These are all in-memory;
-/// the bound is "no accidental O(n²)". Prints raw timings for diagnosis.
-#[test]
-fn test_large_dag_hot_ops_perf_bound() -> anyhow::Result<()> {
-    const N: usize = 150_000;
+/// Smallest of `k` timed runs of `op`. CPU contention only ever ADDS
+/// time, so the per-op minimum is the closest observable to the true
+/// cost — one clean run among `k` discards co-tenant scheduling noise.
+fn min_time<T>(k: usize, mut op: impl FnMut() -> T) -> std::time::Duration {
+    (0..k)
+        .map(|_| {
+            let t = std::time::Instant::now();
+            std::hint::black_box(op());
+            t.elapsed()
+        })
+        .min()
+        .expect("k >= 1")
+}
+
+/// Best-of-k cost of each I-140 hot op on one DAG size, measured by
+/// [`hot_ops_profile`]. Field order = execution order.
+struct HotOps {
+    build_summary: std::time::Duration,
+    find_newly_ready: std::time::Duration,
+    iter_nodes: std::time::Duration,
+    update_ancestors: std::time::Duration,
+    compute_initial: std::time::Duration,
+    full_sweep: std::time::Duration,
+    update_ancestors_propagate: std::time::Duration,
+    update_ancestors_deep: std::time::Duration,
+    reap: std::time::Duration,
+}
+
+/// One measurement pass for [`test_large_dag_hot_ops_perf_bound`]:
+/// build an `n`-node wide DAG and run every per-completion /
+/// per-admin-RPC hot operation in actor order. Repetition counts are
+/// per-op: cheap ops get more samples (their windows are short enough
+/// for a co-tenant burst to cover one entirely); the expensive O(n+e)
+/// ops self-average over their multi-hundred-ms windows and the
+/// repeated ones are recompute-idempotent (same cone, same values).
+/// `remove_build_interest_and_reap` is destructive, so it runs once,
+/// last.
+fn hot_ops_profile(n: usize) -> anyhow::Result<HotOps> {
     const FANOUT: usize = 5;
-    let (nodes, edges) = make_wide_dag(N, FANOUT);
+    let (nodes, edges) = make_wide_dag(n, FANOUT);
 
     let mut dag = DerivationDag::new();
     let build_id = Uuid::new_v4();
     let result = dag.merge(build_id, &nodes, &edges, "")?;
+    assert_eq!(result.newly_inserted.len(), n);
     // Mark first FANOUT nodes Completed (leaves) so find_newly_ready /
     // update_ancestors have realistic work to do.
     for i in 0..FANOUT {
@@ -1385,7 +1418,7 @@ fn test_large_dag_hot_ops_perf_bound() -> anyhow::Result<()> {
             .set_status_for_test(DerivationStatus::Completed);
     }
     // Put remaining nodes in Queued (compute_initial_states would do this).
-    for i in FANOUT..N {
+    for i in FANOUT..n {
         let h = format!("h{i:08}");
         dag.node_mut(&h)
             .unwrap()
@@ -1395,41 +1428,21 @@ fn test_large_dag_hot_ops_perf_bound() -> anyhow::Result<()> {
     let sla = crate::sla::SlaEstimator::new(&crate::sla::config::SlaConfig::test_default());
     let builds = crate::state::Builds::new();
 
-    macro_rules! time {
-        ($name:literal, $bound_ms:literal, $body:expr) => {{
-            let t = std::time::Instant::now();
-            let r = $body;
-            let el = t.elapsed();
-            eprintln!("I-140 bench [{}]: {:?}", $name, el);
-            assert!(
-                el.as_millis() < $bound_ms,
-                "I-140: {} took {:?} on {N}-node DAG (>{}ms bound)",
-                $name,
-                el,
-                $bound_ms
-            );
-            r
-        }};
-    }
-
-    time!("build_summary", 500, dag.build_summary(build_id));
-    time!("find_newly_ready", 100, dag.find_newly_ready("h00000000"));
-    time!("iter_nodes-count", 500, dag.iter_nodes().count());
-    time!(
-        "update_ancestors",
-        2000,
+    let build_summary = min_time(5, || dag.build_summary(build_id));
+    let find_newly_ready = min_time(9, || dag.find_newly_ready("h00000000"));
+    assert_eq!(dag.iter_nodes().count(), n);
+    let iter_nodes = min_time(5, || dag.iter_nodes().count());
+    // Cone walk from a completed node's parents — reaches the full DAG
+    // height on this topology, O(cone + edges).
+    let update_ancestors = min_time(2, || {
         crate::critical_path::update_ancestors(&mut dag, "h00000000")
-    );
-    time!(
-        "compute_initial(critpath)",
-        15000,
+    });
+    let compute_initial = min_time(1, || {
         crate::critical_path::compute_initial(&mut dag, &sla, &builds, &result.newly_inserted)
-    );
-    time!(
-        "full_sweep",
-        15000,
+    });
+    let full_sweep = min_time(1, || {
         crate::critical_path::full_sweep(&mut dag, &sla, &builds)
-    );
+    });
 
     // update_ancestors when the completed node WAS the unique max-child
     // (priority strictly higher than siblings) — the walk reaches the
@@ -1444,39 +1457,170 @@ fn test_large_dag_hot_ops_perf_bound() -> anyhow::Result<()> {
         .unwrap()
         .set_status_for_test(DerivationStatus::Queued);
     dag.node_mut("h00000000").unwrap().sched.priority = 1e9;
-    time!(
-        "update_ancestors(propagate-up)",
-        15000,
+    let update_ancestors_propagate = min_time(2, || {
         crate::critical_path::update_ancestors(&mut dag, "h00000000")
-    );
+    });
     dag.node_mut("h00000000")
         .unwrap()
         .set_status_for_test(DerivationStatus::Completed);
-    time!(
-        "update_ancestors(deep)",
-        15000,
+    let update_ancestors_deep = min_time(2, || {
         crate::critical_path::update_ancestors(&mut dag, "h00000000")
-    );
+    });
 
     // remove_build_interest_and_reap on a sole-interest build with all
     // nodes terminal: K reaps × O(degree) each ≈ O(E). Regression guard
     // for the O(K×N) `values_mut()` full-scan in `remove_node` (~2e10
-    // ops at this scale → would blow well past 15s).
-    for i in FANOUT..N {
+    // ops at the 150k scale).
+    for i in FANOUT..n {
         let h = format!("h{i:08}");
         dag.node_mut(&h)
             .unwrap()
             .set_status_for_test(DerivationStatus::Completed);
     }
-    let reaped = time!(
-        "reap-all",
-        2000,
-        dag.remove_build_interest_and_reap(build_id)
-    );
+    let t = std::time::Instant::now();
+    let reaped = dag.remove_build_interest_and_reap(build_id);
+    let reap = t.elapsed();
     assert_eq!(
         reaped.reaped_paths.len(),
-        N,
+        n,
         "all sole-interest terminal nodes reaped"
+    );
+
+    Ok(HotOps {
+        build_summary,
+        find_newly_ready,
+        iter_nodes,
+        update_ancestors,
+        compute_initial,
+        full_sweep,
+        update_ancestors_propagate,
+        update_ancestors_deep,
+        reap,
+    })
+}
+
+/// I-140: the per-completion / per-admin-RPC hot operations at the
+/// 153k-node scale that stalled dispatch in prod. These are all
+/// in-memory; the property is "no accidental O(n²)" — asserted
+/// STRUCTURALLY as algorithmic shape: every op runs at two sizes 8×
+/// apart and the big/small cost RATIO is bounded. A ratio compares the
+/// op against itself under the same load, so uniform CPU contention
+/// divides out — unlike the absolute per-op wall-clock bounds this
+/// test used before, which flaked on loaded shared builders with the
+/// code byte-identical to its green baseline (structural > retry >
+/// widen).
+///
+/// Threshold arithmetic (sizes 8× apart):
+/// - healthy O(n+e) ⇒ ratio ≈ 8, times ≤2-3× cache-regime inflation
+///   (the small DAG's working set is partially cache-resident, the big
+///   one's is not);
+/// - quadratic regression ⇒ ratio ≈ 64.
+///
+/// `RATIO_BOUND_LINEAR_OPS` = 32 sits 4× above clean-linear and 2×
+/// below quadratic. `RATIO_BOUND_REAP` adds slack for reap's
+/// single-shot sample (destructive op, no best-of-k); the historical
+/// O(K×N) `values_mut()` reap regression still measures ≈ 64.
+///
+/// `find_newly_ready` is O(parent-degree) — size-independent — so a
+/// cross-size ratio (≈1 healthy) would leave an O(n) regression (ratio
+/// 8) inside any cache-tolerant bound. It gets a same-size, same-DAG
+/// comparison instead, against `iter_nodes().count()` — the MINIMAL
+/// full-DAG pass, i.e. the floor any O(n) regression must pay
+/// (healthy ≈ 10⁻²–10⁻³× of it; a regressed full pass ≥ 1×).
+/// Same-size comparison also cancels load AND cache effects.
+///
+/// Deliberately NOT bounded: absolute time (constant-factor-only
+/// regressions). No absolute bound can be both load-immune on a shared
+/// builder and tight enough to matter; nextest's slow-timeout (60s ×
+/// terminate-after 2) is the catastrophe backstop. Raw timings print
+/// for diagnosis.
+#[test]
+fn test_large_dag_hot_ops_perf_bound() -> anyhow::Result<()> {
+    const N_BIG: usize = 150_000;
+    const SIZE_RATIO: usize = 8;
+    const N_SMALL: usize = N_BIG / SIZE_RATIO;
+    const RATIO_BOUND_LINEAR_OPS: f64 = 32.0;
+    const RATIO_BOUND_REAP: f64 = 40.0;
+
+    let small = hot_ops_profile(N_SMALL)?;
+    let big = hot_ops_profile(N_BIG)?;
+
+    // Clamp the denominator at 1µs: sub-µs minima sit below timer
+    // noise, and the clamp only ever LOWERS a ratio — for ops that
+    // fast, no shape regression is in play at the small size anyway.
+    let ratio = |s: std::time::Duration, b: std::time::Duration| {
+        b.as_secs_f64() / s.as_secs_f64().max(1e-6)
+    };
+
+    for (name, s, b, bound) in [
+        (
+            "build_summary",
+            small.build_summary,
+            big.build_summary,
+            RATIO_BOUND_LINEAR_OPS,
+        ),
+        (
+            "iter_nodes-count",
+            small.iter_nodes,
+            big.iter_nodes,
+            RATIO_BOUND_LINEAR_OPS,
+        ),
+        (
+            "update_ancestors",
+            small.update_ancestors,
+            big.update_ancestors,
+            RATIO_BOUND_LINEAR_OPS,
+        ),
+        (
+            "compute_initial(critpath)",
+            small.compute_initial,
+            big.compute_initial,
+            RATIO_BOUND_LINEAR_OPS,
+        ),
+        (
+            "full_sweep",
+            small.full_sweep,
+            big.full_sweep,
+            RATIO_BOUND_LINEAR_OPS,
+        ),
+        (
+            "update_ancestors(propagate-up)",
+            small.update_ancestors_propagate,
+            big.update_ancestors_propagate,
+            RATIO_BOUND_LINEAR_OPS,
+        ),
+        (
+            "update_ancestors(deep)",
+            small.update_ancestors_deep,
+            big.update_ancestors_deep,
+            RATIO_BOUND_LINEAR_OPS,
+        ),
+        ("reap-all", small.reap, big.reap, RATIO_BOUND_REAP),
+    ] {
+        let r = ratio(s, b);
+        eprintln!(
+            "I-140 bench [{name}]: {N_SMALL} nodes {s:?} → {N_BIG} nodes {b:?} \
+             (ratio {r:.1}, bound {bound})"
+        );
+        assert!(
+            r <= bound,
+            "I-140: {name} cost grew {r:.1}× from {N_SMALL} to {N_BIG} nodes \
+             (bound {bound}× for an {SIZE_RATIO}× size step); super-linear \
+             regression — see the threshold arithmetic in the test doc"
+        );
+    }
+
+    eprintln!(
+        "I-140 bench [find_newly_ready]: {:?} vs iter_nodes {:?} at {N_BIG} nodes",
+        big.find_newly_ready, big.iter_nodes
+    );
+    assert!(
+        big.find_newly_ready.as_secs_f64() < big.iter_nodes.as_secs_f64() * 0.5,
+        "I-140: find_newly_ready took {:?} at {N_BIG} nodes — within 2× of the \
+         minimal full-DAG pass (iter_nodes {:?}); it is O(parent-degree) and \
+         must not scan the DAG",
+        big.find_newly_ready,
+        big.iter_nodes
     );
     Ok(())
 }

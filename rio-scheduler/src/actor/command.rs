@@ -683,6 +683,16 @@ pub enum DebugCmd {
     Counters {
         reply: oneshot::Sender<super::TestCountersSnapshot>,
     },
+    /// Override the BuildProgress debounce window
+    /// (`BuildEventBus::progress_debounce`). The I-140 churn perf gate
+    /// pins it wide so its `build_summary`-scan budget is exact: with
+    /// the production 250ms window, the number of per-assign emits that
+    /// escape the debounce depends on how slowly the wave runs — i.e.
+    /// on builder load, the very thing a structural gate must ignore.
+    SetProgressDebounce {
+        window: std::time::Duration,
+        reply: oneshot::Sender<()>,
+    },
     /// Seed `state.sched.last_intent` and/or `resource_floor` for D4
     /// floor tests. Per-field `Option` (builder-style); any `Some`
     /// field materializes a `last_intent`.
