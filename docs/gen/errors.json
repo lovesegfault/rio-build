@@ -471,6 +471,13 @@
     },
     {
       "enum": "DerivationError",
+      "name": "IllTypedOutputs",
+      "crate": "rio-nix",
+      "msg": "ill-typed derivation outputs: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "DerivationError",
       "name": "InputNotFound",
       "crate": "rio-nix",
       "msg": "input derivation not found: {0}",
@@ -524,6 +531,41 @@
       "crate": "rio-nix",
       "msg": "unexpected end of input",
       "doc": ""
+    },
+    {
+      "enum": "DerivationTypeError",
+      "name": "FixedNotNamedOut",
+      "crate": "rio-nix",
+      "msg": "single fixed output must be named \"out\"",
+      "doc": "The single fixed output is not named \"out\"."
+    },
+    {
+      "enum": "DerivationTypeError",
+      "name": "FloatingAlgoMismatch",
+      "crate": "rio-nix",
+      "msg": "all floating outputs must use the same hash algorithm",
+      "doc": "Floating outputs disagree on the hash algorithm (compared after stripping the `r:` method prefix — method is not part of the oracle's `hashAlgo`)."
+    },
+    {
+      "enum": "DerivationTypeError",
+      "name": "Mixed",
+      "crate": "rio-nix",
+      "msg": "can't mix derivation output types",
+      "doc": "Outputs of different kinds in one derivation (including concrete-IA mixed with deferred-IA — distinct types in the oracle's `decide`)."
+    },
+    {
+      "enum": "DerivationTypeError",
+      "name": "MultipleFixed",
+      "crate": "rio-nix",
+      "msg": "only one fixed output is allowed for now",
+      "doc": "More than one fixed output."
+    },
+    {
+      "enum": "DerivationTypeError",
+      "name": "NoOutputs",
+      "crate": "rio-nix",
+      "msg": "must have at least one output",
+      "doc": "Empty output set."
     },
     {
       "enum": "DerivedPathError",
@@ -1498,6 +1540,11 @@
       "name": "DerivationError",
       "crate": "rio-nix",
       "doc": "Errors from parsing or hashing ATerm derivations."
+    },
+    {
+      "name": "DerivationTypeError",
+      "crate": "rio-nix",
+      "doc": "Ill-typed output sets, with the oracle's verbatim wording."
     },
     {
       "name": "DerivedPathError",
