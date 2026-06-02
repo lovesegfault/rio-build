@@ -62,12 +62,18 @@ pub(crate) enum SkipReason {
 }
 
 /// Compute the modulo row for `.drv` bytes, resolving inputs ONLY from
-/// the pre-seeded `input_hashes` cache (path → modulo hash). Pure and
-/// synchronous; the caller owns all I/O.
+/// the pre-seeded `seeds` cache (path → input-form modulo hash). Pure
+/// and synchronous; the caller owns all I/O.
+///
+/// Takes `&mut` and memoizes INTO the cache (the walk inserts every
+/// input-form hash it derives, including the subject's): at read-through
+/// scale the previous per-call clones were O(N²) over a closure of N
+/// derivations — the dominant cost the work budget could not see
+/// (bug_007 sibling cost; pattern R4 dominance).
 pub(crate) fn compute_drv_modulo(
     bytes: &[u8],
     drv_path: &str,
-    input_hashes: &HashMap<String, [u8; 32]>,
+    seeds: &mut HashMap<String, [u8; 32]>,
 ) -> Result<ComputedModulo, SkipReason> {
     use rio_nix::derivation::{Derivation, DerivationLike, input_addressed_output_paths};
 
@@ -90,12 +96,11 @@ pub(crate) fn compute_drv_modulo(
     // false-result class. The masked/published hash is a realisation
     // key; nothing in this cache needs it.
     let resolve_none = |_: &str| -> Option<&Derivation> { None };
-    let mut cache: HashMap<String, [u8; 32]> = input_hashes.clone();
     let modulo_hash = rio_nix::derivation::hash_derivation_modulo_input_form(
         &drv,
         drv_path,
         &resolve_none,
-        &mut cache,
+        seeds,
     )
     .map_err(|_| SkipReason::MissingInput)?;
 
@@ -105,9 +110,10 @@ pub(crate) fn compute_drv_modulo(
     let ia_output_paths = if !unknown && !is_ca {
         // Static input-addressed deriver: derive the per-output paths
         // the same way the trusted plane does. The walk above already
-        // proved every input hash is seeded.
-        let mut cache2: HashMap<String, [u8; 32]> = input_hashes.clone();
-        match input_addressed_output_paths(&drv, drv_path, &resolve_none, &mut cache2) {
+        // proved every input hash is seeded. Sharing ONE cache between
+        // the two walks is sound: `hash_modulo_walk` memoizes only
+        // mask=false (input-form) entries, never the masked subject.
+        match input_addressed_output_paths(&drv, drv_path, &resolve_none, seeds) {
             Ok(map) => map
                 .into_iter()
                 .map(|(name, sp)| (name, sp.as_str().to_string()))
@@ -235,7 +241,7 @@ pub(crate) async fn populate_on_ingest(pool: &PgPool, drv_path: &str, drv_bytes:
             return;
         }
     };
-    let seeds = match load_drv_modulo_batch(pool, &inputs).await {
+    let mut seeds = match load_drv_modulo_batch(pool, &inputs).await {
         Ok(s) => s,
         Err(e) => {
             // A DB failure is not "the inputs are absent" — labeling it
@@ -251,7 +257,7 @@ pub(crate) async fn populate_on_ingest(pool: &PgPool, drv_path: &str, drv_bytes:
             return;
         }
     };
-    match compute_drv_modulo(drv_bytes, drv_path, &seeds) {
+    match compute_drv_modulo(drv_bytes, drv_path, &mut seeds) {
         Ok(computed) => {
             if let Err(e) = upsert_drv_modulo(pool, drv_path, &computed.row).await {
                 warn!(drv_path, error = %e, "drv modulo upsert failed (best-effort)");
@@ -285,91 +291,314 @@ pub(crate) async fn populate_on_ingest(pool: &PgPool, drv_path: &str, drv_bytes:
     }
 }
 
-/// Read-through bounds for proof-time computation
-/// (`store.put.ia-deriver-proof+2`): a deriver closure needing more than
-/// this many input `.drv` fetches, or deeper than this, is declared
-/// unverifiable (fail-closed) rather than letting one upload walk an
-/// unbounded graph on the hot path. Counter-instrumented consts, not
-/// config.
-pub(crate) const READ_THROUGH_MAX_FETCHES: usize = 64;
-pub(crate) const READ_THROUGH_MAX_DEPTH: usize = 32;
-
-/// Fetch a `.drv`'s raw text bytes from the store's OWN backend.
-/// `.drv`s are KB-sized and therefore inline; a chunked or absent
-/// manifest returns `Ok(None)` (not resident in usable form).
+/// Total work budget for one proof-time read-through walk
+/// (`store.put.ia-deriver-proof+3`). UNITS, charged at call time by the
+/// owning [`WorkBudget`]: 1 per cache probe (the initial row lookup and
+/// one BATCHED input probe per expanded node), 1 per own-backend `.drv`
+/// fetch, 1 per chunk fetched during chunked-`.drv` reassembly. Metered
+/// APIs take `&mut WorkBudget`, so an unmetered awaited operation in
+/// the walk is unwritable by construction.
 ///
-/// Error classes are PROPAGATED, never folded into the absent verdict
-/// (merged_bug_015 — pattern R1: the old `.ok()??` collapsed DB
-/// failures and row corruption into "unverifiable", which the proof
-/// gate then served as `PERMISSION_DENIED`, telling an honest worker
-/// its deriver doesn't derive its path because the store's database
-/// hiccuped):
-/// - `get_manifest` errors (connection, serialization, corrupt chunk
-///   list) → `Err` — the caller maps to `INTERNAL`/retriable, never an
-///   authorization verdict.
-/// - a `status='complete'` `.drv` whose inline NAR does not parse as a
-///   single regular file → `Err(InvariantViolation)`: the text-CA gate
-///   (`store.put.drv-text-ca`) proved single-file shape at ingestion,
-///   so failure here is row-level corruption, not absence.
-async fn own_drv_bytes(
-    pool: &PgPool,
-    drv_path: &str,
-) -> Result<Option<Vec<u8>>, super::MetadataError> {
-    match super::get_manifest(pool, drv_path).await? {
-        None => Ok(None),
-        Some(super::ManifestKind::Inline(nar)) => rio_nix::nar::extract_single_file(&nar)
-            .map(Some)
-            .map_err(|e| {
-                super::MetadataError::InvariantViolation(format!(
-                    "complete .drv manifest for {drv_path} holds a NAR that is not a \
-                     single regular file (text-CA-gated at ingestion; this is row \
-                     corruption): {e}"
-                ))
-            }),
-        Some(super::ManifestKind::Chunked(_)) => Ok(None),
+/// SIZING (pattern R4 — calibrated at the measured real-world shape,
+/// not toy fixtures): the measured nixpkgs `hello` closure is 1,963
+/// `.drv`s at inputDrvs depth 236 (fan ≤ 96). A fully cold walk costs
+/// ≤ 2 units/node (fetch + probe; leaves cost 1) ⇒ ~3,926 units, so
+/// 16,384 ≈ 4.2× headroom; the merge-gated 2,048-node real-scale test
+/// asserts work_used ≤ cap/2.
+///
+/// DOMINANCE over the deleted READ_THROUGH_MAX_FETCHES=64 /
+/// READ_THROUGH_MAX_DEPTH=32 pair (R4: a replaced bound needs a written
+/// dominance argument): every closure admissible under the old bounds
+/// (≤ 64 fetches, depth ≤ 32) costs ≤ 64·2 + 64 = 192 units here, far
+/// under 16,384 — nothing previously provable becomes unprovable. The
+/// old depth bound REJECTED the measured real-world class outright
+/// (236 > 32: merged_bug_002, the deploy blocker); it is deleted, not
+/// retuned, because depth was never the cost being bounded — work is.
+/// The old per-node costs the pair did NOT meter (one cache probe per
+/// frontier entry, unbounded chunk reassembly) are charged here.
+///
+/// PROGRESS (monotone): every exit — including over-budget — first
+/// persists every row whose input closure completed
+/// ([`complete_partial_arena`]); persistence of already-discovered work
+/// is deliberately exempt from the budget (bounding it would convert
+/// "bounded work per attempt" into "discovered work discarded", the
+/// merged_bug_002 zero-progress pathology). Retries therefore resume
+/// from durable progress wherever any leaf-complete subtree fits in one
+/// attempt. Accepted fail-closed residual, written here per R4: a pure
+/// CHAIN deeper than ~cap/2 (≈ 8,192 nodes — 34× the measured depth
+/// class) completes no subtree per attempt and stays
+/// `RESOURCE_EXHAUSTED` until the cap is raised; the
+/// `rio_store_ia_proof_work_units` histogram (registered with this
+/// const) makes approach visible long before that.
+///
+/// CppNix parity note: the oracle's `hashDerivationModulo` /
+/// `pathDerivationModulo` recursion (derivations.cc:856-874) is
+/// UNBOUNDED (memoized in-process `drvHashes`); the budget is rio's
+/// deliberate DoS deviation for an adversarial-input network service,
+/// with monotone persistence restoring the oracle's convergence
+/// semantics across attempts.
+pub(crate) const PROOF_WALK_WORK_MAX: usize = 16_384;
+
+/// Cap on a chunked `.drv` NAR's reassembled size. `.drv`s are text; a
+/// multi-MiB one is already pathological — 64 MiB is far beyond any
+/// honest derivation while bounding what one proof walk will buffer.
+pub(crate) const DRV_REASSEMBLY_CAP: u64 = 64 * 1024 * 1024;
+
+/// Typed work budget (pattern R4). All metered operations in the proof
+/// walk take `&mut WorkBudget` and charge BEFORE doing the work; the
+/// only constructor takes the cap, and exhaustion is a typed signal the
+/// caller must route (never a silent skip).
+pub(crate) struct WorkBudget {
+    cap: usize,
+    used: usize,
+}
+
+/// Charge refusal: the budget is exhausted.
+pub(crate) struct Exhausted;
+
+impl WorkBudget {
+    pub(crate) fn new(cap: usize) -> Self {
+        WorkBudget { cap, used: 0 }
+    }
+    /// Units consumed so far (histogram + tests).
+    pub(crate) fn used(&self) -> usize {
+        self.used
+    }
+    /// Charge `units` or refuse without consuming.
+    fn charge(&mut self, units: usize) -> Result<(), Exhausted> {
+        let next = self.used.saturating_add(units);
+        if next > self.cap {
+            return Err(Exhausted);
+        }
+        self.used = next;
+        Ok(())
     }
 }
 
-/// Proof-time read-through: return the deriver's cached row, computing
-/// it (and its missing ancestors) from the store's own backend when
-/// absent — bounded by [`READ_THROUGH_MAX_FETCHES`] /
-/// [`READ_THROUGH_MAX_DEPTH`]. Every computed row is persisted (cache
-/// warm). `None` = unverifiable within bounds.
-// r[impl store.put.ia-deriver-proof+2]
-pub(crate) async fn load_or_compute_drv_modulo(
+/// Why a proof concluded ABSENT (a verdict about the closure, distinct
+/// from infrastructure errors which are `Err(MetadataError)`). The gate
+/// derives both the gRPC code and the client-facing message from this
+/// — `PERMISSION_DENIED` is constructible only from these arms.
+#[derive(Debug)]
+pub(crate) enum AbsentReason {
+    /// A `.drv` in the closure has no complete manifest in this store.
+    NotResident { path: String },
+    /// A `.drv` in the closure is resident but cannot be used.
+    Unparseable { path: String, why: String },
+    /// The walk exhausted its work budget; `persisted` proven rows were
+    /// durably cached before returning, so a retry resumes.
+    OverBudget { persisted: usize, work_used: usize },
+    /// The input metadata forms a cycle: no topological order exists,
+    /// so no row in the cyclic remainder is derivable. Fail-closed
+    /// (`store.gc.sweep-cycle-reclaim` owns cycle reclamation).
+    Cycle,
+}
+
+/// Proof-walk outcome: the deriver row, or a typed absence verdict.
+pub(crate) enum ProofOutcome {
+    Proven(DrvModuloRow),
+    Absent(AbsentReason),
+}
+
+/// One fetched-or-refused own-backend read inside the walk.
+enum FetchedDrv {
+    Bytes(Vec<u8>),
+    Absent,
+    Unreadable(String),
+    OverBudget,
+}
+
+/// Fetch a `.drv`'s raw text bytes from the store's OWN backend,
+/// charging the budget (1 for the manifest fetch; 1 per chunk when
+/// reassembling). Inline NARs extract directly; chunked NARs reassemble
+/// through the chunk cache up to [`DRV_REASSEMBLY_CAP`].
+///
+/// Error classes are PROPAGATED, never folded into the absent verdict
+/// (merged_bug_015 — pattern R1): `get_manifest`/chunk-backend errors →
+/// `Err`; a complete manifest whose NAR fails single-file extraction →
+/// `Err(InvariantViolation)` (text-CA-gated at ingestion, so this is
+/// row corruption, not absence).
+async fn own_drv_bytes(
     pool: &PgPool,
+    chunks: Option<&crate::cas::ChunkCache>,
     drv_path: &str,
-) -> Result<Option<DrvModuloRow>, super::MetadataError> {
-    if let Some(row) = load_drv_modulo(pool, drv_path).await? {
-        return Ok(Some(row));
+    budget: &mut WorkBudget,
+) -> Result<FetchedDrv, super::MetadataError> {
+    if budget.charge(1).is_err() {
+        return Ok(FetchedDrv::OverBudget);
     }
-    // Phase 1 (I/O): pre-fetch the missing closure into an owned arena
-    // — cache rows first, own backend for misses. The hash walk below
-    // is synchronous over this arena; no I/O runs inside a resolver.
-    let mut arena: HashMap<String, Vec<u8>> = HashMap::new();
+    let extract = |nar: &[u8]| -> Result<Vec<u8>, super::MetadataError> {
+        rio_nix::nar::extract_single_file(nar).map_err(|e| {
+            super::MetadataError::InvariantViolation(format!(
+                "complete .drv manifest for {drv_path} holds a NAR that is not a \
+                 single regular file (text-CA-gated at ingestion; this is row \
+                 corruption): {e}"
+            ))
+        })
+    };
+    match super::get_manifest(pool, drv_path).await? {
+        None => Ok(FetchedDrv::Absent),
+        Some(super::ManifestKind::Inline(nar)) => Ok(FetchedDrv::Bytes(extract(&nar)?)),
+        Some(super::ManifestKind::Chunked(entries)) => {
+            let Some(cache) = chunks else {
+                return Ok(FetchedDrv::Unreadable(
+                    "chunked .drv NAR but this store has no chunk backend configured".into(),
+                ));
+            };
+            let total: u64 = entries.iter().map(|(_, sz)| u64::from(*sz)).sum();
+            if total > DRV_REASSEMBLY_CAP {
+                return Ok(FetchedDrv::Unreadable(format!(
+                    "reassembled .drv NAR would be {total} bytes \
+                     (cap {DRV_REASSEMBLY_CAP})"
+                )));
+            }
+            let mut nar = Vec::with_capacity(total as usize);
+            for (hash, _sz) in &entries {
+                if budget.charge(1).is_err() {
+                    return Ok(FetchedDrv::OverBudget);
+                }
+                let chunk = cache.get_verified(hash).await.map_err(|e| {
+                    super::MetadataError::InvariantViolation(format!(
+                        "chunk fetch failed reassembling .drv {drv_path}: {e}"
+                    ))
+                })?;
+                nar.extend_from_slice(&chunk);
+            }
+            Ok(FetchedDrv::Bytes(extract(&nar)?))
+        }
+    }
+}
+
+/// Persist every arena node whose input closure is fully seeded —
+/// bottom-up passes until a pass makes no progress. Returns the number
+/// of rows persisted. Runs on EVERY walk exit (monotone progress, R4):
+/// persistence of already-discovered work is exempt from the budget by
+/// design (see [`PROOF_WALK_WORK_MAX`]).
+async fn complete_partial_arena(
+    pool: &PgPool,
+    arena: &mut HashMap<String, (Vec<u8>, Vec<String>)>,
+    seeds: &mut HashMap<String, [u8; 32]>,
+) -> Result<usize, super::MetadataError> {
+    let mut persisted = 0usize;
+    loop {
+        let ready: Vec<String> = arena
+            .iter()
+            .filter(|(_, (_, inputs))| inputs.iter().all(|i| seeds.contains_key(i)))
+            .map(|(p, _)| p.clone())
+            .collect();
+        if ready.is_empty() {
+            return Ok(persisted);
+        }
+        for path in ready {
+            let (bytes, _inputs) = arena.remove(&path).expect("selected from arena");
+            match compute_drv_modulo(&bytes, &path, seeds) {
+                Ok(c) => {
+                    seeds.insert(path.clone(), c.row.modulo_hash);
+                    upsert_drv_modulo(pool, &path, &c.row).await?;
+                    persisted += 1;
+                }
+                Err(_) => {
+                    // Inputs all seeded yet the walk failed: ill-formed
+                    // bytes slipped past the parse (defensive). Leave it
+                    // un-persisted; the caller's verdict logic treats an
+                    // underivable target as Cycle/Unparseable.
+                    debug!(path, "arena node failed to compute despite seeded inputs");
+                }
+            }
+        }
+    }
+}
+
+/// Proof-time read-through (`store.put.ia-deriver-proof+3`): return the
+/// deriver's cached row, computing it (and its missing ancestors) from
+/// the store's own backend when absent — a single budgeted, MONOTONE
+/// walk (every exit persists what it proved). One batched membership
+/// probe per expanded node; frontier dedup-on-push; eager leaf-first
+/// compute keeps the in-memory arena small.
+// r[impl store.put.ia-deriver-proof+3]
+pub(crate) async fn prove_drv_modulo(
+    pool: &PgPool,
+    chunks: Option<&crate::cas::ChunkCache>,
+    drv_path: &str,
+) -> Result<ProofOutcome, super::MetadataError> {
+    let (outcome, _work) =
+        prove_drv_modulo_with_cap(pool, chunks, drv_path, PROOF_WALK_WORK_MAX).await?;
+    Ok(outcome)
+}
+
+/// [`prove_drv_modulo`] with an explicit cap, returning the work used —
+/// the test seam for budget semantics (production always passes
+/// [`PROOF_WALK_WORK_MAX`]).
+pub(crate) async fn prove_drv_modulo_with_cap(
+    pool: &PgPool,
+    chunks: Option<&crate::cas::ChunkCache>,
+    drv_path: &str,
+    cap: usize,
+) -> Result<(ProofOutcome, usize), super::MetadataError> {
+    let mut budget = WorkBudget::new(cap);
+    let result = prove_inner(pool, chunks, drv_path, &mut budget).await;
+    let work = budget.used();
+    metrics::histogram!("rio_store_ia_proof_work_units").record(work as f64);
+    if let Ok(outcome) = &result {
+        let label = match outcome {
+            ProofOutcome::Proven(_) => "proven",
+            ProofOutcome::Absent(AbsentReason::NotResident { .. }) => "not_resident",
+            ProofOutcome::Absent(AbsentReason::Unparseable { .. }) => "unparseable",
+            ProofOutcome::Absent(AbsentReason::OverBudget { .. }) => "over_budget",
+            ProofOutcome::Absent(AbsentReason::Cycle) => "cycle",
+        };
+        metrics::counter!("rio_store_ia_proof_total", "result" => label).increment(1);
+    }
+    result.map(|o| (o, work))
+}
+
+async fn prove_inner(
+    pool: &PgPool,
+    chunks: Option<&crate::cas::ChunkCache>,
+    drv_path: &str,
+    budget: &mut WorkBudget,
+) -> Result<ProofOutcome, super::MetadataError> {
+    // Fast path: cached row (charged — it is a probe like any other).
+    if budget.charge(1).is_err() {
+        return Ok(ProofOutcome::Absent(AbsentReason::OverBudget {
+            persisted: 0,
+            work_used: budget.used(),
+        }));
+    }
+    if let Some(row) = load_drv_modulo(pool, drv_path).await? {
+        return Ok(ProofOutcome::Proven(row));
+    }
+
+    // Discovery: DFS from the target. arena = fetched-but-uncomputed
+    // nodes (bytes + input list); seeds = proven input-form hashes;
+    // queued = dedup-on-push.
+    let mut arena: HashMap<String, (Vec<u8>, Vec<String>)> = HashMap::new();
     let mut seeds: HashMap<String, [u8; 32]> = HashMap::new();
-    let mut frontier = vec![(drv_path.to_string(), 0usize)];
-    let mut fetches = 0usize;
-    while let Some((path, depth)) = frontier.pop() {
-        if arena.contains_key(&path) || seeds.contains_key(&path) {
+    let mut queued: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack: Vec<String> = vec![drv_path.to_string()];
+    let mut exit: Option<AbsentReason> = None;
+
+    while let Some(path) = stack.pop() {
+        if seeds.contains_key(&path) || arena.contains_key(&path) {
             continue;
         }
-        if depth > 0
-            && let Some(h) = load_drv_modulo_batch(pool, std::slice::from_ref(&path))
-                .await?
-                .remove(&path)
-        {
-            seeds.insert(path, h);
-            continue;
-        }
-        if fetches >= READ_THROUGH_MAX_FETCHES || depth >= READ_THROUGH_MAX_DEPTH {
-            metrics::counter!("rio_store_ia_proof_total", "result" => "unverifiable").increment(1);
-            return Ok(None);
-        }
-        fetches += 1;
-        let Some(bytes) = own_drv_bytes(pool, &path).await? else {
-            metrics::counter!("rio_store_ia_proof_total", "result" => "unverifiable").increment(1);
-            return Ok(None);
+        let bytes = match own_drv_bytes(pool, chunks, &path, budget).await? {
+            FetchedDrv::Bytes(b) => b,
+            FetchedDrv::Absent => {
+                exit = Some(AbsentReason::NotResident { path });
+                break;
+            }
+            FetchedDrv::Unreadable(why) => {
+                exit = Some(AbsentReason::Unparseable { path, why });
+                break;
+            }
+            FetchedDrv::OverBudget => {
+                exit = Some(AbsentReason::OverBudget {
+                    persisted: 0,
+                    work_used: budget.used(),
+                });
+                break;
+            }
         };
         let inputs: Vec<String> = match std::str::from_utf8(&bytes)
             .ok()
@@ -377,48 +606,81 @@ pub(crate) async fn load_or_compute_drv_modulo(
         {
             Some(d) => d.input_drvs().keys().cloned().collect(),
             None => {
-                metrics::counter!("rio_store_ia_proof_total", "result" => "unverifiable")
-                    .increment(1);
-                return Ok(None);
+                exit = Some(AbsentReason::Unparseable {
+                    path,
+                    why: "bytes do not parse as a derivation".into(),
+                });
+                break;
             }
         };
-        for i in inputs {
-            frontier.push((i, depth + 1));
-        }
-        arena.insert(path, bytes);
-    }
-    // Phase 2 (pure): bottom-up over the arena until the target's row
-    // exists. Each pass computes every node whose inputs are all
-    // seeded; a pass with no progress means a cycle — fail closed.
-    let mut remaining: Vec<String> = arena.keys().cloned().collect();
-    while !remaining.is_empty() {
-        let mut next = Vec::new();
-        let mut progressed = false;
-        for path in remaining {
-            let bytes = &arena[&path];
-            match compute_drv_modulo(bytes, &path, &seeds) {
-                Ok(c) => {
-                    seeds.insert(path.clone(), c.row.modulo_hash);
-                    upsert_drv_modulo(pool, &path, &c.row).await?;
-                    progressed = true;
-                    if path == drv_path {
-                        metrics::counter!(
-                            "rio_store_ia_proof_total",
-                            "result" => "computed_on_miss"
-                        )
-                        .increment(1);
-                    }
+
+        // ONE batched probe for every not-yet-seen input of this node
+        // (bug_007: the per-path probe inside the old loop was an
+        // unmetered query per frontier entry).
+        let unseen: Vec<String> = inputs
+            .iter()
+            .filter(|i| !seeds.contains_key(*i) && !arena.contains_key(*i) && !queued.contains(*i))
+            .cloned()
+            .collect();
+        if !unseen.is_empty() {
+            if budget.charge(1).is_err() {
+                exit = Some(AbsentReason::OverBudget {
+                    persisted: 0,
+                    work_used: budget.used(),
+                });
+                break;
+            }
+            let found = load_drv_modulo_batch(pool, &unseen).await?;
+            for (p, h) in &found {
+                seeds.insert(p.clone(), *h);
+            }
+            for p in unseen {
+                if !seeds.contains_key(&p) {
+                    queued.insert(p.clone());
+                    stack.push(p);
                 }
-                Err(_) => next.push(path),
             }
         }
-        if !progressed {
-            metrics::counter!("rio_store_ia_proof_total", "result" => "unverifiable").increment(1);
-            return Ok(None);
+
+        // Eager leaf-first: compute immediately when every input is
+        // already seeded (leaves and probe-satisfied nodes) — keeps the
+        // arena small and persists progress as early as possible.
+        if inputs.iter().all(|i| seeds.contains_key(i)) {
+            let mut local_seeds = std::mem::take(&mut seeds);
+            match compute_drv_modulo(&bytes, &path, &mut local_seeds) {
+                Ok(c) => {
+                    local_seeds.insert(path.clone(), c.row.modulo_hash);
+                    upsert_drv_modulo(pool, &path, &c.row).await?;
+                }
+                Err(_) => {
+                    arena.insert(path, (bytes, inputs));
+                }
+            }
+            seeds = local_seeds;
+        } else {
+            arena.insert(path, (bytes, inputs));
         }
-        remaining = next;
     }
-    Ok(load_drv_modulo(pool, drv_path).await?)
+
+    // EVERY exit persists what it proved (monotone progress).
+    let persisted = complete_partial_arena(pool, &mut arena, &mut seeds).await?;
+
+    match exit {
+        Some(AbsentReason::OverBudget { work_used, .. }) => {
+            Ok(ProofOutcome::Absent(AbsentReason::OverBudget {
+                persisted,
+                work_used,
+            }))
+        }
+        Some(reason) => Ok(ProofOutcome::Absent(reason)),
+        None => match load_drv_modulo(pool, drv_path).await? {
+            Some(row) => Ok(ProofOutcome::Proven(row)),
+            // Discovery completed, the arena drained as far as it
+            // could, and the target is still underivable: the remainder
+            // is cyclic (acyclic closures always topo-complete).
+            None => Ok(ProofOutcome::Absent(AbsentReason::Cycle)),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -434,7 +696,7 @@ mod tests {
     /// against a full-resolution reference walk; before the
     /// input-form fix the cached composition diverged for floating
     /// inputs and silently mis-derived every downstream IA path.
-    // r[verify store.put.ia-deriver-proof+2]
+    // r[verify store.put.ia-deriver-proof+3]
     #[test]
     fn cached_floating_input_matches_full_resolution_walk() {
         use rio_nix::derivation::{Derivation, input_addressed_output_paths};
@@ -465,11 +727,11 @@ mod tests {
 
         // Cached composition: the floating row's stored hash seeds the
         // parent's compute, exactly as the read-through does.
-        let row_f = compute_drv_modulo(floating.as_bytes(), floating_path, &HashMap::new())
+        let row_f = compute_drv_modulo(floating.as_bytes(), floating_path, &mut HashMap::new())
             .expect("floating row computes");
-        let seeds: HashMap<String, [u8; 32]> =
+        let mut seeds: HashMap<String, [u8; 32]> =
             [(floating_path.to_string(), row_f.row.modulo_hash)].into();
-        let row_p = compute_drv_modulo(parent.as_bytes(), parent_path, &seeds)
+        let row_p = compute_drv_modulo(parent.as_bytes(), parent_path, &mut seeds)
             .expect("parent computes from cached seed");
 
         for (name, sp) in &reference {

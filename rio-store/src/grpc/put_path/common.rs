@@ -697,6 +697,42 @@ pub(in crate::grpc) fn verify_ca_store_path(
     Ok(())
 }
 
+/// Map a proof-walk absence verdict to its gRPC status. Total over
+/// [`AbsentReason`] so a new verdict arm cannot silently inherit an
+/// old code (pattern R1); `PERMISSION_DENIED` for the deriver proof is
+/// constructible ONLY through this function's closure-verdict arms.
+///
+/// [`AbsentReason`]: crate::metadata::drv_modulo::AbsentReason
+fn absent_to_status(
+    reason: &crate::metadata::drv_modulo::AbsentReason,
+    deriver: &str,
+    ctx_label: &str,
+) -> Status {
+    use crate::metadata::drv_modulo::{AbsentReason, PROOF_WALK_WORK_MAX};
+    match reason {
+        AbsentReason::NotResident { path } => Status::permission_denied(format!(
+            "{ctx_label}: deriver closure unverifiable — {path} is not resident in \
+             this store, so the claimed output path cannot be proven to belong to \
+             deriver {deriver}; upload the deriver closure (.drv files) first"
+        )),
+        AbsentReason::Unparseable { path, why } => Status::permission_denied(format!(
+            "{ctx_label}: deriver closure unverifiable — {path} cannot be used: {why}"
+        )),
+        AbsentReason::Cycle => Status::permission_denied(format!(
+            "{ctx_label}: deriver closure unverifiable — the input metadata of \
+             deriver {deriver} forms a cycle; no derivation order exists (fail-closed)"
+        )),
+        AbsentReason::OverBudget {
+            persisted,
+            work_used,
+        } => Status::resource_exhausted(format!(
+            "{ctx_label}: deriver-closure proof for {deriver} exceeded its work \
+             budget ({work_used} of {PROOF_WALK_WORK_MAX} units); {persisted} proven \
+             rows were persisted — retrying resumes from durable progress"
+        )),
+    }
+}
+
 pub(in crate::grpc) use crate::ingest::PlaceholderGuard;
 
 impl StoreServiceImpl {
@@ -730,13 +766,13 @@ impl StoreServiceImpl {
         })
     }
 
-    // r[impl store.put.ia-deriver-proof+2]
+    // r[impl store.put.ia-deriver-proof+3]
     /// Descriptor-less INPUT-ADDRESSED uploads must prove deriver
     /// membership against the store's OWN bytes: the claims' deriver
     /// `.drv` (claims.drv_hash == its store path, bound at scheduler
     /// ingress) must be store-resident, and the claimed path must be
     /// among the IA output paths the store derives from its own copy
-    /// via the modulo cache (read-through on miss, bounded).
+    /// via the modulo cache (budgeted monotone read-through on miss).
     /// `expected_outputs` membership alone is no longer sufficient for
     /// IA registration — a forged-claims signer could put arbitrary
     /// paths there; it cannot make the store's bytes derive them.
@@ -747,12 +783,20 @@ impl StoreServiceImpl {
     /// deferred-IA) are membership-only: their true paths come from
     /// realisations (claims for them are realisation-derived at
     /// dispatch; documented residual is compromised-scheduler-only).
+    ///
+    /// Status mapping is total over [`AbsentReason`] (pinned by
+    /// `absent_to_status_bijection`): closure verdicts →
+    /// `PERMISSION_DENIED` with the reason named; budget exhaustion →
+    /// `RESOURCE_EXHAUSTED` (retriable; progress was persisted);
+    /// infrastructure errors → `INTERNAL` (cause server-logged only).
     pub(in crate::grpc) async fn verify_ia_registration_proof(
         &self,
         info: &ValidatedPathInfo,
         claims: Option<&rio_auth::hmac::AssignmentClaims>,
         ctx_label: &str,
     ) -> Result<(), Status> {
+        use crate::metadata::drv_modulo::ProofOutcome;
+
         let Some(claims) = claims else {
             return Ok(()); // dev mode / service relay: no claims to prove
         };
@@ -763,27 +807,29 @@ impl StoreServiceImpl {
             return Ok(()); // .drv text-CA gate owns derivation uploads
         }
         let deriver = claims.drv_hash.as_str();
-        let row = crate::metadata::drv_modulo::load_or_compute_drv_modulo(&self.pool, deriver)
-            .await
-            .map_err(|e| {
-                // Unlike this file's content-derived hash errors (computed
-                // over bytes the caller already holds), this error wraps a
-                // database lookup: sqlx errors can carry SQL fragments and
-                // connection details, and PutPath callers are untrusted
-                // workers. Log the cause server-side; return only a generic
-                // marker the caller can correlate by ctx_label.
-                tracing::error!(deriver, ctx_label, error = %e, "deriver proof lookup failed");
-                Status::internal(format!(
-                    "{ctx_label}: deriver proof lookup failed (see store logs)"
-                ))
-            })?;
-        let Some(row) = row else {
-            // Unverifiable counter emitted inside the read-through.
-            return Err(Status::permission_denied(format!(
-                "{ctx_label}: deriver closure unverifiable — the deriver .drv {deriver} \
-                 (or part of its input closure) is not resident in this store, so the \
-                 claimed output path cannot be proven to belong to it"
-            )));
+        let outcome = crate::metadata::drv_modulo::prove_drv_modulo(
+            &self.pool,
+            self.chunk_cache.as_deref(),
+            deriver,
+        )
+        .await
+        .map_err(|e| {
+            // Unlike this file's content-derived hash errors (computed
+            // over bytes the caller already holds), this error wraps a
+            // database lookup: sqlx errors can carry SQL fragments and
+            // connection details, and PutPath callers are untrusted
+            // workers. Log the cause server-side; return only a generic
+            // marker the caller can correlate by ctx_label.
+            tracing::error!(deriver, ctx_label, error = %e, "deriver proof lookup failed");
+            Status::internal(format!(
+                "{ctx_label}: deriver proof lookup failed (see store logs)"
+            ))
+        })?;
+        let row = match outcome {
+            ProofOutcome::Proven(row) => row,
+            ProofOutcome::Absent(reason) => {
+                return Err(absent_to_status(&reason, deriver, ctx_label));
+            }
         };
         if row.deferred {
             metrics::counter!("rio_store_ia_proof_total", "result" => "deferred_exempt")
@@ -2012,6 +2058,53 @@ mod verify_nar_tests {
             "got: {}",
             err.message()
         );
+    }
+
+    // r[verify store.put.ia-deriver-proof+3]
+    /// gRPC code bijection over the absence verdicts: closure verdicts
+    /// are PERMISSION_DENIED with the reason named; budget exhaustion
+    /// is RESOURCE_EXHAUSTED (retriable) and names the persisted
+    /// progress. Total match — adding a verdict arm without a code
+    /// decision cannot compile.
+    #[test]
+    fn absent_to_status_bijection() {
+        use crate::metadata::drv_modulo::AbsentReason;
+        let d = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv";
+
+        let s = absent_to_status(&AbsentReason::NotResident { path: d.into() }, d, "t");
+        assert_eq!(s.code(), tonic::Code::PermissionDenied);
+        assert!(s.message().contains("not resident"), "{}", s.message());
+
+        let s = absent_to_status(
+            &AbsentReason::Unparseable {
+                path: d.into(),
+                why: "junk".into(),
+            },
+            d,
+            "t",
+        );
+        assert_eq!(s.code(), tonic::Code::PermissionDenied);
+        assert!(s.message().contains("junk"), "{}", s.message());
+
+        let s = absent_to_status(&AbsentReason::Cycle, d, "t");
+        assert_eq!(s.code(), tonic::Code::PermissionDenied);
+        assert!(s.message().contains("cycle"), "{}", s.message());
+
+        let s = absent_to_status(
+            &AbsentReason::OverBudget {
+                persisted: 7,
+                work_used: 99,
+            },
+            d,
+            "t",
+        );
+        assert_eq!(s.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            s.message().contains("7 proven rows were persisted"),
+            "{}",
+            s.message()
+        );
+        assert!(s.message().contains("retrying resumes"), "{}", s.message());
     }
 
     /// A worker upload may only claim `fixed:` content addresses; a

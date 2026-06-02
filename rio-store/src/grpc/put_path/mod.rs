@@ -72,7 +72,7 @@ impl StoreServiceImpl {
         self.verify_assignment_token_inner(request, false)
     }
 
-    // r[impl store.put.ia-deriver-proof+2]
+    // r[impl store.put.ia-deriver-proof+3]
     /// PutPath/PutPathBatch variant of [`Self::verify_assignment_token`]:
     /// the WRITE side. The scheduler's service token is NOT a bypass
     /// here — the scheduler has no PutPath flow (its token serves the
@@ -217,7 +217,7 @@ impl StoreServiceImpl {
             {
                 Ok(Some(c)) => {
                     let g = self.spawn_placeholder_guard(store_path_hash.clone(), c);
-                    // r[impl store.put.ia-deriver-proof+2]
+                    // r[impl store.put.ia-deriver-proof+3]
                     // The proof gate runs ONLY for uploads that own a
                     // fresh placeholder (idempotency precedence): an
                     // already-complete path returned `created: false`

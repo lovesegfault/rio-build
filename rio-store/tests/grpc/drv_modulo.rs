@@ -326,7 +326,7 @@ fn ia_claims_token(deriver: &str, outputs: Vec<String>) -> String {
     HmacSigner::from_key(TEST_KEY.to_vec()).sign(&claims)
 }
 
-// r[verify store.put.ia-deriver-proof+2]
+// r[verify store.put.ia-deriver-proof+3]
 /// Row corruption is an INTERNAL error, never an authorization verdict:
 /// a `status='complete'` deriver `.drv` whose inline NAR does not parse
 /// (text-CA-gated at ingestion, so this is row corruption) must surface
@@ -379,7 +379,7 @@ async fn corrupt_inline_drv_nar_yields_internal_not_permission_denied() -> TestR
     Ok(())
 }
 
-// r[verify store.put.ia-deriver-proof+2]
+// r[verify store.put.ia-deriver-proof+3]
 /// Database failure during the proof lookup is an INTERNAL error, never
 /// `PERMISSION_DENIED`: with the cache table dropped, the proof's own
 /// SELECT fails — pre-fix the `.ok()??` fold reported "deriver closure
@@ -405,4 +405,326 @@ async fn proof_db_error_yields_internal_not_permission_denied() -> TestResult {
         "infrastructure failure is INTERNAL, not an authorization verdict: {err:?}"
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// C1c3 (merged_bug_002 DEPLOY-BLOCKER + bug_007): budgeted monotone walk
+// ---------------------------------------------------------------------------
+
+mod proof_walk {
+    use super::*;
+    use rio_nix::derivation::{Derivation, input_addressed_output_paths};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use rio_store::test_helpers::{PROOF_WALK_WORK_MAX_FOR_TESTS, proof_walk_for_tests};
+    use sha2::{Digest as _, Sha256};
+    use std::collections::HashMap;
+
+    /// Mint a VALID static-IA `.drv` (declared == derived out path)
+    /// whose inputs are previously-minted nodes. Returns the text-CA
+    /// drv path; the text + parsed drv land in `minted`.
+    fn mint_node(
+        tag: &str,
+        inputs: &[String],
+        minted: &mut HashMap<String, (String, Derivation)>,
+        derive_cache: &mut HashMap<String, [u8; 32]>,
+    ) -> String {
+        let inputs_aterm: String = inputs
+            .iter()
+            .map(|p| format!(r#"("{p}",["out"])"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let build = |out: &str| {
+            format!(
+                r#"Derive([("out","{out}","","")],[{inputs_aterm}],[],"x86_64-linux","/bin/sh",["-c","x"],[("name","{tag}"),("out","{out}")])"#
+            )
+        };
+        let masked = Derivation::parse(&build("")).expect("masked parses");
+        let name_only = format!("/nix/store/{}-{tag}.drv", "a".repeat(32));
+        let resolve = |p: &str| -> Option<&Derivation> { minted.get(p).map(|(_, d)| d) };
+        let paths = input_addressed_output_paths(&masked, &name_only, &resolve, derive_cache)
+            .expect("derives");
+        let out = paths["out"].as_str().to_owned();
+        let text = build(&out);
+        let h = NixHash::new(HashAlgo::SHA256, Sha256::digest(text.as_bytes()).to_vec()).unwrap();
+        let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
+        let parsed_refs: Vec<StorePath> =
+            refs.iter().map(|r| StorePath::parse(r).unwrap()).collect();
+        let drv_path = StorePath::make_text(&format!("{tag}.drv"), &h, &parsed_refs)
+            .unwrap()
+            .as_str()
+            .to_owned();
+        let parsed = Derivation::parse(&text).expect("final parses");
+        minted.insert(drv_path.clone(), (text, parsed));
+        drv_path
+    }
+
+    /// Stage a minted `.drv` directly as a complete inline manifest
+    /// (the walk's input contract is DB rows; gRPC ingestion is covered
+    /// by the ingest tests). Does NOT populate the modulo cache.
+    async fn stage_drv_sql(pool: &sqlx::PgPool, path: &str, text: &str) -> anyhow::Result<()> {
+        let key = StorePath::parse(path)?.sha256_digest();
+        let node = rio_nix::nar::NarNode::Regular {
+            executable: false,
+            contents: text.as_bytes().to_vec(),
+        };
+        let mut nar = Vec::new();
+        rio_nix::nar::serialize(&mut nar, &node)?;
+        sqlx::query(
+            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (store_path_hash) DO NOTHING",
+        )
+        .bind(key.as_slice())
+        .bind(path)
+        .bind([0u8; 32].as_slice())
+        .bind(nar.len() as i64)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO manifests (store_path_hash, status, inline_blob) \
+             VALUES ($1, 'complete', $2) ON CONFLICT (store_path_hash) \
+             DO UPDATE SET status = 'complete', inline_blob = $2",
+        )
+        .bind(key.as_slice())
+        .bind(&nar)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn cache_rows(pool: &sqlx::PgPool) -> i64 {
+        sqlx::query_scalar("SELECT count(*)::bigint FROM drv_modulo_cache")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    // r[verify store.put.ia-deriver-proof+3]
+    /// A 300-deep pure chain — 9.4× past the OLD depth bound of 32 that
+    /// rejected the measured real-world class — converges in one cold
+    /// walk with every row persisted.
+    #[tokio::test]
+    async fn deep_chain_300_converges() -> TestResult {
+        let s = StoreSession::new().await?;
+        let mut minted = HashMap::new();
+        let mut dc = HashMap::new();
+        let mut prev: Vec<String> = vec![];
+        let mut last = String::new();
+        for i in 0..300 {
+            last = mint_node(&format!("chain{i}"), &prev, &mut minted, &mut dc);
+            prev = vec![last.clone()];
+        }
+        for (path, (text, _)) in &minted {
+            stage_drv_sql(&s.db.pool, path, text).await?;
+        }
+        let report =
+            proof_walk_for_tests(&s.db.pool, None, &last, PROOF_WALK_WORK_MAX_FOR_TESTS).await?;
+        assert!(report.proven, "chain proves: {report:?}");
+        assert_eq!(cache_rows(&s.db.pool).await, 300, "every row persisted");
+        assert!(
+            report.work_used < 1_000,
+            "ops counted, not free: {}",
+            report.work_used
+        );
+        Ok(())
+    }
+
+    // r[verify store.put.ia-deriver-proof+3]
+    /// THE deploy-blocker merge gate (merged_bug_002): a 2,048-node
+    /// closure at the measured real-world shape class (spine depth
+    /// 2,048 ≥ the measured 236; cross edges for fan) proves in ONE
+    /// cold walk with work_used ≤ cap/2 — structural op counting, no
+    /// wall-clock. Pre-fix, READ_THROUGH_MAX_DEPTH=32 rejected every
+    /// closure of this class outright.
+    #[tokio::test]
+    async fn real_scale_closure_2048_converges_with_headroom() -> TestResult {
+        let s = StoreSession::new().await?;
+        let mut minted = HashMap::new();
+        let mut dc = HashMap::new();
+        let mut paths: Vec<String> = Vec::with_capacity(2048);
+        for i in 0..2048usize {
+            let mut inputs = vec![];
+            if i >= 1 {
+                inputs.push(paths[i - 1].clone());
+            }
+            if i >= 17 {
+                inputs.push(paths[i - 17].clone());
+            }
+            paths.push(mint_node(&format!("rs{i}"), &inputs, &mut minted, &mut dc));
+        }
+        for (path, (text, _)) in &minted {
+            stage_drv_sql(&s.db.pool, path, text).await?;
+        }
+        let target = paths.last().unwrap();
+        let report =
+            proof_walk_for_tests(&s.db.pool, None, target, PROOF_WALK_WORK_MAX_FOR_TESTS).await?;
+        assert!(report.proven, "real-scale closure proves: {report:?}");
+        assert_eq!(cache_rows(&s.db.pool).await, 2048);
+        eprintln!(
+            "real-scale 2048-node walk: work_used = {}",
+            report.work_used
+        );
+        assert!(
+            report.work_used <= PROOF_WALK_WORK_MAX_FOR_TESTS / 2,
+            "headroom gate: work_used {} > cap/2 {}",
+            report.work_used,
+            PROOF_WALK_WORK_MAX_FOR_TESTS / 2
+        );
+        Ok(())
+    }
+
+    // r[verify store.put.ia-deriver-proof+3]
+    /// Over-budget exits persist what they proved, and identical
+    /// retries CONVERGE instead of re-failing forever (the
+    /// merged_bug_002 zero-progress pathology): a 60-leaf star under a
+    /// cap of 30 needs several attempts, each persisting more leaves,
+    /// until the root proves.
+    #[tokio::test]
+    async fn over_budget_persists_monotone_progress() -> TestResult {
+        let s = StoreSession::new().await?;
+        let mut minted = HashMap::new();
+        let mut dc = HashMap::new();
+        let leaves: Vec<String> = (0..60)
+            .map(|i| mint_node(&format!("leaf{i}"), &[], &mut minted, &mut dc))
+            .collect();
+        let root = mint_node("star-root", &leaves, &mut minted, &mut dc);
+        for (path, (text, _)) in &minted {
+            stage_drv_sql(&s.db.pool, path, text).await?;
+        }
+
+        let mut attempts = 0;
+        let mut last_rows = 0i64;
+        loop {
+            attempts += 1;
+            let report = proof_walk_for_tests(&s.db.pool, None, &root, 30).await?;
+            let rows = cache_rows(&s.db.pool).await;
+            if report.proven {
+                break;
+            }
+            assert_eq!(report.reason, Some("over_budget"), "{report:?}");
+            assert!(
+                rows > last_rows,
+                "every over-budget attempt must persist NEW progress \
+                 (attempt {attempts}: {last_rows} -> {rows})"
+            );
+            last_rows = rows;
+            assert!(attempts < 10, "must converge, not livelock");
+        }
+        assert_eq!(cache_rows(&s.db.pool).await, 61);
+        assert!(
+            attempts >= 2,
+            "fixture must actually exercise resumption (got {attempts} attempts)"
+        );
+        Ok(())
+    }
+
+    // r[verify store.put.ia-deriver-proof+3]
+    /// Diamond dedup: A→{B,C}, B→D, C→D — D is fetched and probed ONCE.
+    /// Exact op accounting (1 initial probe + 4 fetches + 2 input
+    /// probes = 7): a regression that re-queues D shows up as a count
+    /// change, not a flake.
+    #[tokio::test]
+    async fn diamond_dedup() -> TestResult {
+        let s = StoreSession::new().await?;
+        let mut minted = HashMap::new();
+        let mut dc = HashMap::new();
+        let d = mint_node("dia-d", &[], &mut minted, &mut dc);
+        let b = mint_node("dia-b", std::slice::from_ref(&d), &mut minted, &mut dc);
+        let c = mint_node("dia-c", std::slice::from_ref(&d), &mut minted, &mut dc);
+        let a = mint_node("dia-a", &[b, c], &mut minted, &mut dc);
+        for (path, (text, _)) in &minted {
+            stage_drv_sql(&s.db.pool, path, text).await?;
+        }
+        let report =
+            proof_walk_for_tests(&s.db.pool, None, &a, PROOF_WALK_WORK_MAX_FOR_TESTS).await?;
+        assert!(report.proven);
+        assert_eq!(
+            report.work_used, 7,
+            "1 initial probe + 4 fetches + 2 input probes; dedup-on-push \
+             means D costs exactly once"
+        );
+        Ok(())
+    }
+
+    // r[verify store.put.ia-deriver-proof+3]
+    /// A chunked `.drv` (≥256 KiB forces FastCDC chunking) is reassembled
+    /// through the chunk cache and proves — chunked storage is no longer
+    /// a verifiability boundary.
+    #[tokio::test]
+    async fn chunked_drv_proof_reassembles() -> TestResult {
+        let (s, backend) = StoreSession::new_chunked().await?;
+        // Big-but-valid .drv: padding via a huge env value.
+        let pad = "p".repeat(400 * 1024);
+        let mut minted = HashMap::new();
+        let mut dc = HashMap::new();
+        // Mint the shape first (small), then re-mint with padding folded
+        // into the env so declared == derived still holds.
+        let build = |out: &str| {
+            format!(
+                r#"Derive([("out","{out}","","")],[],[],"x86_64-linux","/bin/sh",["-c","x"],[("name","chunky"),("out","{out}"),("pad","{pad}")])"#
+            )
+        };
+        let masked = Derivation::parse(&build("")).expect("masked parses");
+        let name_only = format!("/nix/store/{}-chunky.drv", "a".repeat(32));
+        let resolve = |_: &str| -> Option<&Derivation> { None };
+        let paths =
+            input_addressed_output_paths(&masked, &name_only, &resolve, &mut dc).expect("derives");
+        let out = paths["out"].as_str().to_owned();
+        let text = build(&out);
+        let h = NixHash::new(HashAlgo::SHA256, Sha256::digest(text.as_bytes()).to_vec()).unwrap();
+        let drv_path = StorePath::make_text("chunky.drv", &h, &[])
+            .unwrap()
+            .as_str()
+            .to_owned();
+        minted.insert(
+            drv_path.clone(),
+            (text.clone(), Derivation::parse(&text).unwrap()),
+        );
+
+        // Upload via gRPC so the store actually CHUNKS it.
+        let node = rio_nix::nar::NarNode::Regular {
+            executable: false,
+            contents: text.into_bytes(),
+        };
+        let mut nar = Vec::new();
+        rio_nix::nar::serialize(&mut nar, &node)?;
+        let info = make_path_info_for_nar(&drv_path, &nar);
+        let mut client = s.client.clone();
+        assert!(put_path(&mut client, info, nar).await?);
+        // Confirm it really is chunked, then evict the ingest-time cache
+        // row to force the read-through to reassemble.
+        let chunked: bool = sqlx::query_scalar(
+            "SELECT m.inline_blob IS NULL FROM manifests m \
+             JOIN narinfo n USING (store_path_hash) WHERE n.store_path = $1",
+        )
+        .bind(&drv_path)
+        .fetch_one(&s.db.pool)
+        .await?;
+        assert!(chunked, "fixture must exercise the chunked manifest shape");
+        sqlx::query("DELETE FROM drv_modulo_cache")
+            .execute(&s.db.pool)
+            .await?;
+
+        let cache = std::sync::Arc::new(rio_store::cas::ChunkCache::new(std::sync::Arc::clone(
+            &backend,
+        )
+            as std::sync::Arc<dyn ChunkBackend>));
+        let report = proof_walk_for_tests(
+            &s.db.pool,
+            Some(&cache),
+            &drv_path,
+            PROOF_WALK_WORK_MAX_FOR_TESTS,
+        )
+        .await?;
+        assert!(
+            report.proven,
+            "chunked .drv reassembles and proves: {report:?}"
+        );
+        assert!(
+            report.work_used > 2,
+            "chunk fetches are charged: {}",
+            report.work_used
+        );
+        Ok(())
+    }
 }

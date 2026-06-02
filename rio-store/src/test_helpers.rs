@@ -487,3 +487,66 @@ impl ChunkSeed {
         hash
     }
 }
+
+// ---------------------------------------------------------------------------
+// Deriver-proof walk probe (store.put.ia-deriver-proof+3 test seam)
+// ---------------------------------------------------------------------------
+
+/// Structural report from one proof walk, for integration tests that
+/// assert budget semantics (ops counted, monotone persistence) without
+/// reaching into `pub(crate)` internals.
+#[cfg(feature = "server")]
+#[derive(Debug)]
+pub struct ProofWalkReport {
+    /// The walk concluded with a proven row.
+    pub proven: bool,
+    /// Verdict label for absent outcomes
+    /// (`not_resident|unparseable|over_budget|cycle`).
+    pub reason: Option<&'static str>,
+    /// Rows persisted by THIS attempt's monotone exit (over-budget arm
+    /// only; other arms report 0 here — count rows via SQL).
+    pub persisted: usize,
+    /// Work units consumed.
+    pub work_used: usize,
+}
+
+/// Run the deriver-proof walk with an explicit work cap. Production
+/// always uses `PROOF_WALK_WORK_MAX` (re-exported as
+/// [`PROOF_WALK_WORK_MAX_FOR_TESTS`]); tests shrink the cap to exercise
+/// over-budget monotone resumption.
+#[cfg(feature = "server")]
+pub async fn proof_walk_for_tests(
+    pool: &sqlx::PgPool,
+    chunks: Option<&crate::cas::ChunkCache>,
+    drv_path: &str,
+    cap: usize,
+) -> anyhow::Result<ProofWalkReport> {
+    use crate::metadata::drv_modulo::{AbsentReason, ProofOutcome, prove_drv_modulo_with_cap};
+    let (outcome, work_used) = prove_drv_modulo_with_cap(pool, chunks, drv_path, cap).await?;
+    Ok(match outcome {
+        ProofOutcome::Proven(_) => ProofWalkReport {
+            proven: true,
+            reason: None,
+            persisted: 0,
+            work_used,
+        },
+        ProofOutcome::Absent(r) => {
+            let (reason, persisted) = match r {
+                AbsentReason::NotResident { .. } => ("not_resident", 0),
+                AbsentReason::Unparseable { .. } => ("unparseable", 0),
+                AbsentReason::Cycle => ("cycle", 0),
+                AbsentReason::OverBudget { persisted, .. } => ("over_budget", persisted),
+            };
+            ProofWalkReport {
+                proven: false,
+                reason: Some(reason),
+                persisted,
+                work_used,
+            }
+        }
+    })
+}
+
+/// Production work cap, re-exported for scale tests.
+#[cfg(feature = "server")]
+pub const PROOF_WALK_WORK_MAX_FOR_TESTS: usize = crate::metadata::drv_modulo::PROOF_WALK_WORK_MAX;

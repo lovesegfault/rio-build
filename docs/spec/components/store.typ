@@ -353,7 +353,7 @@ the `pending_s3_deletes` table.
     opt out of content verification by omitting its descriptor.
   - *Input-addressed* (`is_ca = false`, not fixed-output-flagged): authorized
     by `expected_outputs` membership (plus
-    #rref("store.put.ia-deriver-proof+2")); a voluntarily attached `fixed:`
+    #rref("store.put.ia-deriver-proof+3")); a voluntarily attached `fixed:`
     descriptor is verified with the same no-modulo-retry semantics as the
     fixed-output class, a non-`fixed:` descriptor on any worker upload is
     rejected, and daemon-era descriptor-less uploads remain membership-only.
@@ -463,17 +463,28 @@ Resolvers in the hash walk are synchronous by design; all I/O happens
 before the walk (cache-row seeding at ingestion; arena pre-fetch at
 proof time).
 
-#r("store.put.ia-deriver-proof+2")[
+#r("store.put.ia-deriver-proof+3")[
   A descriptor-less upload under signed assignment claims that are
   neither content-addressed nor fixed-output (plain input-addressed)
   MUST additionally prove deriver membership against the store's OWN
   bytes: the deriver `.drv` named by the claims (`claims.drv_hash`,
   ingress-bound to its store path) must be store-resident, and the
   claimed path must be among the input-addressed output paths the store
-  derives from its own copy via the modulo cache --- read-through with
-  bounded fetches and depth on a cache miss, fail-closed
-  (`PERMISSION_DENIED`, deriver closure unverifiable) when the closure
-  cannot be completed. Derivers whose own output paths are not
+  derives from its own copy via the modulo cache. On a cache miss the
+  store MUST complete the chain itself with a budgeted, MONOTONE
+  read-through walk over its own resident bytes: every operation
+  (cache probe, `.drv` fetch, chunk reassembly) charges one typed work
+  budget; every exit --- including budget exhaustion --- first persists
+  every row whose input closure completed, so retries resume from
+  durable progress rather than re-deriving (or forever re-failing) the
+  same prefix; budget exhaustion is `RESOURCE_EXHAUSTED` (retriable,
+  with the persisted-row count named), never an authorization verdict.
+  Residency is judged on the store's own manifests regardless of
+  storage form (inline or chunked) and regardless of ingestion order.
+  Closure verdicts are typed and fail-closed (`PERMISSION_DENIED`
+  naming the reason: a non-resident `.drv`, unusable resident bytes, or
+  cyclic input metadata); infrastructure failures are `INTERNAL` and
+  MUST NOT surface as any closure verdict. Derivers whose own output paths are not
   statically derivable (deferred) are membership-only. The scheduler's
   service token MUST NOT bypass PutPath or PutPathBatch (probe rights
   only); the gate applies to both upload RPCs per output. Idempotency

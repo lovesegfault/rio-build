@@ -104,6 +104,16 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         "rio_store_check_available_duration_seconds",
         SUBSTITUTE_DURATION_BUCKETS,
     ),
+    (
+        // Work UNITS (not seconds): cached fast path = 1; the measured
+        // 1,963-drv real-world closure ≈ 3.9k cold; cap 16,384. Buckets
+        // resolve "warm vs cold-walk" and "approaching the cap"
+        // (PROOF_WALK_WORK_MAX sizing note in metadata/drv_modulo.rs).
+        "rio_store_ia_proof_work_units",
+        &[
+            1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 2048.0, 4096.0, 8192.0, 12288.0, 16384.0,
+        ],
+    ),
 ];
 
 /// Registers prometheus metric descriptions. The help strings here are
@@ -129,12 +139,22 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_ia_proof_total",
         "IA deriver-proof gate outcomes on descriptor-less input-addressed \
-         uploads (store.put.ia-deriver-proof+2), labeled by result: ok | \
+         uploads (store.put.ia-deriver-proof+3). Gate-level results: ok | \
          rejected (claimed path is not store-derived from the named \
-         deriver) | computed_on_miss (read-through warmed the modulo \
-         cache) | unverifiable (deriver closure not resident / over \
-         bounds — fail-closed) | deferred_exempt (deriver's own paths \
-         come from realisations; membership-only)"
+         deriver) | deferred_exempt (deriver's own paths come from \
+         realisations; membership-only). Walk-level results: proven | \
+         not_resident (a closure .drv has no complete manifest) | \
+         unparseable (resident but unusable bytes) | cycle (no \
+         derivation order) | over_budget (work cap hit; proven rows \
+         persisted, retry resumes)"
+    );
+    describe_histogram!(
+        "rio_store_ia_proof_work_units",
+        "Work units consumed per deriver-proof walk (cap \
+         PROOF_WALK_WORK_MAX=16384; 1/probe + 1/fetch + 1/chunk). \
+         Sustained approach to the cap means real closures are \
+         outgrowing the budget — raise the const, do not let \
+         RESOURCE_EXHAUSTED retries discover it"
     );
     describe_counter!(
         "rio_store_drv_modulo_cache_total",
