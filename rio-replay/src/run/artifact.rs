@@ -247,7 +247,10 @@ pub(crate) enum SyncPolicy {
     /// the file is part of the campaign's resume substrate. Everything the
     /// resume path reads back MUST carry this policy — a synced-but-not-
     /// restored resume input silently degrades the restored campaign.
-    Synced,
+    Synced {
+        /// Where the file uploads within a sync tick (see [`UploadOrder`]).
+        order: UploadOrder,
+    },
     /// Uploaded by a dynamic directory enumeration in [`sync_state`] but
     /// deliberately NOT restored; the reason documents why the restored
     /// campaign does not need the local copy back.
@@ -256,6 +259,45 @@ pub(crate) enum SyncPolicy {
     /// reschedule is correct.
     LocalOnly { reason: &'static str },
 }
+
+/// Upload position of one [`SyncPolicy::Synced`] file within a sync tick.
+///
+/// This is a manifest column, not a path convention: [`sync_state`]'s sort
+/// and the ordering test both derive the late-upload class from it, so a
+/// new certifying file cannot land outside the class without editing the
+/// table both read. (The previous late class was the syntactic `markers/`
+/// prefix, which is exactly how `collected.json` — a certifier that does
+/// not live under `markers/` — shipped uploading before the journals it
+/// certifies.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadOrder {
+    /// Stage data and journals: uploaded before every certifier in the
+    /// same tick.
+    Data,
+    /// A file whose content vouches for other synced files (a stage
+    /// done-marker; `collected.json`, the processed-batch index over
+    /// results.jsonl and requeues.jsonl): uploaded after EVERY data file
+    /// in the tick. A certifier visible in the store before its data
+    /// would let a crash mid-tick strand a restored campaign trusting a
+    /// claim whose evidence never reached the store — a marker without
+    /// its stage output, or a processed-batch set whose terminal records
+    /// and requeue-journal lines are missing (verdicts silently lost to
+    /// re-execution, consumed retry budgets re-granted by the short
+    /// journal fold). The reverse skew (data newer than the certifier) is
+    /// the tolerated conservative direction: at worst a settled batch is
+    /// re-processed from its own records.
+    Certifier,
+}
+
+/// Manifest shorthand: a synced file that uploads with the data class.
+const SYNCED_DATA: SyncPolicy = SyncPolicy::Synced {
+    order: UploadOrder::Data,
+};
+
+/// Manifest shorthand: a synced file that uploads after every data file.
+const SYNCED_CERTIFIER: SyncPolicy = SyncPolicy::Synced {
+    order: UploadOrder::Certifier,
+};
 
 /// One classification for EVERY file the engine writes (or reads) under
 /// the state dir: the single source of truth the synced/restored set is
@@ -271,28 +313,34 @@ pub(crate) enum SyncPolicy {
 /// batch) is structurally unrepresentable.
 const STATE_DIR_MANIFEST: &[(&str, SyncPolicy)] = &[
     // The campaign identity document doubles as the restore-complete
-    // sentinel; download_state_if_missing writes it last.
-    ("campaign.json", SyncPolicy::Synced),
-    ("progress.json", SyncPolicy::Synced),
+    // sentinel; download_state_if_missing writes it last. On the upload
+    // side it is plain data: a store copy newer than the journals only
+    // re-opens the documented conservative window (resume re-probes).
+    ("campaign.json", SYNCED_DATA),
+    ("progress.json", SYNCED_DATA),
     // The processed-batch dedup set: resume reads it so settled batches
     // are never re-processed (a re-process would re-burn retry budgets
-    // and re-decide jobs against decayed evidence).
-    ("collected.json", SyncPolicy::Synced),
-    ("results.jsonl", SyncPolicy::Synced),
-    ("supply.jsonl", SyncPolicy::Synced),
-    ("dispatch.jsonl", SyncPolicy::Synced),
-    ("batches.jsonl", SyncPolicy::Synced),
+    // and re-decide jobs against decayed evidence). It certifies that
+    // every member batch's terminal records (results.jsonl) and requeue
+    // decisions (requeues.jsonl) are on record — collect_pass_with
+    // appends those first and writes collected.json last — so the upload
+    // order must keep it after the journals it vouches for.
+    ("collected.json", SYNCED_CERTIFIER),
+    ("results.jsonl", SYNCED_DATA),
+    ("supply.jsonl", SYNCED_DATA),
+    ("dispatch.jsonl", SYNCED_DATA),
+    ("batches.jsonl", SYNCED_DATA),
     // The requeue journal: resume folds the retry-budget counters from it
     // (JobLedger::from_journals), so a restored campaign keeps every
     // consumed auto-retry instead of granting fresh budgets.
-    ("requeues.jsonl", SyncPolicy::Synced),
-    ("supply-report.json", SyncPolicy::Synced),
-    ("timed-stats.json", SyncPolicy::Synced),
-    ("report/summary.md", SyncPolicy::Synced),
-    ("report/gate.json", SyncPolicy::Synced),
-    ("markers/plan.done", SyncPolicy::Synced),
-    ("markers/supply.done", SyncPolicy::Synced),
-    ("markers/report.done", SyncPolicy::Synced),
+    ("requeues.jsonl", SYNCED_DATA),
+    ("supply-report.json", SYNCED_DATA),
+    ("timed-stats.json", SYNCED_DATA),
+    ("report/summary.md", SYNCED_DATA),
+    ("report/gate.json", SYNCED_DATA),
+    ("markers/plan.done", SYNCED_CERTIFIER),
+    ("markers/supply.done", SYNCED_CERTIFIER),
+    ("markers/report.done", SYNCED_CERTIFIER),
     (
         "logs/*.log.zst",
         SyncPolicy::UploadOnly {
@@ -337,18 +385,15 @@ const STATE_DIR_MANIFEST: &[(&str, SyncPolicy)] = &[
 /// (so the uploaded campaign prefix carries the complete artifact set);
 /// their upload-only policies are documented in the manifest.
 fn synced_files() -> impl Iterator<Item = &'static str> {
-    STATE_DIR_MANIFEST
-        .iter()
-        .filter_map(|(pattern, policy)| (*policy == SyncPolicy::Synced).then_some(*pattern))
+    STATE_DIR_MANIFEST.iter().filter_map(|(pattern, policy)| {
+        matches!(policy, SyncPolicy::Synced { .. }).then_some(*pattern)
+    })
 }
 
 /// Match one manifest pattern against a state-dir-relative path. Exact
 /// patterns compare equal; a single-`*` pattern matches when the wildcard
 /// covers exactly one slash-free segment (`logs/*.log.zst` matches
-/// `logs/a.log.zst`, never `logs/sub/a.log.zst`). Test-only consumer: the
-/// production sync paths read the derived [`synced_files`] list; per-file
-/// policy lookup exists for the completeness walk.
-#[cfg(test)]
+/// `logs/a.log.zst`, never `logs/sub/a.log.zst`).
 fn pattern_matches(pattern: &str, rel: &str) -> bool {
     match pattern.split_once('*') {
         None => pattern == rel,
@@ -366,8 +411,8 @@ fn pattern_matches(pattern: &str, rel: &str) -> bool {
 
 /// The sync/restore policy for one state-dir-relative path; `None` means
 /// the engine has no classification for it (the completeness walk treats
-/// that as an error).
-#[cfg(test)]
+/// that as an error). Production consumer: [`sync_state`] derives each
+/// upload's ordering class from the policy's [`UploadOrder`] column.
 pub(crate) fn sync_policy(rel: &str) -> Option<SyncPolicy> {
     STATE_DIR_MANIFEST
         .iter()
@@ -460,11 +505,23 @@ pub async fn sync_state(
             }
         }
     }
-    // Upload data files first and `markers/*` last: a stage's done-marker
-    // must never be visible in the store before the data it certifies (a
-    // crash mid-tick would otherwise let a restored campaign trust a marker
-    // whose data never made it to S3).
-    rels.sort_by(|a, b| (a.starts_with("markers/"), a).cmp(&(b.starts_with("markers/"), b)));
+    // Upload data files first and certifiers last, per the manifest's
+    // [`UploadOrder`] column: a certifier (stage done-marker, the
+    // processed-batch index) must never be visible in the store before the
+    // data it vouches for — a crash mid-tick would otherwise let a restored
+    // campaign trust a marker whose stage data never made it to S3, or skip
+    // batches whose terminal records and requeue-journal lines are missing.
+    // Derived from [`sync_policy`] (the same table the restore set and the
+    // ordering test read), never from path shape; the dynamically
+    // enumerated upload-only families have no certifying power and sort
+    // with the data class.
+    let upload_order = |rel: &str| match sync_policy(rel) {
+        Some(SyncPolicy::Synced {
+            order: UploadOrder::Certifier,
+        }) => 1u8,
+        _ => 0u8,
+    };
+    rels.sort_by(|a, b| (upload_order(a), a).cmp(&(upload_order(b), b)));
     let mut uploaded = 0;
     for rel in &rels {
         let path = state.path(rel);
@@ -779,8 +836,21 @@ mod tests {
         }
     }
 
+    /// Certifier-after-data ordering pin, derived from
+    /// [`STATE_DIR_MANIFEST`] itself: the fixture writes EVERY Synced file
+    /// the manifest declares (plus one of each dynamic upload-only
+    /// family), so a new Synced entry joins the test's universe by
+    /// construction, and uploads are classified by the manifest's
+    /// [`UploadOrder`] column — never by path shape. The expected order is
+    /// the manifest's own contract (a certifier vouches for data that must
+    /// already be in the store; see the [`UploadOrder::Certifier`] doc and
+    /// the local write order in `collect_pass_with`, which appends the
+    /// journals first and writes collected.json last). Pins the inversion
+    /// that shipped when collected.json joined the synced set: it sorted
+    /// alphabetically before the results.jsonl/requeues.jsonl it certifies
+    /// because the late class was the syntactic `markers/` prefix.
     #[tokio::test]
-    async fn sync_uploads_data_files_before_markers() {
+    async fn sync_uploads_certifiers_after_every_data_file() {
         let sdir = tempfile::tempdir().unwrap();
         let adir = tempfile::tempdir().unwrap();
         let state = StateDir::new(sdir.path()).unwrap();
@@ -790,35 +860,75 @@ mod tests {
         };
         let mut tracker = SyncTracker::default();
 
-        state
-            .write_json_atomic("campaign.json", &serde_json::json!({"campaignId": "c1"}))
-            .unwrap();
-        state.append_jsonl(StateFile::Results, &rec("a")).unwrap();
+        // Every Synced manifest entry, written from the manifest iteration
+        // itself; the byte content is irrelevant to the ordering.
+        for rel in synced_files() {
+            state.write_bytes(rel, b"x\n").unwrap();
+        }
+        // One member of each dynamic upload-only family the sync
+        // enumerates; they carry no certifying power and sort as data.
         state
             .write_bytes("buckets/match-built.jsonl", b"{}\n")
             .unwrap();
-        state.set_marker("plan").unwrap();
-        state.set_marker("supply").unwrap();
+        state
+            .write_bytes("logs/a.x86_64-linux.log.zst", b"zstd")
+            .unwrap();
 
         let n = sync_state(&state, &store, "replay/campaigns", "c1", &mut tracker)
             .await
             .unwrap();
-        assert_eq!(n, 5, "campaign.json + results + bucket + two markers");
-        let keys = store.puts.lock().unwrap().clone();
-        // A done-marker must never land in the store before the data it
-        // certifies: every marker upload comes after every data upload.
-        let first_marker = keys
-            .iter()
-            .position(|k| k.contains("/markers/"))
-            .expect("markers were uploaded");
-        let last_data = keys
-            .iter()
-            .rposition(|k| !k.contains("/markers/"))
-            .expect("data files were uploaded");
-        assert!(
-            last_data < first_marker,
-            "markers must be uploaded after every data file: {keys:?}"
+        assert_eq!(
+            n,
+            synced_files().count() + 2,
+            "every synced file plus the two dynamic-family files uploaded"
         );
+        let rels: Vec<String> = store
+            .puts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|k| {
+                k.strip_prefix("replay/campaigns/c1/")
+                    .expect("uploads are keyed under the campaign prefix")
+                    .to_string()
+            })
+            .collect();
+        let is_certifier = |rel: &str| {
+            matches!(
+                sync_policy(rel),
+                Some(SyncPolicy::Synced {
+                    order: UploadOrder::Certifier
+                })
+            )
+        };
+        let position = |rel: &str| {
+            rels.iter()
+                .position(|r| r == rel)
+                .unwrap_or_else(|| panic!("{rel} was not uploaded: {rels:?}"))
+        };
+        // The class invariant: every certifier uploads after every
+        // non-certifier in the tick.
+        let last_data = rels
+            .iter()
+            .rposition(|r| !is_certifier(r))
+            .expect("data files were uploaded");
+        let first_certifier = rels
+            .iter()
+            .position(|r| is_certifier(r))
+            .expect("the manifest declares certifiers");
+        assert!(
+            last_data < first_certifier,
+            "certifiers must upload after every data file: {rels:?}"
+        );
+        // The certification edges the manifest documents for
+        // collected.json: the journals whose batch records, terminal
+        // records, and requeue decisions it vouches for.
+        for journal in ["batches.jsonl", "requeues.jsonl", "results.jsonl"] {
+            assert!(
+                position(journal) < position("collected.json"),
+                "collected.json must upload after {journal}: {rels:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1032,6 +1142,89 @@ mod tests {
         );
     }
 
+    /// Rollout fixture for the certifier-last upload fix: a store synced by
+    /// the OLD upload order — collected.json (containing batch 7) PUT, pod
+    /// died before the requeues.jsonl/results.jsonl PUTs — restored by the
+    /// NEW code must load sanely. The torn generation is tolerated in the
+    /// conservative direction (batch 7's members surface as re-offerable
+    /// work and the journal fold under-counts what the dead pod consumed),
+    /// never as a load failure: campaigns mid-flight at rollout carry
+    /// exactly this generation in their stores, and a hard bail would
+    /// strand the campaigns the restore exists to rescue.
+    #[tokio::test]
+    async fn torn_old_order_store_state_restores_and_loads() {
+        use crate::run::ledger::JobLedger;
+        use crate::run::model::RequeueRecord;
+        use crate::run::spec::Knobs;
+        use crate::run::state::latest_per_job;
+        use crate::run::watchdog::Watchdog;
+
+        let adir = tempfile::tempdir().unwrap();
+        let store = LocalDirArtifactStore::new(adir.path());
+        // collected.json@new: batch 7 claimed processed. The journals are
+        // one generation older: results.jsonl has only an unrelated job's
+        // record, requeues.jsonl only an unrelated job's requeue — batch
+        // 7's terminal records and requeue lines never reached the store.
+        store
+            .put_bytes(
+                "replay/campaigns/c1/campaign.json",
+                b"{\"campaignId\":\"c1\"}".to_vec(),
+            )
+            .await
+            .unwrap();
+        store
+            .put_bytes("replay/campaigns/c1/collected.json", b"[3,7]".to_vec())
+            .await
+            .unwrap();
+        let mut results = serde_json::to_vec(&rec("other")).unwrap();
+        results.push(b'\n');
+        store
+            .put_bytes("replay/campaigns/c1/results.jsonl", results)
+            .await
+            .unwrap();
+        let mut requeues = serde_json::to_vec(&RequeueRecord {
+            job: "other".into(),
+            source: "collect".into(),
+            why: "infra".into(),
+            at: "2026-05-26T00:00:00Z".into(),
+        })
+        .unwrap();
+        requeues.push(b'\n');
+        store
+            .put_bytes("replay/campaigns/c1/requeues.jsonl", requeues)
+            .await
+            .unwrap();
+
+        // Pod reschedule: fresh volume, restore, then the resume loads.
+        let sdir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(sdir.path()).unwrap();
+        let restored = download_state_if_missing(&state, &store, "replay/campaigns", "c1")
+            .await
+            .unwrap();
+        assert!(restored);
+        // The processed set parses (batch 7 stays skipped — the
+        // conservative cost of the old order is its members re-executing,
+        // not a wedge), the results stream parses without batch 7's
+        // records, and the ledger fold rebuilds from the short journal
+        // without error.
+        assert_eq!(
+            state.read_json::<Vec<u64>>("collected.json").unwrap(),
+            Some(vec![3, 7])
+        );
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(records.len(), 1);
+        assert!(records.contains_key("other"));
+        let watchdog =
+            std::sync::Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let (ledger, stall_retries) = JobLedger::from_journals(state.clone(), watchdog).unwrap();
+        assert_eq!(ledger.tracker().resubmission_count("other").await, 1);
+        assert_eq!(
+            ledger.tracker().resubmission_count("batch7-member").await,
+            0
+        );
+        assert!(stall_retries.is_empty());
+    }
+
     /// Resume-substrate pin: every file the resume path reads back — the
     /// JSONL streams, the processed-batch set, and the JSON documents the
     /// restored campaign loads — must classify Synced, and the synced set
@@ -1040,9 +1233,11 @@ mod tests {
     #[test]
     fn resume_read_files_are_synced_and_synced_entries_are_exact() {
         for stream in StateFile::ALL {
-            assert_eq!(
-                sync_policy(stream.file_name()),
-                Some(SyncPolicy::Synced),
+            assert!(
+                matches!(
+                    sync_policy(stream.file_name()),
+                    Some(SyncPolicy::Synced { .. })
+                ),
                 "JSONL stream {} must be synced and restored",
                 stream.file_name()
             );
@@ -1054,9 +1249,8 @@ mod tests {
             "supply-report.json",
             "timed-stats.json",
         ] {
-            assert_eq!(
-                sync_policy(doc),
-                Some(SyncPolicy::Synced),
+            assert!(
+                matches!(sync_policy(doc), Some(SyncPolicy::Synced { .. })),
                 "resume-read document {doc} must be synced and restored"
             );
         }
@@ -1071,7 +1265,7 @@ mod tests {
         // Every deliberate exclusion carries its rationale.
         for (pattern, policy) in STATE_DIR_MANIFEST {
             match policy {
-                SyncPolicy::Synced => {}
+                SyncPolicy::Synced { .. } => {}
                 SyncPolicy::UploadOnly { reason } | SyncPolicy::LocalOnly { reason } => {
                     assert!(
                         !reason.trim().is_empty(),
