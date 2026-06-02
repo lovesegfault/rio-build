@@ -1527,6 +1527,16 @@ decision-3 residual; the C5/CE-7 residual row; the trailing-EM closures;
 the admit_pull extraction scope) were NOT part of the 2026-06-01 decision
 and remain standing owner items — carried in the follow-up ledger below.
 
+**Counter-signature record addendum (2026-06-02, follow-up-ledger close-out).**
+Line items 5–8 and the Item I controller-map delta entry were
+counter-signed by the owner on 2026-06-02 (gate label: follow-up-ledger
+close-out); the executor-campaign 1c OA2 landed-form counter-signature was
+additionally collected in the same batch (S-OA2, owner "collect"
+2026-06-02). Signature blocks applied at the closure-evidence decision-3
+provenance row and line-items section, the controller-map Item I delta
+entry, and the controller-map 1c entry; ledger row 8 below is CLOSED
+accordingly. The paragraph above stays as the historical pre-batch record.
+
 ### Final acceptance accounting (the design §8 table, final form)
 
 Per handoff item 5, A5/A6 own this table; each phase's full criteria
@@ -1627,15 +1637,15 @@ this table does not restate their bodies.
 
 | # | Item | Status / pointer |
 |---|---|---|
-| 1 | **Floating-CA stale-reset carrier gap** — the stale-verify reset clears `output_paths`; job assignments carry expected paths `== [""]`; pre-existing Phase B shape, and the walk's stash that papered over it is deleted | Candidate red-first fix outside D′ (D′ follow-up 1; D3-D4 note 7) |
+| 1 | **Floating-CA stale-reset carrier gap** — the stale-verify reset clears `output_paths`; job assignments carry expected paths `== [""]`; pre-existing Phase B shape, and the walk's stash that papered over it is deleted | CLOSED (2026-06-02, this commit): red-first carrier fix landed `1cedf8957` (owner option (a) 2026-06-02: durable `carried_realized_paths` column, migration 082, `stale_reset`-origin-only writes) — realized paths carried across the stale-Completed reset into the stale_reset lane; executor wanted set non-empty for floating-CA; coverage non-vacuity scoped to the empty-expected-slot shape; spec sentence + markers in the same commit |
 | 2 | **FailoverDuo B9 corner** — the predecessor encoding's post-failover stored-union widening violates B9 at the two-builds+failover scope (full alphabet, reproduced; seed `0xffbfc9ac0c85df5b`; transcript in the T-D7.1 commit body and the module scope note). History — production deleted the lossy fallback at D2.3; the corner documents WHY the 062 semantics had to die | CLOSED (2026-06-02, this commit): wired as the permanent seeded expect-violation check `quint-closure-corner-failover-duo-b9` (`mkQuintSimWitnessCheck` gained an optional `--seed`; the check replays the discovery configuration — survivors-restricted alphabet at the FailoverDuo constants, module `closureEvidenceCornerFailoverDuo`; the full-alphabet form's hit rate is below a bounded budget, its status stays the trace-inclusion corollary in the module SCOPE NOTE; red means the predecessor encoding drifted — route to row 3's archive record, never silently delete). The check is the seed-carrier row 3 inherits; retroactive validation of the replacement stands |
 | 3 | **`closureEvidence.qnt` archive** — deliberately NOT archived at this close-out: the survivors core (A14/A15/A22/B9/B10/L3 + 2 kept pins) soaks one integration first; the archive then carries the survivors core forward and the B9 corner with its seed | CLOSED (2026-06-02, this commit): archived IN PLACE under the owner's 2026-06-02 waiver of the post-soak precondition — the file stays at `docs/spec/models/closureEvidence.qnt` as the full predecessor record (header banner records the archival; zero model text deleted, zero checks removed); survivors core + 2 kept pins carried forward unchanged; the B9 corner carried with seed `0xffbfc9ac0c85df5b`, machine-checked via `quint-closure-corner-failover-duo-b9` (row 2); the 15 unwired calibration retirement notes remain valid as-is; pre-prune wiring at D7 commit `94996482b` (identify by subject after rebases) |
 | 4 | **Frozen-contract addendum** — `executor-invariant-map.md`'s frozen pull-protocol contract (:2361–2536) records the materialization PullAssignment kind/`executor_instance` addendum in FINAL form | CLOSED (2026-06-02, this commit): the "Materialization addendum (final, post-D′)" subsection appended to the T-0e.6 contract section — the wire-deltas table, the four semantic rules (BC-1 identity, kind authorization, establishment kind-partition, one-winner arbitration) with record pointers into this map + `sched.materialize.*` / `store.materialize.executor`, and the extends-never-modifies statement (pre-existing rows unchanged) |
-| 5 | **Item I — decision-5 store scaling** | LANDED/INTEGRATED (Items I/S/T integrated 2026-06-02; commissioned owner 2026-06-01): the full scope — backlog gauge `c64ba82e6`, KEDA ScaledObject (three triggers, `open_attempts` re-key) + ComponentScaler CR removal + the vm-substitute-scale decoupling `ebd7def0f`, the controller-map delta entry (controller-invariant-map.md "Item I entry") (harden-store memo §6.2) |
-| 6 | **Item S — store ingest progress/stall hardening** | LANDED/INTEGRATED (Items I/S/T integrated 2026-06-02; commissioned owner 2026-06-01): store-side only as scoped — manifests progress columns `cb98b09eb`, placeholder-heartbeat download progress `84c699e2e`, owner-side stall abort + download-scoped reclaim `26c59ff7d` (harden-store memo §6.2) |
-| 7 | **Item T — conversion visibility & strictness** | Observability half LANDED (Items I/S/T integrated 2026-06-02): the conversion counter + paged alert `RioSchedulerMaterializationConversions` (`17e8de205`) on the intact PD-20/MD-D1 surface; the strictness knob remains trigger-gated — WAITS on alert evidence per harden-store trigger 1 (memo §6.2) |
-| 8 | **Standing owner line items, predecessor map** — closure-evidence Phase-2 counter-signature line items 5–8 (the decision-3 residual; the C5/CE-7 residual row; the trailing-EM closures; the admit_pull extraction scope) | Not in the 2026-06-01 signature set; remain open at the owner |
-| 9 | `setup_with_mock_store_materialization_enabled` alias fold-in (~30 call sites onto `setup_with_mock_store`) | Leisure cleanup (D′ follow-up 3) |
+| 5 | **Item I — decision-5 store scaling** | LANDED/INTEGRATED (Items I/S/T integrated 2026-06-02; commissioned owner 2026-06-01): the full scope — backlog gauge `c64ba82e6`, KEDA ScaledObject (three triggers, `open_attempts` re-key) + ComponentScaler CR removal + the vm-substitute-scale decoupling `ebd7def0f`, the controller-map delta entry (controller-invariant-map.md "Item I entry") (harden-store memo §6.2); CLOSED (2026-06-02, this commit): landed form counter-signed at the item-I landing review (controller map delta entry SIGNED 2026-06-02); lineage re-resolution of the cell's pre-rebase hashes — backlog gauge = `1bd2ecf5c`, CR removal = `c9a9d163e` |
+| 6 | **Item S — store ingest progress/stall hardening** | LANDED/INTEGRATED (Items I/S/T integrated 2026-06-02; commissioned owner 2026-06-01): store-side only as scoped — manifests progress columns `cb98b09eb`, placeholder-heartbeat download progress `84c699e2e`, owner-side stall abort + download-scoped reclaim `26c59ff7d` (harden-store memo §6.2); CLOSED (2026-06-02, this commit): Item S follow-through complete — §6.2 forced-stall VM subtest (tc-netem) landed `954989dd8`; helm values-gated RIO_SUBSTITUTE_STALL_SECS landed `045ddcdd5` (memo §3.1 row 26 helm half) |
+| 7 | **Item T — conversion visibility & strictness** | CLOSED (2026-06-02, this commit): observability half landed earlier — conversion counter + paged alert `RioSchedulerMaterializationConversions` (`17e8de205`) on the intact PD-20/MD-D1 surface; strictness knob landed DEFAULT-OFF `9e410d174` per the owner's implement-now ruling (owner bundle 2026-06-02: `conversion_requires_worker_charge` + `conversion_min_park_dwell_secs`, durable `park_began_at` carrier, migration 083); flipping the default remains an operational act gated on `RioSchedulerMaterializationConversions` alert evidence (harden-store trigger 1) |
+| 8 | **Standing owner line items, predecessor map** — closure-evidence Phase-2 counter-signature line items 5–8 (the decision-3 residual; the C5/CE-7 residual row; the trailing-EM closures; the admit_pull extraction scope) | CLOSED (2026-06-02, this commit): counter-signed owner 2026-06-02 — items 5–8 signature blocks applied at the closure-evidence decision-3 provenance row + line-items section; the Item I controller-map delta entry signature collected at landing review |
+| 9 | `setup_with_mock_store_materialization_enabled` alias fold-in (~30 call sites onto `setup_with_mock_store`) | CLOSED (2026-06-02, this commit): alias folded `83a8c12db` — 35 call sites onto `setup_with_mock_store`, alias deleted, test count unchanged |
 | 10 | **Materialization-kind establishment deadline (post-ledger)** — can a claimed materialization attempt sit unestablished forever when its executor dies unreported? | CLOSED-WITH-RATIONALE (2026-06-02, this commit): the answer is NO — see "Post-ledger closure — materialization-kind establishment deadline" below; no code change, no new knob |
 
 ### Post-ledger closure — materialization-kind establishment deadline (2026-06-02)
@@ -1810,3 +1820,10 @@ follow-up ledger above — each row with an owner and a record.
 - `executor-invariant-map.md` — the frozen pull-protocol contract
   (:2361–2536); Phase A's proto extension is a recorded addendum, never a
   mutation (criterion 4).
+
+**Post-ledger follow-up closures (2026-06-02):** materialization-kind
+establishment deadline closed with rationale (`f2b257b89`, ledger row 10);
+Item S forced-stall VM subtest (`954989dd8`); Item S helm stall knob
+(`045ddcdd5`). Counter-signature batch: items 5–8 + the Item I delta entry
+signed 2026-06-02 (see the Counter-signature record note); the
+executor-campaign 1c OA2 landed form signed 2026-06-02 (S-OA2).

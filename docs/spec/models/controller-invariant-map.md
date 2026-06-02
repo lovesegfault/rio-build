@@ -1247,12 +1247,18 @@ T-1c.1), inside this campaign's Model N scope per the OA2 decision
   runbook stay as the operator-facing tripwire and confirmation
   procedure (deployment-time checklist row D3).
 
-Controller-campaign owner signature for this entry: the scope and
-landing slot are exactly what the jointly-signed OA2 DECIDED block
-(2026-05-27) committed; counter-signature of the landed form remains
-to be collected (the 1b counter-signature above was collected at the
-campaign close-out on 2026-05-28; this entry's landed-form review was
-not part of that batch).
+Controller-campaign owner counter-signature for this entry: SIGNED
+2026-06-02 (collected at the follow-up-ledger close-out — the
+program's final signature event; b1d3a877d had deliberately left this
+entry's landed form open; the scope and landing slot remain exactly
+what the jointly-signed OA2 DECIDED block (2026-05-27) committed).
+Checked at signing: the wedge.rs battery and union-composition
+consumption stand as recorded (r[impl ctrl.nodeclaim.wedge-cluster] at
+nodeclaim_pool/mod.rs reconcile_once Dead arm; rule at controller.typ;
+rio_controller_node_wedge_marked_total registered+incremented); the
+coexistence-posture bullet is read as history — the scheduler
+detector's deletion and dead_nodes-always-empty are the signed 1c'/1d
+content, not deviations. No Model J/N assumption is invalidated.
 
 ## Executor-campaign 1c' entry — deletion wave 1 and the Model J/N obligation re-derivation (delta pass)
 
@@ -1642,7 +1648,12 @@ precedent: collected at landing review).
   now empty (the loop idles until a future CR names a target).
 
 Controller-campaign owner counter-signature for this delta entry:
-PENDING — to be collected at the item-I landing review, checking
-against the as-landed tree that decide.rs and the reconciler are
-byte-unchanged, the CRD ships, and the re-scoped rules' annotation
-sites moved with their bumps.
+SIGNED 2026-06-02 (collected at the item-I landing review). Checked at
+signing: decide.rs/mod.rs functionally unchanged — only the r[...]
+bumps (+4 impl/verify in decide.rs, store.admin.get-load+3 in mod.rs);
+the ComponentScaler CRD ships
+(infra/helm/crds/componentscalers.rio.build.yaml) while the chart
+defines no CR (componentscaler.yaml deleted, store-scaledobject.yaml
+present, store.autoscaling.enabled re-key); annotation sites moved
+with their bumps (controller.typ:843/:875, observability.typ:260). No
+Model J/N assumption is invalidated.
