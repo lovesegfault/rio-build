@@ -59,10 +59,25 @@ test "$(csum "$flipped")" != "$base_sum" || {
 
 # Inverse (mirrors helm/19): an input that does NOT land in the TOML must
 # NOT roll the pod — the named template must render only gateway.toml.
-replicas=$TMPDIR/gateway-buildpolicy-replicas.yaml
-render --set gateway.replicas=3 >"$replicas"
-test "$(csum "$replicas")" = "$base_sum" || {
-  echo "FAIL: checksum/gateway-toml changed on gateway.replicas (non-TOML input)" >&2
+# gateway.sessionDrainSecs feeds the Deployment (terminationGracePeriodSeconds
+# and the RIO_SESSION_DRAIN_SECS env) but not the TOML. gateway.replicas
+# would NOT work here: under the chart default autoscaling=on it is rendered
+# nowhere (gateway.yaml emits replicas only with autoscaling off, and the
+# maxReplicas ternaries discard it), so perturbing it leaves the render
+# byte-identical and the equality below holds for ANY checksum definition.
+drain=$TMPDIR/gateway-buildpolicy-drain.yaml
+render --set gateway.sessionDrainSecs=123 >"$drain"
+# Control first: the perturbation must actually change the render — a
+# render no-op perturbation would make this inverse vacuous again.
+if cmp -s "$base" "$drain"; then
+  echo "FAIL: gateway.sessionDrainSecs=123 left the render byte-identical — the inverse" >&2
+  echo "  check below is vacuous; pick a perturbation that lands in the Deployment" >&2
+  exit 1
+fi
+test "$(csum "$drain")" = "$base_sum" || {
+  echo "FAIL: checksum/gateway-toml changed on gateway.sessionDrainSecs (non-TOML input)" >&2
+  echo "  (over-coverage rolls the only SSH build-submission ingress — and its live" >&2
+  echo "   sessions — on every unrelated gateway.* edit)" >&2
   exit 1
 }
 

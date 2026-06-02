@@ -9,7 +9,7 @@
 # bug_022 / helm/16 (controller.yaml had the identical drift). Fix:
 # hash the rendered `rio.schedulerToml` body via a named template.
 
-render_checksum() {
+render() {
   helm template rio . \
     --set karpenter.enabled=true \
     --set karpenter.clusterName=ci \
@@ -17,9 +17,16 @@ render_checksum() {
     --set karpenter.amiTag=test \
     --set global.image.tag=test \
     --set postgresql.enabled=false \
-    "$@" \
-    | yq -N 'select(.kind=="Deployment" and .metadata.name=="rio-scheduler")
-             | .spec.template.metadata.annotations."checksum/scheduler-toml"'
+    "$@"
+}
+
+checksum_of() {
+  yq -N 'select(.kind=="Deployment" and .metadata.name=="rio-scheduler")
+         | .spec.template.metadata.annotations."checksum/scheduler-toml"' "$@"
+}
+
+render_checksum() {
+  render "$@" | checksum_of
 }
 
 base=$(render_checksum)
@@ -49,8 +56,22 @@ done
 # TOML must NOT roll the pod. The named template must be ONLY the TOML —
 # if it accidentally includes a Deployment field, every replica/image
 # bump rolls the scheduler for nothing.
-got=$(render_checksum --set "scheduler.replicas=3")
-test "$got" = "$base" || {
+base_render=$TMPDIR/scheduler-checksum-base.yaml
+repl_render=$TMPDIR/scheduler-checksum-replicas.yaml
+render >"$base_render"
+render --set "scheduler.replicas=3" >"$repl_render"
+# Control first: the perturbation must actually change the render.
+# scheduler.replicas lands today (scheduler.yaml emits a static replica
+# count), but if the scheduler ever grows an autoscaling gate that makes
+# it a render no-op, the equality below would hold for ANY checksum
+# definition — exactly how helm/26's gateway.replicas inverse went
+# vacuous. Fail loudly instead of proving nothing.
+if cmp -s "$base_render" "$repl_render"; then
+  echo "FAIL: scheduler.replicas=3 left the render byte-identical — the inverse" >&2
+  echo "  check below is vacuous; pick a perturbation that lands in the Deployment" >&2
+  exit 1
+fi
+test "$(checksum_of "$repl_render")" = "$base" || {
   echo "FAIL: checksum/scheduler-toml changed on scheduler.replicas (non-TOML input)" >&2
   echo "  (named template must render only scheduler.toml, not Deployment fields)" >&2
   exit 1
