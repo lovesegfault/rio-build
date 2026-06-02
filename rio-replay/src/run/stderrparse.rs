@@ -22,10 +22,15 @@ static BUILD_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// scheduler terminal failure (`rio-gateway/src/handler/build.rs`). For a
 /// derivation that actually executed, the gateway embeds the
 /// `↳ rio-cli logs '<drv>'` hint after a newline INSIDE the same stderr
-/// payload; this regex is line-oriented (default mode: `.` and `$` stop at
-/// a newline), so callers must split each payload into lines before
-/// matching — the build observer does — and the hint line itself never
-/// matches and is ignored.
+/// payload — and in this regex's default (non-multiline) mode `.` stops at
+/// a newline while `$` matches ONLY at the end of the haystack (no `(?m)`
+/// before-a-newline matching, and none of PCRE's before-final-newline
+/// allowance), so against an unsplit multi-line payload the pattern
+/// matches NOTHING and the relayed reason would be silently lost. Callers
+/// must therefore split each payload into lines before matching — the
+/// build observer does — and the hint line itself never matches and is
+/// ignored. The engine semantics are pinned by
+/// `drv_failed_dollar_matches_only_at_end_of_haystack` below.
 static DRV_FAILED_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"derivation '([^']+\.drv)' failed: (.*)$").expect("static regex"));
 
@@ -285,6 +290,30 @@ mod tests {
             p.reasons["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv"],
             "builder failed with exit code 2"
         );
+    }
+
+    /// Pins the regex-engine semantics [`DRV_FAILED_RE`]'s mandatory
+    /// line-splitting rests on: in Rust's regex default (non-multiline)
+    /// mode `$` matches ONLY at the end of the haystack — not before an
+    /// interior newline (that is `(?m)` behavior) and not before a final
+    /// trailing newline either (PCRE's allowance, which this engine does
+    /// not have). An unsplit relay therefore matches NOTHING — the reason
+    /// is dropped outright, not matched up to its first line — which is
+    /// why every caller splits payloads into lines first.
+    #[test]
+    fn drv_failed_dollar_matches_only_at_end_of_haystack() {
+        let drv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv";
+        let line = format!("derivation '{drv}' failed: builder failed with exit code 2");
+        // Unsplit two-line relay (reason line + hint line in one payload):
+        // zero matches, not a first-line match.
+        let unsplit = format!("{line}\n  ↳ rio-cli logs '{drv}'");
+        assert!(DRV_FAILED_RE.captures(&unsplit).is_none());
+        // Newline-TERMINATED single line: still zero matches.
+        assert!(DRV_FAILED_RE.captures(&format!("{line}\n")).is_none());
+        // Positive control: the properly split line matches and captures.
+        let c = DRV_FAILED_RE.captures(&line).expect("split line matches");
+        assert_eq!(&c[1], drv);
+        assert_eq!(&c[2], "builder failed with exit code 2");
     }
 
     #[test]
