@@ -239,8 +239,17 @@ in
   # extend it, or the lint sees a partial tree under nix and fails (or
   # worse, passes vacuously). Run the lint once with `xtask lint` from
   # a clean checkout vs. `nix build .#checks.<system>.xtask-lint` to
-  # confirm parity. The narrow fileset is the point: rebuild only when
-  # a lint's input changes, not on every workspace edit.
+  # confirm parity.
+  #
+  # structured-attr-reads scans every workspace member's (and excluded
+  # fuzz workspace's) src/tests/fuzz_targets `.rs` files — its domain is
+  # derived from the root Cargo.toml member list and the lint hard-fails
+  # on a member with no staged sources, so the whole-tree `.rs` filter
+  # below is load-bearing, not convenience. That widens this check's
+  # rebuild surface to any first-party Rust edit; the check itself is a
+  # seconds-long file walk, so the trade is deliberate (a class-guard
+  # lint with a narrowed domain would simply not see the next divergent
+  # call site).
   #
   # The crate2nix-built xtask's compile-time `CARGO_MANIFEST_DIR` is a
   # store path, so `RIO_REPO_ROOT` points it at the staged fileset
@@ -253,10 +262,10 @@ in
           root = ../.;
           fileset = pkgs.lib.fileset.unions [
             ../rio-migrations/migrations
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-controller/src)
-            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../xtask/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../.)
+            # structured-attr-reads derives its scan domain from the
+            # workspace member list.
+            ../Cargo.toml
             ../infra/helm/rio-build/templates/scheduler.yaml
             # seccomp-allowlist validates both Localhost profiles —
             # rio-builder.json and rio-fetcher.json. Both must be in

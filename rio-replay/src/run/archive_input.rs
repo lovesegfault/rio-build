@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use anyhow::{Context as _, Result};
-use rio_nix::derivation::Derivation;
+use rio_nix::derivation::{Derivation, structured_attrs};
 use serde::{Deserialize, Serialize};
 
 use crate::archive::reader::ReplayArchive;
@@ -143,14 +143,19 @@ fn workload_entry(
         .filter(|output| !output.path().is_empty())
         .map(|output| (output.name().to_string(), output.path().to_string()))
         .collect();
-    // `requiredSystemFeatures` is an ASCII-whitespace-separated env list,
-    // kept in declaration order — the same extraction the recorder applies
-    // when it backfills unit metadata.
-    let required_features: Vec<String> = derivation
-        .env()
-        .get("requiredSystemFeatures")
-        .map(|raw| raw.split_ascii_whitespace().map(String::from).collect())
-        .unwrap_or_default();
+    // `requiredSystemFeatures` through THE canonical structured-payload-
+    // first read (rio_nix::derivation::structured_attrs): for
+    // `__structuredAttrs` derivations the user attrs live solely in the
+    // env's `__json` payload, so a flat-env-only read recovers no features
+    // and the plan-stage exclusion filter structurally cannot fire — the
+    // unit then fails on the cluster and retires as a false regression.
+    // Sharing the one rule (not a parallel reimplementation) is what keeps
+    // this extraction equal to the recorder's units.jsonl backfill and the
+    // gateway's submit-time read by construction.
+    let required_features = structured_attrs::string_list_attr(
+        &structured_attrs::AtermEnv::new(derivation.env()),
+        structured_attrs::REQUIRED_SYSTEM_FEATURES_ATTR,
+    );
     let job = drv_basename_job(drv);
     Ok(ManifestEntry {
         job: job.clone(),
@@ -1377,6 +1382,71 @@ mod tests {
         let lib_b = units.iter().find(|u| u.job.contains("libB")).unwrap();
         assert_eq!(lib_b.system, "aarch64-linux");
         assert!(!lib_b.outputs.is_empty());
+    }
+
+    #[test]
+    fn load_units_recovers_structured_attrs_features_from_the_aterm() {
+        use crate::archive::schema::{Capabilities, RequestRecord, RequestTarget, Substituters};
+        use crate::archive::writer::{ArchiveWriter, ManifestSeed};
+
+        // A `__structuredAttrs` workload unit recovered from its embedded
+        // ATerm. Nix's derivationStrict serializes the user attrs into
+        // env["__json"] ONLY — no flat `requiredSystemFeatures` key exists
+        // — so the recovery must apply the canonical structured-payload-
+        // first read (rio_nix::derivation::structured_attrs, the rule the
+        // recorder's units.jsonl backfill and the gateway's submit-time
+        // extraction share). A flat-only read recovers [] here, and the
+        // plan-stage exclusion filter could then never fire for the unit.
+        let tmp = tempfile::tempdir().unwrap();
+        let drv = format!("/nix/store/{}-vmTest-1.0.drv", fake_hash("sa-vmTest-drv"));
+        let out = format!("/nix/store/{}-vmTest-1.0", fake_hash("sa-vmTest-out"));
+
+        let writer = ArchiveWriter::create(tmp.path()).unwrap();
+        // The `\"`-escaped __json value is the ATerm spelling of the JSON
+        // payload (ATerm strings escape quotes), shaped exactly like
+        // derivationStrict output: user attrs in the payload, only the
+        // bookkeeping keys flat.
+        writer
+            .add_drv(
+                &drv,
+                &format!(
+                    r#"Derive([("out","{out}","","")],[],[],"x86_64-linux","/bin/sh",["-c","true"],[("__json","{{\"name\":\"vmTest-1.0\",\"requiredSystemFeatures\":[\"kvm\",\"nixos-test\"],\"system\":\"x86_64-linux\"}}"),("__structuredAttrs","1"),("out","{out}")])"#
+                ),
+            )
+            .unwrap();
+        writer
+            .write_requests(&[RequestRecord {
+                session: 0,
+                offset_s: 0.0,
+                targets: vec![RequestTarget {
+                    drv: drv.clone(),
+                    outputs: vec!["*".to_string()],
+                }],
+            }])
+            .unwrap();
+        let stamp: jiff::Timestamp = "2026-05-28T00:00:00Z".parse().unwrap();
+        writer
+            .finalize(ManifestSeed {
+                created_at: stamp,
+                from: stamp,
+                to: stamp,
+                capabilities: Capabilities::default(),
+                substituters: Substituters::default(),
+                fat: false,
+                provenance: serde_json::Map::new(),
+            })
+            .unwrap();
+
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let units = load_units(&archive).unwrap();
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].required_features,
+            vec!["kvm".to_string(), "nixos-test".to_string()],
+            "features must come from the structured payload, in declaration order"
+        );
+        assert_eq!(units[0].system, "x86_64-linux");
+        assert_eq!(units[0].outputs.len(), 1);
     }
 
     #[test]

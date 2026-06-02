@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::Context as _;
+use rio_nix::derivation::structured_attrs::{self, StructuredAttrsEnv, string_list_attr};
 use serde::Deserialize;
 
 use crate::archive::schema::{ClosureRecord, ImpureEnv};
@@ -41,8 +42,8 @@ struct ShowDrv {
     /// JSON emits it: lifted to a top-level object (the env then
     /// carries only output placeholder keys, never the user attrs).
     /// Older show output mirrors the raw derivation env instead, where
-    /// the same payload is the `env.__json` string —
-    /// [`structured_payload`] handles that fallback.
+    /// the same payload is the `env.__json` string — the [`ShowEnv`]
+    /// adapter handles that fallback.
     #[serde(default, rename = "structuredAttrs")]
     structured_attrs: Option<serde_json::Value>,
 }
@@ -100,68 +101,53 @@ fn output_path(drv: &ShowDrv, output_name: &str) -> Option<String> {
     }
 }
 
-/// The derivation's `__structuredAttrs` user-attr payload, if any:
-/// the top-level `structuredAttrs` object when the show format lifts
-/// it there (nix ≥ 2.34, format version 4), else parsed out of
-/// `env.__json` (older show output mirrors the raw derivation env,
-/// where `derivationStrict` serializes the user attrs into that one
-/// key — the same encoding the gateway's `StructuredEnv` reads from
-/// ATerm-derived envs). A malformed `__json` string yields `None`,
-/// matching the gateway's tolerance; the payload is machine-written
-/// by nix, so that arm is never expected to fire.
+/// [`StructuredAttrsEnv`] view of one `nix derivation show` entry — the
+/// recorder-side carrier adapter for the canonical structured-attrs read
+/// (`rio_nix::derivation::structured_attrs`). Deliberately dumb: it only
+/// knows where THIS carrier keeps the two sources — the flat env is a
+/// JSON map (string values only count as flat attrs), and the structured
+/// payload is either the top-level `structuredAttrs` object the show
+/// format lifts it to (nix ≥ 2.34, format version 4) or the raw
+/// `env.__json` string of older show output (the same encoding
+/// ATerm-derived envs carry). All precedence lives in the shared rule, so
+/// the recorder can never silently disagree with the gateway or the
+/// replay engine about what one derivation declares.
 ///
-/// Returns an owned value only for the `__json` arm (one parse per
-/// derivation); the lifted form is borrowed.
-fn structured_payload(drv: &ShowDrv) -> Option<std::borrow::Cow<'_, serde_json::Value>> {
-    use std::borrow::Cow;
-    if let Some(value) = &drv.structured_attrs {
-        return Some(Cow::Borrowed(value));
-    }
-    drv.env
-        .get("__json")
-        .and_then(|v| v.as_str())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-        .map(Cow::Owned)
+/// A malformed `__json` string yields no payload (flat fallback) — the
+/// payload is machine-written by nix, so that arm is never expected to
+/// fire. The `__json` arm parses once per view (one per derivation); the
+/// lifted form is borrowed.
+struct ShowEnv<'a> {
+    env: &'a BTreeMap<String, serde_json::Value>,
+    payload: Option<std::borrow::Cow<'a, serde_json::Value>>,
 }
 
-/// Read a string-list derivation attr (`impureEnvVars`,
-/// `requiredSystemFeatures`) the way the gateway's `StructuredEnv`
-/// does — structured payload first, flat env key second — so the
-/// recorder can never silently disagree with the cluster about the
-/// same derivation:
-///
-/// - in the structured payload the attr is a JSON array of strings
-///   (non-string elements are skipped, like the gateway's reader);
-/// - in the flat env (non-structuredAttrs derivations) it is an
-///   ASCII-whitespace-separated name list.
-///
-/// A structured payload whose object lacks the attr falls through to
-/// the flat env, mirroring the gateway's `or_else` chain. Names are
-/// returned in declaration order; callers needing sorted/deduplicated
-/// forms post-process.
-fn string_list_attr(
-    structured: Option<&serde_json::Value>,
-    env: &BTreeMap<String, serde_json::Value>,
-    key: &str,
-) -> Vec<String> {
-    let from_structured = structured.and_then(|payload| {
-        Some(
-            payload
-                .get(key)?
-                .as_array()?
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect::<Vec<String>>(),
-        )
-    });
-    if let Some(names) = from_structured {
-        return names;
-    }
-    match env.get(key) {
-        Some(serde_json::Value::String(raw)) => {
-            raw.split_ascii_whitespace().map(String::from).collect()
+impl<'a> ShowEnv<'a> {
+    fn new(drv: &'a ShowDrv) -> Self {
+        use std::borrow::Cow;
+        let payload = if let Some(value) = &drv.structured_attrs {
+            Some(Cow::Borrowed(value))
+        } else {
+            drv.env
+                .get("__json")
+                .and_then(|v| v.as_str())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .map(Cow::Owned)
+        };
+        Self {
+            env: &drv.env,
+            payload,
         }
-        _ => Vec::new(),
+    }
+}
+
+impl StructuredAttrsEnv for ShowEnv<'_> {
+    fn flat(&self, key: &str) -> Option<&str> {
+        self.env.get(key).and_then(|value| value.as_str())
+    }
+
+    fn structured_payload(&self) -> Option<&serde_json::Value> {
+        self.payload.as_deref()
     }
 }
 
@@ -205,8 +191,9 @@ pub struct ClosureAdjacency {
     /// keyed by the derivation's full `/nix/store/` path.
     pub records: BTreeMap<String, ClosureRecord>,
     /// Derivation store path → the impure environment variable names it
-    /// declares via `impureEnvVars` (read from the structured-attrs
-    /// payload or the flat env, see `string_list_attr`), sorted and
+    /// declares via `impureEnvVars` (read through the canonical
+    /// structured-payload-first rule, see
+    /// `rio_nix::derivation::structured_attrs`), sorted and
     /// deduplicated. Only derivations declaring at least one variable
     /// are present.
     pub impure_env: ImpureEnv,
@@ -275,19 +262,20 @@ pub fn closure_adjacency_from_show_json(show_json: &str) -> anyhow::Result<Closu
             },
         );
 
-        // impureEnvVars / requiredSystemFeatures are read structured-
-        // payload-first ([`string_list_attr`]): for `__structuredAttrs`
-        // derivations the flat env never carries them, so an env-only
-        // read would silently record no impure declarations (the unit
-        // is then built without its recorded impure env and charged as
-        // a false rio regression) and no required features (the
-        // plan-stage exclusion filter cannot fire while the gateway
-        // still extracts the real features at submit time).
-        let structured = structured_payload(drv);
-        let payload = structured.as_deref();
+        // impureEnvVars / requiredSystemFeatures are read through THE
+        // canonical structured-payload-first rule (`string_list_attr` in
+        // rio_nix::derivation::structured_attrs, via the [`ShowEnv`]
+        // adapter): for `__structuredAttrs` derivations the flat env
+        // never carries them, so an env-only read would silently record
+        // no impure declarations (the unit is then built without its
+        // recorded impure env and charged as a false rio regression) and
+        // no required features (the plan-stage exclusion filter cannot
+        // fire while the gateway still extracts the real features at
+        // submit time).
+        let view = ShowEnv::new(drv);
         // impureEnvVars is stored sorted and deduplicated, and only
         // when non-empty.
-        let mut names = string_list_attr(payload, &drv.env, "impureEnvVars");
+        let mut names = string_list_attr(&view, structured_attrs::IMPURE_ENV_VARS_ATTR);
         names.sort();
         names.dedup();
         if !names.is_empty() {
@@ -295,7 +283,7 @@ pub fn closure_adjacency_from_show_json(show_json: &str) -> anyhow::Result<Closu
         }
         // requiredSystemFeatures keeps declaration order (it backfills
         // per-unit metadata, not an archive member of its own).
-        let features = string_list_attr(payload, &drv.env, "requiredSystemFeatures");
+        let features = string_list_attr(&view, structured_attrs::REQUIRED_SYSTEM_FEATURES_ATTR);
         if !features.is_empty() {
             adjacency
                 .required_system_features

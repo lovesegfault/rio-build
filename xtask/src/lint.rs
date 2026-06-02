@@ -53,6 +53,15 @@ pub enum Lint {
     /// engine's scheduler/store gRPC, hanging the run instead of
     /// failing it.
     ReplayCnpPreflight,
+    /// No first-party code reads a structured-attrs string-list user
+    /// attr (`rio_nix::derivation::structured_attrs::
+    /// STRING_LIST_USER_ATTRS`) straight off an env map with a literal
+    /// key — every read routes through the canonical
+    /// `string_list_attr` precedence rule. Catches a new open-coded
+    /// sibling of the structured-attrs-blind flat read (the shape that
+    /// silently dropped `requiredSystemFeatures` for `__structuredAttrs`
+    /// derivations).
+    StructuredAttrReads,
 }
 
 impl Lint {
@@ -71,6 +80,7 @@ impl Lint {
             Lint::SeccompAllowlist,
             Lint::BookkeepingMarker,
             Lint::ReplayCnpPreflight,
+            Lint::StructuredAttrReads,
         ]
     }
 }
@@ -83,6 +93,7 @@ pub fn run(lint: &Lint) -> Result<()> {
         Lint::SeccompAllowlist => seccomp_allowlist(),
         Lint::BookkeepingMarker => bookkeeping_marker(),
         Lint::ReplayCnpPreflight => replay_cnp_preflight(),
+        Lint::StructuredAttrReads => structured_attr_reads(),
     }
 }
 
@@ -1070,6 +1081,151 @@ fn check_cnp_preflight_file(
         }
     }
     site_lines.len()
+}
+
+/// Structured-attrs read guard: no first-party code reads a
+/// `STRING_LIST_USER_ATTRS` key straight off an env map with a literal
+/// key — every read routes through the canonical
+/// `rio_nix::derivation::structured_attrs::string_list_attr` precedence
+/// rule (or a carrier adapter feeding it).
+///
+/// Why: when `__structuredAttrs = true`, Nix serializes the user attrs
+/// into `env["__json"]` ONLY, so a flat `.get("requiredSystemFeatures")`
+/// silently returns None for exactly the derivations that declare
+/// features. The precedence rule was open-coded per consumer (gateway
+/// wire envs, recorder show JSON, replay-engine archive ATerms) and one
+/// copy was structured-attrs-blind — under a prose comment claiming
+/// parity with another site. The shared function ends the divergence;
+/// this lint keeps a new open-coded sibling from re-introducing it. The
+/// historical bug shape is a literal-keyed map read, which is exactly
+/// the needle; the canonical rule and its adapters take the key as a
+/// parameter, so no conforming line matches.
+///
+/// Quantification domain: every `.rs` file under `src/`, `tests/`, and
+/// `fuzz_targets/` of every root-manifest workspace member AND every
+/// `[workspace] exclude` fuzz workspace — derived from the root
+/// Cargo.toml, not hand-listed, so a new crate joins the domain when it
+/// joins the workspace. A member with none of those directories staged
+/// is a hard error (the nix check stages a fileset; a partial tree must
+/// fail loud, not pass vacuously). Needles derive from
+/// `STRING_LIST_USER_ATTRS` itself, so an attr added to the const is
+/// enforced without touching this lint.
+fn structured_attr_reads() -> Result<()> {
+    use rio_nix::derivation::structured_attrs::STRING_LIST_USER_ATTRS;
+
+    // Floor guard: the class currently lists 2 attrs. An empty/shrunken
+    // const means the class definition moved — fail loud instead of
+    // scanning for nothing.
+    ensure!(
+        STRING_LIST_USER_ATTRS.len() >= 2,
+        "rio_nix::derivation::structured_attrs::STRING_LIST_USER_ATTRS has only {} entries \
+         — the class definition moved or shrank; update `structured_attr_reads` in \
+         xtask/src/lint.rs",
+        STRING_LIST_USER_ATTRS.len(),
+    );
+
+    #[derive(serde::Deserialize)]
+    struct RootManifest {
+        workspace: RootWorkspace,
+    }
+    #[derive(serde::Deserialize)]
+    struct RootWorkspace {
+        members: Vec<String>,
+        #[serde(default)]
+        exclude: Vec<String>,
+    }
+
+    let root = repo_root();
+    let manifest_path = root.join("Cargo.toml");
+    let manifest: RootManifest = toml::from_str(
+        &fs::read_to_string(&manifest_path)
+            .with_context(|| format!("reading {}", manifest_path.display()))?,
+    )
+    .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    let crates: Vec<String> = manifest
+        .workspace
+        .members
+        .into_iter()
+        .chain(manifest.workspace.exclude)
+        .collect();
+    ensure!(
+        crates.len() >= 10,
+        "only {} workspace member/exclude dirs found in the root Cargo.toml — the manifest \
+         shape changed; update `structured_attr_reads` in xtask/src/lint.rs",
+        crates.len(),
+    );
+
+    // The two literal-keyed raw-read shapes per attr: a map lookup
+    // (`env.get("attr")`) and a JSON index (`payload["attr"]`).
+    let needles: Vec<String> = STRING_LIST_USER_ATTRS
+        .iter()
+        .flat_map(|key| [format!(".get(\"{key}\")"), format!("[\"{key}\"]")])
+        .collect();
+
+    let mut files = 0usize;
+    let mut violations: Vec<String> = Vec::new();
+    for crate_dir in &crates {
+        let crate_root = root.join(crate_dir);
+        let mut scanned_any = false;
+        for sub in ["src", "tests", "fuzz_targets"] {
+            let dir = crate_root.join(sub);
+            if !dir.is_dir() {
+                continue;
+            }
+            scanned_any = true;
+            walk_rs(&dir, &mut |p| {
+                files += 1;
+                let src =
+                    fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+                let rel = p.strip_prefix(root).unwrap_or(p).display().to_string();
+                for (idx, line) in src.lines().enumerate() {
+                    // Comment lines may cite the hazardous shape when
+                    // explaining it; only code lines count.
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    for needle in &needles {
+                        if line.contains(needle.as_str()) {
+                            violations.push(format!("{rel}:{}: `{needle}`", idx + 1));
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        ensure!(
+            scanned_any,
+            "workspace member {crate_dir} has no src/, tests/, or fuzz_targets/ directory in \
+             the scanned tree — under the nix check this means the xtask-lint fileset \
+             (nix/misc-checks.nix) no longer stages the lint's domain; a partial tree must \
+             fail, not pass vacuously",
+        );
+    }
+    // Floor guard: ~700 first-party .rs files today. Near-zero means the
+    // walk or the member list regressed, not that the code went clean.
+    ensure!(
+        files >= 100,
+        "structured-attr-reads scanned only {files} .rs file(s) — suspiciously few; the \
+         workspace-member walk has regressed",
+    );
+    if !violations.is_empty() {
+        bail!(
+            "{} structured-attrs raw read(s):\n    {}\n  these attrs live in env[\"__json\"] \
+             for __structuredAttrs derivations, so a literal-keyed flat read silently returns \
+             nothing for them; route the read through \
+             rio_nix::derivation::structured_attrs::string_list_attr (via AtermEnv or a \
+             carrier adapter)",
+            violations.len(),
+            violations.join("\n    "),
+        );
+    }
+    tracing::info!(
+        attrs = STRING_LIST_USER_ATTRS.len(),
+        crates = crates.len(),
+        files,
+        "structured-attr-reads ok"
+    );
+    Ok(())
 }
 
 /// Recursive `.rs` walk via `std` (no `walkdir` dep). Follows symlinks

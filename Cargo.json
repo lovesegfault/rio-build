@@ -30217,6 +30217,10 @@
           "packageId": "rio-crds"
         },
         {
+          "name": "rio-nix",
+          "packageId": "rio-nix"
+        },
+        {
           "name": "rio-proto",
           "packageId": "rio-proto"
         },

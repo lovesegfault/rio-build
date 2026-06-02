@@ -14,6 +14,7 @@ use thiserror::Error;
 
 mod aterm;
 mod hash;
+pub mod structured_attrs;
 
 pub use hash::hash_derivation_modulo;
 

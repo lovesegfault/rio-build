@@ -29,6 +29,10 @@ rio-proto.workspace = true
 # anything is applied, so the launch-written JSON can never drift from
 # what `rio-replay run --spec` parses.
 rio-replay.workspace = true
+# `derivation::structured_attrs::STRING_LIST_USER_ATTRS` — the
+# structured-attr-reads lint derives its needles from the class
+# definition, not a hand-kept copy (src/lint.rs).
+rio-nix.workspace = true
 # CLI + config
 clap = { workspace = true, features = ["derive", "env"] }
 clap-verbosity-flag.workspace = true

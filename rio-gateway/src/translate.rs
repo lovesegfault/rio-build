@@ -8,6 +8,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rio_common::tenant::NormalizedName;
+use rio_nix::derivation::structured_attrs::{self, StructuredAttrsEnv as _};
 use rio_nix::derivation::{Derivation, DerivationLike};
 use rio_nix::protocol::derived_path::OutputSpec;
 use rio_nix::store_path::StorePath;
@@ -462,16 +463,6 @@ pub fn validate_dag(
     Ok(())
 }
 
-/// `__structuredAttrs`-aware env lookup, mirroring Nix's
-/// `ParsedDerivation::get{String,Bool,Strings}Attr`.
-///
-/// When a derivation sets `__structuredAttrs = true`, Nix's
-/// `derivationStrict` serializes user attrs into `env["__json"]` ONLY —
-/// they do NOT appear as separate env keys. Direct `env.get("foo")`
-/// returns None, so the ADR-023 sizing hints (and pre-existing
-/// `requiredSystemFeatures` / `__noChroot`) were always None for
-/// structuredAttrs drvs. JSON is checked first, then raw env, matching
-/// upstream semantics.
 /// Clamp for tenant-controlled string attrs (`pname`/`version`/`name`)
 /// that become cache keys / PG columns. 256 chars: longest real nixpkgs
 /// pname is ~90; this leaves headroom for monorepos with path-style
@@ -486,22 +477,36 @@ const MAX_ATTR_LEN: usize = 256;
 /// and 64 is well past any legitimate `requiredSystemFeatures` set.
 const MAX_LIST_LEN: usize = 64;
 
+/// `__structuredAttrs`-aware env lookup, mirroring Nix's
+/// `ParsedDerivation::get{String,Bool,Strings}Attr`.
+///
+/// When a derivation sets `__structuredAttrs = true`, Nix's
+/// `derivationStrict` serializes user attrs into `env["__json"]` ONLY —
+/// they do NOT appear as separate env keys. Direct `env.get("foo")`
+/// returns None, so the ADR-023 sizing hints (and pre-existing
+/// `requiredSystemFeatures` / `__noChroot`) were always None for
+/// structuredAttrs drvs. The payload-first precedence comes from the
+/// shared `rio_nix::derivation::structured_attrs` view: the string-list
+/// arm IS the canonical [`structured_attrs::string_list_attr`] rule (one
+/// implementation with the recorder and the replay engine), and the
+/// gateway-only scalar arms (string/bool, plus the trust-boundary
+/// clamps below) are built on the same two view accessors.
 pub(crate) struct StructuredEnv<'a> {
-    env: &'a std::collections::BTreeMap<String, String>,
-    json: Option<serde_json::Value>,
+    view: structured_attrs::AtermEnv<'a>,
 }
 
 impl<'a> StructuredEnv<'a> {
     pub(crate) fn new(env: &'a std::collections::BTreeMap<String, String>) -> Self {
-        let json = env.get("__json").and_then(|s| serde_json::from_str(s).ok());
-        Self { env, json }
+        Self {
+            view: structured_attrs::AtermEnv::new(env),
+        }
     }
 
     fn string(&self, key: &str) -> Option<String> {
-        self.json
-            .as_ref()
+        self.view
+            .structured_payload()
             .and_then(|j| j.get(key)?.as_str().map(String::from))
-            .or_else(|| self.env.get(key).cloned())
+            .or_else(|| self.view.flat(key).map(String::from))
     }
 
     /// [`Self::string`] with a `MAX_ATTR_LEN`-char clamp. ADR-023
@@ -519,51 +524,34 @@ impl<'a> StructuredEnv<'a> {
     }
 
     pub(crate) fn bool(&self, key: &str) -> Option<bool> {
-        self.json
-            .as_ref()
+        self.view
+            .structured_payload()
             .and_then(|j| j.get(key)?.as_bool())
-            .or_else(|| self.env.get(key).map(|v| v == "1" || v == "true"))
+            .or_else(|| self.view.flat(key).map(|v| v == "1" || v == "true"))
     }
 
-    fn strings(&self, key: &str) -> Option<Vec<String>> {
-        self.json
-            .as_ref()
-            .and_then(|j| {
-                Some(
-                    j.get(key)?
-                        .as_array()?
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect(),
-                )
-            })
-            .or_else(|| {
-                self.env
-                    .get(key)
-                    .map(|s| s.split_whitespace().map(String::from).collect())
-            })
-    }
-
-    /// [`Self::strings`] with a `MAX_LIST_LEN`-element / `MAX_ATTR_LEN`-
-    /// char clamp. ADR-023 §Threat-model: `requiredSystemFeatures` is
-    /// tenant-controlled and feeds the `derivations.required_features`
-    /// PG `text[]` column, `SpawnIntent.required_features` on the wire,
-    /// and the scheduler's in-memory `DerivationState`. Same threat as
+    /// THE canonical string-list read
+    /// ([`structured_attrs::string_list_attr`]) with a `MAX_LIST_LEN`-
+    /// element / `MAX_ATTR_LEN`-char clamp. ADR-023 §Threat-model:
+    /// `requiredSystemFeatures` is tenant-controlled and feeds the
+    /// `derivations.required_features` PG `text[]` column,
+    /// `SpawnIntent.required_features` on the wire, and the scheduler's
+    /// in-memory `DerivationState`. Same threat as
     /// [`Self::string_clamped`] but for a list. See also
     /// `executor_service.rs`'s `MAX_HEARTBEAT_FEATURES` (the
     /// post-translate scheduler-side bound) and `snapshot.rs`'s LRU
     /// debounce-key clamp — both are second-line defenses behind this
-    /// gateway-side bound at the trust boundary.
-    fn strings_clamped(&self, key: &str) -> Option<Vec<String>> {
-        self.strings(key).map(|mut v| {
-            v.truncate(MAX_LIST_LEN);
-            for s in &mut v {
-                if s.chars().count() > MAX_ATTR_LEN {
-                    *s = s.chars().take(MAX_ATTR_LEN).collect();
-                }
+    /// gateway-side bound at the trust boundary. An attr declared
+    /// nowhere is the empty list (the wire field's own default).
+    fn strings_clamped(&self, key: &str) -> Vec<String> {
+        let mut v = structured_attrs::string_list_attr(&self.view, key);
+        v.truncate(MAX_LIST_LEN);
+        for s in &mut v {
+            if s.chars().count() > MAX_ATTR_LEN {
+                *s = s.chars().take(MAX_ATTR_LEN).collect();
             }
-            v
-        })
+        }
+        v
     }
 }
 
@@ -622,9 +610,7 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
         enable_parallel_checking: env.bool("enableParallelChecking"),
         prefer_local_build: env.bool("preferLocalBuild"),
         system: drv.platform().to_string(),
-        required_features: env
-            .strings_clamped("requiredSystemFeatures")
-            .unwrap_or_default(),
+        required_features: env.strings_clamped(structured_attrs::REQUIRED_SYSTEM_FEATURES_ATTR),
         output_names,
         is_fixed_output: drv.is_fixed_output(),
         expected_output_paths,
