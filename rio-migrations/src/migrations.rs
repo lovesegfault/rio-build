@@ -1320,6 +1320,18 @@ pub const M_067: () = ();
 /// GC-stale rows are harmless: every column is a content-derived
 /// immutable fact about bytes that WERE at that text-CA path — a
 /// re-upload of the same path carries identical bytes by construction.
+///
+/// Lifecycle (round-15 C10, bug_102): rows are deliberately PRESERVED
+/// by the per-path GC sweep (`store.put.ia-deriver-proof+3` — proofs
+/// survive deriver GC, so an IA upload remains provable after its
+/// deriver `.drv` ages out) and deleted on exactly two paths: operator
+/// `InvalidatePath` (`store.admin.invalidate-total`, path-scoped,
+/// unconditional) and the GC-tail orphan reclaim (no narinfo for the
+/// deriver AND `created_at` older than `DRV_MODULO_ORPHAN_TTL_DAYS` =
+/// 90 — bounds growth at roughly churn x TTL x ~1 KiB/row). The policy
+/// triple lives in `rio-store/src/metadata/per_path.rs`
+/// (`store.db.per-path-registry`); editing THIS shipped .sql is never
+/// the mechanism.
 pub const M_068: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.

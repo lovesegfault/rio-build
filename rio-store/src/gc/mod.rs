@@ -323,8 +323,84 @@ pub async fn run_gc(
         }))
         .await;
 
+    // --- Orphaned proof-row reclaim (bug_102's growth half) ---
+    // The per-path sweep PRESERVES drv_modulo_cache by design (proofs
+    // survive deriver GC); rows whose deriver narinfo is gone stop
+    // being reachable through normal upload flows once their usefulness
+    // window passes, and without a reclaim the table grows without
+    // bound. Growth arithmetic for the bound (R4: every bound with its
+    // calibration): a row is ~0.4-1 KiB (path ~60 B + two 32 B hashes +
+    // ia_output_paths jsonb, a few entries at ~100 B each + tuple
+    // overhead). At a dev-cluster churn of ~20k GC'd .drvs/day, a 90-day
+    // TTL bounds the orphan set at ~1.8M rows = ~0.7-1.8 GiB steady
+    // state — vs unbounded before. dry_run skips it (the report string
+    // documents nothing about proof rows; an operator preview must not
+    // mutate). Failures log-and-continue: the reclaim is housekeeping,
+    // never a reason to fail the GC that just ran.
+    if !params.dry_run {
+        match reclaim_orphan_drv_modulo(pool, shutdown).await {
+            Ok(reclaimed) if reclaimed > 0 => {
+                info!(reclaimed, "GC: reclaimed orphaned drv_modulo_cache rows");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "GC: drv_modulo orphan reclaim failed (continuing)");
+            }
+        }
+    }
+
     gc_unlock(lock_conn).await;
     Ok(Some(stats))
+}
+
+/// Batched delete of `drv_modulo_cache` rows that have no narinfo (the
+/// deriver `.drv` was GC'd) AND are older than
+/// [`DRV_MODULO_ORPHAN_TTL_DAYS`]. Resident derivers' rows and young
+/// orphans are spared (the continuity guard: a worker mid-flight on an
+/// output of a just-GC'd deriver keeps its proof). Each batch is its
+/// own statement; terminates when a batch deletes fewer rows than the
+/// batch size (and checks the shutdown token between batches).
+///
+/// [`DRV_MODULO_ORPHAN_TTL_DAYS`]: crate::metadata::per_path::DRV_MODULO_ORPHAN_TTL_DAYS
+async fn reclaim_orphan_drv_modulo(
+    pool: &PgPool,
+    shutdown: &rio_common::signal::Token,
+) -> Result<u64, sqlx::Error> {
+    use crate::metadata::per_path::DRV_MODULO_ORPHAN_TTL_DAYS;
+    const BATCH: i64 = 1_000;
+
+    let mut total = 0u64;
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM drv_modulo_cache
+             WHERE drv_path_hash IN (
+               SELECT c.drv_path_hash
+                 FROM drv_modulo_cache c
+                 LEFT JOIN narinfo n ON n.store_path_hash = c.drv_path_hash
+                WHERE n.store_path_hash IS NULL
+                  AND c.created_at < now() - make_interval(days => $1::int)
+                LIMIT $2
+             )
+            "#,
+        )
+        .bind(DRV_MODULO_ORPHAN_TTL_DAYS)
+        .bind(BATCH)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        total += deleted;
+        if deleted < BATCH as u64 {
+            break;
+        }
+    }
+    if total > 0 {
+        metrics::counter!("rio_store_drv_modulo_orphans_reclaimed_total").increment(total);
+    }
+    Ok(total)
 }
 
 /// Defuse the scopeguard, explicitly release [`GC_LOCK_ID`], return
@@ -913,6 +989,76 @@ mod tests {
     /// a free-running race here can't distinguish "P_i committed
     /// before re-check" from "P_i committed after Q_i's DELETE"
     /// (the latter is a legitimate post-GC dangling ref, not a bug).
+    // r[verify store.db.per-path-registry]
+    /// The GC-tail orphan reclaim: orphans older than the TTL are
+    /// deleted; YOUNG orphans and RESIDENT derivers' rows are spared
+    /// (the continuity guard — a worker mid-flight on an output of a
+    /// just-GC'd deriver keeps its proof), and the batch loop
+    /// terminates on a partial batch.
+    #[tokio::test]
+    async fn orphan_drv_modulo_reclaim_spares_young_and_resident() {
+        use crate::metadata::per_path::DRV_MODULO_ORPHAN_TTL_DAYS;
+        use crate::test_helpers::StoreSeed;
+        use rio_test_support::fixtures::test_store_path;
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let seed = |pool: sqlx::PgPool, name: &'static str, age_days: i64| async move {
+            let path = test_store_path(name);
+            let hash: Vec<u8> = {
+                use sha2::Digest as _;
+                sha2::Sha256::digest(path.as_bytes()).to_vec()
+            };
+            sqlx::query(
+                "INSERT INTO drv_modulo_cache \
+                 (drv_path_hash, drv_path, modulo_hash, ia_output_paths, deferred, created_at) \
+                 VALUES ($1, $2, $3, '[]'::jsonb, FALSE, now() - make_interval(days => $4::int))",
+            )
+            .bind(&hash)
+            .bind(&path)
+            .bind([0u8; 32].as_slice())
+            .bind(age_days)
+            .execute(&pool)
+            .await
+            .unwrap();
+            (path, hash)
+        };
+
+        // Old orphan: no narinfo, older than the TTL → reclaimed.
+        let (_old_path, old_hash) = seed(
+            db.pool.clone(),
+            "old-orphan.drv",
+            DRV_MODULO_ORPHAN_TTL_DAYS + 1,
+        )
+        .await;
+        // Young orphan: no narinfo, INSIDE the TTL → spared.
+        let (_young_path, young_hash) = seed(db.pool.clone(), "young-orphan.drv", 1).await;
+        // Resident: narinfo present, ancient → spared regardless of age.
+        let (resident_path, resident_hash) = seed(
+            db.pool.clone(),
+            "resident.drv",
+            DRV_MODULO_ORPHAN_TTL_DAYS * 2,
+        )
+        .await;
+        StoreSeed::raw_path(&resident_path).seed(&db.pool).await;
+
+        let token = rio_common::signal::Token::new();
+        let reclaimed = reclaim_orphan_drv_modulo(&db.pool, &token).await.unwrap();
+        assert_eq!(reclaimed, 1, "exactly the old orphan");
+
+        let survivors: Vec<Vec<u8>> =
+            sqlx::query_scalar("SELECT drv_path_hash FROM drv_modulo_cache ORDER BY drv_path")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        assert!(!survivors.contains(&old_hash), "old orphan reclaimed");
+        assert!(survivors.contains(&young_hash), "young orphan spared");
+        assert!(survivors.contains(&resident_hash), "resident spared");
+
+        // Termination: a second pass has nothing to do.
+        let reclaimed = reclaim_orphan_drv_modulo(&db.pool, &token).await.unwrap();
+        assert_eq!(reclaimed, 0, "idempotent / terminates on empty batch");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn run_gc_concurrent_with_placeholder_inserts_liveness() {
         use crate::test_helpers::{StoreSeed, path_hash};

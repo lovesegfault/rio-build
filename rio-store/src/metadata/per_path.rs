@@ -15,6 +15,16 @@
 //! registry changes where the statements LIVE, not what they say (the
 //! GC hot path is byte-identical).
 
+/// Orphaned `drv_modulo_cache` rows (no narinfo for their `.drv` —
+/// the deriver was GC'd) are reclaimed by the GC tail once they are
+/// older than this TTL. The const lives HERE, with the registry's
+/// `Survive` declaration, so the lifecycle promise and its enforcement
+/// share one source: the sweep preserves proof rows; the TTL bounds
+/// how long an orphan's usefulness window lasts (a worker re-claiming
+/// an output of a long-GC'd deriver after 90 days re-uploads the
+/// closure and re-proves — `heal_if_missing` repopulates).
+pub(crate) const DRV_MODULO_ORPHAN_TTL_DAYS: i64 = 90;
+
 /// One per-path table. Iteration order of [`PerPathTable::ALL`] is the
 /// EXECUTION order of both deletion paths and is load-bearing:
 /// `RealisationDeps` first (its FKs are `ON DELETE RESTRICT` — the
@@ -142,7 +152,8 @@ impl PerPathTable {
             PerPathTable::DrvModuloCache => SweepPolicy::Survive {
                 rationale: "store.put.ia-deriver-proof+3: proofs survive deriver GC \
                             ('previously verified against resident bytes'); growth is \
-                            bounded by the orphan-TTL reclaim, not the sweep",
+                            bounded by the DRV_MODULO_ORPHAN_TTL_DAYS reclaim in the GC \
+                            tail, not the per-path sweep",
             },
             PerPathTable::SchedulerLivePins => SweepPolicy::Survive {
                 rationale: "scheduler-owned liveness — pins PREVENT sweeps (consulted in \

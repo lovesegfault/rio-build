@@ -182,6 +182,7 @@
     "rio_store_chunk_cache_misses_total",
     "rio_store_chunk_dedup_ratio",
     "rio_store_drv_modulo_cache_total",
+    "rio_store_drv_modulo_orphans_reclaimed_total",
     "rio_store_gc_chunk_orphan_swept_total",
     "rio_store_gc_chunk_resurrected_total",
     "rio_store_gc_orphan_reap_failed_total",
@@ -1140,6 +1141,11 @@
         "name": "rio_store_drv_modulo_cache_total",
         "kind": "counter",
         "help": "Store-side derivation modulo-cache population events at .drv ingestion (store.ingest.drv-modulo-cache+2), labeled by event: populated | skipped_missing_input (out-of-order upload; proof-time read-through completes it) | parse_failed (text-CA-valid bytes that are not a derivation) | seed_load_failed (database error loading input rows — an infrastructure failure, NOT an out-of-order upload)"
+      },
+      {
+        "name": "rio_store_drv_modulo_orphans_reclaimed_total",
+        "kind": "counter",
+        "help": "Orphaned drv_modulo_cache rows reclaimed by the GC tail (no narinfo for the deriver AND older than the 90-day orphan TTL; store.db.per-path-registry's Survive{orphan-TTL} declaration). Steady growth here is normal churn; a sudden spike means a mass deriver GC aged out"
       },
       {
         "name": "rio_store_gc_chunk_orphan_swept_total",

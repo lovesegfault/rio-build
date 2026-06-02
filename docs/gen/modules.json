@@ -1447,6 +1447,11 @@
       "doc": "Admin invalidation of a store path's cache metadata."
     },
     {
+      "path": "metadata/per_path.rs",
+      "depth": 1,
+      "doc": "The per-path table lifecycle registry."
+    },
+    {
       "path": "metadata/queries.rs",
       "depth": 1,
       "doc": "Read-side queries: path info lookup, missing-path batch check, NAR"

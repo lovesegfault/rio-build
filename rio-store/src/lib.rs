@@ -167,6 +167,14 @@ pub fn describe_metrics() {
          infrastructure failure, NOT an out-of-order upload)"
     );
     describe_counter!(
+        "rio_store_drv_modulo_orphans_reclaimed_total",
+        "Orphaned drv_modulo_cache rows reclaimed by the GC tail (no \
+         narinfo for the deriver AND older than the 90-day orphan TTL; \
+         store.db.per-path-registry's Survive{orphan-TTL} declaration). \
+         Steady growth here is normal churn; a sudden spike means a \
+         mass deriver GC aged out"
+    );
+    describe_counter!(
         "rio_store_put_path_bytes_total",
         "Bytes accepted via PutPath (nar_size on success)"
     );
