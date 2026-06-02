@@ -1427,6 +1427,11 @@
       "doc": "Prior cluster signing keys (`cluster_key_history` table, migration 027)."
     },
     {
+      "path": "metadata/drv_modulo.rs",
+      "depth": 1,
+      "doc": "Store-side derivation modulo-hash cache (`drv_modulo_cache`, M_068)."
+    },
+    {
       "path": "metadata/inline.rs",
       "depth": 1,
       "doc": "Inline write-ahead: small NARs stored directly in `manifests.inline_blob`."

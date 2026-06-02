@@ -110,6 +110,7 @@ impl StoreServiceImpl {
         // explicit cleanup loop. Separate from `outputs` so it can be
         // pushed while a phase-2/3 loop holds `&mut outputs`.
         let mut placeholder_guards: Vec<PlaceholderGuard> = Vec::new();
+        let mut drv_cache_candidates: Vec<(String, Vec<u8>)> = Vec::new();
         // Count of outputs for which `claim_placeholder` already fired
         // `{result="exists"}` (AlreadyComplete arm). The error metric
         // unit is per-store-path; on bail! we increment by the number
@@ -185,6 +186,14 @@ impl StoreServiceImpl {
 
             info.store_path_hash = accum.store_path_hash.clone();
             let nar_data = std::mem::take(&mut accum.nar_data);
+            // Capture .drv file bytes BEFORE staging consumes the NAR
+            // (store.ingest.drv-modulo-cache); populated only after the
+            // batch commit succeeds.
+            if info.store_path.ends_with(".drv")
+                && let Ok(bytes) = rio_nix::nar::extract_single_file(&nar_data)
+            {
+                drv_cache_candidates.push((info.store_path.as_str().to_string(), bytes));
+            }
             match self.stage_nar_for_batch(info, claim, nar_data).await {
                 Ok(p) => accum.staged = Some(p),
                 Err(e) => bail!(e),
@@ -204,6 +213,15 @@ impl StoreServiceImpl {
 
         for g in placeholder_guards {
             g.defuse();
+        }
+        // r[impl store.ingest.drv-modulo-cache]
+        // Best-effort modulo-cache population for the batch's .drv
+        // outputs, after the one-transaction commit made them durable.
+        // In-batch ordering is upload order; a consumer uploaded before
+        // its inputs in the SAME batch still skips (out-of-order) and
+        // completes via proof-time read-through.
+        for (drv_path, bytes) in drv_cache_candidates {
+            crate::metadata::drv_modulo::populate_on_ingest(&self.pool, &drv_path, &bytes).await;
         }
         Ok(Response::new(PutPathBatchResponse { created }))
     }

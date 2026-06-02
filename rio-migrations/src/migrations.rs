@@ -1285,6 +1285,36 @@ pub const M_066: () = ();
 /// pre-population rows); nothing reads presence as a CA-ness signal.
 pub const M_067: () = ();
 
+/// `068_store_drv_modulo_cache.sql` — store-side derivation modulo-hash
+/// cache: `drv_modulo_cache(drv_path_hash PK, drv_path, modulo_hash,
+/// ia_output_paths JSONB, deferred, created_at)`.
+///
+/// CppNix parity surface for `Store::queryPartialDerivationOutputMap` /
+/// `drvHashes`/`pathDerivationModulo` (derivations.cc:856-874): the
+/// store consults ONLY its own copy of a derivation when answering
+/// which output paths a deriver owns — never a client's claim about
+/// it. Rows are populated best-effort at `.drv` ingestion (PutPath /
+/// PutPathBatch, after the text-CA gate and `persist_nar` succeed;
+/// missing-input or parse failures skip with a counter and never fail
+/// the upload) and completed read-through at proof time (the IA
+/// deriver-proof gate computes-on-miss from the store's own backend
+/// and warms the cache).
+///
+/// Column semantics: `drv_path_hash` = sha256 of the FULL `.drv` store
+/// path string (narinfo keying convention). `modulo_hash` = the
+/// 32-byte `hashDerivationModulo` over the stored bytes.
+/// `ia_output_paths` = the statically derived `{output_name: path}`
+/// map for static input-addressed derivers ONLY; fixed-output and
+/// unknown-path derivers store `'{}'`. `deferred` = the deriver's own
+/// output paths are not statically derivable (floating-CA self or
+/// deferred-IA) — their true paths come from realisations, so the IA
+/// proof gate exempts them (membership-only; documented residual).
+///
+/// GC-stale rows are harmless: every column is a content-derived
+/// immutable fact about bytes that WERE at that text-CA path — a
+/// re-upload of the same path carries identical bytes by construction.
+pub const M_068: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

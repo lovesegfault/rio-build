@@ -127,6 +127,14 @@ pub fn describe_metrics() {
     );
     describe_histogram!("rio_store_put_path_duration_seconds", "PutPath latency");
     describe_counter!(
+        "rio_store_drv_modulo_cache_total",
+        "Store-side derivation modulo-cache population events at .drv \
+         ingestion (store.ingest.drv-modulo-cache), labeled by event: \
+         populated | skipped_missing_input (out-of-order upload; \
+         proof-time read-through completes it) | parse_failed \
+         (text-CA-valid bytes that are not a derivation)"
+    );
+    describe_counter!(
         "rio_store_put_path_bytes_total",
         "Bytes accepted via PutPath (nar_size on success)"
     );

@@ -425,6 +425,38 @@ side (`gw.dag.drv-cache-text-ca`); `store.put.idempotent` is unchanged ---
 an already-complete `.drv` path no-ops, which is harmless because the
 registered copy is content-bound to the path.
 
+#r("store.ingest.drv-modulo-cache")[
+  When a `.drv` upload finalizes, the store MUST best-effort populate a
+  persistent modulo cache from its OWN copy of the bytes: the
+  `hashDerivationModulo` value, the statically derived
+  `{output name → store path}` map for static input-addressed derivers,
+  and a deferred flag for derivers whose own output paths are not
+  statically derivable (floating-CA self or deferred-IA). Input hashes
+  MUST be resolved only from existing cache rows at ingestion time;
+  population MUST never fail the upload (missing inputs and unparseable
+  bytes skip with a counter), and cached values are immutable
+  content-derived facts (idempotent insert, no overwrite).
+]
+This is rio's persistent form of CppNix's `drvHashes` /
+`pathDerivationModulo` (`derivations.cc:856-874`) feeding
+`Store::queryPartialDerivationOutputMap` (`store-api.cc:396-410`): the
+authority for "which output paths does this deriver own" is the store's
+own text-CA-bound bytes (#rref("store.put.drv-text-ca") makes a `.drv`
+path the unique preimage of its bytes), never a client's claim. Rows the
+ingestion pass skips — out-of-order uploads are normal, a consumer's
+inputs may land later or in the same batch behind it — are completed
+read-through at proof time by the IA deriver-proof gate, which computes
+from the store's own backend with bounded fetches and warms the cache.
+Resolvers in the hash walk are synchronous by design; all I/O happens
+before the walk (cache-row seeding at ingestion; arena pre-fetch at
+proof time). GC-stale rows are harmless: every column is a
+content-derived immutable fact about bytes that were at that text-CA
+path, and a re-upload of the path carries identical bytes by
+construction. Cyclic input metadata fails the walk closed --- population
+is skipped and the proof stays unverifiable; no PutPath-level cycle
+rejection is introduced (`store.gc.sweep-cycle-reclaim` keeps owning
+cycle reclamation).
+
 #r("store.put.idempotent")[
   *Idempotency:* If `PutPath` is called for a store path that already has a
   `'complete'` manifest, the call returns success immediately without

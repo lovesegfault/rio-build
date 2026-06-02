@@ -41,6 +41,7 @@ use tracing::warn;
 
 mod chunked;
 mod cluster_key_history;
+pub(crate) mod drv_modulo;
 mod inline;
 pub(crate) mod invalidate;
 mod queries;

@@ -882,9 +882,25 @@ impl StoreServiceImpl {
         tenant_id: Option<uuid::Uuid>,
     ) -> Result<(), Status> {
         self.maybe_sign(tenant_id, &mut info).await;
+        // Capture the .drv file bytes BEFORE persist_nar consumes the
+        // NAR (store.ingest.drv-modulo-cache): the modulo-cache hook
+        // runs only after the persist succeeds, but the bytes are gone
+        // by then. ~KBs for any real .drv; non-derivations skip.
+        let drv_bytes_for_cache: Option<Vec<u8>> = if info.store_path.ends_with(".drv") {
+            rio_nix::nar::extract_single_file(&nar_data).ok()
+        } else {
+            None
+        };
         if let Err(e) = self.persist_nar(&info, claim, nar_data, "PutPath").await {
             self.abort_upload(&info.store_path_hash, claim).await;
             return Err(e);
+        }
+        // r[impl store.ingest.drv-modulo-cache]
+        // Best-effort, AFTER the text-CA gate (verify_drv_text_path ran
+        // before this finalize) and AFTER the NAR is durable — a
+        // population failure never fails the upload.
+        if let Some(bytes) = drv_bytes_for_cache {
+            metadata::drv_modulo::populate_on_ingest(&self.pool, &info.store_path, &bytes).await;
         }
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
         metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);
