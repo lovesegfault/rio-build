@@ -700,10 +700,18 @@ union of wanted paths, plus the Realisations table for floating-CA outputs)
 rather than the build-event stream because the store is what the client will
 actually fetch from — events describe what the scheduler believes happened
 and may be replayed across failover, while store validity at reporting time
-is the contract the success status hands to the client. When the aggregate
-outcome was a failure, a target is promoted to success only on positive
-store evidence for every requested output; outputs that cannot be mapped to
-a queryable store path leave the scheduler's outcome authoritative.
+is the contract the success status hands to the client. When a target's
+verdict is a failure, the refinement honors the scheduler's per-root
+evidence first: a target whose own recorded terminal is a failure keeps it —
+status and error message — no matter what the store holds, because presence
+proves only that the outputs exist (a concurrent batch, another tenant, or
+an earlier substitution may have landed them), not that this target's build
+succeeded. Only a target with no recorded terminal of its own —
+blanket-failed by the DAG-level fallback — is rescued, on positive store
+evidence for every requested output, and the rescue reports `Substituted`
+with `timesBuilt = 0` (outputs present without execution), never an
+executed `Built`. Outputs that cannot be mapped to a queryable store path
+leave the scheduler's outcome authoritative.
 
 `wopBuildDerivation` (the build-hook path) is a single-target reply, so the
 batch-aggregation hazards above do not apply, but the client-crash one does:

@@ -579,10 +579,7 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             // Record a requested root's own terminal (fetched from a
             // substituter, not executed) so multi-root opcodes can
             // report it per root.
-            act.record_terminal(&drv_event.derivation_path, || BuildResult {
-                status: BuildStatus::Substituted,
-                ..Default::default()
-            });
+            act.record_terminal(&drv_event.derivation_path, BuildResult::substituted);
             // Substituting → Cached: close the actSubstitute +
             // actCopyPath pair. Merge-time cache hits never went
             // Substituting → no aids → no-op.
@@ -1490,9 +1487,12 @@ struct TargetOutputsCheck {
     /// used verbatim in the client-facing error message.
     missing: Vec<String>,
     /// Positive evidence that EVERY wanted output resolved to a concrete
-    /// store path the store reports as present. Required to report a target
-    /// successful when the aggregate outcome was a failure — absence of
-    /// evidence (an unverifiable path) is not enough to override it.
+    /// store path the store reports as present. Required to rescue a
+    /// target with no recorded terminal of its own from a blanket
+    /// DAG-level failure (reported as `Substituted` — present, not
+    /// executed) — absence of evidence (an unverifiable path) is not
+    /// enough to override it, and a target's own recorded failure is
+    /// never overridden at all.
     confirmed_present: bool,
     /// Output name → realized store path for floating-CA outputs (from the
     /// Realisations table). Reused to build `builtOutputs` without a second
@@ -1668,7 +1668,7 @@ async fn check_targets_against_store<W: AsyncWrite + Unpin>(
                 ));
             }
         }
-        // Promotion over a failed aggregate needs positive evidence for
+        // Rescuing a blanket-failed target needs positive evidence for
         // every wanted output; an empty wanted set or any unverifiable
         // output leaves the scheduler outcome authoritative.
         check.confirmed_present =
@@ -2117,9 +2117,17 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         // Each target's verdict starts from its own recorded terminal
         // (per-drv status + error message captured from the event stream —
         // see `ProcessedBuild`); targets with no recorded terminal (event
-        // lost, build cancelled mid-flight) fall back to the DAG-level
-        // result. The store check then refines that per-root verdict in
-        // both directions.
+        // lost, build cancelled mid-flight, never attempted) fall back to
+        // the DAG-level result. The store check then refines the verdict —
+        // but only where the scheduler left no per-root evidence: a
+        // success is demoted when the store is missing what the client is
+        // owed (any root), while the failure-side rescue applies solely to
+        // the DAG-level fallback. A root's OWN recorded failure always
+        // stands — store presence proves the outputs exist (a concurrent
+        // batch, another tenant, or an earlier substitution may have
+        // landed them), not that THIS root's build succeeded — and the
+        // rescue reports presence for what it is: Substituted with
+        // timesBuilt = 0, never an executed Built.
         let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
         let mut checks =
             check_targets_against_store(stderr, ctx, &drv_for_idx, &mut hash_cache).await?;
@@ -2135,11 +2143,9 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
             };
             // This target's own recorded terminal; DAG-level result when
             // none was recorded.
-            let per_root = processed
-                .per_drv
-                .get(&demand.drv_path)
-                .cloned()
-                .unwrap_or_else(|| processed.result.clone());
+            let own_terminal = processed.per_drv.get(&demand.drv_path).cloned();
+            let has_own_terminal = own_terminal.is_some();
+            let per_root = own_terminal.unwrap_or_else(|| processed.result.clone());
             if per_root.status.is_success() {
                 if check.missing.is_empty() {
                     // Verified (or unverifiable — defer to the scheduler):
@@ -2168,21 +2174,30 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                         ),
                     ));
                 }
-            } else if check.confirmed_present {
-                // Partial outcome: this target's terminal (or the DAG-level
-                // result it fell back to) is a failure, but every output
-                // THIS target asked for is present in the store — report
-                // the target honestly as built.
+            } else if !has_own_terminal && check.confirmed_present {
+                // Partial outcome: this target was blanket-failed by the
+                // DAG-level result (the scheduler recorded no terminal for
+                // it), but every output THIS target asked for is present
+                // in the store — rescue it from the unrelated failure,
+                // reporting presence honestly: Substituted, timesBuilt = 0.
+                // Presence proves the outputs exist somehow (a concurrent
+                // batch, another tenant, an earlier substitution), not
+                // that this submission executed the build, so the rescue
+                // must never claim an executed Built.
                 results.push(result_with_wanted_outputs(
-                    BuildResult::success(),
+                    BuildResult::substituted(),
                     demand,
                     &check,
                     &ctx.drv_cache,
                     &mut hash_cache,
                 ));
             } else {
-                // Unverified target with a failed per-root terminal: keep
-                // that target's own failure status + error message.
+                // The root's own recorded failure — or an unverified
+                // blanket failure — stands: keep the per-root status +
+                // error message. Store presence never overrides a root's
+                // OWN failed terminal: the scheduler said this exact
+                // derivation's build failed, and that verdict (with its
+                // error message) is the result the client is owed.
                 results.push(per_root);
             }
         }

@@ -64,9 +64,10 @@ fn conf_fail_drv_aterm() -> String {
 
 /// Third input-addressed test derivation: recorded as CACHED (fetched from a
 /// substituter) by the scripted scheduler while a sibling root fails. Its
-/// `Substituted` status is what discriminates per-root reporting from
-/// DAG-result cloning at the STATUS level: a cloned DAG failure would be
-/// store-promoted to `Built`, never `Substituted`.
+/// `Substituted` status pins per-root STATUS fidelity for a success
+/// terminal that is not `Built`: the root's own recorded terminal must be
+/// reported as-is, not demoted by the sibling failure and not reshaped by
+/// the store check.
 const CONF_DRV_CACHED_PATH: &str =
     "/nix/store/33333333333333333333333333333333-conformance-cached.drv";
 const CONF_DRV_CACHED_OUT: &str =
@@ -83,6 +84,45 @@ fn conf_cached_drv_aterm() -> String {
 /// it, but the client never requests it, so it must not influence any
 /// requested root's result row.
 const CONF_DRV_DEP_PATH: &str = "/nix/store/44444444444444444444444444444444-conformance-dep.drv";
+
+/// Fourth input-addressed test derivation: recorded as FAILING by the
+/// scripted scheduler while its wanted output is nonetheless PRESENT in the
+/// store (a concurrent batch or another tenant can land the same outputs
+/// while a keep-going batch stays open). Unlike [`CONF_DRV_FAIL_OUT`] —
+/// whose `e` hash is outside the nixbase32 alphabet, so the store check
+/// classifies it unverifiable and never reaches a presence verdict — this
+/// output parses as a real store path and is seeded, giving the store check
+/// positive presence evidence: the exact precondition under which the
+/// gateway must STILL report the root's own failure.
+const CONF_DRV_FAILPRESENT_PATH: &str =
+    "/nix/store/55555555555555555555555555555555-conformance-failpresent.drv";
+const CONF_DRV_FAILPRESENT_OUT: &str =
+    "/nix/store/gggggggggggggggggggggggggggggggg-conformance-failpresent-out";
+
+/// Minimal valid ATerm body for [`CONF_DRV_FAILPRESENT_PATH`] (one output,
+/// no inputs).
+fn conf_failpresent_drv_aterm() -> String {
+    format!(
+        r#"Derive([("out","{CONF_DRV_FAILPRESENT_OUT}","","")],[],[],"x86_64-linux","/bin/sh",["-c","false"],[("out","{CONF_DRV_FAILPRESENT_OUT}")])"#
+    )
+}
+
+/// Fifth input-addressed test derivation: requested as a root but never
+/// reported on by the scripted scheduler (no per-derivation terminal — the
+/// batch failed before it was attempted), while its wanted output IS
+/// present in the store.
+const CONF_DRV_RESCUED_PATH: &str =
+    "/nix/store/66666666666666666666666666666666-conformance-rescued.drv";
+const CONF_DRV_RESCUED_OUT: &str =
+    "/nix/store/hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh-conformance-rescued-out";
+
+/// Minimal valid ATerm body for [`CONF_DRV_RESCUED_PATH`] (one output, no
+/// inputs).
+fn conf_rescued_drv_aterm() -> String {
+    format!(
+        r#"Derive([("out","{CONF_DRV_RESCUED_OUT}","","")],[],[],"x86_64-linux","/bin/sh",["-c","true"],[("out","{CONF_DRV_RESCUED_OUT}")])"#
+    )
+}
 
 /// Take the session's client-side duplex stream, split it, and run the REAL
 /// client handshake ([`client_handshake`]) against the gateway. Returns the
@@ -342,10 +382,13 @@ async fn conformance_build_paths_with_results() -> anyhow::Result<()> {
 ///   drv event's own message. The DAG-level `BuildFailed` message wraps it
 ///   (`derivation '…' failed: <msg>`), so a clone-fallback satisfies a
 ///   `contains` check but never equality.
-/// - **Status**: the cached root's own terminal is `Substituted`. A cloned
-///   DAG failure on that root would be store-promoted to `Built` (its
-///   output IS present), so anything but `Substituted` here means the
-///   root's recorded terminal was not consulted.
+/// - **Status**: the completed root must come back `Built`. A cloned DAG
+///   failure on that root could at best be store-rescued to `Substituted`
+///   (its output IS present, but presence-completion never claims an
+///   executed `Built`), so `Built` here proves the root's own Completed
+///   terminal was consulted. The cached root's `Substituted` additionally
+///   pins that a non-`Built` success terminal survives per-root reporting
+///   unchanged.
 ///
 /// The event stream also carries a terminal for an interior derivation the
 /// client never requested ([`CONF_DRV_DEP_PATH`]) with a DIFFERENT error
@@ -363,9 +406,10 @@ async fn conformance_build_paths_with_results_multi_root_per_root_status() -> an
         .seed_with_content(CONF_DRV_CACHED_PATH, conf_cached_drv_aterm().as_bytes());
     // The COMPLETED and CACHED roots' outputs are in the store (a worker
     // upload and a substituter fetch both imply presence). The failing
-    // root's output is deliberately absent: the store verification must
-    // leave that root's own failure standing (no promotion without
-    // positive evidence).
+    // root's output is deliberately absent — its own failure must stand
+    // untouched; the presence-side companion (the failing root's outputs
+    // PRESENT, which equally must not disturb its failure) is pinned by
+    // `conformance_build_paths_with_results_presence_never_fabricates_execution`.
     sess.store
         .seed_with_content(CONF_DRV_OUT, b"conformance out");
     sess.store
@@ -479,8 +523,9 @@ async fn conformance_build_paths_with_results_multi_root_per_root_status() -> an
         results[1].result.built_outputs
     );
     // The cached root reports its own terminal at the STATUS level: a
-    // cloned DAG failure would be store-promoted to Built (the output is
-    // present), never Substituted.
+    // non-Built success terminal must survive per-root reporting unchanged
+    // (neither demoted by the sibling failure nor reshaped by the store
+    // check).
     assert_eq!(
         results[2].result.status,
         BuildStatus::Substituted,
@@ -497,6 +542,158 @@ async fn conformance_build_paths_with_results_multi_root_per_root_status() -> an
         results[2].result.error_msg.is_empty(),
         "cached root must not carry an error message, got: {}",
         results[2].result.error_msg
+    );
+
+    finish(&mut sess, rd, wr).await;
+    Ok(())
+}
+
+// r[verify gw.opcode.build-paths-with-results+2]
+// r[verify gw.opcode.build-results-honest+2]
+/// Store presence must never fabricate an executed build. One two-root
+/// batch pins both directions of the failed-batch store refinement, and
+/// both fixtures sit OUTSIDE the pre-fix behavior (which reported `Built`
+/// with `times_built = 1` for each):
+///
+/// - **A root's own failure stands.** The first root's build genuinely
+///   failed — its own `Failed` terminal, with the scheduler's error
+///   message — and its wanted output IS present in the store (landed by a
+///   concurrent batch or another tenant while this batch stayed open).
+///   Presence proves only that the outputs exist, not that THIS root's
+///   build succeeded: the gateway must report the root's own failure,
+///   status and message verbatim, with no built outputs.
+///
+/// - **Presence-completion is `Substituted`, not `Built`.** The second
+///   root has NO recorded terminal of its own (the scheduler never
+///   attempted it before the batch failed) and its wanted output is
+///   present. The blanket DAG failure is refined by positive store
+///   evidence to `Substituted` with `times_built = 0` — outputs present
+///   without execution — never to `Built`/`times_built = 1`, which is an
+///   execution claim. `Substituted` is a success status to stock clients
+///   (`is_success()`), so the rescue keeps its wire effect, and the entry
+///   still carries the enriched `builtOutputs`.
+#[tokio::test]
+async fn conformance_build_paths_with_results_presence_never_fabricates_execution()
+-> anyhow::Result<()> {
+    use rio_proto::types;
+    let mut sess = GatewaySession::new().await?;
+    sess.store.seed_with_content(
+        CONF_DRV_FAILPRESENT_PATH,
+        conf_failpresent_drv_aterm().as_bytes(),
+    );
+    sess.store
+        .seed_with_content(CONF_DRV_RESCUED_PATH, conf_rescued_drv_aterm().as_bytes());
+    // BOTH roots' outputs are present in the store: the failing root's via
+    // a concurrent landing of the same derivation, the unattempted root's
+    // via an earlier substitution. Presence is the trigger under test.
+    sess.store
+        .seed_with_content(CONF_DRV_FAILPRESENT_OUT, b"conformance failpresent out");
+    sess.store
+        .seed_with_content(CONF_DRV_RESCUED_OUT, b"conformance rescued out");
+    let fail_msg = "builder failed with exit code 1";
+    sess.scheduler
+        .set_submit_outcome(SubmitOutcome::scripted(vec![
+            types::BuildEvent {
+                event: Some(types::build_event::Event::Started(types::BuildStarted {
+                    total_derivations: 2,
+                    cached_derivations: 0,
+                })),
+                ..Default::default()
+            },
+            // The first root fails with its OWN terminal; the second root
+            // gets no derivation event at all before the DAG-level failure.
+            types::BuildEvent {
+                event: Some(types::build_event::Event::Derivation(
+                    types::DerivationEvent::failed(
+                        CONF_DRV_FAILPRESENT_PATH.to_string(),
+                        fail_msg.to_string(),
+                        types::BuildResultStatus::PermanentFailure,
+                    ),
+                )),
+                ..Default::default()
+            },
+            types::BuildEvent {
+                event: Some(types::build_event::Event::Failed(types::BuildFailed {
+                    error_message: format!(
+                        "derivation '{CONF_DRV_FAILPRESENT_PATH}' failed: {fail_msg}"
+                    ),
+                    failed_derivation: CONF_DRV_FAILPRESENT_PATH.to_string(),
+                    status: types::BuildResultStatus::PermanentFailure as i32,
+                })),
+                ..Default::default()
+            },
+        ]));
+    let (mut rd, mut wr, version) = handshake_session(&mut sess).await?;
+
+    let failed_path = format!("{CONF_DRV_FAILPRESENT_PATH}!out");
+    let rescued_path = format!("{CONF_DRV_RESCUED_PATH}!out");
+    let results = client_build_paths_with_results(
+        &mut rd,
+        &mut wr,
+        &[failed_path.as_str(), rescued_path.as_str()],
+        version,
+    )
+    .await?;
+
+    assert_eq!(results.len(), 2, "one result per requested root, in order");
+    assert_eq!(results[0].derived_path, failed_path);
+    assert_eq!(results[1].derived_path, rescued_path);
+
+    // Direction 1: the root's own recorded failure is never overridden by
+    // store presence — status, verbatim message, no outputs, no execution
+    // count.
+    assert_eq!(
+        results[0].result.status,
+        BuildStatus::PermanentFailure,
+        "a root with its own Failed terminal must stay failed even though \
+         its outputs are present in the store, got {:?} ({})",
+        results[0].result.status,
+        results[0].result.error_msg
+    );
+    assert!(!results[0].result.status.is_success());
+    assert_eq!(
+        results[0].result.error_msg, fail_msg,
+        "the failed root must keep its own scheduler error message verbatim"
+    );
+    assert_eq!(results[0].result.times_built, 0);
+    assert!(
+        results[0].result.built_outputs.is_empty(),
+        "a failed root must not report built outputs, got: {:?}",
+        results[0].result.built_outputs
+    );
+
+    // Direction 2: a root with no terminal of its own is rescued from the
+    // blanket DAG failure by positive presence evidence — but as
+    // Substituted/times_built=0 (present without execution), never as an
+    // executed Built.
+    assert_eq!(
+        results[1].result.status,
+        BuildStatus::Substituted,
+        "presence-completion must report Substituted, got {:?} ({})",
+        results[1].result.status,
+        results[1].result.error_msg
+    );
+    assert!(
+        results[1].result.status.is_success(),
+        "Substituted must remain a success status to stock clients"
+    );
+    assert_eq!(
+        results[1].result.times_built, 0,
+        "presence-completion must not claim an executed build"
+    );
+    assert!(
+        results[1].result.error_msg.is_empty(),
+        "rescued root must not carry an error message, got: {}",
+        results[1].result.error_msg
+    );
+    assert_eq!(
+        results[1].result.built_outputs.len(),
+        1,
+        "rescued root still carries its enriched builtOutputs"
+    );
+    assert_eq!(
+        results[1].result.built_outputs[0].out_path,
+        CONF_DRV_RESCUED_OUT
     );
 
     finish(&mut sess, rd, wr).await;

@@ -2742,11 +2742,15 @@ async fn test_build_paths_with_results_missing_output_fails_only_that_target() -
 }
 
 // r[verify gw.opcode.build-results-honest+2]
-/// Partial outcome, the other direction: the aggregate build FAILS, but
-/// target A's wanted output is present in the store. A must report success;
+/// Partial outcome, the other direction: the aggregate build FAILS with no
+/// per-derivation terminal for either target, but target A's wanted output
+/// is present in the store. A is rescued from the blanket failure — as
+/// `Substituted` with `timesBuilt = 0` on the wire (outputs present without
+/// execution; presence evidence never fabricates an executed `Built`) — and
 /// B keeps the mapped failure status + message.
 #[tokio::test]
-async fn test_build_paths_with_results_failure_keeps_verified_target_built() -> anyhow::Result<()> {
+async fn test_build_paths_with_results_failure_rescues_verified_target_as_substituted()
+-> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
         ev(build_event::Event::Started(types::BuildStarted {
@@ -2782,8 +2786,14 @@ async fn test_build_paths_with_results_failure_keeps_verified_target_built() -> 
     let (_, result_a) = read_keyed_result(&mut h.stream).await?;
     assert_eq!(
         result_a.status,
-        BuildStatus::Built,
-        "A's wanted output is in the store — the unrelated batch failure must not mask it: {result_a:?}"
+        BuildStatus::Substituted,
+        "A's wanted output is in the store — the unrelated batch failure must \
+         not mask it, and presence-completion reports Substituted, not an \
+         executed Built: {result_a:?}"
+    );
+    assert_eq!(
+        result_a.times_built, 0,
+        "presence-completion must not claim an execution: {result_a:?}"
     );
     assert!(result_a.error_msg.is_empty(), "{result_a:?}");
     assert_eq!(
