@@ -36,9 +36,9 @@ impl SchedulerDb {
     /// Batch-upsert derivations. Returns a map
     /// `drv_hash -> (derivation_id, resource_floor)`.
     ///
-    /// Array parameters via `UNNEST`: 11 bind params total regardless of
-    /// row count (vs `push_values`' 11×N, which hits PG's 65535-param
-    /// limit at ~5957 rows). `RETURNING drv_hash` because PG doesn't
+    /// Array parameters via `UNNEST`: 10 bind params total regardless of
+    /// row count (vs `push_values`' 10×N, which hits PG's 65535-param
+    /// limit at ~6553 rows). `RETURNING drv_hash` because PG doesn't
     /// guarantee `RETURNING` order matches `UNNEST` input order either.
     ///
     /// `floor_*` columns are returned so merge can hydrate them onto
@@ -54,12 +54,12 @@ impl SchedulerDb {
             return Ok(HashMap::new());
         }
 
-        // Decompose struct-of-rows into row-of-arrays. Eleven parallel
+        // Decompose struct-of-rows into row-of-arrays. Ten parallel
         // Vecs, one per column. This IS a transpose — lives for the
         // duration of one INSERT, cheaper than N roundtrips.
         //
         // Nested-array columns (required_features, expected_output_paths,
-        // output_names, wanted_output_names) can't unnest as text[][] —
+        // output_names) can't unnest as text[][] —
         // PG's multidim arrays are rectangular, but per-row feature
         // lists have variable length. Encode as pg text[] literals
         // ("{a,b,c}") and cast back in the SELECT. sqlx doesn't expose
@@ -74,7 +74,6 @@ impl SchedulerDb {
         let mut output_names = Vec::with_capacity(rows.len());
         let mut is_fixed_output = Vec::with_capacity(rows.len());
         let mut is_ca = Vec::with_capacity(rows.len());
-        let mut wanted_output_names = Vec::with_capacity(rows.len());
         for r in rows {
             drv_hash.push(r.drv_hash.as_str());
             drv_path.push(r.drv_path.as_str());
@@ -86,7 +85,6 @@ impl SchedulerDb {
             output_names.push(encode_pg_text_array(&r.output_names));
             is_fixed_output.push(r.is_fixed_output);
             is_ca.push(r.is_ca);
-            wanted_output_names.push(encode_pg_text_array(&r.wanted_output_names));
         }
 
         // ON CONFLICT: update the recovery columns too. For
@@ -97,67 +95,40 @@ impl SchedulerDb {
         // the row in sync with in-mem. status/retry etc stay as-is —
         // those reflect LIVE state, not merge-time snapshot.
         //
-        // wanted_output_names is the exception: it is NOT a function of
-        // drv_hash — it is a function of who CONSUMES the derivation,
-        // and a second build may want a different output subset.
-        // Overwrite would let build B's narrower {out} clobber build
-        // A's {out,dev} and un-want an output a still-live build needs.
-        // It is therefore UNIONED on conflict, with empty saturating to
-        // empty: '{}' is the "all declared outputs wanted" sentinel, so
-        // all ∪ X = all (mirrors `DerivationState::union_wanted`). The
-        // stored union only ever grows for a given drv_hash; it is the
-        // persistence/recovery fallback — classification reads the live
-        // effective set (`effective_wanted`, in-memory per-build
-        // contributions) and only falls back to this column.
+        // Per-build wanted-output interest is NOT a derivations column:
+        // it lives in the `build_wanted_outputs` relation
+        // (`record_wanted_in_tx`, written by the same merge
+        // transaction), keyed by (build, derivation) — a per-consumer
+        // fact never belongs on the per-drv row.
         let result: Vec<(String, Uuid, i64, i64, i64)> = sqlx::query_as(
             r#"
             INSERT INTO derivations
                 (drv_hash, drv_path, pname, system, status, required_features,
-                 expected_output_paths, output_names, is_fixed_output, is_ca,
-                 wanted_output_names)
+                 expected_output_paths, output_names, is_fixed_output, is_ca)
             SELECT
                 drv_hash, drv_path, pname, system, status,
                 required_features::text[],
                 expected_output_paths::text[],
                 output_names::text[],
-                is_fixed_output, is_ca,
-                wanted_output_names::text[]
+                is_fixed_output, is_ca
             FROM UNNEST(
                 $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
-                $6::text[], $7::text[], $8::text[], $9::bool[], $10::bool[],
-                $11::text[]
+                $6::text[], $7::text[], $8::text[], $9::bool[], $10::bool[]
             ) AS t(drv_hash, drv_path, pname, system, status,
                    required_features, expected_output_paths, output_names,
-                   is_fixed_output, is_ca, wanted_output_names)
+                   is_fixed_output, is_ca)
             -- is_ca UPDATE is idempotent-by-construction: drv_hash is
             -- deterministic (input-addressed=store path; CA=modular hash
             -- per rio-nix hashDerivationModulo). Same drv_hash → same
             -- .drv content → same outputs[] → same is_ca. The EXCLUDED
             -- value always equals the existing row's value. Kept in the
             -- SET-list for insert-columns parity (UNNEST binds $10).
-            --
-            -- wanted_output_names is NOT idempotent-by-construction (it
-            -- depends on the consumers, not the drv): union-with-empty-
-            -- saturation. '{}' = "all wanted", so all ∪ X = all → '{}'
-            -- if either side is empty; otherwise the sorted distinct
-            -- union. Monotonically growing — never overwrite.
             ON CONFLICT (drv_hash) DO UPDATE SET
                 updated_at = now(),
                 expected_output_paths = EXCLUDED.expected_output_paths,
                 output_names = EXCLUDED.output_names,
                 is_fixed_output = EXCLUDED.is_fixed_output,
-                is_ca = EXCLUDED.is_ca,
-                wanted_output_names = CASE
-                    WHEN cardinality(derivations.wanted_output_names) = 0
-                      OR cardinality(EXCLUDED.wanted_output_names) = 0
-                    THEN '{}'::text[]
-                    ELSE ARRAY(
-                        SELECT DISTINCT unnest(
-                            derivations.wanted_output_names
-                                || EXCLUDED.wanted_output_names
-                        ) ORDER BY 1
-                    )
-                END
+                is_ca = EXCLUDED.is_ca
             RETURNING drv_hash, derivation_id,
                       floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
             "#,
@@ -172,7 +143,6 @@ impl SchedulerDb {
         .bind(&output_names)
         .bind(&is_fixed_output)
         .bind(&is_ca)
-        .bind(&wanted_output_names)
         .fetch_all(&mut *tx)
         .await?;
         Ok(result

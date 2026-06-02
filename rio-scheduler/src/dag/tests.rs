@@ -67,60 +67,12 @@ fn test_merge_dedup() -> anyhow::Result<()> {
 }
 
 // r[verify sched.merge.wanted-outputs+2]
-/// A second build merging an already-known node UNIONs its wanted set
-/// into the existing node's (it must never shrink — build B's `{out}`
-/// must not un-want build A's still-needed `dev`), the empty "all
-/// wanted" sentinel saturates the union, and a rolled-back merge
-/// restores the pre-merge wanted set.
-#[test]
-fn test_merge_unions_wanted_outputs_on_existing_node() -> anyhow::Result<()> {
-    let mut dag = DerivationDag::new();
-    let mut node = make_node("hashW", "x86_64-linux");
-    node.wanted_output_names = vec!["out".into()];
-    dag.merge(Uuid::new_v4(), &[node.clone()], &[], "")?;
-    assert_eq!(dag.nodes["hashW"].wanted_output_names, vec!["out"]);
-
-    // Second build wants a different output → union.
-    node.wanted_output_names = vec!["dev".into()];
-    dag.merge(Uuid::new_v4(), &[node.clone()], &[], "")?;
-    assert_eq!(
-        dag.nodes["hashW"].wanted_output_names,
-        vec!["dev", "out"],
-        "second build's wanted set must UNION into the existing node, not replace it"
-    );
-
-    // Third build wants everything (empty sentinel) → saturates to all.
-    node.wanted_output_names = vec![];
-    dag.merge(Uuid::new_v4(), &[node.clone()], &[], "")?;
-    assert!(
-        dag.nodes["hashW"].wanted_output_names.is_empty(),
-        "all ∪ anything = all (the empty sentinel saturates the union)"
-    );
-
-    // A failed merge (cycle) must restore the pre-merge wanted set —
-    // the rejected build's wanted growth must not stick.
-    let mut dag = DerivationDag::new();
-    let mut a = make_node("hashWA", "x86_64-linux");
-    a.wanted_output_names = vec!["out".into()];
-    dag.merge(Uuid::new_v4(), &[a.clone()], &[], "")?;
-    let mut b = make_node("hashWB", "x86_64-linux");
-    b.wanted_output_names = vec![];
-    a.wanted_output_names = vec!["dev".into()];
-    let cycle = vec![make_edge("hashWA", "hashWB"), make_edge("hashWB", "hashWA")];
-    assert!(dag.merge(Uuid::new_v4(), &[a, b], &cycle, "").is_err());
-    assert_eq!(
-        dag.nodes["hashWA"].wanted_output_names,
-        vec!["out"],
-        "rollback must restore the pre-merge wanted set"
-    );
-    Ok(())
-}
-
-/// Alongside the node-level union, `merge` records WHICH build
-/// contributed WHICH wanted set in `wanted_by_build`, on both the
-/// new-node path and the existing-node path. The per-build entry is the
-/// submission's own set (empty = that build wants ALL declared
-/// outputs), independent of what the union saturates to.
+/// `merge` records WHICH build contributed WHICH wanted set in
+/// `wanted_by_build`, on both the new-node path and the existing-node
+/// path. The per-build entry is the submission's own set (empty = that
+/// build wants ALL declared outputs). The relation row written by the
+/// same merge transaction is the durable counterpart
+/// (db/tests/wanted.rs); this in-memory map is its droppable cache.
 #[test]
 fn test_merge_records_per_build_contribution() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -152,8 +104,6 @@ fn test_merge_records_per_build_contribution() -> anyhow::Result<()> {
         Some(&vec!["out".to_string()]),
         "the first build's contribution must not be overwritten by the second's"
     );
-    // The stored node-level union still saturates exactly as before.
-    assert!(n.wanted_output_names.is_empty());
     Ok(())
 }
 
@@ -225,63 +175,15 @@ fn test_merge_duplicate_drv_in_submission_unions_contribution() -> anyhow::Resul
     Ok(())
 }
 
-/// One submission carrying the SAME drv twice where BOTH occurrences
-/// grow a pre-existing node's non-saturated wanted union: a failed
-/// merge must restore the exact pre-merge wanted set. `wanted_grown`
-/// records the node once per growth — twice here, the second prior
-/// being the already-grown value — so rollback must replay the entries
-/// in reverse for the first-captured (true pre-merge) value to stick.
-/// (The duplicate-drv test above keeps the union saturated via the
-/// empty all-wanted sentinel, which never records a second growth.)
-#[test]
-fn test_merge_rollback_duplicate_drv_restores_wanted_union() -> anyhow::Result<()> {
-    let mut dag = DerivationDag::new();
-    let build_a = Uuid::new_v4();
-    let build_b = Uuid::new_v4();
-
-    // Pre-existing node with a non-saturated wanted set {out}.
-    let mut node = make_node("hashWG", "x86_64-linux");
-    node.wanted_output_names = vec!["out".into()];
-    dag.merge(build_a, &[node.clone()], &[], "")?;
-
-    // build_b's submission carries the drv twice; each occurrence grows
-    // the union ({out} → {dev,out} → {dev,man,out}). The merge then
-    // fails on a cycle between two other nodes.
-    let mut occ1 = node.clone();
-    occ1.wanted_output_names = vec!["dev".into()];
-    let mut occ2 = node.clone();
-    occ2.wanted_output_names = vec!["man".into()];
-    let nodes = vec![
-        occ1,
-        occ2,
-        make_node("hashWGy", "x86_64-linux"),
-        make_node("hashWGz", "x86_64-linux"),
-    ];
-    let cycle = vec![
-        make_edge("hashWGy", "hashWGz"),
-        make_edge("hashWGz", "hashWGy"),
-    ];
-    assert!(dag.merge(build_b, &nodes, &cycle, "").is_err());
-    assert_eq!(
-        dag.nodes["hashWG"].wanted_output_names,
-        vec!["out"],
-        "rollback must restore the true pre-merge wanted set, not the \
-         intermediate union captured by the second occurrence"
-    );
-    Ok(())
-}
-
 /// Duplicate-drv failed merge where the pre-existing node is ALSO
 /// retriable-on-resubmit: occurrence 1 takes the resubmit-reset path
 /// (old node moved aside, fresh replacement inserted with the
-/// carried-over union), occurrence 2 then grows the FRESH node's union
-/// and records a contribution. Rollback restores the old node
-/// wholesale from `removed_retriable`; the `wanted_grown` /
-/// `contributions_recorded` entries describe the discarded replacement
-/// and must NOT be replayed onto the restored node — otherwise the
-/// rejected build's wanted names leak into the stored union and a
-/// stray `wanted_by_build` entry appears for a build that is not in
-/// `interested_builds`.
+/// carried-over contributions), occurrence 2 then mutates the FRESH
+/// node and records a contribution. Rollback restores the old node
+/// wholesale from `removed_retriable`; the `contributions_recorded`
+/// entries describe the discarded replacement and must NOT be replayed
+/// onto the restored node — otherwise a stray `wanted_by_build` entry
+/// appears for a build that is not in `interested_builds`.
 #[test]
 fn test_merge_rollback_duplicate_drv_on_retriable_node_restores_exactly() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -318,12 +220,6 @@ fn test_merge_rollback_duplicate_drv_on_retriable_node_restores_exactly() -> any
     assert!(dag.merge(build_b, &nodes, &cycle, "").is_err());
 
     let n = &dag.nodes["hashRW"];
-    assert_eq!(
-        n.wanted_output_names,
-        vec!["out"],
-        "the wholesale-restored node must keep its pre-merge wanted set; \
-         the rejected merge's union must not leak into the stored fallback"
-    );
     assert!(
         !n.wanted_by_build.contains_key(&build_b),
         "no contribution may appear for the rejected build on the restored \

@@ -1091,20 +1091,10 @@ pub struct DerivationState {
     /// approximation (children's expected_output_paths = parent's
     /// inputs; see `approx_input_closure`).
     pub expected_output_paths: Vec<String>,
-    /// Output NAMES any consumer actually references (∪ over parents'
-    /// inputDrvs sets ∪ the root OutputsSpec). EMPTY = all declared
-    /// outputs wanted. This is the STORED node-level union: it grows
-    /// monotonically via union_wanted(), never shrinks, and is what the
-    /// persistence upsert and recovery carry. Classification consults
-    /// it only as the conservative fallback when [`effective_wanted`]
-    /// cannot resolve a live-build union from [`Self::wanted_by_build`];
-    /// everything else (assignment token, GC pins, prefetch, client
-    /// output report) keeps using expected_output_paths.
-    pub wanted_output_names: Vec<String>,
     /// Per-build wanted-output contributions: for each interested build,
-    /// the `wanted_output_names` of THAT build's submission for this
+    /// the wanted output names of THAT build's submission for this
     /// node. An entry whose value is the EMPTY Vec means that build
-    /// wants ALL declared outputs (same sentinel as the union). A
+    /// wants ALL declared outputs. A
     /// MISSING entry for an interested build means its contribution is
     /// UNKNOWN — [`effective_wanted`]'s conservative-absent arm then
     /// saturates the union to all-declared width (T-D2.3/PD-D5).
@@ -1212,7 +1202,6 @@ impl DerivationState {
             attempt_history: Vec::new(),
             output_paths: Vec::new(),
             expected_output_paths: node.expected_output_paths.clone(),
-            wanted_output_names: node.wanted_output_names.clone(),
             // The submitting build's contribution is recorded by
             // `dag.merge` (the build_id isn't known here).
             wanted_by_build: HashMap::new(),
@@ -1320,14 +1309,12 @@ impl DerivationState {
             attempt_history: Vec::new(),
             output_paths: Vec::new(), // completed rows not loaded
             expected_output_paths: row.expected_output_paths,
-            // Persisted with union-on-conflict (`migrations/062`,
-            // `batch_upsert_derivations`). Pre-migration rows carry the
-            // column DEFAULT '{}' = all declared outputs wanted, so
-            // they recover with the old conservative criterion.
-            wanted_output_names: row.wanted_output_names,
-            // Per-build contributions are not persisted; recovered
-            // interest has unknown contributions (missing entries), so
-            // `effective_wanted` falls back to the union above.
+            // Per-build contributions: rebuilt from the durable
+            // `build_wanted_outputs` relation by the recovery loader
+            // (`load_wanted_for_live_builds`) after construction; a
+            // live build with no relation row saturates
+            // `effective_wanted` to all-declared width (the
+            // conservative-absent arm, T-D2.3/PD-D5).
             wanted_by_build: HashMap::new(),
             db_id: Some(row.derivation_id),
             // Instant fields: conservative defaults.
@@ -1418,7 +1405,6 @@ impl DerivationState {
             attempt_history: Vec::new(),
             output_paths: Vec::new(),
             expected_output_paths: Vec::new(),
-            wanted_output_names: Vec::new(),
             wanted_by_build: HashMap::new(),
             db_id: Some(row.derivation_id),
             ready_at: None,
@@ -1497,14 +1483,6 @@ impl DerivationState {
     pub fn output_paths_probeable(&self) -> bool {
         !self.expected_output_paths.is_empty()
             && self.expected_output_paths.iter().all(|p| !p.is_empty())
-    }
-
-    /// Union a newly-merged consumer's wanted set into this node's.
-    /// Delegates to [`union_wanted_saturating`] — see it for the
-    /// saturation algebra (empty = "all declared outputs wanted",
-    /// `all ∪ X = all`, otherwise sorted deduplicated set union).
-    pub fn union_wanted(&mut self, incoming: &[String]) {
-        union_wanted_saturating(&mut self.wanted_output_names, incoming);
     }
 
     /// The derivation's `name` attribute, as encoded in the `.drv`
@@ -1870,8 +1848,8 @@ pub use rio_common::wanted_outputs::{
 /// interested build with NO `wanted_by_build` entry (the legacy shape:
 /// a build whose contributions predate `build_wanted_outputs`, or whose
 /// rows were purged) contributes `{}` — ALL declared outputs — which
-/// SATURATES the union to maximal width. Never the stored union, never
-/// a vacuous narrow set; divergence from the exact union is strictly in
+/// SATURATES the union to maximal width. Never a narrower
+/// stale snapshot, never a vacuous set; divergence from the exact union is strictly in
 /// the widening direction. The degradation is observable:
 /// [`note_wanted_width_saturated`] (counter + rate-limited warn).
 ///
@@ -2064,18 +2042,12 @@ mod tests {
             "/nix/store/bbbb-glibc-dev".into(),
             "/nix/store/cccc-glibc-debug".into(),
         ];
-        fn wanted_paths(s: &DerivationState) -> Vec<&String> {
-            wanted_subset(
-                &s.output_names,
-                &s.expected_output_paths,
-                &s.wanted_output_names,
-            )
-            .collect()
+        fn wanted_paths<'a>(s: &'a DerivationState, wanted: &'a [String]) -> Vec<&'a String> {
+            wanted_subset(&s.output_names, &s.expected_output_paths, wanted).collect()
         }
 
-        s.wanted_output_names = vec![];
         assert_eq!(
-            wanted_paths(&s),
+            wanted_paths(&s, &[]),
             vec![
                 "/nix/store/aaaa-glibc",
                 "/nix/store/bbbb-glibc-dev",
@@ -2084,45 +2056,17 @@ mod tests {
             "empty wanted set must mean ALL declared outputs"
         );
 
-        s.wanted_output_names = vec!["out".into(), "dev".into()];
         assert_eq!(
-            wanted_paths(&s),
+            wanted_paths(&s, &["out".into(), "dev".into()]),
             vec!["/nix/store/aaaa-glibc", "/nix/store/bbbb-glibc-dev"],
             "wanted subset must exclude the unwanted -debug path"
         );
 
         // A wanted name with no matching declared output (defensive) is ignored.
-        s.wanted_output_names = vec!["out".into(), "nonexistent".into()];
-        assert_eq!(wanted_paths(&s), vec!["/nix/store/aaaa-glibc"]);
-    }
-
-    // r[verify sched.merge.wanted-outputs+2]
-    /// `union_wanted` semantics: empty is the "all outputs wanted"
-    /// sentinel, so the union of "all" with anything saturates to "all"
-    /// (stays/becomes empty). Non-empty ∪ non-empty is a sorted,
-    /// deduplicated set union — the wanted set only ever grows.
-    #[test]
-    fn union_wanted_grows_and_empty_saturates() {
-        let mut s = DerivationState::try_from_node(&dummy_node()).unwrap();
-
-        // {out} ∪ {dev} = {dev, out} (sorted union).
-        s.wanted_output_names = vec!["out".into()];
-        s.union_wanted(&["dev".into()]);
-        assert_eq!(s.wanted_output_names, vec!["dev", "out"]);
-
-        // Re-union of an already-present name is a no-op (no duplicates).
-        s.union_wanted(&["out".into()]);
-        assert_eq!(s.wanted_output_names, vec!["dev", "out"]);
-
-        // {} ∪ {out} = {} — "all" absorbs any subset.
-        s.wanted_output_names = vec![];
-        s.union_wanted(&["out".into()]);
-        assert_eq!(s.wanted_output_names, Vec::<String>::new());
-
-        // {out} ∪ {} = {} — a consumer wanting all saturates the union.
-        s.wanted_output_names = vec!["out".into()];
-        s.union_wanted(&[]);
-        assert_eq!(s.wanted_output_names, Vec::<String>::new());
+        assert_eq!(
+            wanted_paths(&s, &["out".into(), "nonexistent".into()]),
+            vec!["/nix/store/aaaa-glibc"]
+        );
     }
 
     /// `effective_wanted` — the wanted set scoped to LIVE interested
@@ -2608,7 +2552,6 @@ mod tests {
             assigned_builder_id: None,
             expected_output_paths: vec![],
             output_names: vec!["out".into()],
-            wanted_output_names: vec![],
             is_fixed_output: false,
             // is_ca=true: this IS a CA derivation, so the flag
             // mattered pre-restart. Prove it's false post-restart

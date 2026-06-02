@@ -256,10 +256,6 @@ pub(crate) struct RecoveryDerivationRow {
     pub assigned_builder_id: Option<String>,
     pub expected_output_paths: Vec<String>,
     pub output_names: Vec<String>,
-    /// Demand-driven wanted-output set (`migrations/062`). Empty = all
-    /// declared outputs wanted (also the pre-migration default, so old
-    /// rows recover with the conservative all-outputs criterion).
-    pub wanted_output_names: Vec<String>,
     pub is_fixed_output: bool,
     pub is_ca: bool,
     /// D4: persisted reactive resource floor (`M_044`). All `bigint`
@@ -292,7 +288,6 @@ impl RecoveryDerivationRow {
             assigned_builder_id: None,
             expected_output_paths: vec![],
             output_names: vec!["out".into()],
-            wanted_output_names: vec![],
             is_fixed_output: false,
             is_ca: false,
             floor_mem_bytes: 0,
@@ -359,10 +354,6 @@ pub(crate) struct DerivationRow {
     pub output_names: Vec<String>,
     pub is_fixed_output: bool,
     pub is_ca: bool,
-    /// Demand-driven wanted-output set (`migrations/062`). Empty = all
-    /// declared outputs wanted. UNIONED on conflict (with empty
-    /// saturating to empty = "all") — see `batch_upsert_derivations`.
-    pub wanted_output_names: Vec<String>,
 }
 
 /// Shared SELECT / FROM clause for `list_builds` and

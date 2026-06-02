@@ -110,7 +110,6 @@ async fn test_batch_upsert_10k_nodes() -> anyhow::Result<()> {
             output_names: vec!["out".into()],
             is_fixed_output: i % 7 == 0,
             is_ca: i % 11 == 0,
-            wanted_output_names: vec![],
         })
         .collect();
 
@@ -189,7 +188,6 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
             output_names: vec!["out".into()],
             is_fixed_output: false,
             is_ca: false,
-            wanted_output_names: vec![],
         })
         .collect();
 
@@ -236,103 +234,6 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
     Ok(())
 }
 
-// D5-retarget: retires with the 062 dual-write (T-D5.3), not before — the
-// stored-union round-trip is the dual-write's pin.
-// r[verify sched.merge.wanted-outputs+2]
-/// wanted_output_names persists, recovers, and UNIONS on conflict.
-/// Two builds wanting different outputs of the same drv must leave the
-/// row with the union — overwrite semantics would let build B's {out}
-/// clobber build A's {out,dev} and un-want a still-needed output.
-/// Empty-on-either-side saturates to empty (= "all wanted"), mirroring
-/// `DerivationState::union_wanted`.
-#[tokio::test]
-async fn wanted_output_names_round_trip_and_union_on_conflict() -> anyhow::Result<()> {
-    let test_db = TestDb::new(&crate::MIGRATOR).await;
-    let db = SchedulerDb::new(test_db.pool.clone());
-
-    let drv_hash = "wanted-union-test";
-    // One upsert of the same drv_hash with the given wanted set,
-    // then read the column back.
-    let upsert_and_read = async |wanted: &[&str]| -> anyhow::Result<Vec<String>> {
-        let row = DerivationRow {
-            drv_hash: drv_hash.into(),
-            drv_path: rio_test_support::fixtures::test_drv_path(drv_hash),
-            pname: Some("test-pkg".into()),
-            system: "x86_64-linux".into(),
-            status: DerivationStatus::Created,
-            required_features: vec![],
-            expected_output_paths: vec![
-                format!("/nix/store/{}-out", "b".repeat(32)),
-                format!("/nix/store/{}-dev", "c".repeat(32)),
-            ],
-            output_names: vec!["out".into(), "dev".into()],
-            is_fixed_output: false,
-            is_ca: false,
-            wanted_output_names: wanted.iter().map(|s| s.to_string()).collect(),
-        };
-        let mut tx = db.pool().begin().await?;
-        SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
-        tx.commit().await?;
-        let (got,): (Vec<String>,) =
-            sqlx::query_as("SELECT wanted_output_names FROM derivations WHERE drv_hash = $1")
-                .bind(drv_hash)
-                .fetch_one(&test_db.pool)
-                .await?;
-        Ok(got)
-    };
-
-    // 1. Fresh insert with wanted = ["out"] → reads back ["out"].
-    assert_eq!(
-        upsert_and_read(&["out"]).await?,
-        vec!["out"],
-        "fresh insert must persist the wanted set verbatim"
-    );
-
-    // 2. Same drv_hash, wanted = ["dev"] → sorted distinct union.
-    assert_eq!(
-        upsert_and_read(&["dev"]).await?,
-        vec!["dev", "out"],
-        "conflict must UNION, not overwrite — build B's {{dev}} must not \
-         clobber build A's {{out}}"
-    );
-
-    // 2b. Re-upserting an already-present subset is idempotent (DISTINCT).
-    assert_eq!(
-        upsert_and_read(&["out"]).await?,
-        vec!["dev", "out"],
-        "re-upserting a subset must not duplicate or reorder"
-    );
-
-    // 3. Incoming empty (= all wanted) saturates the union to empty.
-    assert_eq!(
-        upsert_and_read(&[]).await?,
-        Vec::<String>::new(),
-        "empty incoming set means ALL outputs wanted; all ∪ X = all (= '{{}}')"
-    );
-
-    // 4. Existing empty (= all wanted) absorbs any later narrower set.
-    assert_eq!(
-        upsert_and_read(&["doc"]).await?,
-        Vec::<String>::new(),
-        "once saturated to all-wanted, a narrower incoming set must not \
-         resurrect a finite set"
-    );
-
-    // 5. Recovery sees the persisted column (the round-trip half).
-    let recovered = db.load_nonterminal_derivations().await?;
-    let row = recovered
-        .iter()
-        .find(|r| r.drv_hash == drv_hash)
-        .expect("upserted row is non-terminal and must be recovered");
-    assert_eq!(
-        row.wanted_output_names,
-        Vec::<String>::new(),
-        "recovery SELECT must carry wanted_output_names"
-    );
-
-    Ok(())
-}
-
 // r[verify sched.db.batch-unnest]
 /// Edges: 40k rows. Old limit was 32767 (2 cols). Build a
 /// dense DAG over 10k nodes (fresh DB, so re-insert).
@@ -356,7 +257,6 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
             output_names: vec!["out".into()],
             is_fixed_output: false,
             is_ca: false,
-            wanted_output_names: vec![],
         })
         .collect();
     let mut tx = db.pool().begin().await?;

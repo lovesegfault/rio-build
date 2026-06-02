@@ -65,13 +65,6 @@ pub struct MergeResult {
     /// permanently stick (subsequent submitters would see `is_empty()
     /// == false` and never link THEIR trace).
     pub traceparent_upgraded: Vec<DrvHash>,
-    /// Pre-union `wanted_output_names` of pre-existing nodes whose
-    /// wanted set was grown by this merge's `union_wanted`. Rollback
-    /// restores the prior value — a leaked union is only ever
-    /// conservative (the empty "all wanted" sentinel saturates) but
-    /// would still let a rejected build's wanted set permanently widen
-    /// the cache-hit criterion for everyone else.
-    pub wanted_grown: Vec<(DrvHash, Vec<String>)>,
     /// Pre-existing nodes where this merge recorded the submitting
     /// build's `wanted_by_build` contribution, with the prior entry
     /// value (`None` = the build had no entry). Rollback removes the
@@ -324,12 +317,6 @@ impl DerivationDag {
         // rollback only removes interest from these (not from nodes where
         // build_id was already present from a prior successful merge).
         let mut interest_added: Vec<DrvHash> = Vec::new();
-        // Pre-union wanted_output_names of pre-existing nodes whose
-        // wanted set was grown by this merge, so rollback can restore
-        // them. A leaked union is only ever conservative (more outputs
-        // required for a cache hit) but would still violate the
-        // exact-pre-merge-DAG restore invariant.
-        let mut wanted_grown: Vec<(DrvHash, Vec<String>)> = Vec::new();
         // Prior `wanted_by_build` entry (None = absent) of pre-existing
         // nodes where this merge recorded the submitting build's
         // contribution, so rollback can remove/restore it.
@@ -385,7 +372,6 @@ impl DerivationDag {
                 let carry = (
                     old.interested_builds.clone(),
                     old.retry.resubmit_cycles,
-                    old.wanted_output_names.clone(),
                     old.wanted_by_build.clone(),
                 );
                 removed_retriable.push((drv_hash.clone(), old));
@@ -398,26 +384,13 @@ impl DerivationDag {
             // `rollback_merge` — a failed merge restores the exact
             // pre-merge DAG. Currently: `interested_builds` (via
             // `interest_added`), `traceparent` (via
-            // `traceparent_upgraded`), `wanted_output_names` (via
-            // `wanted_grown`), and `wanted_by_build` (via
+            // `traceparent_upgraded`), and `wanted_by_build` (via
             // `contributions_recorded`).
             if let Some(existing) = self.nodes.get_mut(&drv_hash) {
                 // Node already exists: add this build's interest.
                 // `insert` returns true iff build_id was not already present.
                 if existing.interested_builds.insert(build_id) {
                     interest_added.push(drv_hash.clone());
-                }
-                // Demand-driven completeness: a second build wanting
-                // MORE outputs of an already-known node grows the
-                // in-memory wanted set (union; empty = "all" saturates).
-                // Never shrink — build B's `{out}` must not un-want
-                // build A's still-needed `dev`.
-                if existing.wanted_output_names != node.wanted_output_names {
-                    let prior = existing.wanted_output_names.clone();
-                    existing.union_wanted(&node.wanted_output_names);
-                    if existing.wanted_output_names != prior {
-                        wanted_grown.push((drv_hash.clone(), prior));
-                    }
                 }
                 // Per-build contribution: remember WHAT this submission
                 // wanted so the effective-wanted computation can stop
@@ -427,7 +400,7 @@ impl DerivationDag {
                 // occurrences instead of keeping only the last one. The
                 // prior entry (usually absent; present when the same
                 // build re-merges the node) is captured BEFORE the
-                // mutation for rollback, mirroring `wanted_grown`;
+                // mutation for rollback;
                 // rollback_merge replays these in reverse, so the
                 // first-captured (true pre-merge) value is the one that
                 // sticks even when one merge records the node twice.
@@ -463,7 +436,6 @@ impl DerivationDag {
                             &new_edges,
                             &interest_added,
                             &traceparent_upgraded,
-                            &wanted_grown,
                             &contributions_recorded,
                             build_id,
                             removed_retriable,
@@ -504,18 +476,14 @@ impl DerivationDag {
                 // refresh onward.
                 // retry.count stays at the fresh-state default (0) → full
                 // per-cycle max_retries budget restored on every resubmit.
-                // The prior wanted set is unioned in too — the carried-over
-                // interested builds still want their outputs; replacing the
-                // set with only the resubmitter's would shrink it. Their
-                // per-build contributions are carried alongside (they
-                // follow interest membership); `or_insert` keeps the
-                // resubmitter's own entry authoritative.
-                if let Some((prior_interest, prior_cycles, prior_wanted, prior_contributions)) =
-                    prior
-                {
+                // The prior per-build contributions are carried over too
+                // — the carried-over interested builds still want their
+                // outputs (contributions follow interest membership);
+                // `or_insert` keeps the resubmitter's own entry
+                // authoritative.
+                if let Some((prior_interest, prior_cycles, prior_contributions)) = prior {
                     state.interested_builds.extend(prior_interest);
                     state.retry.resubmit_cycles = prior_cycles + 1;
-                    state.union_wanted(&prior_wanted);
                     for (b, w) in prior_contributions {
                         state.wanted_by_build.entry(b).or_insert(w);
                     }
@@ -591,7 +559,6 @@ impl DerivationDag {
                     &new_edges,
                     &interest_added,
                     &traceparent_upgraded,
-                    &wanted_grown,
                     &contributions_recorded,
                     build_id,
                     removed_retriable,
@@ -607,7 +574,6 @@ impl DerivationDag {
             interest_added,
             removed_retriable,
             traceparent_upgraded,
-            wanted_grown,
             contributions_recorded,
         })
     }
@@ -697,7 +663,6 @@ impl DerivationDag {
         new_edges: &[(DrvHash, DrvHash)],
         interest_added: &[DrvHash],
         traceparent_upgraded: &[DrvHash],
-        wanted_grown: &[(DrvHash, Vec<String>)],
         contributions_recorded: &[(DrvHash, Option<Vec<String>>)],
         build_id: Uuid,
         removed_retriable: Vec<(DrvHash, DerivationState)>,
@@ -766,25 +731,6 @@ impl DerivationDag {
         for hash in traceparent_upgraded {
             if let Some(state) = self.nodes.get_mut(hash) {
                 state.traceparent.clear();
-            }
-        }
-
-        // Restore the pre-union wanted set of pre-existing nodes whose
-        // wanted set this merge grew. Reverse order so that, when one
-        // submission carries the same drv twice and both occurrences
-        // grow the union (the node is recorded twice, the second prior
-        // being the already-grown value), the first-captured (true
-        // pre-merge) value is the one that sticks — mirroring the
-        // `contributions_recorded` restore below.
-        for (hash, prior) in wanted_grown.iter().rev() {
-            // Entries for resubmit-reset hashes describe the discarded
-            // fresh replacement; the wholesale restore above already
-            // carries the exact pre-merge state.
-            if restoring.contains(hash) {
-                continue;
-            }
-            if let Some(state) = self.nodes.get_mut(hash) {
-                state.wanted_output_names = prior.clone();
             }
         }
 

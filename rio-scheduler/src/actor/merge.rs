@@ -1448,10 +1448,9 @@ impl DagActor {
         // LIVE interested build wants: a recorded output whose absence
         // is forgiven by the demand-driven criterion. The wanted source
         // is the live effective set (`effective_wanted` over the node's
-        // interested builds' contributions), falling back to the stored
-        // node-level union (`wanted_output_names`) when that set is
-        // unavailable (no live interested builds, or a live build's
-        // contribution is unknown — post-failover). The submitting
+        // interested builds' contributions); zero live interest or an
+        // unknown live contribution saturates to all-declared (the
+        // conservative-absent arm — nothing is forgiven). The submitting
         // build's wants are already included: `dag.merge`
         // (validate_and_ingest step 2) recorded this submission's
         // contribution + interest and step 3 inserted its live
@@ -1921,13 +1920,6 @@ impl DagActor {
                     output_names: node.output_names.clone(),
                     is_fixed_output: node.is_fixed_output,
                     is_ca: node.is_content_addressed,
-                    // THIS submission's wanted set. The upsert UNIONs
-                    // it into the existing row (empty saturates to
-                    // empty = "all wanted"), so the persisted set is
-                    // the union across every build that ever merged
-                    // this drv — same monotonic-growth semantics as
-                    // the in-memory `DerivationState::union_wanted`.
-                    wanted_output_names: node.wanted_output_names.clone(),
                 }
             })
             .collect();
@@ -2262,7 +2254,6 @@ impl DagActor {
             &merge_result.new_edges,
             &merge_result.interest_added,
             &merge_result.traceparent_upgraded,
-            &merge_result.wanted_grown,
             &merge_result.contributions_recorded,
             build_id,
             merge_result.removed_retriable,
@@ -2741,10 +2732,10 @@ impl DagActor {
     /// demanded node that already exists in the DAG: the submission's
     /// wanted set is unioned with the pre-existing node's LIVE
     /// effective wanted set ([`effective_wanted`] over live interested
-    /// builds, stored-union fallback) — at least as demanding as the
-    /// set post-merge classification (`check_cached_outputs`, the
-    /// dispatch-time probes) evaluates the shared node against; with
-    /// the stored-union fallback it can be strictly wider than the
+    /// builds, conservative-absent saturation) — at least as demanding
+    /// as the set post-merge classification (`check_cached_outputs`,
+    /// the dispatch-time probes) evaluates the shared node against;
+    /// with the saturating arms it can be strictly wider than the
     /// post-merge live set, never narrower. If another live build wants
     /// an output that is missing and not substitutable, that
     /// classification keeps the node on the from-source path; pruning
@@ -2890,7 +2881,7 @@ impl DagActor {
             // all) with the node's live effective wanted set — at
             // least as demanding as what step-4/dispatch
             // classification will use (a superset: with the
-            // stored-union fallback it can be strictly wider than the
+            // saturating arms it can be strictly wider than the
             // post-merge live set, never narrower). A narrower,
             // submission-only criterion can prune this build's dep
             // closure while classification (driven by another live
@@ -2909,8 +2900,8 @@ impl DagActor {
             // The submission's OWN wanted set must also resolve to a
             // verifiable path: post-merge classification of a
             // pre-existing demanded node can degrade to exactly that
-            // contribution (stored-union fallback above, only this
-            // build live afterwards), and an unresolvable set is
+            // contribution (only this build live afterwards), and an
+            // unresolvable set is
             // unclassifiable — nothing would substitute the node
             // whose deps this prune just dropped.
             verifiable_wanted_paths(

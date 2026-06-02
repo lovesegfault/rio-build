@@ -112,7 +112,7 @@ impl SchedulerDb {
                    d.required_features,
                    d.assigned_builder_id,
                    d.expected_output_paths, d.output_names,
-                   d.wanted_output_names, d.is_fixed_output, d.is_ca,
+                   d.is_fixed_output, d.is_ca,
                    d.floor_mem_bytes, d.floor_disk_bytes, d.floor_deadline_secs,
                    a.exec_id
             FROM derivations d
