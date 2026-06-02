@@ -279,6 +279,8 @@ impl Disposition {
 
     /// Every disposition, in assignment-precedence order: when more than
     /// one disposition could apply to a unit, the earliest entry wins.
+    /// The classifier's disposition steps implement this order — see
+    /// `classify()` in the classify module, the one precedence owner.
     pub const ALL: [Disposition; 10] = [
         Disposition::Filtered,
         Disposition::EvalError,
@@ -291,6 +293,31 @@ impl Disposition {
         Disposition::TargetSubstituted,
         Disposition::NotAttempted,
     ];
+
+    /// Whether a unit retiring with this disposition was actually submitted
+    /// to the target (produced a rio observation) — the report's
+    /// "attempted" denominator membership. Deliberately an exhaustive match
+    /// with no wildcard: adding a disposition refuses to compile until its
+    /// attempted-ness is decided here, so the report can never silently
+    /// misclassify a new exclusion as an attempt.
+    pub fn attempted(self) -> bool {
+        match self {
+            // Plan-time exclusions, supply-stage retirements, and the
+            // deadline backfill: the unit was never submitted.
+            Disposition::Filtered
+            | Disposition::EvalError
+            | Disposition::IdentityDivergent
+            | Disposition::NotAttemptable
+            | Disposition::DemotedImpure
+            | Disposition::CachedPrior
+            | Disposition::UploadRejected
+            | Disposition::SupplyFailed
+            | Disposition::NotAttempted => false,
+            // Submitted and completed without execution (the target
+            // substituted it mid-run): a real submission outcome.
+            Disposition::TargetSubstituted => true,
+        }
+    }
 }
 
 /// The single classification a workload unit ends a campaign with:

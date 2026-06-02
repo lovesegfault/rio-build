@@ -408,12 +408,13 @@ pub fn build_record(
         .and_then(|t| build_status_from_name(&t.status))
         .map(|s| s.is_success());
     let aux = AuxFlags {
-        skipped: None,
-        eval_error: false,
         plan_not_attemptable: ctx.plan_not_attemptable,
         plan_snapshot_valid: ctx.plan_snapshot_valid,
-        resolve_unknown_divergent: None,
         timed_interruption: timed_interruption_for(batch, &ctx.drv_path, in_band_success),
+        // Filtered/eval-error/identity-divergent/demoted/supply facts never
+        // apply to a submitted batch member (those units are retired before
+        // submission); the resolve-unknown pass runs outside collect.
+        ..AuxFlags::default()
     };
     let classification = classify(&ctx.expected_outcome, rio_outcome, &aux);
     let reason = batch.reasons.get(&ctx.drv_path).cloned();

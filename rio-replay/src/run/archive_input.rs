@@ -880,6 +880,154 @@ pub(crate) fn write_mini_timed_archive(
     }
 }
 
+/// Write a tiny synthetic directory-form v1 replay archive into `dir`
+/// whose recording declares the impure-env capability: two workload units
+/// (`pureApp.x86_64-linux`, `impureApp.x86_64-linux`), both with recorded
+/// `built` outcomes and requests, and `impure-env.json` listing impure
+/// environment variables for impureApp's derivation — the shape the
+/// impure-demotion policy (live planner and offline dry-run alike) keys
+/// on.
+#[cfg(test)]
+pub(crate) fn write_mini_impure_archive(dir: &std::path::Path) -> MiniArchive {
+    use crate::archive::schema::{
+        Capabilities, ExpectedOutcome, OutcomeRecord, RequestRecord, RequestTarget, Substituters,
+    };
+    use crate::archive::writer::{ArchiveWriter, ManifestSeed};
+
+    let drv = |name: &str| {
+        format!(
+            "/nix/store/{}-{name}.drv",
+            fake_hash(&format!("{name}-drv"))
+        )
+    };
+    let out = |name: &str| format!("/nix/store/{}-{name}", fake_hash(&format!("{name}-out")));
+
+    let pure_drv = drv("pureApp-1.0");
+    let pure_out = out("pureApp-1.0");
+    let impure_drv = drv("impureApp-1.0");
+    let impure_out = out("impureApp-1.0");
+
+    let writer = ArchiveWriter::create(dir).unwrap();
+    writer
+        .add_drv(
+            &pure_drv,
+            &synth_aterm(&[("out", pure_out.as_str())], &[], "x86_64-linux"),
+        )
+        .unwrap();
+    writer
+        .add_drv(
+            &impure_drv,
+            &synth_aterm(&[("out", impure_out.as_str())], &[], "x86_64-linux"),
+        )
+        .unwrap();
+    writer
+        .write_units(&[
+            UnitRecord {
+                drv: pure_drv.clone(),
+                label: Some("pureApp.x86_64-linux".to_string()),
+                system: Some("x86_64-linux".to_string()),
+                outputs: BTreeMap::from([("out".to_string(), pure_out.clone())]),
+                required_features: Vec::new(),
+                identity_divergent: false,
+            },
+            UnitRecord {
+                drv: impure_drv.clone(),
+                label: Some("impureApp.x86_64-linux".to_string()),
+                system: Some("x86_64-linux".to_string()),
+                outputs: BTreeMap::from([("out".to_string(), impure_out.clone())]),
+                required_features: Vec::new(),
+                identity_divergent: false,
+            },
+        ])
+        .unwrap();
+    writer
+        .write_requests(
+            &[&pure_drv, &impure_drv]
+                .into_iter()
+                .map(|unit_drv| RequestRecord {
+                    session: 0,
+                    offset_s: 0.0,
+                    targets: vec![RequestTarget {
+                        drv: unit_drv.clone(),
+                        outputs: vec!["*".to_string()],
+                    }],
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    writer
+        .write_outcomes(
+            &[&pure_drv, &impure_drv]
+                .into_iter()
+                .map(|unit_drv| OutcomeRecord {
+                    session: None,
+                    drv: unit_drv.clone(),
+                    outcome: ExpectedOutcome::Built,
+                    detail: None,
+                    duration_s: Some(1.0),
+                    stop_offset_s: None,
+                    outputs: BTreeMap::new(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    writer
+        .write_closures(&[
+            ClosureRecord {
+                drv: pure_drv.clone(),
+                inputs: Vec::new(),
+                srcs: Vec::new(),
+                outputs: BTreeMap::from([("out".to_string(), Some(pure_out.clone()))]),
+            },
+            ClosureRecord {
+                drv: impure_drv.clone(),
+                inputs: Vec::new(),
+                srcs: Vec::new(),
+                outputs: BTreeMap::from([("out".to_string(), Some(impure_out.clone()))]),
+            },
+        ])
+        .unwrap();
+    writer
+        .write_impure_env(&BTreeMap::from([(
+            impure_drv.clone(),
+            vec!["NIX_SECRET_TOKEN".to_string()],
+        )]))
+        .unwrap();
+
+    let stamp: jiff::Timestamp = "2026-05-28T00:00:00Z".parse().unwrap();
+    let mut provenance = serde_json::Map::new();
+    provenance.insert(
+        "recorder".to_string(),
+        serde_json::Value::from("mini-impure-archive-fixture"),
+    );
+    let finalized = writer
+        .finalize(ManifestSeed {
+            created_at: stamp,
+            from: stamp,
+            to: stamp,
+            capabilities: Capabilities {
+                timed: false,
+                expected_outcomes: true,
+                output_hashes: false,
+                embedded_store_paths: false,
+                impure_env: true,
+                dependency_closures: true,
+            },
+            substituters: Substituters {
+                relay: vec!["https://cache.example.org".to_string()],
+                target: Vec::new(),
+            },
+            fat: false,
+            provenance,
+        })
+        .unwrap();
+    let archive_id_short = crate::archive::identity::short_id(&finalized.archive_id);
+    MiniArchive {
+        archive_id: finalized.archive_id,
+        archive_id_short,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -60,6 +60,7 @@ use crate::archive::schema::{
 use self::artifact::{
     ArtifactStore, S3ArtifactStore, SyncTracker, download_state_if_missing, sync_state,
 };
+use self::classify::{AuxFlags, classify};
 use self::collect::{BatchView, JobContext, process_settled_batch};
 use self::grpc::{AdminApi, ClusterApi, GrpcAdminApi, GrpcStoreApi, StoreApi};
 use self::model::{
@@ -663,30 +664,104 @@ pub async fn ensure_archive(
     Ok((local, Arc::new(archive)))
 }
 
+/// In-scope jobs demoted out of the workload because the archive lists
+/// impure environment variables for their derivations: rio cannot forward
+/// the recording client's `impureEnvVars` values, so rebuilding them would
+/// diverge spuriously. Derived from the same [`supply::workload_set`]
+/// policy the offline timed dry-run reports, so the dry-run's demotion
+/// prediction and the live campaign's dispositions cannot disagree over
+/// the same archive.
+fn demoted_impure_jobs(
+    archive: &ReplayArchive,
+    manifest: &[archive_input::ManifestEntry],
+    in_scope: &HashSet<&str>,
+) -> Vec<String> {
+    let demoted_drvs = supply::workload_set(archive).demoted_impure;
+    manifest
+        .iter()
+        .filter(|m| in_scope.contains(m.job.as_str()) && demoted_drvs.contains(&m.drv_path))
+        .map(|m| m.job.clone())
+        .collect()
+}
+
+/// One disposition per plan-time-excluded job, derived through
+/// [`classify`] — the single precedence owner — over the union of each
+/// job's plan-time facts. A `BTreeMap` cannot hold two dispositions for
+/// one job, so a job in several exclusion sets (realistic on a second
+/// campaign against the same cluster: its outputs sit in another in-scope
+/// job's dep closure AND are already valid in rio-store) gets exactly one
+/// record, under the documented precedence, regardless of set iteration
+/// order. The same map drives the plan-time records, the supply stage's
+/// workload exclusion, and the submit pool, so the consumers cannot
+/// disagree about which units the campaign measures.
+fn plan_time_dispositions(
+    plan: &PlanOutput,
+    divergent_in_scope: &[String],
+    demoted_impure: &[String],
+) -> BTreeMap<String, Disposition> {
+    let divergent: HashSet<&str> = divergent_in_scope.iter().map(String::as_str).collect();
+    let demoted: HashSet<&str> = demoted_impure.iter().map(String::as_str).collect();
+    let not_attemptable: HashSet<&str> = plan.not_attemptable.iter().map(String::as_str).collect();
+    let cached: HashSet<&str> = plan.cached_prior_jobs.iter().map(String::as_str).collect();
+    let mut dispositions = BTreeMap::new();
+    for job in plan
+        .skipped
+        .keys()
+        .chain(plan.not_attemptable.iter())
+        .chain(plan.cached_prior_jobs.iter())
+        .chain(divergent_in_scope.iter())
+        .chain(demoted_impure.iter())
+    {
+        if dispositions.contains_key(job) {
+            continue;
+        }
+        let flags = AuxFlags {
+            skipped: plan.skipped.get(job).cloned(),
+            identity_divergent: divergent.contains(job.as_str()),
+            plan_not_attemptable: not_attemptable.contains(job.as_str()),
+            demoted_impure: demoted.contains(job.as_str()),
+            plan_snapshot_valid: cached.contains(job.as_str()),
+            ..AuxFlags::default()
+        };
+        let class = classify(
+            &model::ExpectedOutcome::Unknown,
+            &RioOutcome::NotAttempted,
+            &flags,
+        );
+        let disposition = class
+            .class
+            .disposition()
+            .expect("a not-attempted unit always classifies into a disposition");
+        // Every iterated job carries at least one exclusion flag, so the
+        // fall-through disposition (plain not-attempted, non-terminal)
+        // cannot be reached; a record under it would leave the job
+        // permanently re-offerable.
+        debug_assert_ne!(disposition, Disposition::NotAttempted, "{job} {flags:?}");
+        dispositions.insert(job.clone(), disposition);
+    }
+    dispositions
+}
+
 /// Plan-time excluded jobs carry their exclusion as `rio.outcome` with no
-/// build/exec fields: write their terminal records right after planning.
-/// The exclusion vocabulary equals the disposition names, so both fields
+/// build/exec fields: write their terminal records right after planning,
+/// one record per job, straight from the [`plan_time_dispositions`] map
+/// (which already settled precedence through the classifier). Both fields
 /// are written via [`Disposition::as_str`] (never hand-typed literals).
-/// `divergent_in_scope` lists the in-scope jobs the recorder marked
-/// identity-divergent: their evaluation here cannot be compared against the
-/// recorded truth, so they are retired up front under the
-/// identity-divergent disposition instead of being submitted.
 fn write_plan_time_records(
     state: &StateDir,
     manifest: &[archive_input::ManifestEntry],
-    plan: &PlanOutput,
-    divergent_in_scope: &[String],
+    dispositions: &BTreeMap<String, Disposition>,
     mode: &str,
     existing: &BTreeMap<String, JobRecord>,
 ) -> Result<()> {
     let by_job: HashMap<&str, &archive_input::ManifestEntry> =
         manifest.iter().map(|m| (m.job.as_str(), m)).collect();
-    let emit = |job: &str, disposition: Disposition| -> Result<()> {
+    for (job, disposition) in dispositions {
         if existing.contains_key(job) {
-            return Ok(());
+            continue;
         }
-        let Some(m) = by_job.get(job) else {
-            return Ok(());
+        let Some(m) = by_job.get(job.as_str()) else {
+            continue;
         };
         state.append_jsonl(
             StateFile::Results,
@@ -717,19 +792,7 @@ fn write_plan_time_records(
                 evidence: None,
                 updated_at: now_rfc3339(),
             },
-        )
-    };
-    for job in plan.skipped.keys() {
-        emit(job, Disposition::Filtered)?;
-    }
-    for job in &plan.not_attemptable {
-        emit(job, Disposition::NotAttemptable)?;
-    }
-    for job in &plan.cached_prior_jobs {
-        emit(job, Disposition::CachedPrior)?;
-    }
-    for job in divergent_in_scope {
-        emit(job, Disposition::IdentityDivergent)?;
+        )?;
     }
     Ok(())
 }
@@ -1272,13 +1335,22 @@ pub async fn run_with_backends(
         .into_iter()
         .filter(|job| in_scope.contains(job.as_str()))
         .collect();
+    // Impure-demoted units leave the workload entirely: excluded from
+    // submission below, their outputs supplied like dependency outputs (the
+    // workload-output never-supply rule no longer covers them), and retired
+    // under the demoted-impure disposition.
+    let demoted_in_scope = demoted_impure_jobs(&archive, &manifest, &in_scope);
+    // The single plan-time disposition map: one disposition per excluded
+    // job, precedence settled by the classifier; records, the supply-stage
+    // exclusion, and the submit pool below all read THIS map.
+    let plan_dispositions =
+        plan_time_dispositions(&plan_output, &divergent_in_scope, &demoted_in_scope);
     let existing_records = latest_per_job(state.load_jsonl(StateFile::Results)?);
     if !state.marker_done("plan") {
         write_plan_time_records(
             &state,
             &manifest,
-            &plan_output,
-            &divergent_in_scope,
+            &plan_dispositions,
             spec.mode.as_str(),
             &existing_records,
         )?;
@@ -1316,13 +1388,8 @@ pub async fn run_with_backends(
         // outputs are what the campaign measures, so they are never
         // supplied; everything else in their closures is fair game for the
         // supply ladder.
-        let attempt_excluded: HashSet<&str> = plan_output
-            .not_attemptable
-            .iter()
-            .chain(plan_output.cached_prior_jobs.iter())
-            .chain(divergent_in_scope.iter())
-            .map(String::as_str)
-            .collect();
+        let attempt_excluded: HashSet<&str> =
+            plan_dispositions.keys().map(String::as_str).collect();
         let mut workload_drvs = BTreeSet::new();
         let mut workload_outputs = BTreeSet::new();
         for m in manifest.iter().filter(|m| {
@@ -1459,7 +1526,6 @@ pub async fn run_with_backends(
         .iter()
         .map(String::as_str)
         .collect();
-    let divergent: HashSet<&str> = divergent_in_scope.iter().map(String::as_str).collect();
     let mut contexts: HashMap<String, JobContext> = HashMap::new();
     let mut attemptable: Vec<batch::PendingJob> = Vec::new();
     for m in manifest
@@ -1497,10 +1563,7 @@ pub async fn run_with_backends(
                 plan_snapshot_valid: cached_prior_jobs.contains(m.job.as_str()),
             },
         );
-        if !not_attemptable.contains(m.job.as_str())
-            && !cached_prior_jobs.contains(m.job.as_str())
-            && !divergent.contains(m.job.as_str())
-        {
+        if !plan_dispositions.contains_key(m.job.as_str()) {
             attemptable.push(batch::PendingJob {
                 job: m.job.clone(),
                 drv_path: target_drv,
@@ -3991,6 +4054,130 @@ mod tests {
         assert_eq!(
             records[queued_job].signature.as_deref(),
             Some("stalled-queued")
+        );
+    }
+
+    /// One disposition per excluded job, by the documented precedence: a
+    /// job in BOTH the not-attemptable and cached-prior plan sets (its
+    /// outputs sit in another in-scope job's dep closure AND were already
+    /// valid in rio-store — routine on the second campaign against the same
+    /// cluster) gets exactly one plan-time record, under not-attemptable.
+    /// Emitting per-set loops used to append two records whose last-wins
+    /// reduction inverted the precedence to cached-prior.
+    #[test]
+    fn overlapping_plan_sets_yield_one_record_under_the_precedent_disposition() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let job = "overlap.x86_64-linux";
+        let manifest = vec![archive_input::ManifestEntry {
+            job: job.to_string(),
+            system: "x86_64-linux".into(),
+            attr: job.to_string(),
+            drv_path: format!("/nix/store/{}-overlap.drv", "d".repeat(32)),
+            outputs: BTreeMap::new(),
+            required_features: Vec::new(),
+        }];
+        let plan = PlanOutput {
+            in_scope: vec![job.to_string()],
+            not_attemptable: vec![job.to_string()],
+            cached_prior_jobs: vec![job.to_string()],
+            ..PlanOutput::default()
+        };
+        let dispositions = plan_time_dispositions(&plan, &[], &[]);
+        assert_eq!(
+            dispositions.get(job).copied(),
+            Some(Disposition::NotAttemptable),
+            "not-attemptable outranks cached-prior in the documented precedence"
+        );
+        write_plan_time_records(&state, &manifest, &dispositions, "leaf", &BTreeMap::new())
+            .unwrap();
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1, "exactly one record per excluded job");
+        assert_eq!(
+            records[0].disposition.as_deref(),
+            Some(Disposition::NotAttemptable.as_str())
+        );
+        // The same map drives the submit exclusion, so the job cannot be
+        // both "excluded with a record" and offered to the pool.
+        assert!(dispositions.contains_key(job));
+    }
+
+    /// The demoted-impure disposition has a live producer: an in-scope unit
+    /// whose derivation appears in the archive's impure-env map is excluded
+    /// from the workload and retired under demoted-impure — the same
+    /// workload_set() policy the offline dry-run reports.
+    #[test]
+    fn impure_units_are_demoted_with_a_plan_time_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        archive_input::write_mini_impure_archive(tmp.path());
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let manifest = load_units(&archive).unwrap();
+        let in_scope: HashSet<&str> = manifest.iter().map(|m| m.job.as_str()).collect();
+        let demoted = demoted_impure_jobs(&archive, &manifest, &in_scope);
+        assert!(!demoted.is_empty(), "the fixture has an impure-env unit");
+        let plan = PlanOutput {
+            in_scope: manifest.iter().map(|m| m.job.clone()).collect(),
+            ..PlanOutput::default()
+        };
+        let dispositions = plan_time_dispositions(&plan, &[], &demoted);
+        for job in &demoted {
+            assert_eq!(
+                dispositions.get(job).copied(),
+                Some(Disposition::DemotedImpure),
+                "{job}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        write_plan_time_records(&state, &manifest, &dispositions, "leaf", &BTreeMap::new())
+            .unwrap();
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        for job in &demoted {
+            assert_eq!(
+                records[job].disposition.as_deref(),
+                Some(Disposition::DemotedImpure.as_str())
+            );
+        }
+    }
+
+    /// SHARED dry-run == live-plan parity invariant over the same archive
+    /// (the timed workstream extends this test with the
+    /// interruption-filtering axis): the offline dry-run and the live
+    /// planner must derive identical impure-demotion sets, because the
+    /// dry-run is the operator's preview of exactly the workload the live
+    /// campaign will measure. Both sides are pinned to the drv level so a
+    /// drift on either side fails here regardless of which one moved.
+    #[test]
+    fn dry_run_and_live_planner_agree_on_the_same_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        archive_input::write_mini_impure_archive(tmp.path());
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let manifest = load_units(&archive).unwrap();
+        let in_scope: HashSet<&str> = manifest.iter().map(|m| m.job.as_str()).collect();
+
+        // Live planner side: the demoted job set, mapped back to drvs.
+        let live_demoted_drvs: BTreeSet<String> = {
+            let by_job: HashMap<&str, &str> = manifest
+                .iter()
+                .map(|m| (m.job.as_str(), m.drv_path.as_str()))
+                .collect();
+            demoted_impure_jobs(&archive, &manifest, &in_scope)
+                .iter()
+                .map(|job| by_job[job.as_str()].to_string())
+                .collect()
+        };
+
+        // Dry-run side: the same archive through the offline path.
+        let dry_demoted_drvs = supply::workload_set(&archive).demoted_impure;
+        assert_eq!(
+            live_demoted_drvs, dry_demoted_drvs,
+            "live demotion must equal the dry-run's workload_set demotion"
+        );
+        let dry = timeline::plan_timed_dry_run(&archive, &Knobs::default(), None).unwrap();
+        assert_eq!(dry.demoted_impure, live_demoted_drvs.len());
+        assert!(
+            !live_demoted_drvs.is_empty(),
+            "vacuous parity would prove nothing: the fixture must demote at least one unit"
         );
     }
 

@@ -102,16 +102,16 @@ pub fn aggregate(records: &BTreeMap<String, JobRecord>) -> Aggregates {
     agg.nar_divergent_jobs.sort();
     let verdict = |v: Verdict| agg.verdict_counts.get(v.as_str()).copied().unwrap_or(0);
     let disposition = |d: Disposition| agg.disposition_counts.get(d.as_str()).copied().unwrap_or(0);
-    // Attempted = jobs that produced a rio observation via submission:
-    // everything except the dispositions that mean the unit was never
-    // submitted (plan-time exclusions, demotions, and deadline backfill).
-    let excluded_from_attempt = disposition(Disposition::Filtered)
-        + disposition(Disposition::EvalError)
-        + disposition(Disposition::NotAttemptable)
-        + disposition(Disposition::NotAttempted)
-        + disposition(Disposition::CachedPrior)
-        + disposition(Disposition::DemotedImpure)
-        + disposition(Disposition::IdentityDivergent);
+    // Attempted = jobs that produced a rio observation via submission. The
+    // not-attempted property is the enum's own exhaustive method, never a
+    // hand-enumerated subset here: a new disposition cannot ship without
+    // deciding its attempted-ness, and this sum picks the decision up
+    // automatically.
+    let excluded_from_attempt: usize = Disposition::ALL
+        .iter()
+        .filter(|d| !d.attempted())
+        .map(|d| disposition(*d))
+        .sum();
     agg.attempted = records.len().saturating_sub(excluded_from_attempt);
     if agg.attempted > 0 {
         agg.infra_rate_pct =
@@ -926,6 +926,38 @@ mod tests {
             evidence: None,
             updated_at: "2026-05-26T00:00:00Z".into(),
         }
+    }
+
+    /// The attempted denominator derives from Disposition::attempted() —
+    /// the enum's own exhaustive method — so EVERY never-submitted
+    /// disposition (plan-time exclusions, the supply retirements
+    /// upload-rejected/supply-failed, the deadline backfill) is excluded,
+    /// and only the mid-run target substitution counts as a submission
+    /// outcome. One record per disposition plus one verdict pins the sum.
+    #[test]
+    fn attempted_denominator_excludes_every_unsubmitted_disposition() {
+        for disposition in Disposition::ALL {
+            assert_eq!(
+                disposition.attempted(),
+                disposition == Disposition::TargetSubstituted,
+                "{disposition:?}"
+            );
+        }
+        let mut records = BTreeMap::new();
+        for (i, disposition) in Disposition::ALL.into_iter().enumerate() {
+            records.insert(
+                format!("d{i}"),
+                rec(&format!("d{i}"), d(disposition), 0, None, false),
+            );
+        }
+        records.insert(
+            "v0".into(),
+            rec("v0", v(Verdict::MatchBuilt), 1, None, false),
+        );
+        let agg = aggregate(&records);
+        // 11 records total; only match-built and target-substituted were
+        // ever submitted.
+        assert_eq!(agg.attempted, 2, "{agg:?}");
     }
 
     #[test]

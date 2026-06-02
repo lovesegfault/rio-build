@@ -36,7 +36,12 @@ pub enum TimedInterruption {
     NotReproduced,
 }
 
-/// Auxiliary flags resolved before classification (plan output + resolve-unknown).
+/// Auxiliary flags resolved before classification (plan output, supply
+/// rollup, resolve-unknown). The plan/supply-time facts all live here so
+/// [`classify`] is the ONE precedence owner for dispositions: plan-time
+/// exclusion records are derived by calling it with
+/// [`RioOutcome::NotAttempted`] plus the job's flags, never by a second
+/// precedence list elsewhere.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AuxFlags {
     /// Job was filtered out / unsupported system or feature (reason string).
@@ -44,13 +49,34 @@ pub struct AuxFlags {
     /// Attr failed local evaluation (recorded as an eval-error exclusion
     /// in the archive).
     pub eval_error: bool,
+    /// The recorder marked the unit's derivation identity divergent from
+    /// the source it recorded: the evaluation here cannot be compared
+    /// against the recorded truth, whatever the replay did.
+    #[serde(default)]
+    pub identity_divergent: bool,
     /// Job is in the plan-time not-attemptable set: in leaf mode its own
     /// outputs sit inside another in-scope job's dependency closure, so
     /// warming would have masked the build.
     pub plan_not_attemptable: bool,
+    /// The archive lists impure environment variables for the unit's
+    /// derivation: the engine cannot forward the recording client's values,
+    /// so the unit is demoted out of the workload — never rebuilt, never
+    /// judged as a regression.
+    #[serde(default)]
+    pub demoted_impure: bool,
     /// Every declared output was already valid in rio-store at the
     /// plan-time validity snapshot.
     pub plan_snapshot_valid: bool,
+    /// The target refused a client upload required for this unit's closure
+    /// (after the fresh-channel retry), so the unit was retired before
+    /// submission.
+    #[serde(default)]
+    pub upload_rejected: bool,
+    /// Required supply for this unit's closure could not be obtained or
+    /// delivered for reasons not attributable to the target, so the unit
+    /// was retired before submission.
+    #[serde(default)]
+    pub supply_failed: bool,
     /// Verdict from the optional resolve-unknown pass over units whose
     /// expected outcome is `unknown`: Some(true) = the recording evaluated a
     /// different drv for this job (identity divergence), Some(false) =
@@ -75,10 +101,19 @@ pub struct Classification {
 }
 
 /// THE classifier. Precedence (highest first): timed-interruption flag →
-/// filtered → eval-error → not-attemptable → not-attempted →
-/// completed-without-execution (cached-prior / target-substituted) → infra
-/// and upstream-source-rot failures including their cascaded dependents →
-/// the remaining cross product, keyed by the expected outcome first.
+/// filtered → eval-error → identity-divergent → not-attemptable →
+/// demoted-impure → completed-without-execution (cached-prior /
+/// target-substituted, including the plan-time cached-prior exclusion) →
+/// upload-rejected → supply-failed → not-attempted → infra and
+/// upstream-source-rot failures including their cascaded dependents → the
+/// remaining cross product, keyed by the expected outcome first.
+///
+/// The disposition steps mirror [`Disposition::ALL`]'s documented
+/// assignment-precedence order exactly; the supply-side facts
+/// (cached-prior at plan time, upload-rejected, supply-failed) apply only
+/// to units with no real outcome (`rio = NotAttempted`) — a unit that was
+/// dispatched anyway is judged on what actually happened, never
+/// retroactively excluded.
 pub fn classify(expected: &ExpectedOutcome, rio: &RioOutcome, flags: &AuxFlags) -> Classification {
     let verdict = |v: Verdict| Classification {
         class: UnifiedClass::Verdict(v),
@@ -88,6 +123,7 @@ pub fn classify(expected: &ExpectedOutcome, rio: &RioOutcome, flags: &AuxFlags) 
         class: UnifiedClass::Disposition(d),
         cascaded: false,
     };
+    let not_attempted = matches!(rio, RioOutcome::NotAttempted);
 
     // 0. timed interruption replay: the recorded outcome was an
     // interruption, so the replay (or the build out-racing it) is the final
@@ -108,17 +144,25 @@ pub fn classify(expected: &ExpectedOutcome, rio: &RioOutcome, flags: &AuxFlags) 
     if flags.eval_error {
         return disposition(Disposition::EvalError);
     }
-    // 3. not-attemptable (plan-time set)
+    // 3. identity-divergent (plan-time set): the recorded truth belongs to
+    // a different derivation, so no outcome of any kind is comparable.
+    if flags.identity_divergent {
+        return disposition(Disposition::IdentityDivergent);
+    }
+    // 4. not-attemptable (plan-time set)
     if flags.plan_not_attemptable {
         return disposition(Disposition::NotAttemptable);
     }
-    // 4. not-attempted
-    if matches!(rio, RioOutcome::NotAttempted) {
-        return disposition(Disposition::NotAttempted);
+    // 5. demoted-impure (plan-time set): the build environment cannot be
+    // reproduced, so the unit is never judged whatever happened.
+    if flags.demoted_impure {
+        return disposition(Disposition::DemotedImpure);
     }
-    // 5/6. completed-without-execution discriminator: plan-snapshot valid ⇒
+    // 6. completed-without-execution discriminator: plan-snapshot valid ⇒
     // cached-prior; (not-attemptable already handled); else
-    // target-substituted.
+    // target-substituted. The plan-time arm covers the unit excluded at
+    // planning because every output was already valid — it was never
+    // submitted, so its "outcome" is not-attempted.
     if let RioOutcome::Built { executed: false } = rio {
         return if flags.plan_snapshot_valid {
             disposition(Disposition::CachedPrior)
@@ -126,7 +170,22 @@ pub fn classify(expected: &ExpectedOutcome, rio: &RioOutcome, flags: &AuxFlags) 
             disposition(Disposition::TargetSubstituted)
         };
     }
-    // 7. infra / source-rot (incl. cascaded dependents per the cascade rule).
+    if not_attempted && flags.plan_snapshot_valid {
+        return disposition(Disposition::CachedPrior);
+    }
+    // 7/8. supply rollup (pre-submission retirement): a required upload the
+    // target refused outranks an engine-side supply failure.
+    if not_attempted && flags.upload_rejected {
+        return disposition(Disposition::UploadRejected);
+    }
+    if not_attempted && flags.supply_failed {
+        return disposition(Disposition::SupplyFailed);
+    }
+    // 9. not-attempted
+    if not_attempted {
+        return disposition(Disposition::NotAttempted);
+    }
+    // 10. infra / source-rot (incl. cascaded dependents per the cascade rule).
     match rio {
         RioOutcome::TargetFailed {
             kind: FailureKind::Infra,
@@ -156,7 +215,7 @@ pub fn classify(expected: &ExpectedOutcome, rio: &RioOutcome, flags: &AuxFlags) 
         }
         _ => {}
     }
-    // 8. Cross product, keyed by the expected outcome first.
+    // 11. Cross product, keyed by the expected outcome first.
     match expected {
         ExpectedOutcome::Unknown => match flags.resolve_unknown_divergent {
             Some(true) => disposition(Disposition::IdentityDivergent),
@@ -350,10 +409,40 @@ mod tests {
         d(Disposition::NotAttempted),
         false
     )]
+    // identity-divergent / demoted-impure are dispositive plan-time facts:
+    // they outrank the sets below them in Disposition::ALL order and apply
+    // whatever the replay did (the recorded truth is not comparable).
+    #[case(ExpectedOutcome::Built, RioOutcome::NotAttempted,
+           AuxFlags { identity_divergent: true, plan_not_attemptable: true, ..flags() },
+           d(Disposition::IdentityDivergent), false)]
+    #[case(ExpectedOutcome::Built, RioOutcome::Built { executed: true },
+           AuxFlags { identity_divergent: true, ..flags() }, d(Disposition::IdentityDivergent), false)]
+    #[case(ExpectedOutcome::Built, RioOutcome::NotAttempted,
+           AuxFlags { demoted_impure: true, plan_snapshot_valid: true, ..flags() },
+           d(Disposition::DemotedImpure), false)]
+    #[case(ExpectedOutcome::Built, RioOutcome::Built { executed: true },
+           AuxFlags { demoted_impure: true, ..flags() }, d(Disposition::DemotedImpure), false)]
     // completed-without-execution discriminator
     #[case(ExpectedOutcome::Built, RioOutcome::Built { executed: false },
            AuxFlags { plan_snapshot_valid: true, ..flags() }, d(Disposition::CachedPrior), false)]
     #[case(ExpectedOutcome::Built, RioOutcome::Built { executed: false }, flags(), d(Disposition::TargetSubstituted), false)]
+    // plan-time cached-prior exclusion: every output already valid at the
+    // snapshot, never submitted — and it outranks the supply dispositions.
+    #[case(ExpectedOutcome::Unknown, RioOutcome::NotAttempted,
+           AuxFlags { plan_snapshot_valid: true, ..flags() }, d(Disposition::CachedPrior), false)]
+    #[case(ExpectedOutcome::Unknown, RioOutcome::NotAttempted,
+           AuxFlags { plan_snapshot_valid: true, upload_rejected: true, ..flags() },
+           d(Disposition::CachedPrior), false)]
+    // supply rollup: a refused required upload outranks an engine-side
+    // supply failure; both apply only to never-attempted units — a unit
+    // dispatched anyway is judged on its real outcome.
+    #[case(ExpectedOutcome::Built, RioOutcome::NotAttempted,
+           AuxFlags { upload_rejected: true, supply_failed: true, ..flags() },
+           d(Disposition::UploadRejected), false)]
+    #[case(ExpectedOutcome::Built, RioOutcome::NotAttempted,
+           AuxFlags { supply_failed: true, ..flags() }, d(Disposition::SupplyFailed), false)]
+    #[case(ExpectedOutcome::Built, failed(FailureKind::Genuine),
+           AuxFlags { upload_rejected: true, ..flags() }, v(Verdict::UnexpectedFailure), false)]
     // infra / source rot (and their cascades)
     #[case(
         ExpectedOutcome::Built,
@@ -557,27 +646,34 @@ mod tests {
             dep(RootCauseKind::Infra),
             dep(RootCauseKind::SourceRot),
         ];
-        let bools = [false, true];
         let resolve = [None, Some(false), Some(true)];
         let timed = [
             None,
             Some(TimedInterruption::Replayed),
             Some(TimedInterruption::NotReproduced),
         ];
+        // Eight independent boolean facts, driven by a bitmask so adding a
+        // flag is one line here and the count assertion below catches a
+        // forgotten dimension.
         let mut grid = 0usize;
         for expected_outcome in &expecteds {
             for rio in &rios {
-                for skipped in &bools {
-                    for eval_error in &bools {
-                        for not_attemptable in &bools {
-                            for snapshot_valid in &bools {
+                for mask in 0u32..(1 << 8) {
+                    let bit = |n: u32| mask & (1 << n) != 0;
+                    {
+                        {
+                            {
                                 for rud in &resolve {
                                     for ti in &timed {
                                         let aux = AuxFlags {
-                                            skipped: skipped.then(|| "filtered".to_string()),
-                                            eval_error: *eval_error,
-                                            plan_not_attemptable: *not_attemptable,
-                                            plan_snapshot_valid: *snapshot_valid,
+                                            skipped: bit(0).then(|| "filtered".to_string()),
+                                            eval_error: bit(1),
+                                            identity_divergent: bit(2),
+                                            plan_not_attemptable: bit(3),
+                                            demoted_impure: bit(4),
+                                            plan_snapshot_valid: bit(5),
+                                            upload_rejected: bit(6),
+                                            supply_failed: bit(7),
                                             resolve_unknown_divergent: *rud,
                                             timed_interruption: *ti,
                                         };
@@ -610,17 +706,60 @@ mod tests {
                                             assert_eq!(c.class, d(Disposition::Filtered), "{ctx}");
                                         } else if aux.eval_error {
                                             assert_eq!(c.class, d(Disposition::EvalError), "{ctx}");
+                                        } else if aux.identity_divergent {
+                                            assert_eq!(
+                                                c.class,
+                                                d(Disposition::IdentityDivergent),
+                                                "{ctx}"
+                                            );
                                         } else if aux.plan_not_attemptable {
                                             assert_eq!(
                                                 c.class,
                                                 d(Disposition::NotAttemptable),
                                                 "{ctx}"
                                             );
-                                        } else if matches!(rio, RioOutcome::NotAttempted) {
+                                        } else if aux.demoted_impure {
                                             assert_eq!(
                                                 c.class,
-                                                d(Disposition::NotAttempted),
+                                                d(Disposition::DemotedImpure),
                                                 "{ctx}"
+                                            );
+                                        } else if matches!(rio, RioOutcome::NotAttempted) {
+                                            // The remaining disposition order over a unit with
+                                            // no real outcome is Disposition::ALL's tail:
+                                            // cached-prior, upload-rejected, supply-failed,
+                                            // not-attempted.
+                                            let want = if aux.plan_snapshot_valid {
+                                                Disposition::CachedPrior
+                                            } else if aux.upload_rejected {
+                                                Disposition::UploadRejected
+                                            } else if aux.supply_failed {
+                                                Disposition::SupplyFailed
+                                            } else {
+                                                Disposition::NotAttempted
+                                            };
+                                            assert_eq!(c.class, d(want), "{ctx}");
+                                        } else if !matches!(
+                                            rio,
+                                            RioOutcome::Built { executed: false }
+                                        ) {
+                                            // A unit with a REAL outcome (built-executed or any
+                                            // failure shape) is judged on it: the rio-gated
+                                            // dispositions never retroactively excuse a
+                                            // dispatched unit. (The resolve-unknown identity
+                                            // disposition is legitimately outcome-independent.)
+                                            assert!(
+                                                !matches!(
+                                                    c.class,
+                                                    UnifiedClass::Disposition(
+                                                        Disposition::CachedPrior
+                                                            | Disposition::UploadRejected
+                                                            | Disposition::SupplyFailed
+                                                            | Disposition::TargetSubstituted
+                                                            | Disposition::NotAttempted
+                                                    )
+                                                ),
+                                                "supply facts must not exclude a real outcome: {ctx}"
                                             );
                                         }
                                         // The match-built verdict only ever comes from builds
@@ -656,7 +795,7 @@ mod tests {
         }
         assert_eq!(
             grid,
-            7 * 11 * 2 * 2 * 2 * 2 * 3 * 3,
+            7 * 11 * (1 << 8) * 3 * 3,
             "grid covered every combination"
         );
     }
