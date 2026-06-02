@@ -49,6 +49,88 @@ pub struct CompleteMarker {
     pub uploader: String,
 }
 
+/// A published archive, as proven by its parsed `complete.json`.
+///
+/// `complete.json` is the one completeness predicate of the layout: it is
+/// uploaded strictly last, so a prefix without it is an in-flight or
+/// interrupted upload (or an interrupted delete's leftovers) — never a
+/// published archive. This type is constructible only from a prefix's
+/// `complete.json` document, so every consumer that enumerates or resolves
+/// archives — the engine and the operator tooling alike — necessarily
+/// applies that one predicate; keying archive existence on any other
+/// object (e.g. `manifest.json`) is unrepresentable.
+#[derive(Debug, Clone)]
+pub struct PublishedArchive {
+    marker: CompleteMarker,
+}
+
+impl PublishedArchive {
+    /// Parse a prefix's `complete.json` bytes into the proof of
+    /// publication. The marker must be internally consistent: a full
+    /// 64-hex lowercase `archive_id` whose first 16 characters equal
+    /// `archive_id_short`.
+    pub fn from_complete_json(bytes: &[u8]) -> anyhow::Result<Self> {
+        let marker: CompleteMarker = serde_json::from_slice(bytes)
+            .with_context(|| format!("parse {ARCHIVE_COMPLETE_OBJECT}"))?;
+        anyhow::ensure!(
+            marker.archive_id.len() == 64
+                && marker
+                    .archive_id
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "{ARCHIVE_COMPLETE_OBJECT} carries a malformed archive_id {:?} (expected 64 \
+             lowercase hex characters)",
+            marker.archive_id
+        );
+        anyhow::ensure!(
+            marker.archive_id_short == identity::short_id(&marker.archive_id),
+            "{ARCHIVE_COMPLETE_OBJECT} is internally inconsistent: archive_id_short {} is not \
+             the leading 16 characters of archive_id {} — the marker was hand-edited or \
+             corrupted",
+            marker.archive_id_short,
+            marker.archive_id
+        );
+        Ok(Self { marker })
+    }
+
+    /// [`Self::from_complete_json`], additionally pinning the marker to
+    /// the `<archive_id_short>/` prefix segment it was fetched from.
+    /// Publishing always writes the marker under its own short id, so a
+    /// mismatch means the archive was copied to the wrong prefix or the
+    /// marker was edited.
+    pub fn from_complete_json_at(bytes: &[u8], archive_id_short: &str) -> anyhow::Result<Self> {
+        let published = Self::from_complete_json(bytes)?;
+        anyhow::ensure!(
+            published.archive_id_short() == archive_id_short,
+            "{ARCHIVE_COMPLETE_OBJECT} says archive_id_short {} but it lives under the \
+             {archive_id_short}/ prefix; the archive was copied to the wrong prefix or the \
+             marker was edited",
+            published.archive_id_short(),
+        );
+        Ok(published)
+    }
+
+    /// Full 64-hex archive id (SHA-256 of the manifest.json bytes).
+    pub fn archive_id(&self) -> &str {
+        &self.marker.archive_id
+    }
+
+    /// First 16 hex characters of the archive id — the S3 prefix segment.
+    pub fn archive_id_short(&self) -> &str {
+        &self.marker.archive_id_short
+    }
+
+    /// The parsed completion marker.
+    pub fn marker(&self) -> &CompleteMarker {
+        &self.marker
+    }
+
+    /// Consume the proof, keeping the marker document.
+    pub fn into_marker(self) -> CompleteMarker {
+        self.marker
+    }
+}
+
 /// A fetched archive on local disk, ready to open in place.
 #[derive(Debug, Clone)]
 pub struct FetchedArchive {
@@ -323,15 +405,9 @@ impl ArchiveStore {
             .await
             .with_context(|| format!("read s3://{}/{complete_key}", self.bucket))?
             .into_bytes();
-        let marker: CompleteMarker = serde_json::from_slice(&marker_bytes)
-            .with_context(|| format!("parse s3://{}/{complete_key}", self.bucket))?;
-        anyhow::ensure!(
-            marker.archive_id_short == archive_id_short,
-            "short id mismatch at s3://{}/{complete_key}: the prefix says {archive_id_short} but \
-             {ARCHIVE_COMPLETE_OBJECT} says {}",
-            self.bucket,
-            marker.archive_id_short
-        );
+        let marker = PublishedArchive::from_complete_json_at(&marker_bytes, archive_id_short)
+            .with_context(|| format!("s3://{}/{complete_key}", self.bucket))?
+            .into_marker();
 
         tokio::fs::create_dir_all(dest_dir)
             .await
@@ -413,11 +489,8 @@ impl ArchiveStore {
     /// discovered through their `complete.json` objects only, so incomplete
     /// or in-flight uploads are invisible. Each marker's `archive_id_short`
     /// is cross-checked against the prefix segment it was found under.
-    /// Returns `(archive_id_short, marker)` pairs sorted by short id.
-    pub async fn list(
-        &self,
-        client: &aws_sdk_s3::Client,
-    ) -> anyhow::Result<Vec<(String, CompleteMarker)>> {
+    /// Returns [`PublishedArchive`]s sorted by short id.
+    pub async fn list(&self, client: &aws_sdk_s3::Client) -> anyhow::Result<Vec<PublishedArchive>> {
         let prefix = self.archives_prefix();
         let complete_suffix = format!("/{ARCHIVE_COMPLETE_OBJECT}");
         let mut complete_keys: Vec<(String, String)> = Vec::new();
@@ -470,23 +543,15 @@ impl ArchiveStore {
                 .await
                 .with_context(|| format!("read s3://{}/{key}", self.bucket))?
                 .into_bytes();
-            let marker: CompleteMarker = serde_json::from_slice(&bytes)
-                .with_context(|| format!("parse s3://{}/{key}", self.bucket))?;
-            // Publishing always writes the marker under its own short id, so
-            // a mismatch means the prefix was hand-copied or the marker was
-            // edited; surface that instead of returning an entry whose fetch
-            // would fail anyway.
-            anyhow::ensure!(
-                marker.archive_id_short == short,
-                "{ARCHIVE_COMPLETE_OBJECT} at s3://{}/{key} says archive_id_short {} but it \
-                 lives under the {short}/ prefix; the archive was copied to the wrong prefix \
-                 or the marker was edited",
-                self.bucket,
-                marker.archive_id_short
-            );
-            archives.push((short, marker));
+            // The prefix cross-check (marker says the short id it lives
+            // under) is the constructor's: a hand-copied prefix or an
+            // edited marker surfaces here instead of as an entry whose
+            // fetch would fail anyway.
+            let published = PublishedArchive::from_complete_json_at(&bytes, &short)
+                .with_context(|| format!("s3://{}/{key}", self.bucket))?;
+            archives.push(published);
         }
-        archives.sort_by(|a, b| a.0.cmp(&b.0));
+        archives.sort_by(|a, b| a.archive_id_short().cmp(b.archive_id_short()));
         Ok(archives)
     }
 
@@ -1024,15 +1089,59 @@ mod tests {
             .fetch(&client, short, &dir.path().join("fetched"))
             .await
             .unwrap_err();
-        assert!(
-            format!("{err:#}").contains("short id mismatch"),
-            "got: {err:#}"
-        );
+        assert!(format!("{err:#}").contains("lives under"), "got: {err:#}");
         assert_eq!(
             get_other.num_calls(),
             0,
             "nothing may be downloaded after the refusal"
         );
+    }
+
+    #[test]
+    fn published_archive_is_only_constructible_from_a_consistent_marker() {
+        let archive_id = "a".repeat(64);
+        let short = &archive_id[..16];
+        let marker = CompleteMarker {
+            archive_id: archive_id.clone(),
+            archive_id_short: short.to_string(),
+            objects: BTreeMap::new(),
+            uploaded_at: test_stamp(),
+            uploader: "rio-replay/test".to_string(),
+        };
+        let bytes = serde_json::to_vec(&marker).unwrap();
+
+        // The complete.json bytes are the proof of publication.
+        let published = PublishedArchive::from_complete_json(&bytes).unwrap();
+        assert_eq!(published.archive_id(), archive_id);
+        assert_eq!(published.archive_id_short(), short);
+        assert_eq!(published.marker().uploader, "rio-replay/test");
+        assert_eq!(published.into_marker().archive_id, archive_id);
+
+        // The prefix-pinned constructor refuses a marker fetched from a
+        // prefix it does not name.
+        PublishedArchive::from_complete_json_at(&bytes, short).unwrap();
+        let err = PublishedArchive::from_complete_json_at(&bytes, "bbbbbbbbbbbbbbbb").unwrap_err();
+        assert!(format!("{err:#}").contains("lives under"), "got: {err:#}");
+
+        // An internally inconsistent marker (short id is not the leading 16
+        // characters of the full id) is refused by every constructor.
+        let mut edited = marker.clone();
+        edited.archive_id_short = "b".repeat(16);
+        let err = PublishedArchive::from_complete_json(&serde_json::to_vec(&edited).unwrap())
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("internally inconsistent"),
+            "got: {err:#}"
+        );
+
+        // A malformed archive id (wrong length / not lowercase hex) and
+        // unparseable bytes are refused too.
+        let mut malformed = marker.clone();
+        malformed.archive_id = "abc".to_string();
+        assert!(
+            PublishedArchive::from_complete_json(&serde_json::to_vec(&malformed).unwrap()).is_err()
+        );
+        assert!(PublishedArchive::from_complete_json(b"not json").is_err());
     }
 
     #[tokio::test]
@@ -1089,10 +1198,10 @@ mod tests {
         let store = ArchiveStore::new("rio-chunks", "replay");
         let archives = store.list(&client).await.unwrap();
         assert_eq!(archives.len(), 2, "the incomplete prefix is invisible");
-        assert_eq!(archives[0].0, short_a);
-        assert_eq!(archives[0].1.archive_id, "a".repeat(64));
-        assert_eq!(archives[1].0, short_b);
-        assert_eq!(archives[1].1.archive_id, "b".repeat(64));
+        assert_eq!(archives[0].archive_id_short(), short_a);
+        assert_eq!(archives[0].archive_id(), "a".repeat(64));
+        assert_eq!(archives[1].archive_id_short(), short_b);
+        assert_eq!(archives[1].archive_id(), "b".repeat(64));
         assert_eq!(get_a.num_calls(), 1);
         assert_eq!(get_b.num_calls(), 1);
     }
