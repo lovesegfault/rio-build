@@ -1302,7 +1302,14 @@ pub const M_067: () = ();
 ///
 /// Column semantics: `drv_path_hash` = sha256 of the FULL `.drv` store
 /// path string (narinfo keying convention). `modulo_hash` = the
-/// 32-byte `hashDerivationModulo` over the stored bytes.
+/// 32-byte INPUT-position form of `hashDerivationModulo` over the
+/// stored bytes (`mask_outputs=false`, CppNix's recursive
+/// `pathDerivationModulo` entry) — NOT the published/masked form a
+/// floating-CA subject advertises as its realisation key. Every
+/// consumer seeds this column into another derivation's modulo walk as
+/// an input digest, and for floating subjects the two forms diverge;
+/// caching the published form would poison every downstream IA
+/// derivation's derived paths (the masked-form false-result class).
 /// `ia_output_paths` = the statically derived `{output_name: path}`
 /// map for static input-addressed derivers ONLY; fixed-output and
 /// unknown-path derivers store `'{}'`. `deferred` = the deriver's own

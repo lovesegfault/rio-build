@@ -49,6 +49,7 @@ pub(crate) struct ComputedModulo {
 }
 
 /// Why a best-effort population was skipped.
+#[derive(Debug)]
 pub(crate) enum SkipReason {
     /// The bytes do not parse as a derivation. (A text-CA-valid `.drv`
     /// path can hold garbage — the upload gate binds bytes to the path,
@@ -68,9 +69,7 @@ pub(crate) fn compute_drv_modulo(
     drv_path: &str,
     input_hashes: &HashMap<String, [u8; 32]>,
 ) -> Result<ComputedModulo, SkipReason> {
-    use rio_nix::derivation::{
-        Derivation, DerivationLike, hash_derivation_modulo, input_addressed_output_paths,
-    };
+    use rio_nix::derivation::{Derivation, DerivationLike, input_addressed_output_paths};
 
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Err(SkipReason::ParseFailed);
@@ -81,10 +80,24 @@ pub(crate) fn compute_drv_modulo(
 
     // Cache-only resolution: a missing input fails the walk (the
     // resolver returns None), mapped to MissingInput below.
+    //
+    // INPUT form, not the published form: every consumer of this row's
+    // hash seeds it into ANOTHER derivation's modulo walk as an
+    // input-position digest (`populate_on_ingest` seeds, the
+    // read-through's bottom-up pass). For floating-CA subjects the
+    // published (masked) form diverges from the input form and would
+    // poison every downstream IA derivation — the masked-form
+    // false-result class. The masked/published hash is a realisation
+    // key; nothing in this cache needs it.
     let resolve_none = |_: &str| -> Option<&Derivation> { None };
     let mut cache: HashMap<String, [u8; 32]> = input_hashes.clone();
-    let modulo_hash = hash_derivation_modulo(&drv, drv_path, &resolve_none, &mut cache)
-        .map_err(|_| SkipReason::MissingInput)?;
+    let modulo_hash = rio_nix::derivation::hash_derivation_modulo_input_form(
+        &drv,
+        drv_path,
+        &resolve_none,
+        &mut cache,
+    )
+    .map_err(|_| SkipReason::MissingInput)?;
 
     let unknown = drv.has_unknown_output_paths();
     let is_ca = drv.is_content_addressed();
@@ -376,4 +389,71 @@ pub(crate) async fn load_or_compute_drv_modulo(
         remaining = next;
     }
     load_drv_modulo(pool, drv_path).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// THE masked-form regression (vm-ca-cutoff class, store edition):
+    /// a floating-CA derivation consumed as an INPUT must contribute
+    /// its `mask_outputs=false` digest to the parent's walk — the
+    /// cache row's `modulo_hash` IS that digest, never the published
+    /// (masked) realisation key. Composes `compute_drv_modulo` exactly
+    /// the way `populate_on_ingest` / the read-through do and compares
+    /// against a full-resolution reference walk; before the
+    /// input-form fix the cached composition diverged for floating
+    /// inputs and silently mis-derived every downstream IA path.
+    // r[verify store.put.ia-deriver-proof]
+    #[test]
+    fn cached_floating_input_matches_full_resolution_walk() {
+        use rio_nix::derivation::{Derivation, input_addressed_output_paths};
+        use std::collections::HashMap;
+
+        let floating_path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-floaty.drv";
+        // The env["out"] placeholder is what masking clears for a
+        // floating subject (oracle maskOutputs masks output-name env
+        // entries too) — it is what makes the published (masked) and
+        // input (unmasked) forms DIVERGE; every real floating drv
+        // carries it.
+        let floating = r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo f > $out"],[("name","floaty"),("out","/1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9")])"#;
+        let parent_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-parent.drv";
+        let parent = format!(
+            r#"Derive([("out","/nix/store/cccccccccccccccccccccccccccccccc-parent","","")],[("{floating_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","cp in $out"],[("name","parent")])"#
+        );
+
+        // Reference: full-resolution walk with the floating drv
+        // resolvable in memory.
+        let floating_drv = Derivation::parse(floating).expect("floating parses");
+        let parent_drv = Derivation::parse(&parent).expect("parent parses");
+        let resolve =
+            |p: &str| -> Option<&Derivation> { (p == floating_path).then_some(&floating_drv) };
+        let mut ref_cache: HashMap<String, [u8; 32]> = HashMap::new();
+        let reference =
+            input_addressed_output_paths(&parent_drv, parent_path, &resolve, &mut ref_cache)
+                .expect("reference walk derives");
+
+        // Cached composition: the floating row's stored hash seeds the
+        // parent's compute, exactly as the read-through does.
+        let row_f = compute_drv_modulo(floating.as_bytes(), floating_path, &HashMap::new())
+            .expect("floating row computes");
+        let seeds: HashMap<String, [u8; 32]> =
+            [(floating_path.to_string(), row_f.row.modulo_hash)].into();
+        let row_p = compute_drv_modulo(parent.as_bytes(), parent_path, &seeds)
+            .expect("parent computes from cached seed");
+
+        for (name, sp) in &reference {
+            assert_eq!(
+                row_p.row.ia_output_paths.get(name).map(String::as_str),
+                Some(sp.as_str()),
+                "cached-seed derivation diverged from the full-resolution walk \
+                 for output {name} — the floating input's cached hash is not \
+                 its input-position form"
+            );
+        }
+        assert!(
+            !reference.is_empty(),
+            "fixture precondition: parent derives outputs"
+        );
+    }
 }

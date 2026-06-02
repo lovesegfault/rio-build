@@ -40,6 +40,26 @@ pub fn hash_derivation_modulo<'c>(
     hash_modulo_walk(drv, drv_path, resolve_input, hash_cache, mask_outputs)
 }
 
+/// The INPUT-position digest of a derivation: the `mask_outputs=false`
+/// form CppNix's recursive `pathDerivationModulo` entry computes when a
+/// derivation appears as another derivation's input.
+///
+/// For IA / FOD / deferred-IA subjects this equals
+/// [`hash_derivation_modulo`] (no masking happens). For floating-CA
+/// subjects the two DIVERGE: `hash_derivation_modulo` returns the
+/// masked-subject form (the published hash, the realisation key), which
+/// MUST NOT be used to stand in for the derivation in a consumer's
+/// modulo walk. Callers that persist or seed per-drv hashes for input
+/// resolution (e.g. the store's `drv_modulo_cache`) must use THIS form.
+pub fn hash_derivation_modulo_input_form<'c>(
+    drv: &'c Derivation,
+    drv_path: &str,
+    resolve_input: &dyn Fn(&str) -> Option<&'c Derivation>,
+    hash_cache: &mut HashMap<String, [u8; 32]>,
+) -> Result<[u8; 32], DerivationError> {
+    hash_modulo_walk(drv, drv_path, resolve_input, hash_cache, false)
+}
+
 /// Canonicalize a declared FOD `outputHash` for the modulo fingerprint.
 ///
 /// CppNix renders the fingerprint hash as

@@ -17,7 +17,9 @@ mod hash;
 mod structured;
 pub mod typed;
 
-pub use hash::{hash_derivation_modulo, input_addressed_output_paths};
+pub use hash::{
+    hash_derivation_modulo, hash_derivation_modulo_input_form, input_addressed_output_paths,
+};
 pub use structured::{SizingHint, StructuredAttrError, StructuredEnv};
 
 /// Errors from parsing or hashing ATerm derivations.
