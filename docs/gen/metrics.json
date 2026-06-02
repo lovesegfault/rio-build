@@ -124,6 +124,7 @@
     "rio_scheduler_merge_foreign_edge_skipped_total",
     "rio_scheduler_merge_phase_seconds",
     "rio_scheduler_merge_rejoin_edge_skipped_total",
+    "rio_scheduler_merge_store_evidence_total",
     "rio_scheduler_orphan_builds_cancelled_total",
     "rio_scheduler_phantom_assignments_drained_total",
     "rio_scheduler_phases_rejected_total",
@@ -839,6 +840,11 @@
         "name": "rio_scheduler_merge_rejoin_edge_skipped_total",
         "kind": "counter",
         "help": "Submitted dependency edges skipped at merge whose parent is a resident closure-holed node not (re)created by the submission — the legitimate full-closure rejoin signature after a reap truncated the parent's children (sched.merge.heal-accepted-edges). The parent's hole stays set until a submission re-creates the node."
+      },
+      {
+        "name": "rio_scheduler_merge_store_evidence_total",
+        "kind": "counter",
+        "help": "Merge-time store-evidence checks for settled identity conflicts (sched.merge.store-evidence-displacement), labeled by result: displaced (claim verified — by ingress-byte-bound rank or against the store's text-CA .drv bytes — and the settled squat erased), mismatch (the store derivation contradicts the claim; submission rejected), unavailable (store silent — fetch failed, path absent, or bytes unverifiable; fail-closed rejection stands), over_budget (per-merge fetch budget exhausted; rejection stands)"
       },
       {
         "name": "rio_scheduler_orphan_builds_cancelled_total",

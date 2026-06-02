@@ -2229,7 +2229,7 @@ undispatchable (workers would be told to fetch a `.drv` that exists in no
 store). Reap-then-resubmit and crash-retry re-creations get the same
 refresh for free.
 
-#r("sched.persist.settled-identity-freeze")[
+#r("sched.persist.settled-identity-freeze+1")[
   A persisted derivation row whose status is `completed` or `skipped`
   MUST NOT be re-created under a conflicting identity: before any state
   is written for a submission, every submitted hash that has no resident
@@ -2239,10 +2239,13 @@ refresh for free.
   content-addressed flag, expected output paths declared by both sides)
   plus at least one piece of content-bound evidence (a shared non-empty
   expected output path, or a byte-equal CA modular hash) --- MUST be
-  rejected with `FAILED_PRECONDITION`. The persistence layer MUST
-  additionally refuse to update a settled row whose public identity
-  conflicts with the incoming re-creation, independent of the pre-merge
-  check.
+  rejected with `FAILED_PRECONDITION`, unless the conflicting
+  re-creation was approved by the store-evidence check
+  (#rref("sched.merge.store-evidence-displacement")). The persistence
+  layer MUST additionally refuse to update a settled row whose public
+  identity conflicts with the incoming re-creation, independent of the
+  pre-merge check, admitting only the per-merge hash list that check
+  approved.
 ]
 The freeze covers the window the merge gate cannot:
 #rref("sched.merge.authoritative-conflict") protects a settled node only
@@ -2261,7 +2264,61 @@ and the upsert run at different times in the same merge: a row that
 settles between them (racing completion fan-out) or a future caller that
 bypasses the check (bug) must still find the row immovable; the upsert
 skips such rows entirely, which surfaces as a loud merge failure rather
-than silent history rewrite.
+than silent history rewrite. The store-evidence carve-out does not weaken
+the guard's posture: the approved-hash list is computed by the same
+pre-merge check inside the same merge, scoped to that one transaction,
+and empty for every other writer --- the freeze stays unconditional
+except where the store's own bytes (or strictly higher ingress-bound
+evidence) proved the settled record is the impostor.
+
+#r("sched.merge.store-evidence-displacement")[
+  When a store-backed submission's declared identity conflicts with a
+  SETTLED content-bound record --- a resident settled authoritative node,
+  or a settled row whose lineage rank is `content_bound_claim` --- the
+  scheduler MUST attempt to verify the claim against the store's own copy
+  of the derivation before rejecting it: fetch the `.drv` the declared
+  path names (subject to a per-merge fetch budget), re-derive its text
+  content-address in the actor and require it to equal the declared path,
+  and compare the parsed derivation against the submission's claimed
+  identity with the same validator SubmitBuild ingress applies to inline
+  content. A verified claim MUST displace the settled squat --- through
+  the displacement primitive for resident victims, and through a
+  per-merge approved-hash carve-out of the settled-row freeze (with the
+  old row's persisted parent-side dependency edges scrubbed in the same
+  transaction) for row-only victims. A contradiction MUST reject the
+  submission with `FAILED_PRECONDITION`. Store silence --- fetch failure,
+  absent path, non-canonical or non-text-CA-consistent bytes, or
+  unresolvable declared-IA inputs --- MUST NOT count as evidence in
+  either direction: the existing rejection stands. A row-only victim
+  whose persisted rank is `path_bound_bytes` or higher MUST NOT be
+  displaced by this check. An ingress-byte-bound submission
+  (`path_bound_bytes`) outranks a `content_bound_claim` row directly and
+  MUST be approved with no store fetch.
+]
+This is the self-service path for `bug_076`-class squats: the victim of a
+content-bound squat on its predictable `drv_path` uploads the genuine
+`.drv` (text-CA-enforced at store ingestion, #rref("store.put.drv-text-ca"))
+and resubmits store-backed; the scheduler verifies the store derivation
+and erases the squat --- no operator involved. The verification is
+self-contained in the actor because store transport is not part of the
+trust boundary for identity decisions: the fetched bytes must re-derive
+the declared path as their text content-address before anything is
+believed, so a confused or hostile store answer cannot smuggle unrelated
+bytes into the comparison. The fetch budget (8 per merge) bounds the
+single-threaded actor's exposure to a submission manufactured to carry
+many settled conflicts; conflicts past the budget keep the fail-closed
+rejection and are observable (`over_budget` on the
+`rio_scheduler_merge_store_evidence_total` counter). The rank gate on
+row-only victims is uniform with the displacement primitive's settled
+rule (#rref("sched.merge.evidence-ranked-displacement")); it is also
+unreachable in honest operation --- store bytes cannot contradict an
+identity that was itself derived from byte-bound evidence --- which is
+exactly why it is enforced in code rather than argued. The displaced
+squat's registered store content (if any) remains until garbage
+collection; this is harmless because realisations are keyed by
+`(modular hash, output name)` and the squat's modular hash differs from
+the genuine derivation's, so stale realisations cannot poison the
+victim's resolution.
 
 #r("sched.persist.atomic-activation+2")[
   The merge-time persistence of (re)created derivation rows --- including

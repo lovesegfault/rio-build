@@ -499,7 +499,7 @@ impl SchedulerDb {
     /// Load the identity columns of SETTLED (`completed`/`skipped`)
     /// derivation rows for the given hashes.
     ///
-    /// r[impl sched.persist.settled-identity-freeze]
+    /// r[impl sched.persist.settled-identity-freeze+1]
     /// A settled row is the durable record of a successful build whose
     /// DAG node may already have been reaped (terminal cleanup); the
     /// merge gate cannot protect it (no resident node), so the

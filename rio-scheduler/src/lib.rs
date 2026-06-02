@@ -174,6 +174,17 @@ pub fn describe_metrics() {
          submission re-creates the node."
     );
     describe_counter!(
+        "rio_scheduler_merge_store_evidence_total",
+        "Merge-time store-evidence checks for settled identity conflicts \
+         (sched.merge.store-evidence-displacement), labeled by result: \
+         displaced (claim verified — by ingress-byte-bound rank or against \
+         the store's text-CA .drv bytes — and the settled squat erased), \
+         mismatch (the store derivation contradicts the claim; submission \
+         rejected), unavailable (store silent — fetch failed, path absent, \
+         or bytes unverifiable; fail-closed rejection stands), over_budget \
+         (per-merge fetch budget exhausted; rejection stands)"
+    );
+    describe_counter!(
         "rio_scheduler_cache_hits_total",
         "Derivations served from cache (labeled by source: scheduler/reprobe/existing/dispatch)"
     );

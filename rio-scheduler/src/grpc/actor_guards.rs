@@ -103,11 +103,20 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         // Same string as `ensure_leader` above so operators grep for
         // one signature.
         ActorError::NotLeader => Status::unavailable("not leader (standby replica)"),
-        // r[impl sched.persist.settled-identity-freeze]
+        // r[impl sched.persist.settled-identity-freeze+1]
         // Client-actionable conflict with a settled (successfully built)
         // derivation record — same FAILED_PRECONDITION class as the
         // merge gate's authoritative-content conflicts; the variant's
-        // #[error] text carries the remediation.
+        // #[error] text carries the remediation (store-backed
+        // resubmission is now self-service via the store-evidence
+        // check).
         ActorError::SettledIdentityConflict { .. } => Status::failed_precondition(err.to_string()),
+        // r[impl sched.merge.store-evidence-displacement]
+        // The store's own text-CA-bound bytes disprove the submission's
+        // claimed identity. FAILED_PRECONDITION, not INVALID_ARGUMENT:
+        // the request is well-formed; it conflicts with durable state
+        // (the store object), and retrying the identical claim can
+        // never succeed.
+        ActorError::StoreEvidenceContradicts { .. } => Status::failed_precondition(err.to_string()),
     }
 }

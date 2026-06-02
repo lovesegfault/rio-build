@@ -920,7 +920,7 @@ pub enum ActorError {
     #[error("not leader (standby replica)")]
     NotLeader,
 
-    /// `r[sched.persist.settled-identity-freeze]`: a submission tried to
+    /// `r[sched.persist.settled-identity-freeze+1]`: a submission tried to
     /// (re)create a derivation whose persisted row is SETTLED
     /// (completed/skipped — the durable record of a successful build,
     /// possibly already reaped from the DAG) under a conflicting
@@ -933,11 +933,28 @@ pub enum ActorError {
     #[error(
         "derivation {drv_path} has a settled (successfully built) record \
          with a different identity; re-creating it would erase that \
-         record. If the settled record is a squat, ask an operator to \
-         clear it; if this is a legitimate rebuild, resubmit with the \
-         original declared identity"
+         record. If your .drv is uploaded to the store, resubmit \
+         store-backed: the scheduler verifies the store derivation and \
+         displaces a squatting record automatically. Otherwise upload \
+         the .drv first, or ask an operator to clear the record"
     )]
     SettledIdentityConflict { drv_path: String },
+
+    /// `r[sched.merge.store-evidence-displacement]`: the merge-time
+    /// store-evidence check fetched the `.drv` the submission's
+    /// declared `drv_path` names, verified its text content-address,
+    /// and the parsed derivation CONTRADICTS the submission's claimed
+    /// identity — the store, not the prior record, disproves the
+    /// claim. Maps to FAILED_PRECONDITION: the submitter's declared
+    /// identity does not belong to the derivation at that path, so no
+    /// retry of the same claim can succeed (fix the submission, or the
+    /// `.drv` upload it references).
+    #[error(
+        "the store derivation at {drv_path} contradicts this \
+         submission's claimed identity; the declared outputs/flags do \
+         not derive from the .drv bytes the store holds at that path"
+    )]
+    StoreEvidenceContradicts { drv_path: String },
 }
 
 /// Read-only view of the actor's backpressure state.

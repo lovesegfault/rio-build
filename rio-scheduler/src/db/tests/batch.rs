@@ -120,7 +120,7 @@ async fn test_batch_upsert_10k_nodes() -> anyhow::Result<()> {
         .collect();
 
     let mut tx = db.pool().begin().await?;
-    let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &rows).await?;
+    let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &rows, &[]).await?;
     tx.commit().await?;
 
     assert_eq!(id_map.len(), N, "RETURNING gave back every row");
@@ -206,7 +206,7 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
     let mut tx = db.pool().begin().await?;
     let t0 = Instant::now();
 
-    let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &rows).await?;
+    let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &rows, &[]).await?;
     let t_derivs = t0.elapsed();
 
     let db_ids: Vec<Uuid> = id_map.values().map(|(id, _)| *id).collect();
@@ -283,7 +283,7 @@ async fn wanted_output_names_round_trip_and_union_on_conflict() -> anyhow::Resul
             evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         };
         let mut tx = db.pool().begin().await?;
-        SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
+        SchedulerDb::batch_upsert_derivations(&mut tx, &[row], &[]).await?;
         tx.commit().await?;
         let (got,): (Vec<String>,) =
             sqlx::query_as("SELECT wanted_output_names FROM derivations WHERE drv_hash = $1")
@@ -381,7 +381,7 @@ async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyho
     };
     let upsert = async |row: DerivationRow| -> anyhow::Result<Uuid> {
         let mut tx = db.pool().begin().await?;
-        let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
+        let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &[row], &[]).await?;
         tx.commit().await?;
         Ok(id_map.get(drv_hash).unwrap().0)
     };
@@ -474,7 +474,7 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
     };
     let upsert = async |row: DerivationRow| -> anyhow::Result<()> {
         let mut tx = db.pool().begin().await?;
-        SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
+        SchedulerDb::batch_upsert_derivations(&mut tx, &[row], &[]).await?;
         tx.commit().await?;
         Ok(())
     };
@@ -600,7 +600,7 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
         })
         .collect();
     let mut tx = db.pool().begin().await?;
-    let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &rows).await?;
+    let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &rows, &[]).await?;
 
     // 40k edges: each node i>0 has 4 parents among [i-1, i-2, ...].
     // ON CONFLICT DO NOTHING dedups any collisions.
@@ -659,6 +659,7 @@ async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Resul
     SchedulerDb::batch_upsert_derivations(
         &mut tx,
         &[row("hookdrv", Some(aterm.clone())), row("plaindrv", None)],
+        &[],
     )
     .await?;
     tx.commit().await?;
@@ -680,7 +681,8 @@ async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Resul
     // A later authoritative upsert refreshes the bytes.
     let aterm2 = b"Derive([],[],[],\"x86_64-linux\",\"/bin/sh\",[],[])".to_vec();
     let mut tx = db.pool().begin().await?;
-    SchedulerDb::batch_upsert_derivations(&mut tx, &[row("hookdrv", Some(aterm2.clone()))]).await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[row("hookdrv", Some(aterm2.clone()))], &[])
+        .await?;
     tx.commit().await?;
     assert_eq!(fetch("hookdrv").await?, Some(aterm2.clone()), "refreshed");
 
@@ -699,7 +701,7 @@ async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Resul
     // blob — a previously-written authoritative copy can never leak
     // into, or outlive, an unrelated later submission.
     let mut tx = db.pool().begin().await?;
-    SchedulerDb::batch_upsert_derivations(&mut tx, &[row("hookdrv", None)]).await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[row("hookdrv", None)], &[]).await?;
     tx.commit().await?;
     assert_eq!(
         fetch("hookdrv").await?,
@@ -767,7 +769,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
     // ── Store-origin row, re-created store-backed ─────────────────────
     // The prior creation parked in a terminal FAILURE state: that is the
     // only settled-adjacent state a conflicting re-creation can reach
-    // (a completed/skipped row is frozen — sched.persist.settled-identity-freeze).
+    // (a completed/skipped row is frozen — sched.persist.settled-identity-freeze+1).
     let first = DerivationRow {
         drv_hash: "recreate-store".into(),
         drv_path: format!("/nix/store/{}-recreate-store-old.drv", "d".repeat(32)),
@@ -787,7 +789,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         closure_hole: false,
     };
     let mut tx = db.pool().begin().await?;
-    SchedulerDb::batch_upsert_derivations(&mut tx, &[first]).await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[first], &[]).await?;
     tx.commit().await?;
     ratchet_accumulators(&test_db.pool, "recreate-store").await?;
 
@@ -813,7 +815,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         closure_hole: false,
     };
     let mut tx = db.pool().begin().await?;
-    let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &[recreator]).await?;
+    let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &[recreator], &[]).await?;
     tx.commit().await?;
 
     let (pname, system, status, features, drv_path): (
@@ -879,12 +881,12 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         closure_hole: false,
     };
     let mut tx = db.pool().begin().await?;
-    SchedulerDb::batch_upsert_derivations(&mut tx, &[auth(DerivationStatus::Failed)]).await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[auth(DerivationStatus::Failed)], &[]).await?;
     tx.commit().await?;
     ratchet_accumulators(&test_db.pool, "recreate-auth").await?;
 
     let mut tx = db.pool().begin().await?;
-    SchedulerDb::batch_upsert_derivations(&mut tx, &[auth(DerivationStatus::Created)]).await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[auth(DerivationStatus::Created)], &[]).await?;
     tx.commit().await?;
 
     let (has_poison, failed, retry_count, resubmit_cycles, floor_mem, _, _) =
@@ -938,8 +940,12 @@ async fn test_batch_upsert_resets_accumulators_on_definition_change() -> anyhow:
 
     // ── (a) authoritative squat → store-backed re-creation ────────────
     let mut tx = db.pool().begin().await?;
-    SchedulerDb::batch_upsert_derivations(&mut tx, &[auth_row("defchange-store", b"Derive-squat")])
-        .await?;
+    SchedulerDb::batch_upsert_derivations(
+        &mut tx,
+        &[auth_row("defchange-store", b"Derive-squat")],
+        &[],
+    )
+    .await?;
     tx.commit().await?;
     ratchet_accumulators(&test_db.pool, "defchange-store").await?;
 
@@ -963,7 +969,7 @@ async fn test_batch_upsert_resets_accumulators_on_definition_change() -> anyhow:
         closure_hole: false,
     };
     let mut tx = db.pool().begin().await?;
-    let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &[store_backed]).await?;
+    let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &[store_backed], &[]).await?;
     tx.commit().await?;
 
     let (has_poison, failed, retry_count, resubmit_cycles, floor_mem, floor_disk, floor_deadline) =
@@ -994,8 +1000,12 @@ async fn test_batch_upsert_resets_accumulators_on_definition_change() -> anyhow:
 
     // ── (b) authoritative squat → byte-different authoritative ────────
     let mut tx = db.pool().begin().await?;
-    SchedulerDb::batch_upsert_derivations(&mut tx, &[auth_row("defchange-auth", b"Derive-squat")])
-        .await?;
+    SchedulerDb::batch_upsert_derivations(
+        &mut tx,
+        &[auth_row("defchange-auth", b"Derive-squat")],
+        &[],
+    )
+    .await?;
     tx.commit().await?;
     ratchet_accumulators(&test_db.pool, "defchange-auth").await?;
 
@@ -1003,7 +1013,7 @@ async fn test_batch_upsert_resets_accumulators_on_definition_change() -> anyhow:
     victim.pname = Some("victim".into());
     victim.status = DerivationStatus::Created;
     let mut tx = db.pool().begin().await?;
-    SchedulerDb::batch_upsert_derivations(&mut tx, &[victim]).await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[victim], &[]).await?;
     tx.commit().await?;
 
     let (has_poison, failed, retry_count, resubmit_cycles, floor_mem, _, _) =
@@ -1043,7 +1053,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
     // Pre-existing terminal-FAILURE authoritative squat row (a prior
     // creation's snapshot that a displacing merge would recreate-refresh
     // — only failure-parked rows are displaceable; completed/skipped
-    // rows are frozen by sched.persist.settled-identity-freeze).
+    // rows are frozen by sched.persist.settled-identity-freeze+1).
     let squat = DerivationRow {
         drv_hash: "atomic-squat".into(),
         drv_path: format!("/nix/store/{}-atomic-squat.drv", "a".repeat(32)),
@@ -1063,7 +1073,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
         closure_hole: false,
     };
     let mut tx = db.pool().begin().await?;
-    SchedulerDb::batch_upsert_derivations(&mut tx, std::slice::from_ref(&squat)).await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, std::slice::from_ref(&squat), &[]).await?;
     tx.commit().await?;
 
     // Pending build that will perform the displacing merge.
@@ -1102,7 +1112,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
     {
         let mut tx = db.pool().begin().await?;
         let id_map =
-            SchedulerDb::batch_upsert_derivations(&mut tx, std::slice::from_ref(&displacer))
+            SchedulerDb::batch_upsert_derivations(&mut tx, std::slice::from_ref(&displacer), &[])
                 .await?;
         let db_ids: Vec<Uuid> = id_map.values().map(|(id, _)| *id).collect();
         SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
@@ -1146,7 +1156,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
     // Same statements, committed → recreate-refresh, links, and the
     // activation become durable together.
     let mut tx = db.pool().begin().await?;
-    let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &[displacer]).await?;
+    let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &[displacer], &[]).await?;
     let db_ids: Vec<Uuid> = id_map.values().map(|(id, _)| *id).collect();
     SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
     SchedulerDb::update_build_status_tx(&mut tx, build_id, crate::state::BuildState::Active, None)
@@ -1389,6 +1399,7 @@ async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::R
     SchedulerDb::batch_upsert_derivations(
         &mut tx,
         &[row("ca-evi", Some([7u8; 32])), row("ca-bare", None)],
+        &[],
     )
     .await?;
     tx.commit().await?;
@@ -1397,7 +1408,7 @@ async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::R
 
     // A later (re)creation refreshes the value.
     let mut tx = db.pool().begin().await?;
-    SchedulerDb::batch_upsert_derivations(&mut tx, &[row("ca-evi", Some([9u8; 32]))]).await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[row("ca-evi", Some([9u8; 32]))], &[]).await?;
     tx.commit().await?;
     assert_eq!(fetch("ca-evi").await?, Some(vec![9u8; 32]), "refreshed");
 
@@ -1426,7 +1437,7 @@ async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::R
     // A (re)creation without evidence clears it (last write wins, same
     // as the rest of the snapshot).
     let mut tx = db.pool().begin().await?;
-    SchedulerDb::batch_upsert_derivations(&mut tx, &[row("ca-evi", None)]).await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[row("ca-evi", None)], &[]).await?;
     tx.commit().await?;
     assert_eq!(fetch("ca-evi").await?, None, "cleared when absent");
 
@@ -1439,7 +1450,7 @@ async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::R
         ..row("ia-deferred-evi", Some([3u8; 32]))
     };
     let mut tx = db.pool().begin().await?;
-    SchedulerDb::batch_upsert_derivations(&mut tx, &[deferred]).await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[deferred], &[]).await?;
     tx.commit().await?;
     assert_eq!(
         fetch("ia-deferred-evi").await?,
@@ -1460,7 +1471,7 @@ async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::R
     Ok(())
 }
 
-// r[verify sched.persist.settled-identity-freeze]
+// r[verify sched.persist.settled-identity-freeze+1]
 /// The upsert's settled-row WHERE guard (defense-in-depth twin of the
 /// pre-merge check): a `completed`/`skipped` row whose public identity
 /// conflicts with the incoming re-creation is left completely untouched
@@ -1493,7 +1504,7 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
     };
     let mut tx = db.pool().begin().await?;
     let ids =
-        SchedulerDb::batch_upsert_derivations(&mut tx, std::slice::from_ref(&settled)).await?;
+        SchedulerDb::batch_upsert_derivations(&mut tx, std::slice::from_ref(&settled), &[]).await?;
     tx.commit().await?;
     assert!(ids.contains_key("settled-guard"), "initial insert returned");
 
@@ -1517,7 +1528,7 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
         closure_hole: false,
     };
     let mut tx = db.pool().begin().await?;
-    let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[conflicting]).await?;
+    let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[conflicting], &[]).await?;
     tx.commit().await?;
     // The guarded row is NOT in RETURNING — the caller (merge persist)
     // surfaces this as MissingDbId instead of corrupting the row.
@@ -1565,7 +1576,7 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
         closure_hole: false,
     };
     let mut tx = db.pool().begin().await?;
-    let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[matching]).await?;
+    let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[matching], &[]).await?;
     tx.commit().await?;
     assert!(
         ids.contains_key("settled-guard"),
@@ -1576,6 +1587,99 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
             .fetch_one(&test_db.pool)
             .await?;
     assert_eq!(status, "created", "matching rebuild re-created the row");
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement]
+// r[verify sched.persist.settled-identity-freeze+1]
+/// The settled-row WHERE guard's evidence carve-out: a conflicting
+/// re-creation whose hash is in the per-merge approved array (the
+/// actor's store-evidence verdict) updates the settled row — and an
+/// identical re-creation WITHOUT the approval is still refused, pinning
+/// that the carve-out is scoped to the array, not a weakening of the
+/// guard.
+#[tokio::test]
+async fn settled_row_upsert_guard_admits_evidence_approved_hash() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let settled = DerivationRow {
+        drv_hash: "evidence-carveout".into(),
+        drv_path: format!("/nix/store/{}-evidence-carveout.drv", "a".repeat(32)),
+        pname: Some("squat".into()),
+        system: "aarch64-linux".into(),
+        status: DerivationStatus::Completed,
+        required_features: vec![],
+        expected_output_paths: vec![format!("/nix/store/{}-squat-out", "b".repeat(32))],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: false,
+        drv_content: Some(b"Derive-squat".to_vec()),
+        ca_modular_hash: None,
+        evidence_rank: crate::state::DefinitionEvidence::ContentBoundClaim,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
+    };
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, std::slice::from_ref(&settled), &[]).await?;
+    tx.commit().await?;
+
+    let genuine = DerivationRow {
+        drv_hash: "evidence-carveout".into(),
+        drv_path: format!("/nix/store/{}-evidence-carveout.drv", "a".repeat(32)),
+        pname: Some("victim".into()),
+        system: "x86_64-linux".into(),
+        status: DerivationStatus::Created,
+        required_features: vec![],
+        expected_output_paths: vec![format!("/nix/store/{}-victim-out", "c".repeat(32))],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: false,
+        drv_content: None,
+        ca_modular_hash: None,
+        evidence_rank: crate::state::DefinitionEvidence::PathBoundBytes,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
+    };
+
+    // Without the approval: the guard refuses (scoped carve-out, not a
+    // weakening).
+    let mut tx = db.pool().begin().await?;
+    let ids =
+        SchedulerDb::batch_upsert_derivations(&mut tx, std::slice::from_ref(&genuine), &[]).await?;
+    tx.commit().await?;
+    assert!(
+        !ids.contains_key("evidence-carveout"),
+        "unapproved conflicting re-creation must still be refused"
+    );
+
+    // With the approval: the row is rewritten to the verified identity.
+    let mut tx = db.pool().begin().await?;
+    let ids = SchedulerDb::batch_upsert_derivations(
+        &mut tx,
+        std::slice::from_ref(&genuine),
+        &["evidence-carveout".to_string()],
+    )
+    .await?;
+    tx.commit().await?;
+    assert!(
+        ids.contains_key("evidence-carveout"),
+        "evidence-approved re-creation updates the settled row"
+    );
+    let (system, status, rank): (String, String, String) = sqlx::query_as(
+        "SELECT system, status, evidence_rank FROM derivations \
+         WHERE drv_hash = 'evidence-carveout'",
+    )
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert_eq!(system, "x86_64-linux", "identity rewritten to the victim's");
+    assert_eq!(
+        status, "created",
+        "settled status replaced by the fresh lifecycle"
+    );
+    assert_eq!(rank, "path_bound_bytes", "verified rank persisted");
     Ok(())
 }
 
@@ -1619,7 +1723,7 @@ async fn test_batch_upsert_evidence_rank_roundtrip_and_recreation() -> anyhow::R
     ];
     let rows: Vec<DerivationRow> = variants.iter().map(|(h, r)| row(h, *r)).collect();
     let mut tx = db.pool().begin().await?;
-    SchedulerDb::batch_upsert_derivations(&mut tx, &rows).await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &rows, &[]).await?;
     tx.commit().await?;
 
     let recovered = db.load_nonterminal_derivations().await?;
@@ -1651,6 +1755,7 @@ async fn test_batch_upsert_evidence_rank_roundtrip_and_recreation() -> anyhow::R
     SchedulerDb::batch_upsert_derivations(
         &mut tx,
         &[row("ev-verified", DefinitionEvidence::UnverifiedClaim)],
+        &[],
     )
     .await?;
     tx.commit().await?;

@@ -2672,7 +2672,10 @@ impl DagActor {
         //
         // r[impl sched.ca.resolve+3]
         let drv_content = if state.drv_content.is_empty() {
-            match self.fetch_drv_content_from_store(drv_hash, state).await {
+            match self
+                .fetch_drv_content_from_store(drv_hash.as_str(), state.drv_path())
+                .await
+            {
                 Some(bytes) => bytes,
                 None => {
                     // Store unreachable or .drv not found — dispatch
@@ -2756,10 +2759,16 @@ impl DagActor {
     /// A larger-than-1-MiB blob means something is badly wrong (the
     /// path isn't a `.drv`, or the store returned a closure NAR).
     /// Either way, bail — resolve can't parse a non-ATerm.
-    async fn fetch_drv_content_from_store(
+    ///
+    /// Shared by the dispatch-time CA resolve (this module) and the
+    /// merge-time store-evidence check
+    /// (`sched.merge.store-evidence-displacement`) — hence the
+    /// path-taking signature: the merge-side caller verifies
+    /// non-resident settled rows, which have no `DerivationState`.
+    pub(super) async fn fetch_drv_content_from_store(
         &self,
-        drv_hash: &DrvHash,
-        state: &crate::state::DerivationState,
+        drv_hash: &str,
+        drv_path: &str,
     ) -> Option<Vec<u8>> {
         /// `.drv` NAR cap. ~1-50 KB typical; 1 MiB is ~20× any
         /// real-world `.drv`. Avoids pulling a multi-GB closure if
@@ -2773,11 +2782,10 @@ impl DagActor {
         const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
         let mut client = self.store_client.as_ref()?.clone();
-        let drv_path = state.drv_path().to_string();
 
         let result = rio_proto::client::get_path_nar(
             &mut client,
-            &drv_path,
+            drv_path,
             FETCH_TIMEOUT,
             MAX_DRV_NAR_SIZE,
             None,

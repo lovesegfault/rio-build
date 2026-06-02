@@ -245,7 +245,7 @@ pub(crate) struct PoisonedDerivationRow {
 
 /// Identity columns of a SETTLED (`completed`/`skipped`) derivation row,
 /// loaded by `load_settled_identity_rows` for the pre-merge
-/// settled-identity freeze (`sched.persist.settled-identity-freeze`).
+/// settled-identity freeze (`sched.persist.settled-identity-freeze+1`).
 /// Compared against an incoming submission node by
 /// `actor::merge::settled_row_identity_matches` — the row-level twin of
 /// `dag::verifiable_identity_matches`.

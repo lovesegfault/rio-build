@@ -26,7 +26,8 @@ fn _actor_error_exhaustive(e: &ActorError) {
         | ActorError::StoreUnavailable
         | ActorError::PermissionDenied { .. }
         | ActorError::NotLeader
-        | ActorError::SettledIdentityConflict { .. } => {}
+        | ActorError::SettledIdentityConflict { .. }
+        | ActorError::StoreEvidenceContradicts { .. } => {}
     }
 }
 
@@ -77,12 +78,20 @@ fn test_actor_error_to_status_all_arms() {
         ),
         (ActorError::NotLeader, Code::Unavailable, "not leader"),
         (
-            // r[verify sched.persist.settled-identity-freeze]
+            // r[verify sched.persist.settled-identity-freeze+1]
             ActorError::SettledIdentityConflict {
                 drv_path: "/nix/store/x".into(),
             },
             Code::FailedPrecondition,
             "settled",
+        ),
+        (
+            // r[verify sched.merge.store-evidence-displacement]
+            ActorError::StoreEvidenceContradicts {
+                drv_path: "/nix/store/x".into(),
+            },
+            Code::FailedPrecondition,
+            "contradicts",
         ),
     ];
     // Count derived from the enum (strum::EnumCount), not a hardcoded

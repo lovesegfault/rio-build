@@ -74,13 +74,17 @@ pub enum DagError {
     /// or displaces it without error when the node is poison-locked —
     /// terminal failure, no longer retriable on resubmit.) A legitimate
     /// bare-resubmission claimant hitting this against a settled squat
-    /// needs operator remediation (clear the settled record) until
-    /// store-evidence displacement lands.
+    /// is self-service: upload the genuine `.drv` to the store and
+    /// resubmit — the merge-time store-evidence check
+    /// (`sched.merge.store-evidence-displacement`) verifies the claim
+    /// against the store's text-CA-bound bytes and raises it past the
+    /// squat's rank.
     #[error(
         "derivation {drv_path} carries authoritative inline content that \
          conflicts with this submission's declared identity; if the \
-         existing record is a squat on your derivation's path, ask an \
-         operator to clear it"
+         existing record is a squat on your derivation's path, upload \
+         your .drv to the store and resubmit store-backed — the \
+         scheduler verifies the store derivation and displaces the squat"
     )]
     ConflictingInFlightContent { drv_path: String },
     /// The inverse direction of [`Self::ConflictingInFlightContent`]: a
@@ -136,7 +140,7 @@ pub enum DagError {
 /// for the resubmit-reset must prove the same verifiable identity, with
 /// the same evidence rules and the same no-evidence-is-conflict stance —
 /// `existing` is then the store-backed node and `node` the claimant.
-fn verifiable_identity_matches(
+pub(crate) fn verifiable_identity_matches(
     existing: &DerivationState,
     node: &crate::domain::DerivationNode,
 ) -> bool {

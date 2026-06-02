@@ -954,7 +954,7 @@ fn validate_authoritative_drv_content(
 /// hash moves every derived path AWAY from honest paths (SHA-256 second
 /// preimage to collide one), so seeding cannot help an attacker reach a
 /// victim's path — see `input_addressed_output_paths`' soundness note.
-fn validate_inline_drv_content(
+pub(crate) fn validate_inline_drv_content(
     nodes: &mut [rio_proto::types::DerivationNode],
 ) -> Result<(), Status> {
     use rio_nix::derivation::{Derivation, DerivationLike};

@@ -55,7 +55,7 @@ pub(super) async fn insert_test_derivation(
         ca_modular_hash: None,
         evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
     };
-    let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
+    let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[row], &[]).await?;
     tx.commit().await?;
     Ok(ids.get(drv_hash).expect("just inserted").0)
 }

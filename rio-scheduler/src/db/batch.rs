@@ -36,9 +36,9 @@ impl SchedulerDb {
     /// Batch-upsert derivations. Returns a map
     /// `drv_hash -> (derivation_id, resource_floor)`.
     ///
-    /// Array parameters via `UNNEST`: 16 bind params total regardless of
-    /// row count (vs `push_values`' 16×N, which hits PG's 65535-param
-    /// limit at ~4095 rows). `RETURNING drv_hash` because PG doesn't
+    /// Array parameters via `UNNEST`: 17 bind params total regardless of
+    /// row count (vs `push_values`' 17×N, which hits PG's 65535-param
+    /// limit at ~3855 rows). `RETURNING drv_hash` because PG doesn't
     /// guarantee `RETURNING` order matches `UNNEST` input order either.
     ///
     /// `floor_*` columns are returned so merge can hydrate them onto
@@ -46,9 +46,18 @@ impl SchedulerDb {
     /// `floor=zeros`, but the DB row may pre-exist (ON CONFLICT) with a
     /// floor promoted by a prior run's failures. Without this the next
     /// SpawnIntent re-uses probe defaults and re-OOMs every run.
+    ///
+    /// `evidence_displaced` is the merge-time store-evidence verdict
+    /// (`sched.merge.store-evidence-displacement`): hashes whose
+    /// conflicting re-creation of a SETTLED row was approved by the
+    /// actor's pre-merge check (ingress-byte-bound rank, or the store's
+    /// own text-CA `.drv` bytes deriving the claimed identity). Only
+    /// these may pass the settled-identity WHERE guard below; the actor's
+    /// check is the decision, this array is its in-transaction execution.
     pub(crate) async fn batch_upsert_derivations(
         tx: &mut PgConnection,
         rows: &[DerivationRow],
+        evidence_displaced: &[String],
     ) -> Result<HashMap<String, (Uuid, crate::state::ResourceFloor)>, sqlx::Error> {
         if rows.is_empty() {
             return Ok(HashMap::new());
@@ -330,7 +339,7 @@ impl SchedulerDb {
                     WHEN derivations.drv_content IS NOT NULL
                          AND EXCLUDED.drv_content IS DISTINCT FROM derivations.drv_content
                     THEN 0 ELSE derivations.floor_deadline_secs END
-            -- r[impl sched.persist.settled-identity-freeze]
+            -- r[impl sched.persist.settled-identity-freeze+1]
             -- Defense-in-depth twin of the pre-merge settled-identity
             -- check (actor/merge.rs): a SETTLED row (completed/skipped —
             -- the durable record of a successful build) whose public
@@ -343,7 +352,16 @@ impl SchedulerDb {
             -- normally. Primary enforcement is the pre-merge check; this
             -- guard only matters if that check is bypassed (bug) or a
             -- racing writer settles the row between check and upsert.
-            WHERE NOT (
+            --
+            -- r[impl sched.merge.store-evidence-displacement]
+            -- The $17 carve-out is the SAME pre-merge check approving a
+            -- conflicting re-creation it verified — by ingress-byte-bound
+            -- rank or against the store's own text-CA .drv bytes
+            -- (sched.merge.store-evidence-displacement). The hash list is
+            -- per-merge and threaded through the one transaction, so the
+            -- guard stays unconditional for every other writer.
+            WHERE derivations.drv_hash = ANY($17)
+               OR NOT (
                 derivations.status IN ('completed', 'skipped')
                 AND (
                     derivations.system IS DISTINCT FROM EXCLUDED.system
@@ -372,6 +390,7 @@ impl SchedulerDb {
         .bind(&drv_content)
         .bind(&ca_modular_hash)
         .bind(&evidence_rank)
+        .bind(evidence_displaced)
         .fetch_all(&mut *tx)
         .await?;
         Ok(result

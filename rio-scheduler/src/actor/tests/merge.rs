@@ -9395,7 +9395,7 @@ async fn test_completed_authoritative_node_survives_conflicting_submission() -> 
     Ok(())
 }
 
-// r[verify sched.persist.settled-identity-freeze]
+// r[verify sched.persist.settled-identity-freeze+1]
 /// After a successful build's node is REAPED (terminal cleanup), its
 /// settled PG row is the only record left — the merge gate cannot see
 /// it. A conflicting resubmission for the same hash must be rejected by
@@ -9482,7 +9482,7 @@ async fn test_settled_row_rejects_conflicting_resubmission_after_reap() -> TestR
     Ok(())
 }
 
-// r[verify sched.persist.settled-identity-freeze]
+// r[verify sched.persist.settled-identity-freeze+1]
 /// A MATCHING-identity resubmission of a reaped hash (same system,
 /// output names, flags, and the same declared expected output path as
 /// content evidence) is a legitimate rebuild — e.g. after the store
@@ -10764,6 +10764,471 @@ async fn test_resubmit_reset_persists_prior_build_failure_evidence(
         query_status(&handle, watcher).await?.state,
         rio_proto::types::BuildState::Active as i32,
         "the prior keep_going build stays Active (its filler is still pending)"
+    );
+    Ok(())
+}
+
+// ===========================================================================
+// Merge-time store-evidence displacement (sched.merge.store-evidence-displacement)
+// ===========================================================================
+
+/// Mint a leaf input-addressed derivation whose declared identity is
+/// derived from real ATerm bytes, and whose `drv_path`/`drv_hash` is the
+/// text content-address of those bytes — exactly what a genuine
+/// store-uploaded `.drv` looks like. Returns the BARE store-backed proto
+/// node (no inline content) plus the canonical ATerm for seeding the
+/// mock store.
+fn mint_text_ca_leaf(tag: &str) -> (rio_proto::types::DerivationNode, String, String) {
+    use rio_nix::derivation::{Derivation, input_addressed_output_paths};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    let build_aterm = |out_path: &str| -> String {
+        format!(
+            r#"Derive([("out","{out_path}","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","{tag}"),("out","{out_path}")])"#
+        )
+    };
+    let masked = build_aterm("");
+    let masked_drv = Derivation::parse(&masked).expect("masked template parses");
+    let name_only_path = format!("/nix/store/{}-{tag}.drv", "a".repeat(32));
+    let resolve_none = |_: &str| -> Option<&Derivation> { None };
+    let paths = input_addressed_output_paths(
+        &masked_drv,
+        &name_only_path,
+        &resolve_none,
+        &mut HashMap::new(),
+    )
+    .expect("derive leaf IA paths");
+    let out_path = paths["out"].as_str().to_owned();
+    let aterm = build_aterm(&out_path);
+    let drv = Derivation::parse(&aterm).expect("final ATerm parses");
+    assert_eq!(drv.to_aterm(), aterm, "fixture must be canonical");
+
+    let content_hash =
+        NixHash::new(HashAlgo::SHA256, Sha256::digest(aterm.as_bytes()).to_vec()).unwrap();
+    let drv_path = StorePath::make_text(&format!("{tag}.drv"), &content_hash, &[])
+        .unwrap()
+        .as_str()
+        .to_owned();
+
+    let node = rio_proto::types::DerivationNode {
+        drv_path: drv_path.clone(),
+        drv_hash: drv_path,
+        pname: tag.to_owned(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: false,
+        expected_output_paths: vec![out_path.clone()],
+        ..Default::default()
+    };
+    (node, aterm, out_path)
+}
+
+/// Actor + mock store wired into the merge path's store client.
+async fn setup_with_mock_store() -> anyhow::Result<(
+    TestDb,
+    rio_test_support::grpc::MockStore,
+    ActorHandle,
+    tokio::task::JoinHandle<()>,
+)> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, task) = setup_actor_with_store(db.pool.clone(), Some(client));
+    Ok((db, store, handle, task))
+}
+
+/// Stage a settled content-bound squat at `drv_hash` and reap it: build,
+/// complete, terminal-cleanup. Afterwards only the PG row remains.
+async fn settle_and_reap_squat(
+    handle: &ActorHandle,
+    worker: &str,
+    drv_hash: &str,
+) -> anyhow::Result<Uuid> {
+    let squatter = Uuid::new_v4();
+    let squat = rio_proto::types::DerivationNode {
+        drv_path: drv_hash.to_owned(),
+        drv_hash: drv_hash.to_owned(),
+        pname: "squat".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        expected_output_paths: vec![test_store_path("squat-out")],
+        drv_content: b"Derive-squat-bytes".to_vec(),
+        drv_content_authoritative: true,
+        ..Default::default()
+    };
+    merge_dag(handle, squatter, vec![squat], vec![], false).await?;
+    let mut rx = connect_executor(handle, worker, "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, drv_hash);
+    complete_success(handle, worker, drv_hash, &test_store_path("squat-out")).await?;
+    wait_for_status(handle, drv_hash, DerivationStatus::Completed).await;
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: squatter })
+        .await?;
+    barrier(handle).await;
+    assert!(
+        handle.debug_query_derivation(drv_hash).await?.is_none(),
+        "squat reaped from the DAG; only the settled row remains"
+    );
+    Ok(squatter)
+}
+
+// r[verify sched.merge.store-evidence-displacement]
+// r[verify sched.persist.settled-identity-freeze+1]
+/// THE bug_076 self-service kill test, row-only form: an authoritative
+/// squat settles at the victim's text-CA `drv_path` and is reaped; the
+/// victim uploads its genuine `.drv` to the store and resubmits
+/// store-backed. The merge-time store-evidence check verifies the claim
+/// against the store's bytes, displaces the settled squat through the
+/// upsert carve-out, and the victim's build dispatches — no operator
+/// involved. The squatter's own build keeps its settled (succeeded)
+/// accounting.
+#[tokio::test]
+async fn test_store_evidence_displaces_settled_squat() -> TestResult {
+    let (db, store, handle, _task) = setup_with_mock_store().await?;
+    let (victim_node, aterm, _out) = mint_text_ca_leaf("evi-displace");
+    let drv_path = victim_node.drv_path.clone();
+
+    let squatter = settle_and_reap_squat(&handle, "w1", &drv_path).await?;
+
+    // The victim's genuine .drv is in the store (text-CA-bound bytes).
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+
+    // Store-backed resubmission of the genuine identity.
+    let victim = Uuid::new_v4();
+    merge_dag(&handle, victim, vec![victim_node.clone()], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Admitted and active — not FAILED_PRECONDITION.
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "verified claim admitted"
+    );
+    // The row was rewritten to the verified identity in the same merge:
+    // fresh lifecycle, victim's declared outputs, store-verified rank.
+    let (status, expected, rank): (String, Vec<String>, String) = sqlx::query_as(
+        "SELECT status, expected_output_paths, evidence_rank \
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(&drv_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_ne!(status, "completed", "settled squat record erased");
+    assert_eq!(
+        expected, victim_node.expected_output_paths,
+        "row carries the victim's verified outputs"
+    );
+    assert_eq!(rank, "path_bound_bytes", "store-verified rank persisted");
+
+    // The victim's build dispatches on the fresh node.
+    let mut rx2 = connect_executor(&handle, "w2", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx2).await;
+    assert_eq!(assn.drv_path, drv_path, "victim's definition dispatched");
+
+    // The squatter's BUILD row keeps its settled accounting — the
+    // displacement erases the derivation record, not build history.
+    let (squat_build_status,): (String,) =
+        sqlx::query_as("SELECT status FROM builds WHERE build_id = $1")
+            .bind(squatter)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(squat_build_status, "succeeded");
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement]
+/// Resident form: the settled authoritative squat is still in the DAG
+/// (not yet reaped). The store-evidence check raises the verified
+/// claimant to path-bound standing and the displacement primitive — not
+/// a parallel path — erases the squat (ContentBoundClaim < the raised
+/// PathBoundBytes).
+#[tokio::test]
+async fn test_store_evidence_displaces_settled_resident_squat() -> TestResult {
+    let (db, store, handle, _task) = setup_with_mock_store().await?;
+    let (victim_node, aterm, _out) = mint_text_ca_leaf("evi-resident");
+    let drv_path = victim_node.drv_path.clone();
+
+    // Squat settles but stays resident.
+    let squatter = Uuid::new_v4();
+    let squat = rio_proto::types::DerivationNode {
+        drv_path: drv_path.clone(),
+        drv_hash: drv_path.clone(),
+        pname: "squat".into(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        expected_output_paths: vec![test_store_path("resident-squat-out")],
+        drv_content: b"Derive-resident-squat".to_vec(),
+        drv_content_authoritative: true,
+        ..Default::default()
+    };
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    let mut rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, drv_path);
+    complete_success(
+        &handle,
+        "w1",
+        &drv_path,
+        &test_store_path("resident-squat-out"),
+    )
+    .await?;
+    wait_for_status(&handle, &drv_path, DerivationStatus::Completed).await;
+
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+
+    let victim = Uuid::new_v4();
+    merge_dag(&handle, victim, vec![victim_node.clone()], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "verified claim displaces the resident settled squat"
+    );
+    // The fresh in-memory node carries the victim's identity.
+    let d = handle
+        .debug_query_derivation(&drv_path)
+        .await?
+        .expect("displacing node resident");
+    assert_ne!(
+        d.status,
+        DerivationStatus::Completed,
+        "squat's settled status gone — fresh lifecycle"
+    );
+    let (rank,): (String,) =
+        sqlx::query_as("SELECT evidence_rank FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(rank, "path_bound_bytes");
+
+    // Victim dispatches.
+    let mut rx2 = connect_executor(&handle, "w2", "x86_64-linux").await?;
+    let assn2 = recv_assignment(&mut rx2).await;
+    assert_eq!(assn2.drv_path, drv_path);
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement]
+/// A claim the store's own bytes CONTRADICT is rejected outright — the
+/// fetched `.drv` is text-CA-bound to the declared path, so the
+/// contradiction is content-bound truth, not transport noise. The
+/// settled record stays.
+#[tokio::test]
+async fn test_store_evidence_mismatch_rejects_submission() -> TestResult {
+    let (db, store, handle, _task) = setup_with_mock_store().await?;
+    let (victim_node, aterm, _out) = mint_text_ca_leaf("evi-mismatch");
+    let drv_path = victim_node.drv_path.clone();
+
+    settle_and_reap_squat(&handle, "w1", &drv_path).await?;
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+
+    // Forge the claims: declared outputs that the store bytes do NOT
+    // derive.
+    let mut forged = victim_node;
+    forged.expected_output_paths = vec![test_store_path("forged-out")];
+
+    let attacker = Uuid::new_v4();
+    let result = merge_dag(&handle, attacker, vec![forged], vec![], false).await;
+    let err = format!(
+        "{:#}",
+        result.expect_err("contradicted claim must be rejected")
+    );
+    assert!(
+        err.contains("contradicts"),
+        "rejection names the store contradiction, got: {err}"
+    );
+
+    // Settled row untouched.
+    let (status, system): (String, String) =
+        sqlx::query_as("SELECT status, system FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(status, "completed");
+    assert_eq!(system, "x86_64-linux");
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement]
+/// Store silence is not evidence: with nothing seeded at the declared
+/// path, the conflicting resubmission keeps the fail-closed
+/// settled-identity rejection — no displacement on an unverifiable
+/// claim.
+#[tokio::test]
+async fn test_store_unavailable_keeps_settled_freeze() -> TestResult {
+    let (db, _store, handle, _task) = setup_with_mock_store().await?;
+    let (victim_node, _aterm, _out) = mint_text_ca_leaf("evi-unavail");
+    let drv_path = victim_node.drv_path.clone();
+
+    settle_and_reap_squat(&handle, "w1", &drv_path).await?;
+    // Nothing seeded: the fetch finds no path.
+
+    let claimant = Uuid::new_v4();
+    let result = merge_dag(&handle, claimant, vec![victim_node], vec![], false).await;
+    let err = format!(
+        "{:#}",
+        result.expect_err("unverifiable claim stays rejected")
+    );
+    assert!(
+        err.contains("settled"),
+        "the original settled-identity rejection stands, got: {err}"
+    );
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = $1")
+        .bind(&drv_path)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(status, "completed", "settled row untouched");
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement]
+/// R4 row-rank gate: a settled row whose persisted lineage is
+/// byte-anchored (`path_bound_bytes`) is NOT displaceable by the
+/// store-evidence path even when the store would verify the claim — the
+/// rank gate refuses before any fetch, rank-uniform with the
+/// displacement primitive's settled rule.
+#[tokio::test]
+async fn test_settled_row_rank_gate_refuses_path_bound_rows() -> TestResult {
+    let (db, store, handle, _task) = setup_with_mock_store().await?;
+    let (victim_node, aterm, _out) = mint_text_ca_leaf("evi-rankgate");
+    let drv_path = victim_node.drv_path.clone();
+
+    settle_and_reap_squat(&handle, "w1", &drv_path).await?;
+    // Backdate the settled row's lineage to byte-anchored.
+    sqlx::query("UPDATE derivations SET evidence_rank = 'path_bound_bytes' WHERE drv_hash = $1")
+        .bind(&drv_path)
+        .execute(&db.pool)
+        .await?;
+    // Even a verifiable store object must not help.
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+
+    let claimant = Uuid::new_v4();
+    let result = merge_dag(&handle, claimant, vec![victim_node], vec![], false).await;
+    let err = format!(
+        "{:#}",
+        result.expect_err("byte-anchored settled row is immovable")
+    );
+    assert!(
+        err.contains("settled"),
+        "freeze rejection stands, got: {err}"
+    );
+    let (status, rank): (String, String) =
+        sqlx::query_as("SELECT status, evidence_rank FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(status, "completed");
+    assert_eq!(rank, "path_bound_bytes");
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement]
+/// The per-merge fetch budget is structural: nine settled conflicts in
+/// one submission exceed the budget of eight, so at least one conflict
+/// keeps its fail-closed rejection and the whole merge fails; the same
+/// staging with eight conflicts verifies every one and is admitted.
+#[tokio::test]
+async fn test_store_evidence_budget_caps_fetches() -> TestResult {
+    let (db, store, handle, _task) = setup_with_mock_store().await?;
+
+    let mut nodes = Vec::new();
+    for i in 0..9 {
+        let (node, aterm, _out) = mint_text_ca_leaf(&format!("evi-budget-{i}"));
+        // Stage the settled conflicting row directly (row-only form):
+        // a content-bound squat lineage with a conflicting identity.
+        sqlx::query(
+            "INSERT INTO derivations \
+             (drv_hash, drv_path, pname, system, status, output_names, \
+              expected_output_paths, drv_content, evidence_rank) \
+             VALUES ($1, $1, 'squat', 'aarch64-linux', 'completed', \
+                     ARRAY['out'], ARRAY[$2], $3, 'content_bound_claim')",
+        )
+        .bind(&node.drv_path)
+        .bind(test_store_path(&format!("squat-{i}-out")))
+        .bind(b"Derive-squat".as_slice())
+        .execute(&db.pool)
+        .await?;
+        store.seed_with_content(&node.drv_path, aterm.as_bytes());
+        nodes.push(node);
+    }
+
+    // Nine conflicts: the ninth lands over budget → its rejection stands
+    // → the merge fails atomically (nothing displaced).
+    let result = merge_dag(&handle, Uuid::new_v4(), nodes.clone(), vec![], false).await;
+    assert!(
+        result.is_err(),
+        "nine settled conflicts exceed the fetch budget of eight"
+    );
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM derivations WHERE status = 'completed' AND pname = 'squat'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(count, 9, "over-budget merge displaced nothing");
+
+    // Eight conflicts: all within budget, all verified, admitted.
+    let eight: Vec<_> = nodes.into_iter().take(8).collect();
+    let ok_build = Uuid::new_v4();
+    merge_dag(&handle, ok_build, eight, vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, ok_build).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "eight verified conflicts admitted within budget"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.store-evidence-displacement]
+/// A MATCHING-identity store-backed resubmission joins the settled node
+/// without ever consulting the store: the store is seeded with bytes
+/// that would CONTRADICT the claim, and the join still succeeds — the
+/// match short-circuits before the evidence machinery (resolved-vs-full
+/// modular-hash equality is decided by `verifiable_identity_matches`,
+/// not by a fetch).
+#[tokio::test]
+async fn test_matching_identity_join_never_consults_store() -> TestResult {
+    let (_db, store, handle, _task) = setup_with_mock_store().await?;
+
+    // A normal authoritative node settles and stays resident.
+    let owner = Uuid::new_v4();
+    let mut node = make_node("evi-match-join");
+    node.expected_output_paths = vec![test_store_path("evi-match-out")];
+    node.drv_content = b"Derive-evi-match".to_vec();
+    node.drv_content_authoritative = true;
+    merge_dag(&handle, owner, vec![node.clone()], vec![], false).await?;
+    let mut rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
+    let drv_path = test_drv_path("evi-match-join");
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, drv_path);
+    complete_success(&handle, "w1", &drv_path, &test_store_path("evi-match-out")).await?;
+    wait_for_status(&handle, "evi-match-join", DerivationStatus::Completed).await;
+
+    // Poison the well: bytes at the declared path that contradict
+    // everything. A fetch would yield Contradicts and fail the merge.
+    store.seed_with_content(
+        &drv_path,
+        b"Derive([(\"out\",\"\",\"\",\"\")],[],[],\"mips64-linux\",\"/bin/false\",[],[])",
+    );
+
+    // Matching store-backed resubmission (same identity + content
+    // evidence via the shared expected path) joins as a cache hit.
+    let mut matching = make_node("evi-match-join");
+    matching.expected_output_paths = vec![test_store_path("evi-match-out")];
+    let joiner = Uuid::new_v4();
+    merge_dag(&handle, joiner, vec![matching], vec![], false).await?;
+    barrier(&handle).await;
+    let st = query_status(&handle, joiner).await?;
+    assert!(
+        st.state == rio_proto::types::BuildState::Active as i32
+            || st.state == rio_proto::types::BuildState::Succeeded as i32,
+        "matching resubmission joins without a store fetch (state {})",
+        st.state
     );
     Ok(())
 }

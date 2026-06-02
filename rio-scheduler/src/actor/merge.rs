@@ -100,7 +100,7 @@ struct DisplacedPriorInterest {
 /// incoming submission node prove the same identity as a SETTLED
 /// (completed/skipped) persisted derivation row?
 ///
-/// r[impl sched.persist.settled-identity-freeze]
+/// r[impl sched.persist.settled-identity-freeze+1]
 /// Public attributes must match (system, sorted output names, the
 /// fixed-output flag, the content-addressed flag, and expected output
 /// paths for names where BOTH sides declare one), and at least one piece
@@ -161,7 +161,175 @@ fn settled_row_identity_matches(
     path_evidence || hash_evidence
 }
 
+/// Per-merge budget for store-evidence `.drv` fetches
+/// (`sched.merge.store-evidence-displacement`): settled-conflict
+/// resolution is a remediation path, not a bulk operation, and an
+/// unbounded fetch loop would let a submission filled with manufactured
+/// conflicts stall the single-threaded actor on store round-trips.
+/// Conflicts past the budget keep the fail-closed rejection (counted
+/// `over_budget`); the client retries with fewer conflicts or after the
+/// earlier ones resolve.
+const MERGE_STORE_EVIDENCE_BUDGET: u32 = 8;
+
+/// Outcome of [`DagActor::check_store_evidence`].
+enum StoreEvidenceOutcome {
+    /// The store's text-CA-bound bytes derive exactly the submission's
+    /// claimed identity — the claim is genuine.
+    Verified,
+    /// The bytes are sound (text-CA-bound to the declared path) but the
+    /// derivation they parse as CONTRADICTS the claim — fail hard, a
+    /// retry of the same claim can never succeed.
+    Contradicts(String),
+    /// The store could not vouch either way (unreachable, path absent,
+    /// non-canonical bytes, unresolvable inputs). Fail closed: no
+    /// upgrade, the existing rejection stands. Store silence is not
+    /// evidence.
+    Unverifiable(&'static str),
+}
+
 impl DagActor {
+    // r[impl sched.merge.store-evidence-displacement]
+    /// Verify a bare store-backed submission node against the store's
+    /// OWN copy of the `.drv` its declared `drv_path` names.
+    ///
+    /// The verification is self-contained in the actor — never trust
+    /// store transport or silence: the fetched bytes must re-derive the
+    /// declared path as their text content-address before anything is
+    /// believed, and only then is the parsed derivation compared
+    /// against the submission's claimed identity by the SAME validator
+    /// SubmitBuild ingress applies to inline content
+    /// (`validate_inline_drv_content` — reusing it is what keeps the
+    /// merge-time and ingress-time identity rules from drifting).
+    ///
+    /// Outcome classification is deterministic, not message-matched:
+    /// availability problems (fetch, UTF-8, parse, canonicality,
+    /// text-CA, unresolvable declared-IA inputs) are pre-checked here
+    /// and return [`StoreEvidenceOutcome::Unverifiable`]; once those
+    /// pass, any validator failure IS an identity contradiction.
+    async fn check_store_evidence(
+        &self,
+        node: &crate::domain::DerivationNode,
+        submission_seed: &HashMap<String, [u8; 32]>,
+    ) -> StoreEvidenceOutcome {
+        use rio_nix::derivation::Derivation;
+        use rio_nix::hash::{HashAlgo, NixHash};
+        use rio_nix::store_path::StorePath;
+        use sha2::{Digest, Sha256};
+
+        let Some(bytes) = self
+            .fetch_drv_content_from_store(node.drv_hash.as_str(), &node.drv_path)
+            .await
+        else {
+            return StoreEvidenceOutcome::Unverifiable("fetch");
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return StoreEvidenceOutcome::Unverifiable("not-utf8");
+        };
+        let Ok(drv) = Derivation::parse(text) else {
+            return StoreEvidenceOutcome::Unverifiable("parse");
+        };
+        // Canonicality: the validator requires bytes == to_aterm(parse).
+        // A store object that parses but re-serializes differently
+        // cannot vouch identity (and is not a contradiction — the store
+        // holds SOME derivation there, just not canonically encoded).
+        if drv.to_aterm().as_bytes() != bytes.as_slice() {
+            return StoreEvidenceOutcome::Unverifiable("non-canonical");
+        }
+        // Text-CA self-consistency of the store object, verified HERE
+        // before any identity comparison: make_text(name, sha256(bytes),
+        // refs) must reproduce the declared path. The store enforces
+        // this at .drv ingestion (store.put.drv-text-ca); re-deriving it
+        // means a confused or hostile store answer cannot smuggle
+        // unrelated bytes into the comparison.
+        let Ok(drv_sp) = StorePath::parse(&node.drv_path) else {
+            return StoreEvidenceOutcome::Unverifiable("drv-path");
+        };
+        let mut refs: Vec<StorePath> = Vec::new();
+        for r in drv.input_srcs().iter().chain(drv.input_drvs().keys()) {
+            match StorePath::parse(r) {
+                Ok(p) => refs.push(p),
+                Err(_) => return StoreEvidenceOutcome::Unverifiable("ref-path"),
+            }
+        }
+        let content_hash =
+            match NixHash::new(HashAlgo::SHA256, Sha256::digest(bytes.as_slice()).to_vec()) {
+                Ok(h) => h,
+                Err(_) => return StoreEvidenceOutcome::Unverifiable("digest"),
+            };
+        match StorePath::make_text(drv_sp.name(), &content_hash, &refs) {
+            Ok(p) if p.as_str() == node.drv_path => {}
+            _ => return StoreEvidenceOutcome::Unverifiable("text-ca"),
+        }
+        // Declared-IA derivability pre-check: the validator derives
+        // input-addressed output paths with a sibling-seeded hash
+        // cache. Seed every direct input from the submission's declared
+        // hashes or the resident DAG; an input neither covers makes the
+        // identity UNVERIFIABLE here (a deeper upload/submission is
+        // needed), never a contradiction.
+        let needs_ia = drv
+            .outputs()
+            .iter()
+            .any(|o| o.hash_algo().is_empty() && !o.path().is_empty());
+        let mut input_seed: Vec<rio_proto::types::DerivationNode> = Vec::new();
+        if needs_ia {
+            for input in drv.input_drvs().keys() {
+                let hash = submission_seed.get(input.as_str()).copied().or_else(|| {
+                    self.dag
+                        .hash_for_path(input)
+                        .and_then(|h| self.dag.node(h))
+                        .and_then(|s| s.ca.modular_hash)
+                });
+                match hash {
+                    Some(h) => input_seed.push(rio_proto::types::DerivationNode {
+                        drv_path: input.clone(),
+                        ca_modular_hash: h.to_vec(),
+                        ..Default::default()
+                    }),
+                    None => return StoreEvidenceOutcome::Unverifiable("inputs"),
+                }
+            }
+        }
+
+        // Identity comparison: the submission's claims, with the
+        // store's bytes attached, through the ingress inline validator.
+        // Every remaining failure mode is a contradiction between the
+        // claimed identity and what the verified bytes derive.
+        let mut synth = rio_proto::types::DerivationNode {
+            drv_hash: node.drv_hash.clone(),
+            drv_path: node.drv_path.clone(),
+            system: node.system.clone(),
+            output_names: node.output_names.clone(),
+            expected_output_paths: node.expected_output_paths.clone(),
+            is_fixed_output: node.is_fixed_output,
+            is_content_addressed: node.is_content_addressed,
+            ca_modular_hash: node.ca_modular_hash.map(|h| h.to_vec()).unwrap_or_default(),
+            drv_content: bytes,
+            drv_content_authoritative: false,
+            ..Default::default()
+        };
+        // The validator treats a node's own declared hash as
+        // self-certification and removes it; siblings carry the seeds.
+        let claimed_modular_hash = !synth.ca_modular_hash.is_empty();
+        let mut slice = vec![std::mem::take(&mut synth)];
+        slice.extend(input_seed);
+        match crate::grpc::validate_inline_drv_content(&mut slice) {
+            // Ingress strip semantics (ingress-inline-drv-binding+1):
+            // when a declared modular hash cannot be RECOMPUTED (a
+            // floating store-backed input is missing from the seeds)
+            // the validator strips the declaration and accepts. At
+            // ingress that is correct (warm gateway shape). HERE it
+            // would be fail-open — Verified must mean "the store's
+            // bytes derive the claimed identity, hash included" — so a
+            // stripped claim is the store failing to vouch, not a
+            // verification.
+            Ok(()) if claimed_modular_hash && slice[0].ca_modular_hash.is_empty() => {
+                StoreEvidenceOutcome::Unverifiable("modular-hash-unrecomputable")
+            }
+            Ok(()) => StoreEvidenceOutcome::Verified,
+            Err(status) => StoreEvidenceOutcome::Contradicts(status.message().to_string()),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // MergeDag
     // -----------------------------------------------------------------------
@@ -517,7 +685,7 @@ impl DagActor {
         phase!("0-topdown-roots");
 
         // === Step 0.5: Settled-row identity freeze ===================
-        // r[impl sched.persist.settled-identity-freeze]
+        // r[impl sched.persist.settled-identity-freeze+1]
         // A derivation row whose status is completed/skipped is the
         // durable record of a successful build. Once its DAG node is
         // reaped (terminal cleanup) the merge gate
@@ -532,6 +700,25 @@ impl DagActor {
         // merge gate's job; the in-flight window between this check and
         // the upsert is covered by the upsert's own settled-row WHERE
         // guard (defense in depth).
+        //
+        // r[impl sched.merge.store-evidence-displacement]
+        // The rejection is no longer unconditional: a conflicting
+        // re-creation of a row whose lineage is CONTENT-BOUND (the
+        // row-level mirror of the displacement primitive's verdicts)
+        // may prove its claim — by ingress-byte-bound rank alone, or
+        // by the budgeted store-evidence check that fetches the `.drv`
+        // the declared path names and verifies the claim against the
+        // store's own text-CA-bound bytes. Approved hashes bypass the
+        // upsert's settled WHERE guard ($-array) and get their stale
+        // parent-side edges scrubbed in the same transaction.
+        let mut store_evidence: std::collections::HashSet<crate::state::DrvHash> =
+            std::collections::HashSet::new();
+        let mut settled_evidence_displaced: Vec<String> = Vec::new();
+        let mut evidence_budget: u32 = MERGE_STORE_EVIDENCE_BUDGET;
+        let submission_seed: HashMap<String, [u8; 32]> = nodes
+            .iter()
+            .filter_map(|n| n.ca_modular_hash.map(|h| (n.drv_path.clone(), h)))
+            .collect();
         let non_resident: Vec<String> = nodes
             .iter()
             .filter(|n| self.dag.node(&n.drv_hash).is_none())
@@ -546,22 +733,192 @@ impl DagActor {
                     let Some(node) = by_hash.get(row.drv_hash.as_str()) else {
                         continue;
                     };
-                    if !settled_row_identity_matches(row, node) {
-                        warn!(
-                            build_id = %build_id,
-                            drv_hash = %row.drv_hash,
-                            drv_path = %row.drv_path,
-                            "rejecting re-creation of a settled derivation row \
-                             with conflicting identity"
-                        );
-                        return Err(ActorError::SettledIdentityConflict {
-                            drv_path: node.drv_path.clone(),
-                        });
+                    if settled_row_identity_matches(row, node) {
+                        continue;
                     }
+                    // Conflict. Row-level mirror of displace(): only a
+                    // content-bound lineage is displaceable —
+                    // store-backed lineages (unverified_claim: the
+                    // store outranks every claim about them) and
+                    // byte-anchored lineages (path_bound_bytes /
+                    // verified_built: nothing outranks them) refuse
+                    // categorically.
+                    let row_rank =
+                        crate::state::DefinitionEvidence::parse_lossy(&row.evidence_rank);
+                    let incoming_rank = crate::state::DefinitionEvidence::from_node_shape(node);
+                    let approved = if row_rank
+                        != crate::state::DefinitionEvidence::ContentBoundClaim
+                    {
+                        false
+                    } else if incoming_rank > row_rank {
+                        // Ingress-byte-bound submission: its bytes were
+                        // text-CA-bound to the declared path at
+                        // SubmitBuild admission — strictly higher
+                        // evidence, no store fetch needed (the R7
+                        // consequence, row form).
+                        metrics::counter!(
+                            "rio_scheduler_merge_store_evidence_total",
+                            "result" => "displaced"
+                        )
+                        .increment(1);
+                        true
+                    } else if node.drv_content.is_empty() && !node.drv_content_authoritative {
+                        // Bare store-backed echo: fetch the proof.
+                        if evidence_budget == 0 {
+                            metrics::counter!(
+                                "rio_scheduler_merge_store_evidence_total",
+                                "result" => "over_budget"
+                            )
+                            .increment(1);
+                            false
+                        } else {
+                            evidence_budget -= 1;
+                            match self.check_store_evidence(node, &submission_seed).await {
+                                StoreEvidenceOutcome::Verified => {
+                                    metrics::counter!(
+                                        "rio_scheduler_merge_store_evidence_total",
+                                        "result" => "displaced"
+                                    )
+                                    .increment(1);
+                                    store_evidence.insert(node.drv_hash.as_str().into());
+                                    true
+                                }
+                                StoreEvidenceOutcome::Contradicts(detail) => {
+                                    metrics::counter!(
+                                        "rio_scheduler_merge_store_evidence_total",
+                                        "result" => "mismatch"
+                                    )
+                                    .increment(1);
+                                    warn!(
+                                        build_id = %build_id,
+                                        drv_hash = %row.drv_hash,
+                                        drv_path = %row.drv_path,
+                                        detail = %detail,
+                                        "store derivation contradicts the submission's claimed identity"
+                                    );
+                                    return Err(ActorError::StoreEvidenceContradicts {
+                                        drv_path: node.drv_path.clone(),
+                                    });
+                                }
+                                StoreEvidenceOutcome::Unverifiable(reason) => {
+                                    metrics::counter!(
+                                        "rio_scheduler_merge_store_evidence_total",
+                                        "result" => "unavailable"
+                                    )
+                                    .increment(1);
+                                    debug!(
+                                        build_id = %build_id,
+                                        drv_hash = %row.drv_hash,
+                                        reason,
+                                        "store evidence unavailable; settled-row rejection stands"
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    if approved {
+                        settled_evidence_displaced.push(row.drv_hash.clone());
+                        continue;
+                    }
+                    warn!(
+                        build_id = %build_id,
+                        drv_hash = %row.drv_hash,
+                        drv_path = %row.drv_path,
+                        "rejecting re-creation of a settled derivation row \
+                         with conflicting identity"
+                    );
+                    return Err(ActorError::SettledIdentityConflict {
+                        drv_path: node.drv_path.clone(),
+                    });
                 }
             }
         }
         phase!("0.5-settled-identity-freeze");
+
+        // === Step 0.6: Resident settled-squat store evidence ==========
+        // r[impl sched.merge.store-evidence-displacement]
+        // The DAG-resident form of the same remediation: a bare
+        // store-backed echo whose identity conflicts with a SETTLED
+        // authoritative node would be rejected by the merge gate
+        // (RefusedSettledOutranked). When the store can prove the
+        // claim, raise the submission's standing so displace() —
+        // which still owns the decision — sees PathBoundBytes against
+        // the squat's ContentBoundClaim. Victims already at
+        // path_bound_bytes / verified_built are unreachable
+        // (rank-uniform with the row gate above), and store-anchored
+        // residents never need this (the gate joins or refuses them
+        // on its own).
+        for node in &nodes {
+            if node.drv_content_authoritative || !node.drv_content.is_empty() {
+                continue;
+            }
+            let Some(existing) = self.dag.node(&node.drv_hash) else {
+                continue;
+            };
+            if !existing.drv_content_authoritative
+                || !matches!(
+                    existing.status(),
+                    crate::state::DerivationStatus::Completed
+                        | crate::state::DerivationStatus::Skipped
+                )
+                || existing.evidence >= crate::state::DefinitionEvidence::PathBoundBytes
+                || crate::dag::verifiable_identity_matches(existing, node)
+            {
+                continue;
+            }
+            if evidence_budget == 0 {
+                metrics::counter!(
+                    "rio_scheduler_merge_store_evidence_total",
+                    "result" => "over_budget"
+                )
+                .increment(1);
+                continue;
+            }
+            evidence_budget -= 1;
+            match self.check_store_evidence(node, &submission_seed).await {
+                StoreEvidenceOutcome::Verified => {
+                    metrics::counter!(
+                        "rio_scheduler_merge_store_evidence_total",
+                        "result" => "displaced"
+                    )
+                    .increment(1);
+                    store_evidence.insert(node.drv_hash.as_str().into());
+                }
+                StoreEvidenceOutcome::Contradicts(detail) => {
+                    metrics::counter!(
+                        "rio_scheduler_merge_store_evidence_total",
+                        "result" => "mismatch"
+                    )
+                    .increment(1);
+                    warn!(
+                        build_id = %build_id,
+                        drv_hash = %node.drv_hash,
+                        detail = %detail,
+                        "store derivation contradicts the submission's claimed identity"
+                    );
+                    return Err(ActorError::StoreEvidenceContradicts {
+                        drv_path: node.drv_path.clone(),
+                    });
+                }
+                StoreEvidenceOutcome::Unverifiable(reason) => {
+                    metrics::counter!(
+                        "rio_scheduler_merge_store_evidence_total",
+                        "result" => "unavailable"
+                    )
+                    .increment(1);
+                    debug!(
+                        build_id = %build_id,
+                        drv_hash = %node.drv_hash,
+                        reason,
+                        "store evidence unavailable; merge-gate rejection stands"
+                    );
+                }
+            }
+        }
+        phase!("0.6-store-evidence");
 
         // === Step 1: DB build row ==================================
         // If this fails, nothing is in memory; caller gets a clean error.
@@ -583,17 +940,17 @@ impl DagActor {
         // prevents the leak where a cyclic submission left permanent entries
         // in build_events/build_sequences/builds with no cleanup scheduled.
         let edges_len = edges.len();
-        // Production entry into the merge gate: the store-evidence set
-        // is empty until the pre-merge enrichment
-        // (sched.merge.store-evidence-displacement) populates it for
-        // store-backed nodes whose settled identity conflict was
-        // verified against the store's own text-CA `.drv` bytes.
+        // Production entry into the merge gate: hashes in the
+        // store-evidence set were verified by Step 0.5/0.6 against the
+        // store's own text-CA `.drv` bytes
+        // (sched.merge.store-evidence-displacement); the gate's
+        // displacement primitive still owns every decision.
         let merge_result = match self.dag.merge_with_evidence(
             build_id,
             &nodes,
             &edges,
             &traceparent,
-            &std::collections::HashSet::new(),
+            &store_evidence,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -739,7 +1096,13 @@ impl DagActor {
         // returns Ok the build is committed (Active); later DB writes are
         // log-and-continue.
         if let Err(e) = self
-            .persist_and_activate(build_id, &nodes, &merge_result, &pruned_closure_parents)
+            .persist_and_activate(
+                build_id,
+                &nodes,
+                &merge_result,
+                &pruned_closure_parents,
+                &settled_evidence_displaced,
+            )
             .await
         {
             self.cleanup_failed_merge(build_id, merge_result).await;
@@ -842,12 +1205,19 @@ impl DagActor {
         nodes: &[crate::domain::DerivationNode],
         merge_result: &crate::dag::MergeResult,
         topdown_pruned_parents: &HashSet<String>,
+        settled_evidence_displaced: &[String],
     ) -> Result<(), ActorError> {
-        self.persist_merge_to_db(build_id, nodes, merge_result, topdown_pruned_parents)
-            .await
-            .inspect_err(
-                |e| error!(build_id = %build_id, error = %e, "merge DB persistence failed; rolling back"),
-            )?;
+        self.persist_merge_to_db(
+            build_id,
+            nodes,
+            merge_result,
+            topdown_pruned_parents,
+            settled_evidence_displaced,
+        )
+        .await
+        .inspect_err(
+            |e| error!(build_id = %build_id, error = %e, "merge DB persistence failed; rolling back"),
+        )?;
 
         // I-169: PG-side poison clear for nodes that were reset by the
         // resubmit-retry path (Poisoned/Cancelled/Failed/DependencyFailed
@@ -2221,6 +2591,7 @@ impl DagActor {
         nodes: &[crate::domain::DerivationNode],
         merge_result: &crate::dag::MergeResult,
         topdown_pruned_parents: &HashSet<String>,
+        settled_evidence_displaced: &[String],
     ) -> Result<(), ActorError> {
         let newly_inserted = &merge_result.newly_inserted;
         // r[impl sched.persist.creation-scoped]
@@ -2333,7 +2704,12 @@ impl DagActor {
 
         // Batch 1: upsert the newly-created derivations, get back
         // drv_hash -> db_id map.
-        let id_map = crate::db::SchedulerDb::batch_upsert_derivations(&mut tx, &node_rows).await?;
+        let id_map = crate::db::SchedulerDb::batch_upsert_derivations(
+            &mut tx,
+            &node_rows,
+            settled_evidence_displaced,
+        )
+        .await?;
 
         // Batch 1b: persist the topdown_pruned stamp for kept nodes this
         // merge merely JOINED. Batch 1 is creation-scoped
@@ -2509,11 +2885,23 @@ impl DagActor {
         // (other nodes depending on the removed hash) are preserved,
         // mirroring the in-memory parents-direction preservation.
         // r[impl sched.merge.displaced-edge-scrub+2]
+        //
+        // Row-only store-evidence displacements
+        // (sched.merge.store-evidence-displacement) chain in for the same
+        // reason: the displaced SETTLED row had no DAG node (reaped), so
+        // the gate never scrubbed anything in memory, but its persisted
+        // parent-side dependency edges still describe the OLD lineage —
+        // the evidence-approved upsert just rewrote the row to the new
+        // definition, which must not inherit them on recovery. Their ids
+        // resolve via id_map because the $-array carve-out admitted those
+        // rows through RETURNING.
         let edge_scrub_ids: Vec<Uuid> = merge_result
             .displaced
             .iter()
             .chain(merge_result.authority_takeovers.iter())
-            .filter_map(|h| id_map.get(h.as_str()).map(|(id, _)| *id))
+            .map(|h| h.as_str())
+            .chain(settled_evidence_displaced.iter().map(String::as_str))
+            .filter_map(|h| id_map.get(h).map(|(id, _)| *id))
             .collect();
         if !edge_scrub_ids.is_empty() {
             let scrubbed =
