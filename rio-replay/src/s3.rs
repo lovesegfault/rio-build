@@ -215,6 +215,14 @@ impl ArchiveS3 {
     /// pointer exists (the recipe has never been recorded). A pointer can
     /// outlive or predate its archive, so callers still probe
     /// [`Self::archive_exists`] before trusting one.
+    ///
+    /// Reads are drift-tolerant per [`ByRecipePointer::names_archive`]'s
+    /// contract: a body that is not valid JSON (a torn or foreign write
+    /// at the pointer key) degrades to `Some` of an empty — unusable —
+    /// pointer with a warning, never an error. The gate then falls
+    /// through to re-record, whose post-publish pointer write overwrites
+    /// the junk; erroring instead would dead-end every unforced eval of
+    /// the recipe with no in-band recovery.
     pub async fn read_by_recipe_pointer(
         &self,
         client: &aws_sdk_s3::Client,
@@ -244,8 +252,18 @@ impl ArchiveS3 {
             .await
             .with_context(|| format!("read s3://{}/{key}", self.bucket))?
             .into_bytes();
-        let pointer: ByRecipePointer = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse s3://{}/{key}", self.bucket))?;
+        let pointer: ByRecipePointer = match serde_json::from_slice(&bytes) {
+            Ok(pointer) => pointer,
+            Err(err) => {
+                tracing::warn!(
+                    key = %key,
+                    error = %err,
+                    "by-recipe pointer body is not valid JSON; treating it as an unusable \
+                     pointer (a re-record overwrites it)"
+                );
+                ByRecipePointer::default()
+            }
+        };
         Ok(Some(pointer))
     }
 }
@@ -412,6 +430,40 @@ mod tests {
             .unwrap();
         assert_eq!(pointer.archive_id_short, "0123456789abcdef");
         assert_eq!(pointer.archive_id, "", "missing fields default to empty");
+    }
+
+    #[tokio::test]
+    async fn by_recipe_pointer_read_degrades_garbage_to_an_unusable_pointer() {
+        // names_archive()'s contract: drift-tolerant reads turn unknown
+        // or GARBAGE pointer objects into empty fields rather than
+        // errors — an unusable pointer means "re-record", which
+        // overwrites it after the publish. A non-JSON body (torn or
+        // foreign write, proxy error page) must therefore read as an
+        // unusable pointer, not as an error: the only caller is the
+        // eval idempotency gate, which would otherwise abort every
+        // unforced eval of the recipe — and since the pointer is only
+        // rewritten after a successful publish and --force salts the
+        // recipe key onto a different pointer object, a hard-failing
+        // read leaves the unsalted recipe unrecordable until an
+        // out-of-band S3 delete.
+        let digest = "ab".repeat(32);
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            GetObjectOutput::builder()
+                .body(ByteStream::from_static(b"<html>502 Bad Gateway</html>"))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&get]);
+
+        let layout = ArchiveS3::new("rio-chunks", "replay");
+        let pointer = layout
+            .read_by_recipe_pointer(&client, &digest)
+            .await
+            .expect("a garbage pointer body must not error")
+            .expect("the pointer object exists, however junk");
+        assert!(
+            !pointer.names_archive(),
+            "a garbage pointer is unusable, so the gate falls through to re-record"
+        );
     }
 
     #[test]
