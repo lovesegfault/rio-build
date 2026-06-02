@@ -51,7 +51,7 @@ use crate::archive::reader::ReplayArchive;
 use super::batch::Batch;
 use super::ledger::JobLedger;
 use super::model::{
-    BATCH_KIND_TIMED, BatchRecord, DispatchEntry, build_status_from_name, now_rfc3339,
+    BATCH_KIND_TIMED, BatchIntent, BatchRecord, DispatchEntry, build_status_from_name, now_rfc3339,
 };
 use super::spec::{Knobs, SupplyDependencies};
 use super::state::{StateDir, StateFile};
@@ -1049,6 +1049,7 @@ async fn dispatch_one_request(
         deadline,
         shared.cooldown,
         interruption_drvs.clone(),
+        BatchIntent::default(),
     )
     .await?;
     let mut batch_ids = vec![batch_id];
@@ -1140,6 +1141,7 @@ async fn dispatch_one_request(
                 BatchDeadline::Build(tokio::time::Instant::now() + build_deadline),
                 shared.cooldown,
                 Vec::new(),
+                BatchIntent::default(),
             )
             .await?;
             attempts += 1;
@@ -2037,6 +2039,7 @@ mod tests {
             disconnect_deadline_fired: record.disconnect_deadline_fired,
             interruption_drvs: record.interruption_drvs.clone(),
             submitted_at: Some(record.started_at.clone()),
+            probe: record.probe,
         };
         let decisions = process_settled_batch(
             state,

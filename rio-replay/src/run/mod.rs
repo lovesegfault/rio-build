@@ -143,6 +143,13 @@ const INFRA_RATE_MIN_SAMPLE: usize = 20;
 /// the logs.
 const HEARTBEAT_EVERY_TICKS: u64 = 10;
 
+/// Consecutive failed canary-probe cycles after which the infra-rate pause
+/// escalates to the operator PAUSE file instead of probing further. Each
+/// failed cycle costs one budget-exempt single-job batch, so this is also
+/// the cap on what an outage can spend before a human must look; removing
+/// the PAUSE file resets the ladder and probing resumes.
+const INFRA_PROBE_PAUSE_AFTER: u32 = 3;
+
 /// Upper bound (one year, in seconds) on recorded request offsets and stop
 /// offsets accepted from an archive. No real recording window comes close;
 /// the cap exists so corrupt or absurd recorded values can neither panic
@@ -1257,24 +1264,205 @@ struct TimedInputs {
     config: TimelineConfig,
 }
 
+/// The submission-stopping backpressure sources the poller can assert.
+///
+/// Quantification domain: every engine-asserted bit OR-ed into
+/// [`PauseState::set_backpressure`] by [`pause_decision`] — the single
+/// chokepoint between a backpressure condition and the pause flag the
+/// submit loop obeys. The operator's manual PAUSE file is outside the
+/// domain (operator-asserted, operator-cleared by definition); everything
+/// else that wants to stop submission must become a variant here.
+///
+/// Self-clearing law: a pause that stops submission must persist only on
+/// state that can still change while paused — otherwise the pause freezes
+/// its own evidence and the campaign wedges until its deadline. Each
+/// variant therefore names that state in [`Self::clears_via`]; the match
+/// there is exhaustive, so a new submission-stopping source cannot compile
+/// until it declares its clearing evidence, and [`pause_decision`]'s
+/// callers must wire the new variant explicitly (their source→bit match is
+/// exhaustive too). Each witness is pinned by a closed-loop test (latch →
+/// evidence change → release), named in the witness text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackpressureSource {
+    /// Idle executors next to queued work with quiescent substitution.
+    DispatchGap,
+    /// Queue depth above `knobs.pause_queue_depth`.
+    QueueDepth,
+    /// Rolling infra-indeterminate rate above `knobs.infra_pause_pct`.
+    InfraRate,
+}
+
+impl BackpressureSource {
+    /// Every source, for tests and witness audits. Kept in sync with the
+    /// enum by [`Self::clears_via`]'s exhaustive match — a new variant
+    /// fails compilation there before this list can silently lag.
+    const ALL: [BackpressureSource; 3] = [
+        BackpressureSource::DispatchGap,
+        BackpressureSource::QueueDepth,
+        BackpressureSource::InfraRate,
+    ];
+
+    /// The self-clearing witness: the state that can still change while
+    /// this source pauses submission, and the closed-loop test pinning it.
+    fn clears_via(self) -> &'static str {
+        match self {
+            BackpressureSource::DispatchGap => {
+                "queued work drains and substitutions complete while paused (the predicate's \
+                 queued guard), and assertions age out when ClusterStatus polls fail — pinned by \
+                 watchdog::tests::dispatch_pause_lifts_when_the_queue_drains"
+            }
+            BackpressureSource::QueueDepth => {
+                "the cluster works the queue down while paused submission adds nothing; each \
+                 fresh ClusterStatus poll re-reads the depth — pinned by \
+                 tests::queue_depth_pause_clears_on_a_fresh_below_threshold_poll"
+            }
+            BackpressureSource::InfraRate => {
+                "the rolling terminal-record window, refreshed by canary-probe verdicts: the \
+                 paused loop produces no records, so the poller releases one budget-exempt \
+                 single-job probe per cycle and escalates to the operator PAUSE file after \
+                 INFRA_PROBE_PAUSE_AFTER failed cycles — pinned by \
+                 tests::infra_pause_canary_probes_then_escalates_without_draining_budgets"
+            }
+        }
+    }
+}
+
+/// Queue-depth backpressure bit: queued derivations above the configured
+/// threshold on a fresh poll. Stateless by design — there is nothing to
+/// latch: each fresh poll re-reads the depth, and a failed poll reads as
+/// not-exceeded rather than holding a stale assertion.
+fn queue_depth_exceeded(limit: Option<u32>, counts: Option<&grpc::ClusterCounts>) -> bool {
+    match (limit, counts) {
+        (Some(limit), Some(c)) => c.queued_derivations > limit,
+        _ => false,
+    }
+}
+
 /// What the poller does with this tick's backpressure conditions, by
 /// scheduling mode: `(set the backpressure pause, recommend an abort)`.
 ///
-/// Timeless campaigns pause new submissions on any condition (dispatch gap,
-/// queue depth, infra-failure rate), exactly as before. Timed campaigns
-/// never gate dispatch on them — pausing a timed run would destroy the
-/// cadence it exists to measure — so the conditions stay advisory: the
-/// infra-failure rate becomes an abort recommendation for the operator and
-/// the rest only feed the watchdog's suspension windows.
+/// Timeless campaigns pause new submissions on any asserted source.
+/// Timed campaigns never gate dispatch on them — pausing a timed run would
+/// destroy the cadence it exists to measure — so the conditions stay
+/// advisory: the infra-failure rate becomes an abort recommendation for
+/// the operator and the rest only feed the watchdog's suspension windows.
+///
+/// `asserted` maps each [`BackpressureSource`] to this tick's bit; callers
+/// write the match out explicitly so adding a source forces every caller
+/// to wire its bit (no pre-collapsed bool can smuggle a new pause in).
 fn pause_decision(
     mode: ScheduleMode,
-    dispatch_pause: bool,
-    queue_depth_pause: bool,
-    infra_pause: bool,
+    asserted: impl Fn(BackpressureSource) -> bool,
 ) -> (bool, bool) {
+    let any = BackpressureSource::ALL.into_iter().any(&asserted);
     match mode {
-        ScheduleMode::Timeless => (dispatch_pause || queue_depth_pause || infra_pause, false),
-        ScheduleMode::Timed => (false, infra_pause),
+        ScheduleMode::Timeless => (any, false),
+        ScheduleMode::Timed => (false, asserted(BackpressureSource::InfraRate)),
+    }
+}
+
+/// What the poller must do for the canary-probe ladder this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeAction {
+    /// Nothing this tick.
+    Hold,
+    /// Grant one probe token: the paused submit loop may release a single
+    /// one-job probe batch.
+    Grant,
+    /// `INFRA_PROBE_PAUSE_AFTER` consecutive probe cycles failed: write
+    /// the operator PAUSE file (the prefetch-shortfall arm's mechanics) —
+    /// the infrastructure needs a human, not more probes.
+    EscalateToOperatorPause,
+}
+
+/// Canary-probe ladder for the infra-rate backpressure pause.
+///
+/// The infra-rate pause is the one backpressure source whose evidence the
+/// pause itself suppresses: the rolling window is computed over terminal
+/// records and a paused loop produces none, so once in-flight work drains
+/// the window freezes over threshold and re-asserts forever. Releasing the
+/// full wave instead would be worse — under a real multi-hour outage every
+/// released batch appends infra records and burns per-job retry budget,
+/// converting a recoverable wedge into mass terminal retirement. The
+/// ladder is the bounded middle: while the latch holds, release ONE
+/// budget-exempt single-job probe per cycle; a probe that produces a
+/// terminal record (any class — built, genuine failure, … all prove the
+/// cluster executed work) refreshes the window and resets the ladder; a
+/// probe that comes back infra-shaped (budget-exempt requeue, no record)
+/// counts a failed cycle; after [`INFRA_PROBE_PAUSE_AFTER`] consecutive
+/// failures the ladder escalates to the operator PAUSE file. Removing the
+/// PAUSE file (the operator's "resume" signal) resets the ladder so
+/// probing restarts against the presumably-repaired infrastructure.
+///
+/// Pure state machine: the poller feeds observations and applies the
+/// returned [`ProbeAction`], so the latch→probe→fail→escalate loop is unit
+/// testable without a live poller.
+struct InfraProbeLadder {
+    failed_cycles: u32,
+    prev_manual: bool,
+}
+
+impl InfraProbeLadder {
+    fn new() -> Self {
+        Self {
+            failed_cycles: 0,
+            prev_manual: false,
+        }
+    }
+
+    /// Feed one poller tick.
+    ///
+    /// `latched`: the infra-rate pause bit this tick. `manual`: the
+    /// operator PAUSE file bit. `in_flight`: current in-flight job count.
+    /// `probe_in_progress`: a probe cycle is anywhere between grant and
+    /// scoring. `concluded_probe`: when the released probe batch was
+    /// collected this tick, whether it produced a terminal record for its
+    /// job (`Some(true)` = evidence refreshed, `Some(false)` =
+    /// infra-shaped failure); `None` when no cycle concluded this tick.
+    fn on_tick(
+        &mut self,
+        latched: bool,
+        manual: bool,
+        in_flight: usize,
+        probe_in_progress: bool,
+        concluded_probe: Option<bool>,
+    ) -> ProbeAction {
+        // The operator removing the PAUSE file is the "resume" signal:
+        // reset the ladder so probing restarts fresh against the
+        // presumably-repaired infrastructure.
+        if self.prev_manual && !manual {
+            self.failed_cycles = 0;
+        }
+        self.prev_manual = manual;
+        if !latched {
+            // Latch released (the window refreshed below threshold):
+            // healthy again, forget the outage.
+            self.failed_cycles = 0;
+            return ProbeAction::Hold;
+        }
+        if let Some(success) = concluded_probe {
+            if success {
+                self.failed_cycles = 0;
+            } else {
+                self.failed_cycles = self.failed_cycles.saturating_add(1);
+            }
+        }
+        // While the operator pause is set the operator owns the campaign —
+        // no probing (and no re-escalating) behind their back.
+        if manual {
+            return ProbeAction::Hold;
+        }
+        if self.failed_cycles >= INFRA_PROBE_PAUSE_AFTER {
+            // Escalation is level-asserted, not edge-fired: it repeats
+            // until the PAUSE file actually exists (a failed write retries
+            // here next tick) and stops only once `manual` reflects it.
+            return ProbeAction::EscalateToOperatorPause;
+        }
+        // Drained with no probe cycle in progress: probe.
+        if in_flight == 0 && !probe_in_progress {
+            return ProbeAction::Grant;
+        }
+        ProbeAction::Hold
     }
 }
 
@@ -1892,6 +2080,7 @@ pub async fn run_with_backends(
         let abort_recommended = abort_recommended.clone();
         let timing_degraded = timing_degraded.clone();
         let supply_for_progress = supply_summary.clone();
+        let processed = processed.clone();
         let mut stop_rx = stop_rx.clone();
         // Per-job count of stall auto-retries already spent (the single
         // auto-retry before stalled-active goes terminal), rehydrated from
@@ -1900,6 +2089,8 @@ pub async fn run_with_backends(
         let mut stall_retries: HashMap<String, u32> = rehydrated_stall_retries;
         tokio::spawn(async move {
             let mut sync_tracker = SyncTracker::default();
+            let mut probe_ladder = InfraProbeLadder::new();
+            let mut was_backpressure = false;
             let mut ticks: u64 = 0;
             let poll_secs = knobs.cluster_status_poll_secs.max(1);
             let ice_every = (knobs.spawn_intents_poll_secs / poll_secs).max(1);
@@ -1950,10 +2141,8 @@ pub async fn run_with_backends(
                 let outcome = watchdog.lock().await.on_tick(&tick);
                 // Backpressure: dispatch-gap pause, queue-depth threshold,
                 // rolling infra-failure rate.
-                let queue_depth_pause = match (knobs.pause_queue_depth, cluster_counts.as_ref()) {
-                    (Some(limit), Some(c)) => c.queued_derivations > limit,
-                    _ => false,
-                };
+                let queue_depth_pause =
+                    queue_depth_exceeded(knobs.pause_queue_depth, cluster_counts.as_ref());
                 let (terminal_in_scope, infra_rate_pct) = {
                     let res = results.lock().await;
                     let mut terminal: Vec<&JobRecord> = res
@@ -1989,12 +2178,27 @@ pub async fn run_with_backends(
                     (terminal_in_scope, infra_rate_pct)
                 };
                 let infra_pause = infra_rate_pct.is_some_and(|rate| rate > knobs.infra_pause_pct);
-                let (backpressure, recommend_abort) = pause_decision(
-                    schedule_mode,
-                    outcome.dispatch_pause,
-                    queue_depth_pause,
-                    infra_pause,
-                );
+                let source_bit = |source: BackpressureSource| match source {
+                    BackpressureSource::DispatchGap => outcome.dispatch_pause,
+                    BackpressureSource::QueueDepth => queue_depth_pause,
+                    BackpressureSource::InfraRate => infra_pause,
+                };
+                let (backpressure, recommend_abort) = pause_decision(schedule_mode, source_bit);
+                // On the rising edge name each asserting source WITH its
+                // self-clearing witness, so the operator can read from the
+                // log what must change for the pause to lift on its own.
+                if backpressure && !was_backpressure {
+                    for source in BackpressureSource::ALL {
+                        if source_bit(source) {
+                            tracing::info!(
+                                source = ?source,
+                                clears_via = source.clears_via(),
+                                "backpressure pause asserted"
+                            );
+                        }
+                    }
+                }
+                was_backpressure = backpressure;
                 pause.set_backpressure(backpressure);
                 if recommend_abort && !abort_recommended.swap(true, Ordering::SeqCst) {
                     tracing::error!(
@@ -2004,6 +2208,78 @@ pub async fn run_with_backends(
                          the recorded cadence, so the campaign keeps dispatching — aborting it \
                          is recommended if the failures persist"
                     );
+                }
+                // Canary-probe ladder (timeless only — timed campaigns
+                // never pause on the infra rate). The infra-rate pause
+                // freezes its own evidence window once in-flight work
+                // drains; the ladder releases one budget-exempt single-job
+                // probe per cycle to refresh it, and escalates to the
+                // operator PAUSE file after INFRA_PROBE_PAUSE_AFTER
+                // consecutive failed cycles.
+                if schedule_mode == ScheduleMode::Timeless {
+                    // Score a concluded probe cycle: the released probe
+                    // batch has been collected, and success means its job
+                    // now holds a terminal record (any class — the cluster
+                    // demonstrably executed work). Lock order: processed is
+                    // try-locked so a long-running collect pass can never
+                    // stall the poller tick.
+                    let concluded = match pause.probe_batch() {
+                        Some((batch_id, jobs)) => match processed.try_lock() {
+                            Ok(done) if done.contains(&batch_id) => {
+                                drop(done);
+                                pause.clear_probe();
+                                let res = results.lock().await;
+                                let success = jobs.iter().any(|job| {
+                                    res.get(job).is_some_and(|r| {
+                                        model::is_terminal_class(&r.verdict, &r.disposition)
+                                    })
+                                });
+                                tracing::info!(batch_id, success, "canary probe cycle concluded");
+                                Some(success)
+                            }
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    let in_flight_now = ledger.tracker().in_flight.lock().await.len();
+                    match probe_ladder.on_tick(
+                        infra_pause,
+                        manual_pause,
+                        in_flight_now,
+                        !pause.probe_idle(),
+                        concluded,
+                    ) {
+                        ProbeAction::Hold => {}
+                        ProbeAction::Grant => {
+                            tracing::info!(
+                                infra_rate_pct,
+                                "infra-rate pause holds with nothing in flight; granting one \
+                                 canary-probe batch to refresh the frozen evidence window"
+                            );
+                            pause.grant_probe();
+                        }
+                        ProbeAction::EscalateToOperatorPause => {
+                            let pause_file = state.path("PAUSE");
+                            if let Err(e) =
+                                std::fs::write(&pause_file, b"infra-rate canary probes exhausted\n")
+                            {
+                                tracing::warn!(
+                                    error = %format!("{e:#}"),
+                                    "writing the PAUSE file failed; the ladder retries on a \
+                                     later cycle"
+                                );
+                            } else {
+                                tracing::error!(
+                                    failed_probe_cycles = INFRA_PROBE_PAUSE_AFTER,
+                                    infra_rate_pct,
+                                    "consecutive canary probes failed while the infra-rate pause \
+                                     held; the campaign is paused for the operator — investigate \
+                                     the infrastructure, then remove the PAUSE file to resume \
+                                     probing"
+                                );
+                            }
+                        }
+                    }
                 }
                 // A pause or dispatch-gap suspension window that closed while
                 // the timed schedule was executing means recorded cadence was
@@ -2507,6 +2783,7 @@ async fn collect_pass_with(
             disconnect_deadline_fired: batch.disconnect_deadline_fired,
             interruption_drvs: batch.interruption_drvs.clone(),
             submitted_at: Some(batch.started_at.clone()),
+            probe: batch.probe,
         };
         // prior_requeues carries each job's TOTAL engine resubmission count
         // so far — any prior requeue consumes the single infra auto-retry
@@ -2550,9 +2827,17 @@ async fn collect_pass_with(
         .await?;
         for (job, decision) in &decisions {
             match decision {
-                collect::CollectDecision::Requeue { why, .. } => {
-                    ledger.requeue_collected(job, *why).await?;
-                    requeued += 1;
+                collect::CollectDecision::Requeue { why, budget } => {
+                    if budget.probe_exempt() {
+                        // Canary-probe re-offer: budget-exempt by the
+                        // carve-out's contract — no journal entry, no
+                        // counter (the probe ladder owns the outage's
+                        // convergence).
+                        ledger.requeue_probe_exempt(job).await;
+                    } else {
+                        ledger.requeue_collected(job, *why).await?;
+                        requeued += 1;
+                    }
                 }
                 collect::CollectDecision::Terminal { .. } => {
                     already_terminal.insert(job.clone());
@@ -2930,6 +3215,7 @@ mod tests {
             disconnect_deadline_fired: false,
             interruption_drvs: Vec::new(),
             import_skipped_drvs: Vec::new(),
+            probe: false,
         }];
         let got = jobs_awaiting_first_submission(
             [
@@ -3644,6 +3930,7 @@ mod tests {
                     disconnect_deadline_fired: true,
                     interruption_drvs: vec![drv.clone()],
                     import_skipped_drvs: Vec::new(),
+                    probe: false,
                 },
             )
             .unwrap();
@@ -3748,6 +4035,7 @@ mod tests {
                     disconnect_deadline_fired: false,
                     interruption_drvs: Vec::new(),
                     import_skipped_drvs: Vec::new(),
+                    probe: false,
                 },
             )
             .unwrap();
@@ -3924,6 +4212,7 @@ mod tests {
                 deadline,
                 Duration::ZERO,
                 drvs,
+                model::BatchIntent::default(),
             )
         };
         let collect = async |processed: &mut HashSet<u64>| {
@@ -4116,6 +4405,7 @@ mod tests {
                     ),
                     Duration::ZERO,
                     Vec::new(),
+                    model::BatchIntent::default(),
                 )
                 .await
                 .unwrap();
@@ -4213,43 +4503,364 @@ mod tests {
     }
 
     /// The poller's pause decision across scheduling modes: in timeless mode
-    /// any backpressure condition (dispatch gap, queue depth, infra rate)
-    /// pauses submission exactly as before; in timed mode none of them gates
-    /// dispatch — the infra-rate condition becomes an abort recommendation
-    /// instead.
+    /// any backpressure source pauses submission exactly as before; in timed
+    /// mode none of them gates dispatch — the infra-rate source becomes an
+    /// abort recommendation instead.
     #[test]
     fn infra_pause_is_advisory_in_timed_mode() {
+        let bits = |dispatch: bool, depth: bool, infra: bool| {
+            move |source: BackpressureSource| match source {
+                BackpressureSource::DispatchGap => dispatch,
+                BackpressureSource::QueueDepth => depth,
+                BackpressureSource::InfraRate => infra,
+            }
+        };
         // Timed: infra rate above the threshold recommends an abort, never a
         // pause; dispatch-gap and queue-depth conditions are advisory too.
         assert_eq!(
-            pause_decision(ScheduleMode::Timed, false, false, true),
+            pause_decision(ScheduleMode::Timed, bits(false, false, true)),
             (false, true)
         );
         assert_eq!(
-            pause_decision(ScheduleMode::Timed, true, true, false),
+            pause_decision(ScheduleMode::Timed, bits(true, true, false)),
             (false, false)
         );
         assert_eq!(
-            pause_decision(ScheduleMode::Timed, false, false, false),
+            pause_decision(ScheduleMode::Timed, bits(false, false, false)),
             (false, false)
         );
-        // Timeless: unchanged — each condition pauses submission and no
-        // abort is ever recommended.
+        // Timeless: unchanged — each source pauses submission and no abort
+        // is ever recommended.
         assert_eq!(
-            pause_decision(ScheduleMode::Timeless, false, false, true),
+            pause_decision(ScheduleMode::Timeless, bits(false, false, true)),
             (true, false)
         );
         assert_eq!(
-            pause_decision(ScheduleMode::Timeless, true, false, false),
+            pause_decision(ScheduleMode::Timeless, bits(true, false, false)),
             (true, false)
         );
         assert_eq!(
-            pause_decision(ScheduleMode::Timeless, false, true, false),
+            pause_decision(ScheduleMode::Timeless, bits(false, true, false)),
             (true, false)
         );
         assert_eq!(
-            pause_decision(ScheduleMode::Timeless, false, false, false),
+            pause_decision(ScheduleMode::Timeless, bits(false, false, false)),
             (false, false)
+        );
+    }
+
+    /// Every submission-stopping backpressure source carries a non-empty
+    /// self-clearing witness, and `ALL` enumerates the enum exactly: the
+    /// no-rest-pattern match below fails compilation when a variant is
+    /// added, forcing the new source into `ALL`, into `clears_via`, and
+    /// into this audit.
+    #[test]
+    fn every_backpressure_source_names_its_self_clearing_witness() {
+        for source in BackpressureSource::ALL {
+            // Exhaustive without a rest pattern: extending the enum breaks
+            // this match until the new source is wired here.
+            match source {
+                BackpressureSource::DispatchGap
+                | BackpressureSource::QueueDepth
+                | BackpressureSource::InfraRate => {}
+            }
+            assert!(
+                !source.clears_via().is_empty(),
+                "{source:?} must name the state that can change while it pauses"
+            );
+        }
+        assert_eq!(BackpressureSource::ALL.len(), 3);
+    }
+
+    /// QueueDepth's self-clearing witness: the bit re-derives from each
+    /// fresh poll (no latching state), so the cluster working the queue
+    /// below the threshold clears the pause on the next poll, and a failed
+    /// poll reads as not-exceeded instead of holding a stale assertion.
+    #[test]
+    fn queue_depth_pause_clears_on_a_fresh_below_threshold_poll() {
+        let counts = |queued: u32| grpc::ClusterCounts {
+            active_executors: 8,
+            queued_derivations: queued,
+            running_derivations: 4,
+            substituting_derivations: 0,
+        };
+        assert!(queue_depth_exceeded(Some(100), Some(&counts(101))));
+        // The cluster worked the queue down while submission was paused:
+        // the very next fresh poll clears the bit.
+        assert!(!queue_depth_exceeded(Some(100), Some(&counts(100))));
+        assert!(!queue_depth_exceeded(Some(100), Some(&counts(0))));
+        // A failed poll cannot hold the pause (no stale assertion).
+        assert!(!queue_depth_exceeded(Some(100), None));
+        // No threshold configured: never asserts.
+        assert!(!queue_depth_exceeded(None, Some(&counts(10_000))));
+    }
+
+    /// The canary-probe ladder's full closed loop at the state-machine
+    /// level: latch → grant → fail × INFRA_PROBE_PAUSE_AFTER → escalate;
+    /// a successful probe resets the failure run; the operator removing
+    /// the PAUSE file re-arms probing; latch release forgets the outage.
+    #[test]
+    fn infra_probe_ladder_grants_scores_and_escalates() {
+        let mut ladder = InfraProbeLadder::new();
+        // Unlatched: nothing happens no matter the drain state.
+        assert_eq!(
+            ladder.on_tick(false, false, 0, false, None),
+            ProbeAction::Hold
+        );
+
+        // Latched + drained + idle channel → grant.
+        assert_eq!(
+            ladder.on_tick(true, false, 0, false, None),
+            ProbeAction::Grant
+        );
+        // Probe in progress (granted/redeemed/released): hold, never a
+        // second grant.
+        assert_eq!(
+            ladder.on_tick(true, false, 0, true, None),
+            ProbeAction::Hold
+        );
+        assert_eq!(
+            ladder.on_tick(true, false, 1, true, None),
+            ProbeAction::Hold
+        );
+
+        // Cycle 1 fails → re-grant; cycle 2 fails → re-grant; cycle 3
+        // fails → escalate to the operator PAUSE.
+        assert_eq!(
+            ladder.on_tick(true, false, 0, false, Some(false)),
+            ProbeAction::Grant
+        );
+        assert_eq!(
+            ladder.on_tick(true, false, 0, false, Some(false)),
+            ProbeAction::Grant
+        );
+        assert_eq!(
+            ladder.on_tick(true, false, 0, false, Some(false)),
+            ProbeAction::EscalateToOperatorPause
+        );
+        // Escalation is level-asserted: it repeats while the PAUSE file is
+        // not yet observed (e.g. the write failed)...
+        assert_eq!(
+            ladder.on_tick(true, false, 0, false, None),
+            ProbeAction::EscalateToOperatorPause
+        );
+        // ...and stops once the manual pause reflects it.
+        assert_eq!(
+            ladder.on_tick(true, true, 0, false, None),
+            ProbeAction::Hold
+        );
+        assert_eq!(
+            ladder.on_tick(true, true, 0, false, None),
+            ProbeAction::Hold
+        );
+
+        // The operator removes the PAUSE file: the falling edge resets the
+        // ladder and probing resumes.
+        assert_eq!(
+            ladder.on_tick(true, false, 0, false, None),
+            ProbeAction::Grant
+        );
+
+        // A successful probe resets the failure run mid-ladder.
+        assert_eq!(
+            ladder.on_tick(true, false, 0, false, Some(false)),
+            ProbeAction::Grant
+        );
+        assert_eq!(
+            ladder.on_tick(true, false, 0, false, Some(true)),
+            ProbeAction::Grant,
+            "a successful probe resets the failed-cycle count"
+        );
+        assert_eq!(
+            ladder.on_tick(true, false, 0, false, Some(false)),
+            ProbeAction::Grant
+        );
+        assert_eq!(
+            ladder.on_tick(true, false, 0, false, Some(false)),
+            ProbeAction::Grant
+        );
+        // Latch release (window refreshed below threshold) forgets the
+        // outage entirely.
+        assert_eq!(
+            ladder.on_tick(false, false, 0, false, None),
+            ProbeAction::Hold
+        );
+        assert_eq!(
+            ladder.on_tick(true, false, 0, false, Some(false)),
+            ProbeAction::Grant
+        );
+    }
+
+    /// The InfraRate witness's closed-loop pin, end to end over the real
+    /// submit loop, collect pass, and probe ladder: with the infra-rate
+    /// latch held and the in-flight work drained, each probe cycle releases
+    /// EXACTLY ONE single-job probe batch (never the wave); the probes'
+    /// infra-shaped failures are budget-exempt (no resubmission counted, no
+    /// journal entry, no terminal record — no mass retirement); and after
+    /// INFRA_PROBE_PAUSE_AFTER consecutive failed cycles the campaign lands
+    /// in the operator PAUSE (the prefetch-shortfall arm's mechanics), not
+    /// in retirement.
+    #[tokio::test(start_paused = true)]
+    async fn infra_pause_canary_probes_then_escalates_without_draining_budgets() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        let pause = Arc::new(model::PauseState::default());
+        // The latch: the poller computed an over-threshold infra rate and
+        // set the backpressure pause. The window is frozen from here on —
+        // only probe verdicts could refresh it.
+        pause.set_backpressure(true);
+        let submitter = Arc::new(FakeSubmitter::default());
+        for _ in 0..INFRA_PROBE_PAUSE_AFTER {
+            submitter
+                .outcomes
+                .lock()
+                .unwrap()
+                .push(Err(anyhow::anyhow!("gateway unreachable")));
+        }
+        let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let (job_ledger, _stalls) =
+            ledger::JobLedger::from_journals((*state).clone(), watchdog).unwrap();
+        let job_ledger = Arc::new(job_ledger);
+        // Four attemptable jobs: a full wave would batch them together —
+        // each probe must pick exactly one (and rotate as cool-downs hold
+        // recently probed jobs back).
+        let jobs = [
+            "a.x86_64-linux",
+            "b.x86_64-linux",
+            "c.x86_64-linux",
+            "d.x86_64-linux",
+        ];
+        let drv = |job: &str| format!("/nix/store/{}-{job}.drv", fake_hash(job));
+        let attemptable: Vec<batch::PendingJob> = jobs
+            .iter()
+            .map(|job| batch::PendingJob {
+                job: (*job).to_string(),
+                drv_path: drv(job),
+                dep_drvs: Vec::new(),
+            })
+            .collect();
+        let contexts: HashMap<String, JobContext> = jobs
+            .iter()
+            .map(|job| ((*job).to_string(), fold_ctx(job, &drv(job))))
+            .collect();
+        let backends = CollectBackends {
+            admin: Arc::new(NoLogsAdmin),
+            store: Arc::new(FakeStoreApi::default()),
+            artifacts: None,
+        };
+        let results: tokio::sync::Mutex<BTreeMap<String, JobRecord>> =
+            tokio::sync::Mutex::new(BTreeMap::new());
+        let mut processed: HashSet<u64> = HashSet::new();
+        let loop_handle = tokio::spawn(run_submit_loop(
+            state.clone(),
+            submitter.clone(),
+            job_ledger.clone(),
+            pause.clone(),
+            attemptable,
+            HashSet::new,
+            || false,
+            "ssh-ng://test".into(),
+            Knobs::default(),
+            Arc::new(AtomicU64::new(1)),
+            None,
+        ));
+
+        // Drive poller ticks: score the concluded probe (exactly the
+        // poller's arm), feed the ladder, apply its action.
+        let mut ladder = InfraProbeLadder::new();
+        let mut escalated = false;
+        for _tick in 0..200 {
+            let concluded = match pause.probe_batch() {
+                Some((batch_id, probe_jobs)) if processed.contains(&batch_id) => {
+                    pause.clear_probe();
+                    let res = results.lock().await;
+                    Some(probe_jobs.iter().any(|job| {
+                        res.get(job)
+                            .is_some_and(|r| model::is_terminal_class(&r.verdict, &r.disposition))
+                    }))
+                }
+                _ => None,
+            };
+            let in_flight = job_ledger.tracker().in_flight.lock().await.len();
+            match ladder.on_tick(true, false, in_flight, !pause.probe_idle(), concluded) {
+                ProbeAction::Hold => {}
+                ProbeAction::Grant => pause.grant_probe(),
+                ProbeAction::EscalateToOperatorPause => {
+                    std::fs::write(state.path("PAUSE"), b"infra-rate canary probes exhausted\n")
+                        .unwrap();
+                    escalated = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            collect_pass_with(
+                &state,
+                &backends,
+                &contexts,
+                &job_ledger,
+                &results,
+                &mut processed,
+                &Knobs::default(),
+                "leaf",
+                "c-probe",
+                None,
+            )
+            .await
+            .unwrap();
+            let mut res = results.lock().await;
+            *res = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        }
+        loop_handle.abort();
+        assert!(
+            escalated,
+            "the ladder must escalate after {INFRA_PROBE_PAUSE_AFTER} failed probe cycles"
+        );
+
+        // The campaign lands in the operator PAUSE, not in retirement: the
+        // PAUSE file exists and the next poller tick would set the manual
+        // bit from it.
+        assert!(state.path("PAUSE").exists());
+        pause.set_manual(state.path("PAUSE").exists());
+        assert!(pause.paused());
+
+        // One single-job batch per probe cycle — never a wave.
+        {
+            let submitted = submitter.submitted.lock().unwrap();
+            assert_eq!(
+                submitted.len(),
+                INFRA_PROBE_PAUSE_AFTER as usize,
+                "exactly one batch per failed probe cycle"
+            );
+            assert!(
+                submitted.iter().all(|(_, batch, _)| batch.jobs.len() == 1),
+                "every probe is a single job"
+            );
+        }
+        let batches: Vec<model::BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
+        assert!(
+            batches.iter().all(|b| b.probe),
+            "every released batch carries the probe intent: {batches:?}"
+        );
+
+        // Budgets NOT drained: no resubmission counted for any job, the
+        // requeue journal is empty (nothing to re-charge on resume), and no
+        // terminal records were written (no mass retirement).
+        for job in &jobs {
+            assert_eq!(
+                job_ledger.tracker().resubmission_count(job).await,
+                0,
+                "{job}: probe failures must never consume the auto-retry budget"
+            );
+        }
+        let journal: Vec<model::RequeueRecord> = state.load_jsonl(StateFile::Requeues).unwrap();
+        assert!(
+            journal.is_empty(),
+            "probe re-offers are never journaled: {journal:?}"
+        );
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert!(
+            records.is_empty(),
+            "probe failures must never write terminal records: {records:?}"
         );
     }
 

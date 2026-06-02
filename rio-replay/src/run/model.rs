@@ -859,6 +859,36 @@ pub struct BatchRecord {
     /// Defaults to empty on records written before the field existed.
     #[serde(default)]
     pub import_skipped_drvs: Vec<String>,
+    /// True when this batch is a canary probe released by the submit loop
+    /// while the infra-rate backpressure pause held: a single job sent to
+    /// test whether the infrastructure recovered, whose infra-shaped
+    /// failures collect re-offers without consuming the per-job retry
+    /// budget (the failure is evidence about the outage, not the job).
+    /// Defaults to false on records written before probing existed —
+    /// pre-probe batches were all full-wave submissions.
+    #[serde(default)]
+    pub probe: bool,
+}
+
+/// Writer intent for one submission, recorded verbatim onto the
+/// [`BatchRecord`] by the submission chokepoint
+/// ([`super::submit::submit_one_batch`]) so collect can apply
+/// writer-specific policy when the batch settles. Intent travels ON the
+/// batch record because legitimacy of a write is a property of the
+/// writing batch, never something a reader can re-derive from per-job
+/// state after the fact.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BatchIntent {
+    /// Canary probe released while the infra-rate pause held (see
+    /// [`BatchRecord::probe`]).
+    pub probe: bool,
+}
+
+impl BatchIntent {
+    /// A canary-probe submission.
+    pub fn probe() -> Self {
+        Self { probe: true }
+    }
 }
 
 /// [`RequeueRecord::source`] value for collect-pass re-offers (a settled
@@ -902,6 +932,15 @@ pub enum RequeueReason {
     /// A positively-identified infrastructure failure consumed the single
     /// auto-retry.
     InfraAutoRetry,
+    /// An infra-shaped failure of a canary-probe batch: the probed outage
+    /// answering, evidence about the outage rather than the job. The
+    /// decision consumer routes probe-exempt re-offers around the journal
+    /// entirely (no entry, no counter — the probe ladder owns the
+    /// outage's convergence), so this reason is normally never journaled;
+    /// it exists so the decision vocabulary stays closed and a journaled
+    /// probe line, should one ever be written, reads back as
+    /// not-a-cluster-attempt.
+    InfraProbe,
     /// Fail-fast marked this job dependency-failed for a trigger outside
     /// its own closure: a cluster attempt denied a fair run by its
     /// batch-mates.
@@ -918,11 +957,12 @@ impl RequeueReason {
     /// Every requeue reason. The vocabulary as data: the per-reason
     /// measurement-semantics test iterates this, so a new reason cannot
     /// ship without an expected-flakiness row.
-    pub const ALL: [RequeueReason; 7] = [
+    pub const ALL: [RequeueReason; 8] = [
         RequeueReason::EngineCancelled,
         RequeueReason::EngineSubmissionFailure,
         RequeueReason::NoInbandResult,
         RequeueReason::InfraAutoRetry,
+        RequeueReason::InfraProbe,
         RequeueReason::FailfastBatchMate,
         RequeueReason::DependencyFailedNoTrigger,
         RequeueReason::ActiveStall,
@@ -937,6 +977,7 @@ impl RequeueReason {
             RequeueReason::EngineSubmissionFailure => "engine-submission-failure",
             RequeueReason::NoInbandResult => "no-inband-result",
             RequeueReason::InfraAutoRetry => "infra-auto-retry",
+            RequeueReason::InfraProbe => "infra-probe",
             RequeueReason::FailfastBatchMate => "failfast-batch-mate",
             RequeueReason::DependencyFailedNoTrigger => "dependency-failed-no-trigger",
             RequeueReason::ActiveStall => "active-stall",
@@ -968,7 +1009,9 @@ impl RequeueReason {
     /// `collect::decide`.
     pub const fn counts_as_cluster_attempt(self) -> bool {
         match self {
-            RequeueReason::EngineCancelled | RequeueReason::EngineSubmissionFailure => false,
+            RequeueReason::EngineCancelled
+            | RequeueReason::EngineSubmissionFailure
+            | RequeueReason::InfraProbe => false,
             RequeueReason::NoInbandResult
             | RequeueReason::InfraAutoRetry
             | RequeueReason::FailfastBatchMate
@@ -1013,11 +1056,42 @@ pub struct RequeueRecord {
 
 /// Cross-component pause flags: a manual operator pause and the
 /// engine's own backpressure pause, OR-ed into one "submission paused"
-/// signal.
+/// signal — plus the canary-probe channel between the poller and the
+/// submit loop.
+///
+/// The probe channel exists because the infra-rate backpressure pause
+/// suppresses its own evidence: the rolling window is computed over
+/// terminal records, and a paused submit loop produces none, so once
+/// in-flight work drains the window freezes and the pause would re-assert
+/// identically forever. The poller therefore grants one-shot probe tokens
+/// ([`Self::grant_probe`]); the paused submit loop redeems a token for a
+/// SINGLE one-job probe batch ([`Self::take_probe`]) and reports what it
+/// released ([`Self::set_probe_batch`]) so the poller can score the cycle
+/// once collect has classified it.
 #[derive(Debug, Default)]
 pub struct PauseState {
     manual: AtomicBool,
     backpressure: AtomicBool,
+    probe: std::sync::Mutex<ProbePhase>,
+}
+
+/// Lifecycle of one canary-probe cycle through the [`PauseState`] channel.
+/// One value, strictly forward (Idle → Granted → Redeemed → Released →
+/// Idle, with Redeemed → Idle on abort), so a granted token can never
+/// release more than one probe batch and the poller can never double-grant
+/// while a probe is anywhere in flight.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum ProbePhase {
+    /// No probe cycle in progress.
+    #[default]
+    Idle,
+    /// The poller granted a token the submit loop has not redeemed yet.
+    Granted,
+    /// The submit loop redeemed the token and is releasing the probe.
+    Redeemed,
+    /// The probe batch was released; the poller scores the cycle once
+    /// collect has classified it, then clears back to Idle.
+    Released { batch_id: u64, jobs: Vec<String> },
 }
 
 impl PauseState {
@@ -1040,6 +1114,71 @@ impl PauseState {
     /// True when any pause source is set.
     pub fn paused(&self) -> bool {
         self.manual() || self.backpressure()
+    }
+
+    fn probe_lock(&self) -> std::sync::MutexGuard<'_, ProbePhase> {
+        self.probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Make one probe token available to the paused submit loop. A no-op
+    /// unless the channel is idle — at most one probe cycle exists at a
+    /// time.
+    pub fn grant_probe(&self) {
+        let mut probe = self.probe_lock();
+        if *probe == ProbePhase::Idle {
+            *probe = ProbePhase::Granted;
+        }
+    }
+
+    /// Redeem the granted probe token, if any. Exactly one caller wins per
+    /// grant.
+    pub fn take_probe(&self) -> bool {
+        let mut probe = self.probe_lock();
+        if *probe == ProbePhase::Granted {
+            *probe = ProbePhase::Redeemed;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The submit loop redeemed a token but dropped the probe without
+    /// submitting it (no offerable job, operator pause, deadline): return
+    /// the channel to idle so the poller can grant again.
+    pub fn abort_probe(&self) {
+        let mut probe = self.probe_lock();
+        if *probe == ProbePhase::Redeemed {
+            *probe = ProbePhase::Idle;
+        }
+    }
+
+    /// The submit loop reports the probe batch it released against the
+    /// redeemed token.
+    pub fn set_probe_batch(&self, batch_id: u64, jobs: Vec<String>) {
+        let mut probe = self.probe_lock();
+        if *probe == ProbePhase::Redeemed {
+            *probe = ProbePhase::Released { batch_id, jobs };
+        }
+    }
+
+    /// True when no probe cycle is in progress (the poller may grant).
+    pub fn probe_idle(&self) -> bool {
+        *self.probe_lock() == ProbePhase::Idle
+    }
+
+    /// The released probe batch, if one is awaiting scoring.
+    pub fn probe_batch(&self) -> Option<(u64, Vec<String>)> {
+        match &*self.probe_lock() {
+            ProbePhase::Released { batch_id, jobs } => Some((*batch_id, jobs.clone())),
+            _ => None,
+        }
+    }
+
+    /// The poller scored the released probe's cycle: channel back to idle.
+    pub fn clear_probe(&self) {
+        *self.probe_lock() = ProbePhase::Idle;
     }
 }
 
@@ -1290,6 +1429,7 @@ mod tests {
             disconnect_deadline_fired: false,
             interruption_drvs: Vec::new(),
             import_skipped_drvs: Vec::new(),
+            probe: false,
         };
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains(r#""results":[{"drvPath":"#), "{json}");
@@ -1303,9 +1443,11 @@ mod tests {
         // `results` key, a stale `exitCode` key) still deserializes: the
         // array defaults to empty and the unknown key is ignored. Lines
         // written before timed scheduling existed lack `interruptionDrvs`
-        // the same way (defaults to empty), and lines written before the
+        // the same way (defaults to empty), lines written before the
         // deadline-cause bit existed lack `disconnectDeadlineFired`
-        // (defaults to false).
+        // (defaults to false), and lines written before canary probing
+        // existed lack `probe` (defaults to false — they were all
+        // full-wave submissions).
         let old = r#"{"batchId":3,"kind":"submit","jobs":["x.x86_64-linux"],"rootDrvs":["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv"],"estNodes":1,"buildId":null,"startedAt":"2026-05-26T00:00:00Z","finishedAt":null,"exitCode":1,"reasons":{},"stderrTail":"tail","engineCancelled":false}"#;
         let parsed: BatchRecord = serde_json::from_str(old).unwrap();
         assert!(parsed.results.is_empty());
@@ -1314,6 +1456,7 @@ mod tests {
         // Lines written before the import-skip breadcrumb existed lack
         // `importSkippedDrvs` the same way (defaults to empty).
         assert!(parsed.import_skipped_drvs.is_empty());
+        assert!(!parsed.probe);
         assert_eq!(parsed.batch_id, 3);
         assert_eq!(parsed.stderr_tail.as_deref(), Some("tail"));
     }
@@ -1408,6 +1551,49 @@ mod tests {
         p.set_backpressure(false);
         p.set_manual(true);
         assert!(p.paused());
+    }
+
+    /// The probe channel is a single forward-only cycle: at most one token,
+    /// exactly one redeemer per grant, no re-grant while a probe is
+    /// anywhere in flight, and abort returns a redeemed-but-unreleased
+    /// cycle to idle.
+    #[test]
+    fn pause_state_probe_channel_is_one_cycle_at_a_time() {
+        let p = PauseState::default();
+        assert!(p.probe_idle());
+        assert!(!p.take_probe(), "no token granted yet");
+        p.grant_probe();
+        p.grant_probe(); // double-grant collapses to one token
+        assert!(!p.probe_idle(), "a granted token blocks re-granting");
+        assert!(p.take_probe(), "the granted token is redeemable once");
+        assert!(!p.take_probe(), "a redeemed token cannot be redeemed again");
+        assert!(
+            !p.probe_idle(),
+            "a redeemed-but-unreleased probe still blocks re-granting"
+        );
+
+        // Granting mid-cycle is a no-op: the channel stays in Redeemed, so
+        // the released batch below is still accepted.
+        p.grant_probe();
+        assert!(!p.take_probe(), "mid-cycle grant must not mint a token");
+
+        assert!(p.probe_batch().is_none());
+        p.set_probe_batch(7, vec!["a.x86_64-linux".to_string()]);
+        assert!(!p.probe_idle(), "a released probe blocks re-granting");
+        assert_eq!(
+            p.probe_batch(),
+            Some((7, vec!["a.x86_64-linux".to_string()]))
+        );
+        p.clear_probe();
+        assert!(p.probe_idle());
+
+        // The abort path: a redeemed probe dropped without submission
+        // returns the channel to idle (and aborting mid-Released is a
+        // no-op — only clear_probe ends a released cycle).
+        p.grant_probe();
+        assert!(p.take_probe());
+        p.abort_probe();
+        assert!(p.probe_idle(), "aborted redemption frees the channel");
     }
 
     #[test]

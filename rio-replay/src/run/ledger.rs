@@ -261,6 +261,21 @@ impl JobLedger {
         Ok(())
     }
 
+    /// A failed canary probe re-offers its member WITHOUT journaling or
+    /// counting: the probe's infra-shaped failure is evidence about the
+    /// outage being probed, not about the job, so no budget moves — and
+    /// `fold(requeues.jsonl) == live counters` holds because neither side
+    /// moves. The job is still observed `Queued` so its clock leaves the
+    /// settled batch's `Active` phase (the probe ladder, not the stall
+    /// ladder, owns the outage's convergence — and the backpressure pause
+    /// freezes stall clocks while the latch holds anyway).
+    pub async fn requeue_probe_exempt(&self, job: &str) {
+        self.watchdog
+            .lock()
+            .await
+            .observe_job(job, JobPhase::Queued);
+    }
+
     /// The active-stall auto-retry: journal the requeue, release the
     /// in-flight reservation, count the resubmission, and observe the job
     /// `Queued` so its wait for the fresh batch is charged to the queued
@@ -457,6 +472,11 @@ mod tests {
             (RequeueReason::EngineSubmissionFailure, false),
             (RequeueReason::NoInbandResult, true),
             (RequeueReason::InfraAutoRetry, true),
+            // The probe carve-out: evidence about the outage, not the job.
+            // Normally never journaled (the decision consumer routes
+            // probe-exempt re-offers around the journal), but a journaled
+            // line must read back as not-a-cluster-attempt.
+            (RequeueReason::InfraProbe, false),
             (RequeueReason::FailfastBatchMate, true),
             (RequeueReason::DependencyFailedNoTrigger, true),
             (RequeueReason::ActiveStall, true),

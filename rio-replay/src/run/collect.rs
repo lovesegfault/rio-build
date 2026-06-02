@@ -76,11 +76,21 @@ pub struct JobContext {
 mod requeue_budget {
     use super::super::spec::Knobs;
 
-    /// See the module docs. The unit field is private on purpose: outside
+    /// What the requeue charges. Private to the witness module so the
+    /// only way to obtain an exempt witness is the probe constructor.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Charge {
+        /// Normal re-offer: the resubmission is journaled and counted.
+        Counted,
+        /// Canary-probe re-offer: neither journaled nor counted.
+        ProbeExempt,
+    }
+
+    /// See the module docs. The field is private on purpose: outside
     /// this module (including the rest of collect.rs) the type can be
     /// moved and matched but never built.
     #[derive(Debug, Clone, PartialEq)]
-    pub struct RequeueBudget(());
+    pub struct RequeueBudget(Charge);
 
     impl RequeueBudget {
         /// The single auto-retry budget for transport-shaped defects
@@ -89,7 +99,7 @@ mod requeue_budget {
         /// max_auto_retries`. Any prior requeue of any reason consumes it
         /// — see [`super::decide`]'s conservative-budget contract.
         pub fn auto_retry(prior_requeues: u32, knobs: &Knobs) -> Option<Self> {
-            (prior_requeues < knobs.max_auto_retries).then_some(Self(()))
+            (prior_requeues < knobs.max_auto_retries).then_some(Self(Charge::Counted))
         }
 
         /// The bound for jobs denied a fair attempt by their batch (a
@@ -110,7 +120,7 @@ mod requeue_budget {
             let limit = knobs
                 .failfast_singleton_after
                 .saturating_add(knobs.max_auto_retries);
-            (prior_requeues < limit).then_some(Self(()))
+            (prior_requeues < limit).then_some(Self(Charge::Counted))
         }
 
         /// The engine-cancelled carve-out: a batch the ENGINE itself
@@ -125,7 +135,31 @@ mod requeue_budget {
         /// reach for this constructor from a new arm without naming an
         /// equivalent backstop.
         pub fn engine_cancelled_carveout() -> Self {
-            Self(())
+            Self(Charge::Counted)
+        }
+
+        /// The canary-probe carve-out: an infra-shaped failure of a probe
+        /// batch (released by the paused submit loop to test whether the
+        /// infrastructure recovered) re-offers the member WITHOUT
+        /// journaling or counting the resubmission — the failure is
+        /// evidence about the outage, not about the job, and charging it
+        /// would convert a transient outage into per-job budget exhaustion
+        /// and mass terminal retirement. Bounded by the probe ladder
+        /// itself: the poller releases at most one single-job probe per
+        /// cycle and escalates to the operator PAUSE file after
+        /// `INFRA_PROBE_PAUSE_AFTER` consecutive failed cycles, so an
+        /// outage costs at most that many exempt re-offers before an
+        /// operator must intervene.
+        pub fn probe_carveout() -> Self {
+            Self(Charge::ProbeExempt)
+        }
+
+        /// True when this witness was minted by the probe carve-out: the
+        /// decision consumer applies the re-offer without journaling or
+        /// counting (`fold(requeues.jsonl) == live counters` holds because
+        /// neither side moves).
+        pub fn probe_exempt(&self) -> bool {
+            self.0 == Charge::ProbeExempt
         }
     }
 }
@@ -274,6 +308,11 @@ pub struct BatchView {
     /// interruption (empty for every non-timed batch).
     pub interruption_drvs: Vec<String>,
     pub submitted_at: Option<String>,
+    /// True for a canary-probe batch (from the batch record's bit, set by
+    /// the submission chokepoint): its infra-shaped failures take the
+    /// budget-exempt probe carve-out instead of consuming the auto-retry
+    /// budget.
+    pub probe: bool,
 }
 
 /// Derive the timed-interruption flag for one root of a settled batch:
@@ -353,11 +392,19 @@ pub fn decide(
         // is always re-offered — the carve-out's bound is the active-stall
         // watchdog (see [`RequeueBudget::engine_cancelled_carveout`]);
         // otherwise a missing result is a transport defect — one
-        // auto-retry, then an infra failure.
+        // auto-retry, then an infra failure. A canary probe's missing
+        // result (the very outage the probe was sent to test) is exempt
+        // from the budget: see [`RequeueBudget::probe_carveout`].
         if batch.engine_cancelled {
             return CollectDecision::Requeue {
                 why: RequeueReason::EngineCancelled,
                 budget: RequeueBudget::engine_cancelled_carveout(),
+            };
+        }
+        if batch.probe {
+            return CollectDecision::Requeue {
+                why: RequeueReason::InfraProbe,
+                budget: RequeueBudget::probe_carveout(),
             };
         }
         if let Some(budget) = RequeueBudget::auto_retry(prior_requeues, knobs) {
@@ -497,20 +544,30 @@ pub fn decide(
     // TimedOut, MiscFailure, CachedFailure, LogLimitExceeded,
     // NotDeterministic, OutputRejected, InputRejected, NoSubstituters): the
     // two-signal rule decides the kind; positively-identified infra gets the
-    // single auto-retry while budget remains.
+    // single auto-retry while budget remains. On a canary probe an infra
+    // failure is the probed outage answering — exempt from the budget
+    // ([`RequeueBudget::probe_carveout`]); every NON-infra probe outcome
+    // (genuine, timeout, source-rot, …) is evidence the cluster executed
+    // the build and classifies normally.
     let (kind, evidence) = resolve_failure_kind(
         signal1,
         poisoned.get(&ctx.drv_path).map(Vec::as_slice),
         ctx.fixed_output_drvs.contains(&ctx.drv_path),
         log_tail,
     );
-    if kind == FailureKind::Infra
-        && let Some(budget) = RequeueBudget::auto_retry(prior_requeues, knobs)
-    {
-        return CollectDecision::Requeue {
-            why: RequeueReason::InfraAutoRetry,
-            budget,
-        };
+    if kind == FailureKind::Infra {
+        if batch.probe {
+            return CollectDecision::Requeue {
+                why: RequeueReason::InfraProbe,
+                budget: RequeueBudget::probe_carveout(),
+            };
+        }
+        if let Some(budget) = RequeueBudget::auto_retry(prior_requeues, knobs) {
+            return CollectDecision::Requeue {
+                why: RequeueReason::InfraAutoRetry,
+                budget,
+            };
+        }
     }
     CollectDecision::Terminal {
         rio: RioOutcome::TargetFailed { kind },
@@ -1469,6 +1526,125 @@ mod tests {
                 evidence,
             } => assert_eq!(evidence.as_deref(), Some("no-inband-result")),
             other => panic!("expected terminal infra, got {other:?}"),
+        }
+    }
+
+    /// The canary-probe carve-out, both directions. Must-exempt: a probe
+    /// batch's infra-shaped failures (missing in-band result, two-signal
+    /// infra) re-offer with the budget-exempt witness even with the
+    /// auto-retry budget long exhausted — a probe failure is evidence about
+    /// the outage, never charged to the job. Must-still-classify: a probe
+    /// whose build actually executed (genuine failure, success) produces
+    /// its normal terminal decision — the probe carve-out can only catch
+    /// infra shapes, so a recovered cluster's verdicts land as evidence.
+    #[test]
+    fn probe_batch_exempts_infra_shapes_but_real_verdicts_still_land() {
+        let knobs = Knobs::default();
+        let c = ctx("app.x86_64-linux", T, &[], ExpectedOutcome::Built);
+        let no_poison: HashMap<String, Vec<String>> = HashMap::new();
+        let probe_batch = BatchView {
+            probe: true,
+            ..BatchView::default()
+        };
+
+        // Missing in-band result on a probe, budget exhausted (prior 5):
+        // exempt requeue, not terminal infra.
+        match decide(&c, None, &probe_batch, &no_poison, 5, &knobs, None) {
+            CollectDecision::Requeue { why, budget } => {
+                assert_eq!(why, RequeueReason::InfraProbe);
+                assert!(
+                    budget.probe_exempt(),
+                    "the witness must carry the exemption"
+                );
+            }
+            other => panic!("expected an exempt probe requeue, got {other:?}"),
+        }
+
+        // Two-signal infra failure on a probe (infra reason, empty poison
+        // entry), budget exhausted: exempt requeue.
+        let infra_probe = BatchView {
+            probe: true,
+            reasons: BTreeMap::from([(
+                T.to_string(),
+                "max_infra_retries=3 exhausted after infrastructure failures: x".to_string(),
+            )]),
+            ..BatchView::default()
+        };
+        let empty_poison: HashMap<String, Vec<String>> = HashMap::from([(T.to_string(), vec![])]);
+        match decide(
+            &c,
+            Some(&po(T, BuildStatus::TransientFailure, "")),
+            &infra_probe,
+            &empty_poison,
+            5,
+            &knobs,
+            None,
+        ) {
+            CollectDecision::Requeue { why, budget } => {
+                assert_eq!(why, RequeueReason::InfraProbe);
+                assert!(budget.probe_exempt());
+            }
+            other => panic!("expected an exempt probe requeue, got {other:?}"),
+        }
+
+        // Genuine failure on a probe: the cluster executed the build — a
+        // real verdict, recorded exactly as on a normal batch.
+        assert!(matches!(
+            decide(
+                &c,
+                Some(&po(
+                    T,
+                    BuildStatus::PermanentFailure,
+                    "builder failed with exit code 2"
+                )),
+                &probe_batch,
+                &no_poison,
+                0,
+                &knobs,
+                None
+            ),
+            CollectDecision::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::Genuine
+                },
+                ..
+            }
+        ));
+
+        // Success on a probe: terminal Built, as on a normal batch.
+        assert!(matches!(
+            decide(
+                &c,
+                Some(&po(T, BuildStatus::Built, "")),
+                &probe_batch,
+                &no_poison,
+                0,
+                &knobs,
+                None
+            ),
+            CollectDecision::Terminal {
+                rio: RioOutcome::Built { executed: true },
+                ..
+            }
+        ));
+
+        // The non-probe charged witness is the contrast: same infra shape,
+        // same exhausted budget, NO probe flag → terminal infra (the
+        // exemption is minted by the probe carve-out alone).
+        let non_probe = BatchView::default();
+        assert!(matches!(
+            decide(&c, None, &non_probe, &no_poison, 5, &knobs, None),
+            CollectDecision::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::Infra
+                },
+                ..
+            }
+        ));
+        // And a within-budget non-probe requeue's witness is NOT exempt.
+        match decide(&c, None, &non_probe, &no_poison, 0, &knobs, None) {
+            CollectDecision::Requeue { budget, .. } => assert!(!budget.probe_exempt()),
+            other => panic!("expected a charged requeue, got {other:?}"),
         }
     }
 
@@ -2596,6 +2772,7 @@ mod tests {
             disconnect_deadline_fired: false,
             interruption_drvs: Vec::new(),
             submitted_at: Some("2026-05-26T01:00:00Z".into()),
+            probe: false,
         };
         let decisions = process_settled_batch(
             &state,

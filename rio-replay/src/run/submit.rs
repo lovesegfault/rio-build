@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 
 use super::batch::{Batch, PendingJob, assemble_batches};
 use super::ledger::JobLedger;
-use super::model::{BATCH_KIND_SUBMIT, BatchRecord, PauseState, now_rfc3339};
+use super::model::{BATCH_KIND_SUBMIT, BatchIntent, BatchRecord, PauseState, now_rfc3339};
 use super::spec::Knobs;
 use super::state::{StateDir, StateFile};
 use super::submitter::{BatchDeadline, Submitter};
@@ -156,6 +156,10 @@ pub fn pending_wave(
 /// are re-offered on a later wave; only state-dir I/O failures propagate.
 /// The reservations are released before the append so an append failure
 /// can never leak in-flight markers.
+///
+/// `intent` is the writer's declared intent ([`BatchIntent`]), recorded
+/// verbatim on the batch record — collect reads it to apply
+/// writer-specific policy (probe budget exemption).
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_one_batch(
     state: &StateDir,
@@ -168,6 +172,7 @@ pub async fn submit_one_batch(
     deadline: BatchDeadline,
     cooldown: Duration,
     interruption_drvs: Vec<String>,
+    intent: BatchIntent,
 ) -> Result<BatchRecord> {
     let started_at = now_rfc3339();
     let outcome = submitter.submit_batch(store_url, &batch, deadline).await;
@@ -187,6 +192,7 @@ pub async fn submit_one_batch(
         disconnect_deadline_fired: false,
         interruption_drvs,
         import_skipped_drvs: Vec::new(),
+        probe: intent.probe,
     };
     match outcome {
         Ok(o) => {
@@ -233,6 +239,13 @@ pub async fn submit_one_batch(
 /// never killed by a pause — pausing only stops new submissions. Either
 /// exit still drains the batches already in flight before returning, which
 /// can take up to the batch timeout.
+///
+/// Canary-probe exception: a paused loop that finds a granted probe token
+/// ([`PauseState::take_probe`]) releases exactly ONE one-job batch flagged
+/// [`BatchIntent::probe`] — the poller's bounded way of refreshing the
+/// infra-rate evidence the pause itself froze. The probe is never a wave:
+/// one token, one singleton batch, reported back through
+/// [`PauseState::set_probe_batch`] so the poller can score the cycle.
 ///
 /// When `supply_topup` is present (the campaign's
 /// [`LadderTopup`](super::supply::exec::LadderTopup) under inline delivery,
@@ -322,15 +335,46 @@ pub async fn run_submit_loop(
             }
             was_paused = paused;
         }
-        if paused {
-            tokio::time::sleep(PAUSE_POLL).await;
-            continue;
-        }
-        let Some(batch) = batches.into_iter().next() else {
-            // Everything pending is in flight or cooling down; wait for
-            // workers to settle or cool-downs to expire.
-            tokio::time::sleep(IN_FLIGHT_POLL).await;
-            continue;
+        let (batch, intent) = if paused {
+            // A paused loop submits nothing — except the single canary
+            // probe the poller granted a token for. The probe is one job,
+            // assembled fresh from the offerable set (never the full
+            // wave), so a frozen infra-rate window is refreshed at the
+            // cost of exactly one batch per probe cycle. A redeemed token
+            // that finds no offerable job aborts the cycle so the poller
+            // can grant again later.
+            let probe = pause.take_probe().then(|| {
+                attemptable
+                    .iter()
+                    .find(|job| !terminal.contains(&job.job) && !blocked.contains(&job.job))
+                    .and_then(|job| {
+                        assemble_batches(std::slice::from_ref(job), 1, usize::MAX)
+                            .into_iter()
+                            .next()
+                    })
+            });
+            match probe {
+                Some(Some(batch)) => (batch, BatchIntent::probe()),
+                Some(None) => {
+                    pause.abort_probe();
+                    tokio::time::sleep(PAUSE_POLL).await;
+                    continue;
+                }
+                None => {
+                    tokio::time::sleep(PAUSE_POLL).await;
+                    continue;
+                }
+            }
+        } else {
+            match batches.into_iter().next() {
+                Some(batch) => (batch, BatchIntent::default()),
+                None => {
+                    // Everything pending is in flight or cooling down; wait
+                    // for workers to settle or cool-downs to expire.
+                    tokio::time::sleep(IN_FLIGHT_POLL).await;
+                    continue;
+                }
+            }
         };
         let permit = semaphore
             .clone()
@@ -342,8 +386,19 @@ pub async fn run_submit_loop(
         // deadline before committing this batch, so a batch selected before
         // the wait cannot start hours after the operator paused or the
         // deadline passed. Dropping the permit and continuing also refreshes
-        // the wave snapshot.
-        if pause.paused() || deadline_reached() {
+        // the wave snapshot. A probe batch exists BECAUSE the engine pause
+        // is on, so it re-checks only the operator's manual pause (which
+        // always wins); a dropped probe aborts its cycle so the poller can
+        // grant a fresh one.
+        let pause_blocks = if intent.probe {
+            pause.manual()
+        } else {
+            pause.paused()
+        };
+        if pause_blocks || deadline_reached() {
+            if intent.probe {
+                pause.abort_probe();
+            }
             drop(permit);
             continue;
         }
@@ -358,16 +413,25 @@ pub async fn run_submit_loop(
         // next wave re-packs the survivors.
         let terminal_now = terminal_jobs();
         if batch.jobs.iter().any(|job| terminal_now.contains(job)) {
+            if intent.probe {
+                pause.abort_probe();
+            }
             drop(permit);
             continue;
         }
         ledger.commit_batch(&batch.jobs).await;
         let batch_id = batch_seq.fetch_add(1, Ordering::SeqCst);
+        if intent.probe {
+            // Report the released probe so the poller can score the cycle
+            // once collect classifies the batch.
+            pause.set_probe_batch(batch_id, batch.jobs.clone());
+        }
         tracing::info!(
             batch_id,
             jobs = batch.jobs.len(),
             est_nodes = batch.est_nodes,
             pending,
+            probe = intent.probe,
             "starting batch"
         );
         let state = state.clone();
@@ -407,6 +471,7 @@ pub async fn run_submit_loop(
                 BatchDeadline::Build(tokio::time::Instant::now() + timeout),
                 cooldown,
                 Vec::new(),
+                intent,
             )
             .await
         });
@@ -510,6 +575,7 @@ mod tests {
             BatchDeadline::Build(tokio::time::Instant::now() + Duration::from_secs(60)),
             Duration::from_secs(60),
             Vec::new(),
+            BatchIntent::default(),
         )
         .await
         .unwrap();
@@ -566,6 +632,7 @@ mod tests {
             deadline,
             Duration::from_secs(60),
             Vec::new(),
+            BatchIntent::default(),
         )
         .await
         .unwrap();
@@ -629,6 +696,7 @@ mod tests {
             BatchDeadline::DisconnectReplay(in_one_min()),
             Duration::from_secs(60),
             Vec::new(),
+            BatchIntent::default(),
         )
         .await
         .unwrap();
@@ -646,6 +714,7 @@ mod tests {
             BatchDeadline::DisconnectReplay(in_one_min()),
             Duration::from_secs(60),
             Vec::new(),
+            BatchIntent::default(),
         )
         .await
         .unwrap();
@@ -663,6 +732,7 @@ mod tests {
             BatchDeadline::Build(in_one_min()),
             Duration::from_secs(60),
             Vec::new(),
+            BatchIntent::default(),
         )
         .await
         .unwrap();
@@ -1030,6 +1100,92 @@ mod tests {
         assert!(
             !submitter.submitted.lock().unwrap().is_empty(),
             "unpaused loop submits"
+        );
+        handle.abort();
+    }
+
+    /// A backpressure-paused loop with a granted probe token releases
+    /// exactly ONE single-job probe batch — never the wave — records the
+    /// probe intent on the batch record, reports the released batch through
+    /// the pause channel, and goes back to submitting nothing until the
+    /// next grant. The operator's manual pause still vetoes probing.
+    #[tokio::test]
+    async fn paused_loop_releases_exactly_one_probe_batch_per_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        let pause = Arc::new(PauseState::default());
+        pause.set_backpressure(true);
+        let submitter = Arc::new(FakeSubmitter::default());
+        submitter
+            .outcomes
+            .lock()
+            .unwrap()
+            .push(Err(anyhow::anyhow!("gateway unreachable")));
+        // Three offerable jobs: a wave would batch them together.
+        let attemptable = vec![pj("a", 0), pj("b", 0), pj("c", 0)];
+        let handle = tokio::spawn(run_submit_loop(
+            state.clone(),
+            submitter.clone(),
+            test_ledger(&state, Arc::new(SubmitTracker::default())),
+            pause.clone(),
+            attemptable,
+            HashSet::new,
+            || false,
+            "ssh-ng://test".into(),
+            Knobs::default(),
+            Arc::new(AtomicU64::new(1)),
+            None,
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            submitter.submitted.lock().unwrap().is_empty(),
+            "no token, no submission"
+        );
+
+        pause.grant_probe();
+        for _ in 0..100 {
+            if !submitter.submitted.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        {
+            let submitted = submitter.submitted.lock().unwrap();
+            assert_eq!(submitted.len(), 1, "one token releases one batch");
+            assert_eq!(
+                submitted[0].1.jobs.len(),
+                1,
+                "the probe is a single job, not the wave"
+            );
+        }
+        // The released probe is reported for poller-side scoring, and the
+        // batch record carries the probe intent.
+        let (batch_id, probe_jobs) = pause.probe_batch().expect("released probe is reported");
+        assert_eq!(probe_jobs.len(), 1);
+        let on_disk: Vec<BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
+        assert_eq!(on_disk.len(), 1);
+        assert!(on_disk[0].probe, "the batch record carries the probe bit");
+        assert_eq!(on_disk[0].batch_id, batch_id);
+        assert_eq!(on_disk[0].jobs, probe_jobs);
+
+        // No further batches without a fresh grant.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            submitter.submitted.lock().unwrap().len(),
+            1,
+            "a redeemed token never releases a second batch"
+        );
+
+        // The operator's manual pause vetoes probing: a token granted under
+        // a manual pause is aborted, not redeemed into a submission.
+        pause.clear_probe();
+        pause.set_manual(true);
+        pause.grant_probe();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            submitter.submitted.lock().unwrap().len(),
+            1,
+            "the manual pause vetoes probe submissions"
         );
         handle.abort();
     }
