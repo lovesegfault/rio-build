@@ -134,6 +134,10 @@ spec:
             - name: RIO_SUBSTITUTE_ADMISSION_PERMITS
               value: {{ $s.substituteAdmissionPermits | quote }}
             {{- end }}
+            {{- if not (kindIs "invalid" $s.substituteStallSecs) }}
+            - name: RIO_SUBSTITUTE_STALL_SECS
+              value: {{ $s.substituteStallSecs | quote }}
+            {{- end }}
             # Materialization executor (PD-D2: spawns iff schedulerAddr
             # is configured — the env below is the spawn condition).
             - name: RIO_MATERIALIZATION__EXECUTOR_CONCURRENCY

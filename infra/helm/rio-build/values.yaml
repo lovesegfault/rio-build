@@ -362,6 +362,13 @@ store:
   # (pgMaxConnections × 3).clamp(64, 128). Override only when the
   # derived value mis-tracks the upstream-fetch bottleneck.
   # substituteAdmissionPermits: 128
+  # Owner-side download stall window, r[store.substitute.stall-abort].
+  # Unset → binary default 180 s (= 6 missed progress heartbeats); also
+  # the competing-replica stall-reclaim threshold. Persist-phase and
+  # PutPath claims are exempt. Override only when upstream transfer
+  # cadence genuinely differs from the default's assumptions — 0 aborts
+  # every download instantly (cluster-wide substitution outage).
+  # substituteStallSecs: 180
   # The store-side materialization-job executor — THE substitution
   # mechanism (design §8): poll → claim → execute → report against the
   # scheduler's ExecutorService, presenting the store-service
