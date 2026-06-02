@@ -716,10 +716,16 @@ fn check_bookkeeping_markers(
                 ));
             }
         }
-        // Only plain `//` comments are markers. `///`/`//!` doc text
-        // mentioning the convention is prose — it documents items, it
-        // cannot bless a statement, and it must not be flagged stale.
-        if is_marker_comment(trimmed) && !marker_annotates_call(&lines, i, call_re) {
+        // Only plain `//` comments are markers — whole-line or trailing
+        // a code/attribute line. `///`/`//!` doc text mentioning the
+        // convention is prose: it documents items, it cannot bless a
+        // statement, and it must not be flagged stale. Every shape the
+        // blessing walk honors is stale-checked here, so a site flipped
+        // to the live-only accessor cannot keep a leftover
+        // justification in any shape.
+        if (is_marker_comment(trimmed) || has_trailing_marker(line))
+            && !marker_annotates_call(&lines, i, call_re)
+        {
             violations.push(format!(
                 "{rel}:{}: stale `{BOOKKEEPING_MARKER}` marker — no \
                  `*_including_terminal*` call in the statement it annotates",
@@ -740,6 +746,18 @@ fn is_marker_comment(trimmed: &str) -> bool {
         && trimmed.contains(BOOKKEEPING_MARKER)
 }
 
+/// Does this code or attribute line carry the marker in a TRAILING `//`
+/// comment? Whole-line comments (including doc comments) are
+/// [`is_marker_comment`]'s domain, not this one's; a marker token before
+/// the `//` (e.g. inside a string literal) is code, not a justification.
+/// Naive about `//` inside string literals, like [`strip_line_comment`].
+fn has_trailing_marker(line: &str) -> bool {
+    !line.trim_start().starts_with("//")
+        && line
+            .split_once("//")
+            .is_some_and(|(_, comment)| comment.contains(BOOKKEEPING_MARKER))
+}
+
 /// Code part of a line: everything before a `//` comment. Naive about
 /// `//` inside string literals — fine for a lint over call sites that
 /// never embed one.
@@ -750,9 +768,14 @@ fn strip_line_comment(line: &str) -> &str {
 /// Upward adjacency: does a `Bookkeeping lookup:` marker bless the
 /// call at `call_idx`? The marker may trail the call line itself, or
 /// sit above it separated only by comment lines, attributes, and
-/// statement-continuation lines. Any line with a `;`, `{`, or `}` in
-/// its code part bounds the statement — a marker beyond it belongs to
-/// a different statement and does NOT bless this call.
+/// statement-continuation lines (trailing any of those intervening
+/// lines, or as a whole-line comment). Any line with a `;`, `{`, or
+/// `}` in its code part bounds the statement — a marker beyond it,
+/// including one trailing the bounding line itself, belongs to a
+/// different statement and does NOT bless this call. The boundary is
+/// therefore checked on the comment-stripped code part BEFORE a
+/// trailing marker is honored; the reverse order would let one
+/// statement's justification bless its neighbor.
 fn marker_blesses_call(lines: &[&str], call_idx: usize) -> bool {
     if lines[call_idx].contains(BOOKKEEPING_MARKER) {
         return true;
@@ -771,15 +794,21 @@ fn marker_blesses_call(lines: &[&str], call_idx: usize) -> bool {
             continue;
         }
         if trimmed.starts_with("#[") {
+            // Attributes belong to the statement below them, so a
+            // marker trailing one blesses that statement (and never
+            // bounds it — attributes carry no statement terminator).
+            if has_trailing_marker(line) {
+                return true;
+            }
             continue;
-        }
-        if line.contains(BOOKKEEPING_MARKER) {
-            // Trailing marker on a continuation line of this statement.
-            return true;
         }
         let code = strip_line_comment(line);
         if code.contains(';') || code.contains('{') || code.contains('}') {
             return false;
+        }
+        if has_trailing_marker(line) {
+            // Trailing marker on a continuation line of this statement.
+            return true;
         }
     }
     false
@@ -791,10 +820,23 @@ fn marker_blesses_call(lines: &[&str], call_idx: usize) -> bool {
 /// line or in the first statement below it (comment/attribute lines
 /// skipped; the statement ends at the first `;`/`{`/`}` code line,
 /// which is itself still checked — `for … in x.iter_including_terminal() {`
-/// carries call and boundary on one line).
+/// carries call and boundary on one line). A TRAILING marker whose own
+/// code part bounds the statement annotates that statement only —
+/// nothing below it can keep it fresh, exactly as nothing below it can
+/// be blessed by it. (Whole-line comment markers have no code part, so
+/// the own-line boundary check never fires for them.)
 fn marker_annotates_call(lines: &[&str], marker_idx: usize, call_re: &regex::Regex) -> bool {
-    if call_re.is_match(strip_line_comment(lines[marker_idx])) {
+    let own_code = strip_line_comment(lines[marker_idx]);
+    if call_re.is_match(own_code) {
         return true;
+    }
+    // Attribute lines never bound the statement (mirrors the upward
+    // walk, where they are skipped before the boundary check), even when
+    // their arguments carry braces in strings.
+    if !lines[marker_idx].trim_start().starts_with("#[")
+        && (own_code.contains(';') || own_code.contains('{') || own_code.contains('}'))
+    {
+        return false;
     }
     let mut budget = 30usize;
     for line in lines.iter().skip(marker_idx + 1) {
@@ -1234,6 +1276,50 @@ mod tests {
     }
 
     #[test]
+    fn trailing_marker_does_not_bless_across_statement_boundary() {
+        // Same boundary rule for the TRAILING marker shape: a marker
+        // trailing statement A's own (bounded) line justifies A only.
+        // The `;` in the line's code part ends the statement, so the
+        // next statement's call cannot ride on it.
+        let (sites, v) = bk(
+            "let a = m.get_including_terminal_for_bookkeeping(x); // Bookkeeping lookup: for a\n\
+             let b = m.get_including_terminal_for_bookkeeping(y);\n",
+        );
+        assert_eq!(sites, 2);
+        assert_eq!(v.len(), 1, "second call unblessed: {v:?}");
+        assert!(v[0].contains("synthetic.rs:2"), "{v:?}");
+    }
+
+    #[test]
+    fn trailing_marker_on_continuation_line_blesses_and_is_not_stale() {
+        // The must-admit direction of the boundary rule: a marker
+        // trailing an UNBOUNDED continuation line of the same statement
+        // still blesses the call below it, and the downward stale walk
+        // finds that call.
+        let (sites, v) = bk("let b = m // Bookkeeping lookup: terminal entry wanted\n\
+             \x20   .get_including_terminal_for_bookkeeping(y);\n");
+        assert_eq!((sites, v.len()), (1, 0), "{v:?}");
+    }
+
+    #[test]
+    fn trailing_marker_on_attribute_blesses_and_is_not_stale() {
+        // Attributes belong to the statement below them, so a marker
+        // trailing one justifies that statement — the same adjacency a
+        // whole-line marker above the attribute has.
+        let (sites, v) = bk("#[allow(unused)] // Bookkeeping lookup: reason\n\
+             let b = m.get_including_terminal_for_bookkeeping(y);\n");
+        assert_eq!((sites, v.len()), (1, 0), "{v:?}");
+
+        // Attribute arguments may carry braces in strings; attribute
+        // lines never bound the statement, in either walk direction.
+        let (sites, v) = bk(
+            "#[doc = \"{see} the convention\"] // Bookkeeping lookup: reason\n\
+             let b = m.get_including_terminal_for_bookkeeping(y);\n",
+        );
+        assert_eq!((sites, v.len()), (1, 0), "{v:?}");
+    }
+
+    #[test]
     fn comment_mention_is_not_a_call_site() {
         let (sites, v) = bk(
             "// routes through .get_including_terminal_for_bookkeeping(id)\n\
@@ -1255,6 +1341,37 @@ mod tests {
         assert_eq!(sites, 0);
         assert_eq!(v.len(), 1, "stale marker flagged: {v:?}");
         assert!(v[0].contains("stale"), "{v:?}");
+    }
+
+    #[test]
+    fn stale_trailing_marker_fails() {
+        // The same accessor-flip leftover in the TRAILING shape: the
+        // call was converted to the live-only accessor and the trailing
+        // justification kept. Honored markers must be stale-checkable in
+        // every shape they are honored in, or a flipped site keeps a
+        // justification that no longer justifies anything.
+        let (sites, v) = bk("let b = m.get(id); // Bookkeeping lookup: outdated rationale\n");
+        assert_eq!(sites, 0);
+        assert_eq!(v.len(), 1, "stale trailing marker flagged: {v:?}");
+        assert!(v[0].contains("stale"), "{v:?}");
+    }
+
+    #[test]
+    fn bounded_trailing_marker_does_not_annotate_the_next_statement() {
+        // The downward mirror of the boundary rule: a trailing marker on
+        // a bounded line annotates that statement only, so a justified
+        // call in the NEXT statement cannot keep it fresh. The call
+        // itself is fine (its own whole-line marker blesses it); only
+        // the leftover trailing marker is flagged.
+        let (sites, v) = bk("let a = m.get(x); // Bookkeeping lookup: leftover\n\
+             // Bookkeeping lookup: real reason\n\
+             let b = m.get_including_terminal_for_bookkeeping(y);\n");
+        assert_eq!(sites, 1);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(
+            v[0].contains("synthetic.rs:1") && v[0].contains("stale"),
+            "{v:?}"
+        );
     }
 
     #[test]
