@@ -109,6 +109,23 @@ pub fn parse_scope(s: &str) -> anyhow::Result<Scope> {
     )
 }
 
+/// Validate `--version-job` at the argument boundary. The job name is
+/// embedded verbatim in the `eval/<id>/job/<name>` Hydra request issued
+/// by the revCount-recovery fallback, so it gets the same charset rule
+/// as every other operator-supplied job name
+/// ([`recipe::validate_job_name`]): a stray character fails in
+/// milliseconds with the flag named, instead of mangling a
+/// politeness-budgeted recovery request issued only after the
+/// multi-minute source prep (a `#` truncates the URL at the fragment,
+/// silently querying a different job).
+fn validate_version_job(version_job: Option<&str>) -> anyhow::Result<()> {
+    match version_job {
+        Some(job) => recipe::validate_job_name(job)
+            .map_err(|e| anyhow::anyhow!("invalid --version-job: {e:#}")),
+        None => Ok(()),
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct EvalArgs {
     /// Hydra evaluation id (e.g. 1824219).
@@ -359,6 +376,7 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
     use crate::s3::{ARCHIVE_IMAGE_OBJECT, ARCHIVE_MANIFEST_OBJECT, ArchiveS3, ByRecipePointer};
 
     let scope = parse_scope(&args.scope)?;
+    validate_version_job(args.version_job.as_deref())?;
     // Sorted + deduplicated once up front: the same normalized list
     // feeds the constituents system filter, the recipe key (where
     // `--systems` argument order must not fork the digest), and the
@@ -1099,6 +1117,21 @@ mod tests {
         assert!(parse_scope("constituents:").is_err());
         assert!(parse_scope("jobs:").is_err());
         assert!(parse_scope("bogus").is_err());
+    }
+
+    #[test]
+    fn version_job_is_validated_like_every_other_job_name() {
+        // Absent flag: nothing to validate.
+        validate_version_job(None).unwrap();
+        validate_version_job(Some("nixos.channel")).unwrap();
+        // A `#` would truncate the `eval/<id>/job/<name>` recovery
+        // request at the fragment; it must be rejected at the argument
+        // boundary with the flag named.
+        let err = validate_version_job(Some("nixos.channel#frag")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--version-job"), "flag not named: {msg}");
+        assert!(validate_version_job(Some("nixos..channel")).is_err());
+        assert!(validate_version_job(Some("")).is_err());
     }
 
     #[test]
