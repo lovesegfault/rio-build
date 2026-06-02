@@ -8,11 +8,29 @@
 //! the image — the identity bytes) and `complete.json`, the completeness
 //! marker, uploaded strictly last with a conditional PUT
 //! (`If-None-Match: *`). A prefix without `complete.json` is incomplete:
-//! the engine never uses it and tooling never lists it, and an uploader
-//! that finds the marker already present refuses to overwrite. This
-//! mirrors the eval-set upload discipline in [`crate::s3`] (see
-//! `docs/dev/2026-05-28-build-replay-design.md`, "S3 layout, write-once
-//! upload, completion marker").
+//! the engine never uses it and never lists it as available, and an
+//! uploader that finds an object already present refuses to overwrite —
+//! unless the at-rest content verifiably equals the bytes it is
+//! uploading, which is how a publisher recognizes its own committed PUT
+//! after a lost response. This mirrors the eval-set upload discipline in
+//! [`crate::s3`] (see `docs/dev/2026-05-28-build-replay-design.md`, "S3
+//! layout, write-once upload, completion marker").
+//!
+//! Lost conditionals are not proof of a foreign publisher. The shared S3
+//! client is deliberately at-least-once (see
+//! [`rio_common::s3::default_client`]: a raised retry budget with
+//! replayable bodies, because S3-compatible backends drop connections
+//! mid-request), so a PUT that commits server-side but loses its
+//! response is replayed by the SDK and collides with its own object —
+//! `412 PreconditionFailed` from the publisher's own write. Every lost
+//! conditional is therefore disambiguated by content before any refusal:
+//! the data objects by size + SHA-256 (every PUT attaches an
+//! `x-amz-checksum-sha256`, so a later HEAD can return the digest), the
+//! small control objects by fetching and comparing. Only verified-foreign
+//! or unattributable content refuses. AWS S3 and MinIO store and return
+//! header-supplied SHA-256 checksums; on a backend that does not, the
+//! image conflict is unattributable and the refusal stands — exactly the
+//! pre-disambiguation behavior, never worse.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,6 +38,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
@@ -217,25 +236,32 @@ impl ArchiveStore {
         )
     }
 
-    /// Classify a lost `If-None-Match: *` PUT on a DATA object (`object`
-    /// already exists at the prefix). With `complete.json` present the
-    /// prefix is a published archive and another publisher simply won: the
-    /// standard write-once refusal. Without it the prefix holds partial
-    /// objects from an interrupted (or still-running) publish, which
-    /// write-once refuses to overwrite — a DISTINCT error naming the
-    /// recovery path, since "already published" would be a lie and the
-    /// retry can never succeed in place.
+    /// Classify a lost `If-None-Match: *` PUT on a DATA object whose
+    /// at-rest content is NOT this publish's bytes (`detail` says how the
+    /// attribution failed — content mismatch or no checksum to compare).
+    /// With `complete.json` present the prefix is a published archive and
+    /// another publisher simply won: the standard write-once refusal.
+    /// Without it the prefix holds partial objects from an interrupted
+    /// (or still-running) publish, which write-once refuses to overwrite
+    /// — a DISTINCT error naming the recovery path, since "already
+    /// published" would be a lie and the retry can never succeed in
+    /// place.
     async fn data_object_conflict(
         &self,
         client: &aws_sdk_s3::Client,
         archive_id_short: &str,
         object: &str,
+        detail: &str,
     ) -> anyhow::Error {
         match self.is_complete(client, archive_id_short).await {
-            Ok(true) => anyhow::anyhow!(self.write_once_refusal(archive_id_short)),
+            Ok(true) => anyhow::anyhow!(
+                "{} — and the existing {object} is not this publish's upload ({detail})",
+                self.write_once_refusal(archive_id_short)
+            ),
             Ok(false) => anyhow::anyhow!(
                 "archive prefix s3://{}/{} has partial objects from an interrupted publish \
-                 ({object} exists but {ARCHIVE_COMPLETE_OBJECT} does not), and archive objects \
+                 ({object} exists but {ARCHIVE_COMPLETE_OBJECT} does not, and the existing \
+                 {object} is not attributable to this publish: {detail}), and archive objects \
                  are write-once — if no other publisher is currently uploading this prefix, run \
                  `cargo xtask replay delete {archive_id_short}` (its sweep tolerates the missing \
                  marker), then retry",
@@ -249,6 +275,124 @@ impl ArchiveStore {
                 self.object_key(archive_id_short, object)
             )),
         }
+    }
+
+    /// The refusal raised when an object this publish already verified (or
+    /// uploaded) vanished from the prefix before the upload could finish:
+    /// a concurrent `replay delete` swept the prefix mid-publish. Nothing
+    /// of this publish remains claimed, so the recovery is simply to
+    /// re-run it.
+    fn swept_mid_publish(&self, archive_id_short: &str, object: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "archive prefix s3://{}/{} was swept mid-publish ({object} is gone — a concurrent \
+             `replay delete` raced this upload); nothing of this publish remains claimed — \
+             re-run the publish",
+            self.bucket,
+            self.prefix(archive_id_short)
+        )
+    }
+
+    /// HEAD `key` and compare what is at rest against the digest this
+    /// publish has in hand for it. The comparison is by size plus the
+    /// stored SHA-256 checksum (`x-amz-checksum-sha256`, returned because
+    /// every publish PUT attaches one); a backend that returns no checksum
+    /// leaves a size-matching object unverifiable
+    /// ([`RemoteObjectMatch::Unverifiable`]) — present, but not
+    /// attributable to anyone.
+    async fn remote_object_match(
+        &self,
+        client: &aws_sdk_s3::Client,
+        key: &str,
+        expected: &MemberDigest,
+    ) -> anyhow::Result<RemoteObjectMatch> {
+        let head = match client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+            .send()
+            .await
+        {
+            Ok(head) => head,
+            Err(SdkError::ServiceError(err)) if err.err().is_not_found() => {
+                return Ok(RemoteObjectMatch::Absent);
+            }
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("HEAD s3://{}/{key}", self.bucket))
+                );
+            }
+        };
+        let Some(size) = head.content_length() else {
+            return Ok(RemoteObjectMatch::Unverifiable(
+                "the backend returned no Content-Length to compare".to_string(),
+            ));
+        };
+        if size != expected.size as i64 {
+            return Ok(RemoteObjectMatch::Foreign(format!(
+                "{size} bytes at rest vs {} bytes staged",
+                expected.size
+            )));
+        }
+        match head.checksum_sha256() {
+            Some(stored) => match base64::engine::general_purpose::STANDARD.decode(stored) {
+                Ok(raw) => {
+                    let at_rest = hex::encode(raw);
+                    if at_rest == expected.sha256 {
+                        Ok(RemoteObjectMatch::Identical)
+                    } else {
+                        Ok(RemoteObjectMatch::Foreign(format!(
+                            "SHA-256 {at_rest} at rest vs {} staged",
+                            expected.sha256
+                        )))
+                    }
+                }
+                // A multipart upload's composite checksum ("<base64>-N")
+                // or other undecodable form cannot be ours (publish PUTs
+                // are single-part), but without a comparable digest the
+                // honest classification is unattributable, not foreign.
+                Err(_) => Ok(RemoteObjectMatch::Unverifiable(format!(
+                    "the backend returned an uncomparable SHA-256 checksum {stored:?}"
+                ))),
+            },
+            None => Ok(RemoteObjectMatch::Unverifiable(format!(
+                "the existing object matches by size ({size} bytes) but the backend returned no \
+                 SHA-256 checksum to attribute it"
+            ))),
+        }
+    }
+
+    /// GET one small control object's bytes; `Ok(None)` when the key does
+    /// not exist (a concurrent delete removed it).
+    async fn get_object_bytes(
+        &self,
+        client: &aws_sdk_s3::Client,
+        key: &str,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let resp = match client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) if err.as_service_error().is_some_and(|e| e.is_no_such_key()) => {
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("GET s3://{}/{key}", self.bucket))
+                );
+            }
+        };
+        let bytes = resp
+            .body
+            .collect()
+            .await
+            .with_context(|| format!("read s3://{}/{key}", self.bucket))?
+            .to_vec();
+        Ok(Some(bytes))
     }
 
     /// Publish a packed archive: upload `archive.dwarfs`, the standalone
@@ -273,10 +417,23 @@ impl ArchiveStore {
     /// is the authoritative write-once claim.
     ///
     /// A failure mid-upload leaves partial objects WITHOUT `complete.json`
-    /// at the prefix — the prefix never looks complete, and the write-once
-    /// data PUTs mean a retry of the same archive is refused with a
-    /// recovery path (delete the partial prefix, then retry) instead of
-    /// silently overwriting objects another publisher may be mid-claiming.
+    /// at the prefix — the prefix never looks complete. Every PUT also
+    /// attaches the object's SHA-256 as an `x-amz-checksum-sha256` header
+    /// (the backend verifies the body against it and stores it), so a
+    /// lost conditional can be disambiguated by content instead of being
+    /// read as proof of a foreign publisher: the SDK retries a PUT whose
+    /// response was lost, and the replay collides with the publisher's
+    /// own committed object. On a lost conditional the existing object is
+    /// compared against the bytes this publish is uploading — the image
+    /// by HEAD size + stored checksum, the standalone manifest by
+    /// fetching and re-hashing (its digest IS the archive id), the marker
+    /// by fetching and comparing identity fields — and a verified match
+    /// continues (or returns the existing marker) instead of refusing.
+    /// This also lets a re-run of an interrupted publish of byte-identical
+    /// inputs resume in place. Only verified-foreign or unattributable
+    /// content is refused, with a recovery path (delete the partial
+    /// prefix, then retry) instead of silently overwriting objects
+    /// another publisher may be mid-claiming.
     pub async fn publish(
         &self,
         client: &aws_sdk_s3::Client,
@@ -340,15 +497,42 @@ impl ArchiveStore {
             .key(&image_key)
             .content_type("application/octet-stream")
             .if_none_match("*")
+            .checksum_sha256(sha256_base64(&image_digest.sha256)?)
             .body(body)
             .send()
             .await
         {
             Ok(_) => {}
-            Err(e) if put_is_precondition_failed(&e) => {
-                return Err(self
-                    .data_object_conflict(client, &archive_id_short, ARCHIVE_IMAGE_OBJECT)
-                    .await);
+            Err(e) if put_lost_conditional(&e) => {
+                // The image is multi-gigabyte, so the self-write check is
+                // a HEAD against the stored checksum, never a re-download.
+                match self
+                    .remote_object_match(client, &image_key, &image_digest)
+                    .await?
+                {
+                    RemoteObjectMatch::Identical => {
+                        tracing::info!(
+                            key = %image_key,
+                            "lost the write-once conditional to an object holding exactly the \
+                             bytes being uploaded (a replayed PUT whose response was lost \
+                             collides with itself); the claim is won"
+                        );
+                    }
+                    RemoteObjectMatch::Absent => {
+                        return Err(self.swept_mid_publish(&archive_id_short, ARCHIVE_IMAGE_OBJECT));
+                    }
+                    RemoteObjectMatch::Foreign(detail)
+                    | RemoteObjectMatch::Unverifiable(detail) => {
+                        return Err(self
+                            .data_object_conflict(
+                                client,
+                                &archive_id_short,
+                                ARCHIVE_IMAGE_OBJECT,
+                                &detail,
+                            )
+                            .await);
+                    }
+                }
             }
             Err(e) => {
                 return Err(
@@ -365,15 +549,48 @@ impl ArchiveStore {
             .key(&manifest_key)
             .content_type("application/json")
             .if_none_match("*")
+            .checksum_sha256(sha256_base64(&archive_id)?)
             .body(ByteStream::from(manifest_bytes.to_vec()))
             .send()
             .await
         {
             Ok(_) => {}
-            Err(e) if put_is_precondition_failed(&e) => {
-                return Err(self
-                    .data_object_conflict(client, &archive_id_short, ARCHIVE_MANIFEST_OBJECT)
-                    .await);
+            Err(e) if put_lost_conditional(&e) => {
+                // The standalone manifest is small and IS the identity
+                // bytes: fetch it and re-hash — an at-rest copy that
+                // reproduces the archive id is byte-identical to what this
+                // publish is uploading, no checksum substrate needed.
+                match self.get_object_bytes(client, &manifest_key).await? {
+                    Some(bytes)
+                        if identity::archive_id_from_manifest_bytes(&bytes) == archive_id =>
+                    {
+                        tracing::info!(
+                            key = %manifest_key,
+                            "lost the write-once conditional to a byte-identical manifest \
+                             (a replayed PUT whose response was lost collides with itself); \
+                             the claim is won"
+                        );
+                    }
+                    Some(bytes) => {
+                        let detail = format!(
+                            "SHA-256 {} at rest vs {archive_id} staged",
+                            identity::archive_id_from_manifest_bytes(&bytes)
+                        );
+                        return Err(self
+                            .data_object_conflict(
+                                client,
+                                &archive_id_short,
+                                ARCHIVE_MANIFEST_OBJECT,
+                                &detail,
+                            )
+                            .await);
+                    }
+                    None => {
+                        return Err(
+                            self.swept_mid_publish(&archive_id_short, ARCHIVE_MANIFEST_OBJECT)
+                        );
+                    }
+                }
             }
             Err(e) => {
                 return Err(anyhow::Error::new(e)
@@ -405,6 +622,7 @@ impl ArchiveStore {
         let mut marker_bytes =
             serde_json::to_vec_pretty(&marker).context("serialize complete.json")?;
         marker_bytes.push(b'\n');
+        let marker_sha256 = hex::encode(sha2::Sha256::digest(&marker_bytes));
         let complete_key = self.object_key(&archive_id_short, ARCHIVE_COMPLETE_OBJECT);
         match client
             .put_object()
@@ -412,17 +630,47 @@ impl ArchiveStore {
             .key(&complete_key)
             .content_type("application/json")
             .if_none_match("*")
+            .checksum_sha256(sha256_base64(&marker_sha256)?)
             .body(ByteStream::from(marker_bytes))
             .send()
             .await
         {
             Ok(_) => {}
-            // The conditional PUT lost: another publisher claimed the prefix
-            // between the HEAD pre-check and this final upload. Surface the
-            // same actionable refusal as the pre-check — the raw 412 carries
-            // nothing the message does not already say.
-            Err(e) if put_is_precondition_failed(&e) => {
-                anyhow::bail!(self.write_once_refusal(&archive_id_short));
+            // The conditional PUT lost: a marker is already in place. That
+            // marker is this publish's own when its identity fields match
+            // (the SDK replays a PUT whose response was lost, colliding
+            // with its own claim) — fetch and compare before refusing.
+            Err(e) if put_lost_conditional(&e) => {
+                match self.get_object_bytes(client, &complete_key).await? {
+                    Some(bytes) => {
+                        match PublishedArchive::from_complete_json_at(&bytes, &archive_id_short) {
+                            Ok(existing) if marker_is_same_publish(existing.marker(), &marker) => {
+                                tracing::info!(
+                                    key = %complete_key,
+                                    archive_id = %existing.archive_id(),
+                                    "lost the completeness conditional to a marker vouching for \
+                                     exactly this publish's objects; the claim is won — archive \
+                                     published"
+                                );
+                                return Ok(existing.into_marker());
+                            }
+                            // A foreign marker (different image bytes — or
+                            // an unparseable one) claimed the prefix between
+                            // the HEAD pre-check and this final upload.
+                            // Surface the same actionable refusal as the
+                            // pre-check.
+                            _ => anyhow::bail!(self.write_once_refusal(&archive_id_short)),
+                        }
+                    }
+                    // The marker the conditional collided with is already
+                    // gone again: a concurrent delete is sweeping the
+                    // prefix.
+                    None => {
+                        return Err(
+                            self.swept_mid_publish(&archive_id_short, ARCHIVE_COMPLETE_OBJECT)
+                        );
+                    }
+                }
             }
             Err(e) => {
                 return Err(anyhow::Error::new(e)
@@ -679,19 +927,68 @@ impl ArchiveStore {
     }
 }
 
-/// Did this PUT lose an `If-None-Match: *` conditional write — an HTTP 412
-/// `PreconditionFailed` rejection because the object already exists? Generic
-/// over the response type so we don't have to name aws-smithy-runtime-api
-/// types (not a direct dependency).
-fn put_is_precondition_failed<R>(
+/// How an at-rest object compares against the digest a publish has in hand
+/// for it — the verdict of the self-write check after a lost conditional.
+/// Only [`Self::Identical`] may continue a publish: the completion marker
+/// must never vouch for content that was not verified.
+#[derive(Debug)]
+enum RemoteObjectMatch {
+    /// Size and stored SHA-256 both match: the object holds exactly the
+    /// bytes this publish is uploading (its own committed PUT after a lost
+    /// response, or a byte-identical re-run resuming in place).
+    Identical,
+    /// The object verifiably differs (size or checksum) — a foreign
+    /// publisher's bytes. The detail names the mismatch.
+    Foreign(String),
+    /// The object exists but the backend returned nothing that can
+    /// attribute it (no comparable checksum, or no size). Refused like
+    /// foreign content: unverified bytes must never be vouched for.
+    Unverifiable(String),
+    /// No object at the key.
+    Absent,
+}
+
+/// Did this PUT lose its `If-None-Match: *` conditional write? Covers both
+/// outcomes AWS documents for conditional writes: HTTP 412
+/// `PreconditionFailed` (the object already exists) and HTTP 409
+/// `ConditionalRequestConflict` (a concurrent conditional operation on the
+/// same key was in flight — the winner may or may not have materialized
+/// yet, which the caller's content probe distinguishes). Generic over the
+/// response type so we don't have to name aws-smithy-runtime-api types
+/// (not a direct dependency).
+fn put_lost_conditional<R>(
     err: &SdkError<aws_sdk_s3::operation::put_object::PutObjectError, R>,
 ) -> bool {
     use aws_sdk_s3::error::ProvideErrorMetadata as _;
 
     match err {
-        SdkError::ServiceError(se) => se.err().code() == Some("PreconditionFailed"),
+        SdkError::ServiceError(se) => matches!(
+            se.err().code(),
+            Some("PreconditionFailed") | Some("ConditionalRequestConflict")
+        ),
         _ => false,
     }
+}
+
+/// Are two completion markers claims of the same publish? Compares the
+/// identity fields — archive id, the full per-object digest map (image and
+/// manifest SHA-256 + size), and the uploader — and deliberately ignores
+/// `uploaded_at`: it is the only field two attempts of the same logical
+/// publish can differ in, and a marker matching on everything else vouches
+/// for exactly the objects this publish verified.
+fn marker_is_same_publish(existing: &CompleteMarker, ours: &CompleteMarker) -> bool {
+    existing.archive_id == ours.archive_id
+        && existing.objects == ours.objects
+        && existing.uploader == ours.uploader
+}
+
+/// A lowercase-hex SHA-256 digest re-encoded as the standard base64 the
+/// `x-amz-checksum-sha256` header carries.
+fn sha256_base64(hex_digest: &str) -> anyhow::Result<String> {
+    let raw = hex::decode(hex_digest).with_context(|| {
+        format!("re-encode SHA-256 digest {hex_digest:?} for the checksum header")
+    })?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(raw))
 }
 
 /// Streaming SHA-256 + size of a local file (the image of a fat archive can
@@ -801,25 +1098,44 @@ mod tests {
 
         // Sequential rules: the write-once existence probe (NotFound), then
         // one PUT per object — image, manifest, complete.json strictly last.
-        // Each PUT rule pins the object's key, its Content-Type, and that
-        // EVERY PUT is conditional (If-None-Match: *): the data objects so a
+        // Each PUT rule pins the object's key, its Content-Type, that EVERY
+        // PUT is conditional (If-None-Match: *) — the data objects so a
         // racing publisher can never overwrite a landed object, the marker
-        // so only one publisher can claim completeness.
+        // so only one publisher can claim completeness — and that every PUT
+        // attaches an x-amz-checksum-sha256 (the substrate the lost-
+        // conditional self-write check compares against).
+        let image_checksum =
+            sha256_base64(&identity::sha256_hex(&std::fs::read(&image).unwrap())).unwrap();
+        let manifest_checksum = sha256_base64(&archive_id).unwrap();
         let head_404 = mock!(aws_sdk_s3::Client::head_object)
             .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
         let puts: Vec<_> = [
-            (ARCHIVE_IMAGE_OBJECT, "application/octet-stream"),
-            (ARCHIVE_MANIFEST_OBJECT, "application/json"),
-            (ARCHIVE_COMPLETE_OBJECT, "application/json"),
+            (
+                ARCHIVE_IMAGE_OBJECT,
+                "application/octet-stream",
+                Some(image_checksum),
+            ),
+            (
+                ARCHIVE_MANIFEST_OBJECT,
+                "application/json",
+                Some(manifest_checksum),
+            ),
+            // The marker's bytes (and so its digest) embed the upload
+            // timestamp; pin only that a checksum is attached.
+            (ARCHIVE_COMPLETE_OBJECT, "application/json", None),
         ]
-        .iter()
-        .map(|&(object, ctype)| {
+        .into_iter()
+        .map(|(object, ctype, checksum)| {
             let key = format!("replay/archives/{short}/{object}");
             mock!(aws_sdk_s3::Client::put_object)
                 .match_requests(move |req| {
                     req.key() == Some(key.as_str())
                         && req.content_type() == Some(ctype)
                         && req.if_none_match() == Some("*")
+                        && match &checksum {
+                            Some(expected) => req.checksum_sha256() == Some(expected.as_str()),
+                            None => req.checksum_sha256().is_some(),
+                        }
                 })
                 .then_output(|| PutObjectOutput::builder().build())
         })
@@ -895,12 +1211,38 @@ mod tests {
     async fn publish_maps_a_lost_conditional_put_to_the_write_once_refusal() {
         let dir = tempfile::TempDir::new().unwrap();
         let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+        let archive_id = identity::archive_id_from_manifest_bytes(&manifest_bytes);
+        let short = identity::short_id(&archive_id);
 
         // The HEAD pre-check sees no marker and the data uploads succeed,
         // but the final conditional PUT comes back 412: another publisher
-        // claimed the prefix in between. The surfaced error must be the same
-        // actionable write-once refusal as the pre-check, not the raw SDK
-        // error.
+        // of the same archive id claimed the prefix in between, and the
+        // self-write probe finds ITS marker (same identity bytes, but
+        // mkdwarfs is not deterministic, so a different image digest). The
+        // surfaced error must be the same actionable write-once refusal as
+        // the pre-check, not the raw SDK error.
+        let foreign_marker = CompleteMarker {
+            archive_id: archive_id.clone(),
+            archive_id_short: short.clone(),
+            objects: BTreeMap::from([
+                (
+                    ARCHIVE_IMAGE_OBJECT.to_string(),
+                    MemberDigest {
+                        sha256: "f0".repeat(32),
+                        size: 4096,
+                    },
+                ),
+                (
+                    ARCHIVE_MANIFEST_OBJECT.to_string(),
+                    MemberDigest {
+                        sha256: archive_id.clone(),
+                        size: manifest_bytes.len() as u64,
+                    },
+                ),
+            ]),
+            uploaded_at: test_stamp(),
+            uploader: "rio-replay/test".to_string(),
+        };
         let head_404 = mock!(aws_sdk_s3::Client::head_object)
             .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
         let complete_suffix = format!("/{ARCHIVE_COMPLETE_OBJECT}");
@@ -913,10 +1255,14 @@ mod tests {
             .then_error(|| {
                 PutObjectError::generic(ErrorMetadata::builder().code("PreconditionFailed").build())
             });
+        let get_foreign_marker = get_rule(
+            format!("replay/archives/{short}/{ARCHIVE_COMPLETE_OBJECT}"),
+            serde_json::to_vec(&foreign_marker).unwrap(),
+        );
         let client = mock_client!(
             aws_sdk_s3,
             RuleMode::MatchAny,
-            &[&head_404, &put_data, &put_complete_412]
+            &[&head_404, &put_data, &put_complete_412, &get_foreign_marker]
         );
 
         let store = ArchiveStore::new("rio-chunks", "replay");
@@ -934,6 +1280,11 @@ mod tests {
             "the raw SDK error must not surface: {message}"
         );
         assert_eq!(put_complete_412.num_calls(), 1);
+        assert_eq!(
+            get_foreign_marker.num_calls(),
+            1,
+            "the lost marker conditional must probe the existing marker before refusing"
+        );
     }
 
     #[tokio::test]
@@ -943,20 +1294,24 @@ mod tests {
 
         // Loser's view of a race it lost AFTER the winner finished: the
         // HEAD pre-check raced past (404), the conditional image PUT comes
-        // back 412, and the classifying probe finds complete.json present —
-        // the winner's claim stands, nothing of the winner's prefix was
-        // overwritten, and the loser gets the standard write-once refusal.
+        // back 412, the self-write probe finds an image of a DIFFERENT size
+        // (mkdwarfs is not deterministic — the winner's bytes), and the
+        // classifying probe finds complete.json present — the winner's
+        // claim stands, nothing of the winner's prefix was overwritten, and
+        // the loser gets the standard write-once refusal.
         let head_404 = mock!(aws_sdk_s3::Client::head_object)
             .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
         let put_image_412 = mock!(aws_sdk_s3::Client::put_object).then_error(|| {
             PutObjectError::generic(ErrorMetadata::builder().code("PreconditionFailed").build())
         });
+        let head_image_foreign = mock!(aws_sdk_s3::Client::head_object)
+            .then_output(|| HeadObjectOutput::builder().content_length(1).build());
         let head_200 = mock!(aws_sdk_s3::Client::head_object)
             .then_output(|| HeadObjectOutput::builder().build());
         let client = mock_client!(
             aws_sdk_s3,
             RuleMode::Sequential,
-            &[&head_404, &put_image_412, &head_200]
+            &[&head_404, &put_image_412, &head_image_foreign, &head_200]
         );
 
         let store = ArchiveStore::new("rio-chunks", "replay");
@@ -964,9 +1319,14 @@ mod tests {
             .publish(&client, &image, &manifest_bytes, "rio-replay/test")
             .await
             .unwrap_err();
+        let message = format!("{err:#}");
         assert!(
-            format!("{err:#}").contains("write-once"),
-            "a complete prefix maps to the write-once refusal: {err:#}"
+            message.contains("write-once"),
+            "a complete prefix maps to the write-once refusal: {message}"
+        );
+        assert!(
+            message.contains("not this publish's upload"),
+            "the refusal names the failed attribution: {message}"
         );
         assert_eq!(
             put_image_412.num_calls(),
@@ -986,7 +1346,8 @@ mod tests {
         // these are partial objects from an interrupted publish (or a
         // publisher still mid-upload), NOT a published archive — claiming
         // "already published" would be a lie and an in-place retry can never
-        // succeed. The error must name the real state and the recovery path
+        // succeed. The self-write probe sees a different-sized image (not
+        // ours), so the error must name the real state and the recovery path
         // (replay delete, whose sweep tolerates the missing marker; then
         // retry).
         let head_404_precheck = mock!(aws_sdk_s3::Client::head_object)
@@ -994,12 +1355,19 @@ mod tests {
         let put_image_412 = mock!(aws_sdk_s3::Client::put_object).then_error(|| {
             PutObjectError::generic(ErrorMetadata::builder().code("PreconditionFailed").build())
         });
+        let head_image_foreign = mock!(aws_sdk_s3::Client::head_object)
+            .then_output(|| HeadObjectOutput::builder().content_length(1).build());
         let head_404_classify = mock!(aws_sdk_s3::Client::head_object)
             .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
         let client = mock_client!(
             aws_sdk_s3,
             RuleMode::Sequential,
-            &[&head_404_precheck, &put_image_412, &head_404_classify]
+            &[
+                &head_404_precheck,
+                &put_image_412,
+                &head_image_foreign,
+                &head_404_classify
+            ]
         );
 
         let store = ArchiveStore::new("rio-chunks", "replay");
@@ -1021,6 +1389,407 @@ mod tests {
             "a partial prefix must not be reported as already published: {message}"
         );
         assert_eq!(put_image_412.num_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn publish_survives_a_replayed_image_put_colliding_with_itself() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+        let image_bytes = std::fs::read(&image).unwrap();
+        let archive_id = identity::archive_id_from_manifest_bytes(&manifest_bytes);
+        let short = identity::short_id(&archive_id);
+        let image_sha256 = identity::sha256_hex(&image_bytes);
+
+        // The at-least-once interleaving the publish client is deliberately
+        // configured for (raised retry budget, replayable bodies): the image
+        // PUT commits server-side but its response is lost (a transient
+        // 500), the SDK replays the PUT, and the replay collides with the
+        // publisher's OWN object — 412 from itself. The self-write check
+        // (HEAD with checksum mode, stored SHA-256 equals the digest in
+        // hand) must recognize the claim as won and let the publish finish.
+        let image_key = format!("replay/archives/{short}/{ARCHIVE_IMAGE_OBJECT}");
+        let head_404_precheck = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let put_image_lost_then_412 = {
+            let key = image_key.clone();
+            mock!(aws_sdk_s3::Client::put_object)
+                .match_requests(move |req| req.key() == Some(key.as_str()))
+                .sequence()
+                .http_status(500, None)
+                .error(|| {
+                    PutObjectError::generic(
+                        ErrorMetadata::builder().code("PreconditionFailed").build(),
+                    )
+                })
+                .build()
+        };
+        let head_image_ours = {
+            let key = image_key.clone();
+            let stored = sha256_base64(&image_sha256).unwrap();
+            let size = image_bytes.len() as i64;
+            mock!(aws_sdk_s3::Client::head_object)
+                .match_requests(move |req| {
+                    req.key() == Some(key.as_str())
+                        && req.checksum_mode() == Some(&aws_sdk_s3::types::ChecksumMode::Enabled)
+                })
+                .then_output(move || {
+                    HeadObjectOutput::builder()
+                        .content_length(size)
+                        .checksum_sha256(stored.clone())
+                        .build()
+                })
+        };
+        let put_rest = mock!(aws_sdk_s3::Client::put_object)
+            .sequence()
+            .output(|| PutObjectOutput::builder().build())
+            .times(2)
+            .build();
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[
+                &head_404_precheck,
+                &put_image_lost_then_412,
+                &head_image_ours,
+                &put_rest
+            ]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        let marker = store
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
+            .await
+            .unwrap();
+        assert_eq!(
+            put_image_lost_then_412.num_calls(),
+            2,
+            "the SDK must have replayed the lost PUT before colliding with itself"
+        );
+        assert_eq!(marker.archive_id, archive_id);
+        assert_eq!(marker.objects[ARCHIVE_IMAGE_OBJECT].sha256, image_sha256);
+        assert_eq!(
+            put_rest.num_calls(),
+            2,
+            "manifest and marker still upload after the rescued image claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_resumes_in_place_when_lost_data_puts_find_identical_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+        let image_bytes = std::fs::read(&image).unwrap();
+        let archive_id = identity::archive_id_from_manifest_bytes(&manifest_bytes);
+        let short = identity::short_id(&archive_id);
+
+        // A re-run over a crashed publish of byte-identical inputs (e.g.
+        // `replay launch --archive` retried with the same image file): both
+        // data PUTs lose their conditionals to objects that hold exactly
+        // the bytes being uploaded — the image verified by HEAD against the
+        // stored checksum, the manifest by fetching and re-hashing (its
+        // digest IS the archive id). The publish resumes in place and only
+        // the marker is newly claimed.
+        let head_404_precheck = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let put_image_412 = mock!(aws_sdk_s3::Client::put_object).then_error(|| {
+            PutObjectError::generic(ErrorMetadata::builder().code("PreconditionFailed").build())
+        });
+        let head_image_ours = {
+            let stored = sha256_base64(&identity::sha256_hex(&image_bytes)).unwrap();
+            let size = image_bytes.len() as i64;
+            mock!(aws_sdk_s3::Client::head_object).then_output(move || {
+                HeadObjectOutput::builder()
+                    .content_length(size)
+                    .checksum_sha256(stored.clone())
+                    .build()
+            })
+        };
+        let put_manifest_412 = mock!(aws_sdk_s3::Client::put_object).then_error(|| {
+            PutObjectError::generic(ErrorMetadata::builder().code("PreconditionFailed").build())
+        });
+        let get_manifest_ours = get_rule(
+            format!("replay/archives/{short}/{ARCHIVE_MANIFEST_OBJECT}"),
+            manifest_bytes.clone(),
+        );
+        let put_marker = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().build());
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[
+                &head_404_precheck,
+                &put_image_412,
+                &head_image_ours,
+                &put_manifest_412,
+                &get_manifest_ours,
+                &put_marker
+            ]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        let marker = store
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
+            .await
+            .unwrap();
+        assert_eq!(marker.archive_id, archive_id);
+        assert_eq!(put_marker.num_calls(), 1, "the marker is claimed fresh");
+    }
+
+    #[tokio::test]
+    async fn publish_returns_the_existing_marker_when_the_lost_marker_put_matches_itself() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+        let image_bytes = std::fs::read(&image).unwrap();
+        let archive_id = identity::archive_id_from_manifest_bytes(&manifest_bytes);
+        let short = identity::short_id(&archive_id);
+
+        // The marker PUT commits but its response is lost; the replay gets
+        // 412 from the publisher's own claim. The at-rest marker matches
+        // this publish on every identity field (archive id, object digests,
+        // uploader) and differs only in uploaded_at — publish must treat
+        // the claim as won and return the AT-REST marker, because that is
+        // the document consumers will read.
+        let existing = CompleteMarker {
+            archive_id: archive_id.clone(),
+            archive_id_short: short.clone(),
+            objects: BTreeMap::from([
+                (
+                    ARCHIVE_IMAGE_OBJECT.to_string(),
+                    MemberDigest {
+                        sha256: identity::sha256_hex(&image_bytes),
+                        size: image_bytes.len() as u64,
+                    },
+                ),
+                (
+                    ARCHIVE_MANIFEST_OBJECT.to_string(),
+                    MemberDigest {
+                        sha256: archive_id.clone(),
+                        size: manifest_bytes.len() as u64,
+                    },
+                ),
+            ]),
+            uploaded_at: test_stamp(),
+            uploader: "rio-replay/test".to_string(),
+        };
+        let head_404_precheck = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let put_data = mock!(aws_sdk_s3::Client::put_object)
+            .sequence()
+            .output(|| PutObjectOutput::builder().build())
+            .times(2)
+            .build();
+        let put_marker_412 = mock!(aws_sdk_s3::Client::put_object).then_error(|| {
+            PutObjectError::generic(ErrorMetadata::builder().code("PreconditionFailed").build())
+        });
+        let get_existing_marker = get_rule(
+            format!("replay/archives/{short}/{ARCHIVE_COMPLETE_OBJECT}"),
+            serde_json::to_vec(&existing).unwrap(),
+        );
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[
+                &head_404_precheck,
+                &put_data,
+                &put_marker_412,
+                &get_existing_marker
+            ]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        let marker = store
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
+            .await
+            .unwrap();
+        assert_eq!(marker.archive_id, archive_id);
+        assert_eq!(
+            marker.uploaded_at,
+            test_stamp(),
+            "the at-rest marker (not the locally rebuilt one) is returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_treats_a_conditional_request_conflict_like_a_lost_conditional() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+        let image_bytes = std::fs::read(&image).unwrap();
+
+        // S3's other documented conditional-write rejection: HTTP 409
+        // ConditionalRequestConflict (a concurrent conditional operation on
+        // the same key). It must route through the same self-write
+        // disambiguation as a 412 — here the at-rest object is ours, so the
+        // publish continues — instead of surfacing as a raw SDK error.
+        let head_404_precheck = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let put_image_409 = mock!(aws_sdk_s3::Client::put_object).then_error(|| {
+            PutObjectError::generic(
+                ErrorMetadata::builder()
+                    .code("ConditionalRequestConflict")
+                    .build(),
+            )
+        });
+        let head_image_ours = {
+            let stored = sha256_base64(&identity::sha256_hex(&image_bytes)).unwrap();
+            let size = image_bytes.len() as i64;
+            mock!(aws_sdk_s3::Client::head_object).then_output(move || {
+                HeadObjectOutput::builder()
+                    .content_length(size)
+                    .checksum_sha256(stored.clone())
+                    .build()
+            })
+        };
+        let put_rest = mock!(aws_sdk_s3::Client::put_object)
+            .sequence()
+            .output(|| PutObjectOutput::builder().build())
+            .times(2)
+            .build();
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[
+                &head_404_precheck,
+                &put_image_409,
+                &head_image_ours,
+                &put_rest
+            ]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        store
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
+            .await
+            .unwrap();
+        assert_eq!(put_image_409.num_calls(), 1);
+        assert_eq!(put_rest.num_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn publish_refuses_an_unattributable_image_conflict() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+        let image_bytes = std::fs::read(&image).unwrap();
+        let archive_id = identity::archive_id_from_manifest_bytes(&manifest_bytes);
+        let short = identity::short_id(&archive_id);
+
+        // The existing image matches by size but the backend returned no
+        // stored SHA-256 to compare (a backend without checksum support, or
+        // an object uploaded without one). Unverified bytes must never be
+        // vouched for: the conflict is refused with the recovery path, and
+        // the message says WHY the object could not be attributed.
+        let head_404_precheck = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let put_image_412 = mock!(aws_sdk_s3::Client::put_object).then_error(|| {
+            PutObjectError::generic(ErrorMetadata::builder().code("PreconditionFailed").build())
+        });
+        let head_image_no_checksum = {
+            let size = image_bytes.len() as i64;
+            mock!(aws_sdk_s3::Client::head_object)
+                .then_output(move || HeadObjectOutput::builder().content_length(size).build())
+        };
+        let head_404_classify = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[
+                &head_404_precheck,
+                &put_image_412,
+                &head_image_no_checksum,
+                &head_404_classify
+            ]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        let err = store
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("no SHA-256 checksum to attribute it"),
+            "the refusal explains the failed attribution: {message}"
+        );
+        assert!(
+            message.contains(&format!("replay delete {short}")),
+            "the recovery path is still named: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_names_the_sweep_when_a_conflicting_object_vanishes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+
+        // The image PUT loses its conditional, but by the time the
+        // self-write probe looks the object is GONE: a concurrent
+        // `replay delete` is sweeping the prefix. The error must name the
+        // sweep and the recovery (re-run), not accuse a publisher.
+        let head_404_precheck = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let put_image_412 = mock!(aws_sdk_s3::Client::put_object).then_error(|| {
+            PutObjectError::generic(ErrorMetadata::builder().code("PreconditionFailed").build())
+        });
+        let head_image_404 = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&head_404_precheck, &put_image_412, &head_image_404]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "replay");
+        let err = store
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("swept mid-publish"),
+            "the sweep is named: {message}"
+        );
+        assert!(message.contains("re-run"), "recovery named: {message}");
+    }
+
+    #[test]
+    fn marker_identity_comparison_ignores_only_the_upload_time() {
+        let archive_id = "a".repeat(64);
+        let ours = CompleteMarker {
+            archive_id: archive_id.clone(),
+            archive_id_short: archive_id[..16].to_string(),
+            objects: BTreeMap::from([(
+                ARCHIVE_IMAGE_OBJECT.to_string(),
+                MemberDigest {
+                    sha256: "b".repeat(64),
+                    size: 7,
+                },
+            )]),
+            uploaded_at: test_stamp(),
+            uploader: "rio-replay/test".to_string(),
+        };
+
+        // Same identity fields, different upload time: the same publish.
+        let mut replayed = ours.clone();
+        replayed.uploaded_at = "2026-06-01T00:00:00Z".parse().unwrap();
+        assert!(marker_is_same_publish(&replayed, &ours));
+
+        // Any identity field differing means a foreign publish: a different
+        // image digest (mkdwarfs nondeterminism), uploader, or archive id.
+        let mut foreign_image = ours.clone();
+        foreign_image.objects.insert(
+            ARCHIVE_IMAGE_OBJECT.to_string(),
+            MemberDigest {
+                sha256: "c".repeat(64),
+                size: 7,
+            },
+        );
+        assert!(!marker_is_same_publish(&foreign_image, &ours));
+        let mut foreign_uploader = ours.clone();
+        foreign_uploader.uploader = "rio-replay/other".to_string();
+        assert!(!marker_is_same_publish(&foreign_uploader, &ours));
+        let mut foreign_id = ours.clone();
+        foreign_id.archive_id = "d".repeat(64);
+        assert!(!marker_is_same_publish(&foreign_id, &ours));
     }
 
     #[tokio::test]

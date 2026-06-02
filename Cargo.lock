@@ -6406,6 +6406,7 @@ dependencies = [
  "aws-sdk-s3",
  "aws-smithy-mocks",
  "axum",
+ "base64 0.22.1",
  "clap",
  "dwarfs",
  "futures-util",

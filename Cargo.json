@@ -20349,6 +20349,10 @@
           "packageId": "aws-sdk-s3"
         },
         {
+          "name": "base64",
+          "packageId": "base64 0.22.1"
+        },
+        {
           "name": "clap",
           "packageId": "clap"
         },

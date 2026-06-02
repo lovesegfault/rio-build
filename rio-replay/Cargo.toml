@@ -34,6 +34,10 @@ async-compression = { workspace = true }
 async-trait = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+# S3 checksum headers (x-amz-checksum-sha256) carry base64 of the raw
+# digest; the archive publisher converts its hex digests to compare an
+# at-rest object against the bytes it has in hand.
+base64 = { workspace = true }
 clap = { workspace = true }
 # In-process reader for the DwarFS images replay archives are published
 # as (no external tools needed to read an archive).
