@@ -154,6 +154,46 @@ impl StoreAdminServiceImpl {
     }
 }
 
+/// Cadence of the in-process PG-pool gauge tick. Matches the old
+/// de-facto cadence ballpark (the ComponentScaler's GetLoad poll);
+/// the gauge is a slow-moving utilization ratio, so 30 s is plenty.
+const PG_POOL_GAUGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Publish `rio_store_pg_pool_utilization` once from the live pool
+/// counters (the same `(size − num_idle)/max_connections` formula
+/// GetLoad reports — see [`StoreAdminServiceImpl::pg_pool_utilization`]).
+fn publish_pg_pool_gauge(pool: &PgPool) {
+    let util = StoreAdminServiceImpl::pg_pool_utilization(pool);
+    metrics::gauge!("rio_store_pg_pool_utilization").set(f64::from(util));
+}
+
+/// Self-publish the PG-pool gauge on a 30 s in-process tick.
+///
+/// Historically the gauge was refreshed only as a `GetLoad`
+/// side-effect, and the store ComponentScaler reconciler was the only
+/// periodic caller — once that CR is removed (KEDA owns the store
+/// replica count) the gauge would freeze, blanking the store
+/// dashboard's PG-pool panel and `xtask k8s status`. The store now
+/// owns its gauge; `GetLoad` keeps publishing on call so the values
+/// the controller acts on (for any future CR target) stay mirrored.
+// r[impl obs.metric.store-pg-pool]
+pub fn spawn_pg_pool_gauge_tick(
+    pool: PgPool,
+    shutdown: rio_common::signal::Token,
+) -> tokio::task::JoinHandle<()> {
+    rio_common::task::spawn_periodic(
+        "pg-pool-gauge",
+        PG_POOL_GAUGE_INTERVAL,
+        shutdown,
+        move || {
+            let pool = pool.clone();
+            async move {
+                publish_pg_pool_gauge(&pool);
+            }
+        },
+    )
+}
+
 /// Cap on `TriggerGc.extra_roots`. Separate from
 /// [`crate::grpc::DEFAULT_MAX_BATCH_PATHS`] (1M, sized for client closure
 /// queries) — GC mark runs under an exclusive lock that blocks PutPath, so
@@ -571,11 +611,9 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     ///
     /// Side-effect: also publishes `rio_store_pg_pool_utilization` so
     /// Prometheus sees the same value the controller acted on. The
-    /// controller's 10s tick is the de-facto gauge update cadence —
-    /// no separate background updater. If no ComponentScaler is
-    /// deployed, the gauge stays at its pre-registered 0.0 (which is
-    /// truthful: with `replicas` chart-fixed there's nothing acting
-    /// on it anyway).
+    /// gauge's steady cadence is the in-process 30 s tick
+    /// ([`spawn_pg_pool_gauge_tick`]) — this handler's publication
+    /// keeps the on-call mirror, it is no longer the only updater.
     // r[impl store.admin.get-load+2]
     // r[impl obs.metric.store-pg-pool]
     #[instrument(skip(self, request), fields(rpc = "GetLoad"))]

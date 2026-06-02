@@ -303,6 +303,11 @@ async fn main() -> anyhow::Result<()> {
         .with_service_verifier(service_verifier)
         .with_substitute_admission(substitute_admission);
     rio_store::gc::orphan::spawn_scanner(pool.clone(), shutdown.clone());
+    // PG-pool gauge self-publication (30s in-process tick). The gauge
+    // must not depend on GetLoad traffic: with the store scaled by
+    // KEDA there is no periodic GetLoad caller, and a frozen gauge
+    // blanks the store dashboard's PG-pool panel + `xtask k8s status`.
+    rio_store::grpc::spawn_pg_pool_gauge_tick(pool.clone(), shutdown.clone());
     // Daily chunk-collect backstop (live arm): covers stores that
     // never trigger GC, so bounded garbage retention has a worst-case
     // cadence (24h + grace + drain lag). The first tick fires one
