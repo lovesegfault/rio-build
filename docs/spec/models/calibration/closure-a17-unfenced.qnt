@@ -1,5 +1,17 @@
 // -*- mode: Bluespec; -*-
 //
+// PHASE D-PRIME RETIREMENT NOTE (substitution-replacement T-D7.1):
+// the wired check quint-closure-calib-a17-unfenced was pruned in the
+// survivors-core landing; successor oracle:
+// quint-materialization-calib-f11-unfenced-resolve
+// (fencedJobWritesOnly — the uniform fence's living falsifiability
+// record).
+// The walk-era mechanism family this corpus calibrated was deleted in
+// Waves D3-D6 (the walk, the evidence columns, the Substituting
+// status; migration 080). This file stays as the predecessor-system
+// evidence record until the A6 archive of closureEvidence.qnt; its
+// re-run command remains valid against the retained model text.
+//
 // Phase-1 calibration override / regression pin, closure-evidence
 // A17/A18 claims-floor fence (the Wave-3 production fix at
 // rio-scheduler db/batch.rs, db/derivations.rs, actor/merge.rs +

@@ -1551,12 +1551,13 @@
                   # scheduler's closure-evidence decision kernel
                   # (rio-evidence-kernel) — the ClosureEvidence
                   # classifier's exhaustive case analysis and the
-                  # must_substitute()/closure_vouched() predicate
-                  # contracts. Seconds-class harnesses (the kernel is a
-                  # case analysis over bools, not a fold); the formal
-                  # model (quint-closure-evidence-*, in quintChecks)
-                  # checks the lifecycle protocol, these harnesses the
-                  # decision predicates it keys on.
+                  # closure_vouched() predicate contract (reduced to
+                  # the 2-input domain in T-D5.2). Seconds-class
+                  # harnesses (the kernel is a case analysis over
+                  # bools, not a fold); the formal survivors core
+                  # (quint-closure-survivors-*, in quintChecks) checks
+                  # the surviving lifecycle protocol, these harnesses
+                  # the decision predicates it keys on.
                   #
                   # This inherit is also what routes a kani proof into the
                   # CI `formal` matrix lane: ciMatrix.formal intersects

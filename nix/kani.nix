@@ -278,10 +278,10 @@ in
   # closure-evidence campaign's Phase-2 assurance deliverable, following
   # the rio-retry-kernel extraction precedent.
   # DerivationDag::closure_evidence, the merge/dispatch predicates, and
-  # the actor pull shim are the projections; the quint model
-  # (quint-closure-evidence-*, in quintChecks) checks the lifecycle
-  # protocol over these predicates, these harnesses prove the predicates
-  # themselves over their full bounded input domain.
+  # the actor pull shim are the projections; the quint survivors core
+  # (quint-closure-survivors-*, in quintChecks) checks the surviving
+  # lifecycle protocol over these predicates, these harnesses prove the
+  # predicates themselves over their full bounded input domain.
   #
   # Nine harnesses, measured at ~0.05–0.65 s CBMC time each (~3 s
   # total, ~15 s wall with the kani-compiler build) on the dev builder.

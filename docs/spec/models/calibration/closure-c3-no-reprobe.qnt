@@ -1,5 +1,16 @@
 // -*- mode: Bluespec; -*-
 //
+// PHASE D-PRIME RETIREMENT NOTE (substitution-replacement T-D7.1):
+// the wired check quint-closure-calib-c3-no-reprobe was pruned in the
+// survivors-core landing; successor oracle: the materialization
+// routing's arm-3 re-probe encoding + noWrongfulTerminalFailure
+// (wired in every quint-materialization-holds-* conjunction).
+// The walk-era mechanism family this corpus calibrated was deleted in
+// Waves D3-D6 (the walk, the evidence columns, the Substituting
+// status; migration 080). This file stays as the predecessor-system
+// evidence record until the A6 archive of closureEvidence.qnt; its
+// re-run command remains valid against the retained model text.
+//
 // Phase-1 calibration override / regression pin, closure-evidence C3+D16
 // settlement (the Wave-1 production fix at rio-scheduler dispatch.rs /
 // build.rs: settle_broken_marked_root + the dispatch-probe partition's

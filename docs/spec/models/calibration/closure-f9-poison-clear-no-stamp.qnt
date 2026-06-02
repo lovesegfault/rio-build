@@ -1,5 +1,17 @@
 // -*- mode: Bluespec; -*-
 //
+// PHASE D-PRIME RETIREMENT NOTE (substitution-replacement T-D7.1):
+// the wired check quint-closure-calib-f9-poison-clear-no-stamp was
+// pruned in the survivors-core landing; successor oracle:
+// quint-materialization-calib-f9-divergent-evidence
+// (routingRequiresDurableVouchOrFailFast; the production read is
+// durable since Wave D2.2).
+// The walk-era mechanism family this corpus calibrated was deleted in
+// Waves D3-D6 (the walk, the evidence columns, the Substituting
+// status; migration 080). This file stays as the predecessor-system
+// evidence record until the A6 archive of closureEvidence.qnt; its
+// re-run command remains valid against the retained model text.
+//
 // Stage-C calibration override, closure-evidence family F9
 // (closure-hole breadcrumb integrity; wired family representative
 // re-routed within the family to CE-41, 9097b71cc — the poison-clear

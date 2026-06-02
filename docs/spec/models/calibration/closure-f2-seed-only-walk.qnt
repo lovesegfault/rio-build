@@ -1,5 +1,16 @@
 // -*- mode: Bluespec; -*-
 //
+// PHASE D-PRIME RETIREMENT NOTE (substitution-replacement T-D7.1):
+// the wired check quint-closure-calib-f2-seed-only-walk was pruned in
+// the survivors-core landing; successor oracles:
+// quint-materialization-calib-f2b-establish-adopt and the B2 pin
+// (mat-b2-no-pin-at-ingest, recorded).
+// The walk-era mechanism family this corpus calibrated was deleted in
+// Waves D3-D6 (the walk, the evidence columns, the Substituting
+// status; migration 080). This file stays as the predecessor-system
+// evidence record until the A6 archive of closureEvidence.qnt; its
+// re-run command remains valid against the retained model text.
+//
 // Stage-C calibration override, closure-evidence family F2 (closure
 // incompleteness behind a "successful" substitution; corpus rep CE-9,
 // 808d82579 — try_substitute never walked narinfo.References, so the

@@ -1,5 +1,15 @@
 // -*- mode: Bluespec; -*-
 //
+// PHASE D-PRIME RETIREMENT NOTE (substitution-replacement T-D7.1):
+// this evidence module was never wired; the closure-evidence wired
+// family was pruned to the survivors core plus the two kept pins
+// (closure-f1-stale-produced, closure-f4-demand-drop).
+// The walk-era mechanism family this corpus calibrated was deleted in
+// Waves D3-D6 (the walk, the evidence columns, the Substituting
+// status; migration 080). This file stays as the predecessor-system
+// evidence record until the A6 archive of closureEvidence.qnt; its
+// re-run command remains valid against the retained model text.
+//
 // Stage-C calibration override, closure-evidence family F1,
 // permissiveness direction (corpus rep CE-1, 5dc6cc478 — TOCTOU between
 // the gateway probe and the merge: the merge trusted the stale probe

@@ -1,5 +1,16 @@
 // -*- mode: Bluespec; -*-
 //
+// PHASE D-PRIME RETIREMENT NOTE (substitution-replacement T-D7.1):
+// the wired check quint-closure-calib-f8-dispatch-no-evidence was
+// pruned in the survivors-core landing; successor oracle:
+// quint-materialization-calib-f8-pull-ignores-job
+// (noFromSourceWhileJobUnresolved — the anchor).
+// The walk-era mechanism family this corpus calibrated was deleted in
+// Waves D3-D6 (the walk, the evidence columns, the Substituting
+// status; migration 080). This file stays as the predecessor-system
+// evidence record until the A6 archive of closureEvidence.qnt; its
+// re-run command remains valid against the retained model text.
+//
 // Stage-C calibration override, closure-evidence family F8
 // (must_substitute enforcement; corpus rep CE-33, 7e1092575 — the
 // post-failover childless pruned root was probed, found definitively

@@ -110,6 +110,21 @@
 // design's §4 crosswalk while the unmodified baseline holds it at the
 // same constants.
 //
+// PHASE D-PRIME STATUS (substitution-replacement, the deletion phase):
+// the verification subject above is the PREDECESSOR system. Waves D3-D6
+// deleted the walk machinery, the Substituting status, the coexistence
+// flag and both evidence columns from production (migration 080); the
+// store-owned materialization job (materializationJob.qnt) is the only
+// substitution mechanism. This file's full-alphabet text is retained
+// UNCHANGED as the predecessor record (archive is stage A6's move, after
+// the survivors core has soaked one integration); the live wired oracle
+// is the closureEvidenceSurvivors module at the end of this file — the
+// six surviving invariants (A14/A15/A22/B9/B10/L3) over the restricted
+// post-deletion action alphabet — plus the two kept calibration pins
+// (closure-f1-stale-produced, closure-f4-demand-drop). The 27 retired
+// walk-era checks' dispositions: the T-D7.1 commit body and the Phase
+// D-prime stage record in substitution-replacement-invariant-map.md.
+//
 // Measured state counts, depths and wall-clocks live in the introducing
 // commits' messages and the invariant map's stage records, never here.
 module closureEvidence {
@@ -3128,4 +3143,215 @@ module closureEvidenceAdversarialStoreEx {
     WALKS_PER_NODE = 1,
     STORE_PER_OUTPUT = false
   ).*
+}
+
+// ===========================================================================
+// Phase D-prime survivors core (substitution-replacement T-D7.1): the
+// post-deletion scheduler's image of this model — the action alphabet
+// restricted to the machinery that SURVIVES the D-prime deletion
+// (status transitions, dep gating, attempts, the prune, poison
+// co-ownership, reap/purge, recovery, the PG intent plumbing) with the
+// walk lifecycle excluded from the step: no walk spawn (probeWalk), no
+// finish/consume/drop (walkFinishes / consumeWalk /
+// dropStaleWalkResult), no substitute_tried demotion
+// (probeFailFastTried), no settlement re-probe (probeSettleTried) —
+// those mechanisms were deleted in Waves D3-D5, so MSubstituting is
+// unreachable here (the deleted status's model image) and the
+// walks/tried/nf state stays frozen at its initial values. The mark
+// letter SURVIVES re-read: the mergeCommit stamp and the
+// probeFailFastMissing consumption are the predecessor carriers of the
+// surviving pruned classification (post-D-prime production:
+// `materialization_jobs.origin = 'pruned'` and its routing fail-fast —
+// materializationJob.qnt delta 1 + the PD-D1 dedup upgrade; this
+// model's durable mark is the closest in-alphabet image).
+//
+// The wired oracle: the six surviving invariants — A14
+// (terminalIsTerminal), A15 (readyImpliesDeclaredDepsProduced), A22
+// (condemnRequiresLiveCoOwnedFailure), B9
+// (staleProducedNeverUnlocksDependents), B10 (demandSetSurvivesPrune)
+// and L3 (liveBuildTerminalOrProgressArmed) — over TWO instantiations
+// whose union covers every survivor subject's contended scope:
+//
+//   closureEvidenceSurvivors          Duo constants (two builds, single
+//     tenure: the prune, reap-survivor, cross-build wanted and
+//     stale-Produced shapes — B9/B10/A14/L3 contended);
+//   closureEvidenceSurvivorsFailover  FailoverEx constants (failover +
+//     lost best-effort writes: the recovery gates — A15/A22 contended).
+//
+// SCOPE NOTE (recorded during T-D7.1 wiring): the first wiring attempt
+// instantiated the restricted alphabet at the closureEvidenceFailoverDuo
+// constants (two builds AND failover) and B9 VIOLATED in 2 M samples —
+// and, by trace inclusion (survivorsStep's disjuncts are a strict
+// subset of step's, same init), the same trace violates B9 under the
+// FULL alphabet at that scope. The trace is the documented
+// predecessor-system degradation, not a restriction artifact: a narrow
+// co-build drives a child Produced, failover drops the memory-only
+// per-build wanted contributions, the effective wanted set widens to
+// the stored union (the 062-column fallback this model encodes — see
+// "interest rebuild without per-build wanted contributions" in the
+// header), and a dependent opens from source above the now-stale
+// Produced child. The shape needs two builds of DIFFERENT widths plus
+// a failover, which no recorded-green regime combined (the B9 holds
+// records are single-tenure duo and single-build failover; FailoverDuo
+// was a C1-strict probe scope, never a holds scope). Production
+// post-D-prime REPLACED the lossy fallback with the durable
+// per-(build, derivation) relation rebuilt at recovery (Wave D2.3 /
+// PD-D5), so the post-deletion system does not have this corner for
+// relation-era builds; the pre-relation legacy residue saturates to
+// all-declared (DQ-2, conservative-absent — the WIDER-only direction)
+// and is recorded as the D-prime wanted-width transition residual.
+// The survivors core therefore wires the six properties at the two
+// recorded-green scopes above; the FailoverDuo B9 corner is recorded
+// in the Phase D-prime stage record as a follow-up candidate against
+// the PREDECESSOR encoding (history — the mechanism it models was
+// deleted), with the trace seed in the stage record.
+//
+// Falsifiability pairing (the sim-holds vacuity rule): the two kept
+// calibration pins — closure-f1-stale-produced (B9) and
+// closure-f4-demand-drop (B10) — keep the invariant set demonstrably
+// falsifiable; A14/A15/A22/L3 ride the same alphabet (their walk-era
+// pre-fix overrides retired with the checks — dispositions in the
+// Phase D-prime stage record).
+// ===========================================================================
+
+/// Survivors core, single-tenure two-build scope (Duo constants).
+module closureEvidenceSurvivors {
+  import closureEvidence(
+    DRVS = Set("d1", "d2"),
+    BUILDS = Set("b1", "b2"),
+    REFS = Set(("d1", "d2")),
+    SUBMISSION_BUDGET = 3,
+    FAILOVERS = 0,
+    PGDROP_BUDGET = 0,
+    STALE_APPLY = false,
+    CROSS_TENURE_WALKS = false,
+    STORE_GC_BUDGET = 0,
+    ROW_GC_BUDGET = 0,
+    PURGE_BUDGET = 0,
+    POISON_BUDGET = 1,
+    CANCEL_BUDGET = 1,
+    WALK_CONSUME_CEIL = 3,
+    ATTEMPT_CYCLE_CEIL = 1,
+    INTENT_CEIL = 3,
+    WALKS_PER_NODE = 1,
+    STORE_PER_OUTPUT = true
+  ).*
+
+  /// The surviving per-derivation letters: stepDrv minus the walk
+  /// lifecycle (probeWalk, walkFinishes, consumeWalk,
+  /// dropStaleWalkResult, probeFailFastTried, probeSettleTried).
+  /// orphanRowGc stays in the alphabet (a surviving mechanism) though
+  /// ROW_GC_BUDGET = 0 keeps it disabled at these constants.
+  action survivorsStepDrv = {
+    nondet d = DRVS.oneOf()
+    any {
+      probeInline(d),
+      probeFailFastMissing(d),
+      probeMissingUnmarked(d),
+      attemptOpen(d),
+      attemptCloseSuccess(d),
+      attemptCloseFail(d),
+      reassignOpen(d),
+      requeueFailed(d),
+      poisonArrival(d),
+      poisonClear(d),
+      orphanRowGc(d)
+    }
+  }
+
+  /// The post-deletion transition relation.
+  action survivorsStep = any {
+    stepStore,
+    stepBuild,
+    survivorsStepDrv,
+    pgApplyAny,
+    pgDropAny,
+    leaderLost,
+    recoverAsLeader
+  }
+
+  /// The six surviving invariants, conjoined (the wired check's oracle;
+  /// nix/quint.nix lists the same six). Manual form:
+  ///
+  ///   quint run --backend=rust --main=closureEvidenceSurvivors \
+  ///     --step=survivorsStep --invariant=survivorsInvariants \
+  ///     docs/spec/models/closureEvidence.qnt
+  val survivorsInvariants = and {
+    terminalIsTerminal,
+    readyImpliesDeclaredDepsProduced,
+    condemnRequiresLiveCoOwnedFailure,
+    staleProducedNeverUnlocksDependents,
+    demandSetSurvivesPrune,
+    liveBuildTerminalOrProgressArmed
+  }
+}
+
+/// Survivors core, failover scope (FailoverEx constants — single
+/// build, one failover, one lost best-effort write: the recovery-gate
+/// subjects A15/A22 contended; same restricted alphabet).
+module closureEvidenceSurvivorsFailover {
+  import closureEvidence(
+    DRVS = Set("d1", "d2"),
+    BUILDS = Set("b1"),
+    REFS = Set(("d1", "d2")),
+    SUBMISSION_BUDGET = 2,
+    FAILOVERS = 1,
+    PGDROP_BUDGET = 1,
+    STALE_APPLY = false,
+    CROSS_TENURE_WALKS = false,
+    STORE_GC_BUDGET = 0,
+    ROW_GC_BUDGET = 0,
+    PURGE_BUDGET = 0,
+    POISON_BUDGET = 1,
+    CANCEL_BUDGET = 1,
+    WALK_CONSUME_CEIL = 3,
+    ATTEMPT_CYCLE_CEIL = 2,
+    INTENT_CEIL = 3,
+    WALKS_PER_NODE = 1,
+    STORE_PER_OUTPUT = false
+  ).*
+
+  /// Same restricted per-derivation alphabet as closureEvidenceSurvivors.
+  action survivorsStepDrv = {
+    nondet d = DRVS.oneOf()
+    any {
+      probeInline(d),
+      probeFailFastMissing(d),
+      probeMissingUnmarked(d),
+      attemptOpen(d),
+      attemptCloseSuccess(d),
+      attemptCloseFail(d),
+      reassignOpen(d),
+      requeueFailed(d),
+      poisonArrival(d),
+      poisonClear(d),
+      orphanRowGc(d)
+    }
+  }
+
+  /// The post-deletion transition relation.
+  action survivorsStep = any {
+    stepStore,
+    stepBuild,
+    survivorsStepDrv,
+    pgApplyAny,
+    pgDropAny,
+    leaderLost,
+    recoverAsLeader
+  }
+
+  /// The six surviving invariants (same conjunction as
+  /// closureEvidenceSurvivors). Manual form:
+  ///
+  ///   quint run --backend=rust --main=closureEvidenceSurvivorsFailover \
+  ///     --step=survivorsStep --invariant=survivorsInvariants \
+  ///     docs/spec/models/closureEvidence.qnt
+  val survivorsInvariants = and {
+    terminalIsTerminal,
+    readyImpliesDeclaredDepsProduced,
+    condemnRequiresLiveCoOwnedFailure,
+    staleProducedNeverUnlocksDependents,
+    demandSetSurvivesPrune,
+    liveBuildTerminalOrProgressArmed
+  }
 }
