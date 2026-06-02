@@ -1177,10 +1177,14 @@ pub const M_064: () = ();
 /// cannot reconstruct which nodes were parentless *within one
 /// submission*.
 ///
-/// Both columns are written only on the insert path (insert_build /
-/// batch_insert_build_derivations, plus the single-row
-/// insert_build_derivation); no backfill — pre-existing rows keep FALSE,
-/// which preserves their original (non-forced) semantics.
+/// Both columns are written only on the insert path: insert_build binds
+/// `force_build_roots`, batch_insert_build_derivations binds `is_root`.
+/// (The test-only single-row insert_build_derivation names neither
+/// column — its INSERT lists only (build_id, derivation_id) — so rows
+/// it creates always take the FALSE defaults; tests that need a root
+/// marker must seed it through batch_insert_build_derivations.) No
+/// backfill — pre-existing rows keep FALSE, which preserves their
+/// original (non-forced) semantics.
 ///
 /// **Writer-semantics widening (no schema change, frozen .sql
 /// untouched):** `is_root = TRUE` originally marked structural
