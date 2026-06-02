@@ -65,8 +65,7 @@ pub(super) async fn insert_test_derivation(
 #[test]
 fn test_derivation_status_roundtrip() -> anyhow::Result<()> {
     // Iterate the macro-generated `ALL` so a new variant is covered
-    // automatically — hand-maintained arrays drifted (`Substituting`
-    // was missing for months).
+    // automatically — hand-maintained arrays drifted historically.
     for status in DerivationStatus::ALL {
         let s = status.as_str();
         let parsed: DerivationStatus = s.parse()?;

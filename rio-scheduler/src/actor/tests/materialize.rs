@@ -1645,25 +1645,18 @@ async fn flag_on_pending_jobs_count_as_substituting_bucket() -> TestResult {
 }
 
 // r[verify sched.admin.snapshot-substituting+2]
-/// Equivalence criterion 2 / stop condition 8: flag-OFF the snapshot
-/// buckets are byte-identical to the as-built status-only semantics —
-/// Substituting counts in substituting_derivations, Ready in
-/// queued_derivations — EVEN IF the in-memory job view somehow carries
-/// entries (defense in depth: the bucket re-sourcing is gated on the
-/// flag itself, not just on the view being empty). This test PINS
-/// criterion 2 and must never change.
+/// Criterion 2 (its final commit — the flag dies next wave): flag-OFF
+/// the snapshot buckets are status-only — a Ready node is queued
+/// EVEN IF the in-memory job view somehow carries entries (defense in
+/// depth: the bucket re-sourcing is gated on the flag itself, not
+/// just on the view being empty). The walk-era Substituting staging
+/// died with the status.
 #[tokio::test]
 async fn flag_off_snapshot_buckets_match_baseline() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor(db.pool.clone()); // flag-off default
 
-    // 1 Substituting, 1 Ready, 1 Running — the as-built disjoint counts.
-    actor.test_inject_ready("off-sub", None, "x86_64-linux", false);
-    actor
-        .dag
-        .node_mut("off-sub")
-        .unwrap()
-        .set_status_for_test(DerivationStatus::Substituting);
+    // 1 Ready (with a sneaky job-view entry below), 1 Running.
     actor.test_inject_ready("off-ready", None, "x86_64-linux", false);
     actor.test_inject_ready("off-run", None, "x86_64-linux", false);
     actor
@@ -1685,8 +1678,8 @@ async fn flag_off_snapshot_buckets_match_baseline() -> TestResult {
 
     let snap = actor.compute_cluster_snapshot();
     assert_eq!(
-        snap.substituting_derivations, 1,
-        "flag-off: substituting counts ONLY Substituting-status nodes"
+        snap.substituting_derivations, 0,
+        "flag-off: the job-derived bucket never fires (the disjunct is flag-gated)"
     );
     assert_eq!(
         snap.queued_derivations, 1,

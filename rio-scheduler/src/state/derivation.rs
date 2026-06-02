@@ -181,12 +181,6 @@ db_str_enum! {
         Ready = "ready",
         Assigned = "assigned",
         Running = "running",
-        /// Upstream substitution in flight: a background task is doing
-        /// `QueryPathInfo` (which triggers store-side `try_substitute`)
-        /// for this derivation's outputs. Dependents stay gated (NOT
-        /// Completed/Skipped); the spawned task posts `SubstituteComplete`
-        /// when done. r[sched.substitute.detached+5]
-        Substituting = "substituting",
         Completed = "completed",
         Failed = "failed",
         Poisoned = "poisoned",
@@ -210,7 +204,41 @@ db_str_enum! {
         /// `find_newly_ready` — matches DependencyFailed precedent).
         Skipped = "skipped",
     }
-    parse_err(other) = TransitionError: TransitionError::UnknownStatus(other.to_string());
+}
+
+// Hand-rolled (not the macro's `parse_err` form) so the decode can
+// carry the PD-D3 legacy arm: pre-080 databases can hold
+// flag-off-era 'substituting' rows, and the recovery reset that used
+// to absorb them died with the walk. Decoding them to Queued (with a
+// warn) lets a post-walk binary boot against such a database; the
+// probe partition re-classifies the absorbed node. Removed by
+// migration 080's data step (T-D6.1).
+impl ::std::str::FromStr for DerivationStatus {
+    type Err = TransitionError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "created" => Ok(Self::Created),
+            "queued" => Ok(Self::Queued),
+            "ready" => Ok(Self::Ready),
+            "assigned" => Ok(Self::Assigned),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "poisoned" => Ok(Self::Poisoned),
+            "dependency_failed" => Ok(Self::DependencyFailed),
+            "cancelled" => Ok(Self::Cancelled),
+            "skipped" => Ok(Self::Skipped),
+            // The PD-D3 legacy decode arm (see the impl comment).
+            "substituting" => {
+                tracing::warn!(
+                    "legacy 'substituting' derivation row absorbed; reset to queued \
+                     — the walk-era status is removed by migration 080"
+                );
+                Ok(Self::Queued)
+            }
+            other => Err(TransitionError::UnknownStatus(other.to_string())),
+        }
+    }
 }
 
 impl DerivationStatus {
@@ -301,15 +329,8 @@ impl DerivationStatus {
                 // closure-invariant fixed-point deferred this hit.
                 // Prior failure history is moot; gate on the dep via
                 // Queued so find_newly_ready picks it up when the dep
-                // completes. Parallel to the →Substituting arm below.
-                // (Failed is non-terminal; its Queued arm is in the
-                // table below.)
-                return Ok(());
-            }
-            if matches!(self, Self::Poisoned | Self::DependencyFailed) && to == Self::Substituting {
-                // I-094 reprobe substitutable lane (see match arm
-                // below). Substituting is non-terminal because a
-                // failed fetch reverts to Ready/Queued.
+                // completes. (Failed is non-terminal; its Queued arm
+                // is in the table below.)
                 return Ok(());
             }
             return Err(TransitionError::TerminalToNonTerminal { from: self, to });
@@ -399,27 +420,6 @@ impl DerivationStatus {
             // race a prior Queued→Ready promotion — matches
             // DependencyFailed precedent at completion.rs).
             (Self::Queued | Self::Ready, Self::Skipped) => true,
-            // r[impl sched.substitute.detached+5]
-            // Detached upstream fetch: spawned from any pre-dispatch
-            // state (merge-time) or Ready (dispatch-time). Completed →
-            // fetch landed; Ready/Queued → fetch failed, fall through
-            // to normal scheduling. Cancelled → all interested builds
-            // cancelled mid-fetch (orphan task is benign — it still
-            // populates the store, the SubstituteComplete is dropped).
-            (Self::Created | Self::Queued | Self::Ready, Self::Substituting) => true,
-            // I-094 reprobe, substitutable lane: poisoned/dep-failed/
-            // failed node's output is upstream-substitutable on
-            // resubmit — same "prior failure is moot" rationale as
-            // the (Poisoned, Completed) arm above. DependencyFailed
-            // and Failed are symmetry-only (both reset by dag.merge
-            // today) but kept parallel to the →Completed arms above.
-            (Self::Poisoned | Self::DependencyFailed | Self::Failed, Self::Substituting) => true,
-            (Self::Substituting, Self::Completed | Self::Ready | Self::Queued) => true,
-            // Fetch failed AND a dep is terminally-failed (I-094
-            // reprobe of a node whose dep stayed Poisoned). Mirror
-            // compute_initial_states' 3-way via `revert_target_for`.
-            (Self::Substituting, Self::DependencyFailed) => true,
-            (Self::Substituting, Self::Cancelled) => true,
             _ => false,
         };
 
@@ -1725,8 +1725,8 @@ impl DerivationState {
             self.running_since = None;
         }
         // r[impl sched.merge.exec-correlation+7]
-        // A node leaving a terminal state (I-094 reprobe → Substituting/
-        // Queued, I-047 stale-output reset → Ready/Queued) is starting a
+        // A node leaving a terminal state (I-094 reprobe → Queued,
+        // I-047 stale-output reset → Ready/Queued) is starting a
         // fresh lifecycle. The terminal's epilogue already stamped the
         // prior execution's row and bd.exec_id correlation; carrying its
         // exec_id forward makes `exec_id_for_terminal` attribute that
@@ -2459,12 +2459,10 @@ mod tests {
             // Cancel: only from in-flight states. Queued/Ready
             // derivations are handled by orphan-removal instead
             // (handle_cancel_build's existing path).
-            (Assigned, Cancelled),            // CancelSignal before worker ACK
-            (Running, Cancelled),             // CancelSignal mid-build (cgroup.kill)
-            (Queued, Skipped),                // CA early-cutoff cascade
-            (Ready, Skipped),                 // CA cutoff after find_newly_ready promoted
-            (Poisoned, Substituting),         // I-094 reprobe substitutable lane
-            (DependencyFailed, Substituting), // symmetry with (DependencyFailed, Completed)
+            (Assigned, Cancelled), // CancelSignal before worker ACK
+            (Running, Cancelled),  // CancelSignal mid-build (cgroup.kill)
+            (Queued, Skipped),     // CA early-cutoff cascade
+            (Ready, Skipped),      // CA cutoff after find_newly_ready promoted
         ];
 
         for (from, to) in valid_transitions {
@@ -2473,6 +2471,23 @@ mod tests {
                 "expected {from} -> {to} to be valid"
             );
         }
+    }
+
+    /// PD-D3 legacy decode arm (T-D3.3): a flag-off-era 'substituting'
+    /// PG row decodes to Queued instead of erroring — DECODE-LEVEL
+    /// (no DB round-trip; stays constructible after migration 080
+    /// narrows the CHECK). Removed (or kept, if migrate-before-recovery
+    /// does not verify) alongside the arm in T-D6.1.
+    #[test]
+    fn legacy_substituting_row_decodes_to_queued() {
+        assert_eq!(
+            "substituting".parse::<DerivationStatus>().unwrap(),
+            DerivationStatus::Queued,
+            "legacy rows must absorb to Queued, not error"
+        );
+        // The arm is reserved for the legacy literal: everything else
+        // unknown still errors.
+        assert!("bogus-status".parse::<DerivationStatus>().is_err());
     }
 
     #[test]
@@ -2584,16 +2599,15 @@ mod tests {
         assert!(Running.validate_transition(Assigned).is_err());
 
         // Failed can go to Ready (retry), Queued (I-094 deferred), or
-        // Completed/Substituting (I-094/I-099 re-probe cache-hit;
-        // symmetry-only — Failed is reset by dag.merge today, but the
-        // state machine and the merge.rs reprobe callers must agree).
+        // Completed (I-094/I-099 re-probe cache-hit; symmetry-only —
+        // Failed is reset by dag.merge today, but the state machine
+        // and the merge.rs reprobe callers must agree).
         assert!(Failed.validate_transition(Running).is_err());
         assert!(Failed.validate_transition(Completed).is_ok());
-        assert!(Failed.validate_transition(Substituting).is_ok());
         assert!(Failed.validate_transition(Queued).is_ok());
 
         // Poisoned can go to Created (TTL), Queued (I-094 deferred),
-        // Completed/Substituting (I-094 reprobe), or stay Poisoned.
+        // Completed (I-094 reprobe), or stay Poisoned.
         // NOT Ready (must gate on dep), Running, Failed.
         assert!(Poisoned.validate_transition(Ready).is_err());
         assert!(Poisoned.validate_transition(Running).is_err());
@@ -2601,7 +2615,7 @@ mod tests {
         assert!(Poisoned.validate_transition(Queued).is_ok());
 
         // DependencyFailed is terminal: can't go anywhere except
-        // self/Completed/Substituting/Queued (re-probe lanes).
+        // self/Completed/Queued (re-probe lanes).
         assert!(DependencyFailed.validate_transition(Ready).is_err());
         assert!(DependencyFailed.validate_transition(Queued).is_ok());
         assert!(DependencyFailed.validate_transition(Created).is_err());
@@ -2619,9 +2633,8 @@ mod tests {
     }
 
     // r[verify sched.state.transitions]
-    /// Failed→Completed/Substituting symmetry: `existing_reprobe`
-    /// includes `Failed`, and `apply_cached_hits` /
-    /// `spawn_substitute_fetches` attempt these transitions on a
+    /// Failed→Completed symmetry: `existing_reprobe` includes
+    /// `Failed`, and `apply_cached_hits` attempts the transition on a
     /// re-probe hit. Today `Failed` is reset by `dag.merge`
     /// (`is_retriable_on_resubmit`), so the path is unreachable; the
     /// arms are kept parallel to Poisoned/DependencyFailed so the
@@ -2633,12 +2646,9 @@ mod tests {
     fn test_failed_reprobe_transitions_symmetry() {
         use DerivationStatus::*;
         assert!(Failed.validate_transition(Completed).is_ok());
-        assert!(Failed.validate_transition(Substituting).is_ok());
         // Parallel: the existing I-094 lanes these mirror.
         assert!(Poisoned.validate_transition(Completed).is_ok());
-        assert!(Poisoned.validate_transition(Substituting).is_ok());
         assert!(DependencyFailed.validate_transition(Completed).is_ok());
-        assert!(DependencyFailed.validate_transition(Substituting).is_ok());
     }
 
     #[test]
@@ -2763,13 +2773,11 @@ mod tests {
         // node instead of transitioning it) — pinned anyway because the
         // predicate is on terminality, not on the lane.
         for (from, to) in [
-            (Poisoned, Substituting),         // I-094 substitutable reprobe
-            (DependencyFailed, Substituting), // I-094 substitutable reprobe
-            (Poisoned, Queued),               // I-094 deferred reprobe
-            (DependencyFailed, Queued),       // I-094 deferred reprobe
-            (Completed, Ready),               // I-047 stale-output reset
-            (Skipped, Queued),                // I-047 stale-output reset
-            (Poisoned, Created),              // carve-out only, no live caller
+            (Poisoned, Queued),         // I-094 deferred reprobe
+            (DependencyFailed, Queued), // I-094 deferred reprobe
+            (Completed, Ready),         // I-047 stale-output reset
+            (Skipped, Queued),          // I-047 stale-output reset
+            (Poisoned, Created),        // carve-out only, no live caller
         ] {
             let mut s = mk(from);
             s.transition(to)
@@ -2805,7 +2813,8 @@ mod tests {
     /// arm's outcome breaks exactly one assertion. Complements
     /// `test_derivation_valid_transitions` (positive list) and
     /// `test_derivation_invalid_transitions` (negative samples) with
-    /// full-coverage table: 11×11 = 121 cases.
+    /// full-coverage table: 11×11 = 121 cases (the count is true
+    /// again now the walk-era Substituting variant is gone).
     ///
     /// Cargo-mutants baseline: 30 candidate mutations in
     /// `validate_transition`. Without this test, deleting or
@@ -2863,18 +2872,6 @@ mod tests {
             // CA early-cutoff
             (Queued, Skipped),
             (Ready, Skipped),
-            // Detached upstream fetch (r[sched.substitute.detached+5])
-            (Created, Substituting),
-            (Queued, Substituting),
-            (Ready, Substituting),
-            (Poisoned, Substituting), // I-094 reprobe substitutable lane
-            (DependencyFailed, Substituting),
-            (Failed, Substituting), // I-094 symmetry
-            (Substituting, Completed),
-            (Substituting, Ready),
-            (Substituting, Queued),
-            (Substituting, DependencyFailed), // fetch failed + dep terminally-failed
-            (Substituting, Cancelled),
             // Terminal self-transitions (idempotent)
             (Completed, Completed),
             (Poisoned, Poisoned),
@@ -3017,7 +3014,7 @@ mod status_snapshot {
     //! `rio-scheduler/tests/golden/derivation_statuses.json` is the single
     //! source of truth — both this Rust-side snapshot test AND
     //! rio-dashboard's vitest (`graphLayout.test.ts` cross-language
-    //! describe block) compare against it. A 12th variant added here
+    //! describe block) compare against it. A new variant added here
     //! without plumbing to the dashboard's STATUS_CLASS/SORT_RANK/
     //! TERMINAL mirrors breaks both checks (loudly, not silently-gray).
 
@@ -3049,7 +3046,7 @@ mod status_snapshot {
 
     // r[verify sched.state.transitions]
     /// The canonical `{as_str, is_terminal}` set matches the golden
-    /// snapshot that rio-dashboard's vitest also reads. Adding a 12th
+    /// snapshot that rio-dashboard's vitest also reads. Adding a
     /// variant to `DerivationStatus` (or changing `is_terminal`'s
     /// classification) drifts `emit()` away from the golden — this test
     /// fails with a diff-friendly multi-line mismatch and a checklist
@@ -3073,6 +3070,7 @@ mod status_snapshot {
     }
 
     /// Positive control: `ALL` is truly exhaustive. A 12th variant
+    /// (or any new variant)
     /// without an `ALL` entry compiles (arrays don't enforce
     /// exhaustiveness) — this exhaustive match forces a compile error
     /// on the new variant, and the .len() assert catches the inverse
@@ -3080,7 +3078,7 @@ mod status_snapshot {
     /// error, so this direction is belt-and-braces).
     #[test]
     fn all_const_is_exhaustive() {
-        // Exhaustive match: adding a 12th variant without a match arm
+        // Exhaustive match: adding a new variant without a match arm
         // here is a compile error — the cheapest possible "did you
         // remember to update ALL?" reminder.
         #[allow(clippy::match_same_arms)]
@@ -3091,16 +3089,15 @@ mod status_snapshot {
                 DerivationStatus::Ready => 2,
                 DerivationStatus::Assigned => 3,
                 DerivationStatus::Running => 4,
-                DerivationStatus::Substituting => 5,
-                DerivationStatus::Completed => 6,
-                DerivationStatus::Failed => 7,
-                DerivationStatus::Poisoned => 8,
-                DerivationStatus::DependencyFailed => 9,
-                DerivationStatus::Cancelled => 10,
-                DerivationStatus::Skipped => 11,
+                DerivationStatus::Completed => 5,
+                DerivationStatus::Failed => 6,
+                DerivationStatus::Poisoned => 7,
+                DerivationStatus::DependencyFailed => 8,
+                DerivationStatus::Cancelled => 9,
+                DerivationStatus::Skipped => 10,
             }
         }
-        assert_eq!(DerivationStatus::ALL.len(), 12);
+        assert_eq!(DerivationStatus::ALL.len(), 11);
         // Each ALL[i] round-trips through the witness at its own index.
         // Catches accidental duplicates or order drift (the golden
         // expects ALL's order).

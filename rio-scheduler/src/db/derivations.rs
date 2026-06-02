@@ -33,7 +33,7 @@ pub(super) fn terminal_assignment_status(drv_status: DerivationStatus) -> Option
         Completed => Some(AssignmentStatus::Completed),
         Poisoned | DependencyFailed => Some(AssignmentStatus::Failed),
         Cancelled | Skipped => Some(AssignmentStatus::Cancelled),
-        Created | Queued | Ready | Assigned | Running | Substituting | Failed => None,
+        Created | Queued | Ready | Assigned | Running | Failed => None,
     }
 }
 

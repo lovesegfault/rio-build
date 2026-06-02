@@ -2436,55 +2436,6 @@ async fn test_false_alarm_lost_then_acquired_in_order_ends_recovered() -> TestRe
     Ok(())
 }
 
-// D3-retarget: retires with the Substituting status (T-D3.3); the legacy
-// decode arm gets its own decode-level unit test there.
-/// Recovery recompute of a `Substituting` node whose dep is `Poisoned`
-/// must reach `DependencyFailed` via the two-step Queued bridge.
-/// Without the bridge covering `Substituting`, the
-/// `Substituting→DependencyFailed` transition (not in the table) fails
-/// with a warn and the node stays `Substituting` forever — no fetch
-/// task (died with the old process), never pushed Ready.
-#[tokio::test]
-async fn test_recovery_substituting_with_poisoned_dep_goes_dependency_failed() -> TestResult {
-    let f = RecoveryFixture::run(async |handle, pool| {
-        // D depends on E. Merge both (build stays Active), then
-        // backdate PG: E poisoned, D substituting (detached fetch in
-        // flight at crash). Direct PG writes so no in-mem cascade
-        // marks the build terminal pre-recovery.
-        let _rx = merge_dag(
-            &handle,
-            Uuid::new_v4(),
-            vec![make_node("sub-D"), make_node("sub-E")],
-            vec![make_test_edge("sub-D", "sub-E")],
-            true,
-        )
-        .await?;
-        barrier(&handle).await;
-        drop(handle);
-        sqlx::query(
-            "UPDATE derivations SET status = 'poisoned', poisoned_at = now() \
-             WHERE drv_hash = 'sub-E'",
-        )
-        .execute(&pool)
-        .await?;
-        sqlx::query("UPDATE derivations SET status = 'substituting' WHERE drv_hash = 'sub-D'")
-            .execute(&pool)
-            .await?;
-        Ok(())
-    })
-    .await?;
-
-    let d = expect_drv(&f.handle, "sub-D").await;
-    assert_eq!(
-        d.status,
-        DerivationStatus::DependencyFailed,
-        "Substituting with poisoned dep must recompute to DependencyFailed \
-         (not stuck Substituting), got {:?}",
-        d.status
-    );
-    Ok(())
-}
-
 /// Shared staging for the cross-build recovery-condemnation tests below
 /// (the bug_009 shape with a within-TTL poison instead of a cancel):
 ///

@@ -434,7 +434,7 @@ impl DagActor {
     ///   fail-fast, top-down substitute fail)
     ///
     /// NOT called for bystander drvs swept to a terminal from a
-    /// non-executing state (`Created|Queued|Ready|Substituting`) by
+    /// non-executing state (`Created|Queued|Ready`) by
     /// someone else's event — a build cancellation sweeping
     /// not-yet-dispatched members, a dependency-failure cascade sweeping
     /// ancestors. The only exec_id those nodes can carry is a stale

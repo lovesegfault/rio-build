@@ -970,36 +970,9 @@ pub(crate) async fn barrier(handle: &ActorHandle) {
         .await;
 }
 
-/// Poll until none of `hashes` is `Substituting` — i.e. every detached
-/// fetch task has posted `SubstituteComplete` and the actor handled it.
-/// Bounded (10ms × 100) so a hung task fails the test instead of
-/// hanging it. r[sched.substitute.detached+5]
-pub(crate) async fn settle_substituting(handle: &ActorHandle, hashes: &[&str]) {
-    use crate::state::DerivationStatus;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-        barrier(handle).await;
-        let mut any = false;
-        for h in hashes {
-            if let Ok(Some(d)) = handle.debug_query_derivation(h).await
-                && d.status == DerivationStatus::Substituting
-            {
-                any = true;
-                break;
-            }
-        }
-        if !any {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("settle_substituting: timed out waiting for SubstituteComplete on {hashes:?}");
-}
-
 /// Poll until `hash` reaches `want` — i.e. the actor has ENTERED the
-/// target status. Inverse of [`settle_substituting`] (which waits for
-/// exit). Same 10ms × 100 bound. For tests that need to observe a node
-/// IN a transient status (e.g. `Substituting`) before flipping a knob.
+/// target status. Bounded (10ms × 100). For tests that need to observe
+/// a node IN a transient status before flipping a knob.
 pub(crate) async fn wait_for_status(
     handle: &ActorHandle,
     hash: &str,

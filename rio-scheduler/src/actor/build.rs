@@ -48,14 +48,11 @@ impl DagActor {
         // Classify every sole-interest node in ONE iter_nodes() pass via
         // an exhaustive match on status(). Exhaustive (not `matches!`
         // allowlists) so adding a DerivationStatus variant is a compile
-        // error here — the previous two-filter shape silently skipped
-        // Substituting (orphaned zero-interest nodes re-entered the
-        // dispatch queue when SubstituteComplete{ok:false} arrived).
+        // error here.
         //
         // Shared derivations (another build still cares) are left alone
         // — the other build drives them.
         let mut to_cancel: Vec<(DrvHash, String)> = Vec::new();
-        let mut to_cancel_substituting: Vec<DrvHash> = Vec::new();
         let mut to_depfail: Vec<DrvHash> = Vec::new();
         for (h, s) in self.dag.iter_nodes() {
             if !(s.interested_builds.len() == 1 && s.interested_builds.contains(&build_id)) {
@@ -67,11 +64,6 @@ impl DagActor {
                 DerivationStatus::Assigned | DerivationStatus::Running => {
                     to_cancel.push((h.into(), s.drv_path().to_string()));
                 }
-                // Detached fetch in flight → transition Cancelled (no
-                // executor to signal). handle_substitute_complete's
-                // "not Substituting → drop" guard then discards the
-                // task's eventual SubstituteComplete.
-                DerivationStatus::Substituting => to_cancel_substituting.push(h.into()),
                 // Not yet dispatched → DependencyFailed.
                 DerivationStatus::Queued | DerivationStatus::Ready | DerivationStatus::Created => {
                     to_depfail.push(h.into());
@@ -144,13 +136,7 @@ impl DagActor {
                  (the controller's Job deletion stops the pods)"
             );
         }
-        for drv_hash in &to_cancel_substituting {
-            if let Some(state) = self.dag.node_mut(drv_hash)
-                && state.transition(DerivationStatus::Cancelled).is_ok()
-            {
-                transitioned.push(drv_hash.as_str());
-            }
-        }
+
         // Batch persist + unpin. fire-and-forget via db; completion
         // handler's no-op for Cancelled means no double-write.
         if !transitioned.is_empty() {

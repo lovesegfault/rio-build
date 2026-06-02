@@ -1386,8 +1386,7 @@ impl DagActor {
         }
         // Persist the corrected statuses (post-commit, batched per
         // status — the durable rows from batch 5 left these at
-        // 'created'; this is the same persist the as-built walk did
-        // with Substituting).
+        // 'created').
         if !corrected_queued.is_empty() {
             let refs: Vec<&str> = corrected_queued.iter().map(DrvHash::as_str).collect();
             self.persist_status_batch(&refs, DerivationStatus::Queued)

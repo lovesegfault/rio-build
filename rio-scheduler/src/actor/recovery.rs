@@ -845,15 +845,9 @@ impl DagActor {
             .dag
             .iter_nodes()
             .filter(|(_, s)| {
-                // Substituting included: the spawned task is gone after
-                // restart, so re-derive Ready/Queued via the same dep-
-                // walk and let the next dispatch-time batch re-probe.
-                // r[impl sched.substitute.detached+5]
                 let status_matches = matches!(
                     s.status(),
-                    DerivationStatus::Created
-                        | DerivationStatus::Queued
-                        | DerivationStatus::Substituting
+                    DerivationStatus::Created | DerivationStatus::Queued
                 );
                 if status_matches && s.interested_builds.is_empty() {
                     orphans_skipped += 1;
@@ -893,16 +887,6 @@ impl DagActor {
             let Some(state) = self.dag.node_mut(hash) else {
                 continue;
             };
-            // Created/Queued → DependencyFailed direct;
-            // Substituting → Queued → DependencyFailed (no direct arm
-            // in validate_transition).
-            if state.status() == DerivationStatus::Substituting
-                && let Err(e) = state.transition(DerivationStatus::Queued)
-            {
-                warn!(drv_hash = %hash, error = %e,
-                      "recovery: Substituting→Queued (failed-dep) failed");
-                continue;
-            }
             if let Err(e) = state.transition(DerivationStatus::DependencyFailed) {
                 warn!(drv_hash = %hash, error = %e,
                       "recovery: →DependencyFailed (failed-dep) failed");
@@ -934,13 +918,10 @@ impl DagActor {
             if from == target {
                 continue;
             }
-            // Created and Substituting need the two-step (both have a
-            // valid →Queued edge but no direct →DependencyFailed).
-            // Queued goes direct.
-            if matches!(
-                from,
-                DerivationStatus::Created | DerivationStatus::Substituting
-            ) && target != DerivationStatus::Queued
+            // Created needs the two-step (a valid →Queued edge but no
+            // direct →DependencyFailed). Queued goes direct.
+            if from == DerivationStatus::Created
+                && target != DerivationStatus::Queued
                 && let Err(e) = state.transition(DerivationStatus::Queued)
             {
                 warn!(drv_hash = %drv_hash, error = %e,

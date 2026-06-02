@@ -12,7 +12,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::db::materialization::FencedJobCreate;
-use crate::state::{DerivationStatus, DrvHash, ExecutorId, JobOrigin};
+use crate::state::{DrvHash, ExecutorId, JobOrigin};
 
 use super::DagActor;
 
@@ -131,12 +131,6 @@ impl DagActor {
         let Some(db_id) = state.db_id else {
             return false;
         };
-        // Skip Substituting nodes (the AS-6 flip-boundary guard: a
-        // flag-off-era walk in flight owns the node; creating a job
-        // under it would race the walk's completion).
-        if state.status() == DerivationStatus::Substituting {
-            return false;
-        }
         // Tenant: any live interested build's tenant (substitution is
         // content-addressed, so whose upstream config we use is
         // irrelevant to the result — the same derivation

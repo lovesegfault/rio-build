@@ -1272,29 +1272,39 @@ async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
     );
 }
 
-// D3-retarget: bucket re-derivation (T-D3.3) — re-assert that the bucket
-// counts pending-unclaimed jobs; the status arm dies.
-/// `substituting_derivations` counts DAG nodes in `Substituting` and is
-/// disjoint from queued/running. Regression: the previous `_ => {}`
-/// match arm dropped Substituting on the floor → ComponentScaler saw
-/// `builders=0` during a substitution cascade and scaled the store
-/// DOWN exactly when it was the bottleneck. The match is now
-/// exhaustive over `DerivationStatus` so a future variant addition is
-/// a compile-time break, not a silently-zero autoscaler input.
+// D3-retargeted (T-D3.3): the bucket is job-derived — the walk-era
+// status arm died with the Substituting status.
+/// `substituting_derivations` counts nodes carrying a pending
+/// UNCLAIMED materialization job and is disjoint from queued/running:
+/// a Ready node with a pending job is substitution backlog (the
+/// ComponentScaler's store signal), not builder-queue backlog.
 // r[verify sched.admin.snapshot-substituting+2]
 #[tokio::test]
 async fn snapshot_counts_substituting() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor(db.pool.clone());
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            materialization: crate::config::MaterializationConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
 
-    // 3 Substituting, 1 Ready, 1 Running — disjoint counts.
+    // 3 Ready nodes with pending unclaimed jobs, 1 plain Ready,
+    // 1 Running — disjoint counts.
     for h in ["s1", "s2", "s3"] {
         actor.test_inject_ready(h, None, "x86_64-linux", false);
-        actor
-            .dag
-            .node_mut(h)
-            .unwrap()
-            .set_status_for_test(DerivationStatus::Substituting);
+        actor.materialization_jobs.insert(
+            crate::state::DrvHash::from(h),
+            crate::actor::materialize::JobViewEntry {
+                job_id: Uuid::new_v4(),
+                parked_until: None,
+                claimed_by: None,
+            },
+        );
     }
     actor.test_inject_ready("q1", None, "x86_64-linux", false);
     actor.push_ready("q1".to_string().into());
@@ -1307,13 +1317,19 @@ async fn snapshot_counts_substituting() {
 
     let snap = actor.compute_cluster_snapshot();
 
-    assert_eq!(snap.substituting_derivations, 3);
-    assert_eq!(snap.queued_derivations, 1, "Substituting is NOT queued");
-    assert_eq!(snap.running_derivations, 1, "Substituting is NOT running");
+    assert_eq!(
+        snap.substituting_derivations, 3,
+        "pending unclaimed jobs ARE the substituting bucket"
+    );
+    assert_eq!(snap.queued_derivations, 1, "job-backed Ready is NOT queued");
+    assert_eq!(
+        snap.running_derivations, 1,
+        "job-backed Ready is NOT running"
+    );
     assert_eq!(
         snap.queued_by_system.values().sum::<u32>(),
         1,
-        "Substituting does NOT enter queued_by_system"
+        "job-backed Ready does NOT enter queued_by_system"
     );
 }
 

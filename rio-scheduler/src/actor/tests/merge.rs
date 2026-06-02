@@ -746,7 +746,7 @@ async fn test_topdown_explicit_target_unavailable_blocks_prune() -> TestResult {
     .await?;
     // app is substitutable, so whichever path was taken it ends up in
     // the detached-fetch lane; wait for that to settle before judging.
-    settle_substituting(&handle, &["tde-app"]).await;
+    barrier(&handle).await;
 
     let status = query_status(&handle, build_id).await?;
     assert_eq!(
@@ -1039,7 +1039,7 @@ async fn test_topdown_stamp_kept_when_existing_children_unbuilt() -> TestResult 
     );
 
     // Let B1's detached fetch settle before teardown.
-    settle_substituting(&handle, &["tdu-r"]).await;
+    barrier(&handle).await;
     Ok(())
 }
 
@@ -1122,7 +1122,7 @@ async fn test_topdown_stamp_only_nodes_whose_closure_was_dropped() -> TestResult
     );
 
     // Let the detached fetches settle before teardown.
-    settle_substituting(&handle, &["tdl-r", "tdl-l"]).await;
+    barrier(&handle).await;
     Ok(())
 }
 

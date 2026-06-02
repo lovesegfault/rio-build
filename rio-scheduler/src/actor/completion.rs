@@ -523,7 +523,7 @@ impl DagActor {
             }
         }
         // A parent can become children-all-produced without any node
-        // becoming Ready (it may already be Substituting/Ready/Running),
+        // becoming Ready (it may already be Ready/Running),
         // so the topdown_pruned re-evaluation runs BEFORE the
         // newly_ready early-return below.
         self.clear_topdown_pruned_for_produced_parents(completed)

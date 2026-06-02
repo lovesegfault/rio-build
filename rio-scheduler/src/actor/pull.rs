@@ -153,10 +153,11 @@ pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
     )
 }
 
-/// `DerivationStatus` → kernel [`PullNodeStatus`] — variant-for-variant.
-/// The exhaustive `match` (no wildcard arm) pins the two alphabets in
-/// lockstep: adding a variant to either enum fails this compile, which
-/// is the same drift tripwire the retry kernel's db-enum mirrors use.
+/// `DerivationStatus` → kernel [`PullNodeStatus`]. The exhaustive
+/// `match` (no wildcard arm) pins the alphabets: adding a scheduler
+/// variant the kernel lacks fails this compile. (The kernel keeps a
+/// `Substituting` variant the scheduler no longer produces — it
+/// shrinks with the kernel reduction, not here.)
 ///
 /// [`PullNodeStatus`]: rio_evidence_kernel::pull::PullNodeStatus
 fn pull_node_status(status: DerivationStatus) -> rio_evidence_kernel::pull::PullNodeStatus {
@@ -167,7 +168,6 @@ fn pull_node_status(status: DerivationStatus) -> rio_evidence_kernel::pull::Pull
         DerivationStatus::Ready => K::Ready,
         DerivationStatus::Assigned => K::Assigned,
         DerivationStatus::Running => K::Running,
-        DerivationStatus::Substituting => K::Substituting,
         DerivationStatus::Completed => K::Completed,
         DerivationStatus::Failed => K::Failed,
         DerivationStatus::Poisoned => K::Poisoned,
@@ -553,7 +553,6 @@ mod kernel_tests {
             (None, PullDecision::Gone),
             (Some(S::Created), PullDecision::NotYetReady),
             (Some(S::Queued), PullDecision::NotYetReady),
-            (Some(S::Substituting), PullDecision::NotYetReady),
             (Some(S::Failed), PullDecision::NotYetReady),
             (Some(S::Ready), PullDecision::DeliverNew),
             (Some(S::Completed), PullDecision::Gone),

@@ -251,18 +251,13 @@ impl DagActor {
         // r[impl sched.admin.snapshot-substituting+2]
         // Exhaustive over DerivationStatus so a future variant addition
         // is a compile-time break here, not a silently-zero autoscaler
-        // input. The `_ => {}` this replaces dropped Substituting on
-        // the floor — substitution cascades read as `builders=0` to
-        // the ComponentScaler and the store scaled DOWN exactly when
-        // it was the bottleneck.
+        // input.
         //
-        // Substitution-replacement Phase B (§2.6 re-sourcing): flag-on,
-        // the substituting bucket is additionally sourced from the
-        // materialization-job view — a node with an unresolved unclaimed
-        // job is substitution backlog whatever its status. The status
-        // arm stays (flag-off-era Substituting nodes keep counting); the
-        // job-view disjunct is flag-gated so flag-off values are
-        // byte-identical to baseline (criterion 2 / stop condition 8).
+        // The substituting bucket is job-derived (§2.6): a node with an
+        // unresolved unclaimed materialization job is substitution
+        // backlog whatever its status. (The walk-era Substituting
+        // status arm is gone with the status; the flag gate on the
+        // job-view disjunct collapses with the flag.)
         for (drv_hash, s) in self.dag.iter_nodes() {
             match s.status() {
                 DerivationStatus::Assigned | DerivationStatus::Running => {
@@ -291,8 +286,6 @@ impl DagActor {
                         *queued_by_system.entry(s.system.clone()).or_default() += 1;
                     }
                 }
-                // r[impl ctrl.scaler.signal-substituting+2]
-                DerivationStatus::Substituting => substituting_derivations += 1,
                 // Pre-ready: not yet store/builder load. Created has no
                 // deps probed; Queued has unmet deps. Neither drives
                 // any RPC traffic — EXCEPT a Queued node carrying a
@@ -591,7 +584,7 @@ impl DagActor {
                 }
                 // 1-layer check: every incomplete dep is Assigned|
                 // Running with a fitted-curve ETA. Any Queued/Ready/
-                // Substituting/Created/unfitted dep → not
+                // Created/unfitted dep → not
                 // forecastable. `had_incomplete` guards the
                 // (degenerate) all-deps-satisfied case — that drv
                 // belongs to the Ready loop, not here.
