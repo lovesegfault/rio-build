@@ -1639,6 +1639,70 @@ this table does not restate their bodies.
 
 ---
 
+## Round 2 program close-out (2026-06-02)
+
+Round 2 (2026-05-29 → 2026-06-02, post-main-rebase, on `formal-sprint`)
+ran two verification campaigns, one replacement campaign, three candidate
+adjudications, the Track C small items and a CI-lane rework. This is the
+program index; every line points at a permanent record.
+
+**Verification campaigns:**
+
+- **Closure evidence** (Track A, Phases 0/1/2): four defect classes fixed
+  red-first (C3 wrongful terminal failure; D16 settlement; the
+  L3-residual recovery-condemnation scoping; the D14/D15
+  deposed-believer windows → the uniform claims-floor fence) and one
+  refuted-with-record (L3 as premised); calibrated model, 29 wired
+  checks, the CE-1..81 acceptance table, the rio-evidence-kernel CBMC
+  extraction. Record: `closure-evidence-invariant-map.md` (post-D′ the
+  wired family is the survivors core + 2 kept pins).
+- **Gateway session/connection lifecycle** (Track B, verify-only): zero
+  as-built defects at model resolution; 34 properties, 40 wired checks,
+  all 17 encodable calibration candidates falsify; closed at Phase 0
+  with counter-signatures. Record: `gw-session-invariant-map.md`.
+
+**The replacement** (Track A stages A3–A6 — this map): the scheduler's
+detached substitution walk replaced by store-owned materialization jobs
+across four phases (dormant → flip → model+calibration → deletion); five
+product bugs + one design correction fixed red-first on the way; net
+−16,075 lines at D′; 21 invariants, 43 wired checks, the calibration
+transfer at 100%.
+
+**Candidates adjudicated and retired:**
+
+- **DAG authority inversion** — RETIRED on the merits (every found
+  defect reproduces under PG authority; the fence is required either
+  way); owner-ratified with named re-open triggers. Record:
+  `dag-authority-rescope-memo.md` §7.
+- **Build-event sourcing (C4)** — the memo's RETIRE verdict was
+  owner-OVERRIDDEN to EXECUTE: the WatchBuild resumability layer deleted
+  (snapshot-first replacement, net −591 lines, migration 077; rules
+  `sched.watch.snapshot-first` / `gw.reconnect.snapshot-resync`); the
+  memo's latent-defect disclosure (post-terminal BuildProgress) fixed
+  red-first via ce-phase2. Records: the C4 re-scope memo; the Track B
+  map's coordination note.
+- **harden-store FINAL-substitution-race-fix (rev 5, never landed)** —
+  RATIFIED RETIRED 2026-06-01: materialization is that design's own D5
+  alternative built out, ~80% of its scheduler half overtaken; the
+  survivors are commissioned as Items S and I, with Item T
+  observability-first; MD-D5 + M1/M2 land in the consolidated checklist
+  above; five owned re-open triggers. Record:
+  `harden-store-reconciliation-memo.md`.
+
+**Small items (Track C):** C1 controller recomputable-cache cleanup
+(net −136), C2 builder envelope re-homing, C3 `dispatchMode: Stream`
+retirement (net −281, migration 076). **CI (Track E):** the dedicated
+formal check lane (sharded gen-matrix fan-out); first green
+formal-sprint GHA run.
+
+End state: one substitution mechanism (store-owned materialization
+jobs); 565 spec rules; 32 VM attrs; 246 quint check attrs; 9 + 8 kernel
+CBMC harnesses; every campaign closed with a permanent calibrated
+falsifiability stack. The program's open work leaves through the
+follow-up ledger above — each row with an owner and a record.
+
+---
+
 ## Cross-references
 
 - `closure-evidence-invariant-map.md` — the predecessor campaign's map; its
