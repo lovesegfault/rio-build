@@ -548,17 +548,31 @@
     },
     {
       "enum": "HandshakeError",
+      "name": "DaemonVersionTooOld",
+      "crate": "rio-nix",
+      "msg": "daemon protocol version {daemon_major}.{daemon_minor} is too old; rio-build requires {}.{}+",
+      "doc": "Client side: the daemon advertised a protocol version below [`MIN_DAEMON_VERSION`]. The floor in the message is derived from that constant, never hand-written."
+    },
+    {
+      "enum": "HandshakeError",
       "name": "InvalidMagic",
       "crate": "rio-nix",
       "msg": "invalid client magic: expected {WORKER_MAGIC_1:#018x}, got {0:#018x}",
-      "doc": ""
+      "doc": "Server side: the client's greeting was not [`WORKER_MAGIC_1`]."
+    },
+    {
+      "enum": "HandshakeError",
+      "name": "InvalidServerMagic",
+      "crate": "rio-nix",
+      "msg": "invalid daemon magic: expected {WORKER_MAGIC_2:#018x}, got {0:#018x}",
+      "doc": "Client side: the daemon's greeting was not [`WORKER_MAGIC_2`]."
     },
     {
       "enum": "HandshakeError",
       "name": "VersionTooOld",
       "crate": "rio-nix",
-      "msg": "client protocol version {client_major}.{client_minor} is too old; rio-build requires 1.35+",
-      "doc": ""
+      "msg": "client protocol version {client_major}.{client_minor} is too old; rio-build requires {}.{}+",
+      "doc": "Server side: the client advertised a protocol version below [`MIN_CLIENT_VERSION`]. The floor in the message is derived from that constant, never hand-written."
     },
     {
       "enum": "HandshakeError",
@@ -1416,7 +1430,7 @@
     {
       "name": "HandshakeError",
       "crate": "rio-nix",
-      "doc": "Errors specific to the handshake."
+      "doc": "Errors specific to the handshake. Attribution is part of each variant's contract: a variant names the peer whose bytes failed validation, so it may only be constructed by the side that performed that validation. The server-side handshake validates the CLIENT's greeting and version ([`Self::InvalidMagic`], [`Self::VersionTooOld`]); the client-side handshake validates the DAEMON's ([`Self::InvalidServerMagic`], [`Self::DaemonVersionTooOld`]). Reusing a variant across sides produces a diagnosis that blames the wrong party and prints the wrong expected constant."
     },
     {
       "name": "HashError",

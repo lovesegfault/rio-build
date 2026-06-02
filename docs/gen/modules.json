@@ -893,6 +893,11 @@
       "doc": "hydra.nixos.org API client."
     },
     {
+      "path": "jobsfile.rs",
+      "depth": 0,
+      "doc": "The jobs-file format — the single owner of its line grammar."
+    },
+    {
       "path": "lib.rs",
       "depth": 0,
       "doc": "rio-replay — build-replay campaign engine."
