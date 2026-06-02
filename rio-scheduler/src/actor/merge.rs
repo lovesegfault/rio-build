@@ -196,6 +196,11 @@ const MERGE_STORE_EVIDENCE_BUDGET: u32 = 8;
 ///
 /// Consumers read through [`Self::get`]; `check_store_evidence` accepts
 /// only this type, never a raw map.
+// TODO: F1 (round-15 C3c8 follow-up) — the seed still carries bare
+// `[u8; 32]` digests; InputFormDigest/PublishedDigest newtypes through
+// `hash_derivation_modulo` would make a published-form digest entering
+// any seed a compile error (PublishedDigest gets no From into seeds),
+// retiring the not-floating call-site predicate this type centralizes.
 pub(super) struct InputFormSeed(HashMap<String, [u8; 32]>);
 
 impl InputFormSeed {

@@ -1377,6 +1377,10 @@ fn setup_failure_to_error(
 /// there is no pre-go window in which a setup failure can be reported
 /// but nothing is positioned to read it.
 // r[impl builder.exec.setup-error-surfaced]
+// TODO: F4 (round-15 C7 follow-up) — promote this handle to a full
+// typestate (Forked -> Going -> Supervised) so pre-go teardown, the go
+// release, and supervision-loop adoption are distinct types and a
+// handle cannot be aborted twice or supervised before release.
 struct SpawnedSandbox {
     tree_guard: ProcessTreeGuard,
     wait_task: tokio::task::JoinHandle<Result<i32, std::io::Error>>,

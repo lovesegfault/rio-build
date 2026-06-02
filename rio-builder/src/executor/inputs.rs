@@ -1332,8 +1332,8 @@ mod tests {
     }
 
     /// No double-fetch by construction: a table that already covers
-    /// every closure `.drv` (retained from the input-drv loop + the
-    /// main text) makes prefetch_graph_drvs a pure merge — proven by
+    /// every demanded `.drv` (retained from the input-drv loop + the
+    /// main text) makes the demand fetch a pure merge — proven by
     /// running it against a store where any fetch would 404.
     // r[verify builder.glue.pure]
     #[tokio::test]
