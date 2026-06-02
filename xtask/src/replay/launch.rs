@@ -1443,13 +1443,38 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
+/// Identity projection of a campaign spec for the relaunch guard:
+/// the parsed JSON document with the volatile provenance fields removed.
+/// Every launch re-runs the pre-flight, which stamps a fresh
+/// `tenants.upstreams_verified_at` (nanosecond timestamp), re-snapshots
+/// `tenants.upstream_snapshot`, and re-reads `cluster_versions` — those
+/// record WHEN/WHAT the pre-flight verified, not WHICH campaign this is,
+/// so two launches with identical flags must compare equal despite them.
+/// `None` when the document does not parse (an unparseable leftover can
+/// never be proven identical, so the guard refuses).
+fn spec_identity(spec_json: &str) -> Option<serde_json::Value> {
+    let mut value: serde_json::Value = serde_json::from_str(spec_json).ok()?;
+    if let Some(spec) = value.as_object_mut() {
+        spec.remove("cluster_versions");
+        if let Some(tenants) = spec.get_mut("tenants").and_then(|t| t.as_object_mut()) {
+            tenants.remove("upstreams_verified_at");
+            tenants.remove("upstream_snapshot");
+        }
+    }
+    Some(value)
+}
+
 /// Refuse to (re)write the `<campaign-id>-spec` ConfigMap when the
 /// campaign id is already in use: a campaign Job with that name exists
 /// (its pod mounts the ConfigMap and re-reads it on container restart),
 /// or a leftover spec ConfigMap holds a different spec than this launch
-/// would apply. Pure so the refusal logic is unit-testable; the caller
-/// supplies the cluster facts. Shared with `replay repro`, which applies
-/// the same ConfigMap+Job pair.
+/// would apply. Specs are compared STRUCTURALLY with the volatile
+/// provenance fields cleared ([`spec_identity`]): every launch stamps
+/// fresh pre-flight provenance, so a byte comparison would refuse every
+/// same-flags relaunch and turn the Job-deletion escape hatch into a
+/// guaranteed second refusal. Pure so the refusal logic is
+/// unit-testable; the caller supplies the cluster facts. Shared with
+/// `replay repro`, which applies the same ConfigMap+Job pair.
 pub(super) fn guard_existing_campaign(
     campaign_id: &str,
     job_exists: bool,
@@ -1463,17 +1488,26 @@ pub(super) fn guard_existing_campaign(
              would overwrite ConfigMap {NS_REPLAY}/{cm}, the spec that campaign mounts. Pick a \
              different --campaign-id, or — only if you mean to relaunch/resume THIS campaign — \
              delete the Job first (`kubectl -n {NS_REPLAY} delete job {campaign_id}`) and re-run \
-             launch."
+             launch with the same flags; if you are also CHANGING the spec, delete the spec \
+             ConfigMap too (`kubectl -n {NS_REPLAY} delete configmap {cm}`)."
         );
     }
-    if existing_spec.is_some_and(|old| old != new_spec) {
+    let differs = match existing_spec {
+        None => false,
+        Some(old) => match (spec_identity(old), spec_identity(new_spec)) {
+            (Some(old_identity), Some(new_identity)) => old_identity != new_identity,
+            // An unparseable side cannot be proven identical: refuse.
+            _ => true,
+        },
+    };
+    if differs {
         bail!(
             "ConfigMap {NS_REPLAY}/{cm} already exists with a different campaign spec (campaign \
-             id {campaign_id} was launched before). Refusing to overwrite it: pick a fresh \
-             --campaign-id, or — if you are deliberately relaunching this campaign after deleting \
-             its Job — delete the stale ConfigMap too (`kubectl -n {NS_REPLAY} delete configmap \
-             {cm}`) and re-run; resume state lives under the campaign's S3 prefix, not in the old \
-             ConfigMap."
+             id {campaign_id} was launched before with different flags). Refusing to overwrite \
+             it: pick a fresh --campaign-id, or — if you are deliberately relaunching this \
+             campaign after deleting its Job — delete the stale ConfigMap too (`kubectl -n \
+             {NS_REPLAY} delete configmap {cm}`) and re-run; resume state lives under the \
+             campaign's S3 prefix, not in the old ConfigMap."
         );
     }
     Ok(())
@@ -2618,10 +2652,13 @@ mod tests {
     #[test]
     fn guard_refuses_existing_job_or_differing_spec() {
         let id = "replay-leaf-20260601-ab12";
-        let spec = r#"{"campaignId":"replay-leaf-20260601-ab12"}"#;
+        let spec = r#"{"campaign_id":"replay-leaf-20260601-ab12","filters":{"limit":50}}"#;
 
-        // Existing Job: refuse regardless of ConfigMap state, with the
-        // delete-Job escape hatch spelled out.
+        // Existing Job: refuse regardless of ConfigMap state. The escape
+        // hatch must be COMPLETE: delete the Job (same-flags relaunch),
+        // and the ConfigMap too when the spec is being changed — without
+        // the latter, a changed-spec relaunch is bounced into a second
+        // refusal at the ConfigMap arm.
         let err = guard_existing_campaign(id, true, None, spec)
             .unwrap_err()
             .to_string();
@@ -2630,12 +2667,21 @@ mod tests {
             err.contains("delete job replay-leaf-20260601-ab12"),
             "{err}"
         );
+        assert!(
+            err.contains("delete configmap replay-leaf-20260601-ab12-spec"),
+            "{err}"
+        );
 
-        // Leftover ConfigMap with a different spec: refuse and name the
-        // ConfigMap to delete.
-        let err = guard_existing_campaign(id, false, Some(r#"{"campaignId":"other"}"#), spec)
-            .unwrap_err()
-            .to_string();
+        // Leftover ConfigMap with a genuinely different spec: refuse and
+        // name the ConfigMap to delete.
+        let err = guard_existing_campaign(
+            id,
+            false,
+            Some(r#"{"campaign_id":"replay-leaf-20260601-ab12","filters":{"limit":10}}"#),
+            spec,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("different campaign spec"), "{err}");
         assert!(
             err.contains("delete configmap replay-leaf-20260601-ab12-spec"),
@@ -2646,5 +2692,64 @@ mod tests {
         // ConfigMap apply) and the fresh-id case are both fine.
         guard_existing_campaign(id, false, Some(spec), spec).unwrap();
         guard_existing_campaign(id, false, None, spec).unwrap();
+
+        // An unparseable leftover can never be proven identical: refuse.
+        let err = guard_existing_campaign(id, false, Some("not json"), spec)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different campaign spec"), "{err}");
+    }
+
+    #[test]
+    fn guard_compares_specs_structurally_ignoring_preflight_provenance() {
+        // Two REAL launches with identical flags differ only in what the
+        // mandatory pre-flight stamped: upstreams_verified_at (nanosecond
+        // timestamp), the upstream snapshot, and the deployed-version
+        // record. The guard must treat them as the same campaign — this is
+        // exactly the delete-the-Job-and-re-run path the Job-arm message
+        // promises — while a real flag change still refuses.
+        let id = "replay-leaf-20260601-ab12";
+        let spec_at = |verified_at: &str, versions: &str, limit: usize| {
+            let mut outcome = outcome();
+            outcome.verified_at = verified_at.into();
+            outcome
+                .deployed_tags
+                .insert("rio-gateway".into(), versions.into());
+            let mut a = args(Mode::Leaf);
+            a.limit = Some(limit);
+            let spec = build_campaign_spec(
+                &a,
+                id,
+                &archive_loc(),
+                "rio-build-chunks-deadbeef",
+                true,
+                HOST_KEY_PIN,
+                &outcome,
+            );
+            serde_json::to_string_pretty(&spec).unwrap()
+        };
+
+        let first = spec_at("2026-06-01T12:00:00.000000001Z", "abc123", 50);
+        let relaunch = spec_at("2026-06-02T08:30:00.999999999Z", "def456", 50);
+        assert_ne!(first, relaunch, "the raw documents do differ");
+        guard_existing_campaign(id, false, Some(&first), &relaunch)
+            .expect("a same-flags relaunch must pass the guard");
+
+        // A genuine spec change (different --limit) is still refused.
+        let changed = spec_at("2026-06-02T08:30:00.999999999Z", "def456", 10);
+        let err = guard_existing_campaign(id, false, Some(&first), &changed)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different campaign spec"), "{err}");
+
+        // The identity projection strips exactly the volatile fields.
+        let identity = spec_identity(&first).unwrap();
+        assert!(identity.get("cluster_versions").is_none());
+        let tenants = identity.get("tenants").unwrap();
+        assert!(tenants.get("upstreams_verified_at").is_none());
+        assert!(tenants.get("upstream_snapshot").is_none());
+        // Non-volatile fields survive the projection.
+        assert_eq!(identity["campaign_id"], serde_json::json!(id));
+        assert_eq!(tenants["build_tenant"], serde_json::json!("replay-leaf"));
     }
 }
