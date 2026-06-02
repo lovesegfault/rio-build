@@ -563,6 +563,14 @@ pub(super) fn substitute_status(e: SubstituteError) -> Status {
         // in-process against the substituter and never crosses this
         // gRPC mapping. Moka didn't cache `Err` either way.
         SubstituteError::Raced => Status::not_found("substitution in progress on another replica"),
+        // Owner-side stall abort (`r[store.substitute.stall-abort]`):
+        // the claim was released in place, so a retry re-claims
+        // immediately — `Unavailable` (transient, retryable), the same
+        // shape as an upstream fetch failure. Never a miss: the path
+        // may well exist upstream; only this download wedged.
+        SubstituteError::Stalled { .. } => {
+            Status::unavailable("upstream download stalled; claim released — retry")
+        }
         // Upstream-429: genuinely transient — `Unavailable` so the
         // scheduler's 8-attempt backoff retries. A bare 429 (no
         // `Retry-After`) is STILL a rate-limit, not a miss; the

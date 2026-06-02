@@ -373,9 +373,14 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_substitute_stale_reclaimed_total",
-        "Stale 'uploading' placeholders reclaimed on the substitution hot \
-         path. Nonzero expected under network churn; sustained high suggests \
-         upstream instability or aggressive pod rollouts."
+        "Stale or stalled 'uploading' placeholders reclaimed on the \
+         substitution hot path, labeled by reason: heartbeat = dead-owner \
+         DELETE + re-insert (resets stall evidence); stall_abort = the owner \
+         aborted its own wedged download and released the claim in place; \
+         stall_reclaim = a competing claimant took over a frozen mid-download \
+         claim in place (stall_count += 1). Nonzero heartbeat expected under \
+         pod churn; sustained stall_abort/stall_reclaim names a wedging \
+         upstream or network path."
     );
     describe_gauge!(
         "rio_store_placeholders_uploading",

@@ -54,10 +54,13 @@ pub(crate) use chunked::{
 };
 pub(crate) use cluster_key_history::load_cluster_key_history;
 pub(crate) use inline::{
-    check_manifest_complete, complete_manifest_inline, insert_manifest_uploading,
+    check_manifest_complete, claim_released_placeholder, complete_manifest_inline,
+    insert_manifest_uploading_as, release_placeholder_in_place, stall_takeover_placeholder,
 };
 #[cfg(test)]
-pub(crate) use inline::{delete_manifest_uploading, manifest_uploading_age};
+pub(crate) use inline::{
+    delete_manifest_uploading, insert_manifest_uploading, manifest_uploading_age,
+};
 pub(crate) use queries::{
     append_signatures, find_missing_paths, get_manifest, get_manifest_batch, query_by_hash_part,
     query_path_info, query_path_info_batch,

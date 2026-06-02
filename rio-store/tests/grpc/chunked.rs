@@ -411,9 +411,13 @@ async fn gt13_batch_reclaims_stale_uploading() -> TestResult {
     .bind(&[0u8; 32] as &[u8])
     .execute(&s.db.pool)
     .await?;
+    // claim_id minted like every real uploader's row (M_052) — a
+    // claim-less 'uploading' row means released-in-place and is
+    // immediately claimable, which would bypass the stale-reclaim arm
+    // this test exercises.
     sqlx::query(
-        "INSERT INTO manifests (store_path_hash, status, updated_at) \
-         VALUES ($1, 'uploading', now() - make_interval(secs => 600))",
+        "INSERT INTO manifests (store_path_hash, status, claim_id, updated_at) \
+         VALUES ($1, 'uploading', gen_random_uuid(), now() - make_interval(secs => 600))",
     )
     .bind(sph.as_slice())
     .execute(&s.db.pool)
@@ -534,10 +538,18 @@ async fn gt13_batch_placeholder_cleanup_on_midloop_abort() -> TestResult {
     .bind(Vec::<String>::new())
     .execute(&s.db.pool)
     .await?;
-    sqlx::query(r#"INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'uploading')"#)
-        .bind(&out1_hash)
-        .execute(&s.db.pool)
-        .await?;
+    // claim_id minted like every real uploader's row (M_052: ownership
+    // unrepresentable-as-absent). A claim-less 'uploading' row means
+    // RELEASED-in-place since the stall machinery landed — immediately
+    // claimable by any caller — which would defeat this fixture's
+    // purpose of modeling a LIVE concurrent owner.
+    sqlx::query(
+        r#"INSERT INTO manifests (store_path_hash, status, claim_id)
+           VALUES ($1, 'uploading', gen_random_uuid())"#,
+    )
+    .bind(&out1_hash)
+    .execute(&s.db.pool)
+    .await?;
 
     // Send the batch. Output-0 metadata+chunk+trailer, then output-1.
     // Handler drains (phase-1) → validates + inserts placeholders

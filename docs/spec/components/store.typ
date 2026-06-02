@@ -1024,16 +1024,50 @@ by the owner itself: a slow owner advances `last_progress_at` every heartbeat;
 a wedged one keeps `updated_at` (liveness) fresh while the progress clock
 freezes (#rref("store.substitute.stale-reclaim")).
 
-#r("store.substitute.stale-reclaim")[
-  When `try_substitute` finds an existing `'uploading'` placeholder for the
-  requested path, it MUST check the placeholder's age. If older than
-  `SUBSTITUTE_STALE_THRESHOLD` (5 minutes), the substituter reclaims the
-  placeholder (DELETE + re-INSERT) and proceeds with the fetch. A young
-  placeholder indicates a live concurrent uploader and returns a miss. This
-  prevents a crashed substitution from blocking the path for the full
-  orphan-scanner interval (15 minutes). The
+#r("store.substitute.stall-abort")[
+  A substitution download with no NAR body bytes for `RIO_SUBSTITUTE_STALL_SECS`
+  (config `substitute_stall_secs`, default 180 s) MUST be aborted by its own
+  owner (`fetch_nar`'s per-read watchdog; the NAR GET carries no request-level
+  timeout, so this is the only clock on the body). The abort releases the claim
+  **in place** --- `claim_id`/`claimed_by` cleared, progress evidence NULLed,
+  durable `stall_count` incremented --- so the row survives with its stall
+  evidence and the next attempt re-claims it immediately
+  (#rref("store.substitute.stale-reclaim")). The release is claim-guarded on
+  the aborting owner's `claim_id`: racing a competing stall-reclaim of the same
+  stall event, whichever lands first wins and `stall_count` increments exactly
+  once. The error surfaces to every coalesced singleflight waiter as `Stalled`
+  (never cached, never folded into a miss); the in-process materialization
+  executor classifies it as retryable infrastructure trouble. Counted as
+  #(refs.metric)("rio_store_substitute_stale_reclaimed_total")`{reason="stall_abort"}`.
+]
+The owner-side abort is what makes stall recovery reach the singleflight
+leader: every same-replica caller coalesces behind the owner, so no competing
+`claim_placeholder` would ever observe the stall from outside. Waiting on the
+local NAR-bytes budget is exempt --- backpressure is not an upstream stall.
+
+#r("store.substitute.stale-reclaim+2")[
+  When a claim attempt finds an existing `'uploading'` placeholder for the
+  requested path, `claim_placeholder` MUST apply three takeover arms in
+  precedence order. (1) A **released-in-place** row (`claim_id` IS NULL ---
+  what #rref("store.substitute.stall-abort") leaves behind) is claimable
+  immediately by any caller, with no staleness threshold and `stall_count`
+  preserved. (2) **Heartbeat death**: a placeholder older than
+  `SUBSTITUTE_STALE_THRESHOLD` (5 minutes) is reclaimed by DELETE + re-INSERT
+  --- benign churn (deploys, scale-in, crashes) resets stall evidence and
+  never accrues strikes; this arm precedes the stall arm so a dead owner is
+  reaped, not striked, when both predicates hold. (3) **Download-stalled**
+  (substitution claimants only, which carry the verified narinfo's `NarSize`):
+  a live claim with `fetched_bytes IS NOT NULL` ∧ `fetched_bytes < nar_size` ∧
+  `last_progress_at` older than the stall window is taken over **in place**
+  (new `claim_id`/`claimed_by`, progress reset, `stall_count += 1`) so stall
+  evidence survives ownership changes. Claims with `fetched_bytes == nar_size`
+  (download complete, persist phase) and PutPath claims (`fetched_bytes` NULL,
+  #rref("store.substitute.progress-heartbeat")) are NEVER stall-reclaimable ---
+  they stay under the heartbeat-death rule alone. A placeholder matching no arm
+  indicates a live, advancing uploader and returns a miss. The
   #(refs.metric)("rio_store_substitute_stale_reclaimed_total") counter tracks
-  reclaim events.
+  reclaim events, labeled by reason
+  (`heartbeat` | `stall_abort` | `stall_reclaim`).
 ]
 
 #r("store.put.stale-reclaim")[

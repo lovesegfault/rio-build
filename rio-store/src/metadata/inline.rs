@@ -37,12 +37,31 @@ use tracing::{debug, instrument};
 /// holds a placeholder (caller should re-check `check_manifest_complete`
 /// — the race winner may have finished).
 // r[impl store.put.placeholder-claim+2]
-#[instrument(skip(pool, references), fields(store_path_hash = hex::encode(store_path_hash), refs = references.len()))]
+/// Test-only convenience wrapper (production callers go through
+/// `ingest::claim_placeholder`, which threads `claimed_by`).
+#[cfg(test)]
 pub(crate) async fn insert_manifest_uploading(
     pool: &PgPool,
     store_path_hash: &[u8],
     store_path: &str,
     references: &[String],
+) -> Result<Option<uuid::Uuid>> {
+    insert_manifest_uploading_as(pool, store_path_hash, store_path, references, None).await
+}
+
+/// [`insert_manifest_uploading`] with owner attribution: `claimed_by`
+/// (the substituting pod's name) is stamped on the placeholder row for
+/// operator-side stall/takeover diagnosis. Substitution claims pass
+/// `Some(pod)`; PutPath and every legacy caller pass `None` via the
+/// plain wrapper (claimed_by stays NULL — the design sets it only on
+/// substitution-claimed placeholders).
+#[instrument(skip(pool, references), fields(store_path_hash = hex::encode(store_path_hash), refs = references.len()))]
+pub(crate) async fn insert_manifest_uploading_as(
+    pool: &PgPool,
+    store_path_hash: &[u8],
+    store_path: &str,
+    references: &[String],
+    claimed_by: Option<&str>,
 ) -> Result<Option<uuid::Uuid>> {
     let mut tx = pool.begin().await?;
 
@@ -76,19 +95,148 @@ pub(crate) async fn insert_manifest_uploading(
     let claim_id = uuid::Uuid::new_v4();
     let result = sqlx::query(
         r#"
-        INSERT INTO manifests (store_path_hash, status, claim_id)
-        VALUES ($1, 'uploading', $2)
+        INSERT INTO manifests (store_path_hash, status, claim_id, claimed_by)
+        VALUES ($1, 'uploading', $2, $3)
         ON CONFLICT (store_path_hash) DO NOTHING
         "#,
     )
     .bind(store_path_hash)
     .bind(claim_id)
+    .bind(claimed_by)
     .execute(&mut *tx)
     .await?;
 
     tx.commit().await?;
 
     Ok((result.rows_affected() > 0).then_some(claim_id))
+}
+
+/// Claim a **released-in-place** `'uploading'` placeholder: a row the
+/// owner-side stall abort left behind (`claim_id IS NULL`,
+/// `r[store.substitute.stall-abort]`). Claimable immediately by ANY
+/// caller — no staleness threshold — with `stall_count` PRESERVED
+/// (the whole point of releasing in place instead of deleting: stall
+/// evidence survives the handoff). Returns the new claim token, or
+/// `None` if no released row exists (live claim, completed, or gone).
+// r[impl store.substitute.stale-reclaim+2]
+#[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
+pub(crate) async fn claim_released_placeholder(
+    pool: &PgPool,
+    store_path_hash: &[u8],
+    claimed_by: Option<&str>,
+) -> Result<Option<uuid::Uuid>> {
+    let claim_id = uuid::Uuid::new_v4();
+    // fetched_bytes/last_progress_at defensively re-NULLed (the release
+    // already cleared them); stall_count deliberately untouched.
+    let result = sqlx::query(
+        r#"
+        UPDATE manifests
+           SET claim_id = $2, claimed_by = $3,
+               fetched_bytes = NULL, last_progress_at = NULL,
+               updated_at = now()
+         WHERE store_path_hash = $1
+           AND status = 'uploading'
+           AND claim_id IS NULL
+        "#,
+    )
+    .bind(store_path_hash)
+    .bind(claim_id)
+    .bind(claimed_by)
+    .execute(pool)
+    .await?;
+    Ok((result.rows_affected() > 0).then_some(claim_id))
+}
+
+/// Take over a **download-stalled** live claim in place: the
+/// download-scoped stall-reclaim arm of
+/// `r[store.substitute.stale-reclaim+2]`. The predicate —
+///
+///   `fetched_bytes IS NOT NULL ∧ fetched_bytes < nar_size ∧
+///    last_progress_at older than the stall window`
+///
+/// — matches only mid-download claims whose progress clock froze:
+/// PutPath claims (`fetched_bytes` NULL) and persist-phase claims
+/// (`fetched_bytes == nar_size`) are structurally outside it, and an
+/// advancing owner refreshes `last_progress_at` every heartbeat. The
+/// handoff is in place (new `claim_id`/`claimed_by`, progress reset,
+/// `stall_count += 1`) so stall evidence accumulates across owners.
+/// Claim-guarded against the owner-side release racing the same stall
+/// event: whichever lands first wins, the loser matches zero rows —
+/// one stall, one strike.
+///
+/// `nar_size` is the caller's verified-narinfo `NarSize` (every
+/// substitution claimant parses the narinfo before claiming); the
+/// row itself stores no expected size while uploading.
+// r[impl store.substitute.stale-reclaim+2]
+#[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
+pub(crate) async fn stall_takeover_placeholder(
+    pool: &PgPool,
+    store_path_hash: &[u8],
+    claimed_by: Option<&str>,
+    nar_size: u64,
+    stall_window: std::time::Duration,
+) -> Result<Option<uuid::Uuid>> {
+    let claim_id = uuid::Uuid::new_v4();
+    let result = sqlx::query(
+        r#"
+        UPDATE manifests
+           SET claim_id = $2, claimed_by = $3,
+               fetched_bytes = NULL, last_progress_at = NULL,
+               stall_count = stall_count + 1,
+               updated_at = now()
+         WHERE store_path_hash = $1
+           AND status = 'uploading'
+           AND claim_id IS NOT NULL
+           AND fetched_bytes IS NOT NULL
+           AND fetched_bytes < $4
+           AND last_progress_at < now() - make_interval(secs => $5)
+        "#,
+    )
+    .bind(store_path_hash)
+    .bind(claim_id)
+    .bind(claimed_by)
+    .bind(i64::try_from(nar_size).unwrap_or(i64::MAX))
+    .bind(stall_window.as_secs() as i64)
+    .execute(pool)
+    .await?;
+    Ok((result.rows_affected() > 0).then_some(claim_id))
+}
+
+/// Owner-side **release-in-place** after a stall abort
+/// (`r[store.substitute.stall-abort]`): relinquish the claim
+/// (`claim_id`/`claimed_by` cleared), NULL the progress evidence, and
+/// record the strike (`stall_count += 1`) — WITHOUT deleting the row,
+/// so the next attempt re-claims immediately
+/// ([`claim_released_placeholder`]) and the stall evidence survives.
+///
+/// Claim-guarded on the aborting owner's `claim_id`: if a competing
+/// stall-reclaim already took the row over, this matches zero rows and
+/// the stall event still increments `stall_count` exactly once.
+/// Returns whether the release applied.
+// r[impl store.substitute.stall-abort]
+#[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
+pub(crate) async fn release_placeholder_in_place(
+    pool: &PgPool,
+    store_path_hash: &[u8],
+    claim: uuid::Uuid,
+) -> Result<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE manifests
+           SET claim_id = NULL, claimed_by = NULL,
+               fetched_bytes = NULL, last_progress_at = NULL,
+               stall_count = stall_count + 1,
+               updated_at = now()
+         WHERE store_path_hash = $1
+           AND status = 'uploading'
+           AND claim_id = $2
+        "#,
+    )
+    .bind(store_path_hash)
+    .bind(claim)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Finalize an inline upload: fill real narinfo + store the NAR in

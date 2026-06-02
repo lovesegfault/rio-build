@@ -1066,6 +1066,128 @@ mod tests {
     }
 
     // r[verify store.materialize.executor+3]
+    // r[verify store.substitute.stall-abort]
+    /// (6b) A WEDGED upstream download (headers, then no body bytes)
+    /// is ended by the substituter's owner-side stall abort and
+    /// surfaces to the executor as **InfraFailure** — the retryable
+    /// infrastructure class that feeds the scheduler's materialization
+    /// re-attempt budget. Never Unobtainable (nothing confirmed
+    /// absent), never Success, never a hang: the stall abort is the
+    /// only clock on the NAR body.
+    #[tokio::test]
+    async fn stalled_download_reports_infra_failure() {
+        use axum::{Router, routing::get};
+        use base64::Engine;
+        use sha2::Digest;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-stall").await;
+
+        // A signed narinfo whose NAR endpoint never sends body bytes.
+        let path = store_path(12, "mat-stalled");
+        let (nar, _) = rio_test_support::fixtures::make_nar(b"never arrives");
+        let seed = [0x42u8; 32];
+        let signer = Signer::from_seed("cache.stall", &seed);
+        let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+        let trusted_key = format!(
+            "cache.stall:{}",
+            base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes())
+        );
+        let nar_hash: [u8; 32] = sha2::Sha256::digest(&nar).into();
+        let nar_hash_str = format!(
+            "sha256:{}",
+            rio_nix::store_path::nixbase32::encode(&nar_hash)
+        );
+        let fp = fingerprint(&path, &nar_hash, nar.len() as u64, &[]);
+        let sig = signer.sign(&fp);
+        let sp = StorePath::parse(&path).unwrap();
+        let hash_part = sp.hash_part();
+        let narinfo = format!(
+            "StorePath: {path}\n\
+             URL: nar/{hash_part}.nar\n\
+             Compression: none\n\
+             NarHash: {nar_hash_str}\n\
+             NarSize: {}\n\
+             References: \n\
+             Sig: {sig}\n",
+            nar.len()
+        );
+        let app = Router::new()
+            .route(
+                "/nix-cache-info",
+                get(|| async { "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n" }),
+            )
+            .route(
+                &format!("/{hash_part}.narinfo"),
+                get(move || async move { narinfo }),
+            )
+            .route(
+                &format!("/nar/{hash_part}.nar"),
+                get(|| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    Vec::<u8>::new()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        metadata::upstreams::insert(
+            &db.pool,
+            tenant,
+            &format!("http://{addr}"),
+            50,
+            std::slice::from_ref(&trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .expect("upstream wired");
+
+        let seeded = seed_job(
+            &db.pool,
+            "mat-stall-drv",
+            &[("out", path.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+
+        // 1s stall window so the abort fires within the test budget.
+        let ctx = ExecutorContext {
+            substituter: std::sync::Arc::new(
+                Substituter::new(db.pool.clone(), None)
+                    .with_http_client(sandbox_http())
+                    .with_stall_window(std::time::Duration::from_secs(1)),
+            ),
+            pool: db.pool.clone(),
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            execute_job(&ctx, &seeded.claimed),
+        )
+        .await
+        .expect("the stall abort must end the wedged download (no hang)");
+
+        let infra = outcome_infra(&outcome).unwrap_or_else(|| {
+            panic!("a stalled download must classify InfraFailure, got {outcome:?}")
+        });
+        assert!(
+            infra.detail.contains("stalled"),
+            "the detail names the stall: {}",
+            infra.detail
+        );
+        assert_eq!(
+            pin_count(&db.pool, "mat-stall-drv", "materialization").await,
+            0,
+            "nothing is pinned when nothing is ingested"
+        );
+    }
+
+    // r[verify store.materialize.executor+3]
     /// (6) Upstream 5xx → InfraFailure (B3's executor half): nothing is
     /// confirmed, so the verdict must be infrastructure trouble — never
     /// Unobtainable (which would route from-source), never Success.

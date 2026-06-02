@@ -146,6 +146,13 @@
         "minimum": 0,
         "default": null
       },
+      "substitute_stall_secs": {
+        "description": "Owner-side download-stall window for upstream substitution: a\nNAR download with no body bytes for this long is aborted by its\nown owner — the placeholder claim is released in place (claim\ncleared, durable `stall_count` incremented) so the next attempt\nre-claims immediately. Also the threshold competing replicas\napply when deciding whether a live mid-download claim is\ndownload-stalled (frozen `last_progress_at`); persist-phase and\nPutPath claims are never stall-reclaimed. Default 180 s = 6\nmissed-progress heartbeats — S3 multipart pauses and admission\nqueueing inside a download don't trip it. Env:\n`RIO_SUBSTITUTE_STALL_SECS`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 180
+      },
       "log_bytes_budget": {
         "description": "Per-replica budget for resident build-log ingest buffer bytes\nacross all concurrent `LogService.AppendLog` streams. Each stream\nreserves `2 × log_cut_threshold_bytes` (its worst-case resident\nbuffer: one chunk mid-cut plus one refilling) at open and holds\nthe reservation for the stream's lifetime; a stream that cannot\nreserve is rejected with `RESOURCE_EXHAUSTED` and the builder\nretries against another replica. Deliberately separate from\n`nar_buffer_budget_bytes` so log ingest and NAR ingest cannot\nstarve each other. Default 1 GiB. Env: `RIO_LOG_BYTES_BUDGET`.",
         "type": "integer",
@@ -346,6 +353,7 @@
     "stream_drain_secs": 90,
     "pg_max_connections": 50,
     "substitute_admission_permits": null,
+    "substitute_stall_secs": 180,
     "log_bytes_budget": 1073741824,
     "log_max_streams": 256,
     "log_ingest_byte_cap": 1073741824,

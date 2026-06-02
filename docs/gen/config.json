@@ -450,6 +450,12 @@
         "description": "Per-replica cap on concurrent `try_substitute` calls."
       },
       {
+        "key": "substitute_stall_secs",
+        "type": "uint64",
+        "default": "180",
+        "description": "Owner-side download-stall window for upstream substitution: a NAR download with no body bytes for this long is aborted by its own owner — the placeholder claim is released in place (claim cleared, durable `stall_count` incremented) so the next attempt re-claims immediately."
+      },
+      {
         "key": "log_bytes_budget",
         "type": "uint64",
         "default": "1073741824",

@@ -59,7 +59,9 @@ pub enum PlaceholderClaim {
 #[derive(Clone, Copy)]
 pub struct IngestHooks {
     /// `metrics::counter!` name incremented when a stale `'uploading'`
-    /// placeholder is reaped on the hot path. e.g.
+    /// placeholder is reaped on the hot path (labeled by reason:
+    /// `heartbeat` for the death-DELETE arm, `stall_reclaim` for the
+    /// download-stalled in-place takeover). e.g.
     /// `rio_store_putpath_stale_reclaimed_total`.
     pub stale_reclaimed_metric: &'static str,
     /// Prefix for `warn!`/`debug!` log lines (e.g. `"PutPath"`,
@@ -67,46 +69,102 @@ pub struct IngestHooks {
     pub ctx_label: &'static str,
 }
 
+/// Substitution-claim parameters for [`claim_placeholder`]'s
+/// download-stalled takeover arm and owner attribution
+/// (`r[store.substitute.stale-reclaim+2]`). PutPath/PutPathBatch pass
+/// `None`: builder claims carry no narinfo-declared size and no
+/// progress evidence, so the stall arm is structurally unreachable
+/// for and from them.
+pub struct SubstituteClaimParams<'a> {
+    /// The verified narinfo's declared `NarSize` — the persist-phase
+    /// exemption bound (`fetched_bytes < nar_size` scopes the stall
+    /// predicate to mid-download claims).
+    pub nar_size: u64,
+    /// The download-stall window (`RIO_SUBSTITUTE_STALL_SECS`).
+    pub stall_window: std::time::Duration,
+    /// Owner attribution stamped on the row (the pod name).
+    pub claimed_by: &'a str,
+}
+
 // r[impl store.put.idempotent]
 // r[impl store.put.stale-reclaim]
 /// Idempotency check + `status='uploading'` placeholder insert +
-/// hot-path stale-reclaim. The shared step-1 of the write-ahead flow.
+/// hot-path stale/stall reclaim. The shared step-1 of the write-ahead
+/// flow.
 ///
 /// Flow:
 /// 1. `check_manifest_complete` → [`PlaceholderClaim::AlreadyComplete`]
 /// 2. `insert_manifest_uploading` → if inserted: [`PlaceholderClaim::Owned`]
-/// 3. ON CONFLICT no-op: try `reap_one` with the stale threshold
-///    (I-207 — a fetcher that died mid-upload leaves a placeholder
-///    the orphan scanner won't reap for 15min, but the scheduler
-///    retries within seconds). If reap succeeded, re-insert.
-/// 4. Still not inserted → [`PlaceholderClaim::Concurrent`] (live
-///    uploader's heartbeat keeps `updated_at` fresh, so reap_one's
-///    threshold check protected it).
+///    (fresh insert, `stall_count` 0)
+/// 3. ON CONFLICT no-op: a **released-in-place** row (`claim_id` NULL —
+///    what the owner-side stall abort leaves behind,
+///    `r[store.substitute.stall-abort]`) is claimed immediately, no
+///    threshold, `stall_count` preserved.
+/// 4. Else try `reap_one` with the stale threshold — heartbeat death
+///    DELETEs + re-inserts, resetting stall evidence (I-207 — a
+///    fetcher that died mid-upload leaves a placeholder the orphan
+///    scanner won't reap for 15min, but the scheduler retries within
+///    seconds). Precedes the stall arm so a dead owner is reaped, not
+///    striked, when both predicates hold.
+/// 5. Else, substitution callers only (`stall` params present): a
+///    **download-stalled** live claim (`fetched_bytes < nar_size` ∧
+///    progress clock older than the stall window) is taken over in
+///    place, `stall_count += 1`.
+/// 6. Still not claimed → [`PlaceholderClaim::Concurrent`] (live
+///    uploader's heartbeat keeps `updated_at` fresh and its progress
+///    clock advancing, so every arm above protected it).
 ///
 /// Per-caller metrics (`exists` / `concurrent_upload` on
 /// `rio_store_put_path_total`) are NOT emitted here — that's a
-/// PutPath-specific counter. Only the stale-reclaim counter (whose
-/// name the caller supplies) is emitted.
+/// PutPath-specific counter. Only the reason-labeled stale-reclaim
+/// counter (whose name the caller supplies) is emitted.
 pub async fn claim_placeholder(
     pool: &PgPool,
     store_path_hash: &[u8],
     store_path: &str,
     refs: &[String],
     hooks: IngestHooks,
+    stall: Option<&SubstituteClaimParams<'_>>,
 ) -> Result<PlaceholderClaim, MetadataError> {
     if metadata::check_manifest_complete(pool, store_path_hash).await? {
         return Ok(PlaceholderClaim::AlreadyComplete);
     }
+
+    let claimed_by = stall.map(|s| s.claimed_by);
 
     // STRUCTURAL: insert_manifest_uploading takes references and writes
     // them into the placeholder narinfo. Mark's CTE walks them from
     // commit → the closure is GC-protected without holding a session
     // lock for the full upload.
     let mut claim =
-        metadata::insert_manifest_uploading(pool, store_path_hash, store_path, refs).await?;
+        metadata::insert_manifest_uploading_as(pool, store_path_hash, store_path, refs, claimed_by)
+            .await?;
+
+    // r[impl store.substitute.stale-reclaim+2]
+    // The slot is occupied. Three takeover arms, in precedence order:
+    //
+    //   (1) released-in-place row (`claim_id` NULL — the owner-side
+    //       stall abort's leavings): claimable IMMEDIATELY by any
+    //       caller, no threshold, `stall_count` preserved;
+    //   (2) heartbeat death (5 min, unchanged): DELETE + re-insert —
+    //       benign churn (deploys, scale-in, crashes) resets stall
+    //       evidence, never accrues strikes. Checked BEFORE the stall
+    //       arm so a dead owner is reaped, not striked, when both
+    //       predicates hold;
+    //   (3) download-stalled live claim (substitution callers only:
+    //       `fetched_bytes < nar_size` ∧ progress clock older than the
+    //       stall window): in-place handoff, `stall_count += 1`.
+    if claim.is_none() {
+        claim = metadata::claim_released_placeholder(pool, store_path_hash, claimed_by).await?;
+        if claim.is_some() {
+            debug!(
+                %store_path,
+                "{}: released-in-place placeholder — claimed immediately", hooks.ctx_label,
+            );
+        }
+    }
 
     if claim.is_none() {
-        // r[impl store.substitute.stale-reclaim]
         // The stale-reclaim is a path-row janitor (reap_one): it
         // deletes the abandoned placeholder rows so this re-upload can
         // proceed; chunks the dead manifest referenced are the collect
@@ -121,18 +179,48 @@ pub async fn claim_placeholder(
                     threshold = ?SUBSTITUTE_STALE_THRESHOLD,
                     "{}: stale 'uploading' placeholder — reclaimed", hooks.ctx_label,
                 );
-                metrics::counter!(hooks.stale_reclaimed_metric).increment(1);
+                metrics::counter!(hooks.stale_reclaimed_metric, "reason" => "heartbeat")
+                    .increment(1);
                 // Propagate (?) — after reap_one Ok(true) the
                 // placeholder is gone; collapsing Err into the
                 // Concurrent path here would silently swallow a DB
-                // failure with no log (asymmetric with line 101).
-                claim =
-                    metadata::insert_manifest_uploading(pool, store_path_hash, store_path, refs)
-                        .await?;
+                // failure with no log (asymmetric with the first
+                // insert above).
+                claim = metadata::insert_manifest_uploading_as(
+                    pool,
+                    store_path_hash,
+                    store_path,
+                    refs,
+                    claimed_by,
+                )
+                .await?;
             }
             Ok(false) => {} // not stale → live concurrent uploader
             Err(e) => warn!(error = %e,
                 "{}: stale-reclaim failed (proceeding to concurrent-abort)", hooks.ctx_label),
+        }
+    }
+
+    if claim.is_none()
+        && let Some(params) = stall
+    {
+        claim = metadata::stall_takeover_placeholder(
+            pool,
+            store_path_hash,
+            claimed_by,
+            params.nar_size,
+            params.stall_window,
+        )
+        .await?;
+        if claim.is_some() {
+            warn!(
+                %store_path,
+                window = ?params.stall_window,
+                "{}: download-stalled placeholder — taken over in place (strike recorded)",
+                hooks.ctx_label,
+            );
+            metrics::counter!(hooks.stale_reclaimed_metric, "reason" => "stall_reclaim")
+                .increment(1);
         }
     }
 
@@ -403,7 +491,7 @@ mod tests {
 
     /// Claim a fresh placeholder, panicking on any non-Owned outcome.
     async fn claim_owned(pool: &PgPool, hash: &[u8], path: &str) -> Uuid {
-        match claim_placeholder(pool, hash, path, &[], TEST_HOOKS)
+        match claim_placeholder(pool, hash, path, &[], TEST_HOOKS, None)
             .await
             .expect("claim_placeholder")
         {
@@ -411,6 +499,43 @@ mod tests {
             PlaceholderClaim::AlreadyComplete => panic!("unexpected AlreadyComplete"),
             PlaceholderClaim::Concurrent => panic!("unexpected Concurrent"),
         }
+    }
+
+    /// The substitution-shaped claim: stall params present (nar_size
+    /// 1000, window 60 s, pod "claimant-pod").
+    async fn claim_substitute(pool: &PgPool, hash: &[u8], path: &str) -> PlaceholderClaim {
+        claim_placeholder(
+            pool,
+            hash,
+            path,
+            &[],
+            TEST_HOOKS,
+            Some(&SubstituteClaimParams {
+                nar_size: 1000,
+                stall_window: Duration::from_secs(60),
+                claimed_by: "claimant-pod",
+            }),
+        )
+        .await
+        .expect("claim_placeholder")
+    }
+
+    /// Backdate the stall-relevant clocks on a row, keeping liveness
+    /// (`updated_at`) fresh unless `dead_heartbeat`.
+    async fn age_row(pool: &PgPool, hash: &[u8], progress_age_secs: i64, dead_heartbeat: bool) {
+        let hb_age = if dead_heartbeat { 600 } else { 0 };
+        sqlx::query(
+            "UPDATE manifests SET \
+                 last_progress_at = now() - make_interval(secs => $2), \
+                 updated_at = now() - make_interval(secs => $3) \
+             WHERE store_path_hash = $1",
+        )
+        .bind(hash)
+        .bind(progress_age_secs)
+        .bind(hb_age)
+        .execute(pool)
+        .await
+        .expect("age_row");
     }
 
     fn test_hash(tag: u8) -> Vec<u8> {
@@ -571,6 +696,316 @@ mod tests {
             gauge_delta(&snap),
             Some(-1.0),
             "defused guard decrements too (success path)"
+        );
+    }
+
+    // ── The four-case stall battery (review-findings watch-item 1) ──
+
+    // r[verify store.substitute.stale-reclaim+2]
+    /// Case 1: a frozen mid-download claim (progress evidence present,
+    /// `fetched_bytes < nar_size`, progress clock older than the stall
+    /// window, heartbeat ALIVE) is taken over IN PLACE: new
+    /// claim_id/claimed_by, progress reset, `stall_count += 1` — the
+    /// download-stalled reclaim arm.
+    #[tokio::test]
+    async fn stall_reclaim_takes_over_frozen_mid_download() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash = test_hash(0xb1);
+        let owner = claim_owned(&db.pool, &hash, "/nix/store/ba-frozen").await;
+
+        // Owner reported progress (100 < 1000), then froze 120s ago
+        // (window 60s); heartbeat stays fresh (alive-but-wedged).
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100).await;
+        age_row(&db.pool, &hash, 120, false).await;
+
+        let claim = claim_substitute(&db.pool, &hash, "/nix/store/ba-frozen").await;
+        let new_claim = match claim {
+            PlaceholderClaim::Owned(c) => c,
+            other => panic!(
+                "a frozen mid-download claim must be stall-reclaimed, got {}",
+                match other {
+                    PlaceholderClaim::AlreadyComplete => "AlreadyComplete",
+                    PlaceholderClaim::Concurrent => "Concurrent",
+                    PlaceholderClaim::Owned(_) => unreachable!(),
+                }
+            ),
+        };
+        assert_ne!(new_claim, owner, "in-place handoff mints a NEW claim");
+
+        let (status, claim_id, fetched, lp, stalls, claimed_by, _) =
+            row_state(&db.pool, &hash).await.expect("row survives");
+        assert_eq!(status, "uploading", "in-place: the row was NOT deleted");
+        assert_eq!(claim_id, Some(new_claim));
+        assert_eq!(fetched, None, "progress evidence reset for the new owner");
+        assert_eq!(lp, None);
+        assert_eq!(stalls, 1, "the stall event accrued exactly one strike");
+        assert_eq!(claimed_by.as_deref(), Some("claimant-pod"));
+    }
+
+    // r[verify store.substitute.stale-reclaim+2]
+    /// Case 2: an ADVANCING download (progress clock fresh) is never
+    /// stall-reclaimed — slow ≠ stuck.
+    #[tokio::test]
+    async fn stall_reclaim_skips_advancing_download() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash = test_hash(0xb2);
+        let owner = claim_owned(&db.pool, &hash, "/nix/store/bb-advancing").await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100).await;
+        // Progress clock fresh (just heartbeated); no aging.
+
+        let claim = claim_substitute(&db.pool, &hash, "/nix/store/bb-advancing").await;
+        assert!(
+            matches!(claim, PlaceholderClaim::Concurrent),
+            "an advancing owner must keep its claim"
+        );
+        let (_, claim_id, _, _, stalls, _, _) = row_state(&db.pool, &hash).await.expect("row");
+        assert_eq!(claim_id, Some(owner), "ownership unchanged");
+        assert_eq!(stalls, 0, "no strike for a healthy transfer");
+    }
+
+    // r[verify store.substitute.stale-reclaim+2]
+    /// Case 3: a PutPath claim (`fetched_bytes` NULL — no progress
+    /// handle) is structurally exempt from the stall arm no matter how
+    /// old its progress-free state is, as long as it heartbeats.
+    #[tokio::test]
+    async fn stall_reclaim_skips_putpath_claim() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash = test_hash(0xb3);
+        let owner = claim_owned(&db.pool, &hash, "/nix/store/bc-putpath").await;
+        // Liveness fresh; fetched_bytes NULL (never heartbeated with
+        // progress). last_progress_at NULL → predicate can't match.
+
+        let claim = claim_substitute(&db.pool, &hash, "/nix/store/bc-putpath").await;
+        assert!(
+            matches!(claim, PlaceholderClaim::Concurrent),
+            "a PutPath claim must never be stall-reclaimed"
+        );
+        let (_, claim_id, fetched, _, stalls, _, _) =
+            row_state(&db.pool, &hash).await.expect("row");
+        assert_eq!(claim_id, Some(owner));
+        assert_eq!(fetched, None);
+        assert_eq!(stalls, 0);
+    }
+
+    // r[verify store.substitute.stale-reclaim+2]
+    /// Case 4: a download-complete (persist-phase) claim
+    /// (`fetched_bytes == nar_size`) is NEVER stall-reclaimable — only
+    /// the 5-minute heartbeat-death rule applies there. Stealing
+    /// mid-persist would discard a finished multi-GiB download.
+    #[tokio::test]
+    async fn stall_reclaim_skips_persist_phase() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash = test_hash(0xb4);
+        let owner = claim_owned(&db.pool, &hash, "/nix/store/bd-persist").await;
+        // Download complete: fetched == nar_size (1000); progress clock
+        // long stale (the persist phase legitimately writes no
+        // progress); heartbeat alive (chunk-upload loop keeps it fresh).
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 1000).await;
+        age_row(&db.pool, &hash, 600, false).await;
+
+        let claim = claim_substitute(&db.pool, &hash, "/nix/store/bd-persist").await;
+        assert!(
+            matches!(claim, PlaceholderClaim::Concurrent),
+            "a persist-phase claim must never be stall-stolen"
+        );
+        let (_, claim_id, fetched, _, stalls, _, _) =
+            row_state(&db.pool, &hash).await.expect("row");
+        assert_eq!(claim_id, Some(owner));
+        assert_eq!(fetched, Some(1000));
+        assert_eq!(stalls, 0);
+    }
+
+    // ── Release-in-place / strike-once / reset ──
+
+    // r[verify store.substitute.stale-reclaim+2]
+    // r[verify store.substitute.stall-abort]
+    /// A released-in-place row (the owner-side stall abort's leavings:
+    /// `claim_id` NULL, `stall_count` recorded) is claimable
+    /// IMMEDIATELY by any caller — no staleness threshold — with the
+    /// stall evidence preserved.
+    #[tokio::test]
+    async fn released_row_immediately_claimable_stall_count_preserved() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash = test_hash(0xb5);
+        let owner = claim_owned(&db.pool, &hash, "/nix/store/be-released").await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100).await;
+
+        // The owner-side abort releases in place.
+        let released = metadata::release_placeholder_in_place(&db.pool, &hash, owner)
+            .await
+            .expect("release");
+        assert!(released, "the owning claim releases its own row");
+        let (status, claim_id, fetched, lp, stalls, claimed_by, _) = row_state(&db.pool, &hash)
+            .await
+            .expect("row survives release");
+        assert_eq!(status, "uploading");
+        assert_eq!(claim_id, None, "claim relinquished");
+        assert_eq!(fetched, None, "progress NULLed");
+        assert_eq!(lp, None);
+        assert_eq!(stalls, 1, "the abort recorded its strike");
+        assert_eq!(claimed_by, None);
+
+        // IMMEDIATELY claimable — fresh row (updated_at = now()), no
+        // threshold — even by a PutPath-shaped caller (params: None).
+        let claim = claim_owned(&db.pool, &hash, "/nix/store/be-released").await;
+        let (_, claim_id, _, _, stalls, _, _) = row_state(&db.pool, &hash).await.expect("row");
+        assert_eq!(claim_id, Some(claim), "released row claimed in place");
+        assert_eq!(stalls, 1, "stall evidence survives the handoff");
+    }
+
+    // r[verify store.substitute.stale-reclaim+2]
+    // r[verify store.substitute.stall-abort]
+    /// Claim-guarded strike-once, both interleavings:
+    /// (a) a competing stall-reclaim lands first → the owner's late
+    ///     release matches zero rows (claim changed) → stall_count
+    ///     stays 1;
+    /// (b) the owner's release lands first → a competing stall-
+    ///     takeover matches zero rows (`fetched_bytes` NULL) and the
+    ///     competitor claims via the released arm instead → stall_count
+    ///     stays 1.
+    #[tokio::test]
+    async fn abort_vs_reclaim_race_strikes_exactly_once() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // (a) reclaim first, release late.
+        let hash = test_hash(0xb6);
+        let owner = claim_owned(&db.pool, &hash, "/nix/store/bf-race-a").await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100).await;
+        age_row(&db.pool, &hash, 120, false).await;
+        let taken = metadata::stall_takeover_placeholder(
+            &db.pool,
+            &hash,
+            Some("competitor"),
+            1000,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("takeover");
+        assert!(taken.is_some(), "the competing reclaim wins the row");
+        let released = metadata::release_placeholder_in_place(&db.pool, &hash, owner)
+            .await
+            .expect("late release");
+        assert!(
+            !released,
+            "the deposed owner's release is claim-guarded out"
+        );
+        let (_, _, _, _, stalls, _, _) = row_state(&db.pool, &hash).await.expect("row");
+        assert_eq!(stalls, 1, "one stall event, one strike (reclaim-first)");
+
+        // (b) release first, takeover late.
+        let hash = test_hash(0xb7);
+        let owner = claim_owned(&db.pool, &hash, "/nix/store/bg-race-b").await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100).await;
+        age_row(&db.pool, &hash, 120, false).await;
+        let released = metadata::release_placeholder_in_place(&db.pool, &hash, owner)
+            .await
+            .expect("release");
+        assert!(released);
+        let taken = metadata::stall_takeover_placeholder(
+            &db.pool,
+            &hash,
+            Some("competitor"),
+            1000,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("late takeover");
+        assert!(
+            taken.is_none(),
+            "the takeover arm must not match a released row (fetched_bytes NULL)"
+        );
+        // The competitor's full claim path picks it up via the
+        // released arm instead — without another strike.
+        let claim = claim_substitute(&db.pool, &hash, "/nix/store/bg-race-b").await;
+        assert!(matches!(claim, PlaceholderClaim::Owned(_)));
+        let (_, _, _, _, stalls, _, _) = row_state(&db.pool, &hash).await.expect("row");
+        assert_eq!(stalls, 1, "one stall event, one strike (release-first)");
+    }
+
+    // r[verify store.substitute.stale-reclaim+2]
+    /// Heartbeat-death keeps DELETING (the unchanged 5-minute rule),
+    /// which RESETS stall evidence: benign churn (deploys, scale-in,
+    /// crashes) never accrues strikes. The dead-owner arm wins over
+    /// the stall arm when both hold.
+    #[tokio::test]
+    async fn heartbeat_death_reap_resets_stall_count() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash = test_hash(0xb8);
+        let owner = claim_owned(&db.pool, &hash, "/nix/store/bh-dead").await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100).await;
+        // Two prior strikes on the row...
+        sqlx::query("UPDATE manifests SET stall_count = 2 WHERE store_path_hash = $1")
+            .bind(hash.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        // ...then the owner dies outright: progress AND heartbeat stale
+        // (a dead owner stops both clocks). The frozen-download
+        // predicate would also match — the DELETE arm must win.
+        age_row(&db.pool, &hash, 600, true).await;
+
+        let claim = claim_substitute(&db.pool, &hash, "/nix/store/bh-dead").await;
+        assert!(matches!(claim, PlaceholderClaim::Owned(_)));
+        let (_, _, fetched, _, stalls, _, _) = row_state(&db.pool, &hash).await.expect("row");
+        assert_eq!(
+            stalls, 0,
+            "heartbeat death deletes the row — strikes reset, never inherited"
+        );
+        assert_eq!(fetched, None);
+    }
+
+    // r[verify store.substitute.stale-reclaim+2]
+    /// The reclaim counter is reason-labeled: `heartbeat` for the
+    /// death-DELETE arm, `stall_reclaim` for the in-place takeover.
+    /// (`stall_abort` is emitted at the owner-side abort site in
+    /// substitute.rs.) Single destructive snapshot at the end.
+    #[tokio::test]
+    async fn reclaim_counter_carries_reasons() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let rec = DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // heartbeat-death reclaim.
+        let hash = test_hash(0xb9);
+        claim_owned(&db.pool, &hash, "/nix/store/bi-hb-dead").await;
+        age_row(&db.pool, &hash, 600, true).await;
+        claim_owned(&db.pool, &hash, "/nix/store/bi-hb-dead").await;
+
+        // stall reclaim.
+        let hash2 = test_hash(0xba);
+        let owner = claim_owned(&db.pool, &hash2, "/nix/store/bj-stalled").await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash2, owner, 100).await;
+        age_row(&db.pool, &hash2, 120, false).await;
+        assert!(matches!(
+            claim_substitute(&db.pool, &hash2, "/nix/store/bj-stalled").await,
+            PlaceholderClaim::Owned(_)
+        ));
+
+        let mut by_reason: std::collections::BTreeMap<String, u64> = Default::default();
+        for (ck, _, _, v) in snap.snapshot().into_vec() {
+            let DebugValue::Counter(c) = v else { continue };
+            if ck.key().name() == "rio_store_substitute_stale_reclaimed_total" {
+                let reason = ck
+                    .key()
+                    .labels()
+                    .find(|l| l.key() == "reason")
+                    .map(|l| l.value().to_owned())
+                    .unwrap_or_else(|| "<unlabeled>".into());
+                *by_reason.entry(reason).or_default() += c;
+            }
+        }
+        assert_eq!(
+            by_reason.get("heartbeat").copied(),
+            Some(1),
+            "death-DELETE arm counts reason=heartbeat; got {by_reason:?}"
+        );
+        assert_eq!(
+            by_reason.get("stall_reclaim").copied(),
+            Some(1),
+            "in-place takeover counts reason=stall_reclaim; got {by_reason:?}"
         );
     }
 }

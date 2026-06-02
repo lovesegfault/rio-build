@@ -1374,6 +1374,13 @@
     },
     {
       "enum": "SubstituteError",
+      "name": "Stalled",
+      "crate": "rio-store",
+      "msg": "download stalled: no body bytes for {window:?}; claim released in place",
+      "doc": "Owner-side download-stall abort (`r[store.substitute.stall-abort]`): no NAR body bytes arrived for the configured stall window, so this owner aborted its own download and released the placeholder claim **in place** (claim cleared, progress NULLed, durable `stall_count` incremented). Returned as `Err` so moka does NOT cache it — every coalesced singleflight waiter sees the stall (the singleflight-leader blind spot: no competing `claim_placeholder` would ever observe it) and the next attempt re-claims the released row immediately. The materialization executor classifies this as infrastructure trouble (retryable), never a miss."
+    },
+    {
+      "enum": "SubstituteError",
       "name": "TooLarge",
       "crate": "rio-store",
       "msg": "upstream {what} exceeds {limit}-byte cap",

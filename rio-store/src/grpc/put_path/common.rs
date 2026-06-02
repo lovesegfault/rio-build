@@ -566,9 +566,19 @@ impl StoreServiceImpl {
         refs: &[String],
         _ctx_label: &str,
     ) -> Result<PlaceholderClaim, metadata::MetadataError> {
-        let claim =
-            ingest::claim_placeholder(&self.pool, store_path_hash, store_path, refs, PUTPATH_HOOKS)
-                .await?;
+        // `stall: None` — PutPath claims carry no narinfo-declared size
+        // and write no progress evidence; the download-stall takeover
+        // arm is structurally unreachable for them
+        // (`r[store.substitute.stale-reclaim+2]`).
+        let claim = ingest::claim_placeholder(
+            &self.pool,
+            store_path_hash,
+            store_path,
+            refs,
+            PUTPATH_HOOKS,
+            None,
+        )
+        .await?;
         match &claim {
             PlaceholderClaim::AlreadyComplete => {
                 metrics::counter!("rio_store_put_path_total", "result" => "exists").increment(1);

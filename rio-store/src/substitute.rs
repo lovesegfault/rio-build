@@ -49,6 +49,16 @@ const SUBSTITUTE_HOOKS: IngestHooks = IngestHooks {
     ctx_label: "substitute",
 };
 
+/// Default owner-side download-stall window
+/// (`r[store.substitute.stall-abort]`): a substitution download with no
+/// body bytes for this long is aborted by its own owner, the claim
+/// released in place. 180 s = 6 missed-progress heartbeats — S3
+/// multipart pauses and admission queueing inside a download don't
+/// trip it; the persist phase is exempt entirely (the stall rules are
+/// scoped `fetched_bytes < nar_size`). Config: `substitute_stall_secs`
+/// / env `RIO_SUBSTITUTE_STALL_SECS`.
+pub const DEFAULT_SUBSTITUTE_STALL_WINDOW: Duration = Duration::from_secs(180);
+
 /// How old an `'uploading'` placeholder must be before the
 /// substitution ingest path reclaims it instead of returning a miss.
 ///
@@ -101,7 +111,9 @@ const SUBSTITUTE_PROBE_CACHE_CAP: u64 = 100_000;
 /// body timeout a slow-loris upstream holds 128 probe slots indefinitely
 /// and stalls `FindMissingPaths`. The NAR GET is intentionally NOT
 /// timeboxed (a multi-GB body legitimately runs long; the
-/// [`MAX_NAR_SIZE`] decompressed cap and 5-min stale-reclaim bound it).
+/// [`MAX_NAR_SIZE`] decompressed cap bounds its size and the per-read
+/// stall watchdog (`r[store.substitute.stall-abort]`) bounds its
+/// idleness).
 #[cfg(not(test))]
 const SUBSTITUTE_SMALL_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -204,6 +216,20 @@ pub enum SubstituteError {
     /// fetch, so callers re-probe later).
     #[error("transient: concurrent uploader holds placeholder")]
     Raced,
+
+    /// Owner-side download-stall abort
+    /// (`r[store.substitute.stall-abort]`): no NAR body bytes arrived
+    /// for the configured stall window, so this owner aborted its own
+    /// download and released the placeholder claim **in place** (claim
+    /// cleared, progress NULLed, durable `stall_count` incremented).
+    /// Returned as `Err` so moka does NOT cache it — every coalesced
+    /// singleflight waiter sees the stall (the singleflight-leader
+    /// blind spot: no competing `claim_placeholder` would ever observe
+    /// it) and the next attempt re-claims the released row
+    /// immediately. The materialization executor classifies this as
+    /// infrastructure trouble (retryable), never a miss.
+    #[error("download stalled: no body bytes for {window:?}; claim released in place")]
+    Stalled { window: Duration },
 
     /// Transient upstream-429 (`r[store.substitute.probe-429-retry+3]`).
     /// `retry_after` is the parsed `Retry-After` header (delta-seconds
@@ -354,6 +380,16 @@ pub struct Substituter {
     /// reacts to. Acquired inside the moka init future — coalesced
     /// waiters on the same `(tenant, path)` do NOT consume permits.
     admission: Option<AdmissionGate>,
+    /// Owner-side download-stall window
+    /// ([`DEFAULT_SUBSTITUTE_STALL_WINDOW`]): both the `fetch_nar`
+    /// abort budget and the takeover threshold competing claimants
+    /// apply via [`ingest::SubstituteClaimParams`]. main.rs wires
+    /// `Config::substitute_stall` here.
+    stall_window: Duration,
+    /// Owner attribution stamped on substitution-claimed placeholders
+    /// (`manifests.claimed_by`): the pod name (`HOSTNAME`), or
+    /// `"unknown"` outside k8s.
+    claimed_by: String,
 }
 
 /// Default NAR-buffer budget when no shared semaphore is wired:
@@ -370,11 +406,12 @@ impl Substituter {
         // instead of panicking. Tests that exercise HTTP inject a
         // working client via `.with_http_client()`.
         //
-        // connect_timeout only — NO body-read timeout. ghc-binary
-        // (2.5GB compressed) legitimately exceeds any sane fixed
-        // timeout. A hung mid-body upstream is bounded by the moka
-        // singleflight TTL + ingest's 5-min stale-placeholder reclaim,
-        // not by aborting the download here.
+        // connect_timeout only — NO request-level body timeout.
+        // ghc-binary (2.5GB compressed) legitimately exceeds any sane
+        // fixed timeout. A hung mid-body upstream is bounded by the
+        // owner-side per-read stall watchdog in fetch_nar
+        // (`r[store.substitute.stall-abort]`, stall_window): time
+        // BETWEEN bytes is bounded, total transfer time is not.
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
@@ -407,7 +444,18 @@ impl Substituter {
                 .build(),
             nar_bytes_budget: Arc::new(Semaphore::new(DEFAULT_SUBSTITUTE_NAR_BUDGET)),
             admission: None,
+            stall_window: DEFAULT_SUBSTITUTE_STALL_WINDOW,
+            claimed_by: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
         }
+    }
+
+    /// Override the owner-side download-stall window
+    /// (`RIO_SUBSTITUTE_STALL_SECS`). Builder-style. main.rs threads
+    /// `Config::substitute_stall` here; tests shrink it so the abort
+    /// path is exercisable in seconds.
+    pub fn with_stall_window(mut self, window: Duration) -> Self {
+        self.stall_window = window;
+        self
     }
 
     /// Enable `sig_mode = add|replace` signing. Builder-style.
@@ -598,16 +646,19 @@ impl Substituter {
             })
             .await
             .map_err(|e: Arc<SubstituteError>| {
-                // `Raced`/`RateLimited`/`Admission` are not-an-error
-                // transients (concurrent uploader / upstream 429 /
-                // local backpressure); skip the error metric so they
-                // don't show up as upstream failure. Admission has its
-                // own dedicated counter.
+                // `Raced`/`RateLimited`/`Admission`/`Stalled` are
+                // not-an-error transients (concurrent uploader /
+                // upstream 429 / local backpressure / owner-side stall
+                // abort); skip the error metric so they don't show up
+                // as upstream failure. Admission and Stalled each have
+                // their own dedicated counter
+                // (stale_reclaimed_total{reason="stall_abort"}).
                 if !matches!(
                     *e,
                     SubstituteError::Raced
                         | SubstituteError::RateLimited { .. }
                         | SubstituteError::Admission(_)
+                        | SubstituteError::Stalled { .. }
                 ) {
                     metrics::counter!(
                         "rio_store_substitute_total",
@@ -698,6 +749,19 @@ impl Substituter {
                     // reaches `AlreadyComplete` once the upload lands.
                     debug!(upstream = %upstream.url, "concurrent uploader, stopping");
                     return Err(SubstituteError::Raced);
+                }
+                Err(e @ SubstituteError::Stalled { .. }) => {
+                    // r[impl store.substitute.stall-abort]
+                    // Owner-side stall abort: STOP the upstream loop —
+                    // the claim was released in place with the strike
+                    // recorded, and the stall must surface to every
+                    // coalesced waiter as the attempt's outcome (moka
+                    // does not cache the Err). Trying the next upstream
+                    // here would silently swallow the stall evidence
+                    // the re-attempt machinery keys on; the next
+                    // attempt re-claims the released row immediately.
+                    warn!(upstream = %upstream.url, "download stalled, stopping");
+                    return Err(e);
                 }
                 Err(SubstituteError::RateLimited { retry_after }) => {
                     // Upstream 429'd the narinfo or NAR GET. CONTINUE
@@ -866,12 +930,23 @@ impl Substituter {
         info.store_path_hash = store_path_hash.to_vec();
         let refs_str: Vec<String> = info.references.iter().map(ToString::to_string).collect();
 
+        // r[impl store.substitute.stale-reclaim+2]
+        // Substitution claims carry the stall params: the verified
+        // narinfo's NarSize scopes the takeover predicate to
+        // mid-download claims (persist phase exempt), and the window
+        // is the same one the owner-side abort applies.
+        let stall_params = ingest::SubstituteClaimParams {
+            nar_size: ni.nar_size,
+            stall_window: self.stall_window,
+            claimed_by: &self.claimed_by,
+        };
         let claim = match ingest::claim_placeholder(
             &self.pool,
             &store_path_hash,
             info.store_path.as_str(),
             &refs_str,
             SUBSTITUTE_HOOKS,
+            Some(&stall_params),
         )
         .await?
         {
@@ -910,6 +985,16 @@ impl Substituter {
                 return Ok(UpstreamOutcome::Raced);
             }
         };
+
+        // Owner attribution at claim time: the one log line that ties
+        // (path, claim, size, pod) together for stall/takeover triage.
+        info!(
+            %store_path,
+            claim_id = %claim,
+            nar_size = ni.nar_size,
+            pod = %self.claimed_by,
+            "substitute: claimed placeholder"
+        );
 
         // r[impl store.put.drop-cleanup+2]
         // We OWN the placeholder. Guard against future-drop (client
@@ -1010,6 +1095,47 @@ impl Substituter {
                 placeholder_guard.defuse();
                 Ok(UpstreamOutcome::Hit(Box::new(info)))
             }
+            // r[impl store.substitute.stall-abort]
+            // Owner-side stall abort: release the claim IN PLACE —
+            // claim cleared, progress NULLed, durable stall_count
+            // incremented — instead of deleting the row, so the next
+            // attempt re-claims immediately and the stall evidence
+            // survives. Claim-guarded: a competing stall-reclaim that
+            // already took the row over wins, and this release matches
+            // zero rows — one stall event, exactly one strike.
+            Err(e @ SubstituteError::Stalled { .. }) => {
+                placeholder_guard.defuse();
+                match metadata::release_placeholder_in_place(&self.pool, &store_path_hash, claim)
+                    .await
+                {
+                    Ok(released) => {
+                        warn!(
+                            %store_path,
+                            claim_id = %claim,
+                            released,
+                            window = ?self.stall_window,
+                            "substitute: download stalled — claim released in place"
+                        );
+                        if released {
+                            metrics::counter!(
+                                SUBSTITUTE_HOOKS.stale_reclaimed_metric,
+                                "reason" => "stall_abort"
+                            )
+                            .increment(1);
+                        }
+                    }
+                    Err(release_err) => {
+                        // The release failed (DB error): fall back to
+                        // the claim-gated delete so the row cannot wedge
+                        // the path until heartbeat death. Strike lost —
+                        // availability over evidence.
+                        warn!(%store_path, error = %release_err,
+                            "substitute: stall release failed; falling back to abort");
+                        ingest::abort_placeholder(&self.pool, &store_path_hash, claim).await;
+                    }
+                }
+                Err(e)
+            }
             Err(e) => {
                 // Defuse the drop-guard and abort synchronously so the
                 // next upstream in `do_substitute`'s loop sees a clean
@@ -1041,10 +1167,20 @@ impl Substituter {
         progress: Option<&SubstProgressFn>,
         progress_bytes: Option<&std::sync::atomic::AtomicU64>,
     ) -> Result<(Bytes, Vec<OwnedSemaphorePermit>), SubstituteError> {
-        let resp = http
-            .get(nar_url)
-            .send()
+        // r[impl store.substitute.stall-abort]
+        // Owner-side stall watchdog: the NAR GET deliberately has no
+        // request-level timeout (a multi-GB body legitimately runs
+        // long), so the only abort clock is THIS one — no response
+        // headers, or no body bytes from one read to the next, for
+        // `stall_window`. The budget acquire below is deliberately
+        // OUTSIDE the watchdog: blocking on the local NAR-bytes
+        // semaphore is backpressure, not an upstream stall, and must
+        // never accrue a strike.
+        let stall = self.stall_window;
+        let stalled = || SubstituteError::Stalled { window: stall };
+        let resp = tokio::time::timeout(stall, http.get(nar_url).send())
             .await
+            .map_err(|_| stalled())?
             .map_err(|e| SubstituteError::Fetch(format!("{nar_url}: {e}")))?;
         // r[impl store.substitute.probe-429-retry+3]
         // 429 on the NAR body GET maps to `RateLimited` (same as the
@@ -1110,9 +1246,13 @@ impl Substituter {
         let mut buf = vec![0u8; 64 * 1024];
         let mut last_progress = 0u64;
         loop {
-            let n = capped
-                .read(&mut buf)
+            // r[impl store.substitute.stall-abort]
+            // Per-read stall clock: each successful read restarts it,
+            // so a slow-but-advancing stream never trips — only a
+            // wedged one (no bytes for the whole window) does.
+            let n = tokio::time::timeout(stall, capped.read(&mut buf))
                 .await
+                .map_err(|_| stalled())?
                 .map_err(|e| SubstituteError::Fetch(format!("{nar_url} body: {e}")))?;
             if n == 0 {
                 break;
@@ -1879,6 +2019,172 @@ mod tests {
         let path = rio_test_support::fixtures::test_store_path("substituted");
         let (nar, _hash) = rio_test_support::fixtures::make_nar(b"hi");
         (path, nar)
+    }
+
+    /// [`spawn_fake_upstream`] variant whose NAR endpoint HANGS (sends
+    /// headers, then no body bytes, forever) for the first
+    /// `hang_requests` requests and serves normally afterwards — the
+    /// wedged-owner fixture for the stall-abort battery.
+    async fn spawn_fake_upstream_hang_then_serve(
+        store_path: &str,
+        nar_bytes: Vec<u8>,
+        key_name: &str,
+        hang_requests: u32,
+    ) -> FakeUpstream {
+        use axum::{Router, routing::get};
+        use base64::Engine;
+
+        let seed = [0x42u8; 32];
+        let signer = Signer::from_seed(key_name, &seed);
+        let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+        let trusted_key = format!(
+            "{key_name}:{}",
+            base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes())
+        );
+
+        let nar_hash: [u8; 32] = sha2::Sha256::digest(&nar_bytes).into();
+        let nar_hash_str = format!(
+            "sha256:{}",
+            rio_nix::store_path::nixbase32::encode(&nar_hash)
+        );
+        let fp = fingerprint(store_path, &nar_hash, nar_bytes.len() as u64, &[]);
+        let sig = signer.sign(&fp);
+        let sp = StorePath::parse(store_path).unwrap();
+        let hash_part = sp.hash_part();
+        let narinfo = format!(
+            "StorePath: {store_path}\n\
+             URL: nar/{hash_part}.nar\n\
+             Compression: none\n\
+             NarHash: {nar_hash_str}\n\
+             NarSize: {}\n\
+             References: \n\
+             Sig: {sig}\n",
+            nar_bytes.len()
+        );
+
+        let narinfo_path = format!("/{hash_part}.narinfo");
+        let nar_path = format!("/nar/{hash_part}.nar");
+        let requests = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let nar_c = nar_bytes.clone();
+        let app = Router::new()
+            .route(
+                "/nix-cache-info",
+                get(|| async { "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n" }),
+            )
+            .route(&narinfo_path, get(move || async move { narinfo }))
+            .route(
+                &nar_path,
+                get(move || async move {
+                    let n = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n < hang_requests {
+                        // Wedge: never produce body bytes.
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                    }
+                    nar_c
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        FakeUpstream {
+            url: format!("http://{addr}"),
+            trusted_key,
+            _task: task,
+        }
+    }
+
+    // r[verify store.substitute.stall-abort]
+    /// Owner-side stall abort end-to-end: a wedged upstream (headers,
+    /// then no body bytes) makes the OWNER abort its own download
+    /// after the stall window — effective even with every caller
+    /// coalesced behind this owner's singleflight, where no competing
+    /// `claim_placeholder` would ever observe the stall. The claim is
+    /// released IN PLACE (row survives, claim cleared, stall_count=1)
+    /// and the next attempt re-claims immediately and completes.
+    #[tokio::test]
+    async fn stall_abort_releases_in_place_then_next_attempt_recovers() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let rec = DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _mguard = metrics::set_default_local_recorder(&rec);
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-stall-abort").await;
+        let (path, nar) = make_path();
+        // Hangs the FIRST NAR request only; the retry serves.
+        let fake =
+            spawn_fake_upstream_hang_then_serve(&path, nar.clone(), "cache.stall-1", 1).await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let sub = test_substituter(db.pool.clone()).with_stall_window(Duration::from_secs(1));
+
+        // Attempt 1: must ABORT (not hang) within the test budget —
+        // the owner-side watchdog is the only thing that can end this
+        // download (the request-level timeouts deliberately exclude
+        // the NAR body).
+        let got = tokio::time::timeout(Duration::from_secs(30), sub.try_substitute(tid, &path))
+            .await
+            .expect("the owner-side stall abort must fire (download never ends on its own)");
+        assert!(
+            matches!(got, Err(SubstituteError::Stalled { .. })),
+            "a wedged download must surface Err(Stalled), got {got:?}"
+        );
+
+        // The claim was released IN PLACE: row survives with the strike.
+        let sp = StorePath::parse(&path).unwrap();
+        let hash = sp.sha256_digest();
+        let (status, claim_id, fetched, stalls): (String, Option<Uuid>, Option<i64>, i16) =
+            sqlx::query_as(
+                "SELECT status, claim_id, fetched_bytes, stall_count \
+                   FROM manifests WHERE store_path_hash = $1",
+            )
+            .bind(hash.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .expect("placeholder row survives the abort");
+        assert_eq!(status, "uploading");
+        assert_eq!(claim_id, None, "claim released (cleared), not deleted");
+        assert_eq!(fetched, None, "progress NULLed on release");
+        assert_eq!(stalls, 1, "the stall recorded its strike");
+
+        // Attempt 2: re-claims the released row IMMEDIATELY (no
+        // staleness threshold) and completes against the now-healthy
+        // upstream. The moka singleflight did NOT cache the Err.
+        let got2 = sub
+            .try_substitute(tid, &path)
+            .await
+            .expect("second attempt must not error")
+            .expect("second attempt re-claims the released row and ingests");
+        assert_eq!(got2.nar_size, nar.len() as u64);
+
+        // The abort was counted with its own reason.
+        let mut stall_aborts = 0u64;
+        for (ck, _, _, v) in snap.snapshot().into_vec() {
+            let DebugValue::Counter(c) = v else { continue };
+            if ck.key().name() == "rio_store_substitute_stale_reclaimed_total"
+                && ck
+                    .key()
+                    .labels()
+                    .any(|l| l.key() == "reason" && l.value() == "stall_abort")
+            {
+                stall_aborts += c;
+            }
+        }
+        assert_eq!(stall_aborts, 1, "the abort increments reason=stall_abort");
     }
 
     // r[verify store.substitute.upstream]
@@ -3309,7 +3615,7 @@ mod tests {
         .unwrap();
     }
 
-    // r[verify store.substitute.stale-reclaim]
+    // r[verify store.substitute.stale-reclaim+2]
     /// A stale 'uploading' placeholder (crashed prior substitution)
     /// must NOT block a fresh try_substitute. Reclaim → re-insert →
     /// fetch completes.

@@ -463,9 +463,16 @@ async fn test_putpath_reclaims_stale_uploading() -> TestResult {
             .execute(&pool)
             .await
             .unwrap();
+            // claim_id minted like every real uploader's row (M_052:
+            // ownership unrepresentable-as-absent). A claim-less
+            // 'uploading' row means RELEASED-in-place since the stall
+            // machinery landed — immediately claimable by design — so
+            // a fixture modeling a live/crashed UPLOADER must carry a
+            // claim token.
             sqlx::query(
-                "INSERT INTO manifests (store_path_hash, status, updated_at) \
-                 VALUES ($1, 'uploading', now() - make_interval(secs => $2))",
+                "INSERT INTO manifests (store_path_hash, status, claim_id, updated_at) \
+                 VALUES ($1, 'uploading', gen_random_uuid(), \
+                         now() - make_interval(secs => $2))",
             )
             .bind(sph.as_slice())
             .bind(age_secs)

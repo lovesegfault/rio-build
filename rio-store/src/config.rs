@@ -149,6 +149,20 @@ pub struct Config {
     /// 128)`. Env: `RIO_SUBSTITUTE_ADMISSION_PERMITS`.
     #[serde(default)]
     pub substitute_admission_permits: Option<usize>,
+    /// Owner-side download-stall window for upstream substitution: a
+    /// NAR download with no body bytes for this long is aborted by its
+    /// own owner — the placeholder claim is released in place (claim
+    /// cleared, durable `stall_count` incremented) so the next attempt
+    /// re-claims immediately. Also the threshold competing replicas
+    /// apply when deciding whether a live mid-download claim is
+    /// download-stalled (frozen `last_progress_at`); persist-phase and
+    /// PutPath claims are never stall-reclaimed. Default 180 s = 6
+    /// missed-progress heartbeats — S3 multipart pauses and admission
+    /// queueing inside a download don't trip it. Env:
+    /// `RIO_SUBSTITUTE_STALL_SECS`.
+    #[serde(rename = "substitute_stall_secs", with = "rio_common::config::secs")]
+    #[schemars(with = "u64")]
+    pub substitute_stall: std::time::Duration,
     /// Per-replica budget for resident build-log ingest buffer bytes
     /// across all concurrent `LogService.AppendLog` streams. Each stream
     /// reserves `2 × log_cut_threshold_bytes` (its worst-case resident
@@ -254,6 +268,7 @@ impl Default for Config {
             stream_drain: std::time::Duration::from_secs(90),
             pg_max_connections: DEFAULT_PG_MAX_CONNECTIONS,
             substitute_admission_permits: None,
+            substitute_stall: crate::substitute::DEFAULT_SUBSTITUTE_STALL_WINDOW,
             log_bytes_budget: 1024 * 1024 * 1024,
             log_max_streams: 256,
             log_ingest_byte_cap: crate::logs::ingest::DEFAULT_PER_EXEC_BYTE_CAP,
