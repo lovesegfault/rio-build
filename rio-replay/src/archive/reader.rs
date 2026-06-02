@@ -722,14 +722,20 @@ fn ensure_relay_substituter_schemes(substituters: &Substituters) -> Result<()> {
     Ok(())
 }
 
-/// What to do with a narinfo sidecar that fails to parse, the one place the
-/// v0 and v1 open paths deliberately differ.
+/// What to do with a defective narinfo sidecar — one that fails to parse,
+/// or whose filename names a different store hash than its content
+/// describes — the one place the v0 and v1 open paths deliberately differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SidecarPolicy {
-    /// v1: a hard open error naming the offending file. Skipping could never
-    /// help a v1 archive anyway — a skipped sidecar would be missing from
-    /// the recomputed narinfo listing digest, so open would still fail, just
-    /// with a far less actionable message.
+    /// v1: a hard open error naming the offending file. Skipping an
+    /// unparseable sidecar could never help a v1 archive anyway — a skipped
+    /// sidecar would be missing from the recomputed narinfo listing digest,
+    /// so open would still fail, just with a far less actionable message.
+    /// A filename↔content identity mismatch, by contrast, is invisible to
+    /// that digest (it hashes content store paths and bytes, independent of
+    /// filenames), so the open-time identity check is the only thing
+    /// standing between a mis-assembled archive and a wrong-sidecar
+    /// verification failure at NAR-serialization time, mid-campaign.
     Strict,
     /// v0: warn and skip. v0 archives are digest-less, irreplaceable
     /// recordings of past production windows; one bad sidecar only makes
@@ -746,7 +752,9 @@ type SidecarDigestListing = Vec<(String, String)>;
 /// sidecar, plus the `(store path, sidecar sha256)` listing the v1 integrity
 /// check recomputes its narinfo digest from. Sidecars without a `URL:` line
 /// get one synthesized (see [`super::parse_narinfo_sidecar`]); sidecars that
-/// still fail to parse are handled per `policy`.
+/// fail to parse, or whose filename disagrees with their content's
+/// `StorePath:` about which store hash they describe, are handled per
+/// `policy`.
 fn index_narinfos(
     backend: &Backend,
     policy: SidecarPolicy,
@@ -777,10 +785,43 @@ fn index_narinfos(
                 continue;
             }
         };
+        // The sidecar carries its identity twice: the filename stem (the
+        // locator — it keys the lookup map below, and through it the v1
+        // sidecar-completeness loop) and the content's `StorePath:` (what
+        // the writer's finalize check keys on, and what every consumer of
+        // the parsed sidecar trusts). Conformant producers write them in
+        // agreement (`ArchiveWriter::embed_store_path` checks the text
+        // against the embedded path), and the listing digest cannot catch a
+        // disagreement — it hashes content identities and bytes, never
+        // filenames, so e.g. swapping two sidecar files recomputes the
+        // identical digest. Cross-check the two here so a mis-assembled or
+        // edited archive is refused (or the sidecar dropped, per policy) at
+        // open time, instead of supplying paths described by the wrong
+        // sidecar and failing NAR verification mid-campaign.
+        let stem_hash = super::hash_part(stem);
+        let content_hash = super::hash_part(&narinfo.store_path);
+        if stem_hash != content_hash {
+            let mismatch = anyhow!(
+                "narinfo sidecar {rel} is named for store hash {stem_hash} but its StorePath \
+                 describes {} — sidecar lookups key on the filename, so this sidecar would be \
+                 served for the wrong store path",
+                narinfo.store_path
+            );
+            match policy {
+                SidecarPolicy::Strict => return Err(mismatch),
+                SidecarPolicy::WarnAndSkip => {
+                    tracing::warn!("skipping mismatched narinfo sidecar: {mismatch:#}");
+                    continue;
+                }
+            }
+        }
         narinfo_digests.push((narinfo.store_path.clone(), identity::sha256_hex(&bytes)));
         // Key by the hash part so `<hash>-<name>.narinfo` sidecar naming
-        // resolves the same as the canonical `<hash>.narinfo`.
-        narinfos.insert(super::hash_part(stem).to_string(), narinfo);
+        // resolves the same as the canonical `<hash>.narinfo`. The identity
+        // cross-check above guarantees this key equals the content
+        // StorePath's hash part — the key the writer enforces completeness
+        // with.
+        narinfos.insert(stem_hash.to_string(), narinfo);
     }
     Ok((narinfos, narinfo_digests))
 }
@@ -1265,6 +1306,67 @@ mod tests {
         assert!(err.contains(&sidecar_name), "got: {err}");
     }
 
+    /// A sidecar whose filename and content disagree about which store path
+    /// it describes is refused at open. The fixture is two writer-produced
+    /// sidecars with their FILES swapped — the realistic mis-assembly shape
+    /// (a foreign recorder, or a shuffled/edited directory-form archive)
+    /// that every other v1 open-time check is provably blind to: the
+    /// completeness loop only tests filename presence, and the narinfo
+    /// listing digest hashes (content store path, bytes) pairs, which a
+    /// swap leaves identical. Without the identity cross-check this archive
+    /// opens cleanly and fails hours later, when `dump_nar` verifies an
+    /// embedded tree against the other path's sidecar.
+    #[test]
+    fn mismatched_sidecar_identity_is_an_open_error() {
+        use crate::archive::writer::test_support::{sidecar_text, stage_tiny_archive, tiny_seed};
+
+        const EXTRA_PATH: &str = "/nix/store/h2222222222222222222222222222222-extra";
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        let writer = crate::archive::writer::ArchiveWriter::create(&root).unwrap();
+        let trees = tempfile::TempDir::new().unwrap();
+        stage_tiny_archive(&writer, &trees.path().join("src"));
+        // A second embedded path, so the archive has two sidecars to swap.
+        let extra_tree = trees.path().join("extra");
+        std::fs::create_dir_all(&extra_tree).unwrap();
+        std::fs::write(extra_tree.join("data.txt"), "second embedded tree\n").unwrap();
+        writer
+            .embed_store_path(
+                EXTRA_PATH,
+                &extra_tree,
+                &sidecar_text(EXTRA_PATH, &extra_tree),
+            )
+            .unwrap();
+        writer.finalize(tiny_seed()).unwrap();
+
+        // The writer-conformant archive opens: the cross-check cannot fire
+        // on agreeing identities.
+        ReplayArchive::open(&root).expect("conformant sidecars must not trip the identity check");
+
+        // Swap the two sidecar files: each filename now locates the OTHER
+        // path's description.
+        let src_sidecar = root
+            .join(NARINFO_DIR)
+            .join(format!("{}.narinfo", hash_part(SRC_PATH)));
+        let extra_sidecar = root
+            .join(NARINFO_DIR)
+            .join(format!("{}.narinfo", hash_part(EXTRA_PATH)));
+        let src_bytes = std::fs::read(&src_sidecar).unwrap();
+        let extra_bytes = std::fs::read(&extra_sidecar).unwrap();
+        std::fs::write(&src_sidecar, &extra_bytes).unwrap();
+        std::fs::write(&extra_sidecar, &src_bytes).unwrap();
+
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(err.contains("is named for store hash"), "got: {err}");
+        // Whichever swapped sidecar is indexed first, the error names both
+        // identities: its filename hash and the other path it describes.
+        assert!(
+            err.contains(hash_part(SRC_PATH)) && err.contains(hash_part(EXTRA_PATH)),
+            "got: {err}"
+        );
+    }
+
     #[test]
     fn cleartext_relay_substituter_is_rejected_on_open() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1618,6 +1720,50 @@ mod tests {
                 .narinfo("c1111111111111111111111111111111")
                 .is_none(),
             "the broken sidecar is skipped"
+        );
+        assert!(
+            archive.narinfo(V0_SRC_PATH).is_some(),
+            "the intact sidecar still loads"
+        );
+    }
+
+    /// A v0 sidecar whose filename and content identities disagree is
+    /// skipped with a warning, like any other defective v0 sidecar: the
+    /// recording is irreplaceable, so the affected path merely loses its
+    /// description. Crucially it is dropped, not indexed under the
+    /// filename — keying it by the (wrong) filename would serve one store
+    /// path's NarHash/References as another's.
+    #[test]
+    fn v0_mismatched_sidecar_identity_is_skipped_not_fatal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        copy_v0_fixture_to(&root);
+
+        // Rename the dep-output sidecar to a stem describing a different
+        // store hash; its content still says c111… . The same mismatch in
+        // a v1 archive is a hard open error
+        // (`mismatched_sidecar_identity_is_an_open_error`).
+        let mismatched_stem = "d1111111111111111111111111111111";
+        std::fs::rename(
+            root.join(NARINFO_DIR)
+                .join("c1111111111111111111111111111111.narinfo"),
+            root.join(NARINFO_DIR)
+                .join(format!("{mismatched_stem}.narinfo")),
+        )
+        .unwrap();
+
+        let archive = ReplayArchive::open(&root).unwrap();
+        assert_eq!(archive.requests().len(), 4);
+        assert!(
+            archive
+                .narinfo("c1111111111111111111111111111111")
+                .is_none(),
+            "the mismatched sidecar is not indexed under its content identity"
+        );
+        assert!(
+            archive.narinfo(mismatched_stem).is_none(),
+            "…and not under its filename identity either: that lookup would \
+             return the wrong path's description"
         );
         assert!(
             archive.narinfo(V0_SRC_PATH).is_some(),

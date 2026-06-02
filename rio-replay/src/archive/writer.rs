@@ -717,18 +717,24 @@ pub(crate) mod test_support {
         std::os::unix::fs::symlink("content.txt", dir.join("latest")).unwrap();
     }
 
-    /// Narinfo sidecar text for the tree at `dir`, derived from its NAR
-    /// serialization. Deliberately carries no `URL:` line (sidecars of
-    /// embedded paths need none), so finalize exercises the URL-synthesis
-    /// path of the sidecar parser.
-    pub(crate) fn src_sidecar_text(dir: &Path) -> String {
+    /// Narinfo sidecar text describing the tree at `dir` as `store_path`,
+    /// derived from its NAR serialization — exactly the shape
+    /// [`ArchiveWriter::embed_store_path`] consumes. Deliberately carries
+    /// no `URL:` line (sidecars of embedded paths need none), so finalize
+    /// exercises the URL-synthesis path of the sidecar parser.
+    pub(crate) fn sidecar_text(store_path: &str, dir: &Path) -> String {
         let mut nar = Vec::new();
         let nar_size = rio_nix::nar::dump_path_streaming(dir, &mut nar).unwrap();
         let digest: [u8; 32] = sha2::Sha256::digest(&nar).into();
         let nar_hash = rio_nix::store_path::nixbase32::encode(&digest);
         format!(
-            "StorePath: {SRC_PATH}\nNarHash: sha256:{nar_hash}\nNarSize: {nar_size}\nReferences:\nCompression: none\n"
+            "StorePath: {store_path}\nNarHash: sha256:{nar_hash}\nNarSize: {nar_size}\nReferences:\nCompression: none\n"
         )
+    }
+
+    /// [`sidecar_text`] for the tiny archive's embedded source tree.
+    pub(crate) fn src_sidecar_text(dir: &Path) -> String {
+        sidecar_text(SRC_PATH, dir)
     }
 
     /// The fixed manifest seed of the tiny archive.
