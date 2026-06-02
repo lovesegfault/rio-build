@@ -72,12 +72,22 @@ fn push_tail(tail: &mut VecDeque<String>, line: String) {
     tail.push_back(line);
 }
 
-/// Feed one observed stderr line through the gateway-line parser (build id,
-/// relayed per-derivation failure reasons) and append it to the capped
+/// Feed one observed stderr payload through the gateway-line parser (build
+/// id, relayed per-derivation failure reasons) and append it to the capped
 /// evidence tail.
-fn observe_line(parsed: &mut ParsedStderr, tail: &mut VecDeque<String>, line: &str) {
-    parse_line(parsed, line);
-    push_tail(tail, line.to_string());
+///
+/// The transport is message-oriented while the parser and the tail are
+/// line-oriented: the gateway packs a non-cascaded failure reason and its
+/// `↳ rio-cli logs` hint into ONE `STDERR_NEXT` payload separated by a
+/// newline (`rio-gateway/src/handler/build.rs`), so every payload is split
+/// into lines here, at the observer boundary — a multi-line payload
+/// structurally cannot reach the line parser, and the evidence tail stays
+/// one line per entry.
+fn observe_line(parsed: &mut ParsedStderr, tail: &mut VecDeque<String>, payload: &str) {
+    for line in payload.split('\n') {
+        parse_line(parsed, line);
+        push_tail(tail, line.to_string());
+    }
 }
 
 /// Map the daemon's per-root keyed results onto the batch's roots
@@ -536,6 +546,74 @@ mod tests {
         assert_eq!(tail.len(), STDERR_TAIL_LINES);
         assert_eq!(tail.front().unwrap(), "noise line 52");
         assert!(tail.back().unwrap().starts_with("derivation '"));
+    }
+
+    /// Generate the gateway's per-derivation failure relay exactly as
+    /// `rio-gateway/src/handler/build.rs` formats it (one `STDERR_NEXT`
+    /// payload per scheduler terminal failure): for a derivation that
+    /// actually executed (non-cascaded), the copy-pasteable
+    /// `↳ rio-cli logs '<drv>'` hint is appended after a newline INSIDE
+    /// the same payload; a cascaded `DependencyFailed` relay suppresses
+    /// the hint and stays single-line. Conformance mirror of the
+    /// gateway's format strings — when the gateway's relay format
+    /// changes, update this generator in the same change.
+    fn gateway_failure_relay(drv: &str, reason: &str, cascaded: bool) -> String {
+        let hint = if cascaded {
+            String::new()
+        } else {
+            format!("\n  ↳ rio-cli logs '{drv}'")
+        };
+        format!("derivation '{drv}' failed: {reason}{hint}")
+    }
+
+    /// The gateway packs a non-cascaded failure reason and its `rio-cli
+    /// logs` hint into ONE multi-line `STDERR_NEXT` payload. The observer
+    /// must split every payload into lines before parsing — otherwise the
+    /// trigger derivation's relayed reason (collect's only reason signal
+    /// for a failed dependency) is silently dropped and the evidence tail
+    /// stops being line-shaped.
+    #[test]
+    fn client_ops_observer_splits_multi_line_failure_relays() {
+        let trigger = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv";
+        let dependent = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-app-2.0.drv";
+        let reason = "builder failed with exit code 2";
+
+        let mut parsed = ParsedStderr::default();
+        let mut tail: VecDeque<String> = VecDeque::new();
+
+        // The trigger drv executed and failed: its relay embeds the hint,
+        // so the payload is genuinely multi-line.
+        let relay = gateway_failure_relay(trigger, reason, false);
+        assert!(relay.contains('\n'), "premise: {relay:?}");
+        observe_line(&mut parsed, &mut tail, &relay);
+
+        // The dependent cascades: hint suppressed, single-line payload.
+        let cascade_reason = format!("dependency '{trigger}' failed: {reason}");
+        let cascade = gateway_failure_relay(dependent, &cascade_reason, true);
+        assert!(!cascade.contains('\n'), "premise: {cascade:?}");
+        observe_line(&mut parsed, &mut tail, &cascade);
+
+        // Both reasons captured — including the trigger's, whose payload
+        // carries the embedded hint.
+        assert_eq!(
+            parsed.reasons.get(trigger).map(String::as_str),
+            Some(reason)
+        );
+        assert_eq!(
+            parsed.reasons.get(dependent).map(String::as_str),
+            Some(cascade_reason.as_str())
+        );
+
+        // The evidence tail is line-shaped: one entry per line, the hint
+        // on its own line, no entry spanning a newline.
+        assert_eq!(
+            Vec::from(tail),
+            vec![
+                format!("derivation '{trigger}' failed: {reason}"),
+                format!("  ↳ rio-cli logs '{trigger}'"),
+                format!("derivation '{dependent}' failed: {cascade_reason}"),
+            ]
+        );
     }
 
     /// Upload deadlines scale with the chunk's payload size on top of the

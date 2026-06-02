@@ -19,9 +19,13 @@ static BUILD_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// `derivation '<drv>' failed: <reason>` — the gateway's relay of one
-/// scheduler terminal failure (`rio-gateway/src/handler/build.rs`). The
-/// `↳ rio-cli logs '<drv>'` hint arrives on the FOLLOWING line and is
-/// ignored.
+/// scheduler terminal failure (`rio-gateway/src/handler/build.rs`). For a
+/// derivation that actually executed, the gateway embeds the
+/// `↳ rio-cli logs '<drv>'` hint after a newline INSIDE the same stderr
+/// payload; this regex is line-oriented (default mode: `.` and `$` stop at
+/// a newline), so callers must split each payload into lines before
+/// matching — the build observer does — and the hint line itself never
+/// matches and is ignored.
 static DRV_FAILED_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"derivation '([^']+\.drv)' failed: (.*)$").expect("static regex"));
 
@@ -39,8 +43,9 @@ pub struct ParsedStderr {
     pub reasons: BTreeMap<String, String>,
 }
 
-/// Feed one stderr line into `parsed` (streaming form, used by the live
-/// child-stderr reader).
+/// Feed one stderr line into `parsed` (streaming form, used by the
+/// client-ops build observer, which splits each relayed stderr payload
+/// into lines before calling this).
 pub fn parse_line(parsed: &mut ParsedStderr, line: &str) {
     if let Some(c) = BUILD_ID_RE.captures(line) {
         let id = &c[1];
