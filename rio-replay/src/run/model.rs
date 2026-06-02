@@ -353,6 +353,108 @@ impl Disposition {
             | Disposition::NotAttempted => true,
         }
     }
+
+    /// The gate accounting of this disposition. Exhaustive on purpose —
+    /// see [`GateAccounting`].
+    pub fn gate_accounting(self) -> GateAccounting {
+        match self {
+            // The target refused a required upload: charged to the target
+            // by the §7.3 regression row even though the unit was never
+            // attempted.
+            Disposition::UploadRejected => GateAccounting::TripsRegression,
+            // A real submission outcome: the target substituted the unit
+            // mid-run. Cannot trip, but the campaign demonstrably
+            // exercised it.
+            Disposition::TargetSubstituted => GateAccounting::EvidenceOnly,
+            // Plan-time exclusions: nothing about these units was observed
+            // at the target.
+            Disposition::Filtered
+            | Disposition::EvalError
+            | Disposition::IdentityDivergent
+            | Disposition::NotAttemptable
+            | Disposition::DemotedImpure
+            | Disposition::CachedPrior => GateAccounting::Excluded,
+            // Engine-side supply failure: counted against run confidence
+            // via the supply-failed low-confidence flag (§7.2), never via
+            // the gate — it is evidence about the engine's supply, not
+            // about the target.
+            Disposition::SupplyFailed => GateAccounting::Excluded,
+            // Deadline backfill: the run ended before the unit was
+            // touched. Counting it would mint coverage out of nothing.
+            Disposition::NotAttempted => GateAccounting::Excluded,
+        }
+    }
+}
+
+/// How the regression gate accounts for one terminal class — the single
+/// derivation surface for BOTH the gate's trip sets and its coverage
+/// witness (`GateResult::checked`), so the two can never disagree about a
+/// class and a new class cannot ship without a gate decision.
+///
+/// Same compile-forcing shape as [`Disposition::attempted`]: the
+/// per-class methods ([`Verdict::gate_accounting`],
+/// [`Disposition::gate_accounting`]) are exhaustive matches with no
+/// wildcard, so adding a verdict or disposition refuses to compile until
+/// its gate accounting is decided here. `attempted()` is deliberately NOT
+/// reused for the gate: it answers a different question (submission
+/// evidence for the report's rate denominators), and the gate's axes
+/// disagree with it in both directions — `upload-rejected` is
+/// not-attempted yet trips the gate, while the not-attempted deadline
+/// backfill must never inflate the gate's coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateAccounting {
+    /// Trips `fail_on: regression` (and therefore `divergence` too):
+    /// charged to the target, or charged to run confidence with trip
+    /// semantics — the design doc §7.3 regression row.
+    TripsRegression,
+    /// Trips only `fail_on: divergence`: informational divergence — the
+    /// §7.3 divergence row's additions.
+    TripsDivergence,
+    /// Never trips, but is real campaign-observed evidence: the unit was
+    /// exercised and classified, so it counts toward the gate's coverage
+    /// witness — an untripped gate over such units verified something.
+    EvidenceOnly,
+    /// Never trips and carries no gate evidence: plan-time exclusions,
+    /// engine-side supply failure (counted against run confidence via the
+    /// supply-failed low-confidence flag, never via the gate), and the
+    /// not-attempted deadline backfill. Excluded from `checked`, so an
+    /// attempted-nothing campaign cannot mint a non-zero coverage witness
+    /// out of backfill records.
+    Excluded,
+}
+
+impl GateAccounting {
+    /// Whether a class with this accounting counts toward the gate's
+    /// coverage witness (`GateResult::checked`).
+    pub fn counts_as_checked(self) -> bool {
+        !matches!(self, GateAccounting::Excluded)
+    }
+}
+
+impl Verdict {
+    /// The gate accounting of this verdict. Exhaustive on purpose — see
+    /// [`GateAccounting`].
+    pub fn gate_accounting(self) -> GateAccounting {
+        match self {
+            // Charged to the target (§7.3 regression row) or to run
+            // confidence with trip semantics (infra-indeterminate).
+            Verdict::UnexpectedFailure
+            | Verdict::UnexpectedDependencyFailure
+            | Verdict::InfraIndeterminate => GateAccounting::TripsRegression,
+            // Informational divergence (§7.3 divergence row).
+            Verdict::OutputDivergence
+            | Verdict::UnexpectedSuccess
+            | Verdict::InterruptionNotReproduced => GateAccounting::TripsDivergence,
+            // Every other verdict is a real classified observation of the
+            // unit: it could not trip, but the gate demonstrably looked.
+            Verdict::MatchBuilt
+            | Verdict::MatchFailed
+            | Verdict::SourceUnavailable
+            | Verdict::TruthIndeterminate
+            | Verdict::NoTruth
+            | Verdict::InterruptionReplayed => GateAccounting::EvidenceOnly,
+        }
+    }
 }
 
 /// The single classification a workload unit ends a campaign with:

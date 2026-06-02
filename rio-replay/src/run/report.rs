@@ -22,7 +22,7 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
 use super::classify::{Headline, NAR_DIFFERS, NAR_EQUAL, headline, job_nar_verdict};
-use super::model::{Disposition, JobRecord, Verdict};
+use super::model::{Disposition, GateAccounting, JobRecord, Verdict};
 use super::spec::{
     CampaignRecord, ComparabilityBlock, FailOn, Knobs, PLAN_COUNT_ATTEMPTABLE, PLAN_COUNT_IN_SCOPE,
     ReportPolicy,
@@ -233,12 +233,23 @@ pub const FLAG_TENANT_UPSTREAMS_UNVERIFIED: &str = "tenant-upstreams-unverified"
 /// but the archive records no cancellations or client disconnects, so the
 /// knob was forced off for this campaign.
 pub const FLAG_REPLAY_INTERRUPTIONS_DISABLED: &str = "replay-interruptions-disabled";
+/// Low-confidence flag: at least one unit retired `supply-failed` — the
+/// engine could not obtain or deliver required supply for reasons not
+/// attributable to the target. This is where §7.2's "counted against run
+/// confidence" for supply-failed lives: the disposition never trips the
+/// regression gate (its [`GateAccounting`] is `Excluded`) and is outside
+/// every rate denominator, so without this flag a mid-run supply collapse
+/// would raise completeness while every automated confidence signal stayed
+/// green. Any-nonzero semantics, mirroring [`FLAG_PREFETCH_SHORTFALL`]:
+/// both mean the headline measured something other than what was planned.
+pub const FLAG_SUPPLY_FAILED_UNITS: &str = "supply-failed-units";
 
 /// Derive the report-time low-confidence flags, in their fixed order:
 /// infra-indeterminate rate, no-truth rate, prefetch shortfall, timing
-/// degradation. Flags set at plan/bootstrap time (tenant verification,
-/// scheduling degradations) are not re-derived here — they arrive through
-/// the base block and are merged by [`comparability_with_counts`].
+/// degradation, supply-failed units. Flags set at plan/bootstrap time
+/// (tenant verification, scheduling degradations) are not re-derived here
+/// — they arrive through the base block and are merged by
+/// [`comparability_with_counts`].
 pub fn low_confidence_flags(
     agg: &Aggregates,
     knobs: &Knobs,
@@ -262,6 +273,15 @@ pub fn low_confidence_flags(
     }
     if block.timing_degraded {
         flags.push(FLAG_TIMING_DEGRADED.to_string());
+    }
+    if agg
+        .disposition_counts
+        .get(Disposition::SupplyFailed.as_str())
+        .copied()
+        .unwrap_or(0)
+        > 0
+    {
+        flags.push(FLAG_SUPPLY_FAILED_UNITS.to_string());
     }
     flags
 }
@@ -732,12 +752,18 @@ pub struct GateResult {
     pub fail_on: String,
     /// Whether any contributing class had a nonzero count.
     pub tripped: bool,
-    /// Coverage witness: how many classified units (verdicts and
-    /// dispositions alike) the trip sets were evaluated over. An untripped
-    /// gate with `checked: 0` passed vacuously — see
-    /// [`GateResult::coverage`]. Defaulted on reload so gate.json written
-    /// before the witness existed still parses (as zero coverage, the
-    /// honest reading of a record that never carried one).
+    /// Coverage witness: how many EVIDENCE-BEARING classified units the
+    /// trip sets were evaluated over — every class whose
+    /// [`GateAccounting`] is not `Excluded`, so verdicts plus the
+    /// upload-rejected and target-substituted dispositions count, while
+    /// plan-time exclusions, supply-failed, and the not-attempted deadline
+    /// backfill do not (the backfill records every untouched unit when a
+    /// deadline fires, and a witness it could inflate would certify
+    /// attempted-nothing campaigns). An untripped gate with `checked: 0`
+    /// passed vacuously — see [`GateResult::coverage`]. Defaulted on
+    /// reload so gate.json written before the witness existed still parses
+    /// (as zero coverage, the honest reading of a record that never
+    /// carried one).
     #[serde(default)]
     pub checked: usize,
     /// The contributing classes with nonzero counts (empty when nothing in
@@ -755,57 +781,72 @@ impl GateResult {
     }
 }
 
+/// Whether a class with the given accounting trips under `fail_on`.
+fn accounting_trips(accounting: GateAccounting, fail_on: FailOn) -> bool {
+    match fail_on {
+        FailOn::None => false,
+        FailOn::Regression => accounting == GateAccounting::TripsRegression,
+        FailOn::Divergence => matches!(
+            accounting,
+            GateAccounting::TripsRegression | GateAccounting::TripsDivergence
+        ),
+    }
+}
+
 /// Evaluate the regression gate over the final per-class counts.
-/// `regression` trips on anything charged to the target or to run
-/// confidence (unexpected-failure, unexpected-dependency-failure,
-/// upload-rejected, infra-indeterminate); `divergence` adds the
-/// informational divergence classes on top (output-divergence,
-/// unexpected-success, interruption-not-reproduced); `none` never trips.
 ///
-/// The result always carries its coverage witness: the total classified
-/// units the counts describe. The denominator is an explicit part of the
-/// evaluation, not an incidentally-incremented counter, so a pass over an
-/// empty classification cannot masquerade as a verified one.
+/// Both the trip sets and the coverage witness derive from ONE per-class
+/// classification, [`GateAccounting`] (an exhaustive method on `Verdict`
+/// and `Disposition`, so a new class cannot ship without a gate
+/// decision): `regression` trips on the classes accounted
+/// `TripsRegression` — exactly the design doc §7.3 regression row
+/// (unexpected-failure, unexpected-dependency-failure, upload-rejected,
+/// infra-indeterminate); `divergence` adds the `TripsDivergence` classes
+/// (output-divergence, unexpected-success, interruption-not-reproduced);
+/// `none` never trips. `supply-failed` deliberately trips NOTHING: per
+/// §7.2 it is counted against run confidence, and that accounting lives
+/// in the supply-failed low-confidence flag
+/// ([`FLAG_SUPPLY_FAILED_UNITS`]), never in the gate.
+///
+/// The result always carries its coverage witness: the number of
+/// EVIDENCE-BEARING classified units the trip sets were evaluated over —
+/// every class except the `Excluded` accounting (plan-time exclusions,
+/// supply-failed, the not-attempted deadline backfill). The exclusion
+/// matters: the backfill writes a record for every untouched unit when a
+/// deadline fires, so a total-classification count would mint a non-zero
+/// witness for a campaign that attempted nothing. The denominator is an
+/// explicit part of the evaluation, not an incidentally-incremented
+/// counter, so a pass over an empty (or all-backfill) classification
+/// cannot masquerade as a verified one.
 pub fn evaluate_gate(
     fail_on: FailOn,
     verdict_counts: &BTreeMap<String, usize>,
     disposition_counts: &BTreeMap<String, usize>,
 ) -> GateResult {
-    let regression = [
-        Verdict::UnexpectedFailure.as_str(),
-        Verdict::UnexpectedDependencyFailure.as_str(),
-        Disposition::UploadRejected.as_str(),
-        Verdict::InfraIndeterminate.as_str(),
-    ];
-    let divergence_extra = [
-        Verdict::OutputDivergence.as_str(),
-        Verdict::UnexpectedSuccess.as_str(),
-        Verdict::InterruptionNotReproduced.as_str(),
-    ];
-    let contributing: Vec<&str> = match fail_on {
-        FailOn::None => Vec::new(),
-        FailOn::Regression => regression.to_vec(),
-        FailOn::Divergence => regression
-            .iter()
-            .chain(divergence_extra.iter())
-            .copied()
-            .collect(),
-    };
-    // The verdict and disposition vocabularies never overlap, so each class
-    // name resolves in exactly one of the two count maps.
     let mut counts = BTreeMap::new();
-    for class in contributing {
-        let count = verdict_counts
-            .get(class)
-            .or_else(|| disposition_counts.get(class))
-            .copied()
-            .unwrap_or(0);
-        if count > 0 {
+    let mut checked = 0usize;
+    let mut account = |class: &str, accounting: GateAccounting, count: usize| {
+        if count == 0 {
+            return;
+        }
+        if accounting.counts_as_checked() {
+            checked += count;
+        }
+        if accounting_trips(accounting, fail_on) {
             counts.insert(class.to_string(), count);
         }
+    };
+    for verdict in Verdict::ALL {
+        let count = verdict_counts.get(verdict.as_str()).copied().unwrap_or(0);
+        account(verdict.as_str(), verdict.gate_accounting(), count);
     }
-    let checked =
-        verdict_counts.values().sum::<usize>() + disposition_counts.values().sum::<usize>();
+    for disposition in Disposition::ALL {
+        let count = disposition_counts
+            .get(disposition.as_str())
+            .copied()
+            .unwrap_or(0);
+        account(disposition.as_str(), disposition.gate_accounting(), count);
+    }
     GateResult {
         policy: ReportPolicy::RegressionGate.as_str().to_string(),
         fail_on: fail_on.as_str().to_string(),
@@ -1667,9 +1708,16 @@ mod tests {
     /// over zero classified units is NothingInScope (a vacuous pass no
     /// consumer can mistake for verified coverage — though it is CLEAN
     /// here: an empty-scope campaign legitimately reports an untripped
-    /// gate), while a real evaluation carries the non-zero classified
-    /// total. Old gate.json files without the field reload as zero
-    /// coverage, the honest reading of a record that never carried one.
+    /// gate), while a real evaluation carries the non-zero EVIDENCE total.
+    /// The witness's axis is [`GateAccounting`] (`checked` counts exactly
+    /// the non-`Excluded` classes — the `GateResult::checked` contract,
+    /// published in the design doc §7.3): a deadline backfill that
+    /// classifies every untouched unit not-attempted, plan-time
+    /// exclusions, and supply-failed must NOT mint coverage, while
+    /// upload-rejected (which trips) and target-substituted (a real
+    /// submission outcome) must. Old gate.json files without the field
+    /// reload as zero coverage, the honest reading of a record that never
+    /// carried one.
     #[test]
     fn gate_passes_carry_a_coverage_witness() {
         let empty = BTreeMap::new();
@@ -1684,14 +1732,17 @@ mod tests {
         dispositions.insert(Disposition::CachedPrior.as_str().to_string(), 3);
         let checked = evaluate_gate(FailOn::Regression, &verdicts, &dispositions);
         assert!(!checked.tripped);
-        assert_eq!(checked.checked, 10, "verdicts and dispositions both count");
+        assert_eq!(
+            checked.checked, 7,
+            "verdicts are evidence; the cached-prior plan-time exclusion is not"
+        );
         assert_eq!(
             checked.coverage(),
-            GateCoverage::Checked(std::num::NonZeroUsize::new(10).unwrap())
+            GateCoverage::Checked(std::num::NonZeroUsize::new(7).unwrap())
         );
         // The witness rides the wire and reloads.
         let json = serde_json::to_value(&checked).unwrap();
-        assert_eq!(json["checked"], 10, "{json}");
+        assert_eq!(json["checked"], 7, "{json}");
         let back: GateResult = serde_json::from_value(json).unwrap();
         assert_eq!(back, checked);
         // A pre-witness gate.json (no "checked" key) reloads as zero
@@ -1706,6 +1757,150 @@ mod tests {
         assert_eq!(legacy.coverage(), GateCoverage::NothingInScope);
     }
 
+    /// `checked` is decided per class by [`GateAccounting`], totally: one
+    /// record of every verdict and every disposition, and the witness sums
+    /// exactly the non-`Excluded` classes. The deadline backfill
+    /// (not-attempted), the filtered scope cut, and supply-failed are the
+    /// load-bearing exclusions — each was a vacuous-coverage hole when
+    /// `checked` summed the whole classification — while upload-rejected
+    /// (not attempted, yet it TRIPS) and target-substituted (submitted)
+    /// pin the axis as gate evidence, not `Disposition::attempted()`.
+    #[test]
+    fn gate_coverage_counts_evidence_not_classification_totality() {
+        let verdicts: BTreeMap<String, usize> = Verdict::ALL
+            .iter()
+            .map(|verdict| (verdict.as_str().to_string(), 1))
+            .collect();
+        let dispositions: BTreeMap<String, usize> = Disposition::ALL
+            .iter()
+            .map(|disposition| (disposition.as_str().to_string(), 1))
+            .collect();
+        let gate = evaluate_gate(FailOn::Regression, &verdicts, &dispositions);
+        let expected: usize = Verdict::ALL
+            .iter()
+            .filter(|verdict| verdict.gate_accounting().counts_as_checked())
+            .count()
+            + Disposition::ALL
+                .iter()
+                .filter(|disposition| disposition.gate_accounting().counts_as_checked())
+                .count();
+        assert_eq!(gate.checked, expected);
+        // The axis, spelled out: every verdict counts; of the dispositions
+        // exactly upload-rejected and target-substituted do.
+        assert_eq!(expected, Verdict::ALL.len() + 2);
+        for disposition in Disposition::ALL {
+            assert_eq!(
+                disposition.gate_accounting().counts_as_checked(),
+                matches!(
+                    disposition,
+                    Disposition::UploadRejected | Disposition::TargetSubstituted
+                ),
+                "{disposition:?}"
+            );
+        }
+        // An all-backfill partial campaign — the deadline fired before
+        // anything was attempted — has zero coverage, whatever its size.
+        let backfill: BTreeMap<String, usize> =
+            BTreeMap::from([(Disposition::NotAttempted.as_str().to_string(), 5000)]);
+        let gate = evaluate_gate(FailOn::Regression, &BTreeMap::new(), &backfill);
+        assert!(!gate.tripped);
+        assert_eq!(gate.checked, 0, "backfill must not mint coverage");
+    }
+
+    /// The trip sets derive from [`GateAccounting`] and must match the
+    /// design doc §7.3 table — the normative contract for what each
+    /// `fail_on` trips on. The doc rows are parsed as data (the backticked
+    /// class names), so this pins set equality in both directions: a class
+    /// added to the accounting without the doc row, or vice versa, fails
+    /// here. Same dev-shell-only doc access as
+    /// `capability_table_pins_the_design_doc`.
+    #[test]
+    fn gate_trip_sets_match_the_design_doc_table() {
+        let derived =
+            |accounting: &dyn Fn(GateAccounting) -> bool| -> std::collections::BTreeSet<String> {
+                Verdict::ALL
+                    .iter()
+                    .filter(|verdict| accounting(verdict.gate_accounting()))
+                    .map(|verdict| verdict.as_str().to_string())
+                    .chain(
+                        Disposition::ALL
+                            .iter()
+                            .filter(|disposition| accounting(disposition.gate_accounting()))
+                            .map(|disposition| disposition.as_str().to_string()),
+                    )
+                    .collect()
+            };
+        let regression = derived(&|acc| acc == GateAccounting::TripsRegression);
+        let divergence_extra = derived(&|acc| acc == GateAccounting::TripsDivergence);
+
+        // The derived sets ARE what evaluate_gate trips on (counts keys).
+        let ones = |names: &std::collections::BTreeSet<String>| -> BTreeMap<String, usize> {
+            names.iter().map(|name| (name.clone(), 1)).collect()
+        };
+        let all_verdicts: BTreeMap<String, usize> = Verdict::ALL
+            .iter()
+            .map(|verdict| (verdict.as_str().to_string(), 1))
+            .collect();
+        let all_dispositions: BTreeMap<String, usize> = Disposition::ALL
+            .iter()
+            .map(|disposition| (disposition.as_str().to_string(), 1))
+            .collect();
+        let gate = evaluate_gate(FailOn::Regression, &all_verdicts, &all_dispositions);
+        assert_eq!(
+            gate.counts
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            regression
+        );
+        let gate = evaluate_gate(FailOn::Divergence, &all_verdicts, &all_dispositions);
+        assert_eq!(
+            gate.counts
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            regression.union(&divergence_extra).cloned().collect()
+        );
+        assert!(!evaluate_gate(FailOn::None, &ones(&regression), &BTreeMap::new()).tripped);
+
+        // Pin against the doc table rows.
+        let doc = crate::test_manifest_dir().join("../docs/dev/2026-05-28-build-replay-design.md");
+        let Ok(text) = std::fs::read_to_string(&doc) else {
+            eprintln!(
+                "design doc not present in this build's source tree; §7.3 trip-table pin not \
+                 checked here (dev-shell test runs check it)"
+            );
+            return;
+        };
+        let row_classes = |row_key: &str| -> std::collections::BTreeSet<String> {
+            let row = text
+                .lines()
+                .find(|line| line.starts_with(&format!("| `{row_key}` |")))
+                .unwrap_or_else(|| panic!("§7.3 has a `{row_key}` row"));
+            let cell = row
+                .trim_start_matches(&format!("| `{row_key}` |"))
+                .to_string();
+            cell.split('`')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(
+            row_classes("regression"),
+            regression,
+            "GateAccounting's regression trip set drifted from the §7.3 table"
+        );
+        let mut doc_divergence = row_classes("divergence");
+        // The divergence row references the regression row by name
+        // ("everything in `regression`, plus …").
+        assert!(doc_divergence.remove("regression"), "divergence row shape");
+        assert_eq!(
+            doc_divergence, divergence_extra,
+            "GateAccounting's divergence additions drifted from the §7.3 table"
+        );
+    }
+
     #[test]
     fn low_confidence_flags_derive_in_fixed_order() {
         let knobs = Knobs::default();
@@ -1713,9 +1908,11 @@ mod tests {
         let mut block = ComparabilityBlock::default();
         // Nothing over threshold, nothing recorded → no flags.
         assert!(low_confidence_flags(&agg, &knobs, &block).is_empty());
-        // Every condition holds → all four flags, in the fixed order.
+        // Every condition holds → all five flags, in the fixed order.
         agg.infra_rate_pct = Some(knobs.infra_low_confidence_pct + 0.1);
         agg.no_truth_rate_pct = Some(knobs.no_truth_threshold_pct + 0.1);
+        agg.disposition_counts
+            .insert(Disposition::SupplyFailed.as_str().to_string(), 2);
         block.prefetch_shortfall_pct = Some(0.5);
         block.timing_degraded = true;
         assert_eq!(
@@ -1725,15 +1922,47 @@ mod tests {
                 FLAG_NO_TRUTH_RATE,
                 FLAG_PREFETCH_SHORTFALL,
                 FLAG_TIMING_DEGRADED,
+                FLAG_SUPPLY_FAILED_UNITS,
             ]
         );
-        // Boundaries: rates exactly at their threshold and a zero shortfall
-        // do not flag (the rules are strictly-greater-than).
+        // Boundaries: rates exactly at their threshold, a zero shortfall,
+        // and zero supply-failed units do not flag (the rate rules are
+        // strictly-greater-than; the count rules are any-nonzero).
         agg.infra_rate_pct = Some(knobs.infra_low_confidence_pct);
         agg.no_truth_rate_pct = Some(knobs.no_truth_threshold_pct);
+        agg.disposition_counts
+            .insert(Disposition::SupplyFailed.as_str().to_string(), 0);
         block.prefetch_shortfall_pct = Some(0.0);
         block.timing_degraded = false;
         assert!(low_confidence_flags(&agg, &knobs, &block).is_empty());
+    }
+
+    /// A mid-run supply collapse must move an automated confidence signal:
+    /// supply-failed retirements raise the supply-failed-units flag — the
+    /// §7.2 "counted against run confidence" accounting — even though the
+    /// disposition stays out of the gate's trip sets, out of `checked`,
+    /// and out of every rate denominator, and even though completeness
+    /// counts the retired units as terminal.
+    #[test]
+    fn supply_failed_units_flag_low_confidence() {
+        let mut records = BTreeMap::new();
+        records.insert("a".into(), rec("a", v(Verdict::MatchBuilt), 1, None, false));
+        records.insert(
+            "b".into(),
+            rec("b", d(Disposition::SupplyFailed), 0, None, false),
+        );
+        let agg = aggregate(&records);
+        let block = ComparabilityBlock::default();
+        let flags = low_confidence_flags(&agg, &Knobs::default(), &block);
+        assert_eq!(flags, vec![FLAG_SUPPLY_FAILED_UNITS]);
+        // ...while the gate neither trips on it nor counts it as coverage.
+        let gate = evaluate_gate(
+            FailOn::Divergence,
+            &agg.verdict_counts,
+            &agg.disposition_counts,
+        );
+        assert!(!gate.tripped);
+        assert_eq!(gate.checked, 1, "only the match-built verdict is evidence");
     }
 
     #[test]
