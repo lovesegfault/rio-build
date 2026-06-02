@@ -70,7 +70,9 @@
     },
     "flake-utils": {
       "inputs": {
-        "systems": "systems"
+        "systems": [
+          "systems"
+        ]
       },
       "locked": {
         "lastModified": 1731533236,
@@ -153,6 +155,33 @@
         "type": "github"
       }
     },
+    "kache": {
+      "inputs": {
+        "flake-utils": [
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "rust-overlay": [
+          "rust-overlay"
+        ]
+      },
+      "locked": {
+        "lastModified": 1780243016,
+        "narHash": "sha256-vtU+WgMsXzE+NC8/X7UlkHaJkClL/hlVkxgv4uU8z7E=",
+        "owner": "kunobi-ninja",
+        "repo": "kache",
+        "rev": "6e5c1083478a5620602db30268eacdb725d15f58",
+        "type": "github"
+      },
+      "original": {
+        "owner": "kunobi-ninja",
+        "ref": "v0.4.0",
+        "repo": "kache",
+        "type": "github"
+      }
+    },
     "nix": {
       "inputs": {
         "flake-compat": [
@@ -202,7 +231,9 @@
     },
     "nixhelm": {
       "inputs": {
-        "flake-utils": "flake-utils",
+        "flake-utils": [
+          "flake-utils"
+        ],
         "haumea": "haumea",
         "nix-kube-generators": "nix-kube-generators",
         "nixpkgs": [
@@ -248,11 +279,14 @@
         "crate2nix": "crate2nix",
         "flake-compat": "flake-compat",
         "flake-parts": "flake-parts",
+        "flake-utils": "flake-utils",
         "git-hooks-nix": "git-hooks-nix",
+        "kache": "kache",
         "nix": "nix",
         "nixhelm": "nixhelm",
         "nixpkgs": "nixpkgs",
         "rust-overlay": "rust-overlay",
+        "systems": "systems",
         "tracey-src": "tracey-src",
         "treefmt-nix": "treefmt-nix"
       }

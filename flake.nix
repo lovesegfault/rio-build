@@ -24,6 +24,15 @@
       flake = false;
     };
 
+    # Dedupe-only, same role as flake-compat: kache and nixhelm both pull
+    # flake-utils (and its `systems` input). Pin one copy at top level and
+    # point both at it so flake.lock doesn't grow `_2` duplicate nodes.
+    flake-utils = {
+      url = "github:numtide/flake-utils";
+      inputs.systems.follows = "systems";
+    };
+    systems.url = "github:nix-systems/default";
+
     # Spec-coverage tool (nix/tracey.nix). Flake input (not fetchFromGitHub)
     # so importCargoLock reads Cargo.lock from a pre-fetched path — no IFD.
     tracey-src = {
@@ -39,6 +48,25 @@
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    # Cross-worktree cargo build cache for the dev shells (content-addressed
+    # RUSTC_WRAPPER; wired local-only in nix/devshell.nix — never `kache
+    # init`). Consumed as a flake input (not flake=false + in-repo build à
+    # la tracey) because upstream's flake owns the annoying packaging bits:
+    # cargoLock outputHashes for its git deps, its own Rust 1.95 MSRV
+    # toolchain via rust-overlay (our nixpkgs rustc is too old), and the
+    # RUSTC_WRAPPER="" anti-self-bootstrap. With the follows below the lock
+    # graph only grows by kache + flake-utils + systems. Tag-pinned; bumps
+    # (`nix flake update kache`) may rotate kache's CACHE_KEY_VERSION —
+    # that's a cold cache, not breakage.
+    kache = {
+      url = "github:kunobi-ninja/kache/v0.4.0";
+      inputs = {
+        nixpkgs.follows = "nixpkgs";
+        rust-overlay.follows = "rust-overlay";
+        flake-utils.follows = "flake-utils";
+      };
     };
 
     # RustSec advisory DB for cargo-deny (hermetic — no network at
@@ -101,6 +129,7 @@
       url = "github:farcaller/nixhelm";
       inputs = {
         nixpkgs.follows = "nixpkgs";
+        flake-utils.follows = "flake-utils";
         # Only chartsDerivations is consumed; the helmupdater Python
         # tool (which these inputs feed) is unused.
         pyproject-nix.follows = "";
@@ -899,6 +928,7 @@
                   ;
                 treefmtWrapper = config.treefmt.build.wrapper;
                 preCommitInstall = config.pre-commit.installationScript;
+                kachePkg = inputs.kache.packages.${system}.default;
               };
 
               # `nix run .#docs` — serve the post-processed HTML tree via
