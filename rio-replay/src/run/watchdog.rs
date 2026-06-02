@@ -61,7 +61,7 @@
 //! timeout (`batch_timeout_hours`) instead, and every warm root receives
 //! a terminal disposition as soon as its batch settles.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -223,11 +223,13 @@ pub enum StallKind {
     /// a failed action retries on the next poll instead of waiting out a
     /// full re-accrual.
     ActiveStall,
-    /// Queued for at least `queued_watchdog_hours` of unsuspended time with
-    /// re-enqueue budget remaining: non-terminal re-enqueue (the clock
-    /// resets and the job's requeue count increments at emission — this
-    /// arm's action is an infallible log line, so edge consumption cannot
-    /// lose a verdict).
+    /// Queued for at least `queued_watchdog_hours` of unsuspended time
+    /// with re-enqueue budget remaining: non-terminal re-enqueue. Armed
+    /// like the other arms — the clock resets and the consumed-requeue
+    /// count increments only when [`Watchdog::confirm_queued_requeue`]
+    /// commits after the run loop journals the ladder step, so a failed
+    /// append re-fires the verdict instead of losing a budget move that
+    /// resume would never see.
     QueuedRequeue,
     /// Queued past the threshold again after `max_queued_requeues`
     /// re-enqueues were already spent: the run loop records a terminal
@@ -280,6 +282,16 @@ pub struct Watchdog {
     /// one tick (and any logging derived from them) come out in a
     /// deterministic order.
     jobs: BTreeMap<String, JobClock>,
+    /// Per-job queued-watchdog re-enqueues already consumed in PRIOR
+    /// processes, folded from the requeue journal on resume. Consulted
+    /// when a clock is created so a pod restart cannot re-grant a
+    /// mid-ladder job the full `(max_queued_requeues + 1) ×
+    /// queued_watchdog_hours` escalation ladder — the same restart-edge
+    /// budget reset the journal exists to prevent for the resubmission
+    /// counters. (The clocks themselves are deliberately volatile — builds
+    /// restart, so stall BASELINES must too — but the consumed ladder
+    /// budget is not a baseline.)
+    requeue_seed: HashMap<String, u32>,
     idle_streak: u32,
     dispatch_streak: u32,
     /// Consecutive ClusterStatus polls that failed (not-polled ticks leave
@@ -325,6 +337,7 @@ impl Watchdog {
         Self {
             knobs,
             jobs: BTreeMap::new(),
+            requeue_seed: HashMap::new(),
             idle_streak: 0,
             dispatch_streak: 0,
             cluster_failed_polls: 0,
@@ -353,7 +366,9 @@ impl Watchdog {
                     JobClock {
                         phase,
                         accrued_secs: 0.0,
-                        requeues: 0,
+                        // Prior processes' consumed ladder budget survives
+                        // the restart; only the clock baseline restarts.
+                        requeues: self.requeue_seed.get(job).copied().unwrap_or(0),
                     },
                 );
             }
@@ -363,6 +378,29 @@ impl Watchdog {
     /// Stop tracking a job (it reached a terminal record).
     pub fn remove_job(&mut self, job: &str) {
         self.jobs.remove(job);
+    }
+
+    /// Seed the consumed queued-requeue budgets from the resume fold
+    /// (the `REQUEUE_SOURCE_QUEUED` slice of requeues.jsonl). Called once
+    /// at construction time on the production path; clocks created later
+    /// start their ladder from the seeded count instead of zero.
+    pub fn set_requeue_seed(&mut self, seed: HashMap<String, u32>) {
+        self.requeue_seed = seed;
+    }
+
+    /// Commit one queued-watchdog re-enqueue: increment the job's consumed
+    /// ladder budget and reset its clock. Called by the run loop AFTER the
+    /// transition is journaled — the QueuedRequeue verdict stays armed
+    /// (re-firing each tick) until this commits, exactly like the other
+    /// deferred arms, so a failed journal append can never consume a
+    /// ladder step that resume would not see.
+    pub fn confirm_queued_requeue(&mut self, job: &str) {
+        if let Some(clock) = self.jobs.get_mut(job)
+            && clock.phase == JobPhase::Queued
+        {
+            clock.requeues = clock.requeues.saturating_add(1);
+            clock.accrued_secs = 0.0;
+        }
     }
 
     /// Test-only view of a job's current phase (`None` = not tracked), so
@@ -546,17 +584,15 @@ impl Watchdog {
 
         // Clocks accrue only while not suspended.
         //
-        // Verdict consumption is level-triggered for the arms whose
-        // actions can fail: an ActiveStall or QueuedEscalate verdict does
-        // NOT reset the clock at emission — only the committed ledger
-        // transition clears the level (the auto-retry's `observe_job`
-        // phase change zeroes the clock; a terminal record's `retire`
-        // removes it). A failed action (journal or results append) thus
-        // leaves the clock over its limit and the verdict genuinely
-        // re-fires on the next poll tick, instead of being silently
-        // forfeited until a full re-accrual. QueuedRequeue stays
-        // edge-consumed (clock reset, requeue counted at emission): its
-        // action is a log line, which cannot fail.
+        // Verdict consumption is level-triggered for every arm: emission
+        // neither resets a clock nor moves a budget — only the committed
+        // ledger transition clears the level (the auto-retry's
+        // `observe_job` phase change zeroes the clock, a terminal record's
+        // `retire` removes it, and a journaled queued re-enqueue's
+        // `confirm_queued_requeue` increments-and-resets). A failed action
+        // (journal or results append) thus leaves the clock over its limit
+        // and the verdict genuinely re-fires on the next poll tick,
+        // instead of being silently forfeited until a full re-accrual.
         let mut stalled = Vec::new();
         if !suspended && delta > 0.0 {
             let active_limit = self.knobs.active_stall_hours * 3600.0;
@@ -579,13 +615,14 @@ impl Watchdog {
                                 requeues_used: clock.requeues,
                             });
                         } else {
-                            clock.requeues += 1;
                             stalled.push(StallVerdict {
                                 job: job.clone(),
                                 kind: StallKind::QueuedRequeue,
-                                requeues_used: clock.requeues,
+                                // Post-increment count for the operator log;
+                                // the clock itself moves only when the
+                                // journaled transition confirms.
+                                requeues_used: clock.requeues + 1,
                             });
-                            clock.accrued_secs = 0.0;
                         }
                     }
                     _ => {}
@@ -761,8 +798,9 @@ mod tests {
         );
 
         // t=11h..12h: second healthy hour → queued clock reaches 2h → first
-        // non-terminal re-enqueue (clock resets, requeues=1). Active is at
-        // 2h of its 6h.
+        // non-terminal re-enqueue (requeues_used reports the post-commit
+        // count; the run loop journals then confirms). Active is at 2h of
+        // its 6h.
         let o = wd.on_tick(&tick(12 * 3600, cluster(5, 5, 0, 8)));
         assert_eq!(
             o.stalled,
@@ -772,6 +810,7 @@ mod tests {
                 requeues_used: 1,
             }]
         );
+        wd.confirm_queued_requeue("queued.x86_64-linux");
 
         // t=12h..14h: two more healthy hours → queued reaches 2h again →
         // second re-enqueue (requeues=2). Active is at 4h of its 6h.
@@ -784,6 +823,7 @@ mod tests {
                 requeues_used: 2,
             }]
         );
+        wd.confirm_queued_requeue("queued.x86_64-linux");
 
         // t=14h..16h: two more healthy hours. Queued hits 2h with requeues
         // already at max_queued_requeues=2 → escalation. Active hits 6h of
@@ -1014,13 +1054,27 @@ mod tests {
         wd.on_tick(&tick(0, cluster(5, 5, 0, 8)));
 
         // Drive the queued job to its escalate state (requeues = max 2):
-        // two QueuedRequeue crossings at 2h and 4h.
+        // two QueuedRequeue crossings at 2h and 4h. The first crossing is
+        // deliberately left unconfirmed for one tick: like the other arms,
+        // QueuedRequeue is level-triggered and re-fires with the SAME
+        // post-commit count until the journaled transition confirms.
         let o = wd.on_tick(&tick(2 * 3600, cluster(5, 5, 0, 8)));
         assert_eq!(o.stalled[0].kind, StallKind::QueuedRequeue);
-        let o = wd.on_tick(&tick(4 * 3600, cluster(5, 5, 0, 8)));
+        assert_eq!(o.stalled[0].requeues_used, 1);
+        let o = wd.on_tick(&tick(2 * 3600 + 60, cluster(5, 5, 0, 8)));
+        assert_eq!(
+            o.stalled[0].kind,
+            StallKind::QueuedRequeue,
+            "unconfirmed QueuedRequeue re-fires next tick"
+        );
+        assert_eq!(o.stalled[0].requeues_used, 1, "same un-committed step");
+        wd.confirm_queued_requeue("queued.x86_64-linux");
+        let o = wd.on_tick(&tick(2 * 3600 + 60 + 2 * 3600, cluster(5, 5, 0, 8)));
         assert_eq!(o.stalled[0].kind, StallKind::QueuedRequeue);
-        // QueuedRequeue is edge-consumed: one minute later, no re-fire.
-        let o = wd.on_tick(&tick(4 * 3600 + 60, cluster(5, 5, 0, 8)));
+        assert_eq!(o.stalled[0].requeues_used, 2);
+        wd.confirm_queued_requeue("queued.x86_64-linux");
+        // Confirmed: one minute later, no re-fire.
+        let o = wd.on_tick(&tick(2 * 3600 + 120 + 2 * 3600, cluster(5, 5, 0, 8)));
         assert!(o.stalled.is_empty(), "{:?}", o.stalled);
 
         // At 6h the active job crosses its threshold and the queued job

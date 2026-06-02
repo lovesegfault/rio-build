@@ -27,6 +27,10 @@
 //! - [`JobLedger::requeue_stalled`]: the active-stall auto-retry — the
 //!   in-flight reservation is released, the resubmission counted, and the
 //!   job observed `Queued`.
+//! - [`JobLedger::requeue_queued`]: a queued-watchdog re-enqueue — the
+//!   ladder step is journaled, then the watchdog's consumed-requeue count
+//!   moves and the clock resets. NOT a resubmission: the job is already
+//!   pending and nothing is re-offered.
 //! - [`JobLedger::retire`]: the job reached a terminal record — it leaves
 //!   the watchdog and the in-flight set. The record append itself stays
 //!   with the caller (collect / the stall writer), which holds the context
@@ -37,18 +41,20 @@
 //! collect-poll window until [`process_settled_batch`] decides requeue vs
 //! terminal — a bounded sliver against multi-hour stall thresholds.
 //!
-//! Restart durability: both requeue transitions journal a
+//! Restart durability: every requeue transition journals a
 //! [`RequeueRecord`] to requeues.jsonl BEFORE moving the in-memory counter,
 //! and [`JobLedger::from_journals`] rebuilds the counters as a pure fold of
-//! that stream. The resubmission counts back documented convergence bounds
-//! (the infra auto-retry budget, fail-fast singleton isolation, the stall
-//! auto-retry gate); the user-facing `attempts`/`flaky` measurement is a
-//! SEPARATE projection of the same journal ([`measured_attempt_requeues`]),
+//! that stream. The journal backs every convergence bound enumerated in
+//! [`JOURNAL_BACKED_BOUNDS`] — that const, not prose, is the list a bound
+//! joins when its budget becomes journal-backed, and the fold-equivalence
+//! test iterates it so an entry without a rehydration assertion fails the
+//! suite. The user-facing `attempts`/`flaky` measurement is a SEPARATE
+//! projection of the same journal ([`measured_attempt_requeues`]),
 //! folding only cluster-attempt reasons — one substrate, two consumers
-//! with explicitly different reason semantics. Deriving any of it from
-//! volatile state would zero every consumed budget at each pod restart —
-//! the exact spin the budget exists to prevent, reopened at the restart
-//! edge.
+//! with explicitly different reason semantics. Deriving any of those
+//! budgets from anything volatile would zero every consumed budget at
+//! each pod restart — the exact spin the budgets exist to prevent,
+//! reopened at the restart edge.
 //! Journal-then-increment keeps the invariant `in-memory counters ==
 //! fold(requeues.jsonl)` under append failures and batch re-processing
 //! alike; the equivalence test in `super::tests` pins it at every batch
@@ -72,7 +78,8 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use super::model::{
-    REQUEUE_SOURCE_COLLECT, REQUEUE_SOURCE_STALL, RequeueReason, RequeueRecord, now_rfc3339,
+    REQUEUE_SOURCE_COLLECT, REQUEUE_SOURCE_QUEUED, REQUEUE_SOURCE_STALL, RequeueReason,
+    RequeueRecord, now_rfc3339,
 };
 use super::state::{StateDir, StateFile};
 use super::submit::SubmitTracker;
@@ -118,6 +125,44 @@ pub fn stamped_attempts(prior_cluster_requeues: u32, currently_committed: bool) 
     prior_cluster_requeues + u32::from(currently_committed)
 }
 
+/// The convergence bounds whose consumed budgets are backed by
+/// requeues.jsonl — the quantification domain of the resume fold. Every
+/// entry MUST have a matching rehydration assertion in the
+/// fold-equivalence test (`journal_backed_bounds_all_rehydrate`), which
+/// iterates this list and panics on an entry it has no assertion arm for:
+/// adding a bound here (or documenting one anywhere else) without wiring
+/// its restart story fails the suite instead of shipping a budget that
+/// silently resets at the restart edge.
+pub const JOURNAL_BACKED_BOUNDS: &[&str] = &[
+    // `prior_requeues < max_auto_retries` (collect's transport-defect arm).
+    "infra-auto-retry-budget",
+    // `resubmissions >= failfast_singleton_after` isolates a job.
+    "failfast-singleton-isolation",
+    // The single stall auto-retry before stalled-active goes terminal.
+    "stall-auto-retry-gate",
+    // `attempts` on terminal records: the cluster-attempt projection
+    // ([`measured_attempt_requeues`]) plus the current attempt
+    // ([`stamped_attempts`]) — the measurement folds the same journal,
+    // through the reason predicate.
+    "attempts-accounting",
+    // `requeues >= max_queued_requeues` escalates the queued ladder.
+    "queued-escalation-ladder",
+];
+
+/// The non-tracker budget slices [`JobLedger::from_journals`] folds out
+/// of requeues.jsonl: counters that live outside the [`SubmitTracker`]
+/// but back journal-backed bounds all the same.
+#[derive(Debug, Default)]
+pub struct RehydratedBudgets {
+    /// Per-job stall auto-retries already spent (`REQUEUE_SOURCE_STALL`
+    /// slice) — the poller's stall gate.
+    pub stall_retries: HashMap<String, u32>,
+    /// Per-job queued-watchdog re-enqueues already consumed
+    /// (`REQUEUE_SOURCE_QUEUED` slice) — seeds the watchdog so a restart
+    /// cannot re-grant the escalation ladder.
+    pub queued_requeues: HashMap<String, u32>,
+}
+
 /// Owner of job scheduling-state transitions. See the module docs.
 pub struct JobLedger {
     /// Journal substrate: every requeue transition appends its
@@ -144,36 +189,52 @@ impl JobLedger {
         }
     }
 
-    /// The production constructor: rebuild the resubmission counters as a
-    /// fold of requeues.jsonl, so every bound they back (the infra
-    /// auto-retry budget, fail-fast singleton isolation, `attempts`
-    /// accounting) survives a pod restart with its consumed budget intact.
-    /// Returns the ledger plus the per-job stall auto-retry counts (the
-    /// `REQUEUE_SOURCE_STALL` slice of the same fold) for the poller's
-    /// stall gate — one journal rehydrates both counter families.
+    /// The production constructor: rebuild the consumed budgets as a fold
+    /// of requeues.jsonl, so every bound in [`JOURNAL_BACKED_BOUNDS`]
+    /// survives a pod restart with its consumed budget intact. Returns the
+    /// ledger plus the non-tracker budget slices ([`RehydratedBudgets`]):
+    /// the stall auto-retry counts for the poller's gate and the
+    /// queued-ladder counts the caller seeds the watchdog with — one
+    /// journal rehydrates every counter family.
     ///
-    /// The fold covers every batch kind by construction: increments are
-    /// journaled at the transition site, not re-derived per batch, so
-    /// timeless collect re-offers and timed-mode stall retries land in the
-    /// same stream. Deliberately NOT rehydrated: in-flight reservations
-    /// (nothing is in flight in a fresh process), watchdog clocks (builds
-    /// restart, so stall baselines must too), and post-settlement
-    /// cool-downs (sub-minute re-offer dampers; at worst one early
-    /// re-offer races the first collect pass, the same window the live
-    /// cool-down already permits at expiry). A state dir from before this
-    /// journal existed folds to empty counters — the pre-journal resume
-    /// behavior, degraded but never worse.
+    /// The fold routes by source: collect and stall entries are engine
+    /// resubmissions (they re-offer the job); queued entries are ladder
+    /// steps only (the job never left the pending pool) and must NOT
+    /// inflate `resubmissions` — counting them there would consume the
+    /// infra auto-retry budget and trip fail-fast singleton isolation for
+    /// jobs that were merely starved. An unknown source from a NEWER
+    /// engine's journal counts as a resubmission — the conservative
+    /// direction (a budget can be retired early, never granted extra).
+    ///
+    /// Deliberately NOT rehydrated: in-flight reservations (nothing is in
+    /// flight in a fresh process), watchdog clock BASELINES (builds
+    /// restart, so accrual must too — but the consumed ladder budget is
+    /// not a baseline and is seeded), and post-settlement cool-downs
+    /// (sub-minute re-offer dampers; at worst one early re-offer races the
+    /// first collect pass, the same window the live cool-down already
+    /// permits at expiry). A state dir from before this journal existed
+    /// folds to empty counters — the pre-journal resume behavior, degraded
+    /// but never worse.
     pub fn from_journals(
         state: StateDir,
         watchdog: Arc<tokio::sync::Mutex<Watchdog>>,
-    ) -> Result<(Self, HashMap<String, u32>)> {
+    ) -> Result<(Self, RehydratedBudgets)> {
         let entries: Vec<RequeueRecord> = state.load_jsonl(StateFile::Requeues)?;
         let mut resubmissions: HashMap<String, u32> = HashMap::new();
         let mut stall_retries: HashMap<String, u32> = HashMap::new();
+        let mut queued_requeues: HashMap<String, u32> = HashMap::new();
         for entry in &entries {
-            *resubmissions.entry(entry.job.clone()).or_default() += 1;
-            if entry.source == REQUEUE_SOURCE_STALL {
-                *stall_retries.entry(entry.job.clone()).or_default() += 1;
+            match entry.source.as_str() {
+                REQUEUE_SOURCE_QUEUED => {
+                    *queued_requeues.entry(entry.job.clone()).or_default() += 1;
+                }
+                REQUEUE_SOURCE_STALL => {
+                    *resubmissions.entry(entry.job.clone()).or_default() += 1;
+                    *stall_retries.entry(entry.job.clone()).or_default() += 1;
+                }
+                _ => {
+                    *resubmissions.entry(entry.job.clone()).or_default() += 1;
+                }
             }
         }
         let tracker = Arc::new(SubmitTracker {
@@ -186,7 +247,10 @@ impl JobLedger {
                 tracker,
                 watchdog,
             },
-            stall_retries,
+            RehydratedBudgets {
+                stall_retries,
+                queued_requeues,
+            },
         ))
     }
 
@@ -298,6 +362,19 @@ impl JobLedger {
             .lock()
             .await
             .observe_job(job, JobPhase::Queued);
+        Ok(())
+    }
+
+    /// A queued-watchdog re-enqueue (the non-terminal ladder step):
+    /// journal the transition, then commit the watchdog's consumed-requeue
+    /// increment and clock reset. Journal-then-commit, like every other
+    /// budget move — a failed append leaves the clock over its limit so
+    /// the armed verdict re-fires next tick, and resume can never see
+    /// fewer consumed steps than the live ladder. Touches NO tracker
+    /// counter: the job is already pending; nothing is re-offered.
+    pub async fn requeue_queued(&self, job: &str) -> Result<()> {
+        self.journal_requeue(job, REQUEUE_SOURCE_QUEUED, "queued-watchdog")?;
+        self.watchdog.lock().await.confirm_queued_requeue(job);
         Ok(())
     }
 
@@ -574,7 +651,8 @@ mod tests {
         // "Pod restart": rebuild from the same state dir.
         let state = StateDir::new(dir.path()).unwrap();
         let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
-        let (resumed, stall_retries) = JobLedger::from_journals(state, watchdog).unwrap();
+        let (resumed, budgets) = JobLedger::from_journals(state, watchdog).unwrap();
+        let stall_retries = budgets.stall_retries;
         assert_eq!(resumed.tracker().resubmission_count("a.x").await, 2);
         assert_eq!(resumed.tracker().resubmission_count("b.x").await, 1);
         assert_eq!(
@@ -591,8 +669,116 @@ mod tests {
         let legacy_dir = tempfile::tempdir().unwrap();
         let legacy_state = StateDir::new(legacy_dir.path()).unwrap();
         let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
-        let (legacy, legacy_stalls) = JobLedger::from_journals(legacy_state, watchdog).unwrap();
+        let (legacy, legacy_budgets) = JobLedger::from_journals(legacy_state, watchdog).unwrap();
+        let legacy_stalls = legacy_budgets.stall_retries;
         assert_eq!(legacy.tracker().resubmission_count("a.x").await, 0);
         assert!(legacy_stalls.is_empty());
+    }
+
+    /// FF over [`JOURNAL_BACKED_BOUNDS`]: the bound list is data, and this
+    /// test iterates it — every listed bound must have a rehydration
+    /// assertion arm here, and an entry without one panics in the
+    /// catch-all. Documenting a new journal-backed bound therefore forces
+    /// its restart story to be wired and pinned in the same change, the
+    /// failure mode that left the queued-escalation ladder volatile while
+    /// its two sibling budget families survived restarts.
+    #[tokio::test]
+    async fn journal_backed_bounds_all_rehydrate() {
+        // One journal exercising every source: two collect re-offers and a
+        // stall retry for "resub.x" (the resubmission-backed bounds), and
+        // two queued ladder steps for "starved.x".
+        let (dir, ledger, _tracker, _watchdog) = ledger();
+        ledger
+            .requeue_collected("resub.x", RequeueReason::InfraAutoRetry)
+            .await
+            .unwrap();
+        ledger
+            .requeue_collected("resub.x", RequeueReason::EngineCancelled)
+            .await
+            .unwrap();
+        ledger.commit_batch(&["resub.x".to_string()]).await;
+        ledger.requeue_stalled("resub.x").await.unwrap();
+        ledger.commit_batch(&["starved.x".to_string()]).await;
+        ledger
+            .requeue_collected("starved.x", RequeueReason::InfraAutoRetry)
+            .await
+            .unwrap();
+        ledger.requeue_queued("starved.x").await.unwrap();
+        ledger.requeue_queued("starved.x").await.unwrap();
+
+        // "Pod restart".
+        let state = StateDir::new(dir.path()).unwrap();
+        let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs {
+            queued_watchdog_hours: 2.0,
+            max_queued_requeues: 2,
+            ..Knobs::default()
+        })));
+        let (resumed, budgets) = JobLedger::from_journals(state, watchdog.clone()).unwrap();
+        watchdog
+            .lock()
+            .await
+            .set_requeue_seed(budgets.queued_requeues.clone());
+
+        for bound in JOURNAL_BACKED_BOUNDS {
+            match *bound {
+                // The three bounds backed by the resubmission counter:
+                // collect + stall entries fold into it, queued entries do
+                // NOT (a starved job must not lose its infra auto-retry,
+                // get singled out, or report inflated attempts because the
+                // ladder ticked while it waited).
+                "infra-auto-retry-budget"
+                | "failfast-singleton-isolation"
+                | "attempts-accounting" => {
+                    assert_eq!(
+                        resumed.tracker().resubmission_count("resub.x").await,
+                        3,
+                        "{bound}: collect+stall entries rehydrate the resubmission counter"
+                    );
+                    assert_eq!(
+                        resumed.tracker().resubmission_count("starved.x").await,
+                        1,
+                        "{bound}: queued entries must not inflate resubmissions"
+                    );
+                }
+                "stall-auto-retry-gate" => {
+                    assert_eq!(
+                        budgets.stall_retries,
+                        HashMap::from([("resub.x".to_string(), 1)]),
+                        "{bound}: the stall slice rehydrates the auto-retry gate"
+                    );
+                }
+                "queued-escalation-ladder" => {
+                    assert_eq!(
+                        budgets.queued_requeues,
+                        HashMap::from([("starved.x".to_string(), 2)]),
+                        "{bound}: the queued slice rehydrates the ladder"
+                    );
+                    // Behavioral pin: with the seed applied, the restarted
+                    // job's FIRST queued crossing escalates instead of
+                    // being re-granted the full ladder.
+                    resumed.commit_batch(&["starved.x".to_string()]).await;
+                    resumed
+                        .requeue_collected("starved.x", RequeueReason::InfraAutoRetry)
+                        .await
+                        .unwrap();
+                    let mut wd = watchdog.lock().await;
+                    wd.on_tick(&tick(0));
+                    let outcome = wd.on_tick(&tick(2 * 3600 + 60));
+                    assert_eq!(
+                        outcome
+                            .stalled
+                            .iter()
+                            .map(|s| (s.job.as_str(), s.kind.clone()))
+                            .collect::<Vec<_>>(),
+                        vec![("starved.x", StallKind::QueuedEscalate)],
+                        "{bound}: a restart must not re-grant the escalation ladder"
+                    );
+                }
+                other => panic!(
+                    "journal-backed bound {other:?} has no rehydration assertion in this test \
+                     — wire its restart story before listing it"
+                ),
+            }
+        }
     }
 }

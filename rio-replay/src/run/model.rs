@@ -899,6 +899,15 @@ pub const REQUEUE_SOURCE_COLLECT: &str = "collect";
 /// auto-retry.
 pub const REQUEUE_SOURCE_STALL: &str = "stall";
 
+/// [`RequeueRecord::source`] value for a queued-watchdog re-enqueue (the
+/// non-terminal QueuedRequeue ladder step). NOT an engine resubmission —
+/// the job is already in the pending pool and nothing is re-offered — so
+/// the resume fold routes this source into the queued-escalation ladder
+/// counter, never into `resubmissions` (it must not consume the infra
+/// auto-retry budget, trip fail-fast singleton isolation, or inflate
+/// `attempts`).
+pub const REQUEUE_SOURCE_QUEUED: &str = "queued";
+
 /// Why the engine re-offered a job: the closed requeue-reason vocabulary,
 /// journaled on every [`RequeueRecord`].
 ///

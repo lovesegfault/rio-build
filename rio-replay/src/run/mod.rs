@@ -1124,8 +1124,10 @@ fn stall_record(
 /// dropped by collect's already-terminal belt once the job retires). A
 /// second ActiveStall for the same job, or a QueuedEscalate, writes the
 /// terminal rio-infra-failure record ("stalled-active" / "stalled-queued")
-/// and retires the job. QueuedRequeue is purely a clock reset (the job is
-/// already in the pending set) — log only.
+/// and retires the job. QueuedRequeue journals the ladder step
+/// (REQUEUE_SOURCE_QUEUED) and then commits the watchdog's
+/// consumed-requeue increment — the job itself stays in the pending set;
+/// nothing is re-offered or counted as a resubmission.
 ///
 /// Failure handling is per-job, log-and-continue: one job's append failure
 /// must never forfeit its siblings' verdicts (wave-committed batch members
@@ -1149,11 +1151,25 @@ async fn apply_stall_actions(
     for stall in stalled {
         match stall.kind {
             StallKind::QueuedRequeue => {
-                tracing::info!(
-                    job = %stall.job,
-                    requeues_used = stall.requeues_used,
-                    "queued watchdog: clock reset, job stays pending (non-terminal re-enqueue)"
-                );
+                // Journal-then-commit through the ledger: the ladder step
+                // is durable before the clock moves, so the consumed
+                // escalation budget survives a pod restart (the resume
+                // fold seeds the watchdog with it). A failed append leaves
+                // the verdict armed — re-fired and retried next tick.
+                match ledger.requeue_queued(&stall.job).await {
+                    Ok(()) => tracing::info!(
+                        job = %stall.job,
+                        requeues_used = stall.requeues_used,
+                        "queued watchdog: clock reset, job stays pending (non-terminal \
+                         re-enqueue)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        job = %stall.job,
+                        error = %format!("{e:#}"),
+                        "queued-requeue journal append failed; the verdict stays armed and \
+                         re-fires on the next poll"
+                    ),
+                }
             }
             StallKind::ActiveStall => {
                 let used = stall_retries.get(&stall.job).copied().unwrap_or(0);
@@ -2096,8 +2112,16 @@ pub async fn run_with_backends(
     // budgets, fail-fast singleton isolation, and attempts accounting
     // those counters back keep their consumed budget across pod restarts
     // instead of silently resetting to zero.
-    let (job_ledger, rehydrated_stall_retries) =
+    let (job_ledger, rehydrated_budgets) =
         ledger::JobLedger::from_journals((*state).clone(), watchdog.clone())?;
+    // Seed the watchdog's consumed queued-ladder budgets from the same
+    // fold: clocks are created fresh (stall baselines restart with the
+    // builds), but a mid-ladder job must not be re-granted the full
+    // escalation ladder at the restart edge.
+    watchdog
+        .lock()
+        .await
+        .set_requeue_seed(rehydrated_budgets.queued_requeues);
     let job_ledger = Arc::new(job_ledger);
     let contexts = Arc::new(contexts);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -2128,7 +2152,7 @@ pub async fn run_with_backends(
         // auto-retry before stalled-active goes terminal), rehydrated from
         // the requeue journal so a pod restart cannot grant every stalled
         // job a second auto-retry.
-        let mut stall_retries: HashMap<String, u32> = rehydrated_stall_retries;
+        let mut stall_retries: HashMap<String, u32> = rehydrated_budgets.stall_retries;
         tokio::spawn(async move {
             let mut sync_tracker = SyncTracker::default();
             let mut probe_ladder = InfraProbeLadder::new();
@@ -4189,8 +4213,9 @@ mod tests {
         boundary: &str,
     ) {
         let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
-        let (folded, folded_stalls) =
+        let (folded, folded_budgets) =
             ledger::JobLedger::from_journals(state.clone(), watchdog).unwrap();
+        let folded_stalls = folded_budgets.stall_retries;
         let live_counts = live.tracker().resubmissions.lock().await.clone();
         let folded_counts = folded.tracker().resubmissions.lock().await.clone();
         assert_eq!(
@@ -4240,8 +4265,9 @@ mod tests {
             .map(|job| ((*job).to_string(), fold_ctx(job, &drv(job))))
             .collect();
         let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
-        let (live, mut stall_retries) =
+        let (live, live_budgets) =
             ledger::JobLedger::from_journals(state.clone(), watchdog).unwrap();
+        let mut stall_retries = live_budgets.stall_retries;
         let backends = CollectBackends {
             admin: Arc::new(NoLogsAdmin),
             store: Arc::new(FakeStoreApi::default()),
@@ -4471,7 +4497,7 @@ mod tests {
         {
             let state = StateDir::new(dir.path()).unwrap();
             let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(knobs.clone())));
-            let (ledger, _stalls) =
+            let (ledger, _budgets) =
                 ledger::JobLedger::from_journals(state.clone(), watchdog).unwrap();
             let ledger = Arc::new(ledger);
             fail_one_batch(state.clone(), ledger.clone(), 1).await;
@@ -4501,7 +4527,7 @@ mod tests {
         {
             let state = StateDir::new(dir.path()).unwrap();
             let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(knobs.clone())));
-            let (ledger, _stalls) =
+            let (ledger, _budgets) =
                 ledger::JobLedger::from_journals(state.clone(), watchdog).unwrap();
             let ledger = Arc::new(ledger);
             assert_eq!(
@@ -4773,7 +4799,7 @@ mod tests {
                 .push(Err(anyhow::anyhow!("gateway unreachable")));
         }
         let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
-        let (job_ledger, _stalls) =
+        let (job_ledger, _budgets) =
             ledger::JobLedger::from_journals((*state).clone(), watchdog).unwrap();
         let job_ledger = Arc::new(job_ledger);
         // Four attemptable jobs: a full wave would batch them together —
@@ -5948,14 +5974,35 @@ mod tests {
 
         // Drive the watchdog so ONE tick carries both verdicts: stuck is
         // Active from t0 (6h threshold); starved is Queued with its
-        // re-enqueue budget spent by two QueuedRequeue crossings (2h, 4h).
+        // re-enqueue budget spent by two QueuedRequeue crossings (2h, 4h),
+        // each applied through the production path (journal + confirm).
         {
             let mut w = wd.lock().await;
             w.observe_job(stuck, watchdog::JobPhase::Active);
             w.observe_job(starved, watchdog::JobPhase::Queued);
             w.on_tick(&tick_at(0));
-            w.on_tick(&tick_at(2 * 3600));
-            w.on_tick(&tick_at(4 * 3600));
+        }
+        for at in [2 * 3600, 4 * 3600] {
+            let crossing = wd.lock().await.on_tick(&tick_at(at));
+            assert!(
+                crossing
+                    .stalled
+                    .iter()
+                    .any(|s| s.job == starved && s.kind == StallKind::QueuedRequeue),
+                "{:?}",
+                crossing.stalled
+            );
+            apply_stall_actions(
+                &state,
+                &job_ledger,
+                &contexts,
+                &results,
+                &mut stall_retries,
+                &crossing.stalled,
+                "leaf",
+                "c-iso",
+            )
+            .await;
         }
         let both = wd.lock().await.on_tick(&tick_at(6 * 3600 + 60));
         assert!(
@@ -5969,9 +6016,13 @@ mod tests {
                 .any(|s| s.job == starved && s.kind == StallKind::QueuedEscalate)
         );
 
-        // Block the requeue journal: a directory at requeues.jsonl makes
-        // its append fail while results.jsonl stays writable.
-        std::fs::create_dir(dir.path().join("requeues.jsonl")).unwrap();
+        // Block the requeue journal: set the existing journal aside and
+        // put a directory at requeues.jsonl, so its append fails while
+        // results.jsonl stays writable.
+        let journal_path = dir.path().join("requeues.jsonl");
+        let journal_aside = dir.path().join("requeues.jsonl.aside");
+        std::fs::rename(&journal_path, &journal_aside).unwrap();
+        std::fs::create_dir(&journal_path).unwrap();
         apply_stall_actions(
             &state,
             &job_ledger,
@@ -6011,7 +6062,8 @@ mod tests {
 
         // The journal recovers: the re-fired verdict applies the auto-retry
         // exactly once, and the committed transition consumes the level.
-        std::fs::remove_dir(dir.path().join("requeues.jsonl")).unwrap();
+        std::fs::remove_dir(&journal_path).unwrap();
+        std::fs::rename(&journal_aside, &journal_path).unwrap();
         apply_stall_actions(
             &state,
             &job_ledger,
@@ -6026,7 +6078,22 @@ mod tests {
         assert_eq!(tracker.resubmission_count(stuck).await, 1);
         assert_eq!(stall_retries.get(stuck), Some(&1));
         let journal: Vec<model::RequeueRecord> = state.load_jsonl(StateFile::Requeues).unwrap();
-        assert_eq!(journal.len(), 1, "exactly one journaled transition");
+        assert_eq!(
+            journal
+                .iter()
+                .filter(|r| r.source == model::REQUEUE_SOURCE_STALL)
+                .count(),
+            1,
+            "exactly one journaled stall transition: {journal:?}"
+        );
+        assert_eq!(
+            journal
+                .iter()
+                .filter(|r| r.source == model::REQUEUE_SOURCE_QUEUED)
+                .count(),
+            2,
+            "the two ladder steps were journaled by the production path: {journal:?}"
+        );
         let after = wd.lock().await.on_tick(&tick_at(6 * 3600 + 180));
         assert!(
             after.stalled.is_empty(),
