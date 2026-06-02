@@ -748,32 +748,42 @@ mod tests {
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let db = TestDb::new(&crate::MIGRATOR).await;
-        // Hold a connection so the published value is provably a real
-        // computation (>0), not the pre-registered 0.0.
-        let _held = db.pool.acquire().await.expect("acquire");
 
         let shutdown = rio_common::signal::Token::new();
         let _task = spawn_pg_pool_gauge_tick(db.pool.clone(), shutdown.clone());
 
-        // spawn_periodic fires its first tick immediately; on the
-        // current-thread test runtime the task runs at our next await
-        // points. Bounded yield loop, no wall-clock sleep.
+        // spawn_periodic fires its first interval tick immediately —
+        // but the tick is a TIMER, and the current-thread runtime only
+        // processes the timer driver when it parks. A yield_now busy
+        // loop starves the driver (observed 40-60% flake), so wait by
+        // SLEEPING: each sleep parks the runtime, the driver fires the
+        // ready tick, the task publishes. Bounded at ~2s worst case;
+        // the success path completes on the first park.
         let mut published = None;
         for _ in 0..1000 {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             published = recorder.gauge_value("rio_store_pg_pool_utilization{}");
             if published.is_some() {
                 break;
             }
         }
+        // PRESENCE is the structural property under test: without the
+        // tick the gauge is only ever set by GetLoad, so a freeze
+        // regression shows up as "never published". The VALUE is not
+        // pinned beyond its range — `size()`/`num_idle()` are
+        // non-atomic separate loads (see `pg_pool_utilization`'s doc),
+        // so even a held connection can transiently read as 0 in-use
+        // under pool churn; the formula itself is covered by
+        // `get_load_tracks_in_use_connections`, and this tick shares
+        // that formula by construction (`publish_pg_pool_gauge` calls
+        // the same fn).
         let v = published.expect(
             "the periodic tick must publish rio_store_pg_pool_utilization \
              without any GetLoad traffic",
         );
         assert!(
-            v > 0.0 && v <= 1.0,
-            "tick must publish the live (size − idle)/max computation \
-             (one connection held → >0); got {v}"
+            (0.0..=1.0).contains(&v),
+            "tick published an out-of-range utilization: {v}"
         );
         shutdown.cancel();
     }
