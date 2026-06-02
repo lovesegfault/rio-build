@@ -780,7 +780,7 @@ pub async fn execute_build(
                 opts,
                 is_fod,
                 log_tx,
-                graph_drvs: &graph_drvs,
+                graph_drvs: std::sync::Arc::clone(&graph_drvs),
             })
             .await?;
 
@@ -1047,7 +1047,7 @@ struct NativeLifecycleArgs<'a> {
     opts: BuildOpts,
     is_fod: bool,
     log_tx: &'a crate::log_stream::SheddingLogSender,
-    graph_drvs: &'a std::collections::BTreeMap<String, String>,
+    graph_drvs: std::sync::Arc<std::collections::BTreeMap<String, String>>,
 }
 
 /// What the native pipeline produced for one build attempt.
@@ -1189,21 +1189,23 @@ async fn run_native_lifecycle(
         netrc: None,
     };
 
-    // The glue is synchronous filesystem work against the FUSE-backed
-    // merged store (`exportReferencesGraph` closure expansion, `.drv`
-    // reads, `passAsFile` staging): a cold read can block for seconds.
-    // Run it on the blocking pool like its sibling stages (overlay
-    // setup/teardown, output processing). This matters structurally, not
-    // just for latency: tokio's worker count equals the pod's
-    // quota-clamped `available_parallelism()` (see `cgroup::nproc`), so a
-    // 1-CPU pod runs a single-worker runtime and a blocking call here
-    // would suspend the limit watchdogs, heartbeats, and every other task
-    // on that worker for the duration of the stall.
+    // The glue is pure CPU (parse + closure walk + serialization — it
+    // holds no filesystem capability, `builder.glue.pure`), but for an
+    // ERG-heavy build that CPU work is real: closureInfo-style graphs
+    // walk thousands of metadata entries and serialize megabytes of
+    // registration text. Run it on the blocking pool like its sibling
+    // stages: tokio's worker count equals the pod's quota-clamped
+    // `available_parallelism()` (see `cgroup::nproc`), so a 1-CPU pod
+    // runs a single-worker runtime and a long compute here would
+    // suspend the heartbeats and every other task on that worker.
+    // The drv-text table rides its Arc (the glue only reads); the
+    // remaining to_vec()s are the closure-path/metadata projections,
+    // already shared shapes elsewhere.
     let drv_path_owned = drv_path.to_owned();
     let basic_drv_owned = basic_drv.clone();
     let input_paths_owned = input_paths.to_vec();
     let input_metadata_owned = input_metadata.to_vec();
-    let graph_drvs_owned = graph_drvs.clone();
+    let graph_drvs_owned = std::sync::Arc::clone(&graph_drvs);
     let glue_join = tokio::task::spawn_blocking(move || {
         glue::derivation_into_request(
             &drv_path_owned,
@@ -1749,12 +1751,17 @@ struct ResolvedInputs {
     /// glue's closure planning and the output policy checks don't need
     /// a second QueryPathInfo pass (I-106).
     input_metadata: Vec<ValidatedPathInfo>,
-    /// ATerm text for every `.drv` in the closure, keyed by store path:
-    /// the request glue's only source of derivation bytes
-    /// (`builder.glue.pure` — the glue holds no filesystem capability).
-    /// Assembled from the texts the fetches above already produced;
-    /// see `inputs::prefetch_graph_drvs`.
-    graph_drvs: std::collections::BTreeMap<String, String>,
+    /// ATerm text for the main `.drv` plus the declaration-demanded
+    /// graph `.drv`s: the request glue's only source of derivation
+    /// bytes (`builder.glue.pure` — the glue holds no filesystem
+    /// capability). Assembled at input resolution; see
+    /// `inputs::fetch_demanded_graph_drvs`. Arc-shared: the glue stage
+    /// runs on the blocking pool and previously deep-cloned the table
+    /// into the closure — for an ERG-heavy build (closureInfo-style,
+    /// thousands of texts) that doubled the table\'s peak memory for
+    /// the duration of the glue run for no reason: the glue only
+    /// reads.
+    graph_drvs: std::sync::Arc<std::collections::BTreeMap<String, String>>,
 }
 
 /// Resolve inputDrvs → BasicDerivation + compute full input closure.
@@ -1930,7 +1937,7 @@ async fn resolve_inputs(
         input_paths,
         input_sized,
         input_metadata,
-        graph_drvs,
+        graph_drvs: std::sync::Arc::new(graph_drvs),
     })
 }
 
