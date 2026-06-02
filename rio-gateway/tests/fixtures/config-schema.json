@@ -126,7 +126,7 @@
         "default": 1048576
       },
       "build_policy": {
-        "description": "Per-tenant build-policy map, keyed by tenant name (the\nauthorized_keys comment). Settable only via the TOML file layer\n(`/etc/rio/gateway.toml`; exposed as helm `gateway.buildPolicy`\nonce the chart grows a gateway.toml mount); the env layer can't\nreliably express map keys (tenant names contain `-` and mixed\ncase, which the `RIO_*__` separator mangles). Unknown tenants →\ndefault (all-false). See `r[gw.build.per-tenant-policy]`.",
+        "description": "Per-tenant build-policy map, keyed by tenant name (the\nauthorized_keys comment). Settable only via the TOML file layer\n(`/etc/rio/gateway.toml`; exposed as helm `gateway.buildPolicy`,\nrendered and mounted by\n`infra/helm/rio-build/templates/gateway.yaml`); the env layer can't\nreliably express map keys (tenant names contain `-` and mixed\ncase, which the `RIO_*__` separator mangles). Unknown tenants →\ndefault (all-false). See `r[gw.build.per-tenant-policy]`.",
         "type": "object",
         "additionalProperties": {
           "$ref": "#/$defs/BuildPolicy"

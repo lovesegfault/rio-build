@@ -33,8 +33,9 @@ pub struct BuildPolicy {
 }
 
 /// Tenant name → policy. TOML: `[build_policy."tenant-name"]` tables in
-/// `/etc/rio/gateway.toml` (exposed as helm `gateway.buildPolicy` once
-/// the chart grows a gateway.toml mount).
+/// `/etc/rio/gateway.toml` (exposed as helm `gateway.buildPolicy`, which
+/// the chart renders into a checksummed gateway.toml ConfigMap mount —
+/// see `infra/helm/rio-build/templates/gateway.yaml`).
 pub type BuildPolicyMap = std::collections::BTreeMap<String, BuildPolicy>;
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -154,8 +155,9 @@ pub struct Config {
     pub max_transitive_inputs: usize,
     /// Per-tenant build-policy map, keyed by tenant name (the
     /// authorized_keys comment). Settable only via the TOML file layer
-    /// (`/etc/rio/gateway.toml`; exposed as helm `gateway.buildPolicy`
-    /// once the chart grows a gateway.toml mount); the env layer can't
+    /// (`/etc/rio/gateway.toml`; exposed as helm `gateway.buildPolicy`,
+    /// rendered and mounted by
+    /// `infra/helm/rio-build/templates/gateway.yaml`); the env layer can't
     /// reliably express map keys (tenant names contain `-` and mixed
     /// case, which the `RIO_*__` separator mangles). Unknown tenants →
     /// default (all-false). See `r[gw.build.per-tenant-policy]`.
