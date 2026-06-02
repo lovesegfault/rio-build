@@ -203,6 +203,7 @@
     "rio_store_put_path_bytes_total",
     "rio_store_put_path_duration_seconds",
     "rio_store_put_path_total",
+    "rio_store_putpath_concurrent_wait_total",
     "rio_store_putpath_incomplete_total",
     "rio_store_putpath_retries_total",
     "rio_store_putpath_stale_reclaimed_total",
@@ -1256,6 +1257,11 @@
         "name": "rio_store_put_path_total",
         "kind": "counter",
         "help": "Total PutPath operations (per store path; PutPathBatch counts each output)"
+      },
+      {
+        "name": "rio_store_putpath_concurrent_wait_total",
+        "kind": "counter",
+        "help": "Concurrent same-path PutPath/PutPathChunked waits resolved, labeled by outcome: completed (winner committed; waiter took the idempotent skip), takeover (winner aborted; waiter claimed the freed placeholder), timeout (budget exhausted; ABORTED surfaced to the client's own retry logic)."
       },
       {
         "name": "rio_store_putpath_incomplete_total",

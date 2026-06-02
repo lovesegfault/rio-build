@@ -213,13 +213,50 @@ impl StoreServiceImpl {
                         claim: Some(c),
                     });
                 }
-                Ok(PlaceholderClaim::Concurrent) => {
-                    drain_stream("PutPathChunked", &mut stream).await;
-                    bail!(Status::aborted(format!(
-                        "PutPathChunked: outputs[{i}]: {}; retry",
-                        rio_proto::CONCURRENT_PUTPATH_MSG
-                    )));
-                }
+                // r[impl store.put.concurrent-wait]
+                // Same bounded wait as PutPath: the builder's client-side
+                // retry has the same budget-vs-upload-duration mismatch
+                // the gateway's does.
+                Ok(PlaceholderClaim::Concurrent) => match self
+                    .wait_for_concurrent_upload(
+                        &store_path_hash,
+                        out.store_path.as_str(),
+                        &refs_str,
+                    )
+                    .await
+                {
+                    Ok(PlaceholderClaim::AlreadyComplete) => {
+                        metrics::counter!("rio_store_put_path_total", "result" => "exists")
+                            .increment(1);
+                        skipped[i] = true;
+                        n_exists_emitted += 1;
+                        output_claims.push(OutputClaim {
+                            store_path_hash,
+                            claim: None,
+                        });
+                    }
+                    Ok(PlaceholderClaim::Owned(c)) => {
+                        guards.push(self.spawn_placeholder_guard(store_path_hash.clone(), c));
+                        output_claims.push(OutputClaim {
+                            store_path_hash,
+                            claim: Some(c),
+                        });
+                    }
+                    Ok(PlaceholderClaim::Concurrent) => {
+                        drain_stream("PutPathChunked", &mut stream).await;
+                        bail!(Status::aborted(format!(
+                            "PutPathChunked: outputs[{i}]: {}; retry",
+                            rio_proto::CONCURRENT_PUTPATH_MSG
+                        )));
+                    }
+                    Err(e) => {
+                        drain_stream("PutPathChunked", &mut stream).await;
+                        bail!(putpath_metadata_status(
+                            "PutPathChunked: concurrent-wait",
+                            e
+                        ));
+                    }
+                },
                 Err(e) => {
                     drain_stream("PutPathChunked", &mut stream).await;
                     bail!(putpath_metadata_status(

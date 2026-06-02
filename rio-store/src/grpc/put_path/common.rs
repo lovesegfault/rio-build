@@ -25,7 +25,7 @@
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tonic::{Request, Status, Streaming};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use rio_proto::types::{PutPathRequest, PutPathTrailer, put_path_request};
 use rio_proto::validated::ValidatedPathInfo;
@@ -47,6 +47,18 @@ pub(in crate::grpc) use crate::ingest::PlaceholderClaim;
 const PUTPATH_HOOKS: ingest::IngestHooks = ingest::IngestHooks {
     stale_reclaimed_metric: "rio_store_putpath_stale_reclaimed_total",
     ctx_label: "PutPath",
+};
+
+/// Poll curve for [`StoreServiceImpl::wait_for_concurrent_upload`].
+/// Full jitter so N losers waiting on the same winner don't hit PG in
+/// lockstep; 1 s cap keeps the post-commit skip latency ≤1 s while the
+/// per-poll cost (one indexed SELECT + one ON CONFLICT no-op INSERT)
+/// stays negligible.
+const CONCURRENT_WAIT_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
+    base: std::time::Duration::from_millis(100),
+    mult: 2.0,
+    cap: std::time::Duration::from_secs(1),
+    jitter: rio_common::backoff::Jitter::Full,
 };
 
 /// How the NAR was persisted. Batch uses this to pick the right
@@ -663,6 +675,86 @@ impl StoreServiceImpl {
             PlaceholderClaim::Owned(_) => {}
         }
         Ok(claim)
+    }
+
+    /// Bounded wait for a concurrent same-path uploader to resolve.
+    ///
+    /// Layer rationale: the loser of a same-path race needs no bytes to
+    /// finish — its optimal outcome is the idempotent skip — so waiting
+    /// HERE, where the winner's placeholder row is directly observable,
+    /// fixes every client at once: the gateway's buffered re-send retry
+    /// (`gw.put.aborted-retry`, ~6 s budget tuned for KB `.drv` NARs —
+    /// no match for a winner streaming a chunked NAR for tens of
+    /// seconds), the gateway's streaming path (cannot retry at all —
+    /// bytes already consumed off the wire), and the builder's upload
+    /// retry. The wire contract is unchanged; the RPC just resolves
+    /// later, bounded by `concurrent_put_wait` ≪ `GRPC_STREAM_TIMEOUT`.
+    ///
+    /// Re-runs the full [`ingest::claim_placeholder`] per poll so every
+    /// transition is handled: winner commits → `AlreadyComplete`
+    /// (caller takes the idempotent-skip path), winner aborts/dies →
+    /// placeholder reaped → `Owned` (caller takes over the upload),
+    /// winner still streaming → keep polling. Returns `Concurrent` only
+    /// when the budget expires with the uploader still live — the
+    /// caller surfaces the original `ABORTED` and the client's retry
+    /// logic stays in charge.
+    // r[impl store.put.concurrent-wait]
+    pub(in crate::grpc) async fn wait_for_concurrent_upload(
+        &self,
+        store_path_hash: &[u8],
+        store_path: &str,
+        refs: &[String],
+    ) -> Result<PlaceholderClaim, metadata::MetadataError> {
+        let budget = self.concurrent_put_wait;
+        let start = std::time::Instant::now();
+        let mut attempt = 0u32;
+        loop {
+            let elapsed = start.elapsed();
+            if elapsed >= budget {
+                metrics::counter!("rio_store_putpath_concurrent_wait_total",
+                    "outcome" => "timeout")
+                .increment(1);
+                return Ok(PlaceholderClaim::Concurrent);
+            }
+            let delay = CONCURRENT_WAIT_BACKOFF
+                .duration(attempt)
+                .min(budget - elapsed);
+            tokio::time::sleep(delay).await;
+            attempt = attempt.saturating_add(1);
+            // Direct ingest call, NOT the metric-wrapping
+            // `claim_placeholder` method: the per-RPC
+            // `concurrent_upload` retry counter fired once on the
+            // initial claim; per-poll increments would inflate it ~1/s
+            // per waiter.
+            match ingest::claim_placeholder(
+                &self.pool,
+                self.chunk_backend.as_ref(),
+                store_path_hash,
+                store_path,
+                refs,
+                PUTPATH_HOOKS,
+            )
+            .await?
+            {
+                PlaceholderClaim::Concurrent => {}
+                PlaceholderClaim::AlreadyComplete => {
+                    debug!(%store_path, waited = ?start.elapsed(),
+                        "PutPath: concurrent upload committed; idempotent skip");
+                    metrics::counter!("rio_store_putpath_concurrent_wait_total",
+                        "outcome" => "completed")
+                    .increment(1);
+                    return Ok(PlaceholderClaim::AlreadyComplete);
+                }
+                PlaceholderClaim::Owned(claim) => {
+                    debug!(%store_path, waited = ?start.elapsed(),
+                        "PutPath: concurrent upload aborted; taking over the placeholder");
+                    metrics::counter!("rio_store_putpath_concurrent_wait_total",
+                        "outcome" => "takeover")
+                    .increment(1);
+                    return Ok(PlaceholderClaim::Owned(claim));
+                }
+            }
+        }
     }
 
     /// gRPC wrapper around [`ingest::persist_nar`]: maps

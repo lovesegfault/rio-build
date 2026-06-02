@@ -333,11 +333,26 @@ pub struct StoreServiceImpl {
     ///
     /// [`wait_for_active_drain`]: rio_common::server::wait_for_active_drain
     active_get_path_streams: Arc<std::sync::atomic::AtomicUsize>,
+    /// Bounded budget for waiting out a concurrent same-path uploader
+    /// before surfacing `ABORTED` (`r[store.put.concurrent-wait]`).
+    /// Default [`DEFAULT_CONCURRENT_PUT_WAIT`]; tests use millisecond
+    /// budgets via `.with_concurrent_put_wait()`.
+    concurrent_put_wait: std::time::Duration,
 }
 
 /// Default `GetPath` chunk-prefetch depth. See
 /// [`StoreServiceImpl::with_chunk_prefetch_k`].
 pub const DEFAULT_CHUNK_PREFETCH_K: usize = 64;
+
+/// Default budget for waiting out a concurrent same-path uploader
+/// (`r[store.put.concurrent-wait]`). Sized to cover a typical chunked
+/// S3 upload of a large NAR (tens of seconds) while staying well under
+/// `rio_common::grpc::GRPC_STREAM_TIMEOUT` (300 s) so a waiting loser
+/// resolves inside the client's own RPC deadline — the gateway's
+/// re-send retry (`gw.put.aborted-retry`, ~6 s spread over 8 attempts)
+/// then multiplies the effective coverage for pathologically slow
+/// winners.
+pub const DEFAULT_CONCURRENT_PUT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Default global NAR buffer budget: 8 × MAX_NAR_SIZE (32 GiB on 64-bit).
 /// `tokio::sync::Semaphore` max permits is `usize::MAX >> 3`; this fits
@@ -364,6 +379,7 @@ impl StoreServiceImpl {
             max_batch_paths: DEFAULT_MAX_BATCH_PATHS,
             chunk_prefetch_k: DEFAULT_CHUNK_PREFETCH_K,
             active_get_path_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            concurrent_put_wait: DEFAULT_CONCURRENT_PUT_WAIT,
         }
     }
 
@@ -466,6 +482,15 @@ impl StoreServiceImpl {
     /// main.rs threads `RIO_CHUNK_PREFETCH_K` here.
     pub fn with_chunk_prefetch_k(mut self, k: usize) -> Self {
         self.chunk_prefetch_k = k;
+        self
+    }
+
+    /// Override the concurrent same-path upload wait budget
+    /// (`r[store.put.concurrent-wait]`). Builder-style. Tests use
+    /// millisecond budgets to exercise the bounded-timeout path without
+    /// real waiting.
+    pub fn with_concurrent_put_wait(mut self, budget: std::time::Duration) -> Self {
+        self.concurrent_put_wait = budget;
         self
     }
 

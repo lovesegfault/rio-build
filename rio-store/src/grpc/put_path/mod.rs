@@ -233,11 +233,15 @@ impl StoreServiceImpl {
     /// `claim_placeholder` + the AlreadyComplete/Concurrent fast-path
     /// arms, factored so the IA (pre-ingest) and CA (post-ingest) call
     /// sites share one match. Returns:
-    ///   - `Ok(Some(claim))` → we own the placeholder; proceed.
+    ///   - `Ok(Some(claim))` → we own the placeholder (claimed outright,
+    ///     or taken over after the concurrent uploader aborted); proceed.
     ///   - `Ok(None)` → path is already complete (or a concurrent
-    ///     uploader just won) → caller returns `created: false`.
-    ///   - `Err(Aborted)` → concurrent `'uploading'` placeholder held by
-    ///     someone else; caller propagates so client retries.
+    ///     uploader won — immediately or while we waited) → caller
+    ///     returns `created: false`.
+    ///   - `Err(Aborted)` → concurrent `'uploading'` placeholder still
+    ///     held after the bounded wait
+    ///     (`r[store.put.concurrent-wait]`); caller propagates so the
+    ///     client's own retry logic stays in charge.
     ///
     /// Does NOT drain the stream — IA caller drains on `Ok(None)`/`Err`
     /// (stream not yet read); CA caller doesn't (stream already drained
@@ -266,11 +270,24 @@ impl StoreServiceImpl {
                         .increment(1);
                     return Ok(None);
                 }
-                debug!(%store_path, "PutPath: concurrent upload in progress, aborting");
-                Err(Status::aborted(format!(
-                    "{} for this path; retry",
-                    rio_proto::CONCURRENT_PUTPATH_MSG
-                )))
+                debug!(%store_path, "PutPath: concurrent upload in progress; waiting");
+                // r[impl store.put.concurrent-wait]
+                match self
+                    .wait_for_concurrent_upload(store_path_hash, store_path, refs)
+                    .await
+                {
+                    Ok(PlaceholderClaim::Owned(claim)) => Ok(Some(claim)),
+                    Ok(PlaceholderClaim::AlreadyComplete) => {
+                        metrics::counter!("rio_store_put_path_total", "result" => "exists")
+                            .increment(1);
+                        Ok(None)
+                    }
+                    Ok(PlaceholderClaim::Concurrent) => Err(Status::aborted(format!(
+                        "{} for this path; retry",
+                        rio_proto::CONCURRENT_PUTPATH_MSG
+                    ))),
+                    Err(e) => Err(putpath_metadata_status("PutPath: concurrent-wait", e)),
+                }
             }
             Err(e) => Err(putpath_metadata_status("PutPath: claim_placeholder", e)),
         }
