@@ -489,6 +489,12 @@ let
       # Same semantics as mkQuintCheck's extraSpecs / step.
       extraSpecs ? [ ],
       step ? null,
+      # Optional fixed simulator seed (hex string): replays a recorded
+      # discovery deterministically; the unseeded sample budget remains
+      # the re-find backstop. null leaves the simulator's own seeding —
+      # and every existing call site's derivation — bit-identical (the
+      # splice below is zero-width and the env entry is absent).
+      seed ? null,
     }:
     pkgs.runCommand "quint-${name}"
       {
@@ -502,7 +508,8 @@ let
           MODEL = spec;
           MAIN = main;
           WITNESS = witness;
-        };
+        }
+        // lib.optionalAttrs (seed != null) { SEED = seed; };
       }
       ''
         set -euo pipefail
@@ -514,7 +521,9 @@ let
         quint run \
           --backend=rust \
           --main=${main} \
-          ${lib.optionalString (step != null) "--step=${step}"} \
+          ${lib.optionalString (step != null) "--step=${step}"}${
+            lib.optionalString (seed != null) " --seed=${seed}"
+          } \
           --invariant=${witness} \
           --max-samples=${toString maxSamples} \
           --max-steps=${toString maxSteps} \
@@ -4278,6 +4287,41 @@ in
         "demandSetSurvivesPrune"
         "liveBuildTerminalOrProgressArmed"
       ];
+      maxSamples = 2000000;
+      maxSteps = 15;
+    };
+
+    # The recorded FailoverDuo B9 corner, made executable (substitution
+    # map follow-up ledger row 2; Phase D-prime T-D7.1 scope finding).
+    # The PREDECESSOR encoding's post-failover stored-union widening
+    # violates B9 at the two-builds+failover scope: a narrow co-build
+    # leaves a child Produced under width {1}; failover drops the
+    # memory-only per-build wanted contributions; the effective wanted
+    # set widens to the stored union (the 062-column fallback this model
+    # encodes); a dependent opens from source above the now-stale
+    # Produced child — a shape no holds record ever covered (FailoverDuo
+    # was a C1-strict probe scope). This is HISTORY, not a product
+    # oracle: production deleted the lossy fallback at Wave D2.3 (the
+    # durable per-(build, derivation) relation is rebuilt at recovery);
+    # the corner documents why the 062 semantics had to die. The check
+    # runs the DISCOVERY configuration — the survivors-restricted
+    # alphabet at the FailoverDuo constants (closureEvidenceCornerFailoverDuo;
+    # the full-alphabet form's hit rate is too low for a bounded budget,
+    # its status is the trace-inclusion corollary recorded in the model's
+    # SCOPE NOTE) — and the pinned seed replays the recorded discovery
+    # deterministically (sub-second); the 2M-sample budget is the
+    # unseeded re-find backstop (T-D7.1: violated within 2 M samples at
+    # this configuration). If this check goes RED, the predecessor
+    # encoding in closureEvidence.qnt has drifted — route to the A6
+    # archive record (substitution map ledger row 3); never silently
+    # delete the check or the corner.
+    quint-closure-corner-failover-duo-b9 = mkQuintSimWitnessCheck {
+      name = "closure-corner-failover-duo-b9";
+      spec = "closureEvidence";
+      main = "closureEvidenceCornerFailoverDuo";
+      step = "survivorsStep";
+      witness = "staleProducedNeverUnlocksDependents";
+      seed = "0xffbfc9ac0c85df5b";
       maxSamples = 2000000;
       maxSteps = 15;
     };

@@ -3204,7 +3204,14 @@ module closureEvidenceAdversarialStoreEx {
 // recorded-green scopes above; the FailoverDuo B9 corner is recorded
 // in the Phase D-prime stage record as a follow-up candidate against
 // the PREDECESSOR encoding (history — the mechanism it models was
-// deleted), with the trace seed in the stage record.
+// deleted), with the trace seed in the stage record. Since the
+// follow-up-ledger close-out the corner is machine-checked, not
+// prose-only: nix/quint.nix wires quint-closure-corner-failover-duo-b9
+// (ledger row 2 closure), replaying the recorded seed as a permanent
+// expect-violation check over the discovery configuration — module
+// closureEvidenceCornerFailoverDuo at the end of this file (the
+// survivors-restricted alphabet at these constants); the full-alphabet
+// status remains the trace-inclusion corollary above.
 //
 // Falsifiability pairing (the sim-holds vacuity rule): the two kept
 // calibration pins — closure-f1-stale-produced (B9) and
@@ -3353,5 +3360,71 @@ module closureEvidenceSurvivorsFailover {
     staleProducedNeverUnlocksDependents,
     demandSetSurvivesPrune,
     liveBuildTerminalOrProgressArmed
+  }
+}
+
+/// The recorded T-D7.1 FailoverDuo B9 corner, executable form
+/// (substitution map follow-up ledger row 2): the survivors-restricted
+/// alphabet at the closureEvidenceFailoverDuo constants — the exact
+/// configuration of the discovery run that violated B9 (the first
+/// survivors-core wiring attempt; see the SCOPE NOTE above the
+/// survivors modules). B9 is violated here BY DESIGN: the predecessor
+/// stored-union fallback this model encodes widens the effective
+/// wanted set across failover. The wired check
+/// quint-closure-corner-failover-duo-b9 (nix/quint.nix) replays the
+/// recorded seed deterministically, with the unseeded sample budget as
+/// the re-find backstop; by trace inclusion (survivorsStep's disjuncts
+/// are a strict subset of step's, same init) the violation also stands
+/// under the full alphabet at this scope. step/stepDrv mirror
+/// closureEvidenceSurvivors verbatim.
+module closureEvidenceCornerFailoverDuo {
+  import closureEvidence(
+    DRVS = Set("d1", "d2"),
+    BUILDS = Set("b1", "b2"),
+    REFS = Set(("d1", "d2")),
+    SUBMISSION_BUDGET = 3,
+    FAILOVERS = 2,
+    PGDROP_BUDGET = 2,
+    STALE_APPLY = false,
+    CROSS_TENURE_WALKS = false,
+    STORE_GC_BUDGET = 0,
+    ROW_GC_BUDGET = 0,
+    PURGE_BUDGET = 0,
+    POISON_BUDGET = 1,
+    CANCEL_BUDGET = 1,
+    WALK_CONSUME_CEIL = 2,
+    ATTEMPT_CYCLE_CEIL = 1,
+    INTENT_CEIL = 3,
+    WALKS_PER_NODE = 1,
+    STORE_PER_OUTPUT = true
+  ).*
+
+  /// Same restricted per-derivation alphabet as closureEvidenceSurvivors.
+  action survivorsStepDrv = {
+    nondet d = DRVS.oneOf()
+    any {
+      probeInline(d),
+      probeFailFastMissing(d),
+      probeMissingUnmarked(d),
+      attemptOpen(d),
+      attemptCloseSuccess(d),
+      attemptCloseFail(d),
+      reassignOpen(d),
+      requeueFailed(d),
+      poisonArrival(d),
+      poisonClear(d),
+      orphanRowGc(d)
+    }
+  }
+
+  /// The post-deletion transition relation.
+  action survivorsStep = any {
+    stepStore,
+    stepBuild,
+    survivorsStepDrv,
+    pgApplyAny,
+    pgDropAny,
+    leaderLost,
+    recoverAsLeader
   }
 }
