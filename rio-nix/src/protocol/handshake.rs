@@ -32,7 +32,7 @@ pub const MIN_CLIENT_VERSION: u64 = 0x123; // 1.35
 /// Minimum protocol version we accept from a daemon when WE are the
 /// client (`client_handshake`). Symmetric with [`MIN_CLIENT_VERSION`]:
 /// an unexpectedly-old daemon must fail at handshake with a clear
-/// `VersionTooOld` rather than a wire desync at the first
+/// `DaemonVersionTooOld` rather than a wire desync at the first
 /// version-dependent read (e.g. `read_build_result`'s `>=1.37` cpu
 /// fields).
 pub const MIN_DAEMON_VERSION: u64 = 0x123; // 1.35
@@ -59,20 +59,53 @@ impl HandshakeResult {
 }
 
 /// Errors specific to the handshake.
+///
+/// Attribution is part of each variant's contract: a variant names the
+/// peer whose bytes failed validation, so it may only be constructed by
+/// the side that performed that validation. The server-side handshake
+/// validates the CLIENT's greeting and version ([`Self::InvalidMagic`],
+/// [`Self::VersionTooOld`]); the client-side handshake validates the
+/// DAEMON's ([`Self::InvalidServerMagic`],
+/// [`Self::DaemonVersionTooOld`]). Reusing a variant across sides
+/// produces a diagnosis that blames the wrong party and prints the
+/// wrong expected constant.
 #[derive(Debug, thiserror::Error)]
 pub enum HandshakeError {
     #[error("wire format error: {0}")]
     Wire(#[from] WireError),
 
+    /// Server side: the client's greeting was not [`WORKER_MAGIC_1`].
     #[error("invalid client magic: expected {WORKER_MAGIC_1:#018x}, got {0:#018x}")]
     InvalidMagic(u64),
 
+    /// Server side: the client advertised a protocol version below
+    /// [`MIN_CLIENT_VERSION`]. The floor in the message is derived from
+    /// that constant, never hand-written.
     #[error(
-        "client protocol version {client_major}.{client_minor} is too old; rio-build requires 1.35+"
+        "client protocol version {client_major}.{client_minor} is too old; rio-build requires {}.{}+",
+        MIN_CLIENT_VERSION >> 8,
+        MIN_CLIENT_VERSION & 0xFF
     )]
     VersionTooOld {
         client_major: u64,
         client_minor: u64,
+    },
+
+    /// Client side: the daemon's greeting was not [`WORKER_MAGIC_2`].
+    #[error("invalid daemon magic: expected {WORKER_MAGIC_2:#018x}, got {0:#018x}")]
+    InvalidServerMagic(u64),
+
+    /// Client side: the daemon advertised a protocol version below
+    /// [`MIN_DAEMON_VERSION`]. The floor in the message is derived from
+    /// that constant, never hand-written.
+    #[error(
+        "daemon protocol version {daemon_major}.{daemon_minor} is too old; rio-build requires {}.{}+",
+        MIN_DAEMON_VERSION >> 8,
+        MIN_DAEMON_VERSION & 0xFF
+    )]
+    DaemonVersionTooOld {
+        daemon_major: u64,
+        daemon_minor: u64,
     },
 }
 
@@ -253,6 +286,68 @@ mod tests {
         assert_eq!(decode_version(0x123), (1, 35));
         assert_eq!(decode_version(0x125), (1, 37));
         assert_eq!(decode_version(0x120), (1, 32));
+    }
+
+    /// Pins each validation variant's attribution: the message must
+    /// blame the peer whose bytes the constructing side validated,
+    /// print the magic constant that side checked against (and not the
+    /// opposite side's), and quote the version floor decoded from the
+    /// constant the check enforces. Operators act on these strings —
+    /// "client ... too old" sends them to upgrade the client, so a
+    /// daemon fault rendered with client wording misdirects the entire
+    /// diagnosis.
+    #[test]
+    fn handshake_error_display_blames_the_validated_peer() {
+        let magic1 = format!("{WORKER_MAGIC_1:#018x}");
+        let magic2 = format!("{WORKER_MAGIC_2:#018x}");
+        // A got-value distinct from both constants, so the assertions
+        // below can tell "prints the checked constant" apart from
+        // "echoes the received value".
+        let got = format!("{0:#018x}", 0xDEADBEEF_u64);
+
+        // Server side validates the client's greeting against WORKER_MAGIC_1.
+        let msg = HandshakeError::InvalidMagic(0xDEADBEEF).to_string();
+        assert!(msg.contains("client magic"), "got: {msg}");
+        assert!(msg.contains(&magic1), "got: {msg}");
+        assert!(!msg.contains(&magic2), "got: {msg}");
+        assert!(msg.contains(&got), "got: {msg}");
+        assert!(!msg.contains("daemon"), "got: {msg}");
+
+        // Server side validates the client's version against MIN_CLIENT_VERSION.
+        let msg = HandshakeError::VersionTooOld {
+            client_major: 1,
+            client_minor: 34,
+        }
+        .to_string();
+        let (floor_major, floor_minor) = decode_version(MIN_CLIENT_VERSION);
+        assert!(msg.contains("client protocol version 1.34"), "got: {msg}");
+        assert!(
+            msg.contains(&format!("requires {floor_major}.{floor_minor}+")),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("daemon"), "got: {msg}");
+
+        // Client side validates the daemon's greeting against WORKER_MAGIC_2.
+        let msg = HandshakeError::InvalidServerMagic(0xDEADBEEF).to_string();
+        assert!(msg.contains("daemon magic"), "got: {msg}");
+        assert!(msg.contains(&magic2), "got: {msg}");
+        assert!(!msg.contains(&magic1), "got: {msg}");
+        assert!(msg.contains(&got), "got: {msg}");
+        assert!(!msg.contains("client"), "got: {msg}");
+
+        // Client side validates the daemon's version against MIN_DAEMON_VERSION.
+        let msg = HandshakeError::DaemonVersionTooOld {
+            daemon_major: 1,
+            daemon_minor: 34,
+        }
+        .to_string();
+        let (floor_major, floor_minor) = decode_version(MIN_DAEMON_VERSION);
+        assert!(msg.contains("daemon protocol version 1.34"), "got: {msg}");
+        assert!(
+            msg.contains(&format!("requires {floor_major}.{floor_minor}+")),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("client"), "got: {msg}");
     }
 
     #[tokio::test]

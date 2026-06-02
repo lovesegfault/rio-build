@@ -338,17 +338,23 @@ pub async fn client_handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     let server_magic = wire::read_u64(reader).await?;
     if server_magic != WORKER_MAGIC_2 {
-        return Err(HandshakeError::InvalidMagic(server_magic));
+        // The DAEMON's greeting failed validation — blame it as such.
+        // `InvalidMagic` is the server-side variant: it renders "client
+        // magic" and prints WORKER_MAGIC_1, both wrong from this side.
+        return Err(HandshakeError::InvalidServerMagic(server_magic));
     }
 
     let server_version = wire::read_u64(reader).await?;
     if server_version < super::handshake::MIN_DAEMON_VERSION {
         // Mirror server_handshake's MIN_CLIENT_VERSION floor: an
         // older-than-expected daemon must fail HERE with a clear error,
-        // not desync later at the first version-dependent read.
-        return Err(HandshakeError::VersionTooOld {
-            client_major: server_version >> 8,
-            client_minor: server_version & 0xFF,
+        // not desync later at the first version-dependent read. The
+        // stale version is the DAEMON's — `VersionTooOld` would render
+        // it as the client's and send operators after the wrong side.
+        let (daemon_major, daemon_minor) = super::handshake::decode_version(server_version);
+        return Err(HandshakeError::DaemonVersionTooOld {
+            daemon_major,
+            daemon_minor,
         });
     }
     wire::write_u64(writer, PROTOCOL_VERSION).await?;
@@ -1069,12 +1075,24 @@ mod tests {
         assert!(
             matches!(
                 err,
-                HandshakeError::VersionTooOld {
-                    client_major: 1,
-                    client_minor: 34
+                HandshakeError::DaemonVersionTooOld {
+                    daemon_major: 1,
+                    daemon_minor: 34
                 }
             ),
             "got: {err:?}"
+        );
+        // The too-old version is the DAEMON's: the rendered diagnosis
+        // must say so, or operators upgrade the wrong component (the
+        // client here is at PROTOCOL_VERSION, well above the floor).
+        let msg = err.to_string();
+        assert!(
+            msg.contains("daemon protocol version 1.34"),
+            "must attribute the stale version to the daemon: {msg}"
+        );
+        assert!(
+            !msg.contains("client"),
+            "must not blame the client for the daemon's version: {msg}"
         );
         server_handle.await??;
         Ok(())
@@ -1579,7 +1597,26 @@ mod tests {
         let err = client_handshake(&mut cr, &mut cw)
             .await
             .expect_err("bad magic should fail handshake");
-        assert!(matches!(err, HandshakeError::InvalidMagic(0xBADC0FFE)));
+        assert!(
+            matches!(err, HandshakeError::InvalidServerMagic(0xBADC0FFE)),
+            "got: {err:?}"
+        );
+        // The DAEMON's greeting failed the WORKER_MAGIC_2 check: the
+        // rendered diagnosis must blame the daemon and print the
+        // constant the client actually compared against.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("daemon magic"),
+            "must attribute the bad greeting to the daemon: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{WORKER_MAGIC_2:#018x}")),
+            "must print the WORKER_MAGIC_2 value the client checked: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{0:#018x}", 0xBADC0FFE_u64)),
+            "must echo the daemon's actual greeting: {msg}"
+        );
         server.await??;
         Ok(())
     }
