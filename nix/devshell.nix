@@ -68,6 +68,14 @@ let
     # .env.local — env vars override this file.
     [cache]
     local_max_size = "256GiB"
+    # Also cache bin crates + nextest harness binaries (kache skips
+    # "user-facing executables" by default). This workspace links five
+    # fat service bins + 51 test binaries — the critical path of a full
+    # build in a fresh worktree is exactly those links, so without this
+    # the dep-cache halves CPU but barely moves wall-clock. Executables
+    # restore by copy (never hardlink), content-keyed with the linker
+    # version in the key.
+    cache_executables = true
   '';
 
   shellPackages = with pkgs; [
