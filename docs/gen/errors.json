@@ -534,6 +534,13 @@
     },
     {
       "enum": "DerivationTypeError",
+      "name": "DuplicateOutputName",
+      "crate": "rio-nix",
+      "msg": "duplicate derivation output '{0}'",
+      "doc": "Two outputs share a name. The oracle's eval refuses to construct this set (primops.cc:1529, wording verbatim); its parsers would first-wins-collapse it (module doc, divergence 4) — rio rejects fail-closed so name-keyed views stay total."
+    },
+    {
+      "enum": "DerivationTypeError",
       "name": "FixedNotNamedOut",
       "crate": "rio-nix",
       "msg": "single fixed output must be named \"out\"",
