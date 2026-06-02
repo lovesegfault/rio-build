@@ -271,6 +271,14 @@ r[builder.mountd.uid-bound]
 
 One live connection per `SO_PEERCRED.uid`. k8s userns maps each pod to a distinct host-uid range, so a sandbox-escaped build cannot open a second connection.
 
+r[builder.mountd.uid-busy-typed]
+
+A uid-colliding connection MUST NOT be dropped silently: mountd reads exactly one request frame (bounded by a short deadline so the doomed connection cannot stand) and answers it with a typed retryable rejection naming the holding `build_id`, then closes. A bare EOF reaches the builder as "mountd connection closed" — indistinguishable from a daemon crash — and burns a build-level infra retry; observed live, re-dispatches racing the previous build's teardown exhausted `max_infra_retries=10` fleet-wide during a 16-client load run. The typed rejection lets the builder's bounded mount retry absorb the race and gives operators the holder's identity instead of an unexplained close. Counted by `rio_mountd_uid_busy_total`.
+
+r[builder.mountd.teardown-fast-release]
+
+Connection teardown MUST release the `build_id` and uid claims after metadata-only work (lazy unmount, mountpoint rmdir, quota release, staging quarantine-rename) and MUST NOT hold them across the recursive staging delete. The rename happens before the `build_id` claim is released, so a same-`build_id` remount cannot lose its fresh staging tree to the pending delete; the deep delete runs detached, with the sweep's quarantine arm as the retry backstop. A re-dispatch of the same drv reconnects with the same uid within ~100 ms of EOF under a saturated scheduler, while the delete is O(staging size) — holding the claims across it is what made those mounts collide.
+
 r[builder.mountd.build-id-unique]
 
 One live `build_id` per process: a process-wide set rejects `Mount{}` for a `build_id` another connection already owns. uid-bound alone does not stop a compromised builder using its first Mount to claim a victim's `build_id`.
@@ -370,7 +378,7 @@ The `r[...]` markers introduced by ADR-022 across the design book are the spec-t
 |---|---|
 | Mount stack | `builder.fs.castore-stack` · `builder.fs.castore-dag-source` · `builder.fs.castore-inode-digest` · `builder.fs.castore-cache-config` · `builder.fs.fd-handoff-ordering` · `builder.overlay.castore-lower` |
 | castore-FUSE | `builder.fs.digest-fuse-open` · `builder.fs.passthrough-on-hit` · `builder.fs.passthrough-stack-depth` · `builder.fs.file-digest-integrity` · `builder.fs.fetch-circuit` · `builder.fs.shared-backing-cache` · `builder.fs.node-digest-cache` · `builder.fs.node-chunk-cache` · `builder.fs.streaming-open` · `builder.fs.streaming-open-threshold` · `builder.fs.open-iomode-compatible` · `builder.fs.open-read-only` · `builder.fs.write-ops-erofs` |
-| Privilege | `builder.mountd.fuse-handoff` · `builder.mountd.backing-broker` · `builder.mountd.backing-readonly` · `builder.mountd.promote-verified` · `builder.mountd.promote-bounded-copy` · `builder.mountd.orphan-scan` · `builder.mountd.concurrency` · `builder.mountd.build-id-validated` · `builder.mountd.build-id-unique` · `builder.mountd.uid-bound` · `builder.mountd.one-mount` · `builder.mountd.staging-quota` · `sec.boundary.mountd` |
+| Privilege | `builder.mountd.fuse-handoff` · `builder.mountd.backing-broker` · `builder.mountd.backing-readonly` · `builder.mountd.promote-verified` · `builder.mountd.promote-bounded-copy` · `builder.mountd.orphan-scan` · `builder.mountd.concurrency` · `builder.mountd.build-id-validated` · `builder.mountd.build-id-unique` · `builder.mountd.uid-bound` · `builder.mountd.uid-busy-typed` · `builder.mountd.teardown-fast-release` · `builder.mountd.one-mount` · `builder.mountd.staging-quota` · `sec.boundary.mountd` |
 | FUSE handler quirks | `builder.fs.listxattr-size-branch` |
 | Result classification | `builder.result.input-eio-is-infra` · `builder.fs.parity` |
 | Dispatch | `sched.dispatch.input-roots` |

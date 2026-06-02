@@ -193,15 +193,18 @@ impl Drop for CastoreSession {
 }
 
 /// Mount-handshake attempts when mountd answers with a transient/busy
-/// rejection (see [`mount_rejection_is_transient`]). One short retry —
-/// the previous session for this uid/build_id is being reaped, not
-/// stuck.
-const MOUNT_RETRYABLE_ATTEMPTS: u32 = 2;
+/// rejection (see [`mount_rejection_is_transient`]). The exponential
+/// schedule (400 ms · 2ⁿ → ~6 s total) absorbs the whole
+/// teardown-in-flight class — including a daemon-version-skewed node
+/// that still holds the claims for the previous build's staging
+/// delete, which the pre-backoff schedule (2 × 400 ms) could not.
+/// Genuinely dead daemons still surface within ~6 s — an infra retry,
+/// not a wedge.
+const MOUNT_RETRYABLE_ATTEMPTS: u32 = 5;
 
-/// Pause between transient Mount attempts — long enough for mountd's
-/// conn-close teardown (MNT_DETACH + staging reap + uid release) to
-/// finish, short enough not to matter against the build's runtime.
-const MOUNT_RETRY_DELAY: Duration = Duration::from_millis(400);
+/// Base pause between transient Mount attempts; attempt `n` sleeps
+/// `MOUNT_RETRY_BASE_DELAY << (n-1)`.
+const MOUNT_RETRY_BASE_DELAY: Duration = Duration::from_millis(400);
 
 /// `true` for Mount rejections a short retry can absorb: a re-dispatch
 /// to the same pod can race mountd's teardown of the previous attempt's
@@ -213,10 +216,52 @@ const MOUNT_RETRY_DELAY: Duration = Duration::from_millis(400);
 fn mount_rejection_is_transient(err: &MountdError) -> bool {
     match err {
         MountdError::Closed => true,
+        // The same daemon-side close observed from the send side
+        // instead of the reader thread — which side sees it first is a
+        // race. Only the peer-closed kinds; anything else (EMSGSIZE,
+        // EBADF, …) is a local bug, not the daemon reaping a
+        // predecessor.
+        MountdError::Frame(super::mountd_proto::FrameError::Io(e)) => matches!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+        ),
         MountdError::Rejected(kind) => {
             matches!(kind, ErrKind::DuplicateBuildId | ErrKind::Retryable(_))
         }
         _ => false,
+    }
+}
+
+/// Connect + `Mount{build_id}` with bounded exponential backoff on
+/// transient rejections. Each attempt is a fresh connection: a
+/// transiently-rejected one is daemon-side doomed (typed rejection or
+/// silent close), so reusing it can only return [`MountdError::Closed`]
+/// again. Blocking, like [`mount_and_serve`].
+fn mount_with_retry(
+    socket: &Path,
+    build_id: &str,
+    request_timeout: Duration,
+) -> Result<(MountdClient, u64, std::os::fd::OwnedFd), MountdError> {
+    let mut attempt = 1;
+    loop {
+        let mountd = MountdClient::connect(socket)?;
+        match mountd.mount(build_id, request_timeout) {
+            Ok((quota, fd)) => return Ok((mountd, quota, fd)),
+            Err(e) if attempt < MOUNT_RETRYABLE_ATTEMPTS && mount_rejection_is_transient(&e) => {
+                let delay = MOUNT_RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                tracing::warn!(
+                    build_id,
+                    error = %e,
+                    attempt,
+                    delay_ms = delay.as_millis() as u64,
+                    "mountd Mount rejected transiently; retrying"
+                );
+                drop(mountd);
+                std::thread::sleep(delay);
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -248,31 +293,13 @@ pub fn mount_and_serve(
     // fast, before the DAG prefetch. If anything later in this function
     // fails, dropping `mountd` (and the fd) closes the UDS connection
     // and the daemon detaches the mount and reaps the staging dir.
-    // Transient/busy rejections get one short retry — see
+    // Transient/busy rejections get a bounded backoff-retry — see
     // `mount_rejection_is_transient`.
-    let (mountd, staging_quota_bytes, fuse_fd) = {
-        let mut attempt = 1;
-        loop {
-            let mountd = MountdClient::connect(&settings.mountd_socket)?;
-            match mountd.mount(build_id, settings.opener.mountd_request_timeout) {
-                Ok((quota, fd)) => break (mountd, quota, fd),
-                Err(e)
-                    if attempt < MOUNT_RETRYABLE_ATTEMPTS && mount_rejection_is_transient(&e) =>
-                {
-                    tracing::warn!(
-                        build_id,
-                        error = %e,
-                        attempt,
-                        "mountd Mount rejected transiently; retrying"
-                    );
-                    drop(mountd);
-                    std::thread::sleep(MOUNT_RETRY_DELAY);
-                    attempt += 1;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-    };
+    let (mountd, staging_quota_bytes, fuse_fd) = mount_with_retry(
+        &settings.mountd_socket,
+        build_id,
+        settings.opener.mountd_request_timeout,
+    )?;
 
     let mut directory = store.directory.clone();
     let tree = runtime.block_on(InoMap::prefetch(
@@ -505,6 +532,17 @@ mod tests {
         // Transient/busy: uid-already-connected (surfaces as Closed),
         // build-id-still-claimed, daemon-side transient.
         assert!(mount_rejection_is_transient(&MountdError::Closed));
+        // The same daemon-side close seen from the send path.
+        assert!(mount_rejection_is_transient(&MountdError::Frame(
+            super::super::mountd_proto::FrameError::Io(std::io::Error::from(
+                std::io::ErrorKind::BrokenPipe
+            ))
+        )));
+        assert!(!mount_rejection_is_transient(&MountdError::Frame(
+            super::super::mountd_proto::FrameError::Io(std::io::Error::from(
+                std::io::ErrorKind::InvalidInput
+            ))
+        )));
         assert!(mount_rejection_is_transient(&MountdError::Rejected(
             ErrKind::DuplicateBuildId
         )));
@@ -521,6 +559,113 @@ mod tests {
         assert!(!mount_rejection_is_transient(&MountdError::Timeout(
             Duration::from_secs(1)
         )));
+    }
+
+    /// A scripted mountd stand-in that accepts SUCCESSIVE connections
+    /// (unlike `testing::RecordingMountd`, which serves exactly one):
+    /// each accepted connection consumes the next entry of `script`.
+    /// `None` = close without replying (the daemon-side silent drop the
+    /// pre-`uid-busy-typed` daemon produced); `Some(resp)` = read one
+    /// frame, reply to its seq, attach a `/dev/null` fd iff the resp is
+    /// `Mounted`, keep the connection open until the client closes.
+    fn scripted_serial_daemon(
+        sock: &std::path::Path,
+        script: Vec<Option<super::super::mountd_proto::Resp>>,
+    ) -> std::thread::JoinHandle<usize> {
+        use super::super::mountd_proto::{self as proto, Reply, Request, Resp};
+        use nix::sys::socket::{
+            AddressFamily, Backlog, SockFlag, SockType, UnixAddr, accept, bind, listen, socket,
+        };
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let listener = socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+        bind(listener.as_raw_fd(), &UnixAddr::new(sock).unwrap()).unwrap();
+        listen(&listener, Backlog::new(8).unwrap()).unwrap();
+        std::thread::spawn(move || {
+            let mut served = 0;
+            let mut held = Vec::new();
+            for entry in script {
+                let conn = accept(listener.as_raw_fd()).unwrap();
+                // SAFETY: accept(2) just returned a fresh fd we own.
+                let conn = unsafe { OwnedFd::from_raw_fd(conn) };
+                served += 1;
+                let Some(resp) = entry else {
+                    continue; // drop = close without reply
+                };
+                let frame = proto::recv_frame(conn.as_raw_fd()).unwrap();
+                let req: Request = proto::decode(&frame.bytes).unwrap();
+                let reply = Reply { seq: req.seq, resp };
+                let bytes = proto::encode(&reply).unwrap();
+                // `Mounted` carries one fd; the kernel holds its own
+                // reference once sendmsg succeeds, so the local File can
+                // drop right after.
+                let null = std::fs::File::open("/dev/null").unwrap();
+                let fds: Vec<i32> = if matches!(reply.resp, Resp::Mounted { .. }) {
+                    vec![null.as_raw_fd()]
+                } else {
+                    Vec::new()
+                };
+                proto::send_frame(conn.as_raw_fd(), &bytes, &fds).unwrap();
+                // Keep the successful connection open until the client
+                // is done with it (dropping it here would EOF the
+                // client's reader thread mid-test).
+                if matches!(reply.resp, Resp::Mounted { .. }) {
+                    held.push(conn);
+                }
+            }
+            served
+        })
+    }
+
+    /// `mount_with_retry` must absorb the transient-rejection class —
+    /// a silent close (old daemons) and a typed retryable rejection
+    /// (`uid-busy-typed` daemons) — and succeed on a later attempt.
+    /// Red on the pre-backoff 2-attempt schedule.
+    #[test]
+    fn mount_with_retry_recovers_after_transient_rejections() {
+        use super::super::mountd_proto::{ErrKind, Resp};
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("mountd.sock");
+        let daemon = scripted_serial_daemon(
+            &sock,
+            vec![
+                None, // attempt 1: silent close → MountdError::Closed
+                Some(Resp::Err(ErrKind::Retryable("uid busy".into()))),
+                Some(Resp::Mounted {
+                    staging_quota_bytes: 42,
+                }),
+            ],
+        );
+
+        let (client, quota, _fd) = mount_with_retry(&sock, "retry-build", Duration::from_secs(2))
+            .expect("third attempt must succeed");
+        assert_eq!(quota, 42);
+        drop(client);
+        assert_eq!(daemon.join().unwrap(), 3, "exactly three attempts");
+    }
+
+    /// Validation rejections fail fast: one connection, no retry —
+    /// retrying a deterministic failure only delays the scheduler's
+    /// requeue.
+    #[test]
+    fn mount_with_retry_fails_fast_on_validation_rejection() {
+        use super::super::mountd_proto::{ErrKind, Resp};
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("mountd.sock");
+        let daemon = scripted_serial_daemon(&sock, vec![Some(Resp::Err(ErrKind::BadBuildId))]);
+
+        let err = match mount_with_retry(&sock, "bad/id", Duration::from_secs(2)) {
+            Ok(_) => panic!("validation rejection must not be retried"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, MountdError::Rejected(ErrKind::BadBuildId)));
+        assert_eq!(daemon.join().unwrap(), 1, "exactly one attempt");
     }
 
     // I-165b: the path computation must return Some when the

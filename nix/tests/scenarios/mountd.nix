@@ -255,7 +255,8 @@ pkgs.testers.runNixOSTest {
     # ── uid-bound + build-id-unique (one holder proves both) ───────────
     with subtest("uid-bound + build-id-unique"):
         serve("build1", "shared", "shared")
-        # Second connection from the same uid: dropped without a reply.
+        # Second connection from the same uid: typed retryable rejection
+        # naming the holder (a silent drop would fail the client).
         machine.succeed(client("build1", "expect-rejected"))
         # Different uid, same build_id: typed rejection.
         machine.succeed(

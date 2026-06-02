@@ -53,6 +53,28 @@ const REAP_PREFIX: &str = ".reap.";
 /// `staging/` — quarantined or not — before any connection exists.
 static REAP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Rename `staging_dir/{name}` to a fresh quarantine name and return
+/// it. Metadata-only, so callers can release claims immediately and
+/// run the slow recursive delete afterwards; a quarantine left behind
+/// by a failed delete (or a daemon restart) is retried by
+/// [`reap_dead_staging`], whose `REAP_PREFIX` arm has no liveness
+/// check. `None`: the dir is already gone, or the rename failed and is
+/// left for the next sweep tick.
+pub(super) fn quarantine_staging(staging_dir: &Path, name: &str) -> Option<PathBuf> {
+    let quarantine = staging_dir.join(format!(
+        "{REAP_PREFIX}{}.{name}",
+        REAP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    match std::fs::rename(staging_dir.join(name), &quarantine) {
+        Ok(()) => Some(quarantine),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!(staging = %name, error = %e, "staging dir not quarantined");
+            None
+        }
+    }
+}
+
 /// One cache entry that could be evicted, oldest-first.
 #[derive(Debug)]
 struct Candidate {
@@ -279,25 +301,17 @@ fn reap_dead_staging_inner(
             if guard.contains(&name) {
                 continue;
             }
-            let quarantine = staging_dir.join(format!(
-                "{REAP_PREFIX}{}.{name}",
-                REAP_SEQ.fetch_add(1, Ordering::Relaxed)
-            ));
             // The rename happens while the lock is still held —
             // intentionally. It is a metadata-only syscall (no data is
             // copied), so it does not extend the critical section
             // meaningfully; moving it outside the lock would re-open the
             // window where a Mount registers this build_id between the
             // liveness check and the rename and then loses its tree.
-            match std::fs::rename(staging_dir.join(&name), &quarantine) {
-                Ok(()) => {}
-                // Teardown won the race and already removed it.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    warn!(staging = %name, error = %e, "dead staging dir not quarantined");
-                    continue;
-                }
-            }
+            // `None` covers both "teardown won the race and already
+            // removed it" and a failed rename retried next tick.
+            let Some(quarantine) = quarantine_staging(staging_dir, &name) else {
+                continue;
+            };
             drop(guard);
             quarantine
         };

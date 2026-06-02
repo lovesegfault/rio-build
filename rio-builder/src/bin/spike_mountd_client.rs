@@ -254,8 +254,9 @@ enum Cmd {
         expect: String,
     },
     /// Assert the connection is refused: connect(2) fails outright
-    /// (socket-file DAC) or the daemon drops it without answering the
-    /// first request (uid-bound rejection).
+    /// (socket-file DAC) or the first request gets the typed retryable
+    /// uid-busy rejection. A silent drop is a failure — it would mean
+    /// regressing to the EOF the client cannot tell from a daemon crash.
     ExpectRejected,
     /// Mount twice on one connection; assert the second is
     /// `AlreadyMounted`.
@@ -465,17 +466,19 @@ fn expect_mount_err(socket: &Path, build_id: &str, expect: &str) -> anyhow::Resu
 
 fn expect_rejected(socket: &Path) -> anyhow::Result<()> {
     let client = MountdClient::connect(socket)?;
-    // The daemon closes rejected connections before reading a frame, so
-    // the Mount either fails at send (EPIPE → Frame) or its reply read
-    // sees EOF (→ Closed). Both prove the rejection; a reply of any
-    // kind — success or a typed error — disproves it.
+    // A uid-colliding connection is answered, not dropped: the first
+    // request gets a typed Retryable naming the holder. EOF or a frame
+    // error here would mean the daemon regressed to the silent drop the
+    // client cannot tell from a crash.
     match client.mount("rejected", RPC_TIMEOUT) {
-        Err(e @ (MountdError::Closed | MountdError::Frame(_))) => {
-            println!("RESULT rejected=dropped err={e}");
+        Err(MountdError::Rejected(ErrKind::Retryable(msg)))
+            if msg.contains("already has a live mountd connection") =>
+        {
+            println!("RESULT rejected=uid-busy msg={msg}");
             Ok(())
         }
-        Ok(_) => bail!("expected the daemon to drop the connection, got Mounted"),
-        Err(other) => bail!("expected the daemon to drop the connection, got {other}"),
+        Ok(_) => bail!("expected the typed uid-busy rejection, got Mounted"),
+        Err(other) => bail!("expected the typed uid-busy rejection, got {other}"),
     }
 }
 
