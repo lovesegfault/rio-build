@@ -121,7 +121,16 @@ const STDERR_TAIL_LINES: usize = 200;
 
 /// Append one line to the capped evidence tail, dropping the oldest line
 /// once [`STDERR_TAIL_LINES`] is reached.
+///
+/// Tail entries are LINES by contract — the cap budgets lines, and
+/// batches.jsonl evidence is rendered one entry per line — so an entry
+/// still carrying a newline means a caller skipped the observer-boundary
+/// split.
 fn push_tail(tail: &mut VecDeque<String>, line: String) {
+    debug_assert!(
+        !line.contains('\n'),
+        "evidence-tail entries are single lines; split payloads before pushing: {line:?}"
+    );
     if tail.len() == STDERR_TAIL_LINES {
         tail.pop_front();
     }
@@ -133,14 +142,18 @@ fn push_tail(tail: &mut VecDeque<String>, line: String) {
 /// evidence tail.
 ///
 /// The transport is message-oriented while the parser and the tail are
-/// line-oriented: the gateway packs a non-cascaded failure reason and its
-/// `↳ rio-cli logs` hint into ONE `STDERR_NEXT` payload separated by a
-/// newline (`rio-gateway/src/handler/build.rs`), so every payload is split
-/// into lines here, at the observer boundary — a multi-line payload
-/// structurally cannot reach the line parser, and the evidence tail stays
-/// one line per entry.
+/// line-oriented, and the gateway's payloads come in both line shapes
+/// (`rio-gateway/src/handler/build.rs`): a non-cascaded failure reason and
+/// its `↳ rio-cli logs` hint arrive as ONE payload separated by an interior
+/// newline, while the unconditional `rio: build <uuid>` announcement and
+/// the `SubmitBuild RPC failed` diagnostic arrive newline-TERMINATED. Every
+/// payload is therefore split here, at the observer boundary, with
+/// `str::lines`'s terminator semantics — the same split `parse_stderr`
+/// uses on whole captures — so a multi-line payload structurally cannot
+/// reach the line parser, a trailing terminator contributes no blank
+/// residue entry, and the evidence tail stays one line per entry.
 fn observe_line(parsed: &mut ParsedStderr, tail: &mut VecDeque<String>, payload: &str) {
-    for line in payload.split('\n') {
+    for line in payload.lines() {
         parse_line(parsed, line);
         push_tail(tail, line.to_string());
     }
@@ -599,7 +612,10 @@ mod tests {
         observe_line(
             &mut parsed,
             &mut tail,
-            "rio: build 0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a (trace 4bf92f3577b34da6a3ce929d0e0e4736)",
+            &gateway_build_announcement(
+                "0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a",
+                "4bf92f3577b34da6a3ce929d0e0e4736",
+            ),
         );
         observe_line(
             &mut parsed,
@@ -638,6 +654,72 @@ mod tests {
             format!("\n  ↳ rio-cli logs '{drv}'")
         };
         format!("derivation '{drv}' failed: {reason}{hint}")
+    }
+
+    /// Generate the gateway's build announcement exactly as
+    /// `rio-gateway/src/handler/build.rs` formats it (one `STDERR_NEXT`
+    /// payload, emitted unconditionally per accepted submission): the
+    /// ` (trace <hex>)` suffix appears only when a trace id exists, and
+    /// the payload is newline-TERMINATED. Conformance mirror of the
+    /// gateway's format string — when the gateway's announcement format
+    /// changes, update this generator in the same change.
+    fn gateway_build_announcement(build_id: &str, trace_id: &str) -> String {
+        let trace_suffix = if trace_id.is_empty() {
+            String::new()
+        } else {
+            format!(" (trace {trace_id})")
+        };
+        format!("rio: build {build_id}{trace_suffix}\n")
+    }
+
+    /// Generate the gateway's submit-failure diagnostic exactly as
+    /// `rio-gateway/src/handler/build.rs` formats it (one `STDERR_NEXT`
+    /// payload, newline-TERMINATED). Conformance mirror of the gateway's
+    /// format string — when the gateway's diagnostic format changes,
+    /// update this generator in the same change.
+    fn gateway_submit_failed(err: &str) -> String {
+        format!("SubmitBuild RPC failed: {err}\n")
+    }
+
+    /// The gateway newline-TERMINATES its build announcement and its
+    /// submit-failure diagnostic, and every relay layer (StderrWriter,
+    /// the wire codec, the client drain, the transport observer) hands
+    /// the payload to the observer verbatim. The observer must treat that
+    /// newline as a line TERMINATOR, not a separator: a terminated
+    /// payload contributes exactly its lines to the evidence tail — no
+    /// blank residue entry burning cap budget and breaking the tail's
+    /// one-line-per-entry invariant.
+    #[test]
+    fn client_ops_observer_drops_payload_terminators_from_the_tail() {
+        let mut parsed = ParsedStderr::default();
+        let mut tail: VecDeque<String> = VecDeque::new();
+
+        let announcement = gateway_build_announcement(
+            "0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a",
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+        );
+        assert!(announcement.ends_with('\n'), "premise: {announcement:?}");
+        observe_line(&mut parsed, &mut tail, &announcement);
+
+        let submit_failed = gateway_submit_failed("status: Unavailable, message: \"leader lost\"");
+        assert!(submit_failed.ends_with('\n'), "premise: {submit_failed:?}");
+        observe_line(&mut parsed, &mut tail, &submit_failed);
+
+        assert_eq!(
+            parsed.build_id.as_deref(),
+            Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a")
+        );
+        // One tail entry per payload line; the terminator itself
+        // contributes nothing.
+        assert_eq!(
+            Vec::from(tail),
+            vec![
+                "rio: build 0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a \
+                 (trace 4bf92f3577b34da6a3ce929d0e0e4736)"
+                    .to_string(),
+                "SubmitBuild RPC failed: status: Unavailable, message: \"leader lost\"".to_string(),
+            ]
+        );
     }
 
     /// The gateway packs a non-cascaded failure reason and its `rio-cli
