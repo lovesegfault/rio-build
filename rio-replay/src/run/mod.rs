@@ -3497,19 +3497,25 @@ mod tests {
         );
     }
 
-    /// Fixture-driven dry-run == live parity: over one archive, the offline
-    /// dry-run plan and a live run's schedule construction must agree —
-    /// they read the same resolved schedule, so the planner's numbers are
-    /// the dispatcher's numbers.
+    /// SHARED fixture-driven dry-run == live parity invariant: over the
+    /// same archive, the offline dry-run and the live campaign's planning
+    /// must derive identical numbers on every axis — the dry-run is the
+    /// operator's preview of exactly the workload the live campaign will
+    /// measure, and both sides read the one schedule `build_schedule`
+    /// resolves, so the planner's numbers are the dispatcher's numbers.
     ///
-    /// Interruption axis: an archive whose ONLY recorded interruption is
-    /// over an impure-demoted unit arms nothing on either side (the unit is
-    /// supplied, never built, so its recorded disconnect is not replayed),
-    /// while the same archive without the demotion arms it on both sides.
-    /// The demotion/exclusion-set axis (plan-time `workload_set` parity)
-    /// extends this test.
+    /// Demotion/exclusion-set axis: the live planner's impure-demotion set
+    /// equals the dry-run's `workload_set` demotion drv for drv. Both sides
+    /// are pinned to the drv level so a drift on either side fails here
+    /// regardless of which one moved.
+    ///
+    /// Interruption-filtering axis: an archive whose ONLY recorded
+    /// interruption is over an impure-demoted unit arms nothing on either
+    /// side (the unit is supplied, never built, so its recorded disconnect
+    /// is not replayed), while the same archive without the demotion arms
+    /// it on both sides.
     #[test]
-    fn dry_run_and_live_planner_agree_on_one_archive() {
+    fn dry_run_and_live_planner_agree_on_the_same_archive() {
         use timeline::plan_timed_dry_run;
 
         // The schedule a live timed campaign would run, constructed exactly
@@ -3538,6 +3544,41 @@ mod tests {
             )
         };
 
+        // ── Demotion/exclusion-set axis ─────────────────────────────────
+        // The impure-policy fixture: pure + impure + fixed-output units,
+        // with impure-env.json demoting exactly one of them.
+        let tmp = tempfile::tempdir().unwrap();
+        archive_input::write_mini_impure_archive(tmp.path());
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let manifest = load_units(&archive).unwrap();
+        let in_scope: HashSet<&str> = manifest.iter().map(|m| m.job.as_str()).collect();
+
+        // Live planner side: the demoted job set, mapped back to drvs.
+        let live_demoted_drvs: BTreeSet<String> = {
+            let by_job: HashMap<&str, &str> = manifest
+                .iter()
+                .map(|m| (m.job.as_str(), m.drv_path.as_str()))
+                .collect();
+            demoted_impure_jobs(&archive, &manifest, &in_scope)
+                .iter()
+                .map(|job| by_job[job.as_str()].to_string())
+                .collect()
+        };
+
+        // Dry-run side: the same archive through the offline path.
+        let dry_demoted_drvs = supply::workload_set(&archive).demoted_impure;
+        assert_eq!(
+            live_demoted_drvs, dry_demoted_drvs,
+            "live demotion must equal the dry-run's workload_set demotion"
+        );
+        let dry = plan_timed_dry_run(&archive, &Knobs::default(), None).unwrap();
+        assert_eq!(dry.demoted_impure, live_demoted_drvs.len());
+        assert!(
+            !live_demoted_drvs.is_empty(),
+            "vacuous parity would prove nothing: the fixture must demote at least one unit"
+        );
+
+        // ── Interruption-filtering axis ─────────────────────────────────
         // Interrupted appB, impure-demoted: the recorded interruption is
         // over a supplied unit.
         let dir = tempfile::tempdir().unwrap();
@@ -4458,47 +4499,6 @@ mod tests {
             fixed,
             [drv_of("fetchSrc.x86_64-linux")].into_iter().collect(),
             "exactly the outputHash-carrying derivation is fixed-output"
-        );
-    }
-
-    /// SHARED dry-run == live-plan parity invariant over the same archive
-    /// (the timed workstream extends this test with the
-    /// interruption-filtering axis): the offline dry-run and the live
-    /// planner must derive identical impure-demotion sets, because the
-    /// dry-run is the operator's preview of exactly the workload the live
-    /// campaign will measure. Both sides are pinned to the drv level so a
-    /// drift on either side fails here regardless of which one moved.
-    #[test]
-    fn dry_run_and_live_planner_agree_on_the_same_archive() {
-        let tmp = tempfile::tempdir().unwrap();
-        archive_input::write_mini_impure_archive(tmp.path());
-        let archive = ReplayArchive::open(tmp.path()).unwrap();
-        let manifest = load_units(&archive).unwrap();
-        let in_scope: HashSet<&str> = manifest.iter().map(|m| m.job.as_str()).collect();
-
-        // Live planner side: the demoted job set, mapped back to drvs.
-        let live_demoted_drvs: BTreeSet<String> = {
-            let by_job: HashMap<&str, &str> = manifest
-                .iter()
-                .map(|m| (m.job.as_str(), m.drv_path.as_str()))
-                .collect();
-            demoted_impure_jobs(&archive, &manifest, &in_scope)
-                .iter()
-                .map(|job| by_job[job.as_str()].to_string())
-                .collect()
-        };
-
-        // Dry-run side: the same archive through the offline path.
-        let dry_demoted_drvs = supply::workload_set(&archive).demoted_impure;
-        assert_eq!(
-            live_demoted_drvs, dry_demoted_drvs,
-            "live demotion must equal the dry-run's workload_set demotion"
-        );
-        let dry = timeline::plan_timed_dry_run(&archive, &Knobs::default(), None).unwrap();
-        assert_eq!(dry.demoted_impure, live_demoted_drvs.len());
-        assert!(
-            !live_demoted_drvs.is_empty(),
-            "vacuous parity would prove nothing: the fixture must demote at least one unit"
         );
     }
 
