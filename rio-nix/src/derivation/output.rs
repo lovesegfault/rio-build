@@ -397,3 +397,196 @@ mod tests {
         ));
     }
 }
+
+/// The drv-level type of a derivation's output set (CppNix
+/// `BasicDerivation::type()`, derivations.cc:795-854, minus `Impure` —
+/// default experimental-feature posture).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivationType {
+    /// All outputs input-addressed; `deferred` iff the paths are not
+    /// yet known (every output Deferred — mixing concrete and deferred
+    /// IA outputs is "can't mix", oracle parity).
+    InputAddressed {
+        /// Whether the IA paths are deferred.
+        deferred: bool,
+    },
+    /// Single fixed output named "out".
+    Fixed,
+    /// All outputs floating-CA on one hash algorithm.
+    Floating,
+}
+
+/// Ill-typed output sets, with the oracle's verbatim wording.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DerivationTypeError {
+    /// Outputs of different kinds in one derivation (including
+    /// concrete-IA mixed with deferred-IA — distinct types in the
+    /// oracle's `decide`).
+    #[error("can't mix derivation output types")]
+    Mixed,
+    /// More than one fixed output.
+    #[error("only one fixed output is allowed for now")]
+    MultipleFixed,
+    /// The single fixed output is not named "out".
+    #[error("single fixed output must be named \"out\"")]
+    FixedNotNamedOut,
+    /// Floating outputs disagree on the hash algorithm (compared
+    /// after stripping the `r:` method prefix — method is not part of
+    /// the oracle's `hashAlgo`).
+    #[error("all floating outputs must use the same hash algorithm")]
+    FloatingAlgoMismatch,
+    /// Empty output set.
+    #[error("must have at least one output")]
+    NoOutputs,
+}
+
+/// The oracle's `hashAlgo` view of a floating algo string: the `r:`
+/// method prefix is NOT part of the algorithm (`r:sha256` and `sha256`
+/// are the same algorithm under different methods), while the
+/// experimental `text:` prefix is compared raw — fail-closed, gated
+/// upstream.
+fn floating_algo(raw: &str) -> &str {
+    raw.strip_prefix("r:").unwrap_or(raw)
+}
+
+/// Classify an output set, mirroring the oracle's `decide` fold.
+// r[impl nix.drv.type-classify]
+pub fn classify_outputs(
+    outputs: &[DerivationOutput],
+) -> Result<DerivationType, DerivationTypeError> {
+    let mut ty: Option<DerivationType> = None;
+    let mut floating: Option<&str> = None;
+    let decide = |new_ty: DerivationType, ty: &mut Option<DerivationType>| match *ty {
+        None => {
+            *ty = Some(new_ty);
+            Ok(())
+        }
+        Some(t) if t != new_ty => Err(DerivationTypeError::Mixed),
+        Some(DerivationType::Fixed) => Err(DerivationTypeError::MultipleFixed),
+        Some(_) => Ok(()),
+    };
+    for o in outputs {
+        match o.kind() {
+            OutputKind::InputAddressed(_) => {
+                decide(DerivationType::InputAddressed { deferred: false }, &mut ty)?;
+            }
+            OutputKind::Deferred => {
+                decide(DerivationType::InputAddressed { deferred: true }, &mut ty)?;
+            }
+            OutputKind::Fixed { .. } => {
+                decide(DerivationType::Fixed, &mut ty)?;
+                if o.name() != "out" {
+                    return Err(DerivationTypeError::FixedNotNamedOut);
+                }
+            }
+            OutputKind::Floating { hash_algo } => {
+                decide(DerivationType::Floating, &mut ty)?;
+                let algo = floating_algo(hash_algo);
+                match floating {
+                    None => floating = Some(algo),
+                    Some(prev) if prev != algo => {
+                        return Err(DerivationTypeError::FloatingAlgoMismatch);
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    ty.ok_or(DerivationTypeError::NoOutputs)
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    const P1: &str = "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-a";
+    const P2: &str = "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-b";
+    const H64: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    fn ia(name: &str, p: &str) -> DerivationOutput {
+        DerivationOutput::new(name, p, "", "").unwrap()
+    }
+    fn deferred(name: &str) -> DerivationOutput {
+        DerivationOutput::new(name, "", "", "").unwrap()
+    }
+    fn fixed(name: &str, p: &str) -> DerivationOutput {
+        DerivationOutput::new(name, p, "sha256", H64).unwrap()
+    }
+    fn floating(name: &str, algo: &str) -> DerivationOutput {
+        DerivationOutput::new(name, "", algo, "").unwrap()
+    }
+
+    /// Every legal uniform shape, including the `r:`-strip floating
+    /// pair (same algorithm under different methods — the
+    /// false-rejection trap).
+    // r[verify nix.drv.type-classify]
+    #[test]
+    fn legal_shapes() {
+        assert_eq!(
+            classify_outputs(&[ia("out", P1), ia("dev", P2)]),
+            Ok(DerivationType::InputAddressed { deferred: false })
+        );
+        assert_eq!(
+            classify_outputs(&[deferred("out"), deferred("dev")]),
+            Ok(DerivationType::InputAddressed { deferred: true })
+        );
+        assert_eq!(
+            classify_outputs(&[fixed("out", P1)]),
+            Ok(DerivationType::Fixed)
+        );
+        assert_eq!(
+            classify_outputs(&[floating("out", "r:sha256"), floating("dev", "sha256")]),
+            Ok(DerivationType::Floating)
+        );
+    }
+
+    /// Every error variant, with the oracle's verbatim wording.
+    // r[verify nix.drv.type-classify]
+    #[test]
+    fn error_matrix() {
+        let cases: [(&[DerivationOutput], DerivationTypeError, &str); 6] = [
+            (
+                &[ia("out", P1), floating("dev", "sha256")],
+                DerivationTypeError::Mixed,
+                "can't mix derivation output types",
+            ),
+            // Concrete IA + deferred IA is ALSO a mix (distinct types
+            // in the oracle's decide).
+            (
+                &[ia("out", P1), deferred("dev")],
+                DerivationTypeError::Mixed,
+                "can't mix derivation output types",
+            ),
+            (
+                &[fixed("out", P1), fixed("dev", P2)],
+                DerivationTypeError::MultipleFixed,
+                "only one fixed output is allowed for now",
+            ),
+            (
+                &[fixed("src", P1)],
+                DerivationTypeError::FixedNotNamedOut,
+                "single fixed output must be named \"out\"",
+            ),
+            (
+                &[floating("out", "sha256"), floating("dev", "sha512")],
+                DerivationTypeError::FloatingAlgoMismatch,
+                "all floating outputs must use the same hash algorithm",
+            ),
+            (
+                &[],
+                DerivationTypeError::NoOutputs,
+                "must have at least one output",
+            ),
+        ];
+        for (outs, want, wording) in cases {
+            let err = classify_outputs(outs).unwrap_err();
+            assert_eq!(err, want);
+            assert_eq!(err.to_string(), wording, "oracle verbatim wording");
+        }
+        // text: floating prefixes compare raw (fail-closed).
+        assert!(matches!(
+            classify_outputs(&[floating("out", "text:sha256"), floating("dev", "sha256")]),
+            Err(DerivationTypeError::FloatingAlgoMismatch)
+        ));
+    }
+}

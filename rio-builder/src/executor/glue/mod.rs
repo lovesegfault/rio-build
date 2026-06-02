@@ -1206,30 +1206,24 @@ mod tests {
         // CppNix: "can't mix derivation output types".
         let zeros = "00".repeat(32);
         let out = fod_path("sha256", &zeros);
-        let drv = mk_drv(
+        // Unrepresentable past construction (oracle type() parity).
+        let err = BasicDerivation::new(
             vec![
                 DerivationOutput::new("out", out.as_str(), "sha256", zeros.as_str()).unwrap(),
                 DerivationOutput::new("doc", IN_DEP, "", "").unwrap(),
             ],
-            &[("name", "demo")],
-        );
-        let (input_paths, input_meta) = closure();
-        let err = derivation_into_request(
-            DRV,
-            &drv,
-            &input_paths,
-            &input_meta,
-            &drv_table(),
-            &paths(),
-            &opts(),
+            BTreeSet::new(),
+            "x86_64-linux".into(),
+            "/bin/sh".into(),
+            vec![],
+            BTreeMap::new(),
         )
         .unwrap_err();
-        match err {
-            GlueError::FixedOutputBadShape { reason } => {
-                assert!(reason.contains("cannot be mixed"), "{reason}")
-            }
-            other => panic!("want FixedOutputBadShape, got: {other}"),
-        }
+        assert!(
+            err.to_string()
+                .contains("can't mix derivation output types"),
+            "{err}"
+        );
     }
 
     /// CppNix `BasicDerivation::type()`: a floating-CA output cannot
@@ -1239,33 +1233,27 @@ mod tests {
     // r[verify builder.exec.output-types-unmixed]
     #[test]
     fn derivation_into_request_rejects_mixed_output_types() {
-        let (input_paths, input_meta) = closure();
-
-        // Floating-CA + declared-path IA sibling → rejected.
-        let mixed = mk_drv(
+        // The drv-level shape gate now lives at CONSTRUCTION
+        // (BasicDerivation::new classifies, oracle type() parity), so a
+        // mixed output set is unrepresentable and the glue can never
+        // see one. This pin witnesses the boundary on the glue's own
+        // input type with the oracle's wording.
+        let err = BasicDerivation::new(
             vec![
                 DerivationOutput::new("out", "", "r:sha256", "").unwrap(),
                 DerivationOutput::new("lib", OUT, "", "").unwrap(),
             ],
-            &[
-                ("name", "demo"),
-                ("out", &hash_placeholder("out")),
-                ("lib", OUT),
-            ],
-        );
-        let err = derivation_into_request(
-            DRV,
-            &mixed,
-            &input_paths,
-            &input_meta,
-            &drv_table(),
-            &paths(),
-            &opts(),
+            BTreeSet::new(),
+            "x86_64-linux".into(),
+            "/bin/sh".into(),
+            vec![],
+            BTreeMap::new(),
         )
         .unwrap_err();
         assert!(
-            matches!(err, GlueError::MixedOutputTypes { .. }),
-            "mixed floating-CA + IA must be rejected, got: {err}"
+            err.to_string()
+                .contains("can't mix derivation output types"),
+            "mixed floating-CA + IA must be rejected at construction, got: {err}"
         );
         assert!(
             err.to_string()
@@ -1274,6 +1262,7 @@ mod tests {
         );
 
         // All-floating still plans (two floating-CA outputs).
+        let (input_paths, input_meta) = closure();
         let all_floating = mk_drv(
             vec![
                 DerivationOutput::new("out", "", "r:sha256", "").unwrap(),
@@ -1326,7 +1315,8 @@ mod tests {
         // CppNix: "only one fixed output is allowed".
         let zeros = "00".repeat(32);
         let ones = "11".repeat(32);
-        let drv = mk_drv(
+        // Unrepresentable past construction (oracle type() parity).
+        let err = BasicDerivation::new(
             vec![
                 DerivationOutput::new(
                     "out",
@@ -1343,52 +1333,39 @@ mod tests {
                 )
                 .unwrap(),
             ],
-            &[("name", "demo")],
-        );
-        let (input_paths, input_meta) = closure();
-        let err = derivation_into_request(
-            DRV,
-            &drv,
-            &input_paths,
-            &input_meta,
-            &drv_table(),
-            &paths(),
-            &opts(),
+            BTreeSet::new(),
+            "x86_64-linux".into(),
+            "/bin/sh".into(),
+            vec![],
+            BTreeMap::new(),
         )
         .unwrap_err();
-        match err {
-            GlueError::FixedOutputBadShape { reason } => {
-                assert!(reason.contains("only one fixed output"), "{reason}")
-            }
-            other => panic!("want FixedOutputBadShape, got: {other}"),
-        }
+        assert!(
+            err.to_string()
+                .contains("only one fixed output is allowed for now"),
+            "{err}"
+        );
     }
 
     #[test]
     fn fixed_output_not_named_out_is_rejected() {
         // CppNix: "single fixed output must be named \"out\"".
         let zeros = "00".repeat(32);
-        let drv = mk_drv(
+        // Unrepresentable past construction (oracle type() parity).
+        let err = BasicDerivation::new(
             vec![DerivationOutput::new("lib", OUT, "sha256", zeros.as_str()).unwrap()],
-            &[("name", "demo")],
-        );
-        let (input_paths, input_meta) = closure();
-        let err = derivation_into_request(
-            DRV,
-            &drv,
-            &input_paths,
-            &input_meta,
-            &drv_table(),
-            &paths(),
-            &opts(),
+            BTreeSet::new(),
+            "x86_64-linux".into(),
+            "/bin/sh".into(),
+            vec![],
+            BTreeMap::new(),
         )
         .unwrap_err();
-        match err {
-            GlueError::FixedOutputBadShape { reason } => {
-                assert!(reason.contains("named \"out\""), "{reason}")
-            }
-            other => panic!("want FixedOutputBadShape, got: {other}"),
-        }
+        assert!(
+            err.to_string()
+                .contains("single fixed output must be named \"out\""),
+            "{err}"
+        );
     }
 
     #[test]

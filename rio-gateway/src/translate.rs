@@ -1873,17 +1873,18 @@ mod tests {
         let key = StorePath::parse(drv_path).unwrap();
         let victim = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
 
-        // Mixed floating-CA + squatted static path → rejected fail-closed.
-        let mixed = Derivation::parse(&format!(
+        // Mixed floating-CA + squatted static path: unrepresentable —
+        // the drv-level classifier rejects the mix at parse (oracle
+        // wording), so the squat-next-to-CA shape never reaches the
+        // binding gate at all.
+        let err = Derivation::parse(&format!(
             r#"Derive([("ca","","r:sha256",""),("evil","{victim}","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("ca",""),("evil","{victim}")])"#
         ))
-        .expect("test ATerm parses");
-        let mut cache = HashMap::new();
-        cache.insert(key.clone(), mixed);
-        let err = validate_output_path_bindings(std::slice::from_ref(&node), &cache).unwrap_err();
+        .unwrap_err();
         assert!(
-            err.contains("cannot derive output paths"),
-            "mixed CA + static shape must be rejected fail-closed: {err}"
+            err.to_string()
+                .contains("can't mix derivation output types"),
+            "mixed CA + static shape dies at the parse boundary: {err}"
         );
 
         // All-floating-CA → still accepted (content-bound fast path).
@@ -1925,18 +1926,22 @@ mod tests {
         };
         let key = StorePath::parse(drv_path).unwrap();
 
+        let _ = key;
+        let _ = node;
+        // Concrete-IA next to deferred-IA is a type MIX in the oracle's
+        // decide() (InputAddressed{deferred:false} vs {deferred:true}),
+        // so the squat-next-to-deferred shape is now unrepresentable at
+        // the parse boundary — strictly earlier than the binding gate
+        // that used to catch it.
         let victim = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
         let aterm = format!(
             r#"Derive([("evil","{victim}","",""),("out","","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("evil","{victim}"),("out","")])"#
         );
-        let drv = Derivation::parse(&aterm).expect("test ATerm parses");
-
-        let mut cache = HashMap::new();
-        cache.insert(key, drv);
-        let err = validate_output_path_bindings(std::slice::from_ref(&node), &cache).unwrap_err();
+        let err = Derivation::parse(&aterm).unwrap_err();
         assert!(
-            err.contains("must match the derivation") || err.contains("derive"),
-            "mixed deferred+squatted shape must be rejected: {err}"
+            err.to_string()
+                .contains("can't mix derivation output types"),
+            "mixed deferred+squatted shape dies at the parse boundary: {err}"
         );
     }
 
@@ -2711,38 +2716,46 @@ mod tests {
         let hex_hash = "5a".repeat(32);
         let victim = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
 
-        // Declared-hash output + IA sibling → rejected (mixing).
-        let mixed = Derivation::parse(&format!(
+        let _ = (key, node);
+        // All three shapes are now unrepresentable at the parse
+        // boundary (drv-level classification, oracle type() parity) —
+        // the submission gate has nothing left to check because the
+        // session drv cache can never contain them.
+
+        // Declared-hash output + IA sibling → mixing, oracle wording.
+        let err = Derivation::parse(&format!(
             r#"Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fetch","sha256","{hex_hash}"),("doc","{victim}","","")],[],[],"x86_64-linux","/bin/sh",[],[("out",""),("doc","")])"#
         ))
-        .expect("test ATerm parses");
-        let mut cache = HashMap::new();
-        cache.insert(key.clone(), mixed);
-        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
-        assert!(err.contains("cannot be mixed"), "{err}");
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("can't mix derivation output types"),
+            "{err}"
+        );
 
-        // Two declared-hash outputs → rejected (only one allowed).
-        // (Fixed outputs must declare paths under the typed boundary.)
+        // Two declared-hash outputs → only one fixed output allowed.
         let p_out = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fetch";
         let p_src = "/nix/store/dddddddddddddddddddddddddddddddd-src";
-        let two = Derivation::parse(&format!(
+        let err = Derivation::parse(&format!(
             r#"Derive([("out","{p_out}","sha256","{hex_hash}"),("src","{p_src}","sha256","{hex_hash}")],[],[],"x86_64-linux","/bin/sh",[],[("out","{p_out}"),("src","{p_src}")])"#
         ))
-        .expect("test ATerm parses");
-        let mut cache = HashMap::new();
-        cache.insert(key.clone(), two);
-        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
-        assert!(err.contains("only one fixed output"), "{err}");
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only one fixed output is allowed for now"),
+            "{err}"
+        );
 
-        // Single declared-hash output not named "out" → rejected.
-        let misnamed = Derivation::parse(&format!(
+        // Single declared-hash output not named "out".
+        let err = Derivation::parse(&format!(
             r#"Derive([("src","{p_src}","sha256","{hex_hash}")],[],[],"x86_64-linux","/bin/sh",[],[("src","{p_src}")])"#
         ))
-        .expect("test ATerm parses");
-        let mut cache = HashMap::new();
-        cache.insert(key.clone(), misnamed);
-        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
-        assert!(err.contains("must be named"), "{err}");
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("single fixed output must be named \"out\""),
+            "{err}"
+        );
     }
 
     #[test]

@@ -208,6 +208,11 @@ impl<'a> ATermParser<'a> {
         if outputs.is_empty() {
             return Err(DerivationError::NoOutputs);
         }
+        // Drv-level shape rule (oracle BasicDerivation::type() parity,
+        // enforced eagerly at parse — the oracle classifies lazily on
+        // first type() call; rio rejects up front so no ill-typed value
+        // exists to defer on).
+        super::output::classify_outputs(&outputs)?;
         self.expect(",")?;
 
         let input_drvs = self.parse_input_drvs()?;

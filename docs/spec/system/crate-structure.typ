@@ -165,8 +165,8 @@ Notable edges:
     )[`StderrWriter` allocates activity IDs as `(getpid() << 32) + counter` to match upstream Nix's `libutil/logging.cc` convention. Starting at bare `1` would put server-allocated IDs in the same low range a client may use for its own activities (I-206: nom showed completed builds as stuck at their last phase).]
 
     #r(
-      "nix.drv.like-trait",
-    )[`DerivationLike` is the shared predicate trait over `Derivation` and `BasicDerivation`: `outputs()`/`platform()`/`env()` accessors plus the default-method predicates `is_fixed_output`, `has_ca_floating_outputs`, `is_content_addressed`. Inherent accessor methods are kept alongside so existing callers don't need a trait import; callers of the predicate methods must `use DerivationLike`.]
+      "nix.drv.like-trait+1",
+    )[`DerivationLike` is the shared predicate trait over `Derivation` and `BasicDerivation`: `outputs()`/`platform()`/`env()` accessors plus `derivation_type()` — the drv-level classifier (#rref("nix.drv.type-classify")) — and the predicates `is_fixed_output`, `has_ca_floating_outputs`, `is_content_addressed`, which MUST be thin wrappers over `derivation_type()` so exactly one classification exists. Inherent accessor methods are kept alongside so existing callers don't need a trait import; callers of the predicate methods must `use DerivationLike`.]
 
     #r(
       "nix.drv.parse-from-nar",
@@ -175,6 +175,11 @@ Notable edges:
     #r(
       "nix.drv.output-typed",
     )[`DerivationOutput` MUST classify its `(path, hashAlgo, hash)` field triple at construction into exactly one of the four legal shapes — input-addressed, deferred, fixed-output, floating-CA (CppNix `parseDerivationOutput`, `derivations.cc:306-354`) — and MUST reject every other shape: a non-empty declared path that does not parse as a store path, a floating output declaring a path, a fixed output without one, and a hash without an algo. Both untrusted parsers (the ATerm parser and the wire `read_basic_derivation`) and every public constructor route through this classification, so no consumer past a parse can observe a malformed declared output path.]
+    #r(
+      "nix.drv.type-classify",
+    )[`classify_outputs` MUST mirror CppNix `BasicDerivation::type()` (`derivations.cc:795-854`): a derivation's output set classifies to exactly one of input-addressed (concrete or deferred — mixing the two is itself a mix), fixed (single output, named `out`), or floating (uniform hash algorithm, compared after stripping the `r:` method prefix), with the oracle's verbatim error wording for every ill-typed set. `Derivation::parse` and `BasicDerivation::new` MUST enforce the classification eagerly, and `hash_derivation_modulo` MUST classify before hashing so an ill-typed value is an error, never a silently masked hash.]
+    The oracle classifies lazily on the first `type()` call; rio rejects at construction so no ill-typed value exists to defer on. `Impure` is omitted (default experimental-feature posture), and `text:`-prefixed floating algos compare raw — fail-closed, gated upstream.
+
     Three deliberate divergences from the oracle, all fail-closed: declared paths get full `StorePath::parse` (not the leading-`/` check) because rio forwards them to workers and joins them against the overlay upper store; `hash`-without-`hashAlgo` is rejected rather than silently dropped on unparse (byte-faithful round-trips are load-bearing; no honest producer emits the shape); and `"impure"` is not special-cased (default experimental-feature posture) — it classifies as a fixed output with an undecodable digest and dies at the decode gates. Junk hash values and algo names remain representable as raw strings: the gateway's realized-offender exemption flow carries them.
 
     #r(

@@ -73,6 +73,9 @@ pub enum DerivationError {
     )]
     HashWithoutAlgo(String),
 
+    #[error("ill-typed derivation outputs: {0}")]
+    IllTypedOutputs(#[from] output::DerivationTypeError),
+
     #[error(
         "derivation '{0}' is not plain input-addressed (fixed-output and floating-CA \
          outputs derive their paths from content, not from the derivation hash)"
@@ -84,7 +87,9 @@ pub enum DerivationError {
 const MAX_ATERM_LIST_ITEMS: usize = 1_048_576;
 
 pub mod output;
-pub use output::{DerivationOutput, OutputKind};
+pub use output::{
+    DerivationOutput, DerivationType, DerivationTypeError, OutputKind, classify_outputs,
+};
 
 /// Common accessor surface for [`Derivation`] and [`BasicDerivation`].
 ///
@@ -100,7 +105,7 @@ pub use output::{DerivationOutput, OutputKind};
 /// becomes the *single* source of the predicate implementations;
 /// callers of `is_fixed_output()` / `has_ca_floating_outputs()` must
 /// `use DerivationLike`.
-// r[impl nix.drv.like-trait]
+// r[impl nix.drv.like-trait+1]
 pub trait DerivationLike {
     /// Output definitions.
     fn outputs(&self) -> &[DerivationOutput];
@@ -109,8 +114,22 @@ pub trait DerivationLike {
     /// Environment variables.
     fn env(&self) -> &BTreeMap<String, String>;
 
-    /// Strict FOD predicate: single output named `out` with both
-    /// `hash_algo` AND `hash` set.
+    /// The drv-level type of this derivation's output set —
+    /// [`classify_outputs`] over `outputs()` (CppNix
+    /// `BasicDerivation::type()` parity).
+    ///
+    /// Constructor-reachable values are always classifiable
+    /// ([`Derivation::parse`] and [`BasicDerivation::new`] enforce it),
+    /// so `Err` is only observable on values built before that gate
+    /// existed (none remain) or through in-crate test literals.
+    fn derivation_type(&self) -> Result<DerivationType, DerivationTypeError> {
+        classify_outputs(self.outputs())
+    }
+
+    /// Strict FOD predicate: thin wrapper over [`DerivationLike::derivation_type`]
+    /// (`DerivationType::Fixed` ⇔ single output named `out` with both
+    /// `hash_algo` AND `hash` set — the truth table is identical to the
+    /// historical per-field check on every constructor-reachable value).
     ///
     /// Contrast [`DerivationOutput::has_hash_algo`] which is the
     /// loose per-output "has hash_algo" check (covers floating-CA
@@ -118,21 +137,14 @@ pub trait DerivationLike {
     /// callers wanting "is this output content-addressed in any
     /// way" use the per-output predicate.
     fn is_fixed_output(&self) -> bool {
-        let outs = self.outputs();
-        outs.len() == 1
-            && outs[0].name() == "out"
-            && !outs[0].hash_algo().is_empty()
-            && !outs[0].hash().is_empty()
+        matches!(self.derivation_type(), Ok(DerivationType::Fixed))
     }
 
-    /// Any output is CA-floating (`hash_algo` set, `hash` empty).
-    ///
-    /// Impure derivations also match this pattern and follow the same
-    /// `hashDerivationModulo` code path (output masking).
+    /// Any output is CA-floating — wrapper over
+    /// [`DerivationLike::derivation_type`] (uniform sets make "any" ⇔
+    /// "all"; ill-typed sets are unreachable past construction).
     fn has_ca_floating_outputs(&self) -> bool {
-        self.outputs()
-            .iter()
-            .any(|o| !o.hash_algo().is_empty() && o.hash().is_empty())
+        matches!(self.derivation_type(), Ok(DerivationType::Floating))
     }
 
     /// Content-addressed in ANY form: either a strict FOD (hash_algo AND
@@ -203,6 +215,27 @@ pub struct Derivation {
     args: Vec<String>,
     /// Environment variables.
     env: BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+impl Derivation {
+    /// Test-only escape hatch past the drv-level shape gate: builds a
+    /// `Derivation` whose OUTPUT SET may be ill-typed (each output is
+    /// still individually well-formed — `OutputRepr` admits nothing
+    /// else). Exists so classify-first propagation (`hash_derivation_modulo`
+    /// rejecting ill-typed subjects) is testable; production paths can
+    /// only obtain classified values.
+    pub(crate) fn new_unchecked_for_tests(outputs: Vec<DerivationOutput>) -> Self {
+        Self {
+            outputs,
+            input_drvs: BTreeMap::new(),
+            input_srcs: BTreeSet::new(),
+            platform: "x86_64-linux".into(),
+            builder: "/bin/sh".into(),
+            args: vec![],
+            env: BTreeMap::new(),
+        }
+    }
 }
 
 impl Derivation {
@@ -341,6 +374,9 @@ impl BasicDerivation {
         if outputs.is_empty() {
             return Err(DerivationError::NoOutputs);
         }
+        // Drv-level shape rule (oracle BasicDerivation::type() parity):
+        // ill-typed output sets are unrepresentable past construction.
+        output::classify_outputs(&outputs)?;
         Ok(BasicDerivation {
             outputs,
             input_srcs,

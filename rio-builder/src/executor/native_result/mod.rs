@@ -935,12 +935,27 @@ mod tests {
 
     #[test]
     fn non_strict_hash_declaring_output_gets_no_descriptor() {
-        // A hash-declaring output with a sibling does not satisfy the
-        // strict FOD predicate: the request glue rejects such shapes
-        // outright, and even if one reached this point the stamping
-        // must not vouch for content nothing verified.
+        // A hash-declaring output with an IA sibling does not satisfy
+        // the strict FOD predicate — and the shape is now
+        // unrepresentable outright (drv-level classification at parse,
+        // oracle type() parity), so the stamping can never be asked to
+        // vouch for content nothing verified.
         let out_p = sp('b', "tarball");
         let doc_p = sp('c', "tarball-doc");
+        let declared_hex = "22".repeat(32);
+        let aterm = format!(
+            r#"Derive([("out","{out_p}","sha256","{declared_hex}"),("doc","{doc_p}","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#
+        );
+        let err = Derivation::parse(&aterm).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("can't mix derivation output types"),
+            "{err}"
+        );
+
+        // The surviving stamping property over a REPRESENTABLE shape:
+        // an all-IA multi-output set gets no CA descriptors (nothing
+        // hash-declaring to vouch for).
         let tmp = tempfile::tempdir().unwrap();
         let host_out = tmp.path().join(out_p.strip_prefix("/nix/store/").unwrap());
         let host_doc = tmp.path().join(doc_p.strip_prefix("/nix/store/").unwrap());
@@ -960,14 +975,7 @@ mod tests {
                 host_path: host_doc,
             },
         ];
-        let declared_hex = "22".repeat(32);
-        let drv = drv_from_aterm_ca(
-            &[
-                ("out", &out_p, "sha256", &declared_hex),
-                ("doc", &doc_p, "", ""),
-            ],
-            &[],
-        );
+        let drv = drv_from_aterm_ca(&[("out", &out_p, "", ""), ("doc", &doc_p, "", "")], &[]);
 
         let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
         for p in &processed.outputs {
@@ -1391,22 +1399,19 @@ mod tests {
         // bytes rewritten) is pinned by
         // `floating_ca_sibling_reference_finalized`.
         // r[verify builder.exec.output-types-unmixed]
+        // The shape is now unrepresentable: the typed parse boundary
+        // classifies the output SET at parse, so the corrupt-artifact
+        // hazard (references remapped to out's final path while lib's
+        // bytes still name the scratch) has no constructible input.
         let lib_p = sp('a', "demo-lib");
-        let out_scratch = sp('s', "demo");
-        let (_tmp, outputs) = fake_outputs(&[
-            ("lib", &lib_p, format!("needs {out_scratch}").as_bytes()),
-            ("out", &out_scratch, b"ca content"),
-        ]);
-        let drv = drv_from_aterm_ca(&[("lib", &lib_p, "", ""), ("out", "", "r:sha256", "")], &[]);
-        let err = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap_err();
-        assert!(
-            matches!(err, OutputRejection::MixedOutputTypes { .. }),
-            "mixed IA + floating-CA must be rejected, got: {err}"
+        let aterm = format!(
+            r#"Derive([("lib","{lib_p}","",""),("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",[],[])"#
         );
-        let msg = err.to_string();
+        let err = Derivation::parse(&aterm).unwrap_err();
         assert!(
-            msg.contains("can't mix derivation output types"),
-            "error carries the oracle's wording: {msg}"
+            err.to_string()
+                .contains("can't mix derivation output types"),
+            "error carries the oracle's wording: {err}"
         );
     }
 

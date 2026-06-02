@@ -36,7 +36,13 @@ pub fn hash_derivation_modulo<'c>(
     // (`pathDerivationModulo`) hard-codes false. We mirror that — the
     // top-level subject masks iff it is CA-floating; every input frame
     // inside the walk uses false.
-    let mask_outputs = drv.has_ca_floating_outputs();
+    // Classify FIRST (oracle hashDerivationModulo calls type() before
+    // hashing, derivations.cc:895): an ill-typed subject is an error,
+    // never silently masked-and-hashed.
+    let mask_outputs = matches!(
+        drv.derivation_type()?,
+        crate::derivation::DerivationType::Floating
+    );
     hash_modulo_walk(drv, drv_path, resolve_input, hash_cache, mask_outputs)
 }
 
@@ -57,6 +63,7 @@ pub fn hash_derivation_modulo_input_form<'c>(
     resolve_input: &dyn Fn(&str) -> Option<&'c Derivation>,
     hash_cache: &mut HashMap<String, [u8; 32]>,
 ) -> Result<[u8; 32], DerivationError> {
+    drv.derivation_type()?;
     hash_modulo_walk(drv, drv_path, resolve_input, hash_cache, false)
 }
 
@@ -156,7 +163,11 @@ fn hash_modulo_walk<'c>(
                 }
                 visiting.insert(path.clone());
 
-                if drv.is_fixed_output() {
+                // Classify every visited derivation (the oracle's
+                // recursive pathDerivationModulo calls type() per
+                // frame); ill-typed inputs propagate as errors.
+                let dty = drv.derivation_type()?;
+                if matches!(dty, crate::derivation::DerivationType::Fixed) {
                     // FOD base case: no inputs to expand.
                     stack.push(WalkFrame::Finish { drv, path });
                     continue;
@@ -267,8 +278,11 @@ pub fn input_addressed_output_paths<'c>(
     resolve_input: &dyn Fn(&str) -> Option<&'c Derivation>,
     hash_cache: &mut HashMap<String, [u8; 32]>,
 ) -> Result<BTreeMap<String, StorePath>, DerivationError> {
-    if drv.is_fixed_output() || drv.has_ca_floating_outputs() {
-        return Err(DerivationError::NotInputAddressed(drv_path.to_string()));
+    match drv.derivation_type()? {
+        crate::derivation::DerivationType::Fixed | crate::derivation::DerivationType::Floating => {
+            return Err(DerivationError::NotInputAddressed(drv_path.to_string()));
+        }
+        crate::derivation::DerivationType::InputAddressed { .. } => {}
     }
 
     // drvName: the `.drv` store path's name minus the extension — the same
@@ -1286,5 +1300,55 @@ mod hash_derivation_modulo_tests {
             "expected CycleDetected, got: {err:?}"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod classify_first_tests {
+    use super::*;
+    use crate::derivation::{DerivationOutput, DerivationTypeError};
+    use std::collections::HashMap;
+
+    /// `hash_derivation_modulo` classifies before hashing: an ill-typed
+    /// subject (two fixed outputs, built via the test escape hatch — no
+    /// production path can construct one) is an error, never a hash.
+    // r[verify nix.drv.type-classify]
+    #[test]
+    fn modulo_rejects_ill_typed_subject() {
+        let h = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let drv = Derivation::new_unchecked_for_tests(vec![
+            DerivationOutput::new(
+                "out",
+                "/nix/store/n2v52szmyja512fxmaax8lixl4dxh4jb-a",
+                "sha256",
+                h,
+            )
+            .unwrap(),
+            DerivationOutput::new(
+                "dev",
+                "/nix/store/gjamk2f57j5pqymvqamgxla350szmld1-b",
+                "sha256",
+                h,
+            )
+            .unwrap(),
+        ]);
+        let resolve = |_: &str| -> Option<&Derivation> { None };
+        let mut cache = HashMap::new();
+        let err = hash_derivation_modulo(
+            &drv,
+            "/nix/store/vfhik20db6k5ff75sf3dbf6i3jymbnir-x.drv",
+            &resolve,
+            &mut cache,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            DerivationError::IllTypedOutputs(DerivationTypeError::MultipleFixed)
+        ));
+        assert!(
+            err.to_string()
+                .contains("only one fixed output is allowed for now"),
+            "oracle wording surfaces: {err}"
+        );
     }
 }
