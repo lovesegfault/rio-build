@@ -350,19 +350,18 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_substitute_skipped_total",
         "Substitution requests short-circuited WITHOUT contacting any \
-         upstream, labeled by reason (no_tenant: the request carried no \
-         resolvable tenant identity; no_upstreams: the tenant has zero \
-         tenant_upstreams rows; disabled: no substituter on this replica; \
-         no_http_client: the reqwest client failed to build at startup so \
-         this replica cannot reach any upstream). \
+         upstream, labeled by reason (no_upstreams: the tenant has zero \
+         tenant_upstreams rows; no_http_client: the reqwest client failed \
+         to build at startup so this replica cannot reach any upstream). \
          Every skip degrades to a from-source build at the scheduler, so a \
-         sustained nonzero no_tenant/disabled/no_http_client rate means \
+         sustained nonzero no_http_client rate means \
          cache.nixos.org-cached paths are being compiled. Distinct from \
          rio_store_substitute_total{result=miss}, which counts attempts \
          that DID reach the upstreams and definitively missed. Granularity: \
-         no_tenant/disabled are per-request; no_upstreams and \
-         no_http_client are per singleflight leader (same as \
-         result=hit|miss)."
+         per singleflight leader (same as result=hit|miss). (The walk-era \
+         per-request no_tenant/disabled reasons died with the \
+         SubstitutePath RPC; the materialization executor reports a \
+         missing tenant as an InfraFailure outcome instead.)"
     );
     describe_counter!(
         "rio_store_substitute_bytes_total",

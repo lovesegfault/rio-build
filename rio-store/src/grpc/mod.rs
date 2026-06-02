@@ -29,8 +29,8 @@ use rio_proto::types::{
     BatchQueryPathInfoResponse, FindMissingPathsRequest, FindMissingPathsResponse, GetPathRequest,
     PathInfo, PutPathBatchRequest, PutPathBatchResponse, PutPathRequest, PutPathResponse,
     QueryPathFromHashPartRequest, QueryPathInfoRequest, QueryRealisationRequest, Realisation,
-    RegisterRealisationRequest, RegisterRealisationResponse, SubstitutePathRequest,
-    TenantQuotaRequest, TenantQuotaResponse,
+    RegisterRealisationRequest, RegisterRealisationResponse, TenantQuotaRequest,
+    TenantQuotaResponse,
 };
 use rio_proto::validated::ValidatedPathInfo;
 
@@ -537,9 +537,8 @@ impl StoreServiceImpl {
 }
 
 /// Map a [`SubstituteError`] that escaped `do_substitute`'s per-upstream
-/// loop to a gRPC `Status`. Shared by `try_substitute_on_miss`
-/// (QueryPathInfo/GetPath unary fallback) and `substitute_path_impl`
-/// (server-streaming variant).
+/// loop to a gRPC `Status`. Caller: `try_substitute_on_miss`
+/// (QueryPathInfo/GetPath unary fallback).
 ///
 /// HashMismatch/SizeMismatch never reach here in practice: per-upstream
 /// integrity errors are swallowed as try-next-upstream inside
@@ -642,16 +641,6 @@ impl StoreService for StoreServiceImpl {
         request: Request<FindMissingPathsRequest>,
     ) -> Result<Response<FindMissingPathsResponse>, Status> {
         self.find_missing_paths_impl(request).await
-    }
-
-    type SubstitutePathStream = queries::SubstitutePathStream;
-
-    #[instrument(skip(self, request), fields(rpc = "SubstitutePath"))]
-    async fn substitute_path(
-        &self,
-        request: Request<SubstitutePathRequest>,
-    ) -> Result<Response<Self::SubstitutePathStream>, Status> {
-        self.substitute_path_impl(request).await
     }
 
     #[instrument(skip(self, request), fields(rpc = "QueryPathFromHashPart"))]
