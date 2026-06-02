@@ -296,7 +296,7 @@ impl DagActor {
         let needs_ia = drv
             .outputs()
             .iter()
-            .any(|o| o.hash_algo().is_empty() && !o.path().is_empty());
+            .any(|o| matches!(o.kind(), rio_nix::derivation::OutputKind::InputAddressed(_)));
         let mut input_seed: Vec<rio_proto::types::DerivationNode> = Vec::new();
         if needs_ia {
             for input in drv.input_drvs().keys() {

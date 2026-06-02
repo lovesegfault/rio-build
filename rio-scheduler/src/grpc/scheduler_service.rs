@@ -574,49 +574,6 @@ impl SchedulerService for SchedulerGrpc {
     }
 }
 
-/// Oracle-parity fixed-output SHAPE rule, shared by both inline-content
-/// validators (`validate_authoritative_drv_content` and
-/// `validate_inline_drv_content`) so they cannot drift: if any output of
-/// the parsed derivation declares a fixed hash (`hash_algo` AND `hash`
-/// set), the derivation MUST have exactly one output and it MUST be
-/// named `out`.
-///
-/// CppNix 2.34.7 `BasicDerivation::type()` (src/libstore/derivations.cc):
-/// "only one fixed output is allowed for now" /
-/// "single fixed output must be named \"out\"". The gateway gate and the
-/// worker glue enforce the same shape via `DerivationLike::is_fixed_output`
-/// (single-out strict predicate).
-///
-/// r[impl sched.recovery.inline-drv-durability+3]
-fn validate_inline_fod_shape(
-    drv: &rio_nix::derivation::Derivation,
-    context: &str,
-) -> Result<(), Status> {
-    let fixed: Vec<&str> = drv
-        .outputs()
-        .iter()
-        .filter(|o| !o.hash_algo().is_empty() && !o.hash().is_empty())
-        .map(|o| o.name())
-        .collect();
-    if fixed.is_empty() {
-        return Ok(());
-    }
-    if drv.outputs().len() != 1 {
-        return Err(Status::invalid_argument(format!(
-            "{context}: only one fixed output is allowed (got {} outputs, {} fixed)",
-            drv.outputs().len(),
-            fixed.len()
-        )));
-    }
-    if fixed[0] != "out" {
-        return Err(Status::invalid_argument(format!(
-            "{context}: single fixed output must be named \"out\" (got '{}')",
-            fixed[0]
-        )));
-    }
-    Ok(())
-}
-
 /// Per-output fixed-output BINDING validation, shared by both inline-content
 /// validators so they cannot drift: decode the declared hash with the
 /// shared length-discriminated parser, derive the store path it commits
@@ -801,10 +758,10 @@ fn validate_authoritative_drv_content(
             "node.is_content_addressed does not match the authoritative drv_content",
         ));
     }
-    // Oracle-parity FOD shape rule (single output named "out") — shared
-    // helper so this validator and validate_inline_drv_content cannot
-    // drift.
-    validate_inline_fod_shape(&drv, "authoritative drv_content")?;
+    // Oracle-parity FOD shape rules (single fixed output, named "out",
+    // unmixed) are inherited from the parse boundary: Derivation::parse
+    // classifies the output set (nix.drv.type-classify), so the bytes
+    // above could not have parsed with an ill-typed shape.
     if node.expected_output_paths.len() != node.output_names.len() {
         return Err(Status::invalid_argument(format!(
             "authoritative submissions must declare exactly one expected_output_paths entry per \
@@ -832,43 +789,47 @@ fn validate_authoritative_drv_content(
 
     let mut has_floating = false;
     for out in drv.outputs() {
-        let (name, path, algo, hash) = (out.name(), out.path(), out.hash_algo(), out.hash());
-        if !algo.is_empty() && !hash.is_empty() {
-            // Fixed output: the declared hash must derive to the path the
-            // ATerm declares AND to the node's expected output path.
-            // Shared binding helper (decode → derive → compare) — also
-            // used by validate_inline_drv_content so the two validators
-            // cannot drift.
-            validate_fixed_output_binding(
-                &drv_name,
-                name,
+        use rio_nix::derivation::OutputKind;
+        let name = out.name();
+        match out.kind() {
+            OutputKind::Fixed {
                 path,
-                algo,
+                hash_algo,
                 hash,
-                expected.get(name).copied(),
-                "authoritative drv_content",
-            )?;
-        } else if !algo.is_empty() {
-            // Floating-CA output: no static path exists yet anywhere.
-            has_floating = true;
-            if !path.is_empty() {
+            } => {
+                // Fixed output: the declared hash must derive to the
+                // path the ATerm declares AND to the node's expected
+                // output path. Shared binding helper (decode → derive →
+                // compare) — also used by validate_inline_drv_content
+                // so the two validators cannot drift.
+                validate_fixed_output_binding(
+                    &drv_name,
+                    name,
+                    path.as_str(),
+                    hash_algo,
+                    hash,
+                    expected.get(name).copied(),
+                    "authoritative drv_content",
+                )?;
+            }
+            OutputKind::Floating { .. } => {
+                // Floating-CA output: no static path exists yet anywhere
+                // (a declared one is unrepresentable past the parse).
+                has_floating = true;
+                if let Some(exp) = expected.get(name)
+                    && !exp.is_empty()
+                {
+                    return Err(Status::invalid_argument(format!(
+                        "node.expected_output_paths['{name}'] must be empty for floating-CA output"
+                    )));
+                }
+            }
+            OutputKind::InputAddressed(_) | OutputKind::Deferred => {
                 return Err(Status::invalid_argument(format!(
-                    "authoritative drv_content output '{name}' is floating-CA but declares a \
-                     path"
+                    "authoritative inline derivations must be content-bound (fixed-output or \
+                     floating-CA); output '{name}' is input-addressed"
                 )));
             }
-            if let Some(exp) = expected.get(name)
-                && !exp.is_empty()
-            {
-                return Err(Status::invalid_argument(format!(
-                    "node.expected_output_paths['{name}'] must be empty for floating-CA output"
-                )));
-            }
-        } else {
-            return Err(Status::invalid_argument(format!(
-                "authoritative inline derivations must be content-bound (fixed-output or \
-                 floating-CA); output '{name}' is input-addressed"
-            )));
         }
     }
 
@@ -1109,9 +1070,9 @@ pub(crate) fn validate_inline_drv_content(
                 "{context}: node.is_content_addressed does not match the parsed derivation"
             )));
         }
-        // Oracle-parity FOD shape rule — shared with the authoritative
-        // validator so the two cannot drift.
-        validate_inline_fod_shape(drv, &context)?;
+        // Oracle-parity FOD shape rules are inherited from the parse
+        // boundary (nix.drv.type-classify) — the bytes parsed, so the
+        // output set is well-typed.
 
         // ── 4/5. Per-output binding (zipped BY NAME) ─────────────────
         if node.expected_output_paths.len() != node.output_names.len() {
@@ -1140,7 +1101,7 @@ pub(crate) fn validate_inline_drv_content(
         let needs_ia = drv
             .outputs()
             .iter()
-            .any(|o| o.hash_algo().is_empty() && !o.path().is_empty());
+            .any(|o| matches!(o.kind(), rio_nix::derivation::OutputKind::InputAddressed(_)));
         let ia_paths = if needs_ia {
             let resolve = |p: &str| parsed.get(p);
             let mut hash_cache = sibling_seed.clone();
@@ -1167,83 +1128,92 @@ pub(crate) fn validate_inline_drv_content(
         };
 
         for out in drv.outputs() {
-            let (name, path, algo, hash) = (out.name(), out.path(), out.hash_algo(), out.hash());
+            use rio_nix::derivation::OutputKind;
+            let name = out.name();
             let exp = expected.get(name).copied();
-            if !algo.is_empty() && !hash.is_empty() {
-                // Fixed output. Supported algos get the full
-                // decode→derive→compare binding (shared helper).
-                // Unsupported legacy algos (md5): the binding cannot be
-                // recomputed here — the text-CA binding above plus the
-                // store's content verification on upload remain the
-                // enforcement; the expected path must still equal the
-                // ATerm-declared one.
-                let algo_supported = algo
-                    .strip_prefix("r:")
-                    .unwrap_or(algo)
-                    .parse::<HashAlgo>()
-                    .is_ok();
-                if algo_supported {
-                    validate_fixed_output_binding(
-                        &drv_name, name, path, algo, hash, exp, &context,
-                    )?;
-                } else {
-                    match exp {
-                        Some(e) if e == path && !e.is_empty() => {}
-                        _ => {
-                            return Err(Status::invalid_argument(format!(
-                                "{context}: output '{name}' (legacy algo {algo:?}) must declare \
-                                 expected_output_paths equal to the ATerm path {path:?}"
-                            )));
+            match out.kind() {
+                OutputKind::Fixed {
+                    path,
+                    hash_algo,
+                    hash,
+                } => {
+                    // Fixed output. Supported algos get the full
+                    // decode→derive→compare binding (shared helper).
+                    // Unsupported legacy algos (md5): the binding cannot
+                    // be recomputed here — the text-CA binding above plus
+                    // the store's content verification on upload remain
+                    // the enforcement; the expected path must still equal
+                    // the ATerm-declared one.
+                    let path = path.as_str();
+                    let algo_supported = hash_algo
+                        .strip_prefix("r:")
+                        .unwrap_or(hash_algo)
+                        .parse::<HashAlgo>()
+                        .is_ok();
+                    if algo_supported {
+                        validate_fixed_output_binding(
+                            &drv_name, name, path, hash_algo, hash, exp, &context,
+                        )?;
+                    } else {
+                        match exp {
+                            Some(e) if e == path && !e.is_empty() => {}
+                            _ => {
+                                return Err(Status::invalid_argument(format!(
+                                    "{context}: output '{name}' (legacy algo {hash_algo:?}) must \
+                                     declare expected_output_paths equal to the ATerm path \
+                                     {path:?}"
+                                )));
+                            }
                         }
                     }
                 }
-            } else if !algo.is_empty() {
-                // Floating-CA: no path exists yet anywhere.
-                if !path.is_empty() {
-                    return Err(Status::invalid_argument(format!(
-                        "{context}: output '{name}' is floating-CA but declares a path"
-                    )));
-                }
-                if let Some(e) = exp
-                    && !e.is_empty()
-                {
-                    return Err(Status::invalid_argument(format!(
-                        "{context}: expected_output_paths['{name}'] must be empty for a \
-                         floating-CA output"
-                    )));
-                }
-            } else if path.is_empty() {
-                // Deferred-IA: path unknown until inputs resolve.
-                if let Some(e) = exp
-                    && !e.is_empty()
-                {
-                    return Err(Status::invalid_argument(format!(
-                        "{context}: expected_output_paths['{name}'] must be empty for a \
-                         deferred input-addressed output"
-                    )));
-                }
-            } else {
-                // Declared-IA: the ATerm path, the recomputed path, and
-                // the node's expected path must all agree.
-                let derived = ia_paths.as_ref().and_then(|m| m.get(name)).ok_or_else(|| {
-                    Status::invalid_argument(format!(
-                        "{context}: output '{name}' has no derivable input-addressed path"
-                    ))
-                })?;
-                if derived.as_str() != path {
-                    return Err(Status::invalid_argument(format!(
-                        "{context}: output '{name}' declares path {path} but the inline bytes \
-                         derive to {} — the declared identity is not this derivation's",
-                        derived.as_str()
-                    )));
-                }
-                match exp {
-                    Some(e) if e == path => {}
-                    _ => {
+                OutputKind::Floating { .. } => {
+                    // Floating-CA: no path exists yet anywhere (declared
+                    // ones are unrepresentable past the parse boundary).
+                    if let Some(e) = exp
+                        && !e.is_empty()
+                    {
                         return Err(Status::invalid_argument(format!(
-                            "{context}: expected_output_paths['{name}'] must equal the derived \
-                             input-addressed path {path}"
+                            "{context}: expected_output_paths['{name}'] must be empty for a \
+                             floating-CA output"
                         )));
+                    }
+                }
+                OutputKind::Deferred => {
+                    // Deferred-IA: path unknown until inputs resolve.
+                    if let Some(e) = exp
+                        && !e.is_empty()
+                    {
+                        return Err(Status::invalid_argument(format!(
+                            "{context}: expected_output_paths['{name}'] must be empty for a \
+                             deferred input-addressed output"
+                        )));
+                    }
+                }
+                OutputKind::InputAddressed(declared) => {
+                    // Declared-IA: the ATerm path, the recomputed path,
+                    // and the node's expected path must all agree.
+                    let path = declared.as_str();
+                    let derived = ia_paths.as_ref().and_then(|m| m.get(name)).ok_or_else(|| {
+                        Status::invalid_argument(format!(
+                            "{context}: output '{name}' has no derivable input-addressed path"
+                        ))
+                    })?;
+                    if derived.as_str() != path {
+                        return Err(Status::invalid_argument(format!(
+                            "{context}: output '{name}' declares path {path} but the inline \
+                             bytes derive to {} — the declared identity is not this derivation's",
+                            derived.as_str()
+                        )));
+                    }
+                    match exp {
+                        Some(e) if e == path => {}
+                        _ => {
+                            return Err(Status::invalid_argument(format!(
+                                "{context}: expected_output_paths['{name}'] must equal the \
+                                 derived input-addressed path {path}"
+                            )));
+                        }
                     }
                 }
             }
