@@ -730,7 +730,7 @@ impl StoreServiceImpl {
         })
     }
 
-    // r[impl store.put.ia-deriver-proof]
+    // r[impl store.put.ia-deriver-proof+2]
     /// Descriptor-less INPUT-ADDRESSED uploads must prove deriver
     /// membership against the store's OWN bytes: the claims' deriver
     /// `.drv` (claims.drv_hash == its store path, bound at scheduler

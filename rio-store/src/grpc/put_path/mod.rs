@@ -72,7 +72,7 @@ impl StoreServiceImpl {
         self.verify_assignment_token_inner(request, false)
     }
 
-    // r[impl store.put.ia-deriver-proof]
+    // r[impl store.put.ia-deriver-proof+2]
     /// PutPath/PutPathBatch variant of [`Self::verify_assignment_token`]:
     /// the WRITE side. The scheduler's service token is NOT a bypass
     /// here — the scheduler has no PutPath flow (its token serves the
@@ -180,16 +180,6 @@ impl StoreServiceImpl {
 
         let raw_info = common::read_first_metadata(&mut stream).await?;
         let mut info = validate_put_metadata(raw_info, auth.hmac_claims.as_ref(), "PutPath")?;
-        // r[impl store.put.ia-deriver-proof]
-        // BEFORE any buffering/placeholder work: reject unprovable IA
-        // claims while the stream is cheap to drain.
-        if let Err(e) = self
-            .verify_ia_registration_proof(&info, auth.hmac_claims.as_ref(), "PutPath")
-            .await
-        {
-            drain_stream(&mut stream).await;
-            return Err(e);
-        }
         // Server-derived in validate_put_metadata (step 7) — never the
         // wire value. r[sec.boundary.grpc-hmac].
         let store_path_hash = info.store_path_hash.clone();
@@ -227,6 +217,29 @@ impl StoreServiceImpl {
             {
                 Ok(Some(c)) => {
                     let g = self.spawn_placeholder_guard(store_path_hash.clone(), c);
+                    // r[impl store.put.ia-deriver-proof+2]
+                    // The proof gate runs ONLY for uploads that own a
+                    // fresh placeholder (idempotency precedence): an
+                    // already-complete path returned `created: false`
+                    // above without consulting the proof — re-upload of
+                    // complete content is governed by idempotency, and
+                    // demanding a registration proof for a no-op
+                    // re-registration rejected honest re-uploads whose
+                    // deriver was registered claimslessly (bug_092,
+                    // fix-child of 8930770dd — pattern R5: the gate made
+                    // lifecycle position load-bearing without a
+                    // population audit). Proof failure releases the
+                    // placeholder before propagating, so a denied upload
+                    // leaves no `'uploading'` squat behind.
+                    if let Err(e) = self
+                        .verify_ia_registration_proof(&info, auth.hmac_claims.as_ref(), "PutPath")
+                        .await
+                    {
+                        g.defuse();
+                        self.abort_upload(&store_path_hash, c).await;
+                        drain_stream(&mut stream).await;
+                        return Err(e);
+                    }
                     (Some(c), Some(g))
                 }
                 Ok(None) => {

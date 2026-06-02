@@ -80,7 +80,7 @@ fn sign_claims_fod(executor_id: &str, outputs: Vec<String>, expiry_offset_secs: 
 /// the IA proof gate — the text-CA gate owns it — but must still pass
 /// membership). Returns `(deriver_drv_path, derived_out_path)` so
 /// callers can claim a path the STORE can prove belongs to the deriver
-/// (`store.put.ia-deriver-proof`).
+/// (`store.put.ia-deriver-proof+2`).
 async fn stage_ia_deriver(
     client: &mut StoreServiceClient<Channel>,
     tag: &str,
@@ -275,7 +275,7 @@ async fn hmac_no_token_rejected() -> TestResult {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-// r[verify store.put.ia-deriver-proof]
+// r[verify store.put.ia-deriver-proof+2]
 async fn hmac_valid_token_accepted() -> TestResult {
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
 
@@ -1138,7 +1138,7 @@ async fn hmac_store_path_hash_mismatch_ignored() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.ia-deriver-proof]
+// r[verify store.put.ia-deriver-proof+2]
 /// THE forged-claims kill test (compromised-scheduler simulation): a
 /// VALIDLY SIGNED token whose expected_outputs (membership) include the
 /// victim's path, naming a resident deriver that does NOT derive it —
@@ -1162,7 +1162,7 @@ async fn ia_proof_rejects_membership_passing_underivable_path() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.ia-deriver-proof]
+// r[verify store.put.ia-deriver-proof+2]
 /// Deriver absent → unverifiable → fail closed; once the deriver is
 /// ingested (read-through warms from resident bytes) the same upload
 /// succeeds.
@@ -1199,7 +1199,7 @@ async fn ia_proof_unverifiable_until_deriver_resident() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.ia-deriver-proof]
+// r[verify store.put.ia-deriver-proof+2]
 /// The PutPathBatch path enforces the same gate per output (the unary
 /// fix alone would leave the batch door open).
 #[tokio::test]
@@ -1246,7 +1246,7 @@ async fn ia_proof_batch_rejects_underivable_output() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.ia-deriver-proof]
+// r[verify store.put.ia-deriver-proof+2]
 /// The capability split: a SCHEDULER service token is no PutPath bypass
 /// (probe rights only) — even though "rio-scheduler" stays in the
 /// general allowlist.
@@ -1268,5 +1268,135 @@ async fn scheduler_service_token_has_no_putpath_bypass() -> TestResult {
     .expect_err("scheduler service token must not bypass PutPath");
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
     assert!(err.message().contains("no bypass for this method"));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// C1c2 (bug_092): idempotency precedence over the deriver proof
+// ---------------------------------------------------------------------------
+
+// r[verify store.put.ia-deriver-proof+2]
+/// Re-upload of an already-complete path under IA claims naming a
+/// NON-resident deriver must succeed with `created: false`: the path is
+/// complete, so the proof is never consulted. Pre-fix, the proof ran
+/// before the idempotency check and rejected the re-upload with
+/// PERMISSION_DENIED — the exact shape a builder produces when
+/// FindMissingPaths raced a concurrent registration (bug_092).
+#[tokio::test]
+async fn reupload_after_claimsless_completion_returns_created_false() -> TestResult {
+    let mut s =
+        StoreSession::new_with_service_hmac(TEST_KEY.to_vec(), SERVICE_KEY.to_vec()).await?;
+    let (nar, _) = make_nar(b"complete content");
+    let path = test_store_path("idem-prec");
+
+    // Claimsless completion (gateway nix-copy shape).
+    let info = make_path_info_for_nar(&path, &nar);
+    assert!(
+        put_path_with_header(
+            &mut s.client,
+            info,
+            nar.clone(),
+            rio_proto::SERVICE_TOKEN_HEADER,
+            &sign_service("rio-gateway", 60),
+        )
+        .await?
+    );
+
+    // Worker re-upload: IA claims naming a deriver that is NOT resident.
+    let absent_deriver = format!("/nix/store/{}-absent.drv", "d".repeat(32));
+    let info = make_path_info_for_nar(&path, &nar);
+    let token = sign_claims_for_deriver(&absent_deriver, vec![path.clone()], 60);
+    let created = put_path_with_token(&mut s.client, info, nar, &token)
+        .await
+        .context("already-complete re-upload must not consult the proof")?;
+    assert!(
+        !created,
+        "re-upload of a complete path reports created=false"
+    );
+    Ok(())
+}
+
+// r[verify store.put.ia-deriver-proof+2]
+/// Batch sibling: an already-complete output inside a PutPathBatch is
+/// skipped (created=false) without consulting the proof, even when the
+/// claims name a non-resident deriver.
+#[tokio::test]
+async fn batch_already_complete_skips_proof() -> TestResult {
+    use rio_proto::types::{PutPathBatchRequest, PutPathRequest, put_path_request};
+    let mut s =
+        StoreSession::new_with_service_hmac(TEST_KEY.to_vec(), SERVICE_KEY.to_vec()).await?;
+    let (nar, _) = make_nar(b"batch complete content");
+    let path = test_store_path("batch-idem-prec");
+
+    let info = make_path_info_for_nar(&path, &nar);
+    assert!(
+        put_path_with_header(
+            &mut s.client,
+            info,
+            nar.clone(),
+            rio_proto::SERVICE_TOKEN_HEADER,
+            &sign_service("rio-gateway", 60),
+        )
+        .await?
+    );
+
+    let absent_deriver = format!("/nix/store/{}-absent2.drv", "e".repeat(32));
+    let token = sign_claims_for_deriver(&absent_deriver, vec![path.clone()], 60);
+
+    let mut info: PathInfo = make_path_info_for_nar(&path, &nar).into();
+    let trailer = rio_proto::types::PutPathTrailer {
+        nar_hash: std::mem::take(&mut info.nar_hash),
+        nar_size: std::mem::take(&mut info.nar_size),
+    };
+    let (tx, rx) = mpsc::channel(8);
+    for msg in [
+        put_path_request::Msg::Metadata(rio_proto::types::PutPathMetadata { info: Some(info) }),
+        put_path_request::Msg::NarChunk(nar),
+        put_path_request::Msg::Trailer(trailer),
+    ] {
+        tx.send(PutPathBatchRequest {
+            output_index: 0,
+            inner: Some(PutPathRequest { msg: Some(msg) }),
+        })
+        .await
+        .unwrap();
+    }
+    drop(tx);
+    let mut req = tonic::Request::new(ReceiverStream::new(rx));
+    req.metadata_mut()
+        .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, token.parse().unwrap());
+    let resp = s
+        .client
+        .put_path_batch(req)
+        .await
+        .context("already-complete batch output must not consult the proof")?
+        .into_inner();
+    assert_eq!(resp.created, vec![false]);
+    Ok(())
+}
+
+// r[verify store.put.ia-deriver-proof+2]
+/// A FRESH (not-yet-registered) path under unprovable claims is still
+/// denied — and the denial releases the placeholder it claimed, leaving
+/// no `'uploading'` squat behind.
+#[tokio::test]
+async fn fresh_unprovable_denied_and_releases_placeholder() -> TestResult {
+    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let (nar, _) = make_nar(b"fresh unprovable");
+    let path = test_store_path("fresh-unprovable");
+    let absent_deriver = format!("/nix/store/{}-absent3.drv", "f".repeat(32));
+    let info = make_path_info_for_nar(&path, &nar);
+    let token = sign_claims_for_deriver(&absent_deriver, vec![path.clone()], 60);
+    let err = put_path_with_token(&mut s.client, info, nar, &token)
+        .await
+        .expect_err("unprovable fresh registration must be denied");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("unverifiable"),
+        "denial names the unverifiable closure: {}",
+        err.message()
+    );
+    let n = poll_scalar_until::<i64>(&s.db.pool, "SELECT count(*)::bigint FROM manifests", 0).await;
+    assert_eq!(n, 0, "denied upload must release its placeholder");
     Ok(())
 }

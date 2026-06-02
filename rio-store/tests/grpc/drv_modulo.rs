@@ -326,7 +326,7 @@ fn ia_claims_token(deriver: &str, outputs: Vec<String>) -> String {
     HmacSigner::from_key(TEST_KEY.to_vec()).sign(&claims)
 }
 
-// r[verify store.put.ia-deriver-proof]
+// r[verify store.put.ia-deriver-proof+2]
 /// Row corruption is an INTERNAL error, never an authorization verdict:
 /// a `status='complete'` deriver `.drv` whose inline NAR does not parse
 /// (text-CA-gated at ingestion, so this is row corruption) must surface
@@ -379,7 +379,7 @@ async fn corrupt_inline_drv_nar_yields_internal_not_permission_denied() -> TestR
     Ok(())
 }
 
-// r[verify store.put.ia-deriver-proof]
+// r[verify store.put.ia-deriver-proof+2]
 /// Database failure during the proof lookup is an INTERNAL error, never
 /// `PERMISSION_DENIED`: with the cache table dropped, the proof's own
 /// SELECT fails — pre-fix the `.ok()??` fold reported "deriver closure

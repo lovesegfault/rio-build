@@ -129,7 +129,7 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_ia_proof_total",
         "IA deriver-proof gate outcomes on descriptor-less input-addressed \
-         uploads (store.put.ia-deriver-proof), labeled by result: ok | \
+         uploads (store.put.ia-deriver-proof+2), labeled by result: ok | \
          rejected (claimed path is not store-derived from the named \
          deriver) | computed_on_miss (read-through warmed the modulo \
          cache) | unverifiable (deriver closure not resident / over \

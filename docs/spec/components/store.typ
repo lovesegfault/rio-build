@@ -353,7 +353,7 @@ the `pending_s3_deletes` table.
     opt out of content verification by omitting its descriptor.
   - *Input-addressed* (`is_ca = false`, not fixed-output-flagged): authorized
     by `expected_outputs` membership (plus
-    #rref("store.put.ia-deriver-proof")); a voluntarily attached `fixed:`
+    #rref("store.put.ia-deriver-proof+2")); a voluntarily attached `fixed:`
     descriptor is verified with the same no-modulo-retry semantics as the
     fixed-output class, a non-`fixed:` descriptor on any worker upload is
     rejected, and daemon-era descriptor-less uploads remain membership-only.
@@ -463,7 +463,7 @@ Resolvers in the hash walk are synchronous by design; all I/O happens
 before the walk (cache-row seeding at ingestion; arena pre-fetch at
 proof time).
 
-#r("store.put.ia-deriver-proof")[
+#r("store.put.ia-deriver-proof+2")[
   A descriptor-less upload under signed assignment claims that are
   neither content-addressed nor fixed-output (plain input-addressed)
   MUST additionally prove deriver membership against the store's OWN
@@ -476,7 +476,15 @@ proof time).
   cannot be completed. Derivers whose own output paths are not
   statically derivable (deferred) are membership-only. The scheduler's
   service token MUST NOT bypass PutPath or PutPathBatch (probe rights
-  only); the gate applies to both upload RPCs per output.
+  only); the gate applies to both upload RPCs per output. Idempotency
+  takes precedence: the proof runs ONLY for uploads that own a fresh
+  `'uploading'` placeholder --- an already-complete path returns
+  `created: false` without consulting the proof (re-upload of complete
+  content is governed by #rref("store.put.idempotent"), and demanding a
+  registration proof for a no-op re-registration would reject honest
+  re-uploads whose deriver was registered through a claimsless route)
+  --- and a proof failure MUST release the just-claimed placeholder
+  before propagating, so a denied upload leaves no `'uploading'` squat.
 ]
 The honest scope (deliberately narrow): the guarantee is that claimed
 paths are genuinely attributable to the NAMED deriver per

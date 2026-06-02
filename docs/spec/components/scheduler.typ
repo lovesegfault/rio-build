@@ -1404,7 +1404,7 @@ moves every derived path AWAY from honest paths --- see the soundness
 note on `input_addressed_output_paths` in rio-nix `derivation/hash.rs`);
 the byte-bound authority for membership is the STORE-side modulo cache,
 which reads only the store's own backend --- which is why the store-side
-deriver proof (`store.put.ia-deriver-proof`, landing with the store
+deriver proof (`store.put.ia-deriver-proof+2`, landing with the store
 workstream) is the authoritative parity surface, and this rule is the
 trusted-plane signing gate in front of it. A submitter who never uploads
 its `.drv` parks in dispatch backoff forever --- correct under the trust

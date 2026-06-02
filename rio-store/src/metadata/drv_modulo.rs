@@ -286,7 +286,7 @@ pub(crate) async fn populate_on_ingest(pool: &PgPool, drv_path: &str, drv_bytes:
 }
 
 /// Read-through bounds for proof-time computation
-/// (`store.put.ia-deriver-proof`): a deriver closure needing more than
+/// (`store.put.ia-deriver-proof+2`): a deriver closure needing more than
 /// this many input `.drv` fetches, or deeper than this, is declared
 /// unverifiable (fail-closed) rather than letting one upload walk an
 /// unbounded graph on the hot path. Counter-instrumented consts, not
@@ -335,7 +335,7 @@ async fn own_drv_bytes(
 /// absent — bounded by [`READ_THROUGH_MAX_FETCHES`] /
 /// [`READ_THROUGH_MAX_DEPTH`]. Every computed row is persisted (cache
 /// warm). `None` = unverifiable within bounds.
-// r[impl store.put.ia-deriver-proof]
+// r[impl store.put.ia-deriver-proof+2]
 pub(crate) async fn load_or_compute_drv_modulo(
     pool: &PgPool,
     drv_path: &str,
@@ -434,7 +434,7 @@ mod tests {
     /// against a full-resolution reference walk; before the
     /// input-form fix the cached composition diverged for floating
     /// inputs and silently mis-derived every downstream IA path.
-    // r[verify store.put.ia-deriver-proof]
+    // r[verify store.put.ia-deriver-proof+2]
     #[test]
     fn cached_floating_input_matches_full_resolution_walk() {
         use rio_nix::derivation::{Derivation, input_addressed_output_paths};

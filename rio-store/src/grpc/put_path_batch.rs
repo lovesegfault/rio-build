@@ -145,16 +145,6 @@ impl StoreServiceImpl {
                 bail!(e);
             }
             // r[impl store.put.drv-text-ca]
-            // r[impl store.put.ia-deriver-proof]
-            // Per-output, beside the other content gates: descriptor-
-            // less IA outputs must prove deriver membership against the
-            // store's own bytes.
-            if let Err(e) = self
-                .verify_ia_registration_proof(info, auth.hmac_claims.as_ref(), &ctx)
-                .await
-            {
-                bail!(e);
-            }
             if let Err(e) = verify_drv_text_path(info, &accum.nar_data, &ctx) {
                 bail!(e);
             }
@@ -193,6 +183,19 @@ impl StoreServiceImpl {
             placeholder_guards
                 .push(self.spawn_placeholder_guard(accum.store_path_hash.clone(), claim));
             accum.claim = Some(claim);
+            // r[impl store.put.ia-deriver-proof+2]
+            // Owned-arm only, AFTER the AlreadyComplete short-circuit
+            // (idempotency precedence — see PutPath): descriptor-less IA
+            // outputs must prove deriver membership against the store's
+            // own bytes before any new registration proceeds. A bail
+            // here drops `placeholder_guards`, whose Drop reaps the
+            // just-claimed placeholder.
+            if let Err(e) = self
+                .verify_ia_registration_proof(info, auth.hmac_claims.as_ref(), &ctx)
+                .await
+            {
+                bail!(e);
+            }
 
             info.store_path_hash = accum.store_path_hash.clone();
             let nar_data = std::mem::take(&mut accum.nar_data);
