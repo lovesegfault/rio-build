@@ -66,11 +66,13 @@ rules:
   #     Jobs into rio-builders/rio-fetchers (ADR-019); the
   #     ClusterRoleBinding below grants batch/jobs cluster-wide so
   #     no per-namespace RoleBinding needed.
-  #   componentscalers — predictive store autoscaling. No create/delete
-  #     (operators apply the CR via this chart); reconciler reads spec,
-  #     writes status (learnedRatio persists across restarts), patches
-  #     the target Deployment's /scale subresource. No /finalizers (no
-  #     owned children).
+  #   componentscalers — predictive replica autoscaling. No
+  #     create/delete (operators apply CRs out of band; the chart
+  #     defines none today — the store moved to the KEDA ScaledObject,
+  #     and the CRD/reconciler stay for future targets); reconciler
+  #     reads spec, writes status (learnedRatio persists across
+  #     restarts), patches the target Deployment's /scale subresource.
+  #     No /finalizers (no owned children).
   {{- $full := list "get" "list" "watch" "create" "update" "patch" "delete" }}
   {{- $ro   := list "get" "list" "watch" "patch" "update" }}
   {{- range $r := list
