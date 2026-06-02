@@ -17,8 +17,9 @@ store executor, scheduler job machinery, dormancy proof — THIS record),
 the go/no-go gate), **D′** (replacement: walk deletion, spec re-pointing,
 migration retirement).
 
-**Status: Phase A complete; Phase B complete (this map carries both stage
-records). Phase A landed every §8-A mechanism dormant behind
+**Status: Phase A complete; Phase B complete; Phase C′ complete (this
+map carries all three stage records — the C′ record at the end is the
+go/no-go evidence). Phase A landed every §8-A mechanism dormant behind
 `materialization.enabled = false`; its dormancy criteria (1–7) hold with
 named artifacts. Phase B (the flag-on cutover) is landed: the deployment
 layer defaults to materialization ENABLED (helm values + VM fixtures, with
@@ -47,7 +48,13 @@ column; nothing is claimed checked until then.
 
 Status legend: **encoded** = present in the draft model; **prod-tested** =
 a Phase A unit/actor/wire test pins the production behavior; **checked** =
-a wired quint check proves it (none in Phase A — C′'s gate).
+a wired quint check proves it (none in Phase A — C′'s gate). **As of the
+Phase C′ stage record (end of this map): every row below is CHECKED** —
+bounded-simulation holds checks per regime with TLC calibration pins as
+the falsifiability pairs (the three-tier contingency; the per-row
+verdicts, the re-encodes, and the wired-check names are in the C′
+record's property and calibration tables, which supersede this column's
+Phase-A/B status).
 
 | Property (`materializationJob.qnt` name) | Statement (one line) | Status |
 |---|---|---|
@@ -814,6 +821,297 @@ NO-GO (any of): a transferred row that holds without ever falsifying
 (calibration failure); a §9.1 property that needs a system change to hold
 (that is a D′-blocking design finding, not a model bug); the model
 verifying a behavior the six-delta review shows the system does not have.
+
+## Phase C′ stage record (model completion + the §9.3 calibration transfer; landed 2026-06-01)
+
+### Identity
+
+- Branch: `a4-cprime`, 4 commits ahead of the Phase B integration tip
+  `1070ebc77`: `ede734b95` (the model re-target, deltas 1–6),
+  `cc21b3bfa` (the 21 calibration override modules + the spawnCoherence
+  PD-7 filter), `c8dc93c15` (the 43-check wiring), and this record.
+- Scope: model + calibration + wiring + this record ONLY — zero
+  rio-scheduler/rio-store production changes (the C′ mandate; a
+  model-revealed defect would have been a stop-and-report, and none was
+  found); `nix/quint.nix` is the one wiring file touched.
+- The dormancy oracle: `retryPolicy.qnt` untouched (zero diff);
+  `quint-retry-policy-pull`'s definition is byte-untouched in
+  `nix/quint.nix` (drv identity — the same derivation green at the
+  Phase B tip).
+
+### The delta-encoding table (go/no-go criterion 3)
+
+The six C′ handoff deltas, each encoded against the behavior-bearing
+commits (not the Phase A draft, not the design text):
+
+| Δ | Encoding (state/action) | As-built citation | Draft-wrong-verdict note |
+|---|---|---|---|
+| 1 | Per-drv `topdownPruned` ghost set by `createJob(OPruned)`; `consumeUnobtainable` arm selection split marked/unmarked per the 6-row B2 table (arm-3 FailFast = the four-conjunct corner; unmarked → `JResolvedFromSource`); the mark consumed by success/from-source resolution (the §4 clear-mirror), by the park re-evaluation, AND by the fail-fast itself; `ffJustifiedAll` carries the four-conjunct justification at decision time | `route_unobtainable` (materialize.rs:530–579, the `_ if inputs.topdown_pruned` arm), `clear_pruned_mark_on_job_resolution` (:979), `fail_fast_topdown_pruned_root` (dispatch.rs:1126 — the fail-fast clear the handoff table did not list; encoded as found in code) | The draft's arm 3 fail-fasted ANY node on confirmed-missing/spent — against the as-built system its `routingRequiresDurableVouchOrFailFast` would VIOLATE on every unmarked-leaf release (the B2 fix's exact disposition) and its `noFailFast` witness would violate through traces the production system routes from-source: wired as drafted it would have verified the pre-B2 system |
+| 2a | Per-replica `channelStale` (failover stales every channel — the kube-proxy ClusterIP pinning); claims and report consumptions gate on a fresh channel; `redialChannel` is the abandon-and-redial (the UNAVAILABLE trigger RPC collapsed into the action); `claimAfterFailover` ghost + the `noPostFailoverClaim` witness make the redial's liveness checkable | `MaterializeTransport::abandon_connection` / `inspect_outcome` (rio-store/src/materialize/client.rs:338–365); the two transport unit pins (`poll_abandons_connection_pinned_to_standby_replica`, `report_abandons_…`) | The draft's atomic direct claim could not represent the dead-end at all — the B3 class was unfalsifiable, so the transition VM scenario's bug had no model-level guard |
+| 2b | `legacyInterest` per (build, drv) (in-memory interest with NO wanted rows — the FP-4(b) window), bounded by `MAX_LEGACY`; the standalone creation sites (`OProbe`, `OStaleReset`) backfill the relation for every live legacy build; the in-tx origins require the creating tenant's rows (the same-tx batch); `creationLeavesTenantResolvable` is the new invariant; the dispatch-probe `dedupRefeed` carries the as-built lazy-heal backfill | `create_materialization_job_if_enabled`'s `live_interested` loop (materialize.rs:184–217 — the loop runs on the dedup arm too, which is the lazy heal the invariant's creation-scoped form prices in) | The draft's `liveWanted(d) != Set()` creation guard made the no-wanted-rows state UNREPRESENTABLE — the B4 bug class could not be expressed, falsified, or guarded |
+| 3 | The park rides the InfraFailure consumption at the budget (`reportInfra`: `newCount >= MAT_BUDGET` ⟹ parked in the same action — the draft's separate `parkOnBudgetExhaustion` transition deleted as not-as-built); `parkReevaluate` (Vouched/Pending → `JResolvedFromSource`, mark cleared, no exec id) vs `parkBackoffExpires` (un-park, count NOT reset); the establishment never parks (`establish_materialization_attempt` leaves the job pending claimable at any count); `stalledJobs` derived val = parked ∧ Broken (the gauge population) | `consume_materialization_outcome` InfraFailure arm (materialize.rs:826), `tick_reevaluate_parked_materialization_jobs` (:1285–1334), `establish_materialization_attempt` (:1243), `park_materialization_job` (:1119 — backoff derives from the SURVIVING count) | The draft's `housekeepingReevaluatePark` unconditionally un-parked Broken-evidence jobs AND reset `matInfraCount` to 0 — against the as-built system it would have verified a park cycle that cannot stall (the MD-D1 alert population would be model-empty, and the budget-reset would mask the as-built exponential-backoff posture) |
+| 4 | `OReprobe` added (the AS-5 6d reset → NQueued in the creation action); `OStaleReset` requires `NCompleted` ∧ a live-wanted output absent and resets to NQueued in the same action (the draft's `nodeStatus != NCompleted` precondition REVERSED for this origin); the 3-in-tx/2-standalone posture is below model atomicity — encoded as the wanted-rows-precondition (in-tx) vs backfill (standalone) split; `poison_cleared` recorded out-of-model (no poison state) | merge.rs:919–934 (`apply_reprobe_reset_in_memory`, the flag-gated 6d slot), merge.rs:1670 (`verify_preexisting_completed`), the T-5.2 five-site posture table | The draft BLOCKED the as-built stale-verify shape (a Completed node with vanished outputs is exactly what creates `stale_reset` jobs) — its `staleResetRun` analogue was unwritable, and `noStaleResetCreation` would have been permanently unviolated (vacuous) |
+| 5 | An explicit `view: str -> ViewState` layer (`VNone`/`VPending(parked)`/`VClaimed(holder)`) — the kernel admission's input; `claimJob` and `builderPull` read the VIEW while the invariants read PG truth; `failover` rebuilds eagerly and faithfully (`projView` over jobs+attempts — holders and park expiries mirrored); `dedupRefeed` is or_insert (armament-preserving); `unresolvedJobAlwaysArmed` re-encoded as view-faithfulness (`view == projView(jobs, attempts)` per drv) | `rebuild_materialization_job_view` (materialize.rs:428, recovery.rs:197), the `entry().or_insert()` dedup feed (materialize.rs:160–176), `materialization_job_view` (:302) | The draft had `failoverPreservesJobs = true` (a placeholder constant) and no view at all — the F10/L1 strand class and the B5(a) overwrite class were both unfalsifiable |
+| 6 | `claimJob` admits NQueued|NReady with NO mark conjunct (the claim IS the substitution; the B1 upgrade); `builderPull` carries the A11 `mustSubstitute` refusal (marked ∧ Broken ⟹ refused — the JobView::None dual-predicate window); `noMarkedClaim` is the B1 regression witness | `admit_pull_kinded`'s two upgraded NotYetReady→DeliverNew cells (rio-evidence-kernel/src/pull.rs:783–810), the as-built `must_substitute` arm (:188) | The draft anticipated PD-6 (Queued claims) but had no mark at all — with Δ1's mark imported naively (a mark conjunct on the claim), the model would have re-introduced the B1 admission gap and verified the pre-B1 system |
+
+Encoding corrections found by the protocol itself (model artifacts, not
+product defects — each verified against the code before correcting):
+
+1. **The one-shot reads the DRV-level history** — the draft's
+   `oneShotSpent` read the per-JOB counter; as built,
+   `count_materialization_rows_in_history` counts the derivation's
+   materialization_unobtainable rows across jobs. The re-encode reads
+   the drv-level ledger. (A resubmit-shaped trace would have
+   mis-verdicted under the draft: re-arm where the production system
+   fail-fasts on the spent drv-level shot.)
+2. **The B2 ingest-guarantee window closes at the §5.3 release** — the
+   first baseline run of the no-pin calibration VIOLATED
+   `pinCoversIngestUntilAllInterestTerminal` under the AS-BUILT step:
+   the `ingested` ghost outlived a legitimate release+GC and re-armed
+   against later-arriving interest. Code walk: the release
+   (job-resolved ∧ all-interest-terminal) is the documented END of the
+   pin guarantee; re-arrival is the stale_reset re-materialization lane
+   (T-1.6), not a pin hole. The ghost now clears with the release; the
+   release witness re-encoded on the present-unpinned-resolved
+   footprint. This is the baseline-protocol working exactly as designed
+   (a calibration row that cannot hold its baseline is recalibrated,
+   never waved through).
+
+### Property verdicts (go/no-go criterion 2)
+
+The §9.1 successor table: 21 named invariants (the 17 original rows —
+three re-encoded as at-decision-time ghost latches — plus `boundsOK`
+and the three delta-derived invariants `creationLeavesTenantResolvable`,
+`materializationCrashChargedOnce`, `crossBuildWantedIsolation`).
+
+- **Bounded-simulation HOLDS** (the GHA-wired deliverable): the full
+  21-invariant conjunction holds in EVERY design-scale regime (base /
+  failover / adversarialStore / staleTenure / crashLoop) at 500 K
+  samples × 15 steps during development and 2 M × 15 in the wired
+  checks (`quint-materialization-holds-*`).
+- **Exhaustive TLC**: no modeled scope's full conjunction converges
+  inside a gate-compatible budget (the measurement table below) — the
+  pre-registered closure-evidence contingency applies: the wired
+  deliverable is the sim-holds + pins + witnesses tier; the Ex-scope
+  conjunctions are documented manual targets, each with a
+  zero-violation bounded prefix at the recorded coordinates. **No
+  violation was found in any prefix** — the as-built-faithful traces
+  TLC explored never falsified a §9.1 invariant (the stop-and-report
+  trigger that did not fire).
+- **Witnesses**: all 20 reachability witnesses VIOLATE (reachable) in
+  their named regimes under the rust simulator; the wired set
+  (14 `quint-materialization-witness-*` checks) covers every §9.1
+  property's contended scenario and every delta's new behavior. Two
+  witness encodings were corrected during the sweep (the store
+  short-circuit needed the as-built Queued cache-hit shape; the release
+  witness the footprint form) — both then violated.
+- **Named runs**: 10 deterministic scenario pins green
+  (`quint-materialization-runs-{base,failover,adversarial}`).
+
+### The calibration-transfer table (go/no-go criterion 1 — every §9.3 row dispositioned)
+
+Protocol: falsification first (the override must VIOLATE its predicted
+property under `calibStep`), then the baseline (the as-built step at
+the SAME constants must HOLD it). Falsifications run under BOTH
+backends (rust simulator at 400 K × 14, then TLC first-violation —
+verdict @ depth/states/wall below; development-host runs at quint's
+default TLC width — the WIRED budgets are each pin's CI-builder
+transcript, which is the width the check runs at by construction, e.g.
+F8 8.5 s / F4 2.2 s in the build logs); baselines under the rust
+simulator at 400 K × 15 (the bounded-coverage form) — the exhaustive
+baseline conjunctions are the same unconverged manual targets as the
+regime exhaustives. Worker counts are labeled on every bounded-prefix
+figure (the orchestrator's comparability rule); the 60-worker entries
+are the reference-budget coordinates. Override modules: `docs/spec/models/calibration/mat-*.qnt`
+(21 modules); wired pins: `quint-materialization-calib-*` (19 checks).
+
+| §9.3 family / rep | Override (pre-fix behavior) | Predicted property | Falsification (TLC @ calibStep) | Baseline (as-built step) | Disposition |
+|---|---|---|---|---|---|
+| F8 (CE-33→A1) + F13 (CE-58→B8) | builder pull ignores the job view + the A11 judgment | `noFromSourceWhileJobUnresolved` | **VIOLATED** — depth 12, 10,832 distinct, 17 s | HOLDS (sim 400 K) | MET (the anchor; WIRED). F13 shares the model's single pull site per the design's own "same check as F8" |
+| F10 L1-half (CE-48(i)→L1) | failover drops the view, no rebuild | `unresolvedJobAlwaysArmed` | **VIOLATED** — depth 10, 1,260 distinct, 13 s | HOLDS | MET (WIRED) |
+| F10 A3-half (CE-45→A3) | — | — | — | — | BY-CONSTRUCTION: no recovery clear gate exists in the job architecture (failover clears no marks; the only mark consumers are the resolution sites and the fail-fast). Argument recorded against `failover`'s frame |
+| B5(a) (`4e57180fd`) | dedup re-feed overwrites armament state | `unresolvedJobAlwaysArmed` | **VIOLATED** — depth 7, 382 distinct, 13 s | HOLDS | MET (WIRED) |
+| CE-17 / F6-hazard / F2(a) | success consumption skips the coverage re-check | `successConsumptionCoversLiveWanted` | **VIOLATED** — depth 10, 703 distinct, 13 s | HOLDS | MET (WIRED; the CE-17 corpus anchor). F6's latch state is by-construction gone (no never-forgive bookkeeping exists); the hazard class (wanted growth racing consumption) is this row |
+| F2(b) / BC-3 | establishment adopts on output presence | `successConsumptionCoversLiveWanted` | **VIOLATED** — depth 14, 3,179 distinct, 15 s | HOLDS | MET (WIRED) |
+| F3 soundness (CE-61→B3) (i) | InfraFailure charged as Unobtainable (unverified) | `noWrongfulTerminalFailure` | **VIOLATED** — depth 15, 41,494 distinct, 27 s | HOLDS | MET (WIRED). Re-point note: the design predicted `noWrongfulFromSourceRouting`; at this model the corrupted charge surfaces through the spent-one-shot fail-fast (the `unobChargeBacked` oracle) — within-family re-route, recorded |
+| F3 soundness (ii) / E5 | budget exhaustion fails the node (no park) | `materializationNeverPoisons` | **VIOLATED** — depth 12, 1,532 distinct, 14 s | HOLDS | MET (WIRED) |
+| F3 permissiveness (CE-60/3→C2) | report's missing paths unverified upstream | `noWrongfulFromSourceRouting` | **VIOLATED** — depth 12, 1,580 distinct, 14 s | HOLDS | MET (WIRED). The by-construction half (routing requires a completed execution) is structural: every consumption requires an open mat-kind attempt |
+| F7 (CE-30/28→A3) | un-keyed resolution (no attempt, no exec id) | `jobResolutionSound` | **VIOLATED** — depth 7, 281 distinct, 13 s | HOLDS | MET (WIRED) |
+| F9 (CE-41→A5 re-pointed) | routing trusts a divergent in-memory child view | `routingRequiresDurableVouchOrFailFast` | **VIOLATED** — depth 11, 1,660 distinct, 14 s | HOLDS | MET (WIRED). The hole-stamp half is by-construction (no holes; no DAG edges in-model; production routing reads the durable relation) |
+| F11 (CE-50→A18, extended) | stale-tenure job resolve APPLIES (no fence) | `fencedJobWritesOnly` | **VIOLATED** — depth 9, 1,059 distinct, 15 s | HOLDS | MET (WIRED; the a17-unfenced analogue for job-table writes). The regime-comparison half: the no-stale-alphabet regimes hold by construction (`ENABLE_STALE_TENURE`) |
+| F1 soundness (CE-2→B9) | — | — | — | — | KEPT GUARD: the stale-Produced verify is untouched production machinery; its oracle (`quint-closure-calib-f1-stale-produced`) stays wired and green; the new model carries the stale-reset SHAPE (Δ4: `OStaleReset` reset-from-Completed, `staleResetRun` + witness) |
+| F1 permissiveness (CE-1→C4) | creation without the presence re-check (the covered-creation delta space) | **predicted NO-falsify** | The §9.1 conjunction over `calibStep`: sim 500 K **[ok]**; TLC bounded zero-violation prefix of 546,655 distinct / depth 14 / 15-min cap at 60 workers (unconverged — recorded as bounded coverage). Reachability: `noCoveredCreationJob` **VIOLATED** (TLC depth 9, 655 distinct — the space is real) | conjunction HOLDS as-built (the regime evidence) | MET, BY-CONSTRUCTION + kept guard re-pointed: a covered-creation cannot produce the CE-1 harm (no build attempt exists for an unresolved-job node; the job resolves by Success coverage). The OLD-model override re-run (`closure-f1-skip-store-recheck` × C4): **still VIOLATED** (5,013 distinct, 55 s) — the kept guard's falsifiability re-validated |
+| F4 B4-half (CE-13→B4) | coverage over the dead-inclusive stored union | `interestUnionLiveOnly` | **VIOLATED** — depth 11, 1,432 distinct, 2.2 s (the wired check's transcript) | HOLDS (sim 400 K) | MET (WIRED). The Success-coverage override half is the CE-17 row |
+| F4 B10-half (CE-66→B10) | — | — | — | — | KEPT GUARD: the prune demand set is untouched; `quint-closure-calib-f4-demand-drop` stays wired and green |
+| F5 (CE-16→B5) PP-5(i) | a build's relation write replaces the other builds' rows | `crossBuildWantedIsolation` | **VIOLATED** — depth 11, 1,352 distinct, 13 s | HOLDS | MET (WIRED). Re-point note: the design predicted `interestUnionLiveOnly`; the per-build write-history ghost is the direct PK-isolation oracle (the live-union latch reads decisions, not rows) — recorded |
+| F5 PP-5(ii) (same-build narrowing) | — | — | `noWantedRewrite` witness **VIOLATED** (reachable) | — | DOCUMENTED-INTENDED (the sign-off evidence): the as-built upsert allows same-build narrowing; recorded as a reachable behavior, not a violation — the draft's write-once guard was corrected to the as-built upsert |
+| F14 (CE-48(i)/CE-52→L1) | — | — | — | — | BY-CONSTRUCTION: no Substituting status exists in the model (fresh flag-on work never reaches the walk — the T-5.3 zero-walk audit + `flag_on_fresh_work_never_walks` own that boundary; legacy-state absorption is VM-tested). The L1 successor is the F10 row |
+| C5 / CE-7 (the 0d deferred manual target) | (the F4 dead-union override IS the re-introduced behavior) | `interestUnionLiveOnly` | the F4 row's falsification | the F4 row's baseline | **CLOSED BY CONSTRUCTION, with the falsification the 0d deferral asked for**: no stored union exists (the §6 join is live-only and derived; `buildTerminal` drops rows atomically), AND the dead-union override demonstrates the latch re-finds exactly the stored-union behavior if re-introduced. Owner sign-off flagged (closes a standing 0d open item) |
+| B2-strong / GC-after-vouch (a) | ingest without the pin INSERT | `pinCoversIngestUntilAllInterestTerminal` | **VIOLATED** — depth 13, 1,438 distinct, 14 s (the GC trace shape re-found) | HOLDS — after the encoding correction recorded above (the release-window artifact; the FIRST baseline run violated and was triaged to the model, not the product) | MET (WIRED; the §9.3 flip executed: the old expect-violation probe's class is now a holds-property + this pin). Shape (b) narrows into B9 (kept guard row) |
+| C1-strict (PP-6) | — | — | — | — | UPGRADED + WIRED: `wrongfulFailFastBoundedPerJob` (≤1 per drv-lifetime, justified) sits in the holds conjunction; non-vacuity via the fail-fast witness; closes the AW2 open item favorably. The bound is per-DRV-history (the as-built `count_materialization_rows_in_history` read — stricter than the design's per-job phrasing; the resubmit lane is out of the §9.1 alphabet, recorded) |
+| PP-4 (i) | mat establishment writes executor_crash | `materializationInvisibleToBuildBudgets` | **VIOLATED** — depth 10, 579 distinct, 14 s | HOLDS | MET (WIRED) |
+| PP-4 (ii) | establishment closes charge-free | `materializationCrashChargedOnce` | **VIOLATED** — depth 12, 1,307 distinct, 14 s | HOLDS | MET (WIRED). Re-point note: the design's "falsifies unresolvedJobAlwaysArmed (never settled)" is a liveness shape; its safety-checkable core is the charge-once discipline — recorded |
+| dedup (the partial-unique index) | creation without the one-unresolved-job arbitration | `atMostOneUnresolvedJobPerDrv` | **VIOLATED** — depth 12, 1,427 distinct, 14 s | HOLDS | MET (WIRED; the C′ handoff's slot-widening executed via the dupJob second-slot ghost) |
+| B4 / Δ2b (`056bfc9b6`) | probe creation without the backfill | `creationLeavesTenantResolvable` | **VIOLATED** — depth 10, 1,487 distinct, 15 s | HOLDS | MET (WIRED) |
+| B1 / Δ6 (`7c9b9f949`) | claim refuses marked nodes (the pre-B1 A11 arm) | **witness flip** (liveness) | as-built direction: `noMarkedClaim` **VIOLATED** (TLC depth 13, 12,720 distinct, 17 s — wired witness); pre-fix direction: NOT violated — sim 300 K [ok]; TLC bounded zero-violation prefix of 2,338,887 distinct states / depth 18 / 24.5 min at auto(192) workers (unconverged — the [ok] direction cannot early-exit; the prefix is the bounded-coverage record) | §9.1 conjunction green under the override (a refusal strands, never corrupts) — sim 300 K [ok] | MET (witness-flip form; the B1 regression guard is the wired marked-claim witness) |
+| B3 / Δ2a (`ce17c6445`) | redial removed from the alphabet | **witness flip** (liveness) | as-built direction: `noPostFailoverClaim` **VIOLATED** (TLC depth 9, 808 distinct, 14 s — wired witness); pre-fix direction: NOT violated — sim 300 K [ok]; TLC bounded zero-violation prefix of 426,036 distinct / depth 14 / 10-min cap at 60 workers — the dead-end made visible as unreachability | §9.1 conjunction green under the override — sim 300 K [ok] | MET (witness-flip form; the B3 liveness guard is the wired post-failover-claim witness) |
+
+**Headline: zero transfer failures.** Every row predicted to falsify
+falsified (18/18, both backends); every baseline held (after one
+model-side recalibration, recorded above); every by-construction row
+carries a structural argument against the final code shape; both
+liveness rows flipped exactly as predicted. No stop-and-report
+condition fired.
+
+### CE-D6 re-run (go/no-go criterion 4)
+
+The deferred manual-target runbook (closure-evidence checklist row
+CE-D6: "before any change to scheduler evidence handling, run the
+seven exhaustive conjunctions"; deferred by Phase B to this gate),
+re-run at the C′ tip — the dual-coverage instant: the predecessor
+model's conjunctions against the tree whose successor checks are
+simultaneously green. Coordinates: 35-minute caps at 60 workers (the
+Wave-4 floor coordinates); every run was still mid-frontier at its
+cap, matching the recorded "none converges" posture — the
+deployment-time formal posture is zero violations at-or-past those
+coordinates, and that is what every row shows. **Zero violations in
+all seven.**
+
+| Conjunction (closureEvidence) | Verdict @ 35 min / 60 workers | Bounded coverage |
+|---|---|---|
+| BaseEx × asBuiltHoldInvariants | zero violation (unconverged) | 22,099,308 distinct / depth 15 — past the Wave-4 16.4 M floor |
+| FailoverEx × asBuiltHoldInvariants | zero violation (unconverged) | 13,577,423 distinct / depth 13 |
+| FaultPersistEx × asBuiltHoldInvariants | zero violation (unconverged) | 19,057,679 distinct / depth 15 |
+| Duo × asBuiltHoldInvariants | zero violation (unconverged) | 1,531,949 distinct / depth 8 |
+| C3Duo × asBuiltHoldInvariants | zero violation (unconverged) | 1,519,758 distinct / depth 8 |
+| AdversarialStoreEx × asBuiltHoldInvariantsAdversarialStore | zero violation (unconverged) | 6,233,351 distinct / depth 11 |
+| StaleDuo × {leaderClassEvidenceWrites, noStaleTenureClearOverride} | zero violation (unconverged) | 2,219,869 distinct / depth 8 |
+
+The closure-evidence wired check set itself is untouched and green at
+this tip (criterion: nothing pruned before D′); the F1-permissiveness
+kept-guard override re-run is in the transfer table above.
+
+### Check inventory (wired this phase)
+
+| Check | Kind | Subject |
+|---|---|---|
+| `quint-materialization-holds-{base,failover,adversarial-store,stale-tenure,crash-loop}` | sim-holds (2 M × 15) | the 21-invariant §9.1 conjunction per design-scale regime |
+| `quint-materialization-runs-{base,failover,adversarial}` | named-run pins | the 10 delta scenario narratives |
+| `quint-materialization-witness-*` (14) | sim expect-violation | every §9.1 property's contended scenario + every delta behavior (incl. the B1 marked-claim and B3 post-failover-claim liveness guards) |
+| `quint-materialization-calib-*` (19) | TLC expect-violation pins | the §9.3 falsification corpus (18 property pins + the F1 covered-creation reachability pin) |
+| `quint-spawn-coherence-mat-jobs` + `quint-spawn-coherence-witness-mat-filtered` | TLC exhaustive + witness | the PD-7 GetSpawnIntents job filter — CONVERGED exhaustively: 15,176,448 distinct states, depth 34, ~2 min on the CI builder class (the one new exhaustive TLC check this phase wires); the six pre-existing spawnCoherence regimes carry `ENABLE_MAT_JOBS = false` (constant-false var; base regime re-verified green at 2,013,280 distinct states) |
+
+Formal-check invariance: `retryPolicy.qnt`, `nix/kani.nix` zero diff;
+`quint-retry-policy-pull` and `quint-retry-policy-pull-materialization`
+definitions byte-untouched (drv identity); zero closure-evidence checks
+removed or modified (the dual-coverage instant — both generations green
+against the same tree).
+
+### Exhaustive measurement table (the budget record)
+
+Coordinates: TLC BFS, 60 workers (the house-budget worker count),
+10-min caps for the Ex measurements (the 15-min-hard rule's
+determination form: every run below was still mid-frontier with a
+growing queue at its cap — none is within reach of a 30-min
+convergence either, per the B1-flip 24.5-min/192-worker corroboration
+at the BaseEx scope). Manual-target command shape:
+
+    quint verify --backend=tlc --main=materializationJob<Scope>Ex \
+      --invariant=<the 21-name §9.1 conjunction> \
+      docs/spec/models/materializationJob.qnt
+
+| Scope (as-built step, full conjunction) | Verdict @ cap | Bounded coverage |
+|---|---|---|
+| materializationJobBaseEx | unconverged @ 10 min | zero violation through 435,251 distinct / depth 14 |
+| materializationJobFailoverEx | unconverged @ 10 min | zero violation through 500,327 distinct / depth 14 |
+| materializationJobAdversarialStoreEx | unconverged @ 10 min | zero violation through 406,878 distinct / depth 16 |
+| materializationJobStaleTenureEx | unconverged @ 10 min | zero violation through 475,795 distinct / depth 14 |
+| materializationJobCrashLoopEx | unconverged @ 10 min | zero violation through 400,001 distinct / depth 14 |
+| (corroboration) matCalibB1ClaimRefusesMarked @ calibStep — a strict SUBSET of the as-built BaseEx space | unconverged @ 24.5 min, auto(192) workers | zero violation through 2,338,887 distinct / depth 18, queue still growing — the superset (as-built BaseEx) therefore cannot converge at 30 min either |
+
+Design-scale (2-drv) regimes are strict supersets of their Ex scopes
+and are not separately measured (the executor/closure precedent: a
+scope whose reduction does not converge is recorded once). The
+`longChecks` Tier-2 mechanism stays empty — no conjunction fits the
+15-30-min window; pressure to change shard knobs remains
+stop-and-report per the standing rule.
+
+Width posture (the orchestrator resource directive, applied): the
+60-worker rows above are the reference-budget coordinates (comparable
+to the house budgets and the Wave-4 floor); the directive's
+wide-instance allowance was additionally exploited for a deepening
+wave on the two most-cited bounded-coverage rows — scale-annotated
+below their reference entries:
+
+| Deepened row | @ 90 workers (15-min cap) |
+|---|---|
+| matCalibF1NoPresenceRecheck × the §9.1 conjunction (calibStep) | zero violation through 818,905 distinct / depth 15 (unconverged @ 15-min cap) |
+| materializationJobBaseEx × the §9.1 conjunction (as-built) | zero violation through 919,952 distinct / depth 16 (unconverged @ 15-min cap) |
+
+### What Phase C′ does NOT claim
+
+- **No exhaustive proof of the §9.1 conjunction at any scope** — the
+  wired holds checks are bounded simulation evidence with falsifiability
+  pins (the closure-evidence Phase-1 three-tier precedent); the Ex-scope
+  conjunctions are documented manual targets with zero-violation bounded
+  coverage at the recorded coordinates.
+- **No production code was changed and none needed to be** — the model
+  matched the as-built system at every delta; the two corrections the
+  protocol forced were model-side (the drv-level one-shot read, the
+  release-window ghost).
+- **The B1/B3 pre-fix flips rest on bounded evidence** for their
+  "NOT violated" half (the [ok] direction cannot early-exit); their
+  as-built halves are wired TLC-violated witnesses.
+- **The finding-11 owner counter-signature** (entry criterion 2) is
+  STILL PENDING at this record — the model encodes the orchestrator's
+  ruling (`sched.materialize.routing+2`, the mark discriminator); if the
+  owner overrules, Δ1's encoding and the F8/F9/B1 rows re-open with B2.
+- **D′ is not authorized by this record** — the go/no-go recommendation
+  below is the owner's input, not the decision.
+
+### The go/no-go recommendation
+
+**RECOMMENDATION: GO for Phase D′**, conditional on the two items
+outside this phase's authority:
+
+1. **The finding-11 owner counter-signature** (entry criterion 2,
+   still pending) — the model encodes the orchestrator's ruling
+   (`sched.materialize.routing+2`); an overrule re-opens Δ1's
+   encoding and the F8/F9/B1 calibration rows together with B2.
+2. **The orchestrator's full-gate run at integration** (criterion 5's
+   gate half) — every new check built green individually at this tip
+   (43/43), tracey-validate and treefmt are green, and zero existing
+   check definitions changed (drv identity for the dormancy oracle);
+   the single-command gate is the integrator's step per the C′
+   mandate.
+
+The three-line evidence summary the recommendation rests on:
+
+- **The model is the as-built system**: all six handoff deltas
+  encoded against the behavior-bearing commits, with two
+  draft-wrong-verdict classes caught and corrected (the delta table)
+  — wiring the draft un-re-targeted would have verified the pre-B1/
+  pre-B2/pre-B3/pre-B4/pre-T-4.3 system.
+- **The §9.3 transfer is complete with zero failures**: 18/18
+  predicted falsifications VIOLATED under both backends and re-held
+  under the as-built baseline at the same constants (one model-side
+  recalibration executed per protocol and recorded); both liveness
+  rows flipped exactly as predicted; every by-construction row
+  carries its structural argument plus reachability or falsifiability
+  evidence; the C5/CE-7 standing open item closes WITH the
+  falsification the 0d deferral asked for.
+- **Every §9.1 property is checked and non-vacuous**: the 21-invariant
+  conjunction holds in all five regimes (bounded simulation at 2 M
+  samples, wired with 19 TLC falsifiability pins and 14 reachability
+  witnesses per the established three-tier contingency; exhaustive
+  conjunctions documented as manual targets with the measured
+  zero-violation bounded coverage), and the CE-D6 runbook re-run is
+  recorded above.
+
+NO-GO triggers checked and not fired: no transferred row held without
+falsifying; no §9.1 property needed a system change to hold; the
+six-delta review found no behavior the model verifies that the system
+lacks.
 
 ---
 

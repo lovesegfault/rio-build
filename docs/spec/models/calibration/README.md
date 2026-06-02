@@ -16,8 +16,19 @@ fix regression pins, `closure-c3-no-reprobe.qnt` and
 actions — the settlement-less fail-fast and the unfenced PG apply —
 rather than a historical origin/main fix, so the wired expect-violation
 checks over them keep the fixed defect classes permanently
-re-discoverable), and — the executor-lifecycle campaign — the single
-re-encoded pull-era
+re-discoverable), one file per
+transferred family of the substitution-replacement C-prime corpus
+(`mat-*.qnt` over `materializationJob.qnt` — the §9.3 calibration
+transfer: the closure-evidence family successors plus the Phase-A/B
+fix regression pins B1/B3/B4/B5a, which freeze the pre-fix production
+behaviors the Phase-B bug harvest removed; the two liveness rows
+`mat-b1-claim-refuses-marked.qnt` / `mat-b3-no-redial.qnt` are
+WITNESS-FLIP modules — their calibStep makes the paired reachability
+witness UNVIOLABLE instead of falsifying an invariant, and
+`mat-f1-no-presence-recheck.qnt` is the by-construction row whose
+calibStep explores exactly the pre-fix-only delta space and must NOT
+falsify the §9.1 conjunction), and — the executor-lifecycle campaign
+— the single re-encoded pull-era
 override (`executor-f4-pull-establish-early.qnt`, over the re-targeted
 live `executorSession.qnt` rather than a frozen as-built encoding). The
 executor corpus's as-built representatives
@@ -65,10 +76,12 @@ module, predicted vs. actual verdict, depth/state counts, and
 disposition — lives next to the owning campaign's invariant map
 (`controller-invariant-map.md`, `refcount-invariant-map.md`,
 `executor-invariant-map.md`, `closure-evidence-invariant-map.md`,
-`gw-session-invariant-map.md`, each in its Stage-C / Phase-0d
-calibration section).
+`gw-session-invariant-map.md`,
+`substitution-replacement-invariant-map.md`, each in its Stage-C /
+Phase-0d / Phase-C-prime calibration section).
 A subset of the overrides is wired into `nix/quint.nix` as permanent
 expect-violation checks (`quint-ctrl-calib-*`, `quint-refcount-calib-*`,
-`quint-executor-calib-*`, `quint-closure-calib-*`, `quint-gw-calib-*`);
+`quint-executor-calib-*`, `quint-closure-calib-*`, `quint-gw-calib-*`,
+`quint-materialization-calib-*`);
 the rest are evidence modules, re-runnable on demand with the command
 above.

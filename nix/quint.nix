@@ -3313,7 +3313,7 @@ in
     #
     # Paired falsifiability pins (the constructor's vacuity rule —
     # every invariant in the list has at least one pin or witness
-    # below): quint-materialization-calib-* (17 expect-violation pins)
+    # below): quint-materialization-calib-* (19 expect-violation pins)
     # + the marked-claim / post-failover-claim witnesses (the B1/B3
     # liveness flips).
     # r[verify sched.materialize.job]
