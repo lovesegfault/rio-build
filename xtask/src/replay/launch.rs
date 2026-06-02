@@ -561,6 +561,13 @@ pub struct PreflightOutcome {
 /// `CampaignSpec` parser and validator. `preflight` is always present:
 /// launch unconditionally runs the full pre-flight, so every launched
 /// campaign records verified tenants and the deployed component versions.
+///
+/// The inputs split into operator intent (`a`, `campaign_id`, `archive`,
+/// `bucket`) and cluster observations (`hmac_present`,
+/// `gateway_host_key`, `preflight`). Spec fields fed by the observation
+/// inputs are excluded from the relaunch guard's comparison
+/// ([`spec_identity`]); a field added from a NEW observation must be
+/// classified there (its completeness test will insist).
 fn build_campaign_spec(
     a: &LaunchArgs,
     campaign_id: &str,
@@ -1484,19 +1491,44 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
-/// Identity projection of a campaign spec for the relaunch guard:
-/// the parsed JSON document with the volatile provenance fields removed.
-/// Every launch re-runs the pre-flight, which stamps a fresh
-/// `tenants.upstreams_verified_at` (nanosecond timestamp), re-snapshots
-/// `tenants.upstream_snapshot`, and re-reads `cluster_versions` — those
-/// record WHEN/WHAT the pre-flight verified, not WHICH campaign this is,
-/// so two launches with identical flags must compare equal despite them.
+/// Identity projection of a campaign spec for the relaunch guard: the
+/// parsed JSON document with every cluster-OBSERVED field removed, so
+/// that only operator intent — flags, campaign id, resolved archive,
+/// artifact bucket — is compared. The strip list answers one question:
+/// which spec fields does launch stamp from cluster observation rather
+/// than from operator input? Those are exactly the fields fed by
+/// [`build_campaign_spec`]'s observation inputs (`hmac_present`,
+/// `gateway_host_key`, `preflight`); every launch re-observes them, so
+/// two launches with identical flags must compare equal despite them:
+///
+/// - `cluster_versions`: deployed image tags, re-read each pre-flight;
+/// - `tenants.upstreams_verified_at`: pre-flight timestamp (nanosecond);
+/// - `tenants.upstream_snapshot`: upstream sets, re-snapshotted;
+/// - `cluster.gateway_host_key`: pin re-derived from the gateway's
+///   host-key Secret — rotating that key must not refuse a same-flags
+///   relaunch (the engine has to pin the CURRENT key regardless);
+/// - `cluster.service_hmac_key_path`: Admin-read auth mode, present iff
+///   the service-HMAC Secret exists. An auth-mode change is a cluster
+///   reconfiguration, not a different campaign: the engine must follow
+///   the deployed cluster's auth mode to talk to it at all, and a
+///   passing guard overwrites the ConfigMap with the fresh observation
+///   anyway — comparing it could only bounce a legitimate relaunch with
+///   a "different flags" misdiagnosis, exactly like the already-stripped
+///   image-tag record of the same redeploy.
+///
+/// `spec_identity_strips_every_cluster_observed_field` is the
+/// completeness check: it flips every observation input and fails on any
+/// stamped field this list misses — extend both together.
 /// `None` when the document does not parse (an unparseable leftover can
 /// never be proven identical, so the guard refuses).
 fn spec_identity(spec_json: &str) -> Option<serde_json::Value> {
     let mut value: serde_json::Value = serde_json::from_str(spec_json).ok()?;
     if let Some(spec) = value.as_object_mut() {
         spec.remove("cluster_versions");
+        if let Some(cluster) = spec.get_mut("cluster").and_then(|c| c.as_object_mut()) {
+            cluster.remove("gateway_host_key");
+            cluster.remove("service_hmac_key_path");
+        }
         if let Some(tenants) = spec.get_mut("tenants").and_then(|t| t.as_object_mut()) {
             tenants.remove("upstreams_verified_at");
             tenants.remove("upstream_snapshot");
@@ -1509,13 +1541,14 @@ fn spec_identity(spec_json: &str) -> Option<serde_json::Value> {
 /// campaign id is already in use: a campaign Job with that name exists
 /// (its pod mounts the ConfigMap and re-reads it on container restart),
 /// or a leftover spec ConfigMap holds a different spec than this launch
-/// would apply. Specs are compared STRUCTURALLY with the volatile
-/// provenance fields cleared ([`spec_identity`]): every launch stamps
-/// fresh pre-flight provenance, so a byte comparison would refuse every
-/// same-flags relaunch and turn the Job-deletion escape hatch into a
-/// guaranteed second refusal. Pure so the refusal logic is
-/// unit-testable; the caller supplies the cluster facts. Shared with
-/// `replay repro`, which applies the same ConfigMap+Job pair.
+/// would apply. Specs are compared STRUCTURALLY with the cluster-observed
+/// fields cleared ([`spec_identity`]): every launch re-observes the
+/// deployed cluster (pre-flight provenance, host-key pin, auth mode), so
+/// a byte comparison would refuse every same-flags relaunch and turn the
+/// Job-deletion escape hatch into a guaranteed second refusal. Pure so
+/// the refusal logic is unit-testable; the caller supplies the cluster
+/// facts. Shared with `replay repro`, which applies the same
+/// ConfigMap+Job pair.
 pub(super) fn guard_existing_campaign(
     campaign_id: &str,
     job_exists: bool,
@@ -1881,6 +1914,11 @@ mod tests {
     /// Fixture gateway host-key pin (what `gateway_host_key_pin` derives
     /// from the deployed host-key Secret on a real launch).
     const HOST_KEY_PIN: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder rio-gateway";
+
+    /// A second fixture pin, as if the gateway host-key Secret was rotated
+    /// between a launch and its same-flags relaunch.
+    const ROTATED_HOST_KEY_PIN: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIRotatedKey rio-gateway";
 
     fn args(mode: Mode) -> LaunchArgs {
         LaunchArgs {
@@ -2816,14 +2854,195 @@ mod tests {
             .to_string();
         assert!(err.contains("different campaign spec"), "{err}");
 
-        // The identity projection strips exactly the volatile fields.
+        // The identity projection strips exactly the cluster-observed fields.
         let identity = spec_identity(&first).unwrap();
         assert!(identity.get("cluster_versions").is_none());
         let tenants = identity.get("tenants").unwrap();
         assert!(tenants.get("upstreams_verified_at").is_none());
         assert!(tenants.get("upstream_snapshot").is_none());
-        // Non-volatile fields survive the projection.
+        let cluster = identity.get("cluster").unwrap();
+        assert!(cluster.get("gateway_host_key").is_none());
+        assert!(cluster.get("service_hmac_key_path").is_none());
+        // Operator intent survives the projection.
         assert_eq!(identity["campaign_id"], serde_json::json!(id));
         assert_eq!(tenants["build_tenant"], serde_json::json!("replay-leaf"));
+        assert_eq!(
+            cluster["scheduler_addr"],
+            serde_json::json!("rio-scheduler.rio-system.svc:9001")
+        );
+    }
+
+    #[test]
+    fn guard_permits_same_flags_relaunch_after_host_key_rotation_or_auth_mode_change() {
+        // The two cluster observations stamped OUTSIDE the pre-flight
+        // outcome: the gateway host-key pin (changes when the remote
+        // gateway-host-key secret is deliberately rotated) and the
+        // service-HMAC auth mode (flips when the Secret appears or
+        // disappears across redeploys). Neither is operator intent, and a
+        // passing guard immediately rewrites the ConfigMap with the fresh
+        // observation — so a same-flags relaunch must pass on both.
+        let id = "replay-leaf-20260601-ab12";
+        let spec_with = |hmac_present: bool, host_key: &str| {
+            let spec = build_campaign_spec(
+                &args(Mode::Leaf),
+                id,
+                &archive_loc(),
+                "rio-build-chunks-deadbeef",
+                hmac_present,
+                host_key,
+                &outcome(),
+            );
+            serde_json::to_string_pretty(&spec).unwrap()
+        };
+
+        let original = spec_with(true, HOST_KEY_PIN);
+        // Host-key rotation alone.
+        let rotated = spec_with(true, ROTATED_HOST_KEY_PIN);
+        assert_ne!(original, rotated, "the raw documents do differ");
+        guard_existing_campaign(id, false, Some(&original), &rotated)
+            .expect("host-key rotation must not refuse a same-flags relaunch");
+        // Auth-mode flip alone.
+        let tokenless = spec_with(false, HOST_KEY_PIN);
+        assert_ne!(original, tokenless, "the raw documents do differ");
+        guard_existing_campaign(id, false, Some(&original), &tokenless)
+            .expect("a service-HMAC auth-mode flip must not refuse a same-flags relaunch");
+    }
+
+    /// Dot-joined paths at which two JSON documents differ. Descends only
+    /// where both sides are objects, so a field whose value changed shape
+    /// (string → null, object → missing) reports at the field itself.
+    fn json_diff_paths(
+        prefix: &str,
+        a: &serde_json::Value,
+        b: &serde_json::Value,
+        out: &mut std::collections::BTreeSet<String>,
+    ) {
+        match (a, b) {
+            (serde_json::Value::Object(map_a), serde_json::Value::Object(map_b)) => {
+                for key in map_a.keys().chain(map_b.keys()) {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    match (map_a.get(key), map_b.get(key)) {
+                        (Some(value_a), Some(value_b)) => {
+                            json_diff_paths(&path, value_a, value_b, out);
+                        }
+                        _ => {
+                            out.insert(path);
+                        }
+                    }
+                }
+            }
+            _ if a != b => {
+                out.insert(prefix.to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn spec_identity_strips_every_cluster_observed_field() {
+        // Completeness check for spec_identity's strip list, derived from
+        // its source of truth: build_campaign_spec's inputs split into
+        // operator intent (LaunchArgs, campaign id, resolved archive,
+        // artifact bucket) and cluster observations (hmac_present,
+        // gateway_host_key, preflight). Hold intent fixed, flip EVERY
+        // observation input, and require the identity projection to erase
+        // exactly the resulting difference.
+        //
+        // A new cluster-observed spec field cannot dodge this test: a new
+        // observation parameter — or PreflightOutcome member; it has no
+        // Default — breaks these constructions at compile time, and a new
+        // spec field stamped from an existing observation surfaces as an
+        // unclassified diff path below. Either way the test stays red
+        // until the field is classified: stripped by spec_identity (add it
+        // to STRIPPED here) or deliberately identity-bearing (add it to
+        // IDENTITY_BEARING with the rationale).
+        let id = "replay-leaf-20260601-ab12";
+        let spec_with = |hmac_present: bool, host_key: &str, preflight: &PreflightOutcome| {
+            build_campaign_spec(
+                &args(Mode::Leaf),
+                id,
+                &archive_loc(),
+                "rio-build-chunks-deadbeef",
+                hmac_present,
+                host_key,
+                preflight,
+            )
+        };
+        let baseline = spec_with(true, HOST_KEY_PIN, &outcome());
+        let reobserved_preflight = PreflightOutcome {
+            deployed_tags: BTreeMap::from([("rio-gateway".to_string(), "def456".to_string())]),
+            upstream_snapshot: BTreeMap::from([("replay-leaf".to_string(), vec![])]),
+            verified_at: "2026-06-02T08:30:00.999999999Z".into(),
+        };
+        let flipped = spec_with(false, ROTATED_HOST_KEY_PIN, &reobserved_preflight);
+
+        // Spec fields the observation inputs stamp, each classified.
+        // Stripped: comparing them would refuse same-flags relaunches.
+        const STRIPPED: [&str; 5] = [
+            "cluster.gateway_host_key",
+            "cluster.service_hmac_key_path",
+            "cluster_versions",
+            "tenants.upstream_snapshot",
+            "tenants.upstreams_verified_at",
+        ];
+        // Identity-bearing: observed, but drift deliberately REFUSES a
+        // relaunch. Empty today — listing a field here requires a comment
+        // on the stamping site saying why its drift makes a different
+        // campaign even though the operator's flags are unchanged.
+        const IDENTITY_BEARING: [&str; 0] = [];
+        let matches = |path: &str, field: &str| {
+            path == field
+                || path
+                    .strip_prefix(field)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        };
+
+        let raw_baseline = serde_json::to_value(&baseline).unwrap();
+        let raw_flipped = serde_json::to_value(&flipped).unwrap();
+        let mut observed = std::collections::BTreeSet::new();
+        json_diff_paths("", &raw_baseline, &raw_flipped, &mut observed);
+
+        // (1) Every field the observation flips reached is classified.
+        for path in &observed {
+            assert!(
+                STRIPPED
+                    .iter()
+                    .chain(IDENTITY_BEARING.iter())
+                    .any(|field| matches(path, field)),
+                "spec field {path:?} is stamped from cluster observation but is neither \
+                 stripped by spec_identity nor ruled identity-bearing — classify it"
+            );
+        }
+        // (2) The flips keep reaching every stripped field, so (1) cannot
+        // pass vacuously after a fixture or stamping refactor.
+        for field in STRIPPED {
+            assert!(
+                observed.iter().any(|path| matches(path, field)),
+                "the observation flips no longer reach {field:?} — fix the fixtures so this \
+                 completeness check keeps covering it"
+            );
+        }
+        // (3) The projection erases the observed difference: with no
+        // identity-bearing observations, the two identities are equal.
+        let baseline_json = serde_json::to_string_pretty(&baseline).unwrap();
+        let flipped_json = serde_json::to_string_pretty(&flipped).unwrap();
+        let baseline_identity = spec_identity(&baseline_json).unwrap();
+        let flipped_identity = spec_identity(&flipped_json).unwrap();
+        assert_eq!(
+            baseline_identity, flipped_identity,
+            "spec_identity must strip every cluster-observed field"
+        );
+        // (4) ...and erases NOTHING else: what the projection removes from
+        // a real spec is exactly the stripped set — over-stripping would
+        // let a genuine flag change slip past the relaunch guard.
+        let mut removed = std::collections::BTreeSet::new();
+        json_diff_paths("", &raw_baseline, &baseline_identity, &mut removed);
+        let stripped: std::collections::BTreeSet<String> =
+            STRIPPED.iter().map(|field| (*field).to_owned()).collect();
+        assert_eq!(removed, stripped);
     }
 }
