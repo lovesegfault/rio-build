@@ -1375,6 +1375,41 @@ to complete; if it cannot finish within the grace period, it is reassigned.
   always `{}` from current Nix.
 ]
 
+#r("sched.dispatch.claims-derived")[
+  When assignment tokens are signed, the scheduler MUST NOT sign
+  upload-authorization claims (`expected_outputs`, `is_ca`,
+  `is_fixed_output`) or forward worker build instructions for a
+  store-backed derivation from submitter-echoed data: for every
+  store-backed node whose definition evidence is below
+  `path_bound_bytes`, dispatch MUST first fetch the `.drv` the declared
+  path names, re-derive its text content-address in the actor, and prove
+  the recorded claims against the parsed derivation with the same
+  validator SubmitBuild ingress applies to inline content; the
+  resolve-need MUST be derived from those verified bytes, never from the
+  submitter's `needs_resolve` echo, and deferred output paths MUST come
+  only from realisations resolved over those bytes. A contradiction MUST
+  poison the node without signing; store unavailability MUST roll the
+  assignment back with dispatch backoff. Ingress-byte-bound nodes
+  (inline or authoritative content) sign their ingress-bound recorded
+  values; nodes already at `path_bound_bytes` or higher skip the
+  re-fetch. Unsigned dev mode mints no claims and is exempt.
+]
+This is the dispatch half of the worker-claims story (CppNix parity:
+`Store::queryPartialDerivationOutputMap` consults the store's own copy of
+the derivation, `store-api.cc:396-410` --- never a client's claim about
+it). The child-seed trust posture is deliberate: static-IA derivation
+seeds child modulo hashes from the DAG's length-checked echoes for direct
+submissions, bounded by second-preimage hardness (a forged child hash
+moves every derived path AWAY from honest paths --- see the soundness
+note on `input_addressed_output_paths` in rio-nix `derivation/hash.rs`);
+the byte-bound authority for membership is the STORE-side modulo cache,
+which reads only the store's own backend --- which is why the store-side
+deriver proof (`store.put.ia-deriver-proof`, landing with the store
+workstream) is the authoritative parity surface, and this rule is the
+trusted-plane signing gate in front of it. A submitter who never uploads
+its `.drv` parks in dispatch backoff forever --- correct under the trust
+model: an honest worker could not have fetched the derivation either.
+
 Queue-level preemption is fully supported:
 - High-priority derivations jump ahead of lower-priority queued (not yet
   running) work. Interactive builds receive an `INTERACTIVE_BOOST` of +1e9 to

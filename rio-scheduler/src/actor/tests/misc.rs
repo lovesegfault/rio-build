@@ -354,6 +354,7 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
     // claims must include them.
     let expected_out = test_store_path("hmac-expected-out");
     let mut node = make_node("hmac-drv");
+    node.drv_content = b"Derive-hmac-test".to_vec(); // ingress-byte-bound (see claims-derived suite)
     node.expected_output_paths = vec![expected_out.clone()];
     merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
@@ -435,7 +436,13 @@ async fn test_hmac_assignment_carries_tenant() -> TestResult {
             build_id: Uuid::new_v4(),
             tenant_id: Some(tenant),
             priority_class: PriorityClass::Scheduled,
-            nodes: vec![make_node("phase2-drv")],
+            nodes: vec![{
+                // Ingress-byte-bound: token-mechanics pin (see the
+                // sched.dispatch.claims-derived suite for store-backed).
+                let mut n = make_node("phase2-drv");
+                n.drv_content = b"Derive-hmac-test".to_vec();
+                n
+            }],
             edges: vec![],
             options: BuildOptions::default(),
             keep_going: false,
@@ -491,6 +498,9 @@ async fn test_hmac_assignment_marks_fixed_output() -> TestResult {
 
     let expected_out = test_store_path("fod-expected-out");
     let mut node = make_node("fod-claims-drv");
+    // Ingress-byte-bound: token-mechanics pin (see the
+    // sched.dispatch.claims-derived suite for store-backed).
+    node.drv_content = b"Derive-hmac-test".to_vec();
     node.is_fixed_output = true;
     node.expected_output_paths = vec![expected_out.clone()];
     merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
@@ -539,7 +549,13 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
             build_id: Uuid::new_v4(),
             tenant_id: None,
             priority_class: PriorityClass::Scheduled,
-            nodes: vec![make_node("clamp-drv")],
+            nodes: vec![{
+                // Ingress-byte-bound: token-mechanics pin (see the
+                // sched.dispatch.claims-derived suite for store-backed).
+                let mut n = make_node("clamp-drv");
+                n.drv_content = b"Derive-hmac-test".to_vec();
+                n
+            }],
             edges: vec![],
             options: BuildOptions {
                 build_timeout: u64::MAX,
@@ -2447,4 +2463,265 @@ async fn build_options_merge_zero_cores_is_all() {
     mk2(8);
     let opts = actor.build_options_for_derivation(&DrvHash::from("h2"));
     assert_eq!(opts.build_cores, 8, "all-positive → max");
+}
+
+// ===========================================================================
+// Dispatch claims derivation (sched.dispatch.claims-derived)
+// ===========================================================================
+
+/// Signer + mock store for the claims-derivation suite. Backoff base is
+/// zeroed so the unavailable→retry path can be driven with Ticks.
+async fn setup_claims_fixture(
+    test_key: &[u8],
+) -> anyhow::Result<(
+    TestDb,
+    rio_test_support::grpc::MockStore,
+    ActorHandle,
+    (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>),
+)> {
+    use rio_auth::hmac::HmacSigner;
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let key = test_key.to_vec();
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |c, p| {
+            c.retry_policy.backoff_base_secs = 0.0;
+            p.hmac_signer = Some(Arc::new(HmacSigner::from_key(key)));
+        });
+    Ok((db, store, handle, (store_task, actor_task)))
+}
+
+/// Drain the worker stream until an Assignment arrives (skipping
+/// Prefetch hints), or `None` after `wait_ms` of silence.
+async fn try_recv_assignment(
+    rx: &mut tokio::sync::mpsc::Receiver<rio_proto::types::SchedulerMessage>,
+    wait_ms: u64,
+) -> Option<rio_proto::types::WorkAssignment> {
+    loop {
+        match tokio::time::timeout(Duration::from_millis(wait_ms), rx.recv()).await {
+            Err(_) => return None,
+            Ok(None) => return None,
+            Ok(Some(msg)) => match msg.msg {
+                Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => return Some(a),
+                Some(rio_proto::types::scheduler_message::Msg::Prefetch(_)) => continue,
+                _ => continue,
+            },
+        }
+    }
+}
+
+// r[verify sched.dispatch.claims-derived]
+/// Happy path: a bare store-backed node whose `.drv` is in the store
+/// gets its claims PROVEN against the store bytes — the token verifies
+/// with the derived (== recorded, now byte-bound) values, the verified
+/// bytes are forwarded to the worker, and the node's standing is
+/// persisted as `path_bound_bytes` so re-dispatch skips the re-fetch.
+#[tokio::test]
+async fn test_dispatch_claims_derived_from_store_bytes() -> TestResult {
+    use rio_auth::hmac::HmacVerifier;
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let (node, aterm, out_path) = mint_text_ca_leaf("claims-happy");
+    let drv_path = node.drv_path.clone();
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+
+    let mut worker_rx = connect_executor(&handle, "claims-w", "x86_64-linux").await?;
+    merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    let assignment = recv_assignment(&mut worker_rx).await;
+    assert_eq!(assignment.drv_path, drv_path);
+    assert_eq!(
+        assignment.drv_content,
+        aterm.as_bytes(),
+        "the store-verified bytes are forwarded as the build instructions"
+    );
+    let claims = HmacVerifier::from_key(test_key)
+        .verify::<rio_auth::hmac::AssignmentClaims>(&assignment.assignment_token)
+        .expect("token verifies");
+    assert_eq!(
+        claims.expected_outputs,
+        vec![out_path],
+        "signed expected_outputs are the byte-derived paths"
+    );
+    assert!(!claims.is_ca && !claims.is_fixed_output);
+
+    let (rank,): (String,) =
+        sqlx::query_as("SELECT evidence_rank FROM derivations WHERE drv_hash = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(rank, "path_bound_bytes", "verification persisted");
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived]
+/// THE forged-claims kill test (merged_bug_053 variants 2/3 + the
+/// needs_resolve bypass): a submitter echoes forged expected outputs
+/// and a forged resolve flag for a store-backed node. The store bytes
+/// disprove the claim — NO token is signed, no WorkAssignment reaches
+/// the worker, the node is poisoned, and the interested build fails
+/// with its evidence persisted at source.
+#[tokio::test]
+async fn test_dispatch_claims_forgery_poisons_without_signing() -> TestResult {
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let (mut node, aterm, _out) = mint_text_ca_leaf("claims-forged");
+    let drv_path = node.drv_path.clone();
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+    // The forgery: claim a different output path, and a resolve flag
+    // that would (pre-derivation) have steered signing onto the echo.
+    node.expected_output_paths = vec![test_store_path("forged-target")];
+    node.needs_resolve = true;
+
+    let mut worker_rx = connect_executor(&handle, "forge-w", "x86_64-linux").await?;
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    assert!(
+        try_recv_assignment(&mut worker_rx, 300).await.is_none(),
+        "no WorkAssignment may be sent for forged claims"
+    );
+    wait_for_status(&handle, &drv_path, DerivationStatus::Poisoned).await;
+    // Failure evidence at source: the interested build's error_summary
+    // is durable while the failure propagates.
+    let (summary,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(build_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        summary.is_some(),
+        "failure evidence persisted at source for the forged dispatch"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived]
+/// Store unavailability is transient: the assignment rolls back with
+/// backoff (no token, node NOT poisoned), and once the `.drv` appears
+/// the next dispatch derives the claims and assigns normally.
+#[tokio::test]
+async fn test_dispatch_claims_unavailable_backs_off_then_succeeds() -> TestResult {
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (_db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let (node, aterm, _out) = mint_text_ca_leaf("claims-unavail");
+    let drv_path = node.drv_path.clone();
+    // NOT seeded yet.
+
+    let mut worker_rx = connect_executor(&handle, "unavail-w", "x86_64-linux").await?;
+    merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    assert!(
+        try_recv_assignment(&mut worker_rx, 300).await.is_none(),
+        "no assignment while the store cannot vouch"
+    );
+    let info = handle
+        .debug_query_derivation(&drv_path)
+        .await?
+        .expect("node resident");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Ready,
+        "unavailable is transient: rolled back to Ready, not poisoned"
+    );
+
+    // The store recovers. A fresh worker registration triggers the
+    // next dispatch pass (the harness's established trigger — Tick
+    // alone only dispatches when the dirty flag is set); the deferred
+    // node's claims now derive and either worker may receive it.
+    store.seed_with_content(&drv_path, aterm.as_bytes());
+    let mut worker_rx2 = connect_executor(&handle, "unavail-w2", "x86_64-linux").await?;
+    for _ in 0..50 {
+        handle.send_unchecked(ActorCommand::Tick).await?;
+        barrier(&handle).await;
+        if let Some(a) = try_recv_assignment(&mut worker_rx, 50).await {
+            assert_eq!(a.drv_path, drv_path);
+            return Ok(());
+        }
+        if let Some(a) = try_recv_assignment(&mut worker_rx2, 50).await {
+            assert_eq!(a.drv_path, drv_path);
+            return Ok(());
+        }
+    }
+    panic!("assignment never arrived after the store recovered");
+}
+
+// r[verify sched.dispatch.claims-derived]
+/// Bytes that do not re-derive the declared text content-address are
+/// transport-grade noise, not evidence in either direction: the
+/// assignment is held (rolled back, NOT poisoned) — never signed.
+#[tokio::test]
+async fn test_dispatch_claims_text_ca_mismatch_never_signs() -> TestResult {
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (_db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let (node, _aterm, _out) = mint_text_ca_leaf("claims-mismatch");
+    let drv_path = node.drv_path.clone();
+    // A DIFFERENT (parseable, canonical) derivation's bytes at the
+    // path: text-CA re-derivation cannot match.
+    let (_other, other_aterm, _o) = mint_text_ca_leaf("claims-other");
+    store.seed_with_content(&drv_path, other_aterm.as_bytes());
+
+    let mut worker_rx = connect_executor(&handle, "mismatch-w", "x86_64-linux").await?;
+    merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    assert!(
+        try_recv_assignment(&mut worker_rx, 300).await.is_none(),
+        "unverifiable bytes must never be signed against"
+    );
+    let info = handle
+        .debug_query_derivation(&drv_path)
+        .await?
+        .expect("node resident");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Ready,
+        "transient, not poisoned"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.claims-derived]
+/// Text-CA-VERIFIED garbage is permanent: the bytes are content-bound
+/// to the declared path (zero-reference text-CA matches) and can never
+/// parse — refetching reproduces them, so the node is poisoned instead
+/// of hot-looping through backoff.
+#[tokio::test]
+async fn test_dispatch_unparseable_verified_bytes_poison() -> TestResult {
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (_db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let garbage = b"this is not a derivation";
+    let h = NixHash::new(HashAlgo::SHA256, Sha256::digest(garbage).to_vec()).unwrap();
+    let garbage_path = StorePath::make_text("garbage.drv", &h, &[])
+        .unwrap()
+        .as_str()
+        .to_owned();
+    store.seed_with_content(&garbage_path, garbage);
+
+    let (mut node, _aterm, _out) = mint_text_ca_leaf("claims-garbage");
+    node.drv_path = garbage_path.clone();
+    node.drv_hash = garbage_path.clone();
+
+    let mut worker_rx = connect_executor(&handle, "garbage-w", "x86_64-linux").await?;
+    merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    assert!(
+        try_recv_assignment(&mut worker_rx, 300).await.is_none(),
+        "no assignment for content-bound garbage"
+    );
+    wait_for_status(&handle, &garbage_path, DerivationStatus::Poisoned).await;
+    Ok(())
 }

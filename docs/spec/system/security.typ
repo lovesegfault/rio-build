@@ -470,8 +470,11 @@ tracey rule or phase deferral.
       bytes equals the declared `.drv` path, declared paths/flags equal
       values recomputed from the bytes
       (#rref("sched.merge.ingress-inline-drv-binding")); store-backed
-      nodes' declarations remain echo-trusted pending store-evidence
-      displacement (follow-up; compromised-worker-only residual). Store:
+      nodes' claims are derived at dispatch from the store's
+      text-CA-verified `.drv` bytes --- never signed from submitter
+      echoes (#rref("sched.dispatch.claims-derived")), and settled
+      conflicts are arbitrated against those bytes
+      (#rref("sched.merge.store-evidence-displacement")). Store:
       HMAC assignment tokens gate registration ---
       `x-rio-assignment-token` metadata on PutPath, `store_path ∈
       claims.expected_outputs` --- and content-addressed or fixed-output

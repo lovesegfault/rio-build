@@ -185,6 +185,28 @@ pub fn describe_metrics() {
          (per-merge fetch budget exhausted; rejection stands)"
     );
     describe_counter!(
+        "rio_scheduler_dispatch_claims_source_total",
+        "Dispatch-time assignment-claims derivations by byte-bound source \
+         (sched.dispatch.claims-derived): inline (ingress-bound inline content), \
+         authoritative (hook-fallback content), store (store .drv fetched, \
+         text-CA-verified, and the recorded claims proven against it — or a \
+         prior verification's persisted path_bound_bytes rank)"
+    );
+    describe_counter!(
+        "rio_scheduler_dispatch_claims_forgery_total",
+        "Store-backed nodes whose recorded claims CONTRADICT the store's \
+         text-CA-verified .drv bytes at dispatch (or whose verified bytes are \
+         content-bound garbage): no token signed, node poisoned \
+         (sched.dispatch.claims-derived). Nonzero → hostile direct submitter."
+    );
+    describe_counter!(
+        "rio_scheduler_dispatch_claims_unavailable_total",
+        "Dispatch-time claims derivations that could not complete because the \
+         store could not vouch (fetch failure, absent .drv, text-CA mismatch, \
+         unresolvable inputs): assignment rolled back with backoff, retried \
+         when the store recovers (sched.dispatch.claims-derived)"
+    );
+    describe_counter!(
         "rio_scheduler_cache_hits_total",
         "Derivations served from cache (labeled by source: scheduler/reprobe/existing/dispatch)"
     );

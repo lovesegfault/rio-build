@@ -106,6 +106,28 @@ fn check_freeze(
     }
 }
 
+/// Outcome of [`DagActor::build_assignment_proto`].
+pub(super) enum AssignmentProtoOutcome {
+    /// Assignment constructed; send it.
+    Ready(Box<rio_proto::types::WorkAssignment>),
+    /// DAG node vanished (TOCTOU vs. concurrent cancel) — caller
+    /// defers with the legacy NO-rollback semantics.
+    NodeGone,
+    /// The store could not vouch for a bare store-backed node's claims
+    /// (`sched.dispatch.claims-derived`): transient — caller rolls the
+    /// assignment back and sets the dispatch backoff.
+    Unavailable(&'static str),
+    /// The store's verified bytes disprove the recorded claims, or are
+    /// content-bound garbage that can never parse: permanent — caller
+    /// rolls back and poisons.
+    Forged(String),
+}
+
+/// `DrvHash` → owned `String` (the domain node synth wants `String`).
+fn state_drv_hash_string(h: &DrvHash) -> String {
+    h.as_str().to_string()
+}
+
 impl DagActor {
     // -----------------------------------------------------------------------
     // Dispatch
@@ -2089,15 +2111,61 @@ impl DagActor {
         // the HINT fails, the build still works (on-demand FUSE).
         self.send_prefetch_hint(executor_id, drv_hash);
 
-        // Resolve CA inputs + construct the WorkAssignment proto.
-        // None means the DAG node disappeared between the Ready
-        // check and here (TOCTOU vs. concurrent cancel) — treat as
-        // assignment failure so the caller defers.
-        let Some(assignment) = self
+        // Derive claims + resolve CA inputs + construct the proto.
+        let assignment = match self
             .build_assignment_proto(drv_hash, executor_id, generation)
             .await
-        else {
-            return false;
+        {
+            AssignmentProtoOutcome::Ready(a) => *a,
+            // Node disappeared between the Ready check and here
+            // (TOCTOU vs. concurrent cancel) — legacy no-rollback
+            // semantics: caller defers.
+            AssignmentProtoOutcome::NodeGone => return false,
+            // r[impl sched.dispatch.claims-derived]
+            // The store could not vouch for a bare store-backed node's
+            // claims (fetch failure, absent .drv, text-CA mismatch,
+            // unresolvable inputs). Transient, store-trust posture:
+            // roll the assignment back AND set the dispatch backoff
+            // ourselves — `rollback_assignment` resets to Ready
+            // without one, and a store outage would otherwise hot-loop
+            // assign → fetch-fail → rollback on every dispatch pass.
+            AssignmentProtoOutcome::Unavailable(reason) => {
+                metrics::counter!("rio_scheduler_dispatch_claims_unavailable_total").increment(1);
+                warn!(
+                    drv_hash = %drv_hash,
+                    executor_id = %executor_id,
+                    reason,
+                    "claims derivation unavailable; assignment rolled back with backoff"
+                );
+                self.rollback_assignment(drv_hash, executor_id).await;
+                if let Some(state) = self.dag.node_mut(drv_hash) {
+                    let backoff = self.retry_policy.backoff_duration(state.retry.count);
+                    state.retry.count += 1;
+                    state.retry.backoff_until = Some(std::time::Instant::now() + backoff);
+                }
+                return false;
+            }
+            // Claims forgery (the verified bytes contradict the
+            // recorded claims) or content-bound unparseable bytes:
+            // PERMANENT. No token is ever signed; the node is poisoned
+            // through the terminal-failure machinery and every
+            // interested build records the failure evidence at source.
+            AssignmentProtoOutcome::Forged(detail) => {
+                metrics::counter!("rio_scheduler_dispatch_claims_forgery_total").increment(1);
+                warn!(
+                    drv_hash = %drv_hash,
+                    executor_id = %executor_id,
+                    detail = %detail,
+                    "dispatch claims forged; poisoning the derivation"
+                );
+                self.rollback_assignment(drv_hash, executor_id).await;
+                let msg = format!("dispatch claims derivation failed permanently: {detail}");
+                self.poison_and_cascade(drv_hash, &msg).await;
+                for build_id in self.get_interested_builds(drv_hash) {
+                    self.record_failure_evidence(build_id, drv_hash).await;
+                }
+                return false;
+            }
         };
 
         if !self.try_send_assignment(drv_hash, executor_id, assignment) {
@@ -2328,13 +2396,11 @@ impl DagActor {
     }
 
     /// Construct the [`WorkAssignment`] proto for `drv_hash` →
-    /// `executor_id`: CA-input resolve, HMAC token sign, build-options
-    /// lookup. Side-effect: stashes `pending_realisation_deps` on the
-    /// node so `handle_success_completion` can write the realisation FK
-    /// rows post-build.
-    ///
-    /// Returns `None` if the DAG node is gone (TOCTOU vs. concurrent
-    /// cancel) — caller treats that as assignment failure.
+    /// `executor_id`: claims derivation, CA-input resolve, HMAC token
+    /// sign, build-options lookup. Side-effect: stashes
+    /// `pending_realisation_deps` on the node so
+    /// `handle_success_completion` can write the realisation FK rows
+    /// post-build.
     ///
     /// [`WorkAssignment`]: rio_proto::types::WorkAssignment
     async fn build_assignment_proto(
@@ -2342,7 +2408,137 @@ impl DagActor {
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
         generation: u64,
-    ) -> Option<rio_proto::types::WorkAssignment> {
+    ) -> AssignmentProtoOutcome {
+        // === Claims derivation (sched.dispatch.claims-derived) ========
+        // r[impl sched.dispatch.claims-derived]
+        // Decide the byte-bound source of every value the token will
+        // sign and the worker will obey, BEFORE any of it is used.
+        // Unsigned dev mode mints no claims — nothing to derive (the
+        // store accepts unsigned only when its own verifier is off).
+        //
+        // Ingress-byte-bound nodes (inline / authoritative): commits
+        // 13/16 bound the recorded values to the bytes at SubmitBuild —
+        // sign recorded. Store-backed nodes already at
+        // `path_bound_bytes` (a prior dispatch derived them, or the
+        // merge-time store-evidence check verified them; recovery
+        // restores the persisted rank): sign recorded. EVERY other
+        // store-backed node: fetch the .drv the declared path names,
+        // re-derive its text content-address in the actor, and run the
+        // parsed derivation against the RECORDED claims through the
+        // same identity validator SubmitBuild ingress applies — the
+        // resolve-need is then derived from those verified bytes,
+        // never from the submitter's `needs_resolve` echo.
+        let verified_bytes: Option<Vec<u8>> = if self.hmac_signer.is_some() {
+            let verdict = {
+                let Some(state) = self.dag.node(drv_hash) else {
+                    return AssignmentProtoOutcome::NodeGone;
+                };
+                if !state.drv_content.is_empty() {
+                    let source = if state.drv_content_authoritative {
+                        "authoritative"
+                    } else {
+                        "inline"
+                    };
+                    metrics::counter!(
+                        "rio_scheduler_dispatch_claims_source_total",
+                        "source" => source
+                    )
+                    .increment(1);
+                    None
+                } else if state.evidence >= crate::state::DefinitionEvidence::PathBoundBytes {
+                    metrics::counter!(
+                        "rio_scheduler_dispatch_claims_source_total",
+                        "source" => "store"
+                    )
+                    .increment(1);
+                    None
+                } else {
+                    // Bare store-backed below path-bound standing:
+                    // synthesize the RECORDED claims (pre-resolve:
+                    // deferred/floating slots still carry their
+                    // ingress-shape empty paths) and verify against the
+                    // store's own bytes. Sibling hash seeds come from
+                    // the DAG children — for a dispatched node its
+                    // dependencies are resident and Completed.
+                    let node = crate::domain::DerivationNode {
+                        drv_hash: state_drv_hash_string(drv_hash),
+                        drv_path: state.drv_path().to_string(),
+                        pname: String::new(),
+                        system: state.system.clone(),
+                        output_names: state.output_names.clone(),
+                        expected_output_paths: state.expected_output_paths.clone(),
+                        is_fixed_output: state.is_fixed_output,
+                        is_content_addressed: state.ca.is_ca,
+                        ca_modular_hash: state.ca.modular_hash,
+                        drv_content: Vec::new(),
+                        drv_content_authoritative: false,
+                        required_features: Vec::new(),
+                        wanted_output_names: Vec::new(),
+                        explicitly_requested: false,
+                        needs_resolve: false,
+                        version: None,
+                        enable_parallel_building: None,
+                        enable_parallel_checking: None,
+                        prefer_local_build: None,
+                    };
+                    let mut seed: std::collections::HashMap<String, [u8; 32]> =
+                        std::collections::HashMap::new();
+                    for child in self.dag.get_children(drv_hash) {
+                        if let Some(cs) = self.dag.node(&child)
+                            && let Some(h) = cs.ca.modular_hash
+                        {
+                            seed.insert(cs.drv_path().to_string(), h);
+                        }
+                    }
+                    Some(self.check_store_evidence(&node, &seed).await)
+                }
+            };
+            match verdict {
+                None => None,
+                Some(super::merge::StoreEvidenceOutcome::Verified(bytes)) => {
+                    metrics::counter!(
+                        "rio_scheduler_dispatch_claims_source_total",
+                        "source" => "store"
+                    )
+                    .increment(1);
+                    // The recorded claims are now PROVEN byte-derived:
+                    // raise the node's standing so re-dispatch skips
+                    // the re-fetch. Best-effort persist — a lost write
+                    // degrades to re-derivation after failover.
+                    if let Some(state) = self.dag.node_mut(drv_hash) {
+                        state.evidence = crate::state::DefinitionEvidence::PathBoundBytes;
+                    }
+                    if let Err(e) = self
+                        .db
+                        .persist_evidence_rank(
+                            drv_hash.as_str(),
+                            crate::state::DefinitionEvidence::PathBoundBytes,
+                        )
+                        .await
+                    {
+                        debug!(drv_hash = %drv_hash, error = %e,
+                               "evidence-rank persist failed (best-effort)");
+                    }
+                    Some(bytes)
+                }
+                Some(super::merge::StoreEvidenceOutcome::Contradicts(detail)) => {
+                    return AssignmentProtoOutcome::Forged(detail);
+                }
+                Some(super::merge::StoreEvidenceOutcome::UnparseableVerified) => {
+                    return AssignmentProtoOutcome::Forged(
+                        "the store's text-CA-bound bytes at the declared path do not \
+                         parse as a derivation (content-bound: refetching reproduces \
+                         them)"
+                            .into(),
+                    );
+                }
+                Some(super::merge::StoreEvidenceOutcome::Unverifiable(reason)) => {
+                    return AssignmentProtoOutcome::Unavailable(reason);
+                }
+            }
+        } else {
+            None
+        };
         // CA input resolution: rewrite placeholder paths in
         // env/args/builder to realized output paths before
         // dispatch. Fires when gateway set needs_resolve (ADR-018
@@ -2361,8 +2557,11 @@ impl DagActor {
         // can be stashed via node_mut() below before the main
         // WorkAssignment construction takes its own & borrow.
         let (drv_content_to_send, resolve_lookups, resolved_output_paths) = {
-            let state = self.dag.node(drv_hash)?;
-            self.maybe_resolve_ca(drv_hash, state).await
+            let Some(state) = self.dag.node(drv_hash) else {
+                return AssignmentProtoOutcome::NodeGone;
+            };
+            self.maybe_resolve_ca(drv_hash, state, verified_bytes.as_deref())
+                .await
         };
 
         // Stash lookups for handle_success_completion's
@@ -2389,7 +2588,9 @@ impl DagActor {
             }
         }
 
-        let state = self.dag.node(drv_hash)?;
+        let Some(state) = self.dag.node(drv_hash) else {
+            return AssignmentProtoOutcome::NodeGone;
+        };
         let build_opts = self.build_options_for_derivation(drv_hash);
 
         // Assignment token: HMAC-signed if configured, else
@@ -2459,7 +2660,7 @@ impl DagActor {
             format!("{executor_id}-{drv_hash}-{generation}")
         };
 
-        Some(rio_proto::types::WorkAssignment {
+        AssignmentProtoOutcome::Ready(Box::new(rio_proto::types::WorkAssignment {
             drv_path: state.drv_path().to_string(),
             // Forward what the gateway inlined (or empty → worker
             // fetches from store). Gateway only inlines for nodes
@@ -2498,7 +2699,7 @@ impl DagActor {
             // proto-build — the actor is single-threaded so that can't
             // happen, but the field is non-Option in the proto.
             exec_id: state.exec_id.map(|u| u.to_string()).unwrap_or_default(),
-        })
+        }))
     }
 
     /// Send a PrefetchHint for the chosen worker to warm its FUSE
@@ -2609,19 +2810,40 @@ impl DagActor {
         &self,
         drv_hash: &DrvHash,
         state: &crate::state::DerivationState,
+        verified_bytes: Option<&[u8]>,
     ) -> (
         Vec<u8>,
         Vec<crate::ca::RealisationLookup>,
         Vec<(String, String)>,
     ) {
-        // Gate: ADR-018 Appendix B `shouldResolve`. Gateway computes
-        // `needs_resolve = has_ca_floating_outputs() || any inputDrv
-        // is floating-CA` at translate time. Covers both floating-CA
-        // self AND ia.deferred (IA with CA inputs — the CA input's
-        // placeholder is embedded in this drv's env/args and needs
-        // rewriting to the realized path).
-        if !state.ca.needs_resolve {
-            return (state.drv_content.clone(), Vec::new(), Vec::new());
+        // Gate: ADR-018 Appendix B `shouldResolve`. For ingress-bound
+        // nodes the gateway computed `needs_resolve =
+        // has_ca_floating_outputs() || any inputDrv is floating-CA` at
+        // translate time and ingress bound the node's shape. For
+        // store-backed nodes whose bytes the claims derivation just
+        // verified, the gate is DERIVED from those bytes — the
+        // submitter's `needs_resolve` echo is never consulted
+        // (sched.dispatch.claims-derived: a forged resolve flag must
+        // not steer signing onto recorded echoes).
+        let needs_resolve = match verified_bytes {
+            Some(bytes) => std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|t| rio_nix::derivation::Derivation::parse(t).ok())
+                .map(|d| {
+                    use rio_nix::derivation::DerivationLike;
+                    d.has_unknown_output_paths() || d.has_ca_floating_outputs()
+                })
+                .unwrap_or(false),
+            None => state.ca.needs_resolve,
+        };
+        if !needs_resolve {
+            return (
+                verified_bytes
+                    .map(|b| b.to_vec())
+                    .unwrap_or_else(|| state.drv_content.clone()),
+                Vec::new(),
+                Vec::new(),
+            );
         }
 
         // Build the input lists: walk DAG children, split into CA
@@ -2642,7 +2864,13 @@ impl DagActor {
         let ca_inputs = self.collect_ca_inputs(drv_hash);
         let ia_inputs = self.collect_ia_inputs(drv_hash);
         if ca_inputs.is_empty() && ia_inputs.is_empty() {
-            return (state.drv_content.clone(), Vec::new(), Vec::new());
+            return (
+                verified_bytes
+                    .map(|b| b.to_vec())
+                    .unwrap_or_else(|| state.drv_content.clone()),
+                Vec::new(),
+                Vec::new(),
+            );
         }
 
         // No drv_content → recovered derivation (scheduler restart,
@@ -2671,7 +2899,11 @@ impl DagActor {
         // (sched.persist.ca-modular-hash, sched.recovery.deferred-resolve).
         //
         // r[impl sched.ca.resolve+3]
-        let drv_content = if state.drv_content.is_empty() {
+        let drv_content = if let Some(bytes) = verified_bytes {
+            // Claims derivation already fetched + text-CA-verified the
+            // bytes — resolve over THOSE, no second fetch.
+            bytes.to_vec()
+        } else if state.drv_content.is_empty() {
             match self
                 .fetch_drv_content_from_store(drv_hash.as_str(), state.drv_path())
                 .await

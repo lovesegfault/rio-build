@@ -1300,3 +1300,58 @@ async fn test_actor_is_alive_detection() {
         "is_alive should report false after actor task dies"
     );
 }
+
+/// Mint a leaf input-addressed derivation whose declared identity is
+/// derived from real ATerm bytes, and whose `drv_path`/`drv_hash` is the
+/// text content-address of those bytes — exactly what a genuine
+/// store-uploaded `.drv` looks like. Returns the BARE store-backed proto
+/// node (no inline content) plus the canonical ATerm for seeding the
+/// mock store.
+pub(crate) fn mint_text_ca_leaf(tag: &str) -> (rio_proto::types::DerivationNode, String, String) {
+    use rio_nix::derivation::{Derivation, input_addressed_output_paths};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    let build_aterm = |out_path: &str| -> String {
+        format!(
+            r#"Derive([("out","{out_path}","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","{tag}"),("out","{out_path}")])"#
+        )
+    };
+    let masked = build_aterm("");
+    let masked_drv = Derivation::parse(&masked).expect("masked template parses");
+    let name_only_path = format!("/nix/store/{}-{tag}.drv", "a".repeat(32));
+    let resolve_none = |_: &str| -> Option<&Derivation> { None };
+    let paths = input_addressed_output_paths(
+        &masked_drv,
+        &name_only_path,
+        &resolve_none,
+        &mut HashMap::new(),
+    )
+    .expect("derive leaf IA paths");
+    let out_path = paths["out"].as_str().to_owned();
+    let aterm = build_aterm(&out_path);
+    let drv = Derivation::parse(&aterm).expect("final ATerm parses");
+    assert_eq!(drv.to_aterm(), aterm, "fixture must be canonical");
+
+    let content_hash =
+        NixHash::new(HashAlgo::SHA256, Sha256::digest(aterm.as_bytes()).to_vec()).unwrap();
+    let drv_path = StorePath::make_text(&format!("{tag}.drv"), &content_hash, &[])
+        .unwrap()
+        .as_str()
+        .to_owned();
+
+    let node = rio_proto::types::DerivationNode {
+        drv_path: drv_path.clone(),
+        drv_hash: drv_path,
+        pname: tag.to_owned(),
+        system: "x86_64-linux".into(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: false,
+        expected_output_paths: vec![out_path.clone()],
+        ..Default::default()
+    };
+    (node, aterm, out_path)
+}

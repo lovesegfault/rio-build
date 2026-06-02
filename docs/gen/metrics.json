@@ -94,6 +94,9 @@
     "rio_scheduler_derivations_gc_deleted_total",
     "rio_scheduler_derivations_queued",
     "rio_scheduler_derivations_running",
+    "rio_scheduler_dispatch_claims_forgery_total",
+    "rio_scheduler_dispatch_claims_source_total",
+    "rio_scheduler_dispatch_claims_unavailable_total",
     "rio_scheduler_dispatch_wait_seconds",
     "rio_scheduler_event_persist_dropped_total",
     "rio_scheduler_executor_reconnect_rejected_total",
@@ -690,6 +693,21 @@
         "name": "rio_scheduler_derivations_running",
         "kind": "gauge",
         "help": "Derivations currently building"
+      },
+      {
+        "name": "rio_scheduler_dispatch_claims_forgery_total",
+        "kind": "counter",
+        "help": "Store-backed nodes whose recorded claims CONTRADICT the store's text-CA-verified .drv bytes at dispatch (or whose verified bytes are content-bound garbage): no token signed, node poisoned (sched.dispatch.claims-derived). Nonzero → hostile direct submitter."
+      },
+      {
+        "name": "rio_scheduler_dispatch_claims_source_total",
+        "kind": "counter",
+        "help": "Dispatch-time assignment-claims derivations by byte-bound source (sched.dispatch.claims-derived): inline (ingress-bound inline content), authoritative (hook-fallback content), store (store .drv fetched, text-CA-verified, and the recorded claims proven against it — or a prior verification's persisted path_bound_bytes rank)"
+      },
+      {
+        "name": "rio_scheduler_dispatch_claims_unavailable_total",
+        "kind": "counter",
+        "help": "Dispatch-time claims derivations that could not complete because the store could not vouch (fetch failure, absent .drv, text-CA mismatch, unresolvable inputs): assignment rolled back with backoff, retried when the store recovers (sched.dispatch.claims-derived)"
       },
       {
         "name": "rio_scheduler_dispatch_wait_seconds",

@@ -172,10 +172,12 @@ fn settled_row_identity_matches(
 const MERGE_STORE_EVIDENCE_BUDGET: u32 = 8;
 
 /// Outcome of [`DagActor::check_store_evidence`].
-enum StoreEvidenceOutcome {
+pub(super) enum StoreEvidenceOutcome {
     /// The store's text-CA-bound bytes derive exactly the submission's
-    /// claimed identity — the claim is genuine.
-    Verified,
+    /// claimed identity — the claim is genuine. Carries the verified
+    /// bytes so callers (the dispatch claims derivation) can forward
+    /// them without a second fetch.
+    Verified(Vec<u8>),
     /// The bytes are sound (text-CA-bound to the declared path) but the
     /// derivation they parse as CONTRADICTS the claim — fail hard, a
     /// retry of the same claim can never succeed.
@@ -185,6 +187,13 @@ enum StoreEvidenceOutcome {
     /// upgrade, the existing rejection stands. Store silence is not
     /// evidence.
     Unverifiable(&'static str),
+    /// The bytes are PROVABLY the store's text-CA object for the
+    /// declared path (zero-reference text-CA re-derivation matched) and
+    /// they do not parse as a derivation. Content-bound and permanent:
+    /// refetching reproduces the same garbage. Only the dispatch-time
+    /// caller distinguishes this (poison vs backoff); the merge-time
+    /// caller folds it into Unverifiable.
+    UnparseableVerified,
 }
 
 impl DagActor {
@@ -206,7 +215,7 @@ impl DagActor {
     /// text-CA, unresolvable declared-IA inputs) are pre-checked here
     /// and return [`StoreEvidenceOutcome::Unverifiable`]; once those
     /// pass, any validator failure IS an identity contradiction.
-    async fn check_store_evidence(
+    pub(super) async fn check_store_evidence(
         &self,
         node: &crate::domain::DerivationNode,
         submission_seed: &HashMap<String, [u8; 32]>,
@@ -222,10 +231,28 @@ impl DagActor {
         else {
             return StoreEvidenceOutcome::Unverifiable("fetch");
         };
+        let zero_ref_text_ca_matches = |bytes: &[u8]| -> bool {
+            let Ok(sp) = StorePath::parse(&node.drv_path) else {
+                return false;
+            };
+            let Ok(h) = NixHash::new(HashAlgo::SHA256, Sha256::digest(bytes).to_vec()) else {
+                return false;
+            };
+            matches!(StorePath::make_text(sp.name(), &h, &[]), Ok(p) if p.as_str() == node.drv_path)
+        };
         let Ok(text) = std::str::from_utf8(&bytes) else {
+            // Binary garbage can still be the genuine (reference-free)
+            // text-CA object at this path — then it is PERMANENTLY not
+            // a derivation, not a transport blip.
+            if zero_ref_text_ca_matches(&bytes) {
+                return StoreEvidenceOutcome::UnparseableVerified;
+            }
             return StoreEvidenceOutcome::Unverifiable("not-utf8");
         };
         let Ok(drv) = Derivation::parse(text) else {
+            if zero_ref_text_ca_matches(&bytes) {
+                return StoreEvidenceOutcome::UnparseableVerified;
+            }
             return StoreEvidenceOutcome::Unverifiable("parse");
         };
         // Canonicality: the validator requires bytes == to_aterm(parse).
@@ -325,7 +352,11 @@ impl DagActor {
             Ok(()) if claimed_modular_hash && slice[0].ca_modular_hash.is_empty() => {
                 StoreEvidenceOutcome::Unverifiable("modular-hash-unrecomputable")
             }
-            Ok(()) => StoreEvidenceOutcome::Verified,
+            Ok(()) => {
+                // `synth.drv_content` was moved into the slice; the
+                // verified bytes are returned from there.
+                StoreEvidenceOutcome::Verified(std::mem::take(&mut slice[0].drv_content))
+            }
             Err(status) => StoreEvidenceOutcome::Contradicts(status.message().to_string()),
         }
     }
@@ -774,7 +805,7 @@ impl DagActor {
                         } else {
                             evidence_budget -= 1;
                             match self.check_store_evidence(node, &submission_seed).await {
-                                StoreEvidenceOutcome::Verified => {
+                                StoreEvidenceOutcome::Verified(_) => {
                                     metrics::counter!(
                                         "rio_scheduler_merge_store_evidence_total",
                                         "result" => "displaced"
@@ -800,7 +831,8 @@ impl DagActor {
                                         drv_path: node.drv_path.clone(),
                                     });
                                 }
-                                StoreEvidenceOutcome::Unverifiable(reason) => {
+                                StoreEvidenceOutcome::Unverifiable(_)
+                                | StoreEvidenceOutcome::UnparseableVerified => {
                                     metrics::counter!(
                                         "rio_scheduler_merge_store_evidence_total",
                                         "result" => "unavailable"
@@ -809,7 +841,6 @@ impl DagActor {
                                     debug!(
                                         build_id = %build_id,
                                         drv_hash = %row.drv_hash,
-                                        reason,
                                         "store evidence unavailable; settled-row rejection stands"
                                     );
                                     false
@@ -855,6 +886,7 @@ impl DagActor {
             if node.drv_content_authoritative || !node.drv_content.is_empty() {
                 continue;
             }
+            // (Step 0.6 — resident settled-squat scan; see header above.)
             let Some(existing) = self.dag.node(&node.drv_hash) else {
                 continue;
             };
@@ -879,7 +911,7 @@ impl DagActor {
             }
             evidence_budget -= 1;
             match self.check_store_evidence(node, &submission_seed).await {
-                StoreEvidenceOutcome::Verified => {
+                StoreEvidenceOutcome::Verified(_) => {
                     metrics::counter!(
                         "rio_scheduler_merge_store_evidence_total",
                         "result" => "displaced"
@@ -903,7 +935,8 @@ impl DagActor {
                         drv_path: node.drv_path.clone(),
                     });
                 }
-                StoreEvidenceOutcome::Unverifiable(reason) => {
+                StoreEvidenceOutcome::Unverifiable(_)
+                | StoreEvidenceOutcome::UnparseableVerified => {
                     metrics::counter!(
                         "rio_scheduler_merge_store_evidence_total",
                         "result" => "unavailable"
@@ -912,7 +945,6 @@ impl DagActor {
                     debug!(
                         build_id = %build_id,
                         drv_hash = %node.drv_hash,
-                        reason,
                         "store evidence unavailable; merge-gate rejection stands"
                     );
                 }
