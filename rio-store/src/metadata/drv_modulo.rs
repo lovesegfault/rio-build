@@ -17,7 +17,7 @@
 //! inputs that have no cache row yet simply skip population (counted),
 //! because out-of-order uploads are normal and the proof-time
 //! read-through completes the chain later.
-// r[impl store.ingest.drv-modulo-cache]
+// r[impl store.ingest.drv-modulo-cache+2]
 
 use std::collections::HashMap;
 
@@ -217,10 +217,29 @@ pub(crate) async fn upsert_drv_modulo(
     Ok(())
 }
 
+/// What one best-effort population attempt did — the batch ingestion
+/// loop uses this to drive its multi-pass fixpoint
+/// (`store.ingest.drv-modulo-cache+2`); nothing else branches on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PopulateOutcome {
+    /// Row upserted (or computation succeeded against an existing row).
+    Populated,
+    /// An input row is still absent — retryable within the same batch
+    /// once siblings populate.
+    MissingInput,
+    /// Terminal for this attempt set: unparseable bytes, or a DB
+    /// failure (counted separately).
+    Skipped,
+}
+
 /// Best-effort ingestion hook: parse the just-persisted `.drv` bytes,
 /// seed input hashes from existing cache rows, compute, upsert. NEVER
 /// fails the upload — every outcome is a counter.
-pub(crate) async fn populate_on_ingest(pool: &PgPool, drv_path: &str, drv_bytes: &[u8]) {
+pub(crate) async fn populate_on_ingest(
+    pool: &PgPool,
+    drv_path: &str,
+    drv_bytes: &[u8],
+) -> PopulateOutcome {
     // Cheap pre-parse for the input list (the compute parses again;
     // ~KBs, negligible vs the upload itself).
     let inputs: Vec<String> = match std::str::from_utf8(drv_bytes)
@@ -238,7 +257,7 @@ pub(crate) async fn populate_on_ingest(pool: &PgPool, drv_path: &str, drv_bytes:
                 drv_path,
                 "drv modulo population skipped: bytes do not parse"
             );
-            return;
+            return PopulateOutcome::Skipped;
         }
     };
     let mut seeds = match load_drv_modulo_batch(pool, &inputs).await {
@@ -254,20 +273,21 @@ pub(crate) async fn populate_on_ingest(pool: &PgPool, drv_path: &str, drv_bytes:
             )
             .increment(1);
             warn!(drv_path, error = %e, "drv modulo population skipped: seed load failed");
-            return;
+            return PopulateOutcome::Skipped;
         }
     };
     match compute_drv_modulo(drv_bytes, drv_path, &mut seeds) {
         Ok(computed) => {
             if let Err(e) = upsert_drv_modulo(pool, drv_path, &computed.row).await {
                 warn!(drv_path, error = %e, "drv modulo upsert failed (best-effort)");
-                return;
+                return PopulateOutcome::Skipped;
             }
             metrics::counter!(
                 "rio_store_drv_modulo_cache_total",
                 "event" => "populated"
             )
             .increment(1);
+            PopulateOutcome::Populated
         }
         Err(SkipReason::ParseFailed) => {
             metrics::counter!(
@@ -275,6 +295,7 @@ pub(crate) async fn populate_on_ingest(pool: &PgPool, drv_path: &str, drv_bytes:
                 "event" => "parse_failed"
             )
             .increment(1);
+            PopulateOutcome::Skipped
         }
         Err(SkipReason::MissingInput) => {
             metrics::counter!(
@@ -285,8 +306,45 @@ pub(crate) async fn populate_on_ingest(pool: &PgPool, drv_path: &str, drv_bytes:
             debug!(
                 drv_path,
                 "drv modulo population skipped: input rows absent (out-of-order upload; \
-                 proof-time read-through completes the chain)"
+                 healed by the in-batch fixpoint, the already-complete re-upload hook, \
+                 or the proof-time read-through)"
             );
+            PopulateOutcome::MissingInput
+        }
+    }
+}
+
+/// Probe-first heal for an ALREADY-COMPLETE `.drv` whose cache row is
+/// missing (`store.ingest.drv-modulo-cache+2`): a no-op when the row
+/// exists; otherwise reads the store's own bytes and re-fires
+/// population. Re-uploads of complete derivations are the natural
+/// retry signal for rows whose original population skipped (the
+/// inputs arrived later) — without this, such rows were only ever
+/// filled by a proof-time read-through.
+pub(crate) async fn heal_if_missing(
+    pool: &PgPool,
+    chunks: Option<&crate::cas::ChunkCache>,
+    drv_path: &str,
+) {
+    if !drv_path.ends_with(".drv") {
+        return;
+    }
+    match load_drv_modulo(pool, drv_path).await {
+        Ok(Some(_)) => return, // probe-first: row present, nothing to heal
+        Ok(None) => {}
+        Err(e) => {
+            warn!(drv_path, error = %e, "modulo-cache heal probe failed (best-effort)");
+            return;
+        }
+    }
+    let mut budget = WorkBudget::new(PROOF_WALK_WORK_MAX);
+    match own_drv_bytes(pool, chunks, drv_path, &mut budget).await {
+        Ok(FetchedDrv::Bytes(bytes)) => {
+            let _ = populate_on_ingest(pool, drv_path, &bytes).await;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(drv_path, error = %e, "modulo-cache heal fetch failed (best-effort)");
         }
     }
 }

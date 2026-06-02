@@ -317,6 +317,22 @@ impl StoreServiceImpl {
             Ok(PlaceholderClaim::Owned(claim)) => Ok(Some(claim)),
             Ok(PlaceholderClaim::AlreadyComplete) => {
                 debug!(%store_path, "PutPath: path already complete");
+                // store.ingest.drv-modulo-cache+2: probe-first heal for
+                // complete .drvs whose cache row is missing (spawned;
+                // best-effort; no-op when the row exists).
+                if store_path.ends_with(".drv") {
+                    let pool = self.pool.clone();
+                    let chunks = self.chunk_cache.clone();
+                    let path = store_path.to_owned();
+                    tokio::spawn(async move {
+                        crate::metadata::drv_modulo::heal_if_missing(
+                            &pool,
+                            chunks.as_deref(),
+                            &path,
+                        )
+                        .await;
+                    });
+                }
                 Ok(None)
             }
             Ok(PlaceholderClaim::Concurrent) => {

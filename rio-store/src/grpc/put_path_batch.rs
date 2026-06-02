@@ -168,6 +168,16 @@ impl StoreServiceImpl {
                 Ok(PlaceholderClaim::AlreadyComplete) => {
                     accum.already_complete = true;
                     n_exists_emitted += 1;
+                    // store.ingest.drv-modulo-cache+2: a re-upload of a
+                    // complete .drv re-fires population — the natural
+                    // retry signal for rows whose original population
+                    // skipped on then-missing inputs. Bytes are in hand;
+                    // push them into the same post-commit fixpoint.
+                    if info.store_path.ends_with(".drv")
+                        && let Ok(bytes) = rio_nix::nar::extract_single_file(&accum.nar_data)
+                    {
+                        drv_cache_candidates.push((info.store_path.as_str().to_string(), bytes));
+                    }
                     continue;
                 }
                 Ok(PlaceholderClaim::Owned(c)) => c,
@@ -200,7 +210,7 @@ impl StoreServiceImpl {
             info.store_path_hash = accum.store_path_hash.clone();
             let nar_data = std::mem::take(&mut accum.nar_data);
             // Capture .drv file bytes BEFORE staging consumes the NAR
-            // (store.ingest.drv-modulo-cache); populated only after the
+            // (store.ingest.drv-modulo-cache+2); populated only after the
             // batch commit succeeds.
             if info.store_path.ends_with(".drv")
                 && let Ok(bytes) = rio_nix::nar::extract_single_file(&nar_data)
@@ -227,14 +237,33 @@ impl StoreServiceImpl {
         for g in placeholder_guards {
             g.defuse();
         }
-        // r[impl store.ingest.drv-modulo-cache]
+        // r[impl store.ingest.drv-modulo-cache+2]
         // Best-effort modulo-cache population for the batch's .drv
-        // outputs, after the one-transaction commit made them durable.
-        // In-batch ordering is upload order; a consumer uploaded before
-        // its inputs in the SAME batch still skips (out-of-order) and
-        // completes via proof-time read-through.
-        for (drv_path, bytes) in drv_cache_candidates {
-            crate::metadata::drv_modulo::populate_on_ingest(&self.pool, &drv_path, &bytes).await;
+        // outputs, after the one-transaction commit made them durable —
+        // run to FIXPOINT so in-batch ordering is irrelevant: a consumer
+        // uploaded before its inputs in the same batch populates on a
+        // later pass once they do (bug_102 sibling of the ordering
+        // class; pattern R2 — the per-upload single pass was an
+        // enumeration of "sites that populate" that silently excluded
+        // reverse-topological batches).
+        let mut pending = drv_cache_candidates;
+        loop {
+            let mut next = Vec::with_capacity(pending.len());
+            let mut progressed = false;
+            for (drv_path, bytes) in pending {
+                use crate::metadata::drv_modulo::PopulateOutcome;
+                match crate::metadata::drv_modulo::populate_on_ingest(&self.pool, &drv_path, &bytes)
+                    .await
+                {
+                    PopulateOutcome::Populated => progressed = true,
+                    PopulateOutcome::MissingInput => next.push((drv_path, bytes)),
+                    PopulateOutcome::Skipped => {}
+                }
+            }
+            if !progressed || next.is_empty() {
+                break;
+            }
+            pending = next;
         }
         Ok(Response::new(PutPathBatchResponse { created }))
     }

@@ -437,7 +437,7 @@ side (`gw.dag.drv-cache-text-ca`); `store.put.idempotent` is unchanged ---
 an already-complete `.drv` path no-ops, which is harmless because the
 registered copy is content-bound to the path.
 
-#r("store.ingest.drv-modulo-cache")[
+#r("store.ingest.drv-modulo-cache+2")[
   When a `.drv` upload finalizes, the store MUST best-effort populate a
   persistent modulo cache from its OWN copy of the bytes: the
   `hashDerivationModulo` value, the statically derived
@@ -447,7 +447,12 @@ registered copy is content-bound to the path.
   MUST be resolved only from existing cache rows at ingestion time;
   population MUST never fail the upload (missing inputs and unparseable
   bytes skip with a counter), and cached values are immutable
-  content-derived facts (idempotent insert, no overwrite).
+  content-derived facts (idempotent insert, no overwrite). Population
+  MUST be order-independent: a batch's `.drv` candidates run to
+  FIXPOINT (passes repeat until none makes progress), so
+  reverse-topological in-batch ordering populates every row; a re-upload
+  of an ALREADY-COMPLETE `.drv` re-fires population for that path; and
+  the heal is probe-first --- a present row makes it a no-op.
 ]
 This is rio's persistent form of CppNix's `drvHashes` /
 `pathDerivationModulo` (`derivations.cc:856-874`) feeding
@@ -455,13 +460,12 @@ This is rio's persistent form of CppNix's `drvHashes` /
 authority for "which output paths does this deriver own" is the store's
 own text-CA-bound bytes (#rref("store.put.drv-text-ca") makes a `.drv`
 path the unique preimage of its bytes), never a client's claim. Rows the
-ingestion pass skips — out-of-order uploads are normal, a consumer's
-inputs may land later or in the same batch behind it — are completed
-read-through at proof time by the IA deriver-proof gate, which computes
-from the store's own backend with bounded fetches and warms the cache.
-Resolvers in the hash walk are synchronous by design; all I/O happens
-before the walk (cache-row seeding at ingestion; arena pre-fetch at
-proof time).
+ingestion pass still skips — a consumer whose inputs have not arrived in
+ANY completed upload yet — are completed read-through at proof time by
+the IA deriver-proof gate, which computes from the store's own backend
+under its work budget and warms the cache. Resolvers in the hash walk
+are synchronous by design; all I/O happens before the walk (cache-row
+seeding at ingestion; arena pre-fetch at proof time).
 
 #r("store.put.ia-deriver-proof+3")[
   A descriptor-less upload under signed assignment claims that are

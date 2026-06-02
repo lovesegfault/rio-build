@@ -1,4 +1,4 @@
-//! Store-side derivation modulo cache (`store.ingest.drv-modulo-cache`).
+//! Store-side derivation modulo cache (`store.ingest.drv-modulo-cache+2`).
 //!
 //! The cache is rio's persistent `drvHashes`/`pathDerivationModulo`
 //! (CppNix `derivations.cc:856-874`): populated best-effort at `.drv`
@@ -97,7 +97,7 @@ async fn cache_row(
     .await?)
 }
 
-// r[verify store.ingest.drv-modulo-cache]
+// r[verify store.ingest.drv-modulo-cache+2]
 /// Golden parity: ingesting a leaf `.drv` populates a row whose modulo
 /// hash equals `rio_nix::hash_derivation_modulo` over the same bytes,
 /// and whose IA output map equals the CppNix-minted declared paths
@@ -135,7 +135,7 @@ async fn ingest_populates_modulo_row_with_golden_parity() -> TestResult {
     Ok(())
 }
 
-// r[verify store.ingest.drv-modulo-cache]
+// r[verify store.ingest.drv-modulo-cache+2]
 /// Chain ingestion: with leaf + multi + fod resident, the consumer's
 /// row derives from CACHE-SEEDED input hashes and must equal the
 /// full-resolution walk over the in-memory corpus — the cache-seeding
@@ -203,7 +203,7 @@ async fn chain_ingestion_seeds_inputs_from_cache_rows() -> TestResult {
     Ok(())
 }
 
-// r[verify store.ingest.drv-modulo-cache]
+// r[verify store.ingest.drv-modulo-cache+2]
 /// Out-of-order upload: a consumer arriving before its inputs SKIPS
 /// population (no row) but the upload itself succeeds — read-through at
 /// proof time completes the chain later.
@@ -228,7 +228,7 @@ async fn out_of_order_upload_skips_population_without_failing() -> TestResult {
     Ok(())
 }
 
-// r[verify store.ingest.drv-modulo-cache]
+// r[verify store.ingest.drv-modulo-cache+2]
 /// Fixed-output derivers cache their modulo hash with an EMPTY IA map
 /// (their paths derive from the declared content hash, not the input
 /// walk); floating-CA derivers are marked deferred.
@@ -266,7 +266,7 @@ async fn fod_and_floating_rows_have_correct_shapes() -> TestResult {
     Ok(())
 }
 
-// r[verify store.ingest.drv-modulo-cache]
+// r[verify store.ingest.drv-modulo-cache+2]
 /// Ordering pin: the text-CA gate runs FIRST — bytes claimed at a
 /// non-matching `.drv` path are rejected before the population hook can
 /// see them; and text-CA-valid garbage uploads fine but populates
@@ -727,4 +727,139 @@ mod proof_walk {
         );
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// C1c4: self-healing ingestion (order-independence by construction)
+// ---------------------------------------------------------------------------
+
+// r[verify store.ingest.drv-modulo-cache+2]
+/// A reverse-topological batch (consumer FIRST, leaf LAST) populates
+/// every row via the post-commit fixpoint — pre-fix only the leaf
+/// populated and the rest waited for a proof-time read-through.
+#[tokio::test]
+async fn reverse_topological_batch_populates_all() -> TestResult {
+    use rio_proto::types::{PutPathBatchRequest, PutPathRequest, put_path_request};
+    let s = StoreSession::new_with_service_hmac(TEST_KEY.to_vec(), SERVICE_KEY.to_vec()).await?;
+
+    // consumer -> multi -> leaf (golden corpus chain), uploaded in ONE
+    // batch in REVERSE topological order.
+    let entries: Vec<(&str, &str, Vec<&str>)> = vec![
+        (
+            GOLDEN_CONSUMER_PATH,
+            GOLDEN_CONSUMER,
+            vec![GOLDEN_FOD_PATH, GOLDEN_LEAF_PATH, GOLDEN_MULTI_PATH],
+        ),
+        (GOLDEN_MULTI_PATH, GOLDEN_MULTI, vec![]),
+        (GOLDEN_FOD_PATH, GOLDEN_FOD, vec![]),
+        (GOLDEN_LEAF_PATH, GOLDEN_LEAF, vec![]),
+    ];
+
+    let (tx, rx) = mpsc::channel(32);
+    for (idx, (path, text, refs)) in entries.iter().enumerate() {
+        let text = text.trim_end();
+        let node = rio_nix::nar::NarNode::Regular {
+            executable: false,
+            contents: text.as_bytes().to_vec(),
+        };
+        let mut nar = Vec::new();
+        rio_nix::nar::serialize(&mut nar, &node)?;
+        let mut info = make_path_info_for_nar(path, &nar);
+        info.references = refs
+            .iter()
+            .map(|r| rio_nix::store_path::StorePath::parse(r))
+            .collect::<Result<_, _>>()?;
+        let mut info: PathInfo = info.into();
+        let trailer = rio_proto::types::PutPathTrailer {
+            nar_hash: std::mem::take(&mut info.nar_hash),
+            nar_size: std::mem::take(&mut info.nar_size),
+        };
+        for msg in [
+            put_path_request::Msg::Metadata(rio_proto::types::PutPathMetadata { info: Some(info) }),
+            put_path_request::Msg::NarChunk(nar),
+            put_path_request::Msg::Trailer(trailer),
+        ] {
+            tx.send(PutPathBatchRequest {
+                output_index: idx as u32,
+                inner: Some(PutPathRequest { msg: Some(msg) }),
+            })
+            .await
+            .unwrap();
+        }
+    }
+    drop(tx);
+    let mut req = tonic::Request::new(ReceiverStream::new(rx));
+    req.metadata_mut().insert(
+        rio_proto::SERVICE_TOKEN_HEADER,
+        service_token().parse().unwrap(),
+    );
+    let mut client = s.client.clone();
+    let resp = client.put_path_batch(req).await?.into_inner();
+    assert_eq!(resp.created, vec![true, true, true, true]);
+
+    for (path, _, _) in &entries {
+        assert!(
+            cache_row(&s.db.pool, path).await?.is_some(),
+            "fixpoint populated {path} despite reverse-topological order"
+        );
+    }
+    Ok(())
+}
+
+// r[verify store.ingest.drv-modulo-cache+2]
+/// Re-upload of an already-complete `.drv` heals a missing cache row
+/// (created=false; probe-first heal re-fires population).
+#[tokio::test]
+async fn already_complete_reupload_heals() -> TestResult {
+    let mut s =
+        StoreSession::new_with_service_hmac(TEST_KEY.to_vec(), SERVICE_KEY.to_vec()).await?;
+    assert!(upload_drv_at(&mut s, GOLDEN_LEAF_PATH, GOLDEN_LEAF, &[]).await?);
+    assert!(cache_row(&s.db.pool, GOLDEN_LEAF_PATH).await?.is_some());
+
+    // Evict the row (simulates a row whose original population skipped).
+    sqlx::query("DELETE FROM drv_modulo_cache")
+        .execute(&s.db.pool)
+        .await?;
+    assert!(cache_row(&s.db.pool, GOLDEN_LEAF_PATH).await?.is_none());
+
+    // Re-upload: created=false, heal re-populates (spawned — poll).
+    assert!(!upload_drv_at(&mut s, GOLDEN_LEAF_PATH, GOLDEN_LEAF, &[]).await?);
+    let mut tries = 0;
+    loop {
+        if cache_row(&s.db.pool, GOLDEN_LEAF_PATH).await?.is_some() {
+            break;
+        }
+        tries += 1;
+        assert!(tries < 100, "heal must repopulate the evicted row");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+// r[verify store.ingest.drv-modulo-cache+2]
+/// Probe-first: when the row already exists, the already-complete
+/// re-upload changes nothing (immutable content-derived facts).
+#[tokio::test]
+async fn probe_first_heal_is_noop() -> TestResult {
+    let mut s =
+        StoreSession::new_with_service_hmac(TEST_KEY.to_vec(), SERVICE_KEY.to_vec()).await?;
+    assert!(upload_drv_at(&mut s, GOLDEN_LEAF_PATH, GOLDEN_LEAF, &[]).await?);
+    let before = cache_row(&s.db.pool, GOLDEN_LEAF_PATH)
+        .await?
+        .expect("populated");
+
+    assert!(!upload_drv_at(&mut s, GOLDEN_LEAF_PATH, GOLDEN_LEAF, &[]).await?);
+    // Give a hypothetical (buggy) rewrite a chance to land, then assert
+    // byte-identical row.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let after = cache_row(&s.db.pool, GOLDEN_LEAF_PATH)
+        .await?
+        .expect("still present");
+    assert_eq!(before.0, after.0, "modulo hash unchanged");
+    assert_eq!(before.2, after.2, "deferred flag unchanged");
+    let n: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM drv_modulo_cache")
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(n, 1);
+    Ok(())
 }

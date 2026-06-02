@@ -159,7 +159,7 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_drv_modulo_cache_total",
         "Store-side derivation modulo-cache population events at .drv \
-         ingestion (store.ingest.drv-modulo-cache), labeled by event: \
+         ingestion (store.ingest.drv-modulo-cache+2), labeled by event: \
          populated | skipped_missing_input (out-of-order upload; \
          proof-time read-through completes it) | parse_failed \
          (text-CA-valid bytes that are not a derivation) | \

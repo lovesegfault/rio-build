@@ -605,7 +605,12 @@ pub(super) async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncW
     // validate references at PutPath time (rio-store/src/metadata/inline.rs:
     // refs go into a `text[]` column, no FK, no existence check — they're
     // walked by GC mark, not validated at insert), so reordering is safe
-    // even though Nix sends entries in topological order.
+    // even though Nix sends entries in topological order. The store's
+    // .drv modulo-cache population is likewise order-independent BY
+    // CONSTRUCTION (store.ingest.drv-modulo-cache+2: in-batch fixpoint,
+    // already-complete re-fire, proof-time read-through) — concurrent
+    // out-of-order .drv arrivals here cost at most a later heal, never
+    // a permanently unprovable deriver.
     //
     // I-052: live-measured ~20 paths/sec sequential (store p50=25ms). At
     // 45k entries that's ~31 minutes before any build starts. 32-way

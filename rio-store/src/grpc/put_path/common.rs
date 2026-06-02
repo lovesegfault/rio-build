@@ -1025,7 +1025,7 @@ impl StoreServiceImpl {
     ) -> Result<(), Status> {
         self.maybe_sign(tenant_id, &mut info).await;
         // Capture the .drv file bytes BEFORE persist_nar consumes the
-        // NAR (store.ingest.drv-modulo-cache): the modulo-cache hook
+        // NAR (store.ingest.drv-modulo-cache+2): the modulo-cache hook
         // runs only after the persist succeeds, but the bytes are gone
         // by then. ~KBs for any real .drv; non-derivations skip.
         let drv_bytes_for_cache: Option<Vec<u8>> = if info.store_path.ends_with(".drv") {
@@ -1037,7 +1037,7 @@ impl StoreServiceImpl {
             self.abort_upload(&info.store_path_hash, claim).await;
             return Err(e);
         }
-        // r[impl store.ingest.drv-modulo-cache]
+        // r[impl store.ingest.drv-modulo-cache+2]
         // Best-effort, AFTER the text-CA gate (verify_drv_text_path ran
         // before this finalize) and AFTER the NAR is durable — a
         // population failure never fails the upload.
