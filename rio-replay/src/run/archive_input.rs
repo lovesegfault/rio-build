@@ -6,14 +6,17 @@
 //! the legacy eval-set artifacts ([`ManifestEntry`], [`DepClosureEntry`]);
 //! these adapters fill those shapes from an open
 //! [`ReplayArchive`] instead:
-//! `units.jsonl` records become manifest entries, the per-derivation
-//! adjacency in `closures.jsonl` is expanded into per-unit transitive
-//! dependency closures, and `exclusions.jsonl` feeds the plan-time
-//! completeness accounting.
+//! the requests-derived workload becomes manifest entries (enriched from
+//! `units.jsonl` records where the recorder wrote them, recovered from the
+//! embedded derivation ATerms otherwise), the per-derivation adjacency in
+//! `closures.jsonl` is expanded into per-unit transitive dependency
+//! closures, and `exclusions.jsonl` feeds the plan-time completeness
+//! accounting.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
+use rio_nix::derivation::Derivation;
 use serde::{Deserialize, Serialize};
 
 use crate::archive::reader::ReplayArchive;
@@ -58,29 +61,52 @@ pub struct DepDrvOutputs {
     pub output_paths: Vec<String>,
 }
 
-/// Workload units from the archive's `units.jsonl`, one [`ManifestEntry`]
-/// per record: `job`/`attr` from the record's label (drv basename without
-/// the `.drv` suffix when the label is absent), `system` (empty string
-/// when absent), declared outputs, and required features.
+/// Workload units in the shape the plan stage consumes, one
+/// [`ManifestEntry`] per derivation in the requests-derived workload.
 ///
-/// Records for derivations no recorded request targets are skipped with a
-/// warning (the reader already drops them at open; the check here is a
-/// second line of defense). The returned entries are sorted by job then
-/// drv path so plan-time iteration order is deterministic — the archive's
-/// unit map carries no inherent order.
+/// The required `requests.jsonl` member is the source of the workload (the
+/// union of all request targets, per the archive contract); the optional
+/// `units.jsonl` member only enriches entries. A workload derivation with
+/// a unit record takes `job`/`attr` from the record's label (drv basename
+/// without the `.drv` suffix when the label is absent), `system` (empty
+/// string when absent), declared outputs, and required features. A
+/// workload derivation without one has the same fields recovered from its
+/// embedded derivation ATerm (see `workload_entry`) — so an archive
+/// without `units.jsonl` (or with one covering only part of the workload)
+/// still plans its full workload instead of silently shrinking it.
+///
+/// The returned entries are sorted by job then drv path so plan-time
+/// iteration order is deterministic.
 pub fn load_units(archive: &ReplayArchive) -> Result<Vec<ManifestEntry>> {
-    let workload = archive.workload_units();
-    let mut units = Vec::with_capacity(archive.units().len());
-    for record in archive.units().values() {
-        if !workload.contains(&record.drv) {
-            tracing::warn!(
-                drv = %record.drv,
-                "skipping a units.jsonl record for a derivation no recorded request targets"
-            );
-            continue;
-        }
+    let units = archive.units();
+    let mut entries = Vec::with_capacity(archive.workload_units().len());
+    for drv in archive.workload_units() {
+        entries.push(workload_entry(archive, drv, units.get(drv))?);
+    }
+    entries.sort_by(|a, b| a.job.cmp(&b.job).then_with(|| a.drv_path.cmp(&b.drv_path)));
+    Ok(entries)
+}
+
+/// One workload unit's manifest entry: metadata from its `units.jsonl`
+/// record when the recorder wrote one, recovered from the unit's embedded
+/// derivation ATerm otherwise.
+///
+/// The recovery parses the real derivation rather than synthesizing an
+/// entry from the request target alone: the entry's `outputs` feed the
+/// warm-set computation, cached-prior detection, and NAR comparison, so an
+/// empty-outputs placeholder would not fail — it would silently degrade
+/// exactly those comparisons for the synthesized units. A workload
+/// derivation whose ATerm is missing from the archive is therefore a hard
+/// per-unit error (the archive cannot say what the unit produces), never a
+/// silent skip.
+fn workload_entry(
+    archive: &ReplayArchive,
+    drv: &str,
+    record: Option<&UnitRecord>,
+) -> Result<ManifestEntry> {
+    if let Some(record) = record {
         let job = unit_job(record);
-        units.push(ManifestEntry {
+        return Ok(ManifestEntry {
             job: job.clone(),
             system: record.system.clone().unwrap_or_default(),
             attr: job,
@@ -89,8 +115,40 @@ pub fn load_units(archive: &ReplayArchive) -> Result<Vec<ManifestEntry>> {
             required_features: record.required_features.clone(),
         });
     }
-    units.sort_by(|a, b| a.job.cmp(&b.job).then_with(|| a.drv_path.cmp(&b.drv_path)));
-    Ok(units)
+    let text = archive.read_drv(drv).with_context(|| {
+        format!(
+            "workload unit {drv} has no units.jsonl record and no readable derivation in the \
+             archive to recover its outputs from"
+        )
+    })?;
+    let derivation = Derivation::parse(&text)
+        .with_context(|| format!("parsing the embedded derivation of workload unit {drv}"))?;
+    // Statically declared output paths only, mirroring what recorders put
+    // in units.jsonl: floating content-addressed outputs have no path until
+    // they are built, so they cannot enter path-keyed planning.
+    let outputs: BTreeMap<String, String> = derivation
+        .outputs()
+        .iter()
+        .filter(|output| !output.path().is_empty())
+        .map(|output| (output.name().to_string(), output.path().to_string()))
+        .collect();
+    // `requiredSystemFeatures` is an ASCII-whitespace-separated env list,
+    // kept in declaration order — the same extraction the recorder applies
+    // when it backfills unit metadata.
+    let required_features: Vec<String> = derivation
+        .env()
+        .get("requiredSystemFeatures")
+        .map(|raw| raw.split_ascii_whitespace().map(String::from).collect())
+        .unwrap_or_default();
+    let job = drv_basename_job(drv);
+    Ok(ManifestEntry {
+        job: job.clone(),
+        system: derivation.platform().to_string(),
+        attr: job,
+        drv_path: drv.to_string(),
+        outputs,
+        required_features,
+    })
 }
 
 /// Per-unit proper transitive dependency closures, reconstructed from the
@@ -204,11 +262,16 @@ pub fn identity_divergent_units(archive: &ReplayArchive) -> Result<Vec<String>> 
 fn unit_job(record: &UnitRecord) -> String {
     match &record.label {
         Some(label) => label.clone(),
-        None => {
-            let base = record.drv.rsplit('/').next().unwrap_or(&record.drv);
-            base.strip_suffix(".drv").unwrap_or(base).to_string()
-        }
+        None => drv_basename_job(&record.drv),
     }
+}
+
+/// The label-less job-name fallback: the drv basename without the `.drv`
+/// suffix. Shared by record-carrying units without a label and workload
+/// units recovered straight from their ATerm (which has no label at all).
+fn drv_basename_job(drv: &str) -> String {
+    let base = drv.rsplit('/').next().unwrap_or(drv);
+    base.strip_suffix(".drv").unwrap_or(base).to_string()
 }
 
 /// Identity of the synthetic archive written by [`write_mini_archive`].
@@ -236,6 +299,18 @@ pub(crate) fn fake_hash(seed: &str) -> String {
 /// derivation, no input sources, and a trivial builder.
 #[cfg(test)]
 fn synth_aterm(outputs: &[(&str, &str)], input_drvs: &[&str], system: &str) -> String {
+    synth_aterm_with_env(outputs, input_drvs, system, &[])
+}
+
+/// [`synth_aterm`] plus extra env entries (e.g. `requiredSystemFeatures`),
+/// appended after the per-output env entries in the given order.
+#[cfg(test)]
+fn synth_aterm_with_env(
+    outputs: &[(&str, &str)],
+    input_drvs: &[&str],
+    system: &str,
+    extra_env: &[(&str, &str)],
+) -> String {
     let outs = outputs
         .iter()
         .map(|(name, path)| format!(r#"("{name}","{path}","","")"#))
@@ -248,6 +323,7 @@ fn synth_aterm(outputs: &[(&str, &str)], input_drvs: &[&str], system: &str) -> S
         .join(",");
     let env = outputs
         .iter()
+        .chain(extra_env)
         .map(|(name, path)| format!(r#"("{name}","{path}")"#))
         .collect::<Vec<_>>()
         .join(",");
@@ -819,5 +895,193 @@ mod tests {
         let archive = ReplayArchive::open(tmp.path()).unwrap();
         let divergent = identity_divergent_units(&archive).unwrap();
         assert_eq!(divergent, vec!["divergentC.x86_64-linux".to_string()]);
+    }
+
+    /// Two-unit archive (appA on x86, libB on aarch64 with a multi-output,
+    /// CA-output, feature-requiring derivation) whose `units.jsonl`
+    /// coverage is the given subset of the workload. The workload itself
+    /// always comes from `requests.jsonl`.
+    fn write_units_subset_archive(dir: &std::path::Path, unit_records_for: &[&str]) {
+        use crate::archive::schema::{
+            Capabilities, ExpectedOutcome, OutcomeRecord, RequestRecord, RequestTarget,
+            Substituters,
+        };
+        use crate::archive::writer::{ArchiveWriter, ManifestSeed};
+
+        let app_a_drv = format!("/nix/store/{}-appA-1.0.drv", fake_hash("appA-drv"));
+        let app_a_out = format!("/nix/store/{}-appA-1.0", fake_hash("appA-out"));
+        let lib_b_drv = format!("/nix/store/{}-libB-2.0.drv", fake_hash("libB-drv"));
+        let lib_b_out = format!("/nix/store/{}-libB-2.0", fake_hash("libB-out"));
+        let lib_b_dev = format!("/nix/store/{}-libB-2.0-dev", fake_hash("libB-dev"));
+
+        let writer = ArchiveWriter::create(dir).unwrap();
+        writer
+            .add_drv(
+                &app_a_drv,
+                &synth_aterm(&[("out", app_a_out.as_str())], &[], "x86_64-linux"),
+            )
+            .unwrap();
+        // libB: two declared outputs, one floating CA output (empty path),
+        // and a requiredSystemFeatures declaration — the metadata shapes
+        // ATerm recovery must reproduce.
+        writer
+            .add_drv(
+                &lib_b_drv,
+                &synth_aterm_with_env(
+                    &[
+                        ("dev", lib_b_dev.as_str()),
+                        ("doc", ""),
+                        ("out", lib_b_out.as_str()),
+                    ],
+                    &[],
+                    "aarch64-linux",
+                    &[("requiredSystemFeatures", "kvm big-parallel")],
+                ),
+            )
+            .unwrap();
+
+        if !unit_records_for.is_empty() {
+            let records: Vec<UnitRecord> = unit_records_for
+                .iter()
+                .map(|name| match *name {
+                    "appA" => UnitRecord {
+                        drv: app_a_drv.clone(),
+                        label: Some("appA.x86_64-linux".to_string()),
+                        system: Some("x86_64-linux".to_string()),
+                        outputs: BTreeMap::from([("out".to_string(), app_a_out.clone())]),
+                        required_features: Vec::new(),
+                        identity_divergent: false,
+                    },
+                    other => panic!("unknown unit fixture {other}"),
+                })
+                .collect();
+            writer.write_units(&records).unwrap();
+        }
+
+        writer
+            .write_requests(&[
+                RequestRecord {
+                    session: 0,
+                    offset_s: 0.0,
+                    targets: vec![RequestTarget {
+                        drv: app_a_drv.clone(),
+                        outputs: vec!["*".to_string()],
+                    }],
+                },
+                RequestRecord {
+                    session: 0,
+                    offset_s: 0.0,
+                    targets: vec![RequestTarget {
+                        drv: lib_b_drv.clone(),
+                        outputs: vec!["*".to_string()],
+                    }],
+                },
+            ])
+            .unwrap();
+        writer
+            .write_outcomes(&[OutcomeRecord {
+                session: None,
+                drv: app_a_drv.clone(),
+                outcome: ExpectedOutcome::Built,
+                detail: None,
+                duration_s: None,
+                stop_offset_s: None,
+                outputs: BTreeMap::new(),
+            }])
+            .unwrap();
+
+        let stamp: jiff::Timestamp = "2026-05-28T00:00:00Z".parse().unwrap();
+        writer
+            .finalize(ManifestSeed {
+                created_at: stamp,
+                from: stamp,
+                to: stamp,
+                capabilities: Capabilities {
+                    timed: false,
+                    expected_outcomes: true,
+                    output_hashes: false,
+                    embedded_store_paths: false,
+                    impure_env: false,
+                    dependency_closures: false,
+                },
+                substituters: Substituters {
+                    relay: Vec::new(),
+                    target: Vec::new(),
+                },
+                fat: false,
+                provenance: serde_json::Map::new(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn load_units_recovers_the_workload_from_aterms_without_units_jsonl() {
+        // A spec-conforming archive without units.jsonl: the workload comes
+        // from requests.jsonl and every entry's metadata is recovered from
+        // the embedded derivation — never an empty (zero-unit) plan and
+        // never an outputs-less placeholder.
+        let tmp = tempfile::tempdir().unwrap();
+        write_units_subset_archive(tmp.path(), &[]);
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        assert!(archive.units().is_empty(), "fixture stages no units.jsonl");
+        assert_eq!(archive.workload_units().len(), 2);
+
+        let units = load_units(&archive).unwrap();
+        assert_eq!(units.len(), 2, "the full request workload is planned");
+
+        let lib_b = units.iter().find(|u| u.job.contains("libB")).unwrap();
+        // job/attr fall back to the drv basename without the .drv suffix
+        assert!(lib_b.job.ends_with("-libB-2.0"), "got: {}", lib_b.job);
+        assert_eq!(lib_b.attr, lib_b.job);
+        assert_eq!(lib_b.system, "aarch64-linux");
+        // declared outputs recovered; the floating CA output (empty path)
+        // is excluded exactly as recorders exclude it from units.jsonl
+        assert_eq!(lib_b.outputs.len(), 2);
+        assert!(lib_b.outputs.contains_key("out"));
+        assert!(lib_b.outputs.contains_key("dev"));
+        assert!(!lib_b.outputs.contains_key("doc"));
+        assert_eq!(
+            lib_b.required_features,
+            vec!["kvm".to_string(), "big-parallel".to_string()],
+            "requiredSystemFeatures recovered in declaration order"
+        );
+
+        let app_a = units.iter().find(|u| u.job.contains("appA")).unwrap();
+        assert_eq!(app_a.system, "x86_64-linux");
+        assert_eq!(app_a.outputs.len(), 1);
+    }
+
+    #[test]
+    fn load_units_keeps_workload_targets_not_covered_by_units_jsonl() {
+        // units.jsonl covering a subset of the request targets must not
+        // shrink the workload: covered units keep their recorded label,
+        // uncovered ones are recovered from their ATerm.
+        let tmp = tempfile::tempdir().unwrap();
+        write_units_subset_archive(tmp.path(), &["appA"]);
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        assert_eq!(archive.units().len(), 1);
+
+        let units = load_units(&archive).unwrap();
+        assert_eq!(units.len(), 2, "the uncovered target is not dropped");
+        assert!(units.iter().any(|u| u.job == "appA.x86_64-linux"));
+        let lib_b = units.iter().find(|u| u.job.contains("libB")).unwrap();
+        assert_eq!(lib_b.system, "aarch64-linux");
+        assert!(!lib_b.outputs.is_empty());
+    }
+
+    #[test]
+    fn load_units_fails_loudly_when_a_recoverable_unit_has_no_drv_member() {
+        // A workload unit with neither a units.jsonl record nor a readable
+        // embedded derivation cannot say what it produces; that is a
+        // per-unit hard error naming the derivation, never a silent skip.
+        let tmp = tempfile::tempdir().unwrap();
+        write_units_subset_archive(tmp.path(), &[]);
+        let lib_b_drv_name = format!("{}-libB-2.0.drv", fake_hash("libB-drv"));
+        std::fs::remove_file(tmp.path().join("nix/store").join(&lib_b_drv_name)).unwrap();
+
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let err = format!("{:#}", load_units(&archive).unwrap_err());
+        assert!(err.contains("no units.jsonl record"), "got: {err}");
+        assert!(err.contains("libB-2.0.drv"), "error names the drv: {err}");
     }
 }

@@ -287,7 +287,7 @@ The workload is the union of all `targets[].drv` across requests. The engine's t
 | `required_features` | array of string | no | Required system features (from `requiredSystemFeatures`), used by feature-exclusion filters. |
 | `identity_divergent` | bool | no (default `false`) | Set by the recorder when its fidelity gate found this unit's derivation identity divergent from the source it recorded. The engine assigns such units the `identity-divergent` disposition and never compares them (§7.2). |
 
-Records for derivations that are not workload units are ignored with a warning. Archives without `units.jsonl` are fully usable; filters that need labels degrade to matching on store-path names.
+Records for derivations that are not workload units are ignored with a warning. Archives without `units.jsonl` (or whose records cover only part of the workload) are fully usable: the engine plans the requests-derived workload regardless, recovering each uncovered unit's `system`, declared outputs, and required features from its embedded `.drv` ATerm — a workload unit with neither a `units.jsonl` record nor a readable embedded derivation is a per-unit hard error, because the archive then cannot say what the unit produces. Filters that need labels degrade to matching on store-path names.
 
 **`closures.jsonl`** (optional, capability `dependency_closures`) — direct dependency adjacency for every derivation in the union requisite closure of the workload (workload units included), one record per derivation:
 
