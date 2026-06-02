@@ -232,6 +232,14 @@ impl Watchdog {
         self.jobs.remove(job);
     }
 
+    /// Test-only view of a job's current phase (`None` = not tracked), so
+    /// transition-site tests can assert observations without reaching into
+    /// the private clock map.
+    #[cfg(test)]
+    pub fn phase_of(&self, job: &str) -> Option<JobPhase> {
+        self.jobs.get(job).map(|clock| clock.phase)
+    }
+
     /// Update the streaks from this tick's observations and return the
     /// currently active suspension components.
     fn evaluate_components(&mut self, tick: &PollTick) -> Vec<&'static str> {

@@ -1,7 +1,10 @@
 //! Submit stage: turns the attemptable, not-yet-terminal job set into
 //! batched gateway submissions. Runs concurrently with collect; the
 //! two stages communicate only through results.jsonl/batches.jsonl and
-//! the in-memory [`SubmitTracker`]. Per-job requeue decisions belong to
+//! the in-memory scheduling state behind the
+//! [`JobLedger`](super::ledger::JobLedger) (the [`SubmitTracker`] plus the
+//! watchdog's phase view — batch commitment goes through the ledger so the
+//! watchdog observes every submission). Per-job requeue decisions belong to
 //! collect — this loop simply re-offers any job whose latest record is
 //! non-terminal, that is not currently in flight, and whose
 //! post-settlement cool-down has expired (the cool-down gives the collect
@@ -17,6 +20,7 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 
 use super::batch::{Batch, PendingJob, assemble_batches};
+use super::ledger::JobLedger;
 use super::model::{BATCH_KIND_SUBMIT, BatchRecord, PauseState, now_rfc3339};
 use super::spec::Knobs;
 use super::state::{StateDir, StateFile};
@@ -239,7 +243,7 @@ pub async fn submit_one_batch(
 pub async fn run_submit_loop(
     state: Arc<StateDir>,
     submitter: Arc<dyn Submitter>,
-    tracker: Arc<SubmitTracker>,
+    ledger: Arc<JobLedger>,
     pause: Arc<PauseState>,
     attemptable: Vec<PendingJob>,
     terminal_jobs: impl Fn() -> HashSet<String> + Send + Sync + 'static,
@@ -282,14 +286,15 @@ pub async fn run_submit_loop(
         let terminal = terminal_jobs();
         let (in_flight_snapshot, resubs) = {
             (
-                tracker.in_flight.lock().await.clone(),
-                tracker.resubmissions.lock().await.clone(),
+                ledger.tracker().in_flight.lock().await.clone(),
+                ledger.tracker().resubmissions.lock().await.clone(),
             )
         };
         // Jobs still inside the post-settlement cool-down are withheld from
         // this wave; ones that already reached a terminal record are dropped
         // from the cooling view so they cannot keep the loop alive.
-        let cooling: HashSet<String> = tracker
+        let cooling: HashSet<String> = ledger
+            .tracker()
             .cooling_jobs()
             .await
             .into_iter()
@@ -340,12 +345,21 @@ pub async fn run_submit_loop(
             drop(permit);
             continue;
         }
-        {
-            let mut in_flight = tracker.in_flight.lock().await;
-            for job in &batch.jobs {
-                in_flight.insert(job.clone());
-            }
+        // The terminal set is just as stale across that wait: a member whose
+        // earlier batch settled and was classified terminal while this batch
+        // sat behind the semaphore must not be submitted again — the
+        // duplicate would waste a concurrency slot and its eventual records
+        // could displace the real verdict under latest-record-per-job
+        // semantics. The view never spuriously shrinks (terminal_view
+        // returns the last good snapshot under contention), so the re-check
+        // can only drop batches that genuinely contain finished work; the
+        // next wave re-packs the survivors.
+        let terminal_now = terminal_jobs();
+        if batch.jobs.iter().any(|job| terminal_now.contains(job)) {
+            drop(permit);
+            continue;
         }
+        ledger.commit_batch(&batch.jobs).await;
         let batch_id = batch_seq.fetch_add(1, Ordering::SeqCst);
         tracing::info!(
             batch_id,
@@ -356,7 +370,7 @@ pub async fn run_submit_loop(
         );
         let state = state.clone();
         let submitter = submitter.clone();
-        let tracker = tracker.clone();
+        let tracker = ledger.tracker_arc();
         let store_url = store_url.clone();
         let supply_topup = supply_topup.clone();
         join_set.spawn(async move {
@@ -410,6 +424,18 @@ mod tests {
     use crate::run::submitter::BatchOutcome;
     use crate::run::submitter::test_support::FakeSubmitter;
     use rio_nix::protocol::build::BuildStatus;
+
+    /// Wrap a tracker in a fresh ledger (default-knob watchdog) for the
+    /// submit-loop tests; the tests keep their tracker handle for direct
+    /// state assertions.
+    fn test_ledger(tracker: Arc<SubmitTracker>) -> Arc<JobLedger> {
+        Arc::new(JobLedger::new(
+            tracker,
+            Arc::new(Mutex::new(crate::run::watchdog::Watchdog::new(
+                Knobs::default(),
+            ))),
+        ))
+    }
 
     fn pj(name: &str, deps: usize) -> PendingJob {
         PendingJob {
@@ -675,7 +701,7 @@ mod tests {
         run_submit_loop(
             state.clone(),
             submitter.clone(),
-            tracker,
+            test_ledger(tracker),
             pause,
             attemptable,
             move || {
@@ -761,7 +787,7 @@ mod tests {
         run_submit_loop(
             state,
             submitter.clone(),
-            tracker,
+            test_ledger(tracker),
             pause,
             vec![pj("a", 0), pj("b", 0), pj("c", 0)],
             move || {
@@ -796,6 +822,57 @@ mod tests {
         }
     }
 
+    /// The permit wait is a staleness window for the terminal set, not just
+    /// pause/deadline: a batch whose member reached a terminal record after
+    /// wave selection must be dropped at the post-acquire re-check instead
+    /// of being submitted as a duplicate (which would waste a concurrency
+    /// slot and let its eventual records displace the real verdict under
+    /// latest-record-per-job semantics). The terminal view here flips
+    /// between selection (empty) and the post-acquire re-check (job
+    /// terminal), exactly the interleaving a slow classification leaves.
+    #[tokio::test]
+    async fn submit_loop_drops_batches_whose_jobs_settled_during_the_permit_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        let submitter = Arc::new(FakeSubmitter::default());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_view = calls.clone();
+        run_submit_loop(
+            state.clone(),
+            submitter.clone(),
+            test_ledger(Arc::new(SubmitTracker::default())),
+            Arc::new(PauseState::default()),
+            vec![pj("a", 0)],
+            move || {
+                // First call: the wave snapshot — job not yet terminal, so
+                // the batch is selected. Every later call (the post-acquire
+                // re-check, the next wave) sees it terminal.
+                if calls_view.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    HashSet::new()
+                } else {
+                    ["a".to_string()].into()
+                }
+            },
+            || false,
+            "ssh-ng://test".into(),
+            Knobs::default(),
+            Arc::new(AtomicU64::new(1)),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            submitter.submitted.lock().unwrap().is_empty(),
+            "the settled-while-waiting batch must be dropped, not submitted"
+        );
+        let records: Vec<BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
+        assert!(records.is_empty(), "{records:?}");
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the loop re-checked the terminal set after the permit"
+        );
+    }
+
     /// A deadline that is already reached exits cleanly before starting any
     /// batch: no submissions, no batch records, and the loop returns Ok.
     #[tokio::test]
@@ -806,7 +883,7 @@ mod tests {
         run_submit_loop(
             state.clone(),
             submitter.clone(),
-            Arc::new(SubmitTracker::default()),
+            test_ledger(Arc::new(SubmitTracker::default())),
             Arc::new(PauseState::default()),
             vec![pj("a", 0)],
             HashSet::new,
@@ -872,7 +949,7 @@ mod tests {
         let handle = tokio::spawn(run_submit_loop(
             state.clone(),
             submitter.clone(),
-            tracker,
+            test_ledger(tracker),
             pause,
             vec![pj("a", 0)],
             HashSet::new,
@@ -914,7 +991,7 @@ mod tests {
         let handle = tokio::spawn(run_submit_loop(
             state.clone(),
             submitter.clone(),
-            tracker,
+            test_ledger(tracker),
             pause.clone(),
             attemptable,
             HashSet::new,

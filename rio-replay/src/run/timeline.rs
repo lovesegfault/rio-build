@@ -49,12 +49,13 @@ use tokio::task::JoinSet;
 use crate::archive::reader::ReplayArchive;
 
 use super::batch::Batch;
+use super::ledger::JobLedger;
 use super::model::{
     BATCH_KIND_TIMED, BatchRecord, DispatchEntry, build_status_from_name, now_rfc3339,
 };
 use super::spec::{Knobs, SupplyDependencies};
 use super::state::{StateDir, StateFile};
-use super::submit::{SubmitTracker, submit_one_batch};
+use super::submit::submit_one_batch;
 use super::submitter::{BatchDeadline, Submitter};
 use super::supply::exec::PreSubmitSupply;
 use super::supply::{PathSource, resolve_source, walk_closure, workload_set};
@@ -677,7 +678,7 @@ pub struct TimedRunStats {
 struct DispatchShared {
     state: Arc<StateDir>,
     submitter: Arc<dyn Submitter>,
-    tracker: Arc<SubmitTracker>,
+    ledger: Arc<JobLedger>,
     timing: SharedTimingLookup,
     deadline_reached: Arc<dyn Fn() -> bool + Send + Sync>,
     /// Pre-submission supply hook (the campaign's [`LadderTopup`] when the
@@ -753,14 +754,14 @@ fn engine_side_submission_failure(record: &BatchRecord) -> bool {
 /// completes after `deadline_reached()` is recorded with `attempts: 0` and
 /// not submitted. The dispatcher never consults the pause state (pause is
 /// advisory in timed mode) and never registers queued jobs with the
-/// watchdog; in-flight requests surface to the watchdog as Active through
-/// the shared `tracker`, which is why the caller passes the same
-/// [`SubmitTracker`] the poller reads.
+/// watchdog; submissions are committed through the shared `ledger`, whose
+/// batch commitment both reserves the jobs in flight and observes them
+/// Active for the watchdog the poller ticks.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_timed_dispatch(
     state: Arc<StateDir>,
     submitter: Arc<dyn Submitter>,
-    tracker: Arc<SubmitTracker>,
+    ledger: Arc<JobLedger>,
     mut schedule: Vec<ScheduledRequest>,
     timing: SharedTimingLookup,
     store_url: String,
@@ -836,7 +837,7 @@ pub async fn run_timed_dispatch(
     let shared = Arc::new(DispatchShared {
         state,
         submitter,
-        tracker,
+        ledger,
         timing,
         deadline_reached: Arc::new(deadline_reached),
         topup,
@@ -1001,15 +1002,11 @@ async fn dispatch_one_request(
         .map(|plan| plan.drvs().map(str::to_string).collect())
         .unwrap_or_default();
 
-    // Reserve the jobs as in flight so the shared tracker (and through it
-    // the watchdog poller) sees this request as Active while it runs;
-    // submit_one_batch releases the reservation when the batch settles.
-    {
-        let mut in_flight = shared.tracker.in_flight.lock().await;
-        for job in &jobs {
-            in_flight.insert(job.clone());
-        }
-    }
+    // Commit the jobs through the ledger: the in-flight reservation and the
+    // watchdog's Active observation land together, so the poller sees this
+    // request as Active while it runs; submit_one_batch releases the
+    // reservation when the batch settles.
+    shared.ledger.commit_batch(&jobs).await;
     let batch_id = shared.batch_seq.fetch_add(1, Ordering::SeqCst);
     tracing::info!(
         request = scheduled.index,
@@ -1024,7 +1021,7 @@ async fn dispatch_one_request(
     let record = submit_one_batch(
         &shared.state,
         shared.submitter.as_ref(),
-        &shared.tracker,
+        shared.ledger.tracker(),
         &shared.store_url,
         BATCH_KIND_TIMED,
         batch_id,
@@ -1101,12 +1098,7 @@ async fn dispatch_one_request(
                 .iter()
                 .map(|target| target.job_key().to_string())
                 .collect();
-            {
-                let mut in_flight = shared.tracker.in_flight.lock().await;
-                for job in &retry_jobs {
-                    in_flight.insert(job.clone());
-                }
-            }
+            shared.ledger.commit_batch(&retry_jobs).await;
             let retry_id = shared.batch_seq.fetch_add(1, Ordering::SeqCst);
             tracing::info!(
                 request = scheduled.index,
@@ -1118,7 +1110,7 @@ async fn dispatch_one_request(
             let retry_record = submit_one_batch(
                 &shared.state,
                 shared.submitter.as_ref(),
-                &shared.tracker,
+                shared.ledger.tracker(),
                 &shared.store_url,
                 BATCH_KIND_TIMED,
                 retry_id,
@@ -1230,7 +1222,7 @@ mod tests {
 
     use rio_nix::protocol::build::BuildStatus;
 
-    use crate::run::collect::{BatchView, JobContext, process_settled_batch};
+    use crate::run::collect::{BatchView, CollectDecision, JobContext, process_settled_batch};
     use crate::run::grpc::test_support::FakeStoreApi;
     use crate::run::grpc::{AdminApi, GraphSnapshot, PoisonedView};
     use crate::run::model::{
@@ -1919,8 +1911,18 @@ mod tests {
         }
     }
 
+    /// Fresh scheduling-state ledger for one dispatcher test.
+    fn test_ledger() -> Arc<JobLedger> {
+        Arc::new(JobLedger::new(
+            Arc::new(crate::run::submit::SubmitTracker::default()),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::run::watchdog::Watchdog::new(Knobs::default()),
+            )),
+        ))
+    }
+
     /// Run the dispatcher with test defaults: no top-up, no deadline, a
-    /// fresh tracker, and batch ids starting at 1.
+    /// fresh ledger, and batch ids starting at 1.
     async fn drive_dispatch(
         state: &Arc<StateDir>,
         submitter: Arc<dyn Submitter>,
@@ -1932,7 +1934,7 @@ mod tests {
         run_timed_dispatch(
             state.clone(),
             submitter,
-            Arc::new(SubmitTracker::default()),
+            test_ledger(),
             schedule,
             timing,
             "ssh-ng://test".into(),
@@ -1966,7 +1968,7 @@ mod tests {
             interruption_drvs: record.interruption_drvs.clone(),
             submitted_at: Some(record.started_at.clone()),
         };
-        let requeue = process_settled_batch(
+        let decisions = process_settled_batch(
             state,
             &NoEvidenceAdmin,
             &FakeStoreApi::default(),
@@ -1979,12 +1981,15 @@ mod tests {
             "leaf",
             "ssh-ng://test",
             &HashMap::new(),
+            &HashSet::new(),
         )
         .await
         .unwrap();
         assert!(
-            requeue.is_empty(),
-            "timed batch members are never re-offered"
+            decisions
+                .values()
+                .all(|d| matches!(d, CollectDecision::Terminal { .. })),
+            "timed batch members are never re-offered: {decisions:?}"
         );
     }
 
@@ -2146,7 +2151,7 @@ mod tests {
         let stats = run_timed_dispatch(
             state.clone(),
             submitter.clone(),
-            Arc::new(SubmitTracker::default()),
+            test_ledger(),
             schedule,
             timing_arc(HashMap::new()),
             "ssh-ng://test".into(),
@@ -2514,7 +2519,7 @@ mod tests {
         let stats = run_timed_dispatch(
             state.clone(),
             submitter.clone(),
-            Arc::new(SubmitTracker::default()),
+            test_ledger(),
             schedule,
             timing_arc(map),
             "ssh-ng://test".into(),

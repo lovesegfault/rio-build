@@ -26,6 +26,7 @@ pub mod collect;
 pub mod drv_import;
 pub mod glob;
 pub mod grpc;
+pub mod ledger;
 pub mod model;
 pub mod plan;
 pub mod report;
@@ -82,7 +83,7 @@ use self::timeline::{
 };
 use self::truth::NarinfoSource;
 use self::watchdog::{
-    COMPONENT_DISPATCH, COMPONENT_PAUSE, JobPhase, PollTick, StallKind, StallVerdict, Watchdog,
+    COMPONENT_DISPATCH, COMPONENT_PAUSE, PollTick, StallKind, StallVerdict, Watchdog,
 };
 
 /// CLI arguments for `rio-replay run`.
@@ -893,23 +894,23 @@ fn stall_record(
 }
 
 /// Apply watchdog stall verdicts. The first ActiveStall for a job triggers
-/// the single auto-retry: release its in-flight reservation and count an
-/// engine resubmission so the submit loop re-offers the job in a fresh
-/// batch on the next wave (the stuck batch's nix child is left to the
-/// `batch_timeout_hours` backstop — the engine holds no handle to kill it
-/// from here, and its eventual settle is harmless under
-/// latest-record-wins). A second ActiveStall for the same job, or a
-/// QueuedEscalate, writes the terminal rio-infra-failure record
-/// ("stalled-active" / "stalled-queued") and retires the job.
-/// QueuedRequeue is purely a clock reset (the job is already in the
-/// pending set) — log only.
+/// the single auto-retry, applied through the ledger's stall-requeue
+/// transition: the in-flight reservation is released, an engine
+/// resubmission is counted, and the job is observed Queued so the submit
+/// loop re-offers it in a fresh batch on the next wave (the stuck batch's
+/// nix child is left to the `batch_timeout_hours` backstop — the engine
+/// holds no handle to kill it from here, and its eventual settle is
+/// dropped by collect's already-terminal belt once the job retires). A
+/// second ActiveStall for the same job, or a QueuedEscalate, writes the
+/// terminal rio-infra-failure record ("stalled-active" / "stalled-queued")
+/// and retires the job. QueuedRequeue is purely a clock reset (the job is
+/// already in the pending set) — log only.
 #[allow(clippy::too_many_arguments)]
 async fn apply_stall_actions(
     state: &StateDir,
-    tracker: &SubmitTracker,
+    ledger: &ledger::JobLedger,
     contexts: &HashMap<String, JobContext>,
     results: &tokio::sync::Mutex<BTreeMap<String, JobRecord>>,
-    watchdog: &tokio::sync::Mutex<Watchdog>,
     stall_retries: &mut HashMap<String, u32>,
     stalled: &[StallVerdict],
     mode: &str,
@@ -928,13 +929,7 @@ async fn apply_stall_actions(
                 let used = stall_retries.entry(stall.job.clone()).or_insert(0);
                 if *used == 0 {
                     *used = 1;
-                    tracker.in_flight.lock().await.remove(&stall.job);
-                    *tracker
-                        .resubmissions
-                        .lock()
-                        .await
-                        .entry(stall.job.clone())
-                        .or_default() += 1;
+                    ledger.requeue_stalled(&stall.job).await;
                     tracing::warn!(
                         job = %stall.job,
                         "active stall: single auto-retry — in-flight reservation released, job \
@@ -946,8 +941,7 @@ async fn apply_stall_actions(
                         state,
                         contexts,
                         results,
-                        watchdog,
-                        tracker,
+                        ledger,
                         &stall.job,
                         "stalled-active",
                         mode,
@@ -966,8 +960,7 @@ async fn apply_stall_actions(
                     state,
                     contexts,
                     results,
-                    watchdog,
-                    tracker,
+                    ledger,
                     &stall.job,
                     "stalled-queued",
                     mode,
@@ -987,14 +980,13 @@ async fn apply_stall_actions(
 
 /// Append the terminal stall record, mirror it into the in-memory results
 /// map (so the submit loop's terminal set sees it immediately), and retire
-/// the job from the watchdog and the in-flight set.
+/// the job through the ledger (watchdog removal + in-flight release).
 #[allow(clippy::too_many_arguments)]
 async fn write_terminal_stall(
     state: &StateDir,
     contexts: &HashMap<String, JobContext>,
     results: &tokio::sync::Mutex<BTreeMap<String, JobRecord>>,
-    watchdog: &tokio::sync::Mutex<Watchdog>,
-    tracker: &SubmitTracker,
+    ledger: &ledger::JobLedger,
     job: &str,
     signature: &str,
     mode: &str,
@@ -1008,12 +1000,11 @@ async fn write_terminal_stall(
         );
         return Ok(());
     };
-    let attempts = tracker.resubmission_count(job).await;
+    let attempts = ledger.tracker().resubmission_count(job).await;
     let record = stall_record(ctx, signature, mode, campaign_id, attempts);
     state.append_jsonl(StateFile::Results, &record)?;
     results.lock().await.insert(job.to_string(), record);
-    watchdog.lock().await.remove_job(job);
-    tracker.in_flight.lock().await.remove(job);
+    ledger.retire(job).await;
     Ok(())
 }
 
@@ -1549,6 +1540,10 @@ pub async fn run_with_backends(
             .collect(),
     ));
     let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(spec.knobs.clone())));
+    // The ledger owns every job-state transition over the tracker and the
+    // watchdog: batch commitment (in-flight + Active), collect/stall
+    // requeues (resubmission + Queued), and terminal retirement.
+    let job_ledger = Arc::new(ledger::JobLedger::new(tracker.clone(), watchdog.clone()));
     let contexts = Arc::new(contexts);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
@@ -1557,7 +1552,7 @@ pub async fn run_with_backends(
         let state = state.clone();
         let cluster = backends.cluster.clone();
         let pause = pause.clone();
-        let tracker = tracker.clone();
+        let ledger = job_ledger.clone();
         let results = results.clone();
         let watchdog = watchdog.clone();
         let knobs = spec.knobs.clone();
@@ -1600,25 +1595,16 @@ pub async fn run_with_backends(
                     ice,
                     engine_paused: pause.paused(),
                 };
-                let outcome = {
-                    let mut wd = watchdog.lock().await;
-                    // Phase bookkeeping: member of an in-flight batch =
-                    // Active, any other non-terminal record = Queued;
-                    // terminal jobs are retired from the watchdog.
-                    let in_flight = tracker.in_flight.lock().await.clone();
-                    let res = results.lock().await;
-                    let terminal = terminal_set(&res);
-                    for job in res.keys().chain(in_flight.iter()) {
-                        if terminal.contains(job) {
-                            wd.remove_job(job);
-                        } else if in_flight.contains(job) {
-                            wd.observe_job(job, JobPhase::Active);
-                        } else {
-                            wd.observe_job(job, JobPhase::Queued);
-                        }
-                    }
-                    wd.on_tick(&tick)
-                };
+                // Phase bookkeeping is event-driven, not reconstructed here:
+                // every job-state transition (batch commit → Active, collect
+                // or stall requeue → Queued, terminal record → removed) goes
+                // through a JobLedger method that emits the watchdog
+                // observation at the transition site. Reconstructing phases
+                // from set membership per tick structurally missed jobs in
+                // neither set (a re-queued job kept accruing Active time in
+                // the pending pool), and a clock keyed on anything but the
+                // job's own transitions could start before its first offer.
+                let outcome = watchdog.lock().await.on_tick(&tick);
                 // Backpressure: dispatch-gap pause, queue-depth threshold,
                 // rolling infra-failure rate.
                 let queue_depth_pause = match (knobs.pause_queue_depth, cluster_counts.as_ref()) {
@@ -1692,7 +1678,7 @@ pub async fn run_with_backends(
                 // Heartbeat: one info! line on a fixed cadence so a long but
                 // healthy quiet stretch is distinguishable from a wedge.
                 if ticks.is_multiple_of(HEARTBEAT_EVERY_TICKS) {
-                    let in_flight_count = tracker.in_flight.lock().await.len();
+                    let in_flight_count = ledger.tracker().in_flight.lock().await.len();
                     tracing::info!(
                         terminal_in_scope,
                         in_scope = in_scope_jobs.len(),
@@ -1710,10 +1696,9 @@ pub async fn run_with_backends(
                 if !outcome.stalled.is_empty()
                     && let Err(e) = apply_stall_actions(
                         &state,
-                        &tracker,
+                        &ledger,
                         &contexts,
                         &results,
-                        &watchdog,
                         &mut stall_retries,
                         &outcome.stalled,
                         &mode,
@@ -1777,7 +1762,7 @@ pub async fn run_with_backends(
     let collector = {
         let state = state.clone();
         let contexts = contexts.clone();
-        let tracker = tracker.clone();
+        let ledger = job_ledger.clone();
         let results = results.clone();
         let processed = processed.clone();
         let knobs = spec.knobs.clone();
@@ -1799,7 +1784,8 @@ pub async fn run_with_backends(
                         &state,
                         &backends_collect,
                         &contexts,
-                        &tracker,
+                        &ledger,
+                        &results,
                         &mut processed_guard,
                         &knobs,
                         &mode,
@@ -1924,7 +1910,7 @@ pub async fn run_with_backends(
                     run_submit_loop(
                         state.clone(),
                         backends.submitter.clone(),
-                        tracker.clone(),
+                        job_ledger.clone(),
                         pause.clone(),
                         attemptable.clone(),
                         terminal_view(results.clone(), terminal_seed),
@@ -1947,7 +1933,7 @@ pub async fn run_with_backends(
                     let mut stats = run_timed_dispatch(
                         state.clone(),
                         backends.submitter.clone(),
-                        tracker.clone(),
+                        job_ledger.clone(),
                         inputs.schedule.clone(),
                         inputs.timing.clone(),
                         spec.cluster.gateway_store_url.clone(),
@@ -1979,7 +1965,8 @@ pub async fn run_with_backends(
                     &state,
                     &final_backends,
                     &contexts,
-                    &tracker,
+                    &job_ledger,
+                    &results,
                     &mut processed_guard,
                     &spec.knobs,
                     spec.mode.as_str(),
@@ -2132,16 +2119,24 @@ struct CollectBackends {
 
 /// One collect pass over every settled, not-yet-processed build batch
 /// (submit-loop and timed-dispatcher kinds alike): classify each batch's
-/// jobs via [`process_settled_batch`], count an engine resubmission for
-/// every re-queued job, and persist the processed-batch set
-/// (collected.json) so resume never re-processes a batch. Returns how many
-/// job re-queues the pass produced.
+/// jobs via [`process_settled_batch`] and apply each returned decision
+/// through the ledger — a re-queued job counts an engine resubmission and
+/// is observed `Queued` (its stall clock resets), a terminalized job is
+/// retired from the watchdog. The processed-batch set (collected.json) is
+/// persisted so resume never re-processes a batch. Returns how many job
+/// re-queues the pass produced.
+///
+/// The pass seeds [`process_settled_batch`]'s already-terminal view from
+/// the shared in-memory results map and extends it with each batch's own
+/// terminal decisions, so a job settled by two unprocessed batches in one
+/// pass (the duplicate-submission shape) is recorded exactly once.
 #[allow(clippy::too_many_arguments)]
 async fn collect_pass_with(
     state: &StateDir,
     backends: &CollectBackends,
     contexts: &HashMap<String, JobContext>,
-    tracker: &SubmitTracker,
+    ledger: &ledger::JobLedger,
+    results: &tokio::sync::Mutex<BTreeMap<String, JobRecord>>,
     processed: &mut HashSet<u64>,
     knobs: &Knobs,
     mode: &str,
@@ -2150,6 +2145,7 @@ async fn collect_pass_with(
 ) -> Result<usize> {
     let batches: Vec<model::BatchRecord> = state.load_jsonl(StateFile::Batches)?;
     let mut requeued = 0usize;
+    let mut already_terminal: HashSet<String> = terminal_set(&*results.lock().await);
     for batch in batches {
         // Both build-batch kinds are collected here: the timeless submit
         // loop's batches and the timed dispatcher's. Anything else (e.g. a
@@ -2173,7 +2169,7 @@ async fn collect_pass_with(
         // so far — any prior requeue consumes the single infra auto-retry
         // budget (see `collect::decide`).
         let prior_requeues: HashMap<String, u32> = {
-            let resubs = tracker.resubmissions.lock().await;
+            let resubs = ledger.tracker().resubmissions.lock().await;
             batch
                 .jobs
                 .iter()
@@ -2193,7 +2189,7 @@ async fn collect_pass_with(
             .artifacts
             .as_deref()
             .zip(artifact_prefix.map(String::from));
-        let requeue = process_settled_batch(
+        let decisions = process_settled_batch(
             state,
             backends.admin.as_ref(),
             backends.store.as_ref(),
@@ -2206,13 +2202,19 @@ async fn collect_pass_with(
             mode,
             campaign_id,
             &first_active,
+            &already_terminal,
         )
         .await?;
-        {
-            let mut resubs = tracker.resubmissions.lock().await;
-            for job in &requeue {
-                *resubs.entry(job.clone()).or_default() += 1;
-                requeued += 1;
+        for (job, decision) in &decisions {
+            match decision {
+                collect::CollectDecision::Requeue { .. } => {
+                    ledger.requeue_collected(job).await;
+                    requeued += 1;
+                }
+                collect::CollectDecision::Terminal { .. } => {
+                    already_terminal.insert(job.clone());
+                    ledger.retire(job).await;
+                }
             }
         }
         processed.insert(batch.batch_id);
@@ -2948,13 +2950,18 @@ mod tests {
             store: Arc::new(FakeStoreApi::default()),
             artifacts: None,
         };
-        let tracker = SubmitTracker::default();
+        let job_ledger = ledger::JobLedger::new(
+            Arc::new(SubmitTracker::default()),
+            Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default()))),
+        );
+        let results = tokio::sync::Mutex::new(BTreeMap::new());
         let mut processed = HashSet::new();
         let requeued = collect_pass_with(
             &state,
             &backends,
             &contexts,
-            &tracker,
+            &job_ledger,
+            &results,
             &mut processed,
             &Knobs::default(),
             "leaf",
@@ -2973,6 +2980,121 @@ mod tests {
             records[job].verdict.as_deref(),
             Some(Verdict::InterruptionReplayed.as_str())
         );
+    }
+
+    /// The collect pass applies its decisions through the ledger at the
+    /// transition site: a settled batch's re-queued member is observed
+    /// Queued (so its pending wait is charged to the queued clock instead
+    /// of a stale Active one) with its resubmission counted, and a
+    /// terminalized member is retired from the watchdog entirely. This is
+    /// the event-driven replacement for the per-tick phase reconstruction
+    /// that structurally missed re-queued jobs.
+    #[tokio::test]
+    async fn collect_pass_applies_transitions_through_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let done_drv = format!("/nix/store/{}-done.drv", "a".repeat(32));
+        let lost_drv = format!("/nix/store/{}-lost.drv", "b".repeat(32));
+        let done_job = "done.x86_64-linux";
+        let lost_job = "lost.x86_64-linux";
+        // One settled submit batch: done has a terminal in-band result,
+        // lost has none (a transport blip — re-queued within budget).
+        state
+            .append_jsonl(
+                StateFile::Batches,
+                &model::BatchRecord {
+                    batch_id: 7,
+                    kind: BATCH_KIND_SUBMIT.to_string(),
+                    jobs: vec![done_job.to_string(), lost_job.to_string()],
+                    root_drvs: vec![done_drv.clone(), lost_drv.clone()],
+                    est_nodes: 2,
+                    build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into()),
+                    started_at: now_rfc3339(),
+                    finished_at: Some(now_rfc3339()),
+                    results: vec![model::PathOutcome {
+                        drv_path: done_drv.clone(),
+                        status: model::build_status_name(
+                            rio_nix::protocol::build::BuildStatus::Built,
+                        )
+                        .to_string(),
+                        error_msg: String::new(),
+                        start_time: 0,
+                        stop_time: 0,
+                    }],
+                    reasons: BTreeMap::new(),
+                    stderr_tail: None,
+                    engine_cancelled: false,
+                    disconnect_deadline_fired: false,
+                    interruption_drvs: Vec::new(),
+                },
+            )
+            .unwrap();
+        let mk_ctx = |job: &str, drv: &str| JobContext {
+            job: job.to_string(),
+            system: "x86_64-linux".into(),
+            drv_path: drv.to_string(),
+            outputs: BTreeMap::new(),
+            dep_drvs: HashSet::new(),
+            expected_outcome: ExpectedOutcome::Built,
+            expected_outputs: BTreeMap::new(),
+            plan_not_attemptable: false,
+            plan_snapshot_valid: false,
+        };
+        let contexts: HashMap<String, JobContext> = HashMap::from([
+            (done_job.to_string(), mk_ctx(done_job, &done_drv)),
+            (lost_job.to_string(), mk_ctx(lost_job, &lost_drv)),
+        ]);
+        let backends = CollectBackends {
+            admin: Arc::new(NoLogsAdmin),
+            store: Arc::new(FakeStoreApi::default()),
+            artifacts: None,
+        };
+        let tracker = Arc::new(SubmitTracker::default());
+        let wd = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let job_ledger = ledger::JobLedger::new(tracker.clone(), wd.clone());
+        // Both jobs were committed (Active) and the batch settled
+        // (reservations released) — the state collect finds them in.
+        job_ledger
+            .commit_batch(&[done_job.to_string(), lost_job.to_string()])
+            .await;
+        tracker
+            .release_after_settle(
+                &[done_job.to_string(), lost_job.to_string()],
+                Duration::ZERO,
+            )
+            .await;
+        let results = tokio::sync::Mutex::new(BTreeMap::new());
+        let mut processed = HashSet::new();
+        let requeued = collect_pass_with(
+            &state,
+            &backends,
+            &contexts,
+            &job_ledger,
+            &results,
+            &mut processed,
+            &Knobs::default(),
+            "leaf",
+            "c-ledger",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(requeued, 1, "the result-less member is re-offered");
+        assert_eq!(tracker.resubmission_count(lost_job).await, 1);
+        let wd = wd.lock().await;
+        assert_eq!(
+            wd.phase_of(lost_job),
+            Some(watchdog::JobPhase::Queued),
+            "the re-queued member transitions to Queued at the decision site"
+        );
+        assert_eq!(
+            wd.phase_of(done_job),
+            None,
+            "the terminalized member is retired from the watchdog"
+        );
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(records[done_job].verdict.as_deref(), Some("match-built"));
+        assert!(!records.contains_key(lost_job), "requeue writes no record");
     }
 
     /// The poller's pause decision across scheduling modes: in timeless mode
@@ -3704,10 +3826,11 @@ mod tests {
     async fn stall_actions_retry_then_terminal() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
-        let tracker = SubmitTracker::default();
+        let tracker = Arc::new(SubmitTracker::default());
         let results = tokio::sync::Mutex::new(BTreeMap::new());
         // Default knobs: active stall 6h, queued watchdog 2h.
-        let wd = tokio::sync::Mutex::new(Watchdog::new(Knobs::default()));
+        let wd = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let job_ledger = ledger::JobLedger::new(tracker.clone(), wd.clone());
         let mut stall_retries: HashMap<String, u32> = HashMap::new();
 
         let active_job = "appB.x86_64-linux";
@@ -3762,7 +3885,7 @@ mod tests {
         // so the whole delta accrues) → first ActiveStall.
         let first = {
             let mut wd = wd.lock().await;
-            wd.observe_job(active_job, JobPhase::Active);
+            wd.observe_job(active_job, watchdog::JobPhase::Active);
             wd.on_tick(&tick_at(0));
             wd.on_tick(&tick_at(7 * 3600))
         };
@@ -3774,10 +3897,9 @@ mod tests {
         );
         apply_stall_actions(
             &state,
-            &tracker,
+            &job_ledger,
             &contexts,
             &results,
-            &wd,
             &mut stall_retries,
             &first.stalled,
             "leaf",
@@ -3805,7 +3927,7 @@ mod tests {
             .insert(active_job.to_string());
         let second = {
             let mut wd = wd.lock().await;
-            wd.observe_job(active_job, JobPhase::Active);
+            wd.observe_job(active_job, watchdog::JobPhase::Active);
             wd.on_tick(&tick_at(14 * 3600))
         };
         assert!(
@@ -3816,10 +3938,9 @@ mod tests {
         );
         apply_stall_actions(
             &state,
-            &tracker,
+            &job_ledger,
             &contexts,
             &results,
-            &wd,
             &mut stall_retries,
             &second.stalled,
             "leaf",
@@ -3852,10 +3973,9 @@ mod tests {
         }];
         apply_stall_actions(
             &state,
-            &tracker,
+            &job_ledger,
             &contexts,
             &results,
-            &wd,
             &mut stall_retries,
             &escalate,
             "leaf",

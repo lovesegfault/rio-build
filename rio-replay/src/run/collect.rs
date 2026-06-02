@@ -31,11 +31,10 @@ use super::classify::{
 use super::grpc::{AdminApi, StoreApi};
 use super::model::{
     BATCH_KIND_TIMED, ExpectedOutcome, ExpectedSide, FailureKind, JobRecord, PathOutcome,
-    RioOutcome, RioSide, RootCauseKind, UnifiedClass, Verdict, build_status_from_name,
-    is_terminal_class, now_rfc3339,
+    RioOutcome, RioSide, RootCauseKind, UnifiedClass, Verdict, build_status_from_name, now_rfc3339,
 };
 use super::spec::Knobs;
-use super::state::{StateDir, StateFile, latest_per_job};
+use super::state::{StateDir, StateFile};
 use super::stderrparse::{ReasonClass, classify_reason, signature_for};
 use super::submitter::repro_command;
 
@@ -63,9 +62,15 @@ pub struct JobContext {
 /// does not return until every requested root has an outcome), so there is
 /// no still-running decision: every member of a settled batch is either
 /// terminal or re-offered.
+///
+/// This is also the only shape [`process_settled_batch`] can return per
+/// job: every job-state transition a settled batch causes is a
+/// `CollectDecision` the caller applies through the ledger, so a new
+/// failure arm cannot re-offer jobs through a side channel that forgets
+/// the retry budget — there is no raw job-list return to reach for.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CollectDecision {
-    /// Terminal outcome — write the results.jsonl record.
+    /// Terminal outcome — the results.jsonl record has been written.
     Terminal {
         rio: RioOutcome,
         evidence: Option<String>,
@@ -529,13 +534,31 @@ fn lossy_log_text(bytes: &[u8]) -> String {
 
 /// Process one settled batch end-to-end: take its in-band per-root results,
 /// decide each job, capture evidence (log tails for failures, NAR hashes
-/// for successes), append terminal records, and return the jobs that must
-/// be re-queued.
+/// for successes), append terminal records, and return the decision made
+/// for every member that transitioned.
+///
+/// The returned map is the function's whole contract: a
+/// [`CollectDecision::Terminal`] entry means the job's results.jsonl record
+/// has been appended (the caller retires the job), a
+/// [`CollectDecision::Requeue`] entry means the job must be re-offered to
+/// the timeless pending pool (the caller counts the resubmission). Members
+/// that made no transition — timed-batch members left to the timed
+/// dispatcher, members with no job context, members already terminal — have
+/// no entry.
 ///
 /// `prior_requeues` carries each job's TOTAL engine resubmission count so
 /// far (every requeue reason counts, not just infra retries) — see
 /// [`decide`] for why any prior requeue consumes the infra auto-retry
 /// budget.
+///
+/// Duplicate-batch belt: `already_terminal` is the ledger's in-memory view
+/// of jobs whose latest record is terminal. The submit loop can re-submit a
+/// job whose terminal record landed between settle and collect (the
+/// cool-down damper narrows that window but does not close it), and a batch
+/// that outlived its job's stall retirement settles late; either way a
+/// member already terminal is dropped here — neither re-offered nor
+/// re-recorded — so a duplicate can never overwrite the job's real verdict
+/// under latest-record-per-job semantics.
 #[allow(clippy::too_many_arguments)]
 pub async fn process_settled_batch(
     state: &StateDir,
@@ -550,8 +573,9 @@ pub async fn process_settled_batch(
     mode: &str,
     campaign_id: &str,
     first_active: &HashMap<String, String>,
-) -> Result<Vec<String>> {
-    let mut requeue = Vec::new();
+    already_terminal: &HashSet<String>,
+) -> Result<BTreeMap<String, CollectDecision>> {
+    let mut decisions: BTreeMap<String, CollectDecision> = BTreeMap::new();
     // Members of timed batches are never re-offered to the timeless pending
     // pool: the timed dispatcher owns its own retries (confirmation
     // re-submissions), and whatever stays unresolved is covered by the
@@ -560,7 +584,8 @@ pub async fn process_settled_batch(
     if batch.results.is_empty() && batch.build_id.is_none() && !(timed && batch.engine_cancelled) {
         // Neither in-band results nor a build id: an engine-side submission
         // failure (channel open, drv import, the build op erroring before
-        // any result arrived). Members of a timed batch are simply left to
+        // any result arrived) — or the engine's own cancellation of the
+        // whole submission. Members of a timed batch are simply left to
         // the timed dispatcher, which owns its own retries. (A timed batch
         // the engine cancelled with no results falls through instead, so
         // armed interruptions whose disconnect-replay deadline fired are
@@ -572,27 +597,18 @@ pub async fn process_settled_batch(
                 "timed batch has no in-band results and no build id (engine-side submission \
                  failure); leaving its members to the timed dispatcher"
             );
-            return Ok(Vec::new());
+            return Ok(decisions);
         }
-        // An engine-cancelled submission (batch deadline, abort) is the
-        // engine's own act, not a transport defect: every member is
-        // re-offered without consuming budget — the engine-cancelled rule
-        // in [`decide`].
-        if batch.engine_cancelled {
-            tracing::info!(
-                jobs = batch_jobs.len(),
-                "engine-cancelled batch settled with no in-band results and no build id; \
-                 re-offering its jobs"
-            );
-            return Ok(batch_jobs.to_vec());
-        }
-        // Otherwise the failure consumes the same bounded auto-retry budget
-        // as a missing in-band result ([`decide`] with no target): re-offer
-        // while budget remains, then terminalize as an infrastructure
-        // failure carrying the recorded submission error as evidence.
-        // Without the bound, a deterministic submission failure (gateway
-        // unreachable, host-key mismatch, drv import error) would re-offer
-        // its members on every wave and the campaign would never drain.
+        // The per-member decision is [`decide`]'s no-result rule — the one
+        // budget site: an engine-cancelled batch (deadline, abort — the
+        // engine's own act, not a transport defect) re-offers every member
+        // without consuming budget; otherwise the failure consumes the same
+        // bounded auto-retry budget as a missing in-band result, then
+        // terminalizes as an infrastructure failure carrying the recorded
+        // submission error as evidence. Without the bound, a deterministic
+        // submission failure (gateway unreachable, host-key mismatch, drv
+        // import error) would re-offer its members on every wave and the
+        // campaign would never drain.
         // No poison snapshot or log tail is fetched: the failure pre-dates
         // any build, so the scheduler holds no evidence for it.
         let evidence = batch
@@ -600,18 +616,6 @@ pub async fn process_settled_batch(
             .clone()
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| "engine-submission-failure".to_string());
-        // Duplicate-batch belt: the submit loop can re-submit a job whose
-        // terminal record landed between settle and collect (the cool-down
-        // damper narrows that window but does not close it). Such a
-        // duplicate must never overwrite the job's real verdict under
-        // latest-record-per-job semantics, so members already terminal in
-        // results.jsonl are dropped here — neither re-offered nor recorded.
-        let already_terminal: HashSet<String> =
-            latest_per_job(state.load_jsonl(StateFile::Results)?)
-                .into_iter()
-                .filter(|(_, r)| is_terminal_class(&r.verdict, &r.disposition))
-                .map(|(job, _)| job)
-                .collect();
         for job in batch_jobs {
             let Some(ctx) = contexts.get(job) else {
                 tracing::warn!(job, "batch member has no job context; skipping");
@@ -625,37 +629,53 @@ pub async fn process_settled_batch(
                 continue;
             }
             let prior = prior_requeues.get(job).copied().unwrap_or(0);
-            if prior < knobs.max_auto_retries {
-                tracing::info!(job, why = "engine-submission-failure", "re-queueing");
-                requeue.push(job.clone());
-                continue;
+            match decide(ctx, None, batch, &HashMap::new(), prior, knobs, None) {
+                CollectDecision::Requeue { why } => {
+                    // The whole submission failed, so "no in-band result"
+                    // understates the cause; the engine-cancelled reason
+                    // passes through unchanged.
+                    let why = if batch.engine_cancelled {
+                        why
+                    } else {
+                        "engine-submission-failure"
+                    };
+                    tracing::info!(job, why, "re-queueing");
+                    decisions.insert(job.clone(), CollectDecision::Requeue { why });
+                }
+                CollectDecision::Terminal { rio, .. } => {
+                    tracing::info!(
+                        job,
+                        prior_requeues = prior,
+                        "engine-side submission failure with no retry budget left; recording an \
+                         infrastructure failure"
+                    );
+                    let record = build_record(
+                        ctx,
+                        &rio,
+                        Some(evidence.clone()),
+                        None,
+                        batch,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        mode,
+                        campaign_id,
+                        prior + 1,
+                        None,
+                        first_active.get(job).cloned(),
+                        None,
+                    );
+                    state.append_jsonl(StateFile::Results, &record)?;
+                    decisions.insert(
+                        job.clone(),
+                        CollectDecision::Terminal {
+                            rio,
+                            evidence: Some(evidence.clone()),
+                        },
+                    );
+                }
             }
-            tracing::info!(
-                job,
-                prior_requeues = prior,
-                "engine-side submission failure with no retry budget left; recording an \
-                 infrastructure failure"
-            );
-            let record = build_record(
-                ctx,
-                &RioOutcome::TargetFailed {
-                    kind: FailureKind::Infra,
-                },
-                Some(evidence.clone()),
-                None,
-                batch,
-                &HashMap::new(),
-                &HashMap::new(),
-                mode,
-                campaign_id,
-                prior + 1,
-                None,
-                first_active.get(job).cloned(),
-                None,
-            );
-            state.append_jsonl(StateFile::Results, &record)?;
         }
-        return Ok(requeue);
+        return Ok(decisions);
     }
     let results_by_drv: HashMap<&str, &PathOutcome> = batch
         .results
@@ -696,6 +716,13 @@ pub async fn process_settled_batch(
             tracing::warn!(job, "batch member has no job context; skipping");
             continue;
         };
+        if already_terminal.contains(job) {
+            tracing::info!(
+                job,
+                "settled-batch member already has a terminal record; dropping"
+            );
+            continue;
+        }
         let target = results_by_drv.get(ctx.drv_path.as_str()).copied();
         let prior = prior_requeues.get(job).copied().unwrap_or(0);
         // Evidence-age gate: when a failed root carries neither an in-band
@@ -744,7 +771,8 @@ pub async fn process_settled_batch(
                     // other requeue-shaped member — including one the
                     // engine's own build deadline cut — stays outstanding
                     // for a later confirmation-retry batch or the
-                    // end-of-run backfill.
+                    // end-of-run backfill (no transition, so no decision
+                    // entry).
                     if timed_interruption_for(batch, &ctx.drv_path, None)
                         == Some(TimedInterruption::Replayed)
                     {
@@ -764,12 +792,19 @@ pub async fn process_settled_batch(
                             None,
                         );
                         state.append_jsonl(StateFile::Results, &record)?;
+                        decisions.insert(
+                            job.clone(),
+                            CollectDecision::Terminal {
+                                rio: RioOutcome::NotAttempted,
+                                evidence: None,
+                            },
+                        );
                     } else {
                         tracing::info!(job, why, "timed batch member is not re-offered");
                     }
                 } else {
                     tracing::info!(job, why, "re-queueing");
-                    requeue.push(job.clone());
+                    decisions.insert(job.clone(), CollectDecision::Requeue { why });
                 }
             }
             CollectDecision::Terminal { rio, evidence } => {
@@ -846,7 +881,7 @@ pub async fn process_settled_batch(
                 let record = build_record(
                     ctx,
                     &rio,
-                    evidence,
+                    evidence.clone(),
                     target,
                     batch,
                     &poisoned,
@@ -859,10 +894,11 @@ pub async fn process_settled_batch(
                     captured_tail.as_deref(),
                 );
                 state.append_jsonl(StateFile::Results, &record)?;
+                decisions.insert(job.clone(), CollectDecision::Terminal { rio, evidence });
             }
         }
     }
-    Ok(requeue)
+    Ok(decisions)
 }
 
 #[cfg(test)]
@@ -873,6 +909,16 @@ mod tests {
     use crate::run::grpc::{GraphSnapshot, PoisonedView};
     use crate::run::model::{BATCH_KIND_SUBMIT, Disposition, build_status_name};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The re-offer view of a decision map: the jobs the caller must
+    /// re-queue, in map (deterministic) order.
+    fn requeued(decisions: &BTreeMap<String, CollectDecision>) -> Vec<String> {
+        decisions
+            .iter()
+            .filter(|(_, decision)| matches!(decision, CollectDecision::Requeue { .. }))
+            .map(|(job, _)| job.clone())
+            .collect()
+    }
 
     fn ctx(job: &str, drv: &str, deps: &[&str], expected: ExpectedOutcome) -> JobContext {
         JobContext {
@@ -1681,7 +1727,7 @@ mod tests {
             interruption_drvs: vec![T.to_string()],
             ..BatchView::default()
         };
-        let requeue = process_settled_batch(
+        let decisions = process_settled_batch(
             &state,
             &LogAdmin::default(),
             &FakeStoreApi::default(),
@@ -1694,10 +1740,11 @@ mod tests {
             "leaf",
             "c1",
             &HashMap::new(),
+            &HashSet::new(),
         )
         .await
         .unwrap();
-        assert!(requeue.is_empty(), "{requeue:?}");
+        assert!(requeued(&decisions).is_empty(), "{decisions:?}");
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].job, "armed.x86_64-linux");
@@ -1713,7 +1760,7 @@ mod tests {
             kind: BATCH_KIND_TIMED.to_string(),
             ..BatchView::default()
         };
-        let requeue = process_settled_batch(
+        let decisions = process_settled_batch(
             &state,
             &LogAdmin::default(),
             &FakeStoreApi::default(),
@@ -1726,10 +1773,11 @@ mod tests {
             "leaf",
             "c1",
             &HashMap::new(),
+            &HashSet::new(),
         )
         .await
         .unwrap();
-        assert!(requeue.is_empty(), "{requeue:?}");
+        assert!(requeued(&decisions).is_empty(), "{decisions:?}");
     }
 
     /// An engine-cancelled batch (channel abandoned at the batch deadline)
@@ -1791,7 +1839,7 @@ mod tests {
         };
         // Knobs::default() grants one auto-retry: "spent" already burned it.
         let prior: HashMap<String, u32> = [("spent.x86_64-linux".to_string(), 1)].into();
-        let requeue = process_settled_batch(
+        let decisions = process_settled_batch(
             &state,
             &admin,
             &FakeStoreApi::default(),
@@ -1804,10 +1852,11 @@ mod tests {
             "leaf",
             "c1",
             &HashMap::new(),
+            &HashSet::new(),
         )
         .await
         .unwrap();
-        assert_eq!(requeue, vec!["fresh.x86_64-linux".to_string()]);
+        assert_eq!(requeued(&decisions), vec!["fresh.x86_64-linux".to_string()]);
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1, "{records:?}");
         let rec = &records[0];
@@ -1830,13 +1879,16 @@ mod tests {
         assert_eq!(admin.log_calls.load(Ordering::SeqCst), 0);
     }
 
-    /// A duplicate engine-side submission failure for a job that already
-    /// settled terminally (the submit loop can re-submit inside the
-    /// settle-to-collect window) is dropped: it must neither overwrite the
-    /// real verdict under latest-record-per-job semantics nor re-offer the
-    /// finished job.
+    /// A duplicate batch for a job that already settled terminally (the
+    /// submit loop can re-submit inside the settle-to-collect window) is
+    /// dropped via the caller-maintained already-terminal view — exactly
+    /// like the production collect pass, which seeds the view from the
+    /// in-memory results map and extends it with each batch's terminal
+    /// decisions. The duplicate must neither overwrite the real verdict
+    /// under latest-record-per-job semantics nor re-offer the finished job,
+    /// whether it settled as an engine-side failure or with a real result.
     #[tokio::test]
-    async fn duplicate_submission_failure_never_clobbers_a_terminal_record() {
+    async fn duplicate_submission_never_clobbers_a_terminal_record() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
         let contexts: HashMap<String, JobContext> = [(
@@ -1852,15 +1904,29 @@ mod tests {
             ..BatchView::default()
         };
         // Duplicate submission of the same job then fails engine-side with
-        // the job's whole retry budget already spent.
-        let duplicate = BatchView {
+        // the job's whole retry budget already spent; a second duplicate
+        // settles with an in-band FAILURE result (the main-loop shape).
+        let duplicate_failure = BatchView {
             kind: BATCH_KIND_SUBMIT.to_string(),
             stderr_tail: Some("engine submission error: channel open failed".into()),
             ..BatchView::default()
         };
+        let duplicate_result = BatchView {
+            kind: BATCH_KIND_SUBMIT.to_string(),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-2f2e3d4c5b6b".to_string()),
+            results: vec![po(T, BuildStatus::PermanentFailure, "exit code 2")],
+            ..BatchView::default()
+        };
         let prior: HashMap<String, u32> = [("ok.x86_64-linux".to_string(), 5)].into();
-        for (batch, prior) in [(&settled, &HashMap::new()), (&duplicate, &prior)] {
-            let requeue = process_settled_batch(
+        // Mirror collect_pass_with's bookkeeping: extend the terminal view
+        // with each batch's terminal decisions before the next batch.
+        let mut already_terminal: HashSet<String> = HashSet::new();
+        for (batch, prior) in [
+            (&settled, &HashMap::new()),
+            (&duplicate_failure, &prior),
+            (&duplicate_result, &prior),
+        ] {
+            let decisions = process_settled_batch(
                 &state,
                 &LogAdmin::default(),
                 &FakeStoreApi::default(),
@@ -1873,10 +1939,16 @@ mod tests {
                 "leaf",
                 "c1",
                 &HashMap::new(),
+                &already_terminal,
             )
             .await
             .unwrap();
-            assert!(requeue.is_empty(), "{requeue:?}");
+            assert!(requeued(&decisions).is_empty(), "{decisions:?}");
+            for (job, decision) in &decisions {
+                if matches!(decision, CollectDecision::Terminal { .. }) {
+                    already_terminal.insert(job.clone());
+                }
+            }
         }
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1, "{records:?}");
@@ -1903,7 +1975,7 @@ mod tests {
             ..BatchView::default()
         };
         let prior: HashMap<String, u32> = [("spent.x86_64-linux".to_string(), 5)].into();
-        let requeue = process_settled_batch(
+        let decisions = process_settled_batch(
             &state,
             &LogAdmin::default(),
             &FakeStoreApi::default(),
@@ -1916,10 +1988,11 @@ mod tests {
             "leaf",
             "c1",
             &HashMap::new(),
+            &HashSet::new(),
         )
         .await
         .unwrap();
-        assert_eq!(requeue, vec!["spent.x86_64-linux".to_string()]);
+        assert_eq!(requeued(&decisions), vec!["spent.x86_64-linux".to_string()]);
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert!(records.is_empty(), "{records:?}");
     }
@@ -1991,7 +2064,7 @@ mod tests {
             interruption_drvs: Vec::new(),
             submitted_at: Some("2026-05-26T01:00:00Z".into()),
         };
-        let requeue = process_settled_batch(
+        let decisions = process_settled_batch(
             &state,
             &admin,
             &store,
@@ -2008,12 +2081,13 @@ mod tests {
             "leaf",
             "c1",
             &HashMap::new(),
+            &HashSet::new(),
         )
         .await
         .unwrap();
 
         // mate's trigger (T) is not in its dep closure → requeued.
-        assert_eq!(requeue, vec!["mate.x86_64-linux".to_string()]);
+        assert_eq!(requeued(&decisions), vec!["mate.x86_64-linux".to_string()]);
         // The poison snapshot is fetched exactly once for the whole batch.
         assert_eq!(admin.poisoned_calls.load(Ordering::SeqCst), 1);
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
@@ -2055,7 +2129,7 @@ mod tests {
         // Neither in-band results nor a build id → engine-side submission
         // failure → the still-unsettled member is re-offered (its retry
         // budget is untouched).
-        let r = process_settled_batch(
+        let decisions = process_settled_batch(
             &state,
             &LogAdmin::default(),
             &store,
@@ -2068,10 +2142,11 @@ mod tests {
             "leaf",
             "c1",
             &HashMap::new(),
+            &HashSet::new(),
         )
         .await
         .unwrap();
-        assert_eq!(r, vec!["mate.x86_64-linux".to_string()]);
+        assert_eq!(requeued(&decisions), vec!["mate.x86_64-linux".to_string()]);
     }
 
     /// A batch whose in-band results are all successes never fetches the
@@ -2091,7 +2166,7 @@ mod tests {
             results: vec![po(T, BuildStatus::Substituted, "")],
             ..BatchView::default()
         };
-        let requeue = process_settled_batch(
+        let decisions = process_settled_batch(
             &state,
             &admin,
             &FakeStoreApi::default(),
@@ -2104,10 +2179,11 @@ mod tests {
             "leaf",
             "c1",
             &HashMap::new(),
+            &HashSet::new(),
         )
         .await
         .unwrap();
-        assert!(requeue.is_empty());
+        assert!(requeued(&decisions).is_empty(), "{decisions:?}");
         assert_eq!(admin.poisoned_calls.load(Ordering::SeqCst), 0);
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1);
@@ -2146,7 +2222,7 @@ mod tests {
         // Budget already consumed → terminal; with Signal 2 unavailable the
         // infra reason still resolves to infra.
         let prior: HashMap<String, u32> = [("bad.x86_64-linux".to_string(), 1)].into();
-        let requeue = process_settled_batch(
+        let decisions = process_settled_batch(
             &state,
             &admin,
             &FakeStoreApi::default(),
@@ -2159,10 +2235,11 @@ mod tests {
             "leaf",
             "c1",
             &HashMap::new(),
+            &HashSet::new(),
         )
         .await
         .unwrap();
-        assert!(requeue.is_empty());
+        assert!(requeued(&decisions).is_empty(), "{decisions:?}");
         assert_eq!(admin.poisoned_calls.load(Ordering::SeqCst), 1);
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1);
@@ -2198,7 +2275,7 @@ mod tests {
             results: vec![po(T, BuildStatus::Built, "")],
             ..BatchView::default()
         };
-        let requeue = process_settled_batch(
+        let decisions = process_settled_batch(
             &state,
             &LogAdmin::default(),
             &store,
@@ -2211,10 +2288,11 @@ mod tests {
             "leaf",
             "c1",
             &HashMap::new(),
+            &HashSet::new(),
         )
         .await
         .unwrap();
-        assert!(requeue.is_empty());
+        assert!(requeued(&decisions).is_empty(), "{decisions:?}");
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].verdict.as_deref(), Some("match-built"));
@@ -2242,7 +2320,7 @@ mod tests {
             results: vec![po(T, BuildStatus::MiscFailure, "")],
             ..BatchView::default()
         };
-        let requeue = process_settled_batch(
+        let decisions = process_settled_batch(
             &state,
             &admin,
             &FakeStoreApi::default(),
@@ -2255,10 +2333,11 @@ mod tests {
             "leaf",
             "c1",
             &HashMap::new(),
+            &HashSet::new(),
         )
         .await
         .unwrap();
-        assert!(requeue.is_empty());
+        assert!(requeued(&decisions).is_empty(), "{decisions:?}");
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1);
         let rec = &records[0];
@@ -2313,6 +2392,7 @@ mod tests {
             "leaf",
             "c1",
             &HashMap::new(),
+            &HashSet::new(),
         )
         .await
         .unwrap();
@@ -2364,6 +2444,7 @@ mod tests {
             "leaf",
             "c1",
             &HashMap::new(),
+            &HashSet::new(),
         )
         .await
         .unwrap();
