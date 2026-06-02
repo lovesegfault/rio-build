@@ -6,7 +6,7 @@
 //! campaign engine (the same artifact read-back `replay setup` runs
 //! after enabling). Pure helpers are split from the I/O so they
 //! unit-test without a cluster; the cluster-reading halves run at
-//! setup/launch time (operator step), never in CI.
+//! setup/launch/repro time (operator step), never in CI.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -202,8 +202,10 @@ fn cnp_admits_replay(cnp: &serde_json::Value, grpc_port: &str) -> bool {
 /// out-of-band CNP edit, or a divergent older deployment on setup's
 /// already-enabled no-upgrade path) renders policies that admit nothing
 /// the engine runs as. Reading the CNPs back catches every one of those
-/// before a campaign Job is created. Both policies are checked before
-/// reporting so the operator gets the complete miss list at once.
+/// before a campaign Job is created — `replay setup` (verify step),
+/// `replay launch` (pre-flight), and `replay repro` all run it. Both
+/// policies are checked before reporting so the operator gets the
+/// complete miss list at once.
 pub async fn verify_cnp_admissions(client: &kclient::Client) -> Result<()> {
     use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 
@@ -211,7 +213,7 @@ pub async fn verify_cnp_admissions(client: &kclient::Client) -> Result<()> {
 
     let gvk = GroupVersionKind::gvk("cilium.io", "v2", "CiliumNetworkPolicy");
     let ar = ApiResource::from_gvk(&gvk);
-    let mut misses: Vec<String> = Vec::new();
+    let mut fetched: Vec<FetchedCnp<'_>> = Vec::new();
     for (ns, name, port) in [
         (NS, "scheduler-ingress", SCHEDULER_GRPC_PORT),
         (NS_STORE, "store-ingress", STORE_GRPC_PORT),
@@ -221,12 +223,32 @@ pub async fn verify_cnp_admissions(client: &kclient::Client) -> Result<()> {
             .get_opt(name)
             .await
             .with_context(|| format!("read CiliumNetworkPolicy {ns}/{name}"))?;
+        fetched.push((ns, name, port, cnp.map(|c| c.data)));
+    }
+    check_cnp_admissions(&fetched)
+}
+
+/// One CNP read-back target as fetched: (policy namespace, policy name,
+/// gRPC port the engine dials it on, the policy object — `None` ⇒ the
+/// policy does not exist).
+type FetchedCnp<'a> = (&'a str, &'a str, &'a str, Option<serde_json::Value>);
+
+/// Decision half of [`verify_cnp_admissions`], split from the fetch so
+/// the refusal contract stays unit-testable without a cluster: every
+/// target policy is checked and ALL misses are reported in one error,
+/// each naming the policy and the missing admission
+/// (namespace + label + port), followed by the silent-drop consequence
+/// and the remediation (`replay.namespace` must equal [`NS_REPLAY`];
+/// re-run `replay setup`).
+fn check_cnp_admissions(fetched: &[FetchedCnp<'_>]) -> Result<()> {
+    let mut misses: Vec<String> = Vec::new();
+    for (ns, name, port, cnp) in fetched {
         match cnp {
             None => misses.push(format!(
                 "CiliumNetworkPolicy {ns}/{name} not found — the deployed chart did not render \
                  its network policies"
             )),
-            Some(cnp) if !cnp_admits_replay(&cnp.data, port) => misses.push(format!(
+            Some(cnp) if !cnp_admits_replay(cnp, port) => misses.push(format!(
                 "CiliumNetworkPolicy {ns}/{name} has no ingress admission for the campaign \
                  engine (namespace {NS_REPLAY}, label rio-replay) on gRPC port {port}"
             )),
@@ -514,5 +536,87 @@ force_build_roots = false
             &json!({"spec": {"ingress": []}}),
             "9001"
         ));
+    }
+
+    #[test]
+    fn cnp_verification_reports_every_miss_with_the_remediation() {
+        let scheduler = json!({"spec": scheduler_ingress_rendered()});
+        let store = json!({"spec": store_ingress_rendered()});
+
+        // The healthy render passes.
+        check_cnp_admissions(&[
+            ("rio-system", "scheduler-ingress", "9001", Some(scheduler)),
+            ("rio-store", "store-ingress", "9002", Some(store.clone())),
+        ])
+        .unwrap();
+
+        // A missing policy refuses, naming the policy and the operator
+        // contract: the silent-drop consequence, the replay.namespace
+        // pin, and the re-setup remediation. This is the refusal
+        // setup/launch/repro surface before any engine Job exists.
+        let err = check_cnp_admissions(&[
+            ("rio-system", "scheduler-ingress", "9001", None),
+            ("rio-store", "store-ingress", "9002", Some(store.clone())),
+        ])
+        .unwrap_err()
+        .to_string();
+        for needle in [
+            "rio-system/scheduler-ingress",
+            "not found",
+            "silently drop",
+            "replay.namespace",
+            "\"rio-replay\"",
+            "cargo xtask replay setup",
+        ] {
+            assert!(err.contains(needle), "missing {needle:?} in: {err}");
+        }
+        assert!(
+            !err.contains("rio-store/store-ingress"),
+            "the healthy policy must not be reported: {err}"
+        );
+
+        // replay.namespace drift: the same verbatim render with the
+        // admission namespace swapped — exactly what a raw-helm
+        // `--set replay.namespace=…` override renders. The policy
+        // exists, so the miss is the no-admission shape naming the
+        // namespace+label pair and the port the engine dials.
+        let mut drifted = scheduler_ingress_rendered();
+        drifted["ingress"][0]["fromEndpoints"]
+            .as_array_mut()
+            .unwrap()
+            .last_mut()
+            .unwrap()["matchLabels"]["k8s:io.kubernetes.pod.namespace"] = json!("replay-two");
+        let err = check_cnp_admissions(&[
+            (
+                "rio-system",
+                "scheduler-ingress",
+                "9001",
+                Some(json!({"spec": drifted})),
+            ),
+            ("rio-store", "store-ingress", "9002", Some(store)),
+        ])
+        .unwrap_err()
+        .to_string();
+        for needle in [
+            "rio-system/scheduler-ingress",
+            "no ingress admission",
+            "namespace rio-replay",
+            "port 9001",
+        ] {
+            assert!(err.contains(needle), "missing {needle:?} in: {err}");
+        }
+
+        // Both targets broken: the complete miss list in ONE error, so
+        // the operator gets the full fix list at once.
+        let err = check_cnp_admissions(&[
+            ("rio-system", "scheduler-ingress", "9001", None),
+            ("rio-store", "store-ingress", "9002", None),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("rio-system/scheduler-ingress") && err.contains("rio-store/store-ingress"),
+            "{err}"
+        );
     }
 }

@@ -9,10 +9,17 @@
 //! fetches the pinned archive and replays the unit over the same client-ops
 //! transport and supply policy the campaign used.
 //!
-//! Tenant provisioning, SSH keys, the HMAC copy, and the pre-flight are all
-//! skipped on purpose: the original campaign's tenants and Secrets already
-//! exist in the rio-replay namespace, and the derived spec points at the
-//! same mounted paths.
+//! Tenant provisioning, SSH keys, the HMAC copy, and most of the launch
+//! pre-flight (deployed image-tag skew, gateway build-policy, tenant
+//! upstream sets) are skipped on purpose: the original campaign's tenants
+//! and Secrets already exist in the rio-replay namespace, and the derived
+//! spec points at the same mounted paths. The deployed CiliumNetworkPolicy
+//! admissions are the exception — they are chart state that can drift
+//! after the original launch (a raw-helm `replay.namespace` override, an
+//! out-of-band CNP edit), and an unadmitted engine does not fail: Cilium
+//! silently drops its scheduler/store gRPC, which hangs a deadline-less
+//! repro forever. So repro re-runs that one read-back
+//! ([`preflight::verify_cnp_admissions`]) before creating anything.
 
 use std::collections::BTreeMap;
 
@@ -23,7 +30,7 @@ use kube::api::Api;
 use rio_replay::run::spec::{CampaignRecord, CampaignSpec, FailOn, ReportBlock, ReportPolicy};
 
 use super::jobs::{self, EngineJobCommon};
-use super::{NS_REPLAY, launch, s3};
+use super::{NS_REPLAY, launch, preflight, s3};
 use crate::k8s::client as kclient;
 use crate::k8s::eks::{TF_DIR, push};
 use crate::{git, tofu, ui};
@@ -200,6 +207,17 @@ pub async fn run(a: ReproArgs) -> Result<()> {
     let client = kclient::client().await?;
     ui::step("rio-replay namespace + ServiceAccount", || {
         jobs::ensure_base(&client, &role_arn)
+    })
+    .await?;
+
+    // The one launch pre-flight check repro keeps: the deployed CNPs must
+    // still admit the engine on the scheduler/store gRPC ports. Unlike
+    // the tenants and Secrets the repro inherits, the admissions can have
+    // drifted since the original campaign launched, and the failure mode
+    // is not an error but a silent gRPC blackhole — fatal for a
+    // single-unit run with no deadline.
+    ui::step("verify CiliumNetworkPolicy admissions", || {
+        preflight::verify_cnp_admissions(&client)
     })
     .await?;
 
