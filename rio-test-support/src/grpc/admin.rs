@@ -26,6 +26,19 @@ pub struct MockAdmin {
     /// Every ClearPoison drv_hash received. For asserting the CLI
     /// passed through the positional arg correctly.
     pub clear_poison_calls: Arc<RwLock<Vec<String>>>,
+    /// Programmed `GetSpawnIntents` response. Defaults to empty-but-Ok
+    /// (a successful zero-intents poll). The nodeclaim-pool
+    /// lifecycle-invariants suite sets this between ticks to drive the
+    /// reconciler's healthy/⊥ arms (⊥ itself is driven by swapping the
+    /// client to a [`super::spawn::dead_channel`], not by this field).
+    pub spawn_intents: Arc<RwLock<types::GetSpawnIntentsResponse>>,
+    /// Every `AckSpawnedIntents` request received, in order. Lets the
+    /// suite assert wire-level effect sets: "no ICE clears sent after
+    /// acquire", "no marks for the controller's own reaps".
+    pub ack_calls: Arc<RwLock<Vec<types::AckSpawnedIntentsRequest>>>,
+    /// Programmed `ListOpenAttempts` response — the open-attempt ledger
+    /// view that drives the OA2 wedge tracker's evidence retention.
+    pub open_attempts: Arc<RwLock<types::ListOpenAttemptsResponse>>,
 }
 
 impl MockAdmin {
@@ -100,6 +113,28 @@ impl AdminService for MockAdmin {
                 ..Default::default()
             }),
         }))
+    }
+
+    async fn get_spawn_intents(
+        &self,
+        _: Request<types::GetSpawnIntentsRequest>,
+    ) -> Result<Response<types::GetSpawnIntentsResponse>, Status> {
+        Ok(Response::new(self.spawn_intents.read().unwrap().clone()))
+    }
+
+    async fn ack_spawned_intents(
+        &self,
+        request: Request<types::AckSpawnedIntentsRequest>,
+    ) -> Result<Response<()>, Status> {
+        self.ack_calls.write().unwrap().push(request.into_inner());
+        Ok(Response::new(()))
+    }
+
+    async fn list_open_attempts(
+        &self,
+        _: Request<types::ListOpenAttemptsRequest>,
+    ) -> Result<Response<types::ListOpenAttemptsResponse>, Status> {
+        Ok(Response::new(self.open_attempts.read().unwrap().clone()))
     }
 
     // ─── Generated methods: Default::default() stubs ────────────────────

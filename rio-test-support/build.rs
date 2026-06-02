@@ -61,6 +61,12 @@ const MANUAL_METHODS: &[&str] = &[
     "TriggerGC",    // streaming — sends one is_complete=true frame
     "ClearPoison",  // records drv_hash to clear_poison_calls
     "CreateTenant", // echoes tenant_name back in TenantInfo
+    // Programmable/recording trio for the nodeclaim-pool
+    // lifecycle-invariants suite (rio-controller): tests program the
+    // poll/ledger responses and assert on the recorded ack requests.
+    "GetSpawnIntents",   // returns the programmed spawn_intents response
+    "AckSpawnedIntents", // records the full request to ack_calls
+    "ListOpenAttempts",  // returns the programmed open_attempts response
 ];
 
 #[cfg(feature = "full")]
