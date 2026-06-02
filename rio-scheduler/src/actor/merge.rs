@@ -2479,10 +2479,11 @@ impl DagActor {
             job_rows
                 .iter()
                 .zip(created)
-                .map(|(row, (job_id, created))| super::materialize::CreatedJob {
+                .map(|(row, result)| super::materialize::CreatedJob {
                     drv_hash: DrvHash::from(row.drv_hash),
-                    job_id,
-                    created,
+                    job_id: result.job_id,
+                    created: result.created,
+                    upgraded: result.upgraded,
                     origin: row.origin,
                 })
                 .collect()

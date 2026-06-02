@@ -267,7 +267,7 @@ fn routing_moot_failure_completes_for_live_interest() {
         durable_evidence: DurableEvidence::Broken, // irrelevant for arm 0
         prior_unobtainable_count: 0,
         reprobe: None,
-        topdown_pruned: false,
+        pruned_origin: false,
     });
     assert_eq!(routing, UnobtainableRouting::CompleteForLiveInterest);
 }
@@ -282,7 +282,7 @@ fn routing_moot_but_uncovered_rearms() {
         durable_evidence: DurableEvidence::Broken,
         prior_unobtainable_count: 0,
         reprobe: None,
-        topdown_pruned: false,
+        pruned_origin: false,
     });
     assert_eq!(routing, UnobtainableRouting::ReArm);
 }
@@ -297,7 +297,7 @@ fn routing_durable_vouched_resolves_from_source() {
         durable_evidence: DurableEvidence::Vouched,
         prior_unobtainable_count: 0,
         reprobe: None,
-        topdown_pruned: false,
+        pruned_origin: false,
     });
     assert_eq!(routing, UnobtainableRouting::ResolveFromSource);
 }
@@ -312,7 +312,7 @@ fn routing_durable_pending_resolves_from_source() {
         durable_evidence: DurableEvidence::Pending,
         prior_unobtainable_count: 0,
         reprobe: None,
-        topdown_pruned: false,
+        pruned_origin: false,
     });
     assert_eq!(routing, UnobtainableRouting::ResolveFromSource);
 }
@@ -336,7 +336,7 @@ fn routing_broken_with_obtainable_reprobe_rearms_once() {
         reprobe,
         // The marked (topdown-pruned root) shape: the only shape where
         // the one-shot-spent settlement may fail-fast (finding 11).
-        topdown_pruned: true,
+        pruned_origin: true,
     };
     // One-shot unspent + obtainable → ReArm.
     assert_eq!(
@@ -375,7 +375,7 @@ fn routing_unmarked_broken_confirmed_missing_resolves_from_source() {
         durable_evidence: DurableEvidence::Broken,
         prior_unobtainable_count: prior,
         reprobe,
-        topdown_pruned: false,
+        pruned_origin: false,
     };
     // Confirmed-missing re-probe, one-shot unspent: the unmarked node
     // must release to from-source — the build attempt proceeds.
@@ -452,7 +452,7 @@ fn routing_fail_fast_requires_all_four_conjuncts() {
                         } else {
                             ReprobeAnswer::Obtainable
                         }),
-                        topdown_pruned: marked,
+                        pruned_origin: marked,
                     };
                     let routing = route_unobtainable(&inputs);
                     if routing == UnobtainableRouting::FailFast {
@@ -521,7 +521,7 @@ fn infra_failure_never_failfasts_never_routes_from_source() {
         prior_unobtainable_count: 99,
         reprobe: Some(ReprobeAnswer::ConfirmedMissing),
         // Even a MARKED node: an empty missing set can never fail-fast.
-        topdown_pruned: true,
+        pruned_origin: true,
     });
     assert!(
         matches!(
@@ -1460,7 +1460,7 @@ async fn flag_on_stale_unobtainable_two_build_dedup_never_fails() -> TestResult 
 /// resolves `resolved_from_source`, and the build stays Active.
 ///
 /// Flag-off oracle: the as-built walk's fail-fast
-/// (`fail_fast_topdown_pruned_root`) is reachable only for nodes carrying
+/// (`fail_fast_pruned_root`) is reachable only for nodes carrying
 /// the `topdown_pruned` mark (`must_substitute` = marked AND Broken —
 /// "unmarked nodes are never affected, whatever their evidence"); an
 /// unmarked node whose walk fails reverts to Ready and falls through to
@@ -5162,6 +5162,426 @@ async fn job_lifecycle_metrics_count_claims_and_resolutions() -> TestResult {
         states,
         vec!["cancelled".to_string(), "resolved_success".to_string()],
         "the counters mirror the job rows"
+    );
+    Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Phase D' T-D2.1 (PD-D1): the settlement mark re-sources to
+// materialization_jobs.origin (+ pruned-wins dedup upgrade)
+// ════════════════════════════════════════════════════════════════════
+
+// r[verify sched.materialize.routing+2]
+/// The arm-3 settlement discriminator reads the consumed job's ORIGIN
+/// (the durable successor of the topdown_pruned mark — design §4/A2/
+/// A13), not the in-memory column. Both divergence directions:
+///   A. origin='pruned' + in-memory mark FALSE (the post-080 world)
+///      → FailFast on the four-conjunct corner;
+///   B. origin='cache_opportunity' + in-memory mark TRUE
+///      → ResolveFromSource (the mark alone no longer fail-fasts).
+#[tokio::test]
+async fn routing_reads_origin_not_column() -> TestResult {
+    use rio_auth::hmac::HmacSigner;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let service_key = b"test-d21-origin-key-32-bytes!!!!".to_vec();
+    let (handle, _actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, p| {
+            cfg.materialization.enabled = true;
+            p.service_signer = Some(Arc::new(HmacSigner::from_key(service_key)));
+        });
+    let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "d21-origin-tenant").await;
+
+    // ── Direction A: unmarked node, job origin forced 'pruned'. ──
+    let out_a = test_store_path("d21a-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out_a.clone());
+    let mut na = make_node("d21a");
+    na.expected_output_paths = vec![out_a.clone()];
+    na.wanted_output_names = vec!["out".into()];
+    let ba = Uuid::new_v4();
+    merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: ba,
+            tenant_id: Some(tenant),
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![na],
+            edges: vec![],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+    let drv_a = expect_drv(&handle, "d21a").await;
+    assert!(!drv_a.topdown_pruned, "premise: A is UNMARKED in memory");
+    // Simulate the post-080 world: the durable fact lives in the job
+    // row's origin alone.
+    sqlx::query("UPDATE materialization_jobs SET origin = 'pruned' WHERE drv_hash = 'd21a'")
+        .execute(&db.pool)
+        .await?;
+
+    let assignment = match claim_materialization(&handle, "d21a", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("A's claim must deliver, got {other:?}"),
+    };
+    let exec_a: Uuid = assignment.exec_id.parse()?;
+    store.state.substitutable.write().unwrap().clear();
+    report_materialization_outcome(
+        &handle,
+        exec_a,
+        "d21a",
+        mat_unobtainable_outcome(vec![out_a.clone()], vec![], "upstream 404 on A"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("A's unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    let st_a = query_status(&handle, ba).await?;
+    assert_eq!(
+        st_a.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "A: a pruned-ORIGIN job's confirmed-missing settlement must \
+         fail-fast even with the in-memory mark false (the origin is \
+         the durable discriminator)"
+    );
+    let job_a: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = 'd21a'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(job_a, "resolved_unobtainable");
+
+    // ── Direction B: real prune (mark TRUE), origin forced back to
+    //    'cache_opportunity'. ──
+    let out_b = test_store_path("d21b-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out_b.clone());
+    let mut nb = make_node("d21b");
+    nb.expected_output_paths = vec![out_b.clone()];
+    nb.wanted_output_names = vec!["out".into()];
+    let mut nb_dep = make_node("d21b-dep");
+    nb_dep.expected_output_paths = vec![test_store_path("d21b-dep-out")];
+    let bb = Uuid::new_v4();
+    merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: bb,
+            tenant_id: Some(tenant),
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![nb, nb_dep],
+            edges: vec![make_test_edge("d21b", "d21b-dep")],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+    let drv_b = expect_drv(&handle, "d21b").await;
+    assert!(drv_b.topdown_pruned, "premise: the prune MARKED B");
+    sqlx::query(
+        "UPDATE materialization_jobs SET origin = 'cache_opportunity' WHERE drv_hash = 'd21b'",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let assignment = match claim_materialization(&handle, "d21b", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("B's claim must deliver, got {other:?}"),
+    };
+    let exec_b: Uuid = assignment.exec_id.parse()?;
+    store.state.substitutable.write().unwrap().clear();
+    report_materialization_outcome(
+        &handle,
+        exec_b,
+        "d21b",
+        mat_unobtainable_outcome(vec![out_b.clone()], vec![], "upstream 404 on B"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("B's unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    let job_b: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = 'd21b'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        job_b, "resolved_from_source",
+        "B: a non-pruned-origin job releases to from-source — the \
+         in-memory mark alone must no longer fail-fast"
+    );
+    let st_b = query_status(&handle, bb).await?;
+    assert_ne!(
+        st_b.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "B: never a fail-fast for a non-pruned-origin settlement"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.job]
+/// The dedup-then-prune corner end-to-end (PD-D1): a node gets a
+/// cache_opportunity job from an earlier merge; a LATER pruned merge
+/// dedups onto it. The dedup must upgrade the job's origin to 'pruned'
+/// (pruned-wins) — and the upgrade is observable
+/// (rio_scheduler_materialization_jobs_origin_upgraded_total) without
+/// counting as a creation. The settlement then fail-fasts on the
+/// four-conjunct corner, keyed on the upgraded origin.
+#[tokio::test]
+async fn unobtainable_on_upgraded_dedup_job_fail_fasts() -> TestResult {
+    use crate::sla::metrics::counter_map;
+    use metrics_util::debugging::DebuggingRecorder;
+    use rio_auth::hmac::HmacSigner;
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&rec);
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let service_key = b"test-d21-dedup-key-32-bytes!!!!!".to_vec();
+    let (handle, _actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, p| {
+            cfg.materialization.enabled = true;
+            p.service_signer = Some(Arc::new(HmacSigner::from_key(service_key)));
+        });
+    let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "d21-dedup-tenant").await;
+
+    // b1: plain merge of R (substitutable before merge) → the new_sub
+    // lane creates the cache_opportunity job; R is unmarked.
+    let out = test_store_path("d21c-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mk_root = || {
+        let mut n = make_node("d21c");
+        n.expected_output_paths = vec![out.clone()];
+        n.wanted_output_names = vec!["out".into()];
+        n
+    };
+    let b1 = Uuid::new_v4();
+    merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: b1,
+            tenant_id: Some(tenant),
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![mk_root()],
+            edges: vec![],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+    let origin: String =
+        sqlx::query_scalar("SELECT origin FROM materialization_jobs WHERE drv_hash = 'd21c'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(origin, "cache_opportunity", "premise: b1's job origin");
+
+    // b2: the pruned merge (R→D, R substitutable) dedups onto b1's job.
+    let mut dep = make_node("d21c-dep");
+    dep.expected_output_paths = vec![test_store_path("d21c-dep-out")];
+    let b2 = Uuid::new_v4();
+    merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: b2,
+            tenant_id: Some(tenant),
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![mk_root(), dep],
+            edges: vec![make_test_edge("d21c", "d21c-dep")],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+    let drv = expect_drv(&handle, "d21c").await;
+    assert!(drv.topdown_pruned, "premise: b2's prune fired and marked R");
+
+    // THE UPGRADE (red-first): the dedup carried the pruned origin onto
+    // the existing pending row.
+    let (origin, n_jobs): (String, i64) = sqlx::query_as(
+        "SELECT min(origin), count(*) FROM materialization_jobs WHERE drv_hash = 'd21c'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(n_jobs, 1, "the dedup found the existing job — one row");
+    assert_eq!(
+        origin, "pruned",
+        "pruned-wins: the dedup must upgrade the existing pending row's origin"
+    );
+    // Observability (DQ-1): the upgrade emits its own counter and is
+    // NOT counted as a creation. ONE counter_map read (the snapshotter
+    // drains — the single-snapshot discipline).
+    let counters = counter_map(&snap);
+    assert_eq!(
+        counters
+            .get("rio_scheduler_materialization_jobs_origin_upgraded_total")
+            .copied()
+            .unwrap_or(0),
+        1,
+        "the origin upgrade must be counted"
+    );
+    assert_eq!(
+        counters
+            .get("rio_scheduler_materialization_jobs_created_total")
+            .copied()
+            .unwrap_or(0),
+        1,
+        "exactly b1's creation — an upgrade is not a creation \
+         (jobs_created_total counts creations only)"
+    );
+
+    // The four-conjunct settlement, keyed on the upgraded origin.
+    let assignment = match claim_materialization(&handle, "d21c", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    store.state.substitutable.write().unwrap().clear();
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "d21c",
+        mat_unobtainable_outcome(vec![out.clone()], vec![], "upstream 404 on the dedup root"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    let job_state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = 'd21c'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        job_state, "resolved_unobtainable",
+        "the upgraded-origin job's confirmed-missing settlement fail-fasts"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.job]
+/// DQ-1 armament preservation: the merge post-commit feed must NOT
+/// clobber a dedup-found job's armament state (park backoff, claim
+/// holder) — the `entry().or_insert()` discipline of the probe path,
+/// extended to the merge feed. A PARKED cache_opportunity job that a
+/// pruned merge dedups onto (and upgrades) must STAY parked: the next
+/// claim answers NotYetReady until the backoff expires.
+#[tokio::test]
+async fn dedup_upgrade_preserves_parked_armament() -> TestResult {
+    use crate::sla::metrics::counter_map;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&rec);
+
+    // max_attempts=1 → one infra report parks; backoff 1 h so the park
+    // cannot expire under the assertions.
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.materialization.enabled = true;
+            cfg.materialization.max_attempts = 1;
+            cfg.materialization.park_backoff_base_secs = 3600;
+            cfg.materialization.park_backoff_cap_secs = 3600;
+        });
+    let _tasks = (store_task, actor_task);
+
+    // b1: R substitutable → job; claim; infra-fail → the job PARKS.
+    let out = test_store_path("d21d-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mk_root = || {
+        let mut n = make_node("d21d");
+        n.expected_output_paths = vec![out.clone()];
+        n.wanted_output_names = vec!["out".into()];
+        n
+    };
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(&handle, b1, vec![mk_root()], vec![], false).await?;
+    barrier(&handle).await;
+    let assignment = match claim_materialization(&handle, "d21d", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the first claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(&handle, exec_id, "d21d", mat_infra_outcome("dead upstream"))
+        .await
+        .map_err(|e| anyhow::anyhow!("infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    let parked = match claim_materialization(&handle, "d21d", "store-test-0").await {
+        Ok(outcome) => outcome,
+        Err(e) => panic!("the parked claim must answer, got {e:?}"),
+    };
+    assert!(
+        matches!(parked, PullOutcome::NotYetReady { .. }),
+        "premise: the job is parked after the budget-exhausting infra \
+         failure, got {parked:?}"
+    );
+
+    // b2: the pruned merge (R→D) dedups onto the PARKED job.
+    let mut dep = make_node("d21d-dep");
+    dep.expected_output_paths = vec![test_store_path("d21d-dep-out")];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        b2,
+        vec![mk_root(), dep],
+        vec![make_test_edge("d21d", "d21d-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // The upgrade happened...
+    let origin: String =
+        sqlx::query_scalar("SELECT origin FROM materialization_jobs WHERE drv_hash = 'd21d'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(origin, "pruned", "the dedup upgraded the parked job");
+    let upgraded = counter_map(&snap)
+        .get("rio_scheduler_materialization_jobs_origin_upgraded_total")
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(upgraded, 1, "the upgrade is counted");
+
+    // ... and the PARK SURVIVED it (the armament-preservation pin): the
+    // merge feed must not reset parked_until/claimed_by for dedup-found
+    // entries.
+    let after = match claim_materialization(&handle, "d21d", "store-test-0").await {
+        Ok(outcome) => outcome,
+        Err(e) => panic!("the post-merge claim must answer, got {e:?}"),
+    };
+    assert!(
+        matches!(after, PullOutcome::NotYetReady { .. }),
+        "park must survive the dedup upgrade (the merge feed must not \
+         clobber the armament state), got {after:?}"
     );
     Ok(())
 }

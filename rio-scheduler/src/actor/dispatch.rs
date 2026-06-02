@@ -319,7 +319,7 @@ impl DagActor {
             .await;
         }
         for drv_hash in &to_fail_fast {
-            self.fail_fast_topdown_pruned_root(
+            self.fail_fast_pruned_root(
                 drv_hash,
                 "wanted output(s) missing upstream and not substitutable at dispatch \
                  after deps were pruned",
@@ -1062,7 +1062,7 @@ impl DagActor {
     ///    missing upstream. Pre-fix that outcome left the node Ready
     ///    and dispatched it from source — the doomed dispatch this arm
     ///    exists to prevent.
-    pub(super) async fn fail_fast_topdown_pruned_root(&mut self, drv_hash: &DrvHash, cause: &str) {
+    pub(super) async fn fail_fast_pruned_root(&mut self, drv_hash: &DrvHash, cause: &str) {
         // A prior iteration of the same dispatch pass may already have
         // settled this node: `batch_probe_cached_ready` collects the
         // whole `to_fail_fast` layer up front, and the first node's
@@ -1251,7 +1251,7 @@ impl DagActor {
 
         if tried {
             // The verification one-shot is spent: this IS the genuine arm.
-            self.fail_fast_topdown_pruned_root(drv_hash, cause).await;
+            self.fail_fast_pruned_root(drv_hash, cause).await;
             return BrokenSettlement::FailedFast;
         }
 
@@ -1286,7 +1286,7 @@ impl DagActor {
             metrics::counter!("rio_scheduler_topdown_settlement_reprobe_total",
                 "outcome" => "fail_fast")
             .increment(1);
-            self.fail_fast_topdown_pruned_root(drv_hash, cause).await;
+            self.fail_fast_pruned_root(drv_hash, cause).await;
             return BrokenSettlement::FailedFast;
         }
 

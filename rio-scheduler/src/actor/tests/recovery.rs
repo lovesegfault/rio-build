@@ -2922,7 +2922,7 @@ async fn test_failover_childless_pruned_root_fails_fast_not_dispatched_from_sour
 /// recovery, so the (correctly kept) mark is consumed by the
 /// resubmit-directing fail-fast inside that same command — there is no
 /// post-fixture point where the kept mark itself is observable
-/// (`fail_fast_topdown_pruned_root` consumes the marker; that
+/// (`fail_fast_pruned_root` consumes the marker; that
 /// consumption is pinned by
 /// `test_fail_fast_clears_topdown_pruned_and_resubmission_builds_from_source`).
 /// The mark's survival through the gate is therefore proven
@@ -3256,7 +3256,7 @@ async fn stage_parent_with_other_builds_cancelled_child(
 ///
 /// Deliberately NOT asserted: "the parent is not DependencyFailed".
 /// The bounded fail-fast itself terminalizes a sole-interest parked
-/// node as DependencyFailed (`fail_fast_topdown_pruned_root` parks it
+/// node as DependencyFailed (`fail_fast_pruned_root` parks it
 /// Queued, then `cancel_build_derivations` dependency-fails every
 /// sole-interest not-yet-dispatched node of the failing build), so the
 /// node's terminal status converges with the pre-fix outcome. What

@@ -98,14 +98,32 @@ pub(crate) struct NewJobRow<'a> {
     pub origin: JobOrigin,
 }
 
+/// Per-input outcome of the in-tx batch creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JobCreateResult {
+    pub job_id: Uuid,
+    /// False when an unresolved job already existed (the
+    /// partial-unique-index dedup found it).
+    pub created: bool,
+    /// The dedup found an existing NON-pruned pending row and this
+    /// batch's pruned input upgraded its origin to `'pruned'`
+    /// (pruned-wins, PD-D1). Always false when `created` is true.
+    pub upgraded: bool,
+}
+
 /// Outcome of the standalone fenced job creation: the unresolved job
 /// for the derivation (created or found by the dedup), or the fence
 /// refused the write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FencedJobCreate {
     /// The write applied. `created` is false when an unresolved job
-    /// already existed (the partial-unique-index dedup found it).
-    Applied { job_id: Uuid, created: bool },
+    /// already existed (the partial-unique-index dedup found it);
+    /// `upgraded` reports the PD-D1 pruned-wins origin upgrade.
+    Applied {
+        job_id: Uuid,
+        created: bool,
+        upgraded: bool,
+    },
     /// The serving generation is below the claims floor: the
     /// transaction rolled back having written nothing.
     Fenced,
@@ -117,13 +135,24 @@ impl SchedulerDb {
     /// of derivations, inside the caller's transaction. The caller's
     /// tx carries the merge fence; this helper adds no second floor
     /// read. Batch UNNEST INSERT + ON CONFLICT dedup (the partial-
-    /// unique index); returns `(job_id, created)` per input row in
+    /// unique index); returns one [`JobCreateResult`] per input row in
     /// input order.
+    ///
+    /// **Pruned-wins origin upgrade (PD-D1, T-D2.1):** a pruned input
+    /// whose creation dedups onto an existing non-pruned pending row
+    /// upgrades that row's origin to `'pruned'` in a follow-up UPDATE
+    /// inside the same transaction (the durable mark must not be lost
+    /// to the dedup order — design §4/A2/A13). The upgrade is monotone
+    /// (`origin <> 'pruned'` guard; never downgraded) and reserved to
+    /// the pruned origin. The follow-up-UPDATE form (rather than
+    /// `ON CONFLICT … DO UPDATE`) keeps the INSERT's RETURNING an
+    /// inserts-only set, so `created` discrimination is untouched
+    /// (an upgrade is NOT a creation).
     pub(crate) async fn create_materialization_jobs_in_tx(
         tx: &mut PgConnection,
         rows: &[NewJobRow<'_>],
         created_generation: i64,
-    ) -> Result<Vec<(Uuid, bool)>, sqlx::Error> {
+    ) -> Result<Vec<JobCreateResult>, sqlx::Error> {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -167,6 +196,32 @@ impl SchedulerDb {
         .await?;
         let by_drv: HashMap<Uuid, Uuid> = pending.into_iter().collect();
 
+        // Pruned-wins upgrade (PD-D1): pruned inputs whose row was
+        // dedup-found (not inserted) upgrade the existing pending row.
+        // The `origin <> 'pruned'` guard makes the statement idempotent
+        // and monotone; RETURNING reports the rows actually upgraded.
+        let pruned_dedup_losers: Vec<Uuid> = rows
+            .iter()
+            .filter(|r| matches!(r.origin, JobOrigin::Pruned))
+            .filter_map(|r| by_drv.get(&r.derivation_id).copied())
+            .filter(|job_id| !inserted.contains(job_id))
+            .collect();
+        let upgraded: HashSet<Uuid> = if pruned_dedup_losers.is_empty() {
+            HashSet::new()
+        } else {
+            let rows: Vec<(Uuid,)> = sqlx::query_as(
+                "UPDATE materialization_jobs SET origin = 'pruned' \
+                  WHERE job_id = ANY($1::uuid[]) \
+                    AND state = 'pending' \
+                    AND origin <> 'pruned' \
+                  RETURNING job_id",
+            )
+            .bind(&pruned_dedup_losers)
+            .fetch_all(&mut *tx)
+            .await?;
+            rows.into_iter().map(|(id,)| id).collect()
+        };
+
         rows.iter()
             .map(|r| {
                 let job_id = by_drv.get(&r.derivation_id).copied().ok_or_else(|| {
@@ -175,7 +230,11 @@ impl SchedulerDb {
                         r.derivation_id
                     ))
                 })?;
-                Ok((job_id, inserted.contains(&job_id)))
+                Ok(JobCreateResult {
+                    job_id,
+                    created: inserted.contains(&job_id),
+                    upgraded: matches!(r.origin, JobOrigin::Pruned) && upgraded.contains(&job_id),
+                })
             })
             .collect()
     }
@@ -211,12 +270,20 @@ impl SchedulerDb {
         )
         .await?;
         tx.commit().await?;
-        let &(job_id, created) = created.first().ok_or_else(|| {
+        let &JobCreateResult {
+            job_id,
+            created,
+            upgraded,
+        } = created.first().ok_or_else(|| {
             sqlx::Error::Protocol(
                 "create_materialization_jobs_in_tx returned no row for a one-row input".into(),
             )
         })?;
-        Ok(FencedJobCreate::Applied { job_id, created })
+        Ok(FencedJobCreate::Applied {
+            job_id,
+            created,
+            upgraded,
+        })
     }
 
     /// The store-poll query: pending, not parked, no active assignment
@@ -336,19 +403,35 @@ impl SchedulerDb {
 
     /// The unresolved (pending) job for one derivation, if any — the
     /// consumption transaction's job lookup (PG is the authority; the
-    /// actor's in-memory view is a cache).
+    /// actor's in-memory view is a cache). Carries the row's ORIGIN:
+    /// `origin = 'pruned'` is the durable settlement discriminator
+    /// (the topdown_pruned mark's successor — design §4/A2/A13,
+    /// T-D2.1).
     pub(crate) async fn unresolved_job_for_derivation(
         &self,
         derivation_id: Uuid,
-    ) -> Result<Option<Uuid>, sqlx::Error> {
-        sqlx::query_scalar(
-            "SELECT job_id FROM materialization_jobs \
+    ) -> Result<Option<(Uuid, JobOrigin)>, sqlx::Error> {
+        let row: Option<(Uuid, String)> = sqlx::query_as(
+            "SELECT job_id, origin FROM materialization_jobs \
               WHERE derivation_id = $1 AND state = 'pending' \
               LIMIT 1",
         )
         .bind(derivation_id)
         .fetch_optional(&self.pool)
-        .await
+        .await?;
+        row.map(|(job_id, origin)| {
+            let origin = origin.parse().map_err(|_| {
+                sqlx::Error::Decode(
+                    format!(
+                        "materialization_jobs.origin: value {origin:?} not in the rust-side \
+                         alphabet"
+                    )
+                    .into(),
+                )
+            })?;
+            Ok((job_id, origin))
+        })
+        .transpose()
     }
 
     /// Dormancy probe (Wave 6 / VM subtest support): row counts of

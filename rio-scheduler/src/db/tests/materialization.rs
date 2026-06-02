@@ -44,6 +44,7 @@ async fn job_creation_is_dedup_idempotent() -> anyhow::Result<()> {
     let FencedJobCreate::Applied {
         job_id: first_id,
         created: true,
+        ..
     } = first
     else {
         anyhow::bail!("first create must apply with created=true, got {first:?}");
@@ -63,6 +64,7 @@ async fn job_creation_is_dedup_idempotent() -> anyhow::Result<()> {
     let FencedJobCreate::Applied {
         job_id: second_id,
         created: false,
+        ..
     } = second
     else {
         anyhow::bail!("second create must be the dedup no-op (created=false), got {second:?}");
@@ -94,6 +96,7 @@ async fn job_creation_is_dedup_idempotent() -> anyhow::Result<()> {
     let FencedJobCreate::Applied {
         job_id: third_id,
         created: true,
+        ..
     } = third
     else {
         anyhow::bail!("create after resolution must create a fresh job, got {third:?}");
@@ -437,7 +440,7 @@ async fn job_create_in_rolled_back_tx_leaves_no_row() -> anyhow::Result<()> {
     )
     .await?;
     assert_eq!(created.len(), 1, "the in-tx core returns one row per input");
-    assert!(created[0].1, "the job reports created inside the tx");
+    assert!(created[0].created, "the job reports created inside the tx");
 
     // The merge fails: the whole transaction rolls back.
     tx.rollback().await?;
@@ -506,8 +509,8 @@ async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<(
         1,
     )
     .await?;
-    assert!(merge_created[0].1, "the merge's in-tx create inserts");
-    let merge_job_id = merge_created[0].0;
+    assert!(merge_created[0].created, "the merge's in-tx create inserts");
+    let merge_job_id = merge_created[0].job_id;
 
     // The dispatch-probe site fires CONCURRENTLY on a separate pool
     // connection: its INSERT ... ON CONFLICT DO NOTHING must block on
@@ -543,6 +546,7 @@ async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<(
     let FencedJobCreate::Applied {
         job_id: probe_job,
         created,
+        ..
     } = probe_outcome
     else {
         anyhow::bail!("the probe-site create must apply (dedup), got {probe_outcome:?}");
@@ -576,6 +580,7 @@ async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<(
     let FencedJobCreate::Applied {
         job_id: probe_first_id,
         created: true,
+        ..
     } = probe_first
     else {
         anyhow::bail!("the probe-first create must insert, got {probe_first:?}");
@@ -594,17 +599,26 @@ async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<(
     .await?;
     merge_tx.commit().await?;
     assert!(
-        !merge_second[0].1,
+        !merge_second[0].created,
         "the merge's in-tx core must take the dedup arm against the probe's row"
     );
+    assert!(
+        merge_second[0].upgraded,
+        "the merge's PRUNED dedup against the probe's cache_opportunity row \
+         is the PD-D1 upgrade"
+    );
     assert_eq!(
-        merge_second[0].0, probe_first_id,
+        merge_second[0].job_id, probe_first_id,
         "the merge converges on the probe site's job"
     );
     assert_eq!(job_count(&test_db.pool, drv2).await?, 1);
 
-    // The surviving rows keep the WINNER's origin in both orders (the
-    // dedup never rewrites an existing row).
+    // Origins after both orders (the pruned-wins extension of this
+    // pin, T-D2.1): order 1 is cache_opportunity-vs-cache_opportunity —
+    // no upgrade, the winner's origin survives; order 2's winner was
+    // the probe's cache_opportunity row, which the merge's PRUNED
+    // dedup UPGRADES (the durable mark must not be lost to the dedup
+    // order).
     let origins: Vec<(String, String)> =
         sqlx::query_as("SELECT drv_hash, origin FROM materialization_jobs ORDER BY drv_hash")
             .fetch_all(&test_db.pool)
@@ -616,12 +630,9 @@ async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<(
                 "job-cross-site-hash".to_string(),
                 "cache_opportunity".to_string()
             ),
-            (
-                "job-cross-site-hash-2".to_string(),
-                "cache_opportunity".to_string()
-            ),
+            ("job-cross-site-hash-2".to_string(), "pruned".to_string()),
         ],
-        "each surviving row keeps its creating site's origin"
+        "non-pruned dedups never rewrite; pruned dedups upgrade"
     );
     Ok(())
 }
@@ -674,5 +685,115 @@ async fn materialization_job_alphabets_match_check_constraints() -> anyhow::Resu
         rust_origins, check_origins,
         "JobOrigin and the 078 CHECK constraint must carry the same alphabet"
     );
+    Ok(())
+}
+
+// ── Phase D' T-D2.1 (PD-D1): pruned-wins origin upgrade on the dedup arm ──
+
+/// The dedup-then-prune corner (PD-D1): a prune landing on a node with
+/// an existing unresolved job must not lose its mark in the origin
+/// world. `create_materialization_jobs_in_tx` upgrades the existing
+/// pending row's origin to 'pruned' (pruned-wins); the upgrade is
+/// monotone (never downgraded by a later non-pruned creation) and
+/// reserved to the pruned origin (reprobe/stale_reset never upgrade).
+/// `created` stays false for the dedup arm — an upgrade is NOT a
+/// creation (jobs_created_total counts creations only).
+// r[verify sched.materialize.job]
+#[tokio::test]
+async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
+    let (test_db, db, drv) = setup("job-upgrade-hash").await?;
+    let origin_of = |pool: sqlx::PgPool, id: Uuid| async move {
+        let o: String =
+            sqlx::query_scalar("SELECT origin FROM materialization_jobs WHERE derivation_id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await?;
+        anyhow::Ok(o)
+    };
+
+    // cache_opportunity first (the probe's creation)...
+    let first = db
+        .create_materialization_job_fenced(
+            drv,
+            "job-upgrade-hash",
+            None,
+            JobOrigin::CacheOpportunity,
+            1,
+        )
+        .await?;
+    let FencedJobCreate::Applied {
+        job_id: first_id,
+        created: true,
+        ..
+    } = first
+    else {
+        anyhow::bail!("first create must apply with created=true, got {first:?}");
+    };
+
+    // ... then a pruned merge dedups onto it: created=false AND the
+    // existing row's origin upgrades to 'pruned' (the durable mark).
+    let second = db
+        .create_materialization_job_fenced(drv, "job-upgrade-hash", None, JobOrigin::Pruned, 1)
+        .await?;
+    let FencedJobCreate::Applied {
+        job_id: second_id,
+        created: false,
+        ..
+    } = second
+    else {
+        anyhow::bail!("the pruned dedup must not be a creation, got {second:?}");
+    };
+    assert_eq!(first_id, second_id, "the dedup found the existing job");
+    assert_eq!(
+        origin_of(test_db.pool.clone(), drv).await?,
+        "pruned",
+        "pruned-wins: the dedup must upgrade the existing pending row's origin"
+    );
+    assert_eq!(job_count(&test_db.pool, drv).await?, 1, "still one row");
+
+    // Monotone: a later cache_opportunity dedup never downgrades.
+    let third = db
+        .create_materialization_job_fenced(
+            drv,
+            "job-upgrade-hash",
+            None,
+            JobOrigin::CacheOpportunity,
+            1,
+        )
+        .await?;
+    assert!(
+        matches!(third, FencedJobCreate::Applied { created: false, .. }),
+        "the post-upgrade dedup is still a no-op creation, got {third:?}"
+    );
+    assert_eq!(
+        origin_of(test_db.pool.clone(), drv).await?,
+        "pruned",
+        "monotone: pruned is never downgraded"
+    );
+
+    // Reserved to pruned: reprobe/stale_reset dedups never upgrade.
+    let drv2 = insert_test_derivation(&db, "job-upgrade-hash-2").await?;
+    db.create_materialization_job_fenced(
+        drv2,
+        "job-upgrade-hash-2",
+        None,
+        JobOrigin::CacheOpportunity,
+        1,
+    )
+    .await?;
+    for origin in [JobOrigin::Reprobe, JobOrigin::StaleReset] {
+        let r = db
+            .create_materialization_job_fenced(drv2, "job-upgrade-hash-2", None, origin, 1)
+            .await?;
+        assert!(
+            matches!(r, FencedJobCreate::Applied { created: false, .. }),
+            "non-pruned dedup is a no-op, got {r:?}"
+        );
+        assert_eq!(
+            origin_of(test_db.pool.clone(), drv2).await?,
+            "cache_opportunity",
+            "only the pruned origin upgrades (got an upgrade from {origin:?})"
+        );
+    }
     Ok(())
 }

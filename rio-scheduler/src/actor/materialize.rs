@@ -69,6 +69,10 @@ pub(crate) struct CreatedJob {
     pub job_id: Uuid,
     /// False when the dedup found a pre-existing unresolved job.
     pub created: bool,
+    /// The dedup upgraded the existing pending row's origin to
+    /// `'pruned'` (pruned-wins, PD-D1 — counted separately from
+    /// creations).
+    pub upgraded: bool,
     pub origin: JobOrigin,
 }
 
@@ -156,7 +160,11 @@ impl DagActor {
             )
             .await
         {
-            Ok(FencedJobCreate::Applied { job_id, created }) => {
+            Ok(FencedJobCreate::Applied {
+                job_id,
+                created,
+                upgraded,
+            }) => {
                 // entry().or_insert(): the dedup arm (created == false)
                 // re-encounters jobs the view may already track — the
                 // dispatch probe re-probing a PARKED node every tick,
@@ -180,6 +188,10 @@ impl DagActor {
                         "origin" => origin.as_str()
                     )
                     .increment(1);
+                }
+                if upgraded {
+                    metrics::counter!("rio_scheduler_materialization_jobs_origin_upgraded_total")
+                        .increment(1);
                 }
                 // Interest: ensure the durable wanted relation reflects
                 // EVERY live interested build of this node — not just a
@@ -273,24 +285,36 @@ impl DagActor {
     /// Post-commit feed of the in-memory job view from the merge
     /// transaction's created-jobs list. Called only AFTER the merge tx
     /// committed (never inside it — a rolled-back merge must leave no
-    /// view entry), in the same post-commit phase that seeds states and
-    /// spawns walks.
+    /// view entry), in the same post-commit phase that seeds states.
+    ///
+    /// `entry().or_insert()` (DQ-1 armament preservation, T-D2.1): the
+    /// dedup arm (`created == false`) re-encounters jobs the view may
+    /// already track — a pruned merge dedup-upgrading a PARKED
+    /// `cache_opportunity` job, a re-merge over a claimed one — and
+    /// must NOT reset their armament state (park backoff, claim
+    /// holder) to a fresh unparked/unclaimed entry. A genuinely new
+    /// job (`created == true`) cannot have a view entry (the
+    /// partial-unique index guarantees no unresolved job existed), so
+    /// or_insert inserts it.
     pub(super) fn note_created_materialization_jobs(&mut self, created: &[CreatedJob]) {
         for job in created {
-            self.materialization_jobs.insert(
-                job.drv_hash.clone(),
-                JobViewEntry {
+            self.materialization_jobs
+                .entry(job.drv_hash.clone())
+                .or_insert(JobViewEntry {
                     job_id: job.job_id,
                     parked_until: None,
                     claimed_by: None,
-                },
-            );
+                });
             if job.created {
                 metrics::counter!(
                     "rio_scheduler_materialization_jobs_created_total",
                     "origin" => job.origin.as_str()
                 )
                 .increment(1);
+            }
+            if job.upgraded {
+                metrics::counter!("rio_scheduler_materialization_jobs_origin_upgraded_total")
+                    .increment(1);
             }
         }
     }
@@ -508,15 +532,16 @@ pub(crate) struct RoutingInputs<'a> {
     /// fetches it only when arms 0–2 do not apply (purity by
     /// parameterization — design §9.4).
     pub reprobe: Option<ReprobeAnswer>,
-    /// Whether the node carries the `topdown_pruned` mark (the arm-3
-    /// settlement discriminator — finding 11): only a MARKED node may
-    /// fail-fast (the prune deliberately dropped its closure, so
-    /// from-source is doomed); an unmarked node whose evidence is
-    /// Broken by structure (childless leaf / probe blip) releases to
-    /// from-source dispatch, exactly as the as-built walk does
-    /// (`must_substitute` = marked AND Broken — unmarked nodes are
-    /// never affected, whatever their evidence).
-    pub topdown_pruned: bool,
+    /// Whether the consumed job's `origin == 'pruned'` — the durable
+    /// successor of the topdown_pruned mark (design §4/A2/A13,
+    /// T-D2.1) and the arm-3 settlement discriminator (finding 11):
+    /// only a pruned-origin job may fail-fast (the prune deliberately
+    /// dropped the node's closure, so from-source is doomed); a
+    /// non-pruned-origin job whose evidence is Broken by structure
+    /// (childless leaf / probe blip) releases to from-source dispatch
+    /// instead — non-pruned nodes are never affected, whatever their
+    /// evidence.
+    pub pruned_origin: bool,
 }
 
 // r[impl sched.materialize.routing+2]
@@ -561,19 +586,17 @@ pub(crate) fn route_unobtainable(inputs: &RoutingInputs<'_>) -> UnobtainableRout
         // missing probe is mapped to ReArm by the caller before this
         // core runs — see the doc above.)
         //
-        // The settlement discriminates on the topdown-pruned mark
-        // (finding 11): only a MARKED node fail-fasts — the prune
-        // deliberately dropped its closure ("this was not built
-        // because outputs were expected available"), so from-source
-        // is doomed and the resubmit-directing error is the correct
-        // verdict. An UNMARKED node — a genuine leaf whose evidence
-        // is Broken by structure (childless) or by a probe blip —
-        // releases to from-source dispatch instead, exactly as the
-        // as-built walk does (`must_substitute` = marked AND Broken;
-        // unmarked nodes are never affected, whatever their
-        // evidence). Flag-state outcome equivalence (OQ7) requires
-        // the two mechanisms to agree on this verdict.
-        _ if inputs.topdown_pruned => UnobtainableRouting::FailFast,
+        // The settlement discriminates on the consumed job's ORIGIN
+        // (finding 11, durably re-sourced by T-D2.1): only a
+        // pruned-origin job fail-fasts — the prune deliberately
+        // dropped the node's closure ("this was not built because
+        // outputs were expected available"), so from-source is doomed
+        // and the resubmit-directing error is the correct verdict. A
+        // non-pruned-origin job — a genuine leaf whose evidence is
+        // Broken by structure (childless) or by a probe blip —
+        // releases to from-source dispatch instead; non-pruned nodes
+        // are never affected, whatever their evidence.
+        _ if inputs.pruned_origin => UnobtainableRouting::FailFast,
         _ => UnobtainableRouting::ResolveFromSource,
     }
 }
@@ -610,14 +633,19 @@ impl DagActor {
         let executor = ExecutorId::from(attempt.executor_id.as_str());
 
         // The unresolved job this attempt executes (PG is the
-        // authority; the in-memory view is a cache).
-        let job_id = self
+        // authority; the in-memory view is a cache). The row carries
+        // the ORIGIN — `'pruned'` is the durable arm-3 settlement
+        // discriminator (T-D2.1; the topdown_pruned column's
+        // successor).
+        let job = self
             .db
             .unresolved_job_for_derivation(attempt.derivation_id)
             .await
             .map_err(|e| {
                 super::pull::PullRejection::Internal(format!("materialization job lookup: {e}"))
             })?;
+        let job_id = job.map(|(id, _)| id);
+        let pruned_origin = job.is_some_and(|(_, origin)| matches!(origin, JobOrigin::Pruned));
 
         // 1. The live effective wanted set (the §6 join), resolved to
         //    store paths — the presence-re-check half of D7's closure.
@@ -695,14 +723,10 @@ impl DagActor {
                     rio_evidence_kernel::ClosureEvidence::Pending => DurableEvidence::Pending,
                     rio_evidence_kernel::ClosureEvidence::Broken => DurableEvidence::Broken,
                 };
-                // The arm-3 mark discriminator (finding 11): read the
-                // node's topdown_pruned mark inside the same consumption
-                // pass so the routing core can refuse to fail-fast
-                // unmarked nodes.
-                let topdown_pruned = self
-                    .dag
-                    .node(drv_hash.as_str())
-                    .is_some_and(|s| s.topdown_pruned);
+                // The arm-3 discriminator (finding 11) is the consumed
+                // job's origin — `pruned_origin` was read from the job
+                // row above (T-D2.1: the durable fact, not the
+                // in-memory column).
                 let needs_probe = u
                     .missing_paths
                     .iter()
@@ -731,7 +755,7 @@ impl DagActor {
                     durable_evidence,
                     prior_unobtainable_count: prior_unobtainable,
                     reprobe,
-                    topdown_pruned,
+                    pruned_origin,
                 });
                 // 3. Execute the routing.
                 match routing {
@@ -787,7 +811,7 @@ impl DagActor {
                             .await;
                         }
                         self.materialization_jobs.remove(&drv_hash);
-                        self.fail_fast_topdown_pruned_root(
+                        self.fail_fast_pruned_root(
                             &drv_hash,
                             "materialization confirmed a live-wanted output missing upstream \
                              and not substitutable",
@@ -976,6 +1000,10 @@ impl DagActor {
     /// produced-children gate stays the cross-restart backstop for a
     /// lost durable write. Materialization-only path — unreachable
     /// flag-off, so flag-off behavior is byte-identical by construction.
+    // D5-delete: the column (and this mirror) die with the evidence
+    // machinery (T-D5.1) — the mark's routing role moved to the job
+    // row's origin in T-D2.1; this clear keeps the legacy column
+    // coherent for flag-off-era readers until then.
     async fn clear_pruned_mark_on_job_resolution(&mut self, drv_hash: &DrvHash) {
         let marked = self.dag.node(drv_hash).is_some_and(|s| s.topdown_pruned);
         if !marked {
