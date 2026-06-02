@@ -216,16 +216,24 @@ pub struct PollTick {
 pub enum StallKind {
     /// Active for at least `active_stall_hours` of unsuspended time. The
     /// run loop decides what follows (the single auto-retry, or a terminal
-    /// infrastructure record once that budget is spent) — the watchdog only
-    /// reports and resets the clock.
+    /// infrastructure record once that budget is spent). The clock is NOT
+    /// reset at emission — the verdict stays armed (re-firing each tick)
+    /// until the run loop's action commits a ledger transition that
+    /// clears it (`observe_job`'s phase change or `retire`'s removal), so
+    /// a failed action retries on the next poll instead of waiting out a
+    /// full re-accrual.
     ActiveStall,
     /// Queued for at least `queued_watchdog_hours` of unsuspended time with
     /// re-enqueue budget remaining: non-terminal re-enqueue (the clock
-    /// resets and the job's requeue count increments).
+    /// resets and the job's requeue count increments at emission — this
+    /// arm's action is an infallible log line, so edge consumption cannot
+    /// lose a verdict).
     QueuedRequeue,
     /// Queued past the threshold again after `max_queued_requeues`
     /// re-enqueues were already spent: the run loop records a terminal
-    /// infrastructure outcome instead of re-enqueueing forever.
+    /// infrastructure outcome instead of re-enqueueing forever. Like
+    /// [`StallKind::ActiveStall`], armed until the terminal record's
+    /// `retire` commits.
     QueuedEscalate,
 }
 
@@ -537,6 +545,18 @@ impl Watchdog {
         }
 
         // Clocks accrue only while not suspended.
+        //
+        // Verdict consumption is level-triggered for the arms whose
+        // actions can fail: an ActiveStall or QueuedEscalate verdict does
+        // NOT reset the clock at emission — only the committed ledger
+        // transition clears the level (the auto-retry's `observe_job`
+        // phase change zeroes the clock; a terminal record's `retire`
+        // removes it). A failed action (journal or results append) thus
+        // leaves the clock over its limit and the verdict genuinely
+        // re-fires on the next poll tick, instead of being silently
+        // forfeited until a full re-accrual. QueuedRequeue stays
+        // edge-consumed (clock reset, requeue counted at emission): its
+        // action is a log line, which cannot fail.
         let mut stalled = Vec::new();
         if !suspended && delta > 0.0 {
             let active_limit = self.knobs.active_stall_hours * 3600.0;
@@ -550,7 +570,6 @@ impl Watchdog {
                             kind: StallKind::ActiveStall,
                             requeues_used: clock.requeues,
                         });
-                        clock.accrued_secs = 0.0;
                     }
                     JobPhase::Queued if clock.accrued_secs >= queued_limit => {
                         if clock.requeues >= self.knobs.max_queued_requeues {
@@ -566,8 +585,8 @@ impl Watchdog {
                                 kind: StallKind::QueuedRequeue,
                                 requeues_used: clock.requeues,
                             });
+                            clock.accrued_secs = 0.0;
                         }
-                        clock.accrued_secs = 0.0;
                     }
                     _ => {}
                 }
@@ -979,6 +998,63 @@ mod tests {
             "sustained gap with quiescent substitution is a real dispatch failure"
         );
         assert_eq!(o.components, vec![COMPONENT_DISPATCH]);
+    }
+
+    /// ActiveStall and QueuedEscalate are level-triggered: emission does
+    /// not reset the clock, so an unconsumed verdict re-fires on the very
+    /// next tick — and only the committed ledger transition (observe_job's
+    /// phase change for the auto-retry, remove_job for a terminal record)
+    /// clears the level. QueuedRequeue stays edge-consumed (its action is
+    /// an infallible log line) and must NOT re-fire.
+    #[test]
+    fn unconsumed_stall_verdicts_re_fire_until_a_transition_commits() {
+        let mut wd = Watchdog::new(knobs());
+        wd.observe_job("active.x86_64-linux", JobPhase::Active);
+        wd.observe_job("queued.x86_64-linux", JobPhase::Queued);
+        wd.on_tick(&tick(0, cluster(5, 5, 0, 8)));
+
+        // Drive the queued job to its escalate state (requeues = max 2):
+        // two QueuedRequeue crossings at 2h and 4h.
+        let o = wd.on_tick(&tick(2 * 3600, cluster(5, 5, 0, 8)));
+        assert_eq!(o.stalled[0].kind, StallKind::QueuedRequeue);
+        let o = wd.on_tick(&tick(4 * 3600, cluster(5, 5, 0, 8)));
+        assert_eq!(o.stalled[0].kind, StallKind::QueuedRequeue);
+        // QueuedRequeue is edge-consumed: one minute later, no re-fire.
+        let o = wd.on_tick(&tick(4 * 3600 + 60, cluster(5, 5, 0, 8)));
+        assert!(o.stalled.is_empty(), "{:?}", o.stalled);
+
+        // At 6h the active job crosses its threshold and the queued job
+        // crosses into escalation. Neither action is applied (a simulated
+        // append failure): both verdicts must re-fire next tick.
+        let o = wd.on_tick(&tick(6 * 3600 + 60, cluster(5, 5, 0, 8)));
+        assert_eq!(o.stalled.len(), 2, "{:?}", o.stalled);
+        let o = wd.on_tick(&tick(6 * 3600 + 120, cluster(5, 5, 0, 8)));
+        assert!(
+            o.stalled.contains(&StallVerdict {
+                job: "active.x86_64-linux".into(),
+                kind: StallKind::ActiveStall,
+                requeues_used: 0,
+            }),
+            "unconsumed ActiveStall re-fires next tick: {:?}",
+            o.stalled
+        );
+        assert!(
+            o.stalled.contains(&StallVerdict {
+                job: "queued.x86_64-linux".into(),
+                kind: StallKind::QueuedEscalate,
+                requeues_used: 2,
+            }),
+            "unconsumed QueuedEscalate re-fires next tick: {:?}",
+            o.stalled
+        );
+
+        // The committed transitions clear the levels: the auto-retry's
+        // Queued observation resets the active job's clock; the terminal
+        // record's removal retires the queued job's.
+        wd.observe_job("active.x86_64-linux", JobPhase::Queued);
+        wd.remove_job("queued.x86_64-linux");
+        let o = wd.on_tick(&tick(6 * 3600 + 180, cluster(5, 5, 0, 8)));
+        assert!(o.stalled.is_empty(), "{:?}", o.stalled);
     }
 
     /// One failed-poll tick during an outage: the streak must neither

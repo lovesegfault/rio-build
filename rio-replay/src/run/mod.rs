@@ -1126,6 +1126,15 @@ fn stall_record(
 /// terminal rio-infra-failure record ("stalled-active" / "stalled-queued")
 /// and retires the job. QueuedRequeue is purely a clock reset (the job is
 /// already in the pending set) — log only.
+///
+/// Failure handling is per-job, log-and-continue: one job's append failure
+/// must never forfeit its siblings' verdicts (wave-committed batch members
+/// cross thresholds on the same tick, so multi-verdict ticks are the
+/// norm). A failed action loses nothing — the watchdog consumes
+/// ActiveStall/QueuedEscalate verdicts only when the action's ledger
+/// transition commits, so the failed job's clock stays over its limit and
+/// the verdict re-fires on the next poll tick (pinned by
+/// `failed_stall_actions_re_fire_next_tick_and_spare_siblings`).
 #[allow(clippy::too_many_arguments)]
 async fn apply_stall_actions(
     state: &StateDir,
@@ -1136,7 +1145,7 @@ async fn apply_stall_actions(
     stalled: &[StallVerdict],
     mode: &str,
     campaign_id: &str,
-) -> Result<()> {
+) {
     for stall in stalled {
         match stall.kind {
             StallKind::QueuedRequeue => {
@@ -1150,20 +1159,32 @@ async fn apply_stall_actions(
                 let used = stall_retries.get(&stall.job).copied().unwrap_or(0);
                 if used == 0 {
                     // The journaled transition first, the local gate after:
-                    // a failed journal append must leave the retry unspent
-                    // (this pass errors and the next poll retries it), or
-                    // the job would go terminal without ever getting the
-                    // auto-retry the gate exists to grant.
-                    ledger.requeue_stalled(&stall.job).await?;
-                    stall_retries.insert(stall.job.clone(), 1);
-                    tracing::warn!(
-                        job = %stall.job,
-                        "active stall: single auto-retry — in-flight reservation released, job \
-                         re-offered in a fresh batch next wave; the stuck batch runs into the \
-                         batch-timeout backstop"
-                    );
+                    // a failed journal append leaves the retry unspent and
+                    // the verdict armed (the clock is consumed only by the
+                    // committed Queued observation), so the next poll tick
+                    // re-fires and retries — the job can never go terminal
+                    // without the auto-retry the gate exists to grant.
+                    match ledger.requeue_stalled(&stall.job).await {
+                        Ok(()) => {
+                            stall_retries.insert(stall.job.clone(), 1);
+                            tracing::warn!(
+                                job = %stall.job,
+                                "active stall: single auto-retry — in-flight reservation \
+                                 released, job re-offered in a fresh batch next wave; the stuck \
+                                 batch runs into the batch-timeout backstop"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                job = %stall.job,
+                                error = %format!("{e:#}"),
+                                "stall auto-retry journal append failed; budget unspent, the \
+                                 verdict stays armed and re-fires on the next poll"
+                            );
+                        }
+                    }
                 } else {
-                    write_terminal_stall(
+                    match write_terminal_stall(
                         state,
                         contexts,
                         results,
@@ -1176,16 +1197,24 @@ async fn apply_stall_actions(
                         mode,
                         campaign_id,
                     )
-                    .await?;
-                    tracing::warn!(
-                        job = %stall.job,
-                        "active stall after the single auto-retry: terminal rio-infra-failure \
-                         (stalled-active)"
-                    );
+                    .await
+                    {
+                        Ok(()) => tracing::warn!(
+                            job = %stall.job,
+                            "active stall after the single auto-retry: terminal \
+                             rio-infra-failure (stalled-active)"
+                        ),
+                        Err(e) => tracing::warn!(
+                            job = %stall.job,
+                            error = %format!("{e:#}"),
+                            "terminal stalled-active append failed; the verdict stays armed \
+                             and re-fires on the next poll"
+                        ),
+                    }
                 }
             }
             StallKind::QueuedEscalate => {
-                write_terminal_stall(
+                match write_terminal_stall(
                     state,
                     contexts,
                     results,
@@ -1198,16 +1227,23 @@ async fn apply_stall_actions(
                     mode,
                     campaign_id,
                 )
-                .await?;
-                tracing::warn!(
-                    job = %stall.job,
-                    requeues_used = stall.requeues_used,
-                    "queued stall escalation: terminal rio-infra-failure (stalled-queued)"
-                );
+                .await
+                {
+                    Ok(()) => tracing::warn!(
+                        job = %stall.job,
+                        requeues_used = stall.requeues_used,
+                        "queued stall escalation: terminal rio-infra-failure (stalled-queued)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        job = %stall.job,
+                        error = %format!("{e:#}"),
+                        "terminal stalled-queued append failed; the verdict stays armed and \
+                         re-fires on the next poll"
+                    ),
+                }
             }
         }
     }
-    Ok(())
 }
 
 /// Append the terminal stall record, mirror it into the in-memory results
@@ -1235,11 +1271,17 @@ async fn write_terminal_stall(
     campaign_id: &str,
 ) -> Result<()> {
     let Some(ctx) = contexts.get(job) else {
+        // No context means no record can be written — but this arm still
+        // returns Ok, and under level-triggered verdicts an Ok return MUST
+        // clear the level: retire the clock so the context-less job (an
+        // unmapped drv-keyed timed target, tracked for watchdog visibility
+        // only) cannot re-fire this verdict every tick forever.
         tracing::warn!(
             job,
             signature,
-            "stall verdict for a job with no context; skipping"
+            "stall verdict for a job with no context; retiring its clock without a record"
         );
+        ledger.retire(job).await;
         return Ok(());
     };
     let prior = ledger::measured_attempt_requeues(state)?
@@ -2327,8 +2369,12 @@ pub async fn run_with_backends(
                         "campaign heartbeat"
                     );
                 }
-                if !outcome.stalled.is_empty()
-                    && let Err(e) = apply_stall_actions(
+                if !outcome.stalled.is_empty() {
+                    // Per-job fault isolation lives inside: a failed action
+                    // logs, leaves its verdict armed (the clock is consumed
+                    // only by the committed transition, so the next tick
+                    // re-fires it), and never forfeits sibling verdicts.
+                    apply_stall_actions(
                         &state,
                         &ledger,
                         &contexts,
@@ -2338,12 +2384,7 @@ pub async fn run_with_backends(
                         &mode,
                         &campaign_id,
                     )
-                    .await
-                {
-                    tracing::warn!(
-                        error = %format!("{e:#}"),
-                        "applying stall verdicts failed; retrying on the next poll"
-                    );
+                    .await;
                 }
                 // progress.json (atomic rewrite — the status loop polls it)
                 // + periodic S3 sync. The timed summary only exists once the
@@ -4310,8 +4351,7 @@ mod tests {
             "leaf",
             "c-fold",
         )
-        .await
-        .unwrap();
+        .await;
         assert_fold_matches_live(&state, &live, &stall_retries, "stall auto-retry").await;
         assert_eq!(live.tracker().resubmission_count(jc).await, 1);
 
@@ -5761,8 +5801,7 @@ mod tests {
             "leaf",
             "c-stall",
         )
-        .await
-        .unwrap();
+        .await;
         // Auto-retry effects: reservation released, resubmission counted, no
         // terminal record yet.
         assert!(!tracker.in_flight.lock().await.contains(active_job));
@@ -5802,8 +5841,7 @@ mod tests {
             "leaf",
             "c-stall",
         )
-        .await
-        .unwrap();
+        .await;
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
         assert_eq!(
             records[active_job].verdict.as_deref(),
@@ -5843,8 +5881,7 @@ mod tests {
             "leaf",
             "c-stall",
         )
-        .await
-        .unwrap();
+        .await;
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
         assert_eq!(
             records[queued_job].verdict.as_deref(),
@@ -5858,6 +5895,144 @@ mod tests {
         // the queue since its last requeue) and this one was never
         // submitted at all: zero attempts, not a phantom one.
         assert_eq!(records[queued_job].attempts, 0);
+    }
+
+    /// The stall arms' failure path at the claimed cadence: a transient
+    /// requeues.jsonl append failure (a) leaves the auto-retry budget
+    /// unspent, (b) never forfeits sibling verdicts on the same tick
+    /// (per-job fault isolation — the sibling's terminal record lands), and
+    /// (c) re-fires the failed verdict on the NEXT poll tick, because the
+    /// clock is consumed by the committed ledger transition rather than at
+    /// emission. Once the journal recovers, the re-fired verdict applies
+    /// the auto-retry exactly once.
+    #[tokio::test]
+    async fn failed_stall_actions_re_fire_next_tick_and_spare_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let tracker = Arc::new(SubmitTracker::default());
+        let results = tokio::sync::Mutex::new(BTreeMap::new());
+        let wd = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let job_ledger = ledger::JobLedger::new(state.clone(), tracker.clone(), wd.clone());
+        let mut stall_retries: HashMap<String, u32> = HashMap::new();
+
+        // Sorted order matters: the failing job comes FIRST in the verdict
+        // slice, so the sibling's success proves isolation, not luck.
+        let stuck = "a-stuck.x86_64-linux";
+        let starved = "c-starved.x86_64-linux";
+        let contexts: HashMap<String, JobContext> = [
+            (
+                stuck.to_string(),
+                fold_ctx(stuck, &format!("/nix/store/{}-stuck.drv", "a".repeat(32))),
+            ),
+            (
+                starved.to_string(),
+                fold_ctx(
+                    starved,
+                    &format!("/nix/store/{}-starved.drv", "b".repeat(32)),
+                ),
+            ),
+        ]
+        .into();
+        let healthy = ClusterCounts {
+            active_executors: 8,
+            queued_derivations: 5,
+            running_derivations: 5,
+            substituting_derivations: 0,
+        };
+        let tick_at = |at: i64| PollTick {
+            at_unix: at,
+            cluster: watchdog::Polled::Fresh(healthy.clone()),
+            ice: IcePoll::NotPolled,
+            engine_paused: false,
+        };
+
+        // Drive the watchdog so ONE tick carries both verdicts: stuck is
+        // Active from t0 (6h threshold); starved is Queued with its
+        // re-enqueue budget spent by two QueuedRequeue crossings (2h, 4h).
+        {
+            let mut w = wd.lock().await;
+            w.observe_job(stuck, watchdog::JobPhase::Active);
+            w.observe_job(starved, watchdog::JobPhase::Queued);
+            w.on_tick(&tick_at(0));
+            w.on_tick(&tick_at(2 * 3600));
+            w.on_tick(&tick_at(4 * 3600));
+        }
+        let both = wd.lock().await.on_tick(&tick_at(6 * 3600 + 60));
+        assert!(
+            both.stalled
+                .iter()
+                .any(|s| s.job == stuck && s.kind == StallKind::ActiveStall)
+        );
+        assert!(
+            both.stalled
+                .iter()
+                .any(|s| s.job == starved && s.kind == StallKind::QueuedEscalate)
+        );
+
+        // Block the requeue journal: a directory at requeues.jsonl makes
+        // its append fail while results.jsonl stays writable.
+        std::fs::create_dir(dir.path().join("requeues.jsonl")).unwrap();
+        apply_stall_actions(
+            &state,
+            &job_ledger,
+            &contexts,
+            &results,
+            &mut stall_retries,
+            &both.stalled,
+            "leaf",
+            "c-iso",
+        )
+        .await;
+
+        // (a) Budget unspent for the failed job — counter, gate, journal.
+        assert_eq!(tracker.resubmission_count(stuck).await, 0);
+        assert!(stall_retries.is_empty(), "{stall_retries:?}");
+        // (b) The sibling's terminal record landed regardless.
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(
+            records[starved].signature.as_deref(),
+            Some("stalled-queued"),
+            "sibling verdicts must not be forfeited by an earlier failure"
+        );
+        assert!(!records.contains_key(stuck));
+
+        // (c) The failed verdict re-fires on the very next poll tick — and
+        // only it (the sibling's committed retire cleared its level).
+        let next = wd.lock().await.on_tick(&tick_at(6 * 3600 + 120));
+        assert_eq!(
+            next.stalled,
+            vec![StallVerdict {
+                job: stuck.to_string(),
+                kind: StallKind::ActiveStall,
+                requeues_used: 0,
+            }],
+            "the failed verdict re-fires next tick; the applied sibling does not"
+        );
+
+        // The journal recovers: the re-fired verdict applies the auto-retry
+        // exactly once, and the committed transition consumes the level.
+        std::fs::remove_dir(dir.path().join("requeues.jsonl")).unwrap();
+        apply_stall_actions(
+            &state,
+            &job_ledger,
+            &contexts,
+            &results,
+            &mut stall_retries,
+            &next.stalled,
+            "leaf",
+            "c-iso",
+        )
+        .await;
+        assert_eq!(tracker.resubmission_count(stuck).await, 1);
+        assert_eq!(stall_retries.get(stuck), Some(&1));
+        let journal: Vec<model::RequeueRecord> = state.load_jsonl(StateFile::Requeues).unwrap();
+        assert_eq!(journal.len(), 1, "exactly one journaled transition");
+        let after = wd.lock().await.on_tick(&tick_at(6 * 3600 + 180));
+        assert!(
+            after.stalled.is_empty(),
+            "the committed Queued observation consumed the verdict: {:?}",
+            after.stalled
+        );
     }
 
     /// One disposition per excluded job, by the documented precedence: a
