@@ -2198,7 +2198,7 @@
     {
       "path": "replay/list.rs",
       "depth": 1,
-      "doc": "`cargo xtask replay list` — list the recorded replay archives in S3."
+      "doc": "`cargo xtask replay list` — list the replay archive prefixes in S3."
     },
     {
       "path": "replay/preflight.rs",
