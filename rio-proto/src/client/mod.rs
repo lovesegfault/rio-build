@@ -105,6 +105,25 @@ pub async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
         .map_err(Into::into)
 }
 
+/// [`connect_channel`] plus h2 keepalive (30s PING / 10s PONG timeout,
+/// while-idle — the `with_h2_keepalive` tuning).
+///
+/// For eager-connect callers whose RPCs can outlive a PING interval —
+/// long polls, log streams — where an ungracefully dead peer (SIGKILL,
+/// netsplit, node loss: anything that skips FIN) must surface as a fast
+/// stream error (~40s) instead of an await stuck until kernel TCP
+/// keepalive (~2h). [`connect_channel`] itself stays keepalive-free on
+/// purpose: short-lived eager channels under heavy parallel test load
+/// hit a PING/PONG race (spurious GoAway → EIO; see the
+/// `with_h2_throughput` doc), which doesn't apply to channels that go
+/// on to carry long-running RPCs.
+pub async fn connect_channel_keepalive(addr: &str) -> anyhow::Result<Channel> {
+    with_h2_keepalive(build_endpoint(addr)?)
+        .connect()
+        .await
+        .map_err(Into::into)
+}
+
 // ===========================================================================
 // Generic typed-client construction
 // ===========================================================================
@@ -312,6 +331,31 @@ mod retry_tests {
             "adaptive_window resets initial_stream_window_size to 65 KiB \
              (hyper SPEC_WINDOW_SIZE) — see H2_INITIAL_STREAM_WINDOW doc"
         );
+    }
+
+    /// `connect_channel_keepalive` shares endpoint construction with
+    /// `connect_channel` and must still complete an eager connect against
+    /// a live server. The keepalive intervals themselves have no public
+    /// accessor on `Endpoint`/`Channel`; what this pins is the helper's
+    /// plumbing — a refactor that breaks the keepalive variant's connect
+    /// path fails here instead of going dark in its consumers.
+    #[tokio::test]
+    async fn connect_channel_keepalive_connects() {
+        let (_reporter, health_svc) = tonic_health::server::health_reporter();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(health_svc)
+                .serve_with_incoming(incoming),
+        );
+
+        connect_channel_keepalive(&addr.to_string())
+            .await
+            .expect("keepalive channel connects to a live server");
+
+        server.abort();
     }
 
     /// Retry loop pattern: connect to a closed port, assert it fails
