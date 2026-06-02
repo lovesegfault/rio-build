@@ -2684,6 +2684,20 @@ Carried forward from Phase 1, plus this stage's additions:
 Phase 2 is complete. The campaign's remaining open work is the close-out itself
 (counter-signatures over this map's records) plus the standing owner items above.
 
+> **A6 close-out disposition (2026-06-02).** Line items 1–4 above are
+> counter-signed: owner, 2026-06-01 (round-2 final decision gate); the
+> signature lines are applied at their flags in this map (the
+> decision-4 provenance row and the four-call provenance paragraph).
+> Items 5–8 were not part of that decision and remain standing owner
+> line items, carried in the successor campaign's follow-up ledger. The
+> close-out record for the whole Track A arc — this map's verification
+> stages plus the substitution replacement — is
+> `substitution-replacement-invariant-map.md` § "Campaign close-out
+> (A5/A6)", which also carries the final consolidated deployment
+> checklist (the CE-D rows' end states, including the CE-D7
+> vacuous-close and the CE-D8 split recorded in the Phase D′
+> cross-reference note above).
+
 ### Successor-campaign cross-reference (substitution replacement, Phase A landed 2026-06-01)
 
 The **substitution-replacement campaign** (Phase A landed 2026-06-01,
