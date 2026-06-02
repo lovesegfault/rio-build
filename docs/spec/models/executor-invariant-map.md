@@ -2582,6 +2582,80 @@ mid-campaign") in full:
   added to the Phase-1 input list below as a 1b/1d deliverable signed
   by that campaign's owner.
 
+#### Materialization addendum (final, post-D′)
+
+Recorded 2026-06-02 — the substitution-replacement campaign's
+follow-up ledger row 4 / D′ handoff item 4
+(`substitution-replacement-invariant-map.md`). That campaign EXTENDED
+this contract with a second attempt kind; this is the extension's
+FINAL, post-D′ form. **The contract's pre-existing rows are UNCHANGED
+— the addendum extends, never modifies** (the campaign's dormancy
+criterion 4): a request without the new fields is a build pull,
+bit-for-bit as frozen above.
+
+Wire deltas (`rio-proto/proto/build_types.proto`, served by the same
+`ExecutorService` unaries):
+
+| Field / surface | Number | Semantics |
+|---|---|---|
+| `PullAssignmentRequest.kind` | `AttemptKind kind = 3` (UNSPECIFIED 0 / BUILD 1 / MATERIALIZATION 2) | The attempt class this pull claims; absent/UNSPECIFIED = BUILD — pre-addendum builder pods send nothing and behave bit-for-bit as before |
+| `PullAssignmentRequest.executor_instance` | `string executor_instance = 4` | Per-replica identity for materialization pulls (the store replica's pod name); mandatory for kind=MATERIALIZATION, ignored for BUILD |
+| `ReportOutcomeRequest.materialization_outcome` | `MaterializationOutcome materialization_outcome = 3` | Set INSTEAD of `report` (message-typed presence; a request carrying both is rejected); oneof `Success{ingested_paths 1, verified_paths 2}` (1) / `Unobtainable{missing_paths 1, verified_paths 2, cause 3}` (2) / `InfraFailure{detail 1}` (3) |
+| `ListMaterializationJobs` (new rpc) | request `service_token = 1`, `limit = 2`; response `jobs = 1` of `MaterializationJobDescriptor{job_id 1, drv_hash 2, tenant_id 3, origin 4}` | Leader-served store-replica poll for claimable jobs (the GetSpawnIntents analogue); read-only, no state change |
+| `ReportMaterializationProgress` (new rpc) | request `exec_id = 1`, `bytes_done = 2`, `bytes_expected = 3`, `upstream_uri = 4`; empty response | Display-only byte progress, droppable; relayed into build events; never persisted, never folded into scheduler state |
+
+The four semantic rules the extension binds — record pointers are the
+substitution map's stage records plus the spec rules
+`sched.materialize.{job,routing,settlement,pinning}` /
+`store.materialize.executor`:
+
+1. **The BC-1 identity rule.** Materialization attempts key the
+   composite identity `{intent}@{instance}`; build pulls keep the
+   attested intent, exactly as frozen. The kind is NEVER inferred from
+   the identity's shape — it rides the request and persists as
+   `drv_executions.attempt_kind`. `executor_instance` is
+   DNS-1123-validated on both sides (store `sanitize_dns1123_label`,
+   scheduler `is_dns1123_label`) and `@` is rejected in BOTH halves
+   (the instance by alphabet, the intent by an explicit guard), so the
+   composite stays unambiguous. Since Phase B Wave 5 the instance is
+   bound INTO the store-service `ServiceClaims` and verified, never
+   trusted (mismatch ⇒ `PermissionDenied`; fail-closed under version
+   skew, three wire-compat legs pinned). Records: Phase A security
+   finding 4 (`defa7f4a7`), the Wave-5 obligation-1 record
+   (`520fc26fb`); `store.materialize.executor`.
+2. **The kind-authorization rule.** Every materialization operation
+   (kind=MATERIALIZATION pulls, materialization reports, job listing,
+   progress) requires the kind-attested store-service credential —
+   `ServiceClaims{caller="rio-store"}` on the service-HMAC family —
+   and EVERY executor token is rejected `PermissionDenied`, on both
+   carriers. Records: Phase A security findings 2/3 (`defa7f4a7`,
+   `b70742c76`) and the Wave-4 ServiceClaims decision.
+3. **The establishment kind-partition.** An established
+   materialization attempt charges `materialization_infra` — never
+   `executor_crash`, never any executor/build budget (BC-2: the
+   charge feeds the materialization budget and nothing else) — and
+   the establishment branch has NO store-probe adopt arm (BC-3: a
+   mid-walk crash leaves outputs present but the closure incomplete);
+   the job stays pending and remains armed
+   (`sched.materialize.settlement`). Materialization charges never
+   produce Poison (`materializationNeverPoisons`,
+   `materializationInvisibleToBuildBudgets`:
+   `quint-retry-policy-pull-materialization` + the kind-partition
+   CBMC harnesses). Records: Phase A deliverable 11 (`34fa915ee`);
+   the retry map's cross-campaign addendum (T-5.1/T-5.2).
+4. **The arbitration.** One winner per job: the kernel's open-attempt
+   arm re-delivers to the same composite identity (`DeliverExisting`)
+   and answers every other replica `NotYetReady`
+   (`atMostOneClaimWinner`, CBMC `check_kinded_one_winner_arbitration`),
+   with `assignments_active_uq` as the durable arbiter. Post-D′ the
+   Phase-A `admit_pull_kinded` coexistence wrapper is collapsed into
+   the single `admit_pull` — the kinded table IS the table (T-D4.1,
+   `8ac576614`).
+
+Nothing else moves: the unary signatures, the frozen-invariant list,
+the disposition table, AD1–AD6 and the coexistence invariant read
+exactly as frozen — build pulls bind, charge, and arbitrate unchanged.
+
 ### The go/no-go evaluation (T-0e.7)
 
 Every design §6 no-go condition (nine bullets) plus the plan's
