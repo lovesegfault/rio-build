@@ -330,6 +330,29 @@ fn map_client_op_error(err: ClientOpError, op: &str, upload: bool) -> TransportE
     }
 }
 
+/// Effective-throughput floor used to scale upload deadlines with payload
+/// size, so a NAR-payload-bearing op is never cut off by a deadline tuned
+/// for metadata-sized ops. Deliberately conservative (1 MiB/s): the
+/// headroom only ever extends the caller's base deadline, so a slow-but-
+/// progressing bulk upload survives while metadata ops keep their tight
+/// bound.
+const UPLOAD_FLOOR_BYTES_PER_SEC: u64 = 1024 * 1024;
+
+/// Deadline for one upload op: the caller's metadata-scale base deadline
+/// plus payload-proportional headroom at [`UPLOAD_FLOOR_BYTES_PER_SEC`].
+///
+/// Derived INSIDE the two NAR-payload-bearing wire ops
+/// ([`DaemonChannel::add_multiple_to_store`],
+/// [`DaemonChannel::add_to_store_nar`]) from the entries they are about to
+/// send — that pair is the complete set of bulk-payload daemon ops, so no
+/// caller can hand a flat metadata-tuned `Duration` to a bulk op and have
+/// it bound the payload phase. Callers pass only the base (their op-class
+/// deadline); the payload bytes are the entries' NAR lengths, which the op
+/// verifies against the declared `nar_size` before writing anyway.
+fn upload_deadline(base: Duration, payload_bytes: u64) -> Duration {
+    base + Duration::from_secs(payload_bytes / UPLOAD_FLOOR_BYTES_PER_SEC)
+}
+
 /// Run one rio-nix client op under a deadline and map its outcome.
 /// `connection` is the pool index of the SSH connection the channel runs on,
 /// carried into timeout errors for triage.
@@ -1092,16 +1115,23 @@ impl DaemonChannel {
 
     /// `wopAddMultipleToStore`: upload a batch of store paths in one framed
     /// stream (`repair = false`, `dont_check_sigs = true`).
+    ///
+    /// `base_timeout` is the caller's metadata-scale deadline; the effective
+    /// deadline adds payload-proportional headroom for the batch's summed
+    /// NAR bytes (see [`upload_deadline`]), so a 256 MiB batch is never cut
+    /// off by a bound calibrated for probe-sized ops.
     pub async fn add_multiple_to_store(
         &mut self,
         entries: Vec<StoreEntry>,
-        timeout: Duration,
+        base_timeout: Duration,
     ) -> std::result::Result<(), TransportError> {
         let op = format!("AddMultipleToStore ({} entries)", entries.len());
         self.ensure_usable(&op)?;
+        let payload_bytes: u64 = entries.iter().map(|entry| entry.nar.len()).sum();
+        let deadline = upload_deadline(base_timeout, payload_bytes);
         let result = run_op(
             client_add_multiple_to_store(&mut self.reader, &mut self.writer, false, true, entries),
-            timeout,
+            deadline,
             &op,
             self.connection_index,
             true,
@@ -1113,16 +1143,22 @@ impl DaemonChannel {
 
     /// `wopAddToStoreNar`: upload one store path with its NAR serialization
     /// (`repair = false`, `dont_check_sigs = true`).
+    ///
+    /// `base_timeout` is the caller's deadline for the op's non-payload
+    /// phases; the effective deadline adds payload-proportional headroom
+    /// for the entry's NAR length (see [`upload_deadline`]), so a multi-GB
+    /// streamed NAR gets time to actually transfer.
     pub async fn add_to_store_nar(
         &mut self,
         entry: StoreEntry,
-        timeout: Duration,
+        base_timeout: Duration,
     ) -> std::result::Result<(), TransportError> {
         let op = format!("AddToStoreNar {}", entry.store_path);
         self.ensure_usable(&op)?;
+        let deadline = upload_deadline(base_timeout, entry.nar.len());
         let result = run_op(
             client_add_to_store_nar(&mut self.reader, &mut self.writer, entry, false, true),
-            timeout,
+            deadline,
             &op,
             self.connection_index,
             true,
@@ -1270,6 +1306,52 @@ mod tests {
 
         // An invalid port is an error rather than a silent default.
         assert!(GatewayEndpoint::parse("ssh-ng://gw:notaport?ssh-key=/k").is_err());
+    }
+
+    /// Upload deadlines scale with payload size at the documented
+    /// 1 MiB/s floor on top of the caller's base — the contract
+    /// originally stated for the drv-text import ("a large
+    /// AddMultipleToStore chunk is never cut off by a deadline tuned
+    /// for metadata-sized ops") and now owned by the transport seam for
+    /// BOTH bulk ops. Universe of the bound: every AddMultipleToStore /
+    /// AddToStoreNar call — the only NAR-payload-bearing daemon ops —
+    /// derives its deadline through `upload_deadline`, so the engine's
+    /// default 256 MiB batch cap gets ≥256s of payload headroom beyond
+    /// the 120s metadata base instead of being cut off at 120s flat.
+    #[test]
+    fn upload_deadline_scales_with_payload_at_the_floor() {
+        let base = Duration::from_secs(120);
+        // Metadata-sized payloads add nothing measurable.
+        assert_eq!(upload_deadline(base, 0), base);
+        assert_eq!(upload_deadline(base, UPLOAD_FLOOR_BYTES_PER_SEC - 1), base);
+        // One floor-unit of payload buys one second of headroom.
+        assert_eq!(
+            upload_deadline(base, UPLOAD_FLOOR_BYTES_PER_SEC),
+            base + Duration::from_secs(1)
+        );
+        // The engine's default batch byte cap (256 MiB, knobs
+        // `upload_batch_max_mib`) needs 256s at the floor — strictly
+        // more than the 120s metadata base that previously bounded the
+        // whole op.
+        let batch_cap = 256 * 1024 * 1024;
+        assert_eq!(
+            upload_deadline(base, batch_cap),
+            base + Duration::from_secs(256)
+        );
+        // A 4 GiB streamed NAR on the large-upload base (600s) gets
+        // proportional room rather than the old flat ceiling.
+        let large_base = Duration::from_secs(600);
+        assert_eq!(
+            upload_deadline(large_base, 4 * 1024 * 1024 * 1024),
+            large_base + Duration::from_secs(4096)
+        );
+        // The scaled deadline is never tighter than the base: the
+        // change can only loosen bounds relative to the flat-deadline
+        // behavior it replaces, so it cannot mass-fail ops that fit
+        // the old bound.
+        for payload in [0u64, 1, 1024, batch_cap, u64::MAX / 2] {
+            assert!(upload_deadline(base, payload) >= base);
+        }
     }
 
     #[test]

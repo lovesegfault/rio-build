@@ -184,19 +184,6 @@ fn observe_line(parsed: &mut ParsedStderr, tail: &mut VecDeque<String>, payload:
 /// default batch-entry cap (`upload_batch_max_entries`).
 const DRV_UPLOAD_CHUNK: usize = 500;
 
-/// Effective-throughput floor used to scale upload deadlines with payload
-/// size, so a large `AddMultipleToStore` chunk is never cut off by a
-/// deadline tuned for metadata-sized ops. Deliberately conservative
-/// (1 MiB/s); drv-text chunks add nothing measurable on top of the base
-/// deadline.
-const UPLOAD_FLOOR_BYTES_PER_SEC: u64 = 1024 * 1024;
-
-/// Deadline for one upload call: the configured per-op deadline plus
-/// payload-proportional headroom at [`UPLOAD_FLOOR_BYTES_PER_SEC`].
-fn upload_deadline(base: Duration, payload_bytes: u64) -> Duration {
-    base + Duration::from_secs(payload_bytes / UPLOAD_FLOOR_BYTES_PER_SEC)
-}
-
 /// Submitter that drives the gateway's worker protocol directly: per batch
 /// it imports the batch's drv closure from the replay archive
 /// (a `QueryValidPaths` probe + `AddMultipleToStore` of the missing texts in
@@ -229,15 +216,12 @@ impl ClientOpsSubmitter {
         )
     }
 
-    /// Materialize one slice of archive paths as upload entries plus their
-    /// total NAR payload size (which scales the upload deadline).
-    fn materialize_entries(&self, paths: &[String]) -> Result<(Vec<StoreEntry>, u64)> {
-        let entries = paths
+    /// Materialize one slice of archive paths as upload entries.
+    fn materialize_entries(&self, paths: &[String]) -> Result<Vec<StoreEntry>> {
+        paths
             .iter()
             .map(|path| self.archive.entry(path))
-            .collect::<Result<Vec<_>>>()?;
-        let payload_bytes = entries.iter().map(|entry| entry.info.nar_size).sum();
-        Ok((entries, payload_bytes))
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Upload one slice of missing drv texts on `chan`, returning the channel
@@ -255,10 +239,13 @@ impl ClientOpsSubmitter {
         mut chan: DaemonChannel,
         paths: &[String],
     ) -> Result<DaemonChannel> {
-        let (entries, payload_bytes) = self.materialize_entries(paths)?;
+        let entries = self.materialize_entries(paths)?;
         let op = format!("AddMultipleToStore ({} drv texts)", paths.len());
-        let deadline = upload_deadline(self.op_timeout, payload_bytes);
-        match chan.add_multiple_to_store(entries, deadline).await {
+        // The base deadline is the metadata-scale per-op bound; the channel
+        // derives payload-proportional headroom from the entries itself, so
+        // every upload op — this drv-text arm and the supply arms alike —
+        // shares one scaling rule at the transport seam.
+        match chan.add_multiple_to_store(entries, self.op_timeout).await {
             Ok(()) => Ok(chan),
             Err(TransportError::Refused(msg)) => {
                 tracing::warn!(
@@ -272,8 +259,8 @@ impl ClientOpsSubmitter {
                     .open_channel()
                     .await
                     .context("open a fresh gateway channel after a refused drv upload")?;
-                let (entries, _) = self.materialize_entries(paths)?;
-                match fresh.add_multiple_to_store(entries, deadline).await {
+                let entries = self.materialize_entries(paths)?;
+                match fresh.add_multiple_to_store(entries, self.op_timeout).await {
                     Ok(()) => Ok(fresh),
                     Err(err) => Err(Self::import_error(
                         &format!("{op} (retry on a fresh channel)"),
@@ -805,21 +792,6 @@ mod tests {
                 format!("  ↳ rio-cli logs '{trigger}'"),
                 format!("derivation '{dependent}' failed: {cascade_reason}"),
             ]
-        );
-    }
-
-    /// Upload deadlines scale with the chunk's payload size on top of the
-    /// configured per-op deadline, at the conservative 1 MiB/s floor.
-    #[test]
-    fn upload_deadline_scales_with_payload() {
-        let base = Duration::from_secs(120);
-        assert_eq!(upload_deadline(base, 0), base);
-        // A drv-text-sized chunk adds nothing measurable.
-        assert_eq!(upload_deadline(base, 512 * 1024), base);
-        // A 100 MiB payload adds 100 seconds of headroom.
-        assert_eq!(
-            upload_deadline(base, 100 * 1024 * 1024),
-            base + Duration::from_secs(100)
         );
     }
 }

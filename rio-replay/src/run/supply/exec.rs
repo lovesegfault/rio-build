@@ -77,9 +77,13 @@ use super::{
     resolve_source, split_batches, topo_levels, walk_closure,
 };
 
-/// Per-operation deadline for individually streamed (large) uploads. Probes
-/// and batch uploads use the spec's `op_timeout_secs`; a multi-GB NAR
-/// legitimately needs longer.
+/// Base deadline for individually streamed (large) uploads. Probes and
+/// batch uploads use the spec's `op_timeout_secs` as their base; a multi-GB
+/// NAR legitimately needs longer even before payload headroom. The wire ops
+/// add payload-proportional headroom on top of whichever base they are
+/// given (`DaemonChannel::{add_multiple_to_store,add_to_store_nar}` derive
+/// the effective deadline from the entries' NAR bytes), so neither arm's
+/// base needs to anticipate payload size.
 const LARGE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Skip detail recorded for uploads this invocation did not attempt because
@@ -447,8 +451,9 @@ pub struct PoolSupplyTransport {
     build: Arc<GatewayPool>,
     /// Prefetch-tenant pool; `None` when the supply policy has no prefetch arm.
     prefetch: Option<Arc<GatewayPool>>,
-    /// Deadline for probes and batch uploads (streamed uploads use
-    /// [`LARGE_UPLOAD_TIMEOUT`]).
+    /// Base deadline for probes and batch uploads (streamed uploads use
+    /// [`LARGE_UPLOAD_TIMEOUT`] as their base); the upload wire ops add
+    /// payload-proportional headroom themselves.
     op_timeout: Duration,
     /// Paths per QueryValidPaths probe call.
     probe_chunk: usize,
@@ -944,6 +949,19 @@ async fn materialize_batch_payload(
 /// Produce the streamed payload for one large item: relayed paths stream
 /// straight from their substituter, embedded paths and derivation texts are
 /// materialized in memory (their bytes are already local).
+///
+/// Deadline scoping is per arm, matching what each arm actually awaits on.
+/// The relay arm's `fetch_nar_streaming` returns at response headers (both
+/// substituter arms hand back an unconsumed body reader; the body is drained
+/// later, inside the wire op's payload-scaled deadline), so `env.op_timeout`
+/// bounds only a metadata-scale header wait — without it, a cache that
+/// completes TLS but never sends response headers pends this await forever,
+/// wedging prewarm workers and both pre-submit top-up paths with no breaker,
+/// watchdog, or settlement signal. The local arm (embedded/drv-text) instead
+/// materializes the FULL NAR in memory before returning; for streamed items
+/// that is payload-scale local work, so a flat metadata deadline around the
+/// whole call would mass-fail healthy multi-GB embedded paths — which is why
+/// the timeout wraps only the relay fetch, not the function.
 async fn materialize_stream_payload(
     env: &UploadEnv<'_>,
     item: &UploadItem,
@@ -958,9 +976,15 @@ async fn materialize_stream_payload(
                     "no admitted relay substituter matches {substituter_url}"
                 ));
             };
-            match substituter.fetch_nar_streaming(narinfo).await {
-                Ok((len, reader)) => Ok(NarPayload::Reader { len, reader }),
-                Err(err) => Err(format!("relay fetch failed: {err:#}")),
+            match tokio::time::timeout(env.op_timeout, substituter.fetch_nar_streaming(narinfo))
+                .await
+            {
+                Ok(Ok((len, reader))) => Ok(NarPayload::Reader { len, reader }),
+                Ok(Err(err)) => Err(format!("relay fetch failed: {err:#}")),
+                Err(_elapsed) => Err(format!(
+                    "relay fetch did not return response headers within {}s",
+                    env.op_timeout.as_secs()
+                )),
             }
         }
         UploadPayload::DrvText(_) | UploadPayload::ArchivePath => {
@@ -2743,6 +2767,101 @@ mod tests {
         for path in [PATH_A, PATH_B] {
             assert_eq!(entry_for(&entries, path).outcome, SUPPLY_OUTCOME_DELIVERED);
         }
+    }
+
+    /// A relay cache that completes the TCP handshake but never sends
+    /// response headers must not wedge the streamed arm: the relay
+    /// materialization's header-phase wait is bounded by `op_timeout`
+    /// (scoped to headers only — the body is consumed later, inside the
+    /// wire op's payload-scaled deadline; the local materialization arm
+    /// is deliberately outside this bound, see
+    /// `materialize_stream_payload`). The item settles FAILED with a
+    /// detail naming the header wait, instead of pending forever with
+    /// no breaker, watchdog, or settlement signal. The outer 30s guard
+    /// is the red-state detector: before the header-phase deadline
+    /// existed, this await never returned.
+    #[tokio::test]
+    async fn streamed_relay_header_stall_settles_failed_within_op_timeout() {
+        // A "cache" that accepts connections and then goes silent, holding
+        // the socket open without ever writing a response.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                held.push(socket);
+            }
+        });
+
+        let (_dir, state) = state();
+        let fake = FakeSupplyTransport::default();
+        let mut ctx = SupplyContext::new(SupplyDependencies::Substituters);
+        let substituter = Substituter::parse(&format!("http://{addr}")).await.unwrap();
+        let canonical = substituter.url();
+        // Insert directly: the public-cache admission guard (which would
+        // refuse a loopback URL) is not under test here.
+        ctx.relay.insert(canonical.clone(), substituter);
+
+        let narinfo = NarInfo {
+            store_path: PATH_A.to_string(),
+            url: "nar/stalled.nar".into(),
+            compression: "none".into(),
+            nar_hash: "sha256:0000000000000000000000000000000000000000000000000000".into(),
+            nar_size: 1024,
+            references: Vec::new(),
+            deriver: None,
+            sigs: Vec::new(),
+            ca: None,
+            file_hash: None,
+            file_size: None,
+        };
+        let relay_item = UploadItem {
+            store_path: PATH_A.to_string(),
+            info: item(PATH_A, vec![0u8; 1024], &[]).info,
+            payload: UploadPayload::Relay {
+                substituter_url: canonical,
+                narinfo,
+            },
+        };
+        let plan = UploadPlan {
+            large: vec![relay_item],
+            batch: Vec::new(),
+            skipped: Vec::new(),
+        };
+        let knobs = Knobs {
+            op_timeout_secs: 1,
+            ..Knobs::default()
+        };
+        let claims = UploadClaims::new();
+
+        let report = tokio::time::timeout(
+            Duration::from_secs(30),
+            prewarm_uploads(&fake, None, &ctx, &plan, &knobs, &state, &claims),
+        )
+        .await
+        .expect(
+            "a headers-withholding relay cache must be bounded by the header-phase deadline, \
+             not wedge prewarm forever",
+        )
+        .unwrap();
+
+        assert_eq!(report.failed, 1, "the stalled relay item settles failed");
+        assert!(
+            fake.uploaded_streamed.lock().unwrap().is_empty(),
+            "nothing reaches the wire when materialization times out"
+        );
+        let entries = entries(&state);
+        let entry = entry_for(&entries, PATH_A);
+        assert_eq!(entry.outcome, SUPPLY_OUTCOME_FAILED);
+        let detail = entry.detail.clone().unwrap_or_default();
+        assert!(
+            detail.contains("response headers"),
+            "the failure detail names the header-phase wait: {detail:?}"
+        );
+        server.abort();
     }
 
     /// The breaker stops transport calls, and what it skips is BOOKKEEPING,
