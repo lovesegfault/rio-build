@@ -96,6 +96,33 @@
 let
   modelsDir = unfilteredRoot + "/docs/spec/models";
 
+  # The §9.1 successor conjunction for materializationJob.qnt (shared
+  # by the five per-regime holds checks below; the C-prime stage
+  # record's property table is the authoritative gloss).
+  matJobInvariants = [
+    "boundsOK"
+    "noFromSourceWhileJobUnresolved"
+    "jobResolutionSound"
+    "routingRequiresDurableVouchOrFailFast"
+    "unresolvedJobAlwaysArmed"
+    "noWrongfulTerminalFailure"
+    "noWrongfulFromSourceRouting"
+    "successConsumptionCoversLiveWanted"
+    "interestUnionLiveOnly"
+    "pinCoversIngestUntilAllInterestTerminal"
+    "failoverPreservesJobs"
+    "fencedJobWritesOnly"
+    "kindMatchesWorker"
+    "materializationNeverPoisons"
+    "materializationInvisibleToBuildBudgets"
+    "atMostOneUnresolvedJobPerDrv"
+    "atMostOneClaimWinner"
+    "wrongfulFailFastBoundedPerJob"
+    "creationLeavesTenantResolvable"
+    "materializationCrashChargedOnce"
+    "crossBuildWantedIsolation"
+  ];
+
   # The leader-election model as its own single-file store path (the
   # same narrowing mkQuintCheck's src uses): the conformance check
   # depends on the model's content, not on whatever tree unfilteredRoot
@@ -3221,6 +3248,476 @@ in
       main = "retryPolicyPullMat";
       step = "pullStep";
       witness = "noMaterializationCrashCharge";
+    };
+
+    # ------------------------------------------------------------------
+    # Substitution-replacement Phase C-prime: the materialization-job
+    # lifecycle model (docs/spec/models/materializationJob.qnt),
+    # re-targeted to the AS-BUILT Phase B system (the six handoff
+    # deltas: the finding-11 mark discriminator + clear-mirror, the
+    # executor channel redial, the wanted backfill, the park
+    # re-evaluation split, the five-origin set, the recovery view
+    # rebuild, the must_substitute claim upgrade). The §9.1 successor
+    # property table (21 invariants incl. the three at-decision-time
+    # re-encodes and the delta-derived invariants), the §9.3
+    # calibration-transfer verdict table, and the exhaustive-budget
+    # measurement record live in
+    # docs/spec/models/substitution-replacement-invariant-map.md
+    # (C-prime stage record).
+    #
+    # Check-set shape (the closure-evidence Phase-1 precedent): the
+    # exhaustive TLC conjunctions do not converge inside a
+    # gate-compatible budget at any modeled scope (the C-prime
+    # measurement table; the reduced -Ex scopes are documented manual
+    # targets with zero-violation bounded coverage), so the GHA-wired
+    # deliverable per regime is the bounded-simulation HOLDS check —
+    # each named pin below is its falsifiability pair — plus the
+    # witness set (every §9.1 property's contended scenario stays
+    # demonstrably reachable) and the §9.3 calibration pins (TLC,
+    # first-violation — the permanent expect-violation record that the
+    # model re-finds every transferred bug class).
+    # ------------------------------------------------------------------
+
+    # Deterministic named-run pins (the delta scenario narratives:
+    # happy path, the park split, the four-conjunct fail-fast, the
+    # unmarked arm-3 from-source, the marked-claim upgrade, the legacy
+    # backfill, the reprobe reset; stale-reset and the failover
+    # redial/view-rebuild run under the regimes that enable them).
+    quint-materialization-runs-base = mkQuintRunCheck {
+      name = "materialization-runs-base";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      match = "happyPathRun|parkSplitRun|prunedFailFastRun|unmarkedArm3FromSourceRun|markedClaimUpgradeRun|legacyBackfillRun|reprobeResetRun";
+    };
+    quint-materialization-runs-failover = mkQuintRunCheck {
+      name = "materialization-runs-failover";
+      spec = "materializationJob";
+      main = "materializationJobFailover";
+      match = "failoverRedialRun|failoverViewRebuildRun";
+    };
+    quint-materialization-runs-adversarial = mkQuintRunCheck {
+      name = "materialization-runs-adversarial";
+      spec = "materializationJob";
+      main = "materializationJobAdversarialStore";
+      match = "staleResetRun";
+    };
+
+    # Bounded-simulation HOLDS checks, one per design-scale regime —
+    # the full 21-invariant §9.1 conjunction. Bounded evidence, not
+    # proof: the exhaustive Ex-scope conjunctions are the documented
+    # manual targets (commands + measured budgets in the C-prime stage
+    # record). Sample sizing: the paired calibration pins' violation
+    # classes are found by the simulator in well under 100 K samples at
+    # the smaller Ex scopes; 2 M samples at design scale clears the
+    # 25/p flake floor with two orders of headroom.
+    #
+    # Paired falsifiability pins (the constructor's vacuity rule —
+    # every invariant in the list has at least one pin or witness
+    # below): quint-materialization-calib-* (17 expect-violation pins)
+    # + the marked-claim / post-failover-claim witnesses (the B1/B3
+    # liveness flips).
+    # r[verify sched.materialize.job]
+    # r[verify sched.materialize.routing+2]
+    quint-materialization-holds-base = mkQuintSimHoldsCheck {
+      name = "materialization-holds-base";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      invariants = matJobInvariants;
+      maxSamples = 2000000;
+      maxSteps = 15;
+    };
+    # r[verify store.materialize.executor+2]
+    quint-materialization-holds-failover = mkQuintSimHoldsCheck {
+      name = "materialization-holds-failover";
+      spec = "materializationJob";
+      main = "materializationJobFailover";
+      invariants = matJobInvariants;
+      maxSamples = 2000000;
+      maxSteps = 15;
+    };
+    # r[verify sched.materialize.pinning]
+    quint-materialization-holds-adversarial-store = mkQuintSimHoldsCheck {
+      name = "materialization-holds-adversarial-store";
+      spec = "materializationJob";
+      main = "materializationJobAdversarialStore";
+      invariants = matJobInvariants;
+      maxSamples = 2000000;
+      maxSteps = 15;
+    };
+    quint-materialization-holds-stale-tenure = mkQuintSimHoldsCheck {
+      name = "materialization-holds-stale-tenure";
+      spec = "materializationJob";
+      main = "materializationJobStaleTenure";
+      invariants = matJobInvariants;
+      maxSamples = 2000000;
+      maxSteps = 15;
+    };
+    quint-materialization-holds-crash-loop = mkQuintSimHoldsCheck {
+      name = "materialization-holds-crash-loop";
+      spec = "materializationJob";
+      main = "materializationJobCrashLoop";
+      invariants = matJobInvariants;
+      maxSamples = 2000000;
+      maxSteps = 15;
+    };
+
+    # Non-vacuity witnesses (rust simulator; expect-violation). Every
+    # §9.1 property's contended scenario + every delta's new behavior
+    # stays demonstrably reachable. No tracey markers on witnesses.
+    # Sample sizing: every witness here was first found in under 300 K
+    # samples (most in the first batches); 2 M is the flake floor.
+
+    # The happy path resolves a job successfully.
+    quint-materialization-witness-success = mkQuintSimWitnessCheck {
+      name = "materialization-witness-success";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noSuccessResolution";
+    };
+    # The four-conjunct fail-fast fires (delta 1: needs the
+    # pruned-origin mark — keeps the arm-3 corner non-vacuous).
+    quint-materialization-witness-fail-fast = mkQuintSimWitnessCheck {
+      name = "materialization-witness-fail-fast";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noFailFast";
+    };
+    # The unmarked arm-3 from-source disposition (delta 1, the B2 fix
+    # row): if this stops violating, the 6-row table's release arm has
+    # gone unreachable and the routing checks are vacuous there.
+    quint-materialization-witness-unmarked-arm3 = mkQuintSimWitnessCheck {
+      name = "materialization-witness-unmarked-arm3";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noUnmarkedArm3FromSource";
+    };
+    # A MARKED node's job is claimed (delta 6 — the B1 admission-gap
+    # regression guard: pre-B1 the must_substitute refusal made this
+    # unreachable; the mat-b1-claim-refuses-marked calibration module
+    # is the recorded pre-fix flip).
+    quint-materialization-witness-marked-claim = mkQuintSimWitnessCheck {
+      name = "materialization-witness-marked-claim";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noMarkedClaim";
+    };
+    # A claim lands AFTER a failover staled every executor channel
+    # (delta 2a — the B3 redial liveness guard: without redialChannel
+    # this is unreachable; the mat-b3-no-redial calibration module is
+    # the recorded pre-fix flip).
+    quint-materialization-witness-post-failover-claim = mkQuintSimWitnessCheck {
+      name = "materialization-witness-post-failover-claim";
+      spec = "materializationJob";
+      main = "materializationJobFailover";
+      witness = "noPostFailoverClaim";
+    };
+    # The budget park fires (delta 3: rides the InfraFailure
+    # consumption).
+    quint-materialization-witness-park = mkQuintSimWitnessCheck {
+      name = "materialization-witness-park";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noPark";
+    };
+    # A Broken-evidence park (the MD-D1 stalled-gauge population) is
+    # reachable (delta 3).
+    quint-materialization-witness-stalled-park = mkQuintSimWitnessCheck {
+      name = "materialization-witness-stalled-park";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noStalledBrokenPark";
+    };
+    # The park re-evaluation resolves a Vouched/Pending park from
+    # source (delta 3, the PD-20 arm).
+    quint-materialization-witness-park-reeval = mkQuintSimWitnessCheck {
+      name = "materialization-witness-park-reeval";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noParkReevalResolve";
+    };
+    # A legacy (flag-off-era) build's relation is backfilled at
+    # creation (delta 2b, the B4 fix's contended state).
+    quint-materialization-witness-legacy-backfill = mkQuintSimWitnessCheck {
+      name = "materialization-witness-legacy-backfill";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noLegacyBackfill";
+    };
+    # A stale_reset job resets a Completed node (delta 4): runs in the
+    # adversarial-store regime (the GC'd-outputs shape needs GC).
+    quint-materialization-witness-stale-reset = mkQuintSimWitnessCheck {
+      name = "materialization-witness-stale-reset";
+      spec = "materializationJob";
+      main = "materializationJobAdversarialStore";
+      witness = "noStaleResetCreation";
+    };
+    # A reprobe-origin job (the AS-5 reset lane, delta 4).
+    quint-materialization-witness-reprobe = mkQuintSimWitnessCheck {
+      name = "materialization-witness-reprobe";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noReprobeCreation";
+    };
+    # The §5.3 pin release fires (job resolved + all interest
+    # terminal) — the pinning rule's release half stays reachable.
+    quint-materialization-witness-pin-release = mkQuintSimWitnessCheck {
+      name = "materialization-witness-pin-release";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noPinRelease";
+    };
+    # A crashed materialization attempt is established (the PP-4
+    # channel both partition invariants constrain).
+    quint-materialization-witness-crash-establishment = mkQuintSimWitnessCheck {
+      name = "materialization-witness-crash-establishment";
+      spec = "materializationJob";
+      main = "materializationJobCrashLoop";
+      witness = "noCrashEstablishment";
+    };
+    # A build-kind attempt opens (kindMatchesWorker /
+    # noFromSourceWhileJobUnresolved non-vacuity).
+    quint-materialization-witness-build-attempt = mkQuintSimWitnessCheck {
+      name = "materialization-witness-build-attempt";
+      spec = "materializationJob";
+      main = "materializationJobBase";
+      witness = "noBuildAttempt";
+    };
+
+    # ---- Materialization C-prime calibration pins ---------------------
+    # The §9.3 transfer corpus, executed (the go/no-go core): each pin
+    # instantiates the re-targeted model at a reduced Ex scope, swaps
+    # ONE action for its PRE-FIX behavior (the override's calibStep)
+    # and passes only while the checker still falsifies the §9.1
+    # property the as-built mechanism protects. Verdict table (every
+    # transferred family dispositioned, incl. the by-construction rows
+    # and the two liveness witness-flips): the C-prime stage record.
+    # TLC backend, first-violation (13-27 s each at the qualifying
+    # measurement). No tracey markers on calibration checks.
+
+    # F8 + F13 (CE-33/CE-58 — THE anchor): the evidence-blind builder
+    # pull delivers from source while the job is unresolved.
+    quint-materialization-calib-f8-pull-ignores-job = mkQuintWitnessCheck {
+      name = "materialization-calib-f8-pull-ignores-job";
+      spec = "calibration/mat-f8-pull-ignores-job";
+      main = "matCalibF8PullIgnoresJob";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "noFromSourceWhileJobUnresolved";
+    };
+    # F10 L1-half (CE-48(i)): the pre-T-4.3 failover drops the view
+    # without the rebuild — the pending job's armed action strands.
+    quint-materialization-calib-f10-view-drop = mkQuintWitnessCheck {
+      name = "materialization-calib-f10-view-drop";
+      spec = "calibration/mat-f10-failover-view-drop";
+      main = "matCalibF10FailoverViewDrop";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "unresolvedJobAlwaysArmed";
+    };
+    # B5(a): the dedup re-feed overwrites armament state (park/holder).
+    quint-materialization-calib-b5a-refeed-overwrite = mkQuintWitnessCheck {
+      name = "materialization-calib-b5a-refeed-overwrite";
+      spec = "calibration/mat-b5a-refeed-overwrite";
+      main = "matCalibB5aRefeedOverwrite";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "unresolvedJobAlwaysArmed";
+    };
+    # CE-17 / F6 / F2(a): success consumption without the coverage
+    # re-check (the wanted-growth race).
+    quint-materialization-calib-ce17-skip-coverage = mkQuintWitnessCheck {
+      name = "materialization-calib-ce17-skip-coverage";
+      spec = "calibration/mat-ce17-skip-coverage";
+      main = "matCalibCe17SkipCoverage";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "successConsumptionCoversLiveWanted";
+    };
+    # F2(b) / BC-3: the establishment adopts on output presence.
+    quint-materialization-calib-f2b-establish-adopt = mkQuintWitnessCheck {
+      name = "materialization-calib-f2b-establish-adopt";
+      spec = "calibration/mat-f2b-establish-adopt";
+      main = "matCalibF2bEstablishAdopt";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "successConsumptionCoversLiveWanted";
+    };
+    # F3 soundness (i): InfraFailure charged as Unobtainable corrupts
+    # the one-shot's evidence.
+    quint-materialization-calib-f3-infra-as-unobtainable = mkQuintWitnessCheck {
+      name = "materialization-calib-f3-infra-as-unobtainable";
+      spec = "calibration/mat-f3-infra-as-unobtainable";
+      main = "matCalibF3InfraAsUnobtainable";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "noWrongfulTerminalFailure";
+    };
+    # F3 soundness (ii) / E5: budget exhaustion fails instead of parks.
+    quint-materialization-calib-f3-park-failfast = mkQuintWitnessCheck {
+      name = "materialization-calib-f3-park-failfast";
+      spec = "calibration/mat-f3-park-failfast";
+      main = "matCalibF3ParkFailFast";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "materializationNeverPoisons";
+    };
+    # F3 permissiveness (CE-60/CE-3): unverified missing paths route
+    # from source while upstream offers them.
+    quint-materialization-calib-f3p-unsound-report = mkQuintWitnessCheck {
+      name = "materialization-calib-f3p-unsound-report";
+      spec = "calibration/mat-f3p-unsound-report";
+      main = "matCalibF3pUnsoundReport";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "noWrongfulFromSourceRouting";
+    };
+    # F7 (CE-30/CE-28): the un-keyed resolution.
+    quint-materialization-calib-f7-unkeyed-resolve = mkQuintWitnessCheck {
+      name = "materialization-calib-f7-unkeyed-resolve";
+      spec = "calibration/mat-f7-unkeyed-resolve";
+      main = "matCalibF7UnkeyedResolve";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "jobResolutionSound";
+    };
+    # F9 (CE-41 re-pointed): routing trusts a divergent in-memory
+    # children view over the durable relation.
+    quint-materialization-calib-f9-divergent-evidence = mkQuintWitnessCheck {
+      name = "materialization-calib-f9-divergent-evidence";
+      spec = "calibration/mat-f9-divergent-evidence";
+      main = "matCalibF9DivergentEvidence";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "routingRequiresDurableVouchOrFailFast";
+    };
+    # F11 (CE-50, the a17-unfenced analogue): a stale tenure's job
+    # resolve applies below the claims floor.
+    quint-materialization-calib-f11-unfenced-resolve = mkQuintWitnessCheck {
+      name = "materialization-calib-f11-unfenced-resolve";
+      spec = "calibration/mat-f11-unfenced-resolve";
+      main = "matCalibF11UnfencedResolve";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "fencedJobWritesOnly";
+    };
+    # B4 (delta 2b): probe creation without the legacy backfill.
+    quint-materialization-calib-b4-no-backfill = mkQuintWitnessCheck {
+      name = "materialization-calib-b4-no-backfill";
+      spec = "calibration/mat-b4-no-backfill";
+      main = "matCalibB4NoBackfill";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "creationLeavesTenantResolvable";
+    };
+    # The partial-unique-index dedup, slot-widened.
+    quint-materialization-calib-dedup-removed = mkQuintWitnessCheck {
+      name = "materialization-calib-dedup-removed";
+      spec = "calibration/mat-dedup-removed";
+      main = "matCalibDedupRemoved";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "atMostOneUnresolvedJobPerDrv";
+    };
+    # PP-4 (i): the establishment writes executor_crash for the
+    # materialization kind.
+    quint-materialization-calib-pp4-build-charge = mkQuintWitnessCheck {
+      name = "materialization-calib-pp4-build-charge";
+      spec = "calibration/mat-pp4-establish-build-charge";
+      main = "matCalibPp4EstablishBuildCharge";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "materializationInvisibleToBuildBudgets";
+    };
+    # PP-4 (ii): the establishment closes the attempt charge-free.
+    quint-materialization-calib-pp4-uncharged = mkQuintWitnessCheck {
+      name = "materialization-calib-pp4-uncharged";
+      spec = "calibration/mat-pp4-establish-uncharged";
+      main = "matCalibPp4EstablishUncharged";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "materializationCrashChargedOnce";
+    };
+    # B2-strong shape (a): ingest without the pin INSERT re-finds the
+    # GC-after-vouch trace shape.
+    quint-materialization-calib-b2-no-pin = mkQuintWitnessCheck {
+      name = "materialization-calib-b2-no-pin";
+      spec = "calibration/mat-b2-no-pin-at-ingest";
+      main = "matCalibB2NoPinAtIngest";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "pinCoversIngestUntilAllInterestTerminal";
+    };
+    # F5 / PP-5 (i): the wholesale relation overwrite breaks
+    # cross-build isolation.
+    quint-materialization-calib-f5-wanted-overwrite = mkQuintWitnessCheck {
+      name = "materialization-calib-f5-wanted-overwrite";
+      spec = "calibration/mat-f5-wanted-overwrite";
+      main = "matCalibF5WantedOverwrite";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "crossBuildWantedIsolation";
+    };
+    # F4 B4-half + the C5/CE-7 closure evidence: the dead-inclusive
+    # stored-union coverage read (a terminal build's stale wants drive
+    # the decision) — the behavior the live-only §6 join replaced.
+    quint-materialization-calib-f4-dead-union = mkQuintWitnessCheck {
+      name = "materialization-calib-f4-dead-union";
+      spec = "calibration/mat-f4-dead-union";
+      main = "matCalibF4DeadUnion";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "interestUnionLiveOnly";
+    };
+    # F1 permissiveness (CE-1): the by-construction row's REACHABILITY
+    # half — the covered-creation space (the state the as-built
+    # presence re-check excludes) is reachable under the override, so
+    # the recorded no-falsification verdict (the §9.1 conjunction holds
+    # over that space — the C-prime stage record's by-construction
+    # evidence) is about a real space, not vacuity.
+    quint-materialization-calib-f1-covered-creation = mkQuintWitnessCheck {
+      name = "materialization-calib-f1-covered-creation";
+      spec = "calibration/mat-f1-no-presence-recheck";
+      main = "matCalibF1NoPresenceRecheck";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "noCoveredCreationJob";
+    };
+
+    # ------------------------------------------------------------------
+    # spawnCoherence PD-7 extension (substitution-replacement Phase B,
+    # design §9.2): the GetSpawnIntents job filter — served sets
+    # exclude intents whose node carries an unresolved materialization
+    # job. The six pre-existing regimes carry ENABLE_MAT_JOBS = false
+    # (constant-false var; reachable state space unchanged — the
+    # regime-split dormancy rule); this regime turns the environment
+    # on. Weakened test: deleting the serve-time conjunct re-finds
+    # VMatJobServed (procedure in the regime module's comment; depth in
+    # the introducing commit).
+    # r[verify sched.materialize.job]
+    quint-spawn-coherence-mat-jobs = mkQuintCheck {
+      name = "spawn-coherence-mat-jobs";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceMatJobs";
+      invariants = [
+        "ceilingRespected"
+        "reapSafety"
+        "orphanRemoved"
+        "ackSoundness"
+        "ackCoversPending"
+        "degradedPolarity"
+        "gateFailClosed"
+        "freedSlotsSpendable"
+        "matJobFilteredFromIntents"
+      ];
+    };
+    # The job filter actually filters (a queued, job-carrying intent
+    # existed at a successful fresh poll) — matJobFilteredFromIntents'
+    # non-vacuity.
+    quint-spawn-coherence-witness-mat-filtered = mkQuintWitnessCheck {
+      name = "spawn-coherence-witness-mat-filtered";
+      spec = "spawnCoherence";
+      main = "spawnCoherenceMatJobs";
+      witness = "canReachMatJobFiltered";
     };
 
     # ------------------------------------------------------------------
