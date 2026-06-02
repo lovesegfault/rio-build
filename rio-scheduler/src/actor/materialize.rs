@@ -717,8 +717,22 @@ impl DagActor {
                 .await;
 
                 // 2. The four-arm routing. Arms 0–2 decide without the
-                //    re-probe; the probe is fetched only for arm 3.
-                let durable_evidence = match self.dag.closure_evidence(drv_hash.as_str()) {
+                //    re-probe; the probe is fetched only for arm 3. The
+                //    evidence is classified over the DURABLE relation
+                //    (T-D2.2/PD-D4: pg.edges + pg.status + live
+                //    co-owning build links — the three-part strict
+                //    criterion), never the in-memory child set, so a
+                //    reap-truncated or post-failover view cannot
+                //    launder a verdict (the F9 hazard).
+                let durable_evidence = match self
+                    .db
+                    .classify_durable_evidence(attempt.derivation_id)
+                    .await
+                    .map_err(|e| {
+                        super::pull::PullRejection::Internal(format!(
+                            "durable evidence classification: {e}"
+                        ))
+                    })? {
                     rio_evidence_kernel::ClosureEvidence::Vouched => DurableEvidence::Vouched,
                     rio_evidence_kernel::ClosureEvidence::Pending => DurableEvidence::Pending,
                     rio_evidence_kernel::ClosureEvidence::Broken => DurableEvidence::Broken,
@@ -1322,7 +1336,27 @@ impl DagActor {
             .collect();
         let mut still_parked = parked.len();
         for (drv_hash, job_id) in parked {
-            let evidence = self.dag.closure_evidence(drv_hash.as_str());
+            // Classify over the DURABLE relation (T-D2.2/PD-D4 — the
+            // same three-part criterion the consumption routing uses;
+            // a stale in-memory view must neither strand a buildable
+            // closure nor auto-resolve on dead previous-generation
+            // evidence). One query per parked job: bounded by the
+            // stalled population, which is small by construction
+            // (alerted at >0 for 15m).
+            let Some(db_id) = self.dag.node(drv_hash.as_str()).and_then(|s| s.db_id) else {
+                continue;
+            };
+            let evidence = match self.db.classify_durable_evidence(db_id).await {
+                Ok(ev) => ev,
+                Err(e) => {
+                    // Conservative: an unanswerable classification
+                    // keeps the job parked (the armed action remains
+                    // park-expiry re-claim).
+                    warn!(drv_hash = %drv_hash, error = %e,
+                          "park re-evaluation evidence query failed; job stays parked");
+                    continue;
+                }
+            };
             let from_source_viable = matches!(
                 evidence,
                 rio_evidence_kernel::ClosureEvidence::Vouched

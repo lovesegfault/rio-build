@@ -5585,3 +5585,389 @@ async fn dedup_upgrade_preserves_parked_armament() -> TestResult {
     );
     Ok(())
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Phase D' T-D2.2 (PD-D4): routing/park evidence classification
+// re-sources to the durable relation (the THREE-part strict criterion)
+// ════════════════════════════════════════════════════════════════════
+
+/// Insert a phantom derivation row directly into PG (a child the
+/// in-memory DAG does NOT track — the truncation/divergence shapes).
+async fn insert_pg_derivation(
+    pool: &sqlx::PgPool,
+    drv_hash: &str,
+    status: &str,
+) -> anyhow::Result<Uuid> {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO derivations (drv_hash, drv_path, system, status) \
+         VALUES ($1, $2, 'x86_64-linux', $3) RETURNING derivation_id",
+    )
+    .bind(drv_hash)
+    .bind(rio_test_support::fixtures::test_drv_path(drv_hash))
+    .bind(status)
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+async fn pg_derivation_id(pool: &sqlx::PgPool, drv_hash: &str) -> anyhow::Result<Uuid> {
+    Ok(
+        sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+            .bind(drv_hash)
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+async fn pg_link(pool: &sqlx::PgPool, build_id: Uuid, derivation_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO build_derivations (build_id, derivation_id) \
+         VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(build_id)
+    .bind(derivation_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn pg_edge(pool: &sqlx::PgPool, parent: Uuid, child: Uuid) -> anyhow::Result<()> {
+    sqlx::query("INSERT INTO derivation_edges (parent_id, child_id) VALUES ($1, $2)")
+        .bind(parent)
+        .bind(child)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// r[verify sched.materialize.routing+2]
+/// The routing classification must survive in-memory truncation: the
+/// consumption transaction classifies over the DURABLE relation
+/// (pg.edges + pg.status + live co-owning build links), not the
+/// in-memory child set. A pruned-origin node whose PG closure holds an
+/// unproduced child VOUCHED by a live co-owning build classifies
+/// Pending (arm 2 → from-source) even when the in-memory view says
+/// childless-Broken — the F9-class laundering the durable read
+/// prevents (here in the conservative direction: the in-memory Broken
+/// would wrongly FAIL-FAST a node whose closure is still buildable).
+#[tokio::test]
+async fn routing_evidence_survives_inmemory_truncation() -> TestResult {
+    use rio_auth::hmac::HmacSigner;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let service_key = b"test-d22-trunc-key-32-bytes!!!!!".to_vec();
+    let (handle, _actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, p| {
+            cfg.materialization.enabled = true;
+            p.service_signer = Some(Arc::new(HmacSigner::from_key(service_key)));
+        });
+    let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "d22-trunc-tenant").await;
+
+    // b1 merges the single node R (substitutable → cache_opportunity
+    // job). In memory R is CHILDLESS.
+    let out = test_store_path("d22a-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut r = make_node("d22a");
+    r.expected_output_paths = vec![out.clone()];
+    r.wanted_output_names = vec!["out".into()];
+    let b1 = Uuid::new_v4();
+    merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: b1,
+            tenant_id: Some(tenant),
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![r],
+            edges: vec![],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // The durable truth diverges from the in-memory view: R has an
+    // UNPRODUCED child in PG, vouched by the live co-owning b1.
+    let r_id = pg_derivation_id(&db.pool, "d22a").await?;
+    let c_id = insert_pg_derivation(&db.pool, "d22a-child", "queued").await?;
+    pg_edge(&db.pool, r_id, c_id).await?;
+    pg_link(&db.pool, b1, c_id).await?;
+
+    // The pruned-origin discriminator (T-D2.1's durable mark).
+    sqlx::query("UPDATE materialization_jobs SET origin = 'pruned' WHERE drv_hash = 'd22a'")
+        .execute(&db.pool)
+        .await?;
+
+    let assignment = match claim_materialization(&handle, "d22a", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    store.state.substitutable.write().unwrap().clear();
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "d22a",
+        mat_unobtainable_outcome(vec![out.clone()], vec![], "upstream 404"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // Durable Pending (live-vouched unproduced child) → arm 2 →
+    // from-source: never the fail-fast the in-memory childless-Broken
+    // view would produce.
+    let job_state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = 'd22a'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        job_state, "resolved_from_source",
+        "the routing must classify over the durable relation (PG holds a \
+         live-vouched unproduced child → Pending → from-source), not the \
+         truncated in-memory view"
+    );
+    let st = query_status(&handle, b1).await?;
+    assert_ne!(
+        st.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "never a fail-fast for a Pending-evidence closure"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.routing+2]
+/// The park re-evaluation classifies over the durable relation too: a
+/// parked job whose node's PG closure is fully produced AND vouched by
+/// a live co-owning build resolves from-source at the next tick, even
+/// when the in-memory view is stale (childless → Broken → the as-built
+/// tick would skip it forever).
+#[tokio::test]
+async fn park_reevaluation_resolves_on_durable_vouch() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.materialization.enabled = true;
+            cfg.materialization.max_attempts = 1;
+            cfg.materialization.park_backoff_base_secs = 3600;
+            cfg.materialization.park_backoff_cap_secs = 3600;
+        });
+    let _tasks = (store_task, actor_task);
+
+    // b1 merges R (substitutable → job); claim; infra-fail → PARKED.
+    let out = test_store_path("d22b-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut r = make_node("d22b");
+    r.expected_output_paths = vec![out.clone()];
+    r.wanted_output_names = vec!["out".into()];
+    let b1 = Uuid::new_v4();
+    let _ev = merge_dag(&handle, b1, vec![r], vec![], false).await?;
+    barrier(&handle).await;
+    let assignment = match claim_materialization(&handle, "d22b", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(&handle, exec_id, "d22b", mat_infra_outcome("dead upstream"))
+        .await
+        .map_err(|e| anyhow::anyhow!("infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    let parked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM materialization_jobs \
+          WHERE drv_hash = 'd22b' AND state = 'pending' AND park_until > now()",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(parked, 1, "precondition: the job is parked");
+
+    // Durable truth: R's closure is fully PRODUCED and vouched by the
+    // live co-owning b1 — from-source is viable. The in-memory view
+    // still says childless (Broken).
+    let r_id = pg_derivation_id(&db.pool, "d22b").await?;
+    let c_id = insert_pg_derivation(&db.pool, "d22b-child", "completed").await?;
+    pg_edge(&db.pool, r_id, c_id).await?;
+    pg_link(&db.pool, b1, c_id).await?;
+
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    let job_state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = 'd22b'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        job_state, "resolved_from_source",
+        "the park re-evaluation must classify over the durable relation \
+         (PG: all children produced + live co-owning voucher → Vouched) \
+         and resolve the parked job from-source"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.routing+2]
+/// The THIRD conjunct's own pin (the stale-evidence direction, RS-1):
+/// produced children whose only voucher is a TERMINAL build — the
+/// previous-generation shape — must classify Broken, NOT Vouched. PG
+/// retains a terminal build's completed children indefinitely; without
+/// live-build scoping a previous-generation node would launder a stale
+/// closure into a doomed from-source dispatch (and the park tick would
+/// auto-resolve it). For a pruned-origin job the correct verdict is
+/// the bounded resubmit-directing fail-fast; a parked twin stays
+/// parked across ticks.
+#[tokio::test]
+async fn classify_durable_evidence_ignores_dead_voucher() -> TestResult {
+    use rio_auth::hmac::HmacSigner;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let service_key = b"test-d22-dead-key-32-bytes!!!!!!".to_vec();
+    let (handle, _actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, p| {
+            cfg.materialization.enabled = true;
+            cfg.materialization.max_attempts = 1;
+            cfg.materialization.park_backoff_base_secs = 3600;
+            cfg.materialization.park_backoff_cap_secs = 3600;
+            p.service_signer = Some(Arc::new(HmacSigner::from_key(service_key)));
+        });
+    let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "d22-dead-tenant").await;
+
+    // ── Shape 1 (consumption): R1 with a pruned-origin job; PG holds
+    //    R1's completed child whose ONLY voucher is a terminal build. ──
+    let out1 = test_store_path("d22c-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out1.clone());
+    let mut r1 = make_node("d22c");
+    r1.expected_output_paths = vec![out1.clone()];
+    r1.wanted_output_names = vec!["out".into()];
+    let b_live = Uuid::new_v4();
+    merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: b_live,
+            tenant_id: Some(tenant),
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![r1],
+            edges: vec![],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+    let r1_id = pg_derivation_id(&db.pool, "d22c").await?;
+    let c1_id = insert_pg_derivation(&db.pool, "d22c-child", "completed").await?;
+    pg_edge(&db.pool, r1_id, c1_id).await?;
+    // The dead voucher: a SUCCEEDED build owns both R1 and the child.
+    let b_old: Uuid =
+        sqlx::query_scalar("INSERT INTO builds (status) VALUES ('succeeded') RETURNING build_id")
+            .fetch_one(&db.pool)
+            .await?;
+    pg_link(&db.pool, b_old, r1_id).await?;
+    pg_link(&db.pool, b_old, c1_id).await?;
+    // The live build links only R1 (a pruning build links kept roots,
+    // never the children) — no LIVE co-owning voucher for the child.
+    sqlx::query("UPDATE materialization_jobs SET origin = 'pruned' WHERE drv_hash = 'd22c'")
+        .execute(&db.pool)
+        .await?;
+
+    let assignment = match claim_materialization(&handle, "d22c", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("R1's claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .retain(|p| p != &out1);
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "d22c",
+        mat_unobtainable_outcome(vec![out1.clone()], vec![], "upstream 404"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    let job_state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = 'd22c'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        job_state, "resolved_unobtainable",
+        "produced-without-LIVE-voucher is Broken (the third conjunct): a \
+         pruned-origin job takes the bounded resubmit-directing fail-fast, \
+         never the doomed from-source dispatch of a never-merged closure"
+    );
+    let st = query_status(&handle, b_live).await?;
+    assert_eq!(
+        st.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "the fail-fast verdict reaches the live interested build"
+    );
+
+    // ── Shape 2 (the park tick): R2, same previous-generation shape,
+    //    PARKED — the tick must NOT auto-resolve it from-source. ──
+    let out2 = test_store_path("d22d-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out2.clone());
+    let mut r2 = make_node("d22d");
+    r2.expected_output_paths = vec![out2.clone()];
+    r2.wanted_output_names = vec!["out".into()];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(&handle, b2, vec![r2], vec![], false).await?;
+    barrier(&handle).await;
+    let assignment = match claim_materialization(&handle, "d22d", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("R2's claim must deliver, got {other:?}"),
+    };
+    let exec2: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(&handle, exec2, "d22d", mat_infra_outcome("dead upstream"))
+        .await
+        .map_err(|e| anyhow::anyhow!("R2's infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    let r2_id = pg_derivation_id(&db.pool, "d22d").await?;
+    let c2_id = insert_pg_derivation(&db.pool, "d22d-child", "completed").await?;
+    pg_edge(&db.pool, r2_id, c2_id).await?;
+    let b_old2: Uuid =
+        sqlx::query_scalar("INSERT INTO builds (status) VALUES ('succeeded') RETURNING build_id")
+            .fetch_one(&db.pool)
+            .await?;
+    pg_link(&db.pool, b_old2, r2_id).await?;
+    pg_link(&db.pool, b_old2, c2_id).await?;
+
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let r2_state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = 'd22d'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        r2_state, "pending",
+        "the park tick must NOT auto-resolve on dead-voucher evidence \
+         (stale previous-generation rows are Broken, not Vouched)"
+    );
+    Ok(())
+}

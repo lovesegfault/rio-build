@@ -2889,10 +2889,12 @@ async fn test_failover_childless_pruned_root_fails_fast_not_dispatched_from_sour
     Ok(())
 }
 
-// D2.2-gate: the keeps-half stale-evidence pin — survives D1 as T-D2.2's
-// gate (the durable three-part classifier must preserve this behavior via
-// the live-co-owning-build conjunct); retires in/after D2.2 superseded by
-// classify_durable_evidence_ignores_dead_voucher.
+// D5-delete: the keeps-half stale-evidence pin served as T-D2.2's gate
+// (stayed green at that boundary — the durable three-part classifier
+// preserves this behavior via the live-co-owning-build conjunct) and is
+// superseded by classify_durable_evidence_ignores_dead_voucher
+// (materialize.rs); it rides to D5 pinning the recovery R-gate until the
+// gate itself deletes there.
 // r[verify sched.merge.substitute-topdown+12]
 /// Live-build scoping of the recovery-time gate: a restored
 /// `topdown_pruned` mark must be KEPT when the parent's produced
@@ -3040,7 +3042,7 @@ async fn test_failover_keeps_topdown_pruned_when_produced_children_belong_to_ter
     Ok(())
 }
 
-// D2.2-gate: keeps-half pin — see
+// D5-delete: keeps-half pin — see
 // test_failover_keeps_topdown_pruned_when_produced_children_belong_to_terminal_build.
 // r[verify sched.merge.substitute-topdown+12]
 /// bug_006 regression (the recovery-time veto): a restored

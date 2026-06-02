@@ -15,6 +15,51 @@ use super::{
     terminal_status_sql,
 };
 
+/// The per-child PRODUCED half of the strict criterion (shared by the
+/// recovery `topdown_pruned` gate and the durable routing classifier —
+/// ONE criterion, two callers; T-D2.2/PD-D4). `e`/`c` are the
+/// edge/child aliases of the enclosing queries.
+const CHILD_PRODUCED_SQL: &str = "c.status IN ('completed', 'skipped')";
+
+/// The per-child LIVE CO-OWNING VOUCHER half (the third conjunct —
+/// RS-1's load-bearing protection): a `'pending'`/`'active'` build
+/// links BOTH the child and the parent. PG retains a terminal build's
+/// completed children indefinitely, so without live-build scoping a
+/// previous-generation node classifies Vouched and launders a stale
+/// closure into a doomed from-source dispatch.
+const CHILD_LIVE_VOUCHER_SQL: &str = "EXISTS (SELECT 1 FROM build_derivations bd \
+     JOIN builds b ON b.build_id = bd.build_id \
+     JOIN build_derivations bdp \
+       ON bdp.build_id = bd.build_id \
+      AND bdp.derivation_id = e.parent_id \
+     WHERE bd.derivation_id = c.derivation_id \
+       AND b.status IN ('pending', 'active'))";
+
+/// The recovery-gate query, assembled once from the shared fragments
+/// (a `LazyLock` so sqlx sees a `'static` string).
+static ALL_CHILDREN_PRODUCED_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "SELECT e.parent_id \
+         FROM derivation_edges e \
+         JOIN derivations c ON c.derivation_id = e.child_id \
+         WHERE e.parent_id = ANY($1) \
+         GROUP BY e.parent_id \
+         HAVING bool_and(({CHILD_PRODUCED_SQL}) AND ({CHILD_LIVE_VOUCHER_SQL}))",
+    )
+});
+
+/// The durable-classifier query (T-D2.2), same shared fragments.
+static CLASSIFY_EVIDENCE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "SELECT count(*), \
+                bool_and(({CHILD_PRODUCED_SQL}) AND ({CHILD_LIVE_VOUCHER_SQL})), \
+                bool_or(({CHILD_PRODUCED_SQL}) AND NOT ({CHILD_LIVE_VOUCHER_SQL})) \
+         FROM derivation_edges e \
+         JOIN derivations c ON c.derivation_id = e.child_id \
+         WHERE e.parent_id = $1",
+    )
+});
+
 impl SchedulerDb {
     /// Load all non-terminal builds. Terminal builds (succeeded/
     /// failed/cancelled) don't need recovery — they're done, and a
@@ -259,28 +304,60 @@ impl SchedulerDb {
         if derivation_ids.is_empty() {
             return Ok(Vec::new());
         }
-        sqlx::query_scalar(
-            r#"
-            SELECT e.parent_id
-            FROM derivation_edges e
-            JOIN derivations c ON c.derivation_id = e.child_id
-            WHERE e.parent_id = ANY($1)
-            GROUP BY e.parent_id
-            HAVING bool_and(
-                c.status IN ('completed', 'skipped')
-                AND EXISTS (SELECT 1 FROM build_derivations bd
-                            JOIN builds b ON b.build_id = bd.build_id
-                            JOIN build_derivations bdp
-                              ON bdp.build_id = bd.build_id
-                             AND bdp.derivation_id = e.parent_id
-                            WHERE bd.derivation_id = c.derivation_id
-                              AND b.status IN ('pending', 'active'))
-            )
-            "#,
-        )
-        .bind(derivation_ids)
-        .fetch_all(&self.pool)
-        .await
+        sqlx::query_scalar(ALL_CHILDREN_PRODUCED_SQL.as_str())
+            .bind(derivation_ids)
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// THE durable closure-evidence classifier (T-D2.2 / PD-D4): the
+    /// strict three-part criterion of
+    /// [`Self::load_parents_with_all_children_produced`] — pg.edges +
+    /// pg.status + LIVE co-owning build links — promoted to a tri-state
+    /// classification consumed by the §2.4 consumption routing and the
+    /// PD-20 park re-evaluation. ONE criterion, shared SQL fragments
+    /// ([`CHILD_PRODUCED_SQL`]/[`CHILD_LIVE_VOUCHER_SQL`]), two callers
+    /// (the recovery gate above until D5; the routing forever).
+    ///
+    /// The cell map (design §4's `closure_hole` successor, all three
+    /// conjuncts):
+    /// - `Vouched` — ≥1 child ∧ every child produced
+    ///   (`completed`/`skipped`) ∧ vouched by a live co-owning build
+    ///   (the `EXISTS` conjunct inside the `bool_and`, exactly as the
+    ///   recovery gate has it).
+    /// - `Broken` — childless/absent (as the in-memory judgment), PLUS
+    ///   the produced-without-a-live-voucher cell: the
+    ///   previous-generation shape (a long-terminal build's completed
+    ///   children persist in PG indefinitely; classifying them Vouched
+    ///   would launder a stale closure into a doomed from-source
+    ///   dispatch — the F9 hazard the third conjunct closes).
+    /// - `Pending` — children exist, none of them stale-produced, not
+    ///   all produced (the buildable-closure case; normal dep gating).
+    ///
+    /// NO hole input — the load-bearing protection is the THIRD
+    /// conjunct, not append-onlyness: pg.edges IS truncated by
+    /// `gc_orphan_terminal_derivations`, and PG's retention of stale
+    /// terminal-build rows is precisely why live-build scoping is
+    /// required.
+    pub(crate) async fn classify_durable_evidence(
+        &self,
+        derivation_id: Uuid,
+    ) -> Result<rio_evidence_kernel::ClosureEvidence, sqlx::Error> {
+        let (n_children, all_strict, stale_produced): (i64, Option<bool>, Option<bool>) =
+            sqlx::query_as(CLASSIFY_EVIDENCE_SQL.as_str())
+                .bind(derivation_id)
+                .fetch_one(&self.pool)
+                .await?;
+        use rio_evidence_kernel::ClosureEvidence;
+        Ok(if n_children == 0 {
+            ClosureEvidence::Broken
+        } else if all_strict == Some(true) {
+            ClosureEvidence::Vouched
+        } else if stale_produced == Some(true) {
+            ClosureEvidence::Broken
+        } else {
+            ClosureEvidence::Pending
+        })
     }
 
     /// Recovered parents with at least one persisted child whose status
