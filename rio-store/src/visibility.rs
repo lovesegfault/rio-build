@@ -6,7 +6,7 @@
 //! materialization walk's local-presence probe and the gRPC read gates
 //! — single-path AND batch (`FindMissingPaths`) — decide visibility
 //! through the SAME code path: one `(owned, any_built)` projection
-//! ([`own_built_projection`]), one `.drv` exemption ([`drv_exempt`]),
+//! ([`own_built_projection`]),
 //! one signature cell ([`sig_cell`]), one malformed-row disposition
 //! (DB-egress validation errors propagate on every entrypoint). The
 //! verdict itself — the I-217 table over
@@ -29,10 +29,19 @@
 //! ## Caller-side policy exemptions
 //!
 //! Anonymous requests (`tenant_id = None`) are unfiltered
-//! (`r[store.tenant.narinfo-filter]`) and `.drv` paths are build
-//! inputs, exempt from tenant scoping (`r[gw.jwt.anon-drv-lookup]`).
-//! Both short-circuit BEFORE the kernel table — they are policy about
-//! whether visibility applies, not visibility cells.
+//! (`r[store.tenant.narinfo-filter]`) — short-circuits BEFORE the
+//! kernel table; it's policy about whether visibility applies, not a
+//! visibility cell.
+//!
+//! No `.drv` exemption (`r[store.tenant.valid-paths-filter]`): `.drv`
+//! paths go through the same ownership/sig checks as outputs.
+//! Exempting them made a cross-tenant `.drv` *valid but unreadable* —
+//! the client skipped the upload, then the builder's castore-FUSE read
+//! (strict `path_tenants` join, `r[store.castore.tenant-scope]`) got
+//! NotFound → EIO → infra-retries exhausted. Reporting it invalid
+//! instead makes the client re-upload, and the idempotent-skip
+//! junction write (`r[store.put.tenant-junction]`) grants this tenant
+//! read access.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -44,21 +53,6 @@ use uuid::Uuid;
 use crate::error::MetadataError;
 use crate::metadata;
 use crate::signing::TenantSigner;
-
-/// The `.drv` exemption test shared by BOTH visibility entrypoints:
-/// parsed [`rio_nix::store_path::StorePath::is_derivation`] semantics
-/// (the name component ends in `.drv`). An unparseable request string
-/// is NOT exempt — it cannot name a derivation the store knows, and it
-/// can never correspond to a complete narinfo row (paths are validated
-/// at ingest). Pre-bug_061 the batch gate tested the RAW string's
-/// suffix while the single-path gate tested the parsed name; for every
-/// path that can actually be locally present the two agree, but the
-/// policy now exists exactly once.
-pub(crate) fn drv_exempt(path: &str) -> bool {
-    rio_nix::store_path::StorePath::parse(path)
-        .map(|sp| sp.is_derivation())
-        .unwrap_or(false)
-}
 
 /// The ONE `(owned, any_built)` projection both visibility entrypoints
 /// read (bug_061): per input hash — does `tid` own it, and has ANY
@@ -250,13 +244,9 @@ pub(crate) async fn visible_to_tenant(
         // Anonymous → unfiltered (r[store.tenant.narinfo-filter]).
         return Ok(Some(TenantVisible(tenant_id.into_iter().collect())));
     };
-    // r[impl gw.jwt.anon-drv-lookup]
-    // .drv files are build INPUTS, not tenant-owned outputs — exempt
-    // from tenant-scoped visibility (store-side mirror of the gateway's
-    // `jwt_unless_drv`).
-    if info.store_path.is_derivation() {
-        return Ok(Some(TenantVisible(tenant_id.into_iter().collect())));
-    }
+    // r[impl store.tenant.valid-paths-filter]
+    // No `.drv` exemption — `.drv` paths take the same ownership/sig
+    // gate as outputs (see module doc for the castore-FUSE rationale).
 
     // The shared projection (bug_061: the SAME query the batch
     // entrypoint runs — `path_tenants` is populated at build-completion
@@ -285,8 +275,9 @@ pub(crate) async fn visible_to_tenant(
 /// Batch entrypoint of the ONE visibility body (bug_061): given the
 /// locally-present subset of a `FindMissingPaths` request, return the
 /// subset visible to `tenant_id`. Anonymous (`None`) is unfiltered
-/// (`r[store.tenant.narinfo-filter]`); `.drv` paths are exempt
-/// ([`drv_exempt`] — same policy as the single-path body); built
+/// (`r[store.tenant.narinfo-filter]`); `.drv` paths get NO exemption
+/// (`r[store.tenant.valid-paths-filter]` — same policy as the
+/// single-path body); built
 /// paths take the kernel verdict over the shared
 /// [`own_built_projection`]; substitution-only paths evaluate the
 /// shared [`sig_cell`] over rows fetched through
@@ -329,16 +320,10 @@ pub(crate) async fn visible_subset(
     let mut visible: HashSet<String> = HashSet::with_capacity(present.len());
     let mut subst_only: Vec<String> = Vec::new();
     for (p, h) in present.iter().zip(&hashes) {
-        // r[impl gw.jwt.anon-drv-lookup]
-        // .drv files are build inputs, not tenant-owned outputs —
-        // exempt per the same (now shared) policy as the single-path
-        // body. Without this, `wopQueryValidPaths` reports a .drv
-        // missing while `wopIsValidPath` reports it valid for the same
-        // path/JWT.
-        if drv_exempt(p) {
-            visible.insert(p.clone());
-            continue;
-        }
+        // r[impl store.tenant.valid-paths-filter]
+        // Same policy as the single-path gate above (see module doc):
+        // no `.drv` exemption — owned → visible,
+        // built-by-another-tenant → hidden, else sig-gated.
         match own_built.get(h) {
             Some(&(owned, any_built)) => {
                 // The kernel's I-217 table (sig_trusted=false is sound

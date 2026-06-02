@@ -101,6 +101,22 @@ impl Scenario for CrossTenantPathRead {
             || out.contains("not in store")
             || out.contains("NotFound")
         {
+            // Build-side half (`r[store.tenant.valid-paths-filter]`):
+            // B builds the SAME expression A built — same .drv. B's
+            // validity check must NOT count A's .drv as valid for B;
+            // B's client re-uploads it, the idempotent skip writes B's
+            // junction row, and the build runs. Before the fix this
+            // died with `max_infra_retries=10 exhausted` on the
+            // builder's castore-FUSE read of the .drv (the two-tenant
+            // brick this scenario exists for).
+            ctx.nix_build_expr_via_gateway(1, &expr)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "B building the expr A already built must succeed \
+                         (valid-paths tenant scoping + junction self-heal): {e:#}"
+                    )
+                })?;
             Ok(Verdict::Pass)
         } else {
             // `timeout` exits 124 on timeout — distinguish a transport

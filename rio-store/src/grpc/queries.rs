@@ -299,7 +299,14 @@ impl StoreServiceImpl {
             (Some(sub), Some(tid)) => {
                 let probe_missing: Vec<String> = missing
                     .iter()
-                    .filter(|p| !crate::visibility::drv_exempt(p))
+                    .filter(|p| {
+                        // Not a visibility-gate concern — `.drv` paths
+                        // are simply never substitutable from a binary
+                        // cache, so probing wastes budget.
+                        !rio_nix::store_path::StorePath::parse(p)
+                            .map(|sp| sp.is_derivation())
+                            .unwrap_or(false)
+                    })
                     .cloned()
                     .collect();
                 if probe_missing.is_empty() {
