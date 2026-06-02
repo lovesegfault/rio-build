@@ -361,7 +361,7 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
         "B's AddSignatures must append; got {sigs:?}"
     );
 
-    // ── Anonymous → batch RPCs pass through (builder, no token) ────────
+    // ── Anonymous → batch RPCs pass through (internal callers, no token) ──
     switch.set(None);
     let resp = client
         .batch_query_path_info(BatchQueryPathInfoRequest {

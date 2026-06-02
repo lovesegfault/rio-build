@@ -480,14 +480,22 @@ impl StoreServiceImpl {
     /// `BatchGetManifest`). These intentionally skip
     /// `r[store.substitute.tenant-sig-visibility]` (the gate would add
     /// per-path PG hits and defeat I-110); turning the documented
-    /// "builder is the only caller, sends no token" into an enforced
-    /// invariant means the skip can't be exploited as a tenant-side
-    /// gate bypass.
+    /// "internal services are the only callers, none carries an
+    /// end-user token" into an enforced invariant means the skip can't
+    /// be exploited as a tenant-side gate bypass.
     ///
-    /// Anonymous (builder, no token) and service-token-with-probe
-    /// (scheduler) pass through — only the JWT-interceptor extension
-    /// (an `x-rio-tenant-token` the gateway forwarded from an ssh-ng
-    /// client) is rejected. Zero PG cost.
+    /// The current callers, all deliberately anonymous (no token): the
+    /// builder's closure BFS, the scheduler's dispatch fast-path, and
+    /// the rio-replay engine (plan-time validity snapshot + collect NAR
+    /// verification). Any future hardening that requires a verified
+    /// service caller on these RPCs must admit all three — the engine
+    /// would then mint `x-rio-service-token` with `caller="rio-replay"`,
+    /// as its AdminService calls already do.
+    ///
+    /// Anonymous and service-token-with-probe requests pass through —
+    /// only the JWT-interceptor extension (an `x-rio-tenant-token` the
+    /// gateway forwarded from an ssh-ng client) is rejected. Zero PG
+    /// cost.
     fn reject_end_user_tenant<T>(
         &self,
         request: &Request<T>,

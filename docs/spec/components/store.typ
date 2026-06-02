@@ -254,8 +254,9 @@ the `pending_s3_deletes` table.
   by `max_batch_paths` (default `DEFAULT_MAX_BATCH_PATHS`, configurable via
   `RIO_MAX_BATCH_PATHS`); over-cap returns `INVALID_ARGUMENT` naming the env
   var. Every path is `validate_store_path`-checked before PG. I-110: builder
-  closure-BFS (`compute_input_closure`) is the only current caller; the
-  per-path → batch swap was the 130× scale unlock.
+  closure-BFS (`compute_input_closure`) was the motivating caller --- the
+  per-path → batch swap was the 130× scale unlock; the scheduler's dispatch
+  fast-path and the rio-replay engine issue the same anonymous batch reads.
 ]
 
 #r("store.api.batch-manifest+2")[

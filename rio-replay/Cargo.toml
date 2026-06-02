@@ -13,8 +13,9 @@ name = "rio-replay"
 path = "src/main.rs"
 
 [dependencies]
-# HMAC service-token signing for the campaign engine's AdminService /
-# StoreService calls (`x-rio-service-token`).
+# HMAC service-token signing for the campaign engine's scheduler
+# AdminService calls (`x-rio-service-token`). StoreService calls are
+# deliberately anonymous — see `run::grpc::GrpcStoreApi`.
 rio-auth = { workspace = true }
 # Shared S3 client builder (rio_common::s3::default_client) — same
 # config as rio-store/rio-scheduler so credential/retry resolution

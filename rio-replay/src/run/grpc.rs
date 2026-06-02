@@ -6,6 +6,11 @@
 //! cluster during the first smoke campaign, while the retry, deadline, and
 //! truncation logic has unit tests below (offline plus a scripted local
 //! mock server).
+//!
+//! Auth posture, per surface: scheduler AdminService calls are HMAC-signed
+//! (`x-rio-service-token`, caller [`ENGINE_CALLER`]); rio-store
+//! StoreService calls are deliberately anonymous — see [`GrpcStoreApi`]
+//! for why that is currently safe.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -33,6 +38,14 @@ pub trait StoreApi: Send + Sync {
 pub const BATCH_QUERY_CHUNK: usize = 500;
 
 /// [`StoreApi`] backed by the rio-store StoreService gRPC endpoint.
+///
+/// Sends no `x-rio-service-token` (unlike [`GrpcAdminApi`], which signs
+/// every scheduler AdminService call). That is deliberate: rio-store's
+/// builder-internal batch RPCs accept anonymous callers — its
+/// `reject_end_user_tenant` gate rejects only gateway-forwarded end-user
+/// tenant JWTs — and the engine's `BatchQueryPathInfo` reads are the same
+/// anonymous local-only shape the builder's closure BFS and the
+/// scheduler's dispatch fast-path already use.
 pub struct GrpcStoreApi {
     addr: String,
     timeout: Duration,
@@ -58,6 +71,14 @@ impl StoreApi for GrpcStoreApi {
         let channel = rio_proto::client::connect_channel(&self.addr)
             .await
             .with_context(|| format!("connect rio-store at {}", self.addr))?;
+        // TODO: if rio-store ever requires a verified service caller on
+        // the batch RPCs, thread GrpcAdminApi's signer in here and mint
+        // `x-rio-service-token` per call through `batch_query_path_info`'s
+        // `extra_metadata` parameter (the scheduler's per-path substitute
+        // calls mint the same way) — the shared helper takes a plain
+        // `StoreServiceClient<Channel>`, so an interceptor-wrapped client
+        // does not fit its signature. The store-side allowlist would also
+        // need a `caller="rio-replay"` entry.
         let mut client = rio_proto::StoreServiceClient::new(channel)
             .max_decoding_message_size(rio_common::grpc::max_message_size())
             .max_encoding_message_size(rio_common::grpc::max_message_size());
