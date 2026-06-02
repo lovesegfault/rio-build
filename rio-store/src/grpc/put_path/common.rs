@@ -432,13 +432,15 @@ impl StoreServiceImpl {
 
     /// Thin wrapper over [`crate::ingest::spawn_placeholder_guard`]
     /// supplying `self.pool`. See that fn's doc for the drop-cleanup +
-    /// heartbeat invariants.
+    /// heartbeat invariants. `progress: None` — PutPath claims keep
+    /// `fetched_bytes` NULL, the structural exemption from every
+    /// download-stall rule (`r[store.substitute.progress-heartbeat]`).
     pub(in crate::grpc) fn spawn_placeholder_guard(
         &self,
         store_path_hash: Vec<u8>,
         claim: uuid::Uuid,
     ) -> PlaceholderGuard {
-        crate::ingest::spawn_placeholder_guard(self.pool.clone(), store_path_hash, claim)
+        crate::ingest::spawn_placeholder_guard(self.pool.clone(), store_path_hash, claim, None)
     }
 
     /// Drain a single-output PutPath stream after metadata: accumulate

@@ -186,6 +186,7 @@
     "rio_store_materialization_executions_total",
     "rio_store_materialization_pinned_paths_total",
     "rio_store_pg_pool_utilization",
+    "rio_store_placeholders_uploading",
     "rio_store_put_path_bytes_total",
     "rio_store_put_path_duration_seconds",
     "rio_store_put_path_total",
@@ -1148,6 +1149,11 @@
         "name": "rio_store_pg_pool_utilization",
         "kind": "gauge",
         "help": "PG connection-pool utilization: (size - num_idle) / max_connections. Updated on each StoreAdminService.GetLoad call (ComponentScaler 10s tick). Sustained > 0.8 = under-provisioned store replicas (I-105 cliff approaching)."
+      },
+      {
+        "name": "rio_store_placeholders_uploading",
+        "kind": "gauge",
+        "help": "Live owned 'uploading' placeholders on this replica (PutPath + substitution ingest), RAII-tracked by the placeholder guard: +1 at claim, -1 when the upload ends (success, abort, or drop). The per-replica in-flight ingest signal; sum() across replicas = cluster-wide concurrent NAR uploads."
       },
       {
         "name": "rio_store_put_path_bytes_total",

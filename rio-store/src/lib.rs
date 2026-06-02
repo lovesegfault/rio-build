@@ -377,6 +377,14 @@ pub fn describe_metrics() {
          path. Nonzero expected under network churn; sustained high suggests \
          upstream instability or aggressive pod rollouts."
     );
+    describe_gauge!(
+        "rio_store_placeholders_uploading",
+        "Live owned 'uploading' placeholders on this replica (PutPath + \
+         substitution ingest), RAII-tracked by the placeholder guard: +1 at \
+         claim, -1 when the upload ends (success, abort, or drop). The \
+         per-replica in-flight ingest signal; sum() across replicas = \
+         cluster-wide concurrent NAR uploads."
+    );
     describe_counter!(
         "rio_store_materialization_executions_total",
         "Materialization job executions finished by this replica's executor, \

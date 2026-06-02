@@ -208,7 +208,14 @@ pub async fn persist_nar(
 /// `cas::HEARTBEAT_TIME_INTERVAL` (the chunk-upload heartbeat) and is
 /// ≪ `SUBSTITUTE_STALE_THRESHOLD` (300s), so a live owner survives ≥9
 /// missed heartbeats before stale-reclaim takes it.
+///
+/// Test override (50ms): the progress-heartbeat tests assert the guard
+/// task's periodic write actually lands; a 30s first tick would make
+/// that untestable. Production cadence is unchanged.
+#[cfg(not(test))]
 const PLACEHOLDER_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const PLACEHOLDER_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// RAII owner of an `'uploading'` placeholder: heartbeats while held,
 /// reaps on drop. See [`spawn_placeholder_guard`].
@@ -239,6 +246,10 @@ impl PlaceholderGuard {
 impl Drop for PlaceholderGuard {
     fn drop(&mut self) {
         self.heartbeat.abort();
+        // The RAII pair of spawn_placeholder_guard's increment. Before
+        // the defused early-return: a defused (successful) upload is
+        // just as over as an aborted one.
+        metrics::gauge!("rio_store_placeholders_uploading").decrement(1.0);
         if self.defused {
             return;
         }
@@ -275,12 +286,22 @@ impl Drop for PlaceholderGuard {
 ///
 /// Call [`PlaceholderGuard::defuse`] on success.
 ///
+/// `progress` (`r[store.substitute.progress-heartbeat]`): when `Some`,
+/// each heartbeat carries the handle's current value (the owner's
+/// decompressed-byte count, advanced by `Substituter::fetch_nar`'s
+/// read loop) via [`cas::heartbeat_uploading_with_progress`] — still
+/// one UPDATE per tick. PutPath/PutPathBatch pass `None`, so builder
+/// claims keep `fetched_bytes` NULL — structurally exempt from every
+/// stall rule keyed on progress evidence.
+///
 /// Shared by `PutPath` and `Substituter::try_upstream`; both run inline
 /// in a request handler future and so share the same drop hazard.
+// r[impl store.substitute.progress-heartbeat]
 pub fn spawn_placeholder_guard(
     pool: PgPool,
     store_path_hash: Vec<u8>,
     claim: Uuid,
+    progress: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> PlaceholderGuard {
     let heartbeat = {
         let pool = pool.clone();
@@ -291,10 +312,25 @@ pub fn spawn_placeholder_guard(
             tick.tick().await; // first tick fires immediately; skip it
             loop {
                 tick.tick().await;
-                cas::heartbeat_uploading(&pool, &hash, claim).await;
+                match &progress {
+                    Some(h) => {
+                        cas::heartbeat_uploading_with_progress(
+                            &pool,
+                            &hash,
+                            claim,
+                            h.load(std::sync::atomic::Ordering::Relaxed),
+                        )
+                        .await;
+                    }
+                    None => cas::heartbeat_uploading(&pool, &hash, claim).await,
+                }
             }
         })
     };
+    // RAII in-flight gauge: +1 here, −1 in Drop (defused or not — the
+    // upload is over either way). Per-replica live owned placeholders;
+    // sum() across replicas = cluster in-flight ingest.
+    metrics::gauge!("rio_store_placeholders_uploading").increment(1.0);
     PlaceholderGuard {
         heartbeat,
         pool,
@@ -317,6 +353,224 @@ pub async fn abort_placeholder(pool: &PgPool, store_path_hash: &[u8], claim: Uui
             store_path_hash = %hex::encode(store_path_hash),
             error = %e,
             "abort_placeholder: cleanup failed; orphan scanner will reclaim",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Placeholder progress/stall battery (work item S)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use rio_test_support::TestDb;
+
+    const TEST_HOOKS: IngestHooks = IngestHooks {
+        stale_reclaimed_metric: "rio_store_substitute_stale_reclaimed_total",
+        ctx_label: "ingest-test",
+    };
+
+    /// Progress/stall column probe for one manifests row.
+    /// `(status, claim_id, fetched_bytes, last_progress_at_epoch,
+    ///   stall_count, claimed_by, updated_at_epoch)`.
+    type RowState = (
+        String,
+        Option<Uuid>,
+        Option<i64>,
+        Option<f64>,
+        i16,
+        Option<String>,
+        f64,
+    );
+
+    async fn row_state(pool: &PgPool, hash: &[u8]) -> Option<RowState> {
+        sqlx::query_as(
+            "SELECT status, claim_id, fetched_bytes, \
+                    EXTRACT(EPOCH FROM last_progress_at)::float8, \
+                    stall_count, claimed_by, \
+                    EXTRACT(EPOCH FROM updated_at)::float8 \
+               FROM manifests WHERE store_path_hash = $1",
+        )
+        .bind(hash)
+        .fetch_optional(pool)
+        .await
+        .expect("row_state query")
+    }
+
+    /// Claim a fresh placeholder, panicking on any non-Owned outcome.
+    async fn claim_owned(pool: &PgPool, hash: &[u8], path: &str) -> Uuid {
+        match claim_placeholder(pool, hash, path, &[], TEST_HOOKS)
+            .await
+            .expect("claim_placeholder")
+        {
+            PlaceholderClaim::Owned(c) => c,
+            PlaceholderClaim::AlreadyComplete => panic!("unexpected AlreadyComplete"),
+            PlaceholderClaim::Concurrent => panic!("unexpected Concurrent"),
+        }
+    }
+
+    fn test_hash(tag: u8) -> Vec<u8> {
+        vec![tag; 32]
+    }
+
+    // r[verify store.substitute.progress-heartbeat]
+    /// The with-progress heartbeat is one claim-guarded UPDATE that
+    /// writes `fetched_bytes` and advances `last_progress_at` ONLY
+    /// when the byte count changed — the stuck≠slow discriminator.
+    /// A wrong claim (stale owner) writes nothing.
+    #[tokio::test]
+    async fn progress_heartbeat_advances_only_on_change() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash = test_hash(0xa1);
+        let claim = claim_owned(&db.pool, &hash, "/nix/store/aa-progress-hb").await;
+
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, claim, 100).await;
+        let (_, _, fetched1, lp1, _, _, _) = row_state(&db.pool, &hash).await.expect("row");
+        assert_eq!(fetched1, Some(100), "first heartbeat lands fetched_bytes");
+        let lp1 = lp1.expect("first progress write sets last_progress_at");
+
+        // Same value → liveness bumps, progress clock does NOT.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, claim, 100).await;
+        let (_, _, fetched2, lp2, _, _, _) = row_state(&db.pool, &hash).await.expect("row");
+        assert_eq!(fetched2, Some(100));
+        assert_eq!(
+            lp2,
+            Some(lp1),
+            "unchanged byte count must NOT advance last_progress_at (a wedged \
+             owner's heartbeat keeps liveness fresh while the progress clock freezes)"
+        );
+
+        // Larger value → progress clock advances.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, claim, 200).await;
+        let (_, _, fetched3, lp3, _, _, _) = row_state(&db.pool, &hash).await.expect("row");
+        assert_eq!(fetched3, Some(200));
+        assert!(
+            lp3.expect("set") > lp1,
+            "advancing byte count must advance last_progress_at"
+        );
+
+        // Claim guard: a stale owner's heartbeat is a no-op.
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, Uuid::new_v4(), 999).await;
+        let (_, _, fetched4, _, _, _, _) = row_state(&db.pool, &hash).await.expect("row");
+        assert_eq!(
+            fetched4,
+            Some(200),
+            "a heartbeat under a foreign claim_id must not write progress"
+        );
+    }
+
+    // r[verify store.substitute.progress-heartbeat]
+    /// The guard plumbing end-to-end: a guard spawned WITH a progress
+    /// handle lands the handle's value in `fetched_bytes` on its
+    /// periodic tick; a guard WITHOUT one (the PutPath shape) keeps
+    /// `fetched_bytes` NULL forever — the structural exemption every
+    /// stall rule keys on.
+    #[tokio::test]
+    async fn guard_progress_handle_lands_putpath_stays_null() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Substitution-shaped guard: progress handle wired.
+        let hash_sub = test_hash(0xa2);
+        let claim_sub = claim_owned(&db.pool, &hash_sub, "/nix/store/ab-guard-sub").await;
+        let handle = Arc::new(AtomicU64::new(0));
+        let guard_sub = spawn_placeholder_guard(
+            db.pool.clone(),
+            hash_sub.clone(),
+            claim_sub,
+            Some(Arc::clone(&handle)),
+        );
+        handle.store(4096, Ordering::Relaxed);
+
+        // PutPath-shaped guard: no handle.
+        let hash_put = test_hash(0xa3);
+        let claim_put = claim_owned(&db.pool, &hash_put, "/nix/store/ac-guard-put").await;
+        let guard_put = spawn_placeholder_guard(db.pool.clone(), hash_put.clone(), claim_put, None);
+
+        // ≥3 test-cadence ticks (50ms each).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let (_, _, fetched_sub, lp_sub, _, _, _) =
+            row_state(&db.pool, &hash_sub).await.expect("sub row");
+        assert_eq!(
+            fetched_sub,
+            Some(4096),
+            "the guard's periodic heartbeat must carry the progress handle's value"
+        );
+        assert!(lp_sub.is_some(), "progress write must set last_progress_at");
+
+        let (_, _, fetched_put, lp_put, _, _, _) =
+            row_state(&db.pool, &hash_put).await.expect("put row");
+        assert_eq!(
+            fetched_put, None,
+            "a PutPath claim (no progress handle) must keep fetched_bytes NULL"
+        );
+        assert_eq!(lp_put, None, "...and never set last_progress_at");
+
+        guard_sub.defuse();
+        guard_put.defuse();
+    }
+
+    // r[verify store.substitute.progress-heartbeat]
+    /// `rio_store_placeholders_uploading` tracks live owned
+    /// placeholders RAII-style: +1 per guard spawn, −1 per guard drop
+    /// (defused or not — the upload is over either way). The gauge is
+    /// the per-replica in-flight ingest signal the dashboards read.
+    ///
+    /// metrics-util's debugging `snapshot()` is DESTRUCTIVE (`swap(0)`
+    /// per read), so each read below observes the DELTA since the
+    /// previous read — +1/+1/−1/−1 pins the inc/dec pairing exactly.
+    #[tokio::test]
+    async fn placeholders_uploading_gauge_tracks_guard_lifecycle() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let rec = DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let gauge_delta = |snap: &metrics_util::debugging::Snapshotter| -> Option<f64> {
+            snap.snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(ck, _, _, v)| {
+                    (ck.key().name() == "rio_store_placeholders_uploading").then(|| match v {
+                        DebugValue::Gauge(g) => g.into_inner(),
+                        _ => f64::NAN,
+                    })
+                })
+        };
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash_a = test_hash(0xa4);
+        let claim_a = claim_owned(&db.pool, &hash_a, "/nix/store/ad-gauge-a").await;
+        let g_a = spawn_placeholder_guard(db.pool.clone(), hash_a, claim_a, None);
+        assert_eq!(gauge_delta(&snap), Some(1.0), "guard spawn increments");
+
+        let hash_b = test_hash(0xa5);
+        let claim_b = claim_owned(&db.pool, &hash_b, "/nix/store/ae-gauge-b").await;
+        let g_b = spawn_placeholder_guard(db.pool.clone(), hash_b, claim_b, None);
+        assert_eq!(
+            gauge_delta(&snap),
+            Some(1.0),
+            "second spawn increments again"
+        );
+
+        drop(g_a); // un-defused drop (the abort path)
+        assert_eq!(
+            gauge_delta(&snap),
+            Some(-1.0),
+            "dropped guard decrements (abort path)"
+        );
+
+        g_b.defuse(); // defused consume (the success path)
+        assert_eq!(
+            gauge_delta(&snap),
+            Some(-1.0),
+            "defused guard decrements too (success path)"
         );
     }
 }

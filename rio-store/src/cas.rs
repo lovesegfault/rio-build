@@ -125,6 +125,42 @@ pub(crate) async fn heartbeat_uploading(pool: &PgPool, store_path_hash: &[u8], c
     .await;
 }
 
+// r[impl store.substitute.progress-heartbeat]
+/// [`heartbeat_uploading`] variant for substitution claims: the same
+/// single claim-guarded UPDATE per heartbeat, additionally carrying
+/// the owner's download progress (`fetched_bytes` = decompressed bytes
+/// read so far) and advancing `last_progress_at` only when the count
+/// changed since the previous heartbeat (`IS DISTINCT FROM` over the
+/// OLD row value — RHS expressions in UPDATE see the pre-update row).
+///
+/// `last_progress_at` is what the download-stalled reclaim arm and the
+/// owner-side stall abort discriminate **stuck ≠ slow** on: a slow
+/// owner advances it every heartbeat; a wedged one freezes it while
+/// `updated_at` (liveness) stays fresh.
+///
+/// Same fire-and-forget error contract as [`heartbeat_uploading`].
+pub(crate) async fn heartbeat_uploading_with_progress(
+    pool: &PgPool,
+    store_path_hash: &[u8],
+    claim: uuid::Uuid,
+    fetched_bytes: u64,
+) {
+    // i64 cast: NAR sizes are capped at MAX_NAR_SIZE (4 GiB) ≪ i64::MAX.
+    let fetched = i64::try_from(fetched_bytes).unwrap_or(i64::MAX);
+    let _ = sqlx::query(
+        "UPDATE manifests SET updated_at = now(), \
+             last_progress_at = CASE WHEN fetched_bytes IS DISTINCT FROM $3 \
+                                     THEN now() ELSE last_progress_at END, \
+             fetched_bytes = $3 \
+         WHERE store_path_hash = $1 AND status = 'uploading' AND claim_id = $2",
+    )
+    .bind(store_path_hash)
+    .bind(claim)
+    .bind(fetched)
+    .execute(pool)
+    .await;
+}
+
 /// Result of `put_chunked`.
 #[derive(Debug)]
 pub struct PutChunkedStats {

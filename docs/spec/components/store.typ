@@ -1004,6 +1004,26 @@ content-addressed output mappings independently of narinfo signatures.
   `B.narinfo` would otherwise ingest A and return it from `QueryPathInfo(B)`.
 ]
 
+#r("store.substitute.progress-heartbeat")[
+  Substitution-claimed `'uploading'` placeholders MUST carry download-progress
+  evidence: the placeholder guard's 30 s heartbeat
+  (`ingest::spawn_placeholder_guard` → `cas::heartbeat_uploading_with_progress`)
+  writes the owner's decompressed-byte count to `manifests.fetched_bytes` and
+  advances `manifests.last_progress_at` only when the count changed since the
+  previous heartbeat --- one claim-guarded UPDATE per tick. The byte count is
+  advanced by `fetch_nar`'s read loop, so the evidence is download-phase only:
+  it stops at `nar_size` when the download completes and the persist phase
+  rides the same heartbeat as plain liveness. `PutPath`/`PutPathBatch` claims
+  pass no progress handle --- their `fetched_bytes` stays NULL, the structural
+  exemption from every stall rule keyed on progress evidence. The
+  #(refs.metric)("rio_store_placeholders_uploading") gauge tracks live owned
+  placeholders per replica (+1 at guard spawn, −1 at guard drop).
+]
+The progress columns make *stuck ≠ slow* decidable by competing claimants and
+by the owner itself: a slow owner advances `last_progress_at` every heartbeat;
+a wedged one keeps `updated_at` (liveness) fresh while the progress clock
+freezes (#rref("store.substitute.stale-reclaim")).
+
 #r("store.substitute.stale-reclaim")[
   When `try_substitute` finds an existing `'uploading'` placeholder for the
   requested path, it MUST check the placeholder's age. If older than

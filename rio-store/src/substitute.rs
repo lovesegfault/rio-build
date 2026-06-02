@@ -915,8 +915,19 @@ impl Substituter {
         // We OWN the placeholder. Guard against future-drop (client
         // RST_STREAM mid-fetch) — the guard's spawn reaps it if any
         // path between here and the defuse below is abandoned.
-        let placeholder_guard =
-            ingest::spawn_placeholder_guard(self.pool.clone(), store_path_hash.to_vec(), claim);
+        //
+        // r[impl store.substitute.progress-heartbeat]
+        // The progress handle: fetch_nar's read loop advances it with
+        // the decompressed-byte count; the guard's heartbeat carries
+        // it to `manifests.fetched_bytes`/`last_progress_at` so
+        // competing claimants can discriminate stuck ≠ slow.
+        let progress_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let placeholder_guard = ingest::spawn_placeholder_guard(
+            self.pool.clone(),
+            store_path_hash.to_vec(),
+            claim,
+            Some(Arc::clone(&progress_bytes)),
+        );
 
         // The remaining steps are fallible AND we own the placeholder;
         // funnel through one async block so a single error arm handles
@@ -933,6 +944,7 @@ impl Substituter {
                     ni.nar_size,
                     base,
                     progress,
+                    Some(&progress_bytes),
                 )
                 .await?;
 
@@ -1027,6 +1039,7 @@ impl Substituter {
         expected_nar_size: u64,
         upstream_base: &str,
         progress: Option<&SubstProgressFn>,
+        progress_bytes: Option<&std::sync::atomic::AtomicU64>,
     ) -> Result<(Bytes, Vec<OwnedSemaphorePermit>), SubstituteError> {
         let resp = http
             .get(nar_url)
@@ -1117,6 +1130,13 @@ impl Substituter {
                     what: "decompressed NAR",
                     limit: cap,
                 });
+            }
+            // r[impl store.substitute.progress-heartbeat]
+            // Advance the durable-progress handle per read; the
+            // placeholder guard's heartbeat samples it every tick.
+            // Relaxed: single writer, freshness-tolerant reader.
+            if let Some(h) = progress_bytes {
+                h.store(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             // r[impl store.substitute.progress-stream]
             if let Some(cb) = progress {
