@@ -1227,7 +1227,8 @@ Phase 1 of the closure-evidence campaign (the 2026-05-30 owner decision,
 "fence everything" / design option D15(b)), replacing the original
 entry-time-leader-checks-only posture, and Phase D-prime kept it
 column-agnostic: job-table and wanted-relation writes feed the same fence
-and the same `rio_scheduler_evidence_write_fenced_total` counter. The
+and the same #(refs.metric)("rio_scheduler_evidence_write_fenced_total")
+counter. The
 deciding evidence was the campaign's stale-tenure model results (the A17
 stale-override and A18 deposed-writer probes,
 `docs/spec/models/closure-evidence-invariant-map.md`): entry-time gates
