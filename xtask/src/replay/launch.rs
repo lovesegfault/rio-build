@@ -764,17 +764,8 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     // The engine pins the gateway's SSH host key (the spec field is
     // required by engine validation), so launch must be able to read it
     // from the deployed chart.
-    let gateway_host_key = ui::step("gateway SSH host-key pin", || async {
-        match gateway_host_key_pin(&client).await? {
-            Some(pin) => Ok(pin),
-            None => bail!(
-                "the deployed rio-gateway runs on an auto-generated (emptyDir) SSH host key, so \
-                 there is nothing to pin and the campaign engine refuses to run without a pinned \
-                 host key. Redeploy with a persistent host key — `cargo xtask k8s -p eks up \
-                 --deploy` sets gateway.ssh.hostKeySecret=rio-gateway-host-key \
-                 (Secret data key `host_key`) — then re-run launch."
-            ),
-        }
+    let gateway_host_key = ui::step("gateway SSH host-key pin", || {
+        require_gateway_host_key_pin(&client)
     })
     .await?;
 
@@ -1685,11 +1676,25 @@ fn sha256_hex(bytes: &[u8]) -> String {
 ///   a "different flags" misdiagnosis, exactly like the already-stripped
 ///   image-tag record of the same redeploy.
 ///
+/// One more class is stripped: ERA CONSTANTS — fields the current launch
+/// stamps as a literal (no observation input flips them), whose value
+/// therefore encodes which CODE ERA wrote the record, not which flags the
+/// operator passed:
+///
+/// - `tenants.upstreams_verified`: stamped literal `true` since the
+///   pre-flight became unconditional; the earlier era stamped
+///   `preflight.is_some()` and `--skip-preflight` records carry `false`.
+///   Comparing a constant against a leftover old-era ConfigMap has zero
+///   flag-discriminating power and can only produce the false "launched
+///   before with different flags" refusal.
+///
 /// `spec_identity_strips_every_cluster_observed_field` is the
 /// completeness check: it flips every observation input and fails on any
-/// stamped field this list misses — extend both together.
-/// `None` when the document does not parse (an unparseable leftover can
-/// never be proven identical, so the guard refuses).
+/// stamped field this list misses (era-constants are exempt from the
+/// flip-reachability clause — by definition no input flips them — and
+/// covered by a direct old-era fixture test instead) — extend both
+/// together. `None` when the document does not parse (an unparseable
+/// leftover can never be proven identical, so the guard refuses).
 fn spec_identity(spec_json: &str) -> Option<serde_json::Value> {
     let mut value: serde_json::Value = serde_json::from_str(spec_json).ok()?;
     if let Some(spec) = value.as_object_mut() {
@@ -1699,6 +1704,7 @@ fn spec_identity(spec_json: &str) -> Option<serde_json::Value> {
             cluster.remove("service_hmac_key_path");
         }
         if let Some(tenants) = spec.get_mut("tenants").and_then(|t| t.as_object_mut()) {
+            tenants.remove("upstreams_verified");
             tenants.remove("upstreams_verified_at");
             tenants.remove("upstream_snapshot");
         }
@@ -1867,14 +1873,35 @@ pub(super) async fn ensure_tenant_keys(
     Ok(())
 }
 
+/// The required form of [`gateway_host_key_pin`]: the campaign engine
+/// refuses to run without a pinned host key, so an unpinnable gateway
+/// (auto-generated emptyDir key) is an error naming the redeploy path.
+/// Shared by launch and `replay repro` — repro re-observes the pin
+/// instead of inheriting the original campaign record's, because the
+/// engine has to pin the CURRENT key regardless of what the record says.
+pub(super) async fn require_gateway_host_key_pin(client: &kclient::Client) -> Result<String> {
+    match gateway_host_key_pin(client).await? {
+        Some(pin) => Ok(pin),
+        None => bail!(
+            "the deployed rio-gateway runs on an auto-generated (emptyDir) SSH host key, so \
+             there is nothing to pin and the campaign engine refuses to run without a pinned \
+             host key. Redeploy with a persistent host key — `cargo xtask k8s -p eks up \
+             --deploy` sets gateway.ssh.hostKeySecret=rio-gateway-host-key \
+             (Secret data key `host_key`) — then re-run launch."
+        ),
+    }
+}
+
 /// Copy the AdminService HMAC token Secret into the campaign namespace so
 /// the Job's `service-hmac` volume resolves (accepted v1 risk; the M2
 /// cleanup deletes it). Returns whether the key exists. On HMAC-less dev
 /// clusters an EMPTY Secret is applied instead — the volume must still
 /// mount or the pod never starts — and the spec records no
 /// `service_hmac_key_path`, so the engine sends tokenless Admin reads
-/// (matching a verifier-less scheduler).
-async fn copy_hmac_secret(client: &kclient::Client) -> Result<bool> {
+/// (matching a verifier-less scheduler). Shared with `replay repro`,
+/// which re-observes the auth mode (and re-copies the current key)
+/// instead of inheriting the original campaign record's.
+pub(super) async fn copy_hmac_secret(client: &kclient::Client) -> Result<bool> {
     let bytes = shared::secret_bytes(jobs::HMAC_SECRET_NAME, jobs::HMAC_KEY_FILENAME).await?;
     let present = bytes.is_some();
     let data = match bytes {
@@ -3355,6 +3382,15 @@ mod tests {
             "tenants.upstream_snapshot",
             "tenants.upstreams_verified_at",
         ];
+        // Era constants: stamped as literals by the current code (NO
+        // observation input flips them — that is what makes them
+        // era-constants), stripped because their value encodes which code
+        // era wrote the record, not which flags the operator passed. Each
+        // entry is exempt from the flip-reachability clause below — a
+        // constant is structurally unreachable by input flips — and is
+        // covered instead by guard_admits_old_era_records_and_still_blocks_intent_drift,
+        // the direct old-era fixture test.
+        const ERA_CONSTANTS: [&str; 1] = ["tenants.upstreams_verified"];
         // Identity-bearing: observed, but drift deliberately REFUSES a
         // relaunch. Empty today — listing a field here requires a comment
         // on the stamping site saying why its drift makes a different
@@ -3384,12 +3420,32 @@ mod tests {
             );
         }
         // (2) The flips keep reaching every stripped field, so (1) cannot
-        // pass vacuously after a fixture or stamping refactor.
+        // pass vacuously after a fixture or stamping refactor. Era
+        // constants are exempt (no flip can reach a constant); their
+        // anti-vacuity guard is (2b).
         for field in STRIPPED {
             assert!(
                 observed.iter().any(|path| matches(path, field)),
                 "the observation flips no longer reach {field:?} — fix the fixtures so this \
                  completeness check keeps covering it"
+            );
+        }
+        // (2b) Every era-constant still EXISTS in the serialized spec (a
+        // renamed or dropped field cannot leave a stale strip entry), and
+        // is genuinely constant: the flips must NOT reach it (if they do,
+        // it has become an observation and belongs in STRIPPED with flip
+        // coverage instead).
+        for field in ERA_CONSTANTS {
+            let mut node = &raw_baseline;
+            for part in field.split('.') {
+                node = node.get(part).unwrap_or_else(|| {
+                    panic!("era-constant {field:?} no longer exists in the spec")
+                });
+            }
+            assert!(
+                !observed.iter().any(|path| matches(path, field)),
+                "{field:?} is reached by observation flips — it is no longer an era-constant; \
+                 move it to STRIPPED"
             );
         }
         // (3) The projection erases the observed difference: with no
@@ -3403,12 +3459,58 @@ mod tests {
             "spec_identity must strip every cluster-observed field"
         );
         // (4) ...and erases NOTHING else: what the projection removes from
-        // a real spec is exactly the stripped set — over-stripping would
-        // let a genuine flag change slip past the relaunch guard.
+        // a real spec is exactly the stripped set plus the era constants —
+        // over-stripping would let a genuine flag change slip past the
+        // relaunch guard.
         let mut removed = std::collections::BTreeSet::new();
         json_diff_paths("", &raw_baseline, &baseline_identity, &mut removed);
-        let stripped: std::collections::BTreeSet<String> =
-            STRIPPED.iter().map(|field| (*field).to_owned()).collect();
+        let stripped: std::collections::BTreeSet<String> = STRIPPED
+            .iter()
+            .chain(ERA_CONSTANTS.iter())
+            .map(|field| (*field).to_owned())
+            .collect();
         assert_eq!(removed, stripped);
+    }
+
+    /// The era-constant strip, exercised over the canned artifact the
+    /// completeness test's input flips structurally cannot produce: a
+    /// leftover spec ConfigMap from the era when launch stamped
+    /// `tenants.upstreams_verified: preflight.is_some()` (false under the
+    /// then-existing --skip-preflight), compared against the current
+    /// build's spec, which stamps the literal `true`. The constant has
+    /// zero flag-discriminating power, so the guard must admit the
+    /// relaunch (must-admit) — while a genuine intent edit in the same
+    /// old-era document still refuses (must-block), proving the admission
+    /// comes from the strip, not from a weakened comparison.
+    #[test]
+    fn guard_admits_old_era_records_and_still_blocks_intent_drift() {
+        let id = "replay-leaf-20260601-ab12";
+        let current = serde_json::to_string_pretty(&build_campaign_spec(
+            &args(Mode::Leaf),
+            id,
+            &archive_loc(),
+            "rio-build-chunks-deadbeef",
+            true,
+            HOST_KEY_PIN,
+            &outcome(),
+        ))
+        .unwrap();
+
+        // The old-era leftover: same flags, era-constant carrying false.
+        let mut old_era: serde_json::Value = serde_json::from_str(&current).unwrap();
+        assert_eq!(old_era["tenants"]["upstreams_verified"], true);
+        old_era["tenants"]["upstreams_verified"] = serde_json::Value::Bool(false);
+        let old_era_json = serde_json::to_string_pretty(&old_era).unwrap();
+        guard_existing_campaign(id, false, Some(&old_era_json), &current)
+            .expect("an old-era upstreams_verified value must not refuse a same-flags relaunch");
+
+        // Same old-era document with a REAL flag difference: still refused.
+        let mut drifted = old_era;
+        drifted["filters"]["limit"] = serde_json::json!(7);
+        let drifted_json = serde_json::to_string_pretty(&drifted).unwrap();
+        let err = guard_existing_campaign(id, false, Some(&drifted_json), &current)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different campaign spec"), "{err}");
     }
 }

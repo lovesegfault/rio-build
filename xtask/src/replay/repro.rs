@@ -9,17 +9,24 @@
 //! fetches the pinned archive and replays the unit over the same client-ops
 //! transport and supply policy the campaign used.
 //!
-//! Tenant provisioning, SSH keys, the HMAC copy, and most of the launch
-//! pre-flight (deployed image-tag skew, gateway build-policy, tenant
-//! upstream sets) are skipped on purpose: the original campaign's tenants
-//! and Secrets already exist in the rio-replay namespace, and the derived
-//! spec points at the same mounted paths. The deployed CiliumNetworkPolicy
-//! admissions are the exception — they are chart state that can drift
-//! after the original launch (a raw-helm `replay.namespace` override, an
-//! out-of-band CNP edit), and an unadmitted engine does not fail: Cilium
-//! silently drops its scheduler/store gRPC, which hangs a deadline-less
-//! repro forever. So repro re-runs that one read-back
-//! ([`preflight::verify_cnp_admissions`]) before creating anything.
+//! Tenant provisioning, SSH keys, and most of the launch pre-flight
+//! (deployed image-tag skew, gateway build-policy, tenant upstream sets)
+//! are skipped on purpose: the original campaign's tenants and SSH
+//! Secrets already exist in the rio-replay namespace, and the derived
+//! spec points at the same mounted paths. What is NOT skipped is anything
+//! that drifts with the cluster while the S3 record stands still:
+//!
+//! - the deployed CiliumNetworkPolicy admissions — chart state that can
+//!   drift after the original launch, and an unadmitted engine does not
+//!   fail: Cilium silently drops its scheduler/store gRPC, which hangs a
+//!   deadline-less repro forever. Repro re-runs the read-back
+//!   ([`preflight::verify_cnp_admissions`]) before creating anything.
+//! - the gateway SSH host-key pin and the service-HMAC auth mode — launch
+//!   re-observes both every run, and the engine fails CLOSED on the
+//!   pinned key, so inheriting the record's values would turn a routine
+//!   key rotation into a guaranteed one-unit infra failure. Repro re-reads
+//!   them (and re-copies the current HMAC key) through the same launch
+//!   helpers and overrides the inherited spec fields.
 
 use std::collections::BTreeMap;
 
@@ -100,11 +107,37 @@ fn job_for_drv(results_jsonl: &[u8], campaign: &str, drv: &str) -> Result<String
     )
 }
 
+/// Drift-prone cluster state repro RE-OBSERVES instead of inheriting from
+/// the original campaign's S3 record. The record outlives cluster state,
+/// and these two fields must follow the CURRENT cluster for the engine to
+/// talk to it at all (the same classification `spec_identity`'s strip
+/// list documents): the gateway host-key pin is fail-closed in the
+/// engine's transport, so a repro of a pre-rotation campaign carrying the
+/// recorded pin would retire its one unit as an infra failure — the
+/// purpose-defeating opposite of reproducing it — and the service-HMAC
+/// auth mode must match whatever the cluster is deployed with today.
+struct ReobservedCluster {
+    /// Whether the service-HMAC Secret currently exists (Admin-read auth
+    /// mode), from the same read-and-copy launch performs.
+    hmac_present: bool,
+    /// The deployed gateway's CURRENT SSH host-key pin.
+    gateway_host_key: String,
+}
+
 /// Derive the single-unit spec for the repro run from the original
-/// campaign's record: identical archive pin, cluster endpoints, tenants,
-/// and knobs; scope narrowed to exactly `job_name`; parity-only report; no
-/// deadline.
-fn derive_repro_spec(original: &CampaignRecord, job_name: &str, repro_id: &str) -> CampaignSpec {
+/// campaign's record: identical archive pin, tenants, and knobs; scope
+/// narrowed to exactly `job_name`; parity-only report; no deadline. The
+/// drift-prone cluster observations are NOT inherited — they are replaced
+/// with `cluster`, the values just re-read from the live cluster.
+/// `tenants.upstreams_verified` IS inherited: it records what the
+/// original launch asserted (and feeds `--allow-unverified-tenants`), and
+/// re-asserting tenant upstreams is exactly the pre-flight repro skips.
+fn derive_repro_spec(
+    original: &CampaignRecord,
+    job_name: &str,
+    repro_id: &str,
+    cluster: &ReobservedCluster,
+) -> CampaignSpec {
     let mut spec = original.spec.clone();
     spec.campaign_id = Some(repro_id.to_owned());
     // Exactly one unit in scope: the job name as an exact-match glob, with
@@ -120,6 +153,11 @@ fn derive_repro_spec(original: &CampaignRecord, job_name: &str, repro_id: &str) 
         fail_on: FailOn::None,
     };
     spec.deadline = None;
+    // Fresh cluster observations override whatever the record carried.
+    spec.cluster.gateway_host_key = Some(cluster.gateway_host_key.clone());
+    spec.cluster.service_hmac_key_path = cluster
+        .hmac_present
+        .then(|| std::path::PathBuf::from(jobs::HMAC_KEY_MOUNT_PATH));
     spec
 }
 
@@ -173,23 +211,8 @@ pub async fn run(a: ReproArgs) -> Result<()> {
     })
     .await?;
     let job_name = job_for_drv(&results_doc, &a.campaign, &a.drv)?;
-
-    // Derived one-unit spec, validated by the engine's own rules before
-    // anything is created.
     let repro_id = repro_campaign_id(&a.campaign);
     launch::validate_repro_campaign_id(&repro_id)?;
-    let spec = derive_repro_spec(&original, &job_name, &repro_id);
-    spec.validate()
-        .context("derived repro spec failed engine validation")?;
-    let spec_json = serde_json::to_string_pretty(&spec)?;
-
-    println!("derived single-unit spec for {job_name} ({}):", a.drv);
-    println!("{spec_json}");
-    println!(
-        "follow-up commands:\n  \
-         cargo xtask replay status {repro_id} --watch\n  \
-         cargo xtask replay report {repro_id}"
-    );
 
     // The repro Job pulls <ecr>/rio-replay:<tag> for the CURRENT tree, same
     // assertion (and same refusal point) as launch.
@@ -209,6 +232,45 @@ pub async fn run(a: ReproArgs) -> Result<()> {
         jobs::ensure_base(&client, &role_arn)
     })
     .await?;
+
+    // Re-observe the drift-prone cluster state before deriving the spec:
+    // the original campaign's S3 record outlives cluster state, and launch
+    // re-reads both of these every run — a repro must too, or a routine
+    // gateway host-key rotation (or auth-mode change) since the original
+    // launch turns the repro into a guaranteed infra failure. The HMAC
+    // step also re-copies the CURRENT key into the namespace, exactly like
+    // launch.
+    let hmac_present = ui::step("copy service-HMAC Secret into rio-replay", || {
+        launch::copy_hmac_secret(&client)
+    })
+    .await?;
+    let gateway_host_key = ui::step("gateway SSH host-key pin", || {
+        launch::require_gateway_host_key_pin(&client)
+    })
+    .await?;
+
+    // Derived one-unit spec, validated by the engine's own rules before
+    // anything is created.
+    let spec = derive_repro_spec(
+        &original,
+        &job_name,
+        &repro_id,
+        &ReobservedCluster {
+            hmac_present,
+            gateway_host_key,
+        },
+    );
+    spec.validate()
+        .context("derived repro spec failed engine validation")?;
+    let spec_json = serde_json::to_string_pretty(&spec)?;
+
+    println!("derived single-unit spec for {job_name} ({}):", a.drv);
+    println!("{spec_json}");
+    println!(
+        "follow-up commands:\n  \
+         cargo xtask replay status {repro_id} --watch\n  \
+         cargo xtask replay report {repro_id}"
+    );
 
     // The one launch pre-flight check repro keeps: the deployed CNPs must
     // still admit the engine on the scheduler/store gRPC ports. Unlike
@@ -488,6 +550,20 @@ mod tests {
         assert!(err.contains("parse a results.jsonl line"), "{err}");
     }
 
+    /// The cluster observations a derive-time caller passes when the
+    /// cluster state matches what the record carries (no drift).
+    fn matching_observations(original: &CampaignRecord) -> ReobservedCluster {
+        ReobservedCluster {
+            hmac_present: original.spec.cluster.service_hmac_key_path.is_some(),
+            gateway_host_key: original
+                .spec
+                .cluster
+                .gateway_host_key
+                .clone()
+                .expect("fixture records a host key"),
+        }
+    }
+
     #[test]
     fn repro_jobs_carry_archive_correlation_annotations() {
         // The repro Job is annotated from the stored campaign record's
@@ -498,6 +574,7 @@ mod tests {
             &original,
             "app.x86_64-linux",
             "replay-leaf-20260601-ab12-repro-0123abcd",
+            &matching_observations(&original),
         );
         let ann = launch::campaign_annotations(None, &original.archive.archive_id_short, spec.mode);
         assert_eq!(
@@ -512,7 +589,12 @@ mod tests {
     fn derived_spec_narrows_scope_and_keeps_the_archive_pin() {
         let original = record_fixture();
         let repro_id = "replay-leaf-20260601-ab12-repro-0123abcd";
-        let spec = derive_repro_spec(&original, "app.x86_64-linux", repro_id);
+        let spec = derive_repro_spec(
+            &original,
+            "app.x86_64-linux",
+            repro_id,
+            &matching_observations(&original),
+        );
 
         // Fresh campaign id, never the original's.
         assert_eq!(spec.campaign_id.as_deref(), Some(repro_id));
@@ -553,7 +635,12 @@ mod tests {
         );
         let mut unverified = original.clone();
         unverified.spec.tenants.upstreams_verified = false;
-        let spec = derive_repro_spec(&unverified, "app.x86_64-linux", repro_id);
+        let spec = derive_repro_spec(
+            &unverified,
+            "app.x86_64-linux",
+            repro_id,
+            &matching_observations(&unverified),
+        );
         assert_eq!(
             engine_args(&spec),
             vec![
@@ -563,5 +650,76 @@ mod tests {
                 "--allow-unverified-tenants"
             ]
         );
+    }
+
+    /// The two drift-prone cluster observations are RE-OBSERVED, never
+    /// inherited: a campaign record in S3 outlives cluster state, the
+    /// engine's transport fails closed on the pinned host key, and launch
+    /// re-reads both fields every run (the contract `spec_identity`'s
+    /// strip-list rationale documents — "the engine has to pin the CURRENT
+    /// key regardless"). Both directions: stale recorded values are
+    /// replaced by the fresh observations, AND the record-honoring fields
+    /// next to them (tenants.upstreams_verified, endpoints, tenants) stay
+    /// inherited — the override is surgical, not a wholesale cluster-block
+    /// rebuild.
+    #[test]
+    fn derived_spec_reobserves_host_key_pin_and_auth_mode() {
+        let original = record_fixture();
+        let repro_id = "replay-leaf-20260601-ab12-repro-0123abcd";
+        let rotated_pin = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIRotatedKey rio-gateway";
+        assert_ne!(
+            original.spec.cluster.gateway_host_key.as_deref(),
+            Some(rotated_pin),
+            "fixture must record a different (stale) pin"
+        );
+        assert!(
+            original.spec.cluster.service_hmac_key_path.is_none(),
+            "fixture records the tokenless era"
+        );
+
+        // The cluster rotated its gateway key AND gained a service-HMAC
+        // Secret since the original launch.
+        let spec = derive_repro_spec(
+            &original,
+            "app.x86_64-linux",
+            repro_id,
+            &ReobservedCluster {
+                hmac_present: true,
+                gateway_host_key: rotated_pin.to_string(),
+            },
+        );
+        assert_eq!(
+            spec.cluster.gateway_host_key.as_deref(),
+            Some(rotated_pin),
+            "the stale recorded pin must be replaced with the live one"
+        );
+        assert_eq!(
+            spec.cluster.service_hmac_key_path.as_deref(),
+            Some(std::path::Path::new("/etc/rio/hmac/service-hmac.key")),
+            "the auth mode follows the live cluster"
+        );
+        // The auth mode also flips OFF when the Secret is gone.
+        let spec = derive_repro_spec(
+            &original,
+            "app.x86_64-linux",
+            repro_id,
+            &ReobservedCluster {
+                hmac_present: false,
+                gateway_host_key: rotated_pin.to_string(),
+            },
+        );
+        assert_eq!(spec.cluster.service_hmac_key_path, None);
+
+        // Record-honoring fields are untouched by the override.
+        assert_eq!(
+            spec.cluster.gateway_store_url,
+            original.spec.cluster.gateway_store_url
+        );
+        assert_eq!(spec.cluster.ssh_key_dir, original.spec.cluster.ssh_key_dir);
+        assert_eq!(
+            spec.tenants.upstreams_verified, original.spec.tenants.upstreams_verified,
+            "the original launch's tenant assertion is record truth, not cluster drift"
+        );
+        spec.validate().unwrap();
     }
 }
