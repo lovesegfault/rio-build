@@ -2105,3 +2105,112 @@ async fn build_options_merge_zero_cores_is_all() {
     let opts = actor.build_options_for_derivation(&DrvHash::from("h2"));
     assert_eq!(opts.build_cores, 8, "all-positive → max");
 }
+
+// ---------------------------------------------------------------------------
+// Attempt-ledger GC tick (sched.db.attempts-gc)
+// ---------------------------------------------------------------------------
+
+// r[verify sched.db.attempts-gc]
+/// The attempt-ledger sweep tick: driven directly on the GC multiple
+/// (the `maybe_refresh_estimator` direct-drive precedent) it deletes
+/// exactly the eligible rows; a standby's `handle_tick` never reaches
+/// it — the standby-tick-noop early-return precedes every sweep, so a
+/// deposed leader cannot delete ledger rows.
+#[tokio::test]
+async fn test_attempt_ledger_gc_tick_leader_sweeps_standby_noops() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Seed one derivation with [old pre-reset attempt, old reset,
+    // fresh attempt].
+    let drv_id = {
+        let mut tx = db.pool.begin().await?;
+        let row = crate::db::DerivationRow {
+            drv_hash: "ledger-gc-smoke".into(),
+            drv_path: rio_test_support::fixtures::test_drv_path("ledger-gc-smoke"),
+            pname: Some("test-pkg".into()),
+            system: "x86_64-linux".into(),
+            status: crate::state::DerivationStatus::Created,
+            required_features: vec![],
+            expected_output_paths: vec![],
+            output_names: vec!["out".into()],
+            is_fixed_output: false,
+            is_ca: false,
+        };
+        let ids = crate::db::SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
+        tx.commit().await?;
+        ids.get("ledger-gc-smoke").expect("just inserted").0
+    };
+    {
+        use crate::db::attempts::AttemptRow;
+        use crate::state::{OutcomeClass, ReportingParty};
+        let a1 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+        let r1 = AttemptRow::new_reset(
+            drv_id,
+            OutcomeClass::ResubmitReset,
+            ReportingParty::Scheduler,
+            1,
+        );
+        let a2 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+        let old = [a1.attempt_id, r1.attempt_id];
+        let mut tx = db.pool.begin().await?;
+        crate::db::SchedulerDb::append_attempts_batch(&mut tx, &[a1, r1, a2]).await?;
+        tx.commit().await?;
+        sqlx::query(
+            "UPDATE drv_attempts SET recorded_at = recorded_at - interval '3 days' \
+             WHERE attempt_id = ANY($1)",
+        )
+        .bind(&old[..])
+        .execute(&db.pool)
+        .await?;
+    }
+    let count = || async {
+        let (n,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM drv_attempts WHERE derivation_id = $1")
+                .bind(drv_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("count query");
+        n
+    };
+    assert_eq!(count().await, 3);
+
+    // Standby half: handle_tick early-returns before any sweep, even
+    // primed one tick short of the GC multiple. The default test
+    // plumbing is a leader, so build the standby LeaderState explicitly
+    // (the spawn_actor_with_leader pattern above).
+    let standby_leader = crate::lease::LeaderState::from_parts(
+        Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        Arc::new(AtomicBool::new(false)),
+        true,
+    );
+    let mut standby = DagActor::new(
+        crate::db::SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing {
+            leader: standby_leader,
+            ..Default::default()
+        },
+    );
+    assert!(
+        !standby.leader.is_leader(),
+        "constructed standby must not lead"
+    );
+    standby.tick_count = 29;
+    standby.handle_tick().await;
+    assert_eq!(count().await, 3, "standby tick must not delete ledger rows");
+
+    // Leader-path half: the sweep tick driven directly on the GC
+    // multiple deletes exactly the pre-reset old attempt row.
+    let leader_actor = {
+        let mut a = bare_actor(db.pool.clone());
+        a.tick_count = 30;
+        a
+    };
+    leader_actor.tick_gc_attempt_ledger().await;
+    assert_eq!(
+        count().await,
+        2,
+        "exactly the pre-reset old attempt row swept; reset + fresh rows survive"
+    );
+    Ok(())
+}

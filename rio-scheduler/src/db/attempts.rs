@@ -31,18 +31,20 @@ use crate::state::{
     ReportingParty,
 };
 
-/// Phase-1 ledger retention floor (decision P8): there is NO TTL sweep
-/// on `drv_attempts` yet, so retention is effectively unbounded and the
-/// suffix bound (rows since the last reset event) is what keeps reads
-/// O(per-cycle attempts). Any future sweep MUST retain rows for at
-/// least this long — the largest decision window computed as a fold
-/// over ledger rows: the infra retry window
-/// (`RetryPolicy::infra_retry_window_secs`, 300 s default — re-check
-/// against the configured value when a sweep is added) and the 24 h
-/// poison TTL.
-// TODO: consult this floor from the (Phase-2) ledger GC sweep; until a
-// sweep exists it is the documentation hook only.
-#[allow(dead_code)]
+/// Ledger retention floor (decision P8), consulted by the live sweep:
+/// `tick_gc_attempt_ledger` computes its horizon as
+/// `sweep_horizon_secs(decision_budget(), LEDGER_RETENTION_FLOOR) =
+/// max(floor, LIVE configured infra_retry_window_secs, POISON_TTL)` —
+/// an operator-widened infra window > 24 h widens retention with it
+/// (the "re-check against the configured value" clause, honored
+/// through the budget rather than a config knob). The sweep
+/// ([`SchedulerDb::gc_attempt_ledger`]) deletes only the suffix
+/// complement: attempt-kind rows strictly before their derivation's
+/// last reset row, past the horizon, with no active assignment for
+/// their exec_id — plus orphaned histories whose derivation row is
+/// gone. The suffix bound (rows since the last reset event) is what
+/// keeps reads O(per-cycle attempts); the sweep preserves that suffix
+/// bit-identically (sched.db.attempts-gc, kernel-proved).
 pub(crate) const LEDGER_RETENTION_FLOOR: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
 
@@ -542,5 +544,78 @@ impl SchedulerDb {
             out.entry(row.derivation_id).or_default().push(row);
         }
         Ok(out)
+    }
+
+    // r[impl sched.db.attempts-gc]
+    /// The attempt-ledger GC sweep: delete (live arm) attempt-kind rows
+    /// strictly before their derivation's last-reset cut, older than
+    /// `horizon_secs`, with no ACTIVE assignment for their `exec_id`;
+    /// plus (orphan arm) any-kind rows whose `derivation_id` has no
+    /// `derivations` row, older than the horizon. At most `2 × limit`
+    /// rows per pass (one `LIMIT` per arm; subselect-LIMIT shape — PG
+    /// has no `DELETE .. LIMIT` — per the derivations-GC precedent).
+    ///
+    /// ONE statement, deliberately and load-bearingly: a single MVCC
+    /// snapshot evaluates the whole eligibility predicate — including
+    /// the `NOT EXISTS` active-assignment probe — and the deletion, so
+    /// the probe and the DELETE cannot disagree. Do NOT split this into
+    /// SELECT-victims-then-DELETE without re-deriving the
+    /// sched.db.attempts-gc stability argument (single-snapshot
+    /// report-idempotency probes; closed assignments never reopen;
+    /// exec_ids never re-bind). Lock-free on purpose: the only feared
+    /// concurrent event is an `assignments` transition, which row locks
+    /// on `drv_attempts` cannot express and which the closure-monotone
+    /// plus fresh-exec_id invariants already exclude; a closure committing
+    /// after this snapshot only defers its rows to the next pass, and a
+    /// deposed leader's concurrent sweep is an idempotent PK DELETE
+    /// over the same stable set.
+    ///
+    /// Index reliance (no new migration): `last_resets` is served by
+    /// the partial index `drv_attempts_reset (derivation_id,
+    /// recorded_at) WHERE event_kind='reset'` (068; the `attempt_id`
+    /// tiebreak sorts within the few equal-`recorded_at` resets per
+    /// derivation); the victim scan probes
+    /// `drv_attempts_derivation_recorded (derivation_id, recorded_at)`
+    /// per candidate derivation; the assignments anti-join hash-builds
+    /// once per pass (no exec_id index exists — same as the existing
+    /// exec_id probes, acceptable at LIMIT-1000 batch scale); the
+    /// orphan arm is the same bounded anti-join class the accepted
+    /// derivations-GC statement runs every pass. DELETE by PK.
+    pub(crate) async fn gc_attempt_ledger(
+        &self,
+        horizon_secs: f64,
+        limit: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "WITH last_resets AS (
+                 SELECT DISTINCT ON (derivation_id) derivation_id, recorded_at, attempt_id
+                 FROM drv_attempts WHERE event_kind = 'reset'
+                 ORDER BY derivation_id, recorded_at DESC, attempt_id DESC),
+             pre_reset AS (
+                 SELECT a.attempt_id FROM drv_attempts a
+                 JOIN last_resets r ON r.derivation_id = a.derivation_id
+                 WHERE a.event_kind = 'attempt'
+                   AND (a.recorded_at, a.attempt_id) < (r.recorded_at, r.attempt_id)
+                   AND a.recorded_at < now() - make_interval(secs => $1)
+                   AND NOT EXISTS (SELECT 1 FROM assignments x
+                                   WHERE x.exec_id = a.exec_id
+                                     AND x.status IN ('pending', 'acknowledged'))
+                 LIMIT $2),
+             orphaned AS (
+                 SELECT a.attempt_id FROM drv_attempts a
+                 WHERE NOT EXISTS (SELECT 1 FROM derivations d
+                                   WHERE d.derivation_id = a.derivation_id)
+                   AND a.recorded_at < now() - make_interval(secs => $1)
+                 LIMIT $2)
+             DELETE FROM drv_attempts a
+             USING (SELECT attempt_id FROM pre_reset
+                    UNION SELECT attempt_id FROM orphaned) v
+             WHERE a.attempt_id = v.attempt_id",
+        )
+        .bind(horizon_secs)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 }

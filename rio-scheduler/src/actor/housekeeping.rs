@@ -126,6 +126,7 @@ impl DagActor {
         self.tick_process_expired_poisons(expired_poisons).await;
 
         self.tick_gc_orphan_derivations().await;
+        self.tick_gc_attempt_ledger().await;
         self.tick_sweep_dispatched_cells();
         self.tick_publish_gauges();
         self.tick_sweep_open_pull_attempts().await;
@@ -456,6 +457,53 @@ impl DagActor {
                 metrics::counter!("rio_scheduler_derivations_gc_deleted_total").increment(n);
             }
             Err(e) => warn!(error = %e, "derivations GC sweep failed; retrying next interval"),
+        }
+    }
+
+    // r[impl sched.db.attempts-gc]
+    /// Attempt-ledger retention sweep (decision P8, phase 2): every
+    /// 30th tick (~5min at the default 10s interval) → delete ≤1000
+    /// rows per arm. Suffix-complement only — the kernel-proved
+    /// eligibility (attempt-kind, strictly pre-reset, past the horizon,
+    /// no active assignment) plus orphaned histories; the decision
+    /// suffix every loader returns is bit-identical before/after.
+    /// Leader-only via `handle_tick`'s standby early-return. Best-
+    /// effort: PG error logs and retries next interval.
+    ///
+    /// Module consts, not config knobs (the derivations-GC precedent:
+    /// "Making this tunable is YAGNI until someone asks"). The one
+    /// value that MUST track live configuration — the infra retry
+    /// window — flows through `decision_budget()` into the horizon.
+    ///
+    /// `pub(super)` for the actor-boundary smoke test, which drives
+    /// this directly (the `maybe_refresh_estimator` precedent).
+    pub(super) async fn tick_gc_attempt_ledger(&self) {
+        const ATTEMPTS_GC_EVERY: u64 = 30;
+        const ATTEMPTS_GC_BATCH: i64 = 1000;
+        if !self.tick_count.is_multiple_of(ATTEMPTS_GC_EVERY) {
+            return;
+        }
+        let horizon = crate::retry_policy::sweep_horizon_secs(
+            &self.decision_budget(),
+            crate::db::attempts::LEDGER_RETENTION_FLOOR.as_secs(),
+        );
+        #[allow(clippy::cast_precision_loss)] // horizon ≪ 2^52 s
+        match self
+            .db
+            .gc_attempt_ledger(horizon as f64, ATTEMPTS_GC_BATCH)
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => {
+                debug!(
+                    deleted = n,
+                    "GC'd attempt-ledger rows past the retention horizon"
+                );
+                metrics::counter!("rio_scheduler_attempts_gc_deleted_total").increment(n);
+            }
+            Err(e) => {
+                warn!(error = %e, "attempt-ledger GC sweep failed; retrying next interval");
+            }
         }
     }
 

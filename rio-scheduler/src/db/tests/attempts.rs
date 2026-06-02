@@ -502,3 +502,377 @@ async fn test_attempt_kind_alphabet_matches_check_constraint() -> anyhow::Result
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// The attempt-ledger GC sweep (sched.db.attempts-gc)
+// ---------------------------------------------------------------------------
+
+/// 24 h in seconds — the floor value the tests pass as the horizon
+/// (the housekeeping tick passes `sweep_horizon_secs(budget, floor)`;
+/// with the default budget that IS the floor).
+const TEST_HORIZON_SECS: f64 = 86_400.0;
+
+/// Append `rows` in one committed transaction.
+async fn append_committed(db: &SchedulerDb, rows: &[AttemptRow]) -> anyhow::Result<()> {
+    let mut tx = db.pool.begin().await?;
+    SchedulerDb::append_attempts_batch(&mut tx, rows).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Backdate `recorded_at` of the given rows by 3 days (past the 24 h
+/// horizon). `recorded_at` is `DEFAULT now()` at insert (068), so tests
+/// age rows explicitly.
+async fn backdate(db: &SchedulerDb, ids: &[Uuid]) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE drv_attempts SET recorded_at = recorded_at - interval '3 days' \
+         WHERE attempt_id = ANY($1)",
+    )
+    .bind(ids)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+/// All attempt_ids for one derivation, in ledger order.
+async fn ledger_ids(db: &SchedulerDb, drv_id: Uuid) -> anyhow::Result<Vec<Uuid>> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT attempt_id FROM drv_attempts WHERE derivation_id = $1 \
+         ORDER BY recorded_at, attempt_id",
+    )
+    .bind(drv_id)
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+// r[verify sched.db.attempts-gc]
+/// Live arm shape: only attempt-kind rows strictly before the last
+/// reset and past the horizon are deleted. R0 (an OLD reset) proves
+/// reset rows of a live derivation are never deleted; A3 (old but
+/// post-reset) proves age alone never deletes; A4 (fresh) proves the
+/// horizon binds.
+#[tokio::test]
+async fn test_attempts_gc_deletes_only_pre_reset_rows_past_horizon() -> anyhow::Result<()> {
+    let (_test_db, db, drv_id) = setup("gc-shape-hash").await?;
+
+    let r0 = AttemptRow::new_reset(
+        drv_id,
+        OutcomeClass::CacheHitClear,
+        ReportingParty::Admin,
+        0,
+    );
+    let a1 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let a2 = AttemptRow::new(drv_id, OutcomeClass::Infra, ReportingParty::Scheduler);
+    let r1 = AttemptRow::new_reset(
+        drv_id,
+        OutcomeClass::ResubmitReset,
+        ReportingParty::Scheduler,
+        1,
+    );
+    let a3 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let a4 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let keep = [r0.attempt_id, r1.attempt_id, a3.attempt_id, a4.attempt_id];
+    let victims = [a1.attempt_id, a2.attempt_id];
+    append_committed(&db, &[r0, a1, a2, r1, a3, a4]).await?;
+    // Everything except A4 is ancient; A3 is old-but-post-reset.
+    let mut old: Vec<Uuid> = victims.to_vec();
+    old.extend([keep[0], keep[1], keep[2]]);
+    backdate(&db, &old).await?;
+
+    let deleted = db.gc_attempt_ledger(TEST_HORIZON_SECS, 1000).await?;
+    assert_eq!(deleted, 2, "exactly the two pre-reset old attempt rows");
+
+    let remaining = ledger_ids(&db, drv_id).await?;
+    assert_eq!(remaining.len(), 4, "R0, R1, A3, A4 survive: {remaining:?}");
+    for id in keep {
+        assert!(remaining.contains(&id), "survivor {id} missing");
+    }
+    for id in victims {
+        assert!(!remaining.contains(&id), "victim {id} survived");
+    }
+    Ok(())
+}
+
+// r[verify sched.db.attempts-gc]
+/// THE decide()-invariance pin (red-first; see the commit body for the
+/// recorded red run against the naive age-only DELETE, which deletes
+/// the reset row, drops the cycle seed, and changes the Decision):
+/// a poisoned derivation's Decision over `load_attempt_suffix` is
+/// bit-identical before/after the guarded sweep, and the verdict stays
+/// a Poison.
+#[tokio::test]
+async fn test_attempts_gc_decide_invariant_for_poisoned_history() -> anyhow::Result<()> {
+    let (_test_db, db, drv_id) = setup("gc-decide-hash").await?;
+
+    // Earlier cycle: two old attempts, then the cycle-2 resubmit reset
+    // (also old). Current cycle: three fresh distinct-source failures —
+    // a poisoned suffix.
+    let a1 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let a2 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let r1 = AttemptRow::new_reset(
+        drv_id,
+        OutcomeClass::ResubmitReset,
+        ReportingParty::Scheduler,
+        2,
+    );
+    let mut f1 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    f1.source_node = Some("node-w1".into());
+    let mut f2 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    f2.source_node = Some("node-w2".into());
+    let mut f3 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    f3.source_node = Some("node-w3".into());
+    let old = [a1.attempt_id, a2.attempt_id, r1.attempt_id];
+    append_committed(&db, &[a1, a2, r1, f1, f2, f3]).await?;
+    backdate(&db, &old).await?;
+
+    let budget = crate::retry_policy::Budget::default();
+    let now = crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime;
+    fn suffix_records(rows: &[AttemptRow]) -> Vec<crate::state::AttemptRecord> {
+        rows.iter().map(AttemptRow::to_record).collect()
+    }
+
+    let before_rows = db
+        .load_attempt_suffix(&[drv_id])
+        .await?
+        .remove(&drv_id)
+        .unwrap_or_default();
+    let before = crate::retry_policy::decide(&suffix_records(&before_rows), &budget, now);
+    assert!(
+        matches!(before.verdict, crate::retry_policy::Verdict::Poison(_)),
+        "setup must produce a poisoned suffix, got {:?}",
+        before.verdict
+    );
+    assert_eq!(
+        before.counters.resubmit_cycles, 2,
+        "the reset row's cycle index seeds the fold"
+    );
+
+    let deleted = db.gc_attempt_ledger(TEST_HORIZON_SECS, 1000).await?;
+    assert_eq!(deleted, 2, "the two pre-reset old attempts");
+
+    let after_rows = db
+        .load_attempt_suffix(&[drv_id])
+        .await?
+        .remove(&drv_id)
+        .unwrap_or_default();
+    let after = crate::retry_policy::decide(&suffix_records(&after_rows), &budget, now);
+    assert_eq!(
+        before, after,
+        "Decision must be bit-identical across the sweep"
+    );
+    assert!(
+        matches!(after.verdict, crate::retry_policy::Verdict::Poison(_)),
+        "the poisoned verdict survives the sweep"
+    );
+    Ok(())
+}
+
+// r[verify sched.db.attempts-gc]
+/// E4: a pre-reset old row whose exec_id still has an ACTIVE
+/// (`pending`) assignments row is kept — the row doubles as the
+/// report-idempotency record; close the assignment and the next pass
+/// sweeps it.
+#[tokio::test]
+async fn test_attempts_gc_skips_rows_with_active_assignment() -> anyhow::Result<()> {
+    let (_test_db, db, drv_id) = setup("gc-active-assignment-hash").await?;
+
+    let exec_id = Uuid::now_v7();
+    let mut a1 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    a1.exec_id = Some(exec_id);
+    let r1 = AttemptRow::new_reset(
+        drv_id,
+        OutcomeClass::ResubmitReset,
+        ReportingParty::Scheduler,
+        1,
+    );
+    let a1_id = a1.attempt_id;
+    let old = [a1.attempt_id, r1.attempt_id];
+    append_committed(&db, &[a1, r1]).await?;
+    backdate(&db, &old).await?;
+
+    db.insert_assignment(drv_id, &ExecutorId::from("builder-1"), 1, exec_id)
+        .await?;
+
+    let deleted = db.gc_attempt_ledger(TEST_HORIZON_SECS, 1000).await?;
+    assert_eq!(deleted, 0, "active assignment exempts the row (E4)");
+    assert!(ledger_ids(&db, drv_id).await?.contains(&a1_id));
+
+    // Close the assignment — the next pass sweeps the row.
+    sqlx::query(
+        "UPDATE assignments SET status = 'completed', completed_at = now() \
+         WHERE exec_id = $1",
+    )
+    .bind(exec_id)
+    .execute(&db.pool)
+    .await?;
+    let deleted = db.gc_attempt_ledger(TEST_HORIZON_SECS, 1000).await?;
+    assert_eq!(deleted, 1, "closed assignment unblocks the sweep");
+    assert!(!ledger_ids(&db, drv_id).await?.contains(&a1_id));
+    Ok(())
+}
+
+// r[verify sched.db.attempts-gc]
+/// Orphan arm: rows (including reset rows) of a derivation_id with no
+/// derivations row are reaped past the horizon; equally old rows of a
+/// live no-reset derivation are all kept (no cut → all live suffix).
+/// Then the unreachability premise is PINNED, not comment-cited:
+/// re-inserting the same drv_hash through the production insert path
+/// mints a DIFFERENT derivation_id with an empty suffix — a
+/// partially-swept orphan history can never resurface inside a fresh
+/// derivation's suffix.
+#[tokio::test]
+async fn test_attempts_gc_reaps_orphaned_histories() -> anyhow::Result<()> {
+    let (_test_db, db, orphan_id) = setup("gc-orphan-hash").await?;
+
+    // Orphan-to-be: attempt + reset rows, all old.
+    let o1 = AttemptRow::new(orphan_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let o2 = AttemptRow::new_reset(
+        orphan_id,
+        OutcomeClass::ResubmitReset,
+        ReportingParty::Scheduler,
+        1,
+    );
+    let old = [o1.attempt_id, o2.attempt_id];
+    append_committed(&db, &[o1, o2]).await?;
+    backdate(&db, &old).await?;
+
+    // A live derivation with NO reset row and equally old rows.
+    let live_id = insert_test_derivation(&db, "gc-orphan-live-hash").await?;
+    let l1 = AttemptRow::new(live_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let l2 = AttemptRow::new(live_id, OutcomeClass::Infra, ReportingParty::Scheduler);
+    let live_old = [l1.attempt_id, l2.attempt_id];
+    append_committed(&db, &[l1, l2]).await?;
+    backdate(&db, &live_old).await?;
+
+    // Orphan the first derivation (what derivations-GC does; 068 has no
+    // FK so the history outlives the row).
+    sqlx::query("DELETE FROM derivations WHERE derivation_id = $1")
+        .bind(orphan_id)
+        .execute(&db.pool)
+        .await?;
+
+    let deleted = db.gc_attempt_ledger(TEST_HORIZON_SECS, 1000).await?;
+    assert_eq!(deleted, 2, "the whole orphaned history, reset row included");
+    assert!(ledger_ids(&db, orphan_id).await?.is_empty());
+    assert_eq!(
+        ledger_ids(&db, live_id).await?.len(),
+        2,
+        "a live no-reset derivation keeps its whole (suffix) history however old"
+    );
+
+    // The unreachability premise: same drv_hash, fresh UUID, empty
+    // suffix.
+    let reborn_id = insert_test_derivation(&db, "gc-orphan-hash").await?;
+    assert_ne!(
+        reborn_id, orphan_id,
+        "a re-submitted drv_hash mints a FRESH derivation UUID"
+    );
+    assert!(
+        !db.load_attempt_suffix(&[reborn_id])
+            .await?
+            .contains_key(&reborn_id),
+        "the reborn derivation's suffix is empty"
+    );
+    Ok(())
+}
+
+// r[verify sched.db.attempts-gc]
+/// The per-arm batch limit bounds one pass; the next pass drains.
+#[tokio::test]
+async fn test_attempts_gc_respects_batch_limit() -> anyhow::Result<()> {
+    let (_test_db, db, drv_id) = setup("gc-batch-hash").await?;
+
+    let v1 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let v2 = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    let v3 = AttemptRow::new(drv_id, OutcomeClass::Infra, ReportingParty::Scheduler);
+    let r1 = AttemptRow::new_reset(
+        drv_id,
+        OutcomeClass::ResubmitReset,
+        ReportingParty::Scheduler,
+        1,
+    );
+    let old = [v1.attempt_id, v2.attempt_id, v3.attempt_id, r1.attempt_id];
+    append_committed(&db, &[v1, v2, v3, r1]).await?;
+    backdate(&db, &old).await?;
+
+    assert_eq!(db.gc_attempt_ledger(TEST_HORIZON_SECS, 2).await?, 2);
+    assert_eq!(db.gc_attempt_ledger(TEST_HORIZON_SECS, 2).await?, 1);
+    assert_eq!(db.gc_attempt_ledger(TEST_HORIZON_SECS, 2).await?, 0);
+    assert_eq!(
+        ledger_ids(&db, drv_id).await?.len(),
+        1,
+        "only the reset row remains"
+    );
+    Ok(())
+}
+
+// r[verify sched.db.attempts-gc]
+/// Cross-layer pin: the SQL suffix cut (`load_attempt_suffix`) returns
+/// exactly `rows[ledger_suffix_start(rows)..]` of the full ordered
+/// history — the kernel mirror and the SQL agree on where the suffix
+/// begins, which is the premise the sweep-invariance proofs rest on.
+#[tokio::test]
+async fn test_suffix_cut_matches_kernel_ledger_suffix_start() -> anyhow::Result<()> {
+    let (_test_db, db, drv_id) = setup("gc-cut-pin-hash").await?;
+
+    let rows = [
+        AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker),
+        AttemptRow::new_reset(
+            drv_id,
+            OutcomeClass::CacheHitClear,
+            ReportingParty::Admin,
+            0,
+        ),
+        AttemptRow::new(drv_id, OutcomeClass::Infra, ReportingParty::Scheduler),
+        AttemptRow::new_reset(
+            drv_id,
+            OutcomeClass::ResubmitReset,
+            ReportingParty::Scheduler,
+            1,
+        ),
+        AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker),
+    ];
+    append_committed(&db, &rows).await?;
+
+    // Full ordered history straight from PG.
+    let full: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT attempt_id, event_kind FROM drv_attempts \
+         WHERE derivation_id = $1 ORDER BY recorded_at, attempt_id",
+    )
+    .bind(drv_id)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(full.len(), 5);
+
+    // Project to kernel rows (only event_kind matters for the cut).
+    let kernel_rows: Vec<rio_retry_kernel::LedgerRow<String>> = full
+        .iter()
+        .map(|(_, ek)| rio_retry_kernel::LedgerRow {
+            event_kind: if ek == "reset" {
+                rio_retry_kernel::AttemptEventKind::Reset
+            } else {
+                rio_retry_kernel::AttemptEventKind::Attempt
+            },
+            outcome_class: rio_retry_kernel::OutcomeClass::Transient,
+            executor: None,
+            reporting_party: rio_retry_kernel::ReportingParty::Scheduler,
+            floor_promoted: false,
+            floor_at_cap: false,
+            resubmit_cycle: 0,
+            at: 0,
+            kind: rio_retry_kernel::AttemptKind::Build,
+        })
+        .collect();
+    let cut = rio_retry_kernel::ledger_suffix_start(&kernel_rows);
+    let expected: Vec<Uuid> = full[cut..].iter().map(|(id, _)| *id).collect();
+
+    let suffix = db
+        .load_attempt_suffix(&[drv_id])
+        .await?
+        .remove(&drv_id)
+        .unwrap_or_default();
+    let got: Vec<Uuid> = suffix.iter().map(|r| r.attempt_id).collect();
+    assert_eq!(got, expected, "SQL cut == kernel ledger_suffix_start");
+    Ok(())
+}

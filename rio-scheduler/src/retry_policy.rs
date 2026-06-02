@@ -38,7 +38,7 @@ use crate::state::{
 };
 
 pub(crate) use rio_retry_kernel::{
-    AbsTime, Budget, FloorOutcomeView, ObservedFailure, PoisonReason, Verdict,
+    AbsTime, Budget, FloorOutcomeView, ObservedFailure, PoisonReason, Verdict, sweep_horizon_secs,
 };
 // The placement partition is consumed by the AD2 spawn gate
 // (controller-side) and the retry-kernel Kani contracts; in this crate

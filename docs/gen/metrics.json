@@ -76,6 +76,7 @@
     "rio_scheduler_assignments_total",
     "rio_scheduler_attempt_record_retries_total",
     "rio_scheduler_attempt_requeue_seconds",
+    "rio_scheduler_attempts_gc_deleted_total",
     "rio_scheduler_broadcast_lagged_total",
     "rio_scheduler_build_duration_seconds",
     "rio_scheduler_build_graph_edges",
@@ -599,6 +600,11 @@
         "name": "rio_scheduler_attempt_requeue_seconds",
         "kind": "histogram",
         "help": "OA1 interval (ii): scheduler-side terminal/death observation → the event that closes the released attempt and (re)queues the derivation, by cause. cause=worker-report: the worker's own failure report and the requeue, same actor turn (the sample is the in-turn processing latency). cause=pod-terminal: disconnect observation → the controller's classifying termination report consumed. cause=establishment: disconnect observation → the TTL-sweep establishment fill. cause=synthesized: a controller-synthesized cancelled/preempted/reaped verdict closed an open pull attempt charge-free (in-turn latency, AD5). cause=worker-abort: the builder's SIGTERM-abort report closed a still-wanted pull attempt charge-free (in-turn latency, AD5). In stream mode the requeue itself happens at the disconnect, so the pod-terminal/establishment samples measure how long the released attempt waited for its classification — the controller-report-slack input the executor-replacement establishment window is sized against (executor-lifecycle campaign, OA1)."
+      },
+      {
+        "name": "rio_scheduler_attempts_gc_deleted_total",
+        "kind": "counter",
+        "help": "drv_attempts rows deleted by the periodic attempt-ledger retention sweep (sched.db.attempts-gc): suffix-complement rows past the retention horizon plus orphaned histories. The decision suffix is provably unchanged by every increment"
       },
       {
         "name": "rio_scheduler_broadcast_lagged_total",

@@ -171,6 +171,12 @@ pub fn describe_metrics() {
         "Orphan-terminal derivations rows deleted by the periodic Tick sweep (I-169.2)"
     );
     describe_counter!(
+        "rio_scheduler_attempts_gc_deleted_total",
+        "drv_attempts rows deleted by the periodic attempt-ledger retention sweep \
+         (sched.db.attempts-gc): suffix-complement rows past the retention horizon plus \
+         orphaned histories. The decision suffix is provably unchanged by every increment"
+    );
+    describe_counter!(
         "rio_scheduler_resource_floor_bumps_total",
         "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled \
          reason=oom_killed|disk_pressure|cgroup_oom|timeout|deadline_exceeded). Reactive \

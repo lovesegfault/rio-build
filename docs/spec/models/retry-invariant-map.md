@@ -2338,6 +2338,23 @@ each handler also gains a durable write).
 - A real ledger GC policy (P8): the compile-time retention-floor
   assertion and the suffix bound stand in; a sweep is future work and
   must respect the recorded retention floor (≥ the poison TTL).
+  **Closed by the TODO-closure wave (2026-06-02): the sweep exists.**
+  `tick_gc_attempt_ledger` (leader-only, every 30th tick, batch 1000)
+  consults the floor via the kernel's `sweep_horizon_secs(budget,
+  LEDGER_RETENTION_FLOOR)` = max(floor, LIVE configured
+  `infra_retry_window_secs`, poison TTL), and deletes only the suffix
+  complement: attempt-kind rows strictly before the last reset row,
+  past the horizon, with no active assignment — plus orphaned
+  histories whose derivation row is gone. The deletion is
+  machine-checked decide()-invariant: `suffix(sweep(L)) == suffix(L)`
+  element-wise, hence `decide()` and `materialization_decide()`
+  bit-identical (the `check_sweep_suffix_equivalence` /
+  `check_sweep_decide_invariant` harnesses; the harness-count tripwire
+  is now 10), with a bounded-exhaustive unit twin and the SQL↔kernel
+  cut pinned cross-layer
+  (`test_suffix_cut_matches_kernel_ledger_suffix_start`). Spec rule:
+  `sched.db.attempts-gc` (scheduler.typ, next to the derivations-GC
+  rule).
 - The deliberately-open policy questions: A7 uniform backoff, A10
   fencepost unification, A8 poison-reason strings (P6 — unadjudicated
   policy changes, not refactoring debt).
