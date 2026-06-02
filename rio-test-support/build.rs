@@ -62,6 +62,7 @@ const MANUAL_METHODS: &[&str] = &[
     "TriggerGC",         // streaming — sends one is_complete=true frame
     "ClearPoison",       // records drv_hash to clear_poison_calls
     "CreateTenant",      // echoes tenant_name back in TenantInfo
+    "ListPoisoned",      // hangable via poisoned_hangs (client deadline tests)
 ];
 
 #[cfg(feature = "full")]

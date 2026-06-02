@@ -10,14 +10,16 @@
 //!
 //! [`MockAdmin`] returns empty-but-valid responses for all unary RPCs;
 //! streaming RPCs return a single terminal message so client drain loops
-//! exit cleanly.
+//! exit cleanly. `get_derivation_logs` outcomes can be scripted per call
+//! via [`LogScript`] (in-stream errors, hangs, broken streams) for
+//! client retry/deadline tests.
 
 mod admin;
 mod scheduler;
 mod spawn;
 mod store;
 
-pub use admin::{MockAdmin, spawn_mock_admin};
+pub use admin::{LogScript, MockAdmin, spawn_mock_admin};
 pub use scheduler::{MockScheduler, SubmitOutcome, WatchOutcome, spawn_mock_scheduler};
 pub use spawn::{
     dead_channel, spawn_grpc_server, spawn_grpc_server_layered, spawn_mock_store,
