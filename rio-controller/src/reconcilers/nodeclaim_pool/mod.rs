@@ -749,7 +749,11 @@ pub struct NodeClaimPoolReconciler {
     /// path that deletes/forgets a tracked claim without showing up
     /// here is exactly the bug_012/bug_020 shape):
     /// 1. `cover_deficit` `extend()`s the names it `create()`d.
-    /// 2. `clear()` on config reload (the config-hash gate).
+    /// 2. `clear()` on the lease-acquire Ok arm (suppress polarity —
+    ///    see the per-field table at the acquire match). There is NO
+    ///    config-reload clear call site (corrected 2026-06-02; the
+    ///    list previously named "the config-hash gate" — a design-era
+    ///    label that never matched the code).
     /// 3. [`health::detect_vanished`] retains in-flight, drops
     ///    registered/terminating/vanished — runs in BOTH
     ///    `reconcile_once` and `consolidate_only`.

@@ -196,7 +196,7 @@ do what the rule says it MUST; recorded in the contradiction table below.
 
 | Rule | Verdict | Audit finding |
 |---|---|---|
-| `ctrl.nodeclaim.inflight-conservation` *(new)* | **COVERS** | Was a GAP. The four-mutator discipline (extend on create, clear on config reload, `detect_vanished` retain rules including the consolidate-only prune, reap-name removal BEFORE detect in both modes) plus the exactly-one-outcome conservation statement. Previously a field doc comment (`mod.rs`, the `inflight_created` mutator list) and two bug-round fixes. |
+| `ctrl.nodeclaim.inflight-conservation` *(new)* | **COVERS** | Was a GAP. The four-mutator discipline (extend on create — `mod.rs:1347`; clear on the lease-acquire Ok arm — `mod.rs:995` *(corrected 2026-06-02: previously written "clear on config reload", a label with no call site — see the encoding-notes nit)*; `detect_vanished` retain rules including the consolidate-only prune — `mod.rs:1341`/`:1472`; reap-name removal BEFORE detect in both modes — `mod.rs:1339`/`:1470`) plus the exactly-one-outcome conservation statement. Previously a field doc comment (`mod.rs`, the `inflight_created` mutator list) and two bug-round fixes. |
 
 #### `BootRecordedOnce`
 
@@ -678,7 +678,22 @@ fail-closed half is separately enforced by `gateFailClosed`.
   code (a config-cell drop shrinks the configured set without touching
   the inflight map). If the config-hash clear exists elsewhere or is
   added later, the model's `configDropsCell` action is the place to
-  mirror it.
+  mirror it. **Correction applied 2026-06-02 (follow-up cleanup
+  rider):** the in-code mutator list was reconciled to the code —
+  mutator 2 now names the lease-acquire Ok arm (`mod.rs:995`,
+  suppress polarity) and states that no config-reload clear exists;
+  the rule-table row above carries the same correction. The ground
+  truth was re-verified at the time of the correction: mutators are
+  exactly extend (`mod.rs:1347`), lease-acquire clear (`mod.rs:995`),
+  `detect_vanished` in both modes (`mod.rs:1341`/`:1472`), and
+  reap-name removal before detect in both modes
+  (`mod.rs:1339`/`:1470`) — the conservation discipline holds. The
+  REMAINING half of the nit: the normative rule text
+  (`controller.typ`, `ctrl.nodeclaim.inflight-conservation`) still
+  reads "clearing on config reload"; reconciling the rule sentence is
+  a tracey-bump change (impl/verify markers go stale) deliberately
+  not taken by the cleanup rider — whoever next amends that rule
+  should carry the bump.
 
 ### Verify-marker status (Stage-B update)
 
@@ -1113,11 +1128,16 @@ scope it leaves unchanged:
     `quint-nodeclaim-falsification-*` checks flip to HOLD invariants in
     the fault-rpc regime per the Stage-B flip protocol — Phase 1 should
     schedule that fix or explicitly defer it.
-  - The `inflight_created` mutator-list comment in
+  - ~~The `inflight_created` mutator-list comment in
     `nodeclaim_pool/mod.rs` still names a config-reload clear that has
     no call site (the Stage-B encoding note); whoever touches that
     block next should reconcile the comment or add the clear, and the
-    model's `configDropsCell` action is the place to mirror it.
+    model's `configDropsCell` action is the place to mirror it.~~
+    **RESOLVED 2026-06-02** (follow-up cleanup rider): the comment was
+    reconciled to the code (mutator 2 = the lease-acquire Ok arm,
+    `mod.rs:995`); see the dated correction at the encoding-notes nit.
+    The normative rule sentence in `controller.typ` still carries the
+    config-reload wording — that half stays open (tracey-bump change).
   - `ctrl.pool.spawn-once` still carries no verify marker (the Stage-B
     encoding note); a Phase-2 code-level dedupe test remains the
     cheapest way to close it.
