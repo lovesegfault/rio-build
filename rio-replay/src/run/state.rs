@@ -41,6 +41,12 @@ pub enum StateFile {
     Batches,
     Supply,
     Dispatch,
+    /// Engine-initiated resubmissions (one [`RequeueRecord`] per requeue),
+    /// journaled by the job ledger so resume can rebuild the retry-budget
+    /// counters as a fold of the stream.
+    ///
+    /// [`RequeueRecord`]: super::model::RequeueRecord
+    Requeues,
 }
 
 impl StateFile {
@@ -50,14 +56,16 @@ impl StateFile {
             StateFile::Batches => "batches.jsonl",
             StateFile::Supply => "supply.jsonl",
             StateFile::Dispatch => "dispatch.jsonl",
+            StateFile::Requeues => "requeues.jsonl",
         }
     }
 
-    pub const ALL: [StateFile; 4] = [
+    pub const ALL: [StateFile; 5] = [
         StateFile::Results,
         StateFile::Batches,
         StateFile::Supply,
         StateFile::Dispatch,
+        StateFile::Requeues,
     ];
 }
 
@@ -762,7 +770,8 @@ mod tests {
     fn supply_and_dispatch_state_files_named() {
         assert_eq!(StateFile::Supply.file_name(), "supply.jsonl");
         assert_eq!(StateFile::Dispatch.file_name(), "dispatch.jsonl");
-        assert_eq!(StateFile::ALL.len(), 4);
+        assert_eq!(StateFile::Requeues.file_name(), "requeues.jsonl");
+        assert_eq!(StateFile::ALL.len(), 5);
     }
 
     #[test]

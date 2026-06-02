@@ -425,11 +425,12 @@ mod tests {
     use crate::run::submitter::test_support::FakeSubmitter;
     use rio_nix::protocol::build::BuildStatus;
 
-    /// Wrap a tracker in a fresh ledger (default-knob watchdog) for the
-    /// submit-loop tests; the tests keep their tracker handle for direct
-    /// state assertions.
-    fn test_ledger(tracker: Arc<SubmitTracker>) -> Arc<JobLedger> {
+    /// Wrap a tracker in a fresh ledger (default-knob watchdog) over the
+    /// test's state dir for the submit-loop tests; the tests keep their
+    /// tracker handle for direct state assertions.
+    fn test_ledger(state: &StateDir, tracker: Arc<SubmitTracker>) -> Arc<JobLedger> {
         Arc::new(JobLedger::new(
+            state.clone(),
             tracker,
             Arc::new(Mutex::new(crate::run::watchdog::Watchdog::new(
                 Knobs::default(),
@@ -701,7 +702,7 @@ mod tests {
         run_submit_loop(
             state.clone(),
             submitter.clone(),
-            test_ledger(tracker),
+            test_ledger(&state, tracker),
             pause,
             attemptable,
             move || {
@@ -784,10 +785,11 @@ mod tests {
             ..Knobs::default()
         };
         let submitted_view = submitter.clone();
+        let ledger = test_ledger(&state, tracker);
         run_submit_loop(
             state,
             submitter.clone(),
-            test_ledger(tracker),
+            ledger,
             pause,
             vec![pj("a", 0), pj("b", 0), pj("c", 0)],
             move || {
@@ -840,7 +842,7 @@ mod tests {
         run_submit_loop(
             state.clone(),
             submitter.clone(),
-            test_ledger(Arc::new(SubmitTracker::default())),
+            test_ledger(&state, Arc::new(SubmitTracker::default())),
             Arc::new(PauseState::default()),
             vec![pj("a", 0)],
             move || {
@@ -883,7 +885,7 @@ mod tests {
         run_submit_loop(
             state.clone(),
             submitter.clone(),
-            test_ledger(Arc::new(SubmitTracker::default())),
+            test_ledger(&state, Arc::new(SubmitTracker::default())),
             Arc::new(PauseState::default()),
             vec![pj("a", 0)],
             HashSet::new,
@@ -949,7 +951,7 @@ mod tests {
         let handle = tokio::spawn(run_submit_loop(
             state.clone(),
             submitter.clone(),
-            test_ledger(tracker),
+            test_ledger(&state, tracker),
             pause,
             vec![pj("a", 0)],
             HashSet::new,
@@ -991,7 +993,7 @@ mod tests {
         let handle = tokio::spawn(run_submit_loop(
             state.clone(),
             submitter.clone(),
-            test_ledger(tracker),
+            test_ledger(&state, tracker),
             pause.clone(),
             attemptable,
             HashSet::new,

@@ -819,6 +819,42 @@ pub struct BatchRecord {
     pub interruption_drvs: Vec<String>,
 }
 
+/// [`RequeueRecord::source`] value for collect-pass re-offers (a settled
+/// batch's member returned to the timeless pending pool).
+pub const REQUEUE_SOURCE_COLLECT: &str = "collect";
+
+/// [`RequeueRecord::source`] value for the watchdog's single active-stall
+/// auto-retry.
+pub const REQUEUE_SOURCE_STALL: &str = "stall";
+
+/// One line of requeues.jsonl: an engine-initiated resubmission, journaled
+/// by the job ledger at the transition site BEFORE the in-memory counter
+/// moves.
+///
+/// This stream is the durable substrate of every bound the resubmission
+/// counters back — the infra auto-retry budget, fail-fast singleton
+/// isolation, the stall auto-retry gate, and the per-record `attempts`
+/// accounting. Requeue decisions write no results.jsonl record and their
+/// batches are skipped on resume (collected.json), so without this journal
+/// a pod restart silently zeroed all consumed budget and every documented
+/// convergence bound reopened at the restart edge. Resume rebuilds the
+/// counters as a pure fold of this stream
+/// ([`super::ledger::JobLedger::from_journals`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequeueRecord {
+    pub job: String,
+    /// Which transition counted it: one of the `REQUEUE_SOURCE_*` constants
+    /// in this module (writers must use the constants, never literals —
+    /// the resume fold derives the stall-retry counters from this field).
+    pub source: String,
+    /// The requeue reason (collect's decision reason, e.g.
+    /// "engine-cancelled" / "infra-auto-retry", or the stall kind).
+    /// Diagnostic: the fold counts entries, never parses reasons.
+    pub why: String,
+    pub at: String,
+}
+
 /// Cross-component pause flags: a manual operator pause and the
 /// engine's own backpressure pause, OR-ed into one "submission paused"
 /// signal.

@@ -282,6 +282,10 @@ const STATE_DIR_MANIFEST: &[(&str, SyncPolicy)] = &[
     ("supply.jsonl", SyncPolicy::Synced),
     ("dispatch.jsonl", SyncPolicy::Synced),
     ("batches.jsonl", SyncPolicy::Synced),
+    // The requeue journal: resume folds the retry-budget counters from it
+    // (JobLedger::from_journals), so a restored campaign keeps every
+    // consumed auto-retry instead of granting fresh budgets.
+    ("requeues.jsonl", SyncPolicy::Synced),
     ("supply-report.json", SyncPolicy::Synced),
     ("timed-stats.json", SyncPolicy::Synced),
     ("report/summary.md", SyncPolicy::Synced),

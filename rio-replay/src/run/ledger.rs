@@ -37,6 +37,19 @@
 //! collect-poll window until [`process_settled_batch`] decides requeue vs
 //! terminal — a bounded sliver against multi-hour stall thresholds.
 //!
+//! Restart durability: both requeue transitions journal a
+//! [`RequeueRecord`] to requeues.jsonl BEFORE moving the in-memory counter,
+//! and [`JobLedger::from_journals`] rebuilds the counters as a pure fold of
+//! that stream. The resubmission counts back documented convergence bounds
+//! (the infra auto-retry budget, fail-fast singleton isolation, the stall
+//! auto-retry gate, `attempts` accounting); deriving them from anything
+//! volatile would zero every consumed budget at each pod restart — the
+//! exact spin the budget exists to prevent, reopened at the restart edge.
+//! Journal-then-increment keeps the invariant `in-memory counters ==
+//! fold(requeues.jsonl)` under append failures and batch re-processing
+//! alike; the equivalence test in `super::tests` pins it at every batch
+//! boundary.
+//!
 //! Lock discipline: every method takes its locks strictly sequentially
 //! (acquire, update, release — never two at once), so the ledger can be
 //! called from the submit loop, the collect pass, and the poller without
@@ -44,20 +57,102 @@
 //!
 //! [`process_settled_batch`]: super::collect::process_settled_batch
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::Result;
+
+use super::model::{REQUEUE_SOURCE_COLLECT, REQUEUE_SOURCE_STALL, RequeueRecord, now_rfc3339};
+use super::state::{StateDir, StateFile};
 use super::submit::SubmitTracker;
 use super::watchdog::{JobPhase, Watchdog};
 
 /// Owner of job scheduling-state transitions. See the module docs.
 pub struct JobLedger {
+    /// Journal substrate: every requeue transition appends its
+    /// [`RequeueRecord`] here before the in-memory counter moves.
+    state: StateDir,
     tracker: Arc<SubmitTracker>,
     watchdog: Arc<tokio::sync::Mutex<Watchdog>>,
 }
 
 impl JobLedger {
-    pub fn new(tracker: Arc<SubmitTracker>, watchdog: Arc<tokio::sync::Mutex<Watchdog>>) -> Self {
-        Self { tracker, watchdog }
+    /// Construct over an explicit tracker (tests and call sites that build
+    /// their own scheduling state). The production resume path MUST use
+    /// [`JobLedger::from_journals`] instead, so the counters are seeded
+    /// from the durable journal rather than starting empty.
+    pub fn new(
+        state: StateDir,
+        tracker: Arc<SubmitTracker>,
+        watchdog: Arc<tokio::sync::Mutex<Watchdog>>,
+    ) -> Self {
+        Self {
+            state,
+            tracker,
+            watchdog,
+        }
+    }
+
+    /// The production constructor: rebuild the resubmission counters as a
+    /// fold of requeues.jsonl, so every bound they back (the infra
+    /// auto-retry budget, fail-fast singleton isolation, `attempts`
+    /// accounting) survives a pod restart with its consumed budget intact.
+    /// Returns the ledger plus the per-job stall auto-retry counts (the
+    /// `REQUEUE_SOURCE_STALL` slice of the same fold) for the poller's
+    /// stall gate — one journal rehydrates both counter families.
+    ///
+    /// The fold covers every batch kind by construction: increments are
+    /// journaled at the transition site, not re-derived per batch, so
+    /// timeless collect re-offers and timed-mode stall retries land in the
+    /// same stream. Deliberately NOT rehydrated: in-flight reservations
+    /// (nothing is in flight in a fresh process), watchdog clocks (builds
+    /// restart, so stall baselines must too), and post-settlement
+    /// cool-downs (sub-minute re-offer dampers; at worst one early
+    /// re-offer races the first collect pass, the same window the live
+    /// cool-down already permits at expiry). A state dir from before this
+    /// journal existed folds to empty counters — the pre-journal resume
+    /// behavior, degraded but never worse.
+    pub fn from_journals(
+        state: StateDir,
+        watchdog: Arc<tokio::sync::Mutex<Watchdog>>,
+    ) -> Result<(Self, HashMap<String, u32>)> {
+        let entries: Vec<RequeueRecord> = state.load_jsonl(StateFile::Requeues)?;
+        let mut resubmissions: HashMap<String, u32> = HashMap::new();
+        let mut stall_retries: HashMap<String, u32> = HashMap::new();
+        for entry in &entries {
+            *resubmissions.entry(entry.job.clone()).or_default() += 1;
+            if entry.source == REQUEUE_SOURCE_STALL {
+                *stall_retries.entry(entry.job.clone()).or_default() += 1;
+            }
+        }
+        let tracker = Arc::new(SubmitTracker {
+            resubmissions: tokio::sync::Mutex::new(resubmissions),
+            ..SubmitTracker::default()
+        });
+        Ok((
+            Self {
+                state,
+                tracker,
+                watchdog,
+            },
+            stall_retries,
+        ))
+    }
+
+    /// Append one requeue transition to the journal. Called BEFORE the
+    /// in-memory increment: an append failure leaves the counter untouched
+    /// (the caller retries the whole transition), so the in-memory state
+    /// can never run ahead of the fold that resume rebuilds it from.
+    fn journal_requeue(&self, job: &str, source: &str, why: &str) -> Result<()> {
+        self.state.append_jsonl(
+            StateFile::Requeues,
+            &RequeueRecord {
+                job: job.to_string(),
+                source: source.to_string(),
+                why: why.to_string(),
+                at: now_rfc3339(),
+            },
+        )
     }
 
     /// Read-side view of the scheduling state (wave snapshots, cool-downs,
@@ -94,9 +189,12 @@ impl JobLedger {
     }
 
     /// Collect re-offers a settled batch's member to the pending pool:
-    /// count the engine resubmission and observe the job `Queued` (the
-    /// phase change resets its stall clock).
-    pub async fn requeue_collected(&self, job: &str) {
+    /// journal the requeue, count the engine resubmission, and observe the
+    /// job `Queued` (the phase change resets its stall clock). `why` is
+    /// the collect decision's requeue reason, recorded on the journal line
+    /// for archaeology.
+    pub async fn requeue_collected(&self, job: &str, why: &str) -> Result<()> {
+        self.journal_requeue(job, REQUEUE_SOURCE_COLLECT, why)?;
         *self
             .tracker
             .resubmissions
@@ -108,13 +206,15 @@ impl JobLedger {
             .lock()
             .await
             .observe_job(job, JobPhase::Queued);
+        Ok(())
     }
 
-    /// The active-stall auto-retry: release the in-flight reservation,
-    /// count the resubmission, and observe the job `Queued` so its wait for
-    /// the fresh batch is charged to the queued clock, not a stale `Active`
-    /// one.
-    pub async fn requeue_stalled(&self, job: &str) {
+    /// The active-stall auto-retry: journal the requeue, release the
+    /// in-flight reservation, count the resubmission, and observe the job
+    /// `Queued` so its wait for the fresh batch is charged to the queued
+    /// clock, not a stale `Active` one.
+    pub async fn requeue_stalled(&self, job: &str) -> Result<()> {
+        self.journal_requeue(job, REQUEUE_SOURCE_STALL, "active-stall")?;
         self.tracker.in_flight.lock().await.remove(job);
         *self
             .tracker
@@ -127,6 +227,7 @@ impl JobLedger {
             .lock()
             .await
             .observe_job(job, JobPhase::Queued);
+        Ok(())
     }
 
     /// The job reached a terminal record (already appended by the caller):
@@ -146,10 +247,13 @@ mod tests {
     use crate::run::watchdog::{IcePoll, PollTick, StallKind};
 
     fn ledger() -> (
+        tempfile::TempDir,
         JobLedger,
         Arc<SubmitTracker>,
         Arc<tokio::sync::Mutex<Watchdog>>,
     ) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
         let tracker = Arc::new(SubmitTracker::default());
         let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs {
             active_stall_hours: 6.0,
@@ -158,7 +262,8 @@ mod tests {
             ..Knobs::default()
         })));
         (
-            JobLedger::new(tracker.clone(), watchdog.clone()),
+            dir,
+            JobLedger::new(state, tracker.clone(), watchdog.clone()),
             tracker,
             watchdog,
         )
@@ -179,7 +284,7 @@ mod tests {
     /// the campaign runs.
     #[tokio::test]
     async fn never_submitted_jobs_are_not_tracked() {
-        let (ledger, _tracker, watchdog) = ledger();
+        let (_dir, ledger, _tracker, watchdog) = ledger();
         // Another job IS committed, so the watchdog has work to do.
         ledger.commit_batch(&["active.x".to_string()]).await;
         let mut wd = watchdog.lock().await;
@@ -197,7 +302,7 @@ mod tests {
     /// both, whether or not the reservation was already released.
     #[tokio::test]
     async fn commit_and_retire_are_uniform() {
-        let (ledger, tracker, watchdog) = ledger();
+        let (_dir, ledger, tracker, watchdog) = ledger();
         ledger.commit_batch(&["a.x".to_string()]).await;
         assert!(tracker.in_flight.lock().await.contains("a.x"));
         assert_eq!(
@@ -222,7 +327,7 @@ mod tests {
     /// (whose stall would burn the infra retry budget).
     #[tokio::test]
     async fn requeue_transitions_to_queued_and_resets_the_clock() {
-        let (ledger, tracker, watchdog) = ledger();
+        let (_dir, ledger, tracker, watchdog) = ledger();
         ledger.commit_batch(&["job.x".to_string()]).await;
         {
             let mut wd = watchdog.lock().await;
@@ -234,7 +339,10 @@ mod tests {
         tracker
             .release_after_settle(&["job.x".to_string()], std::time::Duration::ZERO)
             .await;
-        ledger.requeue_collected("job.x").await;
+        ledger
+            .requeue_collected("job.x", "infra-auto-retry")
+            .await
+            .unwrap();
         assert_eq!(ledger.tracker().resubmission_count("job.x").await, 1);
         {
             let mut wd = watchdog.lock().await;
@@ -262,14 +370,60 @@ mod tests {
     /// counted, phase Queued.
     #[tokio::test]
     async fn stall_requeue_releases_and_observes_queued() {
-        let (ledger, tracker, watchdog) = ledger();
+        let (_dir, ledger, tracker, watchdog) = ledger();
         ledger.commit_batch(&["stuck.x".to_string()]).await;
-        ledger.requeue_stalled("stuck.x").await;
+        ledger.requeue_stalled("stuck.x").await.unwrap();
         assert!(!tracker.in_flight.lock().await.contains("stuck.x"));
         assert_eq!(ledger.tracker().resubmission_count("stuck.x").await, 1);
         assert_eq!(
             watchdog.lock().await.phase_of("stuck.x"),
             Some(JobPhase::Queued)
         );
+    }
+
+    /// Resume rehydration is a pure fold of the requeue journal: a fresh
+    /// ledger built over the same state dir reproduces the previous
+    /// process's resubmission counters and the stall slice that gates the
+    /// single stall auto-retry. Volatile state is deliberately NOT
+    /// rehydrated (in-flight reservations, watchdog clocks, cool-downs),
+    /// and a state dir recorded before the journal existed folds to empty
+    /// counters — the pre-journal behavior, never an error.
+    #[tokio::test]
+    async fn from_journals_rebuilds_counters_and_stall_slice() {
+        let (dir, ledger, _tracker, _watchdog) = ledger();
+        ledger
+            .requeue_collected("a.x", "infra-auto-retry")
+            .await
+            .unwrap();
+        ledger
+            .requeue_collected("a.x", "engine-cancelled")
+            .await
+            .unwrap();
+        ledger.commit_batch(&["b.x".to_string()]).await;
+        ledger.requeue_stalled("b.x").await.unwrap();
+
+        // "Pod restart": rebuild from the same state dir.
+        let state = StateDir::new(dir.path()).unwrap();
+        let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let (resumed, stall_retries) = JobLedger::from_journals(state, watchdog).unwrap();
+        assert_eq!(resumed.tracker().resubmission_count("a.x").await, 2);
+        assert_eq!(resumed.tracker().resubmission_count("b.x").await, 1);
+        assert_eq!(
+            stall_retries,
+            HashMap::from([("b.x".to_string(), 1)]),
+            "only the stall-source entries feed the stall auto-retry gate"
+        );
+        assert!(
+            resumed.tracker().in_flight.lock().await.is_empty(),
+            "in-flight reservations are process-local and never rehydrated"
+        );
+
+        // Pre-journal state dir (no requeues.jsonl): empty counters.
+        let legacy_dir = tempfile::tempdir().unwrap();
+        let legacy_state = StateDir::new(legacy_dir.path()).unwrap();
+        let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let (legacy, legacy_stalls) = JobLedger::from_journals(legacy_state, watchdog).unwrap();
+        assert_eq!(legacy.tracker().resubmission_count("a.x").await, 0);
+        assert!(legacy_stalls.is_empty());
     }
 }

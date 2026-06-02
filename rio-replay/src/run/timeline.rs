@@ -1928,9 +1928,11 @@ mod tests {
         }
     }
 
-    /// Fresh scheduling-state ledger for one dispatcher test.
-    fn test_ledger() -> Arc<JobLedger> {
+    /// Fresh scheduling-state ledger over the test's state dir for one
+    /// dispatcher test.
+    fn test_ledger(state: &StateDir) -> Arc<JobLedger> {
         Arc::new(JobLedger::new(
+            state.clone(),
             Arc::new(crate::run::submit::SubmitTracker::default()),
             Arc::new(tokio::sync::Mutex::new(
                 crate::run::watchdog::Watchdog::new(Knobs::default()),
@@ -1951,7 +1953,7 @@ mod tests {
         run_timed_dispatch(
             state.clone(),
             submitter,
-            test_ledger(),
+            test_ledger(state),
             schedule,
             timing,
             "ssh-ng://test".into(),
@@ -2168,7 +2170,7 @@ mod tests {
         let stats = run_timed_dispatch(
             state.clone(),
             submitter.clone(),
-            test_ledger(),
+            test_ledger(&state),
             schedule,
             timing_arc(HashMap::new()),
             "ssh-ng://test".into(),
@@ -2536,7 +2538,7 @@ mod tests {
         let stats = run_timed_dispatch(
             state.clone(),
             submitter.clone(),
-            test_ledger(),
+            test_ledger(&state),
             schedule,
             timing_arc(map),
             "ssh-ng://test".into(),

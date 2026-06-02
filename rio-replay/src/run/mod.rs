@@ -72,7 +72,7 @@ use self::spec::{
     PlanOutput, ScheduleMode, SupplyDelivery, SupplyDependencies, generate_campaign_id,
 };
 use self::state::{StateDir, StateFile, latest_per_job};
-use self::submit::{SubmitTracker, run_submit_loop};
+use self::submit::run_submit_loop;
 use self::submitter::{ClientOpsSubmitter, Submitter};
 use self::supply::exec::{
     LadderTopup, PoolSupplyTransport, PreSubmitSupply, SupplyInputs, SupplyStageReport,
@@ -1139,10 +1139,15 @@ async fn apply_stall_actions(
                 );
             }
             StallKind::ActiveStall => {
-                let used = stall_retries.entry(stall.job.clone()).or_insert(0);
-                if *used == 0 {
-                    *used = 1;
-                    ledger.requeue_stalled(&stall.job).await;
+                let used = stall_retries.get(&stall.job).copied().unwrap_or(0);
+                if used == 0 {
+                    // The journaled transition first, the local gate after:
+                    // a failed journal append must leave the retry unspent
+                    // (this pass errors and the next poll retries it), or
+                    // the job would go terminal without ever getting the
+                    // auto-retry the gate exists to grant.
+                    ledger.requeue_stalled(&stall.job).await?;
+                    stall_retries.insert(stall.job.clone(), 1);
                     tracing::warn!(
                         job = %stall.job,
                         "active stall: single auto-retry — in-flight reservation released, job \
@@ -1810,7 +1815,6 @@ pub async fn run_with_backends(
     // false for timeless campaigns.
     let abort_recommended = Arc::new(AtomicBool::new(false));
     let timing_degraded = Arc::new(AtomicBool::new(false));
-    let tracker = Arc::new(SubmitTracker::default());
     let results = Arc::new(tokio::sync::Mutex::new(latest_per_job(
         state.load_jsonl(StateFile::Results)?,
     )));
@@ -1829,8 +1833,15 @@ pub async fn run_with_backends(
     let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(spec.knobs.clone())));
     // The ledger owns every job-state transition over the tracker and the
     // watchdog: batch commitment (in-flight + Active), collect/stall
-    // requeues (resubmission + Queued), and terminal retirement.
-    let job_ledger = Arc::new(ledger::JobLedger::new(tracker.clone(), watchdog.clone()));
+    // requeues (resubmission + Queued), and terminal retirement. Its
+    // counters are rebuilt as a fold of requeues.jsonl — sibling resume
+    // state to the results map and processed set above — so the retry
+    // budgets, fail-fast singleton isolation, and attempts accounting
+    // those counters back keep their consumed budget across pod restarts
+    // instead of silently resetting to zero.
+    let (job_ledger, rehydrated_stall_retries) =
+        ledger::JobLedger::from_journals((*state).clone(), watchdog.clone())?;
+    let job_ledger = Arc::new(job_ledger);
     let contexts = Arc::new(contexts);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
@@ -1855,12 +1866,14 @@ pub async fn run_with_backends(
         let timing_degraded = timing_degraded.clone();
         let supply_for_progress = supply_summary.clone();
         let mut stop_rx = stop_rx.clone();
+        // Per-job count of stall auto-retries already spent (the single
+        // auto-retry before stalled-active goes terminal), rehydrated from
+        // the requeue journal so a pod restart cannot grant every stalled
+        // job a second auto-retry.
+        let mut stall_retries: HashMap<String, u32> = rehydrated_stall_retries;
         tokio::spawn(async move {
             let mut sync_tracker = SyncTracker::default();
             let mut ticks: u64 = 0;
-            // Per-job count of stall auto-retries already spent (the single
-            // auto-retry before stalled-active goes terminal).
-            let mut stall_retries: HashMap<String, u32> = HashMap::new();
             let poll_secs = knobs.cluster_status_poll_secs.max(1);
             let ice_every = (knobs.spawn_intents_poll_secs / poll_secs).max(1);
             let sync_every = (knobs.s3_sync_interval_secs / poll_secs).max(1);
@@ -2510,8 +2523,8 @@ async fn collect_pass_with(
         .await?;
         for (job, decision) in &decisions {
             match decision {
-                collect::CollectDecision::Requeue { .. } => {
-                    ledger.requeue_collected(job).await;
+                collect::CollectDecision::Requeue { why } => {
+                    ledger.requeue_collected(job, why).await?;
                     requeued += 1;
                 }
                 collect::CollectDecision::Terminal { .. } => {
@@ -2537,7 +2550,8 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::run::archive_input::{
-        MiniTimedSpec, load_closures, load_units, write_mini_archive, write_mini_timed_archive,
+        MiniTimedSpec, fake_hash, load_closures, load_units, write_mini_archive,
+        write_mini_timed_archive,
     };
     use crate::run::grpc::test_support::FakeStoreApi;
     use crate::run::grpc::{ClusterCounts, GraphSnapshot, IceSnapshot, PoisonedView};
@@ -2546,6 +2560,7 @@ mod tests {
         SUPPLY_OUTCOME_DELIVERED, SUPPLY_OUTCOME_REFUSED, SUPPLY_OUTCOME_UNAVAILABLE, SupplyEntry,
         build_status_name,
     };
+    use crate::run::submit::{SubmitTracker, submit_one_batch};
     use crate::run::submitter::BatchOutcome;
     use crate::run::submitter::test_support::FakeSubmitter;
     use crate::run::supply::exec::test_support::FakeSupplyTransport;
@@ -3623,6 +3638,7 @@ mod tests {
             artifacts: None,
         };
         let job_ledger = ledger::JobLedger::new(
+            state.clone(),
             Arc::new(SubmitTracker::default()),
             Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default()))),
         );
@@ -3724,7 +3740,7 @@ mod tests {
         };
         let tracker = Arc::new(SubmitTracker::default());
         let wd = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
-        let job_ledger = ledger::JobLedger::new(tracker.clone(), wd.clone());
+        let job_ledger = ledger::JobLedger::new(state.clone(), tracker.clone(), wd.clone());
         // Both jobs were committed (Active) and the batch settled
         // (reservations released) — the state collect finds them in.
         job_ledger
@@ -3768,6 +3784,393 @@ mod tests {
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
         assert_eq!(records[done_job].verdict.as_deref(), Some("match-built"));
         assert!(!records.contains_key(lost_job), "requeue writes no record");
+    }
+
+    /// Job context with an empty closure for the journal-fold tests.
+    fn fold_ctx(job: &str, drv: &str) -> JobContext {
+        JobContext {
+            job: job.to_string(),
+            system: "x86_64-linux".into(),
+            drv_path: drv.to_string(),
+            outputs: BTreeMap::new(),
+            dep_drvs: HashSet::new(),
+            expected_outcome: ExpectedOutcome::Built,
+            expected_outputs: BTreeMap::new(),
+            plan_not_attemptable: false,
+            plan_snapshot_valid: false,
+            fixed_output_drvs: Arc::new(HashSet::new()),
+        }
+    }
+
+    /// A fresh fold of the requeue journal must reproduce the live ledger's
+    /// counters exactly — both the resubmission map and its stall slice.
+    async fn assert_fold_matches_live(
+        state: &StateDir,
+        live: &ledger::JobLedger,
+        live_stall_retries: &HashMap<String, u32>,
+        boundary: &str,
+    ) {
+        let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let (folded, folded_stalls) =
+            ledger::JobLedger::from_journals(state.clone(), watchdog).unwrap();
+        let live_counts = live.tracker().resubmissions.lock().await.clone();
+        let folded_counts = folded.tracker().resubmissions.lock().await.clone();
+        assert_eq!(
+            folded_counts, live_counts,
+            "fold(requeues.jsonl) must equal the live resubmission counters at boundary: \
+             {boundary}"
+        );
+        // The fold drops the no-op zero entries the live stall map may
+        // carry; compare on the nonzero support.
+        let live_stalls: HashMap<String, u32> = live_stall_retries
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(job, count)| (job.clone(), *count))
+            .collect();
+        assert_eq!(
+            folded_stalls, live_stalls,
+            "the fold's stall slice must equal the live stall-retry gate at boundary: {boundary}"
+        );
+    }
+
+    /// Forcing function for the resume fold: the ledger's counters must be
+    /// a pure fold of requeues.jsonl AT EVERY BATCH BOUNDARY, across both
+    /// batch kinds and every increment site — collect re-offers on submit
+    /// batches (engine-side submission failure, engine-cancelled,
+    /// fail-fast batch-mate), timed batches with and without a disconnect
+    /// replay (which must NOT increment: their members are never re-offered
+    /// to the timeless pool), the watchdog's stall auto-retry, and a
+    /// budget-exhausted terminal (also no increment). Batches are written
+    /// by the production producer (`submit_one_batch` over a scripted
+    /// submitter) and decisions applied by the production collect pass, so
+    /// an increment site that forgets the journal — or a fold change that
+    /// drifts from the real increment behavior — fails the equality at the
+    /// boundary it touches.
+    #[tokio::test]
+    async fn ledger_counters_are_a_fold_of_the_requeue_journal_at_every_batch_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let drv = |seed: &str| format!("/nix/store/{}-{seed}.drv", fake_hash(seed));
+        let (ja, jb, jc, jd) = (
+            "ja.x86_64-linux",
+            "jb.x86_64-linux",
+            "jc.x86_64-linux",
+            "jd.x86_64-linux",
+        );
+        let contexts: HashMap<String, JobContext> = [ja, jb, jc, jd]
+            .iter()
+            .map(|job| ((*job).to_string(), fold_ctx(job, &drv(job))))
+            .collect();
+        let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let (live, mut stall_retries) =
+            ledger::JobLedger::from_journals(state.clone(), watchdog).unwrap();
+        let backends = CollectBackends {
+            admin: Arc::new(NoLogsAdmin),
+            store: Arc::new(FakeStoreApi::default()),
+            artifacts: None,
+        };
+        let results = tokio::sync::Mutex::new(BTreeMap::new());
+        let mut processed: HashSet<u64> = HashSet::new();
+        let submitter = FakeSubmitter::default();
+        let knobs = Knobs::default();
+        let submit = |batch_id: u64, kind: &'static str, jobs: Vec<&str>, deadline, drvs| {
+            let batch = batch::Batch {
+                jobs: jobs.iter().map(|j| (*j).to_string()).collect(),
+                root_drvs: jobs.iter().map(|j| drv(j)).collect(),
+                est_nodes: jobs.len(),
+            };
+            submit_one_batch(
+                &state,
+                &submitter,
+                live.tracker(),
+                "ssh-ng://test",
+                kind,
+                batch_id,
+                batch,
+                deadline,
+                Duration::ZERO,
+                drvs,
+            )
+        };
+        let collect = async |processed: &mut HashSet<u64>| {
+            collect_pass_with(
+                &state, &backends, &contexts, &live, &results, processed, &knobs, "leaf", "c-fold",
+                None,
+            )
+            .await
+        };
+        let build_deadline = || {
+            submitter::BatchDeadline::Build(tokio::time::Instant::now() + Duration::from_secs(60))
+        };
+
+        // Boundary 1: engine-side submission failure on a submit batch —
+        // both members re-offered within budget (+1 each).
+        submitter
+            .outcomes
+            .lock()
+            .unwrap()
+            .push(Err(anyhow::anyhow!("ssh handshake failed")));
+        submit(
+            1,
+            BATCH_KIND_SUBMIT,
+            vec![ja, jb],
+            build_deadline(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        collect(&mut processed).await.unwrap();
+        assert_fold_matches_live(&state, &live, &stall_retries, "submission failure").await;
+        assert_eq!(live.tracker().resubmission_count(ja).await, 1);
+
+        // Boundary 2: engine-cancelled submit batch — the carve-out
+        // re-offers regardless of budget (+1).
+        submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
+            engine_cancelled: true,
+            ..BatchOutcome::default()
+        }));
+        submit(2, BATCH_KIND_SUBMIT, vec![ja], build_deadline(), Vec::new())
+            .await
+            .unwrap();
+        collect(&mut processed).await.unwrap();
+        assert_fold_matches_live(&state, &live, &stall_retries, "engine-cancelled").await;
+        assert_eq!(live.tracker().resubmission_count(ja).await, 2);
+
+        // Boundary 3: dependency-failed with a trigger outside jb's closure
+        // (fail-fast batch-mate) — re-offered (+1).
+        submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into()),
+            results: vec![PathOutcome {
+                drv_path: drv(jb),
+                status: build_status_name(BuildStatus::DependencyFailed).into(),
+                error_msg: format!("dependency '{}' failed: exit code 2", drv("outside")),
+                start_time: 0,
+                stop_time: 0,
+            }],
+            ..BatchOutcome::default()
+        }));
+        submit(3, BATCH_KIND_SUBMIT, vec![jb], build_deadline(), Vec::new())
+            .await
+            .unwrap();
+        collect(&mut processed).await.unwrap();
+        assert_fold_matches_live(&state, &live, &stall_retries, "failfast batch-mate").await;
+
+        // The watchdog's stall auto-retry, applied through the production
+        // stall path (journal + increment + gate update together).
+        live.commit_batch(&[jc.to_string()]).await;
+        apply_stall_actions(
+            &state,
+            &live,
+            &contexts,
+            &results,
+            &mut stall_retries,
+            &[watchdog::StallVerdict {
+                job: jc.to_string(),
+                kind: watchdog::StallKind::ActiveStall,
+                requeues_used: 0,
+            }],
+            "leaf",
+            "c-fold",
+        )
+        .await
+        .unwrap();
+        assert_fold_matches_live(&state, &live, &stall_retries, "stall auto-retry").await;
+        assert_eq!(live.tracker().resubmission_count(jc).await, 1);
+
+        // Boundary 4: timed batch with the recorded disconnect replayed —
+        // the armed member terminalizes (interruption-replayed) and is
+        // never re-offered, so the counters must NOT move.
+        submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
+            engine_cancelled: true,
+            ..BatchOutcome::default()
+        }));
+        submit(
+            4,
+            BATCH_KIND_TIMED,
+            vec![jc],
+            submitter::BatchDeadline::DisconnectReplay(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            ),
+            vec![drv(jc)],
+        )
+        .await
+        .unwrap();
+        collect(&mut processed).await.unwrap();
+        assert_fold_matches_live(&state, &live, &stall_retries, "timed disconnect replay").await;
+        assert_eq!(
+            live.tracker().resubmission_count(jc).await,
+            1,
+            "a timed member's terminal must not count a resubmission"
+        );
+
+        // Boundary 5: timed submission failure WITHOUT a disconnect replay —
+        // members stay with the timed dispatcher; no decision, no increment.
+        submitter
+            .outcomes
+            .lock()
+            .unwrap()
+            .push(Err(anyhow::anyhow!("channel open refused")));
+        submit(5, BATCH_KIND_TIMED, vec![jd], build_deadline(), Vec::new())
+            .await
+            .unwrap();
+        collect(&mut processed).await.unwrap();
+        assert_fold_matches_live(&state, &live, &stall_retries, "timed submission failure").await;
+        assert_eq!(live.tracker().resubmission_count(jd).await, 0);
+
+        // Boundary 6: budget exhausted — ja's second submission failure
+        // terminalizes (a terminal record, not an increment).
+        submitter
+            .outcomes
+            .lock()
+            .unwrap()
+            .push(Err(anyhow::anyhow!("ssh handshake failed")));
+        submit(6, BATCH_KIND_SUBMIT, vec![ja], build_deadline(), Vec::new())
+            .await
+            .unwrap();
+        collect(&mut processed).await.unwrap();
+        assert_fold_matches_live(&state, &live, &stall_retries, "budget exhausted").await;
+        assert_eq!(live.tracker().resubmission_count(ja).await, 2);
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(
+            records[ja].verdict.as_deref(),
+            Some(Verdict::InfraIndeterminate.as_str())
+        );
+    }
+
+    /// The restart edge the journal closes: a deterministic engine-side
+    /// submission failure consumes the auto-retry budget, the pod
+    /// restarts, and the SECOND failure terminalizes — the rebuilt ledger
+    /// must carry the consumed budget across the restart instead of
+    /// granting a fresh one (which reopened the requeue→restart→requeue
+    /// spin the budget exists to close, and re-packed repeat offenders
+    /// with healthy batch-mates by zeroing singleton isolation).
+    #[tokio::test]
+    async fn retry_budget_survives_a_pod_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = "spin.x86_64-linux";
+        let drv = format!("/nix/store/{}-spin.drv", fake_hash("spin"));
+        let contexts: HashMap<String, JobContext> = [(job.to_string(), fold_ctx(job, &drv))].into();
+        let backends = || CollectBackends {
+            admin: Arc::new(NoLogsAdmin),
+            store: Arc::new(FakeStoreApi::default()),
+            artifacts: None,
+        };
+        let knobs = Knobs::default();
+        let fail_one_batch = |state: StateDir, ledger: Arc<ledger::JobLedger>, batch_id: u64| {
+            let drv = drv.clone();
+            async move {
+                let submitter = FakeSubmitter::default();
+                submitter
+                    .outcomes
+                    .lock()
+                    .unwrap()
+                    .push(Err(anyhow::anyhow!("gateway host key mismatch")));
+                submit_one_batch(
+                    &state,
+                    &submitter,
+                    ledger.tracker(),
+                    "ssh-ng://test",
+                    BATCH_KIND_SUBMIT,
+                    batch_id,
+                    batch::Batch {
+                        jobs: vec![job.to_string()],
+                        root_drvs: vec![drv],
+                        est_nodes: 1,
+                    },
+                    submitter::BatchDeadline::Build(
+                        tokio::time::Instant::now() + Duration::from_secs(60),
+                    ),
+                    Duration::ZERO,
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+            }
+        };
+
+        // Process 1: first failure consumes the single auto-retry.
+        {
+            let state = StateDir::new(dir.path()).unwrap();
+            let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(knobs.clone())));
+            let (ledger, _stalls) =
+                ledger::JobLedger::from_journals(state.clone(), watchdog).unwrap();
+            let ledger = Arc::new(ledger);
+            fail_one_batch(state.clone(), ledger.clone(), 1).await;
+            let results = tokio::sync::Mutex::new(BTreeMap::new());
+            let mut processed = HashSet::new();
+            let requeued = collect_pass_with(
+                &state,
+                &backends(),
+                &contexts,
+                &ledger,
+                &results,
+                &mut processed,
+                &knobs,
+                "leaf",
+                "c-restart",
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(requeued, 1, "first failure is re-offered within budget");
+        }
+
+        // Process 2 (pod restart): resume state exactly as the engine
+        // bootstrap rebuilds it — results from results.jsonl, the
+        // processed set from collected.json, the ledger from the requeue
+        // journal. The restart must not reset the consumed budget.
+        {
+            let state = StateDir::new(dir.path()).unwrap();
+            let watchdog = Arc::new(tokio::sync::Mutex::new(Watchdog::new(knobs.clone())));
+            let (ledger, _stalls) =
+                ledger::JobLedger::from_journals(state.clone(), watchdog).unwrap();
+            let ledger = Arc::new(ledger);
+            assert_eq!(
+                ledger.tracker().resubmission_count(job).await,
+                1,
+                "the rebuilt ledger carries the consumed budget"
+            );
+            let results = tokio::sync::Mutex::new(latest_per_job(
+                state.load_jsonl(StateFile::Results).unwrap(),
+            ));
+            let mut processed: HashSet<u64> = state
+                .read_json::<Vec<u64>>("collected.json")
+                .unwrap()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            assert!(processed.contains(&1), "batch 1 stays processed on resume");
+            fail_one_batch(state.clone(), ledger.clone(), 2).await;
+            let requeued = collect_pass_with(
+                &state,
+                &backends(),
+                &contexts,
+                &ledger,
+                &results,
+                &mut processed,
+                &knobs,
+                "leaf",
+                "c-restart",
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                requeued, 0,
+                "the post-restart failure must consume the journaled budget, not a fresh one"
+            );
+            let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+            let record = &records[job];
+            assert_eq!(
+                record.verdict.as_deref(),
+                Some(Verdict::InfraIndeterminate.as_str()),
+                "budget exhausted across the restart: terminal infra record"
+            );
+            assert_eq!(
+                record.attempts, 2,
+                "attempts accounting also survives the restart"
+            );
+        }
     }
 
     /// The poller's pause decision across scheduling modes: in timeless mode
@@ -4617,7 +5020,7 @@ mod tests {
         let results = tokio::sync::Mutex::new(BTreeMap::new());
         // Default knobs: active stall 6h, queued watchdog 2h.
         let wd = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
-        let job_ledger = ledger::JobLedger::new(tracker.clone(), wd.clone());
+        let job_ledger = ledger::JobLedger::new(state.clone(), tracker.clone(), wd.clone());
         let mut stall_retries: HashMap<String, u32> = HashMap::new();
 
         let active_job = "appB.x86_64-linux";
