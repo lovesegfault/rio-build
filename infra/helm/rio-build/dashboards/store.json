@@ -1,334 +1,812 @@
 {
-  "uid": "rio-store",
-  "title": "rio-build: Store",
-  "tags": ["rio-build", "store"],
-  "timezone": "browser",
-  "schemaVersion": 39,
-  "version": 1,
-  "refresh": "30s",
-  "time": {"from": "now-1h", "to": "now"},
-  "templating": {
-    "list": [
-      {
-        "name": "datasource",
-        "type": "datasource",
-        "query": "prometheus",
-        "current": {},
-        "hide": 0,
-        "refresh": 1
-      }
-    ]
-  },
-  "panels": [
-    {
-      "id": 1,
-      "type": "timeseries",
-      "title": "PutPath latency p50/p99",
-      "description": "rio_store_put_path_duration_seconds — end-to-end PutPath (NAR ingest + chunk + S3 + PG commit).",
-      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(rio_store_put_path_duration_seconds_bucket[5m])))",
-          "legendFormat": "p50",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(rio_store_put_path_duration_seconds_bucket[5m])))",
-          "legendFormat": "p99",
-          "refId": "B"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "none"}
-      }
-    },
-    {
-      "id": 2,
-      "type": "timeseries",
-      "title": "PG pool utilization",
-      "description": "rio_store_pg_pool_utilization — fraction of sqlx connection pool in use. Sustained > 0.9 = pool-starved; PutPath/QueryPath start queueing.",
-      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
-      "targets": [
-        {
-          "expr": "rio_store_pg_pool_utilization",
-          "legendFormat": "{{instance}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "color": {"mode": "thresholds"},
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {"color": "green", "value": null},
-              {"color": "yellow", "value": 0.7},
-              {"color": "red", "value": 0.9}
-            ]
-          },
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "desc"}
-      }
-    },
-    {
-      "id": 3,
-      "type": "timeseries",
-      "title": "PutPath retries",
-      "description": "rate(rio_store_putpath_retries_total[5m]) — serialization-conflict / transient-error retries on the PutPath path. (Metric lands in P0539d; shows No Data until then.)",
-      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 7},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
-      "targets": [
-        {
-          "expr": "sum(rate(rio_store_putpath_retries_total[5m]))",
-          "legendFormat": "retries/s",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "color": {"mode": "thresholds"},
-          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 10}]},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "single", "sort": "none"}
-      }
-    },
-    {
-      "id": 4,
-      "type": "timeseries",
-      "title": "GC sweep paths remaining",
-      "description": "rio_store_gc_sweep_paths_remaining — paths still to scan in the current GC sweep. Sawtooth = healthy; flat non-zero = sweep stuck. (Metric lands in P0539d; shows No Data until then.)",
-      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 7},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
-      "targets": [
-        {
-          "expr": "rio_store_gc_sweep_paths_remaining",
-          "legendFormat": "remaining",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "single", "sort": "none"}
-      }
-    },
-    {
-      "id": 5,
-      "type": "timeseries",
-      "title": "PutPath throughput",
-      "description": "rate(rio_store_put_path_total[1m]) and rate(rio_store_put_path_bytes_total[1m]).",
-      "gridPos": {"x": 0, "y": 15, "w": 24, "h": 7},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
-      "targets": [
-        {
-          "expr": "sum(rate(rio_store_put_path_total[1m]))",
-          "legendFormat": "paths/s",
-          "refId": "A"
-        },
-        {
-          "expr": "sum(rate(rio_store_put_path_bytes_total[1m]))",
-          "legendFormat": "bytes/s",
-          "refId": "B"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
-        },
-        "overrides": [
-          {
-            "matcher": {"id": "byName", "options": "bytes/s"},
-            "properties": [
-              {"id": "unit", "value": "Bps"},
-              {"id": "custom.axisPlacement", "value": "right"}
-            ]
-          }
-        ]
-      },
-      "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "none"}
-      }
-    },
-    {
-      "id": 6,
-      "type": "timeseries",
-      "title": "Build log ingest",
-      "description": "rate(rio_store_log_ingest_lines_total[5m]) and rate(rio_store_log_ingest_bytes_total[5m]): log lines/bytes accepted into AppendLog ingest buffers.",
-      "gridPos": {"x": 0, "y": 22, "w": 12, "h": 7},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
-      "targets": [
-        {
-          "expr": "sum(rate(rio_store_log_ingest_lines_total[5m]))",
-          "legendFormat": "lines/s",
-          "refId": "A"
-        },
-        {
-          "expr": "sum(rate(rio_store_log_ingest_bytes_total[5m]))",
-          "legendFormat": "bytes/s",
-          "refId": "B"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
-        },
-        "overrides": [
-          {
-            "matcher": {"id": "byName", "options": "bytes/s"},
-            "properties": [
-              {"id": "unit", "value": "Bps"},
-              {"id": "custom.axisPlacement", "value": "right"}
-            ]
-          }
-        ]
-      },
-      "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "none"}
-      }
-    },
-    {
-      "id": 7,
-      "type": "timeseries",
-      "title": "Build log chunks",
-      "description": "Chunk commits vs failed cut attempts vs TTL-sweep deletions. Sustained write failures = log durability degraded (the builders' retransmit buffers are absorbing it); see RioLogChunkWriteFailures.",
-      "gridPos": {"x": 12, "y": 22, "w": 12, "h": 7},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
-      "targets": [
-        {
-          "expr": "sum(rate(rio_store_log_chunks_written_total[5m]))",
-          "legendFormat": "written/s",
-          "refId": "A"
-        },
-        {
-          "expr": "sum(rate(rio_store_log_chunk_write_failures_total[5m]))",
-          "legendFormat": "write failures/s",
-          "refId": "B"
-        },
-        {
-          "expr": "sum(rate(rio_store_log_sweep_objects_deleted_total[5m]))",
-          "legendFormat": "swept/s",
-          "refId": "C"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "none"}
-      }
-    },
-    {
-      "id": 8,
-      "type": "timeseries",
-      "title": "Build log sessions and tails",
-      "description": "Active AppendLog ingest sessions and live TailLog subscribers, plus the fan-out drop rate (lossy by contract; readers recover from the manifest on reconnect).",
-      "gridPos": {"x": 0, "y": 29, "w": 12, "h": 7},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
-      "targets": [
-        {
-          "expr": "sum(rio_store_log_active_ingest_sessions)",
-          "legendFormat": "ingest sessions",
-          "refId": "A"
-        },
-        {
-          "expr": "sum(rio_store_log_tail_subscribers)",
-          "legendFormat": "tail subscribers",
-          "refId": "B"
-        },
-        {
-          "expr": "sum(rate(rio_store_log_tail_dropped_total[5m]))",
-          "legendFormat": "tail drops/s",
-          "refId": "C"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "none"}
-      }
-    },
-    {
-      "id": 9,
-      "type": "timeseries",
-      "title": "Build log tail proxy",
-      "description": "Cross-replica TailLog relays (a reader landed on a replica that does not hold the live ingest session). Failures degrade the reader to the history-only view; sustained failures with healthy replicas mean log_peer_url_template does not match the Service topology.",
-      "gridPos": {"x": 12, "y": 29, "w": 12, "h": 7},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
-      "targets": [
-        {
-          "expr": "sum(rate(rio_store_log_tail_proxied_total[5m]))",
-          "legendFormat": "proxied/s",
-          "refId": "A"
-        },
-        {
-          "expr": "sum(rate(rio_store_log_tail_proxy_failures_total[5m]))",
-          "legendFormat": "failures/s",
-          "refId": "B"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "multi", "sort": "none"}
-      }
-    }
+ "uid": "rio-store",
+ "title": "rio-build: Store",
+ "tags": [
+  "rio-build",
+  "store"
+ ],
+ "timezone": "browser",
+ "schemaVersion": 39,
+ "version": 1,
+ "refresh": "30s",
+ "time": {
+  "from": "now-1h",
+  "to": "now"
+ },
+ "templating": {
+  "list": [
+   {
+    "name": "datasource",
+    "type": "datasource",
+    "query": "prometheus",
+    "current": {},
+    "hide": 0,
+    "refresh": 1
+   }
   ]
+ },
+ "panels": [
+  {
+   "id": 1,
+   "type": "timeseries",
+   "title": "PutPath latency p50/p99",
+   "description": "rio_store_put_path_duration_seconds \u2014 end-to-end PutPath (NAR ingest + chunk + S3 + PG commit).",
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(rio_store_put_path_duration_seconds_bucket[5m])))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(rio_store_put_path_duration_seconds_bucket[5m])))",
+     "legendFormat": "p99",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "spanNulls": false
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "id": 2,
+   "type": "timeseries",
+   "title": "PG pool utilization",
+   "description": "rio_store_pg_pool_utilization \u2014 fraction of sqlx connection pool in use. Sustained > 0.9 = pool-starved; PutPath/QueryPath start queueing.",
+   "gridPos": {
+    "x": 12,
+    "y": 0,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "targets": [
+    {
+     "expr": "rio_store_pg_pool_utilization",
+     "legendFormat": "{{instance}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "min": 0,
+     "max": 1,
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 0.7
+       },
+       {
+        "color": "red",
+        "value": 0.9
+       }
+      ]
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 20,
+      "spanNulls": false
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 3,
+   "type": "timeseries",
+   "title": "PutPath retries",
+   "description": "rate(rio_store_putpath_retries_total[5m]) \u2014 serialization-conflict / transient-error retries on the PutPath path. (Metric lands in P0539d; shows No Data until then.)",
+   "gridPos": {
+    "x": 0,
+    "y": 8,
+    "w": 12,
+    "h": 7
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(rio_store_putpath_retries_total[5m]))",
+     "legendFormat": "retries/s",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 1
+       },
+       {
+        "color": "red",
+        "value": 10
+       }
+      ]
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 20,
+      "spanNulls": false
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "single",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "id": 4,
+   "type": "timeseries",
+   "title": "GC sweep paths remaining",
+   "description": "rio_store_gc_sweep_paths_remaining \u2014 paths still to scan in the current GC sweep. Sawtooth = healthy; flat non-zero = sweep stuck. (Metric lands in P0539d; shows No Data until then.)",
+   "gridPos": {
+    "x": 12,
+    "y": 8,
+    "w": 12,
+    "h": 7
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "targets": [
+    {
+     "expr": "rio_store_gc_sweep_paths_remaining",
+     "legendFormat": "remaining",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 20,
+      "spanNulls": false
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "single",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "id": 5,
+   "type": "timeseries",
+   "title": "PutPath throughput",
+   "description": "rate(rio_store_put_path_total[1m]) and rate(rio_store_put_path_bytes_total[1m]).",
+   "gridPos": {
+    "x": 0,
+    "y": 15,
+    "w": 24,
+    "h": 7
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(rio_store_put_path_total[1m]))",
+     "legendFormat": "paths/s",
+     "refId": "A"
+    },
+    {
+     "expr": "sum(rate(rio_store_put_path_bytes_total[1m]))",
+     "legendFormat": "bytes/s",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "spanNulls": false
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "bytes/s"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "Bps"
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "right"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "id": 6,
+   "type": "timeseries",
+   "title": "Build log ingest",
+   "description": "rate(rio_store_log_ingest_lines_total[5m]) and rate(rio_store_log_ingest_bytes_total[5m]): log lines/bytes accepted into AppendLog ingest buffers.",
+   "gridPos": {
+    "x": 0,
+    "y": 22,
+    "w": 12,
+    "h": 7
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(rio_store_log_ingest_lines_total[5m]))",
+     "legendFormat": "lines/s",
+     "refId": "A"
+    },
+    {
+     "expr": "sum(rate(rio_store_log_ingest_bytes_total[5m]))",
+     "legendFormat": "bytes/s",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "spanNulls": false
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "bytes/s"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "Bps"
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "right"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "id": 7,
+   "type": "timeseries",
+   "title": "Build log chunks",
+   "description": "Chunk commits vs failed cut attempts vs TTL-sweep deletions. Sustained write failures = log durability degraded (the builders' retransmit buffers are absorbing it); see RioLogChunkWriteFailures.",
+   "gridPos": {
+    "x": 12,
+    "y": 22,
+    "w": 12,
+    "h": 7
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(rio_store_log_chunks_written_total[5m]))",
+     "legendFormat": "written/s",
+     "refId": "A"
+    },
+    {
+     "expr": "sum(rate(rio_store_log_chunk_write_failures_total[5m]))",
+     "legendFormat": "write failures/s",
+     "refId": "B"
+    },
+    {
+     "expr": "sum(rate(rio_store_log_sweep_objects_deleted_total[5m]))",
+     "legendFormat": "swept/s",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "spanNulls": false
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "id": 8,
+   "type": "timeseries",
+   "title": "Build log sessions and tails",
+   "description": "Active AppendLog ingest sessions and live TailLog subscribers, plus the fan-out drop rate (lossy by contract; readers recover from the manifest on reconnect).",
+   "gridPos": {
+    "x": 0,
+    "y": 29,
+    "w": 12,
+    "h": 7
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "targets": [
+    {
+     "expr": "sum(rio_store_log_active_ingest_sessions)",
+     "legendFormat": "ingest sessions",
+     "refId": "A"
+    },
+    {
+     "expr": "sum(rio_store_log_tail_subscribers)",
+     "legendFormat": "tail subscribers",
+     "refId": "B"
+    },
+    {
+     "expr": "sum(rate(rio_store_log_tail_dropped_total[5m]))",
+     "legendFormat": "tail drops/s",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "spanNulls": false
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "id": 9,
+   "type": "timeseries",
+   "title": "Build log tail proxy",
+   "description": "Cross-replica TailLog relays (a reader landed on a replica that does not hold the live ingest session). Failures degrade the reader to the history-only view; sustained failures with healthy replicas mean log_peer_url_template does not match the Service topology.",
+   "gridPos": {
+    "x": 12,
+    "y": 29,
+    "w": 12,
+    "h": 7
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(rio_store_log_tail_proxied_total[5m]))",
+     "legendFormat": "proxied/s",
+     "refId": "A"
+    },
+    {
+     "expr": "sum(rate(rio_store_log_tail_proxy_failures_total[5m]))",
+     "legendFormat": "failures/s",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "spanNulls": false
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "id": 20,
+   "type": "row",
+   "title": "Store scaling (decision 5)",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 36,
+    "w": 24,
+    "h": 1
+   }
+  },
+  {
+   "id": 21,
+   "type": "timeseries",
+   "title": "Backlog vs replicas",
+   "description": "The KEDA loop end to end: rio_scheduler_substituting_derivations (the leading trigger's query) vs the ScaledObject-managed HPA's desired count vs ready store replicas. Healthy shape: backlog spikes at merge time, desired follows within one 30s KEDA poll, ready follows within node-provisioning latency (~1-4min), no scale-down before the 1800s stabilization window. P10's reaction-time observation reads this panel.",
+   "gridPos": {
+    "x": 0,
+    "y": 37,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "targets": [
+    {
+     "expr": "sum(rio_scheduler_substituting_derivations)",
+     "legendFormat": "backlog (derivations)",
+     "refId": "A"
+    },
+    {
+     "expr": "kube_horizontalpodautoscaler_status_desired_replicas{namespace=\"rio-store\", horizontalpodautoscaler=\"keda-hpa-rio-store\"}",
+     "legendFormat": "desired replicas",
+     "refId": "B"
+    },
+    {
+     "expr": "kube_deployment_status_replicas_ready{namespace=\"rio-store\", deployment=\"rio-store\"}",
+     "legendFormat": "ready replicas",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "spanNulls": false
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "id": 22,
+   "type": "timeseries",
+   "title": "Per-replica bytes: the three load classes",
+   "description": "Decision 5's load model side by side, per pod: substitution ingest (upstream->store, class 1), served read bytes (store->builder, class 2), PutPath ingest (builder->store, class 3). All three share the pod NIC/memory/PG pool - this panel shows which class is driving load and whether the one-per-node spread is keeping per-replica volume balanced. Calibrates targetBacklogPathsPerReplica / targetBuildersPerReplica from the warm-phase capture.",
+   "gridPos": {
+    "x": 12,
+    "y": 37,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "targets": [
+    {
+     "expr": "sum by (pod) (rate(rio_store_substitute_bytes_total[5m]))",
+     "legendFormat": "substitute {{pod}}",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (pod) (rate(rio_store_get_path_bytes_total[5m]))",
+     "legendFormat": "served {{pod}}",
+     "refId": "B"
+    },
+    {
+     "expr": "sum by (pod) (rate(rio_store_put_path_bytes_total[5m]))",
+     "legendFormat": "putpath {{pod}}",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "spanNulls": false
+     },
+     "unit": "Bps"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "id": 23,
+   "type": "timeseries",
+   "title": "Per-replica CPU",
+   "description": "Container CPU per store pod (cores). The ScaledObject's reactive trigger fires at 70% average utilization of the pod request - sustained saturation here with a flat backlog means the static ratios under-provision and the corrective term is doing the scaling (re-tune the targets).",
+   "gridPos": {
+    "x": 0,
+    "y": 45,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "targets": [
+    {
+     "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"rio-store\", pod=~\"rio-store-.*\", container=\"store\"}[5m]))",
+     "legendFormat": "{{pod}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "spanNulls": false
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  },
+  {
+   "id": 24,
+   "type": "timeseries",
+   "title": "Per-replica network throughput",
+   "description": "cadvisor network bytes per store pod. The placement premise: one replica per node means N replicas = N NICs. If per-pod throughput plateaus near the instance type's BASELINE (not burst) bandwidth while CPU stays under the trigger, network saturates first - add the per-pod network prometheus trigger (the documented follow-up).",
+   "gridPos": {
+    "x": 12,
+    "y": 45,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "targets": [
+    {
+     "expr": "sum by (pod) (rate(container_network_receive_bytes_total{namespace=\"rio-store\", pod=~\"rio-store-.*\"}[5m]))",
+     "legendFormat": "rx {{pod}}",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (pod) (rate(container_network_transmit_bytes_total{namespace=\"rio-store\", pod=~\"rio-store-.*\"}[5m]))",
+     "legendFormat": "tx {{pod}}",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "spanNulls": false
+     },
+     "unit": "Bps"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none"
+    }
+   }
+  }
+ ]
 }

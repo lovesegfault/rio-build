@@ -22,14 +22,35 @@ rio_controller_scaling_decisions_total:direction
 rio_controller_reconcile_duration_seconds_bucket:reconciler
 rio_controller_reconcile_errors_total:reconciler
 rio_controller_reconcile_errors_total:error_kind
-rio_controller_component_scaler_desired_replicas:cs
-rio_controller_component_scaler_learned_ratio:cs
-rio_controller_component_scaler_observed_load:cs
 rio_scheduler_builds_total:outcome
 rio_scheduler_actor_cmd_seconds_bucket:cmd
 rio_scheduler_materialization_jobs_resolved_total:outcome
 rio_store_materialization_executions_total:outcome
+rio_store_substitute_bytes_total:pod
+rio_store_get_path_bytes_total:pod
+rio_store_put_path_bytes_total:pod
+kube_horizontalpodautoscaler_status_desired_replicas:namespace
+kube_horizontalpodautoscaler_status_desired_replicas:horizontalpodautoscaler
+kube_deployment_status_replicas_ready:namespace
+kube_deployment_status_replicas_ready:deployment
+container_cpu_usage_seconds_total:namespace
+container_cpu_usage_seconds_total:pod
+container_cpu_usage_seconds_total:container
+container_network_receive_bytes_total:namespace
+container_network_receive_bytes_total:pod
+container_network_transmit_bytes_total:namespace
+container_network_transmit_bytes_total:pod
 '
+# Provenance of the non-rio entries (Store-scaling row, decision 5):
+# `pod` on rio_store_*_bytes_total is the prometheus-operator target
+# label (ServiceMonitor discovery), not an emission-site label —
+# per-replica balance is the thing the panels exist to show.
+# kube_* come from kube-state-metrics and container_* from cadvisor,
+# both shipped by the kube-prometheus-stack reference deploy
+# (infra/eks/monitoring.tf); `keda-hpa-rio-store` is KEDA's managed-HPA
+# naming convention for the rio-store ScaledObject.
+# (The rio_controller_component_scaler_* entries left with the
+# retired ComponentScaler dashboard.)
 
 scratch=$TMPDIR/dashlabels
 rm -rf "$scratch"
