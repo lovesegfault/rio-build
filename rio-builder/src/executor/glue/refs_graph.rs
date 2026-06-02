@@ -116,16 +116,20 @@ impl<'a> ClosureIndex<'a> {
         info.references.iter().map(|r| r.as_str())
     }
 
-    /// The closure of `targets` (BFS over references), all of which must
-    /// lie inside the build's input closure. Returned sorted (store-path
-    /// order), which is also the order CppNix's `StorePathSet` iterates.
-    ///
-    /// All graph traversal is delegated to [`rio_nix::closure`]
-    /// (cycle-safe by construction); this function owns only the
-    /// CppNix-mirroring policy: target normalization, the input-closure
-    /// containment gate, `.drv` output expansion, and the fail-closed
-    /// cycle rejection.
-    fn closure_of(&self, targets: &[String]) -> Result<BTreeSet<&'a str>, GlueError> {
+    /// Phase 1 of the graph materialization: the reference closure of
+    /// `targets` — CppNix `toStorePath()` normalization, the
+    /// input-closure containment gate, and the BFS over references.
+    /// This is the SHARED walk: [`closure_of`](Self::closure_of) (the
+    /// glue's expansion consumer) builds on its result, and
+    /// [`DrvTextDemand::from_declaration`] (the input resolver's demand
+    /// producer) reads exactly its `.drv` members — one function, so
+    /// the producer and the consumer cannot diverge on which paths a
+    /// declaration reaches.
+    // r[impl builder.glue.drv-table-demand]
+    fn reference_closure_of(
+        &self,
+        targets: &[String],
+    ) -> Result<rio_nix::closure::ClosureSet<'a>, GlueError> {
         let mut set = rio_nix::closure::ClosureSet::new();
 
         // CppNix normalizes each target with `toStorePath()` before the
@@ -148,6 +152,20 @@ impl<'a> ClosureIndex<'a> {
             Some(info) => Ok(Self::refs_of_known(info)),
             None => Err(GlueError::ExportRefsMissingMetadata { path: p.to_owned() }),
         })?;
+        Ok(set)
+    }
+
+    /// The closure of `targets` (BFS over references), all of which must
+    /// lie inside the build's input closure. Returned sorted (store-path
+    /// order), which is also the order CppNix's `StorePathSet` iterates.
+    ///
+    /// All graph traversal is delegated to [`rio_nix::closure`]
+    /// (cycle-safe by construction); this function owns only the
+    /// CppNix-mirroring policy: target normalization, the input-closure
+    /// containment gate, `.drv` output expansion, and the fail-closed
+    /// cycle rejection.
+    fn closure_of(&self, targets: &[String]) -> Result<BTreeSet<&'a str>, GlueError> {
+        let mut set = self.reference_closure_of(targets)?;
 
         // CppNix (`LocalDerivationGoal::exportReferences`) post-processes
         // the closure: every `.drv` file in it is parsed and the closure
@@ -395,6 +413,103 @@ pub(crate) fn parse_flat_export_refs(value: &str) -> Result<Vec<(String, String)
             Ok((c[0].to_owned(), c[1].to_owned()))
         })
         .collect()
+}
+
+/// The set of `.drv` texts the request glue's `exportReferencesGraph`
+/// expansion will read for THIS build — derived from the build's own
+/// declaration, which is the only demand origin (the glue's `.drv`
+/// expansion only ever parses `.drv` members of a declared graph's
+/// reference closure; see [`ClosureIndex::closure_of`]).
+///
+/// [`DrvTextDemand::from_declaration`] is the ONLY constructor: a
+/// resolver consuming this type structurally cannot fetch derivation
+/// texts the glue has no reader for, and "no declaration ⇒ zero
+/// graph-purpose fetches at any closure depth" is a type fact, not a
+/// heuristic.
+// r[impl builder.glue.drv-table-demand]
+#[derive(Debug)]
+// First production consumer (`inputs::fetch_demanded_graph_drvs`)
+// lands in the next commit; the allow goes with it.
+#[allow(dead_code)]
+pub(crate) struct DrvTextDemand {
+    paths: BTreeSet<String>,
+}
+
+#[allow(dead_code)] // see struct note: consumer lands next commit
+impl DrvTextDemand {
+    /// Derive the demand from the derivation's declaration (both forms:
+    /// the flat `exportReferencesGraph` env value and the
+    /// structured-attrs `__json` object), walking each declared graph
+    /// with the SAME `reference_closure_of` the glue's expansion uses.
+    ///
+    /// Per-graph failures contribute NO demand, deliberately: a
+    /// malformed declaration, an out-of-closure target, or missing
+    /// metadata is the GLUE's rejection to make, with its canonical
+    /// `GlueError` — the demand model neither duplicates that error
+    /// nor pre-empts it with a resolver-flavored one. The build still
+    /// fails identically; it just fails in the component that owns the
+    /// message. (A demand miss can also never manifest as a missing
+    /// table entry at expansion time for a VALID graph: validity
+    /// implies the same walk succeeds here.)
+    pub(crate) fn from_declaration(
+        drv: &impl rio_nix::derivation::DerivationLike,
+        index: &ClosureIndex<'_>,
+    ) -> Self {
+        let mut paths = BTreeSet::new();
+
+        // Graph target lists, by declaration form. Mirrors the glue's
+        // dispatch in `prepare_request`: structured-attrs builds read
+        // the `__json` object's `exportReferencesGraph` (values
+        // flattened recursively, oracle `flatten`), flat builds read
+        // the alternating `name path` env value.
+        let mut target_lists: Vec<Vec<String>> = Vec::new();
+        if let Some(json_text) = drv.env().get("__json") {
+            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(json_text)
+                && let Some(Value::Object(erg)) = map.get("exportReferencesGraph")
+            {
+                for val in erg.values() {
+                    let mut set = std::collections::BTreeSet::new();
+                    if rio_nix::derivation::typed::flatten_strings(val, &mut set).is_ok() {
+                        target_lists.push(set.into_iter().collect());
+                    }
+                }
+            }
+        } else if let Some(flat) = drv.env().get("exportReferencesGraph")
+            && let Ok(pairs) = parse_flat_export_refs(flat)
+        {
+            for (_, target) in pairs {
+                target_lists.push(vec![target]);
+            }
+        }
+
+        for targets in target_lists {
+            if let Ok(set) = index.reference_closure_of(&targets) {
+                paths.extend(
+                    set.members()
+                        .filter(|p| p.ends_with(".drv"))
+                        .map(str::to_owned),
+                );
+            }
+        }
+
+        Self { paths }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    pub(crate) fn contains(&self, path: &str) -> bool {
+        self.paths.contains(path)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &str> {
+        self.paths.iter().map(String::as_str)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.paths.len()
+    }
 }
 
 #[cfg(test)]
@@ -917,5 +1032,161 @@ mod tests {
                 "{bad:?} must be rejected"
             );
         }
+    }
+
+    // ───────────────────── DrvTextDemand (C9c1) ─────────────────────
+
+    /// Helper: a BasicDerivation with the given env (the demand model
+    /// only reads env + the shared walk).
+    fn demand_drv(env: &[(&str, &str)]) -> rio_nix::derivation::BasicDerivation {
+        rio_nix::derivation::BasicDerivation::new(
+            vec![
+                rio_nix::derivation::DerivationOutput::new(
+                    "out",
+                    "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-demand-out",
+                    "",
+                    "",
+                )
+                .unwrap(),
+            ],
+            std::collections::BTreeSet::new(),
+            "x86_64-linux".into(),
+            "/bin/sh".into(),
+            vec![],
+            env.iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    const D1: &str = "/nix/store/d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1-one.drv";
+    const D2: &str = "/nix/store/d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2-two.drv";
+    const D3: &str = "/nix/store/d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3-three.drv";
+
+    /// A 3-deep .drv chain in the input closure: D1 → D2 → D3, with a
+    /// plain source S hanging off D3.
+    fn drv_chain_fixture() -> (Vec<ValidatedPathInfo>, Vec<String>) {
+        let infos = vec![
+            info(D1, 10, &[D2]),
+            info(D2, 10, &[D3]),
+            info(D3, 10, &[C]),
+            info(C, 40, &[]),
+        ];
+        let paths = vec![
+            D1.to_string(),
+            D2.to_string(),
+            D3.to_string(),
+            C.to_string(),
+        ];
+        (infos, paths)
+    }
+
+    /// "No declaration ⇒ zero graph-purpose fetches at any depth" is a
+    /// type fact: with a 3-deep .drv chain in the closure and NO
+    /// exportReferencesGraph declaration, the demand is empty.
+    // r[verify builder.glue.drv-table-demand]
+    #[test]
+    fn demand_empty_without_declaration_at_depth_3() {
+        let (infos, paths) = drv_chain_fixture();
+        let index = ClosureIndex::new(&infos, &paths);
+        let drv = demand_drv(&[("name", "x")]);
+        let demand = DrvTextDemand::from_declaration(&drv, &index);
+        assert!(demand.is_empty(), "no declaration, no demand: {demand:?}");
+    }
+
+    /// A .drv graph target demands exactly its transitive .drv closure
+    /// — every member the glue's expansion will parse, nothing else
+    /// (the plain source C is in the walk but is not a .drv).
+    // r[verify builder.glue.drv-table-demand]
+    #[test]
+    fn drv_target_demands_its_transitive_drv_closure_exactly() {
+        let (infos, paths) = drv_chain_fixture();
+        let index = ClosureIndex::new(&infos, &paths);
+        let drv = demand_drv(&[("exportReferencesGraph", &format!("graph {D1}"))]);
+        let demand = DrvTextDemand::from_declaration(&drv, &index);
+        let got: Vec<&str> = demand.iter().collect();
+        assert_eq!(got, vec![D1, D2, D3], "exact transitive .drv closure");
+        assert!(!demand.contains(C), "non-.drv members are not demanded");
+    }
+
+    /// CppNix snapshot lockstep: a .drv that appears only inside an
+    /// expanded OUTPUT closure is not itself expanded by the glue
+    /// (the expansion runs over a snapshot), so the demand model must
+    /// not demand its text either — producer and consumer agree
+    /// because they share the same phase-1 walk.
+    // r[verify builder.glue.drv-table-demand]
+    #[test]
+    fn output_expansion_drvs_are_not_demanded() {
+        // Graph target D1 (a .drv) whose OUTPUT's closure contains D2.
+        // Phase 1 reaches only D1 + its refs (none). The output
+        // closure (B → D2) is expansion territory: D2's text is read
+        // never — the snapshot rule — so it must not be demanded.
+        let out_path = B;
+        let infos = vec![
+            info(D1, 10, &[]),
+            info(out_path, 20, &[D2]),
+            info(D2, 10, &[]),
+        ];
+        let paths = vec![D1.to_string(), out_path.to_string(), D2.to_string()];
+        let index = ClosureIndex::new(&infos, &paths);
+        let drv = demand_drv(&[("exportReferencesGraph", &format!("graph {D1}"))]);
+        let demand = DrvTextDemand::from_declaration(&drv, &index);
+        let got: Vec<&str> = demand.iter().collect();
+        assert_eq!(got, vec![D1], "only the phase-1 .drv member");
+        assert!(
+            !demand.contains(D2),
+            "output-closure .drvs are never parsed by the glue (snapshot \
+             rule) and therefore never demanded"
+        );
+    }
+
+    /// The structured-attrs and flat declarations of the same graphs
+    /// produce identical demand.
+    // r[verify builder.glue.drv-table-demand]
+    #[test]
+    fn structured_and_flat_declarations_demand_identically() {
+        let (infos, paths) = drv_chain_fixture();
+        let index = ClosureIndex::new(&infos, &paths);
+
+        let flat = demand_drv(&[("exportReferencesGraph", &format!("g {D2}"))]);
+        let flat_demand = DrvTextDemand::from_declaration(&flat, &index);
+
+        let json = format!(r#"{{"exportReferencesGraph":{{"g":["{D2}"]}}}}"#);
+        let structured = demand_drv(&[("__json", &json)]);
+        let structured_demand = DrvTextDemand::from_declaration(&structured, &index);
+
+        let f: Vec<&str> = flat_demand.iter().collect();
+        let s: Vec<&str> = structured_demand.iter().collect();
+        assert_eq!(f, s, "both forms walk the same closure");
+        assert_eq!(f, vec![D2, D3]);
+    }
+
+    /// Canonical-error ordering: a malformed declaration (or an
+    /// out-of-closure target) contributes NO demand — and the GLUE
+    /// still rejects with its canonical error when it runs. The demand
+    /// model never pre-empts the glue's message with a resolver-
+    /// flavored one.
+    // r[verify builder.glue.drv-table-demand]
+    #[test]
+    fn invalid_graphs_contribute_no_demand_and_glue_owns_the_error() {
+        let (infos, paths) = drv_chain_fixture();
+        let index = ClosureIndex::new(&infos, &paths);
+
+        // Malformed flat value (odd word count).
+        let malformed = demand_drv(&[("exportReferencesGraph", "lonely-name")]);
+        assert!(DrvTextDemand::from_declaration(&malformed, &index).is_empty());
+        let glue_err = parse_flat_export_refs("lonely-name").unwrap_err();
+        assert!(matches!(glue_err, GlueError::ExportRefsMalformed { .. }));
+
+        // Out-of-closure target: no demand; the glue's walk raises the
+        // canonical containment error.
+        let outside = demand_drv(&[("exportReferencesGraph", &format!("g {OUTSIDE}"))]);
+        assert!(DrvTextDemand::from_declaration(&outside, &index).is_empty());
+        let glue_err = index.registration_text(&[OUTSIDE.to_string()]).unwrap_err();
+        assert!(
+            matches!(glue_err, GlueError::ExportRefsOutsideClosure { .. }),
+            "{glue_err}"
+        );
     }
 }

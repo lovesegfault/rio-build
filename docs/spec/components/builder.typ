@@ -623,10 +623,26 @@ glue runs on the blocking pool as pure CPU (parse + closure walk +
 serialization), and a future glue change *cannot* reintroduce a FUSE-backed
 read because there is no store directory, no path join, and no `std::fs`
 call to reach for --- the `ClosureIndex` consumes a caller-supplied
-derivation-text table. The table costs no extra fetches: input resolution
-already fetched the main `.drv` and every input `.drv`; their texts are
-retained, and only residual closure `.drv`s (typically none) are fetched
-through the same deadline-bounded machinery.
+derivation-text table. The table is the retained input-drv texts plus the
+declaration-derived demand below; the original "residual closure `.drv`s
+(typically none)" premise was structurally false --- by the text-CA
+invariant every transitive `.drv` is in the input closure, so for deep
+dependency chains the residual was the entire transitive `.drv` closure,
+re-fetched on every build whether or not anything would read it (the
+I-110 amplification shape).
+
+#r("builder.glue.drv-table-demand")[
+  The derivation texts fetched for the glue's table MUST be exactly the
+  demand derived from the build's own `exportReferencesGraph`
+  declaration --- the only demand origin, since the glue's `.drv`
+  expansion only ever parses `.drv` members of a declared graph's
+  reference closure. The demand MUST be derived with the SAME
+  reference-closure walk the glue's expansion uses, so the producer and
+  the consumer cannot diverge; a build with no declaration incurs zero
+  graph-purpose `.drv` fetches at any closure depth. A declaration the
+  glue would reject contributes no demand: the glue owns the canonical
+  rejection, and the demand model neither duplicates nor pre-empts it.
+]
 
 #r("builder.exec.refs-graph-acyclic")[
   `exportReferencesGraph` materialization MUST terminate with auxiliary
