@@ -75,6 +75,68 @@ fn sign_claims_fod(executor_id: &str, outputs: Vec<String>, expiry_offset_secs: 
 // Enforcement ON + no token → reject
 // ---------------------------------------------------------------------------
 
+/// Mint a leaf IA deriver (CppNix-shape: declared == derived) and
+/// ingest it under an assignment token (a `.drv` upload is exempt from
+/// the IA proof gate — the text-CA gate owns it — but must still pass
+/// membership). Returns `(deriver_drv_path, derived_out_path)` so
+/// callers can claim a path the STORE can prove belongs to the deriver
+/// (`store.put.ia-deriver-proof`).
+async fn stage_ia_deriver(
+    client: &mut StoreServiceClient<Channel>,
+    tag: &str,
+) -> anyhow::Result<(String, String)> {
+    use rio_nix::derivation::{Derivation, input_addressed_output_paths};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+
+    let build = |out: &str| {
+        format!(
+            r#"Derive([("out","{out}","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","{tag}"),("out","{out}")])"#
+        )
+    };
+    let masked = Derivation::parse(&build("")).unwrap();
+    let name_only = format!("/nix/store/{}-{tag}.drv", "a".repeat(32));
+    let none = |_: &str| -> Option<&Derivation> { None };
+    let paths =
+        input_addressed_output_paths(&masked, &name_only, &none, &mut Default::default()).unwrap();
+    let out = paths["out"].as_str().to_owned();
+    let aterm = build(&out);
+    let h = NixHash::new(HashAlgo::SHA256, Sha256::digest(aterm.as_bytes()).to_vec()).unwrap();
+    let drv_path = StorePath::make_text(&format!("{tag}.drv"), &h, &[])
+        .unwrap()
+        .as_str()
+        .to_owned();
+
+    let node = rio_nix::nar::NarNode::Regular {
+        executable: false,
+        contents: aterm.into_bytes(),
+    };
+    let mut nar = Vec::new();
+    rio_nix::nar::serialize(&mut nar, &node)?;
+    let info = make_path_info_for_nar(&drv_path, &nar);
+    let token = sign_claims(vec![drv_path.clone()], 60);
+    anyhow::ensure!(
+        put_path_with_token(client, info, nar, &token).await?,
+        "deriver ingested"
+    );
+    Ok((drv_path, out))
+}
+
+/// Sign claims naming a REAL deriver (post-proof-gate IA staging).
+fn sign_claims_for_deriver(deriver: &str, outputs: Vec<String>, expiry_offset_secs: i64) -> String {
+    let claims = AssignmentClaims {
+        executor_id: "w-test".into(),
+        drv_hash: deriver.into(),
+        expected_outputs: outputs,
+        expiry_unix: (now_unix() as i64 + expiry_offset_secs) as u64,
+        is_ca: false,
+        is_fixed_output: false,
+        tenant: None,
+    };
+    HmacSigner::from_key(TEST_KEY.to_vec()).sign(&claims)
+}
+
 fn sign_service(caller: &str, expiry_offset_secs: i64) -> String {
     let claims = ServiceClaims {
         caller: caller.into(),
@@ -152,7 +214,7 @@ async fn service_token_wrong_caller_rejected() -> TestResult {
     .await
     .expect_err("non-allowlisted caller should be rejected");
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
-    assert!(err.message().contains("not in allowlist"));
+    assert!(err.message().contains("no bypass for this method"));
     Ok(())
 }
 
@@ -213,15 +275,19 @@ async fn hmac_no_token_rejected() -> TestResult {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+// r[verify store.put.ia-deriver-proof]
 async fn hmac_valid_token_accepted() -> TestResult {
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
 
-    let path = test_store_path("hmac-valid");
+    // The legit IA flow: the deriver is store-resident and the claimed
+    // path is one the STORE derives from it.
+    let (deriver, path) = stage_ia_deriver(&mut s.client, "hmac-valid").await?;
     let (nar, _) = make_nar(b"authorized upload");
     let info = make_path_info_for_nar(&path, &nar);
 
-    // Token lists the exact path we're uploading.
-    let token = sign_claims(vec![path.clone()], 60);
+    // Token lists the exact path we're uploading, signed for the
+    // resident deriver.
+    let token = sign_claims_for_deriver(&deriver, vec![path.clone()], 60);
 
     let created = put_path_with_token(&mut s.client, info, nar, &token)
         .await
@@ -435,8 +501,10 @@ async fn hmac_is_ca_wrong_path_leaves_no_placeholder() -> TestResult {
     let mut attacker = s.client.clone();
     let mut victim = s.client.clone();
 
-    // Victim's IA path the attacker wants to squat.
-    let victim_path = test_store_path("victim-glibc-2.40");
+    // Victim's IA path the attacker wants to squat (deriver resident
+    // so the victim's own upload passes the proof gate).
+    let mut staging = s.client.clone();
+    let (victim_deriver, victim_path) = stage_ia_deriver(&mut staging, "victim-glibc").await?;
     let (victim_nar, _) = make_nar(b"legitimate glibc");
     let victim_info = make_path_info_for_nar(&victim_path, &victim_nar);
 
@@ -484,7 +552,7 @@ async fn hmac_is_ca_wrong_path_leaves_no_placeholder() -> TestResult {
 
     // Victim's legitimate IA upload (token lists victim_path) MUST
     // succeed — pre-fix it got `Aborted: concurrent PutPath`.
-    let vtoken = sign_claims(vec![victim_path.clone()], 60);
+    let vtoken = sign_claims_for_deriver(&victim_deriver, vec![victim_path.clone()], 60);
     let created = put_path_with_token(&mut victim, victim_info, victim_nar, &vtoken)
         .await
         .context("victim upload while attacker stream held open")?;
@@ -934,13 +1002,13 @@ async fn hmac_store_path_hash_mismatch_ignored() -> TestResult {
 
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
 
-    let path_a = test_store_path("hmac-hashforge-a");
+    let (deriver_a, path_a) = stage_ia_deriver(&mut s.client, "hmac-hashforge-a").await?;
     let path_b = test_store_path("hmac-hashforge-b");
     let (nar, _) = make_nar(b"authorized payload for A");
     let info = make_path_info_for_nar(&path_a, &nar);
 
     // Token authorizes path A only.
-    let token = sign_claims(vec![path_a.clone()], 60);
+    let token = sign_claims_for_deriver(&deriver_a, vec![path_a.clone()], 60);
 
     // Forge: store_path=A (passes HMAC) but store_path_hash=sha256(B).
     let mut raw: PathInfo = info.into();
@@ -1004,5 +1072,138 @@ async fn hmac_store_path_hash_mismatch_ignored() -> TestResult {
         "A keyed under its own server-derived hash"
     );
 
+    Ok(())
+}
+
+// r[verify store.put.ia-deriver-proof]
+/// THE forged-claims kill test (compromised-scheduler simulation): a
+/// VALIDLY SIGNED token whose expected_outputs (membership) include the
+/// victim's path, naming a resident deriver that does NOT derive it —
+/// the store's own bytes refuse what the signature alone would allow.
+#[tokio::test]
+async fn ia_proof_rejects_membership_passing_underivable_path() -> TestResult {
+    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let (attacker_deriver, _attacker_out) =
+        stage_ia_deriver(&mut s.client, "proof-attacker").await?;
+    let (_victim_deriver, victim_path) = stage_ia_deriver(&mut s.client, "proof-victim").await?;
+
+    let (nar, _) = make_nar(b"squat content");
+    let info = make_path_info_for_nar(&victim_path, &nar);
+    // Signed, membership-passing, WRONG deriver.
+    let token = sign_claims_for_deriver(&attacker_deriver, vec![victim_path.clone()], 60);
+    let err = put_path_with_token(&mut s.client, info, nar, &token)
+        .await
+        .expect_err("underivable claimed path must be rejected");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(err.message().contains("not an output the store derives"));
+    Ok(())
+}
+
+// r[verify store.put.ia-deriver-proof]
+/// Deriver absent → unverifiable → fail closed; once the deriver is
+/// ingested (read-through warms from resident bytes) the same upload
+/// succeeds.
+#[tokio::test]
+async fn ia_proof_unverifiable_until_deriver_resident() -> TestResult {
+    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    // Mint but DO NOT upload yet: compute what the paths will be.
+    let mut probe = s.client.clone();
+    let (deriver, out) = stage_ia_deriver(&mut probe, "proof-late").await?;
+    // Wipe the modulo row to simulate "resident but never populated"
+    // — the read-through must recompute from the store's own bytes.
+    sqlx::query("DELETE FROM drv_modulo_cache")
+        .execute(&s.db.pool)
+        .await?;
+
+    let (nar, _) = make_nar(b"late content");
+    let info = make_path_info_for_nar(&out, &nar);
+    let token = sign_claims_for_deriver(&deriver, vec![out.clone()], 60);
+    assert!(
+        put_path_with_token(&mut s.client, info, nar, &token).await?,
+        "read-through recomputes the proof from resident bytes"
+    );
+    // Cache warmed.
+    let key: Vec<u8> = {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(deriver.as_bytes()).to_vec()
+    };
+    let (n,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM drv_modulo_cache WHERE drv_path_hash = $1")
+            .bind(key)
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert_eq!(n, 1, "read-through warmed the cache");
+    Ok(())
+}
+
+// r[verify store.put.ia-deriver-proof]
+/// The PutPathBatch path enforces the same gate per output (the unary
+/// fix alone would leave the batch door open).
+#[tokio::test]
+async fn ia_proof_batch_rejects_underivable_output() -> TestResult {
+    let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
+    let (attacker_deriver, _o) = stage_ia_deriver(&mut s.client, "proof-batch-a").await?;
+    let (_vd, victim_path) = stage_ia_deriver(&mut s.client, "proof-batch-v").await?;
+
+    let (nar, _) = make_nar(b"batch squat");
+    let info = make_path_info_for_nar(&victim_path, &nar);
+    let token = sign_claims_for_deriver(&attacker_deriver, vec![victim_path.clone()], 60);
+
+    let (tx, rx) = mpsc::channel(16);
+    {
+        use rio_proto::types::{PutPathBatchRequest, PutPathRequest, put_path_request};
+        let mut info: PathInfo = info.into();
+        let trailer = PutPathTrailer {
+            nar_hash: std::mem::take(&mut info.nar_hash),
+            nar_size: std::mem::take(&mut info.nar_size),
+        };
+        for msg in [
+            put_path_request::Msg::Metadata(PutPathMetadata { info: Some(info) }),
+            put_path_request::Msg::NarChunk(nar),
+            put_path_request::Msg::Trailer(trailer),
+        ] {
+            tx.send(PutPathBatchRequest {
+                output_index: 0,
+                inner: Some(PutPathRequest { msg: Some(msg) }),
+            })
+            .await
+            .unwrap();
+        }
+    }
+    drop(tx);
+    let mut req = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+    req.metadata_mut()
+        .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, token.parse().unwrap());
+    let err = s
+        .client
+        .put_path_batch(req)
+        .await
+        .expect_err("batch output must be proof-gated too");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    Ok(())
+}
+
+// r[verify store.put.ia-deriver-proof]
+/// The capability split: a SCHEDULER service token is no PutPath bypass
+/// (probe rights only) — even though "rio-scheduler" stays in the
+/// general allowlist.
+#[tokio::test]
+async fn scheduler_service_token_has_no_putpath_bypass() -> TestResult {
+    let mut s =
+        StoreSession::new_with_service_hmac(TEST_KEY.to_vec(), SERVICE_KEY.to_vec()).await?;
+    let path = test_store_path("sched-no-put");
+    let (nar, _) = make_nar(b"scheduler should not write");
+    let info = make_path_info_for_nar(&path, &nar);
+    let err = put_path_with_header(
+        &mut s.client,
+        info,
+        nar,
+        rio_proto::SERVICE_TOKEN_HEADER,
+        &sign_service("rio-scheduler", 60),
+    )
+    .await
+    .expect_err("scheduler service token must not bypass PutPath");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(err.message().contains("no bypass for this method"));
     Ok(())
 }

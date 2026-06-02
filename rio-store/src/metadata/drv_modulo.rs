@@ -139,9 +139,6 @@ pub(crate) async fn load_drv_modulo_batch(
 }
 
 /// Load one full cached row.
-// First user lands next commit (the IA deriver-proof gate's
-// cache-lookup-then-read-through path).
-#[allow(dead_code)]
 pub(crate) async fn load_drv_modulo(
     pool: &PgPool,
     drv_path: &str,
@@ -269,4 +266,114 @@ pub(crate) async fn populate_on_ingest(pool: &PgPool, drv_path: &str, drv_bytes:
             );
         }
     }
+}
+
+/// Read-through bounds for proof-time computation
+/// (`store.put.ia-deriver-proof`): a deriver closure needing more than
+/// this many input `.drv` fetches, or deeper than this, is declared
+/// unverifiable (fail-closed) rather than letting one upload walk an
+/// unbounded graph on the hot path. Counter-instrumented consts, not
+/// config.
+pub(crate) const READ_THROUGH_MAX_FETCHES: usize = 64;
+pub(crate) const READ_THROUGH_MAX_DEPTH: usize = 32;
+
+/// Fetch a `.drv`'s raw text bytes from the store's OWN backend.
+/// `.drv`s are KB-sized and therefore inline; a chunked or absent
+/// manifest returns `None` (unverifiable).
+async fn own_drv_bytes(pool: &PgPool, drv_path: &str) -> Option<Vec<u8>> {
+    match super::get_manifest(pool, drv_path).await.ok()?? {
+        super::ManifestKind::Inline(nar) => rio_nix::nar::extract_single_file(&nar).ok(),
+        super::ManifestKind::Chunked(_) => None,
+    }
+}
+
+/// Proof-time read-through: return the deriver's cached row, computing
+/// it (and its missing ancestors) from the store's own backend when
+/// absent — bounded by [`READ_THROUGH_MAX_FETCHES`] /
+/// [`READ_THROUGH_MAX_DEPTH`]. Every computed row is persisted (cache
+/// warm). `None` = unverifiable within bounds.
+// r[impl store.put.ia-deriver-proof]
+pub(crate) async fn load_or_compute_drv_modulo(
+    pool: &PgPool,
+    drv_path: &str,
+) -> Result<Option<DrvModuloRow>, sqlx::Error> {
+    if let Some(row) = load_drv_modulo(pool, drv_path).await? {
+        return Ok(Some(row));
+    }
+    // Phase 1 (I/O): pre-fetch the missing closure into an owned arena
+    // — cache rows first, own backend for misses. The hash walk below
+    // is synchronous over this arena; no I/O runs inside a resolver.
+    let mut arena: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut seeds: HashMap<String, [u8; 32]> = HashMap::new();
+    let mut frontier = vec![(drv_path.to_string(), 0usize)];
+    let mut fetches = 0usize;
+    while let Some((path, depth)) = frontier.pop() {
+        if arena.contains_key(&path) || seeds.contains_key(&path) {
+            continue;
+        }
+        if depth > 0
+            && let Some(h) = load_drv_modulo_batch(pool, std::slice::from_ref(&path))
+                .await?
+                .remove(&path)
+        {
+            seeds.insert(path, h);
+            continue;
+        }
+        if fetches >= READ_THROUGH_MAX_FETCHES || depth >= READ_THROUGH_MAX_DEPTH {
+            metrics::counter!("rio_store_ia_proof_total", "result" => "unverifiable").increment(1);
+            return Ok(None);
+        }
+        fetches += 1;
+        let Some(bytes) = own_drv_bytes(pool, &path).await else {
+            metrics::counter!("rio_store_ia_proof_total", "result" => "unverifiable").increment(1);
+            return Ok(None);
+        };
+        let inputs: Vec<String> = match std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|t| rio_nix::derivation::Derivation::parse(t).ok())
+        {
+            Some(d) => d.input_drvs().keys().cloned().collect(),
+            None => {
+                metrics::counter!("rio_store_ia_proof_total", "result" => "unverifiable")
+                    .increment(1);
+                return Ok(None);
+            }
+        };
+        for i in inputs {
+            frontier.push((i, depth + 1));
+        }
+        arena.insert(path, bytes);
+    }
+    // Phase 2 (pure): bottom-up over the arena until the target's row
+    // exists. Each pass computes every node whose inputs are all
+    // seeded; a pass with no progress means a cycle — fail closed.
+    let mut remaining: Vec<String> = arena.keys().cloned().collect();
+    while !remaining.is_empty() {
+        let mut next = Vec::new();
+        let mut progressed = false;
+        for path in remaining {
+            let bytes = &arena[&path];
+            match compute_drv_modulo(bytes, &path, &seeds) {
+                Ok(c) => {
+                    seeds.insert(path.clone(), c.row.modulo_hash);
+                    upsert_drv_modulo(pool, &path, &c.row).await?;
+                    progressed = true;
+                    if path == drv_path {
+                        metrics::counter!(
+                            "rio_store_ia_proof_total",
+                            "result" => "computed_on_miss"
+                        )
+                        .increment(1);
+                    }
+                }
+                Err(_) => next.push(path),
+            }
+        }
+        if !progressed {
+            metrics::counter!("rio_store_ia_proof_total", "result" => "unverifiable").increment(1);
+            return Ok(None);
+        }
+        remaining = next;
+    }
+    load_drv_modulo(pool, drv_path).await
 }

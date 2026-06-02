@@ -145,6 +145,16 @@ impl StoreServiceImpl {
                 bail!(e);
             }
             // r[impl store.put.drv-text-ca]
+            // r[impl store.put.ia-deriver-proof]
+            // Per-output, beside the other content gates: descriptor-
+            // less IA outputs must prove deriver membership against the
+            // store's own bytes.
+            if let Err(e) = self
+                .verify_ia_registration_proof(info, auth.hmac_claims.as_ref(), &ctx)
+                .await
+            {
+                bail!(e);
+            }
             if let Err(e) = verify_drv_text_path(info, &accum.nar_data, &ctx) {
                 bail!(e);
             }

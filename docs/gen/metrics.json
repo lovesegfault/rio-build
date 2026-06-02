@@ -192,6 +192,7 @@
     "rio_store_get_path_duration_seconds",
     "rio_store_get_path_total",
     "rio_store_hmac_rejected_total",
+    "rio_store_ia_proof_total",
     "rio_store_integrity_failures_total",
     "rio_store_pg_pool_utilization",
     "rio_store_put_path_bytes_total",
@@ -1186,6 +1187,11 @@
         "name": "rio_store_hmac_rejected_total",
         "kind": "counter",
         "help": "PutPath rejections by HMAC assignment-token check (labeled by reason)"
+      },
+      {
+        "name": "rio_store_ia_proof_total",
+        "kind": "counter",
+        "help": "IA deriver-proof gate outcomes on descriptor-less input-addressed uploads (store.put.ia-deriver-proof), labeled by result: ok | rejected (claimed path is not store-derived from the named deriver) | computed_on_miss (read-through warmed the modulo cache) | unverifiable (deriver closure not resident / over bounds — fail-closed) | deferred_exempt (deriver's own paths come from realisations; membership-only)"
       },
       {
         "name": "rio_store_integrity_failures_total",

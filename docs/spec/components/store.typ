@@ -449,7 +449,41 @@ read-through at proof time by the IA deriver-proof gate, which computes
 from the store's own backend with bounded fetches and warms the cache.
 Resolvers in the hash walk are synchronous by design; all I/O happens
 before the walk (cache-row seeding at ingestion; arena pre-fetch at
-proof time). GC-stale rows are harmless: every column is a
+proof time).
+
+#r("store.put.ia-deriver-proof")[
+  A descriptor-less upload under signed assignment claims that are
+  neither content-addressed nor fixed-output (plain input-addressed)
+  MUST additionally prove deriver membership against the store's OWN
+  bytes: the deriver `.drv` named by the claims (`claims.drv_hash`,
+  ingress-bound to its store path) must be store-resident, and the
+  claimed path must be among the input-addressed output paths the store
+  derives from its own copy via the modulo cache --- read-through with
+  bounded fetches and depth on a cache miss, fail-closed
+  (`PERMISSION_DENIED`, deriver closure unverifiable) when the closure
+  cannot be completed. Derivers whose own output paths are not
+  statically derivable (deferred) are membership-only. The scheduler's
+  service token MUST NOT bypass PutPath or PutPathBatch (probe rights
+  only); the gate applies to both upload RPCs per output.
+]
+The honest scope (deliberately narrow): the guarantee is that claimed
+paths are genuinely attributable to the NAMED deriver per
+store-resident bytes --- which kills forged cross-deriver membership (a
+compromised worker, or forged store-backed claims, cannot register
+content at a path the named deriver's bytes do not derive). Named
+residuals: a fully compromised SCHEDULER can still name the victim's
+own deriver in claims it signs --- equivalent in power to dispatching
+the victim's real derivation to a hostile worker, and input-addressed
+content is inherently builder-trusted; and deferred-IA derivers are
+membership-only at the store (their dispatch-time claims are
+realisation-derived or unsigned, so the residual exposure is
+compromised-scheduler-only; store-side resolution against realisations
+is buildable later without schema change). Oracle parity:
+`Store::queryPartialDerivationOutputMap` (`store-api.cc:396-410`) and
+the local store's own-copy posture (`local-store.cc:848`). The
+`expected_outputs` membership check stays as the first line
+(`sec.authz.ca-path-derived` is unchanged --- adjacent rule, different
+upload classes); this rule is the second, byte-bound line behind it. GC-stale rows are harmless: every column is a
 content-derived immutable fact about bytes that were at that text-CA
 path, and a re-upload of the path carries identical bytes by
 construction. Cyclic input metadata fails the walk closed --- population

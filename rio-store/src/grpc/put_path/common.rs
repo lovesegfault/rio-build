@@ -701,7 +701,7 @@ impl StoreServiceImpl {
     /// see [`StoreServiceImpl::verify_assignment_token`]) — all
     /// cluster-key-correct.
     pub(in crate::grpc) fn authorize<T>(&self, request: &Request<T>) -> Result<PutAuth, Status> {
-        let hmac_claims = self.verify_assignment_token(request)?;
+        let hmac_claims = self.verify_assignment_token_put(request)?;
         let tenant_id = request
             .extensions()
             .get::<rio_auth::jwt::TenantClaims>()
@@ -710,6 +710,75 @@ impl StoreServiceImpl {
             hmac_claims,
             tenant_id,
         })
+    }
+
+    // r[impl store.put.ia-deriver-proof]
+    /// Descriptor-less INPUT-ADDRESSED uploads must prove deriver
+    /// membership against the store's OWN bytes: the claims' deriver
+    /// `.drv` (claims.drv_hash == its store path, bound at scheduler
+    /// ingress) must be store-resident, and the claimed path must be
+    /// among the IA output paths the store derives from its own copy
+    /// via the modulo cache (read-through on miss, bounded).
+    /// `expected_outputs` membership alone is no longer sufficient for
+    /// IA registration — a forged-claims signer could put arbitrary
+    /// paths there; it cannot make the store's bytes derive them.
+    ///
+    /// Applies iff signed claims are present and the upload is plain IA
+    /// (not is_ca, not is_fixed_output — those flow through the
+    /// descriptor gates). Deferred derivers (floating-CA self /
+    /// deferred-IA) are membership-only: their true paths come from
+    /// realisations (claims for them are realisation-derived at
+    /// dispatch; documented residual is compromised-scheduler-only).
+    pub(in crate::grpc) async fn verify_ia_registration_proof(
+        &self,
+        info: &ValidatedPathInfo,
+        claims: Option<&rio_auth::hmac::AssignmentClaims>,
+        ctx_label: &str,
+    ) -> Result<(), Status> {
+        let Some(claims) = claims else {
+            return Ok(()); // dev mode / service relay: no claims to prove
+        };
+        if claims.is_ca || claims.is_fixed_output {
+            return Ok(()); // descriptor gates own CA/FOD verification
+        }
+        if info.store_path.is_derivation() {
+            return Ok(()); // .drv text-CA gate owns derivation uploads
+        }
+        let deriver = claims.drv_hash.as_str();
+        let row = crate::metadata::drv_modulo::load_or_compute_drv_modulo(&self.pool, deriver)
+            .await
+            .map_err(|e| {
+                Status::internal(format!("{ctx_label}: deriver proof lookup failed: {e}"))
+            })?;
+        let Some(row) = row else {
+            // Unverifiable counter emitted inside the read-through.
+            return Err(Status::permission_denied(format!(
+                "{ctx_label}: deriver closure unverifiable — the deriver .drv {deriver} \
+                 (or part of its input closure) is not resident in this store, so the \
+                 claimed output path cannot be proven to belong to it"
+            )));
+        };
+        if row.deferred {
+            metrics::counter!("rio_store_ia_proof_total", "result" => "deferred_exempt")
+                .increment(1);
+            return Ok(());
+        }
+        let claimed = info.store_path.as_str();
+        if row.ia_output_paths.values().any(|p| p == claimed) {
+            metrics::counter!("rio_store_ia_proof_total", "result" => "ok").increment(1);
+            Ok(())
+        } else {
+            metrics::counter!("rio_store_ia_proof_total", "result" => "rejected").increment(1);
+            warn!(
+                claimed,
+                deriver,
+                "{ctx_label}: claimed path is not among the deriver's store-derived IA outputs"
+            );
+            Err(Status::permission_denied(format!(
+                "{ctx_label}: path {claimed} is not an output the store derives from \
+                 deriver {deriver}"
+            )))
+        }
     }
 
     // r[impl store.put.nar-bytes-budget+3]

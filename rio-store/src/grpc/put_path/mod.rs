@@ -69,6 +69,29 @@ impl StoreServiceImpl {
         &self,
         request: &Request<T>,
     ) -> Result<Option<rio_auth::hmac::AssignmentClaims>, Status> {
+        self.verify_assignment_token_inner(request, false)
+    }
+
+    // r[impl store.put.ia-deriver-proof]
+    /// PutPath/PutPathBatch variant of [`Self::verify_assignment_token`]:
+    /// the WRITE side. The scheduler's service token is NOT a bypass
+    /// here — the scheduler has no PutPath flow (its token serves the
+    /// read-side substitution probe), and honoring it would let a
+    /// scheduler credential skip every registration gate including the
+    /// IA deriver proof. Capability split, not a knob: hardcoded,
+    /// unconditional.
+    pub(super) fn verify_assignment_token_put<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<Option<rio_auth::hmac::AssignmentClaims>, Status> {
+        self.verify_assignment_token_inner(request, true)
+    }
+
+    fn verify_assignment_token_inner<T>(
+        &self,
+        request: &Request<T>,
+        put_side: bool,
+    ) -> Result<Option<rio_auth::hmac::AssignmentClaims>, Status> {
         let Some(verifier) = &self.hmac_verifier else {
             // Verifier not configured = dev mode, accept all.
             return Ok(None);
@@ -88,7 +111,8 @@ impl StoreServiceImpl {
                     if self
                         .service_bypass_callers
                         .iter()
-                        .any(|a| a == &claims.caller) =>
+                        .any(|a| a == &claims.caller)
+                        && !(put_side && claims.caller == "rio-scheduler") =>
                 {
                     metrics::counter!(
                         "rio_store_service_token_accepted_total",
@@ -102,7 +126,9 @@ impl StoreServiceImpl {
                                      "reason" => "service_caller_not_allowlisted")
                     .increment(1);
                     return Err(Status::permission_denied(format!(
-                        "service-token caller {:?} not in allowlist",
+                        "service-token caller {:?} has no bypass for this method \
+                         (scheduler tokens carry probe rights only; PutPath requires \
+                         a per-build assignment token)",
                         claims.caller
                     )));
                 }
@@ -154,6 +180,16 @@ impl StoreServiceImpl {
 
         let raw_info = common::read_first_metadata(&mut stream).await?;
         let mut info = validate_put_metadata(raw_info, auth.hmac_claims.as_ref(), "PutPath")?;
+        // r[impl store.put.ia-deriver-proof]
+        // BEFORE any buffering/placeholder work: reject unprovable IA
+        // claims while the stream is cheap to drain.
+        if let Err(e) = self
+            .verify_ia_registration_proof(&info, auth.hmac_claims.as_ref(), "PutPath")
+            .await
+        {
+            drain_stream(&mut stream).await;
+            return Err(e);
+        }
         // Server-derived in validate_put_metadata (step 7) — never the
         // wire value. r[sec.boundary.grpc-hmac].
         let store_path_hash = info.store_path_hash.clone();
