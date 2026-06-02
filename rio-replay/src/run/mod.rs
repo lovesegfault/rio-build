@@ -247,10 +247,11 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // Gateway worker-protocol transport for build-path submissions. The
     // host-key pin is required by spec validation and re-required here: an
     // absent pin is an explicit error at this call site, never an empty
-    // value passed downstream. Channel budget: a burst of channel-open
-    // refusals against this configuration is a configuration error (the
-    // gateway's per-connection cap changed, or the connections knob is
-    // wrong), not per-unit infra noise.
+    // value passed downstream. Channel budget: a burst of channel-open or
+    // exec refusals against this configuration is a capacity or
+    // configuration problem (the gateway shedding load at its global
+    // session cap, or the connections knob is wrong), not per-unit infra
+    // noise.
     let endpoint = transport::GatewayEndpoint::parse(&spec.cluster.gateway_store_url)?;
     let policy = pinned_host_key_policy(&spec)?;
     let connections = spec
@@ -330,13 +331,15 @@ fn build_supply_transport(spec: &CampaignSpec) -> Result<Arc<dyn SupplyTransport
     let endpoint = transport::GatewayEndpoint::parse(&spec.cluster.gateway_store_url)?;
     let policy = pinned_host_key_policy(spec)?;
     // The supply pools serve probe, upload, and prefetch traffic; deriving
-    // the default connection count from those worker budgets (the gateway
-    // caps channels per connection at 4) keeps channel supply ahead of the
-    // stage's demand.
+    // the default connection count from those worker budgets (at the
+    // transport's per-connection channel fan-out) keeps channel supply
+    // ahead of the stage's demand.
     let connections = spec.knobs.connections.unwrap_or_else(|| {
-        (spec.knobs.probe_concurrency + spec.knobs.upload_workers + spec.knobs.submit_concurrency)
-            .div_ceil(4)
-            .max(1)
+        transport::default_connections(
+            spec.knobs.probe_concurrency
+                + spec.knobs.upload_workers
+                + spec.knobs.submit_concurrency,
+        )
     });
     let build = Arc::new(transport::GatewayPool::new(
         endpoint.clone(),

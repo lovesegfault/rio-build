@@ -172,8 +172,9 @@ pub struct Knobs {
     pub report_top_n: usize,
     /// SSH connections the gateway transport pool dials. `None` derives the
     /// count from the in-flight channel budget as
-    /// ceil(`submit_concurrency` / 4), minimum 1 (the gateway caps channels
-    /// per connection at 4).
+    /// ceil(`submit_concurrency` / `CHANNELS_PER_CONNECTION`), minimum 1.
+    /// The divisor is the transport's own per-connection fan-out — a
+    /// client-side blast-radius choice, not a gateway limit.
     pub connections: Option<usize>,
     /// Deadline in seconds for each probe / upload / path-info client op on
     /// a gateway channel (build submissions use the batch timeout instead).

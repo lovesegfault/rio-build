@@ -8,11 +8,12 @@
 //! layers:
 //!
 //! - [`GatewayPool`]: a fixed budget of authenticated SSH connections, dialed
-//!   lazily on first use. The gateway accepts at most
-//!   [`CHANNELS_PER_CONNECTION`] concurrently open channels per connection
-//!   and drops a connection as soon as its last channel closes, so the pool
-//!   keeps a slot budget per connection, skips closed connections, and
-//!   re-dials them on demand.
+//!   lazily on first use. The pool multiplexes at most
+//!   [`CHANNELS_PER_CONNECTION`] concurrently open channels onto each
+//!   connection (a client-side fan-out choice — see the constant's docs),
+//!   and the gateway drops connections left without a live session past its
+//!   idle grace, so the pool keeps a slot budget per connection, skips
+//!   closed connections, and re-dials them on demand.
 //! - [`DaemonChannel`]: one exec'd channel with the worker-protocol handshake
 //!   already done, exposing per-operation deadline-wrapped wrappers around
 //!   the rio-nix client ops the engine needs.
@@ -42,13 +43,24 @@ use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey};
 use tokio::io::{BufWriter, ReadHalf, WriteHalf};
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, RwLock, Semaphore};
 
-/// Channels the gateway accepts per SSH connection; further opens (or execs)
-/// are rejected until one closes.
+/// Daemon channels the pool multiplexes onto one SSH connection.
 ///
-/// Mirrors `MAX_CHANNELS_PER_CONNECTION` in
-/// `rio-gateway/src/server/connection.rs` — there is no wire-level way to
-/// discover the budget, so if the gateway's constant changes this one must
-/// change with it.
+/// A deliberate client-side fan-out choice, not a gateway limit: spreading
+/// a campaign's channels across connections caps the blast radius of one
+/// dropped connection at this many in-flight submissions. Raising it toward
+/// the gateway's own per-connection bound would concentrate the campaign
+/// onto fewer connections and defeat that point.
+///
+/// The gateway's per-connection bound is a separate, far larger absurdity
+/// detector (`DEFAULT_MAX_CHANNELS_PER_CONNECTION` in
+/// `rio-gateway/src/server/mod.rs`: 512, operator-configurable), and
+/// exceeding it TERMINATES the whole connection rather than rejecting the
+/// open; the gateway's real admission control is its global session cap,
+/// applied per exec. This constant must therefore stay well below the
+/// deployed gateway's bound — a compile-time assertion next to
+/// `DEFAULT_MAX_CHANNELS_PER_CONNECTION` pins the gateway default above
+/// this fan-out — but it is otherwise free to move independently of the
+/// gateway.
 pub const CHANNELS_PER_CONNECTION: usize = 4;
 
 /// The exec command the gateway expects (it requires the command string to
@@ -85,8 +97,8 @@ const DEFAULT_SSH_PORT: u16 = 22;
 const DEFAULT_SSH_USER: &str = "rio";
 
 /// Default number of SSH connections for a desired concurrent-channel count:
-/// `ceil(max_in_flight / 4)` (the gateway's per-connection channel budget),
-/// never less than one connection.
+/// `ceil(max_in_flight / `[`CHANNELS_PER_CONNECTION`]`)`, never less than
+/// one connection.
 pub fn default_connections(max_in_flight: usize) -> usize {
     max_in_flight.div_ceil(CHANNELS_PER_CONNECTION).max(1)
 }
@@ -419,10 +431,10 @@ struct PoolConnection {
     /// (re-dialed) in place: liveness checks and channel opens take the read
     /// side, a (re-)dial takes the write side.
     handle: RwLock<Option<russh::client::Handle<TransportHandler>>>,
-    /// Free channel slots on this connection (the gateway's per-connection
-    /// budget). Slots are held by [`DaemonChannel`]s — including ones whose
-    /// underlying connection has died; those free up as their ops fail and
-    /// the channels get dropped.
+    /// Free channel slots on this connection (the pool's per-connection
+    /// fan-out, [`CHANNELS_PER_CONNECTION`]). Slots are held by
+    /// [`DaemonChannel`]s — including ones whose underlying connection has
+    /// died; those free up as their ops fail and the channels get dropped.
     slots: Arc<Semaphore>,
     /// Position in [`GatewayPool::connections`], for logs and errors.
     index: usize,
@@ -431,19 +443,20 @@ struct PoolConnection {
 /// A pool of authenticated SSH connections to rio-gateway, dialed lazily.
 ///
 /// Every connection carries a [`CHANNELS_PER_CONNECTION`]-permit semaphore
-/// mirroring the gateway's per-connection channel cap. [`Self::open_channel`]
+/// enforcing the pool's per-connection fan-out. [`Self::open_channel`]
 /// prefers the open connection with the most free slots and waits (without
-/// deadlocking) when all `connections × 4` slots are in use; the slot is
-/// released when the returned [`DaemonChannel`] is dropped or
-/// [abandoned](DaemonChannel::abandon).
+/// deadlocking) when all `connections × CHANNELS_PER_CONNECTION` slots are
+/// in use; the slot is released when the returned [`DaemonChannel`] is
+/// dropped or [abandoned](DaemonChannel::abandon).
 ///
-/// The gateway disconnects an SSH connection as soon as its last channel
-/// closes, so pool connections routinely go dead between submissions. The
-/// pool treats that as normal: closed (or never-dialed) connections are
-/// skipped when picking a slot and dialed lazily (one attempt per
-/// acquisition) when they are needed. In-flight operations on a connection
-/// that dies still fail — the caller's retry-on-a-fresh-channel path is the
-/// recovery mechanism, not a transparent transport retry.
+/// The gateway disconnects an SSH connection that has gone without a live
+/// session past its idle grace, so pool connections routinely go dead
+/// between submissions. The pool treats that as normal: closed (or
+/// never-dialed) connections are skipped when picking a slot and dialed
+/// lazily (one attempt per acquisition) when they are needed. In-flight
+/// operations on a connection that dies still fail — the caller's
+/// retry-on-a-fresh-channel path is the recovery mechanism, not a
+/// transparent transport retry.
 ///
 /// The pool owns the SSH connections: keep it alive for as long as any
 /// [`DaemonChannel`] handed out from it is in use.
@@ -498,7 +511,7 @@ impl GatewayPool {
         })
     }
 
-    /// Total channel capacity (connections × 4).
+    /// Total channel capacity (connections × [`CHANNELS_PER_CONNECTION`]).
     pub fn capacity(&self) -> usize {
         pool_capacity(self.connections.len())
     }
@@ -513,21 +526,21 @@ impl GatewayPool {
     /// campaign engine bounds concurrency before asking for a channel). It
     /// cannot deadlock because every slot is released when its
     /// [`DaemonChannel`] drops. Connections the gateway has closed in the
-    /// meantime (it disconnects whenever a connection's last channel closes)
+    /// meantime (it disconnects connections idle past their grace period)
     /// are skipped and re-dialed lazily.
     ///
     /// One channel-open race is absorbed internally: when the exec/open step
     /// lands on a connection the gateway had already closed, or the gateway
-    /// rejects the exec because it has not finished processing an earlier
-    /// channel close (both routine at saturation — closes are processed
-    /// asynchronously), the open is retried once on a freshly acquired slot
-    /// before the error is surfaced.
+    /// sheds the exec because it is momentarily at its global session cap
+    /// (permits free as just-ended sessions finish tearing down, so a fresh
+    /// attempt can land), the open is retried once on a freshly acquired
+    /// slot before the error is surfaced.
     pub async fn open_channel(&self) -> Result<DaemonChannel> {
         match self.open_channel_once().await {
             Err(err) if err.downcast_ref::<ChannelOpenRace>().is_some() => {
                 tracing::debug!(
                     error = %format!("{err:#}"),
-                    "channel open raced a gateway-side close or budget rejection; retrying once on a fresh slot"
+                    "channel open raced a gateway-side close or load-shed exec refusal; retrying once on a fresh slot"
                 );
                 self.open_channel_once().await
             }
@@ -851,24 +864,25 @@ impl GatewayPool {
 }
 
 /// Marker context attached to exec/channel-open failures caused by the
-/// gateway having already closed the connection (it disconnects a connection
-/// whenever its last channel closes) or not yet having processed an earlier
-/// channel close when it re-checked its per-connection budget — both routine
-/// races at saturation. [`GatewayPool::open_channel`] absorbs exactly one
-/// such failure by retrying on a freshly acquired slot.
+/// gateway having already closed the connection (it disconnects connections
+/// left without a live session past their idle grace, and keepalive
+/// timeouts kill half-dead ones) or by the gateway shedding the exec at its
+/// global session cap — transient conditions where one fresh attempt is
+/// worth it. [`GatewayPool::open_channel`] absorbs exactly one such failure
+/// by retrying on a freshly acquired slot.
 #[derive(Debug, Clone, Copy)]
 struct ChannelOpenRace;
 
 impl std::fmt::Display for ChannelOpenRace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("channel open raced a gateway connection close or channel-budget rejection")
+        f.write_str("channel open raced a gateway connection close or load-shed exec refusal")
     }
 }
 
 /// Open one session channel on `connection`, exec the daemon command, and
 /// wait for the gateway to confirm it. `exec` only sends the request; the
-/// accept/reject verdict arrives as a channel message (the gateway re-checks
-/// its 4-channel budget at exec time).
+/// accept/reject verdict arrives as a channel message (the gateway admits
+/// execs against its global session cap at exec time, not at channel open).
 ///
 /// Failures caused by the connection having been closed under us, or by the
 /// gateway rejecting the exec, carry the [`ChannelOpenRace`] context so
@@ -914,7 +928,7 @@ async fn exec_daemon(
             Some(russh::ChannelMsg::Failure) => {
                 return Err(anyhow!(
                     "gateway refused `{DAEMON_COMMAND}` on a new channel \
-                     (per-connection channel budget exhausted?)"
+                     (gateway at its global session cap?)"
                 )
                 .context(ChannelOpenRace));
             }
@@ -1252,7 +1266,7 @@ mod tests {
         assert_eq!(default_connections(8), 2);
         assert_eq!(default_connections(9), 3);
         assert_eq!(default_connections(32), 8);
-        // Capacity follows the gateway's per-connection channel budget.
+        // Capacity follows the pool's per-connection channel fan-out.
         assert_eq!(pool_capacity(1), 4);
         assert_eq!(pool_capacity(8), 32);
     }
