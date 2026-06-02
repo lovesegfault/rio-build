@@ -78,6 +78,7 @@
     "rio_scheduler_build_timeouts_total",
     "rio_scheduler_builds_active",
     "rio_scheduler_builds_total",
+    "rio_scheduler_ca_bookkeeping_skipped_total",
     "rio_scheduler_ca_cutoff_depth_cap_hits_total",
     "rio_scheduler_ca_cutoff_saves_total",
     "rio_scheduler_ca_cutoff_seconds_saved",
@@ -621,6 +622,11 @@
         "help": "Total builds at terminal state (labeled by outcome: success/failure/cancelled)"
       },
       {
+        "name": "rio_scheduler_ca_bookkeeping_skipped_total",
+        "kind": "counter",
+        "help": "Completion-time CA bookkeeping steps skipped because the node has no modular hash (sched.ca.absent-hash-surfaced) — the population the ingress strip legalizes. Labeled by consumer: realisation_insert (the build's realisation NOT registered — clients cannot resolve outputs by derivation), cutoff_compare / cutoff_skipped_copy (early-cutoff lost), realisation_deps (build trace not recorded). Nonzero realisation_insert is the bug_048 signature; the staged re-establisher (follow-up F2) drives this to zero."
+      },
+      {
         "name": "rio_scheduler_ca_cutoff_depth_cap_hits_total",
         "kind": "counter",
         "help": "CA cutoff cascade walks that hit MAX_CASCADE_NODES (1000). Node-count cap, not tree-depth — for wide DAGs (fanout>1), 1000 nodes hit well before depth>3. Non-zero = cascades truncated; operator should review if non-zero."
@@ -713,17 +719,17 @@
       {
         "name": "rio_scheduler_dispatch_claims_stripped_total",
         "kind": "counter",
-        "help": "Bare store-backed nodes whose declared modular hash could not be recomputed against the store's text-CA-verified bytes and was STRIPPED at dispatch (an unverifiable claim is no claim — exact ingress-strip parity): the node proceeds on the verified bytes at path_bound_bytes with the hash cleared in memory and PG (sched.dispatch.claims-derived+1). The expected nonzero source is warm gateway CA-chain / deferred-IA submissions."
+        "help": "Bare store-backed nodes whose declared modular hash could not be recomputed against the store's text-CA-verified bytes and was STRIPPED at dispatch (an unverifiable claim is no claim — exact ingress-strip parity): the node proceeds on the verified bytes at path_bound_bytes with the hash cleared in memory and PG (sched.dispatch.claims-derived+2). The expected nonzero source is warm gateway CA-chain / deferred-IA submissions."
       },
       {
         "name": "rio_scheduler_dispatch_claims_unavailable_total",
         "kind": "counter",
-        "help": "Dispatch-time claims derivations deferred on STORE SILENCE only (fetch failure, absent .drv, transport-grade byte noise): assignment rolled back with backoff and retried when the store recovers, bounded by the claims-unavailable budget. Structurally permanent shapes never land here — they poison with remediation (..._claims_unverifiable_total) and unverifiable declared hashes strip and proceed (..._claims_stripped_total) (sched.dispatch.claims-derived+1)"
+        "help": "Dispatch-time claims derivations deferred on STORE SILENCE only (fetch failure, absent .drv, transport-grade byte noise): assignment rolled back with backoff and retried when the store recovers, bounded by the claims-unavailable budget. Structurally permanent shapes never land here — they poison with remediation (..._claims_unverifiable_total) and unverifiable declared hashes strip and proceed (..._claims_stripped_total) (sched.dispatch.claims-derived+2)"
       },
       {
         "name": "rio_scheduler_dispatch_claims_unverifiable_total",
         "kind": "counter",
-        "help": "Bare store-backed nodes whose claims verification is STRUCTURALLY impossible (unseedable input, unparseable declared path): poisoned at dispatch with generated remediation instead of livelocking through backoff (sched.dispatch.claims-derived+1). Nonzero means submitters are submitting underspecified closures."
+        "help": "Bare store-backed nodes whose claims verification is STRUCTURALLY impossible (unseedable input, unparseable declared path): poisoned at dispatch with generated remediation instead of livelocking through backoff (sched.dispatch.claims-derived+2). Nonzero means submitters are submitting underspecified closures."
       },
       {
         "name": "rio_scheduler_dispatch_wait_seconds",

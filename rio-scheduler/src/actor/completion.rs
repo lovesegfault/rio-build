@@ -1243,45 +1243,72 @@ impl DagActor {
         // completion registers the realisation exactly like a live one.
         if let Some(state) = self.dag.node(drv_hash)
             && (state.ca.is_ca || state.ca.needs_resolve)
-            && let Some(modular_hash) = state.ca.modular_hash
         {
-            // Log the hash in the same hex-encoding the gateway's
-            // wopQueryRealisation handler uses — if nix-build's later
-            // QueryRealisation finds nothing, grep both logs for
-            // `drv_hash=` and compare. A mismatch = our
-            // hash_derivation_modulo diverges from CppNix (the
-            // maskOutputs env-masking gap was one such divergence).
-            info!(
-                drv_hash = %hex::encode(modular_hash),
-                outputs = built_outputs.len(),
-                "insert_realisation: CA build complete, writing realisations"
-            );
-            for output in built_outputs {
-                let Ok(output_hash): Result<[u8; 32], _> = output.output_hash.as_slice().try_into()
-                else {
-                    debug!(
-                        drv_hash = %drv_hash,
-                        output_name = %output.output_name,
-                        hash_len = output.output_hash.len(),
-                        "realisation insert: output_hash not 32 bytes, skipping"
-                    );
-                    continue;
-                };
-                if let Err(e) = crate::ca::insert_realisation(
-                    self.db.pool(),
-                    &modular_hash,
-                    &output.output_name,
-                    &output.output_path,
-                    &output_hash,
-                )
-                .await
-                {
+            // r[impl sched.ca.absent-hash-surfaced]
+            // Exhaustive over the hash's presence (fix-discipline R1):
+            // the ingress strip made None a LEGAL state for exactly
+            // this population — a CA/resolve node whose declared hash
+            // was unverifiable. The if-let skip here was bug_048: the
+            // warm rebuild completed, no realisation row was written,
+            // and nothing said so.
+            match state.ca.modular_hash {
+                None => {
                     warn!(
                         drv_hash = %drv_hash,
-                        output_name = %output.output_name,
-                        error = %e,
-                        "realisation insert failed (best-effort; dependent resolve will retry)"
+                        consumer = "realisation_insert",
+                        "CA bookkeeping skipped: node has no modular hash \
+                         (ingress-stripped or never computed) — the \
+                         realisation is NOT registered and clients cannot \
+                         resolve this build's outputs by derivation until a \
+                         verifying re-establisher runs (staged follow-up F2)"
                     );
+                    metrics::counter!(
+                        "rio_scheduler_ca_bookkeeping_skipped_total",
+                        "consumer" => "realisation_insert"
+                    )
+                    .increment(1);
+                }
+                Some(modular_hash) => {
+                    // Log the hash in the same hex-encoding the gateway's
+                    // wopQueryRealisation handler uses — if nix-build's later
+                    // QueryRealisation finds nothing, grep both logs for
+                    // `drv_hash=` and compare. A mismatch = our
+                    // hash_derivation_modulo diverges from CppNix (the
+                    // maskOutputs env-masking gap was one such divergence).
+                    info!(
+                        drv_hash = %hex::encode(modular_hash),
+                        outputs = built_outputs.len(),
+                        "insert_realisation: CA build complete, writing realisations"
+                    );
+                    for output in built_outputs {
+                        let Ok(output_hash): Result<[u8; 32], _> =
+                            output.output_hash.as_slice().try_into()
+                        else {
+                            debug!(
+                                drv_hash = %drv_hash,
+                                output_name = %output.output_name,
+                                hash_len = output.output_hash.len(),
+                                "realisation insert: output_hash not 32 bytes, skipping"
+                            );
+                            continue;
+                        };
+                        if let Err(e) = crate::ca::insert_realisation(
+                            self.db.pool(),
+                            &modular_hash,
+                            &output.output_name,
+                            &output.output_path,
+                            &output_hash,
+                        )
+                        .await
+                        {
+                            warn!(
+                                drv_hash = %drv_hash,
+                                output_name = %output.output_name,
+                                error = %e,
+                                "realisation insert failed (best-effort; dependent resolve will retry)"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1331,6 +1358,25 @@ impl DagActor {
         // can't be skipped. Per-output granularity is a later
         // refinement.
         let mut prior_seeds: Vec<(Vec<u8>, String)> = Vec::new();
+        if let Some(state) = self.dag.node(drv_hash)
+            && state.ca.is_ca
+        {
+            // r[impl sched.ca.absent-hash-surfaced]
+            if state.ca.modular_hash.is_none() {
+                warn!(
+                    drv_hash = %drv_hash,
+                    consumer = "cutoff_compare",
+                    "CA bookkeeping skipped: no modular hash — early-cutoff \
+                     compare cannot consult prior realisations, downstream \
+                     rebuilds run in full"
+                );
+                metrics::counter!(
+                    "rio_scheduler_ca_bookkeeping_skipped_total",
+                    "consumer" => "cutoff_compare"
+                )
+                .increment(1);
+            }
+        }
         if let Some(state) = self.dag.node(drv_hash)
             && state.ca.is_ca
             && let Some(modular_hash) = state.ca.modular_hash
@@ -1507,6 +1553,25 @@ impl DagActor {
                         state.output_paths =
                             prior_outs.iter().map(|o| o.output_path.clone()).collect();
                     }
+                    if self
+                        .dag
+                        .node(hash)
+                        .is_some_and(|s| s.ca.modular_hash.is_none())
+                    {
+                        // r[impl sched.ca.absent-hash-surfaced]
+                        warn!(
+                            drv_hash = %hash,
+                            consumer = "cutoff_skipped_copy",
+                            "CA bookkeeping skipped: cutoff-skipped node has \
+                             no modular hash — its prior realisation is not \
+                             copied forward"
+                        );
+                        metrics::counter!(
+                            "rio_scheduler_ca_bookkeeping_skipped_total",
+                            "consumer" => "cutoff_skipped_copy"
+                        )
+                        .increment(1);
+                    }
                     if let Some(state) = self.dag.node(hash)
                         && let Some(modular) = state.ca.modular_hash
                     {
@@ -1632,6 +1697,26 @@ impl DagActor {
         // Best-effort: PG blip → warn, don't abort completion.
         // `realisation_deps` is rio's derived-build-trace cache
         // (ADR-018:45), not correctness-critical for the build.
+        if let Some(state) = self.dag.node(drv_hash)
+            && state.ca.modular_hash.is_none()
+            && !state.ca.pending_realisation_deps.is_empty()
+        {
+            // r[impl sched.ca.absent-hash-surfaced]
+            // Pre-fix the pending deps silently lingered (the if-let
+            // below never took them); the lingering is harmless
+            // per-execution state but the SKIP is surfaced now.
+            warn!(
+                drv_hash = %drv_hash,
+                consumer = "realisation_deps",
+                "CA bookkeeping skipped: no modular hash — the resolved \
+                 dependency trace is not recorded for this completion"
+            );
+            metrics::counter!(
+                "rio_scheduler_ca_bookkeeping_skipped_total",
+                "consumer" => "realisation_deps"
+            )
+            .increment(1);
+        }
         if let Some(state) = self.dag.node_mut(drv_hash)
             && let Some(modular_hash) = state.ca.modular_hash
             && !state.ca.pending_realisation_deps.is_empty()

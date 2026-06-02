@@ -1375,6 +1375,27 @@ to complete; if it cannot finish within the grace period, it is reassigned.
   always `{}` from current Nix.
 ]
 
+#r("sched.ca.absent-hash-surfaced")[
+  Every completion-time CA bookkeeping consumer of a derivation's
+  modular hash (realisation registration, early-cutoff comparison and
+  skipped-node realisation copy, dependency-trace recording) MUST
+  handle the hash's absence EXHAUSTIVELY: when the node's gate
+  conditions hold but the hash is `None` — the population the ingress
+  strip legalizes (#rref("sched.merge.ingress-inline-drv-binding+1"))
+  — the consumer MUST surface the skip with a warning naming the node
+  and consumer and an increment of
+  `rio_scheduler_ca_bookkeeping_skipped_total{consumer}`, never skip
+  silently.
+]
+The strip turned `ca.modular_hash = None` into a legal state for
+CA/resolve nodes, and three `if let Some` consumers absorbed it
+silently — a warm CA rebuild completed with no realisation row and no
+signal (round-15 bug_048, pattern R1: lifecycle changed, readers
+unaudited). Surfacing is part 1; the verifying re-establisher that
+makes the realisation-insert skip impossible again is the staged
+follow-up F2 (`ModularHashState` lifecycle enum) — no prose in this
+spec may claim that writer exists until it does (R6).
+
 #r("sched.dispatch.claims-derived+2")[
   When assignment tokens are signed, the scheduler MUST NOT sign
   upload-authorization claims (`expected_outputs`, `is_ca`,

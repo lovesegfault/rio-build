@@ -658,6 +658,18 @@ pub fn describe_metrics() {
          efficacy."
     );
     describe_counter!(
+        "rio_scheduler_ca_bookkeeping_skipped_total",
+        "Completion-time CA bookkeeping steps skipped because the node has \
+         no modular hash (sched.ca.absent-hash-surfaced) — the population \
+         the ingress strip legalizes. Labeled by consumer: \
+         realisation_insert (the build's realisation NOT registered — \
+         clients cannot resolve outputs by derivation), cutoff_compare / \
+         cutoff_skipped_copy (early-cutoff lost), realisation_deps (build \
+         trace not recorded). Nonzero realisation_insert is the bug_048 \
+         signature; the staged re-establisher (follow-up F2) drives this \
+         to zero."
+    );
+    describe_counter!(
         "rio_scheduler_ca_cutoff_seconds_saved",
         "Sum of est_duration of skipped derivations, in hw-normalized \
          ref-seconds (r[sched.sla.hw-ref-seconds]; NOT wall-clock per-build — \
