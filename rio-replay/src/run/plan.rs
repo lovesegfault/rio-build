@@ -340,6 +340,18 @@ pub async fn run_plan(
     } else {
         WarmComputation::default()
     };
+    // Impure-demotion membership, pinned into the plan output: derived
+    // once here and read back on every resume, so the classification a
+    // campaign retires units (and shapes its supply protection set) under
+    // is the FIRST plan's, not whatever a later engine version would
+    // re-derive.
+    let demoted_impure = {
+        let in_scope_set: std::collections::HashSet<&str> =
+            scope.in_scope.iter().map(String::as_str).collect();
+        let mut demoted = super::supply::demoted_impure_jobs(archive, &manifest, &in_scope_set);
+        demoted.sort();
+        demoted
+    };
     let rss_peak_mib = peak_rss_mib();
     let (valid_paths, cached_jobs) = validity_snapshot(store, &manifest, &scope.in_scope).await?;
 
@@ -381,6 +393,7 @@ pub async fn run_plan(
         cached_prior_paths: valid_paths.iter().cloned().collect(),
         cached_prior_jobs: cached_jobs.iter().cloned().collect(),
         counts,
+        demoted_impure: Some(demoted_impure),
     };
     Ok(PlanResult {
         output,
@@ -630,6 +643,11 @@ mod tests {
         assert!(result.output.cached_prior_paths.contains(&app_a_out));
         assert_eq!(result.output.cached_prior_jobs, vec!["appA.x86_64-linux"]);
         assert!(result.low_confidence.is_empty());
+        // The impure-demotion membership is PINNED into the plan output —
+        // Some(empty), never None: an empty pin records "the plan decided
+        // nothing is demoted", which a resume must distinguish from a
+        // legacy record that never decided at all.
+        assert_eq!(result.output.demoted_impure, Some(Vec::new()));
         // The plan-time closure-graph memory measurement is recorded in the
         // counts (always available on Linux).
         assert!(result.output.counts.contains_key(PLAN_COUNT_RSS_BEFORE));

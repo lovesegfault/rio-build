@@ -934,6 +934,19 @@ pub struct PlanOutput {
     pub cached_prior_paths: Vec<String>,
     pub cached_prior_jobs: Vec<String>,
     pub counts: BTreeMap<String, usize>,
+    /// In-scope jobs the plan demoted out of the workload because the
+    /// archive lists impure environment variables for their derivations
+    /// (sorted). Pinned here so the classification is decided ONCE, at
+    /// first plan: a resume reads this membership instead of re-deriving
+    /// it from the archive, so an engine upgrade that changes the
+    /// demotion rule mid-campaign cannot silently move units between
+    /// demoted-impure and buildable (the supply protection set and the
+    /// never-supply rule key on this membership). `None` on campaign
+    /// records written before the pin existed — those re-derive on
+    /// resume, loudly when the re-derivation disagrees with units already
+    /// retired demoted-impure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demoted_impure: Option<Vec<String>>,
 }
 
 /// The campaign.json artifact: identity, the spec as launched, the

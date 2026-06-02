@@ -417,12 +417,26 @@ impl ArchiveWriter {
         }
 
         // Informational counts (operators size campaigns from these without
-        // scanning members).
+        // scanning members) — and the data→flag direction of the
+        // `output_hashes` claim, which keys on record CONTENTS rather than
+        // member presence and so cannot ride the unclaimed-member loop
+        // above: hash-bearing outcomes staged under a manifest that does
+        // not claim them would be withheld by every reader (the flag gates
+        // output-divergence verdicts), which is a recorder bug exactly
+        // like an unclaimed member.
         let expected_outcomes = if presence.outcomes {
             let outcomes_path = self.root.join(super::OUTCOMES_MEMBER);
             let bytes = std::fs::read(&outcomes_path)
                 .with_context(|| format!("read {}", outcomes_path.display()))?;
-            super::parse_jsonl::<OutcomeRecord>(&bytes, super::OUTCOMES_MEMBER)?.len() as u64
+            let records = super::parse_jsonl::<OutcomeRecord>(&bytes, super::OUTCOMES_MEMBER)?;
+            anyhow::ensure!(
+                seed.capabilities.output_hashes
+                    || records.iter().all(|record| record.outputs.is_empty()),
+                "hash-bearing expected outcomes staged but capability `output_hashes` is not \
+                 set — readers withhold unclaimed hashes, so either claim them or strip the \
+                 per-output hashes"
+            );
+            records.len() as u64
         } else {
             0
         };
@@ -1205,6 +1219,67 @@ mod tests {
         seed.capabilities = Capabilities::default();
         let err = writer.finalize(seed).unwrap_err().to_string();
         assert!(err.contains("expected_outcomes"), "got: {err}");
+    }
+
+    /// The data→flag direction for `output_hashes` keys on record CONTENTS
+    /// (hash-bearing outcomes), not member presence: a recorder staging
+    /// per-output hashes it does not claim is a recorder bug exactly like
+    /// an unclaimed member — readers withhold unclaimed hashes, so the
+    /// archive would silently lose its divergence comparability. Hash-less
+    /// outcomes under the same flags finalize fine (must-admit).
+    #[test]
+    fn hash_bearing_outcomes_without_output_hashes_claim_are_rejected() {
+        let stage = |dir: &Path, with_hashes: bool| {
+            let writer = ArchiveWriter::create(dir).unwrap();
+            writer.add_drv(DEP_DRV, DEP_ATERM).unwrap();
+            writer.add_drv(APP_DRV, APP_ATERM).unwrap();
+            writer.write_requests(&tiny_requests()).unwrap();
+            let outputs = if with_hashes {
+                BTreeMap::from([(
+                    "out".to_string(),
+                    crate::archive::schema::OutputHash {
+                        nar_hash: crate::narhash::NarHash::parse(&"1".repeat(64)).unwrap(),
+                        nar_size: 120,
+                    },
+                )])
+            } else {
+                BTreeMap::new()
+            };
+            writer
+                .write_outcomes(&[OutcomeRecord {
+                    session: None,
+                    drv: DEP_DRV.to_string(),
+                    outcome: ExpectedOutcome::Built,
+                    detail: None,
+                    duration_s: None,
+                    stop_offset_s: None,
+                    outputs,
+                }])
+                .unwrap();
+            writer
+        };
+        // expected_outcomes claimed, output_hashes NOT — refuse the
+        // hash-bearing records.
+        let unclaimed = ManifestSeed {
+            capabilities: Capabilities {
+                expected_outcomes: true,
+                output_hashes: false,
+                ..Default::default()
+            },
+            ..tiny_seed()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let err = stage(dir.path(), true)
+            .finalize(unclaimed.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("output_hashes"), "got: {err}");
+        assert!(err.contains("hash-bearing"), "got: {err}");
+
+        // Hash-less outcomes under the identical flags are fine: the
+        // discriminator is the staged data, not the flag combination.
+        let dir = tempfile::TempDir::new().unwrap();
+        stage(dir.path(), false).finalize(unclaimed).unwrap();
     }
 
     #[test]

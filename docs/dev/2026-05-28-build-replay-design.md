@@ -710,6 +710,8 @@ Attributes carried alongside the verdict (not separate verdicts): `cascaded: boo
 
 Per-path supply outcomes (§8.4) are recorded in `supply.jsonl` and roll up into these unit-level dispositions; they are not themselves dispositions.
 
+Plan-time dispositions are pinned by the first plan. The plan stage records the impure-demotion membership it derived (`plan.demotedImpure` in campaign.json, sorted; an empty list is a recorded decision, distinct from the key being absent), and every resume reads the recorded membership instead of re-deriving it from the archive. Re-deriving on resume would make the classification a function of the engine version rather than of the pinned archive: a unit retired `demoted-impure` (outputs supplied, never built) before an engine upgrade could silently flip to buildable after it, putting its outputs back under the never-supply rule while nothing will ever build them. Campaign records written before the pin existed re-derive on resume — the only honest option — and the engine warns loudly when that re-derivation disagrees with units already retired `demoted-impure`; the recommended remedy is a fresh campaign id.
+
 ### 7.3 Aggregation / report policies
 
 Report policies are chosen at launch in the spec (`spec.report: { "policies": ["parity", "regression-gate"], "fail_on": … }`; both may be requested for one campaign) and are never baked into the archive. They read the same `results.jsonl`.

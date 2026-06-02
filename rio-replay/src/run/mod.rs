@@ -791,6 +791,58 @@ fn fixed_output_drvs(
     fixed
 }
 
+/// The campaign's impure-demotion membership: the plan-pinned set when the
+/// campaign record carries one, the legacy re-derivation otherwise.
+///
+/// Plan-time classification PINS at first plan — the documented decision
+/// (design doc §7.2, "Plan-time dispositions are pinned by the first
+/// plan"): the plan stage records the demotion membership it derived, and
+/// every resume reads the recorded membership instead of re-deriving it
+/// from the archive. Re-deriving would make the classification a function
+/// of the engine VERSION, not just of the pinned archive — a unit retired
+/// demoted-impure (outputs suppliable, never built) before an upgrade
+/// could silently flip to buildable after it, putting its outputs back
+/// under the never-supply rule while nothing will ever build them.
+///
+/// Campaign records written before the pin existed (`pinned == None`)
+/// re-derive — the only honest option, there is nothing recorded to read
+/// — and WARN when the re-derivation disagrees with units the campaign
+/// already retired demoted-impure, so the one reclassification surface
+/// that remains is loud, never silent.
+fn resolve_demoted_impure(
+    pinned: Option<&[String]>,
+    rederive: impl FnOnce() -> Vec<String>,
+    existing_records: &BTreeMap<String, JobRecord>,
+) -> Vec<String> {
+    match pinned {
+        Some(pinned) => pinned.to_vec(),
+        None => {
+            let fresh = rederive();
+            let fresh_set: HashSet<&str> = fresh.iter().map(String::as_str).collect();
+            let flipped: Vec<&str> = existing_records
+                .iter()
+                .filter(|(job, record)| {
+                    record.disposition.as_deref() == Some(Disposition::DemotedImpure.as_str())
+                        && !fresh_set.contains(job.as_str())
+                })
+                .map(|(job, _)| job.as_str())
+                .collect();
+            if !flipped.is_empty() {
+                tracing::warn!(
+                    units = flipped.len(),
+                    jobs = ?flipped,
+                    "this campaign record predates the plan-time demotion pin and the \
+                     re-derived impure-demotion membership no longer covers units already \
+                     retired demoted-impure (engine upgrade mid-campaign); their recorded \
+                     retirements stand, but their outputs are no longer supplied — relaunch \
+                     under a fresh campaign id for consistent classification"
+                );
+            }
+            fresh
+        }
+    }
+}
+
 /// One disposition per plan-time-excluded job, derived through
 /// [`classify`] — the single precedence owner — over the union of each
 /// job's plan-time facts. A `BTreeMap` cannot hold two dispositions for
@@ -1900,6 +1952,21 @@ fn timing_index(archive: &ReplayArchive) -> HashMap<(i64, String), RecordedTimin
 /// collect ∥ watchdog ∥ sync) → report, with stage done-markers and resume.
 /// The execute stage is the timeless submit loop or the timed dispatcher,
 /// chosen by `spec.scheduling.mode`.
+/// The timed-mode capability gate: the `timed` flag asserts the archive's
+/// per-request offsets are meaningful recorded times (design doc
+/// "Capabilities" table — the flag gates the timed scheduling mode), so a
+/// timed campaign over a flag-less archive is refused before any stage
+/// marker or campaign record is written. Named (rather than inline) so the
+/// capability flip test can exercise the gate the engine actually runs.
+pub(crate) fn ensure_timed_capability(archive: &ReplayArchive) -> Result<()> {
+    anyhow::ensure!(
+        Capability::Timed.enabled_in(archive.capabilities()),
+        "scheduling.mode is \"timed\" but the archive does not declare the timed capability \
+         (per-request offsets); record a timed archive or run the campaign timeless"
+    );
+    Ok(())
+}
+
 pub async fn run_with_backends(
     args: RunArgs,
     spec: CampaignSpec,
@@ -1922,11 +1989,7 @@ pub async fn run_with_backends(
     let mut replay_interruptions = spec.knobs.replay_interruptions;
     let mut scheduling_low_confidence: Vec<String> = Vec::new();
     if spec.scheduling.mode == ScheduleMode::Timed {
-        anyhow::ensure!(
-            Capability::Timed.enabled_in(archive.capabilities()),
-            "scheduling.mode is \"timed\" but the archive does not declare the timed capability \
-             (per-request offsets); record a timed archive or run the campaign timeless"
-        );
+        ensure_timed_capability(&archive)?;
         if replay_interruptions
             && !archive.outcome_records().any(|record| {
                 matches!(
@@ -2061,11 +2124,18 @@ pub async fn run_with_backends(
         .into_iter()
         .filter(|job| in_scope.contains(job.as_str()))
         .collect();
+    let existing_records = latest_per_job(state.load_jsonl(StateFile::Results)?);
     // Impure-demoted units leave the workload entirely: excluded from
     // submission below, their outputs supplied like dependency outputs (the
     // workload-output never-supply rule no longer covers them), and retired
-    // under the demoted-impure disposition.
-    let demoted_in_scope = supply::demoted_impure_jobs(&archive, &manifest, &in_scope);
+    // under the demoted-impure disposition. Membership is the FIRST plan's
+    // pinned decision (plan_output.demoted_impure), never a per-resume
+    // re-derivation — see [`resolve_demoted_impure`].
+    let demoted_in_scope = resolve_demoted_impure(
+        plan_output.demoted_impure.as_deref(),
+        || supply::demoted_impure_jobs(&archive, &manifest, &in_scope),
+        &existing_records,
+    );
     // The single plan-time disposition map: one disposition per excluded
     // job, precedence settled by the classifier; records, the supply-stage
     // exclusion, and the submit pool below all read THIS map. Arc'd for
@@ -2075,7 +2145,6 @@ pub async fn run_with_backends(
         &divergent_in_scope,
         &demoted_in_scope,
     ));
-    let existing_records = latest_per_job(state.load_jsonl(StateFile::Results)?);
     if !state.marker_done("plan") {
         write_exclusion_records(
             &state,
@@ -3481,6 +3550,104 @@ mod tests {
             dep_closure: Arc::new(Vec::new()),
             plan_dispositions: Arc::new(BTreeMap::new()),
         }
+    }
+
+    /// Minimal terminal record carrying only what
+    /// [`resolve_demoted_impure`] reads: the job key and its disposition.
+    fn demoted_record(job: &str) -> JobRecord {
+        JobRecord {
+            job: job.to_string(),
+            system: "x86_64-linux".into(),
+            drv_path: format!("/nix/store/{}-{job}.drv", fake_hash(job)),
+            mode: "leaf".into(),
+            attempts: 0,
+            build_ids: vec![],
+            rio: model::RioSide::default(),
+            expected: model::ExpectedSide::default(),
+            nar_compare: BTreeMap::new(),
+            verdict: None,
+            disposition: Some(Disposition::DemotedImpure.as_str().to_string()),
+            cascaded: false,
+            failure_cause: None,
+            flaky: false,
+            signature: None,
+            log_key: None,
+            repro: String::new(),
+            evidence: None,
+            updated_at: "2026-06-02T00:00:00Z".into(),
+        }
+    }
+
+    /// Plan-time classification pins at first plan: the plan-recorded
+    /// demotion membership is read back verbatim on resume — even when a
+    /// (newer-engine) re-derivation would disagree — so units cannot
+    /// silently move between demoted-impure and buildable mid-campaign.
+    /// Contract: design doc §7.2, "Plan-time dispositions are pinned by
+    /// the first plan". Legacy campaign records without the pin re-derive
+    /// (the only honest option), which is the one loud reclassification
+    /// surface left.
+    #[test]
+    fn demotion_membership_pins_at_first_plan() {
+        let pinned = vec!["impure-a.x86_64-linux".to_string()];
+        let records = BTreeMap::new();
+        // Pin present: the recorded membership wins; the re-derivation is
+        // not even consulted (it would panic).
+        let resolved = resolve_demoted_impure(Some(&pinned), || unreachable!(), &records);
+        assert_eq!(resolved, pinned);
+        // An empty pinned set is still a pin (the plan decided: nothing
+        // demoted), distinct from a legacy record with no pin at all.
+        let resolved = resolve_demoted_impure(
+            Some(&[]),
+            || vec!["impure-a.x86_64-linux".to_string()],
+            &records,
+        );
+        assert!(resolved.is_empty());
+
+        // Legacy record (no pin): re-derivation is used, including when it
+        // disagrees with an already-retired demoted unit (the warning path
+        // — the retirement stands via the existing record either way).
+        let mut records = BTreeMap::new();
+        records.insert(
+            "impure-a.x86_64-linux".to_string(),
+            demoted_record("impure-a.x86_64-linux"),
+        );
+        let resolved = resolve_demoted_impure(None, Vec::new, &records);
+        assert!(resolved.is_empty());
+    }
+
+    /// A campaign.json plan block written before the demotion pin existed
+    /// parses with `demoted_impure: None` (the legacy marker the resume
+    /// path keys its re-derivation fallback on), and the pin round-trips
+    /// when present.
+    #[test]
+    fn plan_output_without_demotion_pin_parses_as_legacy() {
+        let legacy: PlanOutput = serde_json::from_value(serde_json::json!({
+            "plannedAt": "2026-05-30T00:00:00Z",
+            "inScope": ["a.x86_64-linux"],
+            "skipped": {},
+            "notAttemptable": [],
+            "warmSet": [],
+            "cachedPriorPaths": [],
+            "cachedPriorJobs": [],
+            "counts": {"inScope": 1}
+        }))
+        .unwrap();
+        assert_eq!(legacy.demoted_impure, None);
+
+        let mut pinned = legacy.clone();
+        pinned.demoted_impure = Some(vec!["impure-a.x86_64-linux".to_string()]);
+        let json = serde_json::to_value(&pinned).unwrap();
+        assert_eq!(
+            json["demotedImpure"],
+            serde_json::json!(["impure-a.x86_64-linux"])
+        );
+        let back: PlanOutput = serde_json::from_value(json).unwrap();
+        assert_eq!(back.demoted_impure, pinned.demoted_impure);
+        // The legacy form serializes WITHOUT the key (skip_serializing_if),
+        // so a legacy record rewritten by a new engine stays legacy-shaped
+        // until the plan stage itself records a pin.
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("demotedImpure").is_none(), "{json}");
     }
 
     struct HealthyCluster;

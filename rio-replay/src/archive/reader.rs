@@ -19,8 +19,8 @@ use rio_nix::narinfo::NarInfo;
 
 use super::backend::{Backend, WalkEntry};
 use super::schema::{
-    Capabilities, ClosureRecord, Counts, ExclusionRecord, ExpectedOutcome, ImpureEnv, Manifest,
-    MemberPresence, OutcomeRecord, RequestRecord, SessionKey, Substituters, UnitRecord,
+    Capabilities, Capability, ClosureRecord, Counts, ExclusionRecord, ExpectedOutcome, ImpureEnv,
+    Manifest, MemberPresence, OutcomeRecord, RequestRecord, SessionKey, Substituters, UnitRecord,
 };
 use super::{
     CLOSURES_MEMBER, EXCLUSIONS_MEMBER, IMPURE_ENV_MEMBER, MANIFEST_MEMBER, METADATA_MEMBERS,
@@ -183,6 +183,34 @@ impl ReplayArchive {
                     .insert(record.session, record);
             }
         }
+        // Capability gate, enforced where the data enters: per-output NAR
+        // hashes are usable only under the `output_hashes` flag (the
+        // recorder's claim that it vouches for them — design doc
+        // "Capabilities" table: the flag gates output-divergence verdicts).
+        // Withholding them HERE means no consumer can mint divergence
+        // verdicts from unvouched hashes by forgetting to ask; first-party
+        // producers are flag-consistent, so this only bites foreign v1
+        // archives, which get the warning.
+        if !manifest.capabilities.output_hashes {
+            let mut withheld = 0usize;
+            for record in outcomes
+                .values_mut()
+                .flat_map(|by_session| by_session.values_mut())
+            {
+                if !record.outputs.is_empty() {
+                    record.outputs.clear();
+                    withheld += 1;
+                }
+            }
+            if withheld > 0 {
+                tracing::warn!(
+                    records = withheld,
+                    "outcome records carry per-output hashes but capability `output_hashes` \
+                     is not set; the hashes are withheld — output-divergence verdicts gate \
+                     on the flag"
+                );
+            }
+        }
 
         // Per-unit metadata; records for derivations outside the workload are
         // dropped with a warning (they cannot be scheduled, so keeping them
@@ -226,9 +254,22 @@ impl ReplayArchive {
             None => Vec::new(),
         };
 
+        // Same gate shape for the impure-env map: the member is parsed (a
+        // malformed member is a malformed archive whatever the flags say)
+        // but exposed to consumers only under the `impure_env` flag, so
+        // the impure-demotion decision (workload_set) cannot fire on data
+        // the recorder did not claim. The member-present/flag-false case
+        // is warned about in the capability loop below.
         let impure_env: ImpureEnv = match staged.get(IMPURE_ENV_MEMBER) {
-            Some(bytes) => serde_json::from_slice(bytes)
-                .with_context(|| format!("malformed {IMPURE_ENV_MEMBER}"))?,
+            Some(bytes) => {
+                let parsed: ImpureEnv = serde_json::from_slice(bytes)
+                    .with_context(|| format!("malformed {IMPURE_ENV_MEMBER}"))?;
+                if manifest.capabilities.impure_env {
+                    parsed
+                } else {
+                    ImpureEnv::new()
+                }
+            }
             None => ImpureEnv::new(),
         };
 
@@ -296,8 +337,16 @@ impl ReplayArchive {
         )?;
 
         // Capability flags must be backed by the data they claim. The
-        // reverse direction (member present, flag false) is only a warning:
-        // the data is loaded, but the engine will gate on the flags.
+        // reverse direction (member present, flag false) is only a warning
+        // — but the data is then GATED, not used: impure-env and embedded
+        // store paths are withheld by this reader (above/`has_embedded`),
+        // outcome hashes are stripped above, and the remaining members'
+        // consumers gate on the flag themselves
+        // (`run/truth.rs::expected_outcomes_for_units` for outcomes,
+        // `run/supply.rs::walk_closure` / `run/archive_input.rs::
+        // load_closures` for closures). An archive must stay openable no
+        // matter what an honest-but-conservative recorder declined to
+        // claim.
         let presence = MemberPresence {
             outcomes: staged.contains_key(OUTCOMES_MEMBER),
             units: staged.contains_key(UNITS_MEMBER),
@@ -338,7 +387,7 @@ impl ReplayArchive {
             if member_present && !flag_set {
                 tracing::warn!(
                     "archive carries {staged_what} but capability `{flag}` is not set; the \
-                     engine will gate on the flag"
+                     engine gates on the flag, so the staged data will not be used"
                 );
             }
         }
@@ -718,15 +767,30 @@ impl ReplayArchive {
         self.narinfos.get(super::hash_part(hash_part_or_path))
     }
 
-    /// True if the archive embeds this store path's contents (a non-drv tree).
+    /// True if the archive embeds this store path's contents (a non-drv
+    /// tree) AND declares the `embedded_store_paths` capability — the flag
+    /// gates the archive rung of the supply ladder (design doc
+    /// "Capabilities" table), and the gate is enforced here so no supply
+    /// consumer can plan uploads from trees the recorder did not claim.
+    /// First-party producers are flag-consistent (the writer refuses
+    /// unclaimed members; v0 infers flags from presence), so the
+    /// withholding only bites foreign v1 archives, which get an open-time
+    /// warning.
     pub fn has_embedded(&self, store_path: &str) -> bool {
-        self.store_entries
-            .get(super::hash_part(store_path))
-            .is_some_and(|entry| !entry.name.ends_with(".drv"))
+        Capability::EmbeddedStorePaths.enabled_in(&self.manifest.capabilities)
+            && self
+                .store_entries
+                .get(super::hash_part(store_path))
+                .is_some_and(|entry| !entry.name.ends_with(".drv"))
     }
 
     /// Embedded non-drv store paths (full /nix/store/... paths, sorted).
+    /// Empty when the archive does not declare `embedded_store_paths` —
+    /// same gate as [`Self::has_embedded`].
     pub fn embedded_store_paths(&self) -> Vec<String> {
+        if !Capability::EmbeddedStorePaths.enabled_in(&self.manifest.capabilities) {
+            return Vec::new();
+        }
         self.collect_store_paths(|name| !name.ends_with(".drv"))
     }
 
@@ -1381,6 +1445,202 @@ mod tests {
             err.contains("embedded-derivation listing digest mismatch"),
             "got: {err}"
         );
+    }
+
+    /// Stage every member the capability vocabulary can claim and claim
+    /// all six flags: the tiny archive plus an impure-env entry for `app`
+    /// and adjacency records carrying a sentinel input source the ATerms
+    /// do NOT declare (so the adjacency-vs-ATerm construction choice is
+    /// observable).
+    fn full_capability_archive(root: &Path) {
+        use crate::archive::schema::{Capabilities, ClosureRecord};
+        use crate::archive::writer::ArchiveWriter;
+        use crate::archive::writer::test_support::{
+            APP_DRV, APP_OUT, DEP_DRV, DEP_OUT, SRC_PATH, stage_tiny_archive, tiny_seed,
+        };
+        use std::collections::BTreeMap;
+
+        let writer = ArchiveWriter::create(root).unwrap();
+        let src_tree = tempfile::TempDir::new().unwrap();
+        stage_tiny_archive(&writer, &src_tree.path().join("src"));
+        writer
+            .write_impure_env(&BTreeMap::from([(
+                APP_DRV.to_string(),
+                vec!["NIX_FOO".to_string()],
+            )]))
+            .unwrap();
+        writer
+            .write_closures(&[
+                ClosureRecord {
+                    drv: DEP_DRV.to_string(),
+                    inputs: Vec::new(),
+                    srcs: vec![SRC_PATH.to_string(), SENTINEL_SRC.to_string()],
+                    outputs: BTreeMap::from([("out".to_string(), Some(DEP_OUT.to_string()))]),
+                },
+                ClosureRecord {
+                    drv: APP_DRV.to_string(),
+                    inputs: vec![DEP_DRV.to_string()],
+                    srcs: Vec::new(),
+                    outputs: BTreeMap::from([("out".to_string(), Some(APP_OUT.to_string()))]),
+                },
+            ])
+            .unwrap();
+        let mut seed = tiny_seed();
+        seed.capabilities = Capabilities {
+            timed: true,
+            expected_outcomes: true,
+            output_hashes: true,
+            embedded_store_paths: true,
+            impure_env: true,
+            dependency_closures: true,
+        };
+        writer.finalize(seed).unwrap();
+    }
+
+    /// Input source present only in the adjacency records, never in the
+    /// ATerms — the observable difference between the two closure
+    /// constructions.
+    const SENTINEL_SRC: &str = "/nix/store/h1111111111111111111111111111111-sentinel-src";
+
+    /// Flip one capability flag to false in a finalized archive's
+    /// manifest. The manifest member is not covered by `files`, so the
+    /// edited archive opens — this is exactly the foreign-producer shape
+    /// the open-time leniency exists for: data staged, claim withdrawn,
+    /// open warns and admits, the engine gates.
+    fn set_capability_false(root: &Path, flag: &str) {
+        let manifest_path = root.join(MANIFEST_MEMBER);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["capabilities"][flag] = serde_json::Value::Bool(false);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Behavioral flip test over the WHOLE capability vocabulary
+    /// (quantification domain: `Capability::ALL` — the same closed enum
+    /// the published gates table renders from): for each flag, open the
+    /// same fully-staged archive bytes with the flag claimed and with it
+    /// withdrawn, and assert the behavior the `gates()` table documents
+    /// observably changes. The match is exhaustive on purpose: a new
+    /// `Capability` variant refuses to compile here until its gate delta
+    /// is asserted, so the table can no longer truthfully render a gate
+    /// no code has.
+    ///
+    /// Both directions per flag (must-admit AND must-withhold): the
+    /// flag-true baseline proves the data flows, the flag-false twin
+    /// proves the gate holds — so the discriminator is the flag, not the
+    /// staged data. Contract per arm: the `Capability::gates()` row
+    /// (pinned verbatim into the design doc's Capabilities table).
+    #[test]
+    fn capability_flags_gate_their_documented_engine_behavior() {
+        use crate::archive::schema::Capability;
+        use crate::archive::writer::test_support::{APP_DRV, SRC_PATH};
+        use crate::run::{archive_input, supply, truth};
+
+        let dep_job = "pkgs.dep.x86_64-linux";
+        for capability in Capability::ALL {
+            let base_dir = tempfile::TempDir::new().unwrap();
+            full_capability_archive(base_dir.path());
+            let baseline = ReplayArchive::open(base_dir.path()).unwrap();
+
+            let gated_dir = tempfile::TempDir::new().unwrap();
+            full_capability_archive(gated_dir.path());
+            set_capability_false(gated_dir.path(), capability.flag());
+            let gated = ReplayArchive::open(gated_dir.path())
+                .unwrap_or_else(|e| panic!("flag-false archives stay openable ({e:#})"));
+
+            match capability {
+                // Gates the timed scheduling mode: the engine's legality
+                // check refuses a flag-less archive.
+                Capability::Timed => {
+                    crate::run::ensure_timed_capability(&baseline).unwrap();
+                    let err = crate::run::ensure_timed_capability(&gated)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("timed capability"), "{err}");
+                }
+                // Gates verdict comparison: without the flag every unit's
+                // truth is Unknown (a load/exercise run).
+                Capability::ExpectedOutcomes => {
+                    let units = archive_input::load_units(&baseline).unwrap();
+                    let with = truth::expected_outcomes_for_units(&baseline, &units).unwrap();
+                    assert_eq!(
+                        with[dep_job].outcome,
+                        crate::run::model::ExpectedOutcome::Built
+                    );
+                    let units = archive_input::load_units(&gated).unwrap();
+                    let without = truth::expected_outcomes_for_units(&gated, &units).unwrap();
+                    assert!(
+                        without
+                            .values()
+                            .all(|t| t.outcome == crate::run::model::ExpectedOutcome::Unknown),
+                        "{without:?}"
+                    );
+                }
+                // Gates output-divergence verdicts: per-output hashes are
+                // withheld when unclaimed, so the comparator sees
+                // not-comparable instead of minting divergence from data
+                // the recorder did not vouch for. The outcome itself still
+                // flows (expected_outcomes stays claimed).
+                Capability::OutputHashes => {
+                    let units = archive_input::load_units(&baseline).unwrap();
+                    let with = truth::expected_outcomes_for_units(&baseline, &units).unwrap();
+                    assert!(with[dep_job].side.outputs["out"].nar_hash.is_some());
+                    let units = archive_input::load_units(&gated).unwrap();
+                    let without = truth::expected_outcomes_for_units(&gated, &units).unwrap();
+                    assert_eq!(
+                        without[dep_job].outcome,
+                        crate::run::model::ExpectedOutcome::Built,
+                        "the outcome is vouched for; only the hashes are not"
+                    );
+                    assert!(without[dep_job].side.outputs["out"].nar_hash.is_none());
+                    assert!(
+                        gated
+                            .outcome_records()
+                            .all(|record| record.outputs.is_empty()),
+                        "unclaimed hashes are withheld at the reader"
+                    );
+                }
+                // Gates the archive rung of the supply ladder: unclaimed
+                // embedded trees are not offered as upload sources.
+                Capability::EmbeddedStorePaths => {
+                    assert!(baseline.has_embedded(SRC_PATH));
+                    assert_eq!(baseline.embedded_store_paths(), vec![SRC_PATH.to_string()]);
+                    assert!(!gated.has_embedded(SRC_PATH));
+                    assert!(gated.embedded_store_paths().is_empty());
+                }
+                // Gates impure demotion: units leave the measured workload
+                // only when the recorder claimed the impure-env data.
+                Capability::ImpureEnv => {
+                    let with = supply::workload_set(&baseline);
+                    assert_eq!(
+                        with.demoted_impure.iter().collect::<Vec<_>>(),
+                        vec![APP_DRV]
+                    );
+                    let without = supply::workload_set(&gated);
+                    assert!(without.demoted_impure.is_empty());
+                    assert!(without.drvs.contains(APP_DRV));
+                    assert!(gated.impure_env().is_empty());
+                }
+                // Gates plan-time closure construction: adjacency records
+                // are used only under the flag (the sentinel source exists
+                // only there); otherwise the embedded ATerms are walked.
+                Capability::DependencyClosures => {
+                    let units = archive_input::load_units(&baseline).unwrap();
+                    let with = archive_input::load_closures(&baseline, &units).unwrap();
+                    let dep_entry = with.iter().find(|e| e.job == dep_job).unwrap();
+                    assert!(dep_entry.srcs.contains(&SENTINEL_SRC.to_string()));
+                    let units = archive_input::load_units(&gated).unwrap();
+                    let without = archive_input::load_closures(&gated, &units).unwrap();
+                    let dep_entry = without.iter().find(|e| e.job == dep_job).unwrap();
+                    assert!(!dep_entry.srcs.contains(&SENTINEL_SRC.to_string()));
+                    assert!(dep_entry.srcs.contains(&SRC_PATH.to_string()));
+                }
+            }
+        }
     }
 
     #[test]
