@@ -817,39 +817,81 @@ fn plan_time_dispositions(
 /// supply design: a unit whose closure needs a path the target REFUSED to
 /// accept (after the fresh-channel retry) takes upload-rejected; one whose
 /// required delivery FAILED engine-side takes supply-failed. A required
-/// path is a dependency's declared output OR an input source (a store
-/// path with no producing derivation — patches, builder scripts); source
-/// uploads write the same upload-mechanism journal rows, and a unit
-/// missing a source fails exactly like one missing a dep output. Either
-/// way the unit is retired before submission — dispatching it would
-/// charge a guaranteed missing-input failure to the parity headline, the
-/// exact misattribution these dispositions exist to prevent.
+/// path is a dependency's declared output, an input source (a store path
+/// with no producing derivation — patches, builder scripts), OR a
+/// derivation text (the unit's own drv or a dependency's): all three
+/// families are planned by `plan_uploads` and settle through the same
+/// upload-mechanism journal rows, and a unit missing any of them fails
+/// identically on dispatch. Either way the unit is retired —
+/// dispatching it would charge a guaranteed missing-input failure to the
+/// parity headline, the exact misattribution these dispositions exist to
+/// prevent.
 ///
 /// Scope is deliberately the engine's own upload mechanisms: prefetch
 /// (delegate) failures stay with the prefetch-shortfall gate, and inline
 /// delivery's policy-deferred rows are recorded unavailable, not failures.
-/// The journal's LAST row per path is its settled outcome, so a path a
-/// later arm or top-up delivered never retires anyone. Precedence between
-/// the two dispositions is the classifier's, like every other disposition.
+/// The journal's last SETTLEMENT row per path is its settled outcome
+/// ([`model::supply_outcome_is_settlement`]): a path a later arm or
+/// top-up delivered never retires anyone, and bookkeeping rows
+/// (`unavailable`, breaker/held `skipped`) neither retire nor displace —
+/// a skip is not a delivery attempt.
+///
+/// `attempt_floor` is the bounded supply-attempt count a path must reach
+/// before its settled refusal/failure becomes retiring: each settled
+/// refused/failed row is one claim-resolved delivery attempt, and the
+/// caller passes 2 when a per-submission top-up is wired — the top-up's
+/// documented contract gives a path the prewarm pass refused or failed
+/// "one more delivery attempt" (see the `LadderTopup` doc and the
+/// mode-wiring comment at the supply-stage call site), so retiring on the
+/// first settled attempt would dead-code that backstop and turn one
+/// transient transport failure into permanent exclusions — and 1 when
+/// nothing re-attempts (no top-up wired, or attribution of an
+/// already-dispatched batch member at settle time, where the question is
+/// whether the path WAS settled-undelivered, not whether it might recover
+/// later). Premature retirement and infinite attemptability are both
+/// unrepresentable: below the floor nothing retires and the wired top-up
+/// keeps re-attempting; at the floor the next rollup (process start for
+/// never-dispatched units, the collect pass's batch-settle rollup for
+/// dispatched ones) retires every dependent, after which no batch
+/// contains them and the re-attempts stop.
+///
+/// Precedence between the two dispositions is the classifier's, like
+/// every other disposition.
 fn supply_rollup_dispositions(
     entries: &[SupplyEntry],
     dep_closure: &[archive_input::DepClosureEntry],
     in_scope: &HashSet<&str>,
     already_excluded: &BTreeMap<String, Disposition>,
+    attempt_floor: usize,
 ) -> BTreeMap<String, Disposition> {
-    let mut latest: HashMap<&str, (&str, &str)> = HashMap::new();
+    // Last settlement row per path, plus the per-path count of settled
+    // undelivered upload attempts (refused/failed rows on the upload
+    // mechanisms — each one a claim-resolved transport attempt).
+    let mut last_settlement: HashMap<&str, (&str, &str)> = HashMap::new();
+    let mut undelivered_attempts: HashMap<&str, usize> = HashMap::new();
     for entry in entries {
-        latest.insert(
-            entry.path.as_str(),
-            (entry.mechanism.as_str(), entry.outcome.as_str()),
-        );
+        let outcome = entry.outcome.as_str();
+        if !model::supply_outcome_is_settlement(outcome) {
+            continue;
+        }
+        last_settlement.insert(entry.path.as_str(), (entry.mechanism.as_str(), outcome));
+        let upload_mechanism = entry.mechanism == model::SUPPLY_MECHANISM_UPLOAD_BATCH
+            || entry.mechanism == model::SUPPLY_MECHANISM_UPLOAD_STREAM;
+        if upload_mechanism
+            && (outcome == model::SUPPLY_OUTCOME_REFUSED || outcome == model::SUPPLY_OUTCOME_FAILED)
+        {
+            *undelivered_attempts.entry(entry.path.as_str()).or_default() += 1;
+        }
     }
     let mut refused: HashSet<&str> = HashSet::new();
     let mut failed: HashSet<&str> = HashSet::new();
-    for (path, (mechanism, outcome)) in latest {
+    for (path, (mechanism, outcome)) in last_settlement {
         if mechanism != model::SUPPLY_MECHANISM_UPLOAD_BATCH
             && mechanism != model::SUPPLY_MECHANISM_UPLOAD_STREAM
         {
+            continue;
+        }
+        if undelivered_attempts.get(path).copied().unwrap_or(0) < attempt_floor {
             continue;
         }
         match outcome {
@@ -871,7 +913,13 @@ fn supply_rollup_dispositions(
             continue;
         }
         let mut flags = AuxFlags::default();
+        // The unit's own derivation text is required supply too: the
+        // submitter cannot even import the build without it.
+        flags.upload_rejected |= refused.contains(entry.drv_path.as_str());
+        flags.supply_failed |= failed.contains(entry.drv_path.as_str());
         for dep in &entry.deps {
+            flags.upload_rejected |= refused.contains(dep.drv_path.as_str());
+            flags.supply_failed |= failed.contains(dep.drv_path.as_str());
             for path in &dep.output_paths {
                 flags.upload_rejected |= refused.contains(path.as_str());
                 flags.supply_failed |= failed.contains(path.as_str());
@@ -1966,8 +2014,10 @@ pub async fn run_with_backends(
         .plan
         .clone()
         .context("campaign.json has no plan output")?;
-    let manifest = archive_input::load_units(&archive)?;
-    let dep_closure = archive_input::load_closures(&archive, &manifest)?;
+    // Arc'd: the collect pass's batch-settle supply rollup reads both from
+    // the spawned background task.
+    let manifest = Arc::new(archive_input::load_units(&archive)?);
+    let dep_closure = Arc::new(archive_input::load_closures(&archive, &manifest)?);
     let in_scope: HashSet<&str> = plan_output.in_scope.iter().map(String::as_str).collect();
     // Identity-divergent units that made it into scope are retired at plan
     // time (eval-divergence) and never offered to the submit loop.
@@ -1982,9 +2032,13 @@ pub async fn run_with_backends(
     let demoted_in_scope = supply::demoted_impure_jobs(&archive, &manifest, &in_scope);
     // The single plan-time disposition map: one disposition per excluded
     // job, precedence settled by the classifier; records, the supply-stage
-    // exclusion, and the submit pool below all read THIS map.
-    let plan_dispositions =
-        plan_time_dispositions(&plan_output, &divergent_in_scope, &demoted_in_scope);
+    // exclusion, and the submit pool below all read THIS map. Arc'd for
+    // the collect pass's batch-settle supply rollup.
+    let plan_dispositions = Arc::new(plan_time_dispositions(
+        &plan_output,
+        &divergent_in_scope,
+        &demoted_in_scope,
+    ));
     let existing_records = latest_per_job(state.load_jsonl(StateFile::Results)?);
     if !state.marker_done("plan") {
         write_exclusion_records(
@@ -2192,17 +2246,28 @@ pub async fn run_with_backends(
     let supply_summary = load_supply_summary(&state)?;
 
     // Supply-failure rollup: units whose required uploads (dependency
-    // outputs or input sources) the target refused (upload-rejected) or
-    // whose delivery failed engine-side (supply-failed) are retired here,
-    // before the execute stage, with terminal disposition records — never
-    // dispatched to fail on missing inputs and pollute the parity headline.
-    // Recomputed from the journal on every start (resume re-derives the
-    // same set; existing records win).
+    // outputs, input sources, or derivation texts) the target refused
+    // (upload-rejected) or whose delivery failed engine-side
+    // (supply-failed) are retired here, before the execute stage, with
+    // terminal disposition records — never dispatched to fail on missing
+    // inputs and pollute the parity headline. Recomputed from the journal
+    // on every start (resume re-derives the same set; existing records
+    // win). The attempt floor honors the wired top-up's documented
+    // backstop: with a per-submission top-up present, a path's first
+    // settled refusal/failure leaves its dependents attemptable so the
+    // top-up gets its one more delivery attempt (mode-wiring contract
+    // above); the second settled failure retires. Without a top-up
+    // nothing will re-attempt, so the first settled failure retires —
+    // dispatching would be the guaranteed missing-input failure. Units
+    // dispatched anyway are retired by the collect pass's batch-settle
+    // rollup the moment their batch settles.
+    let supply_attempt_floor = if supply_topup.is_some() { 2 } else { 1 };
     let supply_retired = supply_rollup_dispositions(
         &state.load_jsonl::<SupplyEntry>(StateFile::Supply)?,
         &dep_closure,
         &in_scope,
         &plan_dispositions,
+        supply_attempt_floor,
     );
     if !supply_retired.is_empty() {
         tracing::warn!(
@@ -2674,6 +2739,14 @@ pub async fn run_with_backends(
         })
     };
 
+    // Inputs for the collect pass's batch-settle supply rollup, shared by
+    // the background loop and the drain loop's final passes.
+    let supply_retirement = SupplyRetirementInputs {
+        manifest: manifest.clone(),
+        dep_closure: dep_closure.clone(),
+        plan_dispositions: plan_dispositions.clone(),
+    };
+
     // Background collect loop (timely same-day evidence capture).
     let collector = {
         let state = state.clone();
@@ -2690,6 +2763,7 @@ pub async fn run_with_backends(
             store: backends.store.clone(),
             artifacts: backends.artifacts.clone(),
         };
+        let supply_retirement = supply_retirement.clone();
         let mut stop_rx = stop_rx.clone();
         tokio::spawn(async move {
             let poll = Duration::from_secs(knobs.collect_poll_secs.max(1));
@@ -2707,6 +2781,7 @@ pub async fn run_with_backends(
                         &mode,
                         &campaign_id,
                         Some(&prefix),
+                        &supply_retirement,
                     )
                     .await
                 };
@@ -2888,6 +2963,7 @@ pub async fn run_with_backends(
                     spec.mode.as_str(),
                     &campaign_id,
                     Some(&artifact_prefix),
+                    &supply_retirement,
                 )
                 .await?
             };
@@ -3042,6 +3118,18 @@ struct CollectBackends {
     artifacts: Option<Arc<dyn ArtifactStore>>,
 }
 
+/// Campaign-shaped inputs for the collect pass's batch-settle supply
+/// rollup ([`collect_pass_with`]): the dependency closures that link
+/// journal paths to units, the manifest the exclusion records are written
+/// from, and the plan-time exclusions the rollup must not double-retire.
+/// Clonable into the background collect task.
+#[derive(Clone)]
+struct SupplyRetirementInputs {
+    manifest: Arc<Vec<archive_input::ManifestEntry>>,
+    dep_closure: Arc<Vec<archive_input::DepClosureEntry>>,
+    plan_dispositions: Arc<BTreeMap<String, Disposition>>,
+}
+
 /// One collect pass over every settled, not-yet-processed build batch
 /// (submit-loop and timed-dispatcher kinds alike): classify each batch's
 /// jobs via [`process_settled_batch`] and apply each returned decision
@@ -3055,6 +3143,23 @@ struct CollectBackends {
 /// the shared in-memory results map and extends it with each batch's own
 /// terminal decisions, so a job settled by two unprocessed batches in one
 /// pass (the duplicate-submission shape) is recorded exactly once.
+///
+/// Batch-settle supply rollup: before a batch's members are classified,
+/// the supply journal is re-folded over exactly those members. The
+/// per-submission top-up appends refused/failed settlements DURING
+/// execution — rows the pre-execute rollup ran too early to see (under
+/// inline delivery the supply stage defers every planned upload to the
+/// top-up, so undelivered supply only ever settles here). A member whose
+/// required path was settled-undelivered when its batch ran was doomed
+/// before dispatch: it is retired with the supply disposition
+/// (upload-rejected / supply-failed exclusion record) and dropped by the
+/// already-terminal belt instead of being classified into a false parity
+/// regression. The journal is loaded once per pass — every batch in the
+/// pass topped up before it was submitted, so its settlement rows are on
+/// disk before the batch could settle. This is the named retirer for
+/// dispatched units; never-dispatched dependents are retired by the
+/// process-start rollup once a path's settled failures reach the wired
+/// attempt floor.
 #[allow(clippy::too_many_arguments)]
 async fn collect_pass_with(
     state: &StateDir,
@@ -3067,10 +3172,14 @@ async fn collect_pass_with(
     mode: &str,
     campaign_id: &str,
     artifact_prefix: Option<&str>,
+    supply: &SupplyRetirementInputs,
 ) -> Result<usize> {
     let batches: Vec<model::BatchRecord> = state.load_jsonl(StateFile::Batches)?;
     let mut requeued = 0usize;
     let mut already_terminal: HashSet<String> = terminal_set(&*results.lock().await);
+    // Loaded lazily: only a pass that actually processes a batch pays for
+    // the journal read.
+    let mut supply_entries: Option<Vec<SupplyEntry>> = None;
     for batch in batches {
         // Both build-batch kinds are collected here: the timeless submit
         // loop's batches and the timed dispatcher's. Anything else (e.g. a
@@ -3078,6 +3187,43 @@ async fn collect_pass_with(
         let collectable = matches!(batch.kind.as_str(), BATCH_KIND_SUBMIT | BATCH_KIND_TIMED);
         if !collectable || processed.contains(&batch.batch_id) {
             continue;
+        }
+        // Batch-settle supply rollup (see the function doc): retire
+        // settled-undelivered members before classification. Attempt floor
+        // 1 — the question here is whether the member's required supply WAS
+        // settled-undelivered when it ran, not whether a later attempt
+        // might still recover the path for someone else.
+        let entries = match &supply_entries {
+            Some(entries) => entries,
+            None => supply_entries.insert(state.load_jsonl::<SupplyEntry>(StateFile::Supply)?),
+        };
+        let members: HashSet<&str> = batch
+            .jobs
+            .iter()
+            .map(String::as_str)
+            .filter(|job| !already_terminal.contains(*job))
+            .collect();
+        let supply_retired = supply_rollup_dispositions(
+            entries,
+            &supply.dep_closure,
+            &members,
+            &supply.plan_dispositions,
+            1,
+        );
+        if !supply_retired.is_empty() {
+            tracing::warn!(
+                batch_id = batch.batch_id,
+                units = supply_retired.len(),
+                "retiring settled-batch members whose required supply was refused or failed \
+                 before classification; they are recorded under the upload-rejected / \
+                 supply-failed dispositions instead of a parity verdict"
+            );
+            let existing = results.lock().await.clone();
+            write_exclusion_records(state, &supply.manifest, &supply_retired, mode, &existing)?;
+            for job in supply_retired.keys() {
+                already_terminal.insert(job.clone());
+                ledger.retire(job).await;
+            }
         }
         let view = BatchView {
             kind: batch.kind.clone(),
@@ -3228,6 +3374,17 @@ mod tests {
     use crate::run::submitter::test_support::FakeSubmitter;
     use crate::run::supply::exec::test_support::FakeSupplyTransport;
     use rio_nix::protocol::build::BuildStatus;
+
+    /// Empty batch-settle rollup inputs for collect-pass tests that do not
+    /// exercise supply retirement: no closures means no member can match a
+    /// journal path, so the pass behaves exactly as before the rollup.
+    fn no_supply_retirement() -> SupplyRetirementInputs {
+        SupplyRetirementInputs {
+            manifest: Arc::new(Vec::new()),
+            dep_closure: Arc::new(Vec::new()),
+            plan_dispositions: Arc::new(BTreeMap::new()),
+        }
+    }
 
     struct HealthyCluster;
     #[async_trait]
@@ -4363,6 +4520,7 @@ mod tests {
             "leaf",
             "c-timed",
             None,
+            &no_supply_retirement(),
         )
         .await
         .unwrap();
@@ -4477,6 +4635,7 @@ mod tests {
             "leaf",
             "c-ledger",
             None,
+            &no_supply_retirement(),
         )
         .await
         .unwrap();
@@ -4564,6 +4723,7 @@ mod tests {
             "leaf",
             "c-stale",
             None,
+            &no_supply_retirement(),
         )
         .await
         .unwrap();
@@ -4591,6 +4751,193 @@ mod tests {
     /// build one over a scripted admin instead.
     fn test_probe() -> StallProgressProbe {
         StallProgressProbe::new(Arc::new(NoLogsAdmin), "replay-leaf".to_string())
+    }
+
+    /// The collect pass's batch-settle supply rollup, both directions of
+    /// the contract:
+    ///
+    /// - must-retire: a settled member whose required dependency output the
+    ///   per-submission top-up journaled REFUSED during execution is
+    ///   recorded under the upload-rejected disposition — never classified
+    ///   into the false parity regression its missing-input failure would
+    ///   otherwise become (the misattribution the supply dispositions
+    ///   exist to prevent; the pre-execute rollup ran before these rows
+    ///   existed, so this pass is the only consumer that can see them).
+    /// - must-admit: an identically failing member whose required path was
+    ///   DELIVERED keeps its real failure verdict — supply facts excuse
+    ///   nothing that was actually supplied.
+    ///
+    /// Quantification domain: the settled batch's member set (the rollup
+    /// is scoped to exactly the batch's jobs), with the journal folded
+    /// under the same settlement rules as the pre-execute rollup.
+    #[tokio::test]
+    async fn collect_pass_retires_supply_starved_members_before_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let starved_drv = format!("/nix/store/{}-starved.drv", "a".repeat(32));
+        let supplied_drv = format!("/nix/store/{}-supplied.drv", "b".repeat(32));
+        let starved_job = "starved.x86_64-linux";
+        let supplied_job = "supplied.x86_64-linux";
+        let starved_dep_out = format!("/nix/store/{}-starved-dep-out", "c".repeat(32));
+        let supplied_dep_out = format!("/nix/store/{}-supplied-dep-out", "d".repeat(32));
+        // The execute-phase top-up journaled a settled refusal for the
+        // starved member's required output and a delivery for the other.
+        let supply_row = |path: &str, outcome: &str| SupplyEntry {
+            path: path.to_string(),
+            source: model::SUPPLY_SOURCE_EMBEDDED.to_string(),
+            mechanism: model::SUPPLY_MECHANISM_UPLOAD_BATCH.to_string(),
+            outcome: outcome.to_string(),
+            detail: None,
+            batch_id: Some(1),
+            bytes: None,
+            observed_at: now_rfc3339(),
+        };
+        state
+            .append_jsonl(
+                StateFile::Supply,
+                &supply_row(&starved_dep_out, SUPPLY_OUTCOME_REFUSED),
+            )
+            .unwrap();
+        state
+            .append_jsonl(
+                StateFile::Supply,
+                &supply_row(&supplied_dep_out, SUPPLY_OUTCOME_DELIVERED),
+            )
+            .unwrap();
+        // Both members failed in-band the same way (a refused upload
+        // surfaces as an ordinary missing-input build failure).
+        let failure = |drv: &str| model::PathOutcome {
+            drv_path: drv.to_string(),
+            status: model::build_status_name(
+                rio_nix::protocol::build::BuildStatus::PermanentFailure,
+            )
+            .to_string(),
+            error_msg: "builder failed: missing input".into(),
+            start_time: 0,
+            stop_time: 0,
+        };
+        state
+            .append_jsonl(
+                StateFile::Batches,
+                &model::BatchRecord {
+                    batch_id: 9,
+                    kind: BATCH_KIND_SUBMIT.to_string(),
+                    jobs: vec![starved_job.to_string(), supplied_job.to_string()],
+                    root_drvs: vec![starved_drv.clone(), supplied_drv.clone()],
+                    est_nodes: 2,
+                    build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into()),
+                    started_at: now_rfc3339(),
+                    finished_at: Some(now_rfc3339()),
+                    results: vec![failure(&starved_drv), failure(&supplied_drv)],
+                    reasons: BTreeMap::new(),
+                    stderr_tail: None,
+                    engine_cancelled: false,
+                    disconnect_deadline_fired: false,
+                    interruption_drvs: Vec::new(),
+                    import_skipped_drvs: Vec::new(),
+                    probe: false,
+                    confirmation_attempt: 0,
+                },
+            )
+            .unwrap();
+        let mk_ctx = |job: &str, drv: &str| JobContext {
+            job: job.to_string(),
+            system: "x86_64-linux".into(),
+            drv_path: drv.to_string(),
+            outputs: BTreeMap::new(),
+            dep_drvs: HashSet::new(),
+            expected_outcome: ExpectedOutcome::Built,
+            expected_outputs: BTreeMap::new(),
+            plan_not_attemptable: false,
+            plan_snapshot_valid: false,
+            fixed_output_drvs: Arc::new(HashSet::new()),
+        };
+        let contexts: HashMap<String, JobContext> = HashMap::from([
+            (starved_job.to_string(), mk_ctx(starved_job, &starved_drv)),
+            (
+                supplied_job.to_string(),
+                mk_ctx(supplied_job, &supplied_drv),
+            ),
+        ]);
+        let manifest_entry = |job: &str, drv: &str| archive_input::ManifestEntry {
+            job: job.to_string(),
+            system: "x86_64-linux".into(),
+            attr: String::new(),
+            drv_path: drv.to_string(),
+            outputs: BTreeMap::new(),
+            required_features: Vec::new(),
+        };
+        let closure_entry = |job: &str, drv: &str, dep_out: &str| archive_input::DepClosureEntry {
+            job: job.to_string(),
+            drv_path: drv.to_string(),
+            deps: vec![archive_input::DepDrvOutputs {
+                drv_path: format!("/nix/store/{}-dep.drv", "f".repeat(32)),
+                output_paths: vec![dep_out.to_string()],
+            }],
+            srcs: Vec::new(),
+        };
+        let supply_inputs = SupplyRetirementInputs {
+            manifest: Arc::new(vec![
+                manifest_entry(starved_job, &starved_drv),
+                manifest_entry(supplied_job, &supplied_drv),
+            ]),
+            dep_closure: Arc::new(vec![
+                closure_entry(starved_job, &starved_drv, &starved_dep_out),
+                closure_entry(supplied_job, &supplied_drv, &supplied_dep_out),
+            ]),
+            plan_dispositions: Arc::new(BTreeMap::new()),
+        };
+        let backends = CollectBackends {
+            admin: Arc::new(NoLogsAdmin),
+            store: Arc::new(FakeStoreApi::default()),
+            artifacts: None,
+        };
+        let job_ledger = ledger::JobLedger::new(
+            state.clone(),
+            Arc::new(SubmitTracker::default()),
+            Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default()))),
+        );
+        let results = tokio::sync::Mutex::new(BTreeMap::new());
+        let mut processed = HashSet::new();
+        let requeued = collect_pass_with(
+            &state,
+            &backends,
+            &contexts,
+            &job_ledger,
+            &results,
+            &mut processed,
+            &Knobs::default(),
+            "leaf",
+            "c-supply",
+            None,
+            &supply_inputs,
+        )
+        .await
+        .unwrap();
+        assert_eq!(requeued, 0);
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        // Must-retire: the starved member carries the supply disposition,
+        // not a parity verdict — and exactly one record exists for it (the
+        // already-terminal belt dropped it from classification).
+        assert_eq!(
+            records[starved_job].disposition.as_deref(),
+            Some(Disposition::UploadRejected.as_str()),
+            "{records:?}"
+        );
+        assert_eq!(records[starved_job].verdict, None);
+        let starved_records = state
+            .load_jsonl::<JobRecord>(StateFile::Results)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.job == starved_job)
+            .count();
+        assert_eq!(starved_records, 1, "retired exactly once, never classified");
+        // Must-admit: the supplied member keeps its real failure verdict.
+        assert_eq!(
+            records[supplied_job].verdict.as_deref(),
+            Some(Verdict::UnexpectedFailure.as_str()),
+            "{records:?}"
+        );
     }
 
     /// Job context with an empty closure for the journal-fold tests.
@@ -4710,8 +5057,17 @@ mod tests {
         };
         let collect = async |processed: &mut HashSet<u64>| {
             collect_pass_with(
-                &state, &backends, &contexts, &live, &results, processed, &knobs, "leaf", "c-fold",
+                &state,
+                &backends,
+                &contexts,
+                &live,
+                &results,
+                processed,
+                &knobs,
+                "leaf",
+                "c-fold",
                 None,
+                &no_supply_retirement(),
             )
             .await
         };
@@ -4928,6 +5284,7 @@ mod tests {
                 "leaf",
                 "c-restart",
                 None,
+                &no_supply_retirement(),
             )
             .await
             .unwrap();
@@ -4971,6 +5328,7 @@ mod tests {
                 "leaf",
                 "c-restart",
                 None,
+                &no_supply_retirement(),
             )
             .await
             .unwrap();
@@ -5299,6 +5657,7 @@ mod tests {
                 "leaf",
                 "c-probe",
                 None,
+                &no_supply_retirement(),
             )
             .await
             .unwrap();
@@ -6793,6 +7152,7 @@ mod tests {
                 "leaf",
                 "c-defer",
                 None,
+                &no_supply_retirement(),
             )
             .await
             .unwrap();
@@ -6827,6 +7187,7 @@ mod tests {
                 "leaf",
                 "c-defer2",
                 None,
+                &no_supply_retirement(),
             )
             .await
             .unwrap();
@@ -7262,7 +7623,10 @@ mod tests {
         let in_scope: HashSet<&str> = closures.iter().map(|c| c.job.as_str()).collect();
         let already_excluded =
             BTreeMap::from([("excluded.x".to_string(), Disposition::NotAttemptable)]);
-        let rollup = supply_rollup_dispositions(&entries, &closures, &in_scope, &already_excluded);
+        // Attempt floor 1: nothing will re-attempt these paths (no top-up
+        // wired), so a single settled refusal/failure retires.
+        let rollup =
+            supply_rollup_dispositions(&entries, &closures, &in_scope, &already_excluded, 1);
         assert_eq!(
             rollup,
             BTreeMap::from([
@@ -7275,6 +7639,252 @@ mod tests {
             ]),
             "{rollup:?}"
         );
+    }
+
+    /// The rollup's attempt floor honors the wired top-up's documented
+    /// backstop (the `LadderTopup` contract: a path the prewarm pass
+    /// refused or failed gets one more delivery attempt at submission):
+    /// with floor 2 — the value the supply-stage call site passes whenever
+    /// a per-submission top-up is wired — one settled failure retires
+    /// nobody (the top-up still owes the path its re-attempt), a second
+    /// settled undelivered attempt retires, and a path the re-attempt
+    /// DELIVERED retires nobody no matter how many failures preceded it.
+    /// Bookkeeping rows are not attempts: breaker/held `skipped` rows
+    /// neither count toward the floor nor displace a settled outcome, so a
+    /// breaker collapse (skipped rows only) can never retire and can never
+    /// launder a real failure either.
+    #[test]
+    fn supply_rollup_attempt_floor_honors_the_wired_topup_backstop() {
+        let path = |seed: &str| format!("/nix/store/{}-{seed}", "c".repeat(32 - seed.len()));
+        let entry = |job: &str, needed: &str| archive_input::DepClosureEntry {
+            job: job.to_string(),
+            drv_path: format!("/nix/store/{}-{job}.drv", "e".repeat(32)),
+            deps: vec![archive_input::DepDrvOutputs {
+                drv_path: format!("/nix/store/{}-dep.drv", "d".repeat(32)),
+                output_paths: vec![needed.to_string()],
+            }],
+            srcs: Vec::new(),
+        };
+        let row = |p: &str, outcome: &str| SupplyEntry {
+            path: p.to_string(),
+            source: model::SUPPLY_SOURCE_EMBEDDED.to_string(),
+            mechanism: model::SUPPLY_MECHANISM_UPLOAD_BATCH.to_string(),
+            outcome: outcome.to_string(),
+            detail: None,
+            batch_id: None,
+            bytes: None,
+            observed_at: now_rfc3339(),
+        };
+        let once = path("failed-once");
+        let twice = path("failed-twice");
+        let mixed = path("failed-then-refused");
+        let recovered = path("recovered-on-retry");
+        let collapsed = path("breaker-collapsed");
+        let laundered = path("failed-then-skipped");
+        let entries = vec![
+            row(&once, model::SUPPLY_OUTCOME_FAILED),
+            row(&twice, model::SUPPLY_OUTCOME_FAILED),
+            row(&twice, model::SUPPLY_OUTCOME_FAILED),
+            // Two settled undelivered attempts of mixed flavor: the count
+            // is attempts, the disposition flavor is the LAST settlement.
+            row(&mixed, model::SUPPLY_OUTCOME_FAILED),
+            row(&mixed, model::SUPPLY_OUTCOME_REFUSED),
+            row(&recovered, model::SUPPLY_OUTCOME_FAILED),
+            row(&recovered, model::SUPPLY_OUTCOME_FAILED),
+            row(&recovered, model::SUPPLY_OUTCOME_DELIVERED),
+            // Breaker collapse: skipped rows only — never attempts.
+            row(&collapsed, model::SUPPLY_OUTCOME_SKIPPED),
+            row(&collapsed, model::SUPPLY_OUTCOME_SKIPPED),
+            // A real failure followed by a later breaker skip: the skip
+            // must not displace the settled failure.
+            row(&laundered, model::SUPPLY_OUTCOME_FAILED),
+            row(&laundered, model::SUPPLY_OUTCOME_SKIPPED),
+        ];
+        let closures = vec![
+            entry("once.x", &once),
+            entry("twice.x", &twice),
+            entry("mixed.x", &mixed),
+            entry("recovered.x", &recovered),
+            entry("collapsed.x", &collapsed),
+            entry("laundered.x", &laundered),
+        ];
+        let in_scope: HashSet<&str> = closures.iter().map(|c| c.job.as_str()).collect();
+
+        let floor2 =
+            supply_rollup_dispositions(&entries, &closures, &in_scope, &BTreeMap::new(), 2);
+        assert_eq!(
+            floor2,
+            BTreeMap::from([
+                ("twice.x".to_string(), Disposition::SupplyFailed),
+                ("mixed.x".to_string(), Disposition::UploadRejected),
+            ]),
+            "one settled attempt is below the wired floor; delivered and \
+             skipped paths never retire: {floor2:?}"
+        );
+
+        // Floor 1 (no top-up wired / batch-settle attribution): the single
+        // settled failure retires, the laundering skip still does not save
+        // its path, and the breaker collapse still retires nobody.
+        let floor1 =
+            supply_rollup_dispositions(&entries, &closures, &in_scope, &BTreeMap::new(), 1);
+        assert_eq!(
+            floor1,
+            BTreeMap::from([
+                ("once.x".to_string(), Disposition::SupplyFailed),
+                ("twice.x".to_string(), Disposition::SupplyFailed),
+                ("mixed.x".to_string(), Disposition::UploadRejected),
+                ("laundered.x".to_string(), Disposition::SupplyFailed),
+            ]),
+            "{floor1:?}"
+        );
+    }
+
+    /// The rollup's matching domain is derived from the upload planner's
+    /// [`UploadPayload`] families, never hand-copied: derivation texts
+    /// (`DrvText` — the unit's own drv and its dependencies' drvs),
+    /// archive-embedded paths, and relayed paths (both settling against
+    /// dependency outputs / input sources) all retire the units whose
+    /// closures need them. The exhaustive `match` is the tripwire — a new
+    /// payload family fails to compile here until its closure linkage (and
+    /// with it the rollup's matching axis) is decided.
+    #[test]
+    fn supply_rollup_matches_every_upload_payload_family() {
+        use crate::run::supply::UploadPayload;
+
+        // family → (journal path, the closure entry whose ONLY link to the
+        // path is that family's field).
+        let path = |seed: &str| format!("/nix/store/{}-{seed}", "c".repeat(32 - seed.len()));
+        let drv = |seed: &str| format!("/nix/store/{}-{seed}.drv", "d".repeat(32 - seed.len()));
+        let cases: Vec<(&'static str, String, archive_input::DepClosureEntry)> = {
+            let probe = |payload: &UploadPayload| -> Vec<(&'static str, String, archive_input::DepClosureEntry)> {
+                match payload {
+                    UploadPayload::DrvText(_) => {
+                        // Drv texts cover BOTH drv axes: the unit's own
+                        // derivation and a dependency's.
+                        let own = drv("own");
+                        let dep = drv("dep");
+                        vec![
+                            (
+                                "drvtext-own",
+                                own.clone(),
+                                archive_input::DepClosureEntry {
+                                    job: "drvtext-own.x".into(),
+                                    drv_path: own,
+                                    deps: Vec::new(),
+                                    srcs: Vec::new(),
+                                },
+                            ),
+                            (
+                                "drvtext-dep",
+                                dep.clone(),
+                                archive_input::DepClosureEntry {
+                                    job: "drvtext-dep.x".into(),
+                                    drv_path: drv("root"),
+                                    deps: vec![archive_input::DepDrvOutputs {
+                                        drv_path: dep,
+                                        output_paths: Vec::new(),
+                                    }],
+                                    srcs: Vec::new(),
+                                },
+                            ),
+                        ]
+                    }
+                    UploadPayload::ArchivePath => {
+                        // Embedded paths settle as dependency outputs or
+                        // input sources; cover both linkage fields.
+                        let out = path("embedded-out");
+                        let src = path("embedded-src");
+                        vec![
+                            (
+                                "archive-out",
+                                out.clone(),
+                                archive_input::DepClosureEntry {
+                                    job: "archive-out.x".into(),
+                                    drv_path: drv("ao"),
+                                    deps: vec![archive_input::DepDrvOutputs {
+                                        drv_path: drv("aod"),
+                                        output_paths: vec![out],
+                                    }],
+                                    srcs: Vec::new(),
+                                },
+                            ),
+                            (
+                                "archive-src",
+                                src.clone(),
+                                archive_input::DepClosureEntry {
+                                    job: "archive-src.x".into(),
+                                    drv_path: drv("as"),
+                                    deps: Vec::new(),
+                                    srcs: vec![src],
+                                },
+                            ),
+                        ]
+                    }
+                    UploadPayload::Relay { .. } => {
+                        let out = path("relayed-out");
+                        vec![(
+                            "relay-out",
+                            out.clone(),
+                            archive_input::DepClosureEntry {
+                                job: "relay-out.x".into(),
+                                drv_path: drv("ro"),
+                                deps: vec![archive_input::DepDrvOutputs {
+                                    drv_path: drv("rod"),
+                                    output_paths: vec![out],
+                                }],
+                                srcs: Vec::new(),
+                            },
+                        )]
+                    }
+                }
+            };
+            [
+                probe(&UploadPayload::ArchivePath),
+                probe(&UploadPayload::DrvText(Vec::new())),
+                probe(&UploadPayload::Relay {
+                    substituter_url: "https://cache.example.org".into(),
+                    narinfo: rio_nix::narinfo::NarInfo {
+                        store_path: path("relayed-out"),
+                        url: "nar/x.nar.zst".into(),
+                        compression: "zstd".into(),
+                        nar_hash: "sha256:000".into(),
+                        nar_size: 1,
+                        references: Vec::new(),
+                        deriver: None,
+                        sigs: Vec::new(),
+                        ca: None,
+                        file_hash: None,
+                        file_size: None,
+                    },
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            .collect()
+        };
+
+        for (name, journal_path, closure) in &cases {
+            let entries = vec![SupplyEntry {
+                path: journal_path.clone(),
+                source: model::SUPPLY_SOURCE_EMBEDDED.to_string(),
+                mechanism: model::SUPPLY_MECHANISM_UPLOAD_BATCH.to_string(),
+                outcome: SUPPLY_OUTCOME_REFUSED.to_string(),
+                detail: None,
+                batch_id: None,
+                bytes: None,
+                observed_at: now_rfc3339(),
+            }];
+            let closures = vec![closure.clone()];
+            let in_scope: HashSet<&str> = closures.iter().map(|c| c.job.as_str()).collect();
+            let rollup =
+                supply_rollup_dispositions(&entries, &closures, &in_scope, &BTreeMap::new(), 1);
+            assert_eq!(
+                rollup,
+                BTreeMap::from([(closure.job.clone(), Disposition::UploadRejected)]),
+                "family case {name}: a refused {journal_path} must retire {0}",
+                closure.job
+            );
+        }
     }
 
     /// Fixed-output-ness is derived from the archive's drv ATerms at the

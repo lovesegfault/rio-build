@@ -680,8 +680,12 @@ pub fn build_record(
         plan_snapshot_valid: ctx.plan_snapshot_valid,
         timed_interruption: timed_interruption_for(batch, &ctx.drv_path, in_band_success),
         // Filtered/eval-error/identity-divergent/demoted/supply facts never
-        // apply to a submitted batch member (those units are retired before
-        // submission); the resolve-unknown pass runs outside collect.
+        // apply HERE: plan-time exclusions are retired before submission,
+        // and a member whose required supply settled refused/failed during
+        // execution (the per-submission top-up's journal rows) is retired
+        // by the collect pass's batch-settle supply rollup BEFORE this
+        // classification runs — the already-terminal belt drops it. The
+        // resolve-unknown pass runs outside collect.
         ..AuxFlags::default()
     };
     let classification = classify(&ctx.expected_outcome, rio_outcome, &aux);
