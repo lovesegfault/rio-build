@@ -100,7 +100,13 @@ impl ReplayArchive {
         schema::parse_format_version(&manifest.format_version)
             .with_context(|| format!("{}: {MANIFEST_MEMBER}", path.display()))?;
 
-        ensure_relay_substituter_schemes(&manifest.substituters)?;
+        // Conformant v1 archives cannot carry a screen-rejected relay entry
+        // (the writer refuses them at finalize), so for archives produced by
+        // a foreign recorder the entry is warned about here and judged per
+        // entry at use — open never fails on a list entry, the same
+        // write-once-stays-openable rule the bootstrap classification
+        // documents.
+        warn_unusable_relay_substituters(&manifest.substituters);
 
         // The staged metadata members and the manifest's `files` table must
         // describe the same set, and every listed member's bytes must match
@@ -713,21 +719,6 @@ impl ReplayArchive {
     }
 }
 
-/// Relay substituters are campaign-time fetch sources; refuse plain http://
-/// (the engine never relays over cleartext). Applies to v1 archives only —
-/// a v0 recording is irreplaceable, so its mapped `src_substituters`
-/// entries go through [`warn_unusable_relay_substituters`] instead and are
-/// judged per entry at use.
-fn ensure_relay_substituter_schemes(substituters: &Substituters) -> Result<()> {
-    for relay in &substituters.relay {
-        ensure!(
-            relay.starts_with("https://") || relay.starts_with("s3://"),
-            "relay substituter {relay:?}: only https:// and s3:// are allowed"
-        );
-    }
-    Ok(())
-}
-
 /// Surface screen-rejected relay entries at open time, without judging
 /// them: judgment over archive list entries belongs to
 /// [`crate::nixcache::classify_substituter`] — total, per entry, at the
@@ -954,11 +945,12 @@ mod tests {
     }
 
     /// A write-once archive whose substituter lists carry entries the
-    /// engine's admission screen rejects must still OPEN: the target list
-    /// is never scheme-checked (it is advisory recorder input, copied
-    /// verbatim by the v0 shim), and rejection is the campaign bootstrap's
-    /// per-entry classification — which skips to the next usable entry
-    /// instead of refusing the archive.
+    /// engine's admission screen rejects must still OPEN: neither list is
+    /// scheme-checked at open (the lists are recorder input, and the only
+    /// producer-side rule is the v1 writer's finalize refusal of
+    /// non-https/s3 relay entries), and rejection is the campaign
+    /// bootstrap's per-entry classification — which skips to the next
+    /// usable entry instead of refusing the archive.
     #[test]
     fn archive_with_unusable_substituter_entries_opens_and_classifies() {
         use crate::archive::writer::test_support::{stage_tiny_archive, tiny_seed};
@@ -1396,25 +1388,47 @@ mod tests {
         );
     }
 
+    /// A v1 archive whose RELAY list carries an entry the admission screen
+    /// rejects still opens. Our writer cannot produce such an archive (the
+    /// finalize check refuses it), so the fixture edits the manifest after
+    /// finalize — exactly the shape a foreign v1 recorder could publish.
+    /// The published artifact is write-once: judgment over its list
+    /// entries belongs to the bootstrap's per-entry classification, which
+    /// skips the entry, never to open, which would brick the archive.
     #[test]
-    fn cleartext_relay_substituter_is_rejected_on_open() {
+    fn cleartext_relay_substituter_opens_and_classifies_unusable() {
         let dir = tempfile::TempDir::new().unwrap();
         let (root, _) = staged_tiny_archive(dir.path());
 
-        // The substituter lists live in the manifest, which is not covered by
-        // `files`, so the edit reaches the scheme check rather than a digest
-        // error.
+        // The substituter lists live in the manifest, which is not covered
+        // by `files`, so the edit mimics a foreign recorder rather than
+        // tripping a digest error. The tiny seed spells the same URL in
+        // BOTH lists, so this rewrites the relay entry — the formerly
+        // open-gated population — alongside the never-gated target one.
         rewrite_member(
             &root,
             MANIFEST_MEMBER,
             "https://cache.example.org",
             "http://cache.example.org",
         );
-        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
-        assert!(
-            err.contains("only https:// and s3:// are allowed"),
-            "got: {err}"
+        let archive = ReplayArchive::open(&root).expect("a write-once archive must stay openable");
+        assert_eq!(
+            archive.manifest().substituters.relay,
+            vec!["http://cache.example.org".to_string()]
         );
+        let classified =
+            crate::nixcache::ClassifiedSubstituters::classify(&archive.manifest().substituters);
+        assert!(
+            matches!(
+                &classified.relay[0],
+                crate::nixcache::ArchiveSubstituterUrl::Unusable { .. }
+            ),
+            "the cleartext relay entry classifies Unusable per entry"
+        );
+        // With every entry in both lists rejected, nothing is probeable —
+        // and that is a point-of-use concern (the warm-set probe), not an
+        // open error.
+        assert!(classified.first_probeable().is_none());
     }
 
     #[test]

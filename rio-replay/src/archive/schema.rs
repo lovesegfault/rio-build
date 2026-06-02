@@ -283,9 +283,13 @@ pub struct Counts {
     pub embedded_store_paths: u64,
 }
 
-/// Binary caches associated with the archive. `relay`: caches the engine may
-/// relay content from at campaign time (https:// or s3:// only). `target`:
-/// advisory list of caches the recorder expects the target's tenants to use.
+/// Binary caches associated with the archive. `relay`: caches the engine
+/// may relay content from at campaign time — the v1 writer refuses
+/// non-https/s3 entries at finalize, but readers treat both lists as
+/// untrusted recorder input and classify every entry at use (open never
+/// fails on a list entry; see `crate::nixcache::classify_substituter`).
+/// `target`: advisory list of caches the recorder expects the target's
+/// tenants to use.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Substituters {
     #[serde(default)]
