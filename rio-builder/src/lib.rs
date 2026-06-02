@@ -140,6 +140,14 @@ pub fn describe_metrics() {
          high rate = pathological producer."
     );
     describe_counter!(
+        "rio_builder_graph_drv_fetch_total",
+        ".drv texts fetched at input resolution because the build's \
+         exportReferencesGraph declaration demands them (the glue's only \
+         .drv readers). Expected ~0 fleet-wide — nearly all builds declare \
+         no graph. A sustained nonzero rate without a corresponding ERG \
+         workload is the I-110 closure-prefetch amplification returning."
+    );
+    describe_counter!(
         "rio_builder_log_messages_shed_total",
         "Display-stream messages (BuildLogBatch / BuildPhase, by `kind`) \
          shed because the permanent sink was full — scheduler-link \

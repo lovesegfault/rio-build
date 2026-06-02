@@ -1912,10 +1912,17 @@ async fn resolve_inputs(
         .map(|m| (m.store_path.to_string(), m.nar_size))
         .collect();
 
-    // Complete the glue's derivation table: main drv text + any
-    // residual closure .drvs not covered by the input-drv fetches.
+    // Complete the glue's derivation table: main drv text + exactly
+    // the texts the glue's exportReferencesGraph expansion will read,
+    // derived from the build's own declaration with the same walk the
+    // expansion uses. No declaration ⇒ no graph-purpose fetches —
+    // demand-driven by type (the fetch site cannot see input_paths).
+    let demand = {
+        let index = glue::refs_graph::ClosureIndex::new(&input_metadata, &input_paths);
+        glue::refs_graph::DrvTextDemand::from_declaration(drv, &index)
+    };
     let graph_drvs =
-        inputs::prefetch_graph_drvs(store_client, drv_path, drv_text, graph_drvs, &input_paths)
+        inputs::fetch_demanded_graph_drvs(store_client, drv_path, drv_text, graph_drvs, &demand)
             .await?;
 
     Ok(ResolvedInputs {

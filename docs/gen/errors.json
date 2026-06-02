@@ -1523,6 +1523,11 @@
       "doc": "Error type for executor operations. No `#[from] anyhow::Error` — every variant has a typed source. A catch-all `#[from] anyhow::Error` would mean any `?` on an anyhow::Result anywhere in execute_build silently becomes the wrong variant. Typed sources make the compiler catch misattribution at the `?` site."
     },
     {
+      "name": "FetchError",
+      "crate": "rio-builder",
+      "doc": "Closed permanence classification for one fetch attempt. Every failure source inside [`try_fetch_one`] must choose a class at the point where the error is produced — there is deliberately no `From<anyhow::Error>` impl and no default bucket, so a future failure source cannot silently inherit retryability (the downcast-marker shape this replaces let exactly that happen: any error NOT carrying the marker was retryable by omission). The retry loop matches exhaustively."
+    },
+    {
       "name": "OverlayError",
       "crate": "rio-builder",
       "doc": "Errors from overlay setup and teardown. Distinct from `anyhow::Error` so `ExecutorError::Overlay(#[from])` only catches overlay failures — a bare `?` on an unrelated `anyhow::Result` elsewhere in `execute_build` no longer silently becomes an \"overlay setup failed\" message."

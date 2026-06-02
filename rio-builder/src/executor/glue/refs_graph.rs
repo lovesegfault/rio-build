@@ -185,6 +185,11 @@ impl<'a> ClosureIndex<'a> {
         // deriving expression used `drvPath`-style context the resolver
         // has already pulled those outputs into the input set, so this
         // is the common case rather than an extra requirement.
+        // TODO: F3 (round-15 C4 follow-up) — demand derivation keys on
+        // the `.drv` name suffix; a source path named `*.drv` in a graph
+        // closure is treated as derivation text (parse fails downstream).
+        // Part of the suffix-keyed family F3 unifies on a typed PathKind.
+        // See store.put.drv-text-ca+2.
         let drvs: Vec<&'a str> = set.members().filter(|p| p.ends_with(".drv")).collect();
         for drv_path in drvs {
             for (output, out_path) in self.drv_outputs(drv_path)? {
@@ -428,14 +433,10 @@ pub(crate) fn parse_flat_export_refs(value: &str) -> Result<Vec<(String, String)
 /// heuristic.
 // r[impl builder.glue.drv-table-demand]
 #[derive(Debug)]
-// First production consumer (`inputs::fetch_demanded_graph_drvs`)
-// lands in the next commit; the allow goes with it.
-#[allow(dead_code)]
 pub(crate) struct DrvTextDemand {
     paths: BTreeSet<String>,
 }
 
-#[allow(dead_code)] // see struct note: consumer lands next commit
 impl DrvTextDemand {
     /// Derive the demand from the derivation's declaration (both forms:
     /// the flat `exportReferencesGraph` env value and the
@@ -495,10 +496,12 @@ impl DrvTextDemand {
         Self { paths }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.paths.is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn contains(&self, path: &str) -> bool {
         self.paths.contains(path)
     }
@@ -507,8 +510,15 @@ impl DrvTextDemand {
         self.paths.iter().map(String::as_str)
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.paths.len()
+    /// Test-only seam for loop-level consumers (`inputs.rs` wiring
+    /// tests): production code has exactly one constructor,
+    /// [`from_declaration`](Self::from_declaration) — the demand
+    /// derivation itself is pinned by this module's tests.
+    #[cfg(test)]
+    pub(crate) fn from_paths_for_tests(paths: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            paths: paths.into_iter().collect(),
+        }
     }
 }
 

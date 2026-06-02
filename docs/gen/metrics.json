@@ -14,6 +14,7 @@
     "rio_builder_fuse_fetch_duration_seconds",
     "rio_builder_fuse_index_divergence_total",
     "rio_builder_fuse_jit_lookup_total",
+    "rio_builder_graph_drv_fetch_total",
     "rio_builder_jit_inputs_registered",
     "rio_builder_log_lines_suppressed_total",
     "rio_builder_log_messages_shed_total",
@@ -295,6 +296,11 @@
         "name": "rio_builder_fuse_jit_lookup_total",
         "kind": "counter",
         "help": "Top-level FUSE lookup outcomes under JIT fetch (I-043 redesign), labeled by outcome: reject (not in registered input set → fast ENOENT, no store contact), fetch (registered input materialized), eio (registered input fetch FAILED → EIO so overlay can't negative-cache). reject/fetch ratio ≈ closure utilization; eio nonzero = store degraded."
+      },
+      {
+        "name": "rio_builder_graph_drv_fetch_total",
+        "kind": "counter",
+        "help": ".drv texts fetched at input resolution because the build's exportReferencesGraph declaration demands them (the glue's only .drv readers). Expected ~0 fleet-wide — nearly all builds declare no graph. A sustained nonzero rate without a corresponding ERG workload is the I-110 closure-prefetch amplification returning."
       },
       {
         "name": "rio_builder_jit_inputs_registered",

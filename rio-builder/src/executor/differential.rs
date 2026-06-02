@@ -228,19 +228,27 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
     // The glue holds no filesystem capability (`builder.glue.pure`):
     // the harness assembles the derivation-text table itself from the
     // inputs it just materialized (driver-side std::fs is fine — this
-    // IS the resolve step here), mirroring what the executor's input
-    // resolution does in production.
+    // IS the resolve step here). The table goes through the SAME
+    // demand constructor production uses (DrvTextDemand), so the
+    // pinned erg-* corpus entries verify demand SUFFICIENCY against
+    // the oracle: if the demand model under-supplies a text the glue
+    // needs, the entry fails here as a real demand bug — do not
+    // restore over-supply to paper over one.
     let mut graph_drvs: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     graph_drvs.insert(drv_path_str.clone(), drv_text.clone());
-    for p in &closure_paths {
-        if !p.ends_with(".drv") || graph_drvs.contains_key(p) {
-            continue;
+    {
+        let index = super::glue::refs_graph::ClosureIndex::new(&input_metadata, &closure_paths);
+        let demand = super::glue::refs_graph::DrvTextDemand::from_declaration(&drv, &index);
+        for p in demand.iter() {
+            if graph_drvs.contains_key(p) {
+                continue;
+            }
+            let host = store_dir.join(basename(p).context("closure .drv basename")?);
+            let text = std::fs::read_to_string(&host)
+                .with_context(|| format!("reading materialized input drv {}", host.display()))?;
+            graph_drvs.insert(p.to_owned(), text);
         }
-        let host = store_dir.join(basename(p).context("closure .drv basename")?);
-        let text = std::fs::read_to_string(&host)
-            .with_context(|| format!("reading materialized input drv {}", host.display()))?;
-        graph_drvs.insert(p.clone(), text);
     }
     let basic = BasicDerivation::from_resolved(&drv, resolved_inputs.iter().cloned());
     let paths = SandboxPaths {

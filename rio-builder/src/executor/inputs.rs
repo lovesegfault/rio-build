@@ -329,6 +329,92 @@ pub(super) async fn fetch_drv_from_store(
     // the request glue's graph-derivation table (the glue itself holds
     // no filesystem capability — every input byte arrives as a
     // parameter resolved here, at the resolve step).
+    let text = fetch_drv_text(store_client, drv_path).await?;
+    let drv = Derivation::parse(&text)
+        .map_err(|e| ExecutorError::InvalidDerivation(format!("failed to parse .drv: {e}")))?;
+    Ok((drv, text))
+}
+
+/// Assemble the request glue's graph-derivation table: the main
+/// derivation's text plus the texts the glue's `exportReferencesGraph`
+/// expansion will actually read — exactly the [`DrvTextDemand`]
+/// derived from the build's own declaration. The full input closure is
+/// deliberately NOT a parameter: a resolver that cannot see
+/// `input_paths` cannot regress into fetching by closure membership.
+///
+/// Scale arithmetic (the I-110 multiplication this replaces): a
+/// nixpkgs-scale closure carries on the order of 2,000 transitive
+/// `.drv`s, and the previous closure-membership prefetch fetched every
+/// one of them not retained from the input-drv loop — per build,
+/// whether or not anything would read them, across hundreds of
+/// ephemeral builders. Demand is empty for every build with no
+/// `exportReferencesGraph` declaration, which is nearly all of them;
+/// `rio_builder_graph_drv_fetch_total` counts the demanded fetches and
+/// is the post-wipe resurgence alarm (expected ~0 fleet-wide).
+///
+/// Texts are fetched RAW (no parse): the previous eager
+/// `Derivation::parse` discarded its result — the glue lazily
+/// re-parses at consumption with its own consumption-scoped error
+/// (`ExportRefsDrvUnreadable`).
+///
+/// Failures: store stream faults and missing demanded paths are
+/// worker-local input-materialization faults (`MetadataFetch` →
+/// `InfrastructureFailure` → scheduler re-dispatch). Extract/UTF-8
+/// failures are permanent (`InvalidDerivation`) — justified by
+/// consumption: every demanded byte WILL be read by the glue, and a
+/// `.drv` that is not UTF-8 ATerm can never become readable by
+/// retrying elsewhere.
+// r[impl builder.result.input-materialization-is-infra+4]
+// r[impl builder.glue.pure]
+// r[impl builder.glue.drv-table-demand]
+pub(super) async fn fetch_demanded_graph_drvs(
+    store_client: &StoreServiceClient<Channel>,
+    main_drv_path: &str,
+    main_drv_text: &str,
+    mut table: std::collections::BTreeMap<String, String>,
+    demand: &super::glue::refs_graph::DrvTextDemand,
+) -> Result<std::collections::BTreeMap<String, String>, ExecutorError> {
+    use futures_util::stream::{StreamExt as _, TryStreamExt as _};
+
+    table.insert(main_drv_path.to_owned(), main_drv_text.to_owned());
+
+    let demanded: Vec<String> = demand
+        .iter()
+        .filter(|p| !table.contains_key(*p))
+        .map(str::to_owned)
+        .collect();
+    if demanded.is_empty() {
+        return Ok(table);
+    }
+    metrics::counter!("rio_builder_graph_drv_fetch_total").increment(demanded.len() as u64);
+    tracing::debug!(
+        n_demanded = demanded.len(),
+        "fetching declaration-demanded graph .drv texts for the request glue"
+    );
+    let fetched: Vec<(String, String)> = futures_util::stream::iter(demanded)
+        .map(|path| {
+            let mut client = store_client.clone();
+            async move {
+                let text = fetch_drv_text(&mut client, &path).await?;
+                Ok::<_, ExecutorError>((path, text))
+            }
+        })
+        .buffer_unordered(super::MAX_PARALLEL_FETCHES)
+        .try_collect()
+        .await?;
+    table.extend(fetched);
+    Ok(table)
+}
+
+/// Fetch a `.drv`'s ATerm text from the store WITHOUT parsing it (the
+/// demanded-graph table wants bytes; the glue parses at consumption).
+/// Same classification as [`fetch_drv_from_store`]: stream faults and
+/// missing paths are `MetadataFetch` (infra); extract/UTF-8 failures
+/// are permanent.
+async fn fetch_drv_text(
+    store_client: &mut StoreServiceClient<Channel>,
+    drv_path: &str,
+) -> Result<String, ExecutorError> {
     let result = rio_proto::client::get_path_nar(
         store_client,
         drv_path,
@@ -356,71 +442,9 @@ pub(super) async fn fetch_drv_from_store(
     let bytes = rio_nix::nar::extract_single_file(&nar_data).map_err(|e| {
         ExecutorError::InvalidDerivation(format!("failed to extract .drv from NAR: {e}"))
     })?;
-    let text = String::from_utf8(bytes).map_err(|e| {
+    String::from_utf8(bytes).map_err(|e| {
         ExecutorError::InvalidDerivation(format!(".drv content is not valid UTF-8: {e}"))
-    })?;
-    let drv = Derivation::parse(&text)
-        .map_err(|e| ExecutorError::InvalidDerivation(format!("failed to parse .drv: {e}")))?;
-    Ok((drv, text))
-}
-
-/// Assemble the request glue's graph-derivation table: ATerm text for
-/// every `.drv` in the build's input closure, keyed by store path.
-///
-/// Zero double-fetch by construction: the main derivation's text and
-/// every input `.drv`'s text are retained from fetches that already
-/// happened (`execute_build` step 1, the `resolve_inputs` input-drv
-/// loop); only RESIDUAL closure members ending in `.drv` covered by
-/// neither — typically none — are fetched here, deadline-bounded and
-/// cancellable through the same `get_path_nar` machinery.
-///
-/// Failures are worker-local input-materialization faults
-/// (`MetadataFetch` → `InfrastructureFailure` → scheduler re-dispatch),
-/// never glue rejections: by the time the glue runs, every byte it can
-/// ask for is already in this table.
-// r[impl builder.result.input-materialization-is-infra+4]
-// r[impl builder.glue.pure]
-pub(super) async fn prefetch_graph_drvs(
-    store_client: &StoreServiceClient<Channel>,
-    main_drv_path: &str,
-    main_drv_text: &str,
-    mut table: std::collections::BTreeMap<String, String>,
-    input_paths: &[String],
-) -> Result<std::collections::BTreeMap<String, String>, ExecutorError> {
-    use futures_util::stream::{StreamExt as _, TryStreamExt as _};
-
-    table.insert(main_drv_path.to_owned(), main_drv_text.to_owned());
-
-    let residual: Vec<String> = input_paths
-        .iter()
-        // TODO: F3 (round-15 C4 follow-up) — graph-.drv prefetch keys on
-        // the `.drv` name suffix; a source path named `*.drv` in an
-        // input closure is prefetched as derivation text (parse simply
-        // fails downstream). Part of the suffix-keyed family F3 unifies
-        // on a typed PathKind. See store.put.drv-text-ca+2.
-        .filter(|p| p.ends_with(".drv") && !table.contains_key(p.as_str()))
-        .cloned()
-        .collect();
-    if residual.is_empty() {
-        return Ok(table);
-    }
-    tracing::debug!(
-        n_residual = residual.len(),
-        "prefetching residual closure .drv texts for the request glue"
-    );
-    let fetched: Vec<(String, String)> = futures_util::stream::iter(residual)
-        .map(|path| {
-            let mut client = store_client.clone();
-            async move {
-                let (_, text) = fetch_drv_from_store(&mut client, &path).await?;
-                Ok::<_, ExecutorError>((path, text))
-            }
-        })
-        .buffer_unordered(super::MAX_PARALLEL_FETCHES)
-        .try_collect()
-        .await?;
-    table.extend(fetched);
-    Ok(table)
+    })
 }
 
 /// Compute the input closure for a derivation by querying the store.
@@ -1304,64 +1328,173 @@ mod tests {
     /// running it against a store where any fetch would 404.
     // r[verify builder.glue.pure]
     #[tokio::test]
-    async fn prefetch_graph_drvs_skips_already_fetched() -> anyhow::Result<()> {
+    async fn demanded_texts_already_retained_pure_merge() -> anyhow::Result<()> {
+        use crate::executor::glue::refs_graph::DrvTextDemand;
         let (_store, client) = spawn_and_connect().await?; // EMPTY store
         let main_drv = tp("main.drv");
         let dep_drv = tp("dep.drv");
         let mut table = std::collections::BTreeMap::new();
         table.insert(dep_drv.clone(), "Derive-dep".to_owned());
 
-        let input_paths = vec![main_drv.clone(), dep_drv.clone(), tp("plain-src")];
+        // Both demanded texts are retained → pure merge, zero RPCs
+        // (any fetch against the empty store would fail).
+        let demand = DrvTextDemand::from_paths_for_tests([main_drv.clone(), dep_drv.clone()]);
         let table =
-            prefetch_graph_drvs(&client, &main_drv, "Derive-main", table, &input_paths).await?;
+            fetch_demanded_graph_drvs(&client, &main_drv, "Derive-main", table, &demand).await?;
         assert_eq!(
             table.get(&main_drv).map(String::as_str),
             Some("Derive-main")
         );
         assert_eq!(table.get(&dep_drv).map(String::as_str), Some("Derive-dep"));
-        assert_eq!(table.len(), 2, "non-.drv closure members are not fetched");
+        assert_eq!(table.len(), 2);
         Ok(())
     }
 
-    /// A residual closure `.drv` the table does not cover is fetched;
-    /// a store failure there is a MetadataFetch infrastructure fault
-    /// (the resolve-step classification — never a glue rejection).
-    // r[verify builder.result.input-materialization-is-infra+4]
+    /// THE bug_081 kill shot: with no exportReferencesGraph
+    /// declaration the demand is empty, so input resolution fetches
+    /// NOTHING — proven against an EMPTY store where any fetch 404s.
+    /// The replaced closure-membership prefetch deterministically
+    /// errored here (it fetched every closure `.drv` whether or not
+    /// anything would read it).
+    // r[verify builder.glue.drv-table-demand]
     #[tokio::test]
-    async fn prefetch_graph_drvs_residual_fetch_and_error_classification() -> anyhow::Result<()> {
-        let (store, client) = spawn_and_connect().await?;
+    async fn no_declaration_fetches_nothing_at_depth_3() -> anyhow::Result<()> {
+        use crate::executor::glue::refs_graph::DrvTextDemand;
+        let (_store, client) = spawn_and_connect().await?; // EMPTY store
         let main_drv = tp("main.drv");
-        let residual = tp("residual.drv");
-        let aterm = r#"Derive([("out","/nix/store/llllllllllllllllllllllllllllllll-r","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
-        let (nar, hash) = make_nar(aterm.as_bytes());
-        store.seed(make_path_info(&residual, &nar, hash), nar);
-
-        // Covered residual: fetched into the table.
-        let table = prefetch_graph_drvs(
+        // A 3-deep closure of .drvs, none retained, none in the store.
+        // Old code: 3 fetches → 3 NotFound failures. New code cannot
+        // fetch them BY TYPE: they are not in the demand.
+        let demand = DrvTextDemand::from_paths_for_tests([]);
+        let table = fetch_demanded_graph_drvs(
             &client,
             &main_drv,
             "Derive-main",
             std::collections::BTreeMap::new(),
-            std::slice::from_ref(&residual),
+            &demand,
         )
         .await?;
-        assert_eq!(table.get(&residual).map(String::as_str), Some(aterm));
+        assert_eq!(table.len(), 1, "only the main drv text");
+        Ok(())
+    }
 
-        // Missing residual: MetadataFetch (infra), not InvalidDerivation.
-        let missing = tp("missing.drv");
-        let err = prefetch_graph_drvs(
+    /// An undemanded sibling `.drv` is never fetched: only the
+    /// demanded path is in the store; success proves the sibling
+    /// (whose fetch would 404 → MetadataFetch error) was never
+    /// requested.
+    // r[verify builder.glue.drv-table-demand]
+    #[tokio::test]
+    async fn undemanded_sibling_never_fetched() -> anyhow::Result<()> {
+        use crate::executor::glue::refs_graph::DrvTextDemand;
+        let (store, client) = spawn_and_connect().await?;
+        let main_drv = tp("main.drv");
+        let demanded = tp("demanded.drv");
+        let aterm = r#"Derive([("out","/nix/store/llllllllllllllllllllllllllllllll-r","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
+        let (nar, hash) = make_nar(aterm.as_bytes());
+        store.seed(make_path_info(&demanded, &nar, hash), nar);
+        // The sibling exists in the build's closure conceptually, but
+        // is NOT seeded — a fetch of it would fail the resolve.
+
+        let demand = DrvTextDemand::from_paths_for_tests([demanded.clone()]);
+        let table = fetch_demanded_graph_drvs(
             &client,
             &main_drv,
             "Derive-main",
             std::collections::BTreeMap::new(),
-            std::slice::from_ref(&missing),
+            &demand,
+        )
+        .await?;
+        assert_eq!(table.get(&demanded).map(String::as_str), Some(aterm));
+        assert_eq!(table.len(), 2, "main + demanded only");
+        Ok(())
+    }
+
+    /// 2,000-drv closure, all demanded texts retained: zero RPCs
+    /// (empty store), instant. The scale IS the verification — the
+    /// I-110 shape was per-build whole-closure refetch.
+    // r[verify builder.glue.drv-table-demand]
+    #[tokio::test]
+    async fn two_thousand_drv_demand_retained_zero_rpcs() -> anyhow::Result<()> {
+        use crate::executor::glue::refs_graph::DrvTextDemand;
+        let (_store, client) = spawn_and_connect().await?; // EMPTY store
+        let main_drv = tp("main.drv");
+        let mut table = std::collections::BTreeMap::new();
+        let mut demanded = Vec::new();
+        for i in 0..2000 {
+            let p = tp(&format!("dep-{i}.drv"));
+            table.insert(p.clone(), format!("Derive-{i}"));
+            demanded.push(p);
+        }
+        let demand = DrvTextDemand::from_paths_for_tests(demanded);
+        let table =
+            fetch_demanded_graph_drvs(&client, &main_drv, "Derive-main", table, &demand).await?;
+        assert_eq!(table.len(), 2001);
+        Ok(())
+    }
+
+    /// A demanded `.drv` the table does not cover is fetched RAW; a
+    /// store failure there is a MetadataFetch infrastructure fault
+    /// (the resolve-step classification — never a glue rejection),
+    /// and a demanded path whose bytes are not UTF-8 ATerm is
+    /// permanent (consumption-backed: the glue WILL read these bytes,
+    /// and they can never become readable by retrying elsewhere).
+    // r[verify builder.result.input-materialization-is-infra+4]
+    // r[verify builder.glue.drv-table-demand]
+    #[tokio::test]
+    async fn demanded_fetch_and_error_classification() -> anyhow::Result<()> {
+        use crate::executor::glue::refs_graph::DrvTextDemand;
+        let (store, client) = spawn_and_connect().await?;
+        let main_drv = tp("main.drv");
+        let demanded = tp("residual.drv");
+        let aterm = r#"Derive([("out","/nix/store/llllllllllllllllllllllllllllllll-r","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
+        let (nar, hash) = make_nar(aterm.as_bytes());
+        store.seed(make_path_info(&demanded, &nar, hash), nar);
+
+        // Demanded + present: fetched into the table, raw text.
+        let table = fetch_demanded_graph_drvs(
+            &client,
+            &main_drv,
+            "Derive-main",
+            std::collections::BTreeMap::new(),
+            &DrvTextDemand::from_paths_for_tests([demanded.clone()]),
+        )
+        .await?;
+        assert_eq!(table.get(&demanded).map(String::as_str), Some(aterm));
+
+        // Demanded + missing: MetadataFetch (infra), not InvalidDerivation.
+        let missing = tp("missing.drv");
+        let err = fetch_demanded_graph_drvs(
+            &client,
+            &main_drv,
+            "Derive-main",
+            std::collections::BTreeMap::new(),
+            &DrvTextDemand::from_paths_for_tests([missing.clone()]),
         )
         .await
-        .expect_err("missing residual .drv must fail the resolve step");
+        .expect_err("missing demanded .drv must fail the resolve step");
         assert!(
             matches!(err, ExecutorError::MetadataFetch { ref path, .. } if *path == missing),
             "got: {err}"
         );
+
+        // Demanded + non-UTF-8 bytes: permanent (InvalidDerivation).
+        let invalid = tp("invalid.drv");
+        let (bad_nar, bad_hash) = make_nar(&[0xff, 0xfe, 0x00, 0x80]);
+        store.seed(make_path_info(&invalid, &bad_nar, bad_hash), bad_nar);
+        let err = fetch_demanded_graph_drvs(
+            &client,
+            &main_drv,
+            "Derive-main",
+            std::collections::BTreeMap::new(),
+            &DrvTextDemand::from_paths_for_tests([invalid.clone()]),
+        )
+        .await
+        .expect_err("non-UTF-8 demanded .drv is a permanent input fault");
+        assert!(
+            matches!(err, ExecutorError::InvalidDerivation(_)),
+            "got: {err}"
+        );
+
         Ok(())
     }
 
