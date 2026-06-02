@@ -958,6 +958,11 @@
       "doc": "Thin trait facades over the rio gRPC surfaces the engine reads, so every"
     },
     {
+      "path": "run/ledger.rs",
+      "depth": 1,
+      "doc": "The job ledger: the single owner of job scheduling-state transitions."
+    },
+    {
       "path": "run/model.rs",
       "depth": 1,
       "doc": "Shared campaign data model: per-job records (results.jsonl), per-path"
