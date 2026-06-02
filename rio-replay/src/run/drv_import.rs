@@ -232,7 +232,7 @@ mod tests {
             closure.order,
             vec![stdenv.clone(), lib_a.clone(), app_b.clone()]
         );
-        assert!(closure.skipped.is_empty());
+        assert!(closure.skipped.is_empty(), "{:?}", closure.skipped);
         // Multiple roots and already-reached roots dedup.
         let closure_both = drv_archive
             .closure(&[app_b.clone(), lib_a.clone()])
@@ -285,6 +285,13 @@ mod tests {
         assert!(err.contains("not present in the archive"), "{err}");
     }
 
+    /// A non-embedded interior input is skipped from the import order —
+    /// nothing can be offered for it from the archive — but the skip is
+    /// REPORTED in the result, never swallowed: the format requires the
+    /// full requisite `.drv` closure of every workload unit to be embedded
+    /// (design doc §4), so the embedded-ATerm/-member disagreement this
+    /// fixture stages is a non-conforming archive the submitter must be
+    /// able to name when its roots later fail.
     #[test]
     fn closure_skips_inputs_the_archive_does_not_embed() {
         use crate::archive::schema::{Capabilities, RequestRecord, RequestTarget, Substituters};

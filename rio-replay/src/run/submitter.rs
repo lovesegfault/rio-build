@@ -309,6 +309,23 @@ impl Submitter for ClientOpsSubmitter {
 
         // ── Import: the batch's drv closure from the replay archive ────────
         let closure = self.archive.closure(&batch.root_drvs)?;
+        if !closure.skipped.is_empty() {
+            // A conforming archive embeds the full requisite .drv closure
+            // of every workload unit, so a non-empty skipped set means the
+            // embedded ATerms reference members the archive does not carry
+            // (plan-time membership checks cover the adjacency records,
+            // not the ATerm texts). The batch is still submitted — the
+            // target may have the paths — but a downstream failure of
+            // these roots is now attributable to the archive gap instead
+            // of silently charging the target.
+            tracing::warn!(
+                roots = batch.root_drvs.len(),
+                skipped = closure.skipped.len(),
+                paths = ?closure.skipped,
+                "embedded ATerms reference derivations the archive does not embed; \
+                 they cannot be imported from the archive"
+            );
+        }
         let mut valid: BTreeSet<String> = BTreeSet::new();
         for chunk in closure.order.chunks(self.probe_chunk.max(1)) {
             match chan.query_valid_paths(chunk, self.op_timeout).await {

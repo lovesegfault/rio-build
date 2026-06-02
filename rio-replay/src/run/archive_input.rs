@@ -13,7 +13,7 @@
 //! closures, and `exclusions.jsonl` feeds the plan-time completeness
 //! accounting.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use anyhow::{Context as _, Result};
 use rio_nix::derivation::{Derivation, structured_attrs};
@@ -2263,6 +2263,150 @@ mod tests {
             "the error names the member: {err}"
         );
         assert!(err.contains(&app_drv), "the error names the root: {err}");
+    }
+
+    #[test]
+    fn adjacency_closure_with_unembedded_member_is_a_plan_time_error() {
+        // A dependency-closures archive whose adjacency records reach a
+        // derivation the archive does not embed: complete adjacency,
+        // missing interior member — the one gap shape the fallback walk
+        // cannot catch because the adjacency path never reads the members.
+        // The format's normative rule (design doc §4: the full requisite
+        // .drv closure of every workload unit MUST be embedded) makes this
+        // a non-conforming archive, and it must refuse at plan time with a
+        // named error instead of surfacing as a misattributed build
+        // failure after submission. rio's own writer cannot produce this
+        // shape (finalize walks the ATerm closure), so the fixture stages
+        // it the way it can exist in the wild: a foreign producer whose
+        // closures.jsonl honestly records an edge to a member it never
+        // staged.
+        use crate::archive::schema::{
+            Capabilities, ClosureRecord, RequestRecord, RequestTarget, Substituters,
+        };
+        use crate::archive::writer::{ArchiveWriter, ManifestSeed};
+
+        let app_drv = format!("/nix/store/{}-app-4.0.drv", fake_hash("gap-app-drv"));
+        let app_out = format!("/nix/store/{}-app-4.0", fake_hash("gap-app-out"));
+        let ghost_drv = format!("/nix/store/{}-ghost-1.0.drv", fake_hash("gap-ghost-drv"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = ArchiveWriter::create(tmp.path()).unwrap();
+        // The ATerm declares no inputs, so the writer's own completeness
+        // walk passes; only the adjacency record knows about ghost.
+        writer
+            .add_drv(
+                &app_drv,
+                &synth_aterm(&[("out", app_out.as_str())], &[], "x86_64-linux"),
+            )
+            .unwrap();
+        writer
+            .write_requests(&[RequestRecord {
+                session: 0,
+                offset_s: 0.0,
+                targets: vec![RequestTarget {
+                    drv: app_drv.clone(),
+                    outputs: vec!["*".to_string()],
+                }],
+            }])
+            .unwrap();
+        writer
+            .write_closures(&[
+                ClosureRecord {
+                    drv: app_drv.clone(),
+                    inputs: vec![ghost_drv.clone()],
+                    srcs: Vec::new(),
+                    outputs: BTreeMap::from([("out".to_string(), Some(app_out.clone()))]),
+                },
+                ClosureRecord {
+                    drv: ghost_drv.clone(),
+                    inputs: Vec::new(),
+                    srcs: Vec::new(),
+                    outputs: BTreeMap::new(),
+                },
+            ])
+            .unwrap();
+        let stamp: jiff::Timestamp = "2026-05-28T00:00:00Z".parse().unwrap();
+        writer
+            .finalize(ManifestSeed {
+                created_at: stamp,
+                from: stamp,
+                to: stamp,
+                capabilities: Capabilities {
+                    dependency_closures: true,
+                    ..Capabilities::default()
+                },
+                substituters: Substituters::default(),
+                fat: false,
+                provenance: serde_json::Map::new(),
+            })
+            .unwrap();
+
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let units = load_units(&archive).unwrap();
+        let err = format!("{:#}", load_closures(&archive, &units).unwrap_err());
+        assert!(err.contains("ghost-1.0.drv"), "names the gap: {err}");
+        assert!(err.contains("app-4.0.drv"), "names the unit: {err}");
+        assert!(err.contains("not embedded in the archive"), "got: {err}");
+
+        // Must-admit direction: the conforming sibling (same shape, ghost
+        // actually embedded) plans cleanly through the same path.
+        let tmp_ok = tempfile::tempdir().unwrap();
+        let writer = ArchiveWriter::create(tmp_ok.path()).unwrap();
+        writer
+            .add_drv(
+                &app_drv,
+                &synth_aterm(&[("out", app_out.as_str())], &[], "x86_64-linux"),
+            )
+            .unwrap();
+        writer
+            .add_drv(&ghost_drv, &synth_aterm(&[], &[], "x86_64-linux"))
+            .unwrap();
+        writer
+            .write_requests(&[RequestRecord {
+                session: 0,
+                offset_s: 0.0,
+                targets: vec![RequestTarget {
+                    drv: app_drv.clone(),
+                    outputs: vec!["*".to_string()],
+                }],
+            }])
+            .unwrap();
+        writer
+            .write_closures(&[
+                ClosureRecord {
+                    drv: app_drv.clone(),
+                    inputs: vec![ghost_drv.clone()],
+                    srcs: Vec::new(),
+                    outputs: BTreeMap::from([("out".to_string(), Some(app_out.clone()))]),
+                },
+                ClosureRecord {
+                    drv: ghost_drv.clone(),
+                    inputs: Vec::new(),
+                    srcs: Vec::new(),
+                    outputs: BTreeMap::new(),
+                },
+            ])
+            .unwrap();
+        writer
+            .finalize(ManifestSeed {
+                created_at: stamp,
+                from: stamp,
+                to: stamp,
+                capabilities: Capabilities {
+                    dependency_closures: true,
+                    ..Capabilities::default()
+                },
+                substituters: Substituters::default(),
+                fat: false,
+                provenance: serde_json::Map::new(),
+            })
+            .unwrap();
+        let archive = ReplayArchive::open(tmp_ok.path()).unwrap();
+        let units = load_units(&archive).unwrap();
+        let closures = load_closures(&archive, &units).unwrap();
+        assert_eq!(closures.len(), 1);
+        assert_eq!(closures[0].deps.len(), 1);
+        assert_eq!(closures[0].deps[0].drv_path, ghost_drv);
     }
 
     #[test]
