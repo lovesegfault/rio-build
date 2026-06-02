@@ -35,6 +35,15 @@ pub enum Lint {
     /// profile edit that flips to a denylist or strands the Nix
     /// sandbox.
     SeccompAllowlist,
+    /// Every call site of a `Builds` terminal-inclusive accessor
+    /// (`*_including_terminal*`, rio-scheduler/src/state/build.rs)
+    /// carries an adjacent `// Bookkeeping lookup: <reason>`
+    /// justification, and every such marker annotates a real call
+    /// site. Catches a policy site silently misclassified onto the
+    /// terminal-inclusive side — the choice compiles either way, and
+    /// a misclassified site lets a finished build keep steering
+    /// scheduling until the delayed cleanup.
+    BookkeepingMarker,
 }
 
 impl Lint {
@@ -47,7 +56,12 @@ impl Lint {
     /// subcommand list clap derives from the enum, so a variant added
     /// to the enum but not here fails `cargo test -p xtask`.
     fn all() -> Vec<Lint> {
-        vec![Lint::SchemaLiveness, Lint::HelmSla, Lint::SeccompAllowlist]
+        vec![
+            Lint::SchemaLiveness,
+            Lint::HelmSla,
+            Lint::SeccompAllowlist,
+            Lint::BookkeepingMarker,
+        ]
     }
 }
 
@@ -57,6 +71,7 @@ pub fn run(lint: &Lint) -> Result<()> {
         Lint::SchemaLiveness => schema_liveness(),
         Lint::HelmSla => helm_sla(),
         Lint::SeccompAllowlist => seccomp_allowlist(),
+        Lint::BookkeepingMarker => bookkeeping_marker(),
     }
 }
 
@@ -550,6 +565,247 @@ fn check_seccomp_profile(
     Ok(())
 }
 
+/// The justification-comment token required at every terminal-inclusive
+/// builds-map call site (and forbidden from going stale — see
+/// [`bookkeeping_marker`]).
+const BOOKKEEPING_MARKER: &str = "Bookkeeping lookup:";
+
+/// Justification-marker guard for terminal-inclusive builds-map reads.
+///
+/// `Builds` (rio-scheduler/src/state/build.rs) splits build lookups by
+/// liveness: `get()` returns LIVE builds only — the policy default —
+/// while the `*_including_terminal*` accessors expose lingering
+/// terminal entries for bookkeeping (cleanup, transition validation,
+/// count updates, terminal-event re-send, tenant attribution, sweeps
+/// that filter on `state()` explicitly). Choosing the terminal-
+/// inclusive side is a per-site classification that compiles silently
+/// either way, and a policy site misclassified onto it keeps a
+/// finished build steering scheduling for up to the cleanup delay
+/// (or until restart if the cleanup command is dropped). The dispatch
+/// build-options fold shipped exactly that misclassification: the
+/// liveness-split conversion enumerated the policy consumers from
+/// recall, missed the fifth one, and nothing made the unjustified
+/// terminal-inclusive read visible.
+///
+/// This lint turns the convention into a gate, in both directions:
+///
+/// - every `*_including_terminal*` call site under rio-scheduler/src
+///   must carry a `// Bookkeeping lookup: <reason>` comment adjacent
+///   to the statement containing the call (same line, or above it
+///   with only comment/attribute/statement-continuation lines in
+///   between — a `;`, `{`, or `}` boundary cuts the blessing, so one
+///   marker cannot vouch for a neighboring statement);
+/// - every marker must annotate such a call site, so a site later
+///   flipped to the live-only accessor cannot leave a stale
+///   justification behind.
+///
+/// The accessor-name set is derived from the wrapper definition at
+/// scan time (any `fn *_including_terminal*` in state/build.rs), so a
+/// new family member joins the gate without editing this lint; floor
+/// guards on both the accessor count and the call-site count keep the
+/// scan from passing vacuously if the wrapper moves or the call-site
+/// shape changes.
+fn bookkeeping_marker() -> Result<()> {
+    let root = repo_root();
+    let def_rel = "rio-scheduler/src/state/build.rs";
+    let def_path = root.join(def_rel);
+    let def_src =
+        fs::read_to_string(&def_path).with_context(|| format!("reading {}", def_path.display()))?;
+    let accessors = extract_terminal_accessors(&def_src);
+    // Floor guard: the wrapper defines 7 family members today. An
+    // empty/shrunken set means the wrapper moved or the family was
+    // renamed — fail loud instead of scanning for nothing.
+    ensure!(
+        accessors.len() >= 4,
+        "only {} `fn *_including_terminal*` accessor(s) found in {def_rel} — \
+         the Builds wrapper moved or the family was renamed; update \
+         `bookkeeping_marker` in xtask/src/lint.rs",
+        accessors.len(),
+    );
+
+    let call_re = call_site_regex(&accessors);
+    let scan_root = root.join("rio-scheduler/src");
+    ensure!(
+        scan_root.is_dir(),
+        "bookkeeping-marker scan root {} not found",
+        scan_root.display()
+    );
+    let mut sites = 0usize;
+    let mut violations: Vec<String> = Vec::new();
+    walk_rs(&scan_root, &mut |p| {
+        let src = fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+        let rel = p.strip_prefix(root).unwrap_or(p).display().to_string();
+        sites += check_bookkeeping_markers(&src, &rel, &call_re, &mut violations);
+        Ok(())
+    })?;
+    // Floor guard: ~29 call sites today. Near-zero means the call-site
+    // regex or the scan root regressed, not that the code went clean.
+    ensure!(
+        sites >= 10,
+        "bookkeeping-marker scan found only {sites} `*_including_terminal*` \
+         call site(s) under rio-scheduler/src — suspiciously few; the \
+         call-site detection or scan root has regressed",
+    );
+    if !violations.is_empty() {
+        bail!(
+            "{} bookkeeping-marker violation(s):\n    {}\n  every \
+             `*_including_terminal*` call site needs an adjacent \
+             `// {BOOKKEEPING_MARKER} <why terminal entries are wanted>` comment \
+             (or the live-only accessor, if the read feeds a policy decision), \
+             and every `{BOOKKEEPING_MARKER}` marker must annotate such a call",
+            violations.len(),
+            violations.join("\n    "),
+        );
+    }
+    tracing::info!(
+        accessors = accessors.len(),
+        call_sites = sites,
+        "bookkeeping-marker ok"
+    );
+    Ok(())
+}
+
+/// Accessor-name set for [`bookkeeping_marker`], derived from the
+/// `Builds` wrapper source: every `fn` whose name contains
+/// `_including_terminal`. Doc-comment cross-references don't match
+/// (no `fn` keyword); `BTreeSet` for deterministic regex alternation.
+fn extract_terminal_accessors(src: &str) -> BTreeSet<String> {
+    let re = regex::Regex::new(r"\bfn\s+(\w*_including_terminal\w*)\s*\(").unwrap();
+    re.captures_iter(src).map(|c| c[1].to_owned()).collect()
+}
+
+/// Method-call regex for the accessor set: `.name(` with optional
+/// whitespace. rustfmt never splits between `.` and the method name,
+/// so a per-line match is reliable.
+fn call_site_regex(accessors: &BTreeSet<String>) -> regex::Regex {
+    let alt: Vec<String> = accessors.iter().map(|a| regex::escape(a)).collect();
+    regex::Regex::new(&format!(r"\.\s*(?:{})\s*\(", alt.join("|"))).unwrap()
+}
+
+/// Scan one file for [`bookkeeping_marker`]. Returns the number of
+/// call sites found; pushes a violation for every unjustified call
+/// site and every stale marker.
+fn check_bookkeeping_markers(
+    src: &str,
+    rel: &str,
+    call_re: &regex::Regex,
+    violations: &mut Vec<String>,
+) -> usize {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut sites = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("//") && call_re.is_match(strip_line_comment(line)) {
+            sites += 1;
+            if !marker_blesses_call(&lines, i) {
+                violations.push(format!(
+                    "{rel}:{}: `*_including_terminal*` call without an adjacent \
+                     `{BOOKKEEPING_MARKER}` justification",
+                    i + 1,
+                ));
+            }
+        }
+        // Only plain `//` comments are markers. `///`/`//!` doc text
+        // mentioning the convention is prose — it documents items, it
+        // cannot bless a statement, and it must not be flagged stale.
+        if is_marker_comment(trimmed) && !marker_annotates_call(&lines, i, call_re) {
+            violations.push(format!(
+                "{rel}:{}: stale `{BOOKKEEPING_MARKER}` marker — no \
+                 `*_including_terminal*` call in the statement it annotates",
+                i + 1,
+            ));
+        }
+    }
+    sites
+}
+
+/// Is this trimmed line a plain `//` comment carrying the marker?
+/// Doc comments (`///`, `//!`) are prose about the convention, not
+/// per-site justifications.
+fn is_marker_comment(trimmed: &str) -> bool {
+    trimmed.starts_with("//")
+        && !trimmed.starts_with("///")
+        && !trimmed.starts_with("//!")
+        && trimmed.contains(BOOKKEEPING_MARKER)
+}
+
+/// Code part of a line: everything before a `//` comment. Naive about
+/// `//` inside string literals — fine for a lint over call sites that
+/// never embed one.
+fn strip_line_comment(line: &str) -> &str {
+    line.split("//").next().unwrap_or(line)
+}
+
+/// Upward adjacency: does a `Bookkeeping lookup:` marker bless the
+/// call at `call_idx`? The marker may trail the call line itself, or
+/// sit above it separated only by comment lines, attributes, and
+/// statement-continuation lines. Any line with a `;`, `{`, or `}` in
+/// its code part bounds the statement — a marker beyond it belongs to
+/// a different statement and does NOT bless this call.
+fn marker_blesses_call(lines: &[&str], call_idx: usize) -> bool {
+    if lines[call_idx].contains(BOOKKEEPING_MARKER) {
+        return true;
+    }
+    let mut budget = 30usize;
+    for line in lines[..call_idx].iter().rev() {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            if is_marker_comment(trimmed) {
+                return true;
+            }
+            continue;
+        }
+        if trimmed.starts_with("#[") {
+            continue;
+        }
+        if line.contains(BOOKKEEPING_MARKER) {
+            // Trailing marker on a continuation line of this statement.
+            return true;
+        }
+        let code = strip_line_comment(line);
+        if code.contains(';') || code.contains('{') || code.contains('}') {
+            return false;
+        }
+    }
+    false
+}
+
+/// Downward adjacency for the stale-marker check: does the marker at
+/// `marker_idx` annotate a terminal-inclusive call? Mirror of
+/// [`marker_blesses_call`]: the call must appear on the marker's own
+/// line or in the first statement below it (comment/attribute lines
+/// skipped; the statement ends at the first `;`/`{`/`}` code line,
+/// which is itself still checked — `for … in x.iter_including_terminal() {`
+/// carries call and boundary on one line).
+fn marker_annotates_call(lines: &[&str], marker_idx: usize, call_re: &regex::Regex) -> bool {
+    if call_re.is_match(strip_line_comment(lines[marker_idx])) {
+        return true;
+    }
+    let mut budget = 30usize;
+    for line in lines.iter().skip(marker_idx + 1) {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("#[") {
+            continue;
+        }
+        let code = strip_line_comment(line);
+        if call_re.is_match(code) {
+            return true;
+        }
+        if code.contains(';') || code.contains('{') || code.contains('}') {
+            return false;
+        }
+    }
+    false
+}
+
 /// Recursive `.rs` walk via `std` (no `walkdir` dep). Follows symlinks
 /// — under the nix flake check, the corpus dirs are staged into a
 /// store-path source tree and may be symlinked.
@@ -674,4 +930,128 @@ mod tests {
             "schema captured, not table"
         );
     }
+
+    // ── bookkeeping-marker ─────────────────────────────────────────
+
+    /// Run [`check_bookkeeping_markers`] over a synthetic source with
+    /// the real accessor family; returns (call_sites, violations).
+    fn bk(src: &str) -> (usize, Vec<String>) {
+        let accessors = BTreeSet::from([
+            "get_including_terminal_for_bookkeeping".to_owned(),
+            "iter_including_terminal".to_owned(),
+        ]);
+        let re = call_site_regex(&accessors);
+        let mut violations = Vec::new();
+        let sites = check_bookkeeping_markers(src, "synthetic.rs", &re, &mut violations);
+        (sites, violations)
+    }
+
+    #[test]
+    fn accessor_extraction_from_wrapper_source() {
+        let src = "impl Builds {\n\
+                   \x20   /// [`get_including_terminal_for_bookkeeping`] xref only.\n\
+                   \x20   pub fn get(&self, id: &Uuid) -> Option<&BuildInfo> { todo!() }\n\
+                   \x20   pub fn get_including_terminal_for_bookkeeping(&self, id: &Uuid) {}\n\
+                   \x20   pub fn iter_mut_including_terminal(&mut self) {}\n\
+                   }\n";
+        assert_eq!(
+            extract_terminal_accessors(src),
+            BTreeSet::from([
+                "get_including_terminal_for_bookkeeping".to_owned(),
+                "iter_mut_including_terminal".to_owned(),
+            ]),
+            "fn definitions extracted; live-only get and doc xrefs ignored"
+        );
+    }
+
+    #[test]
+    fn marked_call_sites_pass() {
+        // Single line + trailing marker.
+        let (sites, v) =
+            bk("let b = m.get_including_terminal_for_bookkeeping(id); // Bookkeeping lookup: x\n");
+        assert_eq!((sites, v.len()), (1, 0), "trailing marker blesses: {v:?}");
+
+        // Marker block above a rustfmt-split chain.
+        let (sites, v) = bk(
+            "// Bookkeeping lookup: terminal entries wanted because reasons\n\
+             // (second comment line).\n\
+             let build = self\n\
+             \x20   .builds\n\
+             \x20   .get_including_terminal_for_bookkeeping(&build_id)\n\
+             \x20   .ok_or(Error::NotFound)?;\n",
+        );
+        assert_eq!((sites, v.len()), (1, 0), "block marker blesses: {v:?}");
+
+        // Marker above a for-header (call and `{` share the line).
+        let (sites, v) = bk("// Bookkeeping lookup: sweep filters state explicitly\n\
+             for (id, b) in self.builds.iter_including_terminal() {\n\
+             }\n");
+        assert_eq!((sites, v.len()), (1, 0), "for-header blessed: {v:?}");
+    }
+
+    #[test]
+    fn unmarked_call_site_fails() {
+        let (sites, v) = bk("let b = m.get_including_terminal_for_bookkeeping(id);\n");
+        assert_eq!(sites, 1);
+        assert_eq!(v.len(), 1, "unmarked call must be flagged");
+        assert!(v[0].contains("synthetic.rs:1"), "names file:line: {v:?}");
+    }
+
+    #[test]
+    fn marker_does_not_bless_across_statement_boundary() {
+        // A `;` between marker and call cuts the blessing — one marker
+        // cannot vouch for the next statement.
+        let (sites, v) = bk("// Bookkeeping lookup: for the FIRST statement only\n\
+             let a = m.get_including_terminal_for_bookkeeping(x);\n\
+             let b = m.get_including_terminal_for_bookkeeping(y);\n");
+        assert_eq!(sites, 2);
+        assert_eq!(v.len(), 1, "second call unblessed: {v:?}");
+        assert!(v[0].contains("synthetic.rs:3"));
+    }
+
+    #[test]
+    fn comment_mention_is_not_a_call_site() {
+        let (sites, v) = bk(
+            "// routes through .get_including_terminal_for_bookkeeping(id)\n\
+             // Bookkeeping lookup: prose only, no call\n\
+             let x = 1;\n",
+        );
+        assert_eq!(sites, 0, "comment text is not a call site");
+        // ... and the marker with no call below it is stale.
+        assert_eq!(v.len(), 1, "stale marker flagged: {v:?}");
+        assert!(v[0].contains("stale"));
+    }
+
+    #[test]
+    fn stale_marker_after_accessor_flip_fails() {
+        // The shape left behind when a site is converted to the
+        // live-only accessor but the justification comment is kept.
+        let (sites, v) = bk("// Bookkeeping lookup: outdated rationale\n\
+             let b = m.get(id);\n");
+        assert_eq!(sites, 0);
+        assert_eq!(v.len(), 1, "stale marker flagged: {v:?}");
+        assert!(v[0].contains("stale"), "{v:?}");
+    }
+
+    #[test]
+    fn doc_comment_mention_is_prose_not_marker() {
+        // `///` doc text describing the convention is neither a stale
+        // marker nor a blessing for a following call.
+        let (sites, v) = bk("/// Call sites carry a `// Bookkeeping lookup: <reason>`\n\
+             /// comment, enforced by xtask lint.\n\
+             pub struct Builds;\n");
+        assert_eq!((sites, v.len()), (0, 0), "doc prose ignored: {v:?}");
+
+        // ... and a doc comment cannot bless a call site.
+        let (sites, v) = bk("/// Bookkeeping lookup: doc text, not a justification\n\
+             fn f(m: &M) { m.get_including_terminal_for_bookkeeping(id); }\n");
+        assert_eq!(sites, 1);
+        assert_eq!(v.len(), 1, "doc comment must not bless: {v:?}");
+    }
+
+    // No on-tree test for `bookkeeping_marker` itself: like `helm_sla`
+    // and `seccomp_allowlist` it reads sibling-crate files at runtime,
+    // which the per-member nextest sandbox doesn't stage (manifests +
+    // stub targets only). The `xtask-lint` flake check runs it against
+    // the real tree.
 }

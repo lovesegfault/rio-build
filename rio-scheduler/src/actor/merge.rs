@@ -194,7 +194,8 @@ impl DagActor {
             other_builds,
         } = self.reconcile_merged_state(&ingest).await;
 
-        // Update build's cached count + persist initial denorm columns.
+        // Bookkeeping lookup: count update on the just-merged build
+        // (cached count + initial denorm columns).
         if let Some(build) = self
             .builds
             .get_mut_including_terminal_for_bookkeeping(&build_id)
@@ -344,8 +345,10 @@ impl DagActor {
             })
         {
             self.handle_derivation_failure(build_id, &failed_hash).await;
-            // handle_derivation_failure may have transitioned the build to
-            // Failed. If so, don't dispatch.
+            // Bookkeeping lookup: explicitly probes whether
+            // handle_derivation_failure just terminalized this build —
+            // the read needs to see the lingering terminal entry. If
+            // so, don't dispatch.
             if self
                 .builds
                 .get_including_terminal_for_bookkeeping(&build_id)
@@ -898,6 +901,9 @@ impl DagActor {
         // BuildInfo::transition, not a recoverable error). Other build
         // transitions keep going through `transition_build` (DB-first
         // via the pool) — only the merge path is transactional.
+        // Bookkeeping lookup: applies the in-memory half of the
+        // transactional Pending→Active transition (state-machine
+        // write — the accessor doc's transition category).
         let applied = self
             .builds
             .get_mut_including_terminal_for_bookkeeping(&build_id)

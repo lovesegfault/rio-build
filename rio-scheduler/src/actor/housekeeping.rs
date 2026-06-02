@@ -490,6 +490,9 @@ impl DagActor {
     // r[impl sched.timeout.per-build]
     async fn tick_check_build_timeouts(&mut self) {
         let mut timed_out_builds: Vec<(Uuid, u64)> = Vec::new();
+        // Bookkeeping lookup: sweep filters state() == Active
+        // explicitly — terminal entries are screened by the predicate,
+        // not the accessor.
         for (build_id, build) in self.builds.iter_including_terminal() {
             if build.state() == BuildState::Active
                 && build.options.build_timeout > 0
@@ -503,8 +506,11 @@ impl DagActor {
             warn!(build_id = %build_id, timeout_secs = timeout, "per-build timeout exceeded; cancelling derivations and failing build");
             metrics::counter!("rio_scheduler_build_timeouts_total").increment(1);
 
-            // Set error_summary FIRST so transition_build_to_failed picks it
-            // up for the BuildFailed event + DB error_summary column.
+            // Bookkeeping lookup: stamps error_summary ahead of the
+            // fail transition (the build was Active in this same
+            // turn). Set it FIRST so transition_build_to_failed picks
+            // it up for the BuildFailed event + DB error_summary
+            // column.
             if let Some(build) = self
                 .builds
                 .get_mut_including_terminal_for_bookkeeping(&build_id)
@@ -538,6 +544,9 @@ impl DagActor {
     /// Runs BEFORE `tick_check_orphaned_builds` so completion-retry is
     /// attempted before orphan-cancel.
     async fn tick_recheck_stuck_completions(&mut self) {
+        // Bookkeeping lookup: sweep filters state() == Active
+        // explicitly; check_build_completion is idempotent on terminal
+        // builds anyway.
         let candidates: Vec<Uuid> = self
             .builds
             .iter_including_terminal()
@@ -584,6 +593,9 @@ impl DagActor {
     async fn tick_check_orphaned_builds(&mut self) {
         let now = Instant::now();
         let mut to_cancel: Vec<Uuid> = Vec::new();
+        // Bookkeeping lookup: sweep skips non-Active explicitly (the
+        // state() check below); orphaned_since tracking is per-entry
+        // bookkeeping.
         for (build_id, build) in self.builds.iter_mut_including_terminal() {
             if build.state() != BuildState::Active {
                 // Pending: hasn't started dispatching — the SubmitBuild
@@ -804,6 +816,8 @@ impl DagActor {
                 .filter(|w| w.is_registered())
                 .count() as f64,
         );
+        // Bookkeeping lookup: gauge counts Active only — explicit
+        // state filter, terminal entries contribute nothing.
         metrics::gauge!("rio_scheduler_builds_active").set(
             self.builds
                 .values_including_terminal()

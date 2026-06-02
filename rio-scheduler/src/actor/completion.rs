@@ -1522,6 +1522,8 @@ impl DagActor {
                 );
                 for build_id in interested {
                     self.events.emit(build_id, event.clone());
+                    // Bookkeeping lookup: count update — must reach a
+                    // build that went terminal earlier in this turn.
                     if let Some(b) = self
                         .builds
                         .get_mut_including_terminal_for_bookkeeping(&build_id)
@@ -2087,6 +2089,10 @@ impl DagActor {
     /// a no-op for them — but filtering keeps the intent explicit.
     pub(super) fn prune_interested_keep_going(&mut self, drv_hash: &DrvHash) {
         for build_id in self.get_interested_builds(drv_hash) {
+            // Bookkeeping lookup: completion-accounting prune —
+            // applicability is the keep_going filter below, not
+            // liveness; pruning a terminal build's stale entry is a
+            // harmless no-op.
             if let Some(build) = self
                 .builds
                 .get_mut_including_terminal_for_bookkeeping(&build_id)
@@ -2754,6 +2760,9 @@ impl DagActor {
         // additional parents to DependencyFailed; those must be counted here.
         self.update_build_counts(build_id).await;
 
+        // Bookkeeping lookup: sticky first-failure summary recording;
+        // the fail-fast transition downstream rejects already-terminal
+        // builds (transition_build returns Rejected).
         let Some(build) = self
             .builds
             .get_mut_including_terminal_for_bookkeeping(&build_id)

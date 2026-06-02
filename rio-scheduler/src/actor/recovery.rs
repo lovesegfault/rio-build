@@ -179,6 +179,8 @@ impl DagActor {
 
         self.finalize_recovered_builds(&bd_rows).await;
 
+        // Bookkeeping lookup: diagnostic count for the recovery
+        // summary log line.
         info!(
             builds = self.builds.len_including_terminal(),
             derivations = self.dag.iter_nodes().count(),
@@ -986,6 +988,9 @@ impl DagActor {
             *bd_counts.entry(*build_id).or_insert(0) += 1;
         }
 
+        // Bookkeeping lookup: recovery sweep snapshot — builds that go
+        // terminal during the loop below were already snapshotted, and
+        // check_build_completion early-returns on terminal builds.
         let build_ids_to_check: Vec<Uuid> =
             self.builds.keys_including_terminal().copied().collect();
         for build_id in build_ids_to_check {
@@ -1009,6 +1014,8 @@ impl DagActor {
             // a later ClearPoison/TTL removes the node →
             // failed_count=0 → keep_going build spuriously Succeeds.
             // error_summary is the sticky; failed_count is not.
+            // Bookkeeping lookup: sticky error_summary reconstruction
+            // on a recovered build (count/summary bookkeeping).
             if let Some(b) = self
                 .builds
                 .get_mut_including_terminal_for_bookkeeping(&build_id)

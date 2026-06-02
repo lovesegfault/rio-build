@@ -1420,11 +1420,11 @@ impl DerivationState {
         &'a self,
         builds: &'a super::Builds,
     ) -> impl Iterator<Item = Uuid> + 'a {
-        // Deliberately includes lingering terminal builds: attribution
-        // (SLA model keys, metrics, path-tenant rows) is bookkeeping
-        // about who asked for the work, not a liveness-gated policy
-        // decision — a build that finished a moment ago still owns its
-        // attribution until cleanup.
+        // Bookkeeping lookup: attribution (SLA model keys, metrics,
+        // path-tenant rows) deliberately includes lingering terminal
+        // builds — it records who asked for the work, not a
+        // liveness-gated policy decision; a build that finished a
+        // moment ago still owns its attribution until cleanup.
         self.interested_builds
             .iter()
             .filter_map(|id| builds.get_including_terminal_for_bookkeeping(id)?.tenant_id)

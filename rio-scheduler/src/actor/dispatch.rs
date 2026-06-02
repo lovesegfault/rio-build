@@ -1702,6 +1702,9 @@ impl DagActor {
             }
         }
         for build_id in self.get_interested_builds(drv_hash) {
+            // Bookkeeping lookup: sticky first-failure summary
+            // recording; transition_build_to_failed below rejects
+            // already-terminal builds.
             if let Some(build) = self
                 .builds
                 .get_mut_including_terminal_for_bookkeeping(&build_id)
@@ -2047,6 +2050,9 @@ impl DagActor {
             }
         }
         for (build_id, n) in cached_per_build {
+            // Bookkeeping lookup: count update — cached_count must
+            // converge even for a build that went terminal earlier in
+            // this turn.
             if let Some(b) = self
                 .builds
                 .get_mut_including_terminal_for_bookkeeping(&build_id)

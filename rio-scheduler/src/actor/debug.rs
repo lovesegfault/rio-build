@@ -275,6 +275,8 @@ impl DagActor {
         build_id: Uuid,
         secs_ago: u64,
     ) -> bool {
+        // Bookkeeping lookup: test-only backdate of submitted_at —
+        // state-agnostic debug plumbing, not a scheduling decision.
         let Some(build) = self
             .builds
             .get_mut_including_terminal_for_bookkeeping(&build_id)

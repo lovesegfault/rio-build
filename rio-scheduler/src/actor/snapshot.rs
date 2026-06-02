@@ -325,6 +325,8 @@ impl DagActor {
 
         let mut pending_builds = 0u32;
         let mut active_builds = 0u32;
+        // Bookkeeping lookup: snapshot counts Pending/Active via the
+        // explicit state match below; the terminal arms count nothing.
         for b in self.builds.values_including_terminal() {
             match b.state() {
                 BuildState::Pending => pending_builds += 1,

@@ -377,10 +377,12 @@ impl DagActor {
             .ok_or(ActorError::BuildNotFound(build_id))?;
         let last_seq = self.events.last_seq(build_id);
 
-        // If the build is already terminal, the BuildCompleted/Failed/Cancelled
-        // event was already sent (possibly to zero receivers). A late subscriber
-        // would never see it and would hang forever. Re-send a terminal event
-        // so the new subscriber gets it.
+        // Bookkeeping lookup: terminal-event re-send needs the
+        // lingering terminal entry. If the build is already terminal,
+        // the BuildCompleted/Failed/Cancelled event was already sent
+        // (possibly to zero receivers). A late subscriber would never
+        // see it and would hang forever. Re-send a terminal event so
+        // the new subscriber gets it.
         if let Some(build) = self
             .builds
             .get_including_terminal_for_bookkeeping(&build_id)
@@ -469,6 +471,9 @@ impl DagActor {
         build_id: Uuid,
         summary: &crate::dag::BuildSummary,
     ) {
+        // Bookkeeping lookup: count update — completion/cascade ticks
+        // can land after the build went terminal and the denormalized
+        // counts must still converge.
         let Some(build) = self
             .builds
             .get_mut_including_terminal_for_bookkeeping(&build_id)
@@ -583,6 +588,9 @@ impl DagActor {
         &mut self,
         build_id: Uuid,
     ) -> Result<(), ActorError> {
+        // Bookkeeping lookup: failure-summary read for the BuildFailed
+        // event; the terminal screen lives in transition_build below
+        // (Rejected skips the side effects).
         let (error_summary, failed_derivation) = self
             .builds
             .get_including_terminal_for_bookkeeping(&build_id)
@@ -643,9 +651,11 @@ impl DagActor {
         build_id: Uuid,
         new_state: BuildState,
     ) -> Result<TransitionOutcome, ActorError> {
-        // Dry-run validate without mutating. validate_transition is the
-        // exact predicate transition() uses, so the post-DB transition()
-        // below cannot fail.
+        // Bookkeeping lookup: transition validation must SEE terminal
+        // entries to reject terminal→* as Rejected, not treat them as
+        // missing. Dry-run validate without mutating —
+        // validate_transition is the exact predicate transition()
+        // uses, so the post-DB transition() below cannot fail.
         if let Some(b) = self
             .builds
             .get_including_terminal_for_bookkeeping(&build_id)
@@ -661,6 +671,8 @@ impl DagActor {
             return Ok(TransitionOutcome::Rejected);
         }
 
+        // Bookkeeping lookup: error_summary for the DB status write —
+        // part of the transition validated above.
         let error_summary = self
             .builds
             .get_including_terminal_for_bookkeeping(&build_id)
@@ -672,6 +684,10 @@ impl DagActor {
             .update_build_status(build_id, new_state, error_summary)
             .await?;
 
+        // Bookkeeping lookup: applies the state-machine write — the
+        // entry is live here (terminal was screened by the dry-run),
+        // but transitions are the accessor doc's bookkeeping category
+        // and the live-only get() has no mut counterpart.
         if let Some(build) = self
             .builds
             .get_mut_including_terminal_for_bookkeeping(&build_id)
@@ -726,8 +742,10 @@ impl DagActor {
     /// reap orphaned+terminal DAG nodes, and re-evaluate the surviving
     /// parents that just lost children to the reap.
     pub(super) async fn handle_cleanup_terminal_build(&mut self, build_id: Uuid) {
-        // Only clean up if build is actually terminal (guard against misdirected
-        // cleanup, e.g., if build_id was reused, though UUIDs make this unlikely).
+        // Bookkeeping lookup: terminal cleanup reads the lingering
+        // entry it is about to remove. Only clean up if build is
+        // actually terminal (guard against misdirected cleanup, e.g.,
+        // if build_id was reused, though UUIDs make this unlikely).
         let is_terminal = self
             .builds
             .get_including_terminal_for_bookkeeping(&build_id)

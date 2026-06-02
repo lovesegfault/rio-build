@@ -223,6 +223,14 @@ impl BuildInfo {
 /// builds — goes through the `*_including_terminal*` accessors, whose
 /// names make the inclusion a greppable, review-visible decision
 /// instead of a per-call-site discipline.
+///
+/// Every `*_including_terminal*` call site MUST carry an adjacent
+/// `// Bookkeeping lookup: <reason>` comment justifying the terminal
+/// inclusion — enforced by `cargo xtask lint bookkeeping-marker` (the
+/// `xtask-lint` flake check), which also rejects stale markers. The
+/// behavior-preserving choice is otherwise silent: the one policy
+/// site misclassified onto this side during the liveness split (the
+/// dispatch build-options fold) compiled clean and shipped.
 #[derive(Debug, Default)]
 pub struct Builds {
     inner: HashMap<Uuid, BuildInfo>,
