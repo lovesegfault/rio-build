@@ -258,8 +258,12 @@ pub(crate) struct SettledIdentityRow {
     pub expected_output_paths: Vec<String>,
     pub is_fixed_output: bool,
     pub is_ca: bool,
-    /// Raw bytes of the persisted CA modular hash (`bytea`, possibly
-    /// empty/NULL for rows persisted before the hash was populated).
+    /// Raw bytes of the persisted CA modular hash (`bytea`). The
+    /// gateway populates the hash on every node it can compute
+    /// (`gw.dag.modulo-hash-all-nodes`), so NULL means the creating
+    /// submission carried none — a plain IA node with static output
+    /// paths, a direct submitter's bare node, or an ingress-stripped
+    /// unverifiable claim — never "not populated yet".
     pub ca_modular_hash: Option<Vec<u8>>,
     /// Persisted definition-evidence rank (`M_067`,
     /// `sched.derivation.evidence-rank`). Read by the settled-row
