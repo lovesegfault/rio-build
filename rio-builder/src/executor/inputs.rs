@@ -379,6 +379,7 @@ pub(super) async fn fetch_drv_from_store(
 /// never glue rejections: by the time the glue runs, every byte it can
 /// ask for is already in this table.
 // r[impl builder.result.input-materialization-is-infra+4]
+// r[impl builder.glue.pure]
 pub(super) async fn prefetch_graph_drvs(
     store_client: &StoreServiceClient<Channel>,
     main_drv_path: &str,
@@ -1296,6 +1297,7 @@ mod tests {
     /// every closure `.drv` (retained from the input-drv loop + the
     /// main text) makes prefetch_graph_drvs a pure merge — proven by
     /// running it against a store where any fetch would 404.
+    // r[verify builder.glue.pure]
     #[tokio::test]
     async fn prefetch_graph_drvs_skips_already_fetched() -> anyhow::Result<()> {
         let (_store, client) = spawn_and_connect().await?; // EMPTY store
