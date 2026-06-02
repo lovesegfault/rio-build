@@ -221,7 +221,7 @@ fn tampered_declared_path_is_detected() {
 /// canonical form differed from its file content, that binding would
 /// reject legitimate gateway traffic. This test makes such a divergence a
 /// red unit test instead of a production rejection.
-// r[verify sched.merge.ingress-inline-drv-binding]
+// r[verify sched.merge.ingress-inline-drv-binding+1]
 #[test]
 fn canonical_aterm_round_trip_over_corpus() {
     for (name, text) in FIXTURES {

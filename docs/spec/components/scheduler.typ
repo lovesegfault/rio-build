@@ -819,7 +819,7 @@ from); content-binding for inline submissions is the authoritative-content
 validation, and full evidence-ranked binding for store-backed claims is a
 documented follow-up.
 
-#r("sched.merge.ingress-inline-drv-binding")[
+#r("sched.merge.ingress-inline-drv-binding+1")[
   `SubmitBuild` ingress MUST validate every node that carries non-empty
   `drv_content` without the authoritative flag (the gateway's
   inline-`.drv` optimization): the bytes MUST be the canonical ATerm
@@ -834,8 +834,17 @@ documented follow-up.
   paths recomputed from the bytes with inputs resolved from sibling
   inline derivations and sibling `ca_modular_hash` declarations; and a
   non-empty `ca_modular_hash` MUST equal the modulo hash recomputed over
-  the bytes without the node's own declaration in the seed. Submissions
-  that fail any of these MUST be rejected with `INVALID_ARGUMENT`.
+  the bytes, with only siblings whose published hash IS the
+  input-position (unmasked) form in the seed --- store-backed
+  input-addressed, fixed-output, and deferred entries; never inline or
+  store-backed floating-CA ones --- and never the node's own
+  declaration. Submissions that fail any of these MUST be rejected with
+  `INVALID_ARGUMENT`. When the recompute is impossible because a
+  transitive input is a store-backed floating-CA derivation (its
+  unmasked form is underivable without its bytes), the declared
+  `ca_modular_hash` MUST be discarded at ingress rather than forwarded
+  unverified --- an unverifiable claim is no claim --- and the
+  submission MUST otherwise be accepted.
 ]
 This closes the variant-1 squat for inline content: before the binding, a
 direct submitter could attach inline bytes describing one derivation while
@@ -855,6 +864,20 @@ remain declaration-trusted at ingress --- their binding is the
 documented follow-up (store-evidence displacement), and the residual is
 exploitable only by a compromised worker, which the trust model already
 assumes hostile.
+
+The seed restriction and the discard clause exist because a floating-CA
+derivation's *published* modular hash is its masked-subject form
+(`mask_outputs = has_ca_floating_outputs()`, oracle parity), while the
+recompute's cache consumes input-position (unmasked) digests --- seeding
+the masked form poisons every consumer's recompute and false-rejects
+legitimate gateway-built CA chains. Discard-not-reject because the warm
+gateway shape (inline will-dispatch consumer of an already-realized
+floating drv whose bytes are not re-inlined) is honest traffic whose
+hash is genuinely unverifiable at ingress; discard-not-accept because an
+unverified declaration would otherwise flow into merge-gate identity
+evidence, realisation keys, and the persisted row --- the authoritative
+value is re-established by the dispatch-resolve/completion path, which
+holds the bytes.
 
 #r("sched.merge.edge-creation-scoped")[
   The merge MUST attach a submitted dependency edge to its parent node only

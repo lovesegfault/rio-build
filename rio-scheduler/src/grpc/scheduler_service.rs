@@ -260,7 +260,7 @@ impl SchedulerService for SchedulerGrpc {
         // not a defense). Bind the bytes to the node's claimed identity
         // before they can ever reach the derivations table.
         //
-        // r[impl sched.merge.ingress-inline-drv-binding]
+        // r[impl sched.merge.ingress-inline-drv-binding+1]
         // Non-authoritative inline content (the gateway's inline-.drv
         // optimization) is bound to its declared identity the same way.
         // Both validators are CPU-bound (SHA-256 over up to 1 MiB per
@@ -268,11 +268,11 @@ impl SchedulerService for SchedulerGrpc {
         // graph), so they run on the blocking pool — the backpressure
         // gate above has already bounded how much of this work a caller
         // can queue.
-        let nodes_for_validation = std::mem::take(&mut req.nodes);
+        let mut nodes_for_validation = std::mem::take(&mut req.nodes);
         req.nodes = tokio::task::spawn_blocking(
             move || -> Result<Vec<rio_proto::types::DerivationNode>, Status> {
                 validate_authoritative_drv_content(&nodes_for_validation)?;
-                validate_inline_drv_content(&nodes_for_validation)?;
+                validate_inline_drv_content(&mut nodes_for_validation)?;
                 Ok(nodes_for_validation)
             },
         )
@@ -900,7 +900,7 @@ fn validate_authoritative_drv_content(
 /// Validate NON-authoritative inline derivation content against the
 /// node's declared identity.
 ///
-/// r[impl sched.merge.ingress-inline-drv-binding]
+/// r[impl sched.merge.ingress-inline-drv-binding+1]
 /// The gateway's inline-`.drv` optimization attaches store-backed
 /// derivations' canonical ATerm bytes to will-dispatch nodes so workers
 /// skip a store fetch. Those bytes flow into `WorkAssignment.drv_content`
@@ -937,15 +937,26 @@ fn validate_authoritative_drv_content(
 ///    `ca_modular_hash` declarations; an unresolvable input is a
 ///    rejection, not a skip);
 /// 5. a non-empty `ca_modular_hash` equals the recomputed
-///    `hash_derivation_modulo` over the bytes (siblings seeded, the
-///    node's own declaration excluded so the check cannot be satisfied
-///    by itself).
+///    `hash_derivation_modulo` over the bytes. The seed contains only
+///    hashes whose published form IS the walk's input-position
+///    (mask=false) form: store-backed IA/FOD/deferred-IA siblings.
+///    Inline siblings recompute from bytes; store-backed FLOATING
+///    siblings publish the masked-subject form (oracle parity), which
+///    cannot stand in for the input form — a consumer that needs one
+///    has an ingress-UNVERIFIABLE hash, and an unverifiable claim is NO
+///    claim: the declaration is STRIPPED (the submission is otherwise
+///    accepted — warm gateway submissions legitimately have this
+///    shape), so nothing downstream consumes a value ingress never
+///    checked; the dispatch-resolve/completion path re-establishes the
+///    hash from bytes it can verify.
 ///
 /// The seeded-sibling design is sound against squats: a forged sibling
 /// hash moves every derived path AWAY from honest paths (SHA-256 second
 /// preimage to collide one), so seeding cannot help an attacker reach a
 /// victim's path — see `input_addressed_output_paths`' soundness note.
-fn validate_inline_drv_content(nodes: &[rio_proto::types::DerivationNode]) -> Result<(), Status> {
+fn validate_inline_drv_content(
+    nodes: &mut [rio_proto::types::DerivationNode],
+) -> Result<(), Status> {
     use rio_nix::derivation::{Derivation, DerivationLike};
     use rio_nix::hash::{HashAlgo, NixHash};
     use rio_nix::store_path::StorePath;
@@ -958,10 +969,15 @@ fn validate_inline_drv_content(nodes: &[rio_proto::types::DerivationNode]) -> Re
         return Ok(());
     }
 
+    // Phase A runs over a shared reborrow; the only mutation (stripping
+    // unverifiable hash claims) happens at the end, once every borrow
+    // into the slice is dead.
+    let nodes_ro = &*nodes;
+
     // Parse every inline derivation once (authoritative ones too — they
     // serve as sibling resolvers for IA path derivation below).
     let mut parsed: std::collections::HashMap<&str, Derivation> = std::collections::HashMap::new();
-    for node in nodes {
+    for node in nodes_ro {
         if node.drv_content.is_empty() {
             continue;
         }
@@ -980,14 +996,31 @@ fn validate_inline_drv_content(nodes: &[rio_proto::types::DerivationNode]) -> Re
         parsed.insert(node.drv_path.as_str(), drv);
     }
 
-    // Sibling hash seed: every node's declared 32-byte ca_modular_hash,
-    // keyed by drv_path. Inline siblings' hashes are themselves verified
-    // by step 5 when their turn comes; store-backed siblings' hashes are
-    // declarations whose forgery cannot steer derived paths toward any
-    // honest path (see the soundness note).
-    let sibling_seed: std::collections::HashMap<String, [u8; 32]> = nodes
+    // Sibling hash seed, keyed by drv_path. The walk's cache holds the
+    // mask_outputs=FALSE form (the input-position digest), so a declared
+    // hash may seed it ONLY when the published form equals that form:
+    //
+    //   - inline siblings are EXCLUDED — the walk recomputes their
+    //     unmasked form from the bytes via `parsed` (and step 6 verifies
+    //     their declarations on their own turn);
+    //   - store-backed floating-CA siblings are EXCLUDED — their
+    //     published hash is the masked-subject form (`mask_outputs =
+    //     has_ca_floating_outputs()`, oracle parity), which is NOT the
+    //     input form, and the unmasked form is underivable without the
+    //     bytes. A consumer whose recompute needs one degrades to
+    //     no-evidence below instead of false-rejecting.
+    //   - store-backed IA / FOD / deferred-IA siblings seed soundly:
+    //     for them mask_outputs=false, so published == input form.
+    //
+    // Forged seeds cannot steer derived paths toward any honest path
+    // (see the soundness note).
+    let sibling_seed: std::collections::HashMap<String, [u8; 32]> = nodes_ro
         .iter()
-        .filter(|n| n.ca_modular_hash.len() == 32)
+        .filter(|n| {
+            n.ca_modular_hash.len() == 32
+                && n.drv_content.is_empty()
+                && !(n.is_content_addressed && !n.is_fixed_output)
+        })
         .map(|n| {
             let mut h = [0u8; 32];
             h.copy_from_slice(&n.ca_modular_hash);
@@ -995,7 +1028,14 @@ fn validate_inline_drv_content(nodes: &[rio_proto::types::DerivationNode]) -> Re
         })
         .collect();
 
-    for node in nodes {
+    // Indices whose declared ca_modular_hash proved UNVERIFIABLE at
+    // ingress: an unverifiable claim is NO claim — the field is cleared
+    // before the request proceeds, so nothing downstream (merge-gate
+    // identity comparisons, realisation keying, the persistence upsert)
+    // can consume a value ingress never checked.
+    let mut strip_unverifiable: Vec<usize> = Vec::new();
+
+    for (idx, node) in nodes_ro.iter().enumerate() {
         if node.drv_content.is_empty() || node.drv_content_authoritative {
             continue;
         }
@@ -1212,23 +1252,60 @@ fn validate_inline_drv_content(nodes: &[rio_proto::types::DerivationNode]) -> Re
         if !node.ca_modular_hash.is_empty() {
             let resolve = |p: &str| parsed.get(p);
             let mut hash_cache = sibling_seed.clone();
-            // Never let the node's own declaration satisfy its own check.
+            // Never let the node's own declaration satisfy its own check
+            // (belt-and-suspenders: inline nodes are never seeded).
             hash_cache.remove(&node.drv_path);
-            let recomputed = rio_nix::derivation::hash_derivation_modulo(
+            match rio_nix::derivation::hash_derivation_modulo(
                 drv,
                 &node.drv_path,
                 &resolve,
                 &mut hash_cache,
-            )
-            .map_err(|e| {
-                Status::invalid_argument(format!("{context}: cannot be modulo-hashed: {e}"))
-            })?;
-            if node.ca_modular_hash != recomputed.to_vec() {
-                return Err(Status::invalid_argument(format!(
-                    "{context}: ca_modular_hash does not match the inline bytes"
-                )));
+            ) {
+                Ok(recomputed) => {
+                    if node.ca_modular_hash != recomputed.to_vec() {
+                        return Err(Status::invalid_argument(format!(
+                            "{context}: ca_modular_hash does not match the inline bytes"
+                        )));
+                    }
+                }
+                Err(rio_nix::derivation::DerivationError::InputNotFound(input)) => {
+                    // A transitive input's unmasked form is unavailable:
+                    // the input is store-backed AND floating-CA (its
+                    // published hash is the masked-subject form, which
+                    // cannot stand in for the input-position digest).
+                    // The gateway legitimately produces this shape on
+                    // warm submissions — an inline will-dispatch
+                    // consumer of an already-realized floating drv whose
+                    // bytes are not re-inlined — so rejecting would break
+                    // honest traffic. But an UNVERIFIABLE claim is NO
+                    // claim: the declaration is STRIPPED below, never
+                    // forwarded unverified (it would otherwise flow into
+                    // merge-gate identity evidence, realisation keys, and
+                    // the persisted row). The authoritative value is
+                    // re-established downstream by the dispatch-resolve /
+                    // completion path, which has the bytes to verify.
+                    tracing::info!(
+                        node = %node.drv_hash,
+                        unresolvable_input = %input,
+                        "inline ca_modular_hash unverifiable at ingress \
+                         (floating store-backed input); stripping the \
+                         unverified declaration"
+                    );
+                    strip_unverifiable.push(idx);
+                }
+                Err(e) => {
+                    return Err(Status::invalid_argument(format!(
+                        "{context}: cannot be modulo-hashed: {e}"
+                    )));
+                }
             }
         }
+    }
+
+    // Phase B: an unverifiable claim is no claim. Mutation happens only
+    // here, after every borrow into the slice from phase A is dead.
+    for idx in strip_unverifiable {
+        nodes[idx].ca_modular_hash.clear();
     }
     Ok(())
 }

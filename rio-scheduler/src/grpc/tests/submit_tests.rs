@@ -1465,7 +1465,7 @@ async fn test_submit_build_join_does_not_clear_authoritative_row() {
 /// re-derived here, so the text-CA binding plus the gateway's
 /// realization-probe exemption and the store's content verification
 /// remain the enforcement for them).
-// r[verify sched.merge.ingress-inline-drv-binding]
+// r[verify sched.merge.ingress-inline-drv-binding+1]
 #[tokio::test]
 async fn test_submit_build_md5_fod_content_requires_text_ca_binding() {
     let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
@@ -1766,7 +1766,7 @@ fn rebind_text_ca(node: &mut rio_proto::types::DerivationNode, aterm: &str, tag:
 /// attacker controls drv_path (re-bound to the tampered bytes' text-CA so
 /// that check passes); the per-output IA binding must still catch that the
 /// declared path is not this derivation's.
-// r[verify sched.merge.ingress-inline-drv-binding]
+// r[verify sched.merge.ingress-inline-drv-binding+1]
 #[tokio::test]
 async fn test_submit_build_rejects_inline_ia_path_squat() {
     let (_db, grpc, _handle, _task) = setup_grpc().await;
@@ -1804,7 +1804,7 @@ async fn test_submit_build_rejects_inline_ia_path_squat() {
 }
 
 /// The honest leaf IA fixture is accepted end-to-end.
-// r[verify sched.merge.ingress-inline-drv-binding]
+// r[verify sched.merge.ingress-inline-drv-binding+1]
 #[tokio::test]
 async fn test_submit_build_accepts_inline_leaf_ia_with_derived_path() {
     let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
@@ -1828,7 +1828,7 @@ async fn test_submit_build_accepts_inline_leaf_ia_with_derived_path() {
 /// The validator derives the consumer's declared paths by seeding the hash
 /// cache from the siblings; the oracle-produced golden corpus guarantees
 /// the derived paths equal the declared ones.
-// r[verify sched.merge.ingress-inline-drv-binding]
+// r[verify sched.merge.ingress-inline-drv-binding+1]
 #[tokio::test]
 async fn test_submit_build_accepts_inline_consumer_with_sibling_hashes() {
     use rio_nix::derivation::{Derivation, DerivationLike, hash_derivation_modulo};
@@ -1838,30 +1838,34 @@ async fn test_submit_build_accepts_inline_consumer_with_sibling_hashes() {
     seed_tenant(&db.pool, "team-inline-consumer").await;
 
     // The golden corpus: consumer depends on leaf + multi + fod.
-    let consumer_text = include_str!(
-        "../../../../rio-nix/tests/fixtures/drv/92fkmfw4x3ks4dl3pvhk9s0hm3z30cc2-rio-golden-consumer.drv"
-    )
-    .trim_end();
+    //
+    // The files under `fixtures/` are byte-identical vendored copies of
+    // rio-nix/tests/fixtures/drv/ (source of truth, where nix minted
+    // them). They are immutable by construction — the store-path file
+    // names embed the content hash and these tests depend on
+    // path↔content text-CA agreement, so any edit breaks both crates'
+    // suites loudly. Vendoring (rather than a `../../../../rio-nix/...`
+    // include) keeps the include inside this crate's source tree:
+    // crate2nix builds each crate from a filtered per-crate source where
+    // cross-crate relative includes do not exist, even though they
+    // resolve in a cargo workspace checkout.
+    let consumer_text =
+        include_str!("fixtures/92fkmfw4x3ks4dl3pvhk9s0hm3z30cc2-rio-golden-consumer.drv")
+            .trim_end();
     let consumer_path =
         "/nix/store/92fkmfw4x3ks4dl3pvhk9s0hm3z30cc2-rio-golden-consumer.drv".to_string();
     let inputs: &[(&str, &str)] = &[
         (
             "/nix/store/ragyx33c7zn1kxaag6nc57aiw71699ln-rio-golden-leaf.drv",
-            include_str!(
-                "../../../../rio-nix/tests/fixtures/drv/ragyx33c7zn1kxaag6nc57aiw71699ln-rio-golden-leaf.drv"
-            ),
+            include_str!("fixtures/ragyx33c7zn1kxaag6nc57aiw71699ln-rio-golden-leaf.drv"),
         ),
         (
             "/nix/store/jkafcgv3rmnnyrhbr0zmfmh58fnw8wgw-rio-golden-multi.drv",
-            include_str!(
-                "../../../../rio-nix/tests/fixtures/drv/jkafcgv3rmnnyrhbr0zmfmh58fnw8wgw-rio-golden-multi.drv"
-            ),
+            include_str!("fixtures/jkafcgv3rmnnyrhbr0zmfmh58fnw8wgw-rio-golden-multi.drv"),
         ),
         (
             "/nix/store/5d0dlxwjfzi5pbqb526pd35ny1rcmm7x-rio-golden-fod.drv",
-            include_str!(
-                "../../../../rio-nix/tests/fixtures/drv/5d0dlxwjfzi5pbqb526pd35ny1rcmm7x-rio-golden-fod.drv"
-            ),
+            include_str!("fixtures/5d0dlxwjfzi5pbqb526pd35ny1rcmm7x-rio-golden-fod.drv"),
         ),
     ];
 
@@ -1934,7 +1938,7 @@ async fn test_submit_build_accepts_inline_consumer_with_sibling_hashes() {
 /// Fail-closed: the same consumer submission but one input sibling carries
 /// NO hash declaration (and no inline bytes) — the consumer's IA paths
 /// cannot be derived, so the submission is rejected, never skipped.
-// r[verify sched.merge.ingress-inline-drv-binding]
+// r[verify sched.merge.ingress-inline-drv-binding+1]
 #[tokio::test]
 async fn test_submit_build_rejects_inline_consumer_with_missing_input_hash() {
     use rio_nix::derivation::{Derivation, DerivationLike, hash_derivation_modulo};
@@ -1942,33 +1946,26 @@ async fn test_submit_build_rejects_inline_consumer_with_missing_input_hash() {
 
     let (_db, grpc, _handle, _task) = setup_grpc().await;
 
-    let consumer_text = include_str!(
-        "../../../../rio-nix/tests/fixtures/drv/92fkmfw4x3ks4dl3pvhk9s0hm3z30cc2-rio-golden-consumer.drv"
-    )
-    .trim_end();
+    let consumer_text =
+        include_str!("fixtures/92fkmfw4x3ks4dl3pvhk9s0hm3z30cc2-rio-golden-consumer.drv")
+            .trim_end();
     let consumer_path =
         "/nix/store/92fkmfw4x3ks4dl3pvhk9s0hm3z30cc2-rio-golden-consumer.drv".to_string();
     let inputs: &[(&str, &str, bool)] = &[
         (
             "/nix/store/ragyx33c7zn1kxaag6nc57aiw71699ln-rio-golden-leaf.drv",
-            include_str!(
-                "../../../../rio-nix/tests/fixtures/drv/ragyx33c7zn1kxaag6nc57aiw71699ln-rio-golden-leaf.drv"
-            ),
+            include_str!("fixtures/ragyx33c7zn1kxaag6nc57aiw71699ln-rio-golden-leaf.drv"),
             // The leaf's hash declaration is WITHHELD.
             false,
         ),
         (
             "/nix/store/jkafcgv3rmnnyrhbr0zmfmh58fnw8wgw-rio-golden-multi.drv",
-            include_str!(
-                "../../../../rio-nix/tests/fixtures/drv/jkafcgv3rmnnyrhbr0zmfmh58fnw8wgw-rio-golden-multi.drv"
-            ),
+            include_str!("fixtures/jkafcgv3rmnnyrhbr0zmfmh58fnw8wgw-rio-golden-multi.drv"),
             true,
         ),
         (
             "/nix/store/5d0dlxwjfzi5pbqb526pd35ny1rcmm7x-rio-golden-fod.drv",
-            include_str!(
-                "../../../../rio-nix/tests/fixtures/drv/5d0dlxwjfzi5pbqb526pd35ny1rcmm7x-rio-golden-fod.drv"
-            ),
+            include_str!("fixtures/5d0dlxwjfzi5pbqb526pd35ny1rcmm7x-rio-golden-fod.drv"),
             true,
         ),
     ];
@@ -2038,9 +2035,210 @@ async fn test_submit_build_rejects_inline_consumer_with_missing_input_hash() {
     );
 }
 
+/// Builds a floating-CA leaf node `b` and an inline floating-CA consumer
+/// node `c` referencing it, with gateway-faithful `ca_modular_hash`
+/// values: each node's published hash is its masked-SUBJECT form
+/// (`mask_outputs = has_ca_floating_outputs()`), and the consumer's hash
+/// is computed by recursive resolution so its input rewrite uses `b`'s
+/// UNMASKED form — exactly what `populate_ca_modular_hashes` produces.
+fn floating_chain_nodes(
+    tag_b: &str,
+    tag_c: &str,
+) -> (
+    rio_proto::types::DerivationNode,
+    rio_proto::types::DerivationNode,
+) {
+    use rio_nix::derivation::{Derivation, hash_derivation_modulo};
+    use std::collections::HashMap;
+
+    // Faithful to nix-minted floating drvs: env[out] carries the CA
+    // placeholder, which output-masking clears — so the masked-subject
+    // (published) form genuinely differs from the unmasked input form.
+    // An empty env[out] would be mask-invariant and the chain test
+    // would pass even against a poisoned-seed validator.
+    let b_aterm = r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo b"],[("out","/1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9")])"#;
+    let mut b = make_node(tag_b);
+    rebind_text_ca(&mut b, b_aterm, tag_b);
+    let b_drv = Derivation::parse(b_aterm).unwrap();
+    let b_published =
+        hash_derivation_modulo(&b_drv, &b.drv_path, &|_| None, &mut HashMap::new()).unwrap();
+    b.drv_content_authoritative = false;
+    b.output_names = vec!["out".into()];
+    b.expected_output_paths = vec![String::new()];
+    b.is_content_addressed = true;
+    b.is_fixed_output = false;
+    b.needs_resolve = true;
+    b.ca_modular_hash = b_published.to_vec();
+
+    let c_aterm = format!(
+        r#"Derive([("out","","r:sha256","")],[("{}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo c"],[("out","/1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9")])"#,
+        b.drv_path
+    );
+    let mut c = make_node(tag_c);
+    rebind_text_ca(&mut c, &c_aterm, tag_c);
+    let c_drv = Derivation::parse(&c_aterm).unwrap();
+    let b_path = b.drv_path.clone();
+    let resolve = |p: &str| (p == b_path).then_some(&b_drv);
+    let c_published =
+        hash_derivation_modulo(&c_drv, &c.drv_path, &resolve, &mut HashMap::new()).unwrap();
+    c.drv_content_authoritative = false;
+    c.output_names = vec!["out".into()];
+    c.expected_output_paths = vec![String::new()];
+    c.is_content_addressed = true;
+    c.is_fixed_output = false;
+    c.needs_resolve = true;
+    c.ca_modular_hash = c_published.to_vec();
+
+    (b, c)
+}
+
+/// THE vm-ca-cutoff regression: a COLD floating-CA chain (consumer `c`
+/// with floating input `b`, both inline) must be ACCEPTED. A floating
+/// drv's published hash is its masked-subject form; the consumer's
+/// recompute must derive `b`'s unmasked input form from `b`'s inline
+/// bytes — seeding the masked published form into the walk's
+/// (mask=false) cache poisoned the recompute and false-rejected every
+/// gateway-built CA chain at ingress.
+// r[verify sched.merge.ingress-inline-drv-binding+1]
+#[tokio::test]
+async fn test_submit_build_accepts_inline_floating_chain() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    seed_tenant(&db.pool, "team-float-chain").await;
+
+    let (b, c) = floating_chain_nodes("float-cold-b", "float-cold-c");
+    let c_hash_declared = c.ca_modular_hash.clone();
+    let c_key = c.drv_hash.clone();
+    let edge = rio_proto::types::DerivationEdge {
+        parent_drv_path: c.drv_path.clone(),
+        child_drv_path: b.drv_path.clone(),
+    };
+    let result = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![c, b],
+            edges: vec![edge],
+            tenant_name: "team-float-chain".into(),
+            ..Default::default()
+        }))
+        .await;
+    assert!(
+        result.is_ok(),
+        "cold inline floating-CA chain accepted: {result:?}"
+    );
+
+    // Contrast with the strip cases: a VERIFIED declaration persists.
+    let (persisted,): (Option<Vec<u8>>,) =
+        sqlx::query_as("SELECT ca_modular_hash FROM derivations WHERE drv_hash = $1")
+            .bind(&c_key)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        persisted.as_deref(),
+        Some(c_hash_declared.as_slice()),
+        "verified declaration persists unchanged"
+    );
+}
+
+/// The WARM shape: the floating input `b` is already realized, so the
+/// gateway submits it store-backed (declared masked hash, NO inline
+/// bytes) while the will-dispatch consumer `c` stays inline. `c`'s
+/// declared hash is then ingress-UNVERIFIABLE (its recompute needs
+/// `b`'s unmasked form, underivable without the bytes) — the submission
+/// must be ACCEPTED (never false-reject honest gateway traffic) but the
+/// unverified declaration must be STRIPPED, not forwarded: the strip is
+/// unconditional in this arm, applying to honest claims too, so the
+/// persisted row carries NO hash regardless of what was declared.
+// r[verify sched.merge.ingress-inline-drv-binding+1]
+#[tokio::test]
+async fn test_submit_build_accepts_inline_consumer_of_realized_floating_input() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    seed_tenant(&db.pool, "team-float-warm").await;
+
+    let (mut b, c) = floating_chain_nodes("float-warm-b", "float-warm-c");
+    // Realized input: store-backed. Only the declaration travels.
+    b.drv_content = Vec::new();
+    let c_key = c.drv_hash.clone();
+    let edge = rio_proto::types::DerivationEdge {
+        parent_drv_path: c.drv_path.clone(),
+        child_drv_path: b.drv_path.clone(),
+    };
+    let result = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![c, b],
+            edges: vec![edge],
+            tenant_name: "team-float-warm".into(),
+            ..Default::default()
+        }))
+        .await;
+    assert!(
+        result.is_ok(),
+        "warm inline consumer of a realized floating input accepted: {result:?}"
+    );
+
+    // The honest-but-unverifiable declaration was stripped at ingress:
+    // the persisted row has no hash for the merge gate / recovery to
+    // consume.
+    let (persisted,): (Option<Vec<u8>>,) =
+        sqlx::query_as("SELECT ca_modular_hash FROM derivations WHERE drv_hash = $1")
+            .bind(&c_key)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        persisted, None,
+        "unverifiable declaration stripped, not persisted"
+    );
+}
+
+/// The forged variant of the warm shape: same unresolvable-floating-input
+/// structure, but the declared `ca_modular_hash` is attacker-chosen junk.
+/// Ingress cannot tell honest from forged here (both are unverifiable) —
+/// the unconditional strip is exactly what makes that indistinguishability
+/// safe: the submission is accepted, and the forged value never becomes
+/// merge-gate identity evidence, a realisation key, or a persisted row.
+// r[verify sched.merge.ingress-inline-drv-binding+1]
+#[tokio::test]
+async fn test_submit_build_strips_forged_unverifiable_modular_hash() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    seed_tenant(&db.pool, "team-float-forged").await;
+
+    let (mut b, mut c) = floating_chain_nodes("float-forged-b", "float-forged-c");
+    b.drv_content = Vec::new();
+    // Forge the consumer's declaration.
+    c.ca_modular_hash = vec![0xAB; 32];
+    let c_key = c.drv_hash.clone();
+    let edge = rio_proto::types::DerivationEdge {
+        parent_drv_path: c.drv_path.clone(),
+        child_drv_path: b.drv_path.clone(),
+    };
+    let result = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![c, b],
+            edges: vec![edge],
+            tenant_name: "team-float-forged".into(),
+            ..Default::default()
+        }))
+        .await;
+    assert!(
+        result.is_ok(),
+        "forged-but-unverifiable hash does not reject the submission: {result:?}"
+    );
+
+    let (persisted,): (Option<Vec<u8>>,) =
+        sqlx::query_as("SELECT ca_modular_hash FROM derivations WHERE drv_hash = $1")
+            .bind(&c_key)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        persisted, None,
+        "forged declaration stripped — never persisted as identity evidence"
+    );
+}
+
 /// Variant-3 kill: forged flags. The bytes are honest but the node claims
 /// is_fixed_output (which flows into upload-authorization claims signing).
-// r[verify sched.merge.ingress-inline-drv-binding]
+// r[verify sched.merge.ingress-inline-drv-binding+1]
 #[tokio::test]
 async fn test_submit_build_rejects_inline_flag_forgery() {
     let (_db, grpc, _handle, _task) = setup_grpc().await;
@@ -2067,7 +2265,7 @@ async fn test_submit_build_rejects_inline_flag_forgery() {
 }
 
 /// The declared drv_path is not the text content-address of the bytes.
-// r[verify sched.merge.ingress-inline-drv-binding]
+// r[verify sched.merge.ingress-inline-drv-binding+1]
 #[tokio::test]
 async fn test_submit_build_rejects_inline_text_ca_mismatch() {
     let (_db, grpc, _handle, _task) = setup_grpc().await;
@@ -2095,7 +2293,7 @@ async fn test_submit_build_rejects_inline_text_ca_mismatch() {
 }
 
 /// expected_output_paths disagrees with the (honest) bytes.
-// r[verify sched.merge.ingress-inline-drv-binding]
+// r[verify sched.merge.ingress-inline-drv-binding+1]
 #[tokio::test]
 async fn test_submit_build_rejects_inline_expected_path_mismatch() {
     let (_db, grpc, _handle, _task) = setup_grpc().await;
@@ -2121,7 +2319,7 @@ async fn test_submit_build_rejects_inline_expected_path_mismatch() {
 }
 
 /// ca_modular_hash disagrees with the recomputed value.
-// r[verify sched.merge.ingress-inline-drv-binding]
+// r[verify sched.merge.ingress-inline-drv-binding+1]
 #[tokio::test]
 async fn test_submit_build_rejects_inline_modular_hash_mismatch() {
     let (_db, grpc, _handle, _task) = setup_grpc().await;
