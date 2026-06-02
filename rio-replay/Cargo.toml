@@ -72,6 +72,9 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 # Loopback fake Hydra / fake binary cache for HTTP-client tests (same
 # pattern as rio-store's fake upstream).
 axum = { workspace = true }
+# MockAdmin with scriptable GetDerivationLogs outcomes — the admin
+# facade's deadline/retry tests run against a real tonic server.
+rio-test-support = { workspace = true }
 aws-sdk-s3 = { workspace = true, features = ["test-util"] }
 aws-smithy-mocks = { workspace = true }
 # Ephemeral ed25519 keys for the transport host-key policy tests.

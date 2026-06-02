@@ -20455,6 +20455,10 @@
           "packageId": "rand 0.10.1"
         },
         {
+          "name": "rio-test-support",
+          "packageId": "rio-test-support"
+        },
+        {
           "name": "rstest",
           "packageId": "rstest"
         },
