@@ -4688,6 +4688,314 @@ mod tests {
         );
     }
 
+    /// [`resume_backends`] with an artifact store wired: the production
+    /// substrate's shape, where campaign state is synced to a durable
+    /// store and a replacement pod restores from it.
+    fn resume_backends_with_store(
+        submitter: &Arc<KeyedSubmitter>,
+        supply_transport: &Arc<FakeSupplyTransport>,
+        narinfos: &HashMap<String, String>,
+        artifacts: &Arc<artifact::LocalDirArtifactStore>,
+    ) -> Backends {
+        Backends {
+            artifacts: Some(artifacts.clone() as Arc<dyn ArtifactStore>),
+            ..resume_backends(submitter, supply_transport, narinfos)
+        }
+    }
+
+    /// The substrate-crossing resume shape: a campaign starts on one pod,
+    /// the pod is rescheduled (FRESH state dir — the production Job runs
+    /// every attempt on an emptyDir volume), the replacement restores from
+    /// the artifact store and completes, and a third pod's report-only
+    /// resume re-does nothing. Same-state-dir resume tests cannot see this
+    /// substrate: download_state_if_missing early-returns when
+    /// campaign.json survives locally, so only a fresh-dir process
+    /// exercises the restore the deployment actually relies on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn campaign_completes_across_pod_reschedule_with_artifact_restore() {
+        let (_archive_dir, archive, archive_id) = open_mini_archive();
+        let manifest = load_units(&archive).unwrap();
+        let app_a = manifest
+            .iter()
+            .find(|m| m.job == "appA.x86_64-linux")
+            .unwrap()
+            .clone();
+        let app_b = manifest
+            .iter()
+            .find(|m| m.job == "appB.x86_64-linux")
+            .unwrap()
+            .clone();
+        let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let mut narinfos = HashMap::new();
+        narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
+        let submitter = Arc::new(KeyedSubmitter::default());
+        let supply_transport = Arc::new(FakeSupplyTransport::default());
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(artifact::LocalDirArtifactStore::new(store_dir.path()));
+
+        // Pod 1: prewarm campaign, deadline already past — the supply
+        // stage delivers, nothing is submitted, and the end-of-run sync
+        // pushes the full state (markers included) to the store.
+        let dir_a = tempfile::tempdir().unwrap();
+        let mut args = run_args(dir_a.path());
+        args.deadline = Some("2000-01-01T00:00:00Z".into());
+        run_with_backends(
+            args,
+            leaf_spec(&archive_id),
+            StateDir::new(dir_a.path()).unwrap(),
+            archive.clone(),
+            resume_backends_with_store(&submitter, &supply_transport, &narinfos, &store),
+        )
+        .await
+        .unwrap();
+        assert!(submitter.submitted.lock().unwrap().is_empty());
+        let state_a = StateDir::new(dir_a.path()).unwrap();
+        let created_at = state_a
+            .read_json::<CampaignRecord>("campaign.json")
+            .unwrap()
+            .expect("pod 1 wrote the campaign record")
+            .created_at;
+        let supply_rows_a = state_a
+            .load_jsonl::<SupplyEntry>(StateFile::Supply)
+            .unwrap()
+            .len();
+
+        // Pod 2: FRESH state dir. The restore re-materializes the synced
+        // state and the campaign completes the pending work.
+        script_apps_built(&submitter, &app_a.drv_path, &app_b.drv_path);
+        let dir_b = tempfile::tempdir().unwrap();
+        run_with_backends(
+            run_args(dir_b.path()),
+            leaf_spec(&archive_id),
+            StateDir::new(dir_b.path()).unwrap(),
+            archive.clone(),
+            resume_backends_with_store(&submitter, &supply_transport, &narinfos, &store),
+        )
+        .await
+        .unwrap();
+        let state_b = StateDir::new(dir_b.path()).unwrap();
+        assert_eq!(
+            state_b
+                .read_json::<CampaignRecord>("campaign.json")
+                .unwrap()
+                .expect("pod 2 has the campaign record")
+                .created_at,
+            created_at,
+            "pod 2 must resume pod 1's campaign (restored identity), not start a new one"
+        );
+        assert_eq!(
+            state_b
+                .load_jsonl::<SupplyEntry>(StateFile::Supply)
+                .unwrap()
+                .len(),
+            supply_rows_a,
+            "the restored supply marker must short-circuit the stage: a re-run would have \
+             appended fresh probe/plan rows to the restored journal"
+        );
+        let submitted_after_b = submitter.submitted.lock().unwrap().len();
+        assert!(submitted_after_b > 0, "pod 2 submitted the pending work");
+        let records = latest_per_job(state_b.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(
+            records["appA.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+        assert_eq!(
+            records["appB.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+        let processed_after_b = state_b
+            .read_json::<Vec<u64>>("collected.json")
+            .unwrap()
+            .unwrap_or_default();
+        assert!(
+            !processed_after_b.is_empty(),
+            "pod 2's collect pass settled its batches"
+        );
+
+        // Pod 3: another reschedule, after completion. The restored
+        // verdicts and processed-batch set must make this a report-only
+        // resume: nothing resubmitted, nothing re-processed.
+        let dir_c = tempfile::tempdir().unwrap();
+        run_with_backends(
+            run_args(dir_c.path()),
+            leaf_spec(&archive_id),
+            StateDir::new(dir_c.path()).unwrap(),
+            archive.clone(),
+            resume_backends_with_store(&submitter, &supply_transport, &narinfos, &store),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            submitter.submitted.lock().unwrap().len(),
+            submitted_after_b,
+            "the post-completion resume must not re-execute restored verdicts"
+        );
+        let state_c = StateDir::new(dir_c.path()).unwrap();
+        assert_eq!(
+            state_c
+                .read_json::<Vec<u64>>("collected.json")
+                .unwrap()
+                .unwrap_or_default(),
+            processed_after_b,
+            "the processed-batch set round-trips the store unchanged"
+        );
+        // Every file the restored-and-resumed campaign wrote is classified
+        // in the sync manifest — the resume substrate stays total.
+        artifact::assert_state_dir_files_classified(&state_c);
+    }
+
+    /// The inline crash-loop scenario on the production substrate, and its
+    /// printed remediation performed VERBATIM: an inline campaign's pod is
+    /// rescheduled mid-execute, every replacement pod re-materializes
+    /// markers/supply.done from the artifact store before the resume gate
+    /// runs, so the refusal must (a) fire on the replacement pod, (b) fire
+    /// regardless of a spec switched to prewarm, and (c) print the DURABLE
+    /// marker key — the only copy whose deletion lifts the refusal. The
+    /// test then deletes exactly the key the message names and proves the
+    /// next pod re-runs the supply stage and completes. (This soak is the
+    /// gate for the auto-invalidation follow-up at the bail site.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inline_resume_across_pod_reschedule_refuses_with_durable_remedy() {
+        let (_archive_dir, archive, archive_id) = open_mini_archive();
+        let manifest = load_units(&archive).unwrap();
+        let app_a = manifest
+            .iter()
+            .find(|m| m.job == "appA.x86_64-linux")
+            .unwrap()
+            .clone();
+        let app_b = manifest
+            .iter()
+            .find(|m| m.job == "appB.x86_64-linux")
+            .unwrap()
+            .clone();
+        let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let mut narinfos = HashMap::new();
+        narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
+        let submitter = Arc::new(KeyedSubmitter::default());
+        let supply_transport = Arc::new(FakeSupplyTransport::default());
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(artifact::LocalDirArtifactStore::new(store_dir.path()));
+        let inline_spec = || {
+            let mut spec = leaf_spec(&archive_id);
+            spec.supply.delivery = SupplyDelivery::Inline;
+            spec
+        };
+
+        // Pod 1: the supply stage completes by deferring every planned
+        // upload to the inline top-up; the deadline stops the run before
+        // anything is submitted, and the end-of-run sync pushes the state
+        // — deferral journal and supply marker included — to the store.
+        let dir_a = tempfile::tempdir().unwrap();
+        let mut args = run_args(dir_a.path());
+        args.deadline = Some("2000-01-01T00:00:00Z".into());
+        run_with_backends(
+            args,
+            inline_spec(),
+            StateDir::new(dir_a.path()).unwrap(),
+            archive.clone(),
+            resume_backends_with_store(&submitter, &supply_transport, &narinfos, &store),
+        )
+        .await
+        .unwrap();
+        assert!(submitter.submitted.lock().unwrap().is_empty());
+
+        // Pod 2: FRESH state dir. The restore resurrects the marker before
+        // the gate runs — the refusal must fire and name the durable key.
+        let dir_b = tempfile::tempdir().unwrap();
+        let err = run_with_backends(
+            run_args(dir_b.path()),
+            inline_spec(),
+            StateDir::new(dir_b.path()).unwrap(),
+            archive.clone(),
+            resume_backends_with_store(&submitter, &supply_transport, &narinfos, &store),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            StateDir::new(dir_b.path()).unwrap().marker_done("supply"),
+            "the restore re-materialized the supply marker before the gate"
+        );
+        assert!(
+            msg.contains("artifact store"),
+            "with a store wired the remediation must target the durable copy: {msg}"
+        );
+        // Pod 2b: the operator switches the spec to prewarm and the Job is
+        // relaunched — yet another fresh pod. The restored marker and
+        // deferral journal must still refuse (the wiring changed; what the
+        // completed stage failed to deliver did not).
+        let dir_b2 = tempfile::tempdir().unwrap();
+        let err2 = run_with_backends(
+            run_args(dir_b2.path()),
+            leaf_spec(&archive_id),
+            StateDir::new(dir_b2.path()).unwrap(),
+            archive.clone(),
+            resume_backends_with_store(&submitter, &supply_transport, &narinfos, &store),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err2:#}").contains("supply.delivery \"inline\""),
+            "{err2:#}"
+        );
+        assert!(
+            submitter.submitted.lock().unwrap().is_empty(),
+            "no refusing pod may submit undelivered work"
+        );
+
+        // The remediation, performed verbatim: delete exactly the durable
+        // key the message names (the operator's out-of-band store delete —
+        // the engine has no deletion path).
+        let durable_key = msg
+            .split("delete the durable supply marker ")
+            .nth(1)
+            .and_then(|rest| rest.split(" in the artifact store").next())
+            .expect("the refusal names the durable marker key");
+        assert_eq!(durable_key, "replay/campaigns/c-e2e/markers/supply.done");
+        std::fs::remove_file(store_dir.path().join(durable_key)).unwrap();
+
+        // Pod 3: fresh dir again. No durable marker → the supply stage
+        // re-runs (resume costs re-probing, never correctness), rebuilds
+        // the delivery context, and the campaign completes — with every
+        // batch carrying its delivery proof.
+        script_apps_built(&submitter, &app_a.drv_path, &app_b.drv_path);
+        let dir_c = tempfile::tempdir().unwrap();
+        run_with_backends(
+            run_args(dir_c.path()),
+            inline_spec(),
+            StateDir::new(dir_c.path()).unwrap(),
+            archive.clone(),
+            resume_backends_with_store(&submitter, &supply_transport, &narinfos, &store),
+        )
+        .await
+        .unwrap();
+        let state_c = StateDir::new(dir_c.path()).unwrap();
+        let records = latest_per_job(state_c.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(
+            records["appA.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+        assert_eq!(
+            records["appB.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+        let batches = state_c
+            .load_jsonl::<model::BatchRecord>(StateFile::Batches)
+            .unwrap();
+        assert!(
+            !batches.is_empty() && batches.iter().all(|b| b.topup_delivered),
+            "every batch of the re-run campaign carries its top-up delivery proof: {batches:?}"
+        );
+        let journal = state_c
+            .load_jsonl::<SupplyEntry>(StateFile::Supply)
+            .unwrap();
+        assert!(
+            undelivered_inline_deferrals(&journal).is_empty(),
+            "the re-run stage and its per-batch top-ups redeemed every deferral"
+        );
+        artifact::assert_state_dir_files_classified(&state_c);
+    }
+
     /// The collect pass processes timed-dispatcher batches, not just the
     /// submit loop's: a settled timed batch with an armed interruption that
     /// the engine cancelled is classified (interruption-replayed) and marked
