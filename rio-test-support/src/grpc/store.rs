@@ -74,14 +74,16 @@ pub struct MockStoreState {
 pub struct MockStoreCalls {
     /// Every PutPath metadata received (for assertions on upload count/contents).
     pub put_calls: Arc<RwLock<Vec<types::PathInfo>>>,
-    /// Records every `query_path_info` call's requested path. For
-    /// verifying r[sched.merge.substitute-fetch]'s eager-fetch loop.
+    /// Records every `query_path_info` call's requested path. (The
+    /// walk-era eager-fetch loop this originally verified died with
+    /// Phase D-prime; gateway and builder QPI assertions still read it.)
     pub qpi_calls: Arc<RwLock<Vec<String>>>,
     /// Per-path `query_path_info` attempt count, INCLUDING calls that
     /// fault-short-circuit (the early-return knobs above all skip
-    /// `qpi_calls`). For r[sched.substitute.fanout-bound] structural
-    /// retry assertions: `attempts[p] == N+1` proves N retries + 1
-    /// success without a process-global metrics recorder.
+    /// `qpi_calls`). For structural retry assertions:
+    /// `attempts[p] == N+1` proves N retries + 1 success without a
+    /// process-global metrics recorder (the walk-era fanout-bound rule
+    /// these served retired with Phase D-prime).
     pub qpi_attempts_by_path: Arc<RwLock<HashMap<String, u32>>>,
     /// Number of `batch_query_path_info` calls received. For I-110
     /// tests proving the builder uses one batch RPC per BFS layer
@@ -156,9 +158,8 @@ pub struct MockStoreFaults {
     /// first N attempts PER PATH (tracked via
     /// [`MockStoreCalls::qpi_attempts_by_path`]); attempt N+1 falls
     /// through. Count-based per-path (vs the time-gated knob above) so
-    /// the r[sched.substitute.fanout-bound] regression test asserts
-    /// structurally — every path retried exactly N times — without a
-    /// wall-clock window.
+    /// retry regression tests assert structurally — every path
+    /// retried exactly N times — without a wall-clock window.
     pub fail_qpi_resource_exhausted_per_path_n: Arc<std::sync::atomic::AtomicU32>,
     /// While > 0, query_path_info / substitute_path return `NotFound`
     /// for the first N attempts PER PATH (tracked via

@@ -1596,12 +1596,15 @@ running and ingesting into the store (benign --- the store is content
 addressed) and its late `SubstituteComplete` is dropped by that replica's own
 leader gate (#rref("sched.substitute.leader-gate")).
 
-#r("sched.substitute.fanout-bound")[
-  `RIO_SUBSTITUTE_MAX_CONCURRENT` (default 256) bounds in-flight detached tokio
-  tasks for scheduler memory only. It MUST NOT be tuned as a store-protection
-  knob; per-replica admission is #rref("store.substitute.admission").
-  `ResourceExhausted` from the store is transient and retried.
-]
+*Retired (Phase D-prime --- the walk fan-out bound):*
+`sched.substitute.fanout-bound` bounded the scheduler's in-flight detached
+walk tasks (`RIO_SUBSTITUTE_MAX_CONCURRENT`, scheduler memory only). The walk
+and its task pool were deleted (Waves D3-D4; the knob and its env var died
+with them --- operator-visible, recorded in the D3 commit). The surviving
+store protection is per-replica admission
+(#rref("store.substitute.admission")), which the rule already disclaimed as
+the real bound; the materialization executor's fetch concurrency is
+store-side configuration (#rref("store.materialize.executor")).
 
 #r("sched.admin.spawn-intents.probed-gate+2")[
   `compute_spawn_intents` MUST NOT emit a SpawnIntent for a Ready derivation
@@ -1632,18 +1635,20 @@ node is owned by the dispatch sweep's probe/walk/fail-fast arms
 intents on `must_substitute` is a possible future refinement, not a current
 requirement.
 
-#r("sched.dispatch.substitute-complete-inline+2")[
-  `handle_substitute_complete{ok=true}` MUST run the Ready-set store
-  short-circuit (`sweep_ready_cached` → `batch_probe_cached_ready`) inline in
-  the same handler, so dependents promoted Queued→Ready by the completed
-  substitution are probed for substitutability immediately instead of waiting
-  one Tick per cascade layer. The inline sweep MUST stay bounded:
-  `probed_generation` stamping skips nodes already probed this Tick, so a
-  fresh-cluster substitution burst re-probes only newly-promoted dependents,
-  and #rref("sched.admin.spawn-intents.probed-gate") keeps the spawn-intent
-  path correct (no spurious spawn) for any not-yet-probed tail that defers to
-  the next Tick.
-]
+*Retired (Phase D-prime --- the inline completion cascade):*
+`sched.dispatch.substitute-complete-inline+2` required
+`handle_substitute_complete{ok=true}` to run the Ready-set store
+short-circuit inline in the same handler so substitution cascades probed
+dependents immediately instead of one Tick per layer. The handler died with
+the walk consumption (Wave D3.2). Surviving carriers of the load-bearing
+content: dependents of a materialized node are promoted by the success
+consumption's completion cascade and probed by the dispatch sweep's probe
+partition (#rref("sched.materialize.routing")), and the spawn-intent gate
+(#rref("sched.admin.spawn-intents.probed-gate")) keeps the not-yet-probed
+window spawn-correct exactly as before --- the cascade-layer latency the rule
+existed to bound is owned by the merge-time eager probe
+(#rref("sched.substitute.eager-probe")), which probes the whole submission up
+front.
 
 #r("sched.substitute.leader-gate")[
   `SubstituteComplete` MUST be dropped on a standby replica (`!is_leader()`).
