@@ -73,6 +73,7 @@
     "rio_mountd_promote_inflight",
     "rio_mountd_promote_reject_total",
     "rio_mountd_request_seconds",
+    "rio_mountd_uid_busy_total",
     "rio_scheduler_actor_cmd_seconds",
     "rio_scheduler_actor_mailbox_depth",
     "rio_scheduler_assignments_total",
@@ -601,6 +602,11 @@
         "name": "rio_mountd_request_seconds",
         "kind": "histogram",
         "help": "UDS request latency (labeled by op: mount/backing_open/backing_close/promote/promote_chunks)"
+      },
+      {
+        "name": "rio_mountd_uid_busy_total",
+        "kind": "counter",
+        "help": "Connections rejected because their peer uid already had a live connection (a builder racing the previous build's teardown)"
       }
     ],
     "scheduler": [

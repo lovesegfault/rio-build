@@ -26,7 +26,7 @@
 //! queue unbounded privileged copy work.
 // r[impl builder.mountd.concurrency]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -68,6 +68,13 @@ pub const DEFAULT_MAX_PROMOTE_BYTES: u64 = 4 << 30;
 /// digest (the `.promoting` placeholder) to finish before giving up
 /// with [`ErrKind::RaceTimeout`].
 const PROMOTE_RACE_WAIT: Duration = Duration::from_secs(2);
+
+/// How long a uid-colliding connection may take to send its first
+/// request before the typed rejection is abandoned and the connection
+/// closed anyway. Bounds the doomed connection's lifetime so a hung or
+/// malicious peer cannot hold a second-connection slot open — the
+/// uid-bound invariant's "no standing second connection" property.
+const UID_BUSY_REPLY_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Copy-loop buffer. 64 KiB amortizes syscall overhead without holding
 /// a large allocation per concurrent promote.
@@ -539,8 +546,12 @@ struct Shared {
     staging_base: OwnedFd,
     cache_base: OwnedFd,
     chunks_base: OwnedFd,
-    /// One live connection per `SO_PEERCRED.uid`.
-    live_uids: Mutex<HashSet<libc::uid_t>>,
+    /// One live connection per `SO_PEERCRED.uid`. The value is the
+    /// `build_id` the connection has mounted (empty until `Mount`
+    /// succeeds) so a colliding connect's typed rejection can name the
+    /// holder — usually the previous build of the same pod whose
+    /// teardown is still in flight.
+    live_uids: Mutex<HashMap<libc::uid_t, String>>,
     /// One live `Mount{build_id}` per process across all connections.
     /// `Arc` so the cache sweep can snapshot it without holding the
     /// whole `Shared`.
@@ -628,7 +639,7 @@ pub async fn run(cfg: MountdConfig) -> anyhow::Result<()> {
         staging_base,
         cache_base,
         chunks_base,
-        live_uids: Mutex::new(HashSet::new()),
+        live_uids: Mutex::new(HashMap::new()),
         live_build_ids: Arc::new(Mutex::new(HashSet::new())),
         next_projid: AtomicU32::new(1),
         promote_sem: Arc::new(tokio::sync::Semaphore::new(
@@ -796,12 +807,50 @@ async fn handle_conn(shared: Arc<Shared>, fd: OwnedFd) -> anyhow::Result<()> {
     // build; a sandbox-escaped build cannot open a second.
     // r[impl builder.mountd.uid-bound]
     {
-        let mut uids = shared.live_uids.lock().ignore_poison();
-        if !uids.insert(creds.uid()) {
+        let holder = {
+            let mut uids = shared.live_uids.lock().ignore_poison();
+            match uids.entry(creds.uid()) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(String::new());
+                    None
+                }
+                std::collections::hash_map::Entry::Occupied(o) => Some(o.get().clone()),
+            }
+        };
+        if let Some(holder) = holder {
+            // r[impl builder.mountd.uid-busy-typed]
+            // Read exactly one frame so the rejection can carry the
+            // request's seq (a reply sent before the client's first
+            // request has no waiter and is dropped), then close. The
+            // read deadline bounds the doomed connection's lifetime,
+            // preserving uid-bound's no-standing-second-connection
+            // property.
+            metrics::counter!("rio_mountd_uid_busy_total").increment(1);
             warn!(
                 uid = creds.uid(),
-                "rejecting connection: uid already connected"
+                holder_build_id = %holder,
+                "rejecting connection: uid already connected; answering \
+                 first request with a typed retryable rejection"
             );
+            if let Ok(Ok(frame)) =
+                tokio::time::timeout(UID_BUSY_REPLY_DEADLINE, read_frame(&async_fd)).await
+                && let Ok(req) = proto::decode::<Request>(&frame.bytes)
+            {
+                let holder = if holder.is_empty() {
+                    "an unmounted connection".to_owned()
+                } else {
+                    format!("build {holder}")
+                };
+                let reply = Reply {
+                    seq: req.seq,
+                    resp: Resp::Err(ErrKind::Retryable(format!(
+                        "uid {} already has a live mountd connection (held by \
+                         {holder}; previous teardown likely in flight) — retry",
+                        creds.uid()
+                    ))),
+                };
+                let _ = write_reply(&async_fd, &reply, None).await;
+            }
             return Ok(());
         }
     }
@@ -1214,6 +1263,16 @@ fn handle_mount(
     // From here on, every failure must release the claim.
     match mount_build(shared, state, &build_id) {
         Ok((fuse_fd, quota)) => {
+            // Record the holder so a later uid-colliding connect can
+            // name it in its rejection (see `live_uids` doc).
+            if let Some(slot) = shared
+                .live_uids
+                .lock()
+                .ignore_poison()
+                .get_mut(&state.peer_uid)
+            {
+                slot.clone_from(&build_id);
+            }
             state.build_id = Some(build_id);
             (
                 Resp::Mounted {
@@ -1348,7 +1407,9 @@ fn mount_build(
 }
 
 /// Best-effort removal of the per-build castore mountpoint and staging
-/// tree. Used by both the Mount error path and connection teardown.
+/// tree. Used by the Mount error path, where the staging tree is empty
+/// or nearly so — connection teardown instead quarantine-renames the
+/// tree and deletes it off the claim-release path (see [`teardown`]).
 fn cleanup_build_dirs(shared: &Arc<Shared>, build_id: &str) {
     let mnt = shared.cfg.castore_dir.join(build_id);
     let _ = umount2(&mnt, MntFlags::MNT_DETACH);
@@ -1359,21 +1420,55 @@ fn cleanup_build_dirs(shared: &Arc<Shared>, build_id: &str) {
 /// Connection teardown: undo everything `Mount` set up. Runs on every
 /// connection exit path (orderly close, error, daemon-side rejection
 /// after a successful mount).
+///
+/// The `build_id` and uid claims are released after metadata-only
+/// syscalls only — never across the O(staging size) recursive delete,
+/// which the next build's Mount on this pod would otherwise collide
+/// with. The deep delete runs detached; if it fails or the daemon dies
+/// first, the sweep's `REAP_PREFIX` arm retries it.
+// r[impl builder.mountd.teardown-fast-release]
 fn teardown(shared: &Arc<Shared>, state: &mut ConnState) {
     if let Some(build_id) = state.build_id.take() {
-        cleanup_build_dirs(shared, &build_id);
+        let mnt = shared.cfg.castore_dir.join(&build_id);
+        let _ = umount2(&mnt, MntFlags::MNT_DETACH);
+        let _ = unlinkat(
+            &shared.castore_base,
+            build_id.as_str(),
+            UnlinkatFlags::RemoveDir,
+        );
         if let (Some(projid), Some(staging)) = (state.projid, state.staging_dirfd.as_ref()) {
             // Release the quota record so the projid slot doesn't
-            // accumulate dead accounting. The staging tree is already
-            // gone so the live usage is zero either way.
+            // accumulate dead accounting. The tree is about to be
+            // quarantined and deleted, so the recorded usage is
+            // irrelevant either way.
             let _ = apply_project_quota(staging.as_ref(), projid, 0);
         }
+        // Quarantine BEFORE releasing the build_id claim: once the
+        // claim is gone a re-`Mount` of the same build_id may mkdir a
+        // fresh staging dir at the original name, and a later rename
+        // would steal the new build's tree (same ordering argument as
+        // `sweep::reap_dead_staging`, where the rename runs under the
+        // liveness lock).
+        let quarantined = super::sweep::quarantine_staging(&shared.cfg.staging_dir, &build_id);
         shared
             .live_build_ids
             .lock()
             .ignore_poison()
             .remove(&build_id);
         info!(build_id, "connection closed, build torn down");
+        if let Some(doomed) = quarantined {
+            let deep_delete = move || {
+                let _ = std::fs::remove_dir_all(&doomed);
+            };
+            match tokio::runtime::Handle::try_current() {
+                Ok(h) => {
+                    h.spawn_blocking(deep_delete);
+                }
+                // No runtime (unit tests calling teardown directly):
+                // delete inline.
+                Err(_) => deep_delete(),
+            }
+        }
     }
     shared
         .live_uids
@@ -1406,6 +1501,10 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_mountd_promote_reject_total",
         "Rejected promotes (labeled by reason: mismatch/not-regular/too-large/race-timeout/backlog/other)"
+    );
+    describe_counter!(
+        "rio_mountd_uid_busy_total",
+        "Connections rejected because their peer uid already had a live connection (a builder racing the previous build's teardown)"
     );
     describe_gauge!(
         "rio_mountd_promote_inflight",
@@ -1881,7 +1980,7 @@ mod tests {
                 staging_base: dirfd(&cfg.staging_dir),
                 cache_base: dirfd(&cfg.cache_dir),
                 chunks_base: dirfd(&cfg.chunks_dir),
-                live_uids: Mutex::new(HashSet::new()),
+                live_uids: Mutex::new(HashMap::new()),
                 live_build_ids: Arc::new(Mutex::new(HashSet::new())),
                 next_projid: AtomicU32::new(1),
                 promote_sem: Arc::new(tokio::sync::Semaphore::new(promote_permits)),
@@ -2140,6 +2239,167 @@ mod tests {
                 assert!(!fx.published(&digest).exists());
             }
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ─── uid collision: typed rejection, not a silent close ────────────
+
+    /// Send one frame on a raw SEQPACKET fd and read one reply,
+    /// polling through `EWOULDBLOCK` (the daemon end shares the
+    /// socketpair's NONBLOCK flag).
+    fn roundtrip_raw(fd: &OwnedFd, req: &Request) -> Option<Reply> {
+        let bytes = proto::encode(req).unwrap();
+        proto::send_frame(fd.as_raw_fd(), &bytes, &[]).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match proto::recv_frame(fd.as_raw_fd()) {
+                Ok(frame) => return Some(proto::decode::<Reply>(&frame.bytes).unwrap()),
+                Err(FrameError::Eof) => return None,
+                Err(FrameError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline, "no reply within 2s");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("recv: {e:?}"),
+            }
+        }
+    }
+
+    // r[verify builder.mountd.uid-busy-typed]
+    /// A connection whose uid already has a live one must get a typed
+    /// retryable rejection to its first request — naming the holding
+    /// build — instead of the bare close that is indistinguishable
+    /// from a daemon crash on the builder side.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uid_collision_gets_typed_retryable_reply() {
+        let fx = ConnFx::new(0);
+        let shared = Arc::clone(&fx.shared);
+        // Simulate the holder: this process's uid (what SO_PEERCRED on
+        // a socketpair reports) already owns a mounted connection.
+        shared
+            .live_uids
+            .lock()
+            .ignore_poison()
+            .insert(nix::unistd::getuid().as_raw(), "holder-build".into());
+
+        let (daemon_end, client_end) = nix::sys::socket::socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        let conn = tokio::spawn(handle_conn(Arc::clone(&shared), daemon_end));
+
+        let reply = tokio::task::spawn_blocking(move || {
+            roundtrip_raw(
+                &client_end,
+                &Request {
+                    seq: 7,
+                    req: Req::Mount {
+                        build_id: "colliding-build".into(),
+                    },
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .expect("a typed rejection, not EOF");
+
+        assert_eq!(reply.seq, 7, "rejection must correlate to the request");
+        match reply.resp {
+            Resp::Err(ErrKind::Retryable(msg)) => {
+                assert!(msg.contains("holder-build"), "names the holder: {msg}");
+            }
+            other => panic!("expected Retryable rejection, got {other:?}"),
+        }
+        conn.await.unwrap().unwrap();
+        // The doomed connection must not have evicted the holder.
+        assert_eq!(
+            shared
+                .live_uids
+                .lock()
+                .ignore_poison()
+                .get(&nix::unistd::getuid().as_raw())
+                .map(String::as_str),
+            Some("holder-build")
+        );
+    }
+
+    // r[verify builder.mountd.teardown-fast-release]
+    /// Teardown must release the uid and build_id claims without
+    /// waiting for the recursive staging delete, with the original
+    /// staging path already quarantine-renamed at release time so a
+    /// same-build_id remount cannot lose its fresh tree to the pending
+    /// delete. Pins the mechanism's invariants; the defect it guards —
+    /// claim-hold DURATION across an O(staging size) delete — is a
+    /// timing property a unit test cannot observe, so this test alone
+    /// does not discriminate the pre-fix shape.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn teardown_releases_claims_before_staging_reap() {
+        let mut fx = ConnFx::new(0);
+        let build_id = "teardown-fast";
+        let staging = fx.shared.cfg.staging_dir.join(build_id);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("artifact"), vec![0u8; 1 << 16]).unwrap();
+        fx.shared
+            .live_build_ids
+            .lock()
+            .ignore_poison()
+            .insert(build_id.to_owned());
+        fx.shared
+            .live_uids
+            .lock()
+            .ignore_poison()
+            .insert(fx.state.peer_uid, build_id.to_owned());
+        fx.state.build_id = Some(build_id.to_owned());
+        fx.state.projid = None;
+
+        teardown(&fx.shared, &mut fx.state);
+
+        // Claims released and original path free as soon as teardown
+        // returns — NOT after the deep delete completes.
+        assert!(
+            !fx.shared
+                .live_uids
+                .lock()
+                .ignore_poison()
+                .contains_key(&fx.state.peer_uid),
+            "uid claim must be released synchronously"
+        );
+        assert!(
+            !fx.shared
+                .live_build_ids
+                .lock()
+                .ignore_poison()
+                .contains(build_id),
+            "build_id claim must be released synchronously"
+        );
+        assert!(
+            !staging.exists(),
+            "staging tree must be quarantine-renamed off the original path"
+        );
+
+        // The detached delete (or, if it lost a race, the sweep's
+        // REAP_PREFIX arm) must actually remove the quarantined tree.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let leftovers: Vec<_> = std::fs::read_dir(&fx.shared.cfg.staging_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with(".reap."))
+                })
+                .collect();
+            if leftovers.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "quarantined staging tree not deleted: {leftovers:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 }
