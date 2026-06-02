@@ -189,8 +189,9 @@ async fn main() -> anyhow::Result<()> {
     // the NAMED StoreService (BalancedChannel probe target). The
     // after-grace hook waits for in-flight GetPath body streams to
     // complete (or `stream_drain` to elapse) BEFORE serve_shutdown
-    // tears down the listener — ComponentScaler scale-down assumes
-    // SIGTERM drains in-flight work (decide.rs MAX_SCALE_DOWN_STEP).
+    // tears down the listener — KEDA scale-down (the store
+    // ScaledObject's damped -1 pod / 600s policy) assumes SIGTERM
+    // drains in-flight work.
     // Spawned here (not at the top of main) because the active-stream
     // counter lives on store_service.
     let reporter = health_reporter.clone();

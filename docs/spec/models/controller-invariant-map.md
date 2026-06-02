@@ -327,7 +327,9 @@ Grouped, with the reason they stay outside the Stage-B models:
   (its formula half) — abstracted to opaque outcomes / bucketed
   thresholds; their budget- and polarity-relevant clauses are mapped
   above.
-- **Other loops**: `ctrl.scaler.*`, `store.admin.get-load+2` (L2),
+- **Other loops**: `ctrl.scaler.*`, `store.admin.get-load+3` (L2;
+  rules re-scoped/bumped at the item-I store-CR removal — see that
+  delta entry below),
   `ctrl.gc.*` (L8), `ctrl.pool.disruption`, `ctrl.drain.*` (L3 /
   executor lifecycle), `ctrl.reconcile.owner-refs`,
   `ctrl.backoff.per-object`, `ctrl.condition.sched-unreachable`
@@ -1593,3 +1595,54 @@ one-line touch-up for whoever next edits the file:
    `PodRequestedCache` as the kube-authoritative binding source → the
    rule's substance is unchanged (the binding is kube-authoritative,
    now from the per-tick LIST).
+
+## Item I entry — store ComponentScaler CR removal (KEDA ScaledObject takeover) (delta pass)
+
+Cross-campaign coordination record for harden-store work item I
+(decision-5 store scaling, commissioned at the reconciliation memo's
+ratification), following the C4-deletion precedent ("Track B invariant
+map coordinated"). Written by the item-I executor; docs-only —
+counter-signature of the landed form remains to be collected (the 1b
+precedent: collected at landing review).
+
+- **What changed that touches this map's subjects.** The `store`
+  ComponentScaler CR is removed from the chart
+  (`templates/componentscaler.yaml` deleted; `store.yaml`'s replicas
+  gating re-keyed `componentScaler.store.enabled` →
+  `store.autoscaling.enabled` with the gateway-style lookup-echo); the
+  rio-store Deployment's replica count is now owned by a KEDA
+  ScaledObject (`templates/store-scaledobject.yaml`: substitution
+  backlog / builders-per-replica / CPU triggers, one-per-node
+  topologySpreadConstraints — `infra.store.autoscaling`). The
+  ComponentScaler CRD, the controller reconciler, and
+  `componentscaler/decide.rs` with its full unit battery are
+  UNCHANGED — the chart simply defines no CR. Spec rules re-scoped in
+  the same commit: `ctrl.scaler.signal-substituting+3→+4` (rationale
+  re-keyed from "the store" to "any ComponentScaler target"),
+  `store.admin.get-load+2→+3` (reconciler polling now conditional on a
+  CR targeting the store; PG-pool gauge publication store-owned),
+  `obs.metric.store-pg-pool→+2` (self-published 30 s tick). The
+  `vm-componentscaler-k3s` scenario is retired with the CR (its four
+  wiring markers go with it; `ctrl.scaler.{component,ratio-learn}` and
+  `store.admin.get-load` / `obs.metric.store-pg-pool` keep their unit
+  verify sites in decide.rs / admin.rs); `vm-substitute-scale-k3s` is
+  reworked to assert the autoscaling-signal path (the
+  `rio_scheduler_substituting_derivations` gauge) instead of the CR
+  closed loop.
+- **Model impact: none.** The ComponentScaler loop (L2 / I13) is out
+  of model for this campaign by the Stage-A scope decision recorded
+  above ("out-of-model invariants"); Models J and N consume neither
+  the CR nor the store replica count. No modeled tick body changes.
+- **Stage-C calibration impact: none mechanical.** The M-1/M-2
+  calibration families (and every other family table above) concern
+  the prev_idle/ICE NodeClaim machinery, not the ComponentScaler; no
+  calibrated mechanism's behavior changes when the chart stops
+  defining a store CR. The reconciler code the `ctrl.scaler.*` rules
+  govern is byte-unchanged; only its production target population is
+  now empty (the loop idles until a future CR names a target).
+
+Controller-campaign owner counter-signature for this delta entry:
+PENDING — to be collected at the item-I landing review, checking
+against the as-landed tree that decide.rs and the reconciler are
+byte-unchanged, the CRD ships, and the re-scoped rules' annotation
+sites moved with their bumps.

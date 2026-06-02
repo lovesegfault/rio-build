@@ -1,0 +1,111 @@
+{{- if and .Values.store.enabled .Values.store.autoscaling.enabled }}
+{{- $a := .Values.store.autoscaling -}}
+# r[impl infra.store.autoscaling] (documentary — .yaml is not tracey-
+# scanned; the scannable anchors are xtask deploy.rs and the helm-lint
+# fragment 26-store-scaling.sh asserts this render)
+#
+# KEDA ScaledObject for rio-store — the SINGLE owner of the store
+# Deployment's replica count (the store ComponentScaler CR is gone;
+# the CRD and reconciler stay for future targets). In the chart (not
+# terraform) so `helm rollback` takes scaling config with the rest;
+# gated on store.autoscaling.enabled because the keda.sh CRDs don't
+# exist until helm_release.keda (infra/eks/keda.tf) applies — same
+# pattern as gateway-scaledobject.yaml.
+#
+# The store carries three superimposed load classes with different
+# leading indicators (decision 5):
+#   1. substitution ingest (upstream → store → S3) — dominant after a
+#      wipe / large nixpkgs bump / first-time tenant; leading
+#      indicator: the scheduler's materialization backlog, known at
+#      merge time, minutes before the store feels the load.
+#   2. builder read-serving (S3 → store → builder) — the structural
+#      steady-state load whenever builders run against a warm store;
+#      leading indicator: busy builders.
+#   3. builder upload ingest (PutPath → S3) — bursts as derivations
+#      finish; same leading indicator.
+# All three flow through the same pod NIC, NAR/chunk memory, and PG
+# pool (which is why placement is one-replica-per-node, store.yaml).
+# KEDA takes the max across the triggers: two leading prometheus
+# signals plus CPU as the reactive corrective term for whatever the
+# ratios miss.
+#
+# Why scale-down is heavily damped (the gateway's policy): replica
+# count contracting mid-wave re-funnels ingest through fewer NICs
+# exactly when the backlog gauge is sawtoothing; 1800s stabilization
+# + at most 1 pod per 600s means a wave has to be over for 30 minutes
+# before the first pod is released. Scale-up has no stabilization —
+# adding a pod is cheap and the failure mode of being late is the
+# store at the floor through a whole substitution wave.
+#
+# Kill switch: deleting the ScaledObject freezes replicas at the
+# current count; `store.autoscaling.enabled=false` instead re-renders
+# the static `store.replicas` on the next upgrade — set it
+# deliberately if that path is ever used.
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: rio-store
+  namespace: {{ .Values.namespaces.store.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    # apps/v1 Deployment is KEDA's default target kind; name matches
+    # store.yaml's metadata.name.
+    name: rio-store
+  # Floor/ceiling inherited from the retired ComponentScaler CR (2/14).
+  # The floor carries the first ~1-4 min of a post-wipe wave at reduced
+  # throughput until scale-out lands; raising it is a cost decision
+  # (store pods request 16 CPU / 8 Gi on EKS). The ceiling is bounded
+  # by Aurora connections: maxReplicas × pgMaxConnections must stay
+  # under rds_max_connections (see the values.yaml note).
+  minReplicaCount: {{ $a.minReplicas }}
+  maxReplicaCount: {{ $a.maxReplicas }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 1800
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 600
+        scaleUp:
+          stabilizationWindowSeconds: 0
+  triggers:
+    # Substitution backlog (leading, class 1). AverageValue: KEDA
+    # divides the fleet-wide backlog by the current replica count, so
+    # desiredReplicas = ceil(sum(backlog) / targetBacklogPathsPerReplica).
+    # The gauge counts derivations with unresolved unclaimed
+    # materialization jobs — durable PG-backed state published by the
+    # scheduler leader each tick (sum() collapses the leader-gated
+    # single series; a deposed leader's series is zeroed, not stale).
+    - type: prometheus
+      metricType: AverageValue
+      metadata:
+        serverAddress: {{ $a.prometheusAddress | quote }}
+        query: sum(rio_scheduler_substituting_derivations)
+        threshold: {{ $a.targetBacklogPathsPerReplica | quote }}
+    # Builder demand (leading, classes 2-3). rio_scheduler_open_attempts
+    # is the busy-fleet gauge (one open pull-mode attempt per in-flight
+    # derivation, one attempt per pod). Static ratio seeded from the
+    # ComponentScaler's seedRatio era; the CPU trigger below is the
+    # corrective term the learned ratio used to provide, and the
+    # threshold is re-derived from the warm-phase capture (P10).
+    - type: prometheus
+      metricType: AverageValue
+      metadata:
+        serverAddress: {{ $a.prometheusAddress | quote }}
+        query: sum(rio_scheduler_open_attempts)
+        threshold: {{ $a.targetBuildersPerReplica | quote }}
+    # Saturation (reactive, all classes): decompression, hashing,
+    # chunking, and serve-path proto/TLS make CPU track all three load
+    # classes well enough to act as the corrective term. If the
+    # warm-phase capture shows network saturating before CPU, add a
+    # prometheus trigger on per-pod network throughput (follow-up).
+    - type: cpu
+      metricType: Utilization
+      metadata:
+        value: {{ $a.cpuUtilization | quote }}
+{{- end }}

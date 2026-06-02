@@ -17,8 +17,8 @@ spec:
   {{- else }}
   {{- /* The KEDA-managed HPA owns the replica count: rendering the
          static value here would reset it on every `helm upgrade` and
-         fight the autoscaler (same reasoning as store.yaml +
-         componentScaler). But on an EXISTING release whose previous
+         fight the autoscaler (same reasoning as store.yaml's
+         autoscaling branch). But on an EXISTING release whose previous
          manifest carried `replicas: 2`, simply omitting the field is
          not neutral either: helm's three-way merge turns
          present→absent into a patch to null, the API server

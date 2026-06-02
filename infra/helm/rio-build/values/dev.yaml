@@ -38,6 +38,10 @@ gateway:
     type: ClusterIP
 
 store:
+  # EKS-only (the ScaledObject CR needs the KEDA operator). Local k3s
+  # falls back to the static `replicas` (chart default 1).
+  autoscaling:
+    enabled: false
   chunkBackend:
     kind: s3
     bucket: rio-chunks

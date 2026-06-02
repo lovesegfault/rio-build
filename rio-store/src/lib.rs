@@ -453,15 +453,16 @@ pub fn describe_metrics() {
         "rio_store_substitute_admission_rejected_total",
         "try_substitute calls rejected with ResourceExhausted after waiting \
          SUBSTITUTE_ADMISSION_WAIT (25s) for a permit. Sustained non-zero = \
-         genuine per-replica overload; ComponentScaler should already be \
-         reacting via the GetLoad utilization signal."
+         genuine per-replica overload; the store ScaledObject's backlog/CPU \
+         triggers should already be scaling replicas out."
     );
 
-    // r[impl obs.metric.store-pg-pool]
+    // r[impl obs.metric.store-pg-pool+2]
     describe_gauge!(
         "rio_store_pg_pool_utilization",
         "PG connection-pool utilization: (size - num_idle) / max_connections. \
-         Updated on each StoreAdminService.GetLoad call (ComponentScaler 10s tick). \
+         Self-published every 30s by the in-process tick; also refreshed on \
+         each StoreAdminService.GetLoad call. \
          Sustained > 0.8 = under-provisioned store replicas (I-105 cliff approaching)."
     );
 
@@ -580,9 +581,9 @@ pub fn describe_metrics() {
     // with the real count.
     metrics::gauge!("rio_store_s3_deletes_pending").set(0.0);
     metrics::gauge!("rio_store_s3_deletes_stuck").set(0.0);
-    // Same pre-register reasoning: until the first GetLoad call (or
-    // forever, if no ComponentScaler is deployed) the gauge would be
-    // absent. 0.0 is the correct initial value (idle pool at boot).
+    // Same pre-register reasoning: until the first 30s self-publish
+    // tick the gauge would be absent. 0.0 is the correct initial
+    // value (idle pool at boot).
     metrics::gauge!("rio_store_pg_pool_utilization").set(0.0);
     // Same: until the first try_substitute_on_miss (or forever, if no
     // tenant has upstreams configured). 0.0 = no permits held at boot.

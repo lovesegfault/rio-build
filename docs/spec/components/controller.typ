@@ -840,16 +840,23 @@ busyness (or its absence) from anything other than the durable view.
   and limited to −1/tick. Reconcile interval: 10s.
 ]
 
-#r("ctrl.scaler.signal-substituting+3")[
+#r("ctrl.scaler.signal-substituting+4")[
   The predictive `builders` signal MUST include `substituting_derivations` at
-  1:1 weight with `queued`/`running`. A substitution cascade with zero
-  queued/running MUST NOT produce `builders=0` --- that scales the store toward
-  `min` exactly when it is the bottleneck. The field's source is the
-  scheduler's substituting bucket: derivations with unresolved, unclaimed
+  1:1 weight with `queued`/`running`, for ANY Deployment a ComponentScaler CR
+  targets. A substitution cascade with zero queued/running MUST NOT produce
+  `builders=0` --- that scales the target toward `min` exactly when
+  substitution load is the thing demanding capacity. The field's source is
+  the scheduler's substituting bucket: derivations with unresolved, unclaimed
   materialization jobs (#rref("sched.admin.snapshot-substituting"));
   pending-job backlog is thereby visible to the predictive signal before any
   store replica claims the work.
 ]
+The store itself is no longer a ComponentScaler target: the chart defines no
+store CR, and the store Deployment's replica count is owned by the KEDA
+ScaledObject (#rref("infra.store.autoscaling")), whose leading trigger reads
+the same substituting bucket through its Prometheus form
+(#rref("obs.metric.scheduler-substituting")). This rule governs the
+reconciler's signal arithmetic for whatever target a future CR names.
 
 #r("ctrl.scaler.ratio-learn+2")[
   `status.learnedRatio` self-calibrates against
@@ -865,25 +872,33 @@ busyness (or its absence) from anything other than the durable view.
   learned value, not `spec.seedRatio`.
 ]
 
-#r("store.admin.get-load+2")[
+#r("store.admin.get-load+3")[
   `StoreAdminService.GetLoad` returns `pg_pool_utilization = (pool.size −
   pool.num_idle) / max_connections` and `substitute_admission_utilization =
   (capacity − available_permits) / capacity` for the replica it's called on.
-  The ComponentScaler reconciler polls every store pod (DNS-resolving the
-  headless service); per-pod load is `max(pg_pool_utilization,
-  substitute_admission_utilization)` (substitution can saturate independently
-  --- upstream HTTP bottleneck while PG sits idle), and `observedLoadFactor` is
-  the max across pods. The handler also publishes
-  #(refs.metric)("rio_store_pg_pool_utilization") and
-  #(refs.metric)("rio_store_substitute_admission_utilization") so Prometheus
-  sees the same values the controller acted on.
+  When a ComponentScaler CR targets the store, the reconciler polls every
+  store pod (DNS-resolving the headless service); per-pod load is
+  `max(pg_pool_utilization, substitute_admission_utilization)` (substitution
+  can saturate independently --- upstream HTTP bottleneck while PG sits
+  idle), and `observedLoadFactor` is the max across pods. The handler also
+  publishes #(refs.metric)("rio_store_pg_pool_utilization") and
+  #(refs.metric)("rio_store_substitute_admission_utilization") on call, so
+  Prometheus sees the same values any polling controller acted on; the
+  gauges' steady publication is store-owned
+  (#rref("obs.metric.store-pg-pool")), not a side-effect of being polled.
 ]
+With no store CR in the chart (KEDA owns the store replica count,
+#rref("infra.store.autoscaling")), nothing polls GetLoad periodically --- the
+RPC and its return values stay (rio-cli, ad-hoc diagnosis, any future CR
+target), and the store's 30 s in-process tick keeps the PG-pool gauge live.
 
-When `componentScaler.store.enabled=true`, the helm chart MUST omit
-`Deployment.spec.replicas` from the rendered store template --- otherwise `helm
-upgrade` resets the replica count and fights the controller. The controller's
-`/scale` patches use field-manager `rio-controller-componentscaler` (distinct
-from helm's apply manager).
+For any Deployment a ComponentScaler CR targets, the helm chart MUST omit
+that Deployment's `spec.replicas` from the rendered template --- otherwise
+`helm upgrade` resets the replica count and fights the controller. (The
+store Deployment's own replicas gating is keyed to `store.autoscaling.enabled`
+--- the KEDA branch, #rref("infra.store.autoscaling") --- since the chart
+defines no store CR.) The controller's `/scale` patches use field-manager
+`rio-controller-componentscaler` (distinct from helm's apply manager).
 
 = GC Cron
 

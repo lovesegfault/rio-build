@@ -119,7 +119,7 @@ pub struct Decision {
 /// per-drv `solve_intent_for` + full intent-vec serialization just to
 /// produce a count.
 // r[impl ctrl.scaler.component+2]
-// r[impl ctrl.scaler.signal-substituting+3]
+// r[impl ctrl.scaler.signal-substituting+4]
 pub fn total_builders(cs: &ClusterStatusResponse) -> u64 {
     u64::from(cs.queued_derivations)
         .saturating_add(u64::from(cs.running_derivations))
@@ -330,7 +330,7 @@ mod tests {
     /// bottleneck. Regression: pre-fix the `_ => {}` snapshot match
     /// dropped Substituting → predictive=0 → scale-down during a
     /// fresh-cluster cascade.
-    // r[verify ctrl.scaler.signal-substituting+3]
+    // r[verify ctrl.scaler.signal-substituting+4]
     #[test]
     fn substituting_only_does_not_scale_down() {
         let cs = ClusterStatusResponse {

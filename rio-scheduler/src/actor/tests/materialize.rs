@@ -1555,7 +1555,7 @@ async fn flag_on_unmarked_leaf_confirmed_missing_releases_to_from_source() -> Te
 // ── T-1.1 (Phase B): §2.6 consumer re-sourcing — the snapshot buckets ──
 
 // r[verify sched.admin.snapshot-substituting+3]
-// r[verify ctrl.scaler.signal-substituting+3]
+// r[verify ctrl.scaler.signal-substituting+4]
 /// §2.6 re-sourcing: pending (unclaimed) materialization jobs ARE the
 /// substituting bucket flag-on. A Ready or Queued node carrying an
 /// unresolved unclaimed job counts in `substituting_derivations` and is

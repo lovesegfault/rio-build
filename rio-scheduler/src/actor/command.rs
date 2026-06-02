@@ -600,8 +600,8 @@ pub struct SpawnIntentsSnapshot {
     /// Per-system breakdown of Ready derivations (kind/feature filters
     /// NOT applied — same population as
     /// `ClusterSnapshot.queued_by_system`, but `u64` for proto-compat).
-    /// The ComponentScaler reads this for the predictive store-replica
-    /// signal.
+    /// The ComponentScaler reads this for its predictive signal
+    /// (whatever Deployment a CR targets).
     pub queued_by_system: std::collections::HashMap<String, u64>,
     /// `IceBackoff::masked_cells()` snapshot, formatted via
     /// [`crate::sla::config::cell_label`]. The controller's
@@ -654,9 +654,11 @@ pub struct ClusterSnapshot {
     pub running_derivations: u32,
     /// Derivations carrying an unresolved, unclaimed materialization
     /// job (wire-stable bucket name; the upstream fetch the store
-    /// executor has pending or in flight). Counted as store load for
-    /// the ComponentScaler predictive signal
-    /// (`ctrl.scaler.signal-substituting`).
+    /// executor has pending or in flight). Store-side load: published
+    /// as the `rio_scheduler_substituting_derivations` gauge each tick
+    /// (`obs.metric.scheduler-substituting` — the store ScaledObject's
+    /// leading trigger) and counted in the ComponentScaler predictive
+    /// signal (`ctrl.scaler.signal-substituting`) for any CR target.
     pub substituting_derivations: u32,
     /// Per-system breakdown of `queued_derivations` (Ready-only). Sum
     /// across keys == `queued_derivations`. Populated from

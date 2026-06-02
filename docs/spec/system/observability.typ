@@ -221,8 +221,8 @@ series, and removed with the proto sweep once that role ended.
   housekeeping tick from the freshly computed cluster snapshot, and zeroed
   once on leadership loss.
 ]
-This gauge is the *leading* rio-store autoscaling signal: the backlog is
-known at merge time,
+This gauge is the *leading* rio-store autoscaling signal
+(#rref("infra.store.autoscaling")): the backlog is known at merge time,
 minutes before the store feels the ingest load, and the underlying jobs are
 durable PG rows --- the count survives leader failover instead of resetting
 with leader memory. It follows the leader-gate posture above (a state gauge,
@@ -257,14 +257,21 @@ the helm chart's PrometheusRule.
   follow the `rio_store_*` naming prefix.
 ]
 
-#r("obs.metric.store-pg-pool")[
-  #(refs.metric)("rio_store_pg_pool_utilization") is the *observed* load
-  signal the ComponentScaler calibrates its learned `builders_per_replica`
-  ratio against. PG pool exhaustion is a cliff (I-105: acquire times → 11s →
-  builder FUSE blocks → circuit trip → all builds fail), not a ramp; the
-  predictive signal (`Σ(queued+running)` builders) scales the store _ahead_
-  of the burst, and this gauge corrects the ratio when the prediction drifts.
+#r("obs.metric.store-pg-pool+2")[
+  #(refs.metric)("rio_store_pg_pool_utilization") MUST be self-published by
+  the store on a 30 s in-process tick (`(size − num_idle) /
+  max_connections`), independent of any `GetLoad` traffic; the `GetLoad`
+  handler additionally publishes on call so Prometheus mirrors the values a
+  polling controller acted on.
 ]
+PG pool exhaustion is a cliff (I-105: acquire times → 11s → builder FUSE
+blocks → circuit trip → all builds fail), not a ramp --- this gauge is the
+saturation watch on the store dashboard and `xtask k8s status`. It is no
+longer the store's scaler-calibration signal: the store ComponentScaler CR
+is retired and the KEDA ScaledObject (#rref("infra.store.autoscaling"))
+scales on the backlog/builders/CPU triggers; before the self-publication
+tick the gauge was refreshed only as a `GetLoad` side-effect and would have
+frozen with the CR gone.
 
 == Builder Metrics
 

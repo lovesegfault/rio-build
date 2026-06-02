@@ -69,6 +69,12 @@ controller:
 store:
   enabled: true
   image: rio-store
+  # EKS-only (the ScaledObject CR needs the KEDA operator, which the
+  # airgapped k3s image set doesn't carry). Falls back to the static
+  # `replicas` (chart default 1). Same shape as gateway.autoscaling
+  # below.
+  autoscaling:
+    enabled: false
   chunkBackend:
     # inline = NARs in PG. No MinIO/Rook airgapped.
     kind: inline

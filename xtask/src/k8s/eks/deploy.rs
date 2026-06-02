@@ -260,19 +260,22 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             .set_json("pools", POOLS_JSON)
             // I-054: JWT enables per-tenant upstream substitution
             // (cache.nixos.org). Keypair minted/read by jwt_keypair().
-            // I-128: store.replicas was a fixed "8" here (I-105
-            // mitigation — ephemeral builders' FUSE-warm burst exhausts
-            // a single store's PG pool). ComponentScaler now scales
-            // store 2..14 from Σ(queued+running)/learnedRatio, corrected
-            // against max(GetLoad). store.replicas is IGNORED when the
-            // scaler is enabled (store.yaml omits .spec.replicas).
-            .set("componentScaler.store.enabled", "true")
-            // I-171: was 200 (sized for 16-ACU Aurora). At min 0.5 ACU
-            // (~105 conns) with ComponentScaler max=14 replicas, 200×14
-            // = 2800 saturates; even 2×200=400 does. 20 + idle_timeout
+            //
+            // r[impl infra.store.autoscaling]
+            // Store replica count: owned by the chart-default KEDA
+            // ScaledObject (store.autoscaling.enabled=true,
+            // 2..14 on backlog/builders/CPU triggers — the I-128
+            // fixed-8 era and the ComponentScaler era both retired).
+            // No --set needed; store.replicas is not rendered while
+            // autoscaling is on (store.yaml's lookup-echo branch).
+            //
+            // I-171: pgMaxConnections was 200 (sized for 16-ACU
+            // Aurora). At min 0.5 ACU (~105 conns) with
+            // store.autoscaling.maxReplicas=14, 200×14 = 2800
+            // saturates; even 2×200=400 does. 20 + idle_timeout
             // (rio-store/src/main.rs) keeps steady-state under budget.
             // 14×20=280 can still burst-saturate — TODO(P-new): bump
-            // Aurora min_capacity OR cap componentScaler.store.max
+            // Aurora min_capacity OR cap store.autoscaling.maxReplicas
             // against (rds_max_conns / pgMaxConnections).
             .set("store.pgMaxConnections", "20")
             // I-147/I-150: production-scale resources. values.yaml defaults

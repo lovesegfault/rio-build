@@ -1160,7 +1160,7 @@
       {
         "name": "rio_store_pg_pool_utilization",
         "kind": "gauge",
-        "help": "PG connection-pool utilization: (size - num_idle) / max_connections. Updated on each StoreAdminService.GetLoad call (ComponentScaler 10s tick). Sustained > 0.8 = under-provisioned store replicas (I-105 cliff approaching)."
+        "help": "PG connection-pool utilization: (size - num_idle) / max_connections. Self-published every 30s by the in-process tick; also refreshed on each StoreAdminService.GetLoad call. Sustained > 0.8 = under-provisioned store replicas (I-105 cliff approaching)."
       },
       {
         "name": "rio_store_placeholders_uploading",
@@ -1225,7 +1225,7 @@
       {
         "name": "rio_store_substitute_admission_rejected_total",
         "kind": "counter",
-        "help": "try_substitute calls rejected with ResourceExhausted after waiting SUBSTITUTE_ADMISSION_WAIT (25s) for a permit. Sustained non-zero = genuine per-replica overload; ComponentScaler should already be reacting via the GetLoad utilization signal."
+        "help": "try_substitute calls rejected with ResourceExhausted after waiting SUBSTITUTE_ADMISSION_WAIT (25s) for a permit. Sustained non-zero = genuine per-replica overload; the store ScaledObject's backlog/CPU triggers should already be scaling replicas out."
       },
       {
         "name": "rio_store_substitute_admission_utilization",

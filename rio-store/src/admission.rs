@@ -101,8 +101,8 @@ impl AdmissionGate {
     /// timeout-expiry path increments
     /// `rio_store_substitute_admission_rejected_total`; sustained
     /// non-zero on that counter means the replica is genuinely
-    /// saturated (ComponentScaler should already be reacting via the
-    /// `GetLoad` utilization signal).
+    /// saturated (the store ScaledObject's backlog/CPU triggers
+    /// should already be scaling replicas out).
     // r[impl store.substitute.admission+2]
     pub async fn acquire_bounded(&self) -> Result<OwnedSemaphorePermit, AdmissionError> {
         match tokio::time::timeout(SUBSTITUTE_ADMISSION_WAIT, self.sem.clone().acquire_owned())

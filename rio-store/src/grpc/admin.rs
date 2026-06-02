@@ -176,7 +176,7 @@ fn publish_pg_pool_gauge(pool: &PgPool) {
 /// dashboard's PG-pool panel and `xtask k8s status`. The store now
 /// owns its gauge; `GetLoad` keeps publishing on call so the values
 /// the controller acts on (for any future CR target) stay mirrored.
-// r[impl obs.metric.store-pg-pool]
+// r[impl obs.metric.store-pg-pool+2]
 pub fn spawn_pg_pool_gauge_tick(
     pool: PgPool,
     shutdown: rio_common::signal::Token,
@@ -614,8 +614,8 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     /// gauge's steady cadence is the in-process 30 s tick
     /// ([`spawn_pg_pool_gauge_tick`]) — this handler's publication
     /// keeps the on-call mirror, it is no longer the only updater.
-    // r[impl store.admin.get-load+2]
-    // r[impl obs.metric.store-pg-pool]
+    // r[impl store.admin.get-load+3]
+    // r[impl obs.metric.store-pg-pool+2]
     #[instrument(skip(self, request), fields(rpc = "GetLoad"))]
     async fn get_load(
         &self,
@@ -700,8 +700,8 @@ mod tests {
     /// HELD, utilization is at least `2/max`. The "in-use, not size
     /// or num_idle" property is documented at `pg_pool_utilization`
     /// and follows from the formula by inspection.
-    // r[verify store.admin.get-load+2]
-    // r[verify obs.metric.store-pg-pool]
+    // r[verify store.admin.get-load+3]
+    // r[verify obs.metric.store-pg-pool+2]
     #[tokio::test]
     async fn get_load_tracks_in_use_connections() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -741,7 +741,7 @@ mod tests {
     /// value (blanking the store dashboard's PG-pool panel and
     /// `xtask k8s status`). The test never constructs the admin
     /// service or calls GetLoad: the spawned tick alone must publish.
-    // r[verify obs.metric.store-pg-pool]
+    // r[verify obs.metric.store-pg-pool+2]
     #[tokio::test]
     async fn pg_pool_gauge_tick_publishes_without_get_load() {
         let recorder = rio_test_support::metrics::CountingRecorder::default();
@@ -794,7 +794,7 @@ mod tests {
     /// `AdmissionGate` clone — main.rs wires it; this test proves the
     /// admin side reads through.
     // r[verify store.substitute.admission+2]
-    // r[verify store.admin.get-load+2]
+    // r[verify store.admin.get-load+3]
     #[tokio::test]
     async fn get_load_tracks_substitute_admission() {
         let db = TestDb::new(&crate::MIGRATOR).await;

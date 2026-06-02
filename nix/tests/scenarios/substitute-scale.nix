@@ -1,24 +1,28 @@
-# Substitution → ComponentScaler closed loop (P4 of the substitute-
-# relayering work).
+# Substitution → autoscaling-signal path (item I rework of the P4
+# substitute-relayering scenario; the ComponentScaler closed loop it
+# used to assert is retired — KEDA owns the store replica count).
 #
-# Proves the FULL chain the unit tests can't: 30-leaf cascade hits the
-# store's per-replica admission gate → scheduler reports
-# `substituting_derivations` → ComponentScaler's predictive `builders`
-# signal counts it (P1 c3f32c4a) → desiredReplicas RISES (not falls) →
-# GetLoad's `substitute_admission_utilization` reaches the CR status
-# (P2 6760e2a5). Zero builder pods spawn — every leaf substitutes.
+# Proves the SIGNAL chain the unit tests can't: 30-leaf cascade hits
+# the store's per-replica admission gate → the scheduler leader
+# publishes `rio_scheduler_substituting_derivations` on its
+# housekeeping tick → the gauge RISES while the job backlog drains and
+# RETURNS TO 0 after it — the exact Prometheus series the store
+# ScaledObject's leading trigger queries
+# (templates/store-scaledobject.yaml). Admission utilization is
+# observable on the store metrics surface mid-cascade. Zero builder
+# pods spawn — every leaf substitutes.
 #
-# Why a NEW scenario, not a componentscaler.nix subtest: that scenario's
-# load is intentionally NON-substitutable (`sleep 120` leaves) to keep
-# queued+running stable across the controller-restart subtest. A
-# substitutable leaf-set drains in seconds — incompatible. Fixture also
-# differs (jwtEnabled, store admission cap, no busybox seed).
+# The prometheus→KEDA→replica half cannot run here (the airgapped k3s
+# image set carries no KEDA operator; the gateway's ScaledObject is
+# likewise EKS-only) — it is covered by the helm-template render
+# checks (nix/tests/helm/26-store-scaling.sh) and the post-wipe
+# deployment checklist's P10 observation on EKS.
 #
-# Why a NEW scenario, not a substitute.nix subtest: substitute.nix is the
-# standalone fixture (no k3s → no ComponentScaler CR, no controller
-# reconciler, no /scale subresource). The fake-upstream-cache mechanics
-# (lines ~92-144 there) ARE fixture-agnostic and lifted here onto
-# upstream_v6 (already in CoreDNS test-vms.server, already serving
+# Why a NEW scenario, not a substitute.nix subtest: substitute.nix is
+# the standalone fixture (no k3s → no scheduler leader gauge cadence,
+# no chart-rendered store admission key). The fake-upstream-cache
+# mechanics (lines ~92-144 there) ARE fixture-agnostic and lifted here
+# onto upstream_v6 (already in CoreDNS test-vms.server, already serving
 # /srv on :8080 — see common.mkUpstreamNode).
 #
 # ── Mechanism (substitution-replacement Phase B/D′) ──────────────────
@@ -27,9 +31,8 @@
 # jobs (store-executor pull); the deep-chain eager-burst proof is keyed
 # to the job-creation counter.
 #
-# Tracey: ctrl.scaler.signal-substituting / store.substitute.admission /
-# store.admin.get-load — verify markers at default.nix wiring per the
-# convention.
+# Tracey: obs.metric.scheduler-substituting / store.substitute.admission
+# — verify markers at default.nix wiring per the convention.
 {
   pkgs,
   common,
@@ -63,8 +66,9 @@ let
     print(jwt.encode(claims, sk, algorithm="EdDSA"))
   '';
 
-  # 30 instant leaves + collector. Same shape as componentscaler.nix's
-  # slowFanout but `echo` not `sleep` — we WANT these to be cheap so
+  # 30 instant leaves + collector. Same shape as the retired
+  # componentscaler scenario's slowFanout but `echo` not `sleep` — we
+  # WANT these to be cheap so
   # building them locally on upstream_v6 (512MB) for cache-seeding is
   # trivial. Output paths are input-addressed → identical drv on
   # upstream_v6's local build and the client's ssh-ng submit (same
@@ -131,11 +135,12 @@ in
 pkgs.testers.runNixOSTest {
   name = "rio-substitute-scale";
   skipTypeCheck = true;
-  # k3s bring-up ~240s + cache-seed ~20s + scale-up wait ≤90s + drain
+  # k3s bring-up ~240s + cache-seed ~20s + cascade poll ≤90s + drain
   # ≤90s + chain seed ~10s + chain submit ≤120s + slack. The 30-leaf
   # substitute is serialized (admission=1) over a 200ms tc-netem
-  # upstream → ~24s, so the controller's 10s reconcile tick observes
-  # substituting>0 deterministically.
+  # upstream → ~24s, so the scheduler's 10s housekeeping tick (the
+  # gauge publication cadence) observes a nonzero backlog
+  # deterministically.
   globalTimeout = 1100 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
@@ -286,34 +291,34 @@ pkgs.testers.runNixOSTest {
     ${common.seedBusybox "k3s-server"}
 
     # ══════════════════════════════════════════════════════════════════
-    # cr-baseline — scaler at min, status populated
+    # gauge-baseline — backlog gauge published and at 0 before load
     # ══════════════════════════════════════════════════════════════════
-    # Precondition for the never-dropped-while-substituting assertion:
-    # learnedRatio populated AND desiredReplicas == min == 1. If the
-    # scaler is already >1 (residual load from bring-up), the "rises
-    # above min" check below is VACUOUS.
-    with subtest("cr-baseline: ComponentScaler at min before load"):
+    # Precondition for the rises/falls assertions: the leader publishes
+    # the gauge (its first housekeeping tick has run — series PRESENT,
+    # not just absent-meaning-zero) and bring-up left no residual
+    # backlog. If the gauge started >0 the "rises with the cascade"
+    # check below would be VACUOUS.
+    with subtest("gauge-baseline: backlog gauge published, zero before load"):
+        leader = leader_pod()
+        pf_open(leader, 19091, 9091, tag="pf-sched-metrics")
         k3s_server.wait_until_succeeds(
-            "r=$(k3s kubectl -n ${nsStore} get componentscaler store "
-            "  -o jsonpath='{.status.learnedRatio}') && "
-            'test -n "$r"',
+            "curl -sf http://localhost:19091/metrics "
+            "| grep -q '^rio_scheduler_substituting_derivations '",
             timeout=60,
         )
-        desired0 = kubectl(
-            "get componentscaler store -o jsonpath='{.status.desiredReplicas}'",
-            ns="${nsStore}",
-        ).strip()
-        # min=1 (extraValuesTyped). bring-up has zero scheduler load.
-        assert desired0 == "1", (
-            f"baseline desiredReplicas={desired0!r}, expected 1 (min). "
-            f"Scale-up assertion below would be VACUOUS."
+        m0 = scrape_metrics(k3s_server, 19091)
+        sub0 = metric_value(m0, "rio_scheduler_substituting_derivations")
+        assert sub0 == 0.0, (
+            f"baseline rio_scheduler_substituting_derivations={sub0}, "
+            f"expected 0 (bring-up has no substitution load). The "
+            f"rises-with-cascade assertion below would be VACUOUS."
         )
-        print(f"cr-baseline: desiredReplicas={desired0} ✓")
+        print(f"gauge-baseline: substituting_derivations={sub0} ✓")
 
     # ══════════════════════════════════════════════════════════════════
     # substitute-cascade — 30-leaf submit → all substitute
     # ══════════════════════════════════════════════════════════════════
-    with subtest("substitute-cascade: leaves substitute, scaler rises, no builders"):
+    with subtest("substitute-cascade: leaves substitute, gauge rises and drains, no builders"):
         # ── Submit the 30-leaf DAG via gRPC SubmitBuild ───────────────
         # NOT via `nix-build --store ssh-ng://`: the gateway's
         # wopQueryMissing reports the leaves as substitutable → the
@@ -329,8 +334,8 @@ pkgs.testers.runNixOSTest {
         # gRPC-direct is the only deterministic way to make the
         # SCHEDULER own the substitution decision: hand it the 30 leaf
         # nodes, its dispatch.rs FindMissingPaths sees them
-        # substitutable, creates materialization jobs — the bucket P1
-        # wires into the ComponentScaler signal.
+        # substitutable, creates materialization jobs — the substituting
+        # bucket the backlog gauge publishes.
         #
         # First: instantiate leaf .drvs on client + resolve each drv's
         # output path. expectedOutputPaths MUST be in the proto node:
@@ -386,17 +391,25 @@ pkgs.testers.runNixOSTest {
         payload = json.dumps({"nodes": nodes, "edges": []})
         k3s_server.succeed(f"cat > /tmp/subscale-dag.json <<'EOF'\n{payload}\nEOF")
 
-        # Re-resolve the leader port-forward HERE: sshKeySetupFor +
+        # Re-resolve the leader port-forwards HERE: sshKeySetupFor +
         # seedBusybox above ran ~30s of gateway-bounce + ssh-ng I/O
         # since pf_open; a leader flip in that window leaves the
-        # forward pinned to a now-standby pod (every sample reads 0).
+        # forwards pinned to a now-standby pod (every sample reads 0 —
+        # the standby publishes NO gauge series, the leader gate).
+        # Store metrics too: admission utilization is sampled from the
+        # store's Prometheus surface (single replica, svc forward).
         pf_close("pf-sched")
-        pf_open(leader_pod(), 19001, 9001, tag="pf-sched")
+        pf_close("pf-sched-metrics")
+        leader = leader_pod()
+        pf_open(leader, 19001, 9001, tag="pf-sched")
+        pf_open(leader, 19091, 9091, tag="pf-sched-metrics")
+        pf_open("svc/rio-store", 19092, 9092, ns="${nsStore}", tag="pf-store-metrics")
 
-        # ── Slow the upstream so the cascade outlives one controller
-        # reconcile tick (10s). Tiny NARs over the local vlan drain in
-        # ~400ms — faster than ComponentScaler can observe
-        # substituting_derivations>0 → desiredReplicas never moves.
+        # ── Slow the upstream so the cascade outlives one scheduler
+        # housekeeping tick (10s — the gauge publication cadence).
+        # Tiny NARs over the local vlan drain in ~400ms — no tick
+        # would ever observe a nonzero backlog and the rises/falls
+        # assertions would be unprovable.
         # 200ms egress delay × admission=1 (serial) → each
         # narinfo+NAR fetch ≈ 2 RTTs ≈ 800ms → 30 leaves ≈ 24s.
         # eth1 = the test vlan (eth0 is QEMU user-net). qdisc replace
@@ -422,52 +435,42 @@ pkgs.testers.runNixOSTest {
             "< /tmp/subscale-dag.json'"
         )
 
-        # ── (1) poll (substituting, desired) from t=0 ────────────────
-        # Single Python loop sampling rio-cli status + CR.status. With
-        # netem 200ms + admission=1 the cascade lasts ~24s, so both
-        # the 1s poll here AND the controller's 10s reconcile reliably
-        # observe sub>0. prost-serde keeps Rust snake_case. The
-        # STRUCTURAL proof is the WatchBuild SUBSTITUTING event
-        # count below; sub_peak from this poll drives the (5)
-        # monotone-non-decreasing check.
+        # ── (1) poll (backlog gauge, admission util) from t=0 ────────
+        # Single Python loop sampling the scheduler + store Prometheus
+        # surfaces — the exact series the store ScaledObject's triggers
+        # query. With netem 200ms + admission=1 the cascade lasts ~24s,
+        # so both the 1s poll here AND the scheduler's 10s housekeeping
+        # tick (the gauge publication cadence) reliably observe a
+        # nonzero backlog. The STRUCTURAL proof of "every leaf took the
+        # materialization lane" is the WatchBuild SUBSTITUTING event
+        # count below; gauge_peak/adm_peak from this poll drive the
+        # signal-path assertions.
         samples = []
-        load_seen = ""
-        sub_peak = 0
+        gauge_peak = 0.0
+        adm_peak = 0.0
         for tick in range(90):
-            rc, raw = k3s_server.execute(
-                f"{CLI_ENV}${rioCli} status --json 2>&1"
-            )
-            try:
-                s = json.loads(raw[raw.find("{"):])
-                sub = int(s["substituting_derivations"])
-            except (ValueError, KeyError):
-                print(f"substitute-cascade: tick={tick} cli rc={rc} "
-                      f"raw={raw[:200]!r}")
-                sub = -1
-            sub_peak = max(sub_peak, sub)
-            desired = int(kubectl(
-                "get componentscaler store -o "
-                "jsonpath='{.status.desiredReplicas}'",
-                ns="${nsStore}",
-            ).strip() or "0")
-            lf = kubectl(
-                "get componentscaler store -o "
-                "jsonpath='{.status.observedLoadFactor}'",
-                ns="${nsStore}",
-            ).strip()
-            if lf:
-                load_seen = lf
-            samples.append((sub, desired))
-            # Exit once sub drained AFTER both the scaler reacted and
-            # the poll caught sub>0. Don't gate on the subscale-submit
-            # unit — grpcurl keeps the WatchBuild stream open past
-            # build-complete (server-side half-close vs -max-time).
-            if sub_peak > 0 and sub == 0 and desired > 1:
+            m = scrape_metrics(k3s_server, 19091)
+            sub = metric_value(
+                m, "rio_scheduler_substituting_derivations"
+            ) or 0.0
+            ms = scrape_metrics(k3s_server, 19092)
+            adm = metric_value(
+                ms, "rio_store_substitute_admission_utilization"
+            ) or 0.0
+            gauge_peak = max(gauge_peak, sub)
+            adm_peak = max(adm_peak, adm)
+            samples.append((sub, adm))
+            # Exit once the gauge drained back to 0 AFTER the poll
+            # caught it >0 (rises AND falls observed). Don't gate on
+            # the subscale-submit unit — grpcurl keeps the WatchBuild
+            # stream open past build-complete (server-side half-close
+            # vs -max-time).
+            if gauge_peak > 0 and sub == 0:
                 break
             k3s_server.sleep(1)
         upstream_v6.succeed("tc qdisc del dev eth1 root || true")
-        print(f"substitute-cascade: samples (sub,desired) = {samples}")
-        print(f"substitute-cascade: sub_peak={sub_peak} (best-effort)")
+        print(f"substitute-cascade: samples (gauge,adm) = {samples}")
+        print(f"substitute-cascade: gauge_peak={gauge_peak} adm_peak={adm_peak}")
 
         # ── (1 structural) scheduler emitted SUBSTITUTING per leaf ──
         # Count DERIVATION_EVENT_KIND_SUBSTITUTING in the WatchBuild
@@ -513,49 +516,47 @@ pkgs.testers.runNixOSTest {
             f"upstream unreachable). samples={samples}"
         )
 
-        # ── (2) desiredReplicas rose above min=1 ─────────────────────
-        max_desired = max(d for _, d in samples)
-        assert max_desired > 1, (
-            f"ComponentScaler never scaled store above min=1 during the "
-            f"substitute cascade. P1 (signal-substituting) regressed: "
-            f"decide.rs builders-signal isn't counting the substituting bucket. "
+        # ── (2) the backlog gauge ROSE with the cascade ──────────────
+        # The leading KEDA trigger reads sum(rio_scheduler_
+        # substituting_derivations): a cascade that never moves the
+        # gauge means the signal path is dead and the store would sit
+        # at the floor through a real wave (the incident shape this
+        # design exists for).
+        assert gauge_peak > 0, (
+            f"rio_scheduler_substituting_derivations never rose above 0 "
+            f"during the substitute cascade — the autoscaling signal "
+            f"path is dead (gauge not published from the snapshot "
+            f"bucket, leader pf stale, or the cascade drained inside "
+            f"one 10s gauge tick despite admission=1+netem). "
             f"samples={samples}"
         )
 
-        # ── (5) never dropped while substituting > 0 ─────────────────
-        # Vacuous when the cascade drained faster than the poll caught
-        # sub>0; meaningful on slower hardware / larger NARs.
-        prev_d = samples[0][1]
-        for sub, d in samples:
-            if sub > 0:
-                assert d >= prev_d, (
-                    f"desiredReplicas DROPPED {prev_d}→{d} while "
-                    f"substituting={sub} > 0. ComponentScaler scaled "
-                    f"store DOWN mid-cascade — the P1 closed-loop "
-                    f"regression. samples={samples}"
-                )
-                prev_d = d
-
-        # ── (3) observedLoadFactor populated → GetLoad wiring ─────────
-        # max(pg_util, substitute_admission_util) per componentscaler/
-        # mod.rs effective_load(). NON-EMPTY proves the GetLoad fan-out
-        # reached a store pod and the P2 admission-util field
-        # deserialized into the CR.status pipeline. NOT asserted > 0:
-        # 30 tiny NARs over a local vlan drain through the 1-permit
-        # gate (200ms netem ⇒ ~6s serial) — still racing the
-        # controller's 10s reconcile tick. A `> 0` check is a wall-clock race
-        # (ci-failure-patterns "structural > retry > widen"); the
-        # structural proof of P2 is unit-level (decide.rs::tests
-        # max-of-two), and the e2e proof of the WIRE is field-present.
-        # Same precedent as componentscaler.nix:223-231.
-        assert load_seen != "", (
-            "observedLoadFactor never populated — GetLoad fan-out "
-            "didn't reach a store pod (cross-ns DNS / store-admin "
-            "headless-svc), OR status_changed() never fired."
+        # ── (3) ... and RETURNED TO 0 as the backlog drained ─────────
+        # The loop above exits on (peak>0 AND now==0); reaching here
+        # with a nonzero tail means 90s passed with backlog stuck —
+        # KEDA would hold the store scaled out after the wave ended.
+        assert samples[-1][0] == 0.0, (
+            f"backlog gauge stuck at {samples[-1][0]} after 90s — jobs "
+            f"not draining (claims stalled?) or the gauge is not "
+            f"following the bucket down. samples={samples}"
         )
-        print(f"substitute-cascade: observedLoadFactor={load_seen} (wired) ✓")
 
-        # ── (4) zero builder pods spawned ────────────────────────────
+        # ── (4) admission utilization observable mid-cascade ─────────
+        # The 1-permit gate is held essentially continuously for ~24s
+        # (each fetch ≈ 800ms through the netem'd upstream, 30 serial
+        # fetches), so the 1s sampler must catch utilization 1.0 —
+        # observable on the SAME Prometheus surface KEDA and the
+        # store-scaling dashboard read. This replaces the retired
+        # CR-status (observedLoadFactor) wire proof: the gauge is set
+        # at acquire/release by the gate itself, no GetLoad needed.
+        assert adm_peak >= 1.0, (
+            f"rio_store_substitute_admission_utilization peaked at "
+            f"{adm_peak}, expected 1.0 on a 1-permit gate under a "
+            f"~24s serialized cascade — admission gauge not updating "
+            f"or the store metrics forward died. samples={samples}"
+        )
+
+        # ── (5) zero builder pods spawned ────────────────────────────
         # Every leaf was substitutable → scheduler never emitted a
         # SpawnIntent → controller never created a Job. The DAG is
         # leaves-only (no root) so the strict bound is 0. `kubectl
@@ -603,20 +604,10 @@ pkgs.testers.runNixOSTest {
             f"expected 30 leaf narinfo rows, got {n} — some substitutes "
             f"failed or the cascade was cut short. samples={samples}"
         )
-
-        # ── (6) no demote-to-cache-miss ──────────────────────────────
-        # P2 widened retry so admission RESOURCE_EXHAUSTED is absorbed,
-        # not surfaced as fetch-fail. dispatch.rs:847 logs this exact
-        # line on the give-up branch.
-        sched_logs = kubectl(
-            f"logs {leader_pod()} --since=5m 2>&1 || true"
-        )
-        assert "demoting to cache-miss" not in sched_logs, (
-            "scheduler demoted ≥1 substitute to cache-miss — the "
-            "widened-retry (df9141f5) regressed, OR admission cap=1 "
-            "+ 30 leaves exceeds SUBSTITUTE_FETCH_RETRIES × backoff."
-        )
-        print("substitute-cascade: no demote-to-cache-miss ✓")
+        # (The walk-era demote-to-cache-miss log assertion is gone with
+        # the walk itself: post-D′ a definitive miss is a routed
+        # materialization outcome, and the zero-builder-pods check
+        # above already proves no leaf fell through to a build.)
 
     k3s_server.execute("systemctl stop subscale-submit 2>/dev/null || true")
 
@@ -728,6 +719,7 @@ pkgs.testers.runNixOSTest {
         # metrics (9091) too: scheduler image is distroless (no curl
         # in-pod), so scrape via host-side port-forward.
         pf_close("pf-sched")
+        pf_close("pf-sched-metrics")
         leader = leader_pod()
         pf_open(leader, 19001, 9001, tag="pf-sched")
         pf_open(leader, 19091, 9091, tag="pf-sched-metrics")
@@ -877,6 +869,7 @@ pkgs.testers.runNixOSTest {
 
     pf_close("pf-sched")
     pf_close("pf-store")
+    pf_close("pf-store-metrics")
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';

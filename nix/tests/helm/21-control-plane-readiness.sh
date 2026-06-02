@@ -17,22 +17,19 @@ out=$TMPDIR/cpr.yaml
 helm template rio . --set global.image.tag=test \
   --set podDisruptionBudget.enabled=true \
   --set buildScheduler.enabled=true \
-  --set scheduler.replicas=2 --set gateway.replicas=2 \
-  --set componentScaler.store.enabled=true >"$out"
+  --set scheduler.replicas=2 --set gateway.replicas=2 >"$out"
 
-# Multi-replica Deployments: static `replicas: N` ∪ ComponentScaler-
-# targeted with `replicas.min > 1` ∪ KEDA-ScaledObject-targeted with
-# `minReplicaCount > 1`. r38 (AMEND of r37 verifier-note): rio-store is
-# multi-replica when ComponentScaler manages it but has no static
-# `replicas:` field — the original filter never saw it. Same amendment
-# for rio-gateway once autoscaling became the default: the Deployment
-# omits `.spec.replicas` so helm upgrade doesn't fight the autoscaler,
-# but KEDA holds it at minReplicaCount — it is still a multi-replica
-# control-plane Deployment and still needs podAntiAffinity + a PDB.
+# Multi-replica Deployments: static `replicas: N` ∪ KEDA-ScaledObject-
+# targeted with `minReplicaCount > 1`. r38 (AMEND of r37
+# verifier-note): a KEDA-managed Deployment omits `.spec.replicas` so
+# helm upgrade doesn't fight the autoscaler, but KEDA holds it at
+# minReplicaCount — it is still a multi-replica control-plane
+# Deployment and still needs podAntiAffinity + a PDB. rio-gateway and
+# rio-store both take this shape (the store's ComponentScaler-era CR
+# is gone; its ScaledObject inherited the min:2 floor).
 multi_replica=$(
   {
     yq -N 'select(.kind=="Deployment" and (.spec.replicas // 1) > 1) | .metadata.name' "$out"
-    yq -N 'select(.kind=="ComponentScaler" and (.spec.replicas.min // 1) > 1) | .spec.targetRef.name' "$out"
     yq -N 'select(.kind=="ScaledObject" and (.spec.minReplicaCount // 1) > 1) | .spec.scaleTargetRef.name' "$out"
   } | sort -u
 )
@@ -40,7 +37,7 @@ n=$(echo "$multi_replica" | grep -c . || true)
 # r38 merged_013 (§Stability-tests "nothing → no change"): with the
 # explicit --set values above the chart MUST render ≥4 multi-replica
 # control-plane Deployments (rio-scheduler, rio-gateway,
-# kube-build-scheduler, rio-store via ComponentScaler). 0 means the
+# kube-build-scheduler, rio-store via its ScaledObject). 0 means the
 # yq filter rotted — fail loudly, don't pass vacuously.
 test "$n" -ge 4 || {
   echo "FAIL: expected ≥4 multi-replica Deployments with the explicit --set values, got $n — assertion vacuous" >&2
@@ -50,10 +47,13 @@ test "$n" -ge 4 || {
 
 # Documented exemptions: a Deployment listed here is EXPECTED to fail
 # the readiness checks; the exemption is visible and tracked.
-# - rio-store: ComponentScaler-managed (min:2..max:14) but no
-#   podAntiAffinity / PDB. Adding them is a deliberate change requiring
-#   the I-064-style trade-off analysis (no sticky sessions, S3+PG-backed,
-#   surge-first may not apply). TODO(rio-store anti-affinity).
+# - rio-store: KEDA-ScaledObject-managed (min:2..max:14) with a SOFT
+#   one-per-node topologySpreadConstraint (26-store-scaling.sh) but no
+#   required podAntiAffinity / PDB. Hardening to required rules is a
+#   deliberate change requiring the I-064-style trade-off analysis
+#   (no sticky sessions, S3+PG-backed, surge-first may not apply, and
+#   a required spread would block scale-out on a full pool).
+#   TODO(rio-store anti-affinity).
 exempt_aff_pdb="rio-store"
 # - rio-gateway: required podAntiAffinity + maxUnavailable: 0 is a
 #   DELIBERATE I-064 trade-off (NLB drain race > rollout cost). See

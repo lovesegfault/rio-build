@@ -56,7 +56,6 @@ let
   fetcher-split = import ./scenarios/fetcher-split.nix;
   chaos = import ./scenarios/chaos.nix;
   ca-cutoff = import ./scenarios/ca-cutoff.nix;
-  componentscaler = import ./scenarios/componentscaler.nix;
   substitute = import ./scenarios/substitute.nix;
   log-service = import ./scenarios/log-service.nix;
   substitute-scale = import ./scenarios/substitute-scale.nix;
@@ -393,19 +392,18 @@ let
   };
 
   # ── substitute-scale scenario builder ───────────────────────────────
-  # Substitution → ComponentScaler closed loop on the k3s fixture; the
+  # Substitution → autoscaling-signal path on the k3s fixture; the
   # deployed materialization posture comes straight from the chart's
   # values.yaml default (no --set override — the rendered env IS the
-  # default-plumb proof).
+  # default-plumb proof). The KEDA closed loop itself is EKS-only
+  # (no operator in the airgapped image set; helm fragment
+  # 26-store-scaling.sh covers the ScaledObject render); the scenario
+  # asserts the SIGNAL KEDA consumes — the scheduler's backlog gauge.
   substituteScaleTest = substitute-scale {
     inherit pkgs common;
     fixture = k3sFull {
       jwtEnabled = true;
       extraValuesTyped = {
-        "componentScaler.store.enabled" = true;
-        "componentScaler.store.min" = 1;
-        "componentScaler.store.max" = 4;
-        "componentScaler.store.seedRatio" = 10;
         "store.substituteAdmissionPermits" = 1;
       };
     };
@@ -1032,24 +1030,6 @@ in
   };
 
   #
-  # Own split (not folded into autoscale): fresh fixture → clean
-  # state → fast finalizers. ~4min boot + ~3min subtests.
-  # r[verify ctrl.scaler.component+2]
-  # r[verify ctrl.scaler.ratio-learn+2]
-  # r[verify store.admin.get-load+2]
-  # r[verify obs.metric.store-pg-pool]
-  #   ComponentScaler e2e: CR status populated → 30-leaf slowFanout
-  #   drives predicted=ceil(30/seedRatio=10)=3 → store Deployment
-  #   /scale patched > min within 90s; controller pod restart
-  #   preserves .status.learnedRatio; helm-rendered store has no
-  #   .spec.replicas under any manager except the reconciler's.
-  #
-  # Own scenario (not a lifecycle fragment): needs componentScaler.
-  # store.enabled=true in the fixture, which changes the rendered
-  # store Deployment shape — would invalidate every other lifecycle
-  # subtest's "store has 1 replica" assumption. seedRatio=10 +
-  # min=1 max=4 keeps the scale-up provable inside the 2-node VM's
-  # pod budget.
   # ADR-023 §13b nodeclaim_pool reconciler under KWOK fake-Karpenter.
   # Karpenter is faked: KWOK Stage rules progress NodeClaim status
   # (Launched→Registered, populate allocatable from spec.resources.
@@ -1154,50 +1134,46 @@ in
     };
   };
 
-  vm-componentscaler-k3s = componentscaler {
-    inherit pkgs common;
-    fixture = k3sFull {
-      extraValuesTyped = {
-        "componentScaler.store.enabled" = true;
-        "componentScaler.store.min" = 1;
-        "componentScaler.store.max" = 4;
-        "componentScaler.store.seedRatio" = 10;
-      };
-    };
-  };
-
   # ── substitute-scale ─────────────────────────────────────────────────
-  #   Substitution → ComponentScaler closed loop. 30-leaf substitutable
-  #   fanout against a 1-permit store admission gate: scheduler reports
-  #   substituting_derivations → ComponentScaler counts it (P1) →
-  #   desiredReplicas RISES (never drops mid-cascade) → GetLoad's
-  #   substitute_admission_utilization reaches CR.status (P2). Zero
-  #   builder pods for the leaves. Plus the depth-50 deep-chain
-  #   eager-burst proof. ~7min (k3s + cache-seed + 90s poll).
+  #   Substitution → autoscaling-signal path. 30-leaf substitutable
+  #   fanout against a 1-permit store admission gate: the merge creates
+  #   30 materialization jobs → the scheduler leader publishes the
+  #   backlog gauge (rio_scheduler_substituting_derivations) → the
+  #   gauge RISES with the cascade and returns to 0 as the jobs drain;
+  #   admission utilization observable on the store metrics surface;
+  #   zero builder pods for the leaves. Plus the depth-50 deep-chain
+  #   eager-burst proof. ~7min (k3s + cache-seed + poll).
+  #
+  #   This is the signal half of the store-scaling loop: KEDA consumes
+  #   exactly this gauge (templates/store-scaledobject.yaml), but the
+  #   prometheus→KEDA→replica half cannot run in the k3s fixture (the
+  #   airgapped image set carries no KEDA operator) — it is covered by
+  #   the helm-template render checks (26-store-scaling.sh) and the
+  #   post-wipe deployment checklist's P10 observation on EKS.
   #
   # Distinct runNixOSTest name (rio-substitute-scale) — NOT a variant
-  # of rio-componentscaler / rio-substitute, so the derivation names
-  # don't collide.
+  # of rio-substitute, so the derivation names don't collide.
   #
   # jwtEnabled: substitution is tenant-scoped (try_substitute_on_miss
   # short-circuits without x-rio-tenant-token); the gateway must mint
-  # it from the SSH key comment. seedRatio=10 → 30 substituting leaves
-  # predict ceil(30/10)=3 > min=1. substituteAdmissionPermits=1
+  # it from the SSH key comment. substituteAdmissionPermits=1
   # serializes the 30 fetches so (with 200ms tc-netem on upstream-v6)
-  # the cascade outlives the controller's 10s reconcile tick — at the
-  # derived default (pg_max×3≥64), tiny NARs drain in <1s and
-  # desiredReplicas never moves. Set via the chart key (not extraEnv)
-  # so the values.yaml → store.yaml templating is exercised.
+  # the cascade outlives the scheduler's 10s housekeeping tick (the
+  # gauge publication cadence) — at the derived default (pg_max×3≥64),
+  # tiny NARs drain in <1s and no tick would observe a nonzero
+  # backlog. Set via the chart key (not extraEnv) so the values.yaml →
+  # store.yaml templating is exercised.
   #
-  # r[verify ctrl.scaler.signal-substituting+3]
-  #   cascade: the §2.6 re-sourced substituting bucket (pending unclaimed
-  #   jobs) drives the P1 closed loop — desiredReplicas rises and never
-  #   drops mid-cascade while the job backlog drains.
+  # r[verify obs.metric.scheduler-substituting]
+  #   cascade: the §2.6 substituting bucket (pending unclaimed jobs)
+  #   reaches Prometheus — the backlog gauge rises while the cascade
+  #   drains and returns to 0 after it; the scrape surface IS the
+  #   autoscaling signal path.
   # r[verify store.substitute.admission+2]
-  # r[verify store.admin.get-load+2]
   #   cascade: the store executors' fetches go through the per-replica
-  #   admission gate; GetLoad's admission utilization reaches CR.status
-  #   (P2) unchanged.
+  #   admission gate — utilization observable at 1.0 on the 1-permit
+  #   gate mid-cascade, and the serialized drain outlives the gauge
+  #   tick.
   # r[verify sched.substitute.eager-probe]
   # r[verify sched.materialize.job+2]
   #   deep-chain: one merge burst classifies all 49 seeded links —

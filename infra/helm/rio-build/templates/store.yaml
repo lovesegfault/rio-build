@@ -8,16 +8,37 @@ metadata:
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
 spec:
-  {{- if not .Values.componentScaler.store.enabled }}
-  # Stateless at runtime (PG + S3 hold everything). sqlx::migrate! takes
-  # a PG advisory lock, so concurrent replica startup is safe.
-  #
-  # OMITTED when componentScaler.store.enabled=true: the ComponentScaler
-  # reconciler patches deployments/scale; if helm also rendered
-  # .spec.replicas here, every `helm upgrade` would reset it and fight
-  # the controller. K8s defaults an absent .spec.replicas to 1 on first
-  # apply; the reconciler's first 10s tick corrects to spec.replicas.min.
+  {{- if not $s.autoscaling.enabled }}
+  # Static replica count — autoscaling disabled (environments without
+  # the KEDA operator: k3s VM tests, local dev). Stateless at runtime
+  # (PG + S3 hold everything); sqlx::migrate! takes a PG advisory
+  # lock, so concurrent replica startup is safe. With autoscaling
+  # enabled the KEDA-managed HPA owns the count and helm echoes the
+  # live value instead (the lookup branch below).
   replicas: {{ $s.replicas | default 1 }}
+  {{- else }}
+  {{- /* The KEDA-managed HPA owns the replica count: rendering the
+         static value here would reset it on every `helm upgrade` and
+         fight the autoscaler. But on an EXISTING release whose
+         previous manifest carried `replicas: N` (the pre-KEDA static
+         render, or the ComponentScaler era's first-apply default),
+         simply omitting the field is not neutral either: helm's
+         three-way merge turns present→absent into a patch to null,
+         the API server re-defaults the field to 1, and the Deployment
+         controller kills store pods on the spot — mid-wave that
+         re-funnels every in-flight NAR ingest through one replica.
+
+         So when a live Deployment exists, echo ITS current replica
+         count: the field stays present at exactly the value KEDA last
+         set, the upgrade is a no-op for scale, and helm never fights
+         the HPA. `lookup` returns an empty map under `helm template` /
+         `--dry-run` and on a fresh install (no live Deployment yet) —
+         the field is then omitted, K8s defaults it to 1 on first
+         apply, and KEDA's first reconcile raises it to
+         minReplicaCount. Same shape as gateway.yaml. */}}
+  {{- with lookup "apps/v1" "Deployment" .Values.namespaces.store.name "rio-store" }}
+  replicas: {{ .spec.replicas }}
+  {{- end }}
   {{- end }}
   selector:
     matchLabels:

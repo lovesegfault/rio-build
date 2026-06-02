@@ -445,7 +445,7 @@ mod tests {
     /// `max` over those. Two pods with the saturated dimension on
     /// opposite axes: the result is the global max regardless of
     /// which axis carries it.
-    // r[verify store.admin.get-load+2]
+    // r[verify store.admin.get-load+3]
     #[test]
     fn fold_load_max_of_dimensions_then_pods() {
         let pod_a = GetLoadResponse {

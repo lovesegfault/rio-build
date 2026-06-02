@@ -27,8 +27,8 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
 
   [rio-store],
   [Deployment],
-  [1],
-  [Stateless at runtime (PG + S3 hold everything). Multi-replica is safe: startup migrations serialize via #rref("store.db.migrate-try-lock").],
+  [2--14 (KEDA-autoscaled)],
+  [Stateless at runtime (PG + S3 hold everything). Multi-replica is safe: startup migrations serialize via #rref("store.db.migrate-try-lock"). Replica count owned by a KEDA ScaledObject with one-per-node spread (see Store autoscaling below); k3s/dev profiles disable autoscaling and render a static count.],
 
   [rio-controller],
   [Deployment],
@@ -94,6 +94,40 @@ Executors require a dedicated node pool with:
 Builder pod autoscaling (rio-controller) and node autoscaling (cluster autoscaler or Karpenter) are separate concerns that chain together. rio-controller spawns Pool Jobs based on scheduler queue depth; the node autoscaler provisions capacity for the resulting Pending pods. Without a node autoscaler, rio-controller scaling beyond the static node pool's capacity just produces permanently-Pending pods.
 
 The EKS reference deployment (`infra/eks/`) uses Karpenter: the `executors` managed nodegroup is replaced entirely with three Karpenter NodePools (compute-optimized preferred, general-purpose fallback, untainted general). `consolidationPolicy: WhenEmpty` on builder NodePools means Karpenter never evicts a node with a builder pod on it --- ephemeral Jobs terminate on completion, then Karpenter consolidates the empty node. Scale-to-zero is the default: cold start from zero is \~50-80s (node boot + pod start).
+
+== Store autoscaling
+
+#r("infra.store.autoscaling")[
+  The rio-store Deployment's replica count MUST have exactly one writer ---
+  the KEDA ScaledObject (`templates/store-scaledobject.yaml`): when
+  `store.autoscaling.enabled` the chart MUST NOT render a static
+  `spec.replicas` (on an existing release it echoes the live Deployment's
+  count via `lookup` so an upgrade never null-patches the field), and the
+  chart MUST define no ComponentScaler CR targeting the store. The
+  ScaledObject scales on three triggers --- substitution backlog
+  (#(refs.metric)("rio_scheduler_substituting_derivations") per replica,
+  the leading signal), builders-per-replica
+  (#(refs.metric)("rio_scheduler_open_attempts") per replica), and CPU
+  utilization (reactive corrective) --- with scale-up unstabilized,
+  scale-down damped (1800 s window, −1 pod / 600 s), and floor/ceiling
+  2/14; the store pods MUST carry a soft one-per-node
+  `topologySpreadConstraints` (maxSkew 1 on `kubernetes.io/hostname`,
+  `ScheduleAnyway`).
+]
+The store carries three superimposed load classes --- substitution ingest
+(upstream → store → S3; leading indicator: the scheduler's materialization
+backlog, known at merge time), builder read-serving (S3 → store → builder),
+and builder upload ingest (PutPath → S3; both keyed to busy builders) ---
+all flowing through the same pod NIC, NAR/chunk memory, and PG pool. One
+replica per node makes scale-out add NICs rather than re-partition one
+node's bandwidth; the soft constraint never blocks scale-out on a full
+pool (a stacked replica is slower, never wrong --- correctness never
+depends on scaling). The ceiling is bounded by Aurora connections
+(`maxReplicas × pgMaxConnections` against `rds_max_connections`); the
+trigger thresholds are seeded (600 backlog/replica, 50 builders/replica,
+70 % CPU) and re-derived from the post-wipe warm-phase capture. The
+no-KEDA profiles (`values/vmtest-full.yaml`, `values/dev.yaml`) set
+`store.autoscaling.enabled=false` and render the static `store.replicas`.
 
 = Key Configuration
 
