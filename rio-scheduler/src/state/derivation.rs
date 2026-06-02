@@ -1142,14 +1142,6 @@ pub struct DerivationState {
     /// inline `dispatch_ready` calls instead of re-probing the head.
     /// `probe_generation` advances once per `handle_tick` (1/s).
     pub probed_generation: u64,
-    /// One-shot suppression for the detached-substitute lane: set on
-    /// `SubstituteComplete{ok=false}` so subsequent dispatch passes
-    /// skip substitution and route to a worker. Without this, a
-    /// `FindMissingPaths` that says "substitutable" while
-    /// `QueryPathInfo` says "no" loops at ~1/s and the drv never
-    /// reaches `find_executor` (FMP HEAD probe vs. QPI GET drift).
-    /// In-mem only — recovery resets `Substituting` to dep-walk anyway.
-    pub substitute_tried: bool,
     /// Set when `check_roots_topdown` pruned this node's dep subgraph
     /// from the submission. Carries the invariant "this node MUST
     /// complete via substitution; building is invalid" — its
@@ -1173,8 +1165,8 @@ pub struct DerivationState {
     /// no closure hole, and at recovery additionally a still-live
     /// build co-owning the parent to vouch for each produced child —
     /// or when the fail-fast consumes it) and restored by
-    /// `from_recovery_row` — unlike `substitute_tried`, losing it
-    /// across failover re-arms the doomed from-source dispatch.
+    /// `from_recovery_row` — losing it across failover would re-arm
+    /// the doomed from-source dispatch.
     pub topdown_pruned: bool,
     /// Closure-hole breadcrumb: an un-produced child of this node
     /// (status not Completed/Skipped at removal time) was removed out
@@ -1251,39 +1243,6 @@ pub struct DerivationState {
     /// class as the GC residual; see
     /// `load_parents_with_unproduced_terminal_children`).
     pub closure_hole: bool,
-    /// Output paths that have already triggered a forgiven-seed-became-
-    /// wanted DOWNGRADE of a substitute completion for this node
-    /// (`handle_substitute_complete`) **within the current substitution
-    /// chain**. A path in this set is never included in a later walk's
-    /// forgivable set for the rest of that chain, no matter how the
-    /// live effective wanted set shrinks (a build goes terminal) or
-    /// re-grows (a new build merges) between walks. This is what keeps
-    /// the downgrade → re-spawn chain monotone and terminating: each
-    /// downgrade permanently consumes at least one of the node's
-    /// finitely many declared outputs, so a chain can take at most
-    /// |declared outputs| downgrades.
-    ///
-    /// The set's lifetime is the chain's, not the node's: it survives
-    /// only the chain's own re-spawns (the immediate downgrade
-    /// re-spawn and the deferred next-pass delta re-walk) and is
-    /// cleared whenever the chain ends — the ok=true completion, the
-    /// genuine-failure (ok=false) revert, the topdown fail-fast, an
-    /// accepted worker-build verdict after a from-source routing, and
-    /// every non-substitution completion (the inline store-batch
-    /// completion, the merge-time cached-hit lane, the CA early-cutoff
-    /// Skip). As a backstop, the stale-Completed/Skipped reset in
-    /// `verify_preexisting_completed` clears it again at the moment a
-    /// NEW chain begins, so no completion path missing from that list
-    /// can leak the set across chains. A stale entry surviving into
-    /// a LATER chain would veto forgiving a path no live build wants
-    /// any more and demote a fully-substitutable node to a from-source
-    /// build. A resubmit-reset rebuilds the node state from scratch
-    /// (fresh empty set) and `rollback_merge` restores the removed
-    /// node wholesale, so the set also never outlives the node
-    /// lifetime it was accumulated in. In-mem only — never persisted;
-    /// recovery resets `Substituting` nodes through the dep-walk anyway
-    /// (same recovery semantics as `substitute_tried`).
-    pub never_forgive_paths: HashSet<String>,
 }
 
 impl DerivationState {
@@ -1363,10 +1322,8 @@ impl DerivationState {
             running_since: None,
             traceparent: String::new(),
             probed_generation: 0,
-            substitute_tried: false,
             topdown_pruned: false,
             closure_hole: false,
-            never_forgive_paths: HashSet::new(),
         })
     }
 
@@ -1490,7 +1447,6 @@ impl DerivationState {
             running_since: (status == DerivationStatus::Running).then_some(now),
             traceparent: String::new(), // recovered: no user trace
             probed_generation: 0,
-            substitute_tried: false,
             // Persisted (`migrations/063`) precisely so it survives
             // failover: a pruned root recovered childless MUST keep the
             // "complete via substitution or fail fast" invariant — its
@@ -1503,7 +1459,6 @@ impl DerivationState {
             // children would otherwise launder the recovery-time clear
             // and re-arm the doomed from-source dispatch.
             closure_hole: row.closure_hole,
-            never_forgive_paths: HashSet::new(),
         })
     }
 
@@ -1585,10 +1540,8 @@ impl DerivationState {
             running_since: None,
             traceparent: String::new(),
             probed_generation: 0,
-            substitute_tried: false,
             topdown_pruned: false,
             closure_hole: false,
-            never_forgive_paths: HashSet::new(),
         })
     }
 

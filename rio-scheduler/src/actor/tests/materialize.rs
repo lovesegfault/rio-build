@@ -3410,15 +3410,14 @@ async fn flag_on_every_job_state_has_armed_action() -> TestResult {
     let b16 = Uuid::new_v4();
     merge_dag(&handle, b16, vec![n16], vec![], false).await?;
     barrier(&handle).await;
-    // Force the exact D16 inputs: the mark, the spent one-shot, and the
-    // output present in the store.
+    // Force the D16 inputs that still exist: the mark, plus the output
+    // present in the store. (The spent one-shot died with the walk —
+    // the walk-era D16 limbo's decision cells are deleted; the JOB is
+    // the armed action for a marked node with the output present:
+    // claim → Success → resolves; the clear-mirror removes the mark;
+    // the node completes.)
     assert!(handle.debug_set_topdown_pruned("tot-d16", true).await?);
-    assert!(handle.debug_set_substitute_tried("tot-d16", true).await?);
     store.seed_with_content(&dout16, b"tot-d16-present-content");
-    // Flag-off these inputs form the D16 limbo (every walk decision cell
-    // refuses: marked → no from-source; tried → no re-walk; present →
-    // nothing to fetch). Flag-on the JOB is still armed: claim → Success
-    // → resolves; the clear-mirror removes the mark; the node completes.
     let assignment = match claim_materialization(&handle, "tot-d16", "store-test-0").await {
         Ok(PullOutcome::Deliver(a)) => *a,
         other => panic!("D16 probe: the job must still be claimable, got {other:?}"),
@@ -3757,12 +3756,8 @@ async fn flag_on_reap_survivor_with_unresolved_job_stays_armed() -> TestResult {
              work); qpi_calls={qpi:?}"
         );
     }
-    let drv = expect_drv(&handle, "reapjob-root").await;
-    assert!(
-        !drv.substitute_tried,
-        "the reap hook must NOT spend the verification one-shot on a survivor \
-         whose job is armed"
-    );
+    // (The walk-era one-shot assertion is gone with the field — the
+    // reap hook can no longer spend anything on a survivor.)
     let st_b = query_status(&handle, build_b).await?;
     assert_ne!(
         st_b.state,

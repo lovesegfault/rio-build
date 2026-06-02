@@ -20,10 +20,8 @@ use tracing::{debug, error, info, warn};
 
 use rio_proto::types::FindMissingPathsRequest;
 
-use crate::dag::ClosureEvidence;
 use crate::state::{
-    BuildStateExt, DerivationStatus, DrvHash, ExecutorId, effective_wanted,
-    verifiable_wanted_paths, wanted_subset,
+    BuildStateExt, DerivationStatus, DrvHash, ExecutorId, effective_wanted, verifiable_wanted_paths,
 };
 
 use super::DagActor;
@@ -304,324 +302,6 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.substitute.detached+5]
-    /// Handle a [`ActorCommand::SubstituteComplete`] posted by a
-    /// detached fetch task of a previous-generation walk. The walk
-    /// spawner is deleted (no new commands of this shape are ever
-    /// produced); the consumption side survives one more commit so the
-    /// mailbox arm keeps its handler. `ok=true` → output in rio-store
-    /// with its full reference closure, so `Substituting → Completed`
-    /// is safe. `ok=false` → revert to `Ready`/`Queued`.
-    ///
-    /// `forgiven` is the set of seeds the walk forgave against the
-    /// wanted set *as snapshotted at spawn time*; see the re-check
-    /// below for why it must be re-evaluated here.
-    pub(super) async fn handle_substitute_complete(
-        &mut self,
-        drv_hash: &DrvHash,
-        ok: bool,
-        forgiven: &[String],
-    ) {
-        // r[impl sched.substitute.leader-gate]
-        // `on_lose` only flips atomics; the detached `substitute-fetch`
-        // task survives lease loss and posts here on the standby. The
-        // ok=true branch writes PG (`persist_status(Completed)` /
-        // `complete_ready_from_store`) → split-brain on
-        // `derivations.status`. Same gate as `dispatch_ready` — the new
-        // leader's recovery owns this drv (resets Substituting via the
-        // dep-walk).
-        if !self.leader.is_leader() {
-            debug!(%drv_hash, ok,
-                   "SubstituteComplete on standby (lease lost mid-fetch); dropping");
-            return;
-        }
-        let Some(state) = self.dag.node(drv_hash) else {
-            return;
-        };
-        if state.status() != DerivationStatus::Substituting {
-            debug!(%drv_hash, status = ?state.status(),
-                   "SubstituteComplete: not Substituting (cancelled/re-merged); dropping");
-            return;
-        }
-        let topdown_pruned = state.topdown_pruned;
-        // r[impl sched.merge.wanted-outputs+2]
-        // The walk's forgiveness verdict was computed against the
-        // wanted set as of SPAWN time. A build that merged during the
-        // (potentially minutes-long) detached fetch can have made a
-        // seed the walk forgave wanted by a live build — completing
-        // now would hand that build a node missing an output it wants.
-        // The re-check is evaluated against the LIVE effective wanted
-        // set (`effective_wanted`, computed at this call site because
-        // liveness needs `self.builds`, which the node cannot see),
-        // falling back to the stored node-level union — same source as
-        // the spawn-time forgivable complement. Downgrade to a revert
-        // WITHOUT setting `substitute_tried`: the next dispatch pass
-        // re-probes and re-spawns the walk with the corrected
-        // forgivable set, so the delta is re-substituted (and a genuine
-        // miss then fails the walk → `substitute_tried` → from-source
-        // build). Two revert targets cannot wait for "the next pass" —
-        // a topdown-pruned root with broken closure evidence (childless
-        // or closure-holed) and a node whose dep is terminally failed —
-        // so for those the walk is re-spawned immediately below instead
-        // (see the downgrade re-spawn ahead of the generic revert).
-        //
-        // The trigger paths (forgiven at spawn time AND wanted now) are
-        // collected — not just detected — so the downgrade can record
-        // them in `never_forgive_paths` below.
-        let forgiven_now_wanted_paths: Vec<String> = if ok && !forgiven.is_empty() {
-            let eff = effective_wanted(state, &self.builds);
-            wanted_subset(
-                &state.output_names,
-                &state.expected_output_paths,
-                eff.as_deref().unwrap_or(&state.wanted_output_names),
-            )
-            .filter(|p| forgiven.contains(p))
-            .cloned()
-            .collect()
-        } else {
-            Vec::new()
-        };
-        let forgiven_now_wanted = !forgiven_now_wanted_paths.is_empty();
-        let ok = ok && !forgiven_now_wanted;
-        if forgiven_now_wanted {
-            // Spend the trigger paths' forgiveness BEFORE any re-spawn
-            // (immediate or next-pass): a path that has triggered a
-            // downgrade once is never forgivable again for this node,
-            // no matter how the live effective wanted set later shrinks
-            // (the wanting build goes terminal) or re-grows. This is
-            // the monotone step the walk chain's termination argument
-            // rests on — see the downgrade re-spawn comment below.
-            if let Some(s) = self.dag.node_mut(drv_hash) {
-                s.never_forgive_paths
-                    .extend(forgiven_now_wanted_paths.iter().cloned());
-            }
-            info!(%drv_hash,
-                  "substitute walk forgave a seed that became wanted \
-                   mid-fetch; reverting for re-substitution of the delta");
-        }
-        if ok {
-            // The substitution chain ends in success — the spent-
-            // forgiveness bookkeeping is scoped to the chain, so clear
-            // it. Safe: no re-spawn follows the ok=true arm, and a NEW
-            // chain only starts after an external reset (re-merge of a
-            // failed node, stale-Completed verify, recovery), each of
-            // which is bounded by the same |declared outputs| argument
-            // again — clearing here cannot re-open an unbounded
-            // downgrade loop.
-            if let Some(s) = self.dag.node_mut(drv_hash) {
-                s.never_forgive_paths.clear();
-            }
-            // complete_ready_from_store_batch does Substituting→
-            // Completed (valid transition) + the full post-completion
-            // machinery (output_paths, persist, upsert_path_tenants,
-            // promote_newly_ready, per-build events + completion check).
-            self.complete_ready_from_store_batch(std::slice::from_ref(drv_hash))
-                .await;
-            // r[impl sched.dispatch.substitute-complete-inline+2]
-            // promote_newly_ready pushed dependents to ready_queue at
-            // probed_generation=0. Probe inline so a fully-substitutable
-            // cascade doesn't wait one Tick per layer.
-            // `probed_generation` stamping bounds the cost of a
-            // fresh-cluster substitution burst: nodes already probed
-            // this Tick are skipped, so repeated inline sweeps only ever
-            // probe newly-promoted dependents.
-            // `r[sched.admin.spawn-intents.probed-gate]` still
-            // suppresses spurious intents for the not-yet-probed tail.
-            self.sweep_ready_cached().await;
-            return;
-        }
-        // r[impl sched.merge.substitute-topdown+12]
-        // Topdown-pruned root: the dep subgraph was dropped from this
-        // submission, so a build dispatch cannot succeed (worker
-        // ENOENTs on inputDrvs). Fail every interested build with a
-        // resubmit-directing error instead of demoting to Ready
-        // (vacuously all_deps_completed → would dispatch). keep_going
-        // is irrelevant: a topdown-pruned graph is roots-only by
-        // construction; there is no other work to "keep going" with,
-        // and leaving the build Active would hang it.
-        //
-        // The marked node's routing is keyed on its closure evidence
-        // (`DerivationDag::closure_evidence`):
-        //
-        //  - Vouched (≥1 child, all produced, no closure hole): the
-        //    "deps were dropped" invariant is moot — lazily clear the
-        //    flag (memory + best-effort PG) and fall through to the
-        //    normal revert. This backstops the stamp being conditional
-        //    and the other clear sites (post-reconciliation,
-        //    completion-time, recovery-time) having missed it.
-        //  - Pending (children present but not all produced): a live
-        //    flag alongside unbuilt children is normal (kept by
-        //    design — they can still be reaped unbuilt). Suppress the
-        //    fail-fast, keep the mark, and fall through to the normal
-        //    Ready/Queued handling instead of collaterally failing a
-        //    build whose node IS buildable once those children land.
-        //  - Broken (childless or closure-holed): the child set must
-        //    not vouch for a from-source dispatch — a closure-holed
-        //    node's surviving children (left by a reap, a poison-clear
-        //    removal, or a recovery edge-drop) are not representative
-        //    of the pruned input closure, so neither the lazy clear nor
-        //    the suppression may trust them. Take the fail-fast arm below
-        //    (the bounded resubmit-directing outcome, never the doomed
-        //    from-source dispatch a Ready revert would produce).
-        //
-        // The fail-fast arm additionally gates on
-        // `!forgiven_now_wanted`: that downgrade means the fetch did
-        // NOT definitively fail — it forgave a seed that has since
-        // become wanted. Failing the build here would be premature;
-        // fall through to the downgrade re-spawn below, which re-walks
-        // immediately with the corrected forgivable set. A genuine
-        // failure on that second walk lands back here with
-        // `forgiven_now_wanted = false` and fails the build then.
-        let evidence = self.dag.closure_evidence(drv_hash);
-        if topdown_pruned && evidence == ClosureEvidence::Vouched {
-            debug!(%drv_hash,
-                   "topdown-pruned root's children are all produced; \
-                    invariant moot, clearing flag (memory + PG)");
-            if let Some(s) = self.dag.node_mut(drv_hash) {
-                s.topdown_pruned = false;
-            }
-            // Best-effort PG counterpart of the in-memory clear:
-            // this lazy clear backstops the children-produced-later
-            // case (the completion-time clear in
-            // `clear_topdown_pruned_for_produced_parents` is the
-            // primary site), and the column is what a failover
-            // restores — left set, a new leader would resurrect the
-            // mark onto a node whose closure IS produced and a
-            // later walk failure would wrongly fail-fast. Same
-            // error posture as the fail-fast's clear: warn and
-            // continue, never fail the handler.
-            match self
-                .db
-                .clear_topdown_pruned_by_hash(drv_hash, self.serving_generation())
-                .await
-            {
-                Ok(crate::db::FencedWrite::Fenced) => {
-                    self.note_fenced_evidence_write("lazy walk-failure topdown_pruned clear");
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(%drv_hash, error = %e,
-                          "failed to clear persisted topdown_pruned after lazy clear (continuing)");
-                }
-            }
-        } else if topdown_pruned && evidence == ClosureEvidence::Pending {
-            debug!(%drv_hash,
-                   "topdown-pruned root has unbuilt DAG children; \
-                    suppressing the fail-fast but keeping the mark \
-                    (children can still be reaped unbuilt)");
-        } else if topdown_pruned && !forgiven_now_wanted {
-            // r[impl sched.evidence.settlement]
-            // The walk verdict in hand was fixed at the walk's own check time
-            // and can be stale by the walk's full duration; the build(s) we
-            // are about to fail may want only outputs that have since become
-            // present (the C3 two-build dedup defect). Re-probe before the
-            // terminal verdict.
-            match self
-                .settle_broken_marked_root(
-                    drv_hash,
-                    "upstream substitute fetch failed after deps were pruned",
-                )
-                .await
-            {
-                BrokenSettlement::FailedFast => return,
-                BrokenSettlement::Deferred => {
-                    // No store answer / outputs obtainable: fall through
-                    // to the plain revert below (Ready/Queued, NO
-                    // substitute_tried) so the next sweep re-probes —
-                    // never fail-fast on an unanswerable probe.
-                }
-            }
-        }
-        // 3-way revert (NOT 2-way Ready|Queued): the I-094 reprobe lane
-        // can transition a node whose dep is Poisoned directly →
-        // Substituting; on fetch-fail it must go DependencyFailed, not
-        // Queued (Queued with a Poisoned dep is stuck forever — see
-        // `revert_target_for`).
-        let to = self.dag.revert_target_for(drv_hash);
-        let Some(state) = self.dag.node_mut(drv_hash) else {
-            return;
-        };
-        // The downgrade re-spawn that used to sit here (immediate
-        // re-walk for the DependencyFailed / must-substitute revert
-        // targets of the forgiven-now-wanted downgrade) died with the
-        // walk spawner — the downgrade now falls through to the plain
-        // revert below like every other ok=false outcome.
-        // One-shot fall-through: FMP said substitutable, QPI said no.
-        // Next dispatch pass skips substitution and routes to a worker
-        // — without this the partition re-includes it every Tick (~1/s
-        // livelock; never reaches `find_executor`).
-        //
-        // EXCEPT for the forgiven-seed-became-wanted downgrade: there
-        // the fetch did not definitively fail a wanted path (it never
-        // tried the now-wanted one as wanted), so the next pass MUST
-        // re-substitute with the corrected forgivable set. Bounded:
-        // the trigger path is in `never_forgive_paths`, so that second
-        // walk either succeeds or fails the now-unforgivable seed →
-        // lands back here with `forgiven_now_wanted = false` → sets the
-        // one-shot flag. (The hazardous DependencyFailed /
-        // topdown-must-substitute targets never reach here — they
-        // re-spawned above.)
-        //
-        // ALSO excepted: a marked-Broken node whose settlement above
-        // returned Deferred (no store answer / rejected revert). Setting
-        // the one-shot here would burn the verification credit on a
-        // store outage; leave it unspent so the next dispatch sweep's
-        // settlement-aware partition re-probes (r[sched.evidence.settlement]).
-        let deferred_settlement = rio_evidence_kernel::must_substitute(topdown_pruned, evidence);
-        if !(forgiven_now_wanted || deferred_settlement) {
-            state.substitute_tried = true;
-        }
-        // Chain-scope bookkeeping: the only way this chain continues
-        // past this arm is that deferred delta re-substitution — the
-        // downgrade reverting to Ready/Queued WITHOUT the one-shot
-        // flag, so the next pass re-walks and `never_forgive_paths`
-        // must survive into that walk. Every other way out ends the
-        // chain (a genuine failure routes to a from-source build via
-        // the one-shot flag; DependencyFailed is terminal), so the
-        // spent-forgiveness set is cleared: leaking it into a LATER
-        // substitution chain for this node (a stale-Completed reset, a
-        // resubmit re-probe) would veto forgiving a path no live build
-        // wants any more and turn a fully-substitutable node into a
-        // from-source dispatch.
-        if !(forgiven_now_wanted
-            && matches!(to, DerivationStatus::Ready | DerivationStatus::Queued))
-        {
-            state.never_forgive_paths.clear();
-        }
-        if let Err(e) = state.transition(to) {
-            warn!(%drv_hash, %e, "SubstituteComplete fail: revert rejected");
-            return;
-        }
-        self.persist_status(drv_hash, to, None).await;
-        match to {
-            DerivationStatus::Ready => {
-                // Demoted to from-source: the controller's next
-                // GetSpawnIntents poll sees the Ready node and spawns a
-                // pull-mode pod for it (no store re-probe needed — the
-                // substitute fetch just told us it is not available).
-                self.push_ready(drv_hash.clone());
-            }
-            DerivationStatus::DependencyFailed => {
-                // Cascade + per-build completion-check so the interested
-                // build terminates instead of hanging Active.
-                self.terminal_failure_epilogue(
-                    drv_hash,
-                    "substitute fetch failed and a dependency is terminally failed",
-                    rio_proto::types::BuildResultStatus::DependencyFailed,
-                    None,
-                )
-                .await;
-            }
-            _ => {}
-        }
-        // build_summary counts Substituting as running; revert flips
-        // running→queued. Mirror `rollback_assignment` /
-        // `emit_assignment_started` so the dashboard sees the demote.
-        for build_id in self.get_interested_builds(drv_hash) {
-            self.emit_progress(build_id);
-        }
-    }
-
     // r[impl sched.merge.substitute-topdown+12]
     /// Topdown-pruned fail-fast: the node's dep subgraph was dropped
     /// from its submission, so a from-source build dispatch cannot
@@ -633,28 +313,13 @@ impl DagActor {
     /// error summary ("topdown-pruned root <hash>: <cause>; resubmit
     /// to re-probe or full-merge").
     ///
-    /// Callers (all gate on `topdown_pruned` plus closure evidence the
-    /// classifier judges `Broken` — childless or closure-holed, the
-    /// `must_substitute` predicate — so a reap-truncated child set is
-    /// treated exactly like an empty one at every site; unbuilt
-    /// children (`Pending`) suppress the fail-fast but no longer shed
-    /// the mark; only a `Vouched` child set — all produced, no hole —
-    /// clears it):
-    ///  - [`Self::settle_broken_marked_root`] — the settlement that BOTH
-    ///    the `handle_substitute_complete` Broken arm and the reap-time
-    ///    survivor re-evaluation in `handle_cleanup_terminal_build`
-    ///    (leader-gated) route through (r[sched.evidence.settlement]):
-    ///    the fail-fast fires only when the verification one-shot is
-    ///    already spent or the re-probe confirms a wanted output
-    ///    missing-and-unsubstitutable;
-    ///  - the dispatch-time probe (`batch_probe_cached_ready`) when a
-    ///    marked node with Broken evidence can neither complete inline
-    ///    nor be routed to substitution (its confirmed-missing cell) —
-    ///    the post-failover shape, where the recovered
-    ///    (wider) wanted union contains an output that is genuinely
-    ///    missing upstream. Pre-fix that outcome left the node Ready
-    ///    and dispatched it from source — the doomed dispatch this arm
-    ///    exists to prevent.
+    /// Sole caller: the materialization consumption routing's arm 3
+    /// (route_unobtainable in materialize.rs) — an unobtainable outcome
+    /// on a pruned-origin job whose live-wanted outputs are confirmed
+    /// missing (the four-conjunct settlement; r[sched.evidence.settlement]).
+    /// The walk-era callers (the SubstituteComplete Broken arm, the
+    /// reap-time survivor settlement, the dispatch-probe fail-fast
+    /// cell) died with the walk.
     pub(super) async fn fail_fast_pruned_root(&mut self, drv_hash: &DrvHash, cause: &str) {
         // A prior iteration of the same dispatch pass may already have
         // settled this node: `batch_probe_cached_ready` collects the
@@ -694,12 +359,6 @@ impl DagActor {
         // strips interest below; with zero remaining interest the
         // node is reaped on the next sweep.
         let parked = if let Some(s) = self.dag.node_mut(drv_hash) {
-            s.substitute_tried = true;
-            // The chain ends here (terminal fail-fast): drop the
-            // chain-scoped spent-forgiveness bookkeeping so it
-            // cannot leak into a later substitution chain for this
-            // node (e.g. after a resubmit re-probes it).
-            s.never_forgive_paths.clear();
             // The fail-fast CONSUMES the pruned marker (here and, best-
             // effort, in PG below). The flag can be stale: a merge
             // transaction that committed but whose build activation
@@ -782,92 +441,6 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.evidence.settlement]
-    // r[impl sched.merge.substitute-topdown+12]
-    /// Settlement for a topdown-pruned node whose closure evidence is
-    /// Broken at a fail-fast decision point. Instead of trusting
-    /// walk-failure evidence that may predate out-of-band ingestion (the
-    /// C3 defect), re-probe the LIVE effective wanted outputs and route:
-    ///
-    ///  - every live-wanted output present / substitutable / indeterminate:
-    ///    defer. The verification walk this arm used to spawn died with
-    ///    the walk spawner (the helper itself dies with the consumption
-    ///    component); a deferral never burns the one-shot credit.
-    ///  - otherwise: the established fail-fast (genuine — a wanted output
-    ///    is confirmed missing+unsubstitutable, or the one-shot is spent).
-    ///
-    /// Probe failure / missing store client defers (B3: an indeterminate
-    /// answer never fail-fasts on its own).
-    pub(super) async fn settle_broken_marked_root(
-        &mut self,
-        drv_hash: &DrvHash,
-        cause: &str,
-    ) -> BrokenSettlement {
-        let Some(state) = self.dag.node(drv_hash) else {
-            return BrokenSettlement::Deferred;
-        };
-        let tried = state.substitute_tried;
-        let expected_paths = state.expected_output_paths.clone();
-        // The wanted slice mirrors batch_probe_cached_ready: live
-        // effective wanted, falling back to the stored union, degraded to
-        // all expected paths when unresolvable.
-        let wanted: Vec<String> = {
-            let eff = effective_wanted(state, &self.builds);
-            verifiable_wanted_paths(
-                &state.output_names,
-                &state.expected_output_paths,
-                eff.as_deref().unwrap_or(&state.wanted_output_names),
-            )
-            .map(|w| w.into_iter().map(str::to_owned).collect())
-            .unwrap_or_else(|| expected_paths.clone())
-        };
-
-        if tried {
-            // The verification one-shot is spent: this IS the genuine arm.
-            self.fail_fast_pruned_root(drv_hash, cause).await;
-            return BrokenSettlement::FailedFast;
-        }
-
-        // One single-node FMP call, same shape and failure posture as the
-        // batched dispatch probe.
-        let Some(store) = &self.store_client else {
-            return BrokenSettlement::Deferred;
-        };
-        let probe = self.probe_service_meta(std::iter::once(drv_hash));
-        let probe_meta: Vec<(&'static str, &str)> =
-            probe.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let mut req = tonic::Request::new(FindMissingPathsRequest {
-            store_paths: wanted.clone(),
-        });
-        Self::inject_probe_meta(req.metadata_mut(), &probe_meta);
-        let resp =
-            match tokio::time::timeout(self.grpc_timeout, store.clone().find_missing_paths(req))
-                .await
-            {
-                Ok(Ok(r)) => r.into_inner(),
-                Ok(Err(_)) | Err(_) => return BrokenSettlement::Deferred,
-            };
-        let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
-        let substitutable: HashSet<String> = resp.substitutable_paths.into_iter().collect();
-        let indeterminate: HashSet<String> = resp.indeterminate_paths.into_iter().collect();
-
-        let all_available = wanted.iter().all(|p| {
-            !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
-        });
-        if !all_available {
-            metrics::counter!("rio_scheduler_topdown_settlement_reprobe_total",
-                "outcome" => "fail_fast")
-            .increment(1);
-            self.fail_fast_pruned_root(drv_hash, cause).await;
-            return BrokenSettlement::FailedFast;
-        }
-
-        // All live-wanted outputs are obtainable: defer without burning
-        // the one-shot. The verification walk this arm spawned died
-        // with the walk spawner.
-        BrokenSettlement::Deferred
-    }
-
     // r[impl sched.poison.clear-survivor-reevaluation]
     // r[impl sched.merge.substitute-topdown+12]
     /// Per-survivor verdicts after children were removed from the DAG.
@@ -877,19 +450,12 @@ impl DagActor {
     /// (`handle_clear_poison`) and the poison-TTL sweep
     /// (`tick_process_expired_poisons`).
     ///
-    /// Two stranded shapes are closed, mirroring the reap-survivor hook
-    /// this loop was extracted from:
-    ///
-    ///  - A topdown-pruned survivor with Broken closure evidence
-    ///    (childless, or closure-holed by the removal): nothing
-    ///    children-keyed can ever settle it (`find_newly_ready` only
-    ///    fires on completions), so settle it NOW via
-    ///    [`Self::settle_broken_marked_root`]
-    ///    (r[sched.evidence.settlement]). Skipped while the survivor is
-    ///    `Substituting`/`Assigned`/`Running` — an in-flight walk or
-    ///    attempt keeps its chance and its own completion settles it —
-    ///    and while `Queued` (the promotion arm below + the next
-    ///    dispatch sweep's settlement-aware partition own that shape).
+    /// One stranded shape is closed (the walk-era settlement arm — the
+    /// reap-time fail-fast of a marked spent survivor — died with the
+    /// walk consumption machinery; survivors carrying an unresolved
+    /// materialization job are armed by the job itself, and marked
+    /// survivors without one are re-classified by the next dispatch
+    /// sweep / settled at consumption):
     ///
     ///  - A `Queued` survivor whose last un-produced children were
     ///    removed: it is now vacuously all-deps-completed, but no
@@ -911,11 +477,7 @@ impl DagActor {
     /// production caller is the leader-guarded admin RPC, and
     /// `handle_tick` no-ops on standby
     /// (`r[sched.lease.standby-tick-noop]`).
-    pub(super) async fn reevaluate_removal_survivors(
-        &mut self,
-        survivors: &[DrvHash],
-        settle_cause: &str,
-    ) {
+    pub(super) async fn reevaluate_removal_survivors(&mut self, survivors: &[DrvHash]) {
         for parent in survivors {
             let Some(node) = self.dag.node(parent) else {
                 continue;
@@ -937,31 +499,11 @@ impl DagActor {
             // builder pulls the kinded admission refuses anyway. The
             // job's own §2.4 consumption settlement is the survivor's
             // settlement authority. Flag-gated: flag-off the view is
-            // empty and this gate never fires (byte-identical as-built
-            // reap behavior).
+            // empty and this gate never fires.
             if self.materialization_cfg.enabled && self.has_unresolved_job(parent.as_str()) {
                 continue;
             }
-            // `must_substitute` = marked AND closure evidence Broken
-            // (childless OR closure-holed): a closure hole means the
-            // surviving children are a removal-truncated view of the
-            // pruned closure, so they must not vouch for a from-source
-            // dispatch any more than an empty set would.
-            if self.must_substitute(parent)
-                && status != DerivationStatus::Substituting
-                && status != DerivationStatus::Assigned
-                && status != DerivationStatus::Running
-                && status != DerivationStatus::Queued
-            {
-                // r[impl sched.evidence.settlement]
-                // Same settlement as the SubstituteComplete Broken arm:
-                // before terminally failing the survivor's builds,
-                // re-probe — the outputs may be present (the co-build
-                // dedup shape) or substitutable. The settlement itself
-                // branches on the one-shot (untried -> verification
-                // walk; tried -> fail-fast).
-                self.settle_broken_marked_root(parent, settle_cause).await;
-            } else if status == DerivationStatus::Queued
+            if status == DerivationStatus::Queued
                 && self.dag.all_deps_completed(parent)
                 && let Some(s) = self.dag.node_mut(parent)
                 && s.transition(DerivationStatus::Ready).is_ok()
@@ -977,8 +519,12 @@ impl DagActor {
     }
 
     // r[impl gw.activity.subst-progress]
-    /// Relay byte-progress from a detached substitute fetch to every
-    /// interested build via [`Event::SubstituteProgress`]. Display-only
+    /// Relay byte-progress from a store replica's materialization
+    /// execution to every interested build via
+    /// [`Event::SubstituteProgress`] (BC-4: the
+    /// `ReportMaterializationProgress` RPC posts the
+    /// [`ActorCommand::SubstituteProgress`] this handles — the walk
+    /// producer this relay was built for is deleted). Display-only
     /// (routed through the log broadcast ring, not persisted, reuses
     /// last seq); the gateway translates to `actCopyPath` +
     /// `resProgress`. Non-leader emits are fine — this is read-only
@@ -1038,16 +584,6 @@ impl DagActor {
                       "store-hit Ready→Completed rejected; dispatching instead");
                 continue;
             }
-            // An inline store completion ends any substitution chain
-            // that left this node Ready (the forgiven-now-wanted
-            // downgrade reverts to Ready for a delta re-walk; if the
-            // wanting build goes terminal first, the next pass lands
-            // here instead of re-walking). The spent-forgiveness set is
-            // chain-scoped — clear it so a LATER chain (e.g. a stale-
-            // Completed reset after GC) starts with a clean slate
-            // instead of vetoing forgiveness of a path no live build
-            // wants any more.
-            state.never_forgive_paths.clear();
             // IA-only convenience: `expected_output_paths` IS the
             // realised path. Non-destructive when a path is already
             // known — a caller that resolved the REALIZED floating-CA
@@ -1753,15 +1289,4 @@ impl DagActor {
         let prio = self.queue_priority(&drv_hash);
         self.ready_queue.push(drv_hash, prio);
     }
-}
-
-/// Outcome of [`DagActor::settle_broken_marked_root`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BrokenSettlement {
-    /// The node was fail-fasted (confirmed-missing wanted output, or
-    /// the verification one-shot was already spent).
-    FailedFast,
-    /// The store could not answer (no client / RPC failure), or every
-    /// live-wanted output is obtainable: nothing was decided.
-    Deferred,
 }

@@ -722,8 +722,9 @@ impl DagActor {
         // r[impl sched.merge.substitute-topdown+12]
         // Re-evaluate the surviving parents that just lost children to this
         // reap, via the shared removal-survivor loop
-        // (`reevaluate_removal_survivors` — settlement for marked-Broken
-        // survivors, promotion for now-vacuously-satisfied Queued ones).
+        // (`reevaluate_removal_survivors` — promotion for
+        // now-vacuously-satisfied Queued survivors; job-armed ones are
+        // skipped).
         // The poison-removal paths (admin ClearPoison, the poison-TTL
         // sweep) run the same loop at their own call sites: their removal
         // resets the child for a fresh re-merge AND must wake the
@@ -775,11 +776,8 @@ impl DagActor {
                     }
                 }
             }
-            self.reevaluate_removal_survivors(
-                &reap.surviving_parents,
-                "deps reaped while the closure was never produced",
-            )
-            .await;
+            self.reevaluate_removal_survivors(&reap.surviving_parents)
+                .await;
         }
     }
 

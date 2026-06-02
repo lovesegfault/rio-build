@@ -210,12 +210,6 @@ pub fn describe_metrics() {
          resubmit re-probes"
     );
     describe_counter!(
-        "rio_scheduler_topdown_settlement_reprobe_total",
-        "Settlement re-probes at topdown fail-fast decision points (labels: outcome = \
-         fail_fast). The re-probe confirmed a wanted output missing and unsubstitutable \
-         (the genuine fail-fast); an obtainable answer defers to the next sweep."
-    );
-    describe_counter!(
         "rio_scheduler_queue_backpressure",
         "Backpressure activations (queue reached 80% capacity)"
     );

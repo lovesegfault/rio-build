@@ -445,11 +445,7 @@ impl DagActor {
         // sweep fires — without the re-evaluation it would sit there
         // forever (`find_newly_ready` fires only on completions) and its
         // build would hang. Leader-only: `handle_tick` no-ops on standby.
-        self.reevaluate_removal_survivors(
-            &holed_parents,
-            "poisoned dep expired while the closure was never produced",
-        )
-        .await;
+        self.reevaluate_removal_survivors(&holed_parents).await;
     }
 
     /// DAG-state sweep for `dispatched_cells`. The arm-on-ack write

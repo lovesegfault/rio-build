@@ -1160,20 +1160,6 @@ impl DagActor {
             return;
         }
 
-        // Any accepted worker verdict ends whatever substitution chain
-        // preceded this dispatch: the node can only be Assigned/Running
-        // here, so no walk is in flight and no deferred delta re-walk is
-        // pending. The chain that left it dispatchable from source (the
-        // forgiven-now-wanted downgrade whose newly-wanted path probed as
-        // not substitutable, so no further walk ever ran) is over — clear
-        // the chain-scoped spent-forgiveness set so a LATER substitution
-        // chain for this node (a stale-Completed reset after GC, an
-        // I-094 reprobe) starts with a clean slate instead of vetoing
-        // forgiveness of a path no live build wants any more.
-        if let Some(s) = self.dag.node_mut(drv_hash) {
-            s.never_forgive_paths.clear();
-        }
-
         // Report-carried context for the failure handlers. The
         // line-count sentinel conversion matches the success path's
         // stamp below: 0 ("not reported") and out-of-range worker
@@ -2721,11 +2707,7 @@ impl DagActor {
         // its only wake-up edge, since `find_newly_ready` fires only on
         // completions. Leader-only by the same construction as the PG
         // writes above.
-        self.reevaluate_removal_survivors(
-            &holed_parents,
-            "poisoned dep cleared while the closure was never produced",
-        )
-        .await;
+        self.reevaluate_removal_survivors(&holed_parents).await;
         info!(drv_hash = %drv_hash, "poison cleared by admin; node removed from DAG");
         true
     }

@@ -391,11 +391,6 @@ scheduler:
   # on, executor off) is unrenderable from values.
   materialization:
     enabled: true
-  # Scheduler-side substitute fan-out is DEFAULT_SUBSTITUTE_CONCURRENCY=256
-  # (a memory-safety bound on detached tokio tasks, NOT a throughput knob).
-  # Per-replica throttling lives in the store: r[store.substitute.admission].
-  # RIO_SUBSTITUTE_MAX_CONCURRENT remains an operator escape hatch (env)
-  # but is intentionally not chart-set.
   # I-204: requiredSystemFeatures values that are CAPABILITY HINTS, not
   # hardware gates. Stripped at DAG-insert so spawn/dispatch ignore them.
   # nixpkgs convention: big-parallel = "uses many cores", benchmark =

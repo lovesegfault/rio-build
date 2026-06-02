@@ -127,7 +127,8 @@ pub(super) const BUILD_EVENT_BUFFER_SIZE: usize = 4096;
 /// This ring used to also carry `Event::Log` (the scheduler-relayed live
 /// log tail); the build-log data-plane cutover moved log batches to
 /// rio-store's `LogService` and deleted the variant. Substitute download
-/// progress bars (`r[gw.activity.subst-progress]`) still ride this ring.
+/// progress bars (`r[gw.activity.subst-progress]` — fed by the store
+/// replicas' materialization progress reports) still ride this ring.
 /// The only consumer-side split is the `display_only` `matches!` in
 /// `BuildEventBus::emit`. The 1024 size was chosen for log volume and is
 /// now generous (SubstituteProgress is throttled per-path); it is not
@@ -1263,17 +1264,6 @@ impl DagActor {
                     // exist complete/substitute instead of waiting for
                     // the next merge or completion to trigger it.
                     self.sweep_ready_cached().await;
-                }
-                ActorCommand::SubstituteComplete {
-                    drv_hash,
-                    ok,
-                    forgiven,
-                } => {
-                    // r[impl sched.lease.standby-drops-writes+3]
-                    if self.leader.is_leader() {
-                        self.handle_substitute_complete(&drv_hash, ok, &forgiven)
-                            .await;
-                    }
                 }
                 ActorCommand::SubstituteProgress {
                     drv_hash,

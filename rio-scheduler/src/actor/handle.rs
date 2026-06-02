@@ -19,7 +19,6 @@ pub struct DebugDerivationInfo {
     pub retry: crate::state::RetryState,
     pub ca: crate::state::CaState,
     pub sched: crate::state::SchedHint,
-    pub substitute_tried: bool,
     pub topdown_pruned: bool,
     pub closure_hole: bool,
 }
@@ -317,22 +316,6 @@ impl ActorHandle {
     ) -> Result<bool, ActorError> {
         let drv_hash = drv_hash.to_string();
         self.debug(|reply| DebugCmd::SetTopdownPruned {
-            drv_hash,
-            value,
-            reply,
-        })
-        .await
-    }
-
-    /// Set a derivation's `substitute_tried` one-shot. Returns `false`
-    /// if not found.
-    pub async fn debug_set_substitute_tried(
-        &self,
-        drv_hash: &str,
-        value: bool,
-    ) -> Result<bool, ActorError> {
-        let drv_hash = drv_hash.to_string();
-        self.debug(|reply| DebugCmd::SetSubstituteTried {
             drv_hash,
             value,
             reply,

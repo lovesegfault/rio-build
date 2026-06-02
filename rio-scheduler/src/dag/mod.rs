@@ -1288,13 +1288,6 @@ impl DerivationDag {
             if let Some(state) = self.nodes.get_mut(&hash)
                 && state.transition(DerivationStatus::Skipped).is_ok()
             {
-                // Skipped is a completion through a non-substitution
-                // path: it ends any substitution chain that left this
-                // node parked Queued (a downgraded walk waiting on the
-                // dep this cascade just resolved), so drop the
-                // chain-scoped spent-forgiveness set — same as the
-                // other completion sites.
-                state.never_forgive_paths.clear();
                 skipped.push(hash);
             }
         }

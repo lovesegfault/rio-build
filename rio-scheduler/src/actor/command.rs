@@ -95,32 +95,9 @@ pub enum ActorCommand {
         final_line_count: u64,
     },
 
-    /// A detached upstream-substitute fetch (spawned by
-    /// `spawn_substitute_fetches`) has finished. `ok=true` → every
-    /// wanted output path now present in rio-store, plus the reference
-    /// closure of everything the walk successfully fetched (a forgiven
-    /// unwanted seed can leave a residual hole — see
-    /// `walk_substitute_closure`); handler completes the derivation.
-    /// `ok=false` → a wanted seed or a discovered reference failed;
-    /// handler reverts to Ready/Queued for normal scheduling.
-    ///
-    /// `forgiven` is the set of seed paths whose fetch FAILED but was
-    /// forgiven because they were outside the wanted set *as of spawn
-    /// time*. The handler re-checks them against the node's CURRENT
-    /// wanted set — a build that merged during the walk can have grown
-    /// the wanted union to include one — and downgrades a stale
-    /// `ok=true` to a revert so the delta gets re-substituted.
-    /// r[sched.substitute.detached+5]
-    SubstituteComplete {
-        drv_hash: DrvHash,
-        ok: bool,
-        forgiven: Vec<String>,
-    },
-
-    /// Byte-level progress from a detached substitute fetch's closure
-    /// walk. `bytes_done`/`bytes_expected` are AGGREGATE across all
-    /// paths in the closure walked so far (`walk_substitute_closure`
-    /// accumulates). Handler emits `Event::SubstituteProgress` to the
+    /// Byte-level progress from a store replica's materialization
+    /// execution (BC-4: posted by the `ReportMaterializationProgress`
+    /// RPC handler). Handler emits `Event::SubstituteProgress` to the
     /// drv's interested builds via the log broadcast ring (display-only;
     /// not persisted). r[gw.activity.subst-progress]
     SubstituteProgress {
@@ -500,14 +477,6 @@ pub enum DebugCmd {
         value: bool,
         reply: oneshot::Sender<bool>,
     },
-    /// Set the `substitute_tried` one-shot directly (in-memory). For
-    /// settlement tests that need the tried bit without driving a full
-    /// walk-failure cycle.
-    SetSubstituteTried {
-        drv_hash: String,
-        value: bool,
-        reply: oneshot::Sender<bool>,
-    },
     /// Clear a derivation's `drv_content`. Simulates the post-recovery
     /// state for the `sched.ca.resolve` recovery-fetch test.
     ClearDrvContent {
@@ -590,7 +559,6 @@ impl ActorCommand {
         match self {
             Self::MergeDag { .. } => "MergeDag",
             Self::ProcessCompletion { .. } => "ProcessCompletion",
-            Self::SubstituteComplete { .. } => "SubstituteComplete",
             Self::SubstituteProgress { .. } => "SubstituteProgress",
             Self::CancelBuild { .. } => "CancelBuild",
             Self::PullAssignment { .. } => "PullAssignment",
