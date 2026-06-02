@@ -104,6 +104,12 @@ let
   # to build-from-json.nix (they're already baked into `base` here).
   remapOpts = [ "--remap-path-prefix=${rust}=/rustc" ];
 
+  # Crates that exist in the workspace ONLY as build-dependencies (their
+  # rlibs link into build_script_build binaries, which buildRustCrate
+  # compiles WITHOUT extraRustcOpts). Excluded from instrumentation
+  # flags in buildRustCrateForPkgs below.
+  buildDepOnlyCrates = [ "rio-buildhash" ];
+
   buildRustCrateForPkgs =
     cratePkgs:
     let
@@ -170,8 +176,19 @@ let
       // {
         extraRustcOpts =
           remapOpts
-          ++ globalExtraRustcOpts
-          ++ lib.optionals isLocal (localExtraRustcOpts ++ [ localRemap ])
+          # Crates consumed exclusively as build-dependencies are HOST
+          # artifacts: buildRustCrate compiles build_script_build without
+          # extraRustcOpts, so instrumentation must not leak into the
+          # rlibs those build scripts link. An asan/sancov rlib (fuzz
+          # tree's localExtraRustcOpts) fails the build-script link with
+          # undefined __asan_*/__sanitizer_cov_* — the binary never gets
+          # the sanitizer runtime — and coverage instrumentation is dead
+          # weight at best. Same reasoning cargo itself applies by never
+          # passing RUSTFLAGS to host units.
+          ++ lib.optionals (!lib.elem crate_.crateName buildDepOnlyCrates) (
+            globalExtraRustcOpts ++ lib.optionals isLocal localExtraRustcOpts
+          )
+          ++ lib.optionals isLocal [ localRemap ]
           ++ (crate_'.extraRustcOpts or [ ]);
       }
       //
