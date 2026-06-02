@@ -148,7 +148,7 @@ pub fn string_list(value: &Value) -> Result<Vec<String>, TypedError> {
 /// - float-stored numbers: `static_cast<uint64_t>(double)` —
 ///   truncation toward zero, with the out-of-range/NaN corners pinned
 ///   to the x86-64 lowering the pinned oracle binary actually executes
-///   (see [`double_to_uint_x86_64`]);
+///   (see `double_to_uint_x86_64` below — private, so not linked);
 /// - non-numbers: an error (the only fail-closed arm — matching
 ///   nlohmann's `type_error.302`).
 ///
