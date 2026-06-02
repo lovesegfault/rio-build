@@ -61,6 +61,14 @@ pub const TENANT_MATRIX: [(&str, &[&str], bool); 3] = [
 /// pod label — the chart's CiliumNetworkPolicies admit the engine only
 /// from that namespace+label pair — and with the replay IRSA trust
 /// binding to `rio-replay:rio-replay` (infra/eks/replay.tf).
+///
+/// The chart-value half of that sync is machine-checked, not just
+/// stated: `replay setup` writes `replay.namespace` from this constant,
+/// and both setup's verify step and the `replay launch` pre-flight read
+/// the deployed CNPs back ([`preflight::verify_cnp_admissions`]) and
+/// refuse when the admissions don't cover this namespace on the engine's
+/// gRPC ports. The IRSA trust subject remains doc-synced only (tofu has
+/// no view of this constant).
 pub const NS_REPLAY: &str = "rio-replay";
 pub const SA_REPLAY: &str = "rio-replay";
 

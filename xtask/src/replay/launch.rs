@@ -1823,9 +1823,10 @@ fn derive_openssh_public_key_line(private_key_pem: &str) -> Result<String> {
 }
 
 /// Launch pre-flight: deployed gateway/scheduler image tags vs this tree,
-/// gateway build-policy entries for the campaign tenants, and per-tenant
-/// upstream sets. Runs ALL checks and reports every failure at once — a
-/// red pre-flight should hand the operator the complete fix list, not its
+/// gateway build-policy entries for the campaign tenants, per-tenant
+/// upstream sets, and the deployed CiliumNetworkPolicy admissions for the
+/// engine. Runs ALL checks and reports every failure at once — a red
+/// pre-flight should hand the operator the complete fix list, not its
 /// first item.
 async fn preflight_checks(
     client: &kclient::Client,
@@ -1874,7 +1875,19 @@ async fn preflight_checks(
         Err(e) => failures.push(format!("read deployed gateway build-policy: {e:#}")),
     }
 
-    // 3. Tenant upstream sets (all three campaign tenants).
+    // 3. CiliumNetworkPolicy admissions: the deployed scheduler-ingress /
+    //    store-ingress must admit the engine on the gRPC ports it dials.
+    //    Same artifact read-back `replay setup` runs after enabling — but
+    //    setup only runs when the operator runs it: a raw-helm value
+    //    drift (replay.namespace != the hardcoded engine namespace) or an
+    //    out-of-band CNP edit between setup and launch would otherwise
+    //    surface as the campaign hanging on silent connect timeouts hours
+    //    in, with nothing pointing at the policy.
+    if let Err(e) = preflight::verify_cnp_admissions(client).await {
+        failures.push(format!("{e:#}"));
+    }
+
+    // 4. Tenant upstream sets (all three campaign tenants).
     let mut upstream_snapshot = BTreeMap::new();
     for (tenant, expected, _) in TENANT_MATRIX {
         let listed = match cli.run(&["upstream", "list", "--tenant", tenant, "--json"]) {

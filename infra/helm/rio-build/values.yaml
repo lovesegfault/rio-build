@@ -132,9 +132,17 @@ networkPolicy:
 # flag but never set it.
 replay:
   enabled: false
-  # Namespace the campaign-engine Jobs run in (created by xtask). The CNP
-  # entries match on this namespace plus the pod label
-  # app.kubernetes.io/name=rio-replay.
+  # Namespace the CNP admission entries match on (paired with the pod
+  # label app.kubernetes.io/name=rio-replay). The engine Jobs themselves
+  # are created by xtask in its hardcoded rio-replay namespace (NS_REPLAY
+  # in xtask/src/replay/mod.rs, matching the IRSA trust subject in
+  # infra/eks/replay.tf), so this value must stay equal to it — any other
+  # value renders policies that admit nothing the engine actually runs
+  # as. `cargo xtask replay setup` writes it from that constant, and both
+  # setup and the `replay launch` pre-flight read the deployed CNPs back
+  # and refuse on mismatch, so a drifted override fails loudly before any
+  # campaign Job exists instead of Cilium silently dropping engine
+  # traffic mid-run.
   namespace: rio-replay
 
 # nix.conf knobs for the rio-nix-conf ConfigMap (mounted into worker
