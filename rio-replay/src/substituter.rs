@@ -32,11 +32,27 @@ use crate::nixcache::NormalizedCacheBase;
 /// take minutes on a slow link.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Overall timeout for one narinfo probe. Probes are ~1 KB and the supply
-/// planner issues thousands of them — a stalled server must not wedge a
-/// probe slot forever. NAR fetches deliberately get NO overall timeout
-/// (bodies can be huge); only [`CONNECT_TIMEOUT`] applies there.
+/// Overall timeout for one narinfo probe, covering the request dispatch AND
+/// the body read on both arms (reqwest's per-request timeout spans the body
+/// on the HTTP arm; one `tokio::time::timeout` spans send + collect on the
+/// S3 arm). Probes are ~1 KB and the supply planner issues thousands of
+/// them — a stalled server must not wedge a probe slot forever, and a
+/// deadline that releases at response headers would still leave the body
+/// read unbounded. NAR fetches deliberately get NO overall timeout (bodies
+/// can be huge); only [`CONNECT_TIMEOUT`] applies there, and their callers
+/// own any header-phase deadline.
 const NARINFO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum narinfo body size buffered by a probe, on both arms. Real
+/// narinfos are ~1 KB (a long references list reaches tens of KB), so
+/// 1 MiB is pure headroom: the cap exists because probe bodies are
+/// buffered wholesale at `narinfo_concurrency` fan-out, and a hostile or
+/// misconfigured cache serving multi-GB objects under `<hash>.narinfo`
+/// names must exhaust its budget here — loudly, naming the cap — instead
+/// of OOMing the engine. NAR fetch bodies are NOT under this cap; they are
+/// bounded by their own declared-size discipline (`fetch_nar`'s
+/// `take(declared_size + 1)`).
+const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 
 /// A binary cache reachable over HTTPS or S3.
 ///
@@ -192,14 +208,27 @@ impl Substituter {
     /// (HTTP 404 / S3 `NoSuchKey`). Authorization problems (HTTP 403 / S3
     /// `AccessDenied`) are errors — they must stay visible, never silently
     /// become "not present".
+    ///
+    /// Bounded in time by [`NARINFO_TIMEOUT`] (dispatch + body, both arms)
+    /// and in size by [`MAX_NARINFO_BYTES`] (both arms).
     pub async fn narinfo(&self, hash_part: &str) -> Result<Option<NarInfo>> {
+        self.narinfo_at(hash_part, NARINFO_TIMEOUT).await
+    }
+
+    /// [`narinfo`](Self::narinfo) with an explicit deadline, so tests can
+    /// pin the deadline's scope (it must cover the body read, not just the
+    /// request dispatch) without waiting out the production constant.
+    async fn narinfo_at(&self, hash_part: &str, deadline: Duration) -> Result<Option<NarInfo>> {
         let object = format!("{hash_part}.narinfo");
         match self {
             Self::Http { base, client } => {
                 let url = base.object_url(&object)?;
+                // reqwest's per-request timeout covers connect, headers,
+                // and every body read below — one deadline for the whole
+                // probe, same scope as the S3 arm's wrapper.
                 let resp = client
                     .get(url.clone())
-                    .timeout(NARINFO_TIMEOUT)
+                    .timeout(deadline)
                     .send()
                     .await
                     .with_context(|| format!("GET {url}"))?;
@@ -213,12 +242,19 @@ impl Substituter {
                 if !status.is_success() {
                     bail!("{url}: HTTP {status}");
                 }
-                let text = resp
-                    .text()
-                    .await
-                    .with_context(|| format!("read narinfo body from {url}"))?;
+                let stream_url = url.clone();
+                let stream = resp
+                    .bytes_stream()
+                    .map_err(move |err| std::io::Error::other(format!("{stream_url}: {err}")));
+                let bytes = read_capped_narinfo_body(
+                    tokio_util::io::StreamReader::new(stream),
+                    url.as_str(),
+                )
+                .await?;
+                let text = std::str::from_utf8(&bytes)
+                    .with_context(|| format!("{url}: narinfo is not valid UTF-8"))?;
                 let info =
-                    NarInfo::parse(&text).with_context(|| format!("{url}: malformed narinfo"))?;
+                    NarInfo::parse(text).with_context(|| format!("{url}: malformed narinfo"))?;
                 Ok(Some(info))
             }
             Self::S3 {
@@ -227,28 +263,41 @@ impl Substituter {
                 prefix,
             } => {
                 let key = s3_object_key(bucket, prefix, &object)?;
-                let send = client.get_object().bucket(bucket).key(&key).send();
-                let resp = match tokio::time::timeout(NARINFO_TIMEOUT, send).await {
-                    Err(_) => bail!(
-                        "narinfo probe for s3://{bucket}/{key} timed out after {}s",
-                        NARINFO_TIMEOUT.as_secs()
-                    ),
-                    Ok(Ok(resp)) => resp,
-                    Ok(Err(err)) if err.as_service_error().is_some_and(|e| e.is_no_such_key()) => {
-                        return Ok(None);
-                    }
-                    Ok(Err(err)) => {
-                        return Err(anyhow::Error::new(err).context(format!(
-                            "GET s3://{bucket}/{key} (access problems are not treated as a miss)"
-                        )));
-                    }
+                // ONE deadline over BOTH phases — the GetObject dispatch
+                // and the body read. A timeout around the send alone would
+                // discharge at response headers and leave the collect free
+                // to pend on a stalled or trickling backend forever.
+                let fetch = async {
+                    let resp = match client.get_object().bucket(bucket).key(&key).send().await {
+                        Ok(resp) => resp,
+                        Err(err) if err.as_service_error().is_some_and(|e| e.is_no_such_key()) => {
+                            return Ok(None);
+                        }
+                        Err(err) => {
+                            return Err(anyhow::Error::new(err).context(format!(
+                                "GET s3://{bucket}/{key} (access problems are not treated as a \
+                                 miss)"
+                            )));
+                        }
+                    };
+                    let bytes = read_capped_narinfo_body(
+                        resp.body.into_async_read(),
+                        &format!("s3://{bucket}/{key}"),
+                    )
+                    .await?;
+                    Ok(Some(bytes))
                 };
-                let bytes = resp
-                    .body
-                    .collect()
-                    .await
-                    .with_context(|| format!("read narinfo body from s3://{bucket}/{key}"))?
-                    .into_bytes();
+                let fetched = match tokio::time::timeout(deadline, fetch).await {
+                    Err(_) => bail!(
+                        "narinfo probe for s3://{bucket}/{key} timed out after {}s (the \
+                         deadline covers the GET dispatch and the body read)",
+                        deadline.as_secs()
+                    ),
+                    Ok(fetched) => fetched?,
+                };
+                let Some(bytes) = fetched else {
+                    return Ok(None);
+                };
                 let text = std::str::from_utf8(&bytes)
                     .with_context(|| format!("s3://{bucket}/{key}: narinfo is not valid UTF-8"))?;
                 let info = NarInfo::parse(text)
@@ -428,6 +477,27 @@ fn s3_object_key(bucket: &str, prefix: &str, object: &str) -> Result<String> {
         ));
     }
     Ok(format!("{prefix}{object}"))
+}
+
+/// Read a narinfo body through a [`MAX_NARINFO_BYTES`]-bounded `take`, so a
+/// probe can never buffer more than the cap no matter what the backend
+/// serves: at most cap + 1 bytes are read, and a body that exceeds the cap
+/// is an error naming it. Both probe arms (HTTP and S3) read through this
+/// helper; time-boundedness is the caller's deadline (it spans this read on
+/// both arms).
+async fn read_capped_narinfo_body(reader: impl AsyncRead + Unpin, source: &str) -> Result<Vec<u8>> {
+    let mut reader = reader.take(MAX_NARINFO_BYTES + 1);
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("read narinfo body from {source}"))?;
+    ensure!(
+        bytes.len() as u64 <= MAX_NARINFO_BYTES,
+        "{source}: narinfo body exceeds the {MAX_NARINFO_BYTES}-byte probe cap — narinfos are \
+         ~1 KB; refusing to buffer a body this large",
+    );
+    Ok(bytes)
 }
 
 /// Wrap a raw (still-compressed) NAR body reader in a streaming decoder for
@@ -1100,6 +1170,197 @@ References:
             sub.fetch_nar(&info).await.unwrap(),
             nar,
             "a same-origin redirect must be followed and the NAR verified"
+        );
+
+        server.abort();
+    }
+
+    /// The probe body cap admits exactly `MAX_NARINFO_BYTES` and refuses
+    /// one byte more (limit / limit+1): the must-admit direction keeps
+    /// legitimate large-references narinfos working, the must-block
+    /// direction is the OOM belt.
+    #[tokio::test]
+    async fn narinfo_body_cap_boundary() {
+        let at_cap = vec![b'x'; MAX_NARINFO_BYTES as usize];
+        let read = read_capped_narinfo_body(std::io::Cursor::new(at_cap.clone()), "test://cap")
+            .await
+            .expect("a body at exactly the cap is admitted");
+        assert_eq!(read.len() as u64, MAX_NARINFO_BYTES);
+
+        let over_cap = vec![b'x'; MAX_NARINFO_BYTES as usize + 1];
+        let err = format!(
+            "{:#}",
+            read_capped_narinfo_body(std::io::Cursor::new(over_cap), "test://cap")
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            err.contains(&MAX_NARINFO_BYTES.to_string()),
+            "the refusal names the cap: {err}"
+        );
+    }
+
+    /// HTTP arm: an oversized narinfo body is refused naming the cap
+    /// (must-block), while a normal-sized narinfo on the same server keeps
+    /// parsing (must-admit) — the cap discriminates on size, not on the
+    /// probe path.
+    #[tokio::test]
+    async fn http_narinfo_body_size_is_capped() {
+        let narinfo_text = "\
+StorePath: /nix/store/b2222222222222222222222222222222-present
+URL: nar/b2222222222222222222222222222222.nar.zst
+Compression: zstd
+NarHash: sha256:0000000000000000000000000000000000000000000000000000
+NarSize: 4242
+References:
+";
+        let routes = HashMap::from([
+            (
+                "/b2222222222222222222222222222222.narinfo".to_string(),
+                (200, narinfo_text.as_bytes().to_vec()),
+            ),
+            (
+                "/e5555555555555555555555555555555.narinfo".to_string(),
+                (200, vec![b'x'; MAX_NARINFO_BYTES as usize + 1024]),
+            ),
+        ]);
+        let (base, server) = spawn_test_server(routes).await;
+        let sub = Substituter::parse(&base).await.unwrap();
+
+        let present = sub
+            .narinfo("b2222222222222222222222222222222")
+            .await
+            .unwrap()
+            .expect("a normal-sized narinfo still parses");
+        assert_eq!(present.nar_size, 4242);
+
+        let err = format!(
+            "{:#}",
+            sub.narinfo("e5555555555555555555555555555555")
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            err.contains(&MAX_NARINFO_BYTES.to_string()),
+            "an oversized narinfo body is refused naming the cap: {err}"
+        );
+
+        server.abort();
+    }
+
+    /// S3 arm: the same size cap applies (must-block, via the SDK mock's
+    /// canned oversized body), and `NoSuchKey` keeps mapping to a
+    /// definitive miss (must-admit for the error taxonomy).
+    #[tokio::test]
+    async fn s3_narinfo_body_size_is_capped_and_no_such_key_is_none() {
+        use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
+        use aws_smithy_mocks::{RuleMode, mock, mock_client};
+
+        let oversized = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            GetObjectOutput::builder()
+                .body(aws_sdk_s3::primitives::ByteStream::from(vec![
+                    b'x';
+                    MAX_NARINFO_BYTES
+                        as usize
+                        + 1024
+                ]))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&oversized]);
+        let sub = Substituter::S3 {
+            client,
+            bucket: "test-cache".into(),
+            prefix: String::new(),
+        };
+        let err = format!(
+            "{:#}",
+            sub.narinfo("a1111111111111111111111111111111")
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            err.contains(&MAX_NARINFO_BYTES.to_string()),
+            "an oversized S3 narinfo body is refused naming the cap: {err}"
+        );
+
+        let missing = mock!(aws_sdk_s3::Client::get_object).then_error(|| {
+            GetObjectError::NoSuchKey(aws_sdk_s3::types::error::NoSuchKey::builder().build())
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&missing]);
+        let sub = Substituter::S3 {
+            client,
+            bucket: "test-cache".into(),
+            prefix: String::new(),
+        };
+        assert!(
+            sub.narinfo("a1111111111111111111111111111111")
+                .await
+                .unwrap()
+                .is_none(),
+            "NoSuchKey stays a definitive miss"
+        );
+    }
+
+    /// S3 arm: the probe deadline covers the BODY read, not just the
+    /// GetObject dispatch. A backend that returns response headers and then
+    /// stalls the body forever must fail the probe at the deadline — before
+    /// this bound, the `collect` pended indefinitely (modulo an undocumented
+    /// SDK stalled-stream floor) while holding a probe slot.
+    #[tokio::test]
+    async fn s3_narinfo_deadline_covers_the_body_read() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // Minimal HTTP/1.1 endpoint: answer the GET with 200 + a large
+        // declared content-length, then never send a single body byte.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let head = "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\n\
+                                content-length: 1048576\r\n\r\n";
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    // Hold the socket open without writing the body.
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        // Build the S3 variant directly: `parse` refuses `endpoint=` by
+        // design, and the stall scope under test is the probe's, not the
+        // admission screen's.
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .endpoint_url(format!("http://{addr}"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .force_path_style(true)
+            .build();
+        let sub = Substituter::S3 {
+            client: aws_sdk_s3::Client::from_conf(config),
+            bucket: "stalled".into(),
+            prefix: String::new(),
+        };
+
+        let probe = sub.narinfo_at(
+            "a1111111111111111111111111111111",
+            Duration::from_millis(300),
+        );
+        let err = tokio::time::timeout(Duration::from_secs(20), probe)
+            .await
+            .expect("the probe deadline must fire while the body stalls — it may not pend")
+            .expect_err("a stalled body cannot produce a narinfo");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("timed out"),
+            "the failure names the probe deadline: {msg}"
         );
 
         server.abort();
