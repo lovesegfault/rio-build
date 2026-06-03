@@ -1177,7 +1177,7 @@ builds classify Broken, so a reap-truncated or stale child set cannot read
 as Vouched and no breadcrumb is needed (the relation read is never a
 truncated in-memory view).
 
-#r("sched.evidence.durability+3")[
+#r("sched.evidence.durability+4")[
   A durable scheduler write whose loss would leave PG missing state the
   in-memory view relies on MUST be transactional with the state it
   describes: materialization-job creation rides the merge transaction for
@@ -1208,7 +1208,16 @@ truncated in-memory view).
   not a serializability proof). The comparison is at-or-above (`>=`): a
   write carrying a generation equal to the floor is the same-epoch
   re-acquire keep that #rref("sched.lease.generation-claim") requires, and
-  MUST apply.
+  MUST apply. The fence MUST be a capability, not a recipe: decision-state
+  write transactions are constructed exclusively through a single fenced
+  constructor whose returned transaction handle is the proof the floor
+  check ran on that transaction's own connection (the floor-read SQL and
+  the comparison are private to the persistence layer), the pre-commit
+  re-check is a method of that handle, and the active `assignments` row
+  has exactly one closer — exec-scoped, never derivation-keyed — so an
+  open-coded floor compare, a forgotten fence, or a deposed replica
+  closing a successor's re-minted assignment row is a compile-time error,
+  not a review finding.
 ]
 The in-tx-or-fenced split is the load-bearing durability decision, carried
 over from the predecessor evidence design: state whose loss would make the
@@ -3192,6 +3201,27 @@ were deleted with the WatchBuild resumability layer in favor of
   transitions, so the brief dual-writer windows the lease model prices do not
   corrupt state.
 ]
+
+#r("sched.lease.fence-statement-guard")[
+  The pull mint's active-row upsert MUST carry its generation predicate
+  in-statement: the `ON CONFLICT … DO UPDATE` arm is guarded by
+  `WHERE assignments.generation <= EXCLUDED.generation`, and a
+  predicate-refused upsert MUST abort the mint transaction having written
+  nothing (no execution row for an assignment the mint never owned),
+  surfacing as the same retryable not-leader refusal as the begin-time
+  fence.
+]
+The begin-time floor read is advisory under READ COMMITTED: a successor's
+claim and re-mint can commit between the floor read and the upsert, and the
+Rust-side comparison passes on the stale floor. The statement guard is the
+authoritative half — PostgreSQL evaluates the conflict-arm `WHERE` against
+the row's latest committed version (EvalPlanQual), so the destructive
+overwrite of a newer tenure's row updates zero rows regardless of snapshot
+age. Equality passes (`<=`): the same-epoch re-acquire keep. The residual —
+a fresh INSERT below the floor when no active conflict row exists to
+evaluate against — cannot regress any newer row by construction; it is
+priced in `fence-invariant-map.md` and bounded in `fencedWrites.qnt`
+(`activeRowGenMonotonic` holds even with the residual reachable).
 
 A local counter cannot provide the distinctness half of this rule: an
 incremented-in-memory generation seeded from a high-water mark collides

@@ -3533,7 +3533,7 @@ in
     # column-agnostic core of the durability rule (the evidence-column
     # subject was deleted; migration 080). Falsifiability pair:
     # quint-materialization-calib-f11-unfenced-resolve.
-    # r[verify sched.evidence.durability+3]
+    # r[verify sched.evidence.durability+4]
     quint-materialization-holds-stale-tenure = mkQuintSimHoldsCheck {
       name = "materialization-holds-stale-tenure";
       spec = "materializationJob";

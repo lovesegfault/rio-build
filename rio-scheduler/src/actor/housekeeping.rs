@@ -379,13 +379,16 @@ impl DagActor {
                 .record_reset_with_clear_poison(&drv_hash, reset_row)
                 .await
             {
-                Ok(crate::db::FencedWrite::Applied(_)) => {}
-                // r[impl sched.evidence.durability+3]
+                Ok(
+                    crate::db::FencedOutcome::Applied(_)
+                    | crate::db::FencedOutcome::AlreadyResolved,
+                ) => {}
+                // r[impl sched.evidence.durability+4]
                 // Fenced: deposed replica. The PG clear did not happen,
                 // so the PG-first contract skips the in-memory removal
                 // exactly like the PG-failure arm — the successor owns
                 // this poison's lifecycle now.
-                Ok(crate::db::FencedWrite::Fenced) => {
+                Ok(crate::db::FencedOutcome::Fenced) => {
                     continue;
                 }
                 Err(e) => {
@@ -678,16 +681,28 @@ impl DagActor {
                 let expected = state.expected_output_paths.clone();
                 self.adopt_orphan_completion(&drv_hash, &Some(executor.clone()), expected)
                     .await;
-                if let Err(e) = self
+                // r[impl sched.evidence.durability+4]
+                // Fenced + exec_id-scoped: a deposed replica's sweep
+                // can no longer close a successor's re-minted
+                // assignment row (the derivation_id-keyed unfenced
+                // closer this replaces could).
+                match self
                     .db
-                    .update_assignment_status(
-                        attempt.derivation_id,
-                        crate::db::AssignmentStatus::Completed,
+                    .close_assignment_fenced(
+                        attempt.exec_id,
+                        crate::db::AssignmentCloseStatus::Completed,
+                        self.serving_generation(),
                     )
                     .await
                 {
-                    warn!(drv_hash = %drv_hash, error = %e,
-                          "establishment adopt: failed to close the assignment row");
+                    Ok(o) if o.settled() => {}
+                    Ok(_) => {
+                        self.note_fenced_evidence_write("establishment adopt assignment close");
+                    }
+                    Err(e) => {
+                        warn!(drv_hash = %drv_hash, error = %e,
+                              "establishment adopt: failed to close the assignment row");
+                    }
                 }
                 info!(drv_hash = %drv_hash, exec_id = %attempt.exec_id,
                       "establishment sweep: outputs present in store, adopted as completed (no charge)");
@@ -727,35 +742,22 @@ impl DagActor {
         row.termination_reason = Some("unreported".into());
         type ChargeOutcome = Option<(bool, crate::retry_policy::Decision)>;
         let result: Result<ChargeOutcome, sqlx::Error> = async {
-            let mut tx = self.db.pool().begin().await?;
             // r[impl sched.lease.generation-fence+3]
             // The same generation fence the pull transaction applies:
             // a below-floor serving generation writes nothing.
-            let floor: Option<i64> = sqlx::query_scalar(
-                "SELECT GREATEST( \
-                     (SELECT MAX(generation) FROM assignments), \
-                     (SELECT MAX(generation) FROM leader_generation_claims))",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            if floor.is_some_and(|f| serving_generation < f) {
-                tx.rollback().await?;
-                return Ok(None);
-            }
-            let (won, decision) = self.append_and_decide_in_tx(&mut tx, &row).await?;
+            let mut tx = match self.db.begin_fenced(serving_generation).await? {
+                crate::db::FencedBegin::Fenced { .. } => return Ok(None),
+                crate::db::FencedBegin::Open(ftx) => ftx,
+            };
+            let (won, decision) = self.append_and_decide_in_tx(tx.conn(), &row).await?;
             if won
                 && verdict_eligible
                 && matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_))
             {
-                crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash).await?;
+                crate::db::SchedulerDb::persist_poisoned_in_tx(tx.conn(), &drv_hash).await?;
             }
-            sqlx::query(
-                "UPDATE assignments SET status = 'failed', completed_at = now() \
-                 WHERE exec_id = $1 AND status IN ('pending', 'acknowledged')",
-            )
-            .bind(attempt.exec_id)
-            .execute(&mut *tx)
-            .await?;
+            tx.close_assignment(attempt.exec_id, crate::db::AssignmentCloseStatus::Failed)
+                .await?;
             tx.commit().await?;
             Ok(Some((won, decision)))
         }

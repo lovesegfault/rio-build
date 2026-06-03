@@ -716,7 +716,7 @@ pub enum ActorError {
     #[error("not leader (standby replica)")]
     NotLeader,
 
-    // r[impl sched.evidence.durability+3]
+    // r[impl sched.evidence.durability+4]
     /// The merge transaction's claims-floor fence rejected the write:
     /// this replica's serving generation sits below the durable floor
     /// (a successor has claimed), so committing the merge would let a

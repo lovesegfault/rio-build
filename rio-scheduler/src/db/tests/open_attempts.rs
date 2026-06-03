@@ -195,7 +195,10 @@ async fn mint_persists_dispatched_deadline_and_view_returns_it() -> anyhow::Resu
             crate::state::AttemptKind::Build,
         )
         .await?;
-    assert!(committed, "the fenced mint commits on a fresh cluster");
+    assert!(
+        committed.settled(),
+        "the fenced mint commits on a fresh cluster"
+    );
 
     let rows = db.list_open_pull_attempts().await?;
     assert_eq!(rows.len(), 1);

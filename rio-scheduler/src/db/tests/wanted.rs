@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use super::insert_test_derivation;
 use crate::db::wanted::WantedRow;
-use crate::db::{FencedWrite, SchedulerDb};
+use crate::db::{FencedOutcome, SchedulerDb};
 use crate::state::BuildState;
 
 /// Fresh ephemeral PG + a SchedulerDb handle.
@@ -78,7 +78,7 @@ async fn wanted_rows_recorded_and_isolated_per_build() -> anyhow::Result<()> {
             ],
         )
         .await?;
-    assert_eq!(applied, FencedWrite::Applied(2), "two rows recorded");
+    assert_eq!(applied, FencedOutcome::Applied(2), "two rows recorded");
     let applied = db
         .record_wanted_fenced(
             1,
@@ -89,18 +89,20 @@ async fn wanted_rows_recorded_and_isolated_per_build() -> anyhow::Result<()> {
             }],
         )
         .await?;
-    assert_eq!(applied, FencedWrite::Applied(1));
+    assert_eq!(applied, FencedOutcome::Applied(1));
 
     // Re-record b1's d1 contribution: replaces b1's row only.
-    db.record_wanted_fenced(
-        1,
-        &[WantedRow {
-            build_id: b1,
-            derivation_id: d1,
-            wanted_output_names: &["out".to_string(), "doc".to_string()],
-        }],
-    )
-    .await?;
+    let fenced_outcome = db
+        .record_wanted_fenced(
+            1,
+            &[WantedRow {
+                build_id: b1,
+                derivation_id: d1,
+                wanted_output_names: &["out".to_string(), "doc".to_string()],
+            }],
+        )
+        .await?;
+    assert!(fenced_outcome.settled());
 
     let d1_rows = raw_rows(&test_db.pool, d1).await?;
     assert_eq!(d1_rows.len(), 2, "both builds' d1 rows coexist");
@@ -150,15 +152,17 @@ async fn effective_wanted_union_is_live_only_and_saturating() -> anyhow::Result<
         (b2, vec!["dev".to_string()]),
         (b3, vec!["doc".to_string()]),
     ] {
-        db.record_wanted_fenced(
-            1,
-            &[WantedRow {
-                build_id: b,
-                derivation_id: d,
-                wanted_output_names: &names,
-            }],
-        )
-        .await?;
+        let fenced_outcome = db
+            .record_wanted_fenced(
+                1,
+                &[WantedRow {
+                    build_id: b,
+                    derivation_id: d,
+                    wanted_output_names: &names,
+                }],
+            )
+            .await?;
+        assert!(fenced_outcome.settled());
     }
 
     // Union over live builds only: b3's 'doc' is excluded.
@@ -172,15 +176,17 @@ async fn effective_wanted_union_is_live_only_and_saturating() -> anyhow::Result<
     );
 
     // An empty contribution saturates the union to "all declared".
-    db.record_wanted_fenced(
-        1,
-        &[WantedRow {
-            build_id: b2,
-            derivation_id: d,
-            wanted_output_names: &[],
-        }],
-    )
-    .await?;
+    let fenced_outcome = db
+        .record_wanted_fenced(
+            1,
+            &[WantedRow {
+                build_id: b2,
+                derivation_id: d,
+                wanted_output_names: &[],
+            }],
+        )
+        .await?;
+    assert!(fenced_outcome.settled());
     assert_eq!(
         db.effective_wanted_union(d).await?,
         Some(Vec::new()),
@@ -208,7 +214,7 @@ async fn effective_wanted_union_is_live_only_and_saturating() -> anyhow::Result<
 }
 
 /// (c) The fence: `record_wanted_fenced` with a serving generation
-/// below the durable claims floor → `FencedWrite::Fenced`, zero rows
+/// below the durable claims floor → `FencedOutcome::Fenced`, zero rows
 /// written (the A17/A18 extension the Phase A exit gate names).
 // r[verify sched.materialize.job+2]
 #[tokio::test]
@@ -240,7 +246,7 @@ async fn wanted_write_below_floor_is_fenced() -> anyhow::Result<()> {
         .await?;
     assert_eq!(
         outcome,
-        FencedWrite::Fenced,
+        FencedOutcome::Fenced,
         "below-floor wanted write must be fenced"
     );
     assert!(
@@ -261,7 +267,7 @@ async fn wanted_write_below_floor_is_fenced() -> anyhow::Result<()> {
         .await?;
     assert_eq!(
         outcome,
-        FencedWrite::Applied(1),
+        FencedOutcome::Applied(1),
         "an at-the-floor wanted write must apply"
     );
     assert_eq!(raw_rows(&test_db.pool, d).await?.len(), 1);
@@ -279,22 +285,24 @@ async fn wanted_rows_purged_with_build() -> anyhow::Result<()> {
     let b1 = insert_test_build(&db).await?;
     let b2 = insert_test_build(&db).await?;
 
-    db.record_wanted_fenced(
-        1,
-        &[
-            WantedRow {
-                build_id: b1,
-                derivation_id: d,
-                wanted_output_names: &["out".to_string()],
-            },
-            WantedRow {
-                build_id: b2,
-                derivation_id: d,
-                wanted_output_names: &["out".to_string()],
-            },
-        ],
-    )
-    .await?;
+    let fenced_outcome = db
+        .record_wanted_fenced(
+            1,
+            &[
+                WantedRow {
+                    build_id: b1,
+                    derivation_id: d,
+                    wanted_output_names: &["out".to_string()],
+                },
+                WantedRow {
+                    build_id: b2,
+                    derivation_id: d,
+                    wanted_output_names: &["out".to_string()],
+                },
+            ],
+        )
+        .await?;
+    assert!(fenced_outcome.settled());
 
     // A pending job for the derivation so the interest view has a
     // job to derive interest for.
@@ -325,7 +333,10 @@ async fn wanted_rows_purged_with_build() -> anyhow::Result<()> {
     );
 
     // Purge b1's contributions.
-    let deleted = db.delete_wanted_for_build(b1).await?;
+    let deleted = match db.delete_wanted_for_build(b1, 1).await? {
+        crate::db::FencedOutcome::Applied(n) => n,
+        other => panic!("expected Applied, got {other:?}"),
+    };
     assert_eq!(deleted, 1, "exactly b1's one row deleted");
 
     let d_rows = raw_rows(&test_db.pool, d).await?;

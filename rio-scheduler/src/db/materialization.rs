@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use super::{FencedWrite, SchedulerDb};
+use super::{FencedBegin, FencedOutcome, SchedulerDb};
 use crate::state::{JobOrigin, JobState};
 
 /// One materialization-job row, as the store poll and the consumption
@@ -288,14 +288,12 @@ impl SchedulerDb {
         carried_realized_paths: Option<&[String]>,
         serving_generation: i64,
     ) -> Result<FencedJobCreate, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        let floor = Self::claims_floor(&mut tx).await?;
-        if !Self::at_or_above_floor(floor, serving_generation) {
-            tx.rollback().await?;
-            return Ok(FencedJobCreate::Fenced);
-        }
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            FencedBegin::Fenced { .. } => return Ok(FencedJobCreate::Fenced),
+            FencedBegin::Open(ftx) => ftx,
+        };
         let created = Self::create_materialization_jobs_in_tx(
-            &mut tx,
+            tx.conn(),
             &[NewJobRow {
                 derivation_id,
                 drv_hash,
@@ -360,17 +358,15 @@ impl SchedulerDb {
         resolution_exec_id: Option<Uuid>,
         to_state: JobState,
         serving_generation: i64,
-    ) -> Result<FencedWrite, sqlx::Error> {
+    ) -> Result<FencedOutcome, sqlx::Error> {
         debug_assert!(
             to_state != JobState::Pending,
             "resolution target must be a terminal job state"
         );
-        let mut tx = self.pool.begin().await?;
-        let floor = Self::claims_floor(&mut tx).await?;
-        if !Self::at_or_above_floor(floor, serving_generation) {
-            tx.rollback().await?;
-            return Ok(FencedWrite::Fenced);
-        }
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
+            FencedBegin::Open(ftx) => ftx,
+        };
         let result = sqlx::query(
             "UPDATE materialization_jobs \
                 SET state = $2, resolution_exec_id = $3, resolved_at = now() \
@@ -379,10 +375,10 @@ impl SchedulerDb {
         .bind(job_id)
         .bind(to_state.as_str())
         .bind(resolution_exec_id)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
         tx.commit().await?;
-        Ok(FencedWrite::Applied(result.rows_affected()))
+        Ok(FencedOutcome::Applied(result.rows_affected()))
     }
 
     /// Park (infra-budget exhaustion, design §2.5) — the job stays
@@ -393,13 +389,11 @@ impl SchedulerDb {
         job_id: Uuid,
         park_until_epoch: f64,
         serving_generation: i64,
-    ) -> Result<FencedWrite, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        let floor = Self::claims_floor(&mut tx).await?;
-        if !Self::at_or_above_floor(floor, serving_generation) {
-            tx.rollback().await?;
-            return Ok(FencedWrite::Fenced);
-        }
+    ) -> Result<FencedOutcome, sqlx::Error> {
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
+            FencedBegin::Open(ftx) => ftx,
+        };
         let result = sqlx::query(
             "UPDATE materialization_jobs \
                 SET park_until = to_timestamp($2), park_began_at = now() \
@@ -407,10 +401,10 @@ impl SchedulerDb {
         )
         .bind(job_id)
         .bind(park_until_epoch)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
         tx.commit().await?;
-        Ok(FencedWrite::Applied(result.rows_affected()))
+        Ok(FencedOutcome::Applied(result.rows_affected()))
     }
 
     /// Cancel every unresolved job for a derivation (the zero-live-
@@ -419,23 +413,21 @@ impl SchedulerDb {
         &self,
         derivation_id: Uuid,
         serving_generation: i64,
-    ) -> Result<FencedWrite, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        let floor = Self::claims_floor(&mut tx).await?;
-        if !Self::at_or_above_floor(floor, serving_generation) {
-            tx.rollback().await?;
-            return Ok(FencedWrite::Fenced);
-        }
+    ) -> Result<FencedOutcome, sqlx::Error> {
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
+            FencedBegin::Open(ftx) => ftx,
+        };
         let result = sqlx::query(
             "UPDATE materialization_jobs \
                 SET state = 'cancelled', resolved_at = now() \
               WHERE derivation_id = $1 AND state = 'pending'",
         )
         .bind(derivation_id)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
         tx.commit().await?;
-        Ok(FencedWrite::Applied(result.rows_affected()))
+        Ok(FencedOutcome::Applied(result.rows_affected()))
     }
 
     /// The unresolved (pending) job for one derivation, if any — the

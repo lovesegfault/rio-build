@@ -906,7 +906,7 @@ async fn test_recovery_seeds_generation_from_unpersisted_claim() -> TestResult {
 /// turning the PG assertions below red. If a fencing change makes this
 /// test fail, the capture design is wrong (stop-and-report condition
 /// 2); do NOT adjust this test.
-// r[verify sched.evidence.durability+3]
+// r[verify sched.evidence.durability+4]
 #[tokio::test]
 async fn saturated_floor_recovery_evidence_writes_land() -> TestResult {
     let b_poison = Uuid::new_v4(); // owner of the poisoned-dep pair D→E

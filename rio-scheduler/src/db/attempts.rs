@@ -418,13 +418,22 @@ impl SchedulerDb {
     /// `source_node` (the controller-reported kube-authoritative node,
     /// AD2c) is stamped only when the row does not already carry one —
     /// the pull-mint / worker-report attribution wins when present.
+    /// Claims-floor fenced: a deposed replica's late controller
+    /// installment writes nothing (`Fenced`); `Applied(1)` = THIS call
+    /// filled it; `AlreadyResolved` = the first-writer-wins guard found
+    /// it already filled (or no matching row).
     pub(crate) async fn fill_termination_reason_only(
         &self,
         derivation_id: Uuid,
         exec_id: Uuid,
         termination_reason: &str,
         source_node: Option<&str>,
-    ) -> Result<bool, sqlx::Error> {
+        serving_generation: i64,
+    ) -> Result<super::FencedOutcome, sqlx::Error> {
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            super::FencedBegin::Fenced { .. } => return Ok(super::FencedOutcome::Fenced),
+            super::FencedBegin::Open(ftx) => ftx,
+        };
         let result = sqlx::query(
             "UPDATE drv_attempts \
              SET termination_reason = $3, \
@@ -436,9 +445,14 @@ impl SchedulerDb {
         .bind(exec_id)
         .bind(termination_reason)
         .bind(source_node)
-        .execute(&self.pool)
+        .execute(tx.conn())
         .await?;
-        Ok(result.rows_affected() == 1)
+        tx.commit().await?;
+        if result.rows_affected() == 1 {
+            Ok(super::FencedOutcome::Applied(1))
+        } else {
+            Ok(super::FencedOutcome::AlreadyResolved)
+        }
     }
 
     /// Single-derivation suffix load **inside the caller's transaction**

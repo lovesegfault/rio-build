@@ -77,7 +77,7 @@ fn test_actor_error_to_status_all_arms() {
         ),
         (ActorError::NotLeader, Code::Unavailable, "not leader"),
         (
-            // r[verify sched.evidence.durability+3]
+            // r[verify sched.evidence.durability+4]
             ActorError::StaleGeneration {
                 serving: 1,
                 floor: 2,

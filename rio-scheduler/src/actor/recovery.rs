@@ -341,7 +341,7 @@ impl DagActor {
                 info!(drv_hash = %row.drv_hash, elapsed_secs = row.elapsed_secs,
                       "poison already past TTL at recovery — clearing");
                 let hash: crate::state::DrvHash = row.drv_hash.into();
-                // r[impl sched.evidence.durability+3]
+                // r[impl sched.evidence.durability+4]
                 // Ordering tripwire: this recovery-time fenced write
                 // must run AFTER handle_leader_acquired's generation
                 // claim stamped serving_generation (the claims-floor
@@ -354,7 +354,7 @@ impl DagActor {
                     self.serving_generation
                 );
                 match self.db.clear_poison(&hash, self.serving_generation()).await {
-                    Ok(crate::db::FencedWrite::Fenced) => {
+                    Ok(crate::db::FencedOutcome::Fenced) => {
                         self.note_fenced_evidence_write("expired-at-load poison clear");
                     }
                     Ok(_) => {}
@@ -1280,8 +1280,15 @@ impl DagActor {
         // load's outcome — same TOCTOU-window placement as
         // sweep_stale_live_pins above.
         // r[impl sched.db.assignment-stale-sweep]
-        match self.db.sweep_stale_assignments().await {
-            Ok(n) if n > 0 => {
+        match self
+            .db
+            .sweep_stale_assignments(self.serving_generation())
+            .await
+        {
+            Ok(crate::db::FencedOutcome::Fenced) => {
+                self.note_fenced_evidence_write("stale-assignment repair sweep");
+            }
+            Ok(crate::db::FencedOutcome::Applied(n)) if n > 0 => {
                 info!(
                     swept = n,
                     "swept stale assignments (terminal derivation, pending assignment)"
@@ -1580,7 +1587,7 @@ impl DagActor {
         // reads a floor that covers our claim and exceeds it.
         let rounds_at_claim = self.leader.renew_rounds_started();
 
-        // r[impl sched.evidence.durability+3]
+        // r[impl sched.evidence.durability+4]
         // The claim above is durable (or, on the unclaimed degradation
         // paths, was at least offered to the ledger): every evidence
         // write this tenure issues from here on — starting with

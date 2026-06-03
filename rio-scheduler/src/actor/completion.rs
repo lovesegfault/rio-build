@@ -143,7 +143,7 @@ impl DagActor {
     /// (`sched.evidence.durability`): a deposed replica's transaction
     /// rolls back having written nothing — no attempt row, no poison —
     /// and pushes no in-memory mirror.
-    // r[impl sched.evidence.durability+3]
+    // r[impl sched.evidence.durability+4]
     pub(super) async fn record_attempt_with_poison(
         &mut self,
         drv_hash: &DrvHash,
@@ -154,14 +154,14 @@ impl DagActor {
             return;
         };
         let result: Result<Option<bool>, sqlx::Error> = async {
-            let mut tx = self.db.pool().begin().await?;
-            let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
-            if !crate::db::SchedulerDb::at_or_above_floor(floor, self.serving_generation()) {
-                tx.rollback().await?;
-                return Ok(None);
-            }
-            let inserted = crate::db::SchedulerDb::append_attempt(&mut tx, &row).await?;
-            crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
+            let mut tx = match self.db.begin_fenced(self.serving_generation()).await? {
+                crate::db::FencedBegin::Fenced { .. } => {
+                    return Ok(None);
+                }
+                crate::db::FencedBegin::Open(ftx) => ftx,
+            };
+            let inserted = crate::db::SchedulerDb::append_attempt(tx.conn(), &row).await?;
+            crate::db::SchedulerDb::persist_poisoned_in_tx(tx.conn(), drv_hash).await?;
             tx.commit().await?;
             Ok(Some(inserted))
         }
@@ -297,26 +297,26 @@ impl DagActor {
     /// Claims-floor fenced at the transaction start
     /// (`sched.evidence.durability`): a deposed replica's reset rolls
     /// back having written nothing and returns
-    /// [`crate::db::FencedWrite::Fenced`] — callers treat it like the
+    /// [`crate::db::FencedOutcome::Fenced`] — callers treat it like the
     /// PG-failure arm of their existing contract (nothing was cleared),
     /// minus the error log.
-    // r[impl sched.evidence.durability+3]
+    // r[impl sched.evidence.durability+4]
     pub(super) async fn record_reset_with_clear_poison(
         &mut self,
         drv_hash: &DrvHash,
         row: Option<AttemptRow>,
-    ) -> Result<crate::db::FencedWrite, sqlx::Error> {
-        let mut tx = self.db.pool().begin().await?;
-        let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
-        if !crate::db::SchedulerDb::at_or_above_floor(floor, self.serving_generation()) {
-            tx.rollback().await?;
-            self.note_fenced_evidence_write("poison-clear reset appending transaction");
-            return Ok(crate::db::FencedWrite::Fenced);
-        }
+    ) -> Result<crate::db::FencedOutcome, sqlx::Error> {
+        let mut tx = match self.db.begin_fenced(self.serving_generation()).await? {
+            crate::db::FencedBegin::Fenced { .. } => {
+                self.note_fenced_evidence_write("poison-clear reset appending transaction");
+                return Ok(crate::db::FencedOutcome::Fenced);
+            }
+            crate::db::FencedBegin::Open(ftx) => ftx,
+        };
         if let Some(row) = &row {
-            crate::db::SchedulerDb::append_attempt(&mut tx, row).await?;
+            crate::db::SchedulerDb::append_attempt(tx.conn(), row).await?;
         }
-        crate::db::SchedulerDb::clear_poison_in_tx(&mut tx, drv_hash).await?;
+        crate::db::SchedulerDb::clear_poison_in_tx(tx.conn(), drv_hash).await?;
         tx.commit().await?;
         if let Some(row) = row {
             if let Some(state) = self.dag.node_mut(drv_hash) {
@@ -324,7 +324,7 @@ impl DagActor {
             }
             self.refresh_retry_view(drv_hash);
         }
-        Ok(crate::db::FencedWrite::Applied(1))
+        Ok(crate::db::FencedOutcome::Applied(1))
     }
 
     /// 1a appending transaction for the resubmit reset: one
@@ -337,11 +337,11 @@ impl DagActor {
     /// Claims-floor fenced at the transaction start
     /// (`sched.evidence.durability`): a deposed replica's reset rolls
     /// back having written nothing and pushes no in-memory mirror.
-    // r[impl sched.evidence.durability+3]
+    // r[impl sched.evidence.durability+4]
     pub(super) async fn record_resubmit_resets(
         &mut self,
         reset_on_resubmit: &[DrvHash],
-    ) -> Result<crate::db::FencedWrite, sqlx::Error> {
+    ) -> Result<crate::db::FencedOutcome, sqlx::Error> {
         let rows: Vec<(DrvHash, AttemptRow)> = reset_on_resubmit
             .iter()
             .filter_map(|h| {
@@ -352,15 +352,15 @@ impl DagActor {
             })
             .collect();
         let batch: Vec<AttemptRow> = rows.iter().map(|(_, r)| r.clone()).collect();
-        let mut tx = self.db.pool().begin().await?;
-        let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
-        if !crate::db::SchedulerDb::at_or_above_floor(floor, self.serving_generation()) {
-            tx.rollback().await?;
-            self.note_fenced_evidence_write("resubmit-reset appending transaction");
-            return Ok(crate::db::FencedWrite::Fenced);
-        }
-        crate::db::SchedulerDb::append_attempts_batch(&mut tx, &batch).await?;
-        crate::db::SchedulerDb::clear_poison_batch_in_tx(&mut tx, reset_on_resubmit).await?;
+        let mut tx = match self.db.begin_fenced(self.serving_generation()).await? {
+            crate::db::FencedBegin::Fenced { .. } => {
+                self.note_fenced_evidence_write("resubmit-reset appending transaction");
+                return Ok(crate::db::FencedOutcome::Fenced);
+            }
+            crate::db::FencedBegin::Open(ftx) => ftx,
+        };
+        crate::db::SchedulerDb::append_attempts_batch(tx.conn(), &batch).await?;
+        crate::db::SchedulerDb::clear_poison_batch_in_tx(tx.conn(), reset_on_resubmit).await?;
         tx.commit().await?;
         let applied = rows.len() as u64;
         for (hash, row) in rows {
@@ -369,7 +369,7 @@ impl DagActor {
             }
             self.refresh_retry_view(&hash);
         }
-        Ok(crate::db::FencedWrite::Applied(applied))
+        Ok(crate::db::FencedOutcome::Applied(applied))
     }
 
     // -----------------------------------------------------------------------
@@ -382,7 +382,7 @@ impl DagActor {
     /// PG is recovery-only). Claims-floor fenced
     /// (`sched.evidence.durability`): a Fenced outcome is the fence
     /// refusing a deposed replica's write — warn + count + continue.
-    // r[impl sched.evidence.durability+3]
+    // r[impl sched.evidence.durability+4]
     pub(super) async fn persist_status(
         &self,
         drv_hash: &DrvHash,
@@ -398,7 +398,7 @@ impl DagActor {
             .update_derivation_status(drv_hash, status, executor_id, self.serving_generation())
             .await
         {
-            Ok(crate::db::FencedWrite::Fenced) => {
+            Ok(crate::db::FencedOutcome::Fenced) => {
                 self.note_fenced_evidence_write("derivation status persist");
             }
             Ok(_) => {}
@@ -413,14 +413,14 @@ impl DagActor {
     /// Single SQL UPDATE — no crash window between the two columns.
     /// Logs error!, never returns it (same semantics as `persist_status`).
     /// Claims-floor fenced (`sched.evidence.durability`), same posture.
-    // r[impl sched.evidence.durability+3]
+    // r[impl sched.evidence.durability+4]
     pub(super) async fn persist_poisoned(&self, drv_hash: &DrvHash) {
         match self
             .db
             .persist_poisoned(drv_hash, self.serving_generation())
             .await
         {
-            Ok(crate::db::FencedWrite::Fenced) => {
+            Ok(crate::db::FencedOutcome::Fenced) => {
                 self.note_fenced_evidence_write("poison persist");
             }
             Ok(_) => {}
@@ -452,14 +452,14 @@ impl DagActor {
     /// [`persist_status`].
     ///
     /// [`persist_status`]: Self::persist_status
-    // r[impl sched.evidence.durability+3]
+    // r[impl sched.evidence.durability+4]
     pub(super) async fn persist_status_batch(&self, drv_hashes: &[&str], status: DerivationStatus) {
         match self
             .db
             .update_derivation_status_batch(drv_hashes, status, self.serving_generation())
             .await
         {
-            Ok(crate::db::FencedWrite::Fenced) => {
+            Ok(crate::db::FencedOutcome::Fenced) => {
                 self.note_fenced_evidence_write("derivation status batch persist");
             }
             Ok(_) => {}
@@ -892,11 +892,22 @@ impl DagActor {
         // re-OOM at probe defaults. Outside the node_mut borrow
         // (await point); best-effort — a lost write degrades to one
         // wasted retry.
-        if let Some(floor) = &new_floor
-            && let Err(e) = self.db.update_resource_floor(drv_hash, floor).await
-        {
-            error!(drv_hash = %drv_hash, ?floor, error = %e,
-                   "failed to persist resource_floor");
+        // Fenced + server-side GREATEST ratchet: a deposed replica's
+        // late OOM report writes nothing, and a same-tenure stale base
+        // can never lower a promoted dimension.
+        if let Some(floor) = &new_floor {
+            match self
+                .db
+                .update_resource_floor(drv_hash, floor, self.serving_generation())
+                .await
+            {
+                Ok(o) if o.settled() => {}
+                Ok(_) => self.note_fenced_evidence_write("resource-floor persist"),
+                Err(e) => {
+                    error!(drv_hash = %drv_hash, ?floor, error = %e,
+                           "failed to persist resource_floor");
+                }
+            }
         }
         outcome
     }
@@ -2549,14 +2560,16 @@ impl DagActor {
             .record_reset_with_clear_poison(drv_hash, reset_row)
             .await
         {
-            Ok(crate::db::FencedWrite::Applied(_)) => {}
-            // r[impl sched.evidence.durability+3]
+            Ok(
+                crate::db::FencedOutcome::Applied(_) | crate::db::FencedOutcome::AlreadyResolved,
+            ) => {}
+            // r[impl sched.evidence.durability+4]
             // Fenced: this replica is deposed (a successor's claim is
             // the floor). The PG clear did NOT happen, so the admin
             // contract is the same as the PG-failure arm: report
             // cleared=false, leave the in-memory state untouched. The
             // operator retries against the live leader.
-            Ok(crate::db::FencedWrite::Fenced) => {
+            Ok(crate::db::FencedOutcome::Fenced) => {
                 return false;
             }
             Err(e) => {
@@ -2653,21 +2666,21 @@ impl DagActor {
         // for this observation and persists nothing.
         let (decision, recorded_row) = if let Some(row) = attempt_row {
             let result: Result<Option<crate::retry_policy::Decision>, sqlx::Error> = async {
-                let mut tx = self.db.pool().begin().await?;
-                // r[impl sched.evidence.durability+3]
+                // r[impl sched.evidence.durability+4]
                 // Claims-floor fence at the appending-transaction start:
                 // a deposed replica records nothing and persists nothing.
-                let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
-                if !crate::db::SchedulerDb::at_or_above_floor(floor, self.serving_generation()) {
-                    tx.rollback().await?;
-                    return Ok(None);
-                }
-                let (_, decision) = self.append_and_decide_in_tx(&mut tx, &row).await?;
+                let mut tx = match self.db.begin_fenced(self.serving_generation()).await? {
+                    crate::db::FencedBegin::Fenced { .. } => {
+                        return Ok(None);
+                    }
+                    crate::db::FencedBegin::Open(ftx) => ftx,
+                };
+                let (_, decision) = self.append_and_decide_in_tx(tx.conn(), &row).await?;
                 if matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_)) {
-                    crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
+                    crate::db::SchedulerDb::persist_poisoned_in_tx(tx.conn(), drv_hash).await?;
                 } else {
                     crate::db::SchedulerDb::update_derivation_status_in_tx(
-                        &mut tx,
+                        tx.conn(),
                         drv_hash,
                         DerivationStatus::Ready,
                         None,
@@ -2970,20 +2983,20 @@ impl DagActor {
         // derivations row to update either).
         let (decision, recorded_row) = if let Some(row) = attempt_row {
             let result: Result<Option<crate::retry_policy::Decision>, sqlx::Error> = async {
-                let mut tx = self.db.pool().begin().await?;
-                // r[impl sched.evidence.durability+3]
+                // r[impl sched.evidence.durability+4]
                 // Claims-floor fence at the appending-transaction start.
-                let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
-                if !crate::db::SchedulerDb::at_or_above_floor(floor, self.serving_generation()) {
-                    tx.rollback().await?;
-                    return Ok(None);
-                }
-                let (_, decision) = self.append_and_decide_in_tx(&mut tx, &row).await?;
+                let mut tx = match self.db.begin_fenced(self.serving_generation()).await? {
+                    crate::db::FencedBegin::Fenced { .. } => {
+                        return Ok(None);
+                    }
+                    crate::db::FencedBegin::Open(ftx) => ftx,
+                };
+                let (_, decision) = self.append_and_decide_in_tx(tx.conn(), &row).await?;
                 if matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_)) {
-                    crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
+                    crate::db::SchedulerDb::persist_poisoned_in_tx(tx.conn(), drv_hash).await?;
                 } else {
                     crate::db::SchedulerDb::update_derivation_status_in_tx(
-                        &mut tx,
+                        tx.conn(),
                         drv_hash,
                         DerivationStatus::Ready,
                         None,
@@ -3168,16 +3181,16 @@ impl DagActor {
             // row, fold the suffix through decide(), persist Poisoned —
             // commit or leave the derivation untouched.
             let result: Result<Option<crate::retry_policy::Decision>, sqlx::Error> = async {
-                let mut tx = self.db.pool().begin().await?;
-                // r[impl sched.evidence.durability+3]
+                // r[impl sched.evidence.durability+4]
                 // Claims-floor fence at the appending-transaction start.
-                let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
-                if !crate::db::SchedulerDb::at_or_above_floor(floor, self.serving_generation()) {
-                    tx.rollback().await?;
-                    return Ok(None);
-                }
-                let (_, decision) = self.append_and_decide_in_tx(&mut tx, &row).await?;
-                crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
+                let mut tx = match self.db.begin_fenced(self.serving_generation()).await? {
+                    crate::db::FencedBegin::Fenced { .. } => {
+                        return Ok(None);
+                    }
+                    crate::db::FencedBegin::Open(ftx) => ftx,
+                };
+                let (_, decision) = self.append_and_decide_in_tx(tx.conn(), &row).await?;
+                crate::db::SchedulerDb::persist_poisoned_in_tx(tx.conn(), drv_hash).await?;
                 tx.commit().await?;
                 Ok(Some(decision))
             }
@@ -3332,21 +3345,24 @@ impl DagActor {
         // RAM-checked verdict — there is nothing to append or persist.
         let (verdict, recorded_row) = if let Some(row) = attempt_row {
             let result: Result<Option<crate::retry_policy::Decision>, sqlx::Error> = async {
-                let mut tx = self.db.pool().begin().await?;
-                // r[impl sched.evidence.durability+3]
+                // r[impl sched.evidence.durability+4]
                 // Claims-floor fence at the appending-transaction start.
-                let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
-                if !crate::db::SchedulerDb::at_or_above_floor(floor, self.serving_generation()) {
-                    tx.rollback().await?;
-                    return Ok(None);
-                }
-                let (_, decision) = self.append_and_decide_in_tx(&mut tx, &row).await?;
+                let mut tx = match self.db.begin_fenced(self.serving_generation()).await? {
+                    crate::db::FencedBegin::Fenced { .. } => {
+                        return Ok(None);
+                    }
+                    crate::db::FencedBegin::Open(ftx) => ftx,
+                };
+                let (_, decision) = self.append_and_decide_in_tx(tx.conn(), &row).await?;
                 let status = match decision.verdict {
                     crate::retry_policy::Verdict::Cancel => DerivationStatus::Cancelled,
                     _ => DerivationStatus::Ready,
                 };
                 crate::db::SchedulerDb::update_derivation_status_in_tx(
-                    &mut tx, drv_hash, status, None,
+                    tx.conn(),
+                    drv_hash,
+                    status,
+                    None,
                 )
                 .await?;
                 tx.commit().await?;
@@ -3561,19 +3577,19 @@ impl DagActor {
             .collect();
         let batch: Vec<AttemptRow> = rows.iter().map(|(_, r)| r.clone()).collect();
         let result: Result<bool, sqlx::Error> = async {
-            let mut tx = self.db.pool().begin().await?;
-            // r[impl sched.evidence.durability+3]
+            // r[impl sched.evidence.durability+4]
             // Claims-floor fence at the appending-transaction start: a
             // deposed replica's cascade persists nothing (the successor's
             // recovery recomputes the cascade from the poisoned row).
-            let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
-            if !crate::db::SchedulerDb::at_or_above_floor(floor, self.serving_generation()) {
-                tx.rollback().await?;
-                return Ok(false);
-            }
-            crate::db::SchedulerDb::append_attempts_batch(&mut tx, &batch).await?;
+            let mut tx = match self.db.begin_fenced(self.serving_generation()).await? {
+                crate::db::FencedBegin::Fenced { .. } => {
+                    return Ok(false);
+                }
+                crate::db::FencedBegin::Open(ftx) => ftx,
+            };
+            crate::db::SchedulerDb::append_attempts_batch(tx.conn(), &batch).await?;
             crate::db::SchedulerDb::update_derivation_status_batch_in_tx(
-                &mut tx,
+                tx.conn(),
                 &refs,
                 DerivationStatus::DependencyFailed,
             )

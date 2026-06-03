@@ -145,15 +145,17 @@ async fn materialization_pins_released_only_after_all_interest_terminal() -> any
         None,
     )
     .await?;
-    db.record_wanted_fenced(
-        1,
-        &[WantedRow {
-            build_id,
-            derivation_id: drv_id,
-            wanted_output_names: &[],
-        }],
-    )
-    .await?;
+    let fenced_outcome = db
+        .record_wanted_fenced(
+            1,
+            &[WantedRow {
+                build_id,
+                derivation_id: drv_id,
+                wanted_output_names: &[],
+            }],
+        )
+        .await?;
+    assert!(fenced_outcome.settled());
 
     // The materialization job + the pins its execution ingested.
     let FencedJobCreate::Applied { job_id, .. } = db
@@ -189,13 +191,15 @@ async fn materialization_pins_released_only_after_all_interest_terminal() -> any
     );
 
     // (2) Job resolved, but the interested build is still live → kept.
-    db.resolve_materialization_job_fenced(
-        job_id,
-        Some(Uuid::now_v7()),
-        JobState::ResolvedSuccess,
-        1,
-    )
-    .await?;
+    let fenced_outcome = db
+        .resolve_materialization_job_fenced(
+            job_id,
+            Some(Uuid::now_v7()),
+            JobState::ResolvedSuccess,
+            1,
+        )
+        .await?;
+    assert!(fenced_outcome.settled());
     let released = db.release_materialization_pins_for_resolved_jobs().await?;
     assert_eq!(
         released, 0,

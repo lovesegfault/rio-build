@@ -352,7 +352,7 @@ impl DagActor {
                 crate::state::AttemptKind::Materialization
             }
         };
-        let committed = self
+        let minted = self
             .db
             .mint_pull_attempt_fenced(
                 db_id,
@@ -366,7 +366,7 @@ impl DagActor {
             )
             .await
             .map_err(|e| PullRejection::Internal(format!("pull mint transaction failed: {e}")))?;
-        if !committed {
+        if !minted.settled() {
             info!(
                 drv_hash = %drv_hash,
                 serving_generation,
@@ -827,29 +827,16 @@ impl DagActor {
             row.resubmit_cycle = i32::try_from(state.retry.resubmit_cycles).unwrap_or(i32::MAX);
         }
         let result: Result<Option<bool>, sqlx::Error> = async {
-            let mut tx = self.db.pool().begin().await?;
             // The same generation fence the pull mint and the
             // establishment sweep apply: a below-floor serving
             // generation writes nothing.
-            let floor: Option<i64> = sqlx::query_scalar(
-                "SELECT GREATEST( \
-                     (SELECT MAX(generation) FROM assignments), \
-                     (SELECT MAX(generation) FROM leader_generation_claims))",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            if floor.is_some_and(|f| serving_generation < f) {
-                tx.rollback().await?;
-                return Ok(None);
-            }
-            let inserted = crate::db::SchedulerDb::append_attempt(&mut tx, &row).await?;
-            sqlx::query(
-                "UPDATE assignments SET status = 'failed', completed_at = now() \
-                 WHERE exec_id = $1 AND status IN ('pending', 'acknowledged')",
-            )
-            .bind(exec_id)
-            .execute(&mut *tx)
-            .await?;
+            let mut tx = match self.db.begin_fenced(serving_generation).await? {
+                crate::db::FencedBegin::Fenced { .. } => return Ok(None),
+                crate::db::FencedBegin::Open(ftx) => ftx,
+            };
+            let inserted = crate::db::SchedulerDb::append_attempt(tx.conn(), &row).await?;
+            tx.close_assignment(exec_id, crate::db::AssignmentCloseStatus::Failed)
+                .await?;
             tx.commit().await?;
             Ok(Some(inserted))
         }
@@ -1045,9 +1032,16 @@ impl DagActor {
             let derivation_id = attempt.derivation_id;
             let won = self
                 .db
-                .fill_termination_reason_only(derivation_id, exec_id, label, node_name.as_deref())
+                .fill_termination_reason_only(
+                    derivation_id,
+                    exec_id,
+                    label,
+                    node_name.as_deref(),
+                    self.serving_generation(),
+                )
                 .await
-                .map_err(|e| PullRejection::Internal(format!("installment fill failed: {e}")))?;
+                .map_err(|e| PullRejection::Internal(format!("installment fill failed: {e}")))?
+                .applied();
             let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
             if won {
                 if let Some(state) = self.dag.node_mut(&drv_hash) {

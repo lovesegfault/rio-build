@@ -1,10 +1,23 @@
 //! Assignment CRUD — `assignments` table.
 
+#[cfg(test)]
 use uuid::Uuid;
 
+#[cfg(test)]
 use super::{AssignmentStatus, SchedulerDb};
+#[cfg(test)]
 use crate::state::ExecutorId;
 
+/// TEST FIXTURES ONLY. The production assignment lifecycle writes
+/// exclusively through the fenced capability: the pull mint
+/// (`mint_pull_attempt_fenced`) creates/refreshes active rows and
+/// [`super::FencedTx::close_assignment`] /
+/// [`SchedulerDb::close_assignment_fenced`] are the only closers —
+/// exec_id-scoped, never derivation_id-keyed. The unfenced writers
+/// below exist solely so db tests can seed historical row shapes;
+/// `cfg(test)` keeps them out of the production surface entirely
+/// (enforced by `db/tests/fence_coverage.rs`).
+#[cfg(test)]
 impl SchedulerDb {
     /// Create a new assignment record. Returns the assignment_id.
     ///
@@ -45,24 +58,6 @@ impl SchedulerDb {
         .await?;
 
         Ok(row.0)
-    }
-
-    /// Delete the in-progress assignment for a derivation.
-    /// Called from dispatch.rs on try_send failure to clean up the
-    /// PG row that insert_assignment wrote (no worker ever got the
-    /// assignment, so the row is misleading on recovery).
-    ///
-    /// Only deletes `pending`/`acknowledged` rows — terminal rows
-    /// are audit-valuable even for stale derivations.
-    pub async fn delete_latest_assignment(&self, derivation_id: Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query!(
-            "DELETE FROM assignments \
-             WHERE derivation_id = $1 AND status IN ('pending', 'acknowledged')",
-            derivation_id,
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     /// Update an assignment status. Terminal statuses

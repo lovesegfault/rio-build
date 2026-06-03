@@ -17,7 +17,7 @@
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use super::{FencedWrite, SchedulerDb, encode_pg_text_array};
+use super::{FencedBegin, FencedOutcome, SchedulerDb, encode_pg_text_array};
 
 /// One (build, derivation) wanted contribution, as the merge records it.
 pub(crate) struct WantedRow<'a> {
@@ -71,25 +71,23 @@ impl SchedulerDb {
 
     /// Standalone fenced form (for callers outside the merge tx — the
     /// Phase A actor smoke test and Phase B's reprobe-lane creation).
-    /// Returns [`FencedWrite::Fenced`] (nothing written) when
+    /// Returns [`FencedOutcome::Fenced`] (nothing written) when
     /// `serving_generation` is below the durable claims floor.
     pub(crate) async fn record_wanted_fenced(
         &self,
         serving_generation: i64,
         rows: &[WantedRow<'_>],
-    ) -> Result<FencedWrite, sqlx::Error> {
+    ) -> Result<FencedOutcome, sqlx::Error> {
         if rows.is_empty() {
-            return Ok(FencedWrite::Applied(0));
+            return Ok(FencedOutcome::Applied(0));
         }
-        let mut tx = self.pool.begin().await?;
-        let floor = Self::claims_floor(&mut tx).await?;
-        if !Self::at_or_above_floor(floor, serving_generation) {
-            tx.rollback().await?;
-            return Ok(FencedWrite::Fenced);
-        }
-        Self::record_wanted_in_tx(&mut tx, rows).await?;
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
+            FencedBegin::Open(ftx) => ftx,
+        };
+        Self::record_wanted_in_tx(tx.conn(), rows).await?;
         tx.commit().await?;
-        Ok(FencedWrite::Applied(rows.len() as u64))
+        Ok(FencedOutcome::Applied(rows.len() as u64))
     }
 
     /// THE effective-wanted query (design §6: computed by the one query
@@ -140,13 +138,11 @@ impl SchedulerDb {
         serving_generation: i64,
         build_id: Uuid,
         derivation_id: Uuid,
-    ) -> Result<FencedWrite, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        let floor = Self::claims_floor(&mut tx).await?;
-        if !Self::at_or_above_floor(floor, serving_generation) {
-            tx.rollback().await?;
-            return Ok(FencedWrite::Fenced);
-        }
+    ) -> Result<FencedOutcome, sqlx::Error> {
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
+            FencedBegin::Open(ftx) => ftx,
+        };
         let n = sqlx::query(
             "INSERT INTO build_wanted_outputs (build_id, derivation_id, wanted_output_names) \
              VALUES ($1, $2, '{}') \
@@ -154,11 +150,11 @@ impl SchedulerDb {
         )
         .bind(build_id)
         .bind(derivation_id)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?
         .rows_affected();
         tx.commit().await?;
-        Ok(FencedWrite::Applied(n))
+        Ok(FencedOutcome::Applied(n))
     }
 
     /// Recovery wanted-cache rebuild load (T-D2.3/PD-D5): every
@@ -184,13 +180,24 @@ impl SchedulerDb {
 
     /// Purge a build's contributions (called with the build row's own
     /// purge — existing lifecycle; in Phase A only tests call it).
-    pub(crate) async fn delete_wanted_for_build(&self, build_id: Uuid) -> Result<u64, sqlx::Error> {
-        Ok(
-            sqlx::query("DELETE FROM build_wanted_outputs WHERE build_id = $1")
-                .bind(build_id)
-                .execute(&self.pool)
-                .await?
-                .rows_affected(),
-        )
+    /// Claims-floor fenced like every other wanted-relation writer: a
+    /// deposed replica's late purge must not destroy a successor's
+    /// live interest rows.
+    pub(crate) async fn delete_wanted_for_build(
+        &self,
+        build_id: Uuid,
+        serving_generation: i64,
+    ) -> Result<FencedOutcome, sqlx::Error> {
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
+            FencedBegin::Open(ftx) => ftx,
+        };
+        let n = sqlx::query("DELETE FROM build_wanted_outputs WHERE build_id = $1")
+            .bind(build_id)
+            .execute(tx.conn())
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(FencedOutcome::Applied(n))
     }
 }

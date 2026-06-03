@@ -395,12 +395,13 @@ macro_rules! list_builds_select {
 }
 pub(super) use list_builds_select;
 
-/// Outcome of a claims-floor-fenced evidence write
-/// (`sched.evidence.durability`): either the write applied (with the
-/// number of rows it touched, where the statement reports one) or the
-/// fence rolled the transaction back having written nothing because
-/// the caller's serving generation sits below the durable claims
-/// floor.
+/// Outcome of a claims-floor-fenced decision-state write
+/// (`sched.evidence.durability`): the write applied (with the number
+/// of rows it touched, where the statement reports one), the target
+/// row was already terminally resolved (the at-most-once writers'
+/// idempotent arm), or the fence rolled the transaction back having
+/// written nothing because the caller's serving generation sits below
+/// the durable claims floor.
 ///
 /// `Fenced` is NOT an error: it is the fence working on a deposed
 /// replica whose in-memory state is garbage awaiting the queued
@@ -408,20 +409,212 @@ pub(super) use list_builds_select;
 /// generation, increment `rio_scheduler_evidence_write_fenced_total`,
 /// and continue.
 ///
+/// `#[must_use]`: silently discarding a fence outcome is exactly the
+/// class where a caller mutates its in-memory view without branching
+/// on the durable result (a deposed replica then acts on state the
+/// database refused). The lint turns the discard into a build error
+/// under the gate's `--deny warnings`.
+///
 /// `pub` (not `pub(crate)`) only because the fenced status/poison
 /// writers (`update_derivation_status`, `persist_poisoned`, …) are
 /// `pub` and the private-interfaces lint denies the mismatch; nothing
 /// outside the crate consumes it.
-// r[impl sched.evidence.durability+3]
+// r[impl sched.evidence.durability+4]
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FencedWrite {
+pub enum FencedOutcome {
     /// The write committed; the payload is `rows_affected()` for
     /// statements that report it (0 for fixed-shape single-row writes
     /// whose callers don't consume a count).
     Applied(u64),
+    /// The transaction committed but the target row was already in a
+    /// terminal state, so this write changed nothing — the idempotent
+    /// arm of at-most-once writers. Settled, but NOT the at-most-once
+    /// edge: side effects keyed on "this call resolved it" (counters,
+    /// completion fan-out) belong to `Applied` only.
+    AlreadyResolved,
     /// The serving generation is below the claims floor: the
     /// transaction rolled back having written nothing.
     Fenced,
+}
+
+impl FencedOutcome {
+    /// The durable state is settled (either by this write or an
+    /// earlier one) — in-memory bookkeeping that mirrors the durable
+    /// row may proceed.
+    pub fn settled(self) -> bool {
+        matches!(self, Self::Applied(_) | Self::AlreadyResolved)
+    }
+
+    /// THIS call performed the resolution — the at-most-once edge for
+    /// counters and completion fan-out.
+    pub fn applied(self) -> bool {
+        matches!(self, Self::Applied(_))
+    }
+}
+
+/// The fenced-transaction capability: holding a [`FencedTx`] proves
+/// the claims-floor check ran on this transaction's own connection at
+/// construction time ([`SchedulerDb::begin_fenced`]). It is the ONLY
+/// way to open a decision-state write transaction — the floor helpers
+/// are private to `db`, so an open-coded actor-side floor compare no
+/// longer compiles.
+///
+/// Drop without commit = rollback = fail-safe: an abandoned fenced
+/// transaction writes nothing.
+// r[impl sched.evidence.durability+4]
+// r[impl sched.lease.generation-fence+3]
+pub struct FencedTx {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    serving_generation: i64,
+}
+
+/// Result of [`SchedulerDb::begin_fenced`]: the fence either admitted
+/// the transaction or refused it at the door (nothing written, the
+/// connection returned).
+pub enum FencedBegin {
+    /// The serving generation is at or above the durable claims floor;
+    /// the capability is live.
+    Open(FencedTx),
+    /// Below the floor: rolled back, nothing written. `floor` is the
+    /// durable floor that refused the write (for the caller's `warn!`).
+    Fenced { floor: i64 },
+}
+
+/// Outcome of [`FencedTx::commit_refenced`] — the pre-commit floor
+/// re-check used by settlement-class writers whose transactions span
+/// long reads (the merge settlement pattern, encapsulated).
+pub enum FencedCommit {
+    Committed,
+    /// A newer claim landed mid-transaction: rolled back at commit
+    /// time, nothing written.
+    Refenced {
+        floor: i64,
+    },
+}
+
+/// Terminal statuses [`FencedTx::close_assignment`] may stamp. The
+/// closed set keeps the unique closer total — a new terminal status
+/// extends this enum, not a new open-coded UPDATE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssignmentCloseStatus {
+    Completed,
+    Failed,
+    // The designed close set includes Cancelled (the zero-interest
+    // cancel path's status); its constructor lands with the
+    // cancel_job_and_close_attempt_fenced writer. Allowed-dead until
+    // then so the closed enum ships whole.
+    #[allow(dead_code)]
+    Cancelled,
+}
+
+impl AssignmentCloseStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl FencedTx {
+    /// Escape hatch for the `*_in_tx` statement bodies: the underlying
+    /// connection. The capability stays with the `FencedTx`; the
+    /// borrow ends before `commit`.
+    pub(crate) fn conn(&mut self) -> &mut PgConnection {
+        &mut self.tx
+    }
+
+    /// The generation this transaction was fenced at.
+    #[allow(dead_code)]
+    pub(crate) fn serving_generation(&self) -> i64 {
+        self.serving_generation
+    }
+
+    /// Commit the fenced transaction.
+    pub(crate) async fn commit(self) -> Result<(), sqlx::Error> {
+        self.tx.commit().await
+    }
+
+    /// Re-check the floor immediately before commit and refuse if a
+    /// newer claim landed mid-transaction (the settlement writers'
+    /// pre-commit re-check, encapsulated so the floor SQL stays
+    /// private to this module).
+    pub(crate) async fn commit_refenced(mut self) -> Result<FencedCommit, sqlx::Error> {
+        let floor = claims_floor(&mut self.tx).await?;
+        if !at_or_above_floor(floor, self.serving_generation) {
+            self.tx.rollback().await?;
+            return Ok(FencedCommit::Refenced {
+                floor: floor.unwrap_or(i64::MIN),
+            });
+        }
+        self.tx.commit().await?;
+        Ok(FencedCommit::Committed)
+    }
+
+    /// The unique pull-mode assignment closer: exec_id-scoped, never
+    /// derivation_id-keyed — a deposed replica's stale derivation view
+    /// can never close a successor's assignment row through this
+    /// surface. Returns the closed-row count (0 = already closed or
+    /// re-assigned: the caller's idempotent arm).
+    // r[impl sched.evidence.durability+4]
+    pub(crate) async fn close_assignment(
+        &mut self,
+        exec_id: Uuid,
+        status: AssignmentCloseStatus,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE assignments SET status = $2, completed_at = now() \
+             WHERE exec_id = $1 AND status IN ('pending', 'acknowledged')",
+        )
+        .bind(exec_id)
+        .bind(status.as_str())
+        .execute(&mut *self.tx)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+// r[impl sched.evidence.durability+4]
+/// The durable claims floor: `GREATEST` over
+/// `assignments.generation` and `leader_generation_claims.generation`
+/// — the same two arms as [`SchedulerDb::max_known_generation`], read
+/// on the CALLER's connection so the comparison happens inside the
+/// same transaction as the write it fences. `None` = fresh cluster
+/// (no assignments, no claims): nothing to fence against.
+///
+/// PRIVATE to `db`: the only legitimate consumers are
+/// [`SchedulerDb::begin_fenced`] / [`FencedTx::commit_refenced`] and
+/// the in-module fenced writers. Actor code holds a [`FencedTx`]
+/// instead of comparing floors.
+async fn claims_floor(conn: &mut PgConnection) -> Result<Option<i64>, sqlx::Error> {
+    let row: (Option<i64>,) = sqlx::query_as(
+        "SELECT GREATEST( \
+             (SELECT MAX(generation) FROM assignments), \
+             (SELECT MAX(generation) FROM leader_generation_claims))",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(row.0)
+}
+
+// r[impl sched.evidence.durability+4]
+/// The fence comparison: a write applies iff its serving generation
+/// is at or above the claims floor. The comparison is `>=` (equal
+/// passes) and this is load-bearing — a write carrying a generation
+/// EQUAL to the floor is the same-epoch re-acquire keep that
+/// `sched.lease.generation-claim` requires (same generation ⇔ no
+/// holder change ⇔ no newer tenure's evidence exists), so it MUST
+/// apply; tightening to `>` would fence a leader's own writes after
+/// every same-epoch re-acquire. A negative floor row (hand-edited
+/// anomaly) demands nothing, same trust posture as
+/// `max_known_generation`'s callers.
+fn at_or_above_floor(floor: Option<i64>, serving_generation: i64) -> bool {
+    match floor {
+        Some(f) => serving_generation >= f,
+        None => true,
+    }
 }
 
 impl SchedulerDb {
@@ -435,40 +628,54 @@ impl SchedulerDb {
         &self.pool
     }
 
-    // r[impl sched.evidence.durability+3]
-    /// The durable claims floor: `GREATEST` over
-    /// `assignments.generation` and `leader_generation_claims.generation`
-    /// — the same two arms as [`Self::max_known_generation`], read on
-    /// the CALLER's connection so the comparison happens inside the
-    /// same transaction as the write it fences (the pull-mint pattern,
-    /// `mint_pull_attempt_fenced`). `None` = fresh cluster (no
-    /// assignments, no claims): nothing to fence against.
-    pub(crate) async fn claims_floor(conn: &mut PgConnection) -> Result<Option<i64>, sqlx::Error> {
-        let row: (Option<i64>,) = sqlx::query_as(
-            "SELECT GREATEST( \
-                 (SELECT MAX(generation) FROM assignments), \
-                 (SELECT MAX(generation) FROM leader_generation_claims))",
-        )
-        .fetch_one(&mut *conn)
-        .await?;
-        Ok(row.0)
+    // r[impl sched.evidence.durability+4]
+    // r[impl sched.lease.generation-fence+3]
+    /// Open the fenced-transaction capability: begin a transaction,
+    /// read the claims floor ON ITS CONNECTION, and admit the caller
+    /// only at-or-above the floor. Every decision-state write path in
+    /// the scheduler constructs its transaction here — the fence
+    /// cannot be forgotten, reordered after the write, or compared
+    /// against a floor read on a different connection.
+    pub(crate) async fn begin_fenced(
+        &self,
+        serving_generation: i64,
+    ) -> Result<FencedBegin, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let floor = claims_floor(&mut tx).await?;
+        if !at_or_above_floor(floor, serving_generation) {
+            tx.rollback().await?;
+            return Ok(FencedBegin::Fenced {
+                floor: floor.unwrap_or(i64::MIN),
+            });
+        }
+        Ok(FencedBegin::Open(FencedTx {
+            tx,
+            serving_generation,
+        }))
     }
 
-    // r[impl sched.evidence.durability+3]
-    /// The fence comparison: a write applies iff its serving generation
-    /// is at or above the claims floor. The comparison is `>=` (equal
-    /// passes) and this is load-bearing — a write carrying a generation
-    /// EQUAL to the floor is the same-epoch re-acquire keep that
-    /// `sched.lease.generation-claim` requires (same generation ⇔ no
-    /// holder change ⇔ no newer tenure's evidence exists), so it MUST
-    /// apply; tightening to `>` would fence a leader's own writes after
-    /// every same-epoch re-acquire. A negative floor row (hand-edited
-    /// anomaly) demands nothing, same trust posture as
-    /// `max_known_generation`'s callers.
-    pub(crate) fn at_or_above_floor(floor: Option<i64>, serving_generation: i64) -> bool {
-        match floor {
-            Some(f) => serving_generation >= f,
-            None => true,
+    // r[impl sched.evidence.durability+4]
+    /// Pool wrapper over [`FencedTx::close_assignment`] for callers
+    /// with no surrounding statements: one fenced transaction, one
+    /// exec_id-scoped close. The establishment adopt arm's closer —
+    /// the derivation_id-keyed unfenced writer it replaces let a
+    /// deposed replica close a successor's assignment row.
+    pub(crate) async fn close_assignment_fenced(
+        &self,
+        exec_id: Uuid,
+        status: AssignmentCloseStatus,
+        serving_generation: i64,
+    ) -> Result<FencedOutcome, sqlx::Error> {
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
+            FencedBegin::Open(ftx) => ftx,
+        };
+        let n = tx.close_assignment(exec_id, status).await?;
+        tx.commit().await?;
+        if n == 0 {
+            Ok(FencedOutcome::AlreadyResolved)
+        } else {
+            Ok(FencedOutcome::Applied(n))
         }
     }
 }

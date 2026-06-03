@@ -52,25 +52,4 @@ impl SchedulerDb {
         .await?;
         Ok(())
     }
-
-    /// Delete the lifecycle row for an execution whose `WorkAssignment`
-    /// never reached the worker (`try_send` failed → the caller is
-    /// rolling the whole dispatch back). The inverse of
-    /// [`Self::insert_drv_execution`], called from
-    /// `rollback_assignment` alongside `delete_latest_assignment` for
-    /// the same reason: a row for an execution that never ran is
-    /// misleading — it would sit at `status IS NULL` ("still running")
-    /// until the 30-day TTL sweep.
-    ///
-    /// Guarded on `status IS NULL` so a rollback racing a terminal
-    /// stamp (impossible today — the actor is single-threaded and the
-    /// worker never saw the assignment — but cheap to keep monotone)
-    /// cannot delete a finished execution's row.
-    pub async fn delete_drv_execution(&self, exec_id: Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM drv_executions WHERE exec_id = $1 AND status IS NULL")
-            .bind(exec_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
 }

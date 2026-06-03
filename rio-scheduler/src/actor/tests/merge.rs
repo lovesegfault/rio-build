@@ -2374,7 +2374,7 @@ enum GcState {
 /// so a replica deposed after the enqueue still executes its merge
 /// transaction — racing the new leader's recovery — unless the
 /// transaction itself is fenced.
-// r[verify sched.evidence.durability+3]
+// r[verify sched.evidence.durability+4]
 #[tokio::test]
 async fn merge_from_deposed_generation_is_fenced() -> TestResult {
     let (db, handle, _task) = setup().await;

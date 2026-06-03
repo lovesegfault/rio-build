@@ -770,7 +770,7 @@ impl DagActor {
                     )
                     .await
                 {
-                    Ok(crate::db::FencedWrite::Fenced) => {
+                    Ok(crate::db::FencedOutcome::Fenced) => {
                         self.note_fenced_evidence_write("re-probe-unlocked Ready persist");
                     }
                     Ok(_) => {}
@@ -1080,7 +1080,7 @@ impl DagActor {
                 )
                 .await
             {
-                Ok(crate::db::FencedWrite::Fenced) => {
+                Ok(crate::db::FencedOutcome::Fenced) => {
                     self.note_fenced_evidence_write("deferred re-probe Queued reset persist");
                 }
                 Ok(_) => {}
@@ -1101,7 +1101,7 @@ impl DagActor {
                 )
                 .await
             {
-                Ok(crate::db::FencedWrite::Fenced) => {
+                Ok(crate::db::FencedOutcome::Fenced) => {
                     self.note_fenced_evidence_write("cache-hit Completed batch persist");
                 }
                 Ok(_) => {}
@@ -1403,7 +1403,7 @@ impl DagActor {
                 .update_derivation_status_batch(&hashes, status, self.serving_generation())
                 .await
             {
-                Ok(crate::db::FencedWrite::Fenced) => {
+                Ok(crate::db::FencedOutcome::Fenced) => {
                     self.note_fenced_evidence_write("initial-state status batch persist");
                 }
                 Ok(_) => {}
@@ -1722,7 +1722,7 @@ impl DagActor {
                 .update_derivation_status(&drv_hash_k, target, None, self.serving_generation())
                 .await
             {
-                Ok(crate::db::FencedWrite::Fenced) => {
+                Ok(crate::db::FencedOutcome::Fenced) => {
                     self.note_fenced_evidence_write("stale-completed reset persist");
                 }
                 Ok(_) => {}
@@ -1814,7 +1814,7 @@ impl DagActor {
                 )
                 .await
             {
-                Ok(crate::db::FencedWrite::Fenced) => {
+                Ok(crate::db::FencedOutcome::Fenced) => {
                     self.note_fenced_evidence_write("Ready-parent demotion persist");
                 }
                 Ok(_) => {}
@@ -1911,7 +1911,7 @@ impl DagActor {
     /// pruned roots and the new_sub lane — riding the same
     /// claims-floor fence (no extra floor read). The created jobs are
     /// returned so the caller can feed the in-memory view POST-commit.
-    // r[impl sched.evidence.durability+3]
+    // r[impl sched.evidence.durability+4]
     #[allow(clippy::too_many_arguments)]
     async fn persist_merge_to_db(
         &mut self,
@@ -1960,10 +1960,12 @@ impl DagActor {
             .map(|r| (r.drv_path.as_str(), r.drv_hash.as_str()))
             .collect();
 
-        // Transaction: 3 batched roundtrips instead of 2N+E serial.
-        let mut tx = self.db.pool().begin().await?;
+        // Transaction: 3 batched roundtrips instead of 2N+E serial,
+        // opened through the fenced capability (begin-time floor check
+        // on the transaction's own connection).
+        let serving_generation = self.serving_generation();
 
-        // r[impl sched.evidence.durability+3]
+        // r[impl sched.evidence.durability+4]
         // Claims-floor fence for the whole merge transaction (stamps,
         // links, edges, activation). Checked twice: once here at
         // begin() — a cheap early abort so a large merge from a deposed
@@ -1974,23 +1976,25 @@ impl DagActor {
         // replica deposed after the enqueue (or across this handler's
         // awaits) still executes its merge transaction unless the
         // transaction itself refuses to commit below the floor.
-        let serving_generation = self.serving_generation();
-        let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
-        if !crate::db::SchedulerDb::at_or_above_floor(floor, serving_generation) {
-            tx.rollback().await?;
-            self.note_fenced_evidence_write("merge transaction (begin-time check)");
-            return Err(ActorError::StaleGeneration {
-                serving: serving_generation,
-                floor: floor.unwrap_or(0),
-            });
-        }
+        let mut tx = match self.db.begin_fenced(serving_generation).await? {
+            crate::db::FencedBegin::Fenced { floor } => {
+                self.note_fenced_evidence_write("merge transaction (begin-time check)");
+                return Err(ActorError::StaleGeneration {
+                    serving: serving_generation,
+                    floor,
+                });
+            }
+            crate::db::FencedBegin::Open(ftx) => ftx,
+        };
 
         // Batch 1: upsert all derivations, get back drv_hash -> db_id map.
-        let id_map = crate::db::SchedulerDb::batch_upsert_derivations(&mut tx, &node_rows).await?;
+        let id_map =
+            crate::db::SchedulerDb::batch_upsert_derivations(tx.conn(), &node_rows).await?;
 
         // Batch 2: link all nodes to this build.
         let db_ids: Vec<Uuid> = id_map.values().map(|(id, _)| *id).collect();
-        crate::db::SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
+        crate::db::SchedulerDb::batch_insert_build_derivations(tx.conn(), build_id, &db_ids)
+            .await?;
 
         // Batch 3: insert edges. Resolve drv_path -> db_id via:
         //   1. this tx's id_map (covers newly-inserted + re-upserted
@@ -2022,7 +2026,7 @@ impl DagActor {
             })
             .collect();
         let edge_rows = edge_rows?;
-        crate::db::SchedulerDb::batch_insert_edges(&mut tx, &edge_rows).await?;
+        crate::db::SchedulerDb::batch_insert_edges(tx.conn(), &edge_rows).await?;
 
         // Batch 4: Pending→Active for the build, in the SAME transaction.
         // A committed merge therefore implies an Active builds row; a
@@ -2031,7 +2035,7 @@ impl DagActor {
         // behind for a build the caller is about to reject and roll
         // back in memory. The in-memory BuildInfo transition happens in
         // `persist_and_activate` only after this commit succeeds.
-        crate::db::SchedulerDb::activate_build_tx(&mut tx, build_id).await?;
+        crate::db::SchedulerDb::activate_build_tx(tx.conn(), build_id).await?;
 
         // Batch 5 (substitution-replacement Phase A): the
         // wanted relation + materialization-job creation, INSIDE this
@@ -2057,7 +2061,7 @@ impl DagActor {
                     })
                 })
                 .collect();
-            crate::db::SchedulerDb::record_wanted_in_tx(&mut tx, &wanted_rows).await?;
+            crate::db::SchedulerDb::record_wanted_in_tx(tx.conn(), &wanted_rows).await?;
 
             // (b) Job creation: pruned-origin rows first (kept roots
             // whose dependency closure this prune dropped, gated on
@@ -2151,7 +2155,7 @@ impl DagActor {
             }
 
             let created = crate::db::SchedulerDb::create_materialization_jobs_in_tx(
-                &mut tx,
+                tx.conn(),
                 &job_rows,
                 serving_generation,
             )
@@ -2160,8 +2164,8 @@ impl DagActor {
             // The AS-5 durable reset: poison clear (poisoned_at NULL,
             // status reset) + the budget-reset rows, same transaction.
             if !reset_hashes.is_empty() {
-                crate::db::SchedulerDb::clear_poison_batch_in_tx(&mut tx, &reset_hashes).await?;
-                crate::db::SchedulerDb::append_attempts_batch(&mut tx, &reset_rows).await?;
+                crate::db::SchedulerDb::clear_poison_batch_in_tx(tx.conn(), &reset_hashes).await?;
+                crate::db::SchedulerDb::append_attempts_batch(tx.conn(), &reset_rows).await?;
             }
 
             job_rows
@@ -2194,7 +2198,7 @@ impl DagActor {
             }
         }
 
-        // r[impl sched.evidence.durability+3]
+        // r[impl sched.evidence.durability+4]
         // The AUTHORITATIVE claims-floor re-read, as the last statement
         // before commit. Under READ COMMITTED a successor's claim
         // INSERT can commit while the multi-batch tx body above runs
@@ -2204,17 +2208,16 @@ impl DagActor {
         // here narrows the residual to one floor-read-to-commit round
         // trip; this is a window-narrowing fence, not a serializability
         // proof.
-        let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
-        if !crate::db::SchedulerDb::at_or_above_floor(floor, serving_generation) {
-            tx.rollback().await?;
-            self.note_fenced_evidence_write("merge transaction (commit-time check)");
-            return Err(ActorError::StaleGeneration {
-                serving: serving_generation,
-                floor: floor.unwrap_or(0),
-            });
+        match tx.commit_refenced().await? {
+            crate::db::FencedCommit::Refenced { floor } => {
+                self.note_fenced_evidence_write("merge transaction (commit-time check)");
+                return Err(ActorError::StaleGeneration {
+                    serving: serving_generation,
+                    floor,
+                });
+            }
+            crate::db::FencedCommit::Committed => {}
         }
-
-        tx.commit().await?;
 
         // I-102: a large merge (e.g. 5800 rows for hello-mixed-32x) leaves
         // planner stats stale until autovacuum's analyze cycle (~1-10min on

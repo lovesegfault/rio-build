@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use super::insert_test_derivation;
 use crate::db::materialization::{FencedJobCreate, NewJobRow};
-use crate::db::{FencedWrite, SchedulerDb};
+use crate::db::{FencedOutcome, SchedulerDb};
 use crate::state::{JobOrigin, JobState};
 
 /// Fresh ephemeral PG + a SchedulerDb handle + one derivation.
@@ -90,7 +90,7 @@ async fn job_creation_is_dedup_idempotent() -> anyhow::Result<()> {
             1,
         )
         .await?;
-    assert_eq!(resolved, FencedWrite::Applied(1));
+    assert_eq!(resolved, FencedOutcome::Applied(1));
     let third = db
         .create_materialization_job_fenced(drv, "job-dedup-hash", None, JobOrigin::Pruned, None, 1)
         .await?;
@@ -268,7 +268,7 @@ async fn job_resolution_is_fenced_and_at_most_once() -> anyhow::Result<()> {
     let resolved = db
         .resolve_materialization_job_fenced(job_id, Some(exec_id), JobState::ResolvedSuccess, 1)
         .await?;
-    assert_eq!(resolved, FencedWrite::Applied(1), "first resolve applies");
+    assert_eq!(resolved, FencedOutcome::Applied(1), "first resolve applies");
 
     let (state, resolution_exec, resolved_at): (String, Option<Uuid>, Option<String>) =
         sqlx::query_as(
@@ -297,7 +297,7 @@ async fn job_resolution_is_fenced_and_at_most_once() -> anyhow::Result<()> {
         .await?;
     assert_eq!(
         second,
-        FencedWrite::Applied(0),
+        FencedOutcome::Applied(0),
         "resolving an already-resolved job must be a no-op (at-most-once)"
     );
     let (state, resolution_exec): (String, Option<Uuid>) = sqlx::query_as(
@@ -335,7 +335,7 @@ async fn job_resolution_is_fenced_and_at_most_once() -> anyhow::Result<()> {
         .await?;
     assert_eq!(
         fenced,
-        FencedWrite::Fenced,
+        FencedOutcome::Fenced,
         "below-floor resolution must be fenced"
     );
     let state: String =
@@ -374,7 +374,7 @@ async fn parked_job_excluded_until_backoff_expires() -> anyhow::Result<()> {
     let parked = db
         .park_materialization_job_fenced(job_id, now_epoch + 3600.0, 1)
         .await?;
-    assert_eq!(parked, FencedWrite::Applied(1));
+    assert_eq!(parked, FencedOutcome::Applied(1));
     assert!(
         db.list_claimable_materialization_jobs(10).await?.is_empty(),
         "a parked job is not claimable before its backoff expires"
@@ -390,7 +390,7 @@ async fn parked_job_excluded_until_backoff_expires() -> anyhow::Result<()> {
     let parked = db
         .park_materialization_job_fenced(job_id, now_epoch - 1.0, 1)
         .await?;
-    assert_eq!(parked, FencedWrite::Applied(1));
+    assert_eq!(parked, FencedOutcome::Applied(1));
     assert_eq!(
         db.list_claimable_materialization_jobs(10).await?.len(),
         1,
@@ -418,7 +418,7 @@ async fn job_cancellation_marks_cancelled() -> anyhow::Result<()> {
         .await?;
     assert_eq!(
         cancelled,
-        FencedWrite::Applied(1),
+        FencedOutcome::Applied(1),
         "one pending job cancelled"
     );
 
@@ -435,7 +435,7 @@ async fn job_cancellation_marks_cancelled() -> anyhow::Result<()> {
     let again = db
         .cancel_materialization_jobs_for_derivation_fenced(drv, 1)
         .await?;
-    assert_eq!(again, FencedWrite::Applied(0));
+    assert_eq!(again, FencedOutcome::Applied(0));
     Ok(())
 }
 

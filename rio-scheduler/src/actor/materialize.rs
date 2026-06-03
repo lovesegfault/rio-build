@@ -283,8 +283,10 @@ impl DagActor {
             .backfill_wanted_fenced(self.serving_generation(), build_id, db_id)
             .await
         {
-            Ok(crate::db::FencedWrite::Applied(_)) => {}
-            Ok(crate::db::FencedWrite::Fenced) => {
+            Ok(
+                crate::db::FencedOutcome::Applied(_) | crate::db::FencedOutcome::AlreadyResolved,
+            ) => {}
+            Ok(crate::db::FencedOutcome::Fenced) => {
                 self.note_fenced_evidence_write("wanted relation record");
             }
             Err(e) => {
@@ -1071,23 +1073,16 @@ impl DagActor {
         serving_generation: i64,
     ) {
         let result: Result<Option<bool>, sqlx::Error> = async {
-            let mut tx = self.db.pool().begin().await?;
-            let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
-            if !crate::db::SchedulerDb::at_or_above_floor(floor, serving_generation) {
-                tx.rollback().await?;
-                return Ok(None);
-            }
+            let mut tx = match self.db.begin_fenced(serving_generation).await? {
+                crate::db::FencedBegin::Fenced { .. } => return Ok(None),
+                crate::db::FencedBegin::Open(ftx) => ftx,
+            };
             let mut inserted = false;
             if let Some(row) = &charge_row {
-                inserted = crate::db::SchedulerDb::append_attempt(&mut tx, row).await?;
+                inserted = crate::db::SchedulerDb::append_attempt(tx.conn(), row).await?;
             }
-            sqlx::query(
-                "UPDATE assignments SET status = 'completed', completed_at = now() \
-                 WHERE exec_id = $1 AND status IN ('pending', 'acknowledged')",
-            )
-            .bind(exec_id)
-            .execute(&mut *tx)
-            .await?;
+            tx.close_assignment(exec_id, crate::db::AssignmentCloseStatus::Completed)
+                .await?;
             tx.commit().await?;
             Ok(Some(inserted))
         }
@@ -1129,7 +1124,7 @@ impl DagActor {
             .resolve_materialization_job_fenced(job_id, exec_id, to_state, serving_generation)
             .await
         {
-            Ok(crate::db::FencedWrite::Applied(rows)) => {
+            Ok(crate::db::FencedOutcome::Applied(rows)) => {
                 // T-6.2 lifecycle counter: one increment per APPLIED
                 // terminal resolution, labeled by outcome. rows == 0 is
                 // the at-most-once no-op (already resolved) and never
@@ -1152,7 +1147,15 @@ impl DagActor {
                     .await;
                 rows > 0
             }
-            Ok(crate::db::FencedWrite::Fenced) => {
+            Ok(crate::db::FencedOutcome::AlreadyResolved) => {
+                // Settled by an earlier resolution: not the at-most-once
+                // edge (no counter), but the pin-release re-check is the
+                // same self-scoping no-op-if-live call.
+                self.release_materialization_pins_best_effort("job resolution")
+                    .await;
+                false
+            }
+            Ok(crate::db::FencedOutcome::Fenced) => {
                 self.note_fenced_evidence_write("materialization job resolve");
                 false
             }
@@ -1250,8 +1253,11 @@ impl DagActor {
                 .park_materialization_job_fenced(job_id, park_until_epoch, serving_generation)
                 .await
             {
-                Ok(crate::db::FencedWrite::Applied(_)) => {}
-                Ok(crate::db::FencedWrite::Fenced) => {
+                Ok(
+                    crate::db::FencedOutcome::Applied(_)
+                    | crate::db::FencedOutcome::AlreadyResolved,
+                ) => {}
+                Ok(crate::db::FencedOutcome::Fenced) => {
                     self.note_fenced_evidence_write("materialization job park");
                 }
                 Err(e) => warn!(%job_id, error = %e, "materialization job park failed"),

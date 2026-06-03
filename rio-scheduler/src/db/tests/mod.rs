@@ -14,6 +14,8 @@ mod attempts;
 mod batch;
 mod builds;
 mod derivations;
+mod fence_coverage;
+mod fenced_tx;
 mod history;
 mod live_pins;
 mod materialization;

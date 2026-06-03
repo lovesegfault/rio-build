@@ -104,15 +104,68 @@ pub(crate) struct OpenAttemptRow {
 }
 
 impl SchedulerDb {
+    /// The mint's active-row upsert statement, shared between the
+    /// production mint transaction and the statement-guard interleaving
+    /// test (the test exercises THIS statement under a hand-held race —
+    /// never a copy). Same active-row upsert discipline as the stream
+    /// path's historical insert_assignment (assignments_active_uq is
+    /// the arbiter). Returns `rows_affected`.
+    ///
+    /// **The statement guard (bug_261).** Under READ COMMITTED the
+    /// begin-time floor read races a successor's claim+mint committing
+    /// between the floor read and this upsert: the Rust-side compare
+    /// passes on a stale floor, and an unguarded `DO UPDATE` would
+    /// overwrite the successor's newer row (regressing `generation` and
+    /// clobbering its `exec_id`). The
+    /// `WHERE assignments.generation <= EXCLUDED.generation` predicate
+    /// closes that TOCTOU for the destructive half: PostgreSQL
+    /// evaluates the conflict-arm WHERE against the row's LATEST
+    /// COMMITTED version (EvalPlanQual), so a mid-race lower-generation
+    /// mint updates zero rows — the begin-time floor check is advisory;
+    /// this guard is authoritative. Equal generation passes (`<=`, the
+    /// same-epoch re-acquire keep). The fresh-INSERT-below-floor
+    /// residual (no conflict row to evaluate against) is priced in
+    /// `fence-invariant-map.md` and bounded in `fencedWrites.qnt`.
+    // r[impl sched.lease.fence-statement-guard]
+    pub(crate) async fn mint_assignment_upsert_in_tx(
+        conn: &mut sqlx::PgConnection,
+        derivation_id: Uuid,
+        executor_id: &str,
+        generation: i64,
+        exec_id: Uuid,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id) \
+             VALUES ($1, $2, $3, 'pending', $4) \
+             ON CONFLICT (derivation_id) WHERE status IN ('pending', 'acknowledged') \
+             DO UPDATE SET \
+                 builder_id = EXCLUDED.builder_id, \
+                 generation = EXCLUDED.generation, \
+                 status = 'pending', \
+                 assigned_at = now(), \
+                 completed_at = NULL, \
+                 exec_id = EXCLUDED.exec_id \
+             WHERE assignments.generation <= EXCLUDED.generation",
+        )
+        .bind(derivation_id)
+        .bind(executor_id)
+        .bind(generation)
+        .bind(exec_id)
+        .execute(&mut *conn)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SchedulerDb {
     /// The fenced pull-mint transaction (the durable half of
     /// `PullAssignment`'s Deliver arm): write/refresh the active
     /// `assignments` row and insert the `drv_executions` row
-    /// (`source_node` when known) in ONE transaction that commits only
-    /// if `serving_generation` is not below the durable claims floor
-    /// (GREATEST over `leader_generation_claims` and `assignments` —
-    /// the same arms `max_known_generation` reads). Returns `Ok(true)`
-    /// when the transaction committed and `Ok(false)` when the fence
-    /// aborted it (nothing written).
+    /// (`source_node` when known) through the [`super::FencedTx`]
+    /// capability — committed only at-or-above the durable claims
+    /// floor. Returns [`super::FencedOutcome::Fenced`] when the fence
+    /// (begin-time floor or the upsert's own statement guard) refused;
+    /// nothing written in that case.
     // r[impl sched.executor.pull-transaction+2]
     // r[impl sched.lease.generation-fence+3]
     // The argument list mirrors the row pair this single transaction
@@ -128,42 +181,27 @@ impl SchedulerDb {
         source_node: Option<&str>,
         deadline_secs: Option<f64>,
         attempt_kind: crate::state::AttemptKind,
-    ) -> Result<bool, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        // The floor read runs on the transaction's connection so the
-        // commit happens at-or-after any claim row visible here; a
-        // below-floor serving generation aborts with no writes.
-        let floor: Option<i64> = sqlx::query_scalar(
-            "SELECT GREATEST( \
-                 (SELECT MAX(generation) FROM assignments), \
-                 (SELECT MAX(generation) FROM leader_generation_claims))",
+    ) -> Result<super::FencedOutcome, sqlx::Error> {
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            super::FencedBegin::Fenced { .. } => return Ok(super::FencedOutcome::Fenced),
+            super::FencedBegin::Open(ftx) => ftx,
+        };
+        let upserted = Self::mint_assignment_upsert_in_tx(
+            tx.conn(),
+            derivation_id,
+            executor_id.as_str(),
+            serving_generation,
+            exec_id,
         )
-        .fetch_one(&mut *tx)
         .await?;
-        if floor.is_some_and(|f| serving_generation < f) {
-            tx.rollback().await?;
-            return Ok(false);
+        if upserted == 0 {
+            // The statement guard refused: a newer-generation active
+            // row exists (the begin-time floor read lost the race).
+            // Drop without commit = rollback — the drv_executions row
+            // must not exist for a mint that never owned the
+            // assignment.
+            return Ok(super::FencedOutcome::Fenced);
         }
-        // Same active-row upsert discipline as the stream path's
-        // insert_assignment (assignments_active_uq is the arbiter).
-        sqlx::query(
-            "INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id) \
-             VALUES ($1, $2, $3, 'pending', $4) \
-             ON CONFLICT (derivation_id) WHERE status IN ('pending', 'acknowledged') \
-             DO UPDATE SET \
-                 builder_id = EXCLUDED.builder_id, \
-                 generation = EXCLUDED.generation, \
-                 status = 'pending', \
-                 assigned_at = now(), \
-                 completed_at = NULL, \
-                 exec_id = EXCLUDED.exec_id",
-        )
-        .bind(derivation_id)
-        .bind(executor_id.as_str())
-        .bind(serving_generation)
-        .bind(exec_id)
-        .execute(&mut *tx)
-        .await?;
         // The execution lifecycle row carries the controller-
         // authoritative source attribution (071), the dispatched-
         // deadline anchor for the establishment window (072), and the
@@ -184,10 +222,10 @@ impl SchedulerDb {
         .bind(source_node)
         .bind(deadline_secs)
         .bind(attempt_kind.as_str())
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
         tx.commit().await?;
-        Ok(true)
+        Ok(super::FencedOutcome::Applied(1))
     }
 
     /// Backfill the execution row's controller-authoritative node

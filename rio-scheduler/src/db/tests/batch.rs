@@ -4,7 +4,7 @@ use rio_test_support::TestDb;
 use uuid::Uuid;
 
 use super::insert_test_derivation;
-use crate::db::{DerivationRow, FencedWrite, SchedulerDb, encode_pg_text_array};
+use crate::db::{DerivationRow, FencedOutcome, SchedulerDb, encode_pg_text_array};
 use crate::state::DerivationStatus;
 
 #[test]
@@ -300,7 +300,7 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
 /// no newer tenure's evidence exists, so this is the same-epoch
 /// re-acquire keep, not a hazard. The fence comparison is `>=` and must
 /// never be tightened to `>`: this test pins that.
-// r[verify sched.evidence.durability+3]
+// r[verify sched.evidence.durability+4]
 #[tokio::test]
 async fn same_generation_write_at_floor_applies() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -324,7 +324,7 @@ async fn same_generation_write_at_floor_applies() -> anyhow::Result<()> {
         .update_derivation_status(&hash, DerivationStatus::Queued, None, 5)
         .await?;
     assert!(
-        matches!(outcome, FencedWrite::Applied(_)),
+        matches!(outcome, FencedOutcome::Applied(_)),
         "a write at exactly the floor (same-epoch re-acquire) MUST apply — \
          the >= comparison is load-bearing; got {outcome:?}"
     );
@@ -342,7 +342,7 @@ async fn same_generation_write_at_floor_applies() -> anyhow::Result<()> {
 /// The fence is not over-eager on a fresh cluster: with no claims and
 /// no assignments the floor is empty, and any serving generation
 /// applies.
-// r[verify sched.evidence.durability+3]
+// r[verify sched.evidence.durability+4]
 #[tokio::test]
 async fn empty_floor_write_applies() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -354,7 +354,7 @@ async fn empty_floor_write_applies() -> anyhow::Result<()> {
         .update_derivation_status(&hash, DerivationStatus::Queued, None, 1)
         .await?;
     assert!(
-        matches!(outcome, FencedWrite::Applied(_)),
+        matches!(outcome, FencedOutcome::Applied(_)),
         "a fresh cluster (empty floor) must apply writes; got {outcome:?}"
     );
     let (status,): (String,) =
