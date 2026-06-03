@@ -2857,12 +2857,13 @@ async fn test_build_paths_with_results_failure_rescues_verified_target_as_substi
 // r[verify gw.opcode.lost-terminal-relay+2]
 /// The keep-going sibling of the fail-fast rescue test above — same
 /// scenario, ONE conjunct flipped: the tenant policy stamps
-/// `keep_going = true` onto the submission, so the scheduler settles the
-/// DAG-level failure word only once every derivation resolved, and a
-/// terminal-less confirmed-present root means its evidence never reached
-/// the relay (event loss, or a merge-seeded node that emits no event —
-/// marking either is the conservative polarity per the rio-nix trust
-/// bound). The rescue's wire value is IDENTICAL to the fail-fast cell —
+/// `keep_going = true` onto the submission, so a settled DAG-level
+/// failure word means every derivation resolved with a terminal each
+/// (merge-resolved nodes emit theirs), and a terminal-less
+/// confirmed-present root means its evidence never reached the relay
+/// (event loss, or an event-less abort sweep — marking either is the
+/// conservative polarity per the rio-nix trust bound). The rescue's
+/// wire value is IDENTICAL to the fail-fast cell —
 /// `Substituted`, `timesBuilt = 0`, empty message, same builtOutputs —
 /// and the lost-terminal marker line rides the stderr side channel for
 /// exactly the rescued root, never for the verbatim-failed batch-mate.
@@ -2959,6 +2960,103 @@ async fn test_build_paths_with_results_keepgoing_failure_rescue_relays_lost_term
         result_b.error_msg.contains("boom"),
         "B keeps the scheduler's error message, got: {:?}",
         result_b.error_msg
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify sched.merge.dep-failed-transitive+2]
+// r[verify gw.opcode.build-results-honest+2]
+/// The merge-seed relay, end to end across the wire boundary: the
+/// scheduler resolves a root whose dependency was already terminally
+/// failed at merge by emitting `DerivationFailed{DEPENDENCY_FAILED}`
+/// with the shared producer-formatted message — BEFORE `BuildStarted`
+/// (seeding runs in the merge phases ahead of the Started emission,
+/// like the merge-time `DerivationCached` arms) — so the relay records
+/// an own terminal with no prior Started/activity, and the per-root
+/// verdict reports it VERBATIM: the scheduler's status and message
+/// reach the client byte-for-byte, never the DAG-level blanket (the
+/// false-regression shape: the engine would charge this root the
+/// sibling's failure text) and never a presence rescue. The root's
+/// outputs are deliberately seeded present, pinning that an own
+/// recorded failure outranks store presence; no lost-terminal marker
+/// rides the stream — nothing was lost.
+#[tokio::test]
+async fn test_build_paths_with_results_merge_seeded_dep_failed_keeps_own_terminal()
+-> anyhow::Result<()> {
+    let policy = rio_gateway::config::BuildPolicy {
+        keep_going: true,
+        force_build_roots: false,
+    };
+    let mut h = GatewaySession::new_with_tenant_and_policy("replay-leaf", policy).await?;
+    do_handshake(&mut h.stream).await?;
+    send_set_options(&mut h.stream).await?;
+
+    // Producer-built message: the scheduler's merge-seed emission goes
+    // through rio_proto::dependency_failed_summary — the fixture must
+    // too, or this test certifies a shape production never emits.
+    let seeded_msg = rio_proto::dependency_failed_summary(
+        HONEST_B_DRV,
+        "already poisoned when this build merged",
+    );
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::failed(
+                HONEST_A_DRV.into(),
+                seeded_msg.clone(),
+                types::BuildResultStatus::DependencyFailed,
+            ),
+        )),
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 2,
+            cached_derivations: 0,
+        })),
+        // The keep-going DAG settles failed with the build-level
+        // blanket — which must NOT reach the seeded root's result.
+        ev(build_event::Event::Failed(types::BuildFailed {
+            error_message: rio_proto::dag_first_failure_summary(HONEST_B_DRV),
+            failed_derivation: HONEST_B_DRV.into(),
+            status: 0,
+        })),
+    ]));
+
+    h.store
+        .seed_with_content(HONEST_A_DRV, HONEST_A_ATERM.as_bytes());
+    // Present outputs must not rescue an own recorded failure.
+    h.store.seed_with_content(HONEST_A_OUT, b"a-out");
+
+    let path_a = format!("{HONEST_A_DRV}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: std::slice::from_ref(&path_a),
+        u64: 0,
+    );
+
+    let frames = collect_stderr_frames(&mut h.stream).await;
+    assert!(
+        lost_terminal_marker_drvs(&frames).is_empty(),
+        "an own terminal is never a lost terminal: {frames:?}"
+    );
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+
+    let (echoed, result) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(echoed, path_a);
+    assert_eq!(
+        result.status,
+        BuildStatus::DependencyFailed,
+        "the seeded root's own status must reach the client: {result:?}"
+    );
+    assert_eq!(
+        result.error_msg, seeded_msg,
+        "the producer-formatted dependency summary must arrive verbatim — \
+         not the DAG-level blanket"
+    );
+    assert_eq!(result.times_built, 0, "{result:?}");
+    assert!(
+        result.built_outputs.is_empty(),
+        "a failure carries no builtOutputs: {result:?}"
     );
 
     h.finish().await;

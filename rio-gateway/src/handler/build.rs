@@ -580,10 +580,15 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             // metacharacters.
             //
             // Gated on `failure_status != DEPENDENCY_FAILED`: a
-            // cascaded ancestor never executed (the trigger drv
-            // failed first), so there is no log keyed by this drv —
+            // cascaded ancestor — or a node the scheduler seeded
+            // DependencyFailed at merge against an already-failed
+            // dep — never executed (the trigger drv failed first),
+            // so there is no log keyed by this drv —
             // `rio-cli logs '<cascaded>'` would resolve to NotFound,
             // or worse, a *prior* build's stale log of the same drv.
+            // A pre-existing still-poisoned node arrives as
+            // CACHED_FAILURE instead and keeps the hint: its prior
+            // execution's log exists and is exactly the relevant one.
             // The trigger drv (the one with the actual log) gets its
             // own `Failed` event with a real `failure_status` and
             // emits the hint. In a `--keep-going` build with N
@@ -1039,11 +1044,16 @@ struct ProcessedBuild {
     /// per-tenant policy onto `SubmitBuildRequest.keep_going`. Decides
     /// what a failed DAG-level word implies about a terminal-less root:
     /// under fail-fast the scheduler stops early, so such a root was
-    /// plausibly never attempted; under keep-going the scheduler settles
-    /// the failure word only once every derivation resolved, so a
-    /// terminal-less root there means its evidence never reached this
-    /// relay (event loss, or a merge-seeded node that emits no event) —
-    /// see [`per_root_verdict`]'s marker decision.
+    /// plausibly never attempted; under keep-going a SETTLED failure
+    /// word means every derivation resolved with a terminal event each
+    /// (merge-resolved nodes included — the scheduler emits
+    /// `DerivationFailed` for nodes seeded `DependencyFailed` at merge),
+    /// so a terminal-less root there means either its evidence never
+    /// reached this relay (event loss) or the build was aborted by one
+    /// of the scheduler's event-less sweeps (per-build wall-clock
+    /// timeout, top-down fail-fast, cancellation), which resolve
+    /// remaining nodes without per-derivation events and reuse the
+    /// failure word — see [`per_root_verdict`]'s marker decision.
     keep_going: bool,
     /// True when the DAG-level `result` is a failure word THIS GATEWAY
     /// synthesized rather than a verdict the scheduler emitted: the
@@ -1159,12 +1169,15 @@ enum RootEvidence {
 ///   own `Cached` terminal (a recorded substitution event), and on the
 ///   blanket-failure presence rescue it is set exactly when the failure
 ///   word says nothing about THIS root having been resolved without a
-///   terminal — under keep-going the scheduler settles the failure word
-///   only once every derivation resolved, so a terminal-less root means
-///   its evidence never reached this relay (event loss, or a
-///   merge-seeded node that emits no event — marking either is the
-///   conservative polarity, see the consumer-enforced trust bound in
-///   rio-nix's relay-marker doc); and a SYNTHESIZED failure word
+///   terminal — under keep-going a settled failure word means every
+///   derivation resolved with a terminal each (merge-resolved nodes
+///   included: the scheduler emits `DerivationFailed` for nodes seeded
+///   `DependencyFailed` at merge), so a terminal-less root means event
+///   loss, or a root resolved by one of the scheduler's event-less
+///   abort sweeps (wall-clock timeout, top-down fail-fast,
+///   cancellation — marking either is the conservative polarity, see
+///   the consumer-enforced trust bound in rio-nix's relay-marker
+///   doc); and a SYNTHESIZED failure word
 ///   (reconnect-exhausted stream death, unsubmitted stand-ins) is the
 ///   gateway's own statement that the evidence channel died, whatever
 ///   the batch semantics. Only the fail-fast scheduler-settled rescue
@@ -1321,21 +1334,28 @@ fn per_root_verdict(
                 //   root was plausibly never attempted — nothing was
                 //   lost; the rescue mints a plain Substituted (a
                 //   measurable substitution-shaped event downstream).
-                // - Keep-going (`keep_going`): the scheduler settles
-                //   the failure word only once EVERY derivation
-                //   resolved (one terminal each, with merge-seeded
-                //   DependencyFailed nodes resolved without emitting
-                //   any event), so no own terminal here means this
-                //   root's evidence never reached the relay — the same
-                //   event-loss shape as the completed-DAG cell above.
-                //   Marking a merge-seeded root that happens to be
-                //   present is the conservative polarity: the marker
-                //   only flips that drv's row onto the evidence-loss
-                //   leg — a bounded, gate-visible cost (auto-retry
-                //   burn, then infra-indeterminate, a regression-gate
-                //   trip; rio-nix's consumer-enforced trust bound
-                //   prices it), never minting a success or a
-                //   violation — while leaving it unmarked records a
+                // - Keep-going (`keep_going`): a SETTLED keep-going
+                //   failure word means every derivation resolved with
+                //   a terminal event each — merge-resolved nodes
+                //   included, since the scheduler emits
+                //   `DerivationFailed` for nodes seeded
+                //   `DependencyFailed` at merge (`seed_initial_states`
+                //   / the pre-existing reconciliation arm). No own
+                //   terminal here therefore means event loss — the
+                //   same shape as the completed-DAG cell above — or a
+                //   root resolved by one of the scheduler's
+                //   EVENT-LESS ABORT SWEEPS, which reuse the failure
+                //   word without settling it: the per-build wall-clock
+                //   timeout, the top-down fail-fast, and cancellation
+                //   all resolve remaining nodes with no per-drv
+                //   events. Marking an abort-swept root that happens
+                //   to be present is the conservative polarity: the
+                //   marker only flips that drv's row onto the
+                //   evidence-loss leg — a bounded, gate-visible cost
+                //   (auto-retry burn, then infra-indeterminate, a
+                //   regression-gate trip; rio-nix's consumer-enforced
+                //   trust bound prices it), never minting a success or
+                //   a violation — while leaving it unmarked records a
                 //   substitution event that force-build measurement
                 //   tenants make definitionally impossible.
                 // - Synthesized (`synthesized`): the failure word is
@@ -1350,18 +1370,36 @@ fn per_root_verdict(
                 }
             } else {
                 // Unverified blanket failure stands — under EVERY
-                // (keep_going × synthesized) combination. Under
-                // keep-going the terminal-less unverifiable state is
-                // genuinely ambiguous between event loss and a
-                // merge-seeded DependencyFailed root (the scheduler
-                // emits no event for nodes seeded terminal at merge),
-                // and the verbatim blanket is what the measurement
-                // consumer's poison-recovery arm matches on — minting
-                // an evidence-loss report here would break that
-                // recovery for the seeded case. Closing this cell
-                // needs the producer to disambiguate (scheduler-side
-                // events for merge-seeded nodes), not another
-                // consumer-side guess.
+                // (keep_going × synthesized) combination. The
+                // historical seeding ambiguity is closed at the
+                // producer: a node resolved `DependencyFailed` at
+                // merge now emits its own terminal (scheduler
+                // `seed_initial_states` / the pre-existing
+                // reconciliation arm) and reaches the OwnTerminal arm
+                // above with a named trigger. The cell still cannot
+                // route to the evidence-loss row, because under
+                // keep-going the terminal-less unverifiable state
+                // remains ambiguous between event loss and a root
+                // resolved by one of the scheduler's EVENT-LESS ABORT
+                // SWEEPS — the per-build wall-clock timeout
+                // (housekeeping), the top-down fail-fast (dispatch),
+                // and cancellation all resolve remaining nodes with no
+                // per-drv events and reuse the failure word, which for
+                // a top-down fail-fast after an earlier failure is the
+                // BLANKET text itself. For those rows the verbatim
+                // word is the honest report (a deliberate abort, not
+                // evidence loss), and the blanket text is what the
+                // measurement consumer's poison-recovery arm matches
+                // on — the top-down fail-fast IS the sticky-rot shape
+                // that recovery exists for, so minting an
+                // evidence-loss report here would both misclassify
+                // deliberate aborts as infrastructure loss and sever
+                // that recovery. Closing this cell needs the abort
+                // sweeps to emit per-derivation terminals
+                // (`cancel_build_derivations`' three arms — the
+                // remaining event-less resolvers of the scheduler's
+                // derivation-terminal event rule); until then the
+                // verbatim blanket stands.
                 RootVerdict::Verbatim(dag)
             }
         }
@@ -1377,10 +1415,12 @@ enum RootVerdict {
         base: BuildResult,
         /// True for exactly the presence mints whose `Substituted` word
         /// stands on a lost evidence channel: the Completed-DAG
-        /// lost-terminal cell, the keep-going blanket-rescue cell (the
-        /// scheduler settles a keep-going failure only once every
-        /// derivation resolved, so a terminal-less root there lost its
-        /// evidence), and the synthesized-failure rescue cell (the
+        /// lost-terminal cell, the keep-going blanket-rescue cell (a
+        /// settled keep-going failure means every derivation resolved
+        /// with a terminal each — merge-resolved nodes emit theirs —
+        /// so a terminal-less root there lost its evidence, or was
+        /// resolved by an event-less abort sweep, marked as the
+        /// conservative polarity), and the synthesized-failure rescue cell (the
         /// reconnect-exhausted word is the gateway's own statement that
         /// the evidence channel died) — all `Substituted` off
         /// `confirmed_present` with no own terminal. The wire result is
@@ -2902,7 +2942,9 @@ mod tests {
     /// Quantification domain: evidence enumerates every constructor shape
     /// of [`RootEvidence`] reachable from the handler — own terminals in
     /// all three terminal-event shapes the relay records (Completed →
-    /// `success()`, Cached → `substituted()`, Failed → failure), the
+    /// `success()`, Cached → `substituted()`, Failed → failure, with the
+    /// merge-seed relay's `DependencyFailed` row pinned separately
+    /// through the shared producer formatter), the
     /// DAG fallback for an acknowledged batch with both DAG outcomes
     /// (Completed with this root's terminal lost — the state-channel
     /// Lagged / leader-failover-reconnect / path-key-mismatch shapes —
@@ -2971,6 +3013,17 @@ mod tests {
     // r[verify gw.opcode.lost-terminal-relay+2]
     #[test]
     fn per_root_verdict_lattice_totality() {
+        /// The merge-seed relay row's message, built through the ONE
+        /// producer of the shape (`rio_proto::dependency_failed_summary`
+        /// — the scheduler's runtime cascade and merge-seeding sites all
+        /// format through it), never hand-written: the lattice pins the
+        /// production shape, not a lookalike.
+        static MERGE_SEED_MSG: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            rio_proto::dependency_failed_summary(
+                "/nix/store/cccccccccccccccccccccccccccccccc-dep.drv",
+                "already poisoned when this build merged",
+            )
+        });
         const CONFIRMED: usize = 0;
         const MISSING: usize = 1;
         const UNVERIFIABLE: usize = 2;
@@ -3147,6 +3200,40 @@ mod tests {
             ),
             (
                 Cell {
+                    label: "own DependencyFailed terminal (merge-seed relay)",
+                    own_success: false,
+                    own_failure: Some((BuildStatus::DependencyFailed, MERGE_SEED_MSG.as_str())),
+                    submitted: None,
+                },
+                // The scheduler's merge-seeding emission: a root whose
+                // dependency was already terminally failed when its
+                // batch merged now arrives with its OWN terminal —
+                // status DEPENDENCY_FAILED, message built by the shared
+                // producer formatter naming the trigger — instead of
+                // falling through to the DAG-level blanket cells. The
+                // fixture message goes through
+                // `rio_proto::dependency_failed_summary` (the only
+                // producer of the shape), so this row pins the relay
+                // contract across the crate boundary: such a root is
+                // Verbatim under every store state and can never
+                // re-enter the lost-terminal/blanket fallback lattice.
+                |_, _| {
+                    RootEvidence::OwnTerminal(BuildResult::failure(
+                        BuildStatus::DependencyFailed,
+                        MERGE_SEED_MSG.clone(),
+                    ))
+                },
+                |_, _, _| {
+                    exp(
+                        false,
+                        BuildStatus::DependencyFailed,
+                        0,
+                        Msg::Exact(MERGE_SEED_MSG.as_str()),
+                    )
+                },
+            ),
+            (
+                Cell {
                     label: "Completed DAG, terminal lost",
                     own_success: false,
                     own_failure: None,
@@ -3204,13 +3291,20 @@ mod tests {
                 },
                 // Rescued ONLY by positive presence; otherwise the
                 // blanket failure stands verbatim under every batch-
-                // semantics combination. The rescue's marker keys on
+                // semantics combination (the unverifiable cell keeps
+                // the blanket deliberately: terminal-less there is
+                // ambiguous between event loss and an event-less abort
+                // sweep, and the blanket text feeds the measurement
+                // consumer's poison recovery — see the verdict arm).
+                // The rescue's marker keys on
                 // the bits — both sides of each conjunct:
                 // (kg=f, synth=f) fail-fast scheduler-settled → plain
                 // rescue (the scheduler stopped early; nothing was
                 // lost); (kg=t, synth=f) keep-going scheduler-settled →
-                // marked (every derivation resolved, so a terminal-less
-                // root lost its evidence — or was merge-seeded, where
+                // marked (every derivation resolved with a terminal
+                // each — merge-resolved nodes emit theirs — so a
+                // terminal-less root lost its evidence, or was
+                // resolved by an event-less abort sweep, where
                 // marking is the conservative polarity); (kg=f,
                 // synth=t) and (kg=t, synth=t) → marked (the word is
                 // the gateway's own; the synthesized bit alone decides,

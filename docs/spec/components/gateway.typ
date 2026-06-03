@@ -767,20 +767,29 @@ substitution cell — an own `Cached` terminal, or the fail-fast rescue of a
 root the scheduler plausibly never attempted — would reroute real
 substitution events out of the measurable vocabulary and blind that same
 criterion. Under keep-going the failed-DAG cell is not perfectly
-disambiguated — a terminal-less root may also be a merge-seeded
-`DependencyFailed` node, which the scheduler resolves without emitting any
-event — but marking is the conservative polarity there: the consumer-side
+disambiguated — merge-seeded `DependencyFailed` nodes now emit their own
+terminals (#rref("sched.merge.dep-failed-transitive+2")) and have left the
+terminal-less population, but a terminal-less root may still have been
+resolved by one of the scheduler's event-less abort sweeps (the per-build
+wall-clock timeout, the top-down fail-fast, and cancellation all resolve
+remaining nodes without per-derivation events and reuse the failure word) —
+and marking is the conservative polarity there: the consumer-side
 trust bound (rio-nix's relay-marker doc) caps a marker's effect at flipping
 that drv's same-batch `Substituted` row onto the evidence-loss leg — a
 bounded, gate-visible cost (it burns the drv's shared auto-retry budget and
 at exhaustion mints `infra-indeterminate`, a regression-gate trip; timed
 campaigns terminalize immediately), never minting a success or a violation —
-and the evidence-loss route's re-attempt produces fresh evidence either way. The unverifiable sibling cell of the
-failed keep-going DAG keeps the verbatim blanket failure for the same
-seeding ambiguity in the opposite direction: the blanket text is what the
-measurement consumer's poison-recovery arm matches on, and resolving that
-cell honestly needs the producer to disambiguate (scheduler-side events for
-merge-seeded nodes), not another consumer-side guess.
+and the evidence-loss route's re-attempt produces fresh evidence either way.
+The unverifiable sibling cell of the failed keep-going DAG keeps the
+verbatim blanket failure for the abort-sweep ambiguity in the opposite
+direction: an abort-swept root's honest report IS the verbatim word (a
+deliberate abort, not evidence loss), a top-down fail-fast after an earlier
+failure carries the blanket text itself, and that text is what the
+measurement consumer's poison-recovery arm matches on — the top-down
+fail-fast is precisely the sticky-rot shape the recovery exists for.
+Resolving that cell honestly needs the remaining event-less resolvers (the
+abort sweeps of `cancel_build_derivations`) to emit per-derivation
+terminals, not another consumer-side guess.
 
 The marker's authenticity is producer-owned. The gateway authors the
 stderr framing, so it must never relay forgeable bytes in its own
