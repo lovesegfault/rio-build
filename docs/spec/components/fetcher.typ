@@ -143,23 +143,31 @@ divergence, as a clean rejection instead of a download.
 
 = Transfer contract
 
-#r("fetcher.fetchurl.transfer-cap")[
-  Every byte path of a fetch attempt MUST be metered against the typed
-  per-attempt transfer budget --- the HTTP body on the plain path and
-  the DECOMPRESSED payload on the unpack path (the dimension a
-  decompression bomb amplifies). Budget exhaustion is a typed,
-  permanent-for-candidate failure: never silent truncation (which would
-  surface as a misleading FOD hash mismatch), and never a transient
-  retry (the same candidate serves the same over-budget payload every
-  time). A truncated body remains transient --- truncation is the
-  connection's fault and a retry can succeed; exhaustion is the
-  payload's nature.
+#r("fetcher.fetchurl.transfer-cap+2")[
+  Every byte path of a fetch attempt MUST be metered against ONE typed
+  transfer budget shared by all of the attempt's phases: the HTTP body
+  charge and the DECOMPRESSED-restore charge (the dimension a
+  decompression bomb amplifies) draw from the same meter, so the
+  aggregate an attempt moves --- and the compressed-plus-restored
+  payload it can co-occupy on disk --- never exceeds 1× the cap. A
+  later phase MUST NOT receive a fresh budget. Budget exhaustion is a
+  typed, permanent-for-candidate failure: never silent truncation
+  (which would surface as a misleading FOD hash mismatch), and never a
+  transient retry (the same candidate serves the same over-budget
+  payload every time). A truncated body remains transient ---
+  truncation is the connection's fault and a retry can succeed;
+  exhaustion is the payload's nature.
 ]
 
 The plain path is capped on purpose: the previous shape exempted it
 ("the HTTP body bounds itself --- the server cannot amplify"), but the
 origin URL is tenant-controlled, so the server IS the adversary and
-can stream arbitrarily many body bytes regardless of any header.
+can stream arbitrarily many body bytes regardless of any header. The
+single shared budget closes the same rule's second hole (round-16
+bug_052): the unpack path's restore previously minted an independent
+full budget, so one attempt could move 2× the documented bound and
+hold compressed + restored payloads totalling 2× on disk
+simultaneously.
 
 #r("fetcher.fetchurl.transfer-progress")[
   Long transfers MUST emit a progress line on build stderr at a fixed

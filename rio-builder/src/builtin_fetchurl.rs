@@ -77,17 +77,23 @@ const RETRY_BACKOFF: Backoff = Backoff {
     jitter: Jitter::None,
 };
 
-/// Cap on the bytes moved by ONE fetch attempt: the HTTP body on the
-/// plain path, the DECOMPRESSED payload on the unpack path. 64 GiB is
-/// far beyond any plausible single fetched source archive while still
-/// bounding the damage to roughly the disk headroom a large build
-/// already needs.
+/// Cap on the bytes moved by ONE fetch attempt — a single budget
+/// shared by every phase of the attempt: the HTTP body charge and, on
+/// the unpack path, the decompressed-restore charge draw from the SAME
+/// meter, so an attempt can neither move nor co-occupy on disk more
+/// than 1× this bound in aggregate. (The previous shape gave the
+/// download and the restore independent full budgets — one unpack
+/// attempt could move 2× and hold compressed + restored payloads
+/// totalling 2× simultaneously, contradicting this constant's own
+/// "ONE fetch attempt" wording.) 64 GiB is far beyond any plausible
+/// source archive plus its compressed form while still bounding the
+/// damage to roughly the disk headroom a large build already needs.
 ///
 /// Both paths are capped: the previous shape exempted plain downloads
 /// ("the server cannot amplify") — but the origin URL is
 /// tenant-controlled, so the server IS the adversary and can stream
 /// arbitrarily many body bytes regardless of what any header claims.
-// r[impl fetcher.fetchurl.transfer-cap]
+// r[impl fetcher.fetchurl.transfer-cap+2]
 const MAX_TRANSFER_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Bytes between transfer progress lines on build stderr.
@@ -133,10 +139,11 @@ pub struct FetchurlParams {
     pub hash_algo: String,
     pub hash_b16: String,
     pub netrc: Option<PathBuf>,
-    /// Per-attempt transfer budget (bytes moved: HTTP body on the plain
-    /// path, decompressed payload on the unpack path). Always
-    /// `MAX_TRANSFER_BYTES` in production (`from_env` pins it; this
-    /// is NOT operator-configurable) — a field only so tests can
+    /// Per-attempt transfer budget, shared across the attempt's phases
+    /// (HTTP body + decompressed restore charge one meter — the
+    /// aggregate an attempt moves or co-occupies never exceeds 1×).
+    /// Always `MAX_TRANSFER_BYTES` in production (`from_env` pins it;
+    /// this is NOT operator-configurable) — a field only so tests can
     /// exercise exhaustion without 64 GiB fixtures.
     pub transfer_cap: u64,
 }
@@ -279,6 +286,13 @@ impl FetchError {
 /// it ([`download_to`] charges per chunk; the unpack restore reads
 /// through [`MeteredRead`]).
 ///
+/// ONE meter exists per attempt: [`try_fetch_one`] constructs it and
+/// threads the same instance download → restore (relabeled at the
+/// phase boundary), so the budget is the attempt's AGGREGATE — a
+/// second full budget for a later phase is unconstructible from this
+/// flow, which is what pins the documented 1× movement/co-occupancy
+/// bound.
+///
 /// Exhaustion is a hard error the caller classifies
 /// `PermanentForCandidate`: the same candidate serves the same
 /// over-budget payload on every retry, so retrying is pure waste —
@@ -325,9 +339,16 @@ impl TransferMeter {
         }
     }
 
+    /// Move to the next metered phase of the SAME attempt: the label on
+    /// progress lines changes, the running total and budget do not —
+    /// that continuity is the single-budget property.
+    fn relabel(&mut self, what: &'static str) {
+        self.what = what;
+    }
+
     /// Charge `n` transferred bytes: emit any crossed progress marks,
     /// fail when the budget is exhausted.
-    // r[impl fetcher.fetchurl.transfer-cap]
+    // r[impl fetcher.fetchurl.transfer-cap+2]
     // r[impl fetcher.fetchurl.transfer-progress]
     fn charge(&mut self, n: u64) -> anyhow::Result<()> {
         self.total = self.total.saturating_add(n);
@@ -627,8 +648,14 @@ async fn try_fetch_one(
     ));
     // An interrupted body is transient: the server already proved it
     // can answer, the stream just died.
-    let meter = TransferMeter::new("download", params.transfer_cap);
-    let download_result = download_to(resp, &tmp, meter).await;
+    //
+    // ONE meter for the whole attempt: the download charges it first,
+    // then `finalize_output` threads the SAME meter (relabeled) through
+    // the unpack restore — body bytes + decompressed bytes draw from
+    // one budget, so the attempt's aggregate movement and disk
+    // co-occupancy are both bounded by 1× the cap.
+    let mut meter = TransferMeter::new("download", params.transfer_cap);
+    let download_result = download_to(resp, &tmp, &mut meter).await;
     if let Err(e) = download_result {
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(e);
@@ -637,7 +664,7 @@ async fn try_fetch_one(
     // Finalize failures (bad NAR / bad xz / chmod) are deterministic
     // for THESE bytes: permanent for this candidate; the next candidate
     // may serve different (correct) bytes.
-    let finalize = finalize_output(&tmp, params).await;
+    let finalize = finalize_output(&tmp, params, meter).await;
     // The temp file is consumed by rename on the plain path; on the
     // unpack path (and on any failure) it must not linger in the store
     // scratch where the output scan would reject it as a stray.
@@ -655,7 +682,7 @@ async fn try_fetch_one(
 async fn download_to(
     resp: reqwest::Response,
     dest: &Path,
-    mut meter: TransferMeter,
+    meter: &mut TransferMeter,
 ) -> Result<(), FetchError> {
     use tokio::io::AsyncWriteExt as _;
     let mut file = tokio::fs::File::create(dest)
@@ -683,8 +710,17 @@ async fn download_to(
 }
 
 /// Turn the downloaded temp file into the final output per the params.
+///
+/// `meter` is the attempt's ONE transfer budget, already charged with
+/// the downloaded body; the unpack restore continues charging it (the
+/// plain path moves no further payload bytes — rename is a metadata
+/// operation).
 // r[impl fetcher.fetchurl.attempt-atomic]
-async fn finalize_output(tmp: &Path, params: &FetchurlParams) -> anyhow::Result<()> {
+async fn finalize_output(
+    tmp: &Path,
+    params: &FetchurlParams,
+    meter: TransferMeter,
+) -> anyhow::Result<()> {
     // Attempt atomicity is the FUNCTION's property, not each step's:
     // the guard arms over the output path for the whole fallible scope
     // and is disarmed only after every step — including the trailing
@@ -702,7 +738,7 @@ async fn finalize_output(tmp: &Path, params: &FetchurlParams) -> anyhow::Result<
     // inside the process, which makes attempt-atomicity rio-owned.
     let guard = FreshOutput::arm(&params.output);
     if params.unpack {
-        restore_unpacked(tmp, params).await?;
+        restore_unpacked(tmp, params, meter).await?;
     } else {
         tokio::fs::rename(tmp, &params.output)
             .await
@@ -769,7 +805,11 @@ use std::os::unix::fs::PermissionsExt as _;
 /// synchronous (`rio_nix::nar::restore_path_streaming`), and bridging
 /// it over the async decoder via `SyncIoBridge` avoids buffering the
 /// whole decompressed archive anywhere.
-async fn restore_unpacked(tmp: &Path, params: &FetchurlParams) -> anyhow::Result<()> {
+async fn restore_unpacked(
+    tmp: &Path,
+    params: &FetchurlParams,
+    mut meter: TransferMeter,
+) -> anyhow::Result<()> {
     use async_compression::tokio::bufread::XzDecoder;
     use tokio::io::BufReader;
 
@@ -788,7 +828,10 @@ async fn restore_unpacked(tmp: &Path, params: &FetchurlParams) -> anyhow::Result
     };
 
     let dest = params.output.clone();
-    let meter = TransferMeter::new("unpack", params.transfer_cap);
+    // Same attempt, same budget: only the progress label changes. The
+    // restore's decompressed bytes stack on top of the already-charged
+    // body bytes, keeping the attempt's aggregate at ≤ 1× cap.
+    meter.relabel("unpack");
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         // The restore reads through the meter, so it counts
         // DECOMPRESSED bytes — the dimension a decompression bomb
@@ -1337,7 +1380,7 @@ mod tests {
     /// burned re-downloading an over-budget payload. (The old shape
     /// exempted the plain path entirely: "the server cannot amplify" —
     /// but the origin IS the tenant's server.)
-    // r[verify fetcher.fetchurl.transfer-cap]
+    // r[verify fetcher.fetchurl.transfer-cap+2]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plain_download_over_cap_is_permanent() {
         use axum::{Router, routing::get};
@@ -1384,7 +1427,7 @@ mod tests {
     /// Unpack budget counts DECOMPRESSED bytes: a small xz that
     /// expands past the cap (a decompression bomb) is permanent for
     /// the candidate and is not retried.
-    // r[verify fetcher.fetchurl.transfer-cap]
+    // r[verify fetcher.fetchurl.transfer-cap+2]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xz_bomb_is_permanent_not_retried() {
         use axum::{Router, routing::get};
@@ -1444,7 +1487,7 @@ mod tests {
     /// more) stays TRANSIENT — the documented asymmetry with the cap:
     /// truncation is the connection's fault and a retry can genuinely
     /// succeed; over-budget is the payload's nature.
-    // r[verify fetcher.fetchurl.transfer-cap]
+    // r[verify fetcher.fetchurl.transfer-cap+2]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn truncated_body_is_transient_and_retried() {
         use std::sync::Arc;
@@ -1491,6 +1534,65 @@ mod tests {
             hits.load(Ordering::SeqCst) >= 2,
             "the truncated attempt must be retried"
         );
+    }
+
+    /// The 1× aggregate pin (round-16 bug_052): an unpack attempt's
+    /// download AND restore charge ONE budget. The payload here fits
+    /// the cap in each phase ALONE (64 KiB body, 64 KiB restored, cap
+    /// 1.5× body) — under the old two-meter shape both phases passed
+    /// and the attempt moved 2× body bytes; under the shared budget
+    /// the restore crosses the aggregate mid-stream and the attempt
+    /// fails as typed permanent exhaustion, attempted exactly once.
+    // r[verify fetcher.fetchurl.transfer-cap+2]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unpack_phases_share_one_attempt_budget() {
+        use axum::{Router, routing::get};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // A plain (non-xz) NAR payload: the body bytes and the restored
+        // bytes are the same size, so each phase alone is under the
+        // cap while their sum is not.
+        let inner = tempfile::tempdir().unwrap();
+        std::fs::write(inner.path().join("file"), vec![0x5a_u8; 64 * 1024]).unwrap();
+        let nar = rio_nix::nar::dump_path(&inner.path().join("file")).unwrap();
+        let body_len = nar.len() as u64;
+
+        let hits = Arc::new(AtomicU32::new(0));
+        let h = hits.clone();
+        let app = Router::new().route(
+            "/payload.nar",
+            get(move || {
+                let h = h.clone();
+                let body = nar.clone();
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    body
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let mut p = params(&format!("http://{addr}/payload.nar"), &[]);
+        p.mirrors.clear();
+        p.output = out_dir.path().join("agg-out");
+        p.unpack = true;
+        // Each phase fits alone; the aggregate does not.
+        p.transfer_cap = body_len + body_len / 2;
+        let err = fetch(&p).await.expect_err("aggregate over-cap must fail");
+        assert!(
+            format!("{err:#}").contains("transfer cap"),
+            "typed exhaustion names the cap: {err:#}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "aggregate exhaustion is permanent for the candidate — one attempt"
+        );
+        assert!(!p.output.exists(), "no half-restored tree left behind");
     }
 
     /// A 404 candidate is attempted exactly ONCE: the closed
@@ -1609,7 +1711,9 @@ mod tests {
         p.executable = true;
         p.output = dir.path().join("out");
 
-        finalize_output(&tmp, &p).await.unwrap();
+        finalize_output(&tmp, &p, TransferMeter::new("download", p.transfer_cap))
+            .await
+            .unwrap();
         let meta = std::fs::metadata(&p.output).unwrap();
         assert!(meta.is_file(), "single-file NAR restores to a regular file");
         assert_eq!(
