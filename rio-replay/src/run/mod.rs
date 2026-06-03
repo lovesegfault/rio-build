@@ -813,6 +813,49 @@ fn resolve_demoted_impure(
     }
 }
 
+/// The timed schedule's workload-membership predicate, with the RESOLVED
+/// demotion decision ([`resolve_demoted_impure`] — the plan-time pin, or
+/// its honest re-derivation for pre-pin campaign records) overriding the
+/// fresh per-resume `workload_set` split wherever the decision speaks.
+///
+/// `workload_member` is the sole gate on interruption arming
+/// (`build_schedule` bakes it into every scheduled request), so it is a
+/// CONSUMER of the demotion decision exactly like the disposition records,
+/// the supply protection set, and the submit pool — and it must read the
+/// same resolved membership, or a resume under an engine whose demotion
+/// derivation changed would arm a pinned-demoted unit's recorded
+/// interruption (the channel abandon kills sibling targets' live builds in
+/// a mixed request) or silently disarm a pinned-attemptable one's. The
+/// decision is resolved at the JOB level and projected to drv paths via
+/// the manifest here; request targets outside the pinned scope (out-of-
+/// scope or unmapped drvs — the pin records only in-scope jobs) keep the
+/// fresh split, which is all the information that exists for them.
+///
+/// The offline dry-run planner (`timeline::plan_timed_dry_run`)
+/// legitimately stays on the fresh derivation: it runs without a campaign
+/// record, so there is no pinned decision to read.
+fn pinned_workload_member<'a>(
+    manifest: &[archive_input::ManifestEntry],
+    in_scope: &HashSet<&str>,
+    demoted_in_scope: &'a [String],
+    fresh_workload_drvs: &'a BTreeSet<String>,
+) -> impl Fn(&str) -> bool + 'a {
+    let demoted_jobs: HashSet<&str> = demoted_in_scope.iter().map(String::as_str).collect();
+    let mut pinned_demoted_drvs: HashSet<String> = HashSet::new();
+    let mut pinned_attemptable_drvs: HashSet<String> = HashSet::new();
+    for entry in manifest {
+        if demoted_jobs.contains(entry.job.as_str()) {
+            pinned_demoted_drvs.insert(entry.drv_path.clone());
+        } else if in_scope.contains(entry.job.as_str()) {
+            pinned_attemptable_drvs.insert(entry.drv_path.clone());
+        }
+    }
+    move |drv: &str| {
+        !pinned_demoted_drvs.contains(drv)
+            && (pinned_attemptable_drvs.contains(drv) || fresh_workload_drvs.contains(drv))
+    }
+}
+
 /// One disposition per plan-time-excluded job, derived through
 /// [`classify`] — the single precedence owner — over the union of each
 /// job's plan-time facts. A `BTreeMap` cannot hold two dispositions for
@@ -3259,20 +3302,29 @@ pub async fn run_with_backends(
                 let index = timing_index(&archive);
                 Arc::new(move |session, drv| index.get(&(session, drv.to_string())).cloned())
             };
-            // The same job mapping and workload split the offline dry-run
-            // planner resolves its schedule with: build_schedule bakes both
-            // into the schedule, so the dispatcher, the resume skip-check,
-            // and the dry run all read one resolved artifact.
+            // The same job mapping the offline dry-run planner resolves its
+            // schedule with: build_schedule bakes it into the schedule, so
+            // the dispatcher, the resume skip-check, and the dry run all
+            // read one resolved artifact. The workload split, however, is
+            // NOT the dry-run's fresh derivation: wherever the pinned
+            // demotion decision speaks (in-scope manifest jobs), the
+            // predicate reads it — interruption arming is a consumer of
+            // that decision like dispositions, supply, and the submit pool,
+            // and §7.2 requires every resume to read the recorded
+            // membership instead of re-deriving it. Only out-of-scope and
+            // unmapped request targets keep the fresh archive split.
             let job_of_drv: BTreeMap<String, String> = manifest
                 .iter()
                 .map(|m| (m.drv_path.clone(), m.job.clone()))
                 .collect();
             let workload = supply::workload_set(&archive);
+            let workload_member =
+                pinned_workload_member(&manifest, &in_scope, &demoted_in_scope, &workload.drvs);
             let schedule = build_schedule(
                 &requests,
                 &|session, drv| timing(session, drv),
                 &|drv| job_of_drv.get(drv).cloned(),
-                &|drv| workload.drvs.contains(drv),
+                &workload_member,
                 spec.knobs.speedup,
                 spec.filters.limit,
                 replay_interruptions,
@@ -4026,6 +4078,150 @@ mod tests {
         // until the plan stage itself records a pin.
         let json = serde_json::to_value(&legacy).unwrap();
         assert!(json.get("demotedImpure").is_none(), "{json}");
+    }
+
+    /// Interruption arming reads the PINNED demotion decision, both
+    /// directions (design doc §7.2: every resume reads the recorded
+    /// membership instead of re-deriving it). A campaign record whose pin
+    /// disagrees with the fresh `workload_set` derivation — the resumed-
+    /// under-a-newer-engine shape the pin exists to absorb — must (a) NOT
+    /// arm a pinned-demoted unit's recorded interruption even though the
+    /// fresh split calls it buildable, and (b) STILL arm a
+    /// pinned-attemptable unit's even though the fresh split demotes it.
+    /// Targets outside the pinned scope (unmapped request drvs) keep the
+    /// fresh split — the pin records only in-scope jobs.
+    #[test]
+    fn interruption_arming_honors_the_demotion_pin_in_both_directions() {
+        use crate::archive::schema::RequestTarget;
+
+        let entry = |job: &str, drv: &str| archive_input::ManifestEntry {
+            job: job.to_string(),
+            system: "x86_64-linux".to_string(),
+            attr: String::new(),
+            drv_path: drv.to_string(),
+            outputs: BTreeMap::new(),
+            required_features: Vec::new(),
+        };
+        let drv_demoted = format!("/nix/store/{}-pinned-demoted.drv", "d".repeat(32));
+        let drv_attempt = format!("/nix/store/{}-pinned-attemptable.drv", "e".repeat(32));
+        let drv_unmapped = format!("/nix/store/{}-unmapped.drv", "f".repeat(32));
+        let manifest = vec![
+            entry("demoted.x86_64-linux", &drv_demoted),
+            entry("attempt.x86_64-linux", &drv_attempt),
+        ];
+        let in_scope: HashSet<&str> = ["demoted.x86_64-linux", "attempt.x86_64-linux"]
+            .into_iter()
+            .collect();
+        // The pin demotes `demoted` and keeps `attempt`; the fresh
+        // derivation says exactly the opposite for both, and additionally
+        // owns the unmapped drv.
+        let demoted_in_scope = vec!["demoted.x86_64-linux".to_string()];
+        let fresh_drvs: BTreeSet<String> = [drv_demoted.clone(), drv_unmapped.clone()]
+            .into_iter()
+            .collect();
+        let workload_member =
+            pinned_workload_member(&manifest, &in_scope, &demoted_in_scope, &fresh_drvs);
+        // The predicate itself, all three populations: pin overrides fresh
+        // in both directions; the unmapped drv follows fresh.
+        assert!(
+            !workload_member(&drv_demoted),
+            "pin demotes; fresh opinion ignored"
+        );
+        assert!(
+            workload_member(&drv_attempt),
+            "pin keeps; fresh demotion ignored"
+        );
+        assert!(
+            workload_member(&drv_unmapped),
+            "no pin entry; fresh split applies"
+        );
+
+        // And through the real consumer: build_schedule arms exactly the
+        // members the predicate admits.
+        let request = RequestRecord {
+            session: 4,
+            offset_s: 0.0,
+            targets: [&drv_demoted, &drv_attempt, &drv_unmapped]
+                .iter()
+                .map(|drv| RequestTarget {
+                    drv: drv.to_string(),
+                    outputs: vec!["*".to_string()],
+                })
+                .collect(),
+        };
+        let requests = vec![recorded_request_from(&request)];
+        let interrupted = timeline::RecordedTiming {
+            duration_s: None,
+            stop_offset_s: Some(10.0),
+            interrupted: true,
+            expected_built: false,
+        };
+        let schedule = timeline::build_schedule(
+            &requests,
+            &|_, _| Some(interrupted.clone()),
+            &|_| None,
+            &workload_member,
+            1.0,
+            None,
+            true,
+        );
+        let plan = schedule[0].interruption.as_ref().unwrap();
+        let armed: BTreeSet<&str> = plan.drvs().collect();
+        assert!(
+            !armed.contains(drv_demoted.as_str()),
+            "a pinned-demoted unit's recorded interruption must not arm: {armed:?}"
+        );
+        assert!(
+            armed.contains(drv_attempt.as_str()),
+            "a pinned-attemptable unit's recorded interruption must still arm: {armed:?}"
+        );
+        assert!(
+            armed.contains(drv_unmapped.as_str()),
+            "an unpinned target follows the fresh split: {armed:?}"
+        );
+    }
+
+    /// Consumer enumeration for the fresh `workload_set` derivation: the
+    /// demotion decision is pinned at first plan and resolved through
+    /// `resolve_demoted_impure`, so production code may consult the fresh
+    /// archive split only where no pinned decision can exist. Exactly
+    /// these call sites are allowed (per file, production halves only —
+    /// the same include_str! shape as the `remote_object_match` lint in
+    /// archive/s3.rs); a new caller fails this count until it is routed
+    /// through the pin (or argued into this list):
+    ///
+    /// - supply.rs: 2 — the definition, and `demoted_impure_jobs` (the
+    ///   re-derivation chokepoint `resolve_demoted_impure` itself calls
+    ///   for pre-pin campaign records);
+    /// - timeline.rs: 1 — the offline dry-run planner, which runs without
+    ///   a campaign record (nothing pinned to read);
+    /// - mod.rs: 1 — the timed wiring's FALLBACK feed into
+    ///   `pinned_workload_member`, which consults it only for targets
+    ///   outside the pinned scope;
+    /// - supply/exec.rs: 0.
+    #[test]
+    fn fresh_workload_set_consumers_are_enumerated() {
+        let prod_half = |src: &str| -> String {
+            src.split_once("#[cfg(test)]")
+                .map(|(prod, _)| prod.to_string())
+                .unwrap_or_else(|| src.to_string())
+        };
+        // Built at runtime so this test's own strings cannot match.
+        let needle = format!("{}{}", "workload_set", "(");
+        for (file, src, expected) in [
+            ("supply.rs", include_str!("supply.rs"), 2),
+            ("timeline.rs", include_str!("timeline.rs"), 1),
+            ("mod.rs", include_str!("mod.rs"), 1),
+            ("supply/exec.rs", include_str!("supply/exec.rs"), 0),
+        ] {
+            assert_eq!(
+                prod_half(src).matches(&needle).count(),
+                expected,
+                "{file}: a new fresh-derivation consumer of workload_set must route \
+                 through the demotion pin (resolve_demoted_impure / \
+                 pinned_workload_member) or be argued into this enumeration"
+            );
+        }
     }
 
     struct HealthyCluster;
