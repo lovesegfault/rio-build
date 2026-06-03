@@ -9514,7 +9514,7 @@ async fn test_completed_authoritative_node_survives_conflicting_submission() -> 
     // gate, never displaces. (A conflicting BARE echo is no longer this
     // gate's territory: it routes through the store-evidence check,
     // whose silence/verify/refuse contract has its own pins —
-    // sched.merge.store-evidence-displacement+2.)
+    // sched.merge.store-evidence-displacement+3.)
     let attacker = Uuid::new_v4();
     let mut conflicting = make_test_node("settledA", "aarch64-linux");
     conflicting.drv_content = b"Derive-forged-conflict".to_vec();
@@ -11033,7 +11033,7 @@ async fn test_resubmit_reset_persists_prior_build_failure_evidence(
 }
 
 // ===========================================================================
-// Merge-time store-evidence displacement (sched.merge.store-evidence-displacement+2)
+// Merge-time store-evidence displacement (sched.merge.store-evidence-displacement+3)
 // ===========================================================================
 
 /// Stage a settled content-bound squat at `drv_hash` and reap it: build,
@@ -11072,7 +11072,7 @@ async fn settle_and_reap_squat(
     Ok(squatter)
 }
 
-// r[verify sched.merge.store-evidence-displacement+2]
+// r[verify sched.merge.store-evidence-displacement+3]
 // r[verify sched.persist.settled-identity-freeze+3]
 /// THE bug_076 self-service kill test, row-only form: an authoritative
 /// squat settles at the victim's text-CA `drv_path` and is reaped; the
@@ -11136,7 +11136,7 @@ async fn test_store_evidence_displaces_settled_squat() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+2]
+// r[verify sched.merge.store-evidence-displacement+3]
 /// Resident form: the settled authoritative squat is still in the DAG
 /// (not yet reaped). The store-evidence check raises the verified
 /// claimant to path-bound standing and the displacement primitive — not
@@ -11208,7 +11208,7 @@ async fn test_store_evidence_displaces_settled_resident_squat() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+2]
+// r[verify sched.merge.store-evidence-displacement+3]
 /// THE bug_072 kill (resident settled bare x bare squat cell; depth-3
 /// fix-child of 9d83580f6 <- 1c8cc6877 <- f0a8ffcc9): a bare squat at
 /// the victim's drv_path settles as a CACHE HIT (forged expected
@@ -11408,7 +11408,7 @@ async fn test_hydrated_stripped_row_rejoins_via_m070_bases() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+2]
+// r[verify sched.merge.store-evidence-displacement+3]
 /// A claim the store's own bytes CONTRADICT is rejected outright — the
 /// fetched `.drv` is text-CA-bound to the declared path, so the
 /// contradiction is content-bound truth, not transport noise. The
@@ -11449,7 +11449,7 @@ async fn test_store_evidence_mismatch_rejects_submission() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+2]
+// r[verify sched.merge.store-evidence-displacement+3]
 /// Store silence is not evidence — and it is not a CONFLICT either:
 /// with nothing seeded at the declared path, the merge surfaces
 /// UNAVAILABLE ("retry when the store recovers"), never hardening a
@@ -11484,7 +11484,7 @@ async fn test_store_silence_surfaces_unavailable_row_form() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+2]
+// r[verify sched.merge.store-evidence-displacement+3]
 /// The Step 0.6 (resident squat) form of the silence contract: the
 /// settled authoritative squat is still in the DAG, the bare claimant's
 /// evidence fetch finds nothing — UNAVAILABLE again, by the SAME shared
@@ -11532,7 +11532,7 @@ async fn test_store_silence_surfaces_unavailable_resident_form() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+2]
+// r[verify sched.merge.store-evidence-displacement+3]
 /// R4 row-rank gate: a settled row whose persisted lineage is
 /// byte-anchored (`path_bound_bytes`) is NOT displaceable by the
 /// store-evidence path even when the store would verify the claim — the
@@ -11573,7 +11573,7 @@ async fn test_settled_row_rank_gate_refuses_path_bound_rows() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+2]
+// r[verify sched.merge.store-evidence-displacement+3]
 /// The per-merge fetch budget is structural: nine settled conflicts in
 /// one submission exceed the budget of eight, so at least one conflict
 /// keeps its fail-closed rejection and the whole merge fails; the same
@@ -11641,7 +11641,7 @@ async fn test_store_evidence_budget_caps_fetches() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+2]
+// r[verify sched.merge.store-evidence-displacement+3]
 /// A MATCHING-identity store-backed resubmission joins the settled node
 /// without ever consulting the store: the store is seeded with bytes
 /// that would CONTRADICT the claim, and the join still succeeds — the
@@ -11690,7 +11690,7 @@ async fn test_matching_identity_join_never_consults_store() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+2]
+// r[verify sched.merge.store-evidence-displacement+3]
 /// THE 4x4 arbitration matrix, pinned cell by cell (x bare/non-bare):
 /// no `!=` catch-all survives — every (row rank, incoming rank) pair is
 /// an explicit decision, byte-anchored rows are immovable, the
@@ -11788,7 +11788,7 @@ fn test_settled_arbitration_refuses_undecodable_row_rank() {
     }
 }
 
-// r[verify sched.merge.store-evidence-displacement+2]
+// r[verify sched.merge.store-evidence-displacement+3]
 /// merged_bug_043 kill test, rank form: a settled BARE-ECHO row
 /// (`unverified_claim` — e.g. a forged store-backed squat that settled
 /// before anyone noticed) is displaced by the victim's ordinary
@@ -11845,7 +11845,7 @@ async fn test_unverified_claim_row_displaced_by_ingress_bytes() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+2]
+// r[verify sched.merge.store-evidence-displacement+3]
 /// merged_bug_043 kill test, store-proof form: the victim's
 /// resubmission is BARE (no inline bytes), but its claim verifies
 /// against the store's text-CA `.drv` — a bare store-verified
@@ -11886,7 +11886,7 @@ async fn test_unverified_claim_row_displaced_by_store_verified_bare() -> TestRes
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+2]
+// r[verify sched.merge.store-evidence-displacement+3]
 /// Reverse-squat integrity pin: an AUTHORITATIVE inline claim
 /// (ContentBoundClaim — the hook-fallback shape a forger can mint at
 /// will) can NEVER displace a settled store-backed (`unverified_claim`)
@@ -11933,7 +11933,7 @@ async fn test_reverse_squat_authoritative_cannot_displace_bare_row() -> TestResu
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+2]
+// r[verify sched.merge.store-evidence-displacement+3]
 /// THE merged_bug_020 kill (strip consequence parity, end to end): the
 /// bare claimant's declared `ca_modular_hash` cannot be recomputed
 /// (its only input is a FLOATING drv absent from every seed) but the

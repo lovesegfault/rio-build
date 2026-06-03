@@ -2514,7 +2514,7 @@ async fn try_recv_assignment(
     }
 }
 
-// r[verify sched.dispatch.claims-derived+3]
+// r[verify sched.dispatch.claims-derived+4]
 /// Happy path: a bare store-backed node whose `.drv` is in the store
 /// gets its claims PROVEN against the store bytes — the token verifies
 /// with the derived (== recorded, now byte-bound) values, the verified
@@ -2570,7 +2570,7 @@ async fn test_dispatch_claims_derived_from_store_bytes() -> TestResult {
 /// → `StoreSilence` → transient backoff → poison blaming store
 /// health. The cell pins the shared-cap behavior end to end: bytes
 /// verified, forwarded, and the byte-bound rank persisted.
-// r[verify sched.dispatch.claims-derived+3]
+// r[verify sched.dispatch.claims-derived+4]
 #[tokio::test]
 async fn test_dispatch_claims_verifies_multi_mib_drv() -> TestResult {
     use rio_auth::hmac::HmacVerifier;
@@ -2615,6 +2615,48 @@ async fn test_dispatch_claims_verifies_multi_mib_drv() -> TestResult {
         rank, "path_bound_bytes",
         "multi-MiB .drv reaches byte-bound rank — not StoreSilence backoff"
     );
+    Ok(())
+}
+
+/// Round-17 bug_030 over-cap cell: a bare store-backed node whose
+/// declared path carries a NAR LARGER than the derivation-text class
+/// cap is a CONTENT-BOUND verdict — instant visible poison with the
+/// generated remediation — never store silence. The mock store
+/// declares a hostile 17 MiB `Info.nar_size` over a tiny actual NAR:
+/// the collector's leading pre-check denies byte-free, and the typed
+/// [`DrvFetch::Denied`] maps to
+/// `StructuralReason::OversizedDrvNar` → poison. Pre-typing, this
+/// fold burned the claims-unavailable budget as transient
+/// "store silence" and poisoned blaming store health only at budget
+/// exhaustion — the bounded `wait_for_status(Poisoned)` here is the
+/// discriminator (the silence path parks in backoff far past it).
+/// Reachability: paths that bypassed store admission (substitution
+/// ingest, round-17 merged_063) or hostile PathInfo declarations.
+// r[verify sched.dispatch.claims-derived+4]
+#[tokio::test]
+async fn test_dispatch_claims_over_cap_drv_poisons_content_bound() -> TestResult {
+    let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
+    let (_db, store, handle, _tasks) = setup_claims_fixture(&test_key).await?;
+
+    let (node, aterm, _out) = mint_text_ca_leaf("claims-overcap");
+    let drv_path = node.drv_path.clone();
+
+    // Forge the declared size over the class cap; keep the real NAR
+    // tiny — the denial must be byte-free off the declaration.
+    let (nar, nar_hash) = rio_test_support::fixtures::make_nar(aterm.as_bytes());
+    let mut info = rio_test_support::fixtures::make_path_info(&drv_path, &nar, nar_hash);
+    info.nar_size = rio_common::limits::MAX_DRV_NAR_BYTES + 1024 * 1024;
+    store.seed(info, nar);
+
+    let mut worker_rx = connect_executor(&handle, "overcap-w", "x86_64-linux").await?;
+    merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    assert!(
+        try_recv_assignment(&mut worker_rx, 300).await.is_none(),
+        "no assignment may be signed over an over-cap derivation text"
+    );
+    wait_for_status(&handle, &drv_path, DerivationStatus::Poisoned).await;
     Ok(())
 }
 
@@ -2839,7 +2881,7 @@ async fn test_stripped_node_completes_without_realisation_and_surfaces() -> Test
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+3]
+// r[verify sched.dispatch.claims-derived+4]
 /// Forged `needs_resolve` echo cannot steer post-verification
 /// dispatch: a bare store-backed deferred-IA node submitted with
 /// `needs_resolve = false` (the forged echo — its bytes derive TRUE:
@@ -2878,7 +2920,7 @@ async fn test_dispatch_records_byte_derived_resolve_not_echo() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+3]
+// r[verify sched.dispatch.claims-derived+4]
 /// THE forged-claims kill test (merged_bug_053 variants 2/3 + the
 /// needs_resolve bypass): a submitter echoes forged expected outputs
 /// and a forged resolve flag for a store-backed node. The store bytes
@@ -2922,7 +2964,7 @@ async fn test_dispatch_claims_forgery_poisons_without_signing() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+3]
+// r[verify sched.dispatch.claims-derived+4]
 /// Store unavailability is transient: the assignment rolls back with
 /// backoff (no token, node NOT poisoned), and once the `.drv` appears
 /// the next dispatch derives the claims and assigns normally.
@@ -2989,7 +3031,7 @@ async fn test_dispatch_claims_unavailable_backs_off_then_succeeds() -> TestResul
     panic!("assignment never arrived after the store recovered");
 }
 
-// r[verify sched.dispatch.claims-derived+3]
+// r[verify sched.dispatch.claims-derived+4]
 /// Bytes that do not re-derive the declared text content-address are
 /// transport-grade noise, not evidence in either direction: the
 /// assignment is held (rolled back, NOT poisoned) — never signed.
@@ -3025,7 +3067,7 @@ async fn test_dispatch_claims_text_ca_mismatch_never_signs() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+3]
+// r[verify sched.dispatch.claims-derived+4]
 /// Text-CA-VERIFIED garbage is permanent: the bytes are content-bound
 /// to the declared path (zero-reference text-CA matches) and can never
 /// parse — refetching reproduces them, so the node is poisoned instead
@@ -3121,7 +3163,7 @@ fn input_form_seed_constructor_excludes_floating_published_hashes() {
 /// IA paths from a masked digest, the honest declared paths "differed",
 /// and the node was wrongfully poisoned as FORGED (a hostile-submitter
 /// verdict against an honest victim). Post-fix the child is excluded
-/// and the input is UNSEEDED — under the claims-derived+3 permanence
+/// and the input is UNSEEDED — under the claims-derived+4 permanence
 /// contract that defers on the bounded unseeded budget (the floating
 /// child's row is not seedable either: the not-floating predicate is
 /// uniform across seed sources) and converges to the budget-exhausted
@@ -3215,7 +3257,7 @@ async fn test_dispatch_floating_child_masked_hash_not_treated_as_forged() -> Tes
         try_recv_assignment(&mut worker_rx, 300).await.is_none(),
         "the masked child hash must not be signed against"
     );
-    // Post-claims-derived+3 the unseeded parent DEFERS on its bounded
+    // Post-claims-derived+4 the unseeded parent DEFERS on its bounded
     // budget (cap = max_infra_retries) before the visible poison;
     // each heartbeat chains a Tick that drives another dispatch pass.
     let mut poisoned = false;
@@ -3259,7 +3301,7 @@ async fn test_dispatch_floating_child_masked_hash_not_treated_as_forged() -> Tes
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+3]
+// r[verify sched.dispatch.claims-derived+4]
 /// THE merged_bug_019 strip kill (deploy-blocker; fix-child of
 /// e2c2dbfc2 × 31d281c4d, pattern R1): a bare floating-CA node whose
 /// declared modular hash cannot be recomputed (floating store-backed
@@ -3363,7 +3405,7 @@ async fn test_dispatch_strips_unverifiable_declared_hash_and_assigns() -> TestRe
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+3]
+// r[verify sched.dispatch.claims-derived+4]
 /// THE bug_029 kill, failover trigger (depth 2, e47c330a0 <-
 /// e2c2dbfc2 <- 1c8cc6877, pattern R5 population-axis): a bare
 /// static-IA parent whose completed input child is erased from
@@ -3523,7 +3565,7 @@ async fn test_failover_unseeded_input_reseeds_from_rows_and_dispatches() -> Test
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+3]
+// r[verify sched.dispatch.claims-derived+4]
 /// Read-through MISS arm: the missing input has NO seedable row (the
 /// child never declared a hash, so its row's ca_modular_hash is
 /// NULL). The verdict stands post-read-through — but the consequence
@@ -3657,7 +3699,7 @@ async fn test_unseeded_input_without_row_backs_off_not_poisons() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+3]
+// r[verify sched.dispatch.claims-derived+4]
 /// The verified 100%-livelock population end-to-end: a depth-3
 /// deferred-IA chain (floating leaf ← deferred mid ← deferred root),
 /// all bare store-backed with gateway-shaped declared hashes, under
@@ -3779,7 +3821,7 @@ async fn test_deferred_ia_chain_depth3_dispatches_under_signing() -> TestResult 
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+3]
+// r[verify sched.dispatch.claims-derived+4]
 /// Unseeded-input EXHAUSTION converges to a visible poison: an IA
 /// node whose direct input is neither submitted, nor resident, nor
 /// seedable from any persisted row (the floating child here was
@@ -3927,7 +3969,7 @@ async fn test_dispatch_unseeded_exhaustion_poisons_with_remediation() -> TestRes
     Ok(())
 }
 
-// r[verify sched.dispatch.claims-derived+3]
+// r[verify sched.dispatch.claims-derived+4]
 /// Computed-bound scale pin (counts OPS, not wall-clock): dispatching
 /// 128 independent bare store-backed nodes performs EXACTLY one store
 /// GetPath per node — no closure walks, no refetches after the rank
@@ -4018,7 +4060,7 @@ fn retry_charge_claims_budget_boundaries() {
     );
 }
 
-// r[verify sched.dispatch.claims-derived+3]
+// r[verify sched.dispatch.claims-derived+4]
 /// merged_bug_010 + merged_bug_019 residual: persistent store silence
 /// on a deterministic input converges to a VISIBLE poison at its own
 /// cap — and consumes neither the transient build budget nor the

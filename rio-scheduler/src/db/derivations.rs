@@ -536,7 +536,7 @@ impl SchedulerDb {
         .await
     }
 
-    // r[impl sched.dispatch.claims-derived+3]
+    // r[impl sched.dispatch.claims-derived+4]
     /// Load the input-form columns of derivation rows by drv PATH —
     /// the unseeded-input read-through (bug_029). The rows are
     /// CONTENT-DERIVED state that survives reap and failover (the two
@@ -604,7 +604,7 @@ impl SchedulerDb {
     /// Persist a stripped-claim verification: the rank rises on the
     /// verified bytes AND the unverifiable declared modular hash is
     /// MOVED to the segregated preservation column in the same
-    /// statement (`sched.dispatch.claims-derived+3` — an unverifiable
+    /// statement (`sched.dispatch.claims-derived+4` — an unverifiable
     /// claim is NO claim and never stays in the live evidence column;
     /// exact ingress-strip parity, `ingress-inline-drv-binding+1`).
     /// M_070: round-15 destroyed the value here, which left

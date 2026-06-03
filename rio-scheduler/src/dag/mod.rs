@@ -76,7 +76,7 @@ pub enum DagError {
     /// bare-resubmission claimant hitting this against a settled squat
     /// is self-service: upload the genuine `.drv` to the store and
     /// resubmit — the merge-time store-evidence check
-    /// (`sched.merge.store-evidence-displacement+2`) verifies the claim
+    /// (`sched.merge.store-evidence-displacement+3`) verifies the claim
     /// against the store's text-CA-bound bytes and raises it past the
     /// squat's rank.
     #[error(
@@ -310,9 +310,9 @@ pub(crate) fn verifiable_identity_matches(
 /// hash — then `stripped_declared_hash` carries the strip): the
 /// created node displaces with `path_bound_bytes` standing, records
 /// the BYTE-DERIVED resolve flag (never the submitter's echo,
-/// `sched.dispatch.claims-derived+3`), and applies the strip with
+/// `sched.dispatch.claims-derived+4`), and applies the strip with
 /// M_070 preservation when present
-/// (`sched.merge.store-evidence-displacement+2` — one verdict, one
+/// (`sched.merge.store-evidence-displacement+3` — one verdict, one
 /// consequence, identical at the merge and dispatch consumers).
 #[derive(Debug, Clone, Copy)]
 pub struct StoreEvidenceGrant {
@@ -781,7 +781,7 @@ impl DerivationDag {
     ///   claim is live or parked in the retry machinery, in-flight
     ///   joins are dedup and dispatch re-verifies bare claims against
     ///   the store before signing. SETTLED bare victims are NOT
-    ///   exempt (sched.merge.store-evidence-displacement+2,
+    ///   exempt (sched.merge.store-evidence-displacement+3,
     ///   rank-uniform; bug_072): a settled bare node's recorded
     ///   outputs are served as cache hits, so its protection is the
     ///   same strict rank rule as every other settled form — a
@@ -817,7 +817,7 @@ impl DerivationDag {
             status,
             DerivationStatus::Completed | DerivationStatus::Skipped
         );
-        // r[impl sched.merge.store-evidence-displacement+2]
+        // r[impl sched.merge.store-evidence-displacement+3]
         // Store-anchored exemption is scoped to NON-settled victims;
         // settled bare nodes are rank-arbitrated below (rank-uniform
         // with the row arbitration — bug_072: the categorical
@@ -892,7 +892,7 @@ impl DerivationDag {
     /// [`Self::merge`] with merge-time STORE evidence: hashes in
     /// `store_evidence` were verified by the actor against the store's
     /// own text-CA-enforced `.drv` bytes
-    /// (`sched.merge.store-evidence-displacement+2`), so their incoming
+    /// (`sched.merge.store-evidence-displacement+3`), so their incoming
     /// nodes displace with `PathBoundBytes` standing instead of their
     /// bare ingress shape rank. The set only ever RAISES a displacer's
     /// rank — victims' protection ranks are read from their own state.
@@ -1019,7 +1019,7 @@ impl DerivationDag {
             // Per-node displacer standing: the ingress shape rank,
             // raised to PathBoundBytes when the actor verified this
             // hash against the store's own text-CA-enforced bytes
-            // (sched.merge.store-evidence-displacement+2). Computed once
+            // (sched.merge.store-evidence-displacement+3). Computed once
             // per node, consumed by every displace() call in the arms.
             let displacer_evidence = {
                 let shape = DefinitionEvidence::from_node_shape(node);
@@ -1149,7 +1149,7 @@ impl DerivationDag {
                     )
                     && !verifiable_identity_matches(existing, node)
                 {
-                    // r[impl sched.merge.store-evidence-displacement+2]
+                    // r[impl sched.merge.store-evidence-displacement+3]
                     // Settled bare x bare identity conflict (bug_072):
                     // the store-backed join exemption is for nodes
                     // whose truth lives in the store — but a SETTLED
@@ -1419,7 +1419,7 @@ impl DerivationDag {
                 // carries the verified standing, not the bare echo's
                 // shape rank. Same value the displacement verdict used.
                 state.evidence = state.evidence.max(displacer_evidence);
-                // r[impl sched.dispatch.claims-derived+3]
+                // r[impl sched.dispatch.claims-derived+4]
                 // A store-evidence-created node's resolve flag is the
                 // BYTE-DERIVED one computed at the classification site
                 // (VerifiedDefinition.needs_resolve) — the proto echo
@@ -1428,7 +1428,7 @@ impl DerivationDag {
                 // submitter's claim.
                 if let Some(grant) = store_evidence.get(&drv_hash) {
                     state.ca.needs_resolve = grant.needs_resolve;
-                    // r[impl sched.merge.store-evidence-displacement+2]
+                    // r[impl sched.merge.store-evidence-displacement+3]
                     // Strip consequence parity (merged_bug_020/038):
                     // when the verification verdict was
                     // VerifiedExceptDeclaredHash, the grant carries the

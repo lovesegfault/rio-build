@@ -933,7 +933,7 @@ pub enum ActorError {
     /// possibly already reaped from the DAG) under a conflicting
     /// identity. Maps to FAILED_PRECONDITION (client-actionable
     /// conflict). The `remediation` is GENERATED from the arbitration
-    /// verdict's refuse arm (`sched.merge.store-evidence-displacement+2`,
+    /// verdict's refuse arm (`sched.merge.store-evidence-displacement+3`,
     /// fix-discipline R6) — a refused class structurally cannot emit a
     /// remediation its verdict does not support.
     #[error(
@@ -946,7 +946,7 @@ pub enum ActorError {
         remediation: String,
     },
 
-    /// `r[sched.merge.store-evidence-displacement+2]`: a settled-conflict
+    /// `r[sched.merge.store-evidence-displacement+3]`: a settled-conflict
     /// resolution needed store evidence and the store stayed SILENT
     /// (fetch failure, absent path, transport-grade noise). TRANSIENT:
     /// maps to UNAVAILABLE so clients retry when the store recovers —
@@ -961,7 +961,7 @@ pub enum ActorError {
         reason: &'static str,
     },
 
-    /// `r[sched.merge.store-evidence-displacement+2]`: the per-merge
+    /// `r[sched.merge.store-evidence-displacement+3]`: the per-merge
     /// store-evidence fetch budget was exhausted before this settled
     /// conflict could be verified. Maps to RESOURCE_EXHAUSTED with
     /// actionable guidance (split the submission); partial
@@ -976,7 +976,7 @@ pub enum ActorError {
     )]
     SettledConflictEvidenceBudget { drv_path: String },
 
-    /// `r[sched.merge.store-evidence-displacement+2]`: the merge-time
+    /// `r[sched.merge.store-evidence-displacement+3]`: the merge-time
     /// store-evidence check fetched the `.drv` the submission's
     /// declared `drv_path` names, verified its text content-address,
     /// and the parsed derivation CONTRADICTS the submission's claimed

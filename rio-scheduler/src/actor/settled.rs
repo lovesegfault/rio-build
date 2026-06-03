@@ -206,7 +206,7 @@ pub(crate) enum SettledArbitration {
 }
 
 /// Exhaustive settled-row displacement arbitration
-/// (`sched.merge.store-evidence-displacement+2`).
+/// (`sched.merge.store-evidence-displacement+3`).
 ///
 /// Soundness arguments per row rank:
 /// - `VerifiedBuilt` / `PathBoundBytes`: byte-anchored — the recorded

@@ -111,7 +111,7 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         // resubmission is now self-service via the store-evidence
         // check).
         ActorError::SettledIdentityConflict { .. } => Status::failed_precondition(err.to_string()),
-        // r[impl sched.merge.store-evidence-displacement+2]
+        // r[impl sched.merge.store-evidence-displacement+3]
         // Wire codes DERIVED per variant: silence is transient
         // (UNAVAILABLE — retried), budget exhaustion is load-shaped
         // (RESOURCE_EXHAUSTED — actionable), and only a true identity
@@ -122,7 +122,7 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         ActorError::SettledConflictEvidenceBudget { .. } => {
             Status::resource_exhausted(err.to_string())
         }
-        // r[impl sched.merge.store-evidence-displacement+2]
+        // r[impl sched.merge.store-evidence-displacement+3]
         // The store's own text-CA-bound bytes disprove the submission's
         // claimed identity. FAILED_PRECONDITION, not INVALID_ARGUMENT:
         // the request is well-formed; it conflicts with durable state

@@ -1038,7 +1038,7 @@ re-declaration satisfies it); the witnessed heal
 demanding coverage of the recorded witness set --- both operands
 scheduler-owned (the truncation recorded what it removed; the merge knows
 what it attached). Prior art in the same shape: the displacement
-primitive's evidence ranks (#rref("sched.merge.store-evidence-displacement+2"))
+primitive's evidence ranks (#rref("sched.merge.store-evidence-displacement+3"))
 refuse re-definition unless the incoming claim PROVES rank over the
 recorded row, and the born-holed prune stamp
 (#rref("sched.merge.substitute-topdown+14")) records the dropped closure
@@ -1557,7 +1557,7 @@ makes the realisation-insert skip impossible again is the staged
 follow-up F2 (`ModularHashState` lifecycle enum) — no prose in this
 spec may claim that writer exists until it does (R6).
 
-#r("sched.dispatch.claims-derived+3")[
+#r("sched.dispatch.claims-derived+4")[
   When assignment tokens are signed, the scheduler MUST NOT sign
   upload-authorization claims (`expected_outputs`, `is_ca`,
   `is_fixed_output`) or forward worker build instructions for a
@@ -1584,7 +1584,10 @@ spec may claim that writer exists until it does (R6).
   MUST roll the assignment back with dispatch backoff, bounded by its
   own budget; INSTANT permanence MUST be restricted to CONTENT-BOUND
   reasons (an unparseable declared path, a contradiction, content-bound
-  unparseable bytes) — a verification blocked on MISSING INPUT IDENTITY
+  unparseable bytes, or a derivation-text NAR exceeding the class
+  transfer cap — a denial the store reports byte-free off the declared
+  size, which no retry can shrink and which MUST NOT be folded into
+  store silence) — a verification blocked on MISSING INPUT IDENTITY
   MUST NOT be concluded permanent from resident state alone, because
   residency is scheduler-mutated (terminal reap and leader failover
   both erase a completed input's node without touching content):
@@ -1607,6 +1610,16 @@ spec may claim that writer exists until it does (R6).
   recorded values; nodes already at `path_bound_bytes` or higher skip
   the re-fetch. Unsigned dev mode mints no claims and is exempt.
 ]
+The over-cap clause is round-17 bug_030 (the +4 delta): the
+dispatch-side fetch carried a private 1 MiB cap while every other
+derivation-text site admitted the shared 16 MiB class bound, so any
+(1,16] MiB `.drv` — necessarily bare store-backed, since the inline
+path caps at 1 MiB — was admitted everywhere and then
+deterministically denied HERE, with the denial folded into store
+silence: transient backoff, budget burn, poison blaming store health.
+The class cap is one sealed type
+(`rio_common::limits::MAX_DRV_NAR_BYTES`) and the denial is typed
+content-bound at the fetch, so the verdict carries its own permanence.
 The unseeded-input clause is round-16 bug_029 (the +3 delta): the +2
 text's "an input neither submitted nor resident" arm typed a fact about
 MUTABLE STATE as structural permanence. A guaranteed deploy failover
@@ -2527,7 +2540,7 @@ refresh for free.
   plus at least one piece of content-bound evidence --- MUST be
   rejected with `FAILED_PRECONDITION`, unless the conflicting
   re-creation was approved by the store-evidence check
-  (#rref("sched.merge.store-evidence-displacement+2")). Admissible
+  (#rref("sched.merge.store-evidence-displacement+3")). Admissible
   match bases are: agreement on a shared non-empty expected output
   path; a byte-equal LIVE CA modular hash; a byte-equal PRESERVED
   stripped claim (the segregated column a strip writer moved an
@@ -2598,7 +2611,7 @@ and empty for every other writer --- the freeze stays unconditional
 except where the store's own bytes (or strictly higher ingress-bound
 evidence) proved the settled record is the impostor.
 
-#r("sched.merge.store-evidence-displacement+2")[
+#r("sched.merge.store-evidence-displacement+3")[
   When a store-backed submission's declared identity conflicts with a
   SETTLED record below byte-anchored rank --- a resident settled node
   whether its evidence is authoritative content-bound OR a bare
@@ -2640,11 +2653,13 @@ evidence) proved the settled record is the impostor.
   MUST NOT count as evidence in either direction AND MUST surface as
   `UNAVAILABLE`, never hardening into the conflict's permanent
   `FAILED_PRECONDITION`; permanent unprovability (an unseedable
-  declared-IA input after the persisted-row read-through, or
-  content-bound non-derivation bytes) keeps `FAILED_PRECONDITION` with
-  the generated remediation. Exhaustion of the per-merge fetch budget
-  MUST fail the merge with `RESOURCE_EXHAUSTED` and no partial
-  displacement persisted.
+  declared-IA input after the persisted-row read-through,
+  content-bound non-derivation bytes, or a derivation-text NAR
+  exceeding the class transfer cap — a byte-free deterministic denial
+  that MUST NOT be folded into store silence) keeps
+  `FAILED_PRECONDITION` with the generated remediation. Exhaustion of
+  the per-merge fetch budget MUST fail the merge with
+  `RESOURCE_EXHAUSTED` and no partial displacement persisted.
 ]
 This is the self-service path for `bug_076`-class squats: the victim of a
 content-bound squat on its predictable `drv_path` uploads the genuine

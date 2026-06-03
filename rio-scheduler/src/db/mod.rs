@@ -252,7 +252,7 @@ pub(crate) struct PoisonedDerivationRow {
 }
 
 /// Input-form columns of a derivation row, loaded by drv PATH for the
-/// unseeded-input read-through (`sched.dispatch.claims-derived+3`,
+/// unseeded-input read-through (`sched.dispatch.claims-derived+4`,
 /// bug_029). Selected narrow on purpose: the consumer
 /// (`InputFormSeed::from_persisted_rows`) needs exactly the recorded
 /// hash plus the two flags its not-floating predicate reads.

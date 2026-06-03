@@ -711,7 +711,7 @@ could manufacture such a rejection: an inline fallback node for a
 non-content-bound derivation, which the scheduler's authoritative-content
 validation always refuses. The contract's load-bearing inverse is pinned
 scheduler-side
-(#rref("sched.merge.store-evidence-displacement+2")): conditions that are
+(#rref("sched.merge.store-evidence-displacement+3")): conditions that are
 NOT deterministic content refusals --- store silence while resolving a
 settled conflict, or store-evidence fetch-budget exhaustion --- carry
 `UNAVAILABLE` / `RESOURCE_EXHAUSTED` precisely so they flow through this

@@ -128,7 +128,7 @@ pub(super) enum AssignmentProtoOutcome {
     /// R6) instead of livelocking through backoff.
     PermanentlyUnverifiable(String),
     /// Direct input identities are missing AFTER the persisted-row
-    /// read-through (`sched.dispatch.claims-derived+3`, bug_029):
+    /// read-through (`sched.dispatch.claims-derived+4`, bug_029):
     /// NOT instant permanence — the missing identity is a fact about
     /// CURRENT state (a deeper submission, an upload, or a mid-merge
     /// row can supply it at any time), so the caller rolls back and
@@ -139,6 +139,36 @@ pub(super) enum AssignmentProtoOutcome {
     /// completed input's residency at once) instantly poisoned honest
     /// in-flight builds through the claims gate.
     UnseededInputs(String),
+}
+
+/// Closed outcome of [`DagActor::fetch_drv_content_from_store`]
+/// (round-17 bug_030). Permanence is typed at the fetch site so the
+/// consumers (the store-evidence chokepoint in merge.rs and the
+/// dispatch-time CA resolve) cannot fold a deterministic content-bound
+/// denial into transient store silence — the fold is what burned the
+/// claims-unavailable budget and poisoned blaming store health for a
+/// fact no retry can change.
+pub(super) enum DrvFetch {
+    /// NAR fetched and unwrapped to the raw ATerm bytes.
+    Bytes(Vec<u8>),
+    /// The store could not vouch either way: unconfigured client,
+    /// transport failure, timeout, absent path, or a NAR that is not
+    /// a single regular file. TRANSIENT — the store may answer
+    /// differently later.
+    Silence,
+    /// The transfer was DENIED before any chunk flowed: the path's
+    /// declared NAR size exceeds the derivation-text class cap
+    /// ([`rio_common::limits::MAX_DRV_NAR_BYTES`]). CONTENT-BOUND and
+    /// deterministic — the named path's contents cannot shrink on
+    /// retry. Reachable for paths that bypassed store admission (the
+    /// substitution ingest route, round-17 merged_063) or whose
+    /// PathInfo declares a hostile size.
+    Denied {
+        /// Declared NAR size that tripped the cap.
+        got: u64,
+        /// The class cap it exceeded.
+        limit: u64,
+    },
 }
 
 /// `DrvHash` → owned `String` (the domain node synth wants `String`).
@@ -2139,7 +2169,7 @@ impl DagActor {
             // (TOCTOU vs. concurrent cancel) — legacy no-rollback
             // semantics: caller defers.
             AssignmentProtoOutcome::NodeGone => return false,
-            // r[impl sched.dispatch.claims-derived+3]
+            // r[impl sched.dispatch.claims-derived+4]
             // The store could not vouch for a bare store-backed node's
             // claims — STORE SILENCE only; the cause population is the
             // `SilenceReason` enum (merge.rs), nothing else routes
@@ -2154,7 +2184,7 @@ impl DagActor {
             AssignmentProtoOutcome::Unavailable(reason) => {
                 metrics::counter!("rio_scheduler_dispatch_claims_unavailable_total").increment(1);
                 self.rollback_assignment(drv_hash, executor_id).await;
-                // r[impl sched.dispatch.claims-derived+3]
+                // r[impl sched.dispatch.claims-derived+4]
                 // Store silence is a transient verdict (post-+3 the
                 // unseeded-inputs arm below defers too, on its own
                 // budget), and it
@@ -2232,7 +2262,7 @@ impl DagActor {
                 }
                 return false;
             }
-            // r[impl sched.dispatch.claims-derived+3]
+            // r[impl sched.dispatch.claims-derived+4]
             // Structurally unverifiable: PERMANENT for retries of this
             // submission shape — surface a visible poison carrying the
             // generated remediation instead of livelocking through
@@ -2255,7 +2285,7 @@ impl DagActor {
                 }
                 return false;
             }
-            // r[impl sched.dispatch.claims-derived+3]
+            // r[impl sched.dispatch.claims-derived+4]
             // Post-read-through unseeded inputs (bug_029): bounded
             // backoff on the node's OWN budget, exactly the
             // claims-unavailable shape — because the blocking fact is
@@ -2555,8 +2585,8 @@ impl DagActor {
         executor_id: &ExecutorId,
         generation: u64,
     ) -> AssignmentProtoOutcome {
-        // === Claims derivation (sched.dispatch.claims-derived+3) ======
-        // r[impl sched.dispatch.claims-derived+3]
+        // === Claims derivation (sched.dispatch.claims-derived+4) ======
+        // r[impl sched.dispatch.claims-derived+4]
         // Decide the byte-bound source of every value the token will
         // sign and the worker will obey, BEFORE any of it is used.
         // Unsigned dev mode mints no claims — nothing to derive (the
@@ -2687,7 +2717,7 @@ impl DagActor {
                     // raise the node's standing so re-dispatch skips
                     // the re-fetch. Best-effort persist — a lost write
                     // degrades to re-derivation after failover.
-                    // r[impl sched.dispatch.claims-derived+3]
+                    // r[impl sched.dispatch.claims-derived+4]
                     // The resolve flag is recorded HERE, in the same
                     // node_mut block as the rank raise, from the
                     // byte-derived fact the classification site
@@ -2729,7 +2759,7 @@ impl DagActor {
                             .into(),
                     );
                 }
-                // r[impl sched.dispatch.claims-derived+3]
+                // r[impl sched.dispatch.claims-derived+4]
                 // Three-way permanence contract (the merged_bug_019
                 // deploy-blocker fix; fix-discipline R1 — consequences
                 // derived from the variant's typed permanence):
@@ -2744,12 +2774,12 @@ impl DagActor {
                 // Backoff cannot resolve it: pre-fix this arm
                 // livelocked (deterministic re-verification, identical
                 // result, forever). Restricted BY TYPE to content-bound
-                // reasons (claims-derived+3): missing input identity
+                // reasons (claims-derived+4): missing input identity
                 // is the UnseededInputs arm below.
                 Some(super::merge::StoreEvidenceOutcome::StructurallyUnverifiable(reason)) => {
                     return AssignmentProtoOutcome::PermanentlyUnverifiable(reason.remediation());
                 }
-                // r[impl sched.dispatch.claims-derived+3]
+                // r[impl sched.dispatch.claims-derived+4]
                 // Post-read-through unseeded inputs → BOUNDED BACKOFF
                 // (the bug_029 kill): the chokepoint already consulted
                 // the persisted rows, but residency/rows are state
@@ -2795,7 +2825,7 @@ impl DagActor {
                             state.ca.modular_hash_stripped = Some(stripped);
                         }
                         state.evidence = crate::state::DefinitionEvidence::PathBoundBytes;
-                        // r[impl sched.dispatch.claims-derived+3]
+                        // r[impl sched.dispatch.claims-derived+4]
                         // Same record-at-raise as the Verified arm:
                         // the strip raises rank on these bytes, so the
                         // byte-derived resolve flag rides the raise.
@@ -3114,7 +3144,7 @@ impl DagActor {
         Vec<(String, String)>,
     ) {
         // Gate: the RECORDED resolve flag, single-source
-        // (sched.dispatch.claims-derived+3). Every writer derived it
+        // (sched.dispatch.claims-derived+4). Every writer derived it
         // from bytes through the shared oracle predicate
         // (`rio_nix::derivation::should_resolve`): the gateway's
         // post-BFS pass for ingress-bound nodes (normalized again at
@@ -3198,8 +3228,8 @@ impl DagActor {
                 .fetch_drv_content_from_store(drv_hash.as_str(), state.drv_path())
                 .await
             {
-                Some(bytes) => bytes,
-                None => {
+                DrvFetch::Bytes(bytes) => bytes,
+                DrvFetch::Silence => {
                     // Store unreachable or .drv not found — dispatch
                     // unresolved (worker fails on placeholder,
                     // self-heals via retry after a fresh SubmitBuild
@@ -3209,6 +3239,22 @@ impl DagActor {
                         drv_hash = %drv_hash,
                         "recovered CA-on-CA dispatch: drv_content empty + store fetch failed; \
                          dispatching unresolved (worker will fail on placeholder)"
+                    );
+                    return (state.drv_content.clone(), Vec::new(), Vec::new());
+                }
+                DrvFetch::Denied { got, limit } => {
+                    // Same unresolved degrade — the worker's own fetch
+                    // applies the same class cap and will fail the
+                    // build with its content-bound InvalidDerivation
+                    // classification — but the log must be truthful:
+                    // this is a deterministic denial, NOT a store
+                    // outage (round-17 bug_030's fold, kept out).
+                    warn!(
+                        drv_hash = %drv_hash,
+                        got,
+                        limit,
+                        "recovered CA-on-CA dispatch: .drv NAR exceeds the derivation-text \
+                         class cap (content-bound, not store health); dispatching unresolved"
                     );
                     return (state.drv_content.clone(), Vec::new(), Vec::new());
                 }
@@ -3271,11 +3317,14 @@ impl DagActor {
     /// when `WorkAssignment.drv_content` is empty
     /// ([`rio-builder/src/executor/inputs.rs::fetch_drv_from_store`]).
     ///
-    /// Returns `None` on any failure: store unconfigured
-    /// (`store_client = None`, test mode), `GetPath` error, timeout,
-    /// not-found, or NAR unwrap failure. Callers treat `None` as
-    /// "degrade to the pre-P0408 behavior" — dispatch unresolved,
-    /// worker fails on placeholder, retry-with-backoff self-heals.
+    /// The outcome is CLOSED ([`DrvFetch`]) so the two consumers — the
+    /// merge/dispatch store-evidence chokepoint and the dispatch-time
+    /// CA resolve — derive their consequence from the variant's typed
+    /// permanence instead of collapsing every failure into one shape:
+    /// transient failures (store unconfigured, transport, timeout,
+    /// not-found, NAR shape) are [`DrvFetch::Silence`]; the
+    /// over-class-cap denial is [`DrvFetch::Denied`], content-bound
+    /// and deterministic (round-17 bug_030).
     ///
     /// Hard 2s idle timeout + the shared derivation-text NAR cap
     /// ([`rio_common::limits::MAX_DRV_NAR_BYTES`], 16 MiB): legitimate
@@ -3291,14 +3340,14 @@ impl DagActor {
     ///
     /// Shared by the dispatch-time CA resolve (this module) and the
     /// merge-time store-evidence check
-    /// (`sched.merge.store-evidence-displacement+2`) — hence the
+    /// (`sched.merge.store-evidence-displacement+3`) — hence the
     /// path-taking signature: the merge-side caller verifies
     /// non-resident settled rows, which have no `DerivationState`.
     pub(super) async fn fetch_drv_content_from_store(
         &self,
         drv_hash: &str,
         drv_path: &str,
-    ) -> Option<Vec<u8>> {
+    ) -> DrvFetch {
         /// Per-chunk idle bound for `GetPath` (initial RPC + each
         /// stream.message() — I-211, not whole-call). ~10-50 ms
         /// typical; 2 s covers a slow store without blocking
@@ -3306,7 +3355,10 @@ impl DagActor {
         /// dispatch (same as store-unconfigured).
         const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-        let mut client = self.store_client.as_ref()?.clone();
+        let Some(client) = self.store_client.as_ref() else {
+            return DrvFetch::Silence;
+        };
+        let mut client = client.clone();
 
         let result = rio_proto::client::get_path_nar(
             &mut client,
@@ -3326,7 +3378,25 @@ impl DagActor {
                     drv_path = %drv_path,
                     "recovered CA resolve: .drv not found in store"
                 );
-                return None;
+                return DrvFetch::Silence;
+            }
+            // Content-bound denial: the path's DECLARED NAR size
+            // exceeds the derivation-text class cap, reported by the
+            // collector's leading `Info.nar_size` pre-check before any
+            // chunk flows. Deterministic — a retry cannot shrink the
+            // named path's contents — so this must NOT be folded into
+            // store silence (round-17 bug_030: that fold burned the
+            // claims-unavailable budget and poisoned blaming store
+            // health for a content-bound fact).
+            Err(rio_proto::client::NarCollectError::SizeExceeded { got, limit }) => {
+                debug!(
+                    drv_hash = %drv_hash,
+                    drv_path = %drv_path,
+                    got,
+                    limit,
+                    "drv fetch denied: NAR exceeds the derivation-text class cap"
+                );
+                return DrvFetch::Denied { got, limit };
             }
             Err(e) => {
                 debug!(
@@ -3335,21 +3405,23 @@ impl DagActor {
                     error = %e,
                     "recovered CA resolve: GetPath failed"
                 );
-                return None;
+                return DrvFetch::Silence;
             }
         };
 
         // NAR unwrap: .drv is a single regular file. Anything else
-        // (directory, symlink, corrupt NAR) → None.
+        // (directory, symlink, corrupt NAR) → silence: the store may
+        // answer differently later (the genuine text-CA object
+        // replacing a corrupt one).
         match rio_nix::nar::extract_single_file(&nar) {
-            Ok(bytes) => Some(bytes),
+            Ok(bytes) => DrvFetch::Bytes(bytes),
             Err(e) => {
                 debug!(
                     drv_hash = %drv_hash,
                     error = %e,
                     "recovered CA resolve: NAR unwrap failed (not a single regular file)"
                 );
-                None
+                DrvFetch::Silence
             }
         }
     }

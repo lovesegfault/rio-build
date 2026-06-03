@@ -5124,7 +5124,7 @@ fn recovered_poisoned_squat_keeps_authoritative_gate() -> anyhow::Result<()> {
     DisplaceVerdict::RefusedStoreAnchored
 )]
 // SETTLED bare victims are rank-arbitrated, not categorically exempt
-// (sched.merge.store-evidence-displacement+2 rank-uniform; bug_072):
+// (sched.merge.store-evidence-displacement+3 rank-uniform; bug_072):
 // byte-anchored settled bare nodes refuse by rank...
 #[case::settled_bare_outranking(
     false,
@@ -5385,7 +5385,7 @@ fn store_evidence_set_raises_displacer_standing() -> anyhow::Result<()> {
         DefinitionEvidence::PathBoundBytes,
         "store-evidence-backed creation ranks PathBoundBytes"
     );
-    // r[verify sched.dispatch.claims-derived+3]
+    // r[verify sched.dispatch.claims-derived+4]
     assert!(
         !dag.node("sev").unwrap().ca.needs_resolve,
         "store-evidence-created node carries the BYTE-DERIVED resolve \
@@ -5394,7 +5394,7 @@ fn store_evidence_set_raises_displacer_standing() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+2]
+// r[verify sched.merge.store-evidence-displacement+3]
 /// A grant carrying a strip applies it at node creation: the created
 /// node sheds the submitter's unverifiable declared hash (live None)
 /// and preserves the declared value out-of-band (M_070) — exact
@@ -5449,7 +5449,7 @@ fn store_evidence_grant_strip_applies_at_creation() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.store-evidence-displacement+2]
+// r[verify sched.merge.store-evidence-displacement+3]
 /// bug_072 gate half, fail-closed cell: a settled BARE node and a
 /// conflicting bare incoming WITHOUT a store-evidence grant must
 /// REFUSE — never silently join (pre-fix this cell fell through the

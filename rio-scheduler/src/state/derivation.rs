@@ -613,7 +613,7 @@ pub struct RetryState {
     /// Cleared on successful dispatch (assign_to_worker).
     pub backoff_until: Option<Instant>,
     /// Number of dispatch-time claims-derivation deferrals on STORE
-    /// SILENCE (`sched.dispatch.claims-derived+3`) for this node.
+    /// SILENCE (`sched.dispatch.claims-derived+4`) for this node.
     /// In-memory only — failover forgives (a fresh leader re-probes a
     /// store that may have recovered; the bound exists to stop a
     /// PERSISTENTLY silent store from deferring a deterministic input
@@ -626,7 +626,7 @@ pub struct RetryState {
     pub claims_unavailable_count: u32,
 
     /// Consecutive dispatch deferrals on POST-READ-THROUGH unseeded
-    /// inputs (`sched.dispatch.claims-derived+3`, bug_029): the
+    /// inputs (`sched.dispatch.claims-derived+4`, bug_029): the
     /// claims gate could not seed a direct input's identity from the
     /// submission, the resident DAG, or the persisted rows. Bounded
     /// like `claims_unavailable_count` (its own arm of
@@ -650,7 +650,7 @@ pub enum FailureClass {
     /// Dispatch-time claims derivation deferred on store silence.
     ClaimsUnavailable,
     /// Dispatch-time claims derivation deferred on post-read-through
-    /// unseeded inputs (`sched.dispatch.claims-derived+3`).
+    /// unseeded inputs (`sched.dispatch.claims-derived+4`).
     UnseededInputs,
 }
 
@@ -2409,7 +2409,7 @@ mod tests {
         assert!(crossed.missing().is_empty());
     }
 
-    // r[verify sched.dispatch.claims-derived+3]
+    // r[verify sched.dispatch.claims-derived+4]
     /// The unseeded-inputs budget is its OWN charge arm: independent
     /// of the claims-unavailable counter (charging one never moves
     /// the other), capped to Exhausted, and both reset together on

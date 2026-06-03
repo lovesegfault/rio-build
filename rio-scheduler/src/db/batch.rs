@@ -51,7 +51,7 @@ impl SchedulerDb {
     /// definition-change set: DAG-level displacements and authority
     /// takeovers (`sched.merge.authoritative-conflict`) plus row-only
     /// store-evidence displacements
-    /// (`sched.merge.store-evidence-displacement+2`). Only these may
+    /// (`sched.merge.store-evidence-displacement+3`). Only these may
     /// pass the settled-identity WHERE guard below
     /// (`sched.persist.settled-identity-freeze+3`); the actor's
     /// arbitration is the decision, this array is its in-transaction
@@ -416,7 +416,7 @@ impl SchedulerDb {
             --     conflicts (one-sided evidence is not a contradiction
             --     — same as ModularHashEvidence's one-sided arm).
             --
-            -- r[impl sched.merge.store-evidence-displacement+2]
+            -- r[impl sched.merge.store-evidence-displacement+3]
             -- The $19 carve-out is the merge's FULL approved
             -- definition-change set: DAG-level displacements and
             -- authority takeovers (arbitrated by
@@ -424,7 +424,7 @@ impl SchedulerDb {
             -- store-evidence displacements (verified by the pre-merge
             -- check against ingress-byte-bound rank or the store's own
             -- text-CA .drv bytes,
-            -- sched.merge.store-evidence-displacement+2). Every
+            -- sched.merge.store-evidence-displacement+3). Every
             -- legitimately arbitrated definition change is admitted
             -- EXPLICITLY by this list — never by an axis gap in the
             -- conflict predicate (pre-+3, the missing path/hash axes

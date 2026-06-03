@@ -98,7 +98,7 @@ struct DisplacedPriorInterest {
 }
 
 /// Per-merge budget for store-evidence `.drv` fetches
-/// (`sched.merge.store-evidence-displacement+2`): settled-conflict
+/// (`sched.merge.store-evidence-displacement+3`): settled-conflict
 /// resolution is a remediation path, not a bulk operation, and an
 /// unbounded fetch loop would let a submission filled with manufactured
 /// conflicts stall the single-threaded actor on store round-trips.
@@ -170,7 +170,7 @@ impl InputFormSeed {
     }
 
     /// Seed from PERSISTED derivation rows (the unseeded-input
-    /// read-through, `sched.dispatch.claims-derived+3`): a row's
+    /// read-through, `sched.dispatch.claims-derived+4`): a row's
     /// recorded modular hash qualifies under the same not-floating
     /// predicate as the other constructors — the row is content-derived
     /// state that survives reap and failover, which is exactly why the
@@ -228,7 +228,7 @@ pub(super) enum SilenceReason {
     /// The unseeded-input persisted-row read-through could not run
     /// (PG error). The verification was NOT completed in either
     /// direction — permanence may not be concluded from a failed
-    /// lookup (`claims-derived+3`); retry when the database recovers.
+    /// lookup (`claims-derived+4`); retry when the database recovers.
     RowReadThrough,
 }
 
@@ -249,8 +249,9 @@ impl SilenceReason {
 
 /// Why a verification is STRUCTURALLY impossible: PERMANENT because the
 /// reason is CONTENT-BOUND — it depends only on the submission's own
-/// declared data, never on scheduler-mutated residency. Round-16
-/// bug_029 (claims-derived+3) restricted this enum BY TYPE to exactly
+/// declared data or the immutable contents of the store path that data
+/// names, never on scheduler-mutated residency. Round-16 bug_029 (the
+/// claims-derived+3 delta) restricted this enum BY TYPE to exactly
 /// that: the former `UnseedableInput` variant's verdict depended on
 /// what happened to be RESIDENT (reap and failover both erase residency
 /// without touching content), so a guaranteed deploy failover could
@@ -262,6 +263,22 @@ pub(super) enum StructuralReason {
     /// The node's own declared `drv_path` does not parse as a store
     /// path. Content-bound: no later state change can make it parse.
     UnparseableDrvPath,
+    /// The store path the declaration names carries a NAR larger than
+    /// the derivation-text class cap
+    /// ([`rio_common::limits::MAX_DRV_NAR_BYTES`]) — the transfer is
+    /// denied byte-free off the declared `Info.nar_size`. Content-bound:
+    /// the named path's contents cannot shrink on retry, and a
+    /// "derivation" over the class bound is inadmissible everywhere
+    /// (store admission, gateway BFS, worker fetch all apply the same
+    /// cap). Round-17 bug_030: pre-typing this fold into store silence
+    /// burned the claims-unavailable budget and poisoned blaming store
+    /// health.
+    OversizedDrvNar {
+        /// Declared NAR size that tripped the cap.
+        got: u64,
+        /// The class cap it exceeded.
+        limit: u64,
+    },
 }
 
 impl StructuralReason {
@@ -273,6 +290,12 @@ impl StructuralReason {
             Self::UnparseableDrvPath => "the declared drv_path does not parse as a store \
                  path; resubmit with a valid .drv store path"
                 .to_string(),
+            Self::OversizedDrvNar { got, limit } => format!(
+                "the .drv at the declared drv_path is {got} bytes of NAR, exceeding the \
+                 {limit}-byte derivation-text cap; a derivation this large is not \
+                 admissible — restructure it (move large data out of the derivation, \
+                 e.g. into a fetched source or a builder script) and resubmit"
+            ),
         }
     }
 }
@@ -304,7 +327,7 @@ pub(super) struct VerifiedDefinition {
     /// Dispatch-resolve requirement derived from the bytes via the
     /// shared oracle predicate (`rio_nix::derivation::should_resolve`)
     /// over the resident DAG's child knowledge — never the submitter's
-    /// `needs_resolve` echo (sched.dispatch.claims-derived+3).
+    /// `needs_resolve` echo (sched.dispatch.claims-derived+4).
     pub(super) needs_resolve: bool,
     /// `Some(declared)` iff the classification stripped an
     /// unverifiable declared modular hash
@@ -312,7 +335,7 @@ pub(super) struct VerifiedDefinition {
     /// these bytes apply the strip in the same motion — clear the
     /// live hash, preserve the declared value (M_070) — so the strip
     /// verdict has ONE consequence everywhere
-    /// (`sched.merge.store-evidence-displacement+2`). `None` on full
+    /// (`sched.merge.store-evidence-displacement+3`). `None` on full
     /// verification.
     pub(super) stripped_declared_hash: Option<[u8; 32]>,
 }
@@ -338,11 +361,12 @@ pub(super) enum StoreEvidenceOutcome {
     /// store recovers. Store silence is never evidence.
     StoreSilence(SilenceReason),
     /// Verification is impossible for CONTENT-BOUND reasons (the
-    /// submission's own declared data — see [`StructuralReason`]).
+    /// submission's own declared data, or the immutable contents of
+    /// the store path it names — see [`StructuralReason`]).
     /// PERMANENT: backoff cannot resolve it; consumers must surface
     /// it (visible poison with remediation at dispatch, refusal with
     /// remediation at merge). Instant permanence is restricted to
-    /// this variant BY TYPE (claims-derived+3).
+    /// this variant BY TYPE (claims-derived+4).
     StructurallyUnverifiable(StructuralReason),
     /// Declared-IA derivability is blocked because direct input(s)
     /// are covered by neither the seeds nor the resident DAG. NOT
@@ -352,7 +376,7 @@ pub(super) enum StoreEvidenceOutcome {
     /// chokepoint [`DagActor::check_store_evidence`] performs it and
     /// re-classifies; a post-read-through emission means the rows
     /// were consulted too) and then BOUNDED BACKOFF at dispatch
-    /// before any permanent consequence (`claims-derived+3`,
+    /// before any permanent consequence (`claims-derived+4`,
     /// bug_029). At merge the submitter is present: refusal with the
     /// post-read-through remediation is synchronous self-service.
     /// Carries ALL missing input paths (batched read-through, honest
@@ -481,7 +505,7 @@ pub(super) fn classify_store_evidence(
         .any(|o| matches!(o.kind(), rio_nix::derivation::OutputKind::InputAddressed(_)));
     let mut input_seed: Vec<rio_proto::types::DerivationNode> = Vec::new();
     if needs_ia {
-        // Collect ALL unseedable inputs (claims-derived+3): the
+        // Collect ALL unseedable inputs (claims-derived+4): the
         // read-through is batched — one PG roundtrip covers every
         // missing input — and the remediation names the full set
         // instead of leaking them one resubmit at a time.
@@ -524,7 +548,7 @@ pub(super) fn classify_store_evidence(
     // The validator treats a node's own declared hash as
     // self-certification and removes it; siblings carry the seeds.
     let claimed_modular_hash = !synth.ca_modular_hash.is_empty();
-    // r[impl sched.dispatch.claims-derived+3]
+    // r[impl sched.dispatch.claims-derived+4]
     // Byte-derived dispatch facts, computed HERE — the single site
     // that holds the verified parse — so the consumers that raise
     // rank on these bytes record the derived flag in the same motion
@@ -574,13 +598,13 @@ pub(super) fn classify_store_evidence(
 /// verdict — the SINGLE arbiter for merge Steps 0.5 (settled rows) and
 /// 0.6 (resident settled squats), so the two steps cannot drift on
 /// what a verdict means. Wire-code consequences are DERIVED from the
-/// verdict's typed permanence (`store-evidence-displacement+2`):
+/// verdict's typed permanence (`store-evidence-displacement+3`):
 /// silence is the transient verdict and surfaces UNAVAILABLE;
 /// permanent unprovability carries generated remediation back to the
 /// refusing caller — including post-read-through unseeded inputs,
 /// which at MERGE refuse synchronously (the submitter is present;
 /// the dispatch consumer of the same variant backs off instead,
-/// `claims-derived+3`).
+/// `claims-derived+4`).
 enum EvidenceVerdict {
     /// The claim verified: the hash joined the approved set.
     Approved,
@@ -609,7 +633,7 @@ fn settle_evidence_verdict(
             // The grant carries the byte-derived facts: the DAG stamps
             // them on the node it creates for this hash, so a
             // store-evidence-created node never carries the
-            // submitter's echo (sched.dispatch.claims-derived+3).
+            // submitter's echo (sched.dispatch.claims-derived+4).
             store_evidence.insert(
                 node.drv_hash.as_str().into(),
                 crate::dag::StoreEvidenceGrant {
@@ -636,7 +660,7 @@ fn settle_evidence_verdict(
                 drv_path: node.drv_path.clone(),
             })
         }
-        // r[impl sched.merge.store-evidence-displacement+2]
+        // r[impl sched.merge.store-evidence-displacement+3]
         // TRANSIENT: silence must never harden into the conflict's
         // permanent FAILED_PRECONDITION — surface UNAVAILABLE so the
         // client retries when the store recovers (bug_055's inversion,
@@ -668,7 +692,7 @@ fn settle_evidence_verdict(
             .increment(1);
             Ok(EvidenceVerdict::Unprovable(reason.remediation()))
         }
-        // r[impl sched.dispatch.claims-derived+3]
+        // r[impl sched.dispatch.claims-derived+4]
         // POST-READ-THROUGH unseeded inputs: the chokepoint already
         // consulted the persisted rows (check_store_evidence
         // re-classifies with the row seed before this variant can
@@ -696,7 +720,7 @@ fn settle_evidence_verdict(
             );
             Ok(EvidenceVerdict::Unprovable(unseeded_remediation(&missing)))
         }
-        // r[impl sched.merge.store-evidence-displacement+2]
+        // r[impl sched.merge.store-evidence-displacement+3]
         // STRIP CONSEQUENCE PARITY (merged_bug_020 + merged_bug_038's
         // refusal half): the identity verified EXCEPT an unverifiable
         // declared hash — the SAME verdict the dispatch consumer
@@ -752,7 +776,7 @@ fn settle_evidence_verdict(
 }
 
 impl DagActor {
-    // r[impl sched.merge.store-evidence-displacement+2]
+    // r[impl sched.merge.store-evidence-displacement+3]
     /// Verify a bare store-backed submission node against the store's
     /// OWN copy of the `.drv` its declared `drv_path` names: fetch,
     /// then classify through [`classify_store_evidence`].
@@ -761,11 +785,26 @@ impl DagActor {
         node: &crate::domain::DerivationNode,
         submission_seed: &InputFormSeed,
     ) -> StoreEvidenceOutcome {
-        let Some(bytes) = self
+        let bytes = match self
             .fetch_drv_content_from_store(node.drv_hash.as_str(), &node.drv_path)
             .await
-        else {
-            return StoreEvidenceOutcome::StoreSilence(SilenceReason::Fetch);
+        {
+            super::dispatch::DrvFetch::Bytes(bytes) => bytes,
+            super::dispatch::DrvFetch::Silence => {
+                return StoreEvidenceOutcome::StoreSilence(SilenceReason::Fetch);
+            }
+            // Content-bound denial (round-17 bug_030): the declared
+            // path's NAR exceeds the derivation-text class cap —
+            // deterministic, byte-free, and no retry can shrink it.
+            // Typed as structural permanence so dispatch poisons with
+            // the generated remediation instead of burning the
+            // claims-unavailable budget, and merge refuses with the
+            // same text instead of returning UNAVAILABLE forever.
+            super::dispatch::DrvFetch::Denied { got, limit } => {
+                return StoreEvidenceOutcome::StructurallyUnverifiable(
+                    StructuralReason::OversizedDrvNar { got, limit },
+                );
+            }
         };
         let resident = |path: &str| {
             self.dag
@@ -790,7 +829,7 @@ impl DagActor {
                 .map(|s| s.expected_output_paths.iter().any(|p| p.is_empty()))
         };
         match classify_store_evidence(node, bytes, submission_seed, &resident, &child_unknown) {
-            // r[impl sched.dispatch.claims-derived+3]
+            // r[impl sched.dispatch.claims-derived+4]
             // Persisted-row read-through (bug_029): residency is
             // scheduler-mutated state — reap and failover both erase a
             // completed input's node without touching content — but
@@ -1308,7 +1347,7 @@ impl DagActor {
         // the upsert is covered by the upsert's own settled-row WHERE
         // guard (defense in depth).
         //
-        // r[impl sched.merge.store-evidence-displacement+2]
+        // r[impl sched.merge.store-evidence-displacement+3]
         // The rejection is no longer unconditional: a conflicting
         // re-creation of a row whose lineage is CONTENT-BOUND (the
         // row-level mirror of the displacement primitive's verdicts)
@@ -1463,7 +1502,7 @@ impl DagActor {
         phase!("0.5-settled-identity-freeze");
 
         // === Step 0.6: Resident settled-squat store evidence ==========
-        // r[impl sched.merge.store-evidence-displacement+2]
+        // r[impl sched.merge.store-evidence-displacement+3]
         // The DAG-resident form of the same remediation: a bare
         // store-backed echo whose identity conflicts with a SETTLED
         // resident node — authoritative (would be rejected by the
@@ -1475,7 +1514,7 @@ impl DagActor {
         // standing so displace() — which still owns the decision —
         // sees PathBoundBytes against the squat's ContentBoundClaim /
         // UnverifiedClaim. Rank-uniform with the row gate above
-        // (store-evidence-displacement+2): no settled victim form
+        // (store-evidence-displacement+3): no settled victim form
         // below the byte-anchored ranks is exempt; victims already at
         // path_bound_bytes / verified_built are unreachable here and
         // refuse through the gate.
@@ -1550,7 +1589,7 @@ impl DagActor {
         // Production entry into the merge gate: hashes in the
         // store-evidence set were verified by Step 0.5/0.6 against the
         // store's own text-CA `.drv` bytes
-        // (sched.merge.store-evidence-displacement+2); the gate's
+        // (sched.merge.store-evidence-displacement+3); the gate's
         // displacement primitive still owns every decision.
         let merge_result = match self.dag.merge_with_evidence(
             build_id,
@@ -3307,7 +3346,7 @@ impl DagActor {
                     // in-memory node the merge just created — NOT the
                     // submission echo — so a store-evidence GRANT that
                     // stripped the declaration
-                    // (sched.merge.store-evidence-displacement+2)
+                    // (sched.merge.store-evidence-displacement+3)
                     // persists the post-strip truth: the submitter's
                     // unverifiable declared hash must never re-enter
                     // the row through the persist path after the DAG
@@ -3618,7 +3657,7 @@ impl DagActor {
         // r[impl sched.merge.displaced-edge-scrub+2]
         //
         // Row-only store-evidence displacements
-        // (sched.merge.store-evidence-displacement+2) chain in for the same
+        // (sched.merge.store-evidence-displacement+3) chain in for the same
         // reason: the displaced SETTLED row had no DAG node (reaped), so
         // the gate never scrubbed anything in memory, but its persisted
         // parent-side dependency edges still describe the OLD lineage —
@@ -4563,7 +4602,7 @@ mod evidence_matrix_tests {
         let verified = dn(leaf.clone());
         match classify(&verified, leaf_aterm.as_bytes()) {
             O::Verified(def) => {
-                // r[verify sched.dispatch.claims-derived+3]
+                // r[verify sched.dispatch.claims-derived+4]
                 // Byte-derived resolve fact rides the verdict: an
                 // inputless leaf is `false` by the oracle predicate's
                 // empty-inputs clause EVEN IF a child lookup would
@@ -4690,7 +4729,7 @@ mod evidence_matrix_tests {
             ..Default::default()
         });
         match classify(&parent_node, parent_aterm.as_bytes()) {
-            // r[verify sched.dispatch.claims-derived+3]
+            // r[verify sched.dispatch.claims-derived+4]
             // Missing input identity is the typed UnseededInputs
             // outcome — NOT StructurallyUnverifiable (instant
             // permanence is restricted to content-bound reasons): the
@@ -4749,12 +4788,12 @@ mod evidence_matrix_tests {
                     fparent_aterm.as_bytes(),
                     "verified bytes ride along"
                 );
-                // r[verify sched.dispatch.claims-derived+3]
+                // r[verify sched.dispatch.claims-derived+4]
                 // Floating parent WITH an input: the type clause
                 // derives `true` from the bytes — recorded by the
                 // strip arm exactly like the Verified arm.
                 assert!(def.needs_resolve, "floating-with-input resolves");
-                // r[verify sched.merge.store-evidence-displacement+2]
+                // r[verify sched.merge.store-evidence-displacement+3]
                 // The stripped declared value rides the verdict so the
                 // consuming raise can clear+preserve in one motion.
                 assert_eq!(
