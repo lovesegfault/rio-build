@@ -356,6 +356,19 @@ pub(crate) fn scheduler_reason_corpus() -> Vec<(&'static str, ReasonClass)> {
                 failing_drv: "/nix/store/cccccccccccccccccccccccccccccccc-dep.drv".into(),
             },
         ),
+        // Merge-seed shape: a node resolved DependencyFailed at merge
+        // time (its dep already terminally failed when the build
+        // merged) emits the same shared summary with a state-describing
+        // tail instead of runtime failure text. The literal is pinned
+        // byte-for-byte against the producer formatter by
+        // `dependency_class_is_producer_exact`.
+        (
+            "dependency '/nix/store/cccccccccccccccccccccccccccccccc-dep.drv' failed: already \
+             poisoned when this build merged",
+            Dependency {
+                failing_drv: "/nix/store/cccccccccccccccccccccccccccccccc-dep.drv".into(),
+            },
+        ),
     ]
 }
 
@@ -892,6 +905,93 @@ mod tests {
         for (reason, expected) in scheduler_reason_corpus() {
             assert_eq!(classify_reason(reason), expected, "reason: {reason}");
         }
+    }
+
+    /// The dependency class is producer-exact: every fixture below is
+    /// built through `rio_proto::dependency_failed_summary` — the ONE
+    /// producer of every `DerivationFailed{DEPENDENCY_FAILED}` message
+    /// (the runtime cascade in `terminal_failure_epilogue` and the
+    /// merge-time seeding sites in `seed_initial_states` /
+    /// `reconcile_preexisting`, all rio-scheduler) — never a
+    /// hand-written string, so this classifier cannot certify a shape
+    /// production never emits.
+    ///
+    /// Both directions:
+    /// - formatter output (runtime reason AND each merge-seed tail) →
+    ///   `Dependency { failing_drv }` with the trigger recovered intact;
+    /// - the corpus's dependency rows are byte-identical to formatter
+    ///   output (a literal that drifts from the producer fails here,
+    ///   not silently in a downstream consumer);
+    /// - near-miss shapes must NOT classify as Dependency: the
+    ///   build-level blanket (`dag_first_failure_summary` — no quotes,
+    ///   no reason tail) and the scheduler's no-trigger merge fallback
+    ///   ("a dependency already failed…" — names no derivation) both
+    ///   fall to the conservative Target class.
+    #[test]
+    fn dependency_class_is_producer_exact() {
+        let dep = "/nix/store/cccccccccccccccccccccccccccccccc-dep.drv";
+
+        // Runtime-cascade shape: trigger's full failure text as reason.
+        let runtime = rio_proto::dependency_failed_summary(
+            dep,
+            "poison threshold reached after 3 distinct-worker failures",
+        );
+        assert_eq!(
+            classify_reason(&runtime),
+            ReasonClass::Dependency {
+                failing_drv: dep.into()
+            },
+            "runtime cascade shape"
+        );
+
+        // Merge-seed shapes: one tail per terminal dep state the
+        // scheduler's seed-time scan distinguishes.
+        for tail in [
+            "already poisoned when this build merged",
+            "already cancelled when this build merged",
+            "its own dependency already failed when this build merged",
+        ] {
+            let seeded = rio_proto::dependency_failed_summary(dep, tail);
+            assert_eq!(
+                classify_reason(&seeded),
+                ReasonClass::Dependency {
+                    failing_drv: dep.into()
+                },
+                "merge-seed tail: {tail}"
+            );
+        }
+
+        // The corpus's dependency rows ARE formatter output.
+        let corpus_dep_rows: Vec<&'static str> = scheduler_reason_corpus()
+            .into_iter()
+            .filter_map(|(reason, class)| {
+                matches!(class, ReasonClass::Dependency { .. }).then_some(reason)
+            })
+            .collect();
+        assert_eq!(corpus_dep_rows.len(), 2, "corpus dependency rows");
+        assert_eq!(
+            corpus_dep_rows[0],
+            rio_proto::dependency_failed_summary(
+                dep,
+                "poison threshold reached after 3 distinct-worker failures"
+            ),
+        );
+        assert_eq!(
+            corpus_dep_rows[1],
+            rio_proto::dependency_failed_summary(dep, "already poisoned when this build merged"),
+        );
+
+        // Must-NOT-match near misses.
+        assert_eq!(
+            classify_reason(&rio_proto::dag_first_failure_summary(dep)),
+            ReasonClass::Target,
+            "the build-level blanket names a derivation but is not a dependency cascade"
+        );
+        assert_eq!(
+            classify_reason("a dependency already failed when this build merged"),
+            ReasonClass::Target,
+            "the no-trigger merge fallback names no derivation and must charge conservatively"
+        );
     }
 
     #[test]

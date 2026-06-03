@@ -1911,6 +1911,29 @@ const CONTRACT_REGISTRY: &[ContractRow] = &[
             ],
         },
     },
+    // ── Dependency-cascade text-shape contract: the per-derivation
+    // DEPENDENCY_FAILED message (the shared rio-proto formatter over the
+    // failed dependency's store-path key, produced by the runtime
+    // cascade AND the merge-time seeding sites) demanded by the replay
+    // engine's reason classifier — the trigger it recovers drives
+    // closure-membership checks, trigger-keyed log-tail fetches, and
+    // source-rot attribution. The declared needle is the
+    // fixture-discipline sentence on the formatter; the consumer test's
+    // needles prove its fixtures still go through the formatter rather
+    // than a hand-written string (the dead-detector shape this registry
+    // exists to prevent). ──
+    ContractRow {
+        key: "cascade.dependency-failed-summary",
+        declared: (
+            "rio-proto/src/lib.rs",
+            "Classifier fixtures MUST be built through this function",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/run/stderrparse.rs",
+            test_fn: "dependency_class_is_producer_exact",
+            artifact_needles: &["rio_proto::dependency_failed_summary", "classify_reason"],
+        },
+    },
     // ── Per-root status provenance: the one BuildStatus value the
     // gateway may mint with neither per-root scheduler evidence nor
     // store presence evidence (the lost-terminal evidence-loss row),

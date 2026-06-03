@@ -1101,10 +1101,7 @@ pub fn decide(
         };
     }
     // DAG-fallback blanket recovery — the trigger comes from OUTSIDE the
-    // row. A root whose dependency was already terminally failed when its
-    // batch merged (e.g. a fixed-output derivation still poisoned past the
-    // scheduler's resubmit-reset budget) is fail-fasted at merge seeding,
-    // which emits NO per-root event; the gateway then falls back to the
+    // row. A root with no per-root terminal of its own inherits the
     // DAG-level result, so the row arrives here as the scheduler's
     // build-level summary "derivation /nix/store/<hash>-<name>.drv
     // failed" (`rio_proto::dag_first_failure_summary` over the gateway's
@@ -1112,7 +1109,23 @@ pub fn decide(
     // fetch needle — and would
     // otherwise land Genuine, charging a rotted dependency's whole
     // late-campaign fan-out to the parity headline through a door that
-    // never reaches the dependency-failed cascade arm above. For exactly
+    // never reaches the dependency-failed cascade arm above. The
+    // historical bulk feeder — a root whose dependency was already
+    // terminally failed when its batch merged (e.g. a fixed-output
+    // derivation still poisoned past the scheduler's resubmit-reset
+    // budget), which the scheduler resolved at merge seeding with no
+    // per-root event — now emits its own
+    // `DerivationFailed{DEPENDENCY_FAILED}` terminal naming the trigger
+    // (rio-scheduler `seed_initial_states` /
+    // `rio_proto::dependency_failed_summary`) and classifies through
+    // the in-row cascade arm above with strictly better evidence. The
+    // blanket shape still reaches here from the residual terminal-less
+    // population: per-root event loss (broadcast-ring overflow,
+    // failover replay gaps, crash-interrupted cascades the recovery
+    // sweep re-seeds event-lessly), the scheduler's event-less abort
+    // sweeps (per-build wall-clock timeout, top-down fail-fast, and
+    // fail-fast cancellation resolve remaining nodes without per-drv
+    // events), and pre-emission scheduler versions. For exactly
     // that row shape, the batch's poison snapshot intersected with this
     // job's own dependency closure recovers the trigger CANDIDATE: a
     // poisoned fixed-output member with recorded worker failures is the
@@ -1880,7 +1893,10 @@ pub async fn process_settled_batch(
             None
         };
         // The same trigger-keyed fetch for the DAG-fallback blanket shape
-        // (the eventless merge-seeded fail-fast): the row's own text is
+        // (a terminal-less root that inherited the build-level word —
+        // see the recovery arm in `decide` for the residual feeders now
+        // that merge-seeded nodes emit their own dependency-failed
+        // terminals): the row's own text is
         // the scheduler's needle-free build-level summary, so the only
         // channels that can satisfy the source-rot evidence bar are the
         // trigger's captured relay line (when this batch captured a
@@ -4404,7 +4420,7 @@ mod tests {
         let target = po(
             T,
             BuildStatus::DependencyFailed,
-            &format!("dependency '{DEP}' failed: {trigger_full_msg}"),
+            &rio_proto::dependency_failed_summary(DEP, &trigger_full_msg),
         );
         match decide(
             &c,
@@ -4561,7 +4577,7 @@ mod tests {
         // bare poison summary and the dependent's cascade wrap; the
         // engine's own line-split capture yields both reasons.
         let poison_summary = "poison threshold reached after 3 distinct-worker failures";
-        let dep_msg = format!("dependency '{DEP}' failed: {poison_summary}");
+        let dep_msg = rio_proto::dependency_failed_summary(DEP, poison_summary);
         let relay = format!(
             "derivation '{DEP}' failed: {poison_summary}\n\
              derivation '{T}' failed: {dep_msg}\n"
@@ -4656,7 +4672,7 @@ mod tests {
         // The corpus's needled single-line worker shape, captured as the
         // trigger's relayed reason.
         let needled = "builder failed: unable to download 'https://example.com/src.tar.gz'";
-        let dep_msg = format!("dependency '{DEP}' failed: {needled}");
+        let dep_msg = rio_proto::dependency_failed_summary(DEP, needled);
         let batch = BatchView {
             kind: BATCH_KIND_SUBMIT.to_string(),
             build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
@@ -5253,7 +5269,7 @@ mod tests {
                 target: po(
                     T,
                     BuildStatus::DependencyFailed,
-                    &format!("dependency '{DEP}' failed: {trigger_full_msg}"),
+                    &rio_proto::dependency_failed_summary(DEP, &trigger_full_msg),
                 ),
                 reasons: same_batch_reasons,
                 log_tail: None,
@@ -6007,7 +6023,7 @@ mod tests {
         let batch_relayed = BatchView {
             reasons: BTreeMap::from([(
                 T.to_string(),
-                format!("dependency '{DEP}' failed: poison threshold reached"),
+                rio_proto::dependency_failed_summary(DEP, "poison threshold reached"),
             )]),
             ..BatchView::default()
         };
@@ -6031,7 +6047,7 @@ mod tests {
         let mate = po(
             T,
             BuildStatus::DependencyFailed,
-            &format!("dependency '{OTHER}' failed: poison threshold reached"),
+            &rio_proto::dependency_failed_summary(OTHER, "poison threshold reached"),
         );
         assert_eq!(
             decide(
@@ -6087,7 +6103,7 @@ mod tests {
         let mate = po(
             T,
             BuildStatus::DependencyFailed,
-            &format!("dependency '{OTHER}' failed: poison threshold reached"),
+            &rio_proto::dependency_failed_summary(OTHER, "poison threshold reached"),
         );
         let no_trigger = po(T, BuildStatus::DependencyFailed, "");
 
@@ -7477,7 +7493,7 @@ mod tests {
                 po(
                     OTHER,
                     BuildStatus::DependencyFailed,
-                    &format!("dependency '{T}' failed: failed on every eligible worker"),
+                    &rio_proto::dependency_failed_summary(T, "failed on every eligible worker"),
                 ),
             ],
             reasons: BTreeMap::from([
@@ -7487,7 +7503,7 @@ mod tests {
                 ),
                 (
                     OTHER.to_string(),
-                    format!("dependency '{T}' failed: failed on every eligible worker"),
+                    rio_proto::dependency_failed_summary(T, "failed on every eligible worker"),
                 ),
             ]),
             lost_terminals: BTreeSet::new(),

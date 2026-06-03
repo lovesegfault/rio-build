@@ -1109,7 +1109,9 @@ mod tests {
         observe_line(&mut parsed, &mut tail, &relay);
 
         // The dependent cascades: hint suppressed, single-line payload.
-        let cascade_reason = format!("dependency '{trigger}' failed: {reason}");
+        // Producer-built: the scheduler formats every cascade message
+        // through the shared rio-proto formatter.
+        let cascade_reason = rio_proto::dependency_failed_summary(trigger, reason);
         let cascade = gateway_failure_relay(dependent, &cascade_reason, true);
         assert!(!cascade.contains('\n'), "premise: {cascade:?}");
         observe_line(&mut parsed, &mut tail, &cascade);
