@@ -113,20 +113,25 @@ let
   # list drifts both ways — the next build-dep-only crate silently
   # reintroduces the fuzz-tree asan build-script link failure, and a
   # crate gaining a runtime consumer would silently stay exempt from
-  # instrumenting runtime-reachable code. Membership = referenced from
-  # some workspace member's [build-dependencies] and from NO member's
-  # [dependencies]/[dev-dependencies].
+  # instrumenting runtime-reachable code.
+  #
+  # Scanned over ALL local crates' incoming edges, not just workspace
+  # members': the fuzz sub-workspaces have a single member (the fuzz
+  # crate) and reach rio-* as local path deps, so a members-only scan
+  # would derive an EMPTY set there and silently drop the exemption
+  # exactly where it matters most. Membership = a local crate referenced
+  # via [build-dependencies] by some crate in this tree and via NO
+  # crate's [dependencies]/[dev-dependencies].
   buildDepOnlyCrates =
     let
       resolved = builtins.fromJSON (builtins.readFile resolvedJson);
-      memberCrates = map (id: resolved.crates.${id}) (lib.attrValues resolved.workspaceMembers);
-      depNames = kind: lib.unique (lib.concatMap (c: map (d: d.name) (c.${kind} or [ ])) memberCrates);
+      allCrates = lib.attrValues resolved.crates;
+      depNames = kind: lib.unique (lib.concatMap (c: map (d: d.name) (c.${kind} or [ ])) allCrates);
       buildNames = depNames "buildDependencies";
       runtimeNames = depNames "dependencies" ++ depNames "devDependencies";
+      localNames = map (c: c.crateName) (lib.filter (c: (c.source.type or "") == "local") allCrates);
     in
-    lib.filter (n: lib.elem n buildNames && !lib.elem n runtimeNames) (
-      map (c: c.crateName) memberCrates
-    );
+    lib.filter (n: lib.elem n buildNames && !lib.elem n runtimeNames) localNames;
 
   buildRustCrateForPkgs =
     cratePkgs:
