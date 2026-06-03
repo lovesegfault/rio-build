@@ -1602,9 +1602,11 @@ fn corroborates(target: KillTarget, raw_status: i32) -> bool {
 ///    own watchdog) while an executor kill raced it is attributed to
 ///    the executor's kill — the forwarded status is bit-identical.
 ///    Cost of the forwarding convention; bounded by the canary metric
-///    `rio_builder_kill_verdict_outputs_present_total` (a kill verdict
-///    whose declared outputs all materialized is the coincidence
-///    signature). Irreducible at the wait level: distinguishing "our
+///    `rio_builder_kill_verdict_outputs_present_total` (a CORROBORATED
+///    kill verdict whose declared outputs all materialized is the
+///    coincidence signature; isolated increments are benign — the
+///    alert is on sustained rate, per the builder's kill-canary
+///    contract). Irreducible at the wait level: distinguishing "our
 ///    pidfd SIGKILL" from "any other SIGKILL of the principal in the
 ///    same instant" requires kernel-level exit-reason attribution
 ///    (who sent the signal), which `waitpid`/`waitid` do not expose.

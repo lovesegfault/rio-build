@@ -71,33 +71,88 @@ pub(crate) enum ExitClassification {
 }
 
 /// Is this finished execution the canary signature for kill-verdict
-/// misattribution: a limit-kill verdict (`TimedOut`/`Silent`/
-/// `LogLimitExceeded`) whose declared outputs nevertheless ALL
-/// materialized?
+/// misattribution: a CORROBORATED limit-kill verdict whose declared
+/// outputs nevertheless ALL materialized?
 ///
 /// A correctly attributed limit kill interrupts the build before it
-/// completes, so its outputs are missing (or partial). A kill verdict
-/// with a full output set means one of exactly two things, both worth
-/// an operator's eyes: the natural-137 coincidence (the build's last
-/// act was to exit 137 on its own while a deadline raced it — residual
-/// 1 of the executor's corroboration contract) or a supervision
-/// regression re-opening the relabel-a-completed-build window the
-/// principal-targeted kill closed (merged_bug_046). The counter this
-/// feeds (`rio_builder_kill_verdict_outputs_present_total`) is
-/// expected to stay at 0.
+/// completes, so its outputs are missing (or partial). A corroborated
+/// kill verdict with a full output set is the natural-137 coincidence
+/// (the build's last act was to exit 137 on its own while a deadline
+/// raced it — residual 1 of the executor's corroboration contract) or
+/// a supervision regression re-opening the relabel-a-completed-build
+/// window the principal-targeted kill closed (merged_bug_046).
+///
+/// CONTRACT (round-17 merged_bug_010): the input is the RELAY-FORWARDED
+/// exit — never the builder-side cap override, which is an honest local
+/// verdict about logs, not kill supervision (a build that completed
+/// under a late cap trip is not a relabel). [`settle_exit`] owns that
+/// ordering. The expected steady state is ~0; an ISOLATED increment is
+/// the documented coincidence — the alert condition is a sustained
+/// RATE, which no coincidence produces.
 ///
 /// `outputs` empty is NOT canary territory: nothing materialized, the
 /// verdict is self-consistent.
-// r[impl builder.exec.kill-targets-principal]
+// r[impl builder.exec.kill-canary]
 pub(crate) fn kill_verdict_with_outputs_present(
     exit: ExitOutcome,
     outputs: &[rio_exec::OutputReport],
 ) -> bool {
-    matches!(
-        exit,
-        ExitOutcome::TimedOut | ExitOutcome::Silent | ExitOutcome::LogLimitExceeded
-    ) && !outputs.is_empty()
-        && outputs.iter().all(|o| o.exists)
+    canary_capable(exit).is_some() && !outputs.is_empty() && outputs.iter().all(|o| o.exists)
+}
+
+/// The canary's PRODUCER SET, as an exhaustive match: which
+/// [`ExitOutcome`] variants can increment
+/// `rio_builder_kill_verdict_outputs_present_total`, by their
+/// HELP-text names. A new `ExitOutcome` variant fails compilation here
+/// until it chooses a side, and the set-equality test pins this
+/// function against the registered HELP text — the producer set and
+/// the operator documentation cannot drift apart silently.
+// r[impl builder.exec.kill-canary]
+pub(crate) fn canary_capable(exit: ExitOutcome) -> Option<&'static str> {
+    match exit {
+        ExitOutcome::TimedOut => Some("TimedOut"),
+        ExitOutcome::Silent => Some("Silent"),
+        ExitOutcome::LogLimitExceeded => Some("LogLimitExceeded"),
+        ExitOutcome::Exited(_) | ExitOutcome::Signaled(_) => None,
+    }
+}
+
+/// What [`settle_exit`] decided: the exit to CLASSIFY with, and
+/// whether the canary fired.
+pub(crate) struct SettledExit {
+    pub(crate) classify_as: ExitOutcome,
+    pub(crate) canary: bool,
+}
+
+/// Settle the corroborated exit against the builder-side cap override
+/// — the ONE place the two may meet (round-17 merged_bug_010).
+///
+/// Ordering owned here, statement-order regression unwritable at the
+/// call site: the canary consumes `corroborated` (the relay-forwarded
+/// status, the only evidence kill supervision is judged by) BEFORE the
+/// builder cap override is applied for classification. The override is
+/// an honest builder-local verdict about logs; feeding it to the
+/// canary manufactured increments out of completed builds whose cap
+/// tripped late (benign cause 1 of the round-17 finding) — and the old
+/// expected-0-alert-on-any contract then cried wolf on the natural-137
+/// coincidence too (benign cause 2). The contract is now ~0 with
+/// alert-on-RATE.
+// r[impl builder.exec.kill-canary]
+pub(crate) fn settle_exit(
+    corroborated: ExitOutcome,
+    builder_cap_trip: Option<&crate::log_stream::LogCapTrip>,
+    outputs: &[rio_exec::OutputReport],
+) -> SettledExit {
+    let canary = kill_verdict_with_outputs_present(corroborated, outputs);
+    let classify_as = if builder_cap_trip.is_some() {
+        ExitOutcome::LogLimitExceeded
+    } else {
+        corroborated
+    };
+    SettledExit {
+        classify_as,
+        canary,
+    }
 }
 
 /// Classify a raw exit outcome into the scheduler-facing status.
@@ -872,6 +927,82 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// The canary's producer set (the exhaustive [`canary_capable`]
+    /// match) must equal the set the registered HELP text documents —
+    /// operators read the HELP, the compiler reads the match, and this
+    /// test is the bridge. The HELP string is duplicated here verbatim
+    /// from lib.rs's describe_counter! (a compile-shared const would
+    /// invert the dependency between the crates' layers); if the sets
+    /// drift, ONE of the two assertions below names the missing side.
+    // r[verify builder.exec.kill-canary]
+    #[test]
+    fn canary_producer_set_matches_help_text() {
+        let help = "Corroborated limit-kill verdicts (producers: TimedOut, Silent, \
+                    LogLimitExceeded) whose declared outputs ALL materialized";
+        // The exhaustive-match producer set, by construction.
+        let producers: Vec<&str> = [
+            ExitOutcome::Exited(0),
+            ExitOutcome::Exited(137),
+            ExitOutcome::Signaled(9),
+            ExitOutcome::TimedOut,
+            ExitOutcome::Silent,
+            ExitOutcome::LogLimitExceeded,
+        ]
+        .into_iter()
+        .filter_map(canary_capable)
+        .collect();
+        assert_eq!(
+            producers,
+            vec!["TimedOut", "Silent", "LogLimitExceeded"],
+            "producer set changed — update the HELP text in lib.rs AND this test"
+        );
+        for name in &producers {
+            assert!(
+                help.contains(name),
+                "HELP text does not document producer {name}"
+            );
+        }
+        // No NON-producer name appears in the producers clause.
+        for absent in ["Exited", "Signaled"] {
+            assert!(
+                !help.contains(absent),
+                "HELP names {absent}, which cannot produce an increment"
+            );
+        }
+    }
+
+    /// settle_exit's ordering contract: the canary judges the
+    /// relay-forwarded exit; the builder cap override only steers
+    /// classification (round-17 merged_bug_010 benign cause 1).
+    // r[verify builder.exec.kill-canary]
+    #[test]
+    fn settle_exit_canary_ignores_builder_cap_override() {
+        let report = |exists| rio_exec::OutputReport {
+            path: "/x/out".into(),
+            host_path: "/h/out".into(),
+            exists,
+            metadata: None,
+        };
+        let trip = crate::log_stream::LogCapTrip::Bytes {
+            would_be: 11,
+            limit: 10,
+        };
+        // Completed build (Exited(0), all outputs) + late builder cap
+        // trip: classified LogLimitExceeded, canary does NOT fire.
+        let s = settle_exit(ExitOutcome::Exited(0), Some(&trip), &[report(true)]);
+        assert_eq!(s.classify_as, ExitOutcome::LogLimitExceeded);
+        assert!(!s.canary, "builder override must not manufacture a canary");
+        // Corroborated executor kill verdict + full outputs: canary
+        // fires regardless of the builder trip's presence.
+        let s = settle_exit(ExitOutcome::TimedOut, None, &[report(true)]);
+        assert!(s.canary);
+        let s = settle_exit(ExitOutcome::TimedOut, Some(&trip), &[report(true)]);
+        assert!(s.canary, "the corroborated verdict is what's judged");
+        // Partial outputs: self-consistent kill, no canary.
+        let s = settle_exit(ExitOutcome::TimedOut, None, &[report(true), report(false)]);
+        assert!(!s.canary);
     }
 
     #[test]

@@ -1434,25 +1434,26 @@ async fn run_native_lifecycle(
             // Disk-full probe on the scratch space the build writes to.
             let disk_full =
                 native_result::disk_full_probe(&[&overlay_mount.upper_store(), &build_dir]);
-            let exit = if log_cap_trip.is_some() {
-                rio_exec::ExitOutcome::LogLimitExceeded
-            } else {
-                outcome.exit
-            };
-            // Canary: a kill verdict whose declared outputs ALL
-            // materialized is either the natural-137 coincidence or a
-            // supervision regression re-opening the completed-build
-            // relabel window (merged_bug_046). Expected 0; alert on
-            // any increment and pull the worker's logs for the build.
-            // r[impl builder.exec.kill-targets-principal]
-            if native_result::kill_verdict_with_outputs_present(exit, &outcome.outputs) {
+            // settle_exit owns the canary-before-override ordering
+            // (round-17 merged_bug_010): the canary consumes the
+            // RELAY-FORWARDED exit; the builder cap override applies
+            // only to classification. Expected ~0; an isolated
+            // increment is the documented natural-137 coincidence —
+            // alert on a sustained RATE, and pull the worker's logs
+            // for the named drv either way.
+            // r[impl builder.exec.kill-canary]
+            let settled =
+                native_result::settle_exit(outcome.exit, log_cap_trip.as_ref(), &outcome.outputs);
+            let exit = settled.classify_as;
+            if settled.canary {
                 metrics::counter!("rio_builder_kill_verdict_outputs_present_total").increment(1);
                 tracing::warn!(
                     drv_path = %drv_path,
-                    exit = ?exit,
+                    exit = ?outcome.exit,
                     outputs = outcome.outputs.len(),
-                    "kill verdict with fully materialized outputs — natural-137 \
-                     coincidence or kill-supervision regression (expected never)"
+                    "corroborated kill verdict with fully materialized outputs — \
+                     natural-137 coincidence (isolated) or kill-supervision \
+                     regression (sustained rate)"
                 );
             }
             match native_result::classify_exit(

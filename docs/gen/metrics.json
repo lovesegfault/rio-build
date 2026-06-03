@@ -318,7 +318,7 @@
       {
         "name": "rio_builder_kill_verdict_outputs_present_total",
         "kind": "counter",
-        "help": "Limit-kill verdicts (TimedOut/Silent/LogLimitExceeded) whose declared outputs ALL materialized. Expected 0. Any increment is either the natural-137 coincidence (the build exited 137 on its own as a deadline raced it) or a kill-supervision regression re-opening the completed-build relabel window the principal-targeted kill closed — pull the worker's logs for the named drv either way."
+        "help": "Corroborated limit-kill verdicts (producers: TimedOut, Silent, LogLimitExceeded) whose declared outputs ALL materialized — judged on the relay-forwarded exit, never the builder-side log cap override. Expected ~0: an ISOLATED increment is the documented natural-137 coincidence (the build exited 137 on its own as a deadline raced it); a SUSTAINED RATE is a kill-supervision regression re-opening the completed-build relabel window the principal-targeted kill closed. Alert on rate; pull the worker's logs for the named drv either way."
       },
       {
         "name": "rio_builder_log_lines_suppressed_total",

@@ -924,10 +924,13 @@ build that genuinely exits `137` (or is SIGKILLed by something else
 *inside* the kill scope) while an executor kill raced it is attributed
 to the executor's kill --- bit-identical at the wait level, the cost
 of the forwarding convention; bounded operationally by the canary
-metric #(refs.metric)("rio_builder_kill_verdict_outputs_present_total") (kill verdict
-+ fully materialized declared outputs = the coincidence signature),
-and irreducible without kernel-level exit-reason attribution, which
-`waitid` does not expose. (2) A relay stuck past the escalation grace
+metric #(refs.metric)("rio_builder_kill_verdict_outputs_present_total") (corroborated kill
+verdict + fully materialized declared outputs = the coincidence
+signature, an ISOLATED increment by construction --- the alert
+condition is a sustained rate, per
+#rref("builder.exec.kill-canary")), and irreducible without
+kernel-level exit-reason attribution, which `waitid` does not
+expose. (2) A relay stuck past the escalation grace
 after a principal kill is taken down claim-free; its `signaled(9)`
 status fails corroboration, so the verdict degrades to the honest
 `Signaled(9)` --- the claim is dropped, never honored on manufactured
@@ -940,6 +943,18 @@ semantics shift from the FU1 restructure also stands: a build whose
 silence-killed where it previously froze alongside its enforcement ---
 reaching that state requires a worker bug, since the worker's own
 consumer is structurally non-stalling (#rref("builder.relay.log-shed")).
+
+#r("builder.exec.kill-canary")[
+  The kill-verdict canary
+  (#(refs.metric)("rio_builder_kill_verdict_outputs_present_total")) MUST
+  be judged on the relay-forwarded (corroborated) exit, before any
+  builder-side log-cap override is applied for classification; its
+  producer set (TimedOut, Silent, LogLimitExceeded, maintained as an
+  exhaustive match) MUST equal the set its registered HELP text
+  documents; and the operator contract is approximately-zero with the
+  alert on a sustained rate, never on a single increment (the
+  natural-137 coincidence is benign and reachable).
+]
 
 #r("builder.exec.kill-targets-principal")[
   The executor MUST supervise the build principal --- the sandbox
