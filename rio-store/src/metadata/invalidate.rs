@@ -26,6 +26,25 @@
 //! proofs survive deriver GC) but which "invalidate everything about
 //! this path" must purge: a surviving modulo row would keep proving IA
 //! outputs of a `.drv` whose narinfo the operator just removed.
+//!
+//! ## Serialization scope (round-16 bug_044, honest residuals)
+//!
+//! Every registry delete runs UNDER the path's `manifests` row lock
+//! (`FOR UPDATE`), the same lock and the same order as the GC sweep's
+//! per-path batch — writers serialized by that lock (PutPath finalize
+//! on the same path, the sweep itself) cannot interleave rows between
+//! the deletes and the commit. NOT closed, enumerated per producer:
+//! - a path with NO manifest row (e.g. tenant-attribution-only state)
+//!   has nothing to lock; the deletes still run, unserialized;
+//! - producers that do not take the manifest lock (scheduler
+//!   completion's `path_tenants` upsert, realisation registration,
+//!   `populate_on_ingest`) can commit rows AFTER this transaction —
+//!   invalidation is a point-in-time purge, and the remediation for
+//!   a late row is re-running it (the call is idempotent);
+//! - the lock orders, it does not fence: a writer that committed
+//!   BEFORE our lock acquisition is deleted; one that commits after
+//!   our commit is not. Operators treating invalidation as a fence
+//!   must drain writers first (runbook note).
 
 use std::sync::Arc;
 
@@ -60,9 +79,23 @@ pub(crate) struct InvalidateCounts {
 
 impl InvalidateCounts {
     pub(crate) fn found(&self) -> bool {
-        // An orphan-only modulo row still counts: the operator must see
-        // that the purge took effect (store.admin.invalidate-total).
-        self.narinfo_deleted > 0 || self.realisations_deleted > 0 || self.drv_modulo_deleted > 0
+        // EVERY per-table counter participates (round-16 bug_044
+        // found() fix; store.admin.invalidate-total: "found MUST be
+        // true when any row existed"). Pre-fix only narinfo /
+        // realisations / drv_modulo counted, so a path present ONLY in
+        // path_tenants (the all-cache-hit merge writes ONLY that
+        // table, per store.gc.sweep-recheck+2 arm iii) reported
+        // found=false while rows WERE deleted — the operator reads
+        // "nothing to do" from a call that mutated state.
+        // chunks_zeroed is deliberately excluded: it is observability
+        // for the decrement step and can only be nonzero when
+        // manifest_existed already is.
+        self.narinfo_deleted > 0
+            || self.manifest_existed > 0
+            || self.realisations_deleted > 0
+            || self.realisation_deps_deleted > 0
+            || self.path_tenants_deleted > 0
+            || self.drv_modulo_deleted > 0
     }
 }
 
@@ -90,14 +123,44 @@ pub(crate) async fn invalidate_path(
     let path_str = store_path.as_str();
     let path_hash = store_path.sha256_digest().to_vec();
 
+    // Serialization point FIRST (round-16 bug_044): the manifest
+    // `FOR UPDATE` is the only lock that orders this transaction
+    // against same-path writers (PutPath finalize, the sweep's
+    // per-path batch). Pre-fix the registry deletes ran BEFORE it:
+    // (a) rows committed between a registry delete and the lock
+    // acquisition survived a "total" invalidation, and (b) the order
+    // was the EXACT inversion of the sweep's (manifest lock -> junction
+    // deletes), an AB-BA deadlock pair whenever sweep and invalidate
+    // raced the same path. Single post-lock execution dominates the
+    // planned pre+post re-run: the inverted-order pass (the deadlock
+    // half) no longer exists at all.
+    //
+    // Read the manifest's chunk_list in the same statement: the
+    // CASCADE at the root delete destroys the only record of which
+    // chunks carry this path's refcount, so the read must precede it.
+    // Outer Option = manifest row existence; inner = chunk_list (NULL
+    // for inline NARs).
+    let manifest_row: Option<Option<Vec<u8>>> = sqlx::query_scalar(
+        r#"
+        SELECT md.chunk_list
+          FROM manifests m
+          LEFT JOIN manifest_data md USING (store_path_hash)
+         WHERE m.store_path_hash = $1
+           FOR UPDATE OF m
+        "#,
+    )
+    .bind(&path_hash)
+    .fetch_optional(&mut *tx)
+    .await?;
+    counts.manifest_existed = u64::from(manifest_row.is_some());
+
     // r[impl store.db.per-path-registry+2]
     // Iterate the lifecycle registry in its pinned execution order
-    // (RESTRICT-guarded junction rows first, the CASCADE root last).
-    // The SQL strings and per-table rationale live with the policies in
-    // `metadata/per_path.rs`. The Narinfo arm is special-cased below
-    // the loop: the manifest `FOR UPDATE` hoist must read pre-CASCADE
-    // state, so it sits between the registry's non-root deletes and
-    // the root delete.
+    // (RESTRICT-guarded junction rows first, the CASCADE root last),
+    // now entirely UNDER the manifest lock. The SQL strings and
+    // per-table rationale live with the policies in
+    // `metadata/per_path.rs`. The Narinfo root delete still runs after
+    // the chunk decrement below (CASCADE ordering).
     for table in PerPathTable::ALL {
         if table == PerPathTable::Narinfo {
             break; // root delete runs after the FOR-UPDATE hoist below
@@ -134,28 +197,6 @@ pub(crate) async fn invalidate_path(
             | PerPathTable::Narinfo => unreachable!("non-Delete policies are skipped above"),
         }
     }
-
-    // Read the manifest's chunk_list BEFORE the narinfo delete: the
-    // CASCADE destroys the only record of which chunks carry this
-    // path's refcount. `FOR UPDATE OF m` is the same locking
-    // discipline as the GC sweep / orphan reap — a concurrent PutPath
-    // for the SAME path blocks until this transaction commits, so the
-    // decrement and the delete are atomic with respect to re-uploads.
-    // Outer Option = manifest row existence (observable only before
-    // the CASCADE); inner Option = chunk_list (NULL for inline NARs).
-    let manifest_row: Option<Option<Vec<u8>>> = sqlx::query_scalar(
-        r#"
-        SELECT md.chunk_list
-          FROM manifests m
-          LEFT JOIN manifest_data md USING (store_path_hash)
-         WHERE m.store_path_hash = $1
-           FOR UPDATE OF m
-        "#,
-    )
-    .bind(&path_hash)
-    .fetch_optional(&mut *tx)
-    .await?;
-    counts.manifest_existed = u64::from(manifest_row.is_some());
 
     // Decrement chunk refcounts exactly as the GC sweep would have for
     // this path; chunks that hit 0 are marked deleted and their S3
@@ -363,6 +404,79 @@ mod tests {
         );
         assert_eq!(counts.narinfo_deleted, 0);
         assert_eq!(counts.drv_modulo_deleted, 1);
+    }
+
+    // r[verify store.admin.invalidate-total]
+    /// THE bug_044 found() cells: a path present in EXACTLY ONE
+    /// per-table population must report found=true from that
+    /// population alone. Pre-fix, path_tenants-only (the
+    /// all-cache-hit-merge state, store.gc.sweep-recheck+2 arm iii)
+    /// and deps-bearing populations reported found=false while rows
+    /// WERE deleted.
+    #[tokio::test]
+    async fn found_true_for_each_single_table_population() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Cell 1: path_tenants ONLY (no narinfo, no realisations).
+        let p1 = test_store_path("found-pt-only");
+        let tid = crate::test_helpers::seed_tenant(&db.pool, "found-cells").await;
+        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+            .bind(path_hash(&p1).as_slice())
+            .bind(tid)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let c = invalidate_path(&db.pool, &StorePath::parse(&p1).unwrap(), false, None)
+            .await
+            .unwrap();
+        assert_eq!(c.path_tenants_deleted, 1);
+        assert!(
+            c.found(),
+            "path_tenants-only purge must report found=true (bug_044)"
+        );
+
+        // Cell 2: realisations + dependency edges ONLY. The edge
+        // delete contributes to found() too (a keep_realisations=false
+        // purge that only had edges left after a partial prior run).
+        let p2 = test_store_path("found-real-only");
+        for drv in [0x51u8, 0x52u8] {
+            sqlx::query(
+                "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash) \
+                 VALUES ($1, 'out', $2, $3)",
+            )
+            .bind(vec![drv; 32])
+            .bind(if drv == 0x51 {
+                &p2
+            } else {
+                "/nix/store/other-found-cell"
+            })
+            .bind(vec![0x22u8; 32])
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO realisation_deps (drv_hash, output_name, dep_drv_hash, dep_output_name) \
+             VALUES ($1, 'out', $2, 'out')",
+        )
+        .bind(vec![0x52u8; 32])
+        .bind(vec![0x51u8; 32])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let c = invalidate_path(&db.pool, &StorePath::parse(&p2).unwrap(), false, None)
+            .await
+            .unwrap();
+        assert_eq!(c.realisations_deleted, 1);
+        assert_eq!(c.realisation_deps_deleted, 1, "edge in dep role unlinked");
+        assert!(c.found());
+
+        // Cell 3: empty everywhere -> found=false (idempotence floor).
+        let p3 = test_store_path("found-nothing");
+        let c = invalidate_path(&db.pool, &StorePath::parse(&p3).unwrap(), false, None)
+            .await
+            .unwrap();
+        assert!(!c.found(), "no rows anywhere must stay found=false");
     }
 
     /// Inline (non-chunked) paths have no chunk_list: the decrement
