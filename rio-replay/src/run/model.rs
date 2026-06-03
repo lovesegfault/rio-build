@@ -1024,8 +1024,20 @@ pub struct SettledSupplyPath<'a> {
     pub entry: &'a SupplyEntry,
     /// How many settled refused/failed rows the path accumulated on the
     /// engine upload mechanisms — each one a claim-resolved delivery
-    /// attempt. The supply rollup's attempt floor counts these; skipped
-    /// bookkeeping rows are not attempts and never reach this fold.
+    /// attempt — SINCE the path's delivery need was last met. The
+    /// counter's epoch is declared relative to the displacing event the
+    /// same fold tracks: a settlement that proves the path present at the
+    /// target (`delivered`, `already-present`, `delegated`) resets it to
+    /// zero, exactly as it displaces the latest-settlement slot. The
+    /// supply rollup's attempt floor counts these against its
+    /// epoch-worded retirement contract ("the first settled failure
+    /// leaves dependents attemptable so the top-up gets its one more
+    /// delivery attempt; the second retires" — failures BEFORE a
+    /// delivery cannot pre-spend the post-delivery epoch's floor, or a
+    /// delivered-then-vanished path would retire its dependents on the
+    /// new epoch's first transient failure, bypassing the documented
+    /// backstop). Skipped/unavailable bookkeeping rows are not attempts
+    /// and never reach this fold.
     pub undelivered_upload_attempts: usize,
 }
 
@@ -1082,17 +1094,33 @@ impl<'a> SupplyFold<'a> {
             let path = entry.path.as_str();
             let outcome = entry.outcome.as_str();
             if supply_outcome_is_settlement(outcome) {
-                let is_undelivered_upload_attempt = (entry.mechanism
-                    == SUPPLY_MECHANISM_UPLOAD_BATCH
-                    || entry.mechanism == SUPPLY_MECHANISM_UPLOAD_STREAM)
-                    && (outcome == SUPPLY_OUTCOME_REFUSED || outcome == SUPPLY_OUTCOME_FAILED);
+                // The settlement vocabulary, decided per outcome for the
+                // attempt counter ([`SettledSupplyPath`]'s epoch
+                // declaration): `refused`/`failed` on an engine upload
+                // mechanism count one claim-resolved undelivered attempt;
+                // `refused`/`failed` on any other mechanism (a delegate
+                // prefetch failure is not an upload attempt) neither count
+                // nor reset; every OTHER settlement (`delivered`,
+                // `already-present`, `delegated`) proves the path's
+                // delivery need met at the target and resets the count —
+                // the redemption event the rollup's epoch-worded floor is
+                // counted from.
+                let is_undelivered =
+                    outcome == SUPPLY_OUTCOME_REFUSED || outcome == SUPPLY_OUTCOME_FAILED;
+                let is_undelivered_upload_attempt = is_undelivered
+                    && (entry.mechanism == SUPPLY_MECHANISM_UPLOAD_BATCH
+                        || entry.mechanism == SUPPLY_MECHANISM_UPLOAD_STREAM);
                 collapsed
                     .settled
                     .entry(path)
                     .and_modify(|settled| {
                         settled.entry = entry;
-                        settled.undelivered_upload_attempts +=
-                            usize::from(is_undelivered_upload_attempt);
+                        if is_undelivered {
+                            settled.undelivered_upload_attempts +=
+                                usize::from(is_undelivered_upload_attempt);
+                        } else {
+                            settled.undelivered_upload_attempts = 0;
+                        }
                     })
                     .or_insert(SettledSupplyPath {
                         entry,
@@ -2055,11 +2083,17 @@ mod tests {
         assert!(empty.report_outcomes().is_empty());
     }
 
-    /// The settled undelivered-attempt count: refused/failed rows on the
-    /// engine upload mechanisms each count one claim-resolved attempt —
-    /// regardless of which row ends up latest — while delivered rows,
-    /// non-upload mechanisms (a prefetch `failed` is not an upload
-    /// attempt), and bookkeeping rows never count.
+    /// The settled undelivered-attempt count and its epoch: refused/failed
+    /// rows on the engine upload mechanisms each count one claim-resolved
+    /// attempt; non-upload mechanisms (a prefetch `failed` is not an
+    /// upload attempt) and bookkeeping rows never count and never reset;
+    /// and a settlement that proves the path present (`delivered`,
+    /// `already-present`, `delegated`) RESETS the count to zero — the
+    /// counter is "consecutive settled undelivered upload attempts since
+    /// the delivery need was last met", not a campaign-lifetime
+    /// accumulator. The fixture sequences cross the redemption boundary
+    /// in both directions (attempts → redemption, and redemption →
+    /// attempts) so neither side of the reset can regress unnoticed.
     #[test]
     fn supply_fold_counts_undelivered_upload_attempts_per_path() {
         let path = "/nix/store/retried";
@@ -2083,17 +2117,84 @@ mod tests {
                 SUPPLY_OUTCOME_SKIPPED,
                 None,
             ),
-            fold_row(
-                path,
-                SUPPLY_MECHANISM_UPLOAD_BATCH,
-                SUPPLY_OUTCOME_DELIVERED,
-                None,
-            ),
         ];
         let fold = SupplyFold::collapse(&entries);
         let settled = &fold.latest_settlements()[path];
-        assert_eq!(settled.undelivered_upload_attempts, 2);
+        assert_eq!(
+            settled.undelivered_upload_attempts, 2,
+            "two upload-mechanism attempts; the delegate failure and the \
+             bookkeeping skip count nothing"
+        );
+
+        // Redemption: a delivered settlement zeroes the count exactly as
+        // it displaces the latest-settlement slot.
+        let mut redeemed = entries.clone();
+        redeemed.push(fold_row(
+            path,
+            SUPPLY_MECHANISM_UPLOAD_BATCH,
+            SUPPLY_OUTCOME_DELIVERED,
+            None,
+        ));
+        let fold = SupplyFold::collapse(&redeemed);
+        let settled = &fold.latest_settlements()[path];
+        assert_eq!(settled.undelivered_upload_attempts, 0);
         assert_eq!(settled.entry.outcome, SUPPLY_OUTCOME_DELIVERED);
+
+        // One row past the redemption (the post-delivery epoch): a fresh
+        // failure counts from zero — pre-delivery attempts cannot
+        // pre-spend the new epoch — and a second one accumulates.
+        let mut failed_again = redeemed.clone();
+        failed_again.push(fold_row(
+            path,
+            SUPPLY_MECHANISM_UPLOAD_STREAM,
+            SUPPLY_OUTCOME_FAILED,
+            None,
+        ));
+        let fold = SupplyFold::collapse(&failed_again);
+        let settled = &fold.latest_settlements()[path];
+        assert_eq!(settled.undelivered_upload_attempts, 1);
+        assert_eq!(settled.entry.outcome, SUPPLY_OUTCOME_FAILED);
+        failed_again.push(fold_row(
+            path,
+            SUPPLY_MECHANISM_UPLOAD_BATCH,
+            SUPPLY_OUTCOME_REFUSED,
+            None,
+        ));
+        let fold = SupplyFold::collapse(&failed_again);
+        assert_eq!(
+            fold.latest_settlements()[path].undelivered_upload_attempts,
+            2
+        );
+
+        // The other present-proving settlements reset identically — the
+        // settlement vocabulary is decided per outcome, not per the one
+        // outcome the originating fixture happened to use. A non-upload
+        // failure after a redemption preserves (it neither counts nor
+        // resets).
+        for redemption in [SUPPLY_OUTCOME_ALREADY_PRESENT, SUPPLY_OUTCOME_DELEGATED] {
+            let entries = vec![
+                fold_row(
+                    path,
+                    SUPPLY_MECHANISM_UPLOAD_BATCH,
+                    SUPPLY_OUTCOME_FAILED,
+                    None,
+                ),
+                fold_row(path, SUPPLY_MECHANISM_NONE, redemption, None),
+                fold_row(
+                    path,
+                    SUPPLY_MECHANISM_UPLOAD_BATCH,
+                    SUPPLY_OUTCOME_FAILED,
+                    None,
+                ),
+                fold_row(path, SUPPLY_MECHANISM_DELEGATE, SUPPLY_OUTCOME_FAILED, None),
+            ];
+            let fold = SupplyFold::collapse(&entries);
+            assert_eq!(
+                fold.latest_settlements()[path].undelivered_upload_attempts,
+                1,
+                "{redemption}: one post-redemption upload attempt"
+            );
+        }
     }
 
     /// The as-of scope: rows observed after the cutoff are invisible to

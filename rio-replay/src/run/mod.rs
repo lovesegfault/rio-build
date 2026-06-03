@@ -966,17 +966,23 @@ fn plan_time_dispositions(
 ///
 /// `attempt_floor` is the bounded supply-attempt count a path must reach
 /// before its settled refusal/failure becomes retiring: each settled
-/// refused/failed row is one claim-resolved delivery attempt, and the
-/// caller passes 2 when a per-submission top-up is wired — the top-up's
-/// documented contract gives a path the prewarm pass refused or failed
-/// "one more delivery attempt" (see the `LadderTopup` doc and the
-/// mode-wiring comment at the supply-stage call site), so retiring on the
-/// first settled attempt would dead-code that backstop and turn one
-/// transient transport failure into permanent exclusions — and 1 when
-/// nothing re-attempts (no top-up wired, or attribution of an
-/// already-dispatched batch member at settle time, where the question is
-/// whether the path WAS settled-undelivered, not whether it might recover
-/// later). Premature retirement and infinite attemptability are both
+/// refused/failed row on an upload mechanism is one claim-resolved
+/// delivery attempt, counted per delivery EPOCH — the fold resets the
+/// count at every settlement that proves the path present
+/// ([`model::SettledSupplyPath`]'s epoch declaration), so failures that
+/// preceded a delivery cannot pre-spend the floor of the epoch a later
+/// re-plan opens. The caller passes 2 when a per-submission top-up is
+/// wired — the top-up's documented contract gives a path the prewarm pass
+/// refused or failed "one more delivery attempt" (see the `LadderTopup`
+/// doc and the mode-wiring comment at the supply-stage call site), so
+/// retiring on the first settled attempt of any epoch would dead-code
+/// that backstop and turn one transient transport failure into permanent
+/// exclusions — and 1 when nothing re-attempts (no top-up wired, or
+/// attribution of an already-dispatched batch member at settle time,
+/// where the question is whether the path WAS settled-undelivered, not
+/// whether it might recover later; floor 1 is epoch-insensitive by
+/// construction, since a latest-refused/failed path always counts at
+/// least that latest row). Premature retirement and infinite attemptability are both
 /// unrepresentable: below the floor nothing retires and the wired top-up
 /// keeps re-attempting; at the floor the next rollup (process start for
 /// never-dispatched units, the collect pass's batch-settle rollup for
@@ -2821,13 +2827,17 @@ pub async fn run_with_backends(
     // on every start (resume re-derives the same set; existing records
     // win). The attempt floor honors the wired top-up's documented
     // backstop: with a per-submission top-up present, a path's first
-    // settled refusal/failure leaves its dependents attemptable so the
-    // top-up gets its one more delivery attempt (mode-wiring contract
-    // above); the second settled failure retires. Without a top-up
-    // nothing will re-attempt, so the first settled failure retires —
-    // dispatching would be the guaranteed missing-input failure. Units
-    // dispatched anyway are retired by the collect pass's batch-settle
-    // rollup the moment their batch settles.
+    // settled refusal/failure SINCE ITS LAST DELIVERY leaves its
+    // dependents attemptable so the top-up gets its one more delivery
+    // attempt (mode-wiring contract above); the second settled failure of
+    // that epoch retires. The fold's per-epoch count is what makes this
+    // wording true across resumes: a delivered-then-vanished path
+    // (target-side GC, re-planned on resume) opens a fresh epoch instead
+    // of inheriting pre-delivery failures toward the floor. Without a
+    // top-up nothing will re-attempt, so the first settled failure
+    // retires — dispatching would be the guaranteed missing-input
+    // failure. Units dispatched anyway are retired by the collect pass's
+    // batch-settle rollup the moment their batch settles.
     let supply_attempt_floor = if supply_topup.is_some() { 2 } else { 1 };
     // supply-fold: latest_settlements — process-start rollup over the
     // whole journal (the forward question: what is settled NOW), via
@@ -11289,10 +11299,18 @@ mod tests {
     /// nobody (the top-up still owes the path its re-attempt), a second
     /// settled undelivered attempt retires, and a path the re-attempt
     /// DELIVERED retires nobody no matter how many failures preceded it.
-    /// Bookkeeping rows are not attempts: breaker/held `skipped` rows
-    /// neither count toward the floor nor displace a settled outcome, so a
-    /// breaker collapse (skipped rows only) can never retire and can never
-    /// launder a real failure either.
+    /// The floor is per delivery EPOCH, not per campaign lifetime: a
+    /// delivery resets the attempt count, so a delivered-then-vanished
+    /// path (target-side GC across a resume re-plan) gets the same
+    /// one-more-attempt backstop in its new epoch — its first
+    /// post-delivery failure retires nobody at floor 2, its second
+    /// retires — instead of the pre-delivery failure pre-spending the
+    /// floor and turning one transient post-delivery failure into
+    /// permanent exclusions. Bookkeeping rows are not attempts:
+    /// breaker/held `skipped` rows neither count toward the floor nor
+    /// displace a settled outcome, so a breaker collapse (skipped rows
+    /// only) can never retire and can never launder a real failure
+    /// either.
     #[test]
     fn supply_rollup_attempt_floor_honors_the_wired_topup_backstop() {
         let path = |seed: &str| format!("/nix/store/{}-{seed}", "c".repeat(32 - seed.len()));
@@ -11321,6 +11339,8 @@ mod tests {
         let recovered = path("recovered-on-retry");
         let collapsed = path("breaker-collapsed");
         let laundered = path("failed-then-skipped");
+        let revanished = path("delivered-then-failed");
+        let regressed = path("delivered-then-failed-twice");
         let entries = vec![
             row(&once, model::SUPPLY_OUTCOME_FAILED),
             row(&twice, model::SUPPLY_OUTCOME_FAILED),
@@ -11339,6 +11359,21 @@ mod tests {
             // must not displace the settled failure.
             row(&laundered, model::SUPPLY_OUTCOME_FAILED),
             row(&laundered, model::SUPPLY_OUTCOME_SKIPPED),
+            // One row past the redemption boundary: a pre-delivery failure,
+            // the delivery, then ONE post-delivery failure (the
+            // delivered-then-GC'd-then-transient-failure shape a multi-day
+            // campaign's resume re-plan produces). The delivery opened a
+            // fresh epoch, so the new epoch's first failure must be below
+            // floor 2.
+            row(&revanished, model::SUPPLY_OUTCOME_FAILED),
+            row(&revanished, model::SUPPLY_OUTCOME_DELIVERED),
+            row(&revanished, model::SUPPLY_OUTCOME_FAILED),
+            // ...and the second post-delivery failure reaches the floor:
+            // the backstop is one more attempt per epoch, not amnesty.
+            row(&regressed, model::SUPPLY_OUTCOME_FAILED),
+            row(&regressed, model::SUPPLY_OUTCOME_DELIVERED),
+            row(&regressed, model::SUPPLY_OUTCOME_FAILED),
+            row(&regressed, model::SUPPLY_OUTCOME_FAILED),
         ];
         let closures = vec![
             entry("once.x", &once),
@@ -11347,6 +11382,8 @@ mod tests {
             entry("recovered.x", &recovered),
             entry("collapsed.x", &collapsed),
             entry("laundered.x", &laundered),
+            entry("revanished.x", &revanished),
+            entry("regressed.x", &regressed),
         ];
         let in_scope: HashSet<&str> = closures.iter().map(|c| c.job.as_str()).collect();
 
@@ -11362,14 +11399,19 @@ mod tests {
             BTreeMap::from([
                 ("twice.x".to_string(), Disposition::SupplyFailed),
                 ("mixed.x".to_string(), Disposition::UploadRejected),
+                ("regressed.x".to_string(), Disposition::SupplyFailed),
             ]),
-            "one settled attempt is below the wired floor; delivered and \
-             skipped paths never retire: {floor2:?}"
+            "one settled attempt — in whichever epoch — is below the wired \
+             floor; delivered and skipped paths never retire: {floor2:?}"
         );
 
         // Floor 1 (no top-up wired / batch-settle attribution): the single
         // settled failure retires, the laundering skip still does not save
-        // its path, and the breaker collapse still retires nobody.
+        // its path, and the breaker collapse still retires nobody. The
+        // epoch reset is floor-1-neutral by construction: any path whose
+        // LATEST settlement is refused/failed has at least its latest row
+        // in the current epoch's count, so both post-delivery shapes
+        // retire here exactly as a fresh failure does.
         let floor1 = supply_rollup_dispositions(
             &model::SupplyFold::collapse(&entries),
             &closures,
@@ -11384,6 +11426,8 @@ mod tests {
                 ("twice.x".to_string(), Disposition::SupplyFailed),
                 ("mixed.x".to_string(), Disposition::UploadRejected),
                 ("laundered.x".to_string(), Disposition::SupplyFailed),
+                ("revanished.x".to_string(), Disposition::SupplyFailed),
+                ("regressed.x".to_string(), Disposition::SupplyFailed),
             ]),
             "{floor1:?}"
         );
