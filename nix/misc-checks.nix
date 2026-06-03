@@ -318,6 +318,45 @@ in
         touch $out
       '';
 
+  # helm-env-schema-parity (merged_bug_161 class close): a Rust Config
+  # field that is neither rendered as a chart env nor allowlisted with
+  # a why-comment fails the merge gate — the
+  # knob-in-Rust-forgotten-in-chart class (RIO_LOG_RETENTION_DAYS /
+  # RIO_LOG_CORS_ALLOW_ORIGINS shipped exactly that way) cannot recur
+  # silently. Formal-coverage rationale (none-sensible): this is an
+  # external-equation tier (rendered YAML vs committed schema fixture);
+  # the executable check IS the by-construction artifact.
+  helm-env-schema-parity =
+    let
+      chart = pkgs.lib.cleanSource ../infra/helm/rio-build;
+      fixtures = {
+        rio-scheduler = ../rio-scheduler/tests/fixtures/config-schema.json;
+        rio-store = ../rio-store/tests/fixtures/config-schema.json;
+        rio-gateway = ../rio-gateway/tests/fixtures/config-schema.json;
+        rio-controller = ../rio-controller/tests/fixtures/config-schema.json;
+      };
+      pairs = pkgs.lib.concatStringsSep " " (
+        pkgs.lib.mapAttrsToList (component: fixture: "${component}=${fixture}") fixtures
+      );
+    in
+    pkgs.runCommand "rio-helm-env-schema-parity"
+      {
+        nativeBuildInputs = [
+          pkgs.kubernetes-helm
+          pkgs.python3
+        ];
+      }
+      ''
+        cp -r ${chart} $TMPDIR/chart
+        chmod -R +w $TMPDIR/chart
+        cd $TMPDIR/chart
+        mkdir -p charts
+        ln -s ${subcharts.postgresql} charts/postgresql
+        helm template rio . --set global.image.tag=test > $TMPDIR/render.yaml
+        python3 ${./tests/helm-env-parity.py} $TMPDIR/render.yaml           ${./tests/helm/env-parity-allowlist.json} ${pairs}
+        touch $out
+      '';
+
   # proxy_buffering off in dashboardNginxConf is LOAD-BEARING
   # (docker.nix:349): nginx default-buffers upstream → WatchBuild /
   # TailLog streams arrive as one blob at close. The config is a
