@@ -959,6 +959,15 @@ in
               exit 254
             } ;;
           "secretsmanager create-secret")
+            # Concurrency near-miss injection: the listed id behaves
+            # as if a racing Job created it BETWEEN our describe probe
+            # and this create — the exact window the create-only CAS
+            # guards. Fails without writing, like the real API.
+            if [ -f "$TMPDIR/inject-create-exists" ] \
+              && grep -qx "\$id" "$TMPDIR/inject-create-exists"; then
+              echo "An error occurred (ResourceExistsException): The operation failed because the secret rio/signing-key already exists." >&2
+              exit 254
+            fi
             [ -f "\$f" ] && { echo ResourceExistsException >&2; exit 254; }
             printf '%s' "\$payload" > "\$f" ;;
           "secretsmanager put-secret-value") printf '%s' "\$payload" > "\$f" ;;
@@ -1120,6 +1129,36 @@ in
           && { echo "FAIL-I: consistent pair triggered a heal" >&2; exit 1; }
         cmp secrets/rio_signing-key-pub tmp/i.expected && cmp secrets/rio_signing-key tmp/i.sec \
           || { echo "FAIL-I: steady-state run mutated the pair" >&2; exit 1; }
+
+        # Scenario H (concurrency near-miss, R3): two Jobs race the
+        # GENERATE branch. The loser's private-half create-secret hits
+        # ResourceExistsException in the window between its describe
+        # probe ("missing") and its create — the create-only CAS. The
+        # loser must abort having written NOTHING (with the old
+        # pub-first order it had already clobbered the winner's pub
+        # with a keypair about to be discarded, merged_bug_015); its
+        # retry then converges through the re-derive branch against
+        # the winner's pair.
+        rm -f secrets/rio_signing-key secrets/rio_signing-key-pub
+        echo rio_signing-key > $TMPDIR/inject-create-exists
+        if run 2>$TMPDIR/h-stderr; then
+          echo "FAIL-H: losing Job exited 0 despite losing the create CAS" >&2; exit 1
+        fi
+        rm $TMPDIR/inject-create-exists
+        [ ! -f secrets/rio_signing-key-pub ] \
+          || { echo "FAIL-H: losing Job wrote the pub half (clobbers the winner)" >&2; exit 1; }
+        [ ! -f secrets/rio_signing-key ] \
+          || { echo "FAIL-H: losing Job wrote the private half despite the CAS" >&2; exit 1; }
+        # Winner's pair lands (a clean run plays the winner)...
+        run > /dev/null
+        cp secrets/rio_signing-key tmp/h.sec
+        cp secrets/rio_signing-key-pub tmp/h.pub
+        # ...and the loser's RETRY converges without touching it.
+        run > tmp/h.log
+        grep -q "signing-key pair consistent" tmp/h.log \
+          || { echo "FAIL-H: loser retry did not converge on the winner's pair" >&2; exit 1; }
+        cmp secrets/rio_signing-key tmp/h.sec && cmp secrets/rio_signing-key-pub tmp/h.pub \
+          || { echo "FAIL-H: loser retry mutated the winner's pair" >&2; exit 1; }
         touch $out
       '';
 
