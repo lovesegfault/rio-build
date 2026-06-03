@@ -179,7 +179,7 @@ fn publish_store_gauges(pool: &PgPool, gate: &crate::admission::AdmissionGate) {
 }
 
 /// Self-publish every store-owned gauge on a 30 s in-process tick
-/// (the [`publish_store_gauges`] set). The store owns its gauges;
+/// (the `publish_store_gauges` set). The store owns its gauges;
 /// `GetLoad` keeps publishing on call so the values a caller acts on
 /// stay mirrored, but no gauge's ONLY writer is an RPC handler.
 // r[impl obs.metric.store-pg-pool+2]

@@ -12,7 +12,7 @@
 //!   scrape-surface is a process property, not an actor property, and
 //!   the standby/leader gauge tests' touch-sets stay untouched.
 //!
-//! - [`leader_gauges!`] / [`LeaderGauge`] — the leader-published state
+//! - `leader_gauges!` / [`LeaderGauge`] — the leader-published state
 //!   gauge family. One declaration carries name + label axis + reset
 //!   value; `reset_leader_gauges()` derives the lose-edge sweep from
 //!   the same rows, so a gauge added to the family CANNOT be missed by

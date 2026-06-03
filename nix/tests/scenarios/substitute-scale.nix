@@ -573,6 +573,8 @@ pkgs.testers.runNixOSTest {
         # the fall AND the 30s store gauge tick is the steady-state
         # floor. 45s budget = one 30s tick + scrape slack — a
         # structural assert with a generous window, not a timing gate.
+        import time as _time  # this exec block has no prologue imports
+
         decayed = False
         for _ in range(45):
             ms = scrape_metrics(k3s_server, 19092)
@@ -580,7 +582,7 @@ pkgs.testers.runNixOSTest {
             if val == 0.0:
                 decayed = True
                 break
-            time.sleep(1)
+            _time.sleep(1)
         assert decayed, (
             "rio_store_substitute_admission_utilization never returned "
             "to 0.0 within 45s of the cascade draining — the drop edge "
