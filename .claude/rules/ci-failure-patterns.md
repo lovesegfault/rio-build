@@ -21,6 +21,7 @@ Reference catalog of CI-gate failure signatures that have bitten this project at
 | **statix style** | statix lint → shows under the `pre-commit` check, not standalone | `inherit (pkgs) lib` not `lib = pkgs.lib`. Mechanical fix. |
 | **stdenv pipefail SIGPIPE** | `runCommand` build fails exit-1 with no stderr; buildCommand has a `producer | head -c N` shape | stdenv sets `set -o pipefail`; head closes pipe → producer SIGPIPE → exit≠0. Reverse to `head -c N input | consumer`, or prefix `set +o pipefail;`. |
 | **Cilium config no-restart** | `helm upgrade cilium --reuse-values --set X` succeeds but `cilium-dbg config` still shows old value | Chart doesn't checksum-annotate `cilium-config` ConfigMap → DS pods don't restart. `kubectl -n kube-system rollout restart ds/cilium` after. |
+| **Torn worktree eval under concurrent agents** | Local gate red on a build that can't fail from the diff (e.g. docs-pdf "file not found …/rio-docs-root/…" for a tracked, present file); same HEAD builds the target green afterwards | Flake eval snapshotted the worktree mid-commit (or while sibling worktrees churned the shared .git). Diagnose: failing drv hash ≠ clean-HEAD drv hash for the same target. Fix: re-run the gate from clean HEAD; don't debug the failing drv's contents. |
 
 ## Flaky tests
 
