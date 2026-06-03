@@ -2129,8 +2129,12 @@ impl DagActor {
             AssignmentProtoOutcome::NodeGone => return false,
             // r[impl sched.dispatch.claims-derived+2]
             // The store could not vouch for a bare store-backed node's
-            // claims (fetch failure, absent .drv, text-CA mismatch,
-            // unresolvable inputs). Transient, store-trust posture:
+            // claims — STORE SILENCE only; the cause population is the
+            // `SilenceReason` enum (merge.rs), nothing else routes
+            // here. Structurally permanent shapes (unseedable inputs,
+            // unparseable drv_path) take the PermanentlyUnverifiable
+            // poison arm instead, never this one. Transient,
+            // store-trust posture:
             // roll the assignment back AND set the dispatch backoff
             // ourselves — `rollback_assignment` resets to Ready
             // without one, and a store outage would otherwise hot-loop
