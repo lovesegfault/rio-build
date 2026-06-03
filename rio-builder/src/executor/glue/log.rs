@@ -70,7 +70,7 @@ pub(crate) enum LineAction {
     Consumed,
     /// The per-build line cap was exceeded: the caller must abort the
     /// build with `LogLimitExceeded`.
-    CapExceeded,
+    CapExceeded(crate::log_stream::LogCapTrip),
 }
 
 /// The classification a logical line's head bequeaths to its
@@ -137,7 +137,10 @@ impl NixLogFilter {
         // `>` (not `>=`): the cap is the maximum number of ACCEPTED
         // lines, so the cap-th line still passes and the cap+1-th trips.
         if self.lines_seen > self.cap {
-            return LineAction::CapExceeded;
+            return LineAction::CapExceeded(crate::log_stream::LogCapTrip::Lines {
+                seen: self.lines_seen,
+                cap: self.cap,
+            });
         }
 
         // Continuation of a fragmented logical line: inherit the head's
@@ -283,8 +286,14 @@ mod tests {
         assert!(matches!(one(&mut f, b"four"), LineAction::Forward(_)));
         // …and the cap+1-th trips, regardless of its content, and stays
         // exceeded.
-        assert_eq!(one(&mut f, b"five"), LineAction::CapExceeded);
-        assert_eq!(one(&mut f, b"six"), LineAction::CapExceeded);
+        assert_eq!(
+            one(&mut f, b"five"),
+            LineAction::CapExceeded(crate::log_stream::LogCapTrip::Lines { seen: 5, cap: 4 })
+        );
+        assert_eq!(
+            one(&mut f, b"six"),
+            LineAction::CapExceeded(crate::log_stream::LogCapTrip::Lines { seen: 6, cap: 4 })
+        );
     }
 
     /// An oversized `@nix` frame: the head fragment classifies (and is

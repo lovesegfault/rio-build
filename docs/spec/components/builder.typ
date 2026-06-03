@@ -1085,13 +1085,19 @@ backpressure is display loss only, never control-plane loss.
   non-retryable semantics as the byte limit.
 ]
 
-#r("builder.log-limit+3")[
+#r("builder.log-limit+4")[
   The log batcher enforces per-build `LogLimits`. `total_bytes` (cumulative
   across flushed batches) is a hard cap: a line whose PROSPECTIVE total would
-  exceed it is rejected, `add_line` returns `LimitExceeded{reason}`, the
-  stderr loop flushes already-buffered lines and breaks with
-  `BuildStatus::LogLimitExceeded` --- terminal, non-retryable (same build on a
-  different executor spews the same logs). Maps to
+  exceed it is rejected, `add_line` returns `LimitExceeded{trip}` carrying a
+  typed `LogCapTrip` --- WHICH cap tripped with both sides of the comparison
+  --- and the stderr loop kills the build's PRINCIPAL scope (`<cg>/build`,
+  never the build root: the relay MUST survive a cap kill so the forwarded
+  wait status survives with it, per `builder.exec.kill-targets-principal`)
+  and breaks with `BuildStatus::LogLimitExceeded` --- terminal, non-retryable
+  (same build on a different executor spews the same logs). The verdict
+  message MUST carry the trip's per-attempt figures (CppNix reports only the
+  limit, `derivation-building-goal.cc:1230-1237`; rio reports both sides ---
+  registered superset). Maps to
   #(refs.metric)("rio_builder_builds_total")`{outcome="log_limit"}`.
   `rate_lines_per_sec` (1-second tumbling window, monotonic `Instant`) is a
   suppression threshold: excess lines within a window are DROPPED, and a
@@ -1823,7 +1829,7 @@ forward line-number gap over the shed span (the `obs.log.gap-span` shape the
 scheduler ring buffer already accepts); marker *delivery* at the terminal
 boundary remains best-effort --- a shed terminal batch restores its lease
 with no later batch to ride, a bounded display gap
-(#rref("builder.log-limit+3") guarantees its assembly, not its delivery).
+(#rref("builder.log-limit+4") guarantees its assembly, not its delivery).
 
 #r("builder.result.input-materialization-is-infra+5")[
   A build failure caused by an input path that was verified present in

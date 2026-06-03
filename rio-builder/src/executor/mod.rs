@@ -1366,7 +1366,7 @@ async fn run_native_lifecycle(
 
     let LogLoopResult {
         final_line_count,
-        log_limit_exceeded,
+        log_cap_trip,
     } = log_task.await.unwrap_or_else(|e| {
         // A panicked log loop loses the tail of the build log and the
         // byte-cap signal; the build result itself is unaffected. Make
@@ -1374,7 +1374,7 @@ async fn run_native_lifecycle(
         tracing::warn!(error = %e, "log loop task panicked; build log tail lost");
         LogLoopResult {
             final_line_count: opts.batcher_seed,
-            log_limit_exceeded: false,
+            log_cap_trip: None,
         }
     });
 
@@ -1434,7 +1434,7 @@ async fn run_native_lifecycle(
             // Disk-full probe on the scratch space the build writes to.
             let disk_full =
                 native_result::disk_full_probe(&[&overlay_mount.upper_store(), &build_dir]);
-            let exit = if log_limit_exceeded {
+            let exit = if log_cap_trip.is_some() {
                 rio_exec::ExitOutcome::LogLimitExceeded
             } else {
                 outcome.exit
@@ -1455,7 +1455,13 @@ async fn run_native_lifecycle(
                      coincidence or kill-supervision regression (expected never)"
                 );
             }
-            match native_result::classify_exit(exit, is_fod, disk_full, oom_detected) {
+            match native_result::classify_exit(
+                exit,
+                is_fod,
+                disk_full,
+                oom_detected,
+                log_cap_trip.as_ref(),
+            ) {
                 native_result::ExitClassification::Failed { status, error_msg } => {
                     if oom_detected
                         && status != rio_proto::types::BuildResultStatus::InfrastructureFailure
@@ -1636,7 +1642,11 @@ fn principal_cap_kill(cgroup_path: &std::path::Path) {
 /// What [`native_log_loop`] reports back to the lifecycle.
 struct LogLoopResult {
     final_line_count: u64,
-    log_limit_exceeded: bool,
+    /// `Some` when a builder-side log cap tripped (which one, with the
+    /// per-attempt figures). The exit override and the cap kill are
+    /// keyed on this — never on rio-exec's own `LogLimitExceeded`
+    /// variant, whose trip is corroborated by the relay.
+    log_cap_trip: Option<crate::log_stream::LogCapTrip>,
 }
 
 /// Submit a batch on the display stream. Returns `false` only when the
@@ -1699,7 +1709,7 @@ async fn native_log_loop(
     batcher.attach_relay_shed(&log_tx);
 
     let mut filter = glue::log::NixLogFilter::new();
-    let mut log_limit_exceeded = false;
+    let mut log_cap_trip: Option<crate::log_stream::LogCapTrip> = None;
     let mut flush_tick = tokio::time::interval(Duration::from_millis(100));
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1710,7 +1720,7 @@ async fn native_log_loop(
                 let rio_exec::ExecEvent::Log { stream, line, terminated } = ev else {
                     continue;
                 };
-                if log_limit_exceeded {
+                if log_cap_trip.is_some() {
                     // Already aborting; drain the channel so rio-exec's
                     // reader threads never block on a full channel.
                     continue;
@@ -1723,8 +1733,8 @@ async fn native_log_loop(
                                 break;
                             }
                         }
-                        AddLineResult::LimitExceeded { .. } => {
-                            log_limit_exceeded = true;
+                        AddLineResult::LimitExceeded { trip } => {
+                            log_cap_trip = Some(trip);
                             principal_cap_kill(&cgroup_path);
                         }
                     },
@@ -1745,8 +1755,8 @@ async fn native_log_loop(
                         }
                     }
                     glue::log::LineAction::Consumed => {}
-                    glue::log::LineAction::CapExceeded => {
-                        log_limit_exceeded = true;
+                    glue::log::LineAction::CapExceeded(trip) => {
+                        log_cap_trip = Some(trip);
                         principal_cap_kill(&cgroup_path);
                     }
                 }
@@ -1778,7 +1788,7 @@ async fn native_log_loop(
 
     LogLoopResult {
         final_line_count,
-        log_limit_exceeded,
+        log_cap_trip,
     }
 }
 
@@ -2748,7 +2758,7 @@ mod tests {
             "every line was numbered (delivered or shed): {}",
             result.final_line_count
         );
-        assert!(!result.log_limit_exceeded);
+        assert!(result.log_cap_trip.is_none());
     }
 
     /// Shed accounting end to end: a full sink sheds a batch (counted),
@@ -2839,7 +2849,7 @@ mod tests {
     /// stream closes — with NOTHING buffered — must deliver the marker
     /// batch. Pre-fix the exit path was gated on `has_pending()` and
     /// lost it.
-    // r[verify builder.log-limit+3]
+    // r[verify builder.log-limit+4]
     #[tokio::test]
     async fn log_loop_delivers_terminal_suppression_marker() {
         let tmp = tempfile::tempdir().expect("tempdir");

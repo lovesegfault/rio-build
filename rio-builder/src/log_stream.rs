@@ -88,13 +88,51 @@ pub enum AddLineResult {
     /// Line completed a batch. Caller must send it.
     BatchReady(AssembledBatch),
     /// `total_bytes` limit tripped. Caller must abort the build with
-    /// `BuildStatus::LogLimitExceeded` and the given reason in `error_msg`.
+    /// `BuildStatus::LogLimitExceeded`; the typed trip's figures land
+    /// in `error_msg` via exit classification.
     ///
     /// The line that tripped the limit is **not** buffered (we're done
     /// accepting lines). Any already-buffered lines are still in the
     /// batcher — caller should `flush()` them before aborting so the
     /// client sees output right up to the limit.
-    LimitExceeded { reason: String },
+    LimitExceeded { trip: LogCapTrip },
+}
+
+/// WHICH log cap tripped, with the per-attempt figures the verdict
+/// message carries (round-17 merged_bug_058 c2: the trip used to be a
+/// pre-formatted string, so exit classification could only say "build
+/// exceeded its log size limit" with no figures and no axis).
+///
+/// Oracle parity (PARITY-SWEEP in the introducing commit): CppNix
+/// 2.34.7 `derivation-building-goal.cc:656/:948` checks cumulative
+/// `logSize > maxLogSize` and reports only the LIMIT figure
+/// (`:1230-1237` "killed after writing more than %d bytes"); rio
+/// reports both sides of the comparison. The bytes check here is
+/// PROSPECTIVE (the line that would cross is rejected) where the
+/// oracle counts it first — registered nuance, same terminal verdict.
+/// The line cap has no oracle counterpart (rio-specific, covered by
+/// the spec rule's line-cap clause).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogCapTrip {
+    /// `total_bytes` would be exceeded: the prospective cumulative
+    /// size against the configured limit.
+    Bytes { would_be: u64, limit: u64 },
+    /// The accepted-line cap tripped: lines seen against the cap.
+    Lines { seen: u64, cap: u64 },
+}
+
+impl std::fmt::Display for LogCapTrip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogCapTrip::Bytes { would_be, limit } => write!(
+                f,
+                "log_size_limit exceeded: {would_be} bytes > {limit} limit"
+            ),
+            LogCapTrip::Lines { seen, cap } => {
+                write!(f, "log line cap exceeded: {seen} lines > {cap} cap")
+            }
+        }
+    }
 }
 
 /// Log batcher that collects log lines, emits `BuildLogBatch` messages,
@@ -197,12 +235,12 @@ impl LogBatcher {
     ///
     /// Limit checks happen BEFORE buffering — a line that would exceed the
     /// size limit is rejected, not half-accepted.
-    // r[impl builder.log-limit+3]
+    // r[impl builder.log-limit+4]
     pub fn add_line(&mut self, line: Vec<u8>) -> AddLineResult {
         // --- Rate limit (suppression, not abort) ---
         // Runs BEFORE the size check: a rate-dropped line is never
         // transmitted, so it has zero infrastructure cost and must not
-        // count toward `total_bytes` (`r[builder.log-limit+3]`). Tumbling
+        // count toward `total_bytes` (`r[builder.log-limit+4]`). Tumbling
         // window: if ≥ 1s has elapsed since window_start, reset. Instant
         // (monotonic) so NTP jumps don't spuriously trip/un-trip.
         if self.limits.rate_lines_per_sec > 0 {
@@ -246,11 +284,10 @@ impl LogBatcher {
             let prospective = self.total_bytes.saturating_add(line.len() as u64);
             if prospective > self.limits.total_bytes {
                 return AddLineResult::LimitExceeded {
-                    reason: format!(
-                        "log_size_limit exceeded: {prospective} bytes > {} limit \
-                         ({} lines so far)",
-                        self.limits.total_bytes, self.next_line_number
-                    ),
+                    trip: LogCapTrip::Bytes {
+                        would_be: prospective,
+                        limit: self.limits.total_bytes,
+                    },
                 };
             }
         }
@@ -301,7 +338,7 @@ impl LogBatcher {
     /// `flush_tick` emit a fragmentary marker mid-window whenever some
     /// accepted lines are still buffered alongside drops (any
     /// `rate % MAX_BATCH_LINES != 0`), violating the spec's "single
-    /// marker at window reset" (`r[builder.log-limit+3]`). Only
+    /// marker at window reset" (`r[builder.log-limit+4]`). Only
     /// `add_line`'s window-reset and [`finish`](Self::finish) drain
     /// drops.
     // r[impl builder.relay.log-shed]
@@ -345,7 +382,7 @@ impl LogBatcher {
     /// undercounted `rio_builder_log_lines_suppressed_total`) — and a
     /// terminal drain gated on buffered lines loses them exactly when
     /// the buffer happens to be empty.
-    // r[impl builder.log-limit+3]
+    // r[impl builder.log-limit+4]
     pub fn finish(mut self) -> (Option<AssembledBatch>, u64) {
         let dropped = std::mem::take(&mut self.lines_dropped_this_window);
         if dropped > 0 {
@@ -699,7 +736,7 @@ mod tests {
     // Rate limiting
     // -----------------------------------------------------------------------
 
-    // r[verify builder.log-limit+3]
+    // r[verify builder.log-limit+4]
     #[test]
     fn rate_limit_drops_excess_within_window() {
         let mut batcher = mk(LogLimits {
@@ -755,7 +792,7 @@ mod tests {
     /// emit the marker + metric. The old exit path gated the terminal
     /// flush on `has_pending()`, which only sees buffered lines, so
     /// exactly this state lost the marker silently.
-    // r[verify builder.log-limit+3]
+    // r[verify builder.log-limit+4]
     #[test]
     fn finish_drains_drops_with_empty_buffer() {
         let rec = rio_test_support::metrics::CountingRecorder::default();
@@ -850,10 +887,10 @@ mod tests {
 
     /// Regression: mid-window tick `flush()` with buffered lines + drops
     /// must NOT drain drops (would emit a fragmentary marker, then a
-    /// second one at window-reset — violates `r[builder.log-limit+3]`'s
+    /// second one at window-reset — violates `r[builder.log-limit+4]`'s
     /// "single marker at window reset"). Only `add_line`'s reset and
     /// `final_flush()` drain.
-    // r[verify builder.log-limit+3]
+    // r[verify builder.log-limit+4]
     #[test]
     fn rate_limit_single_marker_per_window_under_mixed_tick_flush() {
         let mut b = mk(LogLimits {
@@ -961,8 +998,8 @@ mod tests {
         // 1000 lines in rapid succession — no trip.
         for _ in 0..1000 {
             // Some of these will be BatchReady (every 64th), none should trip.
-            if let AddLineResult::LimitExceeded { reason } = batcher.add_line(b"x".to_vec()) {
-                panic!("rate=0 should be unlimited, got: {reason}")
+            if let AddLineResult::LimitExceeded { trip } = batcher.add_line(b"x".to_vec()) {
+                panic!("rate=0 should be unlimited, got: {trip}")
             }
         }
     }
@@ -988,10 +1025,19 @@ mod tests {
         ));
         // 90 + 20 = 110 > 100 — trips BEFORE buffering (prospective check).
         match batcher.add_line(vec![b'c'; 20]) {
-            AddLineResult::LimitExceeded { reason } => {
+            AddLineResult::LimitExceeded { trip } => {
+                let reason = trip.to_string();
                 assert!(reason.contains("log_size_limit"));
                 assert!(reason.contains("110"), "should show prospective total");
                 assert!(reason.contains("100"), "should show the limit");
+                assert_eq!(
+                    trip,
+                    LogCapTrip::Bytes {
+                        would_be: 110,
+                        limit: 100
+                    },
+                    "the typed figures are the per-attempt evidence"
+                );
             }
             other => panic!("should trip size limit, got {other:?}"),
         }
@@ -1058,8 +1104,8 @@ mod tests {
         });
         // 10 MiB across many lines — no trip.
         for _ in 0..100 {
-            if let AddLineResult::LimitExceeded { reason } = batcher.add_line(vec![b'x'; 100_000]) {
-                panic!("size=0 should be unlimited, got: {reason}")
+            if let AddLineResult::LimitExceeded { trip } = batcher.add_line(vec![b'x'; 100_000]) {
+                panic!("size=0 should be unlimited, got: {trip}")
             }
         }
     }
@@ -1097,7 +1143,7 @@ mod tests {
     /// bug_140 regression: a large line arriving while the rate window is
     /// full would have been rate-dropped (zero transmitted bytes) — it
     /// must NOT trip the size limit.
-    // r[verify builder.log-limit+3]
+    // r[verify builder.log-limit+4]
     #[test]
     fn rate_dropped_large_line_does_not_trip_size() {
         let mut b = mk(LogLimits {

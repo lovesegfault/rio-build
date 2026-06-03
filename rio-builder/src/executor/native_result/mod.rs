@@ -123,6 +123,7 @@ pub(crate) fn classify_exit(
     is_network_dependent: bool,
     disk_full: bool,
     oom_killed: bool,
+    log_cap_trip: Option<&crate::log_stream::LogCapTrip>,
 ) -> ExitClassification {
     use ExitClassification::Failed;
 
@@ -138,7 +139,18 @@ pub(crate) fn classify_exit(
         },
         ExitOutcome::LogLimitExceeded => Failed {
             status: BuildResultStatus::LogLimitExceeded,
-            error_msg: "build exceeded its log size limit".into(),
+            // Per-attempt figures from the typed trip (round-17
+            // merged_bug_058 c2): WHICH cap, both sides of the
+            // comparison. `None` means rio-exec's own byte limit
+            // tripped (corroborated executor-side; it has no builder
+            // figures to report).
+            error_msg: match log_cap_trip {
+                Some(trip) => format!(
+                    "{trip}; terminal — the same build on another worker \
+                     produces the same logs"
+                ),
+                None => "build exceeded the executor's log byte limit".into(),
+            },
         },
         ExitOutcome::Signaled(sig) if sig == libc::SIGKILL && oom_killed => Failed {
             status: BuildResultStatus::InfrastructureFailure,
@@ -711,7 +723,7 @@ mod tests {
     #[test]
     fn classify_success() {
         assert_eq!(
-            classify_exit(ExitOutcome::Exited(0), false, false, false),
+            classify_exit(ExitOutcome::Exited(0), false, false, false, None),
             ExitClassification::Success
         );
     }
@@ -726,22 +738,46 @@ mod tests {
 
         // Plain non-zero exit, sandboxed build → permanent.
         assert_eq!(
-            failed(classify_exit(ExitOutcome::Exited(1), false, false, false)),
+            failed(classify_exit(
+                ExitOutcome::Exited(1),
+                false,
+                false,
+                false,
+                None
+            )),
             S::PermanentFailure
         );
         // Same exit on a fixed-output (network) build → transient.
         assert_eq!(
-            failed(classify_exit(ExitOutcome::Exited(1), true, false, false)),
+            failed(classify_exit(
+                ExitOutcome::Exited(1),
+                true,
+                false,
+                false,
+                None
+            )),
             S::TransientFailure
         );
         // Signal on a FOD → transient.
         assert_eq!(
-            failed(classify_exit(ExitOutcome::Signaled(15), true, false, false)),
+            failed(classify_exit(
+                ExitOutcome::Signaled(15),
+                true,
+                false,
+                false,
+                None
+            )),
             S::TransientFailure
         );
         // Disk full beats the FOD-transient rule.
         assert_eq!(
-            failed(classify_exit(ExitOutcome::Exited(1), true, true, false)),
+            failed(classify_exit(
+                ExitOutcome::Exited(1),
+                true,
+                true,
+                false,
+                None
+            )),
             S::InfrastructureFailure
         );
         // OOM (SIGKILL + cgroup counter) beats the FOD-transient rule.
@@ -750,7 +786,8 @@ mod tests {
                 ExitOutcome::Signaled(libc::SIGKILL),
                 true,
                 false,
-                true
+                true,
+                None
             )),
             S::InfrastructureFailure
         );
@@ -760,17 +797,24 @@ mod tests {
                 ExitOutcome::Signaled(libc::SIGKILL),
                 false,
                 false,
-                false
+                false,
+                None
             )),
             S::PermanentFailure
         );
         // Timeout / silence / log-limit are passed through.
         assert_eq!(
-            failed(classify_exit(ExitOutcome::TimedOut, false, false, false)),
+            failed(classify_exit(
+                ExitOutcome::TimedOut,
+                false,
+                false,
+                false,
+                None
+            )),
             S::TimedOut
         );
         assert_eq!(
-            failed(classify_exit(ExitOutcome::Silent, true, true, true)),
+            failed(classify_exit(ExitOutcome::Silent, true, true, true, None)),
             S::TimedOut
         );
         assert_eq!(
@@ -778,10 +822,56 @@ mod tests {
                 ExitOutcome::LogLimitExceeded,
                 false,
                 false,
-                false
+                false,
+                None
             )),
             S::LogLimitExceeded
         );
+        // r[verify builder.log-limit+4]
+        // The typed trip's per-attempt figures reach the verdict
+        // message: WHICH cap and both sides of the comparison.
+        let trip = crate::log_stream::LogCapTrip::Bytes {
+            would_be: 67_108_865,
+            limit: 67_108_864,
+        };
+        match classify_exit(
+            ExitOutcome::LogLimitExceeded,
+            false,
+            false,
+            false,
+            Some(&trip),
+        ) {
+            ExitClassification::Failed { status, error_msg } => {
+                assert_eq!(status, S::LogLimitExceeded);
+                assert!(
+                    error_msg.contains("67108865"),
+                    "would-be total: {error_msg}"
+                );
+                assert!(error_msg.contains("67108864"), "limit: {error_msg}");
+                assert!(error_msg.contains("log_size_limit"), "axis: {error_msg}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let lines = crate::log_stream::LogCapTrip::Lines {
+            seen: 1001,
+            cap: 1000,
+        };
+        match classify_exit(
+            ExitOutcome::LogLimitExceeded,
+            false,
+            false,
+            false,
+            Some(&lines),
+        ) {
+            ExitClassification::Failed { error_msg, .. } => {
+                assert!(
+                    error_msg.contains("1001") && error_msg.contains("1000"),
+                    "{error_msg}"
+                );
+                assert!(error_msg.contains("line cap"), "axis: {error_msg}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[test]
