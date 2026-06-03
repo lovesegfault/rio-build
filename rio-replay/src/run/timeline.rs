@@ -2211,7 +2211,10 @@ mod tests {
 
     /// The pre-submission top-up runs once per request with that request's
     /// root drvs, before the request's own submission; a failing top-up
-    /// degrades to a warning and the request is submitted anyway.
+    /// degrades to a warning and the request is submitted anyway — with
+    /// the failure journaled on the request's batch record
+    /// (`topup_delivered: false`): the batch proves the dispatch attempt,
+    /// never that the deferred supply landed.
     #[tokio::test(start_paused = true)]
     async fn topup_runs_before_each_submission_and_failures_never_block_dispatch() {
         let dir = tempfile::tempdir().unwrap();
@@ -2268,9 +2271,17 @@ mod tests {
             calls,
             vec![(vec![DRV_A.to_string()], 0), (vec![DRV_B.to_string()], 1),]
         );
-        // Both requests were submitted despite the scripted top-up failures.
+        // Both requests were submitted despite the scripted top-up failures,
+        // and both batch records journal the failed top-up.
         assert_eq!(submitter.calls.lock().unwrap().len(), 2);
         assert_eq!(stats.dispatched, 2);
+        let records: Vec<crate::run::model::BatchRecord> =
+            state.load_jsonl(StateFile::Batches).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records.iter().all(|record| !record.topup_delivered),
+            "{records:?}"
+        );
     }
 
     /// A timed submission that fails engine-side (no in-band results, no
