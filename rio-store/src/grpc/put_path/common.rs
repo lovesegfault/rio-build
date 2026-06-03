@@ -568,12 +568,12 @@ pub(in crate::grpc) async fn drain_stream<T>(rpc: &'static str, stream: &mut Str
     }
 }
 
-// r[impl store.integrity.verify-on-put]
+// r[impl store.integrity.verify-on-put+2]
 // r[impl sec.drv.validate]
 /// Compare a server-computed NAR digest+size against the
 /// trailer-declared `nar_hash` / `nar_size` (already applied to `info`
 /// via [`apply_trailer`]). The integrity gate of
-/// `r[store.integrity.verify-on-put]` — server computes the digest
+/// `r[store.integrity.verify-on-put+2]` — server computes the digest
 /// independently of the client.
 ///
 /// `computed_hash` is the finalized output of an incremental
@@ -610,7 +610,7 @@ pub(in crate::grpc) fn verify_nar(
     Ok(())
 }
 
-// r[impl sec.authz.ca-path-derived+2]
+// r[impl sec.authz.ca-path-derived+3]
 /// Floating-CA path-authorization gate. When `claims.is_ca` is set,
 /// [`validate_put_metadata`] skipped the `store_path ∈
 /// expected_outputs` check (the path isn't known at sign time). This
@@ -1419,7 +1419,7 @@ impl StoreServiceImpl {
 }
 
 // r[verify sec.drv.validate]
-// r[verify store.integrity.verify-on-put]
+// r[verify store.integrity.verify-on-put+2]
 #[cfg(test)]
 mod verify_nar_tests {
     use super::*;

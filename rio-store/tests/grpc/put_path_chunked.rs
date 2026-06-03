@@ -312,97 +312,100 @@ async fn idempotent_reupload_skips_and_keeps_refcounts() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.narhash-sync]
-/// A claimed `nar_hash` that the recomputed NAR does not hash to is a
-/// FAILED_PRECONDITION, and the placeholder is reaped (no manifest row
-/// left behind).
+/// Counts backend `get` calls. The §6.3 receive walk must never fetch
+/// chunks: the builder's claims are committed as claimed, so there is
+/// nothing to recompute from already-durable bodies.
+#[derive(Default)]
+struct GetCountingBackend {
+    inner: MemoryChunkBackend,
+    gets: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ChunkBackend for GetCountingBackend {
+    async fn put(&self, hash: &[u8; 32], data: bytes::Bytes) -> anyhow::Result<()> {
+        self.inner.put(hash, data).await
+    }
+    async fn get(&self, hash: &[u8; 32]) -> anyhow::Result<Option<bytes::Bytes>> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.get(hash).await
+    }
+    async fn exists_batch(&self, hashes: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
+        self.inner.exists_batch(hashes).await
+    }
+    fn key_for(&self, hash: &[u8; 32]) -> String {
+        self.inner.key_for(hash)
+    }
+    async fn delete_by_key(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.delete_by_key(key).await
+    }
+    async fn put_blob(&self, key: &str, data: bytes::Bytes) -> anyhow::Result<()> {
+        self.inner.put_blob(key, data).await
+    }
+    async fn get_blob(&self, key: &str) -> anyhow::Result<Option<bytes::Bytes>> {
+        self.inner.get_blob(key).await
+    }
+    async fn delete_blob(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.delete_blob(key).await
+    }
+}
+
+/// A fully-deduped upload (every chunk already durable, `novel` empty,
+/// no bodies on the stream) commits without a single backend chunk
+/// read. Pins the structural fix for the deduped-upload stall: the
+/// old verify walk re-fetched every chunk serially to recompute the
+/// NAR hash, which on a large fully-deduped output took longer than
+/// the client's stream timeout.
+// r[verify store.integrity.verify-on-put+2]
 #[tokio::test]
-async fn narhash_mismatch_rejects_and_reaps() -> TestResult {
-    let (mut s, _backend) = StoreSession::new_chunked().await?;
+async fn fully_deduped_upload_commits_with_zero_chunk_reads() -> TestResult {
+    let backend = Arc::new(GetCountingBackend::default());
+    let mut s =
+        StoreSession::new_chunked_with_backend(Arc::clone(&backend) as Arc<dyn ChunkBackend>)
+            .await?;
+
     let dir = tempfile::TempDir::new()?;
     let root = dir.path().join("root");
     write_fixture_tree(&root, &dep_path());
 
-    let mut fx = fixture_for_tree(&root, &out_path("nh"), vec![dep_path()]);
-    fx.output.nar_hash[0] ^= 0xFF;
-    let (begin, frames) = assemble_begin(&[&fx], vec![dep_path()], &Default::default());
+    // Path A uploads everything.
+    let fx_a = fixture_for_tree(&root, &out_path("zra"), vec![dep_path()]);
+    let (begin_a, frames_a) = assemble_begin(&[&fx_a], vec![dep_path()], &Default::default());
+    assert_eq!(
+        send_chunked(&mut s.client, begin_a, frames_a, None).await?,
+        vec![true]
+    );
 
-    let err = send_chunked(&mut s.client, begin, frames, None)
-        .await
-        .expect_err("tampered nar_hash must be rejected");
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+    // Path B: the same tree at a different store path — every chunk
+    // is already durable.
+    let fx_b = fixture_for_tree(&root, &out_path("zrb"), vec![dep_path()]);
+    let durable: std::collections::HashSet<[u8; 32]> =
+        fx_b.chunks.iter().map(|(d, _)| *d).collect();
+    let (begin_b, frames_b) = assemble_begin(&[&fx_b], vec![dep_path()], &durable);
+    assert!(
+        begin_b.novel.is_empty() && frames_b.is_empty(),
+        "fixture must be fully deduped"
+    );
+    assert_eq!(
+        send_chunked(&mut s.client, begin_b, frames_b, None).await?,
+        vec![true]
+    );
 
-    // PlaceholderGuard reaps asynchronously on drop.
-    let n = poll_scalar_until::<i64>(&s.db.pool, "SELECT COUNT(*) FROM manifests", 0).await;
-    assert_eq!(n, 0, "placeholder must be reaped after a mismatch");
-
-    // A nar_size claim smaller than the tree's real expansion is the
-    // same FAILED_PRECONDITION — the verify walk bails as soon as the
-    // regenerated stream exceeds the claim rather than hashing the
-    // whole expansion first. Claim exactly the content sum: large
-    // enough to pass validate_begin's `Σ chunk sizes ≤ nar_size`
-    // bound, but with zero budget left for framing.
-    let mut fx = fixture_for_tree(&root, &out_path("ns"), vec![dep_path()]);
-    fx.output.nar_size = fx.output.chunk_manifest.iter().map(|c| c.size).sum();
-    let (begin, frames) = assemble_begin(&[&fx], vec![dep_path()], &Default::default());
-    let err = send_chunked(&mut s.client, begin, frames, None)
-        .await
-        .expect_err("undersized nar_size claim must be rejected");
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+    assert_eq!(
+        backend.gets.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "PutPathChunked must never read chunks from the backend"
+    );
+    let complete: i64 = count(
+        &s.db.pool,
+        "SELECT COUNT(*) FROM manifests WHERE status = 'complete'",
+    )
+    .await;
+    assert_eq!(complete, 2, "both paths committed");
     Ok(())
 }
 
-// r[verify store.put.verify-file-digest]
-/// A `FileEntry.digest` the content does not hash to is a
-/// FAILED_PRECONDITION even though the NAR-level SHA-256 would still
-/// match — the digest keys the cross-tenant blob namespace.
-#[tokio::test]
-async fn file_digest_mismatch_rejects() -> TestResult {
-    let (mut s, _backend) = StoreSession::new_chunked().await?;
-    // A single-file root keeps the lie local: the FileEntry lives in
-    // the RootNode, so no Directory digests need recomputing to keep
-    // validate_begin's reachability check happy.
-    let dir = tempfile::TempDir::new()?;
-    let f = dir.path().join("just-a-file");
-    std::fs::write(&f, b"some file contents that hash to a known digest")?;
-
-    let mut fx = fixture_for_tree(&f, &out_path("fd"), vec![]);
-    let Some(rio_proto::castore::root_node::Node::File(fe)) =
-        &mut fx.output.root_node.as_mut().unwrap().node
-    else {
-        panic!("single-file fixture must have a File root");
-    };
-    fe.digest[0] ^= 0xFF;
-    let (begin, frames) = assemble_begin(&[&fx], vec![], &Default::default());
-
-    let err = send_chunked(&mut s.client, begin, frames, None)
-        .await
-        .expect_err("file-digest lie must be rejected");
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
-    Ok(())
-}
-
-// r[verify store.put.refs-sync]
-/// A claimed reference whose hash part does not appear anywhere in the
-/// output's bytes is a FAILED_PRECONDITION.
-#[tokio::test]
-async fn refs_mismatch_rejects() -> TestResult {
-    let (mut s, _backend) = StoreSession::new_chunked().await?;
-    let dir = tempfile::TempDir::new()?;
-    let root = dir.path().join("root");
-    // The content does NOT embed the dependency path.
-    write_fixture_tree(&root, "nothing of note");
-
-    let fx = fixture_for_tree(&root, &out_path("rf"), vec![dep_path()]);
-    let (begin, frames) = assemble_begin(&[&fx], vec![dep_path()], &Default::default());
-
-    let err = send_chunked(&mut s.client, begin, frames, None)
-        .await
-        .expect_err("fabricated reference must be rejected");
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
-    Ok(())
-}
-
+// r[verify store.integrity.verify-on-put+2]
 /// Wire-protocol violations: chunks out of `novel` order, a corrupt
 /// chunk body, and an extra frame after `novel` is exhausted are all
 /// INVALID_ARGUMENT; a truncated stream is FAILED_PRECONDITION
@@ -607,10 +610,10 @@ async fn partial_skip_with_skipped_only_novel_chunk_commits() -> TestResult {
 }
 
 // r[verify store.chunk.durable-flag]
-/// A chunk the GC sweep claims between the verify walk's fetch and the
-/// commit transaction must NOT be committed as `durable`: its S3
-/// object may already be drained away, and a manifest pointing at it
-/// would make `HasChunks` lie to every future uploader. The commit
+/// A chunk the GC sweep claims between the builder's `HasChunks` probe
+/// and the commit transaction must NOT be committed as `durable`: its
+/// S3 object may already be drained away, and a manifest pointing at
+/// it would make `HasChunks` lie to every future uploader. The commit
 /// detects the claim on the row-locked chunk and aborts UNAVAILABLE so
 /// the builder re-probes and re-streams.
 #[tokio::test]
@@ -632,9 +635,9 @@ async fn gc_claimed_chunk_aborts_commit_unavailable() -> TestResult {
 
     // Simulate the GC: A's manifest is collected and the sweep claims
     // the now-refcount-0 chunk for the drain. The S3 object is still
-    // in the backend (the drain hasn't run yet) so the verify walk's
-    // fetch succeeds — exactly the window where trusting the fetch
-    // would commit a manifest whose object is about to disappear.
+    // in the backend (the drain hasn't run yet) — exactly the window
+    // where trusting the builder's HasChunks-era view would commit a
+    // manifest whose object is about to disappear.
     sqlx::query("DELETE FROM narinfo")
         .execute(&s.db.pool)
         .await?;
@@ -883,7 +886,7 @@ async fn deleted_tenant_skips_junction_but_upload_commits() -> TestResult {
 /// The CA gate's rejection half: under an `is_ca` claim (empty
 /// `expected_outputs`, as at dispatch time — see the legacy-PutPath CA
 /// tests in `hmac.rs`), a claimed output store path that does NOT match
-/// the path recomputed from the **server-computed** NAR hash is
+/// the path derived from the claimed NAR hash and references is
 /// PERMISSION_DENIED, and no placeholder is left behind. The accepting
 /// half (matching path commits and reads back) is the floating-CA
 /// subtest of the `vm-put-path-chunked` scenario.
@@ -895,8 +898,8 @@ async fn ca_path_mismatch_rejects() -> TestResult {
     let root = dir.path().join("root");
     write_fixture_tree(&root, &dep_path());
 
-    // The claimed path is a fixed test path, not derived from the
-    // content, so the server-side recompute can never agree with it.
+    // The claimed path is a fixed test path, not the fixed-output
+    // derivation of the claimed hash, so the CA gate can never agree.
     let fx = fixture_for_tree(&root, &out_path("ca"), vec![dep_path()]);
     let (begin, frames) = assemble_begin(&[&fx], vec![dep_path()], &Default::default());
 
@@ -915,7 +918,7 @@ async fn ca_path_mismatch_rejects() -> TestResult {
     assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
     assert!(err.message().contains("content-derived CA path"), "{err:?}");
 
-    // CA outputs claim no placeholder before the recompute, so the
+    // CA outputs claim no placeholder before the path check, so the
     // rejected upload must not leave a manifest row behind.
     let n = count(&s.db.pool, "SELECT COUNT(*) FROM manifests").await;
     assert_eq!(n, 0, "rejected CA upload must not leave a placeholder");

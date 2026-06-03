@@ -1447,7 +1447,7 @@
     {
       "path": "grpc/put_path_chunked/verify.rs",
       "depth": 2,
-      "doc": "The §6.3 sequential verify walk for `PutPathChunked`."
+      "doc": "The §6.3 sequential receive walk for `PutPathChunked`."
     },
     {
       "path": "grpc/queries.rs",

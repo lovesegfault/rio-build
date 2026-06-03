@@ -323,20 +323,6 @@ pub fn describe_metrics() {
          Sustained non-zero from one builder = a stale or forged token source."
     );
     describe_counter!(
-        "rio_store_narhash_mismatch_total",
-        "PutPathChunked verify failures where the server-recomputed NAR \
-         SHA-256 (or size, or a file's whole-file BLAKE3, or a deduped \
-         chunk's length) differs from the builder's claim. A builder \
-         NAR-framing bug or a compromised builder — alert-worthy and \
-         approximately never."
-    );
-    describe_counter!(
-        "rio_store_refs_mismatch_total",
-        "PutPathChunked verify failures where the server-side reference \
-         scan over the regenerated NAR disagrees with the builder's \
-         claimed reference set."
-    );
-    describe_counter!(
         "rio_store_putpath_incomplete_total",
         "PutPathChunked streams that ended before every Begin.novel chunk \
          arrived (builder crash mid-upload or transport failure). \
@@ -344,9 +330,10 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_putpath_verify_unavailable_total",
-        "PutPathChunked verify walks aborted by a transient CAS failure \
-         (S3 fault, or a deduped chunk GC'd between the builder's \
-         HasChunks probe and the verify fetch). The builder retries."
+        "PutPathChunked uploads aborted by a transient failure: a chunk \
+         PUT failed, or a referenced chunk was GC-claimed between the \
+         builder's HasChunks probe and the commit's presence proof. The \
+         builder retries."
     );
     describe_counter!(
         "rio_store_service_token_accepted_total",

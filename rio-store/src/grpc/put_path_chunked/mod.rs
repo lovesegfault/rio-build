@@ -8,11 +8,11 @@
 //! - [`validate`] — pure validation of the `Begin` frame against the
 //!   caller's HMAC claims (`r[store.put.chunked-bounds]`). No DB, no
 //!   S3; runs before any placeholder claim or side effect.
-//! - [`verify`] — the §6.3 sequential verify task: regenerate the NAR
-//!   framing from the validated Directory tree, splice each chunk body
-//!   in (novel chunks from the stream, deduped chunks from the CAS),
-//!   recompute SHA-256 + the reference scan + per-file BLAKE3, and
-//!   compare against the claimed values.
+//! - [`verify`] — the §6.3 sequential receive walk: consume each novel
+//!   chunk off the stream in `Begin.novel` order, BLAKE3-verify and
+//!   length-check every received body, and pipeline the backend PUTs.
+//!   The builder's `nar_hash`/refs/file-digest claims are committed as
+//!   claimed; deduped chunks are never fetched.
 //! - [`commit`] — derive the castore index from the validated tree;
 //!   the single-transaction §6.2 commit across all non-skipped outputs
 //!   lives in [`StoreServiceImpl::commit_chunked`].
@@ -48,7 +48,7 @@ mod commit;
 mod verify;
 
 use validate::{ValidatedBegin, validate_begin};
-use verify::{MismatchReason, Verdict};
+use verify::Verdict;
 
 /// Claims to validate a `Begin` frame against when
 /// `verify_assignment_token` returned `Ok(None)` (dev mode — no HMAC
@@ -91,7 +91,7 @@ struct OutputClaim {
 
 impl StoreServiceImpl {
     /// ADR-022 §6 chunked output upload: validate → placeholders →
-    /// write-ahead chunk rows → sequential verify walk → CA recompute →
+    /// write-ahead chunk rows → sequential receive walk → CA path check →
     /// one commit transaction.
     // r[impl store.put.chunked]
     // r[impl store.atomic.multi-output]
@@ -148,13 +148,10 @@ impl StoreServiceImpl {
         // `auth.tenant_id` (unchanged behavior).
         let junction_tenant = auth.registration_tenant();
 
-        // The backend and cache are constructed together (`None` iff the
-        // other is `None` — see `with_chunk_cache`), so one gate covers
-        // both: the verify walk PUTs novel chunks to the backend and
-        // fetches deduped ones through the cache.
-        let (Some(backend), Some(chunk_cache)) =
-            (self.chunk_backend.clone(), self.chunk_cache.clone())
-        else {
+        // The receive walk PUTs novel chunks to the backend; deduped
+        // chunks are never fetched (their digests were verified when
+        // first uploaded).
+        let Some(backend) = self.chunk_backend.clone() else {
             return Err(Status::failed_precondition(
                 "PutPathChunked requires a chunk backend",
             ));
@@ -178,9 +175,9 @@ impl StoreServiceImpl {
         let mut skipped = vec![false; n_outputs];
         for (i, out) in validated.outputs.iter().enumerate() {
             let store_path_hash = out.store_path.sha256_digest().to_vec();
-            // r[impl sec.authz.ca-path-derived+2]
+            // r[impl sec.authz.ca-path-derived+3]
             // CA outputs claim no placeholder before the server-side
-            // CA-path recompute (§6.3) — phase C claims them.
+            // CA-path check (§6.3) — phase C claims them.
             if out.is_ca {
                 output_claims.push(OutputClaim {
                     store_path_hash,
@@ -304,10 +301,7 @@ impl StoreServiceImpl {
         let verdict = match verify::run_verify(
             &mut stream,
             &validated,
-            &skipped,
             &backend,
-            &chunk_cache,
-            MAX_NAR_ENTRIES,
             self.chunk_upload_max_concurrent,
         )
         .await
@@ -316,33 +310,8 @@ impl StoreServiceImpl {
             Err(e) => bail!(e),
         };
 
-        let (computed, uploaded) = match verdict {
-            Verdict::Match { computed, uploaded } => (computed, uploaded),
-            Verdict::Mismatch { output_idx, reason } => {
-                let out = &validated.outputs[output_idx];
-                warn!(
-                    store_path = %out.store_path,
-                    deriver = %begin.deriver,
-                    reason = reason.as_str(),
-                    claimed_nar_hash = %hex::encode(out.nar_hash),
-                    claimed_refs = ?out.references.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
-                    "PutPathChunked: verify mismatch — builder claim does not match recomputed value",
-                );
-                match reason {
-                    MismatchReason::Refs => {
-                        metrics::counter!("rio_store_refs_mismatch_total").increment(1);
-                    }
-                    _ => {
-                        metrics::counter!("rio_store_narhash_mismatch_total").increment(1);
-                    }
-                }
-                bail!(Status::failed_precondition(format!(
-                    "PutPathChunked: outputs[{output_idx}] ({}) failed verification: {} \
-                     does not match the server-recomputed value",
-                    out.store_path,
-                    reason.as_str(),
-                )));
-            }
+        let uploaded = match verdict {
+            Verdict::Match { uploaded } => uploaded,
             Verdict::Incomplete => {
                 metrics::counter!("rio_store_putpath_incomplete_total").increment(1);
                 bail!(Status::failed_precondition(
@@ -355,11 +324,10 @@ impl StoreServiceImpl {
             }
         };
 
-        // ── Phase C: CA recompute → CA placeholders → ONE commit tx. ─
+        // ── Phase C: CA path check → CA placeholders → ONE commit tx. ─
         if let Err(e) = self
             .claim_ca_placeholders(
                 &validated,
-                &computed,
                 &mut skipped,
                 &mut output_claims,
                 &mut guards,
@@ -387,7 +355,6 @@ impl StoreServiceImpl {
         let created = match self
             .commit_chunked(
                 &validated,
-                &computed,
                 &skipped,
                 &output_claims,
                 &begin.deriver,
@@ -477,9 +444,12 @@ impl StoreServiceImpl {
         metadata::insert_pending_chunks(&self.pool, &rows).await
     }
 
-    /// Phase C CA gate: recompute each CA output's store path from the
-    /// **server-computed** NAR hash and reject on mismatch, then claim
-    /// its placeholder.
+    /// Phase C CA gate: derive each CA output's store path from the
+    /// claimed NAR hash and reject on mismatch, then claim its
+    /// placeholder. The hash is the builder's claim — the binding this
+    /// check enforces is path ↔ claimed hash + refs (a `store_path`
+    /// that is not the fixed-output derivation of what the builder
+    /// itself asserted is always a bug or a forgery attempt).
     ///
     /// The spec's single-`INSERT … ON CONFLICT … RETURNING` form is
     /// replaced by the same `claim_placeholder` state machine the
@@ -488,11 +458,10 @@ impl StoreServiceImpl {
     /// refcounts are never double-counted — and the placeholder gets
     /// the same heartbeat/drop-reap lifecycle as every other writer's.
     // r[impl store.put.chunked-ca]
-    // r[impl sec.authz.ca-path-derived+2]
+    // r[impl sec.authz.ca-path-derived+3]
     async fn claim_ca_placeholders(
         &self,
         validated: &ValidatedBegin,
-        computed: &[Option<verify::OutputComputed>],
         skipped: &mut [bool],
         output_claims: &mut [OutputClaim],
         guards: &mut Vec<PlaceholderGuard>,
@@ -502,9 +471,6 @@ impl StoreServiceImpl {
             if !out.is_ca {
                 continue;
             }
-            let comp = computed[i]
-                .as_ref()
-                .expect("CA outputs are never idempotent-skipped before the recompute");
             // Self-reference: `make_fixed_output` has no `:self` token
             // support yet — mirror `verify_ca_store_path`'s explicit
             // rejection rather than silently deriving a wrong path.
@@ -520,11 +486,11 @@ impl StoreServiceImpl {
                      (extend make_fixed_output with :self)",
                 ));
             }
-            let nar_hash = rio_nix::hash::NixHash::new(
-                rio_nix::hash::HashAlgo::SHA256,
-                comp.nar_hash.to_vec(),
-            )
-            .map_err(|e| Status::internal(format!("PutPathChunked: nar_hash construct: {e}")))?;
+            let nar_hash =
+                rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, out.nar_hash.to_vec())
+                    .map_err(|e| {
+                        Status::internal(format!("PutPathChunked: nar_hash construct: {e}"))
+                    })?;
             let expected = StorePath::make_fixed_output(
                 out.store_path.name(),
                 &nar_hash,
@@ -600,7 +566,6 @@ impl StoreServiceImpl {
     async fn commit_chunked(
         &self,
         validated: &ValidatedBegin,
-        computed: &[Option<verify::OutputComputed>],
         skipped: &[bool],
         output_claims: &[OutputClaim],
         deriver: &str,
@@ -694,18 +659,14 @@ impl StoreServiceImpl {
                 infos.push(None);
                 continue;
             }
-            let comp = computed[i]
-                .as_ref()
-                .expect("non-skipped outputs always have a computed verdict");
             let mut info = ValidatedPathInfo {
                 store_path: out.store_path.clone(),
                 store_path_hash: output_claims[i].store_path_hash.clone(),
                 deriver: deriver.clone(),
-                nar_hash: comp.nar_hash,
-                nar_size: comp.nar_size,
-                // Equal to `comp.references` at this point (the verify
-                // walk rejected any disagreement); keep the parsed
-                // StorePath form rather than re-parsing the strings.
+                // The builder's fused-walk claims, committed as
+                // claimed (`r[store.integrity.verify-on-put+2]`).
+                nar_hash: out.nar_hash,
+                nar_size: out.nar_size,
                 references: out.references.clone(),
                 registration_time,
                 ultimate: false,

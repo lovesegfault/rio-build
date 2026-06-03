@@ -197,7 +197,6 @@
     "rio_store_hmac_rejected_total",
     "rio_store_integrity_failures_total",
     "rio_store_nar_index_cache_hits_total",
-    "rio_store_narhash_mismatch_total",
     "rio_store_pg_pool_utilization",
     "rio_store_put_path_bytes_total",
     "rio_store_put_path_duration_seconds",
@@ -207,7 +206,6 @@
     "rio_store_putpath_retries_total",
     "rio_store_putpath_stale_reclaimed_total",
     "rio_store_putpath_verify_unavailable_total",
-    "rio_store_refs_mismatch_total",
     "rio_store_s3_deletes_pending",
     "rio_store_s3_deletes_stuck",
     "rio_store_s3_requests_total",
@@ -1228,11 +1226,6 @@
         "help": "GetNarIndex/GetNarIndexBatch requests served from the nar_index table (the index is written eagerly in the manifest-complete transaction; there is no recompute path)"
       },
       {
-        "name": "rio_store_narhash_mismatch_total",
-        "kind": "counter",
-        "help": "PutPathChunked verify failures where the server-recomputed NAR SHA-256 (or size, or a file's whole-file BLAKE3, or a deduped chunk's length) differs from the builder's claim. A builder NAR-framing bug or a compromised builder — alert-worthy and approximately never."
-      },
-      {
         "name": "rio_store_pg_pool_utilization",
         "kind": "gauge",
         "help": "PG connection-pool utilization: (size - num_idle) / max_connections. Updated on each StoreAdminService.GetLoad call (ComponentScaler 10s tick). Sustained > 0.8 = under-provisioned store replicas (I-105 cliff approaching)."
@@ -1275,12 +1268,7 @@
       {
         "name": "rio_store_putpath_verify_unavailable_total",
         "kind": "counter",
-        "help": "PutPathChunked verify walks aborted by a transient CAS failure (S3 fault, or a deduped chunk GC'd between the builder's HasChunks probe and the verify fetch). The builder retries."
-      },
-      {
-        "name": "rio_store_refs_mismatch_total",
-        "kind": "counter",
-        "help": "PutPathChunked verify failures where the server-side reference scan over the regenerated NAR disagrees with the builder's claimed reference set."
+        "help": "PutPathChunked uploads aborted by a transient failure: a chunk PUT failed, or a referenced chunk was GC-claimed between the builder's HasChunks probe and the commit's presence proof. The builder retries."
       },
       {
         "name": "rio_store_s3_deletes_pending",
