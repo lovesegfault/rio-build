@@ -131,7 +131,12 @@ pub(crate) const MAX_DRV_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
 /// archive into multi-GiB buffered contents — a staging directory
 /// already holds its trees at full size on disk, so on the directory
 /// arm the budget is the same uniform buffer ceiling with no
-/// amplification threat behind it.
+/// amplification threat behind it. (Sparse staging files are the one
+/// exception to "full size on disk" — a hole-ridden file occupies less
+/// physical disk than its stat size — but the budget is a LOGICAL
+/// bound charging that same stat size, which is exactly what a read
+/// materializes in RAM, so sparseness earns no extra allowance and the
+/// amplification threat model stays the image arm.)
 ///
 /// Sizing: 3.2× the largest single object the publisher PUTs (the 5 GiB
 /// compressed image, [`S3_SINGLE_PUT_MAX_BYTES`]) — a single member
