@@ -33,6 +33,31 @@
       "doc": ""
     },
     {
+      "path": "bin/fsbench/",
+      "depth": 1,
+      "doc": ""
+    },
+    {
+      "path": "bin/fsbench/dataset.rs",
+      "depth": 2,
+      "doc": "Deterministic unique-content dataset generation."
+    },
+    {
+      "path": "bin/fsbench/main.rs",
+      "depth": 2,
+      "doc": "fsbench — castore-FUSE micro-benchmark (P0594)."
+    },
+    {
+      "path": "bin/fsbench/phases.rs",
+      "depth": 2,
+      "doc": "The measurement primitives: read-storm, open-storm, randread, and"
+    },
+    {
+      "path": "bin/fsbench/stats.rs",
+      "depth": 2,
+      "doc": "Percentile math for latency samples."
+    },
+    {
       "path": "bin/rio-mountd.rs",
       "depth": 1,
       "doc": "`rio-mountd` — privileged per-node broker for castore-FUSE."
@@ -1657,6 +1682,31 @@
       "path": "k8s/eks/smoke.rs",
       "depth": 2,
       "doc": "End-to-end smoke test via port-forwarded gateway."
+    },
+    {
+      "path": "k8s/fsbench/",
+      "depth": 1,
+      "doc": "`xtask k8s fsbench` — the castore-FUSE micro-benchmark driver"
+    },
+    {
+      "path": "k8s/fsbench/cotenancy.rs",
+      "depth": 2,
+      "doc": "Build→node attribution + passive co-tenancy tagging."
+    },
+    {
+      "path": "k8s/fsbench/parse.rs",
+      "depth": 2,
+      "doc": "PHASE/PERF line parser for the fsbench build log."
+    },
+    {
+      "path": "k8s/fsbench/result.rs",
+      "depth": 2,
+      "doc": "result.json (schema `fsbench/v1`) — the comparable artifact."
+    },
+    {
+      "path": "k8s/fsbench/submit.rs",
+      "depth": 2,
+      "doc": "Bench submission: local prebuild of the fsbench bin, the I-161"
     },
     {
       "path": "k8s/k3s/",
