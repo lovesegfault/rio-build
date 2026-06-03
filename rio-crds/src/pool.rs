@@ -309,7 +309,13 @@ pub struct PoolSpec {
     /// mirrors (origin URLs only). CEL-validated: each entry must be
     /// an absolute URL with no comma or whitespace (the env transport
     /// is comma- and space-delimited; r16 bug_097).
+    /// Bounds (32 entries x 2048 chars) exist for the apiserver's CEL
+    /// cost estimator: an unbounded array of unbounded strings under a
+    /// `matches()` rule exceeds the per-schema cost budget >100x and
+    /// the CRD is REJECTED at apply (observed: every k3s scenario dead
+    /// at bring-up). Generous for real mirror lists (typically 1-4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 32), inner(length(max = 2048)))]
     pub hashed_mirrors: Option<Vec<String>>,
 
     /// Container imagePullPolicy. None = K8s default (IfNotPresent

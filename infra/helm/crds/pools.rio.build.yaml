@@ -102,8 +102,15 @@ spec:
                   mirrors (origin URLs only). CEL-validated: each entry must be
                   an absolute URL with no comma or whitespace (the env transport
                   is comma- and space-delimited; r16 bug_097).
+                  Bounds (32 entries x 2048 chars) exist for the apiserver's CEL
+                  cost estimator: an unbounded array of unbounded strings under a
+                  `matches()` rule exceeds the per-schema cost budget >100x and
+                  the CRD is REJECTED at apply (observed: every k3s scenario dead
+                  at bring-up). Generous for real mirror lists (typically 1-4).
                 items:
+                  maxLength: 2048
                   type: string
+                maxItems: 32
                 nullable: true
                 type: array
               hostNetwork:

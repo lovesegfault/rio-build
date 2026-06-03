@@ -139,7 +139,7 @@ impl std::fmt::Display for HashAlgo {
 /// with case-exact `parseHashAlgo` (`hash.cc:468-490`). The `git:` and
 /// `text:` method prefixes are experimental-feature-gated upstream
 /// (`GitHashing` / `DynamicDerivations`); rio's feature posture is
-/// fixed off, so both fall through to [`HashAlgo::from_str`]'s
+/// fixed off, so both fall through to `HashAlgo::parse`'s
 /// unknown-algorithm rejection here, matching the xp-disabled oracle.
 /// `md5` and `blake3` are accepted by the oracle but not by rio — the
 /// registered divergence `nix.divergence.fod-fallback-fingerprint+1`.

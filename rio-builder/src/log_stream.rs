@@ -2,7 +2,7 @@
 //!
 //! Buffers captured build-output lines and batches them into
 //! `BuildLogBatch` messages (64 lines or 100ms, whichever comes first;
-//! a batch may additionally carry up to [`MARKER_HEADROOM`] out-of-band
+//! a batch may additionally carry up to `MARKER_HEADROOM` out-of-band
 //! marker lines). Batches are sent on the scheduler `BuildExecution`
 //! stream.
 //!
@@ -291,7 +291,7 @@ impl LogBatcher {
     /// The drain is a destructive read of shared evidence UPSTREAM of
     /// the authoritative event the spec's marker clause names (the next
     /// **delivered** batch), so the drained count travels WITH the
-    /// batch as [`AssembledBatch::shed_lease`] and is settled by
+    /// batch as `AssembledBatch::shed_lease` and is settled by
     /// [`SheddingLogSender::try_send_batch`]: sink-accepted → consumed;
     /// shed/closed → restored to the tally so the count rides the next
     /// delivered batch's marker instead of dying with its carrier.
@@ -439,7 +439,7 @@ impl LogBatcher {
 /// the inner batch out without settling.
 ///
 /// The lease must be settled against the sender whose tally it was
-/// drained from ([`LogBatcher::attach_relay_shed`] shares exactly that
+/// drained from (`LogBatcher::attach_relay_shed` shares exactly that
 /// `Arc`, and clones share one tally — in the executor there is one
 /// tally per build's display stream).
 #[must_use = "an unsent AssembledBatch strands its shed lease — settle it via try_send_batch"]
