@@ -165,6 +165,40 @@ impl BuildResult {
         }
     }
 
+    /// Message prefix of [`BuildResult::lost_terminal_unverified`] —
+    /// shared by the producing gateway arm and the measurement
+    /// consumer's detector (rio-replay's collect stage), so the two
+    /// cannot drift: the producer formats the message FROM this
+    /// constant and the detector matches it BY this constant.
+    pub const LOST_TERMINAL_UNVERIFIED_PREFIX: &str =
+        "per-root terminal lost under a completed DAG";
+
+    /// The honest non-presence verdict for a root whose own terminal
+    /// event was lost while the DAG-level result reported success, and
+    /// whose requested outputs the store could not positively confirm.
+    ///
+    /// This is the only `BuildStatus` value that may be minted without
+    /// per-root scheduler evidence AND without store presence evidence:
+    /// every other reportable result is backed by the root's own
+    /// terminal, by positive store presence (`substituted()`), or
+    /// reports the batch-level failure verbatim. The status is
+    /// `TransientFailure` — a re-attempt can succeed and produces fresh
+    /// evidence — and the message starts with
+    /// [`Self::LOST_TERMINAL_UNVERIFIED_PREFIX`] so measurement
+    /// consumers classify the row as evidence loss (infrastructure),
+    /// never as a substitution event or a genuine build failure: the
+    /// DAG completed, so nothing is known to have failed — what was
+    /// lost is the evidence channel, not the build.
+    pub fn lost_terminal_unverified() -> Self {
+        Self::failure(
+            BuildStatus::TransientFailure,
+            format!(
+                "{}; store presence of the requested outputs could not be verified",
+                Self::LOST_TERMINAL_UNVERIFIED_PREFIX
+            ),
+        )
+    }
+
     /// Populate built_outputs from derivation output definitions and a
     /// pre-computed modular derivation hash.
     ///
@@ -578,6 +612,30 @@ mod tests {
             "substituted is a success status to stock clients"
         );
         assert!(present.error_msg.is_empty());
+    }
+
+    /// The evidence-loss constructor claims neither execution nor
+    /// presence: a non-success status (clients see a retryable failure),
+    /// `times_built = 0`, and a message that carries the shared detector
+    /// prefix at byte 0 — measurement consumers match the row by
+    /// `starts_with(LOST_TERMINAL_UNVERIFIED_PREFIX)`, so the prefix
+    /// must be the message's first byte, not merely a substring.
+    #[test]
+    fn lost_terminal_unverified_claims_neither_execution_nor_presence() {
+        let lost = BuildResult::lost_terminal_unverified();
+        assert_eq!(lost.status, BuildStatus::TransientFailure);
+        assert!(
+            !lost.status.is_success(),
+            "an evidence-loss row must not read as success to any client"
+        );
+        assert_eq!(lost.times_built, 0);
+        assert!(
+            lost.error_msg
+                .starts_with(BuildResult::LOST_TERMINAL_UNVERIFIED_PREFIX),
+            "detector prefix must lead the message: {:?}",
+            lost.error_msg
+        );
+        assert!(lost.built_outputs.is_empty());
     }
 
     #[tokio::test]
