@@ -25,8 +25,9 @@ use async_trait::async_trait;
 pub trait StoreApi: Send + Sync {
     /// For every requested path: Some((nar_hash, nar_size)) when the path
     /// is valid in rio-store, None otherwise. Order-insensitive. The hash
-    /// is typed at this boundary (the wire carries the raw digest bytes),
-    /// so downstream comparison is digest-to-digest by construction.
+    /// is typed at this boundary (rio-proto delivers a validated 32-byte
+    /// digest, `ValidatedPathInfo`), so downstream comparison is
+    /// digest-to-digest by construction.
     async fn query_valid(
         &self,
         paths: &[String],
@@ -93,24 +94,18 @@ impl StoreApi for GrpcStoreApi {
             .await
             .map_err(|s| anyhow::anyhow!("BatchQueryPathInfo against {}: {s}", self.addr))?;
             for (path, info) in entries {
-                // A valid path whose reported digest is malformed (not 32
-                // bytes) is a store-contract violation: degrade it to
-                // "valid without NAR identity" with a loud warning instead
-                // of failing the whole batch — the path's record then says
-                // not-comparable, the same as any identity-less success.
-                let identity = info.and_then(|i| {
-                    match crate::narhash::NarHash::from_digest_slice(&i.nar_hash) {
-                        Ok(hash) => Some((hash, i.nar_size)),
-                        Err(e) => {
-                            tracing::warn!(
-                                path,
-                                error = %format!("{e:#}"),
-                                "rio-store reported a malformed nar_hash; recording the path without NAR identity"
-                            );
-                            None
-                        }
-                    }
-                });
+                // `ValidatedPathInfo.nar_hash` is `[u8; 32]` — rio-proto
+                // owns the malformed-digest policy and hard-fails the
+                // whole chunk as `Status::internal` before this point
+                // (`batch_query_path_info`), which the `?` above
+                // surfaces: plan-time refuses to plan via
+                // `validity_snapshot`'s error propagation, collect-time
+                // degrades at its call site to an identity-less success.
+                // The infallible constructor consumes that typed
+                // guarantee by construction: there is no error arm here
+                // to invent a third policy in.
+                let identity =
+                    info.map(|i| (crate::narhash::NarHash::from_digest(i.nar_hash), i.nar_size));
                 out.insert(path, identity);
             }
         }
