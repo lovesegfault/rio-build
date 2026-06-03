@@ -3757,107 +3757,137 @@ mod tests {
     /// into a wire-death streak and the breaker still trips on the
     /// channel evidence alone (a reset would let a flapping relay mask
     /// a genuinely dying gateway).
+    ///
+    /// Pinned over BOTH upload mechanisms: the streamed lane is where
+    /// the original bug lived (every upload-time relay reader death
+    /// blanket-mapped to `MaybeRefused` and charged the breaker), so
+    /// its neutrality stands here as its own observable row — the
+    /// settlement-evidence census alone only proves no charge call
+    /// sits NEXT TO the arm, not that the lane behaves at the
+    /// threshold. The mechanism is asserted on the settled rows, so a
+    /// routing-knob mistake cannot silently collapse both iterations
+    /// into the batch lane.
     #[tokio::test]
     async fn payload_source_failures_never_charge_the_breaker() {
         use super::test_support::ScriptedReply::{PayloadDeath, WireDeath};
-        let serial = Knobs {
-            upload_workers: 1,
-            upload_batch_max_entries: 1,
-            ..Knobs::default()
-        };
         let path_for = |index: usize| format!("/nix/store/{:032}-payload-{index}", index);
-        // Seven paths, every one a payload death (one attempt each — over
-        // the 6-failure threshold if they were charged).
-        let (_dir, state) = state();
-        let fake = FakeSupplyTransport::default();
-        let items: Vec<UploadItem> = (0..7)
-            .map(|index| item(&path_for(index), vec![1u8; 8], &[]))
-            .collect();
-        {
-            let mut scripted = fake.scripted.lock().unwrap();
-            for index in 0..7 {
-                scripted.insert(path_for(index), [PayloadDeath].into_iter().collect());
+        // Streamed iteration: same serial shape plus the size routing the
+        // settlement lattice uses (threshold 1 MiB, items at 2 MiB).
+        for (mechanism, knobs, nar) in [
+            (
+                SUPPLY_MECHANISM_UPLOAD_BATCH,
+                Knobs {
+                    upload_workers: 1,
+                    upload_batch_max_entries: 1,
+                    ..Knobs::default()
+                },
+                vec![1u8; 8],
+            ),
+            (
+                SUPPLY_MECHANISM_UPLOAD_STREAM,
+                Knobs {
+                    upload_workers: 1,
+                    upload_batch_max_entries: 1,
+                    large_nar_threshold_mib: 1,
+                    ..Knobs::default()
+                },
+                vec![3u8; 2 * 1024 * 1024],
+            ),
+        ] {
+            // Seven paths, every one a payload death (one attempt each —
+            // over the 6-failure threshold if they were charged).
+            let (_dir, state) = state();
+            let fake = FakeSupplyTransport::default();
+            let items: Vec<UploadItem> = (0..7)
+                .map(|index| item(&path_for(index), nar.clone(), &[]))
+                .collect();
+            {
+                let mut scripted = fake.scripted.lock().unwrap();
+                for index in 0..7 {
+                    scripted.insert(path_for(index), [PayloadDeath].into_iter().collect());
+                }
             }
-        }
-        let ctx = SupplyContext::new(SupplyDependencies::Substituters);
-        let claims = UploadClaims::new();
-        let report = prewarm_uploads(
-            &fake,
-            None,
-            &ctx,
-            &batch_plan(items),
-            &serial,
-            &state,
-            &claims,
-        )
-        .await
-        .unwrap();
-        assert!(
-            !report.upload_collapsed,
-            "payload-source deaths are a third party's failure — never breaker evidence: \
-             {report:?}"
-        );
-        assert_eq!(
-            report.failed, 7,
-            "every path settles per-path FAILED: {report:?}"
-        );
-        assert_eq!(
-            report.skipped, 0,
-            "no skip-stamping against a healthy gateway: {report:?}"
-        );
-        for index in 0..7 {
-            let entries = entries(&state);
-            let entry = entry_for(&entries, &path_for(index));
-            assert_eq!(entry.outcome, SUPPLY_OUTCOME_FAILED, "{entry:?}");
+            let ctx = SupplyContext::new(SupplyDependencies::Substituters);
+            let claims = UploadClaims::new();
+            let report = prewarm_uploads(
+                &fake,
+                None,
+                &ctx,
+                &batch_plan(items),
+                &knobs,
+                &state,
+                &claims,
+            )
+            .await
+            .unwrap();
             assert!(
-                entry
-                    .detail
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("payload source failed"),
-                "the row names the failing party: {entry:?}"
+                !report.upload_collapsed,
+                "[{mechanism}] payload-source deaths are a third party's failure — never \
+                 breaker evidence: {report:?}"
             );
-        }
-
-        // Neutrality's other half: payload deaths interleaved into a
-        // wire-death streak do not RESET the channel count — six wire
-        // deaths still trip even with payload deaths between them.
-        // Script per path: (WireDeath, PayloadDeath) — the wire death
-        // charges, the retry's payload death settles the path without
-        // touching the count; three paths = 3 charges... so use six
-        // paths for 6 consecutive channel charges across pairs.
-        let (_dir2, state2) = state2();
-        let fake2 = FakeSupplyTransport::default();
-        let items2: Vec<UploadItem> = (0..6)
-            .map(|index| item(&path_for(index), vec![1u8; 8], &[]))
-            .collect();
-        {
-            let mut scripted = fake2.scripted.lock().unwrap();
-            for index in 0..6 {
-                scripted.insert(
-                    path_for(index),
-                    [WireDeath, PayloadDeath].into_iter().collect(),
+            assert_eq!(
+                report.failed, 7,
+                "[{mechanism}] every path settles per-path FAILED: {report:?}"
+            );
+            assert_eq!(
+                report.skipped, 0,
+                "[{mechanism}] no skip-stamping against a healthy gateway: {report:?}"
+            );
+            for index in 0..7 {
+                let entries = entries(&state);
+                let entry = entry_for(&entries, &path_for(index));
+                assert_eq!(entry.mechanism, mechanism, "{entry:?}");
+                assert_eq!(entry.outcome, SUPPLY_OUTCOME_FAILED, "{entry:?}");
+                assert!(
+                    entry
+                        .detail
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("payload source failed"),
+                    "[{mechanism}] the row names the failing party: {entry:?}"
                 );
             }
+
+            // Neutrality's other half: payload deaths interleaved into a
+            // wire-death streak do not RESET the channel count — six wire
+            // deaths still trip even with payload deaths between them.
+            // Script per path: (WireDeath, PayloadDeath) — the wire death
+            // charges, the retry's payload death settles the path without
+            // touching the count; six paths = 6 consecutive channel
+            // charges across pairs.
+            let (_dir2, state2) = state2();
+            let fake2 = FakeSupplyTransport::default();
+            let items2: Vec<UploadItem> = (0..6)
+                .map(|index| item(&path_for(index), nar.clone(), &[]))
+                .collect();
+            {
+                let mut scripted = fake2.scripted.lock().unwrap();
+                for index in 0..6 {
+                    scripted.insert(
+                        path_for(index),
+                        [WireDeath, PayloadDeath].into_iter().collect(),
+                    );
+                }
+            }
+            let ctx2 = SupplyContext::new(SupplyDependencies::Substituters);
+            let claims2 = UploadClaims::new();
+            let report = prewarm_uploads(
+                &fake2,
+                None,
+                &ctx2,
+                &batch_plan(items2),
+                &knobs,
+                &state2,
+                &claims2,
+            )
+            .await
+            .unwrap();
+            assert!(
+                report.upload_collapsed,
+                "[{mechanism}] six wire deaths trip the breaker even with payload deaths \
+                 interleaved — a payload death must not reset the channel count: {report:?}"
+            );
         }
-        let ctx2 = SupplyContext::new(SupplyDependencies::Substituters);
-        let claims2 = UploadClaims::new();
-        let report = prewarm_uploads(
-            &fake2,
-            None,
-            &ctx2,
-            &batch_plan(items2),
-            &serial,
-            &state2,
-            &claims2,
-        )
-        .await
-        .unwrap();
-        assert!(
-            report.upload_collapsed,
-            "six wire deaths trip the breaker even with payload deaths interleaved — a \
-             payload death must not reset the channel count: {report:?}"
-        );
     }
 
     /// Standing enumeration of this module's settlement-evidence sites
