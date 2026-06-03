@@ -51,6 +51,80 @@ let
       }
       touch $out
     '';
+
+  # Hermetic regen-and-diff for one fuzz workspace's Cargo.json — the
+  # crate2nix-drift recipe below, parameterized over fuzz/<ws>. Why
+  # this must exist: nix/fuzz.nix consumes ONLY the checked-in fuzz
+  # Cargo.json (its src filesets stage Cargo.toml + fuzz_targets — the
+  # fuzz Cargo.locks are read by NO derivation), so a lock-only version
+  # bump or feature flip otherwise builds the OLD graph bit-identically
+  # green; the only loud failure mode is a newly-ADDED dep missing from
+  # the stale json. The pre-commit crate2nix-check covers the same
+  # drift, but only when Cargo.{toml,lock} is staged, hooks are
+  # installed, and --no-verify isn't used — this is the hermetic
+  # backstop.
+  #
+  # Mechanics: cargoDeps vendors the fuzz workspace's OWN lock, and
+  # `cargoRoot` points cargoSetupHook's lock-consistency validation at
+  # fuzz/<ws>/Cargo.lock instead of the root lock. crate2nix emits
+  # output-relative paths, so generation must run in-place inside
+  # fuzz/<ws> for the `../..` member paths to match the committed file
+  # (same trick the pre-commit hook documents). `cargo metadata`
+  # tolerates missing explicit-path [[bin]] files (verified for the
+  # pinned cargo: exit 0 with fuzz_targets/ deleted), so the eval-time
+  # fuzz_targets stubs are belt-and-braces for any future crate2nix
+  # that probes target paths — existence-keyed like stubTargetFiles,
+  # which itself covers the path-dep workspace members' autodiscovery.
+  mkFuzzCrate2nixDrift =
+    ws:
+    let
+      stubFuzzTargets =
+        let
+          dir = unfilteredRoot + "/fuzz/${ws}/fuzz_targets";
+        in
+        pkgs.lib.optionalString (builtins.pathExists dir) (
+          pkgs.lib.concatMapStrings (f: ''
+            touch fuzz/${ws}/fuzz_targets/${f}
+          '') (builtins.filter (f: pkgs.lib.hasSuffix ".rs" f) (builtins.attrNames (builtins.readDir dir)))
+        );
+    in
+    pkgs.stdenv.mkDerivation {
+      pname = "rio-crate2nix-drift-fuzz-${ws}";
+      inherit version;
+      src = pkgs.lib.fileset.toSource {
+        root = unfilteredRoot;
+        fileset = pkgs.lib.fileset.unions [
+          manifestsFileset
+          (unfilteredRoot + "/fuzz/${ws}/Cargo.lock")
+          (unfilteredRoot + "/fuzz/${ws}/Cargo.json")
+        ];
+      };
+      cargoRoot = "fuzz/${ws}";
+      cargoDeps = rustPlatformStable.importCargoLock {
+        lockFile = unfilteredRoot + "/fuzz/${ws}/Cargo.lock";
+      };
+      nativeBuildInputs = [
+        crate2nixCli
+        rustStable
+        rustPlatformStable.cargoSetupHook
+      ];
+      buildPhase = ''
+        export HOME=$TMPDIR
+        export CARGO_NET_OFFLINE=true
+        ${stubTargetFiles}
+        mkdir -p fuzz/${ws}/fuzz_targets
+        ${stubFuzzTargets}
+        ( cd fuzz/${ws} && crate2nix generate --format json -o Cargo.json.check )
+        echo >> fuzz/${ws}/Cargo.json.check  # match end-of-file-fixer
+        diff -u fuzz/${ws}/Cargo.json fuzz/${ws}/Cargo.json.check || {
+          echo 'error: fuzz/${ws}/Cargo.json is stale — run `cargo xtask regen cargo-json`'
+          exit 1
+        }
+      '';
+      installPhase = ''
+        touch $out
+      '';
+    };
 in
 {
   # License + advisory audit. Policy: deny GPL-3.0 (project is
@@ -190,10 +264,10 @@ in
   # stubTargetFiles synthesizes the (empty) target files autodiscovery
   # needs, so the output depends on manifests + lock only (verified for
   # crate2nix 0.15.0: relative paths, lock-derived sha256s, no absolute
-  # roots). The two fuzz-workspace Cargo.jsons are NOT covered here
-  # (own lockfiles + fuzz target layout): their backstops are the
-  # pre-commit hook plus the loud build failure a lock/json mismatch
-  # produces in the fuzz derivations themselves.
+  # roots). The two fuzz-workspace Cargo.jsons get the same
+  # regen-and-diff treatment below (crate2nix-drift-fuzz-*) — no fuzz
+  # derivation reads the fuzz Cargo.locks, so a stale json builds the
+  # old graph silently; only a newly-added dep fails loudly.
   crate2nix-drift = pkgs.stdenv.mkDerivation {
     pname = "rio-crate2nix-drift";
     inherit version;
@@ -227,6 +301,12 @@ in
       touch $out
     '';
   };
+
+  # Fuzz-workspace Cargo.json drift — see mkFuzzCrate2nixDrift above
+  # for why these exist (the fuzz derivations would otherwise build a
+  # stale graph silently).
+  crate2nix-drift-fuzz-rio-nix = mkFuzzCrate2nixDrift "rio-nix";
+  crate2nix-drift-fuzz-rio-store = mkFuzzCrate2nixDrift "rio-store";
 
   # Spec-coverage validation: fails on broken r[...]
   # references, duplicate requirement IDs, or unparseable

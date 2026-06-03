@@ -106,7 +106,9 @@ derivation is invalidated on `.proto` changes but not on Rust-only commits.
     caption: [Workspace dependency graph. Solid = prod (default-feature
       reachable); dotted = `optional = true` not enabled by `default`;
       dashed = `[dev-dependencies]` only; dash-dotted =
-      `[build-dependencies]` (build-script only).],
+      `[build-dependencies]` (links into the consumer's build script;
+      absorbs optional build-deps, and a dep also reachable at runtime
+      renders solid instead).],
   )
 }
 

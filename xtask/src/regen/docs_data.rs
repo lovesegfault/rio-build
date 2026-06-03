@@ -473,9 +473,13 @@ fn workspace() -> Result<serde_json::Value> {
         if let Some(d) = t.get("dev-dependencies").and_then(|v| v.as_table()) {
             dev.extend(internal(d).0); // dev-deps don't carry `optional`
         }
-        // [build-dependencies] — build.rs-only edges (rio-buildhash's
-        // consumers). Optional build-deps fold into the same set: the
-        // edge kind is "build" either way for the autograph.
+        // [build-dependencies] — edges that link into the consumer's
+        // build.rs (rio-buildhash's consumers). Optional build-deps
+        // fold into the same set: edge KIND outranks activation (see
+        // the precedence comment below). The fold's `o` leg is
+        // currently a no-op — the only in-tree optional build-dep
+        // (rio-test-support → rio-proto) is default-feature-reachable
+        // and lands in `r`.
         if let Some(d) = t.get("build-dependencies").and_then(|v| v.as_table()) {
             let (r, o) = internal(d);
             build.extend(r);
@@ -509,14 +513,23 @@ fn workspace() -> Result<serde_json::Value> {
         // renders exactly one edge, the strongest that applies.
         // (rio-store has rio-test-support in both optional [deps] AND
         // [dev-deps]; without dedup the autograph would render a
-        // dotted+dashed double-edge.) Build outranks optional AND dev:
-        // a [build-dependencies] edge is unconditional and shapes the
-        // production artifact, while an optional dep may never be
-        // compiled and a dev-dep is test-only — a dep in build+optional
-        // must not render as the dotted "maybe enabled" edge alone.
+        // dotted+dashed double-edge.) Build outranks optional AND dev
+        // by edge KIND, not by certainty: a build edge means "links
+        // into the consumer's build.rs", and hiding that linkage
+        // behind a dotted runtime-"maybe" edge or a dashed test-only
+        // edge would misstate what the dep touches. An optional,
+        // non-default build-dep (rio-test-support's rio-proto shape)
+        // is NOT unconditional — the caption says the dash-dotted
+        // style absorbs those.
         let build: Vec<_> = build.difference(&prod).cloned().collect();
+        // difference(&prod): internal() partitions one table at a
+        // time, so a dep optional in [dependencies] but required in
+        // [target.<cfg>.dependencies] lands in prod AND optional —
+        // without this it would render a solid+dotted double edge.
+        // (No such dep exists today; by-construction guarantee, not a
+        // rendering change.)
         let optional: std::collections::BTreeSet<_> = optional
-            .iter()
+            .difference(&prod)
             .filter(|d| !build.contains(*d))
             .cloned()
             .collect();

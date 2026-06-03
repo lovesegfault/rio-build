@@ -31,7 +31,8 @@ let
   #
   # Both skip (exit 0) with the real reason: every guarded gate has a
   # hermetic CI backstop (clippy/nextest for sqlx staleness,
-  # hakari-drift, crate2nix-drift), so fail-open here is honest.
+  # hakari-drift, crate2nix-drift (root + fuzz variants)), so
+  # fail-open here is honest.
   cargoEnvGuard = ''
     if [ -z "''${RIO_DEVSHELL:-}" ]; then
       echo "''${0##*/}: not in the rio dev shell (RIO_DEVSHELL unset); skipping — CI enforces this gate" >&2
@@ -91,7 +92,7 @@ in
   # fails to compile — so `cargo check --all-targets` on the
   # crates that use query! is the definitive staleness check
   # (seconds warm; the unit-test graph of three crates when
-  # cold). Fires only on .rs changes to skip docs-only
+  # cold). Fires only on .rs/.sqlx changes to skip docs-only
   # commits. CI catches the same failure via the clippy/nextest
   # builds, so this hook is dev-ergonomics:
   # fail at commit time instead of 10min later.
@@ -107,31 +108,83 @@ in
         # validate the staged queries against this checkout's cache.
         SQLX_OFFLINE_DIR="$(git rev-parse --show-toplevel)/.sqlx"
         export SQLX_OFFLINE_DIR
+        # Trigger = a staged .rs file containing a REAL callsite-shaped
+        # match: //-comment lines stripped, then the sqlx::-qualified
+        # macro shape (also covers query_file!/query_unchecked!).
+        # 2026-06 census: every real callsite in-tree is
+        # `sqlx::`-qualified (zero `use sqlx::query…` imports), and
+        # every out-of-crate match is a pure //-comment line (xtask +
+        # rio-buildhash + rio-migrations doc-comments) — the previous
+        # whole-file grep hard-blocked commits on exactly those.
+        # Residuals, accepted: a block comment or string literal shaped
+        # like `sqlx::query…!` still trips this; a future UNqualified
+        # `query!(` behind a use-import under-triggers and the hook
+        # silently skips — CI clippy/nextest remains the staleness
+        # backstop either way (this hook is dev-ergonomics, per the
+        # header above).
+        real_callsite() {
+          grep -Ev '^[[:space:]]*//' -- "$1" 2>/dev/null \
+            | grep -Eq 'sqlx::query[a-z_]*!'
+        }
+        # Owning crate = nearest ancestor dir with a Cargo.toml.
+        # Walking up (instead of `cut -d/ -f1`) maps nested crates to
+        # the manifest that actually owns the file.
+        owning_crate() {
+          d=$(dirname -- "$1")
+          while [ "$d" != "." ] && [ "$d" != "/" ]; do
+            if [ -f "$d/Cargo.toml" ]; then
+              printf '%s\n' "$d"
+              return 0
+            fi
+            d=$(dirname -- "$d")
+          done
+        }
         # Derive the crate list from the staged hits instead of
-        # hand-listing it: map each query!-matching staged file to its
-        # top-level crate dir. A hand list here was a third independent
+        # hand-listing it: a hand list here was a third independent
         # mirror of "the set of query! crates" (alongside crate2nix.nix
-        # sqlxOffline and the per-crate build.rs trackers) — a fourth
-        # crate gaining query! would fire the trigger, pass vacuously,
-        # and fail in CI 10min later.
-        crates=$(git diff --cached --name-only -- '*.rs' \
-          | xargs -r grep -l 'query!\|query_as!\|query_scalar!' \
-          | cut -d/ -f1 | sort -u)
+        # sqlxQueryCrates and the per-crate build.rs trackers) — a
+        # fourth crate gaining query! would fire the trigger, pass
+        # vacuously, and fail in CI 10min later.
+        crates=$(git diff --cached --name-only --diff-filter=d -- '*.rs' \
+          | while IFS= read -r f; do
+              real_callsite "$f" && owning_crate "$f"
+            done | sort -u)
+        # A staged .sqlx/ edit can stale ANY consumer of the cache, not
+        # just crates whose .rs files moved — widen to every
+        # track_sqlx-wired crate. Derived from the build scripts, NOT
+        # `grep rio_buildhash`: rio-migrations wires track_migrations
+        # (sqlx::migrate! reads migrations/, never .sqlx/) and must not
+        # burn a vacuous cargo check here.
+        if git diff --cached --name-only | grep -q '^\.sqlx/'; then
+          crates=$(
+            {
+              printf '%s\n' "$crates"
+              git ls-files '*build.rs' \
+                | xargs -r grep -l track_sqlx 2>/dev/null \
+                | xargs -r -n1 dirname
+            } | sort -u | grep -v '^$'
+          )
+        fi
         [ -n "$crates" ] || exit 0
         args=""
         for c in $crates; do
           [ -f "$c/Cargo.toml" ] || continue
-          # A query! crate without the rio-buildhash tracker reopens
-          # the kache stale-replay channel — refuse loudly instead of
-          # checking vacuously. (A doc-comment-only match in a
-          # tracker-less crate also lands here; none exist today, and
-          # the message names the fix either way.)
-          if [ -f "$c/build.rs" ] && grep -q rio_buildhash "$c/build.rs"; then
-            args="$args -p $c"
-          else
-            echo "sqlx-prepare-check: $c has query! callsites but no rio-buildhash tracker in build.rs — wire track_sqlx() first (see CLAUDE.md, out-of-band macro inputs)" >&2
+          if [ -f "$c/build.rs" ] && grep -q track_sqlx "$c/build.rs"; then
+            # CHECK arm. -p takes the package name from the manifest —
+            # the directory name is convention, not contract.
+            args="$args -p $(awk -F'"' '/^name[[:space:]]*=/{print $2; exit}' "$c/Cargo.toml")"
+          elif awk '/^\[dependencies\]/{f=1;next} /^\[/{f=0} f && /^sqlx[[:space:]]*[.=]/{found=1} END{exit !found}' "$c/Cargo.toml"; then
+            # REFUSE arm: real callsites + sqlx in [dependencies] but
+            # no tracker — kache would replay compiles against an
+            # unobserved .sqlx. (sqlx only in [dev-dependencies] with
+            # test-only query! would skip instead of refuse; no such
+            # crate exists.)
+            echo "sqlx-prepare-check: $c has sqlx in [dependencies] and real query! callsites but no track_sqlx() in build.rs — kache would replay compiles against an unobserved .sqlx; wire rio-buildhash::track_sqlx() (see CLAUDE.md, out-of-band macro inputs)" >&2
             exit 1
           fi
+          # else: callsite-shaped text in a crate without the sqlx
+          # runtime dep (string literal / block comment in a tool
+          # crate) — cannot be a compiled query!, skip silently.
         done
         [ -n "$args" ] || exit 0
         # --all-targets: cfg(test)/tests/ query! sites are in the
@@ -150,7 +203,7 @@ in
           || { echo 'sqlx-prepare-check failed — if the errors above say `no cached data for query`, run `cargo xtask regen sqlx`; otherwise fix the reported error'; exit 1; }
       ''
     );
-    files = "\\.rs$";
+    files = "(\\.rs$|^\\.sqlx/)";
     language = "system";
     pass_filenames = false;
   };
@@ -162,11 +215,12 @@ in
   # the new one — silent divergence until a nix-only build
   # fails with "crate foo not found". File-gated on
   # Cargo.toml/Cargo.lock so unrelated commits don't pay
-  # the ~10s regeneration cost. The hermetic backstop for the
-  # ROOT Cargo.json is `checks.<system>.crate2nix-drift`
-  # (nix/misc-checks.nix); the fuzz Cargo.jsons rely on this
-  # hook plus the loud lock/json mismatch failure in the fuzz
-  # derivations.
+  # the ~10s regeneration cost. The hermetic backstops are
+  # `checks.<system>.crate2nix-drift` for the ROOT Cargo.json and
+  # `crate2nix-drift-fuzz-{rio-nix,rio-store}` for the fuzz ones
+  # (all nix/misc-checks.nix) — the fuzz derivations never read
+  # the fuzz Cargo.locks, so a stale json builds the old graph
+  # silently; only a newly-added dep fails loudly.
   crate2nix-check = {
     enable = true;
     name = "crate2nix-check";
