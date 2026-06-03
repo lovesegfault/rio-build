@@ -937,6 +937,48 @@ mod tests {
         Ok(())
     }
 
+    /// Content pin for the DAG key the whole pipeline rides on: every
+    /// `build_node` mint sets `drv_hash` to the FULL drv store path —
+    /// both `DerivationLike` sources, both IA and CA shapes. Downstream
+    /// consumers depend on this exact content shape, not just uniqueness:
+    /// the scheduler keys its DAG on it, interpolates it into the
+    /// build-level first-failure summary
+    /// (`rio_proto::dag_first_failure_summary`), and the replay engine's
+    /// blanket detector parses that summary expecting a store path. The
+    /// field NAME says hash; the wire CONTENT is the path — this pin is
+    /// what keeps every component holding the same belief about the
+    /// bytes.
+    #[rstest]
+    #[case::ia("", "")]
+    #[case::fod("sha256", "deadbeef")]
+    fn build_node_drv_hash_is_the_full_store_path(
+        #[case] algo: &str,
+        #[case] hash: &str,
+    ) -> anyhow::Result<()> {
+        let drv_path = test_drv_path("hash-content-pin");
+        let basic = make_basic_drv_with_output(algo, hash)?;
+        let node = build_node(&drv_path, &basic);
+        assert_eq!(
+            node.drv_hash, drv_path,
+            "basic: drv_hash must be the full drv store path"
+        );
+        assert!(
+            node.drv_hash.starts_with("/nix/store/"),
+            "{}",
+            node.drv_hash
+        );
+
+        let aterm = format!(
+            r#"Derive([("out","/nix/store/aaa-out","{algo}","{hash}")],[],[],"x86_64-linux","/bin/sh",[],[])"#
+        );
+        let node = build_node(&drv_path, &Derivation::parse(&aterm)?);
+        assert_eq!(
+            node.drv_hash, drv_path,
+            "full: drv_hash must be the full drv store path"
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_build_submit_request_carries_tenant_name() {
         use crate::config::BuildPolicy;

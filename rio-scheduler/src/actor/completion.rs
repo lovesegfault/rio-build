@@ -2777,9 +2777,14 @@ impl DagActor {
         // `failed_derivation=""` (transition_build_to_failed
         // `.unwrap_or_default()`s both). `get_or_insert` keeps the
         // first failure across multiple calls under keep_going.
+        // The summary text is a cross-component contract (the replay
+        // engine's blanket detector parses it, and the interpolated key
+        // is the full drv store path the gateway mints as `drv_hash`) —
+        // produced only through the shared formatter, never an inline
+        // format string, so the shape cannot drift from its consumer.
         build
             .error_summary
-            .get_or_insert_with(|| format!("derivation {drv_hash} failed"));
+            .get_or_insert_with(|| rio_proto::dag_first_failure_summary(drv_hash));
         build
             .failed_derivation
             .get_or_insert_with(|| drv_hash.to_string());

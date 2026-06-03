@@ -82,13 +82,23 @@ macro_rules! arc_string_newtype {
 }
 
 arc_string_newtype! {
-    /// Derivation hash newtype. The 32-char nixbase32 hash part of a .drv
-    /// store path, plus the name component (`{hash}-{name}.drv`).
+    /// Derivation DAG-key newtype: the unique, non-empty key the gateway
+    /// mints per derivation node and the scheduler keys its DAG on.
     ///
-    /// Distinct from `drv_path` (full `/nix/store/HASH-name.drv` string).
-    /// Prevents accidental swaps — see the post-2a `drv_key` rename where
-    /// `handle_completion` took a `drv_hash: String` that was sometimes
-    /// actually a path.
+    /// CONTENT SHAPE: in production this is the FULL derivation store
+    /// path (`/nix/store/{hash}-{name}.drv`) — `build_node` in
+    /// rio-gateway/src/translate.rs sets `drv_hash: drv_path` for every
+    /// node, and ingest carries it verbatim. The bare `{hash}-{name}.drv`
+    /// basename this type was once documented as does not occur on the
+    /// production wire; consumers that interpolate the key into text
+    /// (e.g. `rio_proto::dag_first_failure_summary`, parsed downstream by
+    /// the replay engine's blanket detector) must expect the store-path
+    /// shape.
+    ///
+    /// Still distinct from a raw `drv_path: String` at the type level:
+    /// the newtype prevents accidental swaps with other strings — see the
+    /// post-2a `drv_key` rename where `handle_completion` took a
+    /// `drv_hash: String` that was sometimes actually a different path.
     ///
     /// Implements `Borrow<str>` so `HashMap<DrvHash, _>::get(&str)` works.
     /// `Arc<str>` backing — clone is an atomic refcount bump, not alloc.

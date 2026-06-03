@@ -35,6 +35,34 @@ pub const CONCURRENT_PUTPATH_MSG: &str = "concurrent PutPath in progress";
 /// constant so a rename forces all sites to update in lockstep.
 pub const CGROUP_OOM_MSG: &str = "cgroup OOM during build";
 
+/// The scheduler's build-level first-failure summary, recorded as
+/// `error_summary` by `handle_derivation_failure`
+/// (rio-scheduler/src/actor/completion.rs) and carried verbatim into the
+/// `BuildFailed` event's `error_message`.
+///
+/// This is a wire-format contract with two producers and a text-shape
+/// consumer, kept as one function so none of them can drift again:
+///
+/// - **Content**: `drv_key` is the scheduler DAG's node key
+///   (`DrvHash`). The gateway mints it as the FULL derivation store path
+///   (`/nix/store/{hash}-{name}.drv`) — `build_node` in
+///   rio-gateway/src/translate.rs sets `drv_hash: drv_path` — and the
+///   scheduler ingest carries it verbatim into the DAG, so the
+///   interpolated token is a store path, NOT the bare `{hash}-{name}.drv`
+///   basename the field name suggests.
+/// - **Format**: this function is the only producer of the summary text.
+/// - **Consumer**: the gateway's per-root DAG fallback relays the summary
+///   byte-for-byte onto roots without a recorded terminal of their own,
+///   and the replay engine's blanket detector
+///   (`is_dag_fallback_blanket` in rio-replay/src/run/collect.rs) parses
+///   exactly this shape to recover cascade triggers from outside the row.
+///   Detector fixtures MUST be built through this function — a
+///   hand-written consumer-side fixture once encoded a producer shape
+///   production never emits and certified a dead recovery arm green.
+pub fn dag_first_failure_summary(drv_key: &str) -> String {
+    format!("derivation {drv_key} failed")
+}
+
 pub mod client;
 pub mod interceptor;
 // Trait impls (`From<NixStatus> for BuildResultStatus` and inverse) are

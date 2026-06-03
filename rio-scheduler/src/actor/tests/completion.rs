@@ -3835,6 +3835,67 @@ async fn test_keep_going_build_failed_records_first_failure() -> TestResult {
     Ok(())
 }
 
+/// Producer capture for the DAG-level first-failure summary, end to end
+/// through the real actor: a node keyed the way the GATEWAY mints keys
+/// (`drv_hash` = the FULL drv store path — `build_node` in
+/// rio-gateway/src/translate.rs, content-pinned there by
+/// `build_node_drv_hash_is_the_full_store_path`) fails, and the
+/// `BuildFailed` event's `error_message` is byte-for-byte
+/// `rio_proto::dag_first_failure_summary(&drv_path)`.
+///
+/// This is the producer half of a cross-crate text-shape contract: the
+/// gateway's per-root DAG fallback relays exactly these bytes onto roots
+/// without their own terminal, and the replay engine's blanket detector
+/// (`is_dag_fallback_blanket`, fixture-coupled to the same shared
+/// formatter) parses them to recover cascade triggers. The interpolated
+/// token being a STORE PATH (not the bare `{hash}-{name}.drv` basename
+/// the field name suggests) is the load-bearing fact this capture pins —
+/// a consumer-side fixture once encoded the basename belief and shipped
+/// a detector that could never match production output.
+#[tokio::test]
+async fn test_build_failed_summary_interpolates_the_full_drv_store_path() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("blank-w", "x86_64-linux").await?;
+
+    // Gateway-shaped node: the DAG key IS the drv store path.
+    let drv_path = test_drv_path("blanket-pin");
+    let mut node = make_node("blanket-pin");
+    node.drv_hash = drv_path.clone();
+    let mut ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    handle.debug_force_assign(&drv_path, "blank-w").await?;
+    let _ = recv_assignment(&mut rx).await;
+    complete_failure(
+        &handle,
+        "blank-w",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "boom",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let mut saw_failed = false;
+    while let Ok(e) = ev.try_recv() {
+        if let Some(rio_proto::types::build_event::Event::Failed(f)) = e.event {
+            saw_failed = true;
+            assert_eq!(
+                f.error_message,
+                rio_proto::dag_first_failure_summary(&drv_path),
+                "the summary must be the shared formatter applied to the full store path"
+            );
+            assert_eq!(f.failed_derivation, drv_path);
+            assert!(
+                f.error_message.contains("/nix/store/"),
+                "the interpolated key is a store path, never a bare hash-name basename: {}",
+                f.error_message
+            );
+        }
+    }
+    assert!(saw_failed, "fail-fast build must emit BuildFailed");
+    Ok(())
+}
+
 /// Unsolicited `Cancelled` from a worker (DAG status NOT Cancelled) is
 /// treated as infrastructure failure — drv resets to Ready,
 /// `infra_count` bumps. Previously the match arm was a comment-only

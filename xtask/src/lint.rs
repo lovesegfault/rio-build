@@ -1851,6 +1851,29 @@ const CONTRACT_REGISTRY: &[ContractRow] = &[
             artifact_needles: &["resolve_demoted_impure(Some(&pinned)"],
         },
     },
+    // ── DAG-fallback blanket text-shape contract: the scheduler's
+    // build-level first-failure summary (the shared rio-proto formatter
+    // over the gateway's store-path DAG key) demanded by the replay
+    // engine's blanket detector. The declared needle is the
+    // fixture-discipline sentence on the formatter; the consumer test's
+    // needles prove its fixtures still go through the formatter rather
+    // than a hand-written string (the dead-detector shape this row
+    // exists to prevent). ──
+    ContractRow {
+        key: "blanket.dag-first-failure-summary",
+        declared: (
+            "rio-proto/src/lib.rs",
+            "Detector fixtures MUST be built through this function",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/run/collect.rs",
+            test_fn: "dag_fallback_blanket_detector_is_producer_exact",
+            artifact_needles: &[
+                "rio_proto::dag_first_failure_summary",
+                "is_dag_fallback_blanket",
+            ],
+        },
+    },
 ];
 
 /// Field names of one struct in `src`: the `pub <name>: <..>` lines

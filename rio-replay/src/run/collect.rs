@@ -293,19 +293,29 @@ fn fetch_signature_present(text: &str) -> bool {
 /// DAG-fallback blanket a root's in-band result carries when NO per-root
 /// terminal event was ever emitted for it.
 ///
-/// Producer shape, matched exactly: the scheduler records the build's
-/// first failure as `derivation {hash}-{name}.drv failed` over the failing
-/// node's hash-name key (`rio-scheduler/src/actor/completion.rs`,
-/// `handle_derivation_failure`) and emits it as the `BuildFailed` message;
-/// the gateway clones that DAG-level result onto every requested root
-/// without a recorded terminal of its own
+/// Producer shape, matched exactly. FORMAT: the scheduler records the
+/// build's first failure via `rio_proto::dag_first_failure_summary` —
+/// `derivation {key} failed` (`rio-scheduler/src/actor/completion.rs`,
+/// `handle_derivation_failure`) — and emits it as the `BuildFailed`
+/// message; the gateway clones that DAG-level result onto every requested
+/// root without a recorded terminal of its own
 /// (`rio-gateway/src/handler/build.rs`, `root_evidence` /
-/// `per_root_verdict` — "Unverified blanket failure stands"). The
-/// interpolated key is a bare 32-char lowercase nix hash, `-`, the name,
-/// `.drv` — never quoted, never a `/nix/store/` path, and never followed
-/// by a `: <reason>` tail — which distinguishes it from the gateway's
-/// per-derivation relay lines (`derivation '<path>' failed: <reason>`)
-/// and from every worker/scheduler reason in the relayed vocabulary.
+/// `per_root_verdict` — "Unverified blanket failure stands"). CONTENT:
+/// the interpolated key is the scheduler's DAG key, which the gateway
+/// mints as the FULL drv store path (`build_node` in
+/// rio-gateway/src/translate.rs sets `drv_hash: drv_path`, content-pinned
+/// by `build_node_drv_hash_is_the_full_store_path`), so the production
+/// token is `/nix/store/{hash}-{name}.drv`. The bare `{hash}-{name}.drv`
+/// basename — the key shape the scheduler's `DrvHash` was historically
+/// documented as — is tolerated too, so a future ingress normalization to
+/// the documented shape cannot silently kill this recovery arm again.
+///
+/// Either way the key is a 32-char lowercase nix hash, `-`, the name,
+/// `.drv` — never quoted and never followed by a `: <reason>` tail —
+/// which distinguishes the blanket from the gateway's per-derivation
+/// relay lines (`derivation '<path>' failed: <reason>`), the cascade
+/// shape (`dependency '<drv>' failed: …`), and every worker/scheduler
+/// reason in the relayed vocabulary.
 fn is_dag_fallback_blanket(text: &str) -> bool {
     let Some(node) = text
         .trim()
@@ -314,14 +324,22 @@ fn is_dag_fallback_blanket(text: &str) -> bool {
     else {
         return false;
     };
-    let bytes = node.as_bytes();
+    if node.contains([' ', '\'', ':']) {
+        return false;
+    }
+    // Production keys are full store paths (see CONTENT above); the bare
+    // hash-name shape is the documented historical form. Both reduce to
+    // the same `{32-char-hash}-{name}.drv` basename (store-path names
+    // cannot contain `/`, so a residual slash disqualifies).
+    let basename = node.strip_prefix("/nix/store/").unwrap_or(node);
+    let bytes = basename.as_bytes();
     bytes.len() > 33
         && bytes[..32]
             .iter()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
         && bytes[32] == b'-'
-        && node.ends_with(".drv")
-        && !node.contains([' ', '\'', ':'])
+        && basename.ends_with(".drv")
+        && !basename.contains('/')
 }
 
 /// A cascade trigger recovered from OUTSIDE a failed row: the
@@ -909,8 +927,10 @@ pub fn decide(
     // scheduler's resubmit-reset budget) is fail-fasted at merge seeding,
     // which emits NO per-root event; the gateway then falls back to the
     // DAG-level result, so the row arrives here as the scheduler's
-    // build-level summary "derivation <hash>-<name>.drv failed" —
-    // Target-classified, no trigger reference, no fetch needle — and would
+    // build-level summary "derivation /nix/store/<hash>-<name>.drv
+    // failed" (`rio_proto::dag_first_failure_summary` over the gateway's
+    // store-path DAG key) — Target-classified, no trigger reference, no
+    // fetch needle — and would
     // otherwise land Genuine, charging a rotted dependency's whole
     // late-campaign fan-out to the parity headline through a door that
     // never reaches the dependency-failed cascade arm above. For exactly
@@ -2877,34 +2897,61 @@ mod tests {
     /// build-level first-failure summary and nothing else from the
     /// failure vocabulary.
     ///
-    /// Producer contract: `rio-scheduler/src/actor/completion.rs`
-    /// `handle_derivation_failure` records `error_summary =
-    /// "derivation {hash}-{name}.drv failed"` over the failing node's
-    /// hash-name key (NOT a store path), and the gateway's DAG fallback
-    /// relays it verbatim as the per-root result for roots without their
-    /// own terminal (`rio-gateway/src/handler/build.rs` `root_evidence` /
+    /// Producer contract, BOTH halves: the FORMAT is
+    /// `rio_proto::dag_first_failure_summary` (the one production
+    /// formatter — `rio-scheduler/src/actor/completion.rs`
+    /// `handle_derivation_failure` records `error_summary` through it,
+    /// captured end-to-end by the scheduler's
+    /// `test_build_failed_summary_interpolates_the_full_drv_store_path`),
+    /// and the CONTENT of the interpolated key is the FULL drv store path
+    /// (`build_node` in rio-gateway/src/translate.rs mints `drv_hash =
+    /// drv_path`, content-pinned by
+    /// `build_node_drv_hash_is_the_full_store_path`). The gateway's DAG
+    /// fallback relays the summary verbatim as the per-root result for
+    /// roots without their own terminal
+    /// (`rio-gateway/src/handler/build.rs` `root_evidence` /
     /// `per_root_verdict`).
+    ///
+    /// The positive fixture is therefore CONSTRUCTED VIA the producer's
+    /// own format chain — the shared cross-crate formatter applied to a
+    /// store path rio-nix validates as parseable — never a hand-written
+    /// consumer-side string. The previous revision of this test built its
+    /// positive fixture by stripping `/nix/store/` off the path (a
+    /// transformation no producer performs) and pinned the real
+    /// production string as must-NOT-match: detector and test shared the
+    /// same wrong belief about the producer, and CI certified a recovery
+    /// arm that could never fire. Fixture-from-producer-chain is the rule
+    /// that makes that shape impossible.
     #[test]
     fn dag_fallback_blanket_detector_is_producer_exact() {
         use crate::run::stderrparse::scheduler_reason_corpus;
-        // Producer-verbatim positive: the scheduler's format string
-        // applied to the trigger's hash-name key.
-        let blanket = format!(
-            "derivation {} failed",
-            DEP.trim_start_matches("/nix/store/")
-        );
+        // Producer-typed value: the gateway interpolates a parsed-valid
+        // drv store path (translate.rs operates on validated paths).
+        let _ = rio_nix::store_path::StorePath::parse(DEP)
+            .expect("the fixture's drv path must be a valid store path");
+        // Producer-verbatim positive: the production formatter applied to
+        // the production key shape (the full store path).
+        let blanket = rio_proto::dag_first_failure_summary(DEP);
         assert!(is_dag_fallback_blanket(&blanket), "{blanket:?}");
+        // Tolerated historical key shape: the bare hash-name basename the
+        // scheduler's DrvHash was once documented as. Kept admitted so an
+        // ingress normalization to the documented shape cannot silently
+        // kill the recovery arm.
+        let basename_blanket = rio_proto::dag_first_failure_summary(
+            DEP.strip_prefix("/nix/store/")
+                .expect("DEP is a full store path"),
+        );
+        assert!(
+            is_dag_fallback_blanket(&basename_blanket),
+            "{basename_blanket:?}"
+        );
         // Must-block: every other failure shape the engine can see.
         let relay_line = format!("derivation '{DEP}' failed: builder failed with exit code 2");
         let cascade_line = format!(
             "dependency '{DEP}' failed: poison threshold reached after 3 distinct-worker \
              failures"
         );
-        let store_path_interpolation = format!("derivation {DEP} failed");
-        let trailing_reason = format!(
-            "derivation {} failed: boom",
-            DEP.trim_start_matches("/nix/store/")
-        );
+        let trailing_reason = format!("derivation {DEP} failed: boom");
         for not_blanket in [
             // The gateway's per-derivation relay line: quoted full path
             // plus a `: <reason>` tail.
@@ -2916,8 +2963,9 @@ mod tests {
             // No hash-name key: bare name, or hash without `.drv`.
             "derivation foo.drv failed",
             "derivation bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep failed",
-            // A store path is not the producer's interpolation.
-            store_path_interpolation.as_str(),
+            "derivation /nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep failed",
+            // A residual slash past the store prefix is no store path.
+            "derivation /nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-a/b.drv failed",
             // A reason tail disqualifies even a real key.
             trailing_reason.as_str(),
             "",
@@ -2947,9 +2995,11 @@ mod tests {
     /// own Failed event embedding the daemon's last-N-log-lines text, and
     /// the cascade's `dependency '<drv>' failed: <text>` events;
     /// `rio-scheduler/src/actor/build.rs` `transition_build_to_failed`:
-    /// the build-level `derivation <hash>-<name>.drv failed` summary —
-    /// the ONLY text for a root fail-fasted eventlessly at merge seeding,
-    /// `rio-scheduler/src/actor/merge.rs` `seed_initial_states`):
+    /// the build-level `derivation /nix/store/<hash>-<name>.drv failed`
+    /// summary (`rio_proto::dag_first_failure_summary` over the gateway's
+    /// store-path DAG key) — the ONLY text for a root fail-fasted
+    /// eventlessly at merge seeding, `rio-scheduler/src/actor/merge.rs`
+    /// `seed_initial_states`):
     ///
     /// 1. own-terminal DependencyFailed, same batch — the dependent's own
     ///    message embeds the trigger's complete failure text.
@@ -3022,10 +3072,9 @@ mod tests {
             "dependency '{DEP}' failed: poison threshold reached after 3 distinct-worker \
              failures"
         );
-        let blanket = format!(
-            "derivation {} failed",
-            DEP.trim_start_matches("/nix/store/")
-        );
+        // Producer-verbatim: the shared formatter over the store-path DAG
+        // key (see dag_fallback_blanket_detector_is_producer_exact).
+        let blanket = rio_proto::dag_first_failure_summary(DEP);
         let own_failure = format!(
             "builder for '{T}' failed with exit code 2;\n\
              last 2 log lines:\n\
@@ -3208,10 +3257,9 @@ mod tests {
         };
         let store = FakeStoreApi::default();
         let contexts: HashMap<String, JobContext> = [("app.x86_64-linux".to_string(), app)].into();
-        let blanket = format!(
-            "derivation {} failed",
-            DEP.trim_start_matches("/nix/store/")
-        );
+        // Producer-verbatim: the shared formatter over the store-path DAG
+        // key (see dag_fallback_blanket_detector_is_producer_exact).
+        let blanket = rio_proto::dag_first_failure_summary(DEP);
         let batch = BatchView {
             kind: BATCH_KIND_SUBMIT.to_string(),
             build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
@@ -3404,12 +3452,9 @@ mod tests {
     fn blanket_recovery_picks_deterministically_and_gates_on_rot_evidence() {
         let knobs = Knobs::default();
         let no_reasons = BatchView::default();
-        let blanket_for = |drv: &str| {
-            format!(
-                "derivation {} failed",
-                drv.trim_start_matches("/nix/store/")
-            )
-        };
+        // Producer-verbatim: the shared formatter over the store-path DAG
+        // key (see dag_fallback_blanket_detector_is_producer_exact).
+        let blanket_for = rio_proto::dag_first_failure_summary;
         let execs = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let row = po(T, BuildStatus::MiscFailure, &blanket_for(DEP));
         // The recovered trigger's fetched tail: the fetcher's own output,
