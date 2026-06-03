@@ -99,108 +99,94 @@ let
   # cc-wrapper derivation rehashes whenever any link input changes, so a
   # toolchain bump is a cold cache, never a dangling interpreter. Old
   # epochs are pruned by the shellHook after 14 days unused.
-  kacheEnvSalt = builtins.substring 0 12 (builtins.hashString "sha256" (toString moldStdenv.cc));
+  # The salt also folds in both rust toolchain store paths: rustc -vV is
+  # kache's only toolchain key input, and a toolchain repackaging can
+  # rotate the store path while -vV stays byte-identical — restored
+  # dylib-class artifacts may reference the old path. Both shells share
+  # one wrapper, so both toolchains ride the salt; a nightly-only bump
+  # therefore colds the stable epoch too (one rebuild — accepted).
+  kacheEnvSalt = builtins.substring 0 12 (
+    builtins.hashString "sha256" "${toString moldStdenv.cc}:${toString rustStable}:${toString rustNightly}"
+  );
 
   # Policy wrapper around kache. The policy must live IN THE BINARY:
   # env hygiene done in the shellHook does not survive everything that
   # re-loads user config into a child environment (xtask's dotenvy
   # re-reads .env.local wholesale; IDEs spawn cargo with their own env).
-  # Four jobs:
+  # Structured so every policy decision happens ONCE, at the top, before
+  # any exec. Five jobs:
   #
-  #  1. Local-only by ALLOWLIST: every KACHE_* var not explicitly allowed
-  #     is dropped, so S3/planner/manifest knobs can never reach kache no
-  #     matter who spawned it — and a future kache release that grows new
-  #     remote vars is denied by default instead of silently honored.
-  #     (KACHE_ACTIVE/KACHE_VERSION pass through: internal coordination
-  #     for nested-wrapper detection.) KACHE_CACHE_DIR is deliberately
-  #     NOT allowlisted: it is kache's own standard variable, so a
-  #     machine-global export from another kache-using project would
-  #     silently repoint OUR store — foreign eviction budget, foreign
-  #     (possibly remote-fetched) artifacts. The store-relocation knob
-  #     is the rio-namespaced RIO_KACHE_CACHE_DIR, which only rio-aware
-  #     contexts set.
-  #  2. Pin KACHE_CONFIG and the store location: RIO_KACHE_CACHE_DIR if
-  #     set, else the repo-scoped, environment-salted epoch (see
-  #     kacheEnvSalt) — our 256GiB budget and provenance stay ours
-  #     alone. No HOME (some spawners scrub it) → fail OPEN: bypass to
-  #     the real compiler instead of aborting under nounset.
-  #  3. Never cache what kache cannot key: v0.4.0 has no -Z parse arm
-  #     at all (src/args.rs — unknown argv tokens fall through), so ANY
-  #     -Z flag on the rustc command line is invisible to the cache key.
-  #     -Z flags travelling via RUSTFLAGS are keyed (kache hashes
-  #     CARGO_ENCODED_RUSTFLAGS) — but cargo also splices RUSTFLAGS onto
-  #     argv, and the wrapper cannot tell which route a token took, so
-  #     the safe invariant is: any -Z token → passthrough, uncached.
-  #     This subsumes the original -Zunpretty case (cargo expand on a
-  #     warm cache would "hit" the ordinary compile's entry and emit
-  #     nothing) and means devshell `cargo fuzz` builds (-Zsanitizer)
-  #     run uncached — a deliberate trade of fuzz-dep caching for
-  #     immunity to unkeyed-flag collisions.
-  #  4. Stamp the default store epoch's .last-used on every invocation:
-  #     the shellHook prune decides "abandoned" from this stamp, and
-  #     long-lived sessions (tmux panes, IDE-captured envs) compile for
-  #     weeks without re-entering a shell — liveness must ride the
-  #     compile, not the shell entry.
+  #  1. Validate the rio-namespaced knobs (policy in the binary — values
+  #     arrive via dotenvy/direnv paths that never saw the shellHook
+  #     loader) and resolve + stamp the store BEFORE any bypass, so
+  #     liveness rides every invocation, bypassed or not.
+  #  2. Local-only by ALLOWLIST: every KACHE_* var not explicitly allowed
+  #     is dropped — remote knobs AND behavior knobs (cache_executables,
+  #     compression, …): the pinned config owns behavior, and a foreign
+  #     project's machine-global export must not steer our store. The
+  #     allowlist keeps only internal coordination (KACHE_ACTIVE/
+  #     KACHE_VERSION — gating those on a rio sentinel would break build
+  #     scripts spawning cargo inside a kache compile; the documented
+  #     trade is that a rio build launched from inside ANOTHER project's
+  #     kache-wrapped build runs uncached, exotic and fail-open), the
+  #     opt-out (KACHE_DISABLED), and output-only logging knobs.
+  #  3. Never cache what kache cannot key: any -Z argv token →
+  #     passthrough (v0.4.0 has no -Z parse arm; RUSTFLAGS-borne flags
+  #     are keyed via CARGO_ENCODED_RUSTFLAGS but cargo splices them
+  #     onto argv too, so the invariant is route-independent). Watch
+  #     item: a future cargo auto-injecting a -Z flag onto argv (the
+  #     1.80-era -Zon-broken-pipe incident) would silently bypass every
+  #     compile — symptom: `kache stats` counters stop moving.
+  #  4. Never cache online sqlx compiles, from any spawner: bypass when
+  #     the env is online by sqlx-macros-core 0.9's OWN semantics —
+  #     SQLX_OFFLINE not truthy ("true" any-case or "1",
+  #     metadata.rs:160-162) AND DATABASE_URL set non-empty
+  #     (query/mod.rs:81-88). DATABASE_URL never reaches a cache key and
+  #     RIO_SQLX_HASH still hashes the PRE-regen .sqlx, so caching would
+  #     store online-typed artifacts under offline-looking keys, and a
+  #     repeat prepare could hit-replay without the macros ever writing
+  #     prepare's metadata. Residual (documented): sqlx also reads these
+  #     two from .env files, which the wrapper cannot see.
+  #  5. Bypassed compiles sweep their own debris first: kache pre-cleans
+  #     restored outputs before its own real compiles, but a bypass runs
+  #     plain rustc, which EACCESes on mode-0444 hardlink restores (or,
+  #     under uid 0, silently truncates the SHARED store inode). The
+  #     sweep unlinks exactly the shared-inode signature — -links +1 AND
+  #     not user-writable — scoped to this compile's --out-dir and
+  #     --crate-name. Never chmod: the inode is the store blob.
   kacheWrapped = pkgs.writeShellApplication {
     name = "kache";
     text = ''
-      # Any -Z token (joined or two-arg form: a bare "-Z" matches too)
-      # → run the real compiler uncached. See policy job 3. Watch item:
-      # if a future cargo starts auto-injecting a -Z flag onto rustc
-      # argv (the 1.80-era -Zon-broken-pipe incident that broke
-      # sccache), every compile would silently take this bypass —
-      # symptom: `kache stats` hit/miss counters stop moving. Verified
-      # absent on the current pinned nightly; if it returns, exempt the
-      # known-output-irrelevant flag here.
-      for a in "$@"; do
-        case "$a" in
-          -Z* | --unpretty*) exec "$@" ;;
-          *) ;;
+      # PATH-aware "argv[1] is a runnable compiler" test. cargo passes
+      # the BARE name "rustc" (verified empirically with a logging shim
+      # on real cargo builds) — a plain [ -x "$1" ] is a CWD-relative
+      # pathname test that NEVER fires for cargo-spawned compiles.
+      is_compiler() {
+        case "''${1:-}" in
+          "") return 1 ;;
+          */*) [ -x "$1" ] ;;
+          *) command -v "$1" >/dev/null 2>&1 ;;
         esac
-      done
-      # Online sqlx compiles (cargo sqlx prepare, SQLX_OFFLINE=false
-      # checks against a live DB) → passthrough, uncached, regardless of
-      # spawner: DATABASE_URL never reaches a cache key (read via plain
-      # std::env in the macros, invisible to dep-info) and RIO_SQLX_HASH
-      # still hashes the PRE-regen .sqlx, so caching would store
-      # online-typed artifacts under offline-looking keys AND a repeat
-      # prepare could hit-replay without ever running the macros that
-      # write prepare's metadata. xtask's regen flow also sets
-      # KACHE_DISABLED, but this chokepoint covers direct sqlx-cli use
-      # too — the CLI ships in this shell.
-      if [ "''${SQLX_OFFLINE:-}" = "false" ] && [ -x "''${1:-}" ]; then
-        exec "$@"
-      fi
-      # Allowlist notes: KACHE_MAX_SIZE is deliberately NOT allowlisted
-      # (same rationale as KACHE_CACHE_DIR — it is the literal eviction
-      # budget; a foreign project's global export must not shrink ours);
-      # the rio-namespaced RIO_KACHE_MAX_SIZE below is the knob.
-      # KACHE_ACTIVE stays allowlisted as a deliberate trade: it is
-      # kache's own nested-wrapper coordination var, and gating it on a
-      # rio sentinel would break build scripts that spawn cargo inside a
-      # kache compile; the cost is that a rio build launched from inside
-      # ANOTHER project's kache-wrapped build runs uncached (exotic, and
-      # fails open).
-      allow=" KACHE_ACTIVE KACHE_VERSION KACHE_CACHE_EXECUTABLES \
-        KACHE_CLEAN_INCREMENTAL KACHE_COMPRESSION_LEVEL KACHE_DAEMON_IDLE_TIMEOUT \
-        KACHE_DISABLED KACHE_LOG KACHE_LOG_FILE KACHE_LOG_FILE_PATH \
-        KACHE_PROGRESS "
-      # Pure-bash prefix expansion — no externals, nothing that can fail
-      # silently inside a process substitution.
-      for name in "''${!KACHE_@}"; do
-        case "$allow" in
-          *" $name "*) ;;
-          *) unset "$name" ;;
-        esac
-      done
-      export KACHE_CONFIG=${kacheConfig}
+      }
+      # sqlx-macros-core 0.9 is_truthy_bool: "true" (any ASCII case) or
+      # exactly "1". Everything else — unset, "", "0", "false", "no" —
+      # is NOT offline.
+      sqlx_offline_truthy() {
+        local v="''${SQLX_OFFLINE:-}"
+        [ "''${v,,}" = "true" ] || [ "$v" = "1" ]
+      }
+
+      # Job 1a: knob validation.
       if [ -n "''${RIO_KACHE_MAX_SIZE:-}" ]; then
-        export KACHE_MAX_SIZE="$RIO_KACHE_MAX_SIZE"
+        case "$RIO_KACHE_MAX_SIZE" in
+          [0-9]*KiB | [0-9]*MiB | [0-9]*GiB | [0-9]*TiB)
+            export KACHE_MAX_SIZE="$RIO_KACHE_MAX_SIZE"
+            ;;
+          *)
+            echo "kache wrapper: ignoring RIO_KACHE_MAX_SIZE ($RIO_KACHE_MAX_SIZE) — expected <integer><KiB|MiB|GiB|TiB>, e.g. 512GiB" >&2
+            ;;
+        esac
       fi
-      # Policy lives in the binary: validate the relocation knob HERE,
-      # not only in the shellHook loader (xtask's dotenvy and direnv
-      # deliver values that never saw the loader). Relative paths would
-      # resolve per-process-cwd and fragment the store per worktree.
       if [ -n "''${RIO_KACHE_CACHE_DIR:-}" ]; then
         case "$RIO_KACHE_CACHE_DIR" in
           /*) ;;
@@ -210,19 +196,91 @@ let
             ;;
         esac
       fi
+
+      # Job 1b: store resolution + liveness stamp, BEFORE any bypass so
+      # bypass-heavy sessions (fuzz loops, online checks) stay live for
+      # the prune — and gated on KACHE_DISABLED so a permanently
+      # opted-out user's dead store can age out instead of being stamped
+      # (and even mkdir'd) forever.
+      no_store=0
       if [ -n "''${RIO_KACHE_CACHE_DIR:-}" ]; then
         export KACHE_CACHE_DIR="$RIO_KACHE_CACHE_DIR"
       elif [ -n "''${HOME:-}" ]; then
         export KACHE_CACHE_DIR="$HOME/.cache/rio-build/kache/${kacheEnvSalt}"
-        # Liveness stamp for the shellHook's epoch prune. Failures must
-        # never break a compile (read-only HOME, racing a prune) — the
-        # store itself fails open inside kache too.
-        { mkdir -p "$KACHE_CACHE_DIR" && touch "$KACHE_CACHE_DIR/.last-used"; } 2>/dev/null || true
       else
-        # No HOME, no override: nowhere sane for a store. In wrapper
-        # usage argv[1] is the real compiler — bypass kache entirely
-        # rather than abort; CLI usage falls through disabled.
-        if [ -x "''${1:-}" ]; then
+        no_store=1
+      fi
+      kd="''${KACHE_DISABLED:-}"
+      if [ "$no_store" = 0 ] && [ "''${kd,,}" != "true" ] && [ "$kd" != "1" ]; then
+        case "$KACHE_CACHE_DIR" in
+          # Stamp default epochs AND relocated stores parked under the
+          # prune root (a salt-shaped RIO_KACHE_CACHE_DIR would
+          # otherwise look idle to the shellHook prune and be rm -rf'd
+          # mid-use). Failures never break a compile.
+          "''${HOME:-/nonexistent}/.cache/rio-build/kache/"*)
+            { mkdir -p "$KACHE_CACHE_DIR" && touch "$KACHE_CACHE_DIR/.last-used"; } 2>/dev/null || true
+            ;;
+          *) ;;
+        esac
+      fi
+
+      # Jobs 3-5: ONE argv scan classifies the invocation and captures
+      # the sweep coordinates (--crate-name is already underscore-form
+      # from cargo).
+      zflag=0 crate_name="" out_dir="" prev=""
+      for a in "$@"; do
+        case "$prev" in
+          --crate-name) crate_name="$a" ;;
+          --out-dir) out_dir="$a" ;;
+        esac
+        case "$a" in
+          -Z* | --unpretty*) zflag=1 ;;
+          --crate-name=*) crate_name="''${a#--crate-name=}" ;;
+          --out-dir=*) out_dir="''${a#--out-dir=}" ;;
+        esac
+        prev="$a"
+      done
+      sweep_debris() {
+        [ -n "$out_dir" ] && [ -d "$out_dir" ] || return 0
+        if [ -n "$crate_name" ]; then
+          find "$out_dir" -maxdepth 1 -type f -name "*''${crate_name}*" \
+            -links +1 ! -perm -u+w -delete 2>/dev/null || true
+        else
+          find "$out_dir" -maxdepth 1 -type f \
+            -links +1 ! -perm -u+w -delete 2>/dev/null || true
+        fi
+      }
+      if [ "$zflag" = 1 ]; then
+        sweep_debris
+        exec "$@"
+      fi
+      if ! sqlx_offline_truthy && [ -n "''${DATABASE_URL:-}" ] && is_compiler "''${1:-}"; then
+        # Online-mode sqlx env (job 4). The is_compiler gate keeps CLI
+        # invocations (kache stats) out of the bypass; a CLI subcommand
+        # that collides with a PATH binary under an online env would
+        # misroute — accepted, none of kache's subcommands do.
+        sweep_debris
+        exec "$@"
+      fi
+
+      # Job 2: allowlist scrub. Pure-bash prefix expansion — no
+      # externals, nothing that can fail silently inside a process
+      # substitution.
+      allow=" KACHE_ACTIVE KACHE_VERSION KACHE_DISABLED \
+        KACHE_LOG KACHE_LOG_FILE KACHE_LOG_FILE_PATH KACHE_PROGRESS "
+      for name in "''${!KACHE_@}"; do
+        case "$allow" in
+          *" $name "*) ;;
+          *) unset "$name" ;;
+        esac
+      done
+      export KACHE_CONFIG=${kacheConfig}
+      if [ "$no_store" = 1 ]; then
+        # No HOME, no override: nowhere sane for a store. Bypass to the
+        # real compiler when argv[1] is one; CLI usage falls through
+        # disabled.
+        if is_compiler "''${1:-}"; then
+          sweep_debris
           exec "$@"
         fi
         export KACHE_DISABLED=1
@@ -461,10 +519,14 @@ let
           #  - cached compiles carry --remap-path-prefix sentinels, so
           #    debuginfo paths read <WORKSPACE>/… — see CLAUDE.md for the
           #    gdb/lldb substitute-path recipe;
-          #  - devshell `cargo fuzz` builds carry -Zsanitizer on argv and
-          #    therefore take the wrapper's -Z passthrough: fully
-          #    uncached, dev incremental preserved, nothing keyed or
-          #    stored (CI fuzz derivations are hermetic and unaffected).
+          #  - devshell `cargo fuzz` TARGET-unit compiles carry
+          #    -Zsanitizer on argv (cargo-fuzz routes it via RUSTFLAGS,
+          #    which only reach target units) and take the wrapper's -Z
+          #    passthrough: uncached, incremental preserved. Fuzz HOST
+          #    units — build scripts, proc-macros, their dep rlibs —
+          #    carry no -Z token and ARE cached normally through kache,
+          #    with -C incremental stripped (CI fuzz derivations are
+          #    hermetic and unaffected either way).
           #
           # Repo-local kubeconfig: xtask k8s writes here, so
           # direct kubectl/helm in the shell hits the same
@@ -498,6 +560,13 @@ let
             # still works for debugging after shell entry.
             if [ -f "$rio_root/rio-buildhash/Cargo.toml" ]; then
               export SQLX_OFFLINE_DIR="$rio_root/.sqlx"
+            else
+              # Foreign-checkout entry: a stale inherited value (sibling
+              # worktree shell, IDE-captured env) must not survive — both
+              # readers would silently use the WRONG worktree's cache and
+              # the tracker would take the Track arm, so the loud
+              # degraded path would never fire. Unset restores it.
+              unset SQLX_OFFLINE_DIR
             fi
             # (a) Honor the supported per-user knobs from .env.local even
             #     without direnv (`nix develop -c …` from a bare shell).

@@ -66,8 +66,19 @@ pub async fn run() -> Result<()> {
     // and rustc's truncating opens would then silently rewrite the
     // shared store inode (the exact poisoning forbidden above) instead
     // of EACCESing.
+    // `-links +1` narrows the unlink to the shared-inode signature:
+    // kache restores are hardlinks by construction (nlink >= 2, the
+    // second link being the store blob), while legitimate read-only
+    // OUT_DIR artifacts (build scripts fs::copy'ing from read-only
+    // sources, e.g. nix-vendored bundled bindings) are nlink-1 and must
+    // survive — cargo never re-runs a build script because OUT_DIR
+    // content vanished, so deleting them bricks the scratch target.
     if isolated.exists() {
-        sh::run(cmd!(sh, "find {isolated} -type f ! -perm -u+w -delete")).await?;
+        sh::run(cmd!(
+            sh,
+            "find {isolated} -type f -links +1 ! -perm -u+w -delete"
+        ))
+        .await?;
     }
 
     // `cargo sqlx prepare` bumps src/{lib,main}.rs mtimes on every
