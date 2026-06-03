@@ -22,6 +22,15 @@ struct Outcome {
 
 pub fn run() -> Result<()> {
     let sh = shell()?;
+    // Mutant compiles are write-only churn for the shared kache store:
+    // every viable mutant is unique source bytes (mutated crate + all
+    // dependents + relinked test binaries under cache_executables), and
+    // .config/mutants.toml's cap_lints makes cargo-mutants inject
+    // --cap-lints=warn via CARGO_ENCODED_RUSTFLAGS — a hashed kache key
+    // input — so even the unmutated baseline lives in a keyspace no
+    // normal build reads. Nothing here is ever a useful hit; don't let
+    // it evict artifacts that are.
+    let _env = sh.push_env("KACHE_DISABLED", "1");
     crate::sh::run_interactive(cmd!(
         sh,
         "cargo mutants --in-place --no-shuffle --config .config/mutants.toml"

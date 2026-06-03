@@ -57,13 +57,15 @@
       pkgs.writeShellScript "sqlx-prepare-check" ''
         # language=system → this runs in the COMMITTING environment, not a
         # sandbox. Outside the dev shell (IDE git UIs, bare terminals) the
-        # build env is incomplete (no PROTOC/LIBCLANG_PATH) and, since the
-        # devshell exports RUSTC_WRAPPER, cargo would also see flipped
-        # fingerprints and rebuild the world just to fail confusingly.
-        # Skip with a note instead — CI's hermetic checks are the real
-        # enforcement of this gate.
-        if [ -z "''${PROTOC:-}" ]; then
-          echo 'sqlx-prepare-check: not in the dev shell (PROTOC unset); skipping — CI enforces this gate' >&2
+        # build env is incomplete (no LIBCLANG_PATH/PG_BIN/cmake) and the
+        # check could only fail confusingly. Skip with a note instead —
+        # CI's hermetic checks are the real enforcement. The sentinel is
+        # the rio-specific RIO_DEVSHELL, not a generic tool var like
+        # PROTOC: any other protobuf project's shell exports PROTOC too,
+        # and passing the guard in such a foreign env reproduces exactly
+        # the confusing failure the guard exists to prevent.
+        if [ -z "''${RIO_DEVSHELL:-}" ]; then
+          echo 'sqlx-prepare-check: not in the rio dev shell (RIO_DEVSHELL unset); skipping — CI enforces this gate' >&2
           exit 0
         fi
         # A stale shell can outlive `nix store gc`: RUSTC_WRAPPER then
@@ -81,7 +83,13 @@
         if git diff --cached --name-only -- '*.rs' \
            | xargs -r grep -l 'query!\|query_as!\|query_scalar!' \
            | grep -q .; then
-          SQLX_OFFLINE=true cargo check --quiet -p rio-scheduler -p rio-store -p rio-controller \
+          # --all-targets: cfg(test)/tests/ query! sites are in the
+          # offline cache too (regen sqlx prepares with `-- --all-targets`
+          # for the LivePin contract anchors) — without it a stale
+          # test-only entry sails through commit and fails in CI ~10min
+          # later. Scoped to query!-touching commits, so the wider unit
+          # graph only compiles when it can actually catch something.
+          SQLX_OFFLINE=true cargo check --quiet --all-targets -p rio-scheduler -p rio-store -p rio-controller \
             || { echo 'sqlx query cache stale — run `cargo xtask regen sqlx`'; exit 1; }
         fi
       ''

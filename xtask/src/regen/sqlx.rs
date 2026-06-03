@@ -35,19 +35,39 @@ pub async fn run() -> Result<()> {
     // reasons above.)
     let isolated = sh.current_dir().join("target/sqlx-prepare");
     let _env3 = sh.push_env("CARGO_TARGET_DIR", &isolated);
+    // Disable the kache wrapper for every inner build of this flow.
+    // Prepare's compiles are typed against the LIVE database
+    // (DATABASE_URL set, SQLX_OFFLINE=false), but neither variable
+    // reaches a cache key — sqlx-macros read them via plain
+    // std::env::var, invisible to dep-info on stable — and RIO_SQLX_HASH
+    // still hashes the PRE-regen .sqlx (the CLI rewrites it only after
+    // the inner builds finish). Caching such compiles would store
+    // online-typed artifacts under offline-looking keys: today they land
+    // in a parallel keyspace only because CARGO_TARGET_DIR alters the
+    // remap-sentinel set, which is an accident, not a guarantee — and
+    // either way each regen would flood the shared store with a full
+    // parallel workspace build that nothing replays. Disabled mode is
+    // pure passthrough (no lookup, no store, no pre-pass); prepare's
+    // metadata emission is unaffected because the REAL rustc run always
+    // expands the macros.
+    let _env4 = sh.push_env("KACHE_DISABLED", "1");
+    // Earlier kache-ENABLED runs hardlink-restored artifacts into this
+    // scratch target as read-only store inodes (mode 0444, nlink 2).
+    // With the wrapper disabled, kache's pre-clean never runs and plain
+    // rustc EACCESes overwriting them ("output file … is not
+    // writeable"). Unlink them up front — never chmod: the inode is
+    // SHARED with the kache store, so making it writable would let
+    // rustc truncate the store blob in place and poison every future
+    // restore of that entry. Unlinking only drops this target's link;
+    // cargo rebuilds the missing outputs.
+    if isolated.exists() {
+        sh::run(cmd!(sh, "find {isolated} -type f ! -writable -delete")).await?;
+    }
 
     // `cargo sqlx prepare` bumps src/{lib,main}.rs mtimes on every
     // workspace crate to force proc-macro re-expansion (stable can't
     // track env vars). Snapshot mtimes now, restore after, so the
     // main target/ fingerprint stays valid.
-    //
-    // The devshell's kache RUSTC_WRAPPER does not defeat that forcing:
-    // kache runs a real `rustc --emit=dep-info` pre-pass before any
-    // cache lookup, and dep-info emission fully expands proc macros —
-    // so query! hits the live DB and emits prepare's metadata even
-    // when the compiled artifact is then restored from cache. Verified
-    // by deleting a .sqlx entry and watching regen restore it
-    // byte-for-byte with caching enabled.
     let snapshot = snapshot_mtimes()?;
     let _restore = scopeguard::guard(snapshot, |s| {
         for (p, t) in s {

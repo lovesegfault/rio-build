@@ -122,10 +122,18 @@ let
   #     kacheEnvSalt) — our 256GiB budget and provenance stay ours
   #     alone. No HOME (some spawners scrub it) → fail OPEN: bypass to
   #     the real compiler instead of aborting under nounset.
-  #  3. Pass -Zunpretty (cargo expand) straight to the real compiler:
-  #     kache v0.4.0 does not key the flag (no -Z parse arm in
-  #     src/args.rs), so a warm cache would "hit" the ordinary compile's
-  #     entry and expansion output would be silently empty.
+  #  3. Never cache what kache cannot key: v0.4.0 has no -Z parse arm
+  #     at all (src/args.rs — unknown argv tokens fall through), so ANY
+  #     -Z flag on the rustc command line is invisible to the cache key.
+  #     -Z flags travelling via RUSTFLAGS are keyed (kache hashes
+  #     CARGO_ENCODED_RUSTFLAGS) — but cargo also splices RUSTFLAGS onto
+  #     argv, and the wrapper cannot tell which route a token took, so
+  #     the safe invariant is: any -Z token → passthrough, uncached.
+  #     This subsumes the original -Zunpretty case (cargo expand on a
+  #     warm cache would "hit" the ordinary compile's entry and emit
+  #     nothing) and means devshell `cargo fuzz` builds (-Zsanitizer)
+  #     run uncached — a deliberate trade of fuzz-dep caching for
+  #     immunity to unkeyed-flag collisions.
   #  4. Stamp the default store epoch's .last-used on every invocation:
   #     the shellHook prune decides "abandoned" from this stamp, and
   #     long-lived sessions (tmux panes, IDE-captured envs) compile for
@@ -134,17 +142,13 @@ let
   kacheWrapped = pkgs.writeShellApplication {
     name = "kache";
     text = ''
-      prev=""
+      # Any -Z token (joined or two-arg form: a bare "-Z" matches too)
+      # → run the real compiler uncached. See policy job 3.
       for a in "$@"; do
-        if [ "$a" = "-Z" ]; then
-          prev="-Z"
-          continue
-        fi
-        case "$prev$a" in
-          -Zunpretty* | --unpretty*) exec "$@" ;;
+        case "$a" in
+          -Z* | --unpretty*) exec "$@" ;;
           *) ;;
         esac
-        prev=""
       done
       allow=" KACHE_ACTIVE KACHE_VERSION KACHE_CACHE_EXECUTABLES \
         KACHE_CLEAN_INCREMENTAL KACHE_COMPRESSION_LEVEL KACHE_DAEMON_IDLE_TIMEOUT \
@@ -358,6 +362,11 @@ let
           # `cargo xtask regen sqlx` unsets this locally to regenerate.
           SQLX_OFFLINE = "true";
           RUST_SRC_PATH = "${rust}/lib/rustlib/src/rust/library";
+          # Purpose-built "inside the rio dev shell" sentinel. Hooks and
+          # scripts that need to know (sqlx-prepare-check) test THIS, not
+          # generic tool vars like PROTOC that any protobuf project's
+          # shell also exports.
+          RIO_DEVSHELL = "1";
           # Cross-worktree cargo build cache (github:kunobi-ninja/kache).
           # Content-addressed RUSTC_WRAPPER: blake3 keys are path-
           # normalized (workspace root → sentinel), so byte-identical
