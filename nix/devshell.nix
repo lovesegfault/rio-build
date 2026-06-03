@@ -113,63 +113,132 @@ let
   # env hygiene done in the shellHook does not survive everything that
   # re-loads user config into a child environment (xtask's dotenvy
   # re-reads .env.local wholesale; IDEs spawn cargo with their own env).
-  # Five jobs. Execution order is 1 (validate + stamp) -> one argv
-  # scan -> 3/4 (bypass arms, which sweep per job 5 and exec the REAL
-  # compiler — kache never runs on those paths, so the job-2 scrub is
-  # irrelevant to them) -> 2 (allowlist + pinned config) -> exec kache.
-  # The invariant is that validation and liveness precede every exec,
-  # and the scrub precedes the only exec that reaches kache:
+  # Six jobs, numbered in EXECUTION order — the script reads top to
+  # bottom (e4d8cb643 let comment order and execution order diverge,
+  # and the drift hid a self-scrub bug; keep them in sync):
   #
-  #  1. Validate the rio-namespaced knobs (policy in the binary — values
-  #     arrive via dotenvy/direnv paths that never saw the shellHook
-  #     loader) and resolve + stamp the store BEFORE any bypass, so
-  #     liveness rides every invocation, bypassed or not.
-  #  2. Local-only by ALLOWLIST: every KACHE_* var not explicitly allowed
-  #     is dropped — remote knobs AND behavior knobs (cache_executables,
-  #     compression, …): the pinned config owns behavior, and a foreign
-  #     project's machine-global export must not steer our store. The
-  #     allowlist keeps only internal coordination (KACHE_ACTIVE/
-  #     KACHE_VERSION — gating those on a rio sentinel would break build
-  #     scripts spawning cargo inside a kache compile; the documented
-  #     trade is that a rio build launched from inside ANOTHER project's
-  #     kache-wrapped build runs uncached, exotic and fail-open), the
-  #     opt-out (KACHE_DISABLED), and output-only logging knobs.
-  #  3. Never cache what kache cannot key: any -Z argv token →
-  #     passthrough (v0.4.0 has no -Z parse arm; RUSTFLAGS-borne flags
-  #     are keyed via CARGO_ENCODED_RUSTFLAGS but cargo splices them
-  #     onto argv too, so the invariant is route-independent). Watch
-  #     item: a future cargo auto-injecting a -Z flag onto argv (the
-  #     1.80-era -Zon-broken-pipe incident) would silently bypass every
-  #     compile — symptom: `kache stats` counters stop moving.
-  #  4. Never cache online sqlx compiles, from any spawner: bypass when
-  #     the env is online by sqlx-macros-core 0.9's OWN semantics —
-  #     SQLX_OFFLINE not truthy ("true" any-case or "1",
-  #     metadata.rs:160-162) AND DATABASE_URL set non-empty
-  #     (query/mod.rs:81-88). DATABASE_URL never reaches a cache key and
-  #     RIO_SQLX_HASH still hashes the PRE-regen .sqlx, so caching would
-  #     store online-typed artifacts under offline-looking keys, and a
-  #     repeat prepare could hit-replay without the macros ever writing
-  #     prepare's metadata. Residual (documented): sqlx also reads these
-  #     two from .env files, which the wrapper cannot see.
-  #  5. Bypassed compiles sweep their own debris first: kache pre-cleans
-  #     restored outputs before its own real compiles, but a bypass runs
-  #     plain rustc, which EACCESes on mode-0444 hardlink restores (or,
-  #     under uid 0, silently truncates the SHARED store inode). The
-  #     sweep unlinks exactly the shared-inode signature — -links +1 AND
-  #     not user-writable — scoped to this compile's --out-dir and
-  #     --crate-name. Never chmod: the inode is the store blob.
+  #  1. Allowlist scrub, FIRST — the scrub may only ever see inherited
+  #     env, never a wrapper-authored export. Every KACHE_* var not
+  #     explicitly allowed is dropped — remote knobs AND behavior knobs
+  #     (cache_executables, compression, …): the pinned config owns
+  #     behavior, and a foreign project's machine-global export must
+  #     not steer our store. The allowlist keeps only internal
+  #     coordination (KACHE_ACTIVE/KACHE_VERSION — gating those on a
+  #     rio sentinel would break build scripts spawning cargo inside a
+  #     kache compile; the documented trade is that a rio build
+  #     launched from inside ANOTHER project's kache-wrapped build runs
+  #     uncached, exotic and fail-open), the opt-out (KACHE_DISABLED),
+  #     and output-only logging knobs.
+  #  2. Pin the config (KACHE_CONFIG) so kache's config search can
+  #     never reach a user-level ~/.config/kache/config.toml.
+  #  3. Validate + map the rio-namespaced knobs (policy in the binary —
+  #     values arrive via dotenvy/direnv paths that never saw the
+  #     shellHook loader). Post-scrub by construction, so the mapped
+  #     KACHE_CACHE_DIR/KACHE_MAX_SIZE exports survive to the exec.
+  #  4. Store resolution + liveness stamp, BEFORE any bypass so
+  #     bypass-heavy sessions (fuzz loops, online checks) stay live for
+  #     the prune — stamping gated on KACHE_DISABLED so an opted-out
+  #     user's dead store can age out instead of being stamped (and
+  #     even mkdir'd) forever.
+  #  5. One argv scan: -Z detection plus the sweep coordinates
+  #     (--crate-name/--out-dir) feeding sweep_debris (see its comment
+  #     for the restore-shape taxonomy and predicate rationale).
+  #  6. Routing. Four bypass conditions, every one through the single
+  #     run_real() chokepoint (sweep debris, then exec the REAL
+  #     compiler — kache never runs on those paths), all
+  #     is_compiler-gated so a CLI word can never exec a PATH binary
+  #     that happens to share a subcommand's name:
+  #      - KACHE_DISABLED truthy by kache's own parse: kache's disabled
+  #        mode is pure passthrough with no pre-clean, so without the
+  #        sweep a disabled rebuild EACCESes on read-only restores from
+  #        earlier enabled runs;
+  #      - any -Z argv token → kache cannot key it (v0.4.0 has no -Z
+  #        parse arm; RUSTFLAGS-borne flags are keyed via
+  #        CARGO_ENCODED_RUSTFLAGS but cargo splices them onto argv
+  #        too, so the invariant is route-independent). Watch item: a
+  #        future cargo auto-injecting a -Z flag onto argv (the
+  #        1.80-era -Zon-broken-pipe incident) would silently bypass
+  #        every compile — symptom: `kache stats` counters stop moving.
+  #        Gating this arm on is_compiler is a deliberate behavior
+  #        change: a -Z-looking token on a CLI invocation now falls
+  #        through to kache instead of exec'ing argv blind;
+  #      - online-mode sqlx env, by sqlx-macros-core 0.9's OWN
+  #        semantics — SQLX_OFFLINE not truthy ("true" any-case or "1",
+  #        metadata.rs:160-162) AND DATABASE_URL set non-empty
+  #        (query/mod.rs:81-88). DATABASE_URL never reaches a cache key
+  #        and RIO_SQLX_HASH still hashes the PRE-regen .sqlx, so
+  #        caching would store online-typed artifacts under
+  #        offline-looking keys, and a repeat prepare could hit-replay
+  #        without the macros ever writing prepare's metadata. Residual
+  #        (documented): sqlx also reads these two from .env files,
+  #        which the wrapper cannot see;
+  #      - no HOME and no override: nowhere sane for a store.
+  #     Everything else execs kache — the one exec the job-1 scrub
+  #     protects.
   kacheWrapped = pkgs.writeShellApplication {
     name = "kache";
+    # sweep_debris's find and job 4's mkdir/touch must come from the
+    # wrapper's own closure: the sweep is `2>/dev/null || true`-guarded,
+    # so under a spawner with a minimal PATH (IDE-spawned cargo) a
+    # missing find would silently no-op the debris sweep and resurrect
+    # the EACCES it exists to prevent. Prepending these cannot shadow
+    # compiler resolution — neither package ships rustc, clippy-driver,
+    # or rustdoc.
+    runtimeInputs = with pkgs; [
+      findutils
+      coreutils
+    ];
     text = ''
+      # Job 1: allowlist scrub — FIRST, before ANY wrapper export, so it
+      # can only ever see inherited env. e4d8cb643 regressed exactly
+      # this by reordering: the scrub ran after the wrapper's own
+      # KACHE_CACHE_DIR/KACHE_MAX_SIZE exports (neither is allowlisted)
+      # and unset them, so every wrapped compile fell back to kache's
+      # default unsalted ~/.cache/kache (v0.4.0 config.rs:153-164,
+      # precedence env > config > default; the pinned config sets no
+      # local_store) — defeating epoch salting and deadening the
+      # documented RIO_KACHE_* knobs. Scrub-before-export forecloses
+      # the class: no future job reshuffle can make the scrub eat
+      # wrapper-authored values. Pure-bash prefix expansion — no
+      # externals, nothing that can fail silently inside a process
+      # substitution.
+      allow=" KACHE_ACTIVE KACHE_VERSION KACHE_DISABLED \
+        KACHE_LOG KACHE_LOG_FILE KACHE_LOG_FILE_PATH KACHE_PROGRESS "
+      for name in "''${!KACHE_@}"; do
+        case "$allow" in
+          *" $name "*) ;;
+          *) unset "$name" ;;
+        esac
+      done
+
+      # Job 2: pin the config (post-scrub: an inherited KACHE_CONFIG
+      # was just dropped). Short-circuits kache's config search so a
+      # user-level ~/.config/kache/config.toml — possibly holding S3
+      # creds for other projects — can never load here.
+      export KACHE_CONFIG=${kacheConfig}
+
       # PATH-aware "argv[1] is a runnable compiler" test. cargo passes
       # the BARE name "rustc" (verified empirically with a logging shim
       # on real cargo builds) — a plain [ -x "$1" ] is a CWD-relative
-      # pathname test that NEVER fires for cargo-spawned compiles.
+      # pathname test that NEVER fires for cargo-spawned compiles. The
+      # bare-name arm is a fixed allowlist (cargo passes rustc;
+      # RUSTC_WORKSPACE_WRAPPER chains pass clippy-driver; rustdoc is
+      # future-proofing), NOT a blind `command -v` probe: kache CLI
+      # words must never satisfy this test, and they CAN collide with
+      # PATH binaries. Of v0.4.0's subcommand words (clap enum,
+      # main.rs:61-210: list gc purge clean init doctor sync
+      # save-manifest daemon monitor stats why-miss report config),
+      # `init` and `sync` resolve on this devshell PATH (2026-06-03
+      # sweep: init → /run/current-system/sw/bin/init, sync →
+      # coreutils) — under a probe-shaped arm, `kache sync` in an
+      # online-sqlx env would exec coreutils sync: exit 0 after
+      # syncing filesystems, a silent wrong action.
       is_compiler() {
         case "''${1:-}" in
           "") return 1 ;;
           */*) [ -x "$1" ] ;;
-          *) command -v "$1" >/dev/null 2>&1 ;;
+          rustc | clippy-driver | rustdoc) command -v "$1" >/dev/null 2>&1 ;;
+          *) return 1 ;;
         esac
       }
       # sqlx-macros-core 0.9 is_truthy_bool: "true" (any ASCII case) or
@@ -179,17 +248,49 @@ let
         local v="''${SQLX_OFFLINE:-}"
         [ "''${v,,}" = "true" ] || [ "$v" = "1" ]
       }
+      # kache's own opt-out parse — Config::load, v0.4.0
+      # config.rs:149-151: disabled iff KACHE_DISABLED is exactly "1"
+      # or "true" in any ASCII case; set-but-falsy ("0", "", "false")
+      # does NOT disable. (EnvOverrides::detect at config.rs:130 tests
+      # mere presence via .is_ok(), but that struct is dead-code-allowed
+      # override *tracking*, not behavior — don't "align" this helper
+      # to it.)
+      kache_disabled() {
+        local v="''${KACHE_DISABLED:-}"
+        [ "$v" = "1" ] || [ "''${v,,}" = "true" ]
+      }
 
-      # Job 1a: knob validation.
+      # Job 3: validate + map the rio-namespaced knobs. Post-scrub by
+      # construction, so these exports are the only KACHE_CACHE_DIR/
+      # KACHE_MAX_SIZE kache can ever see. The size check is
+      # suffix-strip + all-digits, not a `[0-9]*GiB` glob — in a case
+      # pattern that glob means "one digit, then ANYTHING" (1.5GiB,
+      # '5 GiB' and 1fooGiB all matched while the warning promised
+      # <integer><unit>). Strictness matters because kache itself is
+      # silent on garbage: KACHE_MAX_SIZE parses via bytesize behind
+      # .ok().and_then(parse_size) (v0.4.0 config.rs:166-176,
+      # :702-704), so an unparseable value degrades to the pinned
+      # config's local_max_size without a word — this warning is the
+      # only loud guard.
       if [ -n "''${RIO_KACHE_MAX_SIZE:-}" ]; then
+        size_ok=0
         case "$RIO_KACHE_MAX_SIZE" in
-          [0-9]*KiB | [0-9]*MiB | [0-9]*GiB | [0-9]*TiB)
-            export KACHE_MAX_SIZE="$RIO_KACHE_MAX_SIZE"
+          *KiB | *MiB | *GiB | *TiB)
+            size_int="''${RIO_KACHE_MAX_SIZE%???}"
+            if [ -n "$size_int" ]; then
+              case "$size_int" in
+                *[!0-9]*) ;;
+                *) size_ok=1 ;;
+              esac
+            fi
             ;;
-          *)
-            echo "kache wrapper: ignoring RIO_KACHE_MAX_SIZE ($RIO_KACHE_MAX_SIZE) — expected <integer><KiB|MiB|GiB|TiB>, e.g. 512GiB" >&2
-            ;;
+          *) ;;
         esac
+        if [ "$size_ok" = 1 ]; then
+          export KACHE_MAX_SIZE="$RIO_KACHE_MAX_SIZE"
+        else
+          echo "kache wrapper: ignoring RIO_KACHE_MAX_SIZE ($RIO_KACHE_MAX_SIZE) — expected <integer><KiB|MiB|GiB|TiB>, e.g. 512GiB" >&2
+        fi
       fi
       if [ -n "''${RIO_KACHE_CACHE_DIR:-}" ]; then
         case "$RIO_KACHE_CACHE_DIR" in
@@ -201,11 +302,14 @@ let
         esac
       fi
 
-      # Job 1b: store resolution + liveness stamp, BEFORE any bypass so
+      # Job 4: store resolution + liveness stamp, BEFORE any bypass so
       # bypass-heavy sessions (fuzz loops, online checks) stay live for
-      # the prune — and gated on KACHE_DISABLED so a permanently
-      # opted-out user's dead store can age out instead of being stamped
-      # (and even mkdir'd) forever.
+      # the prune. Resolution always runs — CLI invocations under a
+      # disabled env still fall through to kache and must see the right
+      # store (v0.4.0's CLI ignores the flag for stats/list); only the
+      # stamp is gated on KACHE_DISABLED, so a permanently opted-out
+      # user's dead store can age out instead of being stamped (and
+      # even mkdir'd) forever.
       no_store=0
       if [ -n "''${RIO_KACHE_CACHE_DIR:-}" ]; then
         export KACHE_CACHE_DIR="$RIO_KACHE_CACHE_DIR"
@@ -214,8 +318,7 @@ let
       else
         no_store=1
       fi
-      kd="''${KACHE_DISABLED:-}"
-      if [ "$no_store" = 0 ] && [ "''${kd,,}" != "true" ] && [ "$kd" != "1" ]; then
+      if [ "$no_store" = 0 ] && ! kache_disabled; then
         case "$KACHE_CACHE_DIR" in
           # Stamp default epochs AND relocated stores parked under the
           # prune root (a salt-shaped RIO_KACHE_CACHE_DIR would
@@ -228,7 +331,7 @@ let
         esac
       fi
 
-      # Jobs 3-5: ONE argv scan classifies the invocation and captures
+      # Job 5: ONE argv scan classifies the invocation and captures
       # the sweep coordinates (--crate-name is already underscore-form
       # from cargo).
       zflag=0 crate_name="" out_dir="" prev=""
@@ -244,48 +347,93 @@ let
         esac
         prev="$a"
       done
+
+      # Bypassed compiles sweep their own debris first: kache
+      # pre-cleans restored outputs before its own real compiles, but a
+      # bypass runs plain rustc, which EACCESes on read-only restores
+      # (or, under uid 0, silently truncates a SHARED store inode).
+      # Restores come in three shapes (kache v0.4.0):
+      #  - hardlink: nlink >= 2, mode 0444, inode SHARED with the
+      #    store blob (LinkStrategy::Hardlink fallback, link.rs:81);
+      #  - reflink: nlink = 1, mode 0444 — link_to_target tries
+      #    reflink FIRST (link.rs:52) and set_executable_perms is
+      #    Copy-strategy-only (link.rs:53-57, :103-108), so
+      #    .rlib/.rmeta/.o/.d restores on a reflink fs keep the blob's
+      #    read-only mode at nlink 1;
+      #  - post-eviction debris: unlink_blob (store.rs:40-50, reached
+      #    via remove_entry :1007-1012) chmods the shared inode
+      #    writable best-effort, then unlinks the store name — the
+      #    surviving target file is usually nlink-1 0666 (benign:
+      #    plain rustc overwrites it), but nlink-1 0444 when that
+      #    chmod failed.
+      # Crate-name arm: the predicate is read-only ALONE — at
+      # -maxdepth 1 of this compile's --out-dir, an ANCHORED
+      # {lib,}<crate>-* match is either a rustc output (created
+      # writable) or a kache restore, so a -links +1 narrowing would
+      # just resurrect the EACCES for the nlink-1 shapes above. The
+      # anchor matters too: an unanchored *<crate>* would let crate
+      # foo's sweep unlink a just-restored libfoo_bar-* sibling output
+      # mid-parallel-build. A read-only file a user manually parked at
+      # depth 1 of a cargo --out-dir under exactly that name pattern
+      # is accepted collateral (the dir is cargo-owned). The fallback
+      # arm (no --crate-name: non-cargo spawners only — cargo always
+      # passes it) keeps the conservative shared-inode signature
+      # `-links +1`, since without a name anchor read-only alone could
+      # hit user files in a hand-rolled --out-dir.
+      # `! -perm -u+w` is a mode-bit test, not access(2) `-writable`:
+      # the latter is vacuous under uid 0, and root skipping the
+      # unlink means rustc's truncating open rewrites the shared store
+      # inode. Executables/dylibs need no sweep: LinkStrategy::Copy
+      # (compiler/mod.rs:200-205) restores them 0755 nlink-1, which
+      # the predicate skips. Never chmod: the nlink >= 2 shape still
+      # shares the store inode — chmod + overwrite would poison every
+      # future restore of that blob.
       sweep_debris() {
         [ -n "$out_dir" ] && [ -d "$out_dir" ] || return 0
         if [ -n "$crate_name" ]; then
-          find "$out_dir" -maxdepth 1 -type f -name "*''${crate_name}*" \
-            -links +1 ! -perm -u+w -delete 2>/dev/null || true
+          find "$out_dir" -maxdepth 1 -type f \
+            \( -name "lib''${crate_name}-*" -o -name "''${crate_name}-*" \) \
+            ! -perm -u+w -delete 2>/dev/null || true
         else
           find "$out_dir" -maxdepth 1 -type f \
             -links +1 ! -perm -u+w -delete 2>/dev/null || true
         fi
       }
-      if [ "$zflag" = 1 ]; then
-        sweep_debris
-        exec "$@"
-      fi
-      if ! sqlx_offline_truthy && [ -n "''${DATABASE_URL:-}" ] && is_compiler "''${1:-}"; then
-        # Online-mode sqlx env (job 4). The is_compiler gate keeps CLI
-        # invocations (kache stats) out of the bypass; a CLI subcommand
-        # that collides with a PATH binary under an online env would
-        # misroute — accepted, none of kache's subcommands do.
-        sweep_debris
-        exec "$@"
-      fi
 
-      # Job 2: allowlist scrub. Pure-bash prefix expansion — no
-      # externals, nothing that can fail silently inside a process
-      # substitution.
-      allow=" KACHE_ACTIVE KACHE_VERSION KACHE_DISABLED \
-        KACHE_LOG KACHE_LOG_FILE KACHE_LOG_FILE_PATH KACHE_PROGRESS "
-      for name in "''${!KACHE_@}"; do
-        case "$allow" in
-          *" $name "*) ;;
-          *) unset "$name" ;;
-        esac
-      done
-      export KACHE_CONFIG=${kacheConfig}
+      # Job 6: routing. run_real is the single plain-compiler
+      # chokepoint — every bypass sweeps, then execs the real thing;
+      # kache never runs on these paths.
+      run_real() {
+        sweep_debris
+        exec "$@"
+      }
+      # Disabled bypass: kache's disabled mode is pure passthrough (no
+      # lookup, no store, no pre-clean), so without this arm a
+      # disabled rebuild EACCESes on restores from earlier enabled
+      # runs — the exact hole xtask's regen-sqlx tree-wide pre-clean
+      # was built around (xtask/src/regen/sqlx.rs). CLI words fall
+      # through with KACHE_DISABLED intact — kache sees the flag.
+      if kache_disabled && is_compiler "''${1:-}"; then
+        run_real "$@"
+      fi
+      # -Z bypass (header job 6 has the full rationale + watch item).
+      if [ "$zflag" = 1 ] && is_compiler "''${1:-}"; then
+        run_real "$@"
+      fi
+      # Online-mode sqlx bypass (header job 6 has the full rationale).
+      # The is_compiler gate keeps CLI invocations (kache stats) out
+      # of the bypass — and it must be the fixed allowlist above,
+      # because kache's own subcommand words `init` and `sync` DO
+      # resolve to PATH binaries here.
+      if ! sqlx_offline_truthy && [ -n "''${DATABASE_URL:-}" ] && is_compiler "''${1:-}"; then
+        run_real "$@"
+      fi
       if [ "$no_store" = 1 ]; then
-        # No HOME, no override: nowhere sane for a store. Bypass to the
-        # real compiler when argv[1] is one; CLI usage falls through
-        # disabled.
+        # No HOME, no override: nowhere sane for a store. Bypass to
+        # the real compiler when argv[1] is one; CLI usage falls
+        # through disabled.
         if is_compiler "''${1:-}"; then
-          sweep_debris
-          exec "$@"
+          run_real "$@"
         fi
         export KACHE_DISABLED=1
       fi
@@ -554,10 +702,16 @@ let
             # hashes are the same directory by construction. Exported
             # whenever rio_root IS a rio checkout (same uniquely-rio
             # marker as the knob loader below): a foreign-repo
-            # invocation must not export a bogus path — the macros would
-            # fall through their chain to a real .sqlx while the tracker
-            # pinned a constant sentinel. Left unset instead, the
-            # tracker's `untracked` warning makes the state loud. The
+            # invocation must not export the foreign root's .sqlx — if
+            # that dir EXISTS, rio compiles started elsewhere would
+            # Track-hash the wrong cache while sqlx's per-query lookup
+            # falls through to the real workspace .sqlx (a kache key
+            # that never observed its input); if it doesn't exist, the
+            # tracker goes unkeyed (per-run-unique RIO_SQLX_HASH,
+            # rio-buildhash/src/lib.rs unkeyed() — never replayable,
+            # just permanent misses). Left unset instead, the tracker's
+            # `untracked` warning makes the state loud without steering
+            # a foreign project's own macros. The
             # export overrides any inherited value on purpose (a stale
             # sibling-worktree value would retarget both readers); a
             # per-invocation override (SQLX_OFFLINE_DIR=… cargo check)
@@ -606,19 +760,36 @@ let
             fi
             # (b) Default-store epoch hygiene: seed this salt's stamp
             #     (the wrapper refreshes it on every invocation — see
-            #     job 1b in kacheWrapped) and prune sibling epochs whose stamp
-            #     is 14+ days old. Scope and safety rules:
+            #     job 4 in kacheWrapped) and prune sibling epochs whose
+            #     stamp is 14+ days old. Scope and safety rules:
+            #     - seeding/re-stamping honors KACHE_DISABLED with
+            #       kache's own truthiness ("1" or any-case "true",
+            #       v0.4.0 config.rs:149-151), mirroring the wrapper's
+            #       stamp gate: an opted-out user's dead store must age
+            #       out, not be re-seeded at every shell entry. The
+            #       knob loader above runs first, so a .env.local
+            #       opt-out is honored here too;
+            #     - a configured RIO_KACHE_CACHE_DIR parked UNDER this
+            #       root is re-stamped before the prune (mirror of
+            #       wrapper job 4): it may be 12-hex salt-shaped, and
+            #       without a fresh stamp a 14-day-idle relocated store
+            #       would be rm -rf'd at shell entry before the first
+            #       compile could re-stamp it;
             #     - only 12-hex salt-shaped dirnames are pruned: a
-            #       relocated store a user parked under this root must
-            #       never be rm -rf'd (the wrapper only stamps the
-            #       default epoch, so such a store would look idle);
+            #       .last-used stamp records "a wrapper/shell
+            #       invocation resolved to this store", not "kache
+            #       read or wrote it" — nothing stamps a parked dir
+            #       once it stops being configured, so the name-shape
+            #       gate is the structural guard that keeps human-named
+            #       dirs out of the reaper;
             #     - a salt-shaped dir missing its stamp is stamped now,
             #       never deleted (a recreated epoch cannot become
             #       invisible to this GC);
             #     - the prune runs even when RIO_KACHE_CACHE_DIR is set
-            #       (only the current-salt seeding is skipped) so
-            #       relocated users still age out their pre-relocation
-            #       epochs instead of leaking 256GiB dirs forever;
+            #       or caching is disabled (only seeding/re-stamping is
+            #       skipped) so relocated and opted-out users still age
+            #       out their stale epochs instead of leaking 256GiB
+            #       dirs forever;
             #     - every command is failure-guarded: a read-only HOME
             #       or a racing sibling prune must not abort direnv's
             #       strict-mode env load.
@@ -626,9 +797,20 @@ let
             #     GNU find -regex/-printf: Linux-only, harmless no-op
             #     elsewhere.
             rio_kache_root="$HOME/.cache/rio-build/kache"
-            if [ -z "''${RIO_KACHE_CACHE_DIR:-}" ]; then
-              { mkdir -p "$rio_kache_root/${kacheEnvSalt}" \
-                && touch "$rio_kache_root/${kacheEnvSalt}/.last-used"; } 2>/dev/null || true
+            rio_kache_kd="''${KACHE_DISABLED:-}"
+            if [ "$rio_kache_kd" != "1" ] && [ "''${rio_kache_kd,,}" != "true" ]; then
+              if [ -z "''${RIO_KACHE_CACHE_DIR:-}" ]; then
+                { mkdir -p "$rio_kache_root/${kacheEnvSalt}" \
+                  && touch "$rio_kache_root/${kacheEnvSalt}/.last-used"; } 2>/dev/null || true
+              else
+                case "$RIO_KACHE_CACHE_DIR" in
+                  "$rio_kache_root"/*)
+                    { mkdir -p "$RIO_KACHE_CACHE_DIR" \
+                      && touch "$RIO_KACHE_CACHE_DIR/.last-used"; } 2>/dev/null || true
+                    ;;
+                  *) ;;
+                esac
+              fi
             fi
             if [ -d "$rio_kache_root" ]; then
               for rio_epoch in "$rio_kache_root"/*/; do
@@ -643,7 +825,7 @@ let
                 -regextype posix-extended -regex '.*/[0-9a-f]{12}/\.last-used' \
                 -mtime +14 -printf '%h\0' 2>/dev/null | xargs -0 -r rm -rf -- || true
             fi
-            unset rio_epoch rio_epoch_name rio_kache_root
+            unset rio_epoch rio_epoch_name rio_kache_root rio_kache_kd
             ${preCommitInstall}
           '';
         }

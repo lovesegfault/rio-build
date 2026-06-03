@@ -73,6 +73,17 @@ pub async fn run() -> Result<()> {
     // sources, e.g. nix-vendored bundled bindings) are nlink-1 and must
     // survive — cargo never re-runs a build script because OUT_DIR
     // content vanished, so deleting them bricks the scratch target.
+    //
+    // Division of labor with kacheWrapped (nix/devshell.nix): the
+    // RUSTC_WRAPPER now sweeps each compile's own --out-dir on every
+    // disabled/bypassed invocation, INCLUDING nlink-1 reflink restores
+    // (kache tries reflink before hardlink, v0.4.0 link.rs:52, and only
+    // Copy-strategy artifacts get chmodded 0755 — so on a reflink fs a
+    // restore is read-only at nlink 1, invisible to the `-links +1`
+    // signature here, which this scope must keep for the OUT_DIR files
+    // above). This tree-wide pass stays as defense in depth for
+    // invocations that never see the wrapper (bare cargo without
+    // RUSTC_WRAPPER on the scratch target).
     if isolated.exists() {
         sh::run(cmd!(
             sh,
