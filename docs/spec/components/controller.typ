@@ -1146,13 +1146,14 @@ defines no store CR.) The controller's `/scale` patches use field-manager
   is the raw scheduler count and needs no FFD gate to be authoritative.
 ]
 
-#r("ctrl.nodeclaim.lease-edge-polarity+2")[
+#r("ctrl.nodeclaim.lease-edge-polarity+3")[
   Every cross-tick in-memory field of the NodeClaim-pool reconciler is
   classified by its stale-state polarity, and its clear-or-keep MUST sit on
   the matching lease edge. The classes and the per-field classification:
   *suppress* (a stale entry suppresses a later observation or signal) ---
-  `recorded_boot` and `inflight_created`, cleared on the lease-acquire edge
-  in the reload `Ok` arm only; *amplify* (a stale entry amplifies a
+  `recorded_boot`, `inflight_created`, and `pending_evidence` (a stale
+  buffered ICE-clear from a previous tenure could mask a genuinely ICE'd
+  cell), cleared on the lease-acquire edge in the reload `Ok` arm only; *amplify* (a stale entry amplifies a
   destructive action) --- `prev_idle`, cleared unconditionally on the
   lease-acquire edge BEFORE the PG reload attempt, so even a failed reload
   cannot leave a pre-acquire idle timestamp in place and the idle basis is
@@ -1220,7 +1221,7 @@ fleet-wide learning.
   here.
 ]
 
-#r("ctrl.nodeclaim.consolidate-only-degraded+2")[
+#r("ctrl.nodeclaim.consolidate-only-degraded+3")[
   After `BOT_TICKS_BEFORE_CONSOLIDATE_ONLY` (5) consecutive failed
   `GetSpawnIntents` polls the NodeClaim-pool reconciler MUST run in
   consolidate-only mode until a poll succeeds. A consolidate-only tick MAY
@@ -1228,17 +1229,34 @@ fleet-wide learning.
   claims, prune `inflight_created`, and persist sketches (subject to the
   reload latch); it MUST NOT create NodeClaims, MUST NOT republish the
   placeable set (the consumer's own failed poll keeps it fail-closed,
-  #rref("ctrl.nodeclaim.placeable-gate")), and MUST NOT send ICE marks or
-  clears (locally detected ICE cells are dropped, not queued). Idle reaping
+  #rref("ctrl.nodeclaim.placeable-gate")), and MUST NOT send ICE marks
+  (locally detected ICE cells are dropped, not queued). Idle reaping
   in this mode treats the placeable set as empty --- no FFD reservation is
   honored during the outage. During a `GetSpawnIntents` outage EVERY
   leader tick --- failed-poll ticks before the threshold and
   consolidate-only ticks after it --- MUST run the kube-only observation
   block (idle→busy pruning and Registered-edge recording); a
   pre-threshold failed-poll tick MUST take no effect beyond those
-  observations (no create, reap, ack, or publish), and samples recorded
-  during an outage are clear-free (`registered_cells` discarded).
+  observations (no create, reap, ack, or publish). Scheduler-bound
+  observation outputs produced during the outage (`registered_cells`
+  ICE-clears, observed instance types) are BUFFERED, not discarded
+  (#rref("ctrl.nodeclaim.evidence-buffered")).
 ]
+
+#r("ctrl.nodeclaim.evidence-buffered")[
+  Scheduler-bound evidence produced by the kube-only observation block on a
+  tick that cannot ship it (a pre-threshold failed-poll tick or a
+  consolidate-only tick) MUST be buffered and drained into the next
+  successful tick's `AckSpawnedIntents` --- never discarded. The producing
+  edges are consume-once (`recorded_boot` marks the node so the Registered
+  edge never re-fires), so a discard loses the cell's ICE-clear and the
+  observed instance type permanently. The buffer is cleared on the
+  lease-acquire edge (suppress polarity:
+  #rref("ctrl.nodeclaim.lease-edge-polarity")).
+]
+The buffer also closes the pre-existing ≥5-tick loss: observed instance
+types recorded across a long consolidate-only stretch now reach the
+scheduler's cost table when the outage ends.
 
 #r("ctrl.nodeclaim.wedge-cluster+1")[
   On every full reconcile tick the NodeClaim-pool reconciler MUST compute a

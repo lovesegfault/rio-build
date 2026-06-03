@@ -3114,7 +3114,7 @@ in
     # pre-fix falsification was the corpus's only pre-registered
     # as-built defect, flipped per the invariant map's protocol when
     # the skip was fixed.
-    # r[verify ctrl.nodeclaim.consolidate-only-degraded+2]
+    # r[verify ctrl.nodeclaim.consolidate-only-degraded+3]
     # r[verify ctrl.nodeclaim.budget.per-class+2]
     quint-nodeclaim-lifecycle-fault-rpc = mkQuintCheck {
       name = "nodeclaim-lifecycle-fault-rpc";
@@ -3140,7 +3140,7 @@ in
     # unconditional prev_idle clear, the Ok-arm-only suppress clears,
     # the reload latch gating persist) and the producer-side gate
     # guarantee (unarmed on loss before the consumer's next tick).
-    # r[verify ctrl.nodeclaim.lease-edge-polarity+2]
+    # r[verify ctrl.nodeclaim.lease-edge-polarity+3]
     # r[verify ctrl.nodeclaim.placeable-gate+5]
     # r[verify ctrl.nodeclaim.ice-mark-clear]
     quint-nodeclaim-lifecycle-fault-lease = mkQuintCheck {

@@ -69,6 +69,48 @@ pub use ffd::{
 };
 pub use sketch::{CapacityType, Cell, CellSketches, CellState};
 
+/// Scheduler-bound evidence from kube-only observation
+/// (merged_bug_007). The producer edges are consume-once, so a value
+/// of this type must never be dropped — `#[must_use]` turns the old
+/// `let _ =` discard into a deny-warnings error; ticks that cannot
+/// ship it merge it into the reconciler's buffer instead.
+#[must_use = "kube-only evidence is consume-once: merge it into pending_evidence or drain it into an Ack"]
+#[derive(Debug, Default)]
+pub(crate) struct PendingSchedulerEvidence {
+    /// Cells whose NodeClaim reached `Registered=True` (the ICE-clear
+    /// signal). `BTreeSet`: dedup across merged ticks + deterministic
+    /// wire order.
+    pub(crate) registered_cells: std::collections::BTreeSet<Cell>,
+    /// Per-cell instance types Karpenter resolved (CostTable feed).
+    /// Deduped by full tuple on merge.
+    pub(crate) observed_types: Vec<rio_proto::types::ObservedInstanceType>,
+}
+
+impl PendingSchedulerEvidence {
+    /// Merge another tick's evidence (dedup both planes).
+    pub(crate) fn merge(&mut self, other: PendingSchedulerEvidence) {
+        self.registered_cells.extend(other.registered_cells);
+        for o in other.observed_types {
+            if !self.observed_types.iter().any(|e| {
+                e.cell == o.cell
+                    && e.instance_type == o.instance_type
+                    && e.cores == o.cores
+                    && e.mem_bytes == o.mem_bytes
+            }) {
+                self.observed_types.push(o);
+            }
+        }
+    }
+
+    /// Consume into the wire shapes `report_unfulfillable` takes.
+    pub(crate) fn drain(self) -> (Vec<Cell>, Vec<rio_proto::types::ObservedInstanceType>) {
+        (
+            self.registered_cells.into_iter().collect(),
+            self.observed_types,
+        )
+    }
+}
+
 /// Reconcile interval. Matches the Pool reconciler's `GetSpawnIntents`
 /// poll cadence so the scheduler's `compute_spawn_intents` snapshot is
 /// no staler here than in the legacy spawn path.
@@ -701,6 +743,16 @@ pub struct NodeClaimPoolReconciler {
     /// are recorded-only (so they don't re-edge later) without pushing
     /// the cell to `report_unfulfillable`'s ICE-clear.
     recorded_boot: HashSet<String>,
+    /// merged_bug_007: scheduler-bound evidence produced by kube-only
+    /// observation on ticks that cannot ship it (⊥ pre-threshold +
+    /// consolidate-only). The producing edges are CONSUME-ONCE
+    /// (`recorded_boot` marks the node; the edge never re-fires), so
+    /// `#[must_use]` + this buffer make the discard unrepresentable:
+    /// every `kube_only_observations` return is either drained into a
+    /// healthy tick's Ack or merged here. Polarity: SUPPRESS — cleared
+    /// on the lease-acquire edge (a stale buffered ICE-clear from a
+    /// previous tenure could mask a genuinely ICE'd cell).
+    pending_evidence: PendingSchedulerEvidence,
     /// `name → epoch-secs at which the node was first observed idle`
     /// (`requested.0 == 0`). r42 bug_020: the SOLE idle-duration source
     /// — Karpenter v1 does not write `Empty`, so the controller's own
@@ -910,6 +962,7 @@ impl NodeClaimPoolReconciler {
             prev_unplaced_extras: HashSet::new(),
             inflight_created: HashMap::new(),
             consecutive_bot_ticks: 0,
+            pending_evidence: PendingSchedulerEvidence::default(),
             tick_counter: 0,
             wedge: wedge::WedgeTracker::default(),
         }
@@ -998,7 +1051,7 @@ impl NodeClaimPoolReconciler {
         // pre-lapse timestamp over-reaps. Clearing here makes the
         // `Err` arm under-reap by one cycle (the documented SAFE
         // direction) instead of unboundedly over-reaping.
-        // r[impl ctrl.nodeclaim.lease-edge-polarity+2]
+        // r[impl ctrl.nodeclaim.lease-edge-polarity+3]
         if self.reload_pending() {
             self.prev_idle.clear();
             let halflife = Duration::from_secs(self.cfg.sketch_halflife_secs);
@@ -1008,6 +1061,10 @@ impl NodeClaimPoolReconciler {
                     self.sketches = s;
                     self.recorded_boot.clear();
                     self.inflight_created.clear();
+                    // suppress polarity (see the table below):
+                    // buffered evidence from a previous tenure could
+                    // ship a stale ICE-clear.
+                    self.pending_evidence = PendingSchedulerEvidence::default();
                     // `prev_extra_cells` is intentionally NOT cleared
                     // here (r41 bug_025). Per-field stale-state
                     // polarity on the lease-acquire edge:
@@ -1026,6 +1083,10 @@ impl NodeClaimPoolReconciler {
                     //   - `prev_unplaced_extras` CLEANUP → never cleared
                     //     (stale entry → one trailing zero-write for
                     //     `ffd_unplaced_cores`; r43 bug_026)
+                    //   - `pending_evidence` suppress → cleared above
+                    //     (a stale buffered ICE-clear from a previous
+                    //     tenure could mask a genuinely ICE'd cell;
+                    //     merged_bug_007)
                     //
                     // When adding a field that holds in-memory edge
                     // state, classify its polarity here and put the
@@ -1085,7 +1146,7 @@ impl NodeClaimPoolReconciler {
         live: &[ffd::LiveNode],
         now: f64,
         now_sys: std::time::SystemTime,
-    ) -> (Vec<Cell>, Vec<rio_proto::types::ObservedInstanceType>) {
+    ) -> PendingSchedulerEvidence {
         // Uncensored idle→busy edges (see caller-ordering note above).
         consolidate::observe_idle_to_busy(live, &mut self.prev_idle, &mut self.sketches, now);
         // r[ctrl.nodeclaim.lead-time-ddsketch]: record boot times on
@@ -1097,12 +1158,15 @@ impl NodeClaimPoolReconciler {
         // via the 3×TICK recency-gate at `sketch.rs::observe_registered`
         // — the gate marks the node in `recorded_boot` (so it never
         // re-edges) without recording.
-        let result = self
-            .sketches
-            .observe_registered(live, &mut self.recorded_boot, now);
+        let (registered, observed) =
+            self.sketches
+                .observe_registered(live, &mut self.recorded_boot, now);
         self.sketches
             .maybe_rotate_all(now_sys, Duration::from_secs(self.cfg.sketch_halflife_secs));
-        result
+        PendingSchedulerEvidence {
+            registered_cells: registered.into_iter().collect(),
+            observed_types: observed,
+        }
     }
 
     /// One tick: poll → FFD sim → cover deficit → reap → persist.
@@ -1143,7 +1207,7 @@ impl NodeClaimPoolReconciler {
 
         let Some(mut intents) = intents else {
             self.consecutive_bot_ticks = self.consecutive_bot_ticks.saturating_add(1);
-            // r[impl ctrl.nodeclaim.consolidate-only-degraded+2]
+            // r[impl ctrl.nodeclaim.consolidate-only-degraded+3]
             if self.consecutive_bot_ticks >= BOT_TICKS_BEFORE_CONSOLIDATE_ONLY {
                 return self.consolidate_only(now_sys).await;
             }
@@ -1164,10 +1228,11 @@ impl NodeClaimPoolReconciler {
             // `consolidate_only`'s fail-closed posture); the streak
             // increment already happened above, so a kube failure
             // cannot stall the threshold.
-            // r[impl ctrl.nodeclaim.consolidate-only-degraded+2]
+            // r[impl ctrl.nodeclaim.consolidate-only-degraded+3]
             let pod_snapshot = self.list_pool_pods().await?;
             let live = self.list_live_nodeclaims(&pod_snapshot).await?;
-            let _ = self.kube_only_observations(&live, epoch_secs(now_sys), now_sys);
+            let ev = self.kube_only_observations(&live, epoch_secs(now_sys), now_sys);
+            self.pending_evidence.merge(ev);
             return Ok(());
         };
         self.consecutive_bot_ticks = 0;
@@ -1254,7 +1319,14 @@ impl NodeClaimPoolReconciler {
         // `registered_cells` feeds `report_unfulfillable`'s ICE-clear;
         // `observed_types` feeds the scheduler's `CostTable.cells`
         // (R24B7 instance-type autodiscovery).
-        let (registered_cells, observed_types) = self.kube_only_observations(&live, now, now_sys);
+        // Fresh evidence merges INTO the buffer, then the whole buffer
+        // drains into this tick's Ack (merged_bug_007: ⊥-tick and
+        // consolidate-only edges are consume-once and must not be
+        // lost; the merge also fixes the pre-existing ≥5-tick
+        // observed_types loss across consolidate-only stretches).
+        let fresh = self.kube_only_observations(&live, now, now_sys);
+        self.pending_evidence.merge(fresh);
+        let (registered_cells, observed_types) = std::mem::take(&mut self.pending_evidence).drain();
 
         let bound = pod_snapshot.bound_intents();
         // §13d STRIKE-7 (mb_012): the agnostic-fallback admit predicate
@@ -1457,11 +1529,16 @@ impl NodeClaimPoolReconciler {
         let pod_snapshot = self.list_pool_pods().await?;
         let live = self.list_live_nodeclaims(&pod_snapshot).await?;
         let now = epoch_secs(now_sys);
-        // r43 bug_023: same kube-only block as `reconcile_once`. Discard
-        // the return — `report_unfulfillable` and the scheduler's
-        // `CostTable.cells` need the scheduler reachable; same shape as
-        // the `ice_cells` discard below.
-        let _ = self.kube_only_observations(&live, now, now_sys);
+        // r43 bug_023: same kube-only block as `reconcile_once`. The
+        // scheduler-bound outputs are BUFFERED (merged_bug_007): the
+        // Registered edge is consume-once (`recorded_boot`), so an
+        // ICE-clear or observed instance type produced here must
+        // survive to the next healthy Ack — discarding it lost the
+        // evidence permanently. `report_unfulfillable` and the
+        // scheduler's `CostTable.cells` still need the scheduler; the
+        // buffer drains on the next reconcile_once.
+        let ev = self.kube_only_observations(&live, now, now_sys);
+        self.pending_evidence.merge(ev);
         // r42 bug_023: `consolidate_only` calls `emit_live_gauges`
         // AFTER `reap_idle`, so `prev_extra_cells` is still the
         // previous tick's value here — use it directly.
@@ -1497,7 +1574,7 @@ impl NodeClaimPoolReconciler {
             health::reap_unhealthy(&self.nodeclaims, &live, &[], &self.sketches, &self.cfg, now)
                 .await?;
         // r[impl ctrl.nodeclaim.inflight-conservation+2]
-        // r[impl ctrl.nodeclaim.consolidate-only-degraded+2]
+        // r[impl ctrl.nodeclaim.consolidate-only-degraded+3]
         // r40 bug_012: prune inflight_created against this tick's `live`
         // so the controller's own reaps below aren't later misread by
         // reconcile_once's detect_vanished as Karpenter GC. The

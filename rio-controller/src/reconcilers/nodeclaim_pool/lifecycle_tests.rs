@@ -299,6 +299,7 @@ impl Lab {
             prev_unplaced_extras: HashSet::new(),
             inflight_created: HashMap::new(),
             consecutive_bot_ticks: 0,
+            pending_evidence: Default::default(),
             tick_counter: 0,
             wedge: wedge::WedgeTracker::default(),
         };
@@ -398,7 +399,7 @@ async fn seed_previous_leader(db: &TestDb) -> usize {
 /// `inflight_created` entry would still be tracked (its claim is live
 /// and in-flight, so nothing else drops it); the cleared
 /// `recorded_boot` re-edges the FRESH registration into a sample.
-// r[verify ctrl.nodeclaim.lease-edge-polarity+2]
+// r[verify ctrl.nodeclaim.lease-edge-polarity+3]
 #[tokio::test]
 async fn acquire_ok_clears_prev_idle_and_suppress_fields() {
     let mut lab = Lab::new().await;
@@ -469,7 +470,7 @@ async fn acquire_ok_clears_prev_idle_and_suppress_fields() {
 /// — a wrongful Err-arm clear would re-edge it into a sample + an
 /// ICE-clear ack; n9 is live in-flight — a wrongful clear would
 /// untrack it for good (nothing re-adds an untracked live claim).
-// r[verify ctrl.nodeclaim.lease-edge-polarity+2]
+// r[verify ctrl.nodeclaim.lease-edge-polarity+3]
 #[tokio::test]
 async fn acquire_err_still_clears_prev_idle_keeps_suppress() {
     let mut lab = Lab::new().await;
@@ -625,7 +626,7 @@ async fn vanish_is_marked_own_reap_is_not() {
 /// R4 reload latch: a closed-pool acquire gates persist (PG rows
 /// byte-unchanged through a degraded tick), the Ok retry reloads and
 /// un-gates, and a later sample-bearing tick persists again.
-// r[verify ctrl.nodeclaim.lease-edge-polarity+2]
+// r[verify ctrl.nodeclaim.lease-edge-polarity+3]
 #[tokio::test]
 async fn reload_err_gates_persist_and_retries_next_tick() {
     let mut lab = Lab::new().await;
@@ -660,7 +661,7 @@ async fn reload_err_gates_persist_and_retries_next_tick() {
 /// (the trailing zero-write happens — observed via a local
 /// DebuggingRecorder), are consumed exactly once, and the next tick
 /// writes nothing for the vanished cell.
-// r[verify ctrl.nodeclaim.lease-edge-polarity+2]
+// r[verify ctrl.nodeclaim.lease-edge-polarity+3]
 #[test]
 fn acquire_keeps_cleanup_sets_one_trailing_write_then_drop() {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -750,7 +751,7 @@ async fn loss_unarms_gate_same_tick() {
 
 /// R7 standby: a standby tick has no effects and freezes every
 /// counter/field (empty verifier + closed pool prove "no traffic").
-// r[verify ctrl.nodeclaim.lease-edge-polarity+2]
+// r[verify ctrl.nodeclaim.lease-edge-polarity+3]
 #[tokio::test]
 async fn standby_tick_no_effect_and_frozen_counters() {
     let mut lab = Lab::new().await;
@@ -772,7 +773,7 @@ async fn standby_tick_no_effect_and_frozen_counters() {
 /// R8 `consecutive_bot_ticks` (retain-safe class): frozen across
 /// loss/standby/acquire, advanced only by leader ⊥ ticks, threshold 5
 /// pinned structurally, reset on the first successful poll.
-// r[verify ctrl.nodeclaim.consolidate-only-degraded+2]
+// r[verify ctrl.nodeclaim.consolidate-only-degraded+3]
 #[tokio::test]
 async fn bot_streak_frozen_across_acquire_resets_on_success() {
     let mut lab = Lab::new().await;
@@ -815,7 +816,7 @@ async fn bot_streak_frozen_across_acquire_resets_on_success() {
 /// R9 wedge (retain-safe class): expiry evidence fed through the real
 /// tick survives the acquire edge and still drives a Dead reap one
 /// tick later; `tick_counter` advances on every leader tick.
-// r[verify ctrl.nodeclaim.lease-edge-polarity+2]
+// r[verify ctrl.nodeclaim.lease-edge-polarity+3]
 #[tokio::test]
 async fn wedge_evidence_survives_acquire() {
     let mut lab = Lab::new().await;
@@ -865,7 +866,7 @@ async fn wedge_evidence_survives_acquire() {
 /// observation block — idle→busy pruning with the uncensored gap,
 /// in-window Registered samples with the clear DISCARDED — and reaps
 /// idle past threshold with `placeable` empty.
-// r[verify ctrl.nodeclaim.consolidate-only-degraded+2]
+// r[verify ctrl.nodeclaim.consolidate-only-degraded+3]
 #[tokio::test]
 async fn consolidate_only_runs_kube_observations_and_reaps_with_empty_placeable() {
     let mut lab = Lab::new().await;
@@ -922,7 +923,7 @@ async fn consolidate_only_runs_kube_observations_and_reaps_with_empty_placeable(
 /// sides pinned in one test. RED pre-fix: the ⊥ arm skips all
 /// observations, so c1's edge ages past the gate and the sample is
 /// lost (`boot_samples == 0`).
-// r[verify ctrl.nodeclaim.consolidate-only-degraded+2]
+// r[verify ctrl.nodeclaim.consolidate-only-degraded+3]
 #[tokio::test]
 async fn bot_tick_records_registered_edge_inside_window() {
     let mut lab = Lab::new().await;
@@ -947,8 +948,9 @@ async fn bot_tick_records_registered_edge_inside_window() {
     assert!(lab.r.recorded_boot.contains("c1"));
 
     // Recovery at t=50: c2's edge (also t=15) is first observed 35s
-    // stale → record-only, no second sample; no clears ship at any
-    // point (the ⊥ arm discards them; recovery has no fresh edge).
+    // stale → record-only, no second sample and no clear for IT. c1's
+    // in-window edge was consumed on a ⊥ tick — its ICE-clear is
+    // BUFFERED (merged_bug_007) and ships on this recovery Ack.
     lab.r.admin = admin_client(lab.admin_channel.clone());
     lab.tick(
         50,
@@ -960,8 +962,9 @@ async fn bot_tick_records_registered_edge_inside_window() {
     assert!(
         lab.ack_calls()
             .iter()
-            .all(|a| a.registered_cells.is_empty()),
-        "no ICE-clear shipped during or after the outage"
+            .any(|a| a.registered_cells.contains(&cell().to_string())),
+        "the ⊥-tick edge's buffered ICE-clear ships on the recovery Ack \
+         (pre-buffer this asserted all-empty: the discard was the pin)"
     );
 }
 
@@ -973,7 +976,7 @@ async fn bot_tick_records_registered_edge_inside_window() {
 /// the cycle is unobserved, `prev_idle` keeps the t=0 seed
 /// (over-estimate), and the assertions on the re-seeded timestamp and
 /// the uncensored gap fail.
-// r[verify ctrl.nodeclaim.consolidate-only-degraded+2]
+// r[verify ctrl.nodeclaim.consolidate-only-degraded+3]
 #[tokio::test]
 async fn bot_tick_prunes_idle_to_busy() {
     let mut lab = Lab::new().await;
@@ -1017,7 +1020,7 @@ async fn bot_tick_prunes_idle_to_busy() {
 /// FIX-T15: the fixed ⊥ arm performs exactly `[Pods LIST, NodeClaims
 /// LIST]` — no create/reap/ack/publish — pinning the fix's wire cost
 /// forever (the verifier rejects anything else).
-// r[verify ctrl.nodeclaim.consolidate-only-degraded+2]
+// r[verify ctrl.nodeclaim.consolidate-only-degraded+3]
 #[tokio::test]
 async fn bot_tick_makes_exactly_two_lists_no_effects() {
     let mut lab = Lab::new().await;
@@ -1087,4 +1090,62 @@ async fn report_unfulfillable_always_ships_the_snapshot() {
     assert_eq!(snap.bound.len(), 1);
     assert_eq!(snap.bound[0].intent_id, "drv-285");
     assert!(acks[1].bound_intents.is_empty());
+}
+
+// r[verify ctrl.nodeclaim.evidence-buffered]
+/// merged_bug_007's recorded red, kept as the regression pin: a
+/// pre-threshold ⊥ tick consumes a fresh Registered edge
+/// (`recorded_boot` marks it — consume-once) but its ICE-clear is
+/// scheduler-bound; pre-fix the `let _ =` discarded it permanently and
+/// the recovery Ack shipped nothing. The `#[must_use]` buffer drains
+/// it into the next healthy Ack.
+#[tokio::test]
+async fn bot_tick_registered_edge_survives_to_recovery_ack() {
+    let mut lab = Lab::new().await;
+    lab.r.admin = admin_client(dead_channel());
+
+    // Pre-threshold ⊥ tick (streak 1): a FRESH Registered edge is
+    // observed kube-only. The boot sample records locally — but the
+    // ICE-clear (registered cell) is scheduler-bound evidence.
+    lab.tick(
+        600,
+        bot_tick_scenario(vec![], vec![nc_json("n-fresh", 0, Some(595))]),
+    )
+    .await;
+    assert!(
+        lab.r.recorded_boot.contains("n-fresh"),
+        "the edge was consumed on the ⊥ tick"
+    );
+
+    // Recovery: the buffered ICE-clear must ship on the next healthy
+    // Ack — the edge is consume-once and cannot re-fire.
+    lab.r.admin = admin_client(lab.admin_channel.clone());
+    lab.tick(610, full_tick_scenario(vec![], vec![], vec![]))
+        .await;
+    assert!(
+        lab.ack_calls()
+            .iter()
+            .any(|a| a.registered_cells.contains(&cell().to_string())),
+        "the ⊥-tick Registered edge's ICE-clear must survive to the recovery Ack"
+    );
+}
+
+// r[verify ctrl.nodeclaim.evidence-buffered]
+/// The buffer is cleared on the lease-acquire edge (suppress
+/// polarity): evidence captured under a previous tenure must not ship
+/// a stale ICE-clear after re-acquisition.
+#[tokio::test]
+async fn pending_evidence_cleared_on_acquire_edge() {
+    let mut lab = Lab::new().await;
+    lab.r.pending_evidence.registered_cells.insert(cell());
+    lab.r.hooks.on_acquire();
+    lab.tick(600, full_tick_scenario(vec![], vec![], vec![]))
+        .await;
+    assert!(
+        lab.ack_calls()
+            .iter()
+            .all(|a| a.registered_cells.is_empty()),
+        "stale pre-tenure evidence must not ship after acquire (Ok-arm clear, \
+         suppress polarity — same class as recorded_boot)"
+    );
 }
