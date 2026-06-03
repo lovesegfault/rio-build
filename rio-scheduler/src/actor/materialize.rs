@@ -67,6 +67,132 @@ pub(crate) struct JobViewEntry {
     pub parked_at: Option<std::time::Instant>,
 }
 
+/// `#[must_use]` actor-side disposition of a fenced durable write —
+/// the gate every job-view removal and companion action derives from
+/// (`sched.materialize.view-settlement`). `Applied`/`AlreadyResolved`
+/// (= settled) authorize the view mutation and the companions;
+/// `Fenced` keeps the entry inert until the LeaderLost wipe (a deposed
+/// believer mutates nothing it no longer owns); `Failed` keeps it for
+/// the next tick's level-triggered retry (tick cadence bounds the
+/// retry; the durable row is the authority either way).
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WriteDisposition {
+    /// The durable write applied (rows > 0): the at-most-once edge.
+    Applied,
+    /// Already settled durably by an earlier write (idempotent
+    /// re-entry; not the at-most-once edge).
+    AlreadyResolved,
+    /// The claims-floor fence refused the write (deposed believer).
+    Fenced,
+    /// The write errored (PG unavailable, …) — retried next tick.
+    Failed,
+}
+
+impl WriteDisposition {
+    /// Whether the durable state is SETTLED (applied now or earlier)
+    /// — the only dispositions that authorize removing a view entry
+    /// or running a companion action.
+    pub(super) fn settled(self) -> bool {
+        matches!(self, Self::Applied | Self::AlreadyResolved)
+    }
+}
+
+// r[impl sched.materialize.view-settlement]
+/// The in-memory materialization job view (a droppable cache of the
+/// durable job table). The wrapper makes the removal discipline
+/// STRUCTURAL: [`JobView::remove_settled`] is the only per-entry
+/// removal and demands the durable write's [`WriteDisposition`] — an
+/// unconditional `.remove()` no longer typechecks. Whole-view
+/// transitions are [`JobView::wipe`] (LeaderLost — the cache drops
+/// with the tenure) and [`JobView::rebuild`] (recovery — re-read from
+/// the durable authority).
+#[derive(Debug, Default)]
+pub(crate) struct JobView(std::collections::HashMap<DrvHash, JobViewEntry>);
+
+impl JobView {
+    pub(crate) fn get<Q>(&self, k: &Q) -> Option<&JobViewEntry>
+    where
+        DrvHash: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        self.0.get(k)
+    }
+
+    pub(super) fn get_mut<Q>(&mut self, k: &Q) -> Option<&mut JobViewEntry>
+    where
+        DrvHash: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        self.0.get_mut(k)
+    }
+
+    pub(crate) fn contains_key<Q>(&self, k: &Q) -> bool
+    where
+        DrvHash: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        self.0.contains_key(k)
+    }
+
+    pub(super) fn keys(&self) -> impl Iterator<Item = &DrvHash> {
+        self.0.keys()
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&DrvHash, &JobViewEntry)> {
+        self.0.iter()
+    }
+
+    /// LeaderLost: the whole cache drops with the tenure.
+    pub(super) fn wipe(&mut self) {
+        self.0.clear();
+    }
+
+    /// Recovery: rebuild the cache from the durable rows.
+    pub(super) fn rebuild(&mut self, entries: impl IntoIterator<Item = (DrvHash, JobViewEntry)>) {
+        self.0.clear();
+        self.0.extend(entries);
+    }
+
+    /// Direct insertion (test seeding). Additive only — the removal
+    /// discipline is untouched.
+    #[cfg(test)]
+    pub(super) fn insert(&mut self, k: DrvHash, v: JobViewEntry) -> Option<JobViewEntry> {
+        self.0.insert(k, v)
+    }
+
+    /// Insert-or-keep for the creation paths: a pre-existing entry
+    /// (the dedup found an unresolved row, or recovery rebuilt it)
+    /// keeps its armament state (park backoff, claim holder); a new
+    /// job gets the fresh entry. Additive only — never a removal.
+    pub(super) fn entry_or_insert(
+        &mut self,
+        k: DrvHash,
+        default: JobViewEntry,
+    ) -> &mut JobViewEntry {
+        self.0.entry(k).or_insert(default)
+    }
+
+    // r[impl sched.materialize.view-settlement]
+    /// THE per-entry removal: only a settled durable disposition may
+    /// remove. Returns whether THIS call removed the entry — the gate
+    /// every companion action (requeue, completion batch, fail-fast,
+    /// conversion counter) hangs on. `Fenced`/`Failed` keep the entry:
+    /// the armed action stays level-triggered instead of stranding the
+    /// durable row behind an empty view.
+    pub(super) fn remove_settled<Q>(&mut self, k: &Q, d: WriteDisposition) -> bool
+    where
+        DrvHash: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        if d.settled() {
+            self.0.remove(k).is_some()
+        } else {
+            false
+        }
+    }
+}
+
 /// One job the merge transaction created (or found via the dedup) —
 /// what `persist_merge_to_db` returns to the post-commit phase so the
 /// in-memory view is fed OUTSIDE the transaction (a rolled-back merge
@@ -177,16 +303,16 @@ impl DagActor {
                 // (created == true) cannot have a view entry (the
                 // partial-unique index guarantees no unresolved job
                 // existed), so or_insert inserts it.
-                let entry =
-                    self.materialization_jobs
-                        .entry(drv_hash.clone())
-                        .or_insert(JobViewEntry {
-                            job_id,
-                            parked_until: None,
-                            claimed_by: None,
-                            carried_realized_paths: None,
-                            parked_at: None,
-                        });
+                let entry = self.materialization_jobs.entry_or_insert(
+                    drv_hash.clone(),
+                    JobViewEntry {
+                        job_id,
+                        parked_until: None,
+                        claimed_by: None,
+                        carried_realized_paths: None,
+                        parked_at: None,
+                    },
+                );
                 // Mirror the durable set-if-null carrier semantics on
                 // the view copy (display only).
                 if entry.carried_realized_paths.is_none()
@@ -312,9 +438,9 @@ impl DagActor {
     /// or_insert inserts it.
     pub(super) fn note_created_materialization_jobs(&mut self, created: &[CreatedJob]) {
         for job in created {
-            self.materialization_jobs
-                .entry(job.drv_hash.clone())
-                .or_insert(JobViewEntry {
+            self.materialization_jobs.entry_or_insert(
+                job.drv_hash.clone(),
+                JobViewEntry {
                     job_id: job.job_id,
                     parked_until: None,
                     claimed_by: None,
@@ -323,7 +449,8 @@ impl DagActor {
                     // site does); recovery rebuilds from the column.
                     carried_realized_paths: None,
                     parked_at: None,
-                });
+                },
+            );
             if job.created {
                 metrics::counter!(
                     "rio_scheduler_materialization_jobs_created_total",
@@ -475,34 +602,33 @@ impl DagActor {
         &mut self,
         rows: Vec<crate::db::materialization::RecoveredJobRow>,
     ) {
-        self.materialization_jobs.clear();
-        for row in rows {
-            self.materialization_jobs.insert(
-                DrvHash::from(row.drv_hash.as_str()),
-                JobViewEntry {
-                    job_id: row.job_id,
-                    parked_until: row
-                        .park_remaining_secs
-                        .filter(|secs| *secs > 0.0)
-                        .map(|secs| {
-                            std::time::Instant::now() + std::time::Duration::from_secs_f64(secs)
-                        }),
-                    claimed_by: row.claimed_by.map(ExecutorId::from),
-                    carried_realized_paths: row.carried_realized_paths,
-                    // Failover-exact dwell (migration 083): the durable
-                    // park-begin anchor, replayed as "that many seconds
-                    // ago" on the recovered leader's clock.
-                    parked_at: row
-                        .park_began_secs_ago
-                        .filter(|secs| *secs >= 0.0)
-                        .map(|secs| {
-                            std::time::Instant::now()
-                                .checked_sub(std::time::Duration::from_secs_f64(secs))
-                                .unwrap_or_else(std::time::Instant::now)
-                        }),
-                },
-            );
-        }
+        let entries =
+            rows.into_iter().map(|row| {
+                (
+                    DrvHash::from(row.drv_hash.as_str()),
+                    JobViewEntry {
+                        job_id: row.job_id,
+                        parked_until: row.park_remaining_secs.filter(|secs| *secs > 0.0).map(
+                            |secs| {
+                                std::time::Instant::now() + std::time::Duration::from_secs_f64(secs)
+                            },
+                        ),
+                        claimed_by: row.claimed_by.map(ExecutorId::from),
+                        carried_realized_paths: row.carried_realized_paths,
+                        // Failover-exact dwell (migration 083): the durable
+                        // park-begin anchor, replayed as "that many seconds
+                        // ago" on the recovered leader's clock.
+                        parked_at: row.park_began_secs_ago.filter(|secs| *secs >= 0.0).map(
+                            |secs| {
+                                std::time::Instant::now()
+                                    .checked_sub(std::time::Duration::from_secs_f64(secs))
+                                    .unwrap_or_else(std::time::Instant::now)
+                            },
+                        ),
+                    },
+                )
+            });
+        self.materialization_jobs.rebuild(entries);
     }
 }
 
@@ -711,41 +837,58 @@ impl DagActor {
                 // Success appends NOTHING to the ledger (design §2.4 —
                 // success is not a fold event). Coverage decides
                 // Complete vs ReArm (the CE-17 class).
-                self.close_materialization_attempt(exec_id, &drv_hash, None, serving_generation)
+                //
+                // Every companion below gates on the close disposition
+                // (sched.materialize.view-settlement): a Fenced close
+                // means a deposed believer — it mutates nothing it no
+                // longer owns; a Failed close retries via the report's
+                // idempotent re-delivery / the establishment backstop.
+                let close_d = self
+                    .close_materialization_attempt(exec_id, &drv_hash, None, serving_generation)
                     .await;
+                if !close_d.settled() {
+                    return Ok(());
+                }
                 if success_covers_live_wanted(
                     &s.ingested_paths,
                     &s.verified_paths,
                     &live_wanted_paths,
                 ) {
-                    if let Some(job_id) = job_id {
-                        self.resolve_materialization_job(
-                            job_id,
-                            Some(exec_id),
-                            crate::state::JobState::ResolvedSuccess,
-                            serving_generation,
-                        )
-                        .await;
+                    let d = match job_id {
+                        Some(job_id) => {
+                            self.resolve_materialization_job(
+                                job_id,
+                                Some(exec_id),
+                                crate::state::JobState::ResolvedSuccess,
+                                serving_generation,
+                            )
+                            .await
+                        }
+                        // No durable row: the job settled earlier (PG
+                        // is the authority) — removing the stale view
+                        // entry is reconciliation, not a decision.
+                        None => WriteDisposition::AlreadyResolved,
+                    };
+                    if self.materialization_jobs.remove_settled(&drv_hash, d) {
+                        // Stamp the carried realized path(s) BEFORE the
+                        // completion chokepoint: its non-destructive guard
+                        // keeps a known path, so the floating-CA node
+                        // re-completes with the realized path instead of
+                        // the [""] placeholder (GC retention + the
+                        // client-visible path restored).
+                        if !carried_paths.is_empty()
+                            && let Some(state) = self.dag.node_mut(&drv_hash)
+                            && state.output_paths.is_empty()
+                        {
+                            state.output_paths = carried_paths.clone();
+                        }
+                        // The build-success path: outputs are present and
+                        // verified in the store; complete the node for live
+                        // interest through the same chokepoint the
+                        // dispatch-time store short-circuit uses.
+                        self.complete_ready_from_store_batch(std::slice::from_ref(&drv_hash))
+                            .await;
                     }
-                    self.materialization_jobs.remove(&drv_hash);
-                    // Stamp the carried realized path(s) BEFORE the
-                    // completion chokepoint: its non-destructive guard
-                    // keeps a known path, so the floating-CA node
-                    // re-completes with the realized path instead of
-                    // the [""] placeholder (GC retention + the
-                    // client-visible path restored).
-                    if !carried_paths.is_empty()
-                        && let Some(state) = self.dag.node_mut(&drv_hash)
-                        && state.output_paths.is_empty()
-                    {
-                        state.output_paths = carried_paths.clone();
-                    }
-                    // The build-success path: outputs are present and
-                    // verified in the store; complete the node for live
-                    // interest through the same chokepoint the
-                    // dispatch-time store short-circuit uses.
-                    self.complete_ready_from_store_batch(std::slice::from_ref(&drv_hash))
-                        .await;
                 } else {
                     // Coverage failed — interest grew between execution
                     // and consumption, or the report did not cover the
@@ -780,13 +923,21 @@ impl DagActor {
                     &drv_hash,
                     crate::state::OutcomeClass::MaterializationUnobtainable,
                 );
-                self.close_materialization_attempt(
-                    exec_id,
-                    &drv_hash,
-                    Some(row),
-                    serving_generation,
-                )
-                .await;
+                let close_d = self
+                    .close_materialization_attempt(
+                        exec_id,
+                        &drv_hash,
+                        Some(row),
+                        serving_generation,
+                    )
+                    .await;
+                if !close_d.settled() {
+                    // view-settlement gate: a deposed/failed close runs
+                    // no routing — the durable attempt row is still the
+                    // authority and the establishment sweep / re-report
+                    // is the armed action.
+                    return Ok(());
+                }
 
                 // 2. The four-arm routing. Arms 0–2 decide without the
                 //    re-probe; the probe is fetched only for arm 3. The
@@ -846,55 +997,70 @@ impl DagActor {
                 // 3. Execute the routing.
                 match routing {
                     UnobtainableRouting::CompleteForLiveInterest => {
-                        if let Some(job_id) = job_id {
-                            self.resolve_materialization_job(
-                                job_id,
-                                Some(exec_id),
-                                crate::state::JobState::ResolvedSuccess,
-                                serving_generation,
-                            )
-                            .await;
+                        let d = match job_id {
+                            Some(job_id) => {
+                                self.resolve_materialization_job(
+                                    job_id,
+                                    Some(exec_id),
+                                    crate::state::JobState::ResolvedSuccess,
+                                    serving_generation,
+                                )
+                                .await
+                            }
+                            None => WriteDisposition::AlreadyResolved,
+                        };
+                        if self.materialization_jobs.remove_settled(&drv_hash, d) {
+                            self.complete_ready_from_store_batch(std::slice::from_ref(&drv_hash))
+                                .await;
                         }
-                        self.materialization_jobs.remove(&drv_hash);
-                        self.complete_ready_from_store_batch(std::slice::from_ref(&drv_hash))
-                            .await;
                     }
                     UnobtainableRouting::ReArm => {
                         self.rearm_materialization_job(&drv_hash, &executor).await;
                     }
                     UnobtainableRouting::ResolveFromSource => {
-                        if let Some(job_id) = job_id {
-                            self.resolve_materialization_job(
-                                job_id,
-                                Some(exec_id),
-                                crate::state::JobState::ResolvedFromSource,
-                                serving_generation,
+                        let d = match job_id {
+                            Some(job_id) => {
+                                self.resolve_materialization_job(
+                                    job_id,
+                                    Some(exec_id),
+                                    crate::state::JobState::ResolvedFromSource,
+                                    serving_generation,
+                                )
+                                .await
+                            }
+                            None => WriteDisposition::AlreadyResolved,
+                        };
+                        if self.materialization_jobs.remove_settled(&drv_hash, d) {
+                            // The node returns to its dep-derived status
+                            // (the normal Ready path) — requeue it.
+                            self.reassign_derivations(
+                                std::slice::from_ref(&drv_hash),
+                                Some(&executor),
                             )
                             .await;
                         }
-                        self.materialization_jobs.remove(&drv_hash);
-                        // The node returns to its dep-derived status
-                        // (the normal Ready path) — requeue it.
-                        self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
-                            .await;
                     }
                     UnobtainableRouting::FailFast => {
-                        if let Some(job_id) = job_id {
-                            self.resolve_materialization_job(
-                                job_id,
-                                Some(exec_id),
-                                crate::state::JobState::ResolvedUnobtainable,
-                                serving_generation,
+                        let d = match job_id {
+                            Some(job_id) => {
+                                self.resolve_materialization_job(
+                                    job_id,
+                                    Some(exec_id),
+                                    crate::state::JobState::ResolvedUnobtainable,
+                                    serving_generation,
+                                )
+                                .await
+                            }
+                            None => WriteDisposition::AlreadyResolved,
+                        };
+                        if self.materialization_jobs.remove_settled(&drv_hash, d) {
+                            self.fail_fast_pruned_root(
+                                &drv_hash,
+                                "materialization confirmed a live-wanted output missing upstream \
+                                 and not substitutable",
                             )
                             .await;
                         }
-                        self.materialization_jobs.remove(&drv_hash);
-                        self.fail_fast_pruned_root(
-                            &drv_hash,
-                            "materialization confirmed a live-wanted output missing upstream \
-                             and not substitutable",
-                        )
-                        .await;
                     }
                 }
                 Ok(())
@@ -912,13 +1078,18 @@ impl DagActor {
                 row.executor_id = Some(executor.clone());
                 row.attempt_kind = crate::state::AttemptKind::Materialization;
                 row.error_msg = (!f.detail.is_empty()).then(|| f.detail.clone());
-                self.close_materialization_attempt(
-                    exec_id,
-                    &drv_hash,
-                    Some(row),
-                    serving_generation,
-                )
-                .await;
+                let close_d = self
+                    .close_materialization_attempt(
+                        exec_id,
+                        &drv_hash,
+                        Some(row),
+                        serving_generation,
+                    )
+                    .await;
+                if !close_d.settled() {
+                    // view-settlement gate (mirrors the Success arm).
+                    return Ok(());
+                }
                 // Budget: at max_attempts the job parks (durable
                 // park_until + the view), else it re-arms claimable.
                 let infra_count = self.count_materialization_rows_in_history(
@@ -1071,8 +1242,8 @@ impl DagActor {
         drv_hash: &DrvHash,
         charge_row: Option<crate::db::attempts::AttemptRow>,
         serving_generation: i64,
-    ) {
-        let result: Result<Option<bool>, sqlx::Error> = async {
+    ) -> WriteDisposition {
+        let result: Result<Option<(u64, bool)>, sqlx::Error> = async {
             let mut tx = match self.db.begin_fenced(serving_generation).await? {
                 crate::db::FencedBegin::Fenced { .. } => return Ok(None),
                 crate::db::FencedBegin::Open(ftx) => ftx,
@@ -1081,28 +1252,39 @@ impl DagActor {
             if let Some(row) = &charge_row {
                 inserted = crate::db::SchedulerDb::append_attempt(tx.conn(), row).await?;
             }
-            tx.close_assignment(exec_id, crate::db::AssignmentCloseStatus::Completed)
+            let closed = tx
+                .close_assignment(exec_id, crate::db::AssignmentCloseStatus::Completed)
                 .await?;
             tx.commit().await?;
-            Ok(Some(inserted))
+            Ok(Some((closed, inserted)))
         }
         .await;
         match result {
-            Ok(Some(inserted)) => {
+            Ok(Some((closed, inserted))) => {
                 if inserted && let Some(row) = charge_row {
                     if let Some(state) = self.dag.node_mut(drv_hash) {
                         state.push_attempt_record(row.to_record());
                     }
                     self.refresh_retry_view(drv_hash);
                 }
+                if closed > 0 {
+                    WriteDisposition::Applied
+                } else {
+                    // Already closed (idempotent re-report or a prior
+                    // settlement): the durable state is settled either
+                    // way — terminal-row-wins.
+                    WriteDisposition::AlreadyResolved
+                }
             }
             Ok(None) => {
                 self.note_fenced_evidence_write("materialization attempt close");
+                WriteDisposition::Fenced
             }
             Err(e) => {
                 warn!(drv_hash = %drv_hash, %exec_id, error = %e,
                       "materialization attempt close failed; the establishment sweep remains \
                        the backstop");
+                WriteDisposition::Failed
             }
         }
     }
@@ -1118,7 +1300,7 @@ impl DagActor {
         exec_id: Option<Uuid>,
         to_state: crate::state::JobState,
         serving_generation: i64,
-    ) -> bool {
+    ) -> WriteDisposition {
         match self
             .db
             .resolve_materialization_job_fenced(job_id, exec_id, to_state, serving_generation)
@@ -1145,7 +1327,11 @@ impl DagActor {
                 // resolution is a no-op when interest is still live.
                 self.release_materialization_pins_best_effort("job resolution")
                     .await;
-                rows > 0
+                if rows > 0 {
+                    WriteDisposition::Applied
+                } else {
+                    WriteDisposition::AlreadyResolved
+                }
             }
             Ok(crate::db::FencedOutcome::AlreadyResolved) => {
                 // Settled by an earlier resolution: not the at-most-once
@@ -1153,15 +1339,15 @@ impl DagActor {
                 // same self-scoping no-op-if-live call.
                 self.release_materialization_pins_best_effort("job resolution")
                     .await;
-                false
+                WriteDisposition::AlreadyResolved
             }
             Ok(crate::db::FencedOutcome::Fenced) => {
                 self.note_fenced_evidence_write("materialization job resolve");
-                false
+                WriteDisposition::Fenced
             }
             Err(e) => {
                 warn!(%job_id, error = %e, "materialization job resolve failed");
-                false
+                WriteDisposition::Failed
             }
         }
     }
@@ -1246,7 +1432,13 @@ impl DagActor {
         let cap = self.materialization_cfg.park_backoff_cap_secs;
         let exp = infra_count.saturating_sub(self.materialization_cfg.max_attempts);
         let backoff_secs = base.saturating_mul(2u64.saturating_pow(exp)).min(cap);
-        if let Some(job_id) = job_id {
+        // The view mutation gates on the durable park's disposition
+        // (sched.materialize.view-settlement): a deposed believer's
+        // refused park must not project a parked view over a durable
+        // row the successor owns. A view-only entry (no durable job
+        // row) has nothing to settle against — it parks in memory and
+        // the next consumption/cancel pass reconciles it.
+        let durable = if let Some(job_id) = job_id {
             let park_until_epoch = crate::db::attempts::epoch_now() + backoff_secs as f64;
             match self
                 .db
@@ -1256,14 +1448,22 @@ impl DagActor {
                 Ok(
                     crate::db::FencedOutcome::Applied(_)
                     | crate::db::FencedOutcome::AlreadyResolved,
-                ) => {}
+                ) => WriteDisposition::Applied,
                 Ok(crate::db::FencedOutcome::Fenced) => {
                     self.note_fenced_evidence_write("materialization job park");
+                    WriteDisposition::Fenced
                 }
-                Err(e) => warn!(%job_id, error = %e, "materialization job park failed"),
+                Err(e) => {
+                    warn!(%job_id, error = %e, "materialization job park failed");
+                    WriteDisposition::Failed
+                }
             }
-        }
-        if let Some(entry) = self.materialization_jobs.get_mut(drv_hash) {
+        } else {
+            WriteDisposition::Applied
+        };
+        if durable.settled()
+            && let Some(entry) = self.materialization_jobs.get_mut(drv_hash)
+        {
             entry.claimed_by = None;
             entry.parked_until =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs));
@@ -1354,13 +1554,22 @@ impl DagActor {
         row.attempt_kind = crate::state::AttemptKind::Materialization;
         row.source_node = attempt.source_node.clone();
         row.termination_reason = Some("unreported".into());
-        self.close_materialization_attempt(
-            attempt.exec_id,
-            &drv_hash,
-            Some(row),
-            serving_generation,
-        )
-        .await;
+        let close_d = self
+            .close_materialization_attempt(
+                attempt.exec_id,
+                &drv_hash,
+                Some(row),
+                serving_generation,
+            )
+            .await;
+        // The companions gate on the close disposition
+        // (sched.materialize.view-settlement): a deposed believer's
+        // fenced establishment performs NO rearm and NO requeue — the
+        // successor's own sweep owns this attempt now. A failed close
+        // re-runs next tick (the sweep is idempotent).
+        if !close_d.settled() {
+            return;
+        }
         // The claim is gone; the job stays pending (claimable again).
         self.rearm_materialization_job(&drv_hash, &executor).await;
         // The node returns to its dispatchable status.
@@ -1505,7 +1714,7 @@ impl DagActor {
             // stop excluding the node the moment the job row is
             // terminal.
             let serving_generation = self.serving_generation();
-            let applied = self
+            let d = self
                 .resolve_materialization_job(
                     job_id,
                     None,
@@ -1523,25 +1732,30 @@ impl DagActor {
             // RioSchedulerMaterializationConversions alert watches
             // their sustained rate. Applied-only (the at-most-once
             // edge), so a deposed leader's fenced resolve never counts.
-            if applied {
-                metrics::counter!(
-                    "rio_scheduler_materialization_converted_total",
-                    "origin" => origin_label
-                )
-                .increment(1);
+            // The view removal + every companion gate on the resolve
+            // disposition (sched.materialize.view-settlement): a Fenced
+            // or Failed resolve keeps the job parked — counted by the
+            // gauge below, re-evaluated next tick.
+            if self.materialization_jobs.remove_settled(&drv_hash, d) {
+                if d == WriteDisposition::Applied {
+                    metrics::counter!(
+                        "rio_scheduler_materialization_converted_total",
+                        "origin" => origin_label
+                    )
+                    .increment(1);
+                }
+                self.reassign_derivations(std::slice::from_ref(&drv_hash), None)
+                    .await;
+                still_parked -= 1;
+                tracing::info!(
+                    drv_hash = %drv_hash,
+                    %job_id,
+                    ?evidence,
+                    origin = origin_label,
+                    "parked materialization job re-evaluated: from-source is viable; \
+                     resolved from_source and requeued (PD-20)"
+                );
             }
-            self.materialization_jobs.remove(&drv_hash);
-            self.reassign_derivations(std::slice::from_ref(&drv_hash), None)
-                .await;
-            still_parked -= 1;
-            tracing::info!(
-                drv_hash = %drv_hash,
-                %job_id,
-                ?evidence,
-                origin = origin_label,
-                "parked materialization job re-evaluated: from-source is viable; \
-                 resolved from_source and requeued (PD-20)"
-            );
         }
         // The stalled gauge: ground truth after the re-evaluation pass.
         metrics::gauge!("rio_scheduler_materialization_stalled").set(still_parked as f64);
@@ -1579,35 +1793,62 @@ impl DagActor {
     }
 
     // r[impl sched.materialize.job+2]
+    // r[impl sched.materialize.view-settlement]
     /// Cancel the job for a derivation whose live interest dropped to
     /// zero, closing any open materialization attempt CHARGE-FREE (no
-    /// drv_attempts row at all) — BC-2's no-controller closer. The job
-    /// resolution is fenced and pending-only (terminal-row-wins).
+    /// drv_attempts row at all) — BC-2's no-controller closer. ONE
+    /// fenced transaction resolves the job AND closes the kind-guarded
+    /// assignments row, keyed entirely on durable state: the close is
+    /// TOTAL over the DAG-absent arm (its own trigger — the
+    /// `None => true` zero-interest filter — guarantees the node may
+    /// be gone, so no in-memory exec_id is ever read). The view
+    /// removal gates on the disposition; a Fenced/Failed cancel keeps
+    /// the entry and re-attempts next tick (level-triggered).
     pub(super) async fn cancel_materialization_for_zero_interest(&mut self, drv_hash: &DrvHash) {
         let Some(entry) = self.materialization_jobs.get(drv_hash) else {
             return;
         };
         let job_id = entry.job_id;
         let serving_generation = self.serving_generation();
-        // Close any open attempt charge-free (no charge row — a
-        // cancellation is not a failure; the budget is untouched).
-        if let Some(exec_id) = self.dag.node(drv_hash).and_then(|s| s.exec_id) {
-            self.close_materialization_attempt(exec_id, drv_hash, None, serving_generation)
+        let d = match self
+            .db
+            .cancel_job_and_close_attempt_fenced(job_id, serving_generation)
+            .await
+        {
+            Ok(crate::db::FencedOutcome::Applied(_)) => {
+                // The at-most-once edge: the same lifecycle counter the
+                // exec-keyed resolver increments (T-6.2).
+                metrics::counter!(
+                    "rio_scheduler_materialization_jobs_resolved_total",
+                    "outcome" => Self::resolution_outcome_label(crate::state::JobState::Cancelled)
+                )
+                .increment(1);
+                WriteDisposition::Applied
+            }
+            Ok(crate::db::FencedOutcome::AlreadyResolved) => WriteDisposition::AlreadyResolved,
+            Ok(crate::db::FencedOutcome::Fenced) => {
+                self.note_fenced_evidence_write("materialization job cancel");
+                WriteDisposition::Fenced
+            }
+            Err(e) => {
+                warn!(drv_hash = %drv_hash, %job_id, error = %e,
+                      "zero-interest materialization cancel failed; retried next tick");
+                WriteDisposition::Failed
+            }
+        };
+        if self.materialization_jobs.remove_settled(drv_hash, d) {
+            // r[impl sched.materialize.pinning]
+            // §5.3 release site: cancellation resolves the job, so its
+            // pins may be releasable (self-scoping no-op when live
+            // interest remains elsewhere).
+            self.release_materialization_pins_best_effort("job cancellation")
                 .await;
+            tracing::info!(
+                drv_hash = %drv_hash,
+                %job_id,
+                "materialization job cancelled: no live interested build remains \
+                 (attempt closed in the same fenced transaction)"
+            );
         }
-        // Cancel the job (fenced, pending-only).
-        self.resolve_materialization_job(
-            job_id,
-            None,
-            crate::state::JobState::Cancelled,
-            serving_generation,
-        )
-        .await;
-        self.materialization_jobs.remove(drv_hash);
-        tracing::info!(
-            drv_hash = %drv_hash,
-            %job_id,
-            "materialization job cancelled: no live interested build remains"
-        );
     }
 }

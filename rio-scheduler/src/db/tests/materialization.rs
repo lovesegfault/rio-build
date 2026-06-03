@@ -399,11 +399,15 @@ async fn parked_job_excluded_until_backoff_expires() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// (f) `cancel_materialization_jobs_for_derivation_fenced`: pending →
-/// cancelled (the zero-live-interest closer; Phase A: tests only).
+/// (f) `cancel_job_and_close_attempt_fenced`: pending → cancelled,
+/// open materialization-kind assignment closed in the SAME fenced
+/// transaction (the zero-live-interest closer, total over the
+/// DAG-absent arm), charge-free; idempotent re-entry answers
+/// `AlreadyResolved`.
 // r[verify sched.materialize.job+2]
+// r[verify sched.materialize.view-settlement]
 #[tokio::test]
-async fn job_cancellation_marks_cancelled() -> anyhow::Result<()> {
+async fn job_cancellation_marks_cancelled_and_closes_attempt() -> anyhow::Result<()> {
     let (test_db, db, drv) = setup("job-cancel-hash").await?;
 
     let created = db
@@ -413,9 +417,20 @@ async fn job_cancellation_marks_cancelled() -> anyhow::Result<()> {
         anyhow::bail!("create must apply");
     };
 
-    let cancelled = db
-        .cancel_materialization_jobs_for_derivation_fenced(drv, 1)
+    // Seed an open materialization-kind attempt for the derivation
+    // (assignment + drv_executions row carrying the kind).
+    let exec_id = uuid::Uuid::new_v4();
+    db.insert_assignment(drv, &crate::state::ExecutorId::from("store-0"), 1, exec_id)
         .await?;
+    sqlx::query(
+        "INSERT INTO drv_executions (exec_id, drv_hash, executor_id, started_at, attempt_kind) \
+         VALUES ($1, 'job-cancel-hash', 'store-0', now(), 'materialization')",
+    )
+    .bind(exec_id)
+    .execute(&test_db.pool)
+    .await?;
+
+    let cancelled = db.cancel_job_and_close_attempt_fenced(job_id, 1).await?;
     assert_eq!(
         cancelled,
         FencedOutcome::Applied(1),
@@ -430,12 +445,30 @@ async fn job_cancellation_marks_cancelled() -> anyhow::Result<()> {
     .await?;
     assert_eq!(state, "cancelled");
     assert!(resolved_at.is_some(), "cancellation stamps resolved_at");
-
-    // Cancelling again (nothing pending): no-op.
-    let again = db
-        .cancel_materialization_jobs_for_derivation_fenced(drv, 1)
+    let (a_status,): (String,) =
+        sqlx::query_as("SELECT status FROM assignments WHERE exec_id = $1")
+            .bind(exec_id)
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(
+        a_status, "cancelled",
+        "the open attempt closes in the same fenced transaction"
+    );
+    let (charges,): (i64,) = sqlx::query_as("SELECT count(*) FROM drv_attempts")
+        .fetch_one(&test_db.pool)
         .await?;
-    assert_eq!(again, FencedOutcome::Applied(0));
+    assert_eq!(charges, 0, "charge-free (BC-2)");
+
+    // Cancelling again (nothing pending): idempotent re-entry.
+    let again = db.cancel_job_and_close_attempt_fenced(job_id, 1).await?;
+    assert_eq!(again, FencedOutcome::AlreadyResolved);
+
+    // Below the floor: fenced.
+    sqlx::query("INSERT INTO leader_generation_claims (generation, holder_id) VALUES (5, 'succ')")
+        .execute(&test_db.pool)
+        .await?;
+    let fenced = db.cancel_job_and_close_attempt_fenced(job_id, 1).await?;
+    assert_eq!(fenced, FencedOutcome::Fenced);
     Ok(())
 }
 

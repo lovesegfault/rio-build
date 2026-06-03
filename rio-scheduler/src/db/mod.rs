@@ -500,11 +500,8 @@ pub enum FencedCommit {
 pub(crate) enum AssignmentCloseStatus {
     Completed,
     Failed,
-    // The designed close set includes Cancelled (the zero-interest
-    // cancel path's status); its constructor lands with the
-    // cancel_job_and_close_attempt_fenced writer. Allowed-dead until
-    // then so the closed enum ships whole.
-    #[allow(dead_code)]
+    /// The zero-interest cancel path's status
+    /// ([`SchedulerDb::cancel_job_and_close_attempt_fenced`]).
     Cancelled,
 }
 

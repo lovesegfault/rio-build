@@ -407,27 +407,58 @@ impl SchedulerDb {
         Ok(FencedOutcome::Applied(result.rows_affected()))
     }
 
-    /// Cancel every unresolved job for a derivation (the zero-live-
-    /// interest closer).
-    pub(crate) async fn cancel_materialization_jobs_for_derivation_fenced(
+    // r[impl sched.materialize.view-settlement]
+    /// The zero-live-interest closer (BC-2), job_id-keyed and TOTAL
+    /// over the DAG-absent arm: ONE fenced transaction (1) cancels the
+    /// pending job row and (2) closes its open materialization-kind
+    /// assignment — found through the durable
+    /// `drv_executions.attempt_kind` join, never an in-memory exec_id
+    /// (the node may be reaped; the post-failover view rebuild
+    /// presents exactly that shape). Charge-free by construction: no
+    /// `drv_attempts` row is written, and a closed assignment is
+    /// invisible to the establishment sweep — the leaked-attempt →
+    /// `materialization_infra` conversion is unreachable for cancelled
+    /// jobs. `Applied(n)` = the job row flipped pending→cancelled;
+    /// `AlreadyResolved` = it was already terminal (the attempt close
+    /// still ran — idempotent re-entry).
+    pub(crate) async fn cancel_job_and_close_attempt_fenced(
         &self,
-        derivation_id: Uuid,
+        job_id: Uuid,
         serving_generation: i64,
     ) -> Result<FencedOutcome, sqlx::Error> {
         let mut tx = match self.begin_fenced(serving_generation).await? {
             FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
             FencedBegin::Open(ftx) => ftx,
         };
-        let result = sqlx::query(
+        let cancelled = sqlx::query(
             "UPDATE materialization_jobs \
                 SET state = 'cancelled', resolved_at = now() \
-              WHERE derivation_id = $1 AND state = 'pending'",
+              WHERE job_id = $1 AND state = 'pending'",
         )
-        .bind(derivation_id)
+        .bind(job_id)
+        .execute(tx.conn())
+        .await?
+        .rows_affected();
+        sqlx::query(
+            "UPDATE assignments a \
+                SET status = $2, completed_at = now() \
+               FROM drv_executions e \
+              WHERE a.exec_id = e.exec_id \
+                AND e.attempt_kind = 'materialization' \
+                AND a.derivation_id = \
+                    (SELECT derivation_id FROM materialization_jobs WHERE job_id = $1) \
+                AND a.status IN ('pending', 'acknowledged')",
+        )
+        .bind(job_id)
+        .bind(super::AssignmentCloseStatus::Cancelled.as_str())
         .execute(tx.conn())
         .await?;
         tx.commit().await?;
-        Ok(FencedOutcome::Applied(result.rows_affected()))
+        Ok(if cancelled > 0 {
+            FencedOutcome::Applied(cancelled)
+        } else {
+            FencedOutcome::AlreadyResolved
+        })
     }
 
     /// The unresolved (pending) job for one derivation, if any — the

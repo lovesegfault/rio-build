@@ -6397,3 +6397,239 @@ async fn consumption_coverage_saturates_on_missing_relation_rows() -> TestResult
     );
     Ok(())
 }
+
+// ── A1 Layer 2: outcome-derived view settlement (133/276) ──────────────────
+//
+// The job-view is a droppable cache of the durable job table; a view
+// REMOVAL is only sound when the durable resolution SETTLED
+// (Applied/AlreadyResolved). A Fenced or Failed durable write keeping
+// the view entry is what makes the armed action level-triggered
+// instead of stranding the pending row invisibly.
+
+// r[verify sched.materialize.view-settlement]
+/// A deposed believer's zero-interest cancel is refused by the fence —
+/// and the view entry SURVIVES the refusal, so the cancel re-attempts
+/// every tick (level-triggered) instead of stranding the durable
+/// pending row behind an empty view (the 133 class).
+#[tokio::test]
+async fn fenced_resolve_keeps_view_entry_and_gates() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let out = test_store_path("matview-fence-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("matview-fence");
+    n.expected_output_paths = vec![out.clone()];
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM materialization_jobs WHERE state = 'pending'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(jobs, 1, "precondition: the probe partition created the job");
+
+    // The only interested build goes terminal (zero live interest)…
+    cancel_build(&handle, build_id).await?;
+    barrier(&handle).await;
+    // …then a successor claims generation 2: this actor is now a
+    // deposed believer (it never observes a lease transition).
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) VALUES (2, 'successor')",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let before = handle.debug_counters().await?.evidence_writes_fenced;
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let after_first = handle.debug_counters().await?.evidence_writes_fenced;
+    assert!(
+        after_first > before,
+        "the deposed cancel must be refused by the fence (counter {before} -> {after_first})"
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        state, "pending",
+        "the fenced cancel must leave the durable row pending"
+    );
+
+    // THE 133 OBSERVABLE: a second tick must RE-ATTEMPT the cancel
+    // (the view entry survived the Fenced disposition). Pre-fix the
+    // entry was removed unconditionally and the second tick finds
+    // nothing — the fenced counter freezes while the durable row
+    // stays pending forever (until recovery).
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let after_second = handle.debug_counters().await?.evidence_writes_fenced;
+    assert!(
+        after_second > after_first,
+        "the view entry must survive a Fenced resolution: tick 2 re-attempts the \
+         cancel ({after_first} -> {after_second}); a removed entry strands the \
+         durable pending row behind an empty view"
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        state, "pending",
+        "still pending — only a live leader settles it"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.view-settlement]
+/// The zero-interest cancel is TOTAL over the DAG-absent arm (276):
+/// after the sole-interest build's cleanup reaps the node, the cancel
+/// must still close the open materialization attempt — in the same
+/// fenced transaction as the job resolution, charge-free, with no
+/// in-memory exec_id read. Pre-fix the exec_id came from the (gone)
+/// DAG node, the attempt stayed open, and the establishment sweep
+/// later converted the leak into a materialization_infra charge.
+#[tokio::test]
+async fn zero_interest_cancel_closes_attempt_without_dag_node() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let out = test_store_path("matview-nonode-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("matview-nonode");
+    n.expected_output_paths = vec![out.clone()];
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+    let outcome = claim_materialization(&handle, "matview-nonode", "store-replica-0").await;
+    assert!(
+        matches!(outcome, Ok(PullOutcome::Deliver(_))),
+        "claim delivered, got {outcome:?}"
+    );
+
+    // Build terminal + cleanup: the sole-interest node is reaped from
+    // the DAG while the materialization attempt is still open.
+    cancel_build(&handle, build_id).await?;
+    barrier(&handle).await;
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle
+            .debug_query_derivation("matview-nonode")
+            .await?
+            .is_none(),
+        "precondition: the cancelled sole-interest node was reaped"
+    );
+    // Re-open the attempt row: the cancel transition's terminal
+    // persist fold (I-209) closed it alongside the node, but the
+    // node-absent + open-attempt state is exactly what a post-failover
+    // view rebuild presents (the job and its open attempt are durable;
+    // the reaped node is not). The zero-interest arm must be TOTAL
+    // over that state — the close may never key on the in-memory node
+    // its own trigger arm (`None => true`) guarantees absent.
+    let exec_id: Uuid = sqlx::query_scalar("SELECT exec_id FROM assignments LIMIT 1")
+        .fetch_one(&db.pool)
+        .await?;
+    sqlx::query(
+        "UPDATE assignments SET status = 'pending', completed_at = NULL WHERE exec_id = $1",
+    )
+    .bind(exec_id)
+    .execute(&db.pool)
+    .await?;
+
+    // The zero-interest tick: cancel the job AND close the attempt,
+    // node-absent, in one fenced transaction.
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let job_state: String = sqlx::query_scalar("SELECT state FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(job_state, "cancelled");
+    let open: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM assignments WHERE status IN ('pending', 'acknowledged')",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        open, 0,
+        "the open materialization attempt must be closed by the node-absent cancel"
+    );
+    let closed_status: String =
+        sqlx::query_scalar("SELECT status FROM assignments ORDER BY assigned_at DESC LIMIT 1")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        closed_status, "cancelled",
+        "closed BY the cancel (charge-free), not failed by a later sweep"
+    );
+
+    // No charge ever lands: zero rows now, and the establishment sweep
+    // has nothing to establish (the leaked-attempt path is unreachable
+    // for cancelled jobs).
+    let exec_id: Uuid = sqlx::query_scalar("SELECT exec_id FROM assignments LIMIT 1")
+        .fetch_one(&db.pool)
+        .await?;
+    sqlx::query(
+        "UPDATE assignments SET assigned_at = now() - interval '100 days' WHERE exec_id = $1",
+    )
+    .bind(exec_id)
+    .execute(&db.pool)
+    .await?;
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let charges: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_attempts")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        charges, 0,
+        "a cancelled job's closed attempt must never be establishment-charged"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.view-settlement]
+/// A deposed believer's establishment sweep: the close is fenced (no
+/// charge row) AND the companions gate on the close disposition — no
+/// rearm, no requeue. Pre-fix both ran unconditionally: a deposed
+/// actor rearmed the view and requeued the node it no longer owns.
+#[tokio::test]
+async fn deposed_establishment_performs_no_rearm_or_requeue() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let out = test_store_path("est-mat-fence-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("est-mat-fence");
+    n.expected_output_paths = vec![out];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    barrier(&handle).await;
+    let outcome = claim_materialization(&handle, "est-mat-fence", "store-replica-0").await;
+    let assignment = match outcome {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("expected Deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    let status_claimed = expect_drv(&handle, "est-mat-fence").await.status;
+
+    sqlx::query(
+        "UPDATE assignments SET assigned_at = now() - interval '100 days' WHERE exec_id = $1",
+    )
+    .bind(exec_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) VALUES (2, 'successor')",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_attempts")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(rows, 0, "the deposed establishment's charge must be fenced");
+    assert_eq!(
+        expect_drv(&handle, "est-mat-fence").await.status,
+        status_claimed,
+        "a deposed establishment must not requeue the node (the companion \
+         actions gate on the close disposition)"
+    );
+    Ok(())
+}

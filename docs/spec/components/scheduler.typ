@@ -1412,6 +1412,30 @@ faithfulness, all five materialization regimes) with the F10/B5(a)
 calibration pins as its falsifiability pair; production verification: the
 armed-action totality test and the failover VM scenario.
 
+#r("sched.materialize.view-settlement")[
+  The in-memory materialization job view is a droppable cache of the durable
+  job table, and every per-entry view REMOVAL MUST derive from the settled
+  disposition of the durable write it mirrors: a removal is authorized only
+  when the fenced resolution applied or was already applied
+  (Applied/AlreadyResolved); a Fenced or Failed durable write MUST keep the
+  view entry (a deposed believer mutates nothing it no longer owns; a failed
+  write's armed action stays level-triggered through the next tick). Every
+  companion action of a settlement --- requeue, completion batch, fail-fast,
+  re-arm, conversion accounting --- MUST gate on the same disposition. The
+  zero-interest cancellation MUST be total over the DAG-absent arm: it
+  resolves the job and closes its open materialization-kind attempt in one
+  fenced transaction keyed entirely on durable state, never on an in-memory
+  exec_id its own trigger arm guarantees may be absent.
+]
+The structural carrier is the `JobView` wrapper: `remove_settled` is the
+only per-entry removal in the type (whole-view `wipe`/`rebuild` belong to
+LeaderLost and recovery), so an unconditional removal does not typecheck ---
+the discipline is compile-borne, not reviewed-in. Model-level verification:
+`viewMatchesDurableUnresolved` and `chargeFreeCancellation`
+(materializationJob.qnt, the resolve-faults regime) with the
+mat-133-discarded-outcome / mat-276-dag-absent-cancel calibration pins as
+the falsifiability pair.
+
 #r("sched.materialize.conversion-strictness")[
   The parked-job re-evaluation MUST support two independently default-off
   strictness fields on the `[materialization]` config surface ---

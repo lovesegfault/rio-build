@@ -701,8 +701,15 @@ async fn spawn_intents_excludes_job_pending_nodes() -> TestResult {
          (coherent with the ClusterSnapshot bucket exclusion)"
     );
 
-    // The job resolves (view entry removed) → candidacy restored.
-    actor.materialization_jobs.remove("pd7-job-pending");
+    // The job resolves (a SETTLED durable disposition removes the
+    // view entry — the only removal path) → candidacy restored.
+    assert!(
+        actor.materialization_jobs.remove_settled(
+            "pd7-job-pending",
+            crate::actor::materialize::WriteDisposition::Applied,
+        ),
+        "settled removal of an existing entry"
+    );
     let snap = actor.compute_spawn_intents(&Default::default());
     assert_eq!(
         snap.intents.len(),

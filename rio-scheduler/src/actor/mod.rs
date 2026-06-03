@@ -277,7 +277,7 @@ pub struct DagActor {
     /// admission's job-view projection. Authority lives in PG
     /// (`materialization_jobs` + the partial-unique dedup index);
     /// recovery rebuild is Phase B.
-    materialization_jobs: HashMap<DrvHash, materialize::JobViewEntry>,
+    materialization_jobs: materialize::JobView,
     /// Database handle.
     db: SchedulerDb,
     /// Store service client for scheduler-side cache checks. `None` in tests
@@ -723,7 +723,7 @@ impl DagActor {
             poison_config: cfg.poison,
             establishment_report_slack: cfg.establishment_report_slack,
             materialization_cfg: cfg.materialization,
-            materialization_jobs: HashMap::new(),
+            materialization_jobs: materialize::JobView::default(),
             db,
             store_client: plumbing.store_client,
             grpc_timeout: cfg.grpc_timeout,
@@ -928,7 +928,7 @@ impl DagActor {
         // of PG rows; a new tenure rebuilds it from PG (Phase B) or
         // re-populates it from its own creation paths. Stale entries
         // would project job state for a DAG this wipe just discarded.
-        materialization_jobs.clear();
+        materialization_jobs.wipe();
         // The DAG this fn just emptied no longer reflects PG; only the
         // next successful recovery (handle_leader_acquired's Ok arm)
         // re-asserts authoritativeness. Clearing HERE covers all four
