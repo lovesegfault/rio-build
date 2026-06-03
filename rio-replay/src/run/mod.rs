@@ -3531,7 +3531,7 @@ pub async fn run_with_backends(
                     // fallback for prewarm misses.
                     let terminal = terminal_set(&*results.lock().await);
                     let dispatch_started_at_unix = jiff::Timestamp::now().as_second();
-                    let mut stats = run_timed_dispatch(
+                    let outcome = run_timed_dispatch(
                         state.clone(),
                         backends.submitter.clone(),
                         job_ledger.clone(),
@@ -3547,28 +3547,61 @@ pub async fn run_with_backends(
                     )
                     .await?;
                     let dispatch_ended_at_unix = jiff::Timestamp::now().as_second();
-                    // A pause/dispatch suspension window during execution
-                    // degrades timing fidelity exactly like the resume
-                    // re-anchoring the dispatcher itself reports. LEVEL-read
-                    // from the watchdog's window log, scoped to the
-                    // execution interval just captured: a wedge still open
-                    // right now never produced a close event yet must flag
-                    // (closing later, e.g. during the final collect pass,
-                    // cannot help — this is the only timed-stats.json
-                    // write); a window closed before dispatch began or
-                    // opened after this read is outside timed execution and
-                    // must not flag. The interval is stamped into the
-                    // artifact so the persisted bit stays auditable against
-                    // the suspension windows the report renders next to it.
-                    stats.dispatch_started_at_unix = Some(dispatch_started_at_unix);
-                    stats.dispatch_ended_at_unix = Some(dispatch_ended_at_unix);
-                    stats.timing_degraded = stats.timing_degraded
-                        || watchdog
-                            .lock()
-                            .await
-                            .suspension_summary()
-                            .degrades_timing(dispatch_started_at_unix, dispatch_ended_at_unix);
-                    state.write_json_atomic("timed-stats.json", &stats)?;
+                    // timed-stats.json is campaign-cumulative truth with a
+                    // per-run producer, so the write site decides
+                    // rewrite-vs-preserve: a re-entered dispatcher with
+                    // NOTHING pending (the post-drain tail — a crash after
+                    // the stats write, during collect/backfill/report)
+                    // dispatched nothing and re-anchored nothing, and its
+                    // zeroed per-run stats must not displace the faithful
+                    // artifact the draining process persisted — the
+                    // overwrite would zero a cadence-perfect campaign's
+                    // lateness/interruption numbers and (before the
+                    // dispatcher's bit was gated on re-anchoring) latch a
+                    // false sticky timing_degraded into campaign
+                    // comparability. No drain done-marker exists; the
+                    // artifact's own presence is the idempotence witness.
+                    let prior_stats: Option<TimedRunStats> = state.read_json("timed-stats.json")?;
+                    if outcome.pending == 0 && prior_stats.is_some() {
+                        tracing::info!(
+                            resume_count = outcome.stats.resume_count,
+                            "timed dispatcher re-entered with nothing pending; preserving \
+                             the prior run's timed-stats.json artifact"
+                        );
+                    } else {
+                        let mut stats = outcome.stats;
+                        // A pause/dispatch suspension window during execution
+                        // degrades timing fidelity exactly like the resume
+                        // re-anchoring the dispatcher itself reports. LEVEL-read
+                        // from the watchdog's window log, scoped to the
+                        // execution interval just captured: a wedge still open
+                        // right now never produced a close event yet must flag
+                        // (closing later, e.g. during the final collect pass,
+                        // cannot help — this is the only timed-stats.json
+                        // write); a window closed before dispatch began or
+                        // opened after this read is outside timed execution and
+                        // must not flag. The interval is stamped into the
+                        // artifact so the persisted bit stays auditable against
+                        // the suspension windows the report renders next to it.
+                        stats.dispatch_started_at_unix = Some(dispatch_started_at_unix);
+                        stats.dispatch_ended_at_unix = Some(dispatch_ended_at_unix);
+                        stats.timing_degraded = stats.timing_degraded
+                            // The one cell that writes WITHOUT pending work:
+                            // resumed, nothing pending, and no prior artifact
+                            // (a crash in the window between schedule drain
+                            // and the first stats write). The zeros here
+                            // describe none of the campaign's dispatches —
+                            // the prior process's lateness samples died with
+                            // it — so the artifact must disclose, not claim
+                            // fabricated 0ms percentiles as faithful cadence.
+                            || (outcome.resumed && outcome.pending == 0)
+                            || watchdog
+                                .lock()
+                                .await
+                                .suspension_summary()
+                                .degrades_timing(dispatch_started_at_unix, dispatch_ended_at_unix);
+                        state.write_json_atomic("timed-stats.json", &stats)?;
+                    }
                 }
             }
             // Final synchronous pass to catch the tail (and any requeues).
@@ -9792,6 +9825,115 @@ mod tests {
             agg.verdict_counts.values().sum::<usize>()
                 + agg.disposition_counts.values().sum::<usize>(),
             in_scope
+        );
+    }
+
+    /// A faithful timed-stats.json artifact survives a post-drain resume
+    /// UNFLAGGED: after a campaign drains and persists its stats, a
+    /// second process over the same state dir (the post-drain-crash
+    /// resume — collect/backfill/report died after the stats write) must
+    /// neither overwrite the artifact with the resuming process's zeroed
+    /// per-run stats nor latch `timing_degraded` into campaign
+    /// comparability. Both halves are load-bearing and ordered: the
+    /// write-site preserve keeps the dispatched/lateness numbers, and
+    /// the dispatcher's re-anchoring gate keeps the bit false — an
+    /// ungated bit with the preserve would flag a faithful artifact; a
+    /// gated bit without the preserve would present fabricated zero
+    /// percentiles as faithful. Resume == fresh on every artifact axis
+    /// asserted here.
+    #[tokio::test]
+    async fn timed_post_drain_resume_preserves_timed_stats_and_comparability() {
+        let archive_dir = tempfile::tempdir().unwrap();
+        let built = write_mini_timed_archive(archive_dir.path(), MiniTimedSpec::default());
+        let archive = Arc::new(ReplayArchive::open(archive_dir.path()).unwrap());
+        let manifest = load_units(&archive).unwrap();
+        let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let mut narinfos = HashMap::new();
+        narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
+
+        let submitter = Arc::new(KeyedSubmitter::default());
+        for m in &manifest {
+            submitter.outcomes.lock().unwrap().insert(
+                m.drv_path.clone(),
+                BatchOutcome {
+                    build_id: Some("0193e4a2-7c1b-7d20-9b3a-00000000abcd".into()),
+                    results: vec![PathOutcome {
+                        drv_path: m.drv_path.clone(),
+                        status: build_status_name(BuildStatus::Built).into(),
+                        error_msg: String::new(),
+                        start_time: 0,
+                        stop_time: 0,
+                    }],
+                    ..BatchOutcome::default()
+                },
+            );
+        }
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let mut spec = leaf_spec(&built.archive_id);
+        spec.scheduling.mode = ScheduleMode::Timed;
+        spec.knobs.speedup = 1000.0;
+        let backends = || Backends {
+            store: Arc::new(FakeStoreApi::default()),
+            admin: Arc::new(NoLogsAdmin),
+            cluster: Arc::new(HealthyCluster),
+            submitter: submitter.clone(),
+            supply_transport: Some(Arc::new(FakeSupplyTransport::default())),
+            narinfo: Some(Arc::new(MapNarinfo(narinfos.clone()))),
+            artifacts: None,
+        };
+        run_with_backends(
+            run_args(state_dir.path()),
+            spec.clone(),
+            StateDir::new(state_dir.path()).unwrap(),
+            archive.clone(),
+            backends(),
+        )
+        .await
+        .unwrap();
+
+        let state = StateDir::new(state_dir.path()).unwrap();
+        let first: timeline::TimedRunStats = state
+            .read_json("timed-stats.json")
+            .unwrap()
+            .expect("first run writes the artifact");
+        assert_eq!(first.dispatched, 2);
+        assert!(!first.timing_degraded);
+
+        // Resume over the same state dir: everything is terminal, the
+        // dispatcher re-enters with nothing pending.
+        run_with_backends(
+            run_args(state_dir.path()),
+            spec,
+            StateDir::new(state_dir.path()).unwrap(),
+            archive,
+            backends(),
+        )
+        .await
+        .unwrap();
+
+        let resumed: timeline::TimedRunStats = state
+            .read_json("timed-stats.json")
+            .unwrap()
+            .expect("the artifact survives the resume");
+        assert_eq!(
+            resumed, first,
+            "a post-drain resume must preserve the faithful artifact verbatim — \
+             not replace it with the resuming process's zeroed per-run stats"
+        );
+        assert!(!resumed.timing_degraded);
+        // The sticky comparability surface stays clean too: no
+        // timing_degraded bit, no low-confidence flag.
+        let campaign: CampaignRecord = state.read_json("campaign.json").unwrap().unwrap();
+        assert!(!campaign.comparability.timing_degraded);
+        assert!(
+            !campaign
+                .comparability
+                .low_confidence
+                .iter()
+                .any(|flag| flag == report::FLAG_TIMING_DEGRADED),
+            "{:?}",
+            campaign.comparability.low_confidence
         );
     }
 

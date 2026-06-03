@@ -713,6 +713,29 @@ pub struct TimedRunStats {
     pub dispatch_ended_at_unix: Option<i64>,
 }
 
+/// What one timed dispatcher run reports back to the run loop: the
+/// aggregated per-run statistics plus the resume facts the
+/// timed-stats.json write site keys its rewrite-or-preserve decision on.
+/// `pending`/`resumed` are deliberately NOT serialized fields of
+/// [`TimedRunStats`] — they describe THIS process's entry conditions,
+/// not the campaign artifact.
+pub struct TimedDispatchOutcome {
+    /// The per-run statistics (this process's dispatches only — per-run
+    /// scoping is the documented resume design, disclosed via
+    /// `resume_count` and the degradation flag).
+    pub stats: TimedRunStats,
+    /// Schedule entries this run actually had left to dispatch (not
+    /// already settled by a prior run). Zero means the dispatcher was
+    /// re-entered after a fully drained schedule — it re-anchored
+    /// nothing and dispatched nothing, so its zeroed stats describe no
+    /// campaign work and must not displace a faithful artifact a prior
+    /// process persisted.
+    pub pending: usize,
+    /// Prior dispatch.jsonl entries existed (a previous dispatcher run
+    /// happened in this campaign).
+    pub resumed: bool,
+}
+
 /// Everything the per-request dispatch tasks share; cloned once per task
 /// behind an [`Arc`].
 struct DispatchShared {
@@ -782,13 +805,23 @@ fn engine_side_submission_failure(record: &BatchRecord) -> bool {
 /// Resume semantics: requests whose every target is already settled are
 /// skipped — counted into `resume_count` when a prior dispatch.jsonl entry
 /// shows they were dispatched before — and, when any prior dispatch entry
-/// exists, the pending schedule is re-anchored so the first pending request
-/// fires immediately and `timing_degraded` is set. A mapped target is
-/// settled when its job is terminal (per `terminal_jobs`); a target without
-/// a unit mapping can never get a terminal record (collect has no job
-/// context for it), so it is settled once a prior run actually submitted
-/// the request — the same drv-path job key the dispatch bookkeeping uses,
-/// judged by the only evidence that key can ever leave.
+/// exists AND requests are still pending, the pending schedule is
+/// re-anchored so the first pending request fires immediately and
+/// `timing_degraded` is set. The degradation bit is gated on actual
+/// re-anchoring (`resumed && pending > 0`), per its own contract
+/// (`spec::ComparabilityBlock::timing_degraded`: re-anchoring or a
+/// suspension window — nothing else): a resume that finds everything
+/// already settled re-anchors nothing and dispatches nothing, so flagging
+/// it would stamp a false sticky degradation onto a cadence-faithful
+/// campaign whose only sin was a post-drain crash. The
+/// rewrite-or-preserve decision for the persisted artifact belongs to the
+/// run loop's single write site, which gets `pending`/`resumed` on the
+/// returned [`TimedDispatchOutcome`]. A mapped target is settled when its
+/// job is terminal (per `terminal_jobs`); a target without a unit mapping
+/// can never get a terminal record (collect has no job context for it),
+/// so it is settled once a prior run actually submitted the request — the
+/// same drv-path job key the dispatch bookkeeping uses, judged by the
+/// only evidence that key can ever leave.
 ///
 /// The campaign deadline stops new dispatches only: a request whose sleep
 /// completes after `deadline_reached()` is recorded with `attempts: 0` and
@@ -811,7 +844,7 @@ pub async fn run_timed_dispatch(
     deadline_reached: impl Fn() -> bool + Send + Sync + Clone + 'static,
     topup: Option<Arc<dyn PreSubmitSupply>>,
     terminal_jobs: Arc<tokio::sync::Mutex<HashSet<String>>>,
-) -> Result<TimedRunStats> {
+) -> Result<TimedDispatchOutcome> {
     let requests_total = schedule.len();
 
     // ── Resume ──────────────────────────────────────────────────────────
@@ -928,23 +961,35 @@ pub async fn run_timed_dispatch(
         submission_failures,
         "timed dispatch drained"
     );
-    Ok(TimedRunStats {
-        requests_total,
-        dispatched,
-        max_dispatch_lateness_ms,
-        lateness_p50_ms,
-        lateness_p95_ms,
-        interruptions_replayed,
-        interruptions_not_reproduced,
-        submission_failures,
-        resume_count,
-        timing_degraded: resumed,
-        // The execution-interval stamps and the suspension-overlap half of
-        // `timing_degraded` belong to the run loop's write site — the only
-        // place timed-stats.json is persisted, with the watchdog handle in
-        // scope; the dispatcher itself reports resume re-anchoring only.
-        dispatch_started_at_unix: None,
-        dispatch_ended_at_unix: None,
+    Ok(TimedDispatchOutcome {
+        stats: TimedRunStats {
+            requests_total,
+            dispatched,
+            max_dispatch_lateness_ms,
+            lateness_p50_ms,
+            lateness_p95_ms,
+            interruptions_replayed,
+            interruptions_not_reproduced,
+            submission_failures,
+            resume_count,
+            // Gated on actual re-anchoring, per the bit's contract: a
+            // resumed dispatcher with nothing pending re-anchored nothing
+            // (`re_anchor_pending` no-ops on an empty pending set) and
+            // dispatched nothing, so the recorded cadence was not
+            // disturbed by THIS process. The run loop must pair this gate
+            // with the rewrite-skip at the write site — an ungated
+            // overwrite of a faithful artifact with this run's zeros
+            // would present fabricated 0ms percentiles as faithful.
+            timing_degraded: resumed && pending > 0,
+            // The execution-interval stamps and the suspension-overlap half of
+            // `timing_degraded` belong to the run loop's write site — the only
+            // place timed-stats.json is persisted, with the watchdog handle in
+            // scope; the dispatcher itself reports resume re-anchoring only.
+            dispatch_started_at_unix: None,
+            dispatch_ended_at_unix: None,
+        },
+        pending,
+        resumed,
     })
 }
 
@@ -2165,15 +2210,17 @@ mod tests {
     }
 
     /// Run the dispatcher with test defaults: no top-up, no deadline, a
-    /// fresh ledger, and batch ids starting at 1.
-    async fn drive_dispatch(
+    /// fresh ledger, and batch ids starting at 1. Returns the full
+    /// outcome; most tests read `.stats`, the resume tests also assert
+    /// the `pending`/`resumed` facts the write site keys on.
+    async fn drive_dispatch_outcome(
         state: &Arc<StateDir>,
         submitter: Arc<dyn Submitter>,
         schedule: Vec<ScheduledRequest>,
         timing: SharedTimingLookup,
         config: TimelineConfig,
         terminal: HashSet<String>,
-    ) -> TimedRunStats {
+    ) -> TimedDispatchOutcome {
         run_timed_dispatch(
             state.clone(),
             submitter,
@@ -2190,6 +2237,20 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// [`drive_dispatch_outcome`], stats only.
+    async fn drive_dispatch(
+        state: &Arc<StateDir>,
+        submitter: Arc<dyn Submitter>,
+        schedule: Vec<ScheduledRequest>,
+        timing: SharedTimingLookup,
+        config: TimelineConfig,
+        terminal: HashSet<String>,
+    ) -> TimedRunStats {
+        drive_dispatch_outcome(state, submitter, schedule, timing, config, terminal)
+            .await
+            .stats
     }
 
     /// Run the production collect classification over one settled timed
@@ -2440,7 +2501,8 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .stats;
 
         // One top-up call per request, carrying that request's roots, and
         // each happened before the request's own submission: the first saw
@@ -2967,7 +3029,8 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .stats;
 
         // The submitter was called 6s after admission (the top-up), and the
         // deadline it received still fires 10s after ADMISSION — only 4s
@@ -3146,6 +3209,79 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].request_index, 1);
         assert_eq!(entries[1].attempts, 1);
+    }
+
+    /// The other side of the degradation bit's re-anchoring conjunct
+    /// (`resumed && pending > 0`): a resume that finds EVERY request
+    /// already settled — the post-drain tail, where a prior process
+    /// drained the schedule and crashed during collect/backfill/report —
+    /// re-anchors nothing, dispatches nothing, and must NOT flag
+    /// `timing_degraded`. The bit's contract
+    /// (`spec::ComparabilityBlock::timing_degraded`) names re-anchoring
+    /// and suspension windows only; flagging a no-op re-entry would
+    /// stamp a false sticky degradation onto a cadence-faithful
+    /// campaign. The outcome's `pending == 0` is what the run loop's
+    /// write site keys the artifact-preserve decision on, so it is
+    /// pinned here alongside the bit.
+    #[tokio::test(start_paused = true)]
+    async fn timed_post_drain_resume_with_nothing_pending_stays_unflagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        let requests = vec![request(1, 0.0, DRV_A), request(2, 300.0, DRV_B)];
+        let jobs = BTreeMap::from([
+            (DRV_A.to_string(), "a".to_string()),
+            (DRV_B.to_string(), "b".to_string()),
+        ]);
+        let schedule = build_schedule(
+            &requests,
+            &no_timing,
+            &jobs_in(&jobs),
+            &all_workload,
+            1.0,
+            None,
+            true,
+        );
+        // Both requests were dispatched and settled by the prior process.
+        for (job, drv, index) in [("a", DRV_A, 0usize), ("b", DRV_B, 1usize)] {
+            state
+                .append_jsonl(StateFile::Results, &terminal_job_record(job, drv))
+                .unwrap();
+            state
+                .append_jsonl(StateFile::Dispatch, &prior_dispatch_entry(index, 1, drv))
+                .unwrap();
+        }
+
+        let submitter = Arc::new(InstrumentedSubmitter::new(
+            FakeSubmitter::default(),
+            Duration::ZERO,
+        ));
+        let outcome = drive_dispatch_outcome(
+            &state,
+            submitter.clone(),
+            schedule,
+            timing_arc(HashMap::new()),
+            TimelineConfig::from_knobs(&Knobs::default()),
+            ["a".to_string(), "b".to_string()].into_iter().collect(),
+        )
+        .await;
+
+        assert!(
+            submitter.calls.lock().unwrap().is_empty(),
+            "nothing pending"
+        );
+        assert!(outcome.resumed);
+        assert_eq!(outcome.pending, 0);
+        assert_eq!(outcome.stats.resume_count, 2);
+        assert_eq!(outcome.stats.dispatched, 0);
+        assert!(
+            !outcome.stats.timing_degraded,
+            "a no-op re-entry re-anchored nothing and must not claim degradation"
+        );
+        // No new dispatch entries: the journal still describes the prior
+        // process's dispatches, which is exactly why the write site must
+        // not let this run's zeroed stats displace the prior artifact.
+        let entries: Vec<DispatchEntry> = state.load_jsonl(StateFile::Dispatch).unwrap();
+        assert_eq!(entries.len(), 2);
     }
 
     /// timed-stats.json is a persisted, S3-synced artifact a resumed
