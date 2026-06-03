@@ -1709,6 +1709,8 @@ mod tests {
             submission_failures: 1,
             resume_count: 1,
             timing_degraded: true,
+            dispatch_started_at_unix: Some(1_700_000_000),
+            dispatch_ended_at_unix: Some(1_700_003_600),
         };
         let suspension = SuspensionSummary::default();
         let input = ReportInput {

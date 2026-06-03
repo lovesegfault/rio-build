@@ -84,9 +84,7 @@ use self::timeline::{
     TimedRunStats, TimelineConfig, build_schedule, run_timed_dispatch,
 };
 use self::truth::NarinfoSource;
-use self::watchdog::{
-    COMPONENT_DISPATCH, COMPONENT_PAUSE, IcePoll, PollTick, StallKind, StallVerdict, Watchdog,
-};
+use self::watchdog::{IcePoll, PollTick, StallKind, StallVerdict, Watchdog};
 
 /// CLI arguments for `rio-replay run`.
 #[derive(Debug, Args)]
@@ -2932,12 +2930,13 @@ pub async fn run_with_backends(
     let pause = Arc::new(PauseState::default());
     // Timed-mode pause semantics: the poller never gates dispatch on
     // backpressure, it only latches an abort recommendation (infra-failure
-    // rate) and a timing-degraded flag (a pause/dispatch suspension window
-    // closed while the schedule was executing). Both are written by the
-    // poller and read when the timed run statistics are assembled; they stay
-    // false for timeless campaigns.
+    // rate), read when the timed run statistics are assembled; it stays
+    // false for timeless campaigns. Timing degradation is deliberately NOT
+    // a poller-side latch: the timed drain arm level-reads the watchdog's
+    // suspension-window log when it persists the statistics, so a
+    // pause/dispatch window still open at schedule drain — which never
+    // produces a window-close event — counts all the same.
     let abort_recommended = Arc::new(AtomicBool::new(false));
-    let timing_degraded = Arc::new(AtomicBool::new(false));
     let results = Arc::new(tokio::sync::Mutex::new(latest_per_job(
         state.load_jsonl(StateFile::Results)?,
     )));
@@ -2994,7 +2993,6 @@ pub async fn run_with_backends(
         let mode = spec.mode.as_str().to_string();
         let schedule_mode = spec.scheduling.mode;
         let abort_recommended = abort_recommended.clone();
-        let timing_degraded = timing_degraded.clone();
         let supply_for_progress = supply_summary.clone();
         let recorder_excluded_for_progress = recorder_excluded.clone();
         let processed = processed.clone();
@@ -3242,19 +3240,6 @@ pub async fn run_with_backends(
                             }
                         }
                     }
-                }
-                // A pause or dispatch-gap suspension window that closed while
-                // the timed schedule was executing means recorded cadence was
-                // not honored for its duration: the timing-fidelity numbers
-                // are degraded.
-                if schedule_mode == ScheduleMode::Timed
-                    && let Some(window) = &outcome.closed_window
-                    && window
-                        .components
-                        .iter()
-                        .any(|c| c == COMPONENT_PAUSE || c == COMPONENT_DISPATCH)
-                {
-                    timing_degraded.store(true, Ordering::SeqCst);
                 }
                 // Heartbeat: one info! line on a fixed cadence so a long but
                 // healthy quiet stretch is distinguishable from a wedge.
@@ -3534,6 +3519,7 @@ pub async fn run_with_backends(
                     // every request a pre-submission gap top-up — the inline
                     // fallback for prewarm misses.
                     let terminal = terminal_set(&*results.lock().await);
+                    let dispatch_started_at_unix = jiff::Timestamp::now().as_second();
                     let mut stats = run_timed_dispatch(
                         state.clone(),
                         backends.submitter.clone(),
@@ -3549,11 +3535,28 @@ pub async fn run_with_backends(
                         Arc::new(tokio::sync::Mutex::new(terminal)),
                     )
                     .await?;
+                    let dispatch_ended_at_unix = jiff::Timestamp::now().as_second();
                     // A pause/dispatch suspension window during execution
-                    // degrades timing fidelity exactly like a resume does;
-                    // the persisted statistics feed the report.
-                    stats.timing_degraded =
-                        stats.timing_degraded || timing_degraded.load(Ordering::SeqCst);
+                    // degrades timing fidelity exactly like the resume
+                    // re-anchoring the dispatcher itself reports. LEVEL-read
+                    // from the watchdog's window log, scoped to the
+                    // execution interval just captured: a wedge still open
+                    // right now never produced a close event yet must flag
+                    // (closing later, e.g. during the final collect pass,
+                    // cannot help — this is the only timed-stats.json
+                    // write); a window closed before dispatch began or
+                    // opened after this read is outside timed execution and
+                    // must not flag. The interval is stamped into the
+                    // artifact so the persisted bit stays auditable against
+                    // the suspension windows the report renders next to it.
+                    stats.dispatch_started_at_unix = Some(dispatch_started_at_unix);
+                    stats.dispatch_ended_at_unix = Some(dispatch_ended_at_unix);
+                    stats.timing_degraded = stats.timing_degraded
+                        || watchdog
+                            .lock()
+                            .await
+                            .suspension_summary()
+                            .degrades_timing(dispatch_started_at_unix, dispatch_ended_at_unix);
                     state.write_json_atomic("timed-stats.json", &stats)?;
                 }
             }
@@ -4590,6 +4593,54 @@ mod tests {
                 .get(&batch.root_drvs[0])
                 .cloned()
                 .unwrap_or_default())
+        }
+    }
+
+    /// [`HealthyCluster`] counts plus a shared poll counter, for tests
+    /// that must order poller progress against the dispatch path.
+    struct CountingCluster(Arc<AtomicU64>);
+
+    #[async_trait]
+    impl ClusterApi for CountingCluster {
+        async fn cluster_status(&self) -> Result<ClusterCounts> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ClusterCounts {
+                active_executors: 2,
+                queued_derivations: 1,
+                running_derivations: 1,
+                substituting_derivations: 0,
+            })
+        }
+        async fn spawn_intents(&self) -> Result<IceSnapshot> {
+            Ok(IceSnapshot::default())
+        }
+    }
+
+    /// [`KeyedSubmitter`] behind a gate that releases no submission until
+    /// the watchdog poller has STARTED its second tick, observed through a
+    /// [`CountingCluster`]'s shared counter. The poller loop is
+    /// sequential, so the second `cluster_status` call proves the first
+    /// tick — `Watchdog::on_tick` included — completed, and any suspension
+    /// window that tick opened is in the watchdog's log strictly before
+    /// any request can settle. Tests ordering "window observed" before
+    /// "schedule drains" wait here instead of sleeping.
+    struct TickGatedSubmitter {
+        inner: KeyedSubmitter,
+        cluster_polls: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl Submitter for TickGatedSubmitter {
+        async fn submit_batch(
+            &self,
+            store_url: &str,
+            batch: &batch::Batch,
+            deadline: submitter::BatchDeadline,
+        ) -> Result<BatchOutcome> {
+            while self.cluster_polls.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            self.inner.submit_batch(store_url, batch, deadline).await
         }
     }
 
@@ -9431,7 +9482,17 @@ mod tests {
         assert_eq!(stats.dispatched, 2);
         assert_eq!(stats.interruptions_replayed, 1);
         assert_eq!(stats.submission_failures, 0);
+        // No suspension window and no resume: the degradation bit stays
+        // false, and the execution interval it was judged over is stamped
+        // for the audit trail regardless of the verdict.
         assert!(!stats.timing_degraded);
+        let started = stats
+            .dispatch_started_at_unix
+            .expect("the write site stamps the execution interval");
+        let ended = stats
+            .dispatch_ended_at_unix
+            .expect("the write site stamps the execution interval");
+        assert!(started <= ended, "{stats:?}");
         // The final progress document carries the supply and timed summary
         // blocks (with the upload-throughput field present even when the
         // fake transport uploaded nothing) and the abort recommendation.
@@ -9454,6 +9515,20 @@ mod tests {
         assert!(
             plan_counts.contains_key(PLAN_COUNT_RSS_PEAK),
             "{plan_counts:?}"
+        );
+        // Negative direction of the timing-degradation contract: an
+        // undegraded run must NOT carry the bit or its low-confidence
+        // flag — flagging a faithful run discards its comparability for
+        // nothing.
+        assert!(!campaign.comparability.timing_degraded);
+        assert!(
+            !campaign
+                .comparability
+                .low_confidence
+                .iter()
+                .any(|flag| flag == report::FLAG_TIMING_DEGRADED),
+            "{:?}",
+            campaign.comparability.low_confidence
         );
         let summary = std::fs::read_to_string(state.path("report/summary.md")).unwrap();
         assert!(summary.contains("Build-outcome parity"));
@@ -9569,6 +9644,151 @@ mod tests {
             !summary.to_lowercase().contains("partial"),
             "the ordinary timed exit must not be marked partial: {summary}"
         );
+    }
+
+    /// An operator PAUSE held from before dispatch until past schedule
+    /// drain — the wedge-spanning-drain shape — must surface as
+    /// `timing_degraded` in timed-stats.json and as the `timing-degraded`
+    /// low-confidence flag, per the comparability contract
+    /// (`spec::ComparabilityBlock::timing_degraded`: "a pause/dispatch
+    /// suspension window during timed execution") and the design rule
+    /// that the engine never silently warps the clock. The suspension
+    /// window never CLOSES here (the final progress.json pins it still
+    /// open), so the bit can only come from a level read of the
+    /// watchdog's window log at drain — a close-event latch reports
+    /// nothing for this run and falsely claims undegraded cadence.
+    ///
+    /// Determinism: the PAUSE file pre-exists the run and is never
+    /// removed, so the poller's FIRST tick opens the pause window; the
+    /// gated submitter releases no submission until the poller's second
+    /// tick proves that window is in the log. The window is therefore
+    /// open with `started_at_unix` before every settlement, and still
+    /// open when the drain-time read happens — no sleep-and-hope timing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timed_pause_held_past_drain_flags_timing_degraded() {
+        let archive_dir = tempfile::tempdir().unwrap();
+        let built = write_mini_timed_archive(archive_dir.path(), MiniTimedSpec::default());
+        let archive = Arc::new(ReplayArchive::open(archive_dir.path()).unwrap());
+        let manifest = load_units(&archive).unwrap();
+        let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let mut narinfos = HashMap::new();
+        narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
+
+        // Both recorded requests settle Built in band, but only after the
+        // poller has demonstrably observed the pause window.
+        let cluster_polls = Arc::new(AtomicU64::new(0));
+        let inner = KeyedSubmitter::default();
+        for m in &manifest {
+            inner.outcomes.lock().unwrap().insert(
+                m.drv_path.clone(),
+                BatchOutcome {
+                    results: vec![PathOutcome {
+                        drv_path: m.drv_path.clone(),
+                        status: build_status_name(BuildStatus::Built).into(),
+                        error_msg: String::new(),
+                        start_time: 0,
+                        stop_time: 0,
+                    }],
+                    ..BatchOutcome::default()
+                },
+            );
+        }
+        let submitter = Arc::new(TickGatedSubmitter {
+            inner,
+            cluster_polls: cluster_polls.clone(),
+        });
+
+        let state_dir = tempfile::tempdir().unwrap();
+        // The operator pause: present before the run starts, never
+        // removed. In timed mode the dispatcher fires through it (pause
+        // is advisory), which is exactly why the report must disclose it.
+        std::fs::write(state_dir.path().join("PAUSE"), b"operator hold\n").unwrap();
+        let mut spec = leaf_spec(&built.archive_id);
+        spec.scheduling.mode = ScheduleMode::Timed;
+        spec.knobs.speedup = 1000.0;
+        let backends = Backends {
+            store: Arc::new(FakeStoreApi::default()),
+            admin: Arc::new(NoLogsAdmin),
+            cluster: Arc::new(CountingCluster(cluster_polls.clone())),
+            submitter,
+            supply_transport: Some(Arc::new(FakeSupplyTransport::default())),
+            narinfo: Some(Arc::new(MapNarinfo(narinfos))),
+            artifacts: None,
+        };
+        run_with_backends(
+            run_args(state_dir.path()),
+            spec,
+            StateDir::new(state_dir.path()).unwrap(),
+            archive,
+            backends,
+        )
+        .await
+        .unwrap();
+
+        let state = StateDir::new(state_dir.path()).unwrap();
+        // The dispatcher ran normally: both requests dispatched and built.
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(
+            records["appA.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+        let stats: timeline::TimedRunStats = state
+            .read_json("timed-stats.json")
+            .unwrap()
+            .expect("timed-stats.json written by the timed arm");
+        assert_eq!(stats.dispatched, 2);
+        // The persisted statistics carry the degradation bit AND the
+        // execution interval it was derived over.
+        assert!(
+            stats.timing_degraded,
+            "a pause window open across the whole execution must degrade timing: {stats:?}"
+        );
+        let started = stats
+            .dispatch_started_at_unix
+            .expect("the write site stamps the execution interval");
+        let ended = stats
+            .dispatch_ended_at_unix
+            .expect("the write site stamps the execution interval");
+        assert!(started <= ended, "{stats:?}");
+        // The window that justified the bit is STILL OPEN in the final
+        // suspension summary: no close event ever fired, so an
+        // edge-triggered latch could not have set the bit — this pins the
+        // level read.
+        let progress: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(state.path("progress.json")).unwrap())
+                .unwrap();
+        let windows = progress["suspension"]["windows"]
+            .as_array()
+            .expect("suspension windows rendered");
+        assert_eq!(windows.len(), 1, "{progress}");
+        assert!(
+            windows[0]["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == "pause"),
+            "{progress}"
+        );
+        assert!(
+            windows[0]["endedAtUnix"].is_null(),
+            "the pause window must still be open at report time: {progress}"
+        );
+        assert_eq!(progress["timed"]["timingDegraded"], true, "{progress}");
+        // The comparability block and its low-confidence flag follow the
+        // persisted bit into campaign.json and the rendered summary.
+        let campaign: CampaignRecord = state.read_json("campaign.json").unwrap().unwrap();
+        assert!(campaign.comparability.timing_degraded);
+        assert!(
+            campaign
+                .comparability
+                .low_confidence
+                .iter()
+                .any(|flag| flag == report::FLAG_TIMING_DEGRADED),
+            "{:?}",
+            campaign.comparability.low_confidence
+        );
+        let summary = std::fs::read_to_string(state.path("report/summary.md")).unwrap();
+        assert!(summary.contains("| timing degraded | true |"), "{summary}");
     }
 
     /// Transport-error path end to end: the first submission fails

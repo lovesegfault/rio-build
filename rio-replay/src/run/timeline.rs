@@ -694,8 +694,23 @@ pub struct TimedRunStats {
     pub resume_count: usize,
     /// True when this run resumed a previous timed run, so the recorded
     /// cadence was re-anchored and the timing-fidelity numbers are
-    /// low-confidence.
+    /// low-confidence — or when a pause/dispatch suspension window
+    /// overlapped the execution interval below (derived by the run loop
+    /// from the watchdog's window log when it persists these statistics).
     pub timing_degraded: bool,
+    /// Unix second the run loop handed the schedule to the dispatcher.
+    /// With `dispatch_ended_at_unix` this is the execution interval the
+    /// suspension-overlap derivation of `timing_degraded` is scoped to,
+    /// persisted so the bit can be audited against the suspension windows
+    /// rendered next to it in the report. Stamped at the single
+    /// `timed-stats.json` write site (the run loop's timed drain arm);
+    /// `None` only on artifacts written before the field existed.
+    #[serde(default)]
+    pub dispatch_started_at_unix: Option<i64>,
+    /// Unix second the dispatcher returned with the schedule drained —
+    /// see `dispatch_started_at_unix`.
+    #[serde(default)]
+    pub dispatch_ended_at_unix: Option<i64>,
 }
 
 /// Everything the per-request dispatch tasks share; cloned once per task
@@ -924,6 +939,12 @@ pub async fn run_timed_dispatch(
         submission_failures,
         resume_count,
         timing_degraded: resumed,
+        // The execution-interval stamps and the suspension-overlap half of
+        // `timing_degraded` belong to the run loop's write site — the only
+        // place timed-stats.json is persisted, with the watchdog handle in
+        // scope; the dispatcher itself reports resume re-anchoring only.
+        dispatch_started_at_unix: None,
+        dispatch_ended_at_unix: None,
     })
 }
 
@@ -2972,6 +2993,46 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].request_index, 1);
         assert_eq!(entries[1].attempts, 1);
+    }
+
+    /// timed-stats.json is a persisted, S3-synced artifact a resumed
+    /// campaign re-reads (run/mod.rs assembles the final report from it),
+    /// so artifacts written before a field existed must keep
+    /// deserializing. The era fixture is built through the CURRENT
+    /// producer's serialization chain (struct → serde camelCase) minus
+    /// exactly the keys that era did not write — never a hand-typed JSON
+    /// string that could drift from the real wire names.
+    #[test]
+    fn timed_stats_artifacts_from_before_newer_fields_deserialize() {
+        let modern = TimedRunStats {
+            requests_total: 2,
+            dispatched: 2,
+            max_dispatch_lateness_ms: 40,
+            timing_degraded: true,
+            ..TimedRunStats::default()
+        };
+        let mut value = serde_json::to_value(&modern).unwrap();
+        let map = value.as_object_mut().unwrap();
+        // Fields added after the artifact first shipped, newest era first.
+        // The remove-must-succeed assert doubles as a rename guard: if a
+        // serialized name changes, this pin must be revisited, not skipped.
+        for added_later in [
+            "dispatchStartedAtUnix",
+            "dispatchEndedAtUnix",
+            "submissionFailures",
+        ] {
+            assert!(
+                map.remove(added_later).is_some(),
+                "{added_later} is no longer serialized under that name — update this era pin"
+            );
+        }
+        let old: TimedRunStats = serde_json::from_value(value).expect("era artifact deserializes");
+        assert_eq!(old.requests_total, 2);
+        assert_eq!(old.max_dispatch_lateness_ms, 40);
+        assert!(old.timing_degraded);
+        assert_eq!(old.submission_failures, 0);
+        assert_eq!(old.dispatch_started_at_unix, None);
+        assert_eq!(old.dispatch_ended_at_unix, None);
     }
 
     /// A request whose targets include one WITHOUT a units.jsonl mapping is

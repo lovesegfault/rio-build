@@ -86,6 +86,19 @@ pub const COMPONENT_ICE: &str = "ice";
 /// for `dispatch_gap_polls` consecutive polls. Also pauses submission.
 pub const COMPONENT_DISPATCH: &str = "dispatch";
 
+/// Registry of every suspension-component value `Watchdog::on_tick` can
+/// emit. Predicates that classify components — today
+/// [`SuspensionSummary::degrades_timing`] — are pinned against this list
+/// by tests, so adding a component here without deciding its membership
+/// in each classifying predicate fails the build's tests rather than
+/// silently falling into a default bucket.
+pub const ALL_COMPONENTS: &[&str] = &[
+    COMPONENT_PAUSE,
+    COMPONENT_IDLE,
+    COMPONENT_ICE,
+    COMPONENT_DISPATCH,
+];
+
 /// Consecutive failed spawn-intents polls after which the sticky
 /// [`COMPONENT_ICE`] snapshot is considered stale and stops asserting the
 /// component. One failed poll holds the prior state — a leader-failover or
@@ -273,6 +286,58 @@ pub struct SuspensionSummary {
     pub total_secs_by_component: BTreeMap<String, f64>,
 }
 
+impl SuspensionSummary {
+    /// True when any window in this summary both carries a
+    /// submission-suspending component and overlaps the closed interval
+    /// `[interval_started_at_unix, interval_ended_at_unix]` — the level
+    /// read behind the timed report's `timing_degraded` bit (the
+    /// comparability contract in `run/spec.rs`: a pause/dispatch
+    /// suspension window during timed execution means the recorded
+    /// cadence was not honored). Reading the window LOG instead of
+    /// window-close events makes the bit total over the interval:
+    ///
+    /// - A still-open window (`ended_at_unix: None`) extends through the
+    ///   read instant, so a pause or dispatch wedge persisting past
+    ///   schedule drain counts even though it never produced a close
+    ///   event — and a window that closes after the read was open at the
+    ///   read and counts identically.
+    /// - Component membership: exactly the components that suspend the
+    ///   engine's own submission path qualify — [`COMPONENT_PAUSE`] (the
+    ///   operator told the engine not to submit) and
+    ///   [`COMPONENT_DISPATCH`] (the run loop pauses submission on the
+    ///   dispatch gap). The capacity components ([`COMPONENT_IDLE`],
+    ///   [`COMPONENT_ICE`]) freeze stall clocks only and never gate
+    ///   submission, so they do not indict the dispatcher's cadence; the
+    ///   recorded run was equally exposed to cluster-capacity weather.
+    ///   Pinned against [`ALL_COMPONENTS`] by test.
+    /// - Granularity: window edges are poller-tick observations and a
+    ///   window's component list is its lifetime union, so boundary
+    ///   touches and mixed windows count whole. Both inclusions err
+    ///   toward flagging — for an honesty bit the acceptable direction
+    ///   is claiming degradation a tick early, never claiming fidelity
+    ///   that did not hold.
+    ///
+    /// Input provenance: the interval bounds come from the run loop's own
+    /// clock at the dispatch call site and the windows from the
+    /// watchdog's tick log (operator PAUSE file plus cluster-feed
+    /// observations) — the same engine clock on both sides, and no
+    /// peer-controlled magnitude reaches this predicate.
+    pub fn degrades_timing(
+        &self,
+        interval_started_at_unix: i64,
+        interval_ended_at_unix: i64,
+    ) -> bool {
+        self.windows.iter().any(|w| {
+            w.components
+                .iter()
+                .any(|c| c == COMPONENT_PAUSE || c == COMPONENT_DISPATCH)
+                && w.started_at_unix <= interval_ended_at_unix
+                && w.ended_at_unix
+                    .is_none_or(|ended| ended >= interval_started_at_unix)
+        })
+    }
+}
+
 /// The watchdog state machine: suspension streaks, per-job stall clocks,
 /// and the suspension-window log.
 pub struct Watchdog {
@@ -326,7 +391,13 @@ pub struct Watchdog {
     summary: SuspensionSummary,
 }
 
-/// What one [`Watchdog::on_tick`] call decided.
+/// What one [`Watchdog::on_tick`] call decided: per-tick verdicts and
+/// live levels. Window HISTORY is deliberately not part of the outcome —
+/// suspension windows, open and closed alike, are level state read via
+/// [`Watchdog::suspension_summary`], because a consumer keying behavior
+/// on a window-close tick misses windows still open when it stops
+/// looking (a wedge spanning schedule drain never produces a close event
+/// at all).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TickOutcome {
     /// True when any suspension component is active this tick.
@@ -348,10 +419,6 @@ pub struct TickOutcome {
     /// `BackpressureSource::QueueDepth`; it is not a suspension component
     /// (it gates new submissions, never the stall clocks).
     pub queue_depth_pause: bool,
-    /// The suspension window that ended on this tick, if one did (already
-    /// recorded in the summary). Exposed so the run loop can act on window
-    /// edges without edge-detecting `suspended` across ticks itself.
-    pub closed_window: Option<SuspensionWindow>,
 }
 
 impl Watchdog {
@@ -608,7 +675,6 @@ impl Watchdog {
             && self.cluster_failed_polls < CLUSTER_STALE_AFTER_FAILED_POLLS;
 
         // Suspension-window bookkeeping.
-        let mut closed_window = None;
         if suspended {
             for c in &components {
                 *self
@@ -645,8 +711,7 @@ impl Watchdog {
                 duration_secs = tick.at_unix - w.started_at_unix,
                 "suspension window closed: stall clocks resume"
             );
-            self.summary.windows.push(w.clone());
-            closed_window = Some(w);
+            self.summary.windows.push(w);
         }
 
         // Clocks accrue only while not suspended.
@@ -706,7 +771,6 @@ impl Watchdog {
             stalled,
             dispatch_pause,
             queue_depth_pause,
-            closed_window,
         }
     }
 
@@ -780,13 +844,10 @@ mod tests {
         assert!(o.suspended);
         assert_eq!(o.components, vec![COMPONENT_IDLE]);
         assert!(!o.dispatch_pause);
-        // Recovery closes the window — and the closing tick reports the
-        // just-closed window so the run loop never edge-detects.
+        // Recovery closes the window, recorded in the level summary with
+        // the closing tick's timestamp.
         let o = wd.on_tick(&tick(240, cluster(10, 4, 0, 8)));
         assert!(!o.suspended);
-        let closed = o.closed_window.expect("closing tick exposes the window");
-        assert_eq!(closed.started_at_unix, 180);
-        assert_eq!(closed.ended_at_unix, Some(240));
         let summary = wd.suspension_summary();
         assert_eq!(summary.windows.len(), 1);
         assert_eq!(summary.windows[0].components, vec![COMPONENT_IDLE]);
@@ -928,14 +989,22 @@ mod tests {
         let mut t = tick(120, cluster(5, 5, 0, 8));
         t.engine_paused = true;
         assert!(wd.on_tick(&t).suspended);
-        let o = wd.on_tick(&tick(180, cluster(5, 5, 0, 8)));
-        assert!(o.closed_window.is_some(), "first window closes");
+        assert!(!wd.on_tick(&tick(180, cluster(5, 5, 0, 8))).suspended);
+        assert_eq!(
+            wd.suspension_summary().windows.len(),
+            1,
+            "first window closes"
+        );
         // Window 2: paused again for one 60s tick, recovers at 300.
         let mut t = tick(240, cluster(5, 5, 0, 8));
         t.engine_paused = true;
         assert!(wd.on_tick(&t).suspended);
-        let o = wd.on_tick(&tick(300, cluster(5, 5, 0, 8)));
-        assert!(o.closed_window.is_some(), "second window closes");
+        assert!(!wd.on_tick(&tick(300, cluster(5, 5, 0, 8))).suspended);
+        assert_eq!(
+            wd.suspension_summary().windows.len(),
+            2,
+            "second window closes"
+        );
 
         let summary = wd.suspension_summary();
         assert_eq!(summary.windows.len(), 2);
@@ -965,7 +1034,12 @@ mod tests {
         let o = wd.on_tick(&tick(6 * 60, cluster(100, 90, 0, 100)));
         assert!(!o.dispatch_pause);
         assert!(!o.suspended);
-        assert!(o.closed_window.is_some(), "dispatch window closed");
+        let summary = wd.suspension_summary();
+        assert_eq!(
+            summary.windows.last().and_then(|w| w.ended_at_unix),
+            Some(6 * 60),
+            "dispatch window closed"
+        );
     }
 
     #[test]
@@ -1000,7 +1074,12 @@ mod tests {
         let o = wd.on_tick(&tick(6 * 60, cluster(0, 0, 0, 100)));
         assert!(!o.dispatch_pause, "drained queue clears the pause");
         assert!(!o.suspended);
-        assert!(o.closed_window.is_some(), "dispatch window closed");
+        let summary = wd.suspension_summary();
+        assert_eq!(
+            summary.windows.last().and_then(|w| w.ended_at_unix),
+            Some(6 * 60),
+            "dispatch window closed"
+        );
     }
 
     #[test]
@@ -1246,7 +1325,12 @@ mod tests {
             o.components
         );
         assert!(!o.suspended);
-        assert!(o.closed_window.is_some(), "idle window closes at staleness");
+        let summary = wd.suspension_summary();
+        assert_eq!(
+            summary.windows.last().and_then(|w| w.ended_at_unix),
+            Some(240),
+            "idle window closes at staleness"
+        );
         // Further failures keep it de-asserted, and the stall clocks now
         // run: 2h of unsuspended queued time later the queued watchdog
         // fires — the outage no longer disables stall detection.
@@ -1347,7 +1431,12 @@ mod tests {
             o.components
         );
         assert!(!o.suspended);
-        assert!(o.closed_window.is_some(), "ice window closed at staleness");
+        let summary = wd.suspension_summary();
+        assert_eq!(
+            summary.windows.last().and_then(|w| w.ended_at_unix),
+            Some(900),
+            "ice window closed at staleness"
+        );
         // Not-polled ticks must NOT re-arm the component from the stale
         // snapshot...
         assert!(
@@ -1435,6 +1524,227 @@ mod tests {
         assert!(json.get("totalSecsByComponent").is_some(), "{json}");
         let back: SuspensionSummary = serde_json::from_value(json).unwrap();
         assert_eq!(back, summary);
+    }
+
+    /// Drive the watchdog's own predicates until a window carrying exactly
+    /// `component` is open, returning the summary and the window's start
+    /// tick. Every fixture window in the `degrades_timing` tests is
+    /// produced through `on_tick` — the same producer the run loop feeds —
+    /// never hand-assembled, so the tests cannot drift from what the
+    /// watchdog actually records.
+    fn window_via_ticks(component: &str) -> (SuspensionSummary, i64) {
+        let mut wd = Watchdog::new(knobs());
+        let opened_at;
+        if component == COMPONENT_PAUSE {
+            // Pause asserts on the same tick (no streak warm-up).
+            let mut t = tick(1_000, cluster(1, 1, 0, 1));
+            t.engine_paused = true;
+            let o = wd.on_tick(&t);
+            assert_eq!(o.components, vec![COMPONENT_PAUSE]);
+            opened_at = 1_000;
+        } else if component == COMPONENT_IDLE {
+            // Three consecutive queued-but-nothing-occupied polls.
+            for i in 0..2 {
+                assert!(
+                    !wd.on_tick(&tick(1_000 + i * 60, cluster(10, 0, 0, 8)))
+                        .suspended
+                );
+            }
+            let o = wd.on_tick(&tick(1_120, cluster(10, 0, 0, 8)));
+            assert_eq!(o.components, vec![COMPONENT_IDLE]);
+            opened_at = 1_120;
+        } else if component == COMPONENT_ICE {
+            // A masked-cells snapshot at the threshold.
+            let mut t = tick(1_000, cluster(5, 5, 0, 10));
+            t.ice = IcePoll::Fresh(masked(3));
+            let o = wd.on_tick(&t);
+            assert_eq!(o.components, vec![COMPONENT_ICE]);
+            opened_at = 1_000;
+        } else if component == COMPONENT_DISPATCH {
+            // Five consecutive over-gap polls; running > 0 keeps the idle
+            // streak from co-asserting.
+            for i in 0..4 {
+                assert!(
+                    !wd.on_tick(&tick(1_000 + i * 60, cluster(100, 10, 0, 100)))
+                        .suspended
+                );
+            }
+            let o = wd.on_tick(&tick(1_240, cluster(100, 10, 0, 100)));
+            assert_eq!(o.components, vec![COMPONENT_DISPATCH]);
+            opened_at = 1_240;
+        } else {
+            panic!(
+                "suspension component {component:?} has no production driver in this test — \
+                 add one and classify the component for SuspensionSummary::degrades_timing"
+            );
+        }
+        (wd.suspension_summary(), opened_at)
+    }
+
+    /// `degrades_timing` consumes the suspension-component vocabulary, so
+    /// its membership is pinned over EVERY producer of that vocabulary
+    /// (`ALL_COMPONENTS`), each driven through the watchdog's own tick
+    /// predicates: the submission-suspending components (pause, dispatch)
+    /// degrade a timed run's cadence claim, the capacity components
+    /// (idle, ice) freeze stall clocks only and do not. A new component
+    /// lands in the panic arms here and in `window_via_ticks` until it is
+    /// classified. Contract: `run/spec.rs` `ComparabilityBlock::
+    /// timing_degraded` — "a pause/dispatch suspension window during
+    /// timed execution".
+    #[test]
+    fn degrades_timing_classifies_every_component_in_the_registry() {
+        for &component in ALL_COMPONENTS {
+            let (summary, opened_at) = window_via_ticks(component);
+            // The window is open; the read interval covers its start.
+            let expected = if component == COMPONENT_PAUSE || component == COMPONENT_DISPATCH {
+                // Suspends the engine's own submission path: in timeless
+                // mode these gate the submit loop; a timed dispatcher
+                // firing through them is not honoring recorded cadence.
+                true
+            } else if component == COMPONENT_IDLE || component == COMPONENT_ICE {
+                // Cluster-capacity weather: freezes stall clocks, never
+                // gates submission, and the recorded run was equally
+                // exposed to it — no cadence claim is broken.
+                false
+            } else {
+                panic!(
+                    "suspension component {component:?} is unclassified for degrades_timing — \
+                     decide whether it suspends the submission path and pin it here"
+                );
+            };
+            assert_eq!(
+                summary.degrades_timing(opened_at, opened_at + 600),
+                expected,
+                "component {component:?}"
+            );
+        }
+
+        // Registry ↔ producer completeness: one tick asserting every
+        // condition at once yields a window whose component set is exactly
+        // the registry, so a component producible by `evaluate_components`
+        // cannot hide outside `ALL_COMPONENTS`.
+        let mut wd = Watchdog::new(knobs());
+        let mut all = tick(0, cluster(1, 0, 0, 60));
+        all.engine_paused = true;
+        all.ice = IcePoll::Fresh(masked(3));
+        for i in 1..=5 {
+            all.at_unix = i * 60;
+            wd.on_tick(&all);
+        }
+        let summary = wd.suspension_summary();
+        assert_eq!(summary.windows.len(), 1);
+        let mut seen: Vec<&str> = summary.windows[0]
+            .components
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut registry: Vec<&str> = ALL_COMPONENTS.to_vec();
+        seen.sort_unstable();
+        registry.sort_unstable();
+        assert_eq!(
+            seen, registry,
+            "ALL_COMPONENTS drifted from on_tick's vocabulary"
+        );
+    }
+
+    /// The timing-degradation read is LEVEL-triggered over the window log,
+    /// so windows straddling either end of the execution interval count
+    /// and windows entirely outside it do not — the contract scopes the
+    /// bit to "during timed execution" (`run/spec.rs`,
+    /// `ComparabilityBlock::timing_degraded`), and the design rule is
+    /// that the engine never silently warps the clock: a wedge the
+    /// dispatcher fired through must flag even if it never closes.
+    #[test]
+    fn degrades_timing_level_reads_windows_across_the_interval() {
+        // Open a pause window at t=1000 and never close it: the
+        // wedge-spanning-drain shape (an operator PAUSE held past
+        // schedule drain emits no close event at all).
+        let mut wd = Watchdog::new(knobs());
+        let mut t = tick(1_000, cluster(1, 1, 0, 1));
+        t.engine_paused = true;
+        wd.on_tick(&t);
+        let open = wd.suspension_summary();
+        assert_eq!(open.windows[0].ended_at_unix, None);
+        // Open at the read instant → counts, with no close event ever.
+        assert!(open.degrades_timing(1_500, 2_000));
+        // Window opened after the interval ended (a pause raised only
+        // once the schedule had drained) → post-execution, no flag.
+        assert!(!open.degrades_timing(500, 900));
+
+        // Close it at t=2500: the close-after-drain shape (the wedge
+        // clears during the final collect pass). The window still
+        // overlaps the execution interval and still counts; a later
+        // interval that starts after the close does not.
+        assert!(!wd.on_tick(&tick(2_500, cluster(1, 1, 0, 1))).suspended);
+        let closed = wd.suspension_summary();
+        assert_eq!(closed.windows[0].ended_at_unix, Some(2_500));
+        assert!(closed.degrades_timing(1_500, 2_000));
+        assert!(!closed.degrades_timing(2_600, 3_000));
+
+        // Strictly-pre-execution window: opened at 1000, closed at 2500,
+        // interval starts later → no flag (the over-report direction the
+        // edge latch used to get wrong: any pre-dispatch close marked the
+        // whole run).
+        assert!(!closed.degrades_timing(2_501, 3_000));
+        // Boundary touches count: window edges are poller-tick
+        // observations, so sub-tick truth at a shared second is unknowable
+        // and the inclusive read errs toward flagging, never toward
+        // claiming fidelity.
+        assert!(
+            closed.degrades_timing(2_500, 3_000),
+            "ended == interval start"
+        );
+        assert!(
+            closed.degrades_timing(500, 1_000),
+            "started == interval end"
+        );
+    }
+
+    /// Qualifying component and interval overlap must hold on the SAME
+    /// window: a pause window outside the interval plus a capacity window
+    /// inside it must not flag (the predicate is per-window, not
+    /// any-qualifying AND any-overlapping across the summary). A mixed
+    /// window counts whole: its component list is the lifetime union, so
+    /// a capacity window that picks up a pause mid-life flags for its
+    /// whole span — window-granularity evidence, erring toward flagging.
+    #[test]
+    fn degrades_timing_requires_overlap_and_qualifying_component_on_one_window() {
+        // Window 1: pause, [1000, 1060]. Window 2: idle, opening at 2120
+        // (the third consecutive idle poll) and never closing.
+        let mut wd = Watchdog::new(knobs());
+        let mut paused = tick(1_000, cluster(10, 5, 0, 8));
+        paused.engine_paused = true;
+        wd.on_tick(&paused);
+        wd.on_tick(&tick(1_060, cluster(10, 5, 0, 8))); // closes the pause window
+        for i in 0..3 {
+            wd.on_tick(&tick(2_000 + i * 60, cluster(10, 0, 0, 8)));
+        }
+        let summary = wd.suspension_summary();
+        assert_eq!(summary.windows.len(), 2);
+        assert_eq!(summary.windows[0].components, vec![COMPONENT_PAUSE]);
+        assert_eq!(summary.windows[1].components, vec![COMPONENT_IDLE]);
+        // Interval covers only the idle window: the pause window is
+        // outside it, the inside window does not qualify → no flag.
+        assert!(!summary.degrades_timing(2_120, 3_000));
+
+        // Mixed window: idle opens at 3000 (streak pre-warmed above...
+        // fresh watchdog for clean state), gains pause mid-life.
+        let mut wd = Watchdog::new(knobs());
+        for i in 0..3 {
+            wd.on_tick(&tick(3_000 + i * 60, cluster(10, 0, 0, 8)));
+        }
+        let mut gains_pause = tick(3_180, cluster(10, 0, 0, 8));
+        gains_pause.engine_paused = true;
+        wd.on_tick(&gains_pause);
+        let mixed = wd.suspension_summary();
+        assert_eq!(mixed.windows.len(), 1);
+        assert!(
+            mixed.windows[0]
+                .components
+                .iter()
+                .any(|c| c == COMPONENT_PAUSE)
+        );
+        assert!(mixed.degrades_timing(3_150, 3_300));
     }
 
     /// QueueDepth's closed loop under the cluster feed's one staleness
@@ -1545,7 +1855,7 @@ mod tests {
         const ALLOWED: &[(&str, &str)] = &[
             (
                 "mod.rs",
-                "COMPONENT_DISPATCH, COMPONENT_PAUSE, IcePoll, PollTick, StallKind, StallVerdict, Watchdog,",
+                "use self::watchdog::{IcePoll, PollTick, StallKind, StallVerdict, Watchdog};",
             ),
             ("mod.rs", "Ok(counts) => watchdog::Polled::Fresh(counts),"),
             ("mod.rs", "watchdog::Polled::Failed"),
