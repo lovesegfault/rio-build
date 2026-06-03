@@ -113,6 +113,26 @@ MATRIX_KINDS = ("checks", "formal", "fuzz", "vm-test", "coverage")
 # nowait partition there would always be empty.
 SPLIT_KINDS = ("checks", "formal")
 
+# Apalache server heap (MiB) assumed for a formal check whose
+# derivation exports no meta.serverHeapMb (bug_383): matches
+# quint.nix's constructor default. Checks at or below this ride the
+# round-robin shards; anything above is isolated into a singleton
+# shard named for the check.
+DEFAULT_SERVER_HEAP_MB = 4096
+
+# Documentation constant (bug_383): the per-shard memory envelope the
+# ci.yml formal jobs are budgeted against. Derivation: a shard builds
+# with `nix build --max-jobs 2`, so the worst case is two concurrent
+# DEFAULT_SERVER_HEAP_MB Apalache servers + TLC + node overhead
+# (~2×(4GiB + ~0.5GiB) ≈ 9-10GiB) — inside a 16GiB runner. A check
+# that RAISES serverHeapMb past the default would break that envelope
+# inside a shared shard (8GiB server × 2 jobs > 16GiB), which is
+# exactly why cluster_formal isolates it as a singleton (one heavy
+# server + one light neighbor at most ≈ 12-13GiB, still inside
+# 16GiB). The value is exported by the quint.nix constructors as
+# derivation meta — ONE binding sizes the JVM and the shard placement.
+FORMAL_SHARD_BUDGET_MB = 2 * DEFAULT_SERVER_HEAP_MB
+
 # Target shard width for the `formal` kind (see cluster_formal).
 # Override with FORMAL_SHARD_SIZE (validated by formal_shard_size --
 # anything that is not an integer >= 1 is a hard gen-matrix failure).
@@ -191,6 +211,12 @@ def pending(results):
         out[kind][name] = {
             "drv": r["drvPath"],
             "needed": frozenset(r.get("neededBuilds", [])),
+            # bug_383: absent for non-quint kinds and for derivations
+            # that predate the meta export — both default to the
+            # constructor's 4096, i.e. "not heavy".
+            "serverHeapMb": (r.get("meta") or {}).get(
+                "serverHeapMb", DEFAULT_SERVER_HEAP_MB
+            ),
         }
     return dict(out)
 
@@ -419,7 +445,7 @@ def formal_shard_size():
     return value
 
 
-def cluster_formal(names, shard_size=None):
+def cluster_formal(names, shard_size=None, heap_by_name=None):
     """Shard the formal-verification checks (quint-*/mbt-*/kani-*).
 
     These derivations' build IS the verification run -- a TLC or CBMC
@@ -441,9 +467,24 @@ def cluster_formal(names, shard_size=None):
     """
     if shard_size is None:
         shard_size = formal_shard_size()
+    heap_by_name = heap_by_name or {}
     kani = sorted(n for n in names if n.startswith("kani-"))
-    rest = sorted(n for n in names if not n.startswith("kani-"))
+    # bug_383: a check whose Apalache server heap exceeds the default
+    # cannot share a shard — two concurrent heavy servers under
+    # `--max-jobs 2` blow the runner envelope (FORMAL_SHARD_BUDGET_MB).
+    # Isolate each into a singleton named for the check (the kani
+    # pattern: exact attribution, no neighbor to starve).
+    heavy = sorted(
+        n
+        for n in names
+        if not n.startswith("kani-")
+        and heap_by_name.get(n, DEFAULT_SERVER_HEAP_MB) > DEFAULT_SERVER_HEAP_MB
+    )
+    rest = sorted(
+        n for n in names if not n.startswith("kani-") and n not in set(heavy)
+    )
     clusters = [{"name": n, "targets": n} for n in kani]
+    clusters.extend({"name": n, "targets": n} for n in heavy)
     if rest:
         count = -(-len(rest) // shard_size)  # ceil division
         width = len(str(count))
@@ -499,7 +540,17 @@ def build_outputs(results):
     # needs the full cluster list before any kind's matrix can be
     # finalized.
     kind_clusters = {
-        kind: clusterers[kind](sorted(pend.get(kind, {})))
+        kind: (
+            cluster_formal(
+                sorted(pend.get(kind, {})),
+                heap_by_name={
+                    n: m.get("serverHeapMb", DEFAULT_SERVER_HEAP_MB)
+                    for n, m in pend.get(kind, {}).items()
+                },
+            )
+            if kind == "formal"
+            else clusterers[kind](sorted(pend.get(kind, {})))
+        )
         for kind in MATRIX_KINDS
     }
     trunk = global_trunk(kind_clusters, pend)
@@ -583,6 +634,11 @@ def run_nix_eval_jobs(workers):
         ".#githubActions",
         "--force-recurse",
         "--check-cache-status",
+        # bug_383: surface meta.serverHeapMb so cluster_formal can
+        # isolate heavy Apalache checks (verified supported and
+        # composable with --check-cache-status on the pinned
+        # nix-eval-jobs).
+        "--meta",
         "--workers",
         str(workers),
     ]
@@ -765,11 +821,20 @@ class FilterTests(unittest.TestCase):
                     "b": {
                         "drv": "/d/checks.b.drv",
                         "needed": frozenset({"/d/dep.drv"}),
+                        "serverHeapMb": DEFAULT_SERVER_HEAP_MB,
                     },
-                    "c": {"drv": "/d/checks.c.drv", "needed": frozenset()},
+                    "c": {
+                        "drv": "/d/checks.c.drv",
+                        "needed": frozenset(),
+                        "serverHeapMb": DEFAULT_SERVER_HEAP_MB,
+                    },
                 },
                 "fuzz": {
-                    "d": {"drv": "/d/fuzz.d.drv", "needed": frozenset()},
+                    "d": {
+                        "drv": "/d/fuzz.d.drv",
+                        "needed": frozenset(),
+                        "serverHeapMb": DEFAULT_SERVER_HEAP_MB,
+                    },
                 },
             },
         )
@@ -1103,6 +1168,45 @@ class FormalClusterTests(unittest.TestCase):
         os.environ.pop("FORMAL_SHARD_SIZE", None)
         if self._saved_shard_size is not None:
             os.environ["FORMAL_SHARD_SIZE"] = self._saved_shard_size
+
+    def test_heavy_checks_isolated_into_singletons(self):
+        # bug_383 red-first: against the pre-isolation cluster_formal,
+        # this test FAILS — the 8GiB checks land inside round-robin
+        # shards and two of them under --max-jobs 2 exceed the runner
+        # envelope (FORMAL_SHARD_BUDGET_MB).
+        names = [f"quint-light{i}" for i in range(6)] + [
+            "quint-heavy-a",
+            "quint-heavy-b",
+            "kani-rio-lease",
+        ]
+        heap = {
+            "quint-heavy-a": 8192,
+            "quint-heavy-b": 8192,
+            # absent entries default to DEFAULT_SERVER_HEAP_MB
+        }
+        got = cluster_formal(names, shard_size=3, heap_by_name=heap)
+        by_name = {c["name"]: c["targets"] for c in got}
+        # Each heavy is a singleton named for the check (kani pattern).
+        self.assertEqual(by_name["quint-heavy-a"], "quint-heavy-a")
+        self.assertEqual(by_name["quint-heavy-b"], "quint-heavy-b")
+        # kani stays a singleton too.
+        self.assertEqual(by_name["kani-rio-lease"], "kani-rio-lease")
+        # Lights are sharded; no heavy appears in any shared shard and
+        # nothing is lost.
+        shard_members = " ".join(
+            c["targets"] for c in got if c["name"].startswith("quint-") and "of" in c["name"]
+        ).split()
+        self.assertEqual(
+            sorted(shard_members), sorted(f"quint-light{i}" for i in range(6))
+        )
+
+    def test_absent_heap_meta_defaults_light(self):
+        # A formal set with NO heap metadata behaves exactly as before
+        # (pure round-robin) — the meta export is additive.
+        names = [f"quint-w{i}" for i in range(4)]
+        with_meta = cluster_formal(names, shard_size=2, heap_by_name={})
+        without = cluster_formal(names, shard_size=2)
+        self.assertEqual(with_meta, without)
 
     def test_kani_singletons_rest_sharded(self):
         names = [f"quint-w{i}" for i in range(5)] + [

@@ -233,7 +233,6 @@ let
   # The default-heap prelude every existing check interpolates; renders
   # the exact text the constructors carried before the heap was
   # parameterized, so no existing derivation rehashes.
-  apalacheServerPrelude = apalacheServerPreludeWithHeap 4096;
 
   # One `quint verify` run per (model, main-module, invariant-set,
   # backend) tuple. `main` selects the module within the file — a model
@@ -272,10 +271,20 @@ let
       # workers" says nothing about other widths. null (the default)
       # keeps the pre-Phase-1 behavior: derive from NIX_BUILD_CORES.
       workers ? null,
+      # Apalache server heap (MiB) — same semantics as
+      # mkQuintWitnessCheck's parameter. Exported as meta.serverHeapMb
+      # (bug_383) so gen_matrix.py can isolate heavy checks into
+      # singleton formal shards: ONE binding sizes the JVM and the CI
+      # budget; a check whose heap is raised here moves itself out of
+      # the round-robin shards automatically.
+      serverHeapMb ? 4096,
     }:
     pkgs.runCommand "quint-${name}"
       {
         nativeBuildInputs = [ pkgs.quint ];
+        # bug_383: the SAME binding that sizes the JVM below — exported
+        # for gen_matrix.py's heavy-shard isolation.
+        meta.serverHeapMb = serverHeapMb;
         # Only the named .qnt files. A model that imports another file
         # (a shared harness, an override module's parent model) extends
         # the fileset via extraSpecs — keeping it narrow means an
@@ -313,7 +322,7 @@ let
           ''
         }printf '{"workers": %s}\n' "$workers" > tlc-config.json
 
-        ${apalacheServerPrelude}
+        ${apalacheServerPreludeWithHeap serverHeapMb}
 
         # The transcript is the proof artifact: it records the
         # invariants checked, the state count, and the depth — keep it.
@@ -392,6 +401,10 @@ let
     pkgs.runCommand "quint-${name}"
       {
         nativeBuildInputs = [ pkgs.quint ];
+        # bug_383: the SAME binding that sizes the JVM below — exported
+        # for gen_matrix.py's heavy-shard isolation (a check raised
+        # past the 4096 default moves itself into a singleton shard).
+        meta.serverHeapMb = serverHeapMb;
         # Same fileset narrowing as mkQuintCheck.
         src = lib.fileset.toSource {
           root = modelsDir;

@@ -239,18 +239,26 @@ jobs:
   # rio-infra (arc.tf), not in this repo, so they cannot be verified
   # here; the in-repo evidence points small (actionlint.yaml: spot,
   # 4-16 vCPU; gen_matrix.py sizes its eval workers for a 4-8 GiB
-  # pod). Two concurrent builds bound the worst case to roughly
-  # 2 × (4 GiB apalache -Xmx + TLC heap + node) ≈ 8-10 GiB plus the
-  # nix daemon and runner agent — assumed to fit a ≥16 GiB pod with
-  # headroom, and judged against the first real runs (an OOM here
-  # looks like the very "runner lost communication" failure this lane
-  # exists to fix; check the pod's memory limit and OOM-kill events
-  # before blaming a shard). Only raise --max-jobs after confirming
-  # the real limit in rio-infra: ~5-6 GiB per in-flight check means
-  # 3 jobs wants ≥20 GiB. The shard width (FORMAL_SHARD_SIZE, default
-  # 12) and this cap bound a shard to ~6 build waves; a typical shard
+  # pod). Heap-aware sharding (bug_383): every quint check exports its
+  # Apalache server heap as meta.serverHeapMb (quint.nix — the SAME
+  # binding that sizes the JVM), and gen_matrix.py isolates anything
+  # above the 4096 MiB default into a SINGLETON shard named for the
+  # check. So the round-robin shards' worst case is two concurrent
+  # DEFAULT-heap builds: 2 × (4 GiB apalache -Xmx + TLC heap + node)
+  # ≈ 8-10 GiB plus the nix daemon and runner agent — fits a ≥16 GiB
+  # pod with headroom. A heavy singleton's worst case is one 8 GiB
+  # server + TLC + node ≈ 10-12 GiB — also inside 16 GiB, which is
+  # exactly why heavies may not share a shard (two of them under
+  # --max-jobs 2 would want ~20 GiB). An OOM here looks like the very
+  # "runner lost communication" failure this lane exists to fix;
+  # check the pod's memory limit and OOM-kill events before blaming a
+  # shard. Only raise --max-jobs after confirming the real limit in
+  # rio-infra: ~5-6 GiB per in-flight default-heap check means 3 jobs
+  # wants ≥20 GiB. The shard width (FORMAL_SHARD_SIZE, default 12)
+  # and this cap bound a shard to ~6 build waves; a typical shard
   # finishes in 10-20min, the 45min timeout leaves headroom for an
-  # unlucky deal of the minutes-class exhaustive regime checks.
+  # unlucky deal of the minutes-class exhaustive regime checks (the
+  # heavy singletons no longer participate in that lottery).
   formal:
     name: formal / ${{ matrix.name }}
     needs: [gen-matrix, warm]
