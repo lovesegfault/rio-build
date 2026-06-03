@@ -443,8 +443,13 @@ pub(crate) enum AbsentReason {
     NotResident { path: String },
     /// A `.drv` in the closure is resident but cannot be used.
     Unparseable { path: String, why: String },
-    /// The walk exhausted its work budget; `persisted` proven rows were
-    /// durably cached before returning, so a retry resumes.
+    /// The walk exhausted its work budget. `persisted` counts the rows
+    /// the EXIT DRAIN proved and upserted (`complete_partial_arena`);
+    /// rows the walk upserted eagerly mid-flight are durable too but
+    /// are NOT included in this count (round-16 merged_bug_086) — so
+    /// treat it as "additional rows proven at exit", not "total rows
+    /// this attempt made durable". Either way the cache strictly grew
+    /// and a retry resumes from it.
     OverBudget { persisted: usize, work_used: usize },
     /// The input metadata forms a cycle: no topological order exists,
     /// so no row in the cyclic remainder is derivable. Fail-closed
@@ -474,8 +479,15 @@ enum FetchedDrv {
 /// Error classes are PROPAGATED, never folded into the absent verdict
 /// (merged_bug_015 — pattern R1): `get_manifest`/chunk-backend errors →
 /// `Err`; a complete manifest whose NAR fails single-file extraction →
-/// `Err(InvariantViolation)` (text-CA-gated at ingestion, so this is
-/// row corruption, not absence).
+/// `Err(InvariantViolation)` (text-CA-gated at ingestion, so THAT one
+/// is row corruption, not absence).
+///
+/// Honest caveat (round-16 bug_027): the chunk-FETCH error below is
+/// currently also wrapped as `InvariantViolation`, conflating
+/// transient chunk-backend failures (S3 blips, timeouts) with
+/// corruption — callers and operators must not read that variant as
+/// proof of data loss until the typed `ChunkError` split lands in the
+/// proof-walk work.
 async fn own_drv_bytes(
     pool: &PgPool,
     chunks: Option<&crate::cas::ChunkCache>,
@@ -529,8 +541,13 @@ async fn own_drv_bytes(
 
 /// Persist every arena node whose input closure is fully seeded —
 /// bottom-up passes until a pass makes no progress. Returns the number
-/// of rows persisted. Runs on EVERY walk exit (monotone progress, R4):
-/// persistence of already-discovered work is exempt from the budget by
+/// of rows persisted. Runs on every TYPED-VERDICT walk exit (monotone
+/// progress, R4); the `Err` propagation paths in `prove_inner`
+/// currently bypass this drain (round-16 bug_084 — "every exit" is the
+/// goal the proof-walk owner type will enforce, not the shipped
+/// behavior; an infra error today loses the un-drained arena, costing
+/// re-derivation on retry, never correctness). Persistence of
+/// already-discovered work is exempt from the budget by
 /// design (see [`PROOF_WALK_WORK_MAX`]).
 async fn complete_partial_arena(
     pool: &PgPool,
