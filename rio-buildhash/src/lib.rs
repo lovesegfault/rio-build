@@ -47,7 +47,10 @@
 //! script because its emitted `rustc-env` VALUE changed, and a watched
 //! mtime older than the script stamp is not stale). Consequence: degraded
 //! sessions rebuild the sqlx crates on every build, with a warning, and
-//! nothing they produce can ever be replayed from a wrapper cache. That
+//! nothing they produce can ever be replayed from a wrapper cache — but
+//! kache still STORES each unique-keyed miss (rlibs, dependents,
+//! executables), so a prolonged degraded session floods the store with
+//! write-only entries; prefer `KACHE_DISABLED=1` for such sessions. That
 //! cost is deliberate — supported contexts always set the variable, and a
 //! cache key must never claim to cover an input it cannot observe.
 //!
@@ -296,6 +299,11 @@ fn divergent_fallthrough(tracked: &Path, manifest_dir: &Path) -> Option<PathBuf>
 /// for why degraded states must be unkeyed rather than pinned to a
 /// constant sentinel.
 fn unkeyed(why: &str) -> String {
+    println!(
+        "cargo:warning=rio-buildhash: builds in this state are uncacheable but still \
+         written to the kache store under never-replayable keys — for prolonged \
+         sessions in this state, set KACHE_DISABLED=1"
+    );
     println!("cargo:warning=rio-buildhash: {why}");
     emit_always_rerun();
     unique_value("unkeyed")

@@ -170,6 +170,15 @@ in
         for c in $crates; do
           [ -f "$c/Cargo.toml" ] || continue
           if [ -f "$c/build.rs" ] && grep -q track_sqlx "$c/build.rs"; then
+            # The tracker is only half the contract: without a
+            # consumer-side `const _: &str = env!("RIO_SQLX_HASH");`
+            # rustc records no env-dep and the tracking silently does
+            # nothing (rio-buildhash docs) — refuse the same way as a
+            # missing tracker, naming the missing half.
+            if ! grep -rq 'env!("RIO_SQLX_HASH")' "$c/src" 2>/dev/null; then
+              echo "sqlx-prepare-check: $c wires track_sqlx() but no source file reads env!(\"RIO_SQLX_HASH\") — without the read, rustc records no env-dep and the tracking silently does nothing; add the const (see rio-buildhash docs)" >&2
+              exit 1
+            fi
             # CHECK arm. -p takes the package name from the manifest —
             # the directory name is convention, not contract.
             args="$args -p $(awk -F'"' '/^name[[:space:]]*=/{print $2; exit}' "$c/Cargo.toml")"
