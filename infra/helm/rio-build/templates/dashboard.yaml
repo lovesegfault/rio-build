@@ -49,13 +49,22 @@ spec:
           type: RuntimeDefault
       containers:
         # SPA serve + gRPC-Web proxy to the leader-only
-        # rio-scheduler-leader Service. Config is baked into the image
-        # (nix/docker.nix dashboardNginxConf) — no ConfigMap, no
-        # runtime templating. A changed upstream name is a
-        # docker-dashboard rebuild, not a helm value.
+        # rio-scheduler-leader Service. The nginx conf is baked into
+        # the image (nix/docker.nix dashboardNginxConf) with envsubst
+        # placeholders for the upstream FQDNs — the env block below
+        # (bug_403) substitutes the LIVE namespace names from
+        # .Values.namespaces at pod start, so a namespaces override
+        # reaches the baked image AND rolls the pod (env change =
+        # template-hash change). Adding an upstream is a
+        # files/dashboard-upstreams.json edit + image rebuild.
         - name: nginx
           image: {{ include "rio.image" (list . $d.image) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          env:
+            {{- range ($.Files.Get "files/dashboard-upstreams.json" | fromJsonArray) }}
+            - name: {{ .env }}
+              value: "{{ .service }}.{{ index $.Values.namespaces .namespaceRef "name" }}.svc.cluster.local"
+            {{- end }}
           ports:
             - name: http
               containerPort: 8080

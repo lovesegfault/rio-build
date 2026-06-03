@@ -331,18 +331,24 @@ in
     }
     # Syntax check: njs js_import/js_set wiring is easy to get wrong
     # and vm-dashboard-k3s is the only other place nginx parses this.
-    # `nginx -t` resolves upstreams and open()s the error_log/access_log
-    # targets after parsing — sed the cluster FQDNs (one per upstream;
-    # the scheduler one is the leader-only rio-scheduler-leader
-    # Service) to a resolvable address and /dev/std{err,out} to TMPDIR
-    # (a remote build sandbox may not provide /dev/std*). Everything
-    # else is checked verbatim.
+    # The conf now carries ENVSUBST PLACEHOLDERS for the upstream
+    # FQDNs (generated from files/dashboard-upstreams.json; the image
+    # entrypoint substitutes at pod start) — run the SAME substitution
+    # the entrypoint performs, with the env defaulted to a resolvable
+    # address, so the guard checks the runtime artifact, not the
+    # template. /dev/std{err,out} → TMPDIR (a remote build sandbox may
+    # not provide /dev/std*). Everything else is checked verbatim.
     mkdir -p $TMPDIR/logs
-    sed -e 's/rio-scheduler-leader\.rio-system\.svc\.cluster\.local/127.0.0.1/' \
-        -e 's/rio-store\.rio-store\.svc\.cluster\.local/127.0.0.1/' \
-        -e "s#/dev/stderr#$TMPDIR/logs/error.log#" \
+    RIO_SCHEDULER_FQDN=127.0.0.1 RIO_STORE_FQDN=127.0.0.1 \
+      ${pkgs.gettext}/bin/envsubst '$RIO_SCHEDULER_FQDN $RIO_STORE_FQDN' \
+      < ${dockerImages.dashboardNginxConf} > $TMPDIR/nginx-subst.conf
+    if grep -F '{RIO_' $TMPDIR/nginx-subst.conf; then
+      echo "FAIL: unsubstituted upstream placeholder survived envsubst — keep the entrypoint var list in sync with dashboard-upstreams.json" >&2
+      exit 1
+    fi
+    sed -e "s#/dev/stderr#$TMPDIR/logs/error.log#" \
         -e "s#/dev/stdout#$TMPDIR/logs/access.log#" \
-      ${dockerImages.dashboardNginxConf} > $TMPDIR/nginx.conf
+      $TMPDIR/nginx-subst.conf > $TMPDIR/nginx.conf
     ${dockerImages.dashboardNginx}/bin/nginx -t -p $TMPDIR -c $TMPDIR/nginx.conf
     touch $out
   '';

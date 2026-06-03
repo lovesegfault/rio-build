@@ -374,3 +374,25 @@ budgets (against one pod they block every drain).
 {{- $c := . -}}
 {{- if gt (int (ternary $c.autoscaling.minReplicas ($c.replicas | default 1) $c.autoscaling.enabled)) 1 -}}true{{- end -}}
 {{- end -}}
+
+{{/*
+rio.dashboardIngressFrom (bug_238): emit the dashboard-pod
+fromEndpoints entry for a backend ingress policy IFF some record in
+files/dashboard-upstreams.json targets (component, port) — the same
+registry that generates the nginx upstreams and the dashboard-egress
+edges, so an upstream cannot exist without BOTH sides of its network
+edge. Args: root, component name, port.
+*/}}
+{{- define "rio.dashboardIngressFrom" -}}
+{{- $root := index . 0 -}}
+{{- $component := index . 1 -}}
+{{- $port := index . 2 -}}
+{{- $records := $root.Files.Get "files/dashboard-upstreams.json" | fromJsonArray -}}
+{{- range $records -}}
+{{- if and (eq .component $component) (eq (int .port) (int $port)) }}
+- matchLabels:
+    k8s:io.kubernetes.pod.namespace: {{ $root.Values.namespaces.system.name }}
+    k8s:app.kubernetes.io/name: rio-dashboard
+{{- end -}}
+{{- end -}}
+{{- end -}}

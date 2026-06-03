@@ -278,6 +278,10 @@ spec:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
             k8s:app.kubernetes.io/name: rio-store
+        # Dashboard nginx → scheduler gRPC-Web (bug_238): generated
+        # from files/dashboard-upstreams.json — present iff the
+        # registry has a rio-scheduler:9001 record.
+        {{- include "rio.dashboardIngressFrom" (list $ "rio-scheduler" 9001) | nindent 8 }}
       toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
     # Metrics: Prometheus scrape from host-network kubelet.
     # `cluster` covers apiserver pods/proxy (kubectl get --raw).
@@ -319,6 +323,11 @@ spec:
         - matchLabels: {app.kubernetes.io/component: rio-fetcher}
           matchExpressions:
             - {key: k8s:io.kubernetes.pod.namespace, operator: Exists}
+        # Dashboard nginx → store LogService (bug_238): generated from
+        # files/dashboard-upstreams.json (redundant with the blanket
+        # system-namespace entry above, but structural — the registry
+        # guarantees the pair even if that blanket ever narrows).
+        {{- include "rio.dashboardIngressFrom" (list $ "rio-store" 9002) | nindent 8 }}
       toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
     - fromEntities: [host, remote-node, cluster]
       toPorts:
@@ -453,18 +462,17 @@ spec:
 {{- end }}
 {{- if .Values.dashboard.enabled }}
 ---
-# Dashboard egress: DNS + the Cilium per-Gateway envoy + rio-store
-# (build logs). nginx proxies /rio.* to the Gateway's listener;
-# Cilium's envoy forwards to rio-scheduler (same-ns, plaintext-over-
-# WireGuard). Cilium creates the envoy Deployment in the Gateway's OWN
-# namespace with label `gateway.networking.k8s.io/gateway-name:
-# <name>` — same-ns, so no cross-ns selector needed.
-#
-# rio-store:9002 is dialed DIRECTLY by nginx (the rio_store upstream in
-# dashboard-nginx.conf) for /rio.store.LogService/TailLog — build logs
-# live in the store, and in-cluster traffic can't reach the Cilium
-# Gateway ClusterIP (selectorless Service; the L7 redirect fires only
-# on the LoadBalancer IP).
+# Dashboard egress (bug_238): DNS + ONE edge per record in
+# files/dashboard-upstreams.json — the SAME registry that generates
+# the nginx upstream blocks (docker.nix) and the backend-ingress
+# entries (rio.dashboardIngressFrom), so an upstream cannot exist
+# without its policy pair. nginx dials every backend DIRECTLY (the
+# old Gateway-proxy hop is gone — in-cluster traffic can't reach the
+# Cilium Gateway ClusterIP anyway: selectorless Service, the L7
+# redirect fires only on the LoadBalancer IP). The pre-registry
+# hand-list narrated that deleted architecture and was missing the
+# scheduler:9001 edge entirely — the SPA's scheduler RPCs were
+# dropped wherever the policy was enforced.
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
@@ -485,17 +493,13 @@ spec:
         - ports:
             - {port: "53", protocol: UDP}
             - {port: "53", protocol: TCP}
+    {{- range ($.Files.Get "files/dashboard-upstreams.json" | fromJsonArray) }}
+    # {{ .name }} → {{ .service }}.{{ index $.Values.namespaces .namespaceRef "name" }}:{{ .port }}
     - toEndpoints:
         - matchLabels:
-            gateway.networking.k8s.io/gateway-name: rio-dashboard
-      toPorts: [{ports: [{port: "8080", protocol: TCP}]}]
-    # Build logs: the nginx rio_store upstream → rio-store:9002
-    # (cross-namespace; the auto-injected pod.namespace label scopes
-    # the match to the store namespace).
-    - toEndpoints:
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
-            k8s:app.kubernetes.io/name: rio-store
-      toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
+            k8s:io.kubernetes.pod.namespace: {{ index $.Values.namespaces .namespaceRef "name" }}
+            k8s:app.kubernetes.io/name: {{ .component }}
+      toPorts: [{ports: [{port: {{ .port | quote }}, protocol: TCP}]}]
+    {{- end }}
 {{- end }}
 {{- end }}

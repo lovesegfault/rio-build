@@ -1325,9 +1325,21 @@ in
   #   + method-gate 404. Coverage
   #   mode (no rio-dashboard image) runs the gateway/EDS/tonic-web
   #   subtests only; the nginx pod is absent so its curls are skipped.
+  # networkPolicy.enabled (bug_238): the dashboard's east-west edges
+  # (nginx → scheduler:9001 / store:9002) are now generated from
+  # files/dashboard-upstreams.json and ENFORCED here — the existing
+  # nginx-path scheduler-RPC subtests are the regression test (RED at
+  # the pre-registry tip: the hand-written egress lacked the
+  # scheduler:9001 edge entirely, so every SPA scheduler RPC was
+  # dropped under enforcement).
   vm-dashboard-k3s = dashboard-gateway {
     inherit pkgs common;
-    fixture = k3sFull { gatewayEnabled = true; };
+    fixture = k3sFull {
+      gatewayEnabled = true;
+      extraValues = {
+        "networkPolicy.enabled" = "true";
+      };
+    };
     withDashboardCurls = dockerImages ? dashboard;
   };
 

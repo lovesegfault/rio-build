@@ -379,6 +379,26 @@ let
   dashboardServiceTokenJs = pkgs.writeText "service-token.js" (
     builtins.readFile ./dashboard-service-token.js
   );
+  # Dashboard east-west upstreams (bug_238/bug_403): ONE record per
+  # backend, shared with the chart (networkpolicy pairs + env wiring) —
+  # see the JSON's _comment for the full contract.
+  dashboardUpstreams = lib.importJSON ../infra/helm/rio-build/files/dashboard-upstreams.json;
+  # Default FQDNs = today's literals (chart default namespace names —
+  # values.yaml namespaces.{system,store}.name; overrides flow through
+  # dashboard.yaml's env, which substitutes the live names at pod
+  # start). Bare `docker run` and the conf-guard get these defaults.
+  dashboardNsDefaults = {
+    system = "rio-system";
+    store = "rio-store";
+  };
+  dashboardUpstreamDefault =
+    u: "${u.service}.${dashboardNsDefaults.${u.namespaceRef}}.svc.cluster.local";
+  # ''${ENV} stays literal in the conf — the ENTRYPOINT substitutes it
+  # (envsubst with an explicit var list, protecting nginx-native $vars).
+  dashboardUpstreamBlocks = lib.concatMapStringsSep "\n" (u: ''
+    upstream ${u.name} {
+      server ''${${u.env}}:${toString u.port};
+    }'') dashboardUpstreams;
   dashboardNginxConf = pkgs.replaceVars ./dashboard-nginx.conf {
     mimeTypes = "${dashboardNginx}/conf/mime.types";
     serviceTokenJs = dashboardServiceTokenJs;
@@ -386,7 +406,22 @@ let
     readonlyAdminAlt = lib.concatStringsSep "|" dashboardReadonlyAdmin;
     readonlySchedulerAlt = lib.concatStringsSep "|" dashboardReadonlyScheduler;
     readonlyStoreLogsAlt = lib.concatStringsSep "|" dashboardReadonlyStoreLogs;
+    upstreamBlocks = dashboardUpstreamBlocks;
   };
+  # Entrypoint: default each upstream env to today's literal, then
+  # envsubst ONLY the registry's vars into a writable conf (/tmp —
+  # readOnlyRootFilesystem) and exec nginx. The explicit var list is
+  # load-bearing: a bare envsubst would also rewrite nginx-native
+  # $vars ($uri, $content_type, …) to empty strings.
+  dashboardEntrypoint = pkgs.writeShellScript "rio-dashboard-entrypoint" ''
+    ${lib.concatMapStringsSep "\n" (u: ''
+      export ${u.env}="''${${u.env}:-${dashboardUpstreamDefault u}}"
+    '') dashboardUpstreams}
+    ${pkgs.gettext}/bin/envsubst '${
+      lib.concatMapStringsSep " " (u: "$" + u.env) dashboardUpstreams
+    }' <${dashboardNginxConf} >/tmp/nginx.conf
+    exec ${dashboardNginx}/bin/nginx -c /tmp/nginx.conf
+  '';
 
   mkImage =
     {
@@ -684,11 +719,9 @@ rec {
       rioDashboard
     ];
     config = {
-      Cmd = [
-        "${dashboardNginx}/bin/nginx"
-        "-c"
-        "${dashboardNginxConf}"
-      ];
+      # Entrypoint (not Cmd): the envsubst wrapper is the contract —
+      # pods must not bypass the env substitution.
+      Entrypoint = [ "${dashboardEntrypoint}" ];
       Labels = mkLabels "rio-dashboard — Svelte SPA + gRPC-Web proxy to Envoy Gateway";
       ExposedPorts."8080/tcp" = { };
     };
