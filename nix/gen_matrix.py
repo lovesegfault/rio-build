@@ -469,6 +469,7 @@ def cluster_formal(names, shard_size=None, heap_by_name=None):
         shard_size = formal_shard_size()
     heap_by_name = heap_by_name or {}
     kani = sorted(n for n in names if n.startswith("kani-"))
+
     # bug_383: a check whose Apalache server heap exceeds the default
     # cannot share a shard — two concurrent heavy servers under
     # `--max-jobs 2` blow the runner envelope (FORMAL_SHARD_BUDGET_MB).
