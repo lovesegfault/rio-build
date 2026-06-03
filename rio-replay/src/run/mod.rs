@@ -3813,6 +3813,18 @@ async fn collect_pass_with(
         if !collectable || processed.contains(&batch.batch_id) {
             continue;
         }
+        // PRE-CLASSIFICATION RETIREMENT CHAIN, in order: (1) the probe
+        // short-circuit below is the supply rollup's entry condition;
+        // (2) inside it, the journal folds AS OF the batch's dispatch
+        // and (3) in-band success exempts members from journal
+        // inference; (4) supply retirements land in `already_terminal`
+        // BEFORE (5) the import-gap retirement runs (its sibling — gap
+        // retirement respects already_terminal, requires a
+        // failure-shaped in-band result, and deliberately does NOT
+        // exempt probes); classification (`decide`, with the arm-entry
+        // probe rule guarding the no-result arm) comes last. Reordering
+        // any pair changes attribution: see each step's own comment.
+        //
         // Batch-settle supply rollup (see the function doc): retire
         // settled-undelivered members before classification — but only
         // members the journal can prove were starved AT DISPATCH and
