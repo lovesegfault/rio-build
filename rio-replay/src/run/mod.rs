@@ -6900,14 +6900,20 @@ mod tests {
                 Some(Verdict::InfraIndeterminate.as_str()),
                 "budget exhausted across the restart: terminal infra record"
             );
-            // The measurement is the journal's cluster-attempt projection:
-            // the journaled engine-side submission failure never reached
-            // the cluster, so it does not count — only the final failed
-            // submission this record is about is stamped. (The BUDGET fold
-            // above still counts both, which is what exhausted it.)
+            // The measurement is the journal's cluster-attempt projection
+            // plus the current event when it is itself a cluster attempt
+            // (`RequeueReason::counts_as_cluster_attempt`, the ONLY path
+            // from events to the measurement: an engine-side submission
+            // failure "never reached the cluster at all"). BOTH of this
+            // job's submissions failed engine-side — zero cluster contact
+            // across the whole history — so the record reports 0, the
+            // same value the stalled-queued writer stamps for identical
+            // truth. (The BUDGET fold above still counts both requeues,
+            // which is what exhausted it: budget and measurement are
+            // different projections by design.)
             assert_eq!(
-                record.attempts, 1,
-                "engine-side requeues stay out of the measured attempts across the restart"
+                record.attempts, 0,
+                "a never-reached-cluster history must measure zero attempts across the restart"
             );
         }
     }

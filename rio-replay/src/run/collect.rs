@@ -2687,6 +2687,99 @@ mod tests {
         }
     }
 
+    /// Standing enumeration of every wire-success predicate consumer in
+    /// the run module's production code — the audit that decayed when the
+    /// belt re-conflated the success grades is now a test instead of a
+    /// one-time sweep. Quantification domain: `.is_success()` /
+    /// `.executed()` call sites in `run/**/*.rs` production regions (each
+    /// file truncated at its first `#[cfg(test)]`; files outside `run/`
+    /// use HTTP-status `is_success`, a different type).
+    ///
+    /// The law: `BuildStatus::is_success()` is completion-shaped and may
+    /// only feed POLARITY questions (failure detection, retry-loop stops,
+    /// the pre-decide evidence-fetch gates) or the decide() chokepoint
+    /// that translates wire status into the graded evidence vocabulary
+    /// (`RioOutcome::Built { executed }`). Any consumer whose decision
+    /// needs proof a build EXECUTED — today exactly one, the belt's
+    /// confirmation supersede — must use `BuildStatus::executed()`. A new
+    /// call site fails these counts until it is enumerated here with its
+    /// question decided.
+    #[test]
+    fn wire_success_consumers_are_enumerated_by_question() {
+        // (file, expected `.is_success()` sites, expected `.executed()`
+        // sites, the questions they answer).
+        let expected: &[(&str, usize, usize, &str)] = &[
+            (
+                "collect.rs",
+                5,
+                1,
+                "is_success: the decide() executed/presence chokepoint, the interruption \
+                 rule's in-band-success input, the poison-fetch gate, the belt's \
+                 presence-drop log arm, and the log-signal failure gate (all polarity or \
+                 pre-decide); executed: the belt's confirmation supersede — the one \
+                 evidence-graded gate",
+            ),
+            (
+                "timeline.rs",
+                2,
+                0,
+                "polarity only: the confirmation retry loop stops on any success status \
+                 (the belt upstream decides what may supersede), and in_band_success \
+                 feeds the interruption rule",
+            ),
+            (
+                "supply/exec.rs",
+                1,
+                0,
+                "polarity only: a prefetch submission's success status",
+            ),
+        ];
+        let run_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/run");
+        // Built at runtime so this test's own source cannot match.
+        let success_needle = format!(".{}{}", "is_success", "()");
+        let executed_needle = format!(".{}{}", "executed", "()");
+        let mut found: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+        let mut stack = vec![run_root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&path).unwrap();
+                let prod = src
+                    .split("#[cfg(test)]")
+                    .next()
+                    .expect("split always yields at least one piece");
+                let success = prod.matches(success_needle.as_str()).count();
+                let executed = prod.matches(executed_needle.as_str()).count();
+                if success > 0 || executed > 0 {
+                    let rel = path
+                        .strip_prefix(&run_root)
+                        .unwrap()
+                        .display()
+                        .to_string()
+                        .replace('\\', "/");
+                    found.insert(rel, (success, executed));
+                }
+            }
+        }
+        let expected_map: std::collections::BTreeMap<String, (usize, usize)> = expected
+            .iter()
+            .map(|(file, success, executed, _q)| ((*file).to_string(), (*success, *executed)))
+            .collect();
+        assert_eq!(
+            found, expected_map,
+            "wire-success consumers changed: every `.is_success()` / `.executed()` call \
+             site in run/ production code must be enumerated here with its question \
+             (polarity / chokepoint / evidence-graded) decided"
+        );
+    }
+
     /// The probe bit crossed with EVERY sibling field of [`BatchView`] —
     /// not just the failure shapes a script happens to produce.
     /// Quantification domain: `BatchView`'s full field list, enumerated
