@@ -103,7 +103,8 @@ bootstrap:
   # Nix-built image (awscli2 + openssl + nix). See nix/docker.nix.
   image: rio-bootstrap
   serviceAccount:
-    # IRSA: secretsmanager:CreateSecret, PutSecretValue, DescribeSecret on rio/*
+    # IRSA role annotation; the grant set lives ONLY in
+    # infra/eks/secrets.tf (aws_iam_policy.rio_bootstrap).
     annotations: {}
 
 podDisruptionBudget:

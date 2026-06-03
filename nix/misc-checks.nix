@@ -1401,13 +1401,21 @@ in
         touch $out
       '';
 
-  # The bootstrap script's AWS verbs must be a subset of the IRSA
-  # policy in infra/eks/secrets.tf — round-16 bug_023's disclosure arm
-  # was unexecutable in EKS only because the role happened to lack
-  # GetSecretValue; now that the grant exists ON PURPOSE (pair probe +
-  # re-derive), drift in either direction must fail the gate, not be
-  # discovered as AccessDenied in a Job log (or as a silently
-  # over-privileged role).
+  # The bootstrap script's AWS calls and the IRSA policy in
+  # infra/eks/secrets.tf must agree on (action, resource) PAIRS, not
+  # just action names. Round-16's confinements introduced a resource
+  # axis (GetSecretValue → rio/signing-key*; PutSecretValue →
+  # rio/signing-key-pub, round-17 merged_bug_013) that an action-name
+  # gate is structurally blind to (round-17 merged_bug_004): a future
+  # script edit reading rio/hmac would have passed the old gate and
+  # AccessDenied'd at runtime — the precise drift this gate's header
+  # promises cannot happen. For every action the script uses, the
+  # EXPECTED Resource is DERIVED from the script's own per-verb target
+  # set (longest common prefix + '*', which also matches Secrets
+  # Manager's random ARN suffix); the granting statement's resource
+  # must equal it exactly — too wide is an over-grant, too narrow is
+  # a runtime AccessDenied. The gate self-calibrates against three
+  # negative fixtures so its own parsing cannot silently rot.
   bootstrap-iam-parity =
     pkgs.runCommand "rio-bootstrap-iam-parity"
       {
@@ -1415,36 +1423,102 @@ in
         policy = ../infra/eks/secrets.tf;
       }
       ''
-        # CLI verbs used by the script → IAM action names.
-        verbs=$(grep -oE 'aws secretsmanager [a-z-]+' $script | awk '{print $3}' | sort -u)
-        [ -n "$verbs" ] || { echo "FAIL: no aws secretsmanager verbs found in script?" >&2; exit 1; }
-        # The FULL rio_bootstrap policy resource (to the closing brace
-        # of the jsonencode block). The policy is multi-statement since
-        # the GetSecretValue grant was confined to the signing-key pair
-        # (least privilege) — a single-statement extraction stopping at
-        # the first Resource line would miss actions granted in later
-        # statements and report them as missing.
-        block=$(sed -n '/resource "aws_iam_policy" "rio_bootstrap"/,/^}/p' $policy)
-        [ -n "$block" ] || { echo "FAIL: rio_bootstrap policy block not found in secrets.tf" >&2; exit 1; }
-        fail=0
-        for v in $verbs; do
-          action=$(echo "$v" | sed -E 's/(^|-)([a-z])/\U\2/g')
-          echo "$block" | grep -q "secretsmanager:$action" || {
-            echo "FAIL: script uses 'aws secretsmanager $v' but the rio_bootstrap IAM policy lacks secretsmanager:$action" >&2
-            fail=1
-          }
-        done
-        # Reverse direction: every granted action is used by the script
-        # (no silent over-grant).
-        granted=$(echo "$block" | grep -oE 'secretsmanager:[A-Za-z]+' | cut -d: -f2 | sort -u)
-        for a in $granted; do
-          verb=$(echo "$a" | sed -E 's/([A-Z])/-\L\1/g; s/^-//')
-          echo "$verbs" | grep -qx "$verb" || {
-            echo "FAIL: IAM grants secretsmanager:$a but the script never uses 'aws secretsmanager $verb'" >&2
-            fail=1
-          }
-        done
-        [ "$fail" = 0 ] || exit 1
+        parity() {
+          s=$1; p=$2
+          block=$(sed -n '/resource "aws_iam_policy" "rio_bootstrap"/,/^}/p' "$p")
+          [ -n "$block" ] || { echo "FAIL: rio_bootstrap policy block not found"; return 1; }
+
+          # Script (verb, target) pairs: literal --secret-id/--name
+          # args of executed calls, plus secret_state callsites for
+          # describe-secret (the probe takes the id as an argument;
+          # it is the script's only describe site, pinned by
+          # bootstrap-probe-conformance). Remediation prose is immune
+          # by construction: its verbs ride as printf arguments.
+          pairs=$(grep -oE 'aws secretsmanager [a-z-]+ +(--secret-id|--name) +rio/[a-z-]+' "$s" \
+            | awk '{print $3" "$5}')
+          probes=$(grep -oE '\$\(secret_state +rio/[a-z-]+\)' "$s" \
+            | grep -oE 'rio/[a-z-]+' | sed 's/^/describe-secret /')
+          pairs=$(printf '%s\n%s\n' "$pairs" "$probes" | sort -u | grep .)
+          [ -n "$pairs" ] || { echo "FAIL: no aws secretsmanager calls found in script?"; return 1; }
+          verbs=$(printf '%s\n' "$pairs" | awk '{print $1}' | sort -u)
+
+          # Statement table: lines tagged by statement index.
+          stmts=$(printf '%s\n' "$block" | awk '/Effect = "Allow"/{n++} n>0{print n"\t"$0}')
+          nmax=$(printf '%s\n' "$stmts" | awk -F'\t' 'END{print $1+0}')
+          fail=0
+          for v in $verbs; do
+            action=$(echo "$v" | sed -E 's/(^|-)([a-z])/\U\2/g')
+            targets=$(printf '%s\n' "$pairs" | awk -v v="$v" '$1==v{print $2}' | sort -u)
+            expected=$(printf '%s\n' $targets | awk '
+              NR==1{p=$0; next}
+              {while (length(p)>0 && substr($0,1,length(p))!=p) p=substr(p,1,length(p)-1)}
+              END{print p"*"}')
+            grants=""
+            i=1
+            while [ "$i" -le "$nmax" ]; do
+              printf '%s\n' "$stmts" | awk -F'\t' -v i="$i" '$1==i{print $2}' \
+                | grep -q "secretsmanager:$action" && grants="$grants $i"
+              i=$((i+1))
+            done
+            ng=$(echo $grants | wc -w)
+            if [ "$ng" = 0 ]; then
+              echo "FAIL: script uses 'aws secretsmanager $v' on {$(echo $targets | tr ' ' ',')}"
+              echo "      but no rio_bootstrap statement grants secretsmanager:$action"
+              fail=1; continue
+            fi
+            if [ "$ng" != 1 ]; then
+              echo "FAIL: secretsmanager:$action is granted by $ng statements ($grants);"
+              echo "      one statement per action keeps the resource axis auditable"
+              fail=1; continue
+            fi
+            res=$(printf '%s\n' "$stmts" | awk -F'\t' -v i="$(echo $grants)" '$1==i{print $2}' \
+              | grep -oE ':secret:[^"]*' | sed 's/^:secret://' | sort -u)
+            if [ "$(printf '%s\n' "$res" | wc -l)" != 1 ] || [ -z "$res" ]; then
+              echo "FAIL: statement$grants (secretsmanager:$action) needs exactly one secret:* resource"
+              fail=1; continue
+            fi
+            if [ "$res" != "$expected" ]; then
+              echo "FAIL: secretsmanager:$action is granted on 'secret:$res' but the script's"
+              echo "      target set {$(echo $targets | tr ' ' ',')} derives 'secret:$expected'."
+              echo "      Too wide = over-grant (merged_bug_013); too narrow = runtime"
+              echo "      AccessDenied the gate exists to prevent (merged_bug_004)."
+              fail=1
+            fi
+          done
+          # Reverse direction: every granted action is exercised by
+          # the script (no silent over-grant).
+          granted=$(printf '%s\n' "$block" | grep -oE 'secretsmanager:[A-Za-z]+' | cut -d: -f2 | sort -u)
+          for a in $granted; do
+            verb=$(echo "$a" | sed -E 's/([A-Z])/-\L\1/g; s/^-//')
+            echo "$verbs" | grep -qx "$verb" || {
+              echo "FAIL: IAM grants secretsmanager:$a but the script never executes 'aws secretsmanager $verb'"
+              fail=1
+            }
+          done
+          return $fail
+        }
+
+        parity $script $policy || { echo "FAIL: live script/policy pair failed parity" >&2; exit 1; }
+
+        # Self-calibration: three negative fixtures that the round-17
+        # findings prove this gate MUST catch. Each mutation must turn
+        # the gate red, or the parsing has rotted.
+        cat $script > f1.sh
+        printf 'aws secretsmanager get-secret-value --secret-id rio/hmac --query SecretString --output text > /dev/null\n' >> f1.sh
+        if parity f1.sh $policy >/dev/null 2>&1; then
+          echo "FAIL: fixture-1 (script reads rio/hmac) passed — the resource axis is not enforced (merged_bug_004)" >&2
+          exit 1
+        fi
+        sed 's|rio/signing-key-pub\*|rio/*|' $policy > f2.tf
+        if parity $script f2.tf >/dev/null 2>&1; then
+          echo "FAIL: fixture-2 (PutSecretValue widened to rio/*) passed — over-grants are invisible (merged_bug_013)" >&2
+          exit 1
+        fi
+        grep -v 'secretsmanager:GetSecretValue' $policy > f3.tf
+        if parity $script f3.tf >/dev/null 2>&1; then
+          echo "FAIL: fixture-3 (GetSecretValue grant removed) passed — missing grants are invisible" >&2
+          exit 1
+        fi
         touch $out
       '';
 

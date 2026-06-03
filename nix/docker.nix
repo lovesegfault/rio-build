@@ -448,8 +448,9 @@ rec {
   # Needs rio-cli (keygen), awscli2, openssl. No Nix closure: the
   # signing keypair comes from `rio-cli keygen`, which emits the same
   # name:base64 format `nix-store --generate-binary-cache-key` did.
-  # IRSA via the rio-bootstrap ServiceAccount gives it
-  # secretsmanager:CreateSecret/PutSecretValue/DescribeSecret on rio/*.
+  # IRSA grants: defined ONLY in infra/eks/secrets.tf
+  # (aws_iam_policy.rio_bootstrap); bootstrap-iam-parity pins every
+  # (action, resource) pair against this script's calls.
   #
   # Exposed (not let-local) so the bootstrap-idempotent check
   # (nix/misc-checks.nix) can run it against a mocked aws CLI and

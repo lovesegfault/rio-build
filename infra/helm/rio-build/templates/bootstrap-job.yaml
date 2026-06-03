@@ -18,12 +18,11 @@ metadata:
     helm.sh/hook-weight: "-1"
     helm.sh/hook-delete-policy: before-hook-creation
     {{- with $b.serviceAccount.annotations }}
-    # IRSA: secretsmanager:CreateSecret, PutSecretValue, DescribeSecret,
-    # GetSecretValue on arn:aws:secretsmanager:*:*:secret:rio/* —
-    # GetSecretValue feeds the signing-key pair-consistency probe and
-    # the pub re-derive (both delegate byte work to rio-cli; the
-    # script never decodes key material). Kept in lockstep with the
-    # script by the bootstrap-iam-parity check.
+    # IRSA role annotation. The grant set is defined ONLY in
+    # infra/eks/secrets.tf (aws_iam_policy.rio_bootstrap) — per-action
+    # resource scopes included; do NOT hand-build the role from a
+    # comment. bootstrap-iam-parity (nix/misc-checks.nix) pins every
+    # (action, resource) pair against the script's calls.
     {{- toYaml . | nindent 4 }}
     {{- end }}
 automountServiceAccountToken: false
