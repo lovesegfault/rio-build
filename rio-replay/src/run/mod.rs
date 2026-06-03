@@ -3289,18 +3289,24 @@ struct SupplyRetirementInputs {
 /// pass (the duplicate-submission shape) is recorded exactly once.
 ///
 /// Batch-settle supply rollup: before a batch's members are classified,
-/// the supply journal is re-folded over exactly those members. The
-/// per-submission top-up appends refused/failed settlements DURING
-/// execution — rows the pre-execute rollup ran too early to see (under
-/// inline delivery the supply stage defers every planned upload to the
-/// top-up, so undelivered supply only ever settles here). A member whose
-/// required path was settled-undelivered when its batch ran was doomed
-/// before dispatch: it is retired with the supply disposition
-/// (upload-rejected / supply-failed exclusion record) and dropped by the
-/// already-terminal belt instead of being classified into a false parity
-/// regression. The journal is loaded once per pass — every batch in the
-/// pass topped up before it was submitted, so its settlement rows are on
-/// disk before the batch could settle. This is the named retirer for
+/// the supply journal is re-folded over exactly those members, AS OF the
+/// batch's dispatch ([`model::SupplyFold::collapse_as_of`] at its
+/// `started_at`). The per-submission top-up appends refused/failed
+/// settlements DURING execution — rows the pre-execute rollup ran too
+/// early to see (under inline delivery the supply stage defers every
+/// planned upload to the top-up, so undelivered supply only ever settles
+/// here). A member whose required path was settled-undelivered when its
+/// batch ran was doomed before dispatch: it is retired with the supply
+/// disposition (upload-rejected / supply-failed exclusion record) and
+/// dropped by the already-terminal belt instead of being classified into
+/// a false parity regression. Two guards keep the attribution honest: a
+/// member whose own in-band result is success-shaped is exempt (in-row
+/// evidence outranks journal inference — it completed regardless of the
+/// journal's claim), and the as-of scope keeps a LATER batch's delivery
+/// of a re-claimed path from masking that this member dispatched without
+/// it. The journal is loaded once per pass — every batch in the pass
+/// topped up before it was submitted, so its settlement rows are on disk
+/// before the batch could settle. This is the named retirer for
 /// dispatched units; never-dispatched dependents are retired by the
 /// process-start rollup once a path's settled failures reach the wired
 /// attempt floor.
@@ -3333,25 +3339,61 @@ async fn collect_pass_with(
             continue;
         }
         // Batch-settle supply rollup (see the function doc): retire
-        // settled-undelivered members before classification. Attempt floor
-        // 1 — the question here is whether the member's required supply WAS
-        // settled-undelivered when it ran, not whether a later attempt
-        // might still recover the path for someone else.
+        // settled-undelivered members before classification — but only
+        // members the journal can prove were starved AT DISPATCH and
+        // whose own in-band result does not refute the starvation:
         //
-        // supply-fold: latest_settlements — batch-settle rollup, via
-        // supply_rollup_dispositions.
+        // - In-band evidence outranks journal inference. A member whose
+        //   in-band row is success-shaped completed despite the journal —
+        //   the target substituted the input from its own upstream
+        //   mid-run, the recovery the TargetSubstituted disposition
+        //   documents, and §7.2's rule is that anything surviving to an
+        //   attempt receives a verdict. Retiring it would replace a real
+        //   result with a fabricated not-attempted exclusion record (and,
+        //   for the refused flavor, a false regression-gate trip on a
+        //   demonstrably successful unit), so success-shaped members are
+        //   exempted here and flow to classification.
+        // - The journal is folded AS OF this batch's dispatch. Claims are
+        //   released on refusal/failure precisely so a LATER batch's
+        //   top-up can re-claim and deliver the path; that later delivery
+        //   must not mask that THIS member dispatched starved (its
+        //   missing-input failure would otherwise classify as a parity
+        //   regression). started_at is anchored after the batch's own
+        //   top-up, so the batch's own settlement rows are in scope.
+        //
+        // Attempt floor 1 — the question here is whether the member's
+        // required supply WAS settled-undelivered when it ran, not
+        // whether a later attempt might still recover the path for
+        // someone else.
+        //
+        // supply-fold: latest_settlements — batch-settle rollup (as-of
+        // the batch's dispatch), via supply_rollup_dispositions.
         let entries = match &supply_entries {
             Some(entries) => entries,
             None => supply_entries.insert(state.load_jsonl::<SupplyEntry>(StateFile::Supply)?),
         };
+        let in_band_success: HashSet<&str> = batch
+            .results
+            .iter()
+            .filter(|result| {
+                model::build_status_from_name(&result.status)
+                    .is_some_and(|status| status.is_success())
+            })
+            .map(|result| result.drv_path.as_str())
+            .collect();
         let members: HashSet<&str> = batch
             .jobs
             .iter()
             .map(String::as_str)
             .filter(|job| !already_terminal.contains(*job))
+            .filter(|job| {
+                !contexts
+                    .get(*job)
+                    .is_some_and(|ctx| in_band_success.contains(ctx.drv_path.as_str()))
+            })
             .collect();
         let supply_retired = supply_rollup_dispositions(
-            &model::SupplyFold::collapse(entries),
+            &model::SupplyFold::collapse_as_of(entries, &batch.started_at),
             &supply.dep_closure,
             &members,
             &supply.plan_dispositions,
@@ -3513,8 +3555,8 @@ mod tests {
     use crate::run::grpc::{ClusterCounts, GraphSnapshot, IceSnapshot, PoisonedView};
     use crate::run::model::{
         DispatchEntry, ExpectedOutcome, PathOutcome, SUPPLY_OUTCOME_DELEGATED,
-        SUPPLY_OUTCOME_DELIVERED, SUPPLY_OUTCOME_REFUSED, SUPPLY_OUTCOME_UNAVAILABLE, SupplyEntry,
-        build_status_name,
+        SUPPLY_OUTCOME_DELIVERED, SUPPLY_OUTCOME_FAILED, SUPPLY_OUTCOME_REFUSED,
+        SUPPLY_OUTCOME_UNAVAILABLE, SupplyEntry, build_status_name,
     };
     use crate::run::submit::{SubmitTracker, submit_one_batch};
     use crate::run::submitter::BatchOutcome;
@@ -5428,36 +5470,70 @@ mod tests {
         StallProgressProbe::new(Arc::new(NoLogsAdmin), "replay-leaf".to_string())
     }
 
-    /// The collect pass's batch-settle supply rollup, both directions of
-    /// the contract:
+    /// The collect pass's batch-settle supply rollup, quantified over the
+    /// FULL (in-band shape × journal outcome × settlement time) lattice —
+    /// the three axes the call site's contract names, not just the
+    /// failure classes a single scenario scripts:
     ///
-    /// - must-retire: a settled member whose required dependency output the
-    ///   per-submission top-up journaled REFUSED during execution is
-    ///   recorded under the upload-rejected disposition — never classified
-    ///   into the false parity regression its missing-input failure would
-    ///   otherwise become (the misattribution the supply dispositions
-    ///   exist to prevent; the pre-execute rollup ran before these rows
-    ///   existed, so this pass is the only consumer that can see them).
-    /// - must-admit: an identically failing member whose required path was
-    ///   DELIVERED keeps its real failure verdict — supply facts excuse
-    ///   nothing that was actually supplied.
-    ///
-    /// Quantification domain: the settled batch's member set (the rollup
-    /// is scoped to exactly the batch's jobs), with the journal folded
-    /// under the same settlement rules as the pre-execute rollup.
+    /// - (failure × refused at dispatch): must-retire under
+    ///   upload-rejected — never classified into the false parity
+    ///   regression its missing-input failure would otherwise become
+    ///   (the misattribution the supply dispositions exist to prevent;
+    ///   the pre-execute rollup ran before these rows existed, so this
+    ///   pass is the only consumer that can see them).
+    /// - (failure × delivered at dispatch): must-admit — supply facts
+    ///   excuse nothing that was actually supplied; the real failure
+    ///   verdict survives.
+    /// - (SUCCESS × refused at dispatch): must-admit — in-band evidence
+    ///   outranks journal inference. The member completed despite the
+    ///   refusal (the target substituted the input from its own upstream
+    ///   mid-run — the recovery the TargetSubstituted disposition,
+    ///   model.rs, documents; design §7.2: anything that survives to an
+    ///   attempt receives a verdict). Retiring it would replace a real
+    ///   result with a fabricated not-attempted upload-rejected record —
+    ///   a false regression-gate trip on a demonstrably successful unit.
+    /// - (failure × failed at dispatch, DELIVERED LATER by another
+    ///   batch's re-claimed top-up): must-retire under supply-failed —
+    ///   the as-of fold keeps the later delivery from masking that this
+    ///   member dispatched starved (claims are released on failure
+    ///   precisely so a later top-up can re-claim, so the journal's
+    ///   whole-history last row IS delivered; only the dispatch-time
+    ///   scope attributes correctly).
     #[tokio::test]
     async fn collect_pass_retires_supply_starved_members_before_classification() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
-        let starved_drv = format!("/nix/store/{}-starved.drv", "a".repeat(32));
-        let supplied_drv = format!("/nix/store/{}-supplied.drv", "b".repeat(32));
-        let starved_job = "starved.x86_64-linux";
-        let supplied_job = "supplied.x86_64-linux";
-        let starved_dep_out = format!("/nix/store/{}-starved-dep-out", "c".repeat(32));
-        let supplied_dep_out = format!("/nix/store/{}-supplied-dep-out", "d".repeat(32));
-        // The execute-phase top-up journaled a settled refusal for the
-        // starved member's required output and a delivery for the other.
-        let supply_row = |path: &str, outcome: &str| SupplyEntry {
+        let job_of = |name: &str| format!("{name}.x86_64-linux");
+        let drv_of = |name: &str, fill: char| {
+            format!("/nix/store/{}-{name}.drv", fill.to_string().repeat(32))
+        };
+        let dep_out_of = |name: &str, fill: char| {
+            format!("/nix/store/{}-{name}-dep-out", fill.to_string().repeat(32))
+        };
+        let starved = (
+            "starved",
+            drv_of("starved", 'a'),
+            dep_out_of("starved", 'c'),
+        );
+        let supplied = (
+            "supplied",
+            drv_of("supplied", 'b'),
+            dep_out_of("supplied", 'd'),
+        );
+        let recovered = (
+            "recovered",
+            drv_of("recovered", 'g'),
+            dep_out_of("recovered", 'h'),
+        );
+        let doomed = ("doomed", drv_of("doomed", 'i'), dep_out_of("doomed", 'j'));
+        let units = [&starved, &supplied, &recovered, &doomed];
+        // Time axis: rows at T0 (before dispatch), the batch dispatched at
+        // T1, the masking delivery at T2 — fixed RFC3339 instants in the
+        // exact shape the production clock helper writes.
+        let at_dispatch = "2026-06-03T10:00:00Z";
+        let dispatched = "2026-06-03T10:05:00Z";
+        let later = "2026-06-03T10:10:00Z";
+        let supply_row = |path: &str, outcome: &str, observed: &str| SupplyEntry {
             path: path.to_string(),
             source: model::SUPPLY_SOURCE_EMBEDDED.to_string(),
             mechanism: model::SUPPLY_MECHANISM_UPLOAD_BATCH.to_string(),
@@ -5465,22 +5541,23 @@ mod tests {
             detail: None,
             batch_id: Some(1),
             bytes: None,
-            observed_at: now_rfc3339(),
+            observed_at: observed.to_string(),
         };
-        state
-            .append_jsonl(
-                StateFile::Supply,
-                &supply_row(&starved_dep_out, SUPPLY_OUTCOME_REFUSED),
-            )
-            .unwrap();
-        state
-            .append_jsonl(
-                StateFile::Supply,
-                &supply_row(&supplied_dep_out, SUPPLY_OUTCOME_DELIVERED),
-            )
-            .unwrap();
-        // Both members failed in-band the same way (a refused upload
-        // surfaces as an ordinary missing-input build failure).
+        for row in [
+            // The execute-phase top-up settled these before dispatch.
+            supply_row(&starved.2, SUPPLY_OUTCOME_REFUSED, at_dispatch),
+            supply_row(&supplied.2, SUPPLY_OUTCOME_DELIVERED, at_dispatch),
+            supply_row(&recovered.2, SUPPLY_OUTCOME_REFUSED, at_dispatch),
+            supply_row(&doomed.2, SUPPLY_OUTCOME_FAILED, at_dispatch),
+            // A LATER batch's top-up re-claimed and delivered the doomed
+            // member's path: the whole-journal last settlement is
+            // delivered, but it was failed when this batch dispatched.
+            supply_row(&doomed.2, SUPPLY_OUTCOME_DELIVERED, later),
+        ] {
+            state.append_jsonl(StateFile::Supply, &row).unwrap();
+        }
+        // In-band axis: identical missing-input failures everywhere except
+        // the recovered member, whose in-band row is success-shaped.
         let failure = |drv: &str| model::PathOutcome {
             drv_path: drv.to_string(),
             status: model::build_status_name(
@@ -5491,19 +5568,32 @@ mod tests {
             start_time: 0,
             stop_time: 0,
         };
+        let success = |drv: &str| model::PathOutcome {
+            drv_path: drv.to_string(),
+            status: model::build_status_name(rio_nix::protocol::build::BuildStatus::Substituted)
+                .to_string(),
+            error_msg: String::new(),
+            start_time: 0,
+            stop_time: 0,
+        };
         state
             .append_jsonl(
                 StateFile::Batches,
                 &model::BatchRecord {
                     batch_id: 9,
                     kind: BATCH_KIND_SUBMIT.to_string(),
-                    jobs: vec![starved_job.to_string(), supplied_job.to_string()],
-                    root_drvs: vec![starved_drv.clone(), supplied_drv.clone()],
-                    est_nodes: 2,
+                    jobs: units.iter().map(|unit| job_of(unit.0)).collect(),
+                    root_drvs: units.iter().map(|unit| unit.1.clone()).collect(),
+                    est_nodes: 4,
                     build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into()),
-                    started_at: now_rfc3339(),
-                    finished_at: Some(now_rfc3339()),
-                    results: vec![failure(&starved_drv), failure(&supplied_drv)],
+                    started_at: dispatched.to_string(),
+                    finished_at: Some(later.to_string()),
+                    results: vec![
+                        failure(&starved.1),
+                        failure(&supplied.1),
+                        success(&recovered.1),
+                        failure(&doomed.1),
+                    ],
                     reasons: BTreeMap::new(),
                     stderr_tail: None,
                     engine_cancelled: false,
@@ -5528,13 +5618,10 @@ mod tests {
             plan_snapshot_valid: false,
             fixed_output_drvs: Arc::new(HashSet::new()),
         };
-        let contexts: HashMap<String, JobContext> = HashMap::from([
-            (starved_job.to_string(), mk_ctx(starved_job, &starved_drv)),
-            (
-                supplied_job.to_string(),
-                mk_ctx(supplied_job, &supplied_drv),
-            ),
-        ]);
+        let contexts: HashMap<String, JobContext> = units
+            .iter()
+            .map(|unit| (job_of(unit.0), mk_ctx(&job_of(unit.0), &unit.1)))
+            .collect();
         let manifest_entry = |job: &str, drv: &str| archive_input::ManifestEntry {
             job: job.to_string(),
             system: "x86_64-linux".into(),
@@ -5553,14 +5640,18 @@ mod tests {
             srcs: Vec::new(),
         };
         let supply_inputs = SupplyRetirementInputs {
-            manifest: Arc::new(vec![
-                manifest_entry(starved_job, &starved_drv),
-                manifest_entry(supplied_job, &supplied_drv),
-            ]),
-            dep_closure: Arc::new(vec![
-                closure_entry(starved_job, &starved_drv, &starved_dep_out),
-                closure_entry(supplied_job, &supplied_drv, &supplied_dep_out),
-            ]),
+            manifest: Arc::new(
+                units
+                    .iter()
+                    .map(|unit| manifest_entry(&job_of(unit.0), &unit.1))
+                    .collect(),
+            ),
+            dep_closure: Arc::new(
+                units
+                    .iter()
+                    .map(|unit| closure_entry(&job_of(unit.0), &unit.1, &unit.2))
+                    .collect(),
+            ),
             plan_dispositions: Arc::new(BTreeMap::new()),
         };
         let backends = CollectBackends {
@@ -5592,15 +5683,20 @@ mod tests {
         .unwrap();
         assert_eq!(requeued, 0);
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
-        // Must-retire: the starved member carries the supply disposition,
-        // not a parity verdict — and exactly one record exists for it (the
-        // already-terminal belt dropped it from classification).
+        let starved_job = job_of(starved.0);
+        let supplied_job = job_of(supplied.0);
+        let recovered_job = job_of(recovered.0);
+        let doomed_job = job_of(doomed.0);
+        // (failure × refused-at-dispatch) must-retire: the starved member
+        // carries the supply disposition, not a parity verdict — and
+        // exactly one record exists for it (the already-terminal belt
+        // dropped it from classification).
         assert_eq!(
-            records[starved_job].disposition.as_deref(),
+            records[&starved_job].disposition.as_deref(),
             Some(Disposition::UploadRejected.as_str()),
             "{records:?}"
         );
-        assert_eq!(records[starved_job].verdict, None);
+        assert_eq!(records[&starved_job].verdict, None);
         let starved_records = state
             .load_jsonl::<JobRecord>(StateFile::Results)
             .unwrap()
@@ -5608,12 +5704,36 @@ mod tests {
             .filter(|r| r.job == starved_job)
             .count();
         assert_eq!(starved_records, 1, "retired exactly once, never classified");
-        // Must-admit: the supplied member keeps its real failure verdict.
+        // (failure × delivered-at-dispatch) must-admit: the supplied
+        // member keeps its real failure verdict.
         assert_eq!(
-            records[supplied_job].verdict.as_deref(),
+            records[&supplied_job].verdict.as_deref(),
             Some(Verdict::UnexpectedFailure.as_str()),
             "{records:?}"
         );
+        // (success × refused-at-dispatch) must-admit: the recovered
+        // member's in-band success survives — classified normally (the
+        // target-substituted disposition), never replaced by an
+        // upload-rejected exclusion record.
+        assert_ne!(
+            records[&recovered_job].disposition.as_deref(),
+            Some(Disposition::UploadRejected.as_str()),
+            "in-band success must exempt the member from journal retirement: {records:?}"
+        );
+        assert_eq!(
+            records[&recovered_job].disposition.as_deref(),
+            Some(Disposition::TargetSubstituted.as_str()),
+            "{records:?}"
+        );
+        // (failure × failed-at-dispatch, delivered-later) must-retire:
+        // the as-of fold sees the dispatch-time failure, not the later
+        // masking delivery — supply-failed, not a parity verdict.
+        assert_eq!(
+            records[&doomed_job].disposition.as_deref(),
+            Some(Disposition::SupplyFailed.as_str()),
+            "a later batch's delivery must not rewrite this batch's starvation: {records:?}"
+        );
+        assert_eq!(records[&doomed_job].verdict, None);
     }
 
     /// Job context with an empty closure for the journal-fold tests.
