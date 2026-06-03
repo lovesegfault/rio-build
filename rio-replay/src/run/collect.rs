@@ -2720,6 +2720,16 @@ mod tests {
                  evidence-graded gate",
             ),
             (
+                "mod.rs",
+                2,
+                0,
+                "polarity only: import_gap_retirements consumes failure-shaped in-band \
+                 results (a root that succeeded is judged on its success, never retired \
+                 over an archive gap), and the batch-settle supply rollup's in-band \
+                 success exemption (in-row evidence outranks journal inference) — both \
+                 pre-classification gates, neither asserts execution",
+            ),
+            (
                 "timeline.rs",
                 2,
                 0,
