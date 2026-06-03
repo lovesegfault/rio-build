@@ -998,6 +998,100 @@ in
       witness = "noReclaimAfterRestore";
     };
 
+    # ---- bughunt-wave F1: suspend + shutdown lease regimes -----------
+    # (delimited section: leaderElection.qnt fault-gated extension.
+    # All four pre-existing regimes above instantiate the new fault
+    # budgets at zero and were re-measured state-count-identical at the
+    # introducing commit — the new vars are constant there and multiply
+    # no states.)
+
+    # The split-renew (suspend) fault regime: a steady renew's PUT
+    # commits at send while the response read parks — a host suspend
+    # straddling an in-flight round-trip (bug_096). The parked node is
+    # exempt from the loop-discipline tick cap (the honest statement of
+    # the bug: the loop-interval assumption never held across a parked
+    # await), so dual belief IS reachable here and the operative
+    # property is boundedDualLeadership, not neverDual — see the module
+    # comment and lease-invariant-map.md's documented deviation (a).
+    # The production fix encoded: renewReadOk stamps the fence from the
+    # attempt-start ANCHOR (RenewAnchor/BlindClock); the paired
+    # expect-violation pin is quint-lease-calib-096-response-anchor,
+    # which re-introduces response anchoring and must keep violating
+    # boundedDualLeadership.
+    # r[verify sched.lease.self-fence+2]
+    quint-leader-election-suspend = mkQuintCheck {
+      name = "leader-election-suspend";
+      spec = "leaderElection";
+      main = "leaderElectionSuspend";
+      invariants = [
+        "boundsOK"
+        "clockSkewBound"
+        "atMostOneCASWinner"
+        # The resume-bounded form: the post-read believer's
+        # resume-to-first-tick gap legitimately exceeds the exact tick
+        # cap (see the val's doc); the legacy regimes keep the exact
+        # loopInterval.
+        "loopIntervalResumeBounded"
+        "boundedDualLeadership"
+        "staleLeaderHasStaleGeneration"
+      ];
+    };
+
+    # The graceful-exit (shutdown) fault regime: SIGTERM breaks the
+    # loop and runs the release gate, which is HOLD-gated — the
+    # belief/hold split of bug_387 (LeaseStanding). gracefulHandover is
+    # the headline: no node ever exits while the apiserver still names
+    # it holder without releasing; neverDual carries over from the
+    # asymmetric constants (an exited node is not a believer). The
+    # paired expect-violation pin is quint-lease-calib-387-belief-gate
+    # (the belief-gated release must keep violating gracefulHandover).
+    # r[verify sched.lease.graceful-release+2]
+    quint-leader-election-shutdown = mkQuintCheck {
+      name = "leader-election-shutdown";
+      spec = "leaderElection";
+      main = "leaderElectionShutdown";
+      invariants = [
+        "boundsOK"
+        "clockSkewBound"
+        "atMostOneCASWinner"
+        "loopInterval"
+        "boundedDualLeadership"
+        "staleLeaderHasStaleGeneration"
+        "neverDual"
+        "gracefulHandover"
+      ];
+    };
+
+    # Non-vacuity witnesses for the two new regimes (same discipline as
+    # the witness block above: each check passes only when the checker
+    # VIOLATES the witness, proving the guarded scenario reachable).
+    quint-leader-election-witness-suspend-straddle = mkQuintWitnessCheck {
+      name = "leader-election-witness-suspend-straddle";
+      spec = "leaderElection";
+      main = "leaderElectionSuspend";
+      witness = "noSuspendStraddle";
+    };
+    quint-leader-election-witness-fence-then-exit = mkQuintWitnessCheck {
+      name = "leader-election-witness-fence-then-exit";
+      spec = "leaderElection";
+      main = "leaderElectionShutdown";
+      witness = "noFenceThenExit";
+    };
+
+    # Deterministic named-run replays for the two new regimes (the
+    # executable scenario pins: the straddle-fences narrative and the
+    # fence-then-SIGTERM release/skip pair).
+    quint-leader-election-runs-suspend = mkQuintRunCheck {
+      name = "leader-election-runs-suspend";
+      spec = "leaderElection";
+      main = "leaderElectionSuspend";
+    };
+    quint-leader-election-runs-shutdown = mkQuintRunCheck {
+      name = "leader-election-runs-shutdown";
+      spec = "leaderElection";
+      main = "leaderElectionShutdown";
+    };
+
     # ------------------------------------------------------------------
     # rio-store's LogService: the build-log session/chunk/dedup protocol
     # (model C of the log-formal campaign — the successor to the retired

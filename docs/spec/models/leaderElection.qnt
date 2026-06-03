@@ -219,6 +219,12 @@ module leaderElection {
   /// A node's observed-record staleness clock (TLA+ obs[n]): the rv it is
   /// watching and the local-clock instant it started watching.
   type ObsState = | NoObs | Observed({ rv: int, since: int })
+  /// An in-flight renew round-trip whose apiserver write committed at
+  /// SEND but whose response has not been read yet (the loop parked on
+  /// the await). `anchor` is the attempt-start instant on the node's
+  /// clock — what production's RenewAnchor captures before the await.
+  /// Only the suspend fault (MAX_SUSPENDS > 0) ever creates one.
+  type PendingState = | NoPending | PendingRead({ anchor: int })
 
   // --- 2. constants (const = overridable per fault regime) --------------
   const NODES: Set[Node]
@@ -253,6 +259,21 @@ module leaderElection {
   /// claims ledger AND the assignment history together (the floor is
   /// GREATEST over both).
   const MAX_RESTORES: int
+  /// Split renews per trace (0 = disabled): a steady-state renew whose
+  /// apiserver write commits at send while the response read is
+  /// arbitrarily delayed — the loop parked on the await, i.e. a host
+  /// suspend (or long stall) straddling an in-flight round-trip. While
+  /// a read is pending the node takes NO actions (the production loop
+  /// is parked), which exempts it from the loop-discipline tick cap —
+  /// the honest statement of bug_096: the loop-interval assumption
+  /// never held across a parked await.
+  const MAX_SUSPENDS: int
+  /// Graceful process exits per trace (0 = disabled): SIGTERM — the
+  /// loop breaks, runs the release gate, and the process never comes
+  /// back (recover is guarded). Exercises the belief/hold split
+  /// (bug_387): the release fires iff the node HELD the lease
+  /// unsuperseded, regardless of the belief the self-fence cleared.
+  const MAX_SHUTDOWNS: int
 
   /// acquiredAt sentinel: "never acquired" (the TLA+ acquiredAt[n] =
   /// NULL). -1 can never equal a real rv (>= 0), mirroring a model
@@ -326,6 +347,34 @@ module leaderElection {
   /// by the noFloorBumpAfterDeletion witness; never read by an action
   /// guard.
   var renewBumpedAboveEntry: bool
+  /// In-flight split renew per node (suspend fault only; constant
+  /// NoPending at MAX_SUSPENDS = 0).
+  var pending: Node -> PendingState
+  /// LeaseStanding.held_unsuperseded: acquired and not since observed
+  /// a completed round resolving not-leading. Tracked only when the
+  /// shutdown fault is enabled (trackHeld), so the existing regimes'
+  /// state spaces are untouched. Set on steal/renewLease, cleared on
+  /// conflict / observing a non-own holder / crash; UNTOUCHED by
+  /// selfFence — the fix encoded.
+  var held: Node -> bool
+  /// Process exited gracefully (terminal; recover is guarded on it).
+  var exited: Node -> bool
+  /// Split renews so far (0..MAX_SUSPENDS).
+  var suspends: int
+  /// Graceful exits so far (0..MAX_SHUTDOWNS).
+  var shutdowns: int
+  /// History latch: a node exited while the apiserver still named it
+  /// holder and the release did not run. gracefulHandover = its
+  /// negation.
+  var releaseSkippedWhileHolder: bool
+  /// History latch: a split renew's read happened more than FENCE_AFTER
+  /// past its anchor — the suspend straddled the in-flight round-trip.
+  /// Read by the noSuspendStraddle witness.
+  var suspendStraddled: bool
+  /// History latch: a shutdown ran on a node that still held the lease
+  /// at the apiserver but no longer believed (post-self-fence) — the
+  /// fence-then-SIGTERM shape. Read by the noFenceThenExit witness.
+  var fenceThenExit: bool
 
   // --- 4. accessor / guard helpers --------------------------------------
   // The TLA+ reads snap[n].rv directly after guarding snap[n] /= NULL;
@@ -340,6 +389,14 @@ module leaderElection {
   def hasObs(n: Node): bool = obs.get(n) != NoObs
   def obsRvOf(n: Node): int = match obs.get(n) { | NoObs => -1 | Observed(o) => o.rv }
   def obsSinceOf(n: Node): int = match obs.get(n) { | NoObs => -1 | Observed(o) => o.since }
+  def hasPending(n: Node): bool = pending.get(n) != NoPending
+  def anchorOf(n: Node): int = match pending.get(n) { | NoPending => -1 | PendingRead(p) => p.anchor }
+
+  /// held tracking, gated on the shutdown fault so the four existing
+  /// regimes are STATE-SPACE-IDENTICAL at MAX_SHUTDOWNS = 0 (held stays
+  /// at its init value; a constant variable multiplies no states).
+  def trackHeld(cur: Node -> bool, n: Node, v: bool): Node -> bool =
+    if (MAX_SHUTDOWNS > 0) cur.put(n, v) else cur
 
   /// The shared CAS guard for steal/renewLease (TLA+ ReplaceGuard's
   /// precondition half). NOT a standalone action -- a predicate both
@@ -440,6 +497,28 @@ module leaderElection {
   /// quint-leader-election-witness-dual-belief (nix/quint.nix) fails if
   /// dual belief ever stops being reachable in the base regime.
   val neverDual = not(dual)
+
+  /// The graceful-handover invariant (sched.lease.graceful-release+2):
+  /// no node ever exits while the apiserver still names it holder
+  /// without running the release. With the hold-gated release this is
+  /// an invariant (¬held ∧ holder == us is unreachable: the hold
+  /// clears only on completed rounds that observed someone else, on
+  /// crash, or on a previous exit); with the belief-gated release the
+  /// fence-then-SIGTERM trace violates it — the lease-387-belief-gate
+  /// calibration pins that falsification.
+  val gracefulHandover = not(releaseSkippedWhileHolder)
+
+  /// Witness (expect-violation): the suspend actually straddles an
+  /// in-flight renew in the suspend regime — a read completing more
+  /// than FENCE_AFTER past its anchor is reachable. Guards the suspend
+  /// regime's boundedDualLeadership verdict against vacuity.
+  val noSuspendStraddle = not(suspendStraddled)
+
+  /// Witness (expect-violation): the fence-then-exit shape — a node
+  /// exiting not-believing while the apiserver still names it holder —
+  /// is reachable in the shutdown regime. Guards gracefulHandover
+  /// against vacuity (a release gate nobody reaches proves nothing).
+  val noFenceThenExit = not(fenceThenExit)
 
   // --- expect-violation witnesses (non-vacuity probes) -------------------
   //
@@ -551,8 +630,25 @@ module leaderElection {
   /// precondition, loopInterval fails loudly instead of
   /// boundedDualLeadership failing confusingly one tick past the bound.
   val loopInterval = NODES.forall(n =>
-    (alive.get(n) and leading.get(n)) implies
+    (alive.get(n) and leading.get(n) and pending.get(n) == NoPending) implies
       (clocks.get(n) - fence.get(n) <= FENCE_AFTER + RENEW))
+
+  /// loopInterval's suspend-regime form: downstream of a split renew
+  /// the post-read believer legitimately exceeds the tick-cap bound for
+  /// the resume-to-first-tick gap (the read stamps the OLD anchor; the
+  /// suspended interval already passed) — the production residual
+  /// clock.rs documents. The tick cap still blocks any FURTHER clock
+  /// advance for that node (TLC explores no successor that ticks it),
+  /// so the gap admits no additional time; the disjunct only excuses
+  /// states a split renew can produce (suspends > 0), keeping the full
+  /// tripwire on every pre-fault prefix — and the four legacy regimes
+  /// (MAX_SUSPENDS = 0) keep the exact loopInterval.
+  val loopIntervalResumeBounded = NODES.forall(n =>
+    (alive.get(n) and leading.get(n) and pending.get(n) == NoPending) implies
+      or {
+        clocks.get(n) - fence.get(n) <= FENCE_AFTER + RENEW,
+        suspends > 0,
+      })
 
   /// The soft half of sched.lease.at-most-one-leader+3. Two nodes
   /// simultaneously believing they lead IS reachable (the dual-belief
@@ -768,7 +864,10 @@ module leaderElection {
   /// the bound, so only that direction is checked.
   action tick(n: Node): bool = all {
     clocks.get(n) < MAX_TIME,
-    (alive.get(n) and leading.get(n)) implies
+    // pending == NoPending: a loop parked on an in-flight read runs no
+    // fence checks — the loop-discipline cap does not apply to it (the
+    // honest statement of bug_096; vacuous at MAX_SUSPENDS = 0).
+    (alive.get(n) and leading.get(n) and pending.get(n) == NoPending) implies
       ((clocks.get(n) + 1) - fence.get(n) <= FENCE_AFTER + RENEW),
     NODES.forall(m => (clocks.get(n) + 1) - clocks.get(m) <= MAX_SKEW),
     clocks' = clocks.put(n, clocks.get(n) + 1),
@@ -780,6 +879,10 @@ module leaderElection {
     restores' = restores, stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
     renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    pending' = pending, held' = held, exited' = exited,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
   }
 
   /// GET the lease. The obs[n] update follows decide_pure()'s
@@ -818,6 +921,7 @@ module leaderElection {
   /// -- is what makes the fence/steal separation argument sound.
   action apiGet(n: Node): bool = all {
     alive.get(n),
+    pending.get(n) == NoPending,
     snap' = snap.put(n, Snap(lease)),
     obs' = obs.put(n,
       if (lease.holder == NoHolder) NoObs
@@ -832,6 +936,15 @@ module leaderElection {
     stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
     renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    // The hold clears when the GET observes a holder that is not us
+    // (the model point where production's Standby resolution lands —
+    // on_observed(false)); observing our own holdership keeps it.
+    pending' = pending,
+    held' = trackHeld(held, n, if (lease.holder == Held(n)) held.get(n) else false),
+    exited' = exited,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
   }
 
   /// The write-ahead claim INSERT succeeds: the PG floor advances to the
@@ -956,6 +1069,7 @@ module leaderElection {
     val seeded = seedFor(n, entry)
     all {
       alive.get(n),
+      pending.get(n) == NoPending,
       hasSnap(n),
       // decide()'s steal condition: the lease is unheld, or its holder
       // has been observed at the same rv for longer than the steal
@@ -1016,6 +1130,10 @@ module leaderElection {
       stealBumpedForeignTie' = (stealBumpedForeignTie or
         (genHW == entry and genHWHolder != Held(n))),
       renewBumpedAboveEntry' = renewBumpedAboveEntry,
+      pending' = pending, held' = trackHeld(held, n, true), exited' = exited,
+      suspends' = suspends, shutdowns' = shutdowns,
+      releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+      suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
       // The claim disjunction: the INSERT into the claims ledger either
       // lands (claimOk -- the floor advances when seeded exceeds it; on
       // seedFor's own-row-tie retain path seeded equals genHW, so claimOk
@@ -1143,6 +1261,7 @@ module leaderElection {
     val claimTarget = if (isEdge) seeded else genHW
     all {
       alive.get(n),
+      pending.get(n) == NoPending,
       hasSnap(n),
       snapHolderOf(n) == Held(n),
       casOk(n),
@@ -1169,6 +1288,10 @@ module leaderElection {
       // right-hand side are load-bearing (`or` binds looser than `=`).
       renewBumpedAboveEntry' = (renewBumpedAboveEntry or
         (isEdge and genHW > entry)),
+      pending' = pending, held' = trackHeld(held, n, true), exited' = exited,
+      suspends' = suspends, shutdowns' = shutdowns,
+      releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+      suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
       // The same claim disjunction as steal's, restricted to the edge
       // branch via claimTarget -- a steady-state renew never claims, so
       // it cannot fail to claim. The retry-on-the-next-acquire-edge
@@ -1189,6 +1312,7 @@ module leaderElection {
   /// not-leading, both reset fence -- the model collapses them.
   action conflict(n: Node): bool = all {
     alive.get(n),
+    pending.get(n) == NoPending,
     hasSnap(n),
     lease.rv != snapRvOf(n),
     fence' = fence.put(n, clocks.get(n)),
@@ -1202,6 +1326,12 @@ module leaderElection {
     stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
     renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    // 409 = a completed round resolving not-leading: the hold clears
+    // (production's on_observed(false)).
+    pending' = pending, held' = trackHeld(held, n, false), exited' = exited,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
   }
 
   /// maybe_self_fence(): a Leading node that has not had a successful
@@ -1212,6 +1342,11 @@ module leaderElection {
   /// -- sound for safety).
   action selfFence(n: Node): bool = all {
     alive.get(n),
+    // A loop parked on an in-flight read runs no fence checks; the
+    // first POST-READ tick is where the fence fires (vacuous at
+    // MAX_SUSPENDS = 0). held is deliberately UNTOUCHED below — the
+    // belief/hold split (bug_387): fencing is local.
+    pending.get(n) == NoPending,
     leading.get(n),
     clocks.get(n) - fence.get(n) > FENCE_AFTER,
     leading' = leading.put(n, false),
@@ -1223,6 +1358,10 @@ module leaderElection {
     restores' = restores, stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
     renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    pending' = pending, held' = held, exited' = exited,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
   }
 
   /// Pod crash. Loses ALL in-memory state: the belief, the snapshot, the
@@ -1247,6 +1386,15 @@ module leaderElection {
     stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
     renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    // The crash kills the in-flight read with the process (the PUT it
+    // committed stays committed — exactly a real apiserver) and loses
+    // the in-memory hold.
+    pending' = pending.put(n, NoPending),
+    held' = trackHeld(held, n, false),
+    exited' = exited,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
   }
 
   /// Pod restart. The recovered process has no observation (its first
@@ -1256,6 +1404,10 @@ module leaderElection {
   /// without contention).
   action recover(n: Node): bool = all {
     not(alive.get(n)),
+    // A graceful exit is terminal: SIGTERM'd processes do not restart
+    // within the trace (the Deployment replaces the POD; a fresh
+    // replica is a fresh node identity, out of scope at |NODES| = 2).
+    not(exited.get(n)),
     alive' = alive.put(n, true),
     clocks' = clocks, lease' = lease, leading' = leading, snap' = snap,
     obs' = obs, fence' = fence, gen' = gen, genHW' = genHW,
@@ -1265,6 +1417,137 @@ module leaderElection {
     restores' = restores, stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
     renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    pending' = pending, held' = held, exited' = exited,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+  }
+
+  /// Suspend fault, send half: a steady-state renew whose PUT commits
+  /// at the apiserver NOW while the response read is delayed (the loop
+  /// parks on the await). The fence is UNCHANGED — the anchor is
+  /// captured into the pending read, and only renewReadOk stamps it
+  /// (the production RenewAnchor/BlindClock encoding). The rv bumps at
+  /// send: a thief's staleness clock measures from this write, exactly
+  /// like production (the apiserver committed; only the response is in
+  /// flight). Only the current holder steady-renews (the acquire edge
+  /// is not split: an acquiring node that suspends mid-acquire fails
+  /// its round and is covered by the error arm — no stamp).
+  action renewSendSteady(n: Node): bool = all {
+    suspends < MAX_SUSPENDS,
+    alive.get(n),
+    leading.get(n),
+    pending.get(n) == NoPending,
+    hasSnap(n),
+    snapHolderOf(n) == Held(n),
+    casOk(n),
+    lease' = { ...lease, rv: snapRvOf(n) + 1 },
+    snap' = snap.put(n, NoSnap),
+    pending' = pending.put(n, PendingRead({ anchor: clocks.get(n) })),
+    suspends' = suspends + 1,
+    casRace' = casRaceAfterPut(n),
+    held' = trackHeld(held, n, true),
+    fence' = fence, clocks' = clocks, alive' = alive, leading' = leading,
+    obs' = obs, gen' = gen, genHW' = genHW, genHWHolder' = genHWHolder,
+    acquiredAt' = acquiredAt, deletes' = deletes,
+    delVictims' = delVictims, claimFailures' = claimFailures,
+    restores' = restores, stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    exited' = exited, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
+  }
+
+  /// Suspend fault, read half: the parked response arrives. THE FIX
+  /// ENCODED: the fence restarts at the captured ANCHOR — never at the
+  /// read instant (BlindClock has no API for that; the calibration
+  /// override lease-096-response-anchor re-introduces it and must
+  /// violate boundedDualLeadership). The straddle latch records a read
+  /// completing more than FENCE_AFTER past its anchor — the suspended
+  /// interval the response would have erased under response anchoring.
+  action renewReadOk(n: Node): bool = all {
+    alive.get(n),
+    pending.get(n) != NoPending,
+    fence' = fence.put(n, anchorOf(n)),
+    pending' = pending.put(n, NoPending),
+    // Parentheses load-bearing: `or` binds looser than `=` (the steal
+    // action's discriminator comment is the precedent).
+    suspendStraddled' = (suspendStraddled or
+      (clocks.get(n) - anchorOf(n) > FENCE_AFTER)),
+    clocks' = clocks, lease' = lease, alive' = alive, leading' = leading,
+    snap' = snap, obs' = obs, gen' = gen, genHW' = genHW,
+    genHWHolder' = genHWHolder, acquiredAt' = acquiredAt,
+    casRace' = casRace, deletes' = deletes, delVictims' = delVictims,
+    claimFailures' = claimFailures, restores' = restores,
+    stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    held' = held, exited' = exited,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    fenceThenExit' = fenceThenExit,
+  }
+
+  /// Shutdown fault: SIGTERM. The loop breaks and runs the release
+  /// gate — THE FIX ENCODED: release iff the node HELD the lease
+  /// unsuperseded (LeaseStanding.should_release_on_shutdown), NEVER
+  /// the belief the self-fence cleared (the calibration override
+  /// lease-387-belief-gate swaps the gate and must violate
+  /// gracefulHandover). A release clears the holder and bumps the rv,
+  /// so a standby's next GET sees an empty holder and steals on its
+  /// poll tick instead of waiting out the staleness threshold. The
+  /// fenceThenExit latch records the interesting shape: exiting
+  /// not-believing while the apiserver still names us.
+  action shutdown(n: Node): bool = {
+    // The release predicate — THE FIX: hold-gated. The latch below
+    // fires iff the node exits while the GATE'S OWN SPEC says release
+    // (held ∧ holder == us) and the release did not run: identically
+    // false here by construction, and exactly the fence-then-SIGTERM
+    // shape under the belief-gated calibration override
+    // (lease-387-belief-gate), whose shutdownBeliefGated releases on
+    // `leading` instead. Deliberately NOT "holder == us and no
+    // release": a crash-restarted process whose previous incarnation's
+    // lease survives has held = false by the gate's spec (it never
+    // acquired THIS incarnation; sched.lease.graceful-release+2 gates
+    // on "ever acquired and not since observed another holder") — its
+    // skipped release costs the steal threshold, never correctness,
+    // matching production.
+    val releases = held.get(n) and lease.holder == Held(n)
+    all {
+    shutdowns < MAX_SHUTDOWNS,
+    alive.get(n),
+    not(exited.get(n)),
+    pending.get(n) == NoPending,
+    // State-space bound, as a PRECONDITION (the steal convention): the
+    // release PUT bumps the rv, so a shutdown at the rv ceiling is the
+    // exploration boundary — disabling loses nothing.
+    lease.rv < MAX_RV,
+    // Parentheses load-bearing on both latches (see steal's precedent).
+    releaseSkippedWhileHolder' = (releaseSkippedWhileHolder or
+      (held.get(n) and lease.holder == Held(n) and not(releases))),
+    fenceThenExit' = (fenceThenExit or
+      (held.get(n) and not(leading.get(n)) and lease.holder == Held(n))),
+    lease' = if (releases)
+               { holder: NoHolder, rv: lease.rv + 1, gen: lease.gen }
+             else lease,
+    alive' = alive.put(n, false),
+    exited' = exited.put(n, true),
+    leading' = leading.put(n, false),
+    held' = trackHeld(held, n, false),
+    shutdowns' = shutdowns + 1,
+    snap' = snap.put(n, NoSnap),
+    obs' = obs.put(n, NoObs),
+    clocks' = clocks, fence' = fence, gen' = gen, genHW' = genHW,
+    genHWHolder' = genHWHolder, acquiredAt' = acquiredAt,
+    casRace' = casRace, deletes' = deletes, delVictims' = delVictims,
+    claimFailures' = claimFailures, restores' = restores,
+    stealRetained' = stealRetained,
+    stealBumpedForeignTie' = stealBumpedForeignTie,
+    renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    pending' = pending, suspends' = suspends,
+    suspendStraddled' = suspendStraddled,
+    }
   }
 
   /// Operator fault: `kubectl delete lease` destroys the Lease object and
@@ -1319,6 +1602,10 @@ module leaderElection {
     stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
     renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    pending' = pending, held' = held, exited' = exited,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
   }
 
   /// Operator/infrastructure fault: a PostgreSQL point-in-time restore
@@ -1347,6 +1634,10 @@ module leaderElection {
     stealRetained' = stealRetained,
     stealBumpedForeignTie' = stealBumpedForeignTie,
     renewBumpedAboveEntry' = renewBumpedAboveEntry,
+    pending' = pending, held' = held, exited' = exited,
+    suspends' = suspends, shutdowns' = shutdowns,
+    releaseSkippedWhileHolder' = releaseSkippedWhileHolder,
+    suspendStraddled' = suspendStraddled, fenceThenExit' = fenceThenExit,
   }
 
   // --- 7. init ----------------------------------------------------------
@@ -1374,6 +1665,14 @@ module leaderElection {
     stealRetained' = false,
     stealBumpedForeignTie' = false,
     renewBumpedAboveEntry' = false,
+    pending' = NODES.mapBy(n => NoPending),
+    held' = NODES.mapBy(n => false),
+    exited' = NODES.mapBy(n => false),
+    suspends' = 0,
+    shutdowns' = 0,
+    releaseSkippedWhileHolder' = false,
+    suspendStraddled' = false,
+    fenceThenExit' = false,
   }
 
   // --- 8. step ----------------------------------------------------------
@@ -1441,6 +1740,21 @@ module leaderElection {
     nondet n = NODES.oneOf()
     recover(n)
   }
+  /// One holder's split renew commits at send (suspend fault).
+  action renewSendSteadyAny = {
+    nondet n = NODES.oneOf()
+    renewSendSteady(n)
+  }
+  /// One parked read completes (suspend fault).
+  action renewReadOkAny = {
+    nondet n = NODES.oneOf()
+    renewReadOk(n)
+  }
+  /// One node receives SIGTERM (shutdown fault).
+  action shutdownAny = {
+    nondet n = NODES.oneOf()
+    shutdown(n)
+  }
 
   action step = any {
     tickAny,
@@ -1453,6 +1767,12 @@ module leaderElection {
     recoverAny,
     deleteLease,
     pgRestore,
+    // Fault-gated (disabled at MAX_SUSPENDS = MAX_SHUTDOWNS = 0, so the
+    // four pre-existing regimes' transition relations — and state
+    // spaces — are unchanged; re-measured at the introducing commit).
+    renewSendSteadyAny,
+    renewReadOkAny,
+    shutdownAny,
   }
 }
 
@@ -1554,7 +1874,9 @@ module leaderElectionBase {
     MAX_RV = 8,
     MAX_DELETES = 0,
     MAX_CLAIM_FAILURES = 0,
-    MAX_RESTORES = 0
+    MAX_RESTORES = 0,
+    MAX_SUSPENDS = 0,
+    MAX_SHUTDOWNS = 0
   ).*
 
   // --- deterministic protocol runs ---------------------------------------
@@ -1748,7 +2070,9 @@ module leaderElectionDeletion {
     MAX_RV = 8,
     MAX_DELETES = 1,
     MAX_CLAIM_FAILURES = 0,
-    MAX_RESTORES = 0
+    MAX_RESTORES = 0,
+    MAX_SUSPENDS = 0,
+    MAX_SHUTDOWNS = 0
   ).*
 }
 
@@ -1834,7 +2158,9 @@ module leaderElectionAsymmetric {
     MAX_RV = 8,
     MAX_DELETES = 0,
     MAX_CLAIM_FAILURES = 0,
-    MAX_RESTORES = 0
+    MAX_RESTORES = 0,
+    MAX_SUSPENDS = 0,
+    MAX_SHUTDOWNS = 0
   ).*
 }
 
@@ -1919,6 +2245,161 @@ module leaderElectionPgFaults {
     MAX_RV = 8,
     MAX_DELETES = 0,
     MAX_CLAIM_FAILURES = 1,
-    MAX_RESTORES = 1
+    MAX_RESTORES = 1,
+    MAX_SUSPENDS = 0,
+    MAX_SHUTDOWNS = 0
   ).*
+}
+
+// =========================================================================
+// The suspend regime: the split-renew fault enabled (MAX_SUSPENDS = 1)
+// over the asymmetric-TTL constants. A steady-state renew's PUT commits
+// at send while the loop parks on the response read — a host suspend
+// straddling an in-flight round-trip — and the parked node is exempt
+// from the loop-discipline tick cap for exactly that interval (the
+// honest statement of bug_096: the loop-interval assumption never held
+// across a parked await).
+//
+// The operative property here is boundedDualLeadership, NOT neverDual:
+// a parked believer with a thief past its steal threshold is a genuine
+// dual-belief state — reachable under EITHER anchoring — because the
+// believer takes no actions (and so discovers nothing) while parked.
+// What the anchoring decides is whether the dual is *bounded*: with the
+// fence restarting at the attempt-start ANCHOR (renewReadOk — the
+// production RenewAnchor encoding), the post-read believer is at or
+// past its own fence deadline, so discovery disjunct (1) is armed and
+// boundedDualLeadership HOLDS; with response anchoring (the
+// lease-096-response-anchor calibration override), the post-read
+// believer's fence is fresh, its snapshot is spent, and NO discovery
+// path is armed — boundedDualLeadership is VIOLATED. See
+// docs/spec/models/lease-invariant-map.md for the neverDual exclusion
+// rationale (documented deviation (a)).
+//
+// Non-vacuity: the noSuspendStraddle witness (expect-violation,
+// quint-leader-election-witness-suspend-straddle) proves the straddle
+// scenario is actually explored.
+module leaderElectionSuspend {
+  import leaderElection(
+    NODES = Set("n1", "n2"),
+    FENCE_AFTER = 2,
+    STEAL_AFTER = 5,
+    RENEW = 1,
+    MAX_SKEW = 1,
+    MAX_TIME = 8,
+    MAX_GEN = 4,
+    MAX_RV = 8,
+    MAX_DELETES = 0,
+    MAX_CLAIM_FAILURES = 0,
+    MAX_RESTORES = 0,
+    MAX_SUSPENDS = 1,
+    MAX_SHUTDOWNS = 0
+  ).*
+
+  /// The suspend-straddle scenario, end to end: n1 acquires, its next
+  /// steady renew commits at send (anchor = clock 0), the host
+  /// suspends — three ticks pass while the read is parked and the tick
+  /// cap is exempt — the read completes (fence := anchor, straddle
+  /// latched), and the very next fence check fires: the tick cap now
+  /// blocks n1's clock, selfFence is the enabled action, and the
+  /// zombie leader is gone at the first post-resume check. Under
+  /// response anchoring the same schedule leaves n1 leading with a
+  /// fresh fence — the calibration override's falsification.
+  run suspendStraddleFencesRun =
+    init
+      .then(apiGet("n1"))
+      .then(steal("n1"))
+      .then(apiGet("n1"))
+      .then(renewSendSteady("n1"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(renewReadOk("n1"))
+      .then(selfFence("n1"))
+      .expect(all {
+        not(leading.get("n1")),
+        suspendStraddled,
+        lease.holder == Held("n1"),  // the fence is local; the lease still names n1
+      })
+}
+
+// =========================================================================
+// The shutdown regime: the graceful-exit fault enabled
+// (MAX_SHUTDOWNS = 1) over the asymmetric-TTL constants, verifying the
+// belief/hold split (bug_387). The release gate is HOLD-gated
+// (LeaseStanding.should_release_on_shutdown): a self-fence clears only
+// belief, so fence-then-SIGTERM still releases the lease the apiserver
+// still attributes to us — gracefulHandover is the headline invariant,
+// and neverDual carries over from the asymmetric regime (an exited
+// node is not a believer; the early release only ACCELERATES the
+// successor, never overlaps it).
+//
+// Non-vacuity: the noFenceThenExit witness (expect-violation,
+// quint-leader-election-witness-fence-then-exit) proves the
+// fence-then-SIGTERM shape is actually explored; the
+// lease-387-belief-gate calibration override swaps the gate back to
+// belief and must violate gracefulHandover.
+module leaderElectionShutdown {
+  import leaderElection(
+    NODES = Set("n1", "n2"),
+    FENCE_AFTER = 2,
+    STEAL_AFTER = 5,
+    RENEW = 1,
+    MAX_SKEW = 1,
+    MAX_TIME = 8,
+    MAX_GEN = 4,
+    MAX_RV = 8,
+    MAX_DELETES = 0,
+    MAX_CLAIM_FAILURES = 0,
+    MAX_RESTORES = 0,
+    MAX_SUSPENDS = 0,
+    MAX_SHUTDOWNS = 1
+  ).*
+
+  /// Fence-then-SIGTERM releases: n1 acquires, goes blind past its
+  /// fence deadline, self-fences (belief gone, HOLD intact), and the
+  /// SIGTERM release gate still clears the holder — the successor
+  /// steals on its next poll instead of waiting out the staleness
+  /// threshold. Under the belief-gated release (the calibration
+  /// override) the same schedule skips the release and latches
+  /// releaseSkippedWhileHolder.
+  run fenceThenSigtermReleasesRun =
+    init
+      .then(apiGet("n1"))
+      .then(steal("n1"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(selfFence("n1"))
+      .then(shutdown("n1"))
+      .expect(all {
+        lease.holder == NoHolder,
+        exited.get("n1"),
+        not(leading.get("n1")),
+        fenceThenExit,
+        gracefulHandover,
+      })
+
+  /// The legitimate skip: n1 is deposed by a steal it OBSERVES (a
+  /// completed round resolving not-leading clears the hold), so its
+  /// SIGTERM touches nothing — the thief's lease survives.
+  run conflictThenSigtermSkipsRun =
+    init
+      .then(apiGet("n1"))
+      .then(steal("n1"))
+      .then(apiGet("n2"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(selfFence("n1"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(tick("n1")).then(tick("n2"))
+      .then(steal("n2"))
+      .then(apiGet("n1"))
+      .then(shutdown("n1"))
+      .expect(all {
+        lease.holder == Held("n2"),
+        exited.get("n1"),
+        gracefulHandover,
+      })
 }
