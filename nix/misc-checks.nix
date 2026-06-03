@@ -2027,6 +2027,8 @@ in
         check_pin 'Err(e.to_string())' rio-store/src/cas.rs 0 \
           "no carve-out: the singleflight Shared carries the typed Clone FetchFail (W2-S3 c6 dropped the last stringly carrier)"
 
+        touch $out
+      '';
 
   # Round-17 merged_bug_058 / RC17-09 (kill-writer conformance — the
   # F2 TRIGGER DEFINITION for the kill-corroboration family): every
@@ -2076,8 +2078,8 @@ in
             remediation; fail=1
           fi
         }
-        prim rio-exec/src/execute.rs 3 \
-          "CLAIMED principal (KillTarget::Principal, post-placement) + CLAIMED tree (kill_pid_and_cgroup, pre-placement) + TEST read"
+        prim rio-exec/src/execute.rs 5 \
+          "CLAIMED principal (KillTarget::Principal, post-placement) + CLAIMED tree (kill_pid_and_cgroup, pre-placement) + 3 TEST reads (cancel assertion; placement near-miss battery asserts no kill file touched x2)"
         prim rio-builder/src/cgroup.rs 4 \
           "kill_principal_scope SCOPED x2 (principal write + pre-placement ENOENT fallback) + BuildCgroup::kill TEARDOWN + kill_cgroup TEARDOWN"
         prim rio-builder/src/executor/mod.rs 1 \

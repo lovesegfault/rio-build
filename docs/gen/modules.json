@@ -63,6 +63,11 @@
       "doc": "Differential-harness driver: build one derivation with the native"
     },
     {
+      "path": "executor/dropped.rs",
+      "depth": 1,
+      "doc": "Resolve-time residency-gap evidence, typed (round-17 merged_bug_054"
+    },
+    {
       "path": "executor/glue/",
       "depth": 1,
       "doc": "Nix request glue: `Derivation` → [`rio_exec::ExecutionRequest`]."
