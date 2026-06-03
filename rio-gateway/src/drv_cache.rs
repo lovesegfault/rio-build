@@ -239,7 +239,7 @@ pub(crate) async fn resolve_derivation(
             store_client,
             None,
             drv_path.as_str(),
-            rio_common::limits::MAX_DRV_NAR_BYTES,
+            rio_common::limits::NarSizeCap::derivation(),
         )
         .await?,
     )?;
@@ -328,7 +328,7 @@ pub(crate) async fn resolve_derivations_batch(
                         &mut client,
                         None,
                         sp.as_str(),
-                        rio_common::limits::MAX_DRV_NAR_BYTES,
+                        rio_common::limits::NarSizeCap::derivation(),
                     )
                     .await?,
                 )?;

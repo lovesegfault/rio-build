@@ -382,7 +382,7 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
         store_client,
         jwt,
         path.as_str(),
-        rio_common::limits::MAX_NAR_SIZE,
+        rio_common::limits::NarSizeCap::general(),
     )
     .await
     {

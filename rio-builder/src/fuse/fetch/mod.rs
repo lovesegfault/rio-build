@@ -674,7 +674,7 @@ fn stream_nar_to_spool(
                 &mut store_client,
                 store_path,
                 fetch_timeout,
-                rio_common::limits::MAX_NAR_SIZE,
+                rio_common::limits::NarSizeCap::general(),
                 // Hint consumed above. Only send on attempt 0; on retries
                 // it's None — same staleness rationale as the take above.
                 if attempt == 0 { hint.clone() } else { None },

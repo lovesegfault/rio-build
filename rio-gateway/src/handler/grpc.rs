@@ -456,11 +456,13 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
 /// Fetch NAR data from store via gRPC GetPath.
 /// Returns (PathInfo, NAR bytes) or None if not found.
 ///
-/// `max_nar_bytes` is the collect cap: callers fetching general paths
-/// pass `rio_common::limits::MAX_NAR_SIZE`; the `.drv` BFS resolution
-/// passes `MAX_DRV_NAR_BYTES` so 32-way derivation fan-out cannot buffer
-/// GiB-scale "derivations" (round-16 bug_095) — the collector's
-/// leading `Info.nar_size` pre-check makes the over-cap case byte-free.
+/// `max_nar_bytes` is the sealed class cap (`NarSizeCap`): callers
+/// fetching general paths pass `NarSizeCap::general()`; the `.drv` BFS
+/// resolution passes `NarSizeCap::derivation()` so 32-way derivation
+/// fan-out cannot buffer GiB-scale "derivations" (round-16 bug_095) —
+/// the collector's leading `Info.nar_size` pre-check makes the
+/// over-cap case byte-free, and the sealed type makes a private or
+/// divergent bound unwritable at any call site (round-17 bug_030).
 ///
 /// Delegates to `rio_proto::client::get_path_nar` — DO NOT inline that
 /// helper's await structure here. Under `#[tokio::test(start_paused =
@@ -475,7 +477,7 @@ pub(crate) async fn grpc_get_path(
     store_client: &mut StoreServiceClient<Channel>,
     jwt_token: Option<&str>,
     store_path: &str,
-    max_nar_bytes: u64,
+    max_nar_bytes: rio_common::limits::NarSizeCap,
 ) -> anyhow::Result<Option<(ValidatedPathInfo, Vec<u8>)>> {
     use rio_proto::client::NarCollectError;
     let md = jwt_metadata(jwt_token);

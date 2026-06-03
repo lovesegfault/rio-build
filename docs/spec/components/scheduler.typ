@@ -1613,7 +1613,7 @@ spec may claim that writer exists until it does (R6).
 The over-cap clause is round-17 bug_030 (the +4 delta): the
 dispatch-side fetch carried a private 1 MiB cap while every other
 derivation-text site admitted the shared 16 MiB class bound, so any
-(1,16] MiB `.drv` — necessarily bare store-backed, since the inline
+over-1-up-to-16 MiB `.drv` — necessarily bare store-backed, since the inline
 path caps at 1 MiB — was admitted everywhere and then
 deterministically denied HERE, with the denial folded into store
 silence: transient backoff, budget burn, poison blaming store health.

@@ -160,16 +160,64 @@ pub const MAX_DRV_CONTENT_BYTES: usize = 1024 * 1024;
 /// tens of GiB into trusted-plane buffers (round-16 bug_095).
 pub const MAX_DRV_NAR_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The NAR byte cap appropriate for a path class: derivation texts get
-/// [`MAX_DRV_NAR_BYTES`], everything else [`MAX_NAR_SIZE`]. Single
-/// source for the split so the store's admission bound and the
-/// worker/gateway collection bounds cannot drift apart.
-pub const fn nar_size_cap(is_derivation: bool) -> u64 {
-    if is_derivation {
-        MAX_DRV_NAR_BYTES
-    } else {
-        MAX_NAR_SIZE
+/// The NAR transfer cap for a path CLASS, as a sealed type: derivation
+/// texts get [`MAX_DRV_NAR_BYTES`], everything else [`MAX_NAR_SIZE`].
+///
+/// The field is PRIVATE and the only constructors are the two class
+/// constructors — there is no `From<u64>` and no arithmetic: a fetch
+/// site cannot mint a private or divergent bound, by construction
+/// (round-17 bug_030: the round-16 cap consolidation missed the
+/// scheduler's dispatch fetch precisely because the bound was an
+/// untyped `u64` any site could shadow with a local const; the typed
+/// seal turns the next missed sibling into a compile error). The NAR
+/// fetch primitives (`get_path_nar` / `get_path_nar_to_file` in
+/// rio-proto) take this type — never a raw `u64` — and the
+/// `drv-cap-conformance` CI check pins both that signature and the
+/// constructor call-site registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NarSizeCap(u64);
+
+impl NarSizeCap {
+    /// The derivation-text class cap ([`MAX_DRV_NAR_BYTES`], 16 MiB).
+    /// For every fetch whose target is a `.drv` (claims verification,
+    /// CA resolve, glue-table fetches, BFS `.drv` resolution).
+    pub const fn derivation() -> Self {
+        Self(MAX_DRV_NAR_BYTES)
     }
+
+    /// The general path-class cap ([`MAX_NAR_SIZE`], 4 GiB). For
+    /// fetches of arbitrary store paths (FUSE input materialization,
+    /// client downloads).
+    pub const fn general() -> Self {
+        Self(MAX_NAR_SIZE)
+    }
+
+    /// The class cap for a path, derived from whether it is a
+    /// derivation. Single source for the split so the store's
+    /// admission bound and the worker/gateway collection bounds cannot
+    /// drift apart.
+    pub const fn for_path_class(is_derivation: bool) -> Self {
+        if is_derivation {
+            Self::derivation()
+        } else {
+            Self::general()
+        }
+    }
+
+    /// The cap in bytes — for comparisons and error text only. This
+    /// is deliberately a one-way door: bytes come OUT of a class cap;
+    /// a cap never comes from bytes.
+    pub const fn bytes(self) -> u64 {
+        self.0
+    }
+}
+
+/// The NAR byte cap appropriate for a path class. Prefer
+/// [`NarSizeCap::for_path_class`]; this remains for arithmetic-only
+/// consumers (store admission accumulation) and returns the same
+/// sealed value's byte count.
+pub const fn nar_size_cap(is_derivation: bool) -> u64 {
+    NarSizeCap::for_path_class(is_derivation).bytes()
 }
 
 /// Worker heartbeat interval. The worker sends a HeartbeatRequest to the

@@ -84,8 +84,13 @@ impl NarCollectError {
 
 /// Drain a `GetPath` response stream into `(Option<PathInfo>, nar_bytes)`.
 ///
-/// Enforces `max_size` (callers typically pass `rio_common::limits::MAX_NAR_SIZE`).
-/// Ignores empty messages (proto-mismatch safety).
+/// Enforces `max_size` in raw bytes — this is the INTERNAL byte
+/// mechanic beneath [`get_path_nar`]/[`get_path_nar_to_file`], whose
+/// public signatures take the sealed class cap
+/// (`rio_common::limits::NarSizeCap`) instead; new external callers
+/// should use those (the `drv-cap-conformance` check pins the
+/// call-site registry). Ignores empty messages (proto-mismatch
+/// safety).
 ///
 /// `idle_timeout`: when `Some`, bounds the time between successive stream
 /// messages — a stalled store (no chunks arriving) trips at the timeout,
@@ -474,7 +479,7 @@ pub async fn get_path_nar(
     client: &mut StoreServiceClient<Channel>,
     store_path: &str,
     timeout: Duration,
-    max_nar_size: u64,
+    max_nar_size: rio_common::limits::NarSizeCap,
     manifest_hint: Option<crate::types::ManifestHint>,
     extra_metadata: &[(&'static str, &str)],
 ) -> Result<Option<(ValidatedPathInfo, Vec<u8>)>, NarCollectError> {
@@ -497,7 +502,7 @@ pub async fn get_path_nar(
         Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
         Err(status) => return Err(NarCollectError::Stream(status)),
     };
-    let (info, nar) = collect_nar_stream(&mut stream, max_nar_size, Some(timeout)).await?;
+    let (info, nar) = collect_nar_stream(&mut stream, max_nar_size.bytes(), Some(timeout)).await?;
     match info {
         Some(raw) => {
             let validated = ValidatedPathInfo::try_from(raw)?;
@@ -522,7 +527,7 @@ pub async fn get_path_nar_to_file(
     client: &mut StoreServiceClient<Channel>,
     store_path: &str,
     timeout: Duration,
-    max_nar_size: u64,
+    max_nar_size: rio_common::limits::NarSizeCap,
     manifest_hint: Option<crate::types::ManifestHint>,
     extra_metadata: &[(&'static str, &str)],
     spool: &mut (impl AsyncWrite + Unpin),
@@ -544,7 +549,8 @@ pub async fn get_path_nar_to_file(
         Err(status) => return Err(NarCollectError::Stream(status)),
     };
     let (info, _written) =
-        collect_nar_stream_to_writer(&mut stream, max_nar_size, Some(timeout), spool).await?;
+        collect_nar_stream_to_writer(&mut stream, max_nar_size.bytes(), Some(timeout), spool)
+            .await?;
     match info {
         Some(raw) => {
             let validated = ValidatedPathInfo::try_from(raw)?;

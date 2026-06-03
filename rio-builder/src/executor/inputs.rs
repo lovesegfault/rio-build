@@ -436,7 +436,7 @@ async fn fetch_drv_text(
         store_client,
         drv_path,
         rio_common::grpc::GRPC_STREAM_TIMEOUT,
-        rio_common::limits::MAX_DRV_NAR_BYTES,
+        rio_common::limits::NarSizeCap::derivation(),
         None,
         &[],
     )

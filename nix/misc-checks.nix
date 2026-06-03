@@ -1162,6 +1162,141 @@ in
         touch $out
       '';
 
+  # NAR class-cap conformance (round-17 bug_030 / RC17-01): the
+  # round-16 cap consolidation missed the scheduler dispatch fetch
+  # because nothing made "every derivation-text fetch site uses the
+  # shared bound" mechanically checkable. The NarSizeCap type seal
+  # makes a raw-u64 fetch param a compile error; this check covers the
+  # residue the type system cannot reach: (1) new private NAR-cap
+  # consts shadowing the class caps, (2) the sealed signatures
+  # regressing to raw u64, (3) the constructor call-site registry
+  # (set-equality: a NEW fetch site must register here with its class
+  # reasoning, a REMOVED one must deregister).
+  #
+  # This is the round-17 reference deny-table implementation
+  # (plan §E.4): pattern + count-pinned per-file carve-outs with
+  # reason comments + remediation-naming failure messages. Later
+  # conformance checks copy this shape.
+  drv-cap-conformance =
+    pkgs.runCommand "rio-drv-cap-conformance"
+      {
+        nativeBuildInputs = [ pkgs.ripgrep ];
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-common/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-proto/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-gateway/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-builder/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store/src)
+          ];
+        };
+      }
+      ''
+        cd $src
+        fail=0
+
+        # ── 1. Deny-table: NAR/DRV size-cap consts. The ONLY minting
+        # site is rio-common/src/limits.rs; every other match needs a
+        # count-pinned carve-out naming a DISTINCT mechanism (not a
+        # transfer cap). Format: path:expected-count:reason.
+        denylist_carveouts() {
+          cat <<'TABLE'
+        rio-common/src/limits.rs:4:the owner — MAX_NAR_SIZE, MAX_NARINFO_BYTES, MAX_DRV_CONTENT_BYTES, MAX_DRV_NAR_BYTES
+        rio-gateway/src/translate.rs:2:inline-DAG size bounds (64 KiB inline + fallback alias of the shared const), not transfer caps
+        rio-proto/src/client/store.rs:1:NAR_CHUNK_SIZE is the stream chunking unit, not a cap
+        rio-store/src/substitute.rs:2:decompression bomb bound (prod aliases MAX_NAR_SIZE; cfg(test) dual) — substitution-ingest admission caps are W1-S4 scope
+        rio-store/src/metadata/drv_modulo.rs:1:chunk-reassembly arena bound, a distinct R4 budget
+        TABLE
+        }
+        pattern='const [A-Z_]*(DRV|NAR)[A-Z_]*(SIZE|BYTES|CAP)[A-Z_]*[[:space:]]*:[[:space:]]*(u64|usize)'
+        actual=$(rg -n "$pattern" --type rust . | sed 's|^\./||' | sort)
+        # Per-file expected counts from the table:
+        while IFS=: read -r file expected reason; do
+          file=$(echo "$file" | tr -d ' ')
+          [ -n "$file" ] || continue
+          got=$(echo "$actual" | grep -c "^$file:" || true)
+          if [ "$got" != "$expected" ]; then
+            echo "FAIL: $file has $got NAR/DRV-cap const matches, deny-table pins $expected ($reason)." >&2
+            echo "  A NEW size-cap const must live in rio-common/src/limits.rs (or, if it is" >&2
+            echo "  genuinely a distinct mechanism, add a count-pinned carve-out with its reason" >&2
+            echo "  to denylist_carveouts in nix/misc-checks.nix drv-cap-conformance)." >&2
+            fail=1
+          fi
+        done < <(denylist_carveouts | sed 's/^[[:space:]]*//')
+        # Files NOT in the table must have zero matches:
+        table_files=$(denylist_carveouts | sed 's/^[[:space:]]*//' | cut -d: -f1 | tr -d ' ')
+        echo "$actual" | cut -d: -f1 | sort -u | while read -r f; do
+          [ -n "$f" ] || continue
+          echo "$table_files" | grep -qx "$f" || {
+            echo "FAIL: $f mints a NAR/DRV size-cap const outside rio-common/src/limits.rs:" >&2
+            echo "$actual" | grep "^$f:" >&2
+            echo "  Use rio_common::limits::NarSizeCap (round-17 bug_030: a private cap is the" >&2
+            echo "  unmigrated-sibling signature) or register a carve-out with its reason." >&2
+            exit 1
+          }
+        done || fail=1
+
+        # ── 2. The sealed fetch signatures must never regress to raw
+        # u64. Carve-out: the two INTERNAL collectors keep max_size: u64
+        # (the byte mechanic beneath the seal), pinned at exactly 2.
+        raw_param=$(rg -c 'max_nar_size: u64' rio-proto/src/client/store.rs || true)
+        if [ "''${raw_param:-0}" != "0" ]; then
+          echo "FAIL: get_path_nar/get_path_nar_to_file take max_nar_size: u64 again —" >&2
+          echo "  the param must be rio_common::limits::NarSizeCap (the class-cap seal)." >&2
+          fail=1
+        fi
+        internal=$(rg -c 'max_size: u64' rio-proto/src/client/store.rs || true)
+        if [ "''${internal:-0}" != "2" ]; then
+          echo "FAIL: expected exactly 2 internal 'max_size: u64' collector params in" >&2
+          echo "  rio-proto/src/client/store.rs, found ''${internal:-0}. If a collector was" >&2
+          echo "  added/removed, update this pin; new EXTERNAL fetch APIs take NarSizeCap." >&2
+          fail=1
+        fi
+
+        # ── 3. Constructor call-site registry (set-equality): every
+        # NarSizeCap mint outside rio-common is a fetch site that chose
+        # a class. Adding a fetch site = register it here with its
+        # class reasoning; removing one = deregister.
+        registry() {
+          cat <<'TABLE'
+        rio-scheduler/src/actor/dispatch.rs:derivation:1:claims/CA-resolve .drv fetch (bug_030 site)
+        rio-builder/src/executor/inputs.rs:derivation:1:worker glue-table .drv text fetch
+        rio-gateway/src/drv_cache.rs:derivation:2:BFS .drv resolution (cold + warm paths)
+        rio-builder/src/fuse/fetch/mod.rs:general:1:FUSE input materialization (arbitrary paths)
+        rio-gateway/src/handler/opcodes_read.rs:general:1:client NAR download (arbitrary paths; stored .drvs already admission-bounded)
+        TABLE
+        }
+        while IFS=: read -r file class expected reason; do
+          file=$(echo "$file" | tr -d ' ')
+          [ -n "$file" ] || continue
+          got=$(rg -c "NarSizeCap::$class\(\)" "$file" || true)
+          if [ "''${got:-0}" != "$expected" ]; then
+            echo "FAIL: $file has ''${got:-0} NarSizeCap::$class() call(s), registry pins $expected ($reason)." >&2
+            echo "  New fetch site? Add it to the registry in nix/misc-checks.nix" >&2
+            echo "  drv-cap-conformance with its class reasoning. Removed one? Deregister it." >&2
+            fail=1
+          fi
+        done < <(registry | sed 's/^[[:space:]]*//')
+        # Mints outside the registry (and outside the owning crate):
+        rg -ln 'NarSizeCap::(derivation|general|for_path_class)\(' --type rust .           | sed 's|^\./||' | grep -v '^rio-common/src/limits.rs$' | sort -u | while read -r f; do
+          registry | sed 's/^[[:space:]]*//' | cut -d: -f1 | tr -d ' ' | grep -qx "$f" || {
+            # Comments/docs may NAME the constructors; only CALLS count.
+            calls=$(rg -n 'NarSizeCap::(derivation|general|for_path_class)\(\)' "$f" | rg -v '^\s*\d+:\s*//' | wc -l)
+            [ "$calls" = "0" ] || {
+              echo "FAIL: $f mints a NarSizeCap outside the call-site registry:" >&2
+              rg -n 'NarSizeCap::(derivation|general|for_path_class)\(\)' "$f" >&2
+              echo "  Register it in nix/misc-checks.nix drv-cap-conformance with its class reasoning." >&2
+              exit 1
+            }
+          }
+        done || fail=1
+
+        [ "$fail" = 0 ] || exit 1
+        touch $out
+      '';
+
   # The bootstrap script's AWS verbs must be a subset of the IRSA
   # policy in infra/eks/secrets.tf — round-16 bug_023's disclosure arm
   # was unexecutable in EKS only because the role happened to lack

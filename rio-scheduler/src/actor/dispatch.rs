@@ -3364,7 +3364,7 @@ impl DagActor {
             &mut client,
             drv_path,
             FETCH_TIMEOUT,
-            rio_common::limits::MAX_DRV_NAR_BYTES,
+            rio_common::limits::NarSizeCap::derivation(),
             None,
             &[],
         )
