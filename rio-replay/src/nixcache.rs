@@ -389,9 +389,10 @@ impl NixCacheClient {
     /// any other non-200 is an error carrying a body snippet. The campaign
     /// engine's upstream-coverage probe uses this form so it can decide how
     /// to record a body that fails to parse. The body read is capped at
-    /// [`crate::substituter::MAX_NARINFO_BYTES`] — the same cap both probe
-    /// arms enforce — so an operator cache serving an oversized object
-    /// under a narinfo name errors loudly instead of buffering it.
+    /// `substituter::MAX_NARINFO_BYTES` (private to that module) — the
+    /// same cap both probe arms enforce — so an operator cache serving an
+    /// oversized object under a narinfo name errors loudly instead of
+    /// buffering it.
     pub async fn fetch_narinfo_text(&self, store_path: &str) -> anyhow::Result<Option<String>> {
         use crate::substituter::MAX_NARINFO_BYTES;
         let url = self.narinfo_url(store_path)?;
