@@ -1146,10 +1146,27 @@ async fn apply_stall_actions(
     stall_retries: &mut HashMap<String, u32>,
     stalled: &[StallVerdict],
     mode: &str,
+    schedule_mode: ScheduleMode,
     campaign_id: &str,
 ) {
     for stall in stalled {
         match stall.kind {
+            // Queued-watchdog requeues do not apply to timed mode (design
+            // §9.4): admission is governed by the recorded schedule, not a
+            // queue of attemptable units, so there is no pending pool to
+            // re-enqueue into. Unreachable by construction — no timed
+            // transition observes Queued — and kept as a guard so a future
+            // regression cannot spin the level-triggered verdict forever:
+            // the clock is retired and the member is left to the
+            // dispatcher / end-of-run backfill.
+            StallKind::QueuedRequeue if schedule_mode == ScheduleMode::Timed => {
+                tracing::warn!(
+                    job = %stall.job,
+                    "queued-watchdog verdict in timed mode (queued requeues do not apply); \
+                     retiring the clock — the member belongs to the dispatcher/backfill"
+                );
+                ledger.retire(&stall.job).await;
+            }
             StallKind::QueuedRequeue => {
                 // Journal-then-commit through the ledger: the ladder step
                 // is durable before the clock moves, so the consumed
@@ -1173,7 +1190,11 @@ async fn apply_stall_actions(
             }
             StallKind::ActiveStall => {
                 let used = stall_retries.get(&stall.job).copied().unwrap_or(0);
-                if used == 0 {
+                // The auto-retry is a re-offer into the timeless pending
+                // pool; timed mode has no such pool (design §9.4), so a
+                // stalled timed request escalates directly — exactly as a
+                // stalled batch goes terminal once its retry is spent.
+                if used == 0 && schedule_mode == ScheduleMode::Timeless {
                     // The journaled transition first, the local gate after:
                     // a failed journal append leaves the retry unspent and
                     // the verdict armed (the clock is consumed only by the
@@ -1274,6 +1295,14 @@ async fn apply_stall_actions(
 /// journal projection and stamping helper as every collect writer
 /// (`ledger::stamped_attempts`), so the stall arm can no longer drift to
 /// a different +1 convention.
+///
+/// Already-terminal guard: a job whose latest record is ALREADY terminal
+/// only needs the retirement — writing would let a leaked stall clock
+/// (any path that recorded a verdict without retiring) overwrite the real
+/// verdict with a stalled-* infra record under latest-record-per-job
+/// semantics. The guard makes verdict displacement structurally
+/// unreachable from the stall path: the heuristic writer yields to any
+/// recorded verdict, never the reverse.
 #[allow(clippy::too_many_arguments)]
 async fn write_terminal_stall(
     state: &StateDir,
@@ -1300,6 +1329,23 @@ async fn write_terminal_stall(
         ledger.retire(job).await;
         return Ok(());
     };
+    {
+        let res = results.lock().await;
+        if res
+            .get(job)
+            .is_some_and(|r| model::is_terminal_class(&r.verdict, &r.disposition))
+        {
+            tracing::warn!(
+                job,
+                signature,
+                "stall verdict for a job whose record is already terminal; retiring the leaked \
+                 clock without overwriting the verdict"
+            );
+            drop(res);
+            ledger.retire(job).await;
+            return Ok(());
+        }
+    }
     let prior = ledger::measured_attempt_requeues(state)?
         .get(job)
         .copied()
@@ -2406,6 +2452,7 @@ pub async fn run_with_backends(
                         &mut stall_retries,
                         &outcome.stalled,
                         &mode,
+                        schedule_mode,
                         &campaign_id,
                     )
                     .await;
@@ -2703,10 +2750,18 @@ pub async fn run_with_backends(
     let partial = drain_result?;
 
     // ── Stage: report ───────────────────────────────────────────────────────
-    // Partial run (deadline/abort): backfill explicit not-attempted records
-    // for every in-scope job still missing one, so bucket counts sum to
-    // in-scope and the partial report is complete over the scope.
-    if partial {
+    // Backfill explicit not-attempted records for every in-scope job still
+    // missing one, so bucket counts sum to in-scope on EVERY exit path —
+    // not just the deadline-partial one. Timed campaigns drain normally
+    // (partial == false is their ordinary exit) yet leave recordless
+    // members by design: collect defers engine-submission failures and
+    // build-deadline-cut members to "the end-of-run backfill", and the
+    // dispatcher gives such members exactly one attempt — gating the
+    // backfill on the optional wall-clock deadline silently dropped those
+    // in-scope units from every report bucket. Idempotent: existing
+    // records always win, so the timeless drained path (which has records
+    // for everything) is unaffected.
+    {
         let written = {
             let res = results.lock().await;
             write_not_attempted_records(&state, &manifest, &plan_output, spec.mode.as_str(), &res)?
@@ -2714,7 +2769,8 @@ pub async fn run_with_backends(
         if written > 0 {
             tracing::info!(
                 written,
-                "partial run: backfilled not-attempted records for in-scope jobs without one"
+                partial,
+                "backfilled not-attempted records for in-scope jobs without one"
             );
             let mut res = results.lock().await;
             *res = latest_per_job(state.load_jsonl(StateFile::Results)?);
@@ -2940,6 +2996,22 @@ async fn collect_pass_with(
                 }
                 collect::CollectDecision::Terminal { .. } => {
                     already_terminal.insert(job.clone());
+                    ledger.retire(job).await;
+                }
+                collect::CollectDecision::Defer { reason } => {
+                    // The member's resolution belongs to another owner
+                    // (timed dispatcher retries, the end-of-run backfill);
+                    // its stall clock must not keep accruing toward a
+                    // spurious stalled verdict on work nothing is doing.
+                    // The ledger no-ops when a newer batch currently owns
+                    // the job (its live clock stays).
+                    tracing::debug!(job, reason, "deferred member released from the watchdog");
+                    ledger.defer_settled(job).await;
+                }
+                collect::CollectDecision::AlreadyTerminal => {
+                    // Belt-dropped duplicate of a recorded member: retire
+                    // the clock too, or the ladder eventually overwrites
+                    // the real verdict with a stalled-queued infra record.
                     ledger.retire(job).await;
                 }
             }
@@ -4486,6 +4558,7 @@ mod tests {
                 requeues_used: 0,
             }],
             "leaf",
+            ScheduleMode::Timeless,
             "c-fold",
         )
         .await;
@@ -5727,6 +5800,111 @@ mod tests {
         artifact::assert_state_dir_files_classified(&state);
     }
 
+    /// A timed campaign that drains NORMALLY (no deadline, partial ==
+    /// false) still backfills not-attempted records for members that ended
+    /// recordless: appB's submission fails engine-side (settles with
+    /// neither results nor a build id), collect defers it, the dispatcher
+    /// gives it exactly one attempt — and the end-of-run backfill must
+    /// cover it anyway, so verdict + disposition counts partition the
+    /// in-scope set on the campaign's ORDINARY exit path, not just the
+    /// deadline-partial one.
+    #[tokio::test]
+    async fn mini_timed_campaign_backfills_recordless_members_without_a_deadline() {
+        let archive_dir = tempfile::tempdir().unwrap();
+        let built = write_mini_timed_archive(archive_dir.path(), MiniTimedSpec::default());
+        let archive = Arc::new(ReplayArchive::open(archive_dir.path()).unwrap());
+        let manifest = load_units(&archive).unwrap();
+        let app_a = manifest
+            .iter()
+            .find(|m| m.job == "appA.x86_64-linux")
+            .unwrap()
+            .clone();
+        let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let mut narinfos = HashMap::new();
+        narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
+
+        // appA settles Built in band; appB has NO scripted outcome, so the
+        // KeyedSubmitter returns the default — neither results nor a build
+        // id, the engine-side submission-failure shape.
+        let submitter = Arc::new(KeyedSubmitter::default());
+        submitter.outcomes.lock().unwrap().insert(
+            app_a.drv_path.clone(),
+            BatchOutcome {
+                build_id: Some("0193e4a2-7c1b-7d20-9b3a-00000000dddd".into()),
+                results: vec![PathOutcome {
+                    drv_path: app_a.drv_path.clone(),
+                    status: build_status_name(BuildStatus::Built).into(),
+                    error_msg: String::new(),
+                    start_time: 0,
+                    stop_time: 0,
+                }],
+                ..BatchOutcome::default()
+            },
+        );
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let mut spec = leaf_spec(&built.archive_id);
+        spec.scheduling.mode = ScheduleMode::Timed;
+        spec.knobs.speedup = 1000.0;
+        let backends = Backends {
+            store: Arc::new(FakeStoreApi::default()),
+            admin: Arc::new(NoLogsAdmin),
+            cluster: Arc::new(HealthyCluster),
+            submitter: submitter.clone(),
+            supply_transport: Some(Arc::new(FakeSupplyTransport::default())),
+            narinfo: Some(Arc::new(MapNarinfo(narinfos))),
+            artifacts: None,
+        };
+        run_with_backends(
+            run_args(state_dir.path()),
+            spec,
+            StateDir::new(state_dir.path()).unwrap(),
+            archive,
+            backends,
+        )
+        .await
+        .unwrap();
+
+        let state = StateDir::new(state_dir.path()).unwrap();
+        // The submission failure was counted by the dispatcher...
+        let stats: timeline::TimedRunStats = state
+            .read_json("timed-stats.json")
+            .unwrap()
+            .expect("timed-stats.json written by the timed arm");
+        assert_eq!(stats.submission_failures, 1, "{stats:?}");
+        // ...and the recordless member is backfilled on the NORMAL exit:
+        // every in-scope job has a record, with appB explicitly
+        // not-attempted rather than silently absent.
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(
+            records["appA.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+        assert_eq!(
+            records["appB.x86_64-linux"].disposition.as_deref(),
+            Some(Disposition::NotAttempted.as_str()),
+            "the engine-submission-failure member is backfilled without a deadline"
+        );
+        // Conservation: verdict + disposition counts partition in_scope.
+        let campaign: CampaignRecord = state.read_json("campaign.json").unwrap().unwrap();
+        let in_scope = campaign.plan.as_ref().unwrap().in_scope.len();
+        let agg = report::aggregate(&records);
+        assert_eq!(
+            agg.verdict_counts.values().sum::<usize>()
+                + agg.disposition_counts.values().sum::<usize>(),
+            in_scope,
+            "bucket counts must sum to in-scope on the ordinary exit path"
+        );
+        // This was NOT a deadline-partial run: the rendered report carries
+        // no partial marker (the args fixture configures no deadline, so
+        // the drain loop exited on its ordinary path).
+        let summary = std::fs::read_to_string(state.path("report/summary.md")).unwrap();
+        assert!(
+            !summary.to_lowercase().contains("partial"),
+            "the ordinary timed exit must not be marked partial: {summary}"
+        );
+    }
+
     /// Transport-error path end to end: the first submission fails
     /// engine-side (channel open refused), the batch is recorded with the
     /// error text and no in-band results, the jobs are re-offered, and the
@@ -5936,6 +6114,7 @@ mod tests {
             &mut stall_retries,
             &first.stalled,
             "leaf",
+            ScheduleMode::Timeless,
             "c-stall",
         )
         .await;
@@ -5976,6 +6155,7 @@ mod tests {
             &mut stall_retries,
             &second.stalled,
             "leaf",
+            ScheduleMode::Timeless,
             "c-stall",
         )
         .await;
@@ -6016,6 +6196,7 @@ mod tests {
             &mut stall_retries,
             &escalate,
             "leaf",
+            ScheduleMode::Timeless,
             "c-stall",
         )
         .await;
@@ -6032,6 +6213,294 @@ mod tests {
         // the queue since its last requeue) and this one was never
         // submitted at all: zero attempts, not a phantom one.
         assert_eq!(records[queued_job].attempts, 0);
+    }
+
+    /// The terminal stall writer's both directions. Must-yield: a job
+    /// whose latest record is ALREADY terminal (a leaked clock — any path
+    /// that recorded without retiring) only gets its clock retired; the
+    /// real verdict survives under latest-record-per-job. Must-write: a
+    /// job with no terminal record still gets its stalled-* record — the
+    /// guard must not blunt the ladder's real backstop.
+    #[tokio::test]
+    async fn terminal_stall_writer_yields_to_an_existing_terminal_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let tracker = Arc::new(SubmitTracker::default());
+        let wd = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let job_ledger = ledger::JobLedger::new(state.clone(), tracker.clone(), wd.clone());
+        let mut stall_retries: HashMap<String, u32> = HashMap::new();
+
+        let recorded = "recorded.x86_64-linux";
+        let starved = "starved.x86_64-linux";
+        let contexts: HashMap<String, JobContext> = [
+            (
+                recorded.to_string(),
+                fold_ctx(recorded, &format!("/nix/store/{}-r.drv", "a".repeat(32))),
+            ),
+            (
+                starved.to_string(),
+                fold_ctx(starved, &format!("/nix/store/{}-s.drv", "b".repeat(32))),
+            ),
+        ]
+        .into();
+
+        // recorded: a real match-built verdict already on disk and in the
+        // shared map, but its clock leaked (committed and never retired).
+        let real_record = JobRecord {
+            job: recorded.to_string(),
+            system: "x86_64-linux".into(),
+            drv_path: format!("/nix/store/{}-r.drv", "a".repeat(32)),
+            mode: "leaf".into(),
+            attempts: 1,
+            build_ids: vec![],
+            rio: model::RioSide {
+                outcome: "built".into(),
+                ..Default::default()
+            },
+            expected: model::ExpectedSide {
+                outcome: "built".into(),
+                ..Default::default()
+            },
+            nar_compare: BTreeMap::new(),
+            verdict: Some(Verdict::MatchBuilt.as_str().to_string()),
+            disposition: None,
+            cascaded: false,
+            failure_cause: None,
+            flaky: false,
+            signature: None,
+            log_key: None,
+            repro: String::new(),
+            evidence: None,
+            updated_at: now_rfc3339(),
+        };
+        state
+            .append_jsonl(StateFile::Results, &real_record)
+            .unwrap();
+        let results = tokio::sync::Mutex::new(BTreeMap::from([(
+            recorded.to_string(),
+            real_record.clone(),
+        )]));
+        job_ledger.commit_batch(21, &[recorded.to_string()]).await;
+        job_ledger.commit_batch(22, &[starved.to_string()]).await;
+
+        // Both verdicts arrive on one tick: the leaked clock's escalation
+        // and a genuinely starved job's.
+        let verdicts = vec![
+            StallVerdict {
+                job: recorded.to_string(),
+                kind: StallKind::QueuedEscalate,
+                requeues_used: 2,
+            },
+            StallVerdict {
+                job: starved.to_string(),
+                kind: StallKind::QueuedEscalate,
+                requeues_used: 2,
+            },
+        ];
+        apply_stall_actions(
+            &state,
+            &job_ledger,
+            &contexts,
+            &results,
+            &mut stall_retries,
+            &verdicts,
+            "leaf",
+            ScheduleMode::Timeless,
+            "c-guard",
+        )
+        .await;
+
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(
+            records[recorded].verdict.as_deref(),
+            Some(Verdict::MatchBuilt.as_str()),
+            "the real verdict must survive the leaked clock's escalation"
+        );
+        assert_eq!(
+            records[starved].signature.as_deref(),
+            Some("stalled-queued"),
+            "the genuinely starved sibling still gets its stalled record"
+        );
+        let wd = wd.lock().await;
+        assert_eq!(
+            wd.phase_of(recorded),
+            None,
+            "the leaked clock is retired without a write"
+        );
+        assert_eq!(wd.phase_of(starved), None);
+        drop(wd);
+        assert_eq!(
+            results.lock().await[recorded].verdict.as_deref(),
+            Some(Verdict::MatchBuilt.as_str()),
+            "the in-memory view keeps the real verdict too"
+        );
+    }
+
+    /// Timed-mode stall gating (design section 9.4): an active stall in a
+    /// timed campaign escalates directly to the terminal stalled-active
+    /// record — there is no pending pool, so the timeless auto-retry
+    /// requeue must not fire (no requeue journal entry, no resubmission,
+    /// no Queued observation for a ladder that does not apply).
+    #[tokio::test]
+    async fn timed_active_stall_escalates_directly_without_a_requeue() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let tracker = Arc::new(SubmitTracker::default());
+        let results = tokio::sync::Mutex::new(BTreeMap::new());
+        let wd = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let job_ledger = ledger::JobLedger::new(state.clone(), tracker.clone(), wd.clone());
+        let mut stall_retries: HashMap<String, u32> = HashMap::new();
+        let job = "slowreq.x86_64-linux";
+        let contexts: HashMap<String, JobContext> = [(
+            job.to_string(),
+            fold_ctx(job, &format!("/nix/store/{}-slow.drv", "c".repeat(32))),
+        )]
+        .into();
+        job_ledger.commit_batch(31, &[job.to_string()]).await;
+
+        apply_stall_actions(
+            &state,
+            &job_ledger,
+            &contexts,
+            &results,
+            &mut stall_retries,
+            &[StallVerdict {
+                job: job.to_string(),
+                kind: StallKind::ActiveStall,
+                requeues_used: 0,
+            }],
+            "leaf",
+            ScheduleMode::Timed,
+            "c-timedstall",
+        )
+        .await;
+
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(
+            records[job].signature.as_deref(),
+            Some("stalled-active"),
+            "a stalled timed request escalates to the terminal record directly"
+        );
+        assert_eq!(
+            tracker.resubmission_count(job).await,
+            0,
+            "no resubmission: there is no pool to re-offer into"
+        );
+        let journal: Vec<model::RequeueRecord> = state.load_jsonl(StateFile::Requeues).unwrap();
+        assert!(journal.is_empty(), "no requeue journal entry: {journal:?}");
+        assert_eq!(
+            wd.lock().await.phase_of(job),
+            None,
+            "the terminal record retires the clock"
+        );
+    }
+
+    /// Deferred members release their stall clocks at the consumer — and
+    /// the release respects ownership: a member deferred by a STALE batch
+    /// while a newer batch holds a live reservation keeps its Active clock.
+    #[tokio::test]
+    async fn deferred_members_release_clocks_unless_a_newer_batch_owns_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let job = "deferred.x86_64-linux";
+        let drv = format!("/nix/store/{}-deferred.drv", fake_hash("deferred"));
+        let contexts: HashMap<String, JobContext> = [(job.to_string(), fold_ctx(job, &drv))].into();
+        let mk_batch = |id: u64| model::BatchRecord {
+            batch_id: id,
+            kind: BATCH_KIND_TIMED.to_string(),
+            jobs: vec![job.to_string()],
+            root_drvs: vec![drv.clone()],
+            est_nodes: 1,
+            build_id: None,
+            started_at: now_rfc3339(),
+            finished_at: Some(now_rfc3339()),
+            results: Vec::new(),
+            reasons: BTreeMap::new(),
+            stderr_tail: Some("engine submission error: ssh".into()),
+            engine_cancelled: false,
+            disconnect_deadline_fired: false,
+            interruption_drvs: Vec::new(),
+            import_skipped_drvs: Vec::new(),
+            probe: false,
+            confirmation_attempt: 0,
+        };
+        let backends = CollectBackends {
+            admin: Arc::new(NoLogsAdmin),
+            store: Arc::new(FakeStoreApi::default()),
+            artifacts: None,
+        };
+
+        // Leg 1: the settled batch is the only owner — the deferred
+        // member's clock is released (no spurious stall can ever accrue).
+        {
+            let state_dir = tempfile::tempdir().unwrap();
+            let state = StateDir::new(state_dir.path()).unwrap();
+            state
+                .append_jsonl(StateFile::Batches, &mk_batch(40))
+                .unwrap();
+            let tracker = Arc::new(SubmitTracker::default());
+            let wd = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+            let job_ledger = ledger::JobLedger::new(state.clone(), tracker.clone(), wd.clone());
+            job_ledger.commit_batch(40, &[job.to_string()]).await;
+            tracker
+                .release_after_settle(40, &[job.to_string()], Duration::ZERO)
+                .await;
+            let results = tokio::sync::Mutex::new(BTreeMap::new());
+            let mut processed = HashSet::new();
+            collect_pass_with(
+                &state,
+                &backends,
+                &contexts,
+                &job_ledger,
+                &results,
+                &mut processed,
+                &Knobs::default(),
+                "leaf",
+                "c-defer",
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                wd.lock().await.phase_of(job),
+                None,
+                "the deferred member's clock is released"
+            );
+        }
+
+        // Leg 2: a newer batch owns the job when the stale batch's defer
+        // is applied — the live clock must stay Active.
+        {
+            state
+                .append_jsonl(StateFile::Batches, &mk_batch(41))
+                .unwrap();
+            let tracker = Arc::new(SubmitTracker::default());
+            let wd = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+            let job_ledger = ledger::JobLedger::new(state.clone(), tracker.clone(), wd.clone());
+            // B41 settled and released; B42 (newer) re-committed the job.
+            job_ledger.commit_batch(42, &[job.to_string()]).await;
+            let results = tokio::sync::Mutex::new(BTreeMap::new());
+            let mut processed = HashSet::new();
+            collect_pass_with(
+                &state,
+                &backends,
+                &contexts,
+                &job_ledger,
+                &results,
+                &mut processed,
+                &Knobs::default(),
+                "leaf",
+                "c-defer2",
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                wd.lock().await.phase_of(job),
+                Some(watchdog::JobPhase::Active),
+                "a stale defer must not release the live owner's clock"
+            );
+        }
     }
 
     /// The stall arms' failure path at the claimed cadence: a transient
@@ -6111,6 +6580,7 @@ mod tests {
                 &mut stall_retries,
                 &crossing.stalled,
                 "leaf",
+                ScheduleMode::Timeless,
                 "c-iso",
             )
             .await;
@@ -6142,6 +6612,7 @@ mod tests {
             &mut stall_retries,
             &both.stalled,
             "leaf",
+            ScheduleMode::Timeless,
             "c-iso",
         )
         .await;
@@ -6183,6 +6654,7 @@ mod tests {
             &mut stall_retries,
             &next.stalled,
             "leaf",
+            ScheduleMode::Timeless,
             "c-iso",
         )
         .await;

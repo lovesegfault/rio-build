@@ -33,6 +33,10 @@
 //!   ladder step is journaled, then the watchdog's consumed-requeue count
 //!   moves and the clock resets. NOT a resubmission: the job is already
 //!   pending and nothing is re-offered.
+//! - [`JobLedger::defer_settled`]: collect deliberately left a settled
+//!   member to another owner — its stall clock is released (unless a
+//!   newer batch holds a live reservation), because a deferred member has
+//!   nothing in flight for the ladder to measure.
 //! - [`JobLedger::retire`]: the job reached a terminal record — it leaves
 //!   the watchdog and the in-flight set. The record append itself stays
 //!   with the caller (collect / the stall writer), which holds the context
@@ -381,6 +385,21 @@ impl JobLedger {
         self.journal_requeue(job, REQUEUE_SOURCE_QUEUED, "queued-watchdog")?;
         self.watchdog.lock().await.confirm_queued_requeue(job);
         Ok(())
+    }
+
+    /// A settled batch's member was deliberately left unresolved by
+    /// collect (timed-mode skip arms, no-context members): release its
+    /// stall clock — the member has nothing in flight for the ladder to
+    /// measure, and its bound is the deferral target (the timed
+    /// dispatcher's retries, the per-batch timeout, the end-of-run
+    /// backfill), not the watchdog. No-op when a NEWER batch currently
+    /// owns the job: its reservation means a live clock that must keep
+    /// running (the stale batch's deferral has no authority over it).
+    pub async fn defer_settled(&self, job: &str) {
+        if self.tracker.in_flight.lock().await.contains_key(job) {
+            return;
+        }
+        self.watchdog.lock().await.remove_job(job);
     }
 
     /// The job reached a terminal record (already appended by the caller):

@@ -170,23 +170,28 @@ pub use requeue_budget::RequeueBudget;
 ///
 /// In-band per-root results are terminal by construction (the build call
 /// does not return until every requested root has an outcome), so there is
-/// no still-running decision: every member of a settled batch is either
-/// terminal or re-offered.
+/// no still-running decision.
 ///
-/// This is also the only shape [`process_settled_batch`] can return per
-/// job: every job-state transition a settled batch causes is a
-/// `CollectDecision` the caller applies through the ledger, so a new
-/// failure arm cannot re-offer jobs through a side channel that forgets
-/// the retry budget — there is no raw job-list return to reach for, and
-/// the `Requeue` variant itself demands a [`RequeueBudget`] witness that
-/// only the budget checks (or the named engine-cancelled carve-out) can
-/// mint. The reason is a typed [`RequeueReason`], not a string: the
-/// journaled reason now carries measurement semantics
-/// (`counts_as_cluster_attempt`), so a new arm cannot invent a reason the
-/// measurement has not classified.
+/// TOTAL over batch members: [`process_settled_batch`] returns exactly one
+/// decision per member — "skip" is unrepresentable. A member the pass
+/// deliberately leaves to another owner (the timed dispatcher's retries,
+/// the end-of-run backfill) is an explicit [`CollectDecision::Defer`], and
+/// a duplicate dropped by the already-terminal belt is an explicit
+/// [`CollectDecision::AlreadyTerminal`] — both are lifecycle decisions the
+/// caller maps to a ledger exit, so no arm can leave a watchdog clock
+/// accruing toward a spurious stall on a member nothing is working on.
+/// Every job-state transition a settled batch causes flows through this
+/// enum, so a new failure arm cannot re-offer jobs through a side channel
+/// that forgets the retry budget — there is no raw job-list return to
+/// reach for, and the `Requeue` variant itself demands a [`RequeueBudget`]
+/// witness that only the budget checks (or the named carve-outs) can mint.
+/// The reason is a typed [`RequeueReason`], not a string: the journaled
+/// reason carries measurement semantics (`counts_as_cluster_attempt`), so
+/// a new arm cannot invent a reason the measurement has not classified.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CollectDecision {
-    /// Terminal outcome — the results.jsonl record has been written.
+    /// Terminal outcome — the results.jsonl record has been written; the
+    /// caller retires the job.
     Terminal {
         rio: RioOutcome,
         evidence: Option<String>,
@@ -197,6 +202,18 @@ pub enum CollectDecision {
         why: RequeueReason,
         budget: RequeueBudget,
     },
+    /// Deliberately left unresolved by this pass — another owner holds the
+    /// member's resolution (the timed dispatcher's confirmation retries,
+    /// the end-of-run not-attempted backfill, or no job context exists to
+    /// record against). The caller releases the member's stall clock: a
+    /// deferred member has nothing in flight for the ladder to measure,
+    /// and its bound is the deferral target, not the watchdog.
+    Defer { reason: &'static str },
+    /// The member already holds a terminal record and this batch's result
+    /// is not a sanctioned superseding write: dropped by the belt. The
+    /// caller retires the job — a recorded member must never keep a live
+    /// clock for the stall ladder to overwrite its real verdict with.
+    AlreadyTerminal,
 }
 
 impl CollectDecision {
@@ -206,7 +223,9 @@ impl CollectDecision {
     pub fn requeue_why(&self) -> Option<&'static str> {
         match self {
             CollectDecision::Requeue { why, .. } => Some(why.as_str()),
-            CollectDecision::Terminal { .. } => None,
+            CollectDecision::Terminal { .. }
+            | CollectDecision::Defer { .. }
+            | CollectDecision::AlreadyTerminal => None,
         }
     }
 }
@@ -821,8 +840,20 @@ pub async fn process_settled_batch(
             tracing::info!(
                 jobs = batch_jobs.len(),
                 "timed batch has no in-band results and no build id (engine-side submission \
-                 failure); leaving its members to the timed dispatcher"
+                 failure); deferring its members to the timed dispatcher / end-of-run backfill"
             );
+            for job in batch_jobs {
+                decisions.insert(
+                    job.clone(),
+                    if already_terminal.contains(job) {
+                        CollectDecision::AlreadyTerminal
+                    } else {
+                        CollectDecision::Defer {
+                            reason: "engine-submission-failure-timed",
+                        }
+                    },
+                );
+            }
             return Ok(decisions);
         }
         // The per-member decision is [`decide`]'s no-result rule — the one
@@ -844,7 +875,13 @@ pub async fn process_settled_batch(
             .unwrap_or_else(|| "engine-submission-failure".to_string());
         for job in batch_jobs {
             let Some(ctx) = contexts.get(job) else {
-                tracing::warn!(job, "batch member has no job context; skipping");
+                tracing::warn!(job, "batch member has no job context; deferring");
+                decisions.insert(
+                    job.clone(),
+                    CollectDecision::Defer {
+                        reason: "no-job-context",
+                    },
+                );
                 continue;
             };
             if already_terminal.contains(job) {
@@ -852,10 +889,16 @@ pub async fn process_settled_batch(
                     job,
                     "member of a failed submission already has a terminal record; dropping"
                 );
+                decisions.insert(job.clone(), CollectDecision::AlreadyTerminal);
                 continue;
             }
             let prior = prior_requeues.get(job).copied().unwrap_or(0);
             match decide(ctx, None, batch, &HashMap::new(), prior, knobs, None) {
+                // decide() never defers or belt-drops — those are
+                // membership decisions made here, not outcome decisions.
+                CollectDecision::Defer { .. } | CollectDecision::AlreadyTerminal => {
+                    unreachable!("decide() only returns Requeue or Terminal")
+                }
                 CollectDecision::Requeue { why, budget } => {
                     // The whole submission failed, so "no in-band result"
                     // understates the cause; the engine-cancelled reason
@@ -940,7 +983,17 @@ pub async fn process_settled_batch(
 
     for job in batch_jobs {
         let Some(ctx) = contexts.get(job) else {
-            tracing::warn!(job, "batch member has no job context; skipping");
+            // No context, no possible record — but the commitment created
+            // a watchdog clock (drv-keyed unmapped targets are committed
+            // for visibility), so the exit must be explicit or the ladder
+            // measures a member nothing will ever resolve.
+            tracing::warn!(job, "batch member has no job context; deferring");
+            decisions.insert(
+                job.clone(),
+                CollectDecision::Defer {
+                    reason: "no-job-context",
+                },
+            );
             continue;
         };
         let target = results_by_drv.get(ctx.drv_path.as_str()).copied();
@@ -965,6 +1018,7 @@ pub async fn process_settled_batch(
                     job,
                     "settled-batch member already has a terminal record; dropping"
                 );
+                decisions.insert(job.clone(), CollectDecision::AlreadyTerminal);
                 continue;
             }
             tracing::info!(
@@ -1011,6 +1065,11 @@ pub async fn process_settled_batch(
             knobs,
             log_signal_text.as_deref(),
         ) {
+            // decide() never defers or belt-drops — membership decisions
+            // are made above, outcome decisions here.
+            CollectDecision::Defer { .. } | CollectDecision::AlreadyTerminal => {
+                unreachable!("decide() only returns Requeue or Terminal")
+            }
             CollectDecision::Requeue { why, budget } => {
                 if timed {
                     // Never re-offered (the timed dispatcher owns retries).
@@ -1052,7 +1111,13 @@ pub async fn process_settled_batch(
                         tracing::info!(
                             job,
                             why = why.as_str(),
-                            "timed batch member is not re-offered"
+                            "timed batch member is deferred, not re-offered"
+                        );
+                        decisions.insert(
+                            job.clone(),
+                            CollectDecision::Defer {
+                                reason: why.as_str(),
+                            },
                         );
                     }
                 } else {
@@ -2804,9 +2869,10 @@ mod tests {
         run_batch(&state, &initial_failure, &already_terminal).await;
         already_terminal.insert(job.to_string());
         let decisions = run_batch(&state, &plain_duplicate_success, &already_terminal).await;
-        assert!(
-            decisions.is_empty(),
-            "an unsanctioned duplicate is dropped: {decisions:?}"
+        assert_eq!(
+            decisions.get(job),
+            Some(&CollectDecision::AlreadyTerminal),
+            "an unsanctioned duplicate is dropped (and its clock retired): {decisions:?}"
         );
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1, "{records:?}");
@@ -2820,12 +2886,173 @@ mod tests {
         run_batch(&state, &initial_failure, &already_terminal).await;
         already_terminal.insert(job.to_string());
         let decisions = run_batch(&state, &confirmation_failure, &already_terminal).await;
-        assert!(
-            decisions.is_empty(),
-            "a re-confirmed failure is dropped: {decisions:?}"
+        assert_eq!(
+            decisions.get(job),
+            Some(&CollectDecision::AlreadyTerminal),
+            "a re-confirmed failure is dropped (and its clock retired): {decisions:?}"
         );
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1, "{records:?}");
+    }
+
+    /// Exit totality over the deliberate skip arms, enumerated as data:
+    /// every arm that resolves nothing must still produce an explicit
+    /// decision (Defer / AlreadyTerminal) the consumer maps to a ledger
+    /// exit — "skip" is unrepresentable, so no settled member can silently
+    /// keep a stall clock accruing toward a spurious stalled verdict. The
+    /// table IS the skip-arm class definition: a new deliberate-skip arm
+    /// joins it with its expected decision, and the per-row totality
+    /// assertion (exactly one decision per member) catches an arm that
+    /// forgets to decide.
+    #[tokio::test]
+    async fn every_skip_arm_makes_an_explicit_decision() {
+        let job = "skippy.x86_64-linux";
+        let no_ctx_job = "ghost.x86_64-linux";
+        let contexts: HashMap<String, JobContext> =
+            [(job.to_string(), ctx(job, T, &[], ExpectedOutcome::Built))].into();
+        let terminal_set: HashSet<String> = [job.to_string()].into();
+        let empty_set: HashSet<String> = HashSet::new();
+
+        // (arm name, batch fixture, member, already_terminal view,
+        //  expected decision)
+        let arms: Vec<(&str, BatchView, &str, &HashSet<String>, CollectDecision)> = vec![
+            (
+                "timed engine-side submission failure",
+                BatchView {
+                    kind: BATCH_KIND_TIMED.to_string(),
+                    ..BatchView::default()
+                },
+                job,
+                &empty_set,
+                CollectDecision::Defer {
+                    reason: "engine-submission-failure-timed",
+                },
+            ),
+            (
+                "timed engine-cancelled member (requeue-shaped, no replay)",
+                BatchView {
+                    kind: BATCH_KIND_TIMED.to_string(),
+                    build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+                    results: vec![],
+                    engine_cancelled: true,
+                    ..BatchView::default()
+                },
+                job,
+                &empty_set,
+                CollectDecision::Defer {
+                    reason: "engine-cancelled",
+                },
+            ),
+            (
+                "timed member with no in-band result",
+                BatchView {
+                    kind: BATCH_KIND_TIMED.to_string(),
+                    build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+                    results: vec![po(OTHER, BuildStatus::Built, "")],
+                    ..BatchView::default()
+                },
+                job,
+                &empty_set,
+                CollectDecision::Defer {
+                    reason: "no-inband-result",
+                },
+            ),
+            (
+                "no-context member of a settled batch",
+                BatchView {
+                    kind: BATCH_KIND_SUBMIT.to_string(),
+                    build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+                    results: vec![po(T, BuildStatus::Built, "")],
+                    ..BatchView::default()
+                },
+                no_ctx_job,
+                &empty_set,
+                CollectDecision::Defer {
+                    reason: "no-job-context",
+                },
+            ),
+            (
+                "no-context member of a failed submission",
+                BatchView {
+                    kind: BATCH_KIND_SUBMIT.to_string(),
+                    ..BatchView::default()
+                },
+                no_ctx_job,
+                &empty_set,
+                CollectDecision::Defer {
+                    reason: "no-job-context",
+                },
+            ),
+            (
+                "already-terminal duplicate of a settled batch",
+                BatchView {
+                    kind: BATCH_KIND_SUBMIT.to_string(),
+                    build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+                    results: vec![po(T, BuildStatus::Built, "")],
+                    ..BatchView::default()
+                },
+                job,
+                &terminal_set,
+                CollectDecision::AlreadyTerminal,
+            ),
+            (
+                "already-terminal member of a failed submission",
+                BatchView {
+                    kind: BATCH_KIND_SUBMIT.to_string(),
+                    ..BatchView::default()
+                },
+                job,
+                &terminal_set,
+                CollectDecision::AlreadyTerminal,
+            ),
+            (
+                "already-terminal member of a timed submission failure",
+                BatchView {
+                    kind: BATCH_KIND_TIMED.to_string(),
+                    ..BatchView::default()
+                },
+                job,
+                &terminal_set,
+                CollectDecision::AlreadyTerminal,
+            ),
+        ];
+
+        for (name, batch, member, already_terminal, expected) in arms {
+            let dir = tempfile::tempdir().unwrap();
+            let state = StateDir::new(dir.path()).unwrap();
+            let decisions = process_settled_batch(
+                &state,
+                &LogAdmin::default(),
+                &FakeStoreApi::default(),
+                None,
+                &contexts,
+                &[member.to_string()],
+                &batch,
+                &HashMap::new(),
+                &Knobs::default(),
+                "leaf",
+                "c-skip",
+                &HashMap::new(),
+                already_terminal,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                decisions.len(),
+                1,
+                "{name}: exactly one decision per member, never a silent skip: {decisions:?}"
+            );
+            assert_eq!(
+                decisions.get(member),
+                Some(&expected),
+                "{name}: wrong decision"
+            );
+            let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+            assert!(
+                records.is_empty(),
+                "{name}: skip arms write no records: {records:?}"
+            );
+        }
     }
 
     /// The engine-cancelled carve-out survives the submission-failure

@@ -2064,9 +2064,12 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            decisions
-                .values()
-                .all(|d| matches!(d, CollectDecision::Terminal { .. })),
+            decisions.values().all(|d| matches!(
+                d,
+                CollectDecision::Terminal { .. }
+                    | CollectDecision::Defer { .. }
+                    | CollectDecision::AlreadyTerminal
+            )),
             "timed batch members are never re-offered: {decisions:?}"
         );
     }
