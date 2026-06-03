@@ -1142,9 +1142,11 @@ pub const M_063: () = ();
 /// (`derivations.closure_hole OR EXCLUDED.closure_hole`); the merge-time
 /// upsert always binds `false`, so a later non-edge-declaring merge of
 /// the same drv can never clear it through the upsert. Cleared by the
-/// merge-time heal (`clear_closure_hole_by_hashes` — a full merge
-/// re-declares the node's edges, so its child set is representative
-/// again) and by the batched Vouched-keyed mark clears
+/// merge-time heal (`clear_closure_hole_by_hashes` — keyed on the
+/// coverage-healed parents only: accepted trigger ∧ every recorded
+/// missing child re-attached, per `MergeResult::healed_parents` and
+/// the M_069 witness set; acceptance alone does not heal) and by the
+/// batched Vouched-keyed mark clears
 /// (`clear_topdown_pruned_by_hashes` — the breadcrumb travels with the
 /// mark those sites clear); the singular `clear_topdown_pruned_by_hash`
 /// (the lazy walk-failure clear and the fail-fast consume) is
