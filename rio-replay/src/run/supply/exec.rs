@@ -738,7 +738,12 @@ impl SupplyTransport for PoolSupplyTransport {
             .await
             .context("open a daemon channel for the prefetch build")?;
         let derived: Vec<String> = roots.iter().map(|drv| format!("{drv}!*")).collect();
-        match channel.build_paths_with_results(&derived, timeout).await {
+        // No closure-node estimate here (the prefetch plan tracks roots and
+        // the paths they produce, not closure unions), so the op keeps the
+        // roots-scaled drain-budget floor; prefetch ops resolve via target-
+        // side substitution, whose per-path activity traffic sits far below
+        // build-log volume.
+        match channel.build_paths_with_results(&derived, timeout, 0).await {
             // The mapping checks the daemon's result count against the
             // submitted roots and warns on a mismatch; uncovered roots are
             // handled by the prefetch arm's missing-result rule.

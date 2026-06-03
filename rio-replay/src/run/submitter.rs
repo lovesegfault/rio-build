@@ -360,8 +360,17 @@ impl Submitter for ClientOpsSubmitter {
         let timeout = deadline.remaining_from(tokio::time::Instant::now());
         let build_result = {
             let mut observer = |line: &str| observe_line(&mut parsed, &mut tail, line);
-            chan.build_paths_with_results_observed(&derived, timeout, &mut observer)
-                .await
+            // `est_nodes` is the assembler's exact merged-closure union for
+            // this batch (roots + dependency drvs, shared deps counted
+            // once) — the workload estimate that keys the op's stderr
+            // drain budget to the volume the DAG can healthily emit.
+            chan.build_paths_with_results_observed(
+                &derived,
+                timeout,
+                batch.est_nodes,
+                &mut observer,
+            )
+            .await
         };
         let (results, engine_cancelled) = match build_result {
             // The mapping checks the daemon's result count against the

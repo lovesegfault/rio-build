@@ -1239,10 +1239,17 @@ impl DaemonChannel {
 
     /// `wopBuildPathsWithResults`: build the given derived paths and collect
     /// the daemon's per-path results (submission order).
+    ///
+    /// `closure_nodes` is the engine-side estimate of how many derivations
+    /// the op's merged closure builds (the batch assembler's `est_nodes`,
+    /// derived from the replay archive's dependency records); it keys the
+    /// stderr drain budget to the op's workload. Callers without an
+    /// estimate pass `0` and keep the roots-scaled floor.
     pub async fn build_paths_with_results(
         &mut self,
         derived: &[String],
         timeout: Duration,
+        closure_nodes: usize,
     ) -> std::result::Result<Vec<KeyedBuildResult>, TransportError> {
         let op = format!("BuildPathsWithResults ({} paths)", derived.len());
         self.ensure_usable(&op)?;
@@ -1253,6 +1260,7 @@ impl DaemonChannel {
                 &mut self.writer,
                 derived,
                 negotiated_version,
+                closure_nodes,
             ),
             timeout,
             &op,
@@ -1268,12 +1276,13 @@ impl DaemonChannel {
     /// every relayed daemon log line is passed to `observer` while the build
     /// runs, so the engine can capture the gateway's `rio: build <uuid>`
     /// announcement and the relayed `derivation '<drv>' failed:` lines as
-    /// evidence. Deadline handling and error mapping are identical to the
-    /// unobserved method.
+    /// evidence. Deadline handling, error mapping, and the `closure_nodes`
+    /// budget keying are identical to the unobserved method.
     pub async fn build_paths_with_results_observed(
         &mut self,
         derived: &[String],
         timeout: Duration,
+        closure_nodes: usize,
         observer: &mut (dyn FnMut(&str) + Send),
     ) -> std::result::Result<Vec<KeyedBuildResult>, TransportError> {
         let op = format!("BuildPathsWithResults ({} paths)", derived.len());
@@ -1285,6 +1294,7 @@ impl DaemonChannel {
                 &mut self.writer,
                 derived,
                 negotiated_version,
+                closure_nodes,
                 observer,
             ),
             timeout,

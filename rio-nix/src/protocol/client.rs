@@ -250,9 +250,11 @@ pub enum ClientOpError {
 /// The calibration unit is one submitted ROOT (whose closure can
 /// legitimately stream millions of lines), but the drain's consumption
 /// scope is one whole op — and a batch submitter may pack many roots into
-/// one op. [`stderr_budget_for_roots`] therefore scales this constant by
-/// the op's root count: without that, a healthy log-heavy multi-root batch
-/// trips a cap calibrated for one build, the resulting Wire error mandates
+/// one op. [`stderr_budget_for_workload`] therefore scales the budget with
+/// the op's workload (merged-closure node estimate, with
+/// [`stderr_budget_for_roots`] as the floor): without that, a healthy
+/// log-heavy batch — many roots, or one root with a large closure — trips
+/// a cap calibrated for one build, the resulting Wire error mandates
 /// channel abandonment, and every still-running build in the DAG is
 /// cancelled. Single-unit ops ([`drain_stderr_typed`] /
 /// [`drain_stderr_with_observer`] callers) consume exactly one unit of this
@@ -276,8 +278,71 @@ pub const STDERR_BUDGET_ROOT_MULTIPLIER_CAP: usize = 256;
 /// caller's per-op deadline (a count cap cannot protect against a silently
 /// stalled peer), and the drain never buffers the messages it counts, so
 /// the budget does not change memory bounds for any consumer.
+///
+/// Root count is the workload's ARITY, not its size: build-op log volume
+/// scales with the merged-closure node count (one frame per build-log line
+/// per derivation the DAG builds), and a one-root op can legally carry a
+/// many-thousand-node closure. This function is therefore only the FLOOR
+/// of [`stderr_budget_for_workload`] — the budget every op keeps even with
+/// no workload estimate.
 pub fn stderr_budget_for_roots(roots: usize) -> usize {
     MAX_BUILD_LOG_STDERR_MESSAGES.saturating_mul(roots.clamp(1, STDERR_BUDGET_ROOT_MULTIPLIER_CAP))
+}
+
+/// Per-merged-closure-node STDERR allowance in
+/// [`stderr_budget_for_workload`].
+///
+/// Calibration contract: the replay engine's cross-crate calibration test
+/// (`default_batch_shape_fits_the_stderr_drain_budget` in that crate)
+/// models a deliberately log-heavy but HEALTHY batch at 10,000 lines per
+/// merged-closure node (~4.5× the mid-range from-source nixpkgs average of
+/// ~2.2k lines/drv); this allowance is one decade above that model, so a
+/// healthy closure of any legal shape never consumes more than a tenth of
+/// its node-scaled budget. The belt exists for a daemon that streams
+/// FOREVER, not for trimming heavy-but-finite logs.
+pub const STDERR_BUDGET_PER_CLOSURE_NODE: usize = 100_000;
+
+/// Cap on the closure-node multiplier in [`stderr_budget_for_workload`],
+/// so the count belt stays a real bound on a runaway daemon instead of
+/// scaling toward infinity with a pathological node estimate. 65,536 is
+/// more than 7× the largest closure pinned by an in-repo batch-assembly
+/// test (a 9,001-node oversized singleton) and more than 4× a
+/// chromium/texlive-class nixpkgs closure; the estimate is computed
+/// engine-side from the replay
+/// archive's dependency records (archive-controlled, not wire-peer-
+/// controlled), and a hostile or corrupt archive declaring absurd
+/// dependency lists buys at most this multiplier. Ops estimating more
+/// nodes get no additional count headroom and rely on their wall-clock
+/// deadline, exactly like the root cap above.
+pub const STDERR_BUDGET_NODE_MULTIPLIER_CAP: usize = 65_536;
+
+/// STDERR message budget for one build op submitting `roots` derived
+/// paths whose merged closure is estimated at `closure_nodes` derivations:
+/// the larger of the per-root floor ([`stderr_budget_for_roots`]) and the
+/// per-node allowance ([`STDERR_BUDGET_PER_CLOSURE_NODE`] ×
+/// `closure_nodes`, multiplier clamped to
+/// `1..=`[`STDERR_BUDGET_NODE_MULTIPLIER_CAP`]).
+///
+/// The budget is keyed on the quantity it bounds: BuildPathsWithResults
+/// streams every triggered build's log lines through one drain, and that
+/// volume scales with how many derivations the DAG builds — the merged-
+/// closure node count — not with how many roots were submitted. Scaling by
+/// roots alone leaves the few-roots/large-closure corner (oversized
+/// singletons, fail-fast isolation singletons, wave-tail batches) at the
+/// single-unit budget while its healthy volume is hundreds of times that.
+///
+/// `closure_nodes` provenance: an engine-side estimate derived from the
+/// submitted plan (the replay engine's batch assembler computes the exact
+/// union of root + dependency derivations from the archive's records).
+/// Callers with no estimate pass `0`: the floor keeps them at exactly the
+/// roots-scaled budget. The estimate can only RAISE the budget above the
+/// floor, never lower it, so a too-small estimate degrades to the
+/// pre-existing roots calibration rather than below it.
+pub fn stderr_budget_for_workload(roots: usize, closure_nodes: usize) -> usize {
+    stderr_budget_for_roots(roots).max(
+        STDERR_BUDGET_PER_CLOSURE_NODE
+            .saturating_mul(closure_nodes.clamp(1, STDERR_BUDGET_NODE_MULTIPLIER_CAP)),
+    )
 }
 
 /// Drain the STDERR loop until `STDERR_LAST`, surfacing `STDERR_ERROR` as
@@ -523,19 +588,32 @@ pub struct KeyedBuildResult {
 ///
 /// `negotiated_version` comes from [`client_handshake`]; it gates
 /// version-dependent [`BuildResult`] fields (e.g. cpu stats at >= 1.37).
+///
+/// `closure_nodes` is the caller's estimate of how many derivations the
+/// op's merged closure builds — the variable the stderr drain budget
+/// scales with (see [`stderr_budget_for_workload`]). Pass `0` when no
+/// estimate exists; the roots-scaled floor then applies.
 pub async fn client_build_paths_with_results<R, W, S>(
     reader: &mut R,
     writer: &mut W,
     derived_paths: &[S],
     negotiated_version: u64,
+    closure_nodes: usize,
 ) -> std::result::Result<Vec<KeyedBuildResult>, ClientOpError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
     S: AsRef<str>,
 {
-    client_build_paths_with_results_inner(reader, writer, derived_paths, negotiated_version, None)
-        .await
+    client_build_paths_with_results_inner(
+        reader,
+        writer,
+        derived_paths,
+        negotiated_version,
+        closure_nodes,
+        None,
+    )
+    .await
 }
 
 /// [`client_build_paths_with_results`] with a log-line observer: every
@@ -552,6 +630,7 @@ pub async fn client_build_paths_with_results_observed<R, W, S>(
     writer: &mut W,
     derived_paths: &[S],
     negotiated_version: u64,
+    closure_nodes: usize,
     observer: &mut (dyn FnMut(&str) + Send),
 ) -> std::result::Result<Vec<KeyedBuildResult>, ClientOpError>
 where
@@ -564,6 +643,7 @@ where
         writer,
         derived_paths,
         negotiated_version,
+        closure_nodes,
         Some(observer),
     )
     .await
@@ -577,6 +657,7 @@ async fn client_build_paths_with_results_inner<R, W, S>(
     writer: &mut W,
     derived_paths: &[S],
     negotiated_version: u64,
+    closure_nodes: usize,
     observer: Option<&mut (dyn FnMut(&str) + Send)>,
 ) -> std::result::Result<Vec<KeyedBuildResult>, ClientOpError>
 where
@@ -589,13 +670,15 @@ where
     wire::write_u64(writer, BuildMode::Normal as u64).await?;
     writer.flush().await.map_err(WireError::Io)?;
 
-    // The drain budget scales with the number of submitted roots: this op
-    // streams every triggered build's log lines through one drain, so a
-    // flat per-build budget would be consumed at whole-batch scope.
+    // The drain budget scales with the workload the op triggers: log
+    // volume follows the merged-closure node count (every triggered
+    // build's lines stream through this one drain), with the submitted
+    // root count as the floor for callers without an estimate — a flat
+    // per-build budget would be consumed at whole-op scope.
     drain_stderr_typed_bounded(
         reader,
         observer,
-        stderr_budget_for_roots(derived_paths.len()),
+        stderr_budget_for_workload(derived_paths.len(), closure_nodes),
     )
     .await?;
 
@@ -1532,7 +1615,7 @@ mod tests {
     /// (the budget's consumption scope is the whole op), while the cap
     /// keeps the belt finite for pathological root counts. Universe: every
     /// `client_build_paths_with_results*` call derives its drain budget
-    /// through this function.
+    /// through `stderr_budget_for_workload`, whose floor this function is.
     #[test]
     fn stderr_budget_scales_per_root_with_a_capped_multiplier() {
         // Floor: zero/one root keep the single-build calibration.
@@ -1553,6 +1636,55 @@ mod tests {
             stderr_budget_for_roots(STDERR_BUDGET_ROOT_MULTIPLIER_CAP + 1_000),
             STDERR_BUDGET_ROOT_MULTIPLIER_CAP * MAX_BUILD_LOG_STDERR_MESSAGES
         );
+    }
+
+    /// The workload budget is keyed on the variable the drained volume
+    /// actually follows — merged-closure nodes — with the roots budget as
+    /// the floor. Universe: every `client_build_paths_with_results*` call
+    /// derives its drain budget through this function; the corners come
+    /// from the legal (roots, nodes) shapes the replay engine's batch
+    /// assembler emits (its cross-crate calibration test enumerates them
+    /// from the assembler itself), where roots and nodes are independent
+    /// axes — budget(f(roots)) against volume(g(nodes)) must be evaluated
+    /// where f is minimal and g maximal, not only on the diagonal.
+    #[test]
+    fn stderr_budget_for_workload_scales_with_nodes_above_the_roots_floor() {
+        // No estimate (0) and tiny closures keep exactly the roots floor:
+        // non-replay single-unit callers are unchanged.
+        assert_eq!(stderr_budget_for_workload(1, 0), stderr_budget_for_roots(1));
+        assert_eq!(stderr_budget_for_workload(1, 1), stderr_budget_for_roots(1));
+        assert_eq!(
+            stderr_budget_for_workload(50, 0),
+            stderr_budget_for_roots(50)
+        );
+        // The binding corner the roots key missed: ONE root with a large
+        // closure gets a node-scaled budget, not the single-unit floor.
+        assert_eq!(
+            stderr_budget_for_workload(1, 4_500),
+            4_500 * STDERR_BUDGET_PER_CLOSURE_NODE
+        );
+        assert!(
+            stderr_budget_for_workload(1, 4_500) > stderr_budget_for_roots(1),
+            "a 1-root/4500-node op must not be budgeted as a single unit"
+        );
+        // The floor wins whenever it is larger: many roots with a modest
+        // shared closure never drop below the per-root calibration.
+        assert_eq!(
+            stderr_budget_for_workload(50, 100),
+            stderr_budget_for_roots(50)
+        );
+        // Hostile/corrupt magnitudes CLAMP — they must not scale. The
+        // node estimate is archive-derived (a corrupt or hostile archive
+        // can declare absurd dependency lists), so the absurd inputs
+        // assert the cap explicitly rather than being assumed
+        // unreachable.
+        for absurd in [STDERR_BUDGET_NODE_MULTIPLIER_CAP + 1, usize::MAX] {
+            assert_eq!(
+                stderr_budget_for_workload(1, absurd),
+                STDERR_BUDGET_NODE_MULTIPLIER_CAP * STDERR_BUDGET_PER_CLOSURE_NODE,
+                "an absurd node estimate ({absurd}) must clamp at the node multiplier cap"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1870,9 +2002,14 @@ mod tests {
         });
 
         let (mut cr, mut cw) = tokio::io::split(client_stream);
-        let results =
-            client_build_paths_with_results(&mut cr, &mut cw, &[dp_all, dp_out], PROTOCOL_VERSION)
-                .await?;
+        let results = client_build_paths_with_results(
+            &mut cr,
+            &mut cw,
+            &[dp_all, dp_out],
+            PROTOCOL_VERSION,
+            0,
+        )
+        .await?;
         server.await??;
 
         assert_eq!(results.len(), 2);
@@ -1908,7 +2045,7 @@ mod tests {
         });
 
         let (mut cr, mut cw) = tokio::io::split(client_stream);
-        let err = client_build_paths_with_results(&mut cr, &mut cw, &[dp], PROTOCOL_VERSION)
+        let err = client_build_paths_with_results(&mut cr, &mut cw, &[dp], PROTOCOL_VERSION, 0)
             .await
             .expect_err("oversized result count must be rejected");
         assert!(
@@ -1943,9 +2080,14 @@ mod tests {
         });
 
         let (mut cr, mut cw) = tokio::io::split(client_stream);
-        let results =
-            client_build_paths_with_results(&mut cr, &mut cw, wire::NO_STRINGS, PROTOCOL_VERSION)
-                .await?;
+        let results = client_build_paths_with_results(
+            &mut cr,
+            &mut cw,
+            wire::NO_STRINGS,
+            PROTOCOL_VERSION,
+            0,
+        )
+        .await?;
         assert!(results.is_empty());
         server.await??;
         Ok(())
@@ -2004,6 +2146,7 @@ mod tests {
             &mut cw,
             &[dp],
             PROTOCOL_VERSION,
+            0,
             &mut |line| seen.push(line.to_string()),
         )
         .await?;
@@ -2020,7 +2163,7 @@ mod tests {
         let server = spawn_server(server_stream);
         let (mut cr, mut cw) = tokio::io::split(client_stream);
         let unobserved =
-            client_build_paths_with_results(&mut cr, &mut cw, &[dp], PROTOCOL_VERSION).await?;
+            client_build_paths_with_results(&mut cr, &mut cw, &[dp], PROTOCOL_VERSION, 0).await?;
         server.await??;
 
         assert_eq!(observed.len(), unobserved.len());

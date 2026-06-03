@@ -323,7 +323,7 @@ async fn conformance_build_paths_with_results() -> anyhow::Result<()> {
 
     let derived_path = format!("{CONF_DRV_PATH}!out");
     let results =
-        client_build_paths_with_results(&mut rd, &mut wr, &[derived_path.as_str()], version)
+        client_build_paths_with_results(&mut rd, &mut wr, &[derived_path.as_str()], version, 0)
             .await?;
 
     assert_eq!(results.len(), 1, "one derived path submitted, one result");
@@ -484,6 +484,7 @@ async fn conformance_build_paths_with_results_multi_root_per_root_status() -> an
         &mut wr,
         &[ok_path.as_str(), fail_path.as_str(), cached_path.as_str()],
         version,
+        0,
     )
     .await?;
 
@@ -632,6 +633,7 @@ async fn conformance_build_paths_with_results_presence_never_fabricates_executio
         &mut wr,
         &[failed_path.as_str(), rescued_path.as_str()],
         version,
+        0,
     )
     .await?;
 
@@ -718,9 +720,10 @@ async fn conformance_daemon_refusal_is_typed() -> anyhow::Result<()> {
     let (mut rd, mut wr, version) = handshake_session(&mut sess).await?;
 
     let derived_path = format!("{CONF_DRV_PATH}!out");
-    let err = client_build_paths_with_results(&mut rd, &mut wr, &[derived_path.as_str()], version)
-        .await
-        .expect_err("over-quota build submission must be refused");
+    let err =
+        client_build_paths_with_results(&mut rd, &mut wr, &[derived_path.as_str()], version, 0)
+            .await
+            .expect_err("over-quota build submission must be refused");
 
     match err {
         ClientOpError::Daemon(e) => assert!(

@@ -1214,49 +1214,134 @@ mod tests {
         );
     }
 
-    /// Cross-crate calibration: the engine's default batch shape must fit
-    /// the protocol client's stderr drain budget. The budget constant lives
-    /// in rio-nix and is calibrated per submitted root; the decision of how
-    /// many roots (and how large a merged closure) one op carries is made
-    /// HERE, by these knobs — so this is the test that fails when either
-    /// crate moves its end of the calibration. Universe: `Knobs::default()`
-    /// (the shape every campaign gets unless overridden) against the
-    /// budget rio-nix derives for it.
+    /// Cross-crate calibration: every batch shape the engine's assembler
+    /// can legally emit under the default knobs must fit the protocol
+    /// client's stderr drain budget. The budget constants live in rio-nix
+    /// and the decision of how many roots (and how large a merged closure)
+    /// one op carries is made HERE, by these knobs and `assemble_batches` —
+    /// so this is the test that fails when either crate moves its end of
+    /// the calibration.
+    ///
+    /// Universe: the corners of the legal (roots, est_nodes) space at
+    /// `Knobs::default()`, ENUMERATED FROM THE ADMISSION CODE — each corner
+    /// batch is produced by `assemble_batches` itself, not hand-assumed.
+    /// Budget is monotone in each axis while volume follows nodes alone,
+    /// so the binding corner is min-roots × max-nodes, not the diagonal:
+    ///
+    /// 1. max-roots × max-nodes (the packed default batch),
+    /// 2. ONE root carrying `batch_max_nodes` (a wave-tail batch),
+    /// 3. the oversized singleton (one job whose own closure exceeds
+    ///    `batch_max_nodes` — admitted alone, est_nodes above the cap),
+    /// 4. the fail-fast/canary singleton admission `(1, usize::MAX)`,
+    ///    whose REALIZED est_nodes is the job's actual closure union (the
+    ///    admission cap is not a workload).
     #[test]
     fn default_batch_shape_fits_the_stderr_drain_budget() {
         use rio_nix::protocol::client::{
-            STDERR_BUDGET_ROOT_MULTIPLIER_CAP, stderr_budget_for_roots,
+            STDERR_BUDGET_NODE_MULTIPLIER_CAP, STDERR_BUDGET_ROOT_MULTIPLIER_CAP,
+            stderr_budget_for_workload,
         };
 
+        use crate::run::batch::{PendingJob, assemble_batches};
+
         let knobs = Knobs::default();
-        // The multiplier cap must not bind for the default packing —
-        // otherwise raising batch_max_jobs would silently stop scaling the
-        // budget.
+        // Neither multiplier cap may bind for shapes the default packing
+        // emits — otherwise raising the knob would silently stop scaling
+        // the budget.
         assert!(
             knobs.batch_max_jobs <= STDERR_BUDGET_ROOT_MULTIPLIER_CAP,
-            "default batch_max_jobs ({}) exceeds the drain-budget multiplier cap ({}) — the \
-             per-root calibration would silently stop scaling; split batches or raise the cap \
-             in rio-nix",
+            "default batch_max_jobs ({}) exceeds the drain-budget root multiplier cap ({}) — \
+             the per-root calibration would silently stop scaling; split batches or raise the \
+             cap in rio-nix",
             knobs.batch_max_jobs,
             STDERR_BUDGET_ROOT_MULTIPLIER_CAP,
         );
+        assert!(
+            knobs.batch_max_nodes <= STDERR_BUDGET_NODE_MULTIPLIER_CAP,
+            "default batch_max_nodes ({}) exceeds the drain-budget node multiplier cap ({}) — \
+             the per-node calibration would silently stop scaling; split batches or raise the \
+             cap in rio-nix",
+            knobs.batch_max_nodes,
+            STDERR_BUDGET_NODE_MULTIPLIER_CAP,
+        );
+
         // Per-closure-node log allowance the budget must absorb: 10k lines
         // per merged-closure node is ~4.5× the mid-range from-source
         // nixpkgs average (~2.2k lines/drv) — a deliberately log-heavy but
         // healthy batch must never trip the count belt (the belt exists
         // for a daemon that streams FOREVER, and wall-clock deadlines are
-        // the liveness bound).
+        // the liveness bound). rio-nix's STDERR_BUDGET_PER_CLOSURE_NODE is
+        // documented against this exact model.
         const LOG_LINES_PER_CLOSURE_NODE: usize = 10_000;
-        let worst_healthy_batch = knobs.batch_max_nodes * LOG_LINES_PER_CLOSURE_NODE;
-        let budget = stderr_budget_for_roots(knobs.batch_max_jobs);
-        assert!(
-            budget >= worst_healthy_batch,
-            "a default-shaped batch ({} nodes × {LOG_LINES_PER_CLOSURE_NODE} lines = {} lines) \
-             would trip the drain budget ({budget}) — healthy log-heavy batches must never be \
-             cut off mid-DAG",
+
+        let job = |name: &str, deps: usize| PendingJob {
+            job: name.to_string(),
+            drv_path: format!("/nix/store/{:0>32}-{name}.drv", name.len()),
+            dep_drvs: (0..deps)
+                .map(|i| format!("/nix/store/{i:0>32}-dep-{name}-{i}.drv"))
+                .collect(),
+        };
+
+        // Corner 1+2: jobs with disjoint closures packed under the default
+        // caps. The first batch fills to the node cap with multiple roots;
+        // forcing per-job closures near the cap also yields the one-root/
+        // max-nodes wave-tail shape.
+        let per_job_nodes = knobs.batch_max_nodes / 10;
+        let packed: Vec<PendingJob> = (0..30)
+            .map(|i| job(&format!("packed{i}"), per_job_nodes - 1))
+            .collect();
+        let mut corner_batches =
+            assemble_batches(&packed, knobs.batch_max_jobs, knobs.batch_max_nodes);
+        let tail: Vec<PendingJob> = vec![job("wavetail", knobs.batch_max_nodes - 1)];
+        corner_batches.extend(assemble_batches(
+            &tail,
+            knobs.batch_max_jobs,
             knobs.batch_max_nodes,
-            worst_healthy_batch,
+        ));
+        // Corner 3: the oversized singleton — one job whose own closure
+        // exceeds batch_max_nodes is still admitted, alone (the same shape
+        // the batch module's own oversized_single_job_becomes_singleton
+        // test pins at 9001 nodes).
+        let oversized: Vec<PendingJob> = vec![job("texlive", 2 * knobs.batch_max_nodes)];
+        corner_batches.extend(assemble_batches(
+            &oversized,
+            knobs.batch_max_jobs,
+            knobs.batch_max_nodes,
+        ));
+        // Corner 4: the fail-fast/canary singleton admission shape — one
+        // job assembled with (1, usize::MAX) caps. The admission cap is
+        // unbounded but the REALIZED est_nodes is the job's actual closure.
+        let isolated = job("isolated", 2 * knobs.batch_max_nodes);
+        corner_batches.extend(assemble_batches(
+            std::slice::from_ref(&isolated),
+            1,
+            usize::MAX,
+        ));
+
+        let one_root_corner_seen = corner_batches
+            .iter()
+            .any(|batch| batch.root_drvs.len() == 1 && batch.est_nodes >= knobs.batch_max_nodes);
+        assert!(
+            one_root_corner_seen,
+            "corner enumeration must include the min-roots/max-nodes shape; got {:?}",
+            corner_batches
+                .iter()
+                .map(|b| (b.root_drvs.len(), b.est_nodes))
+                .collect::<Vec<_>>()
         );
+
+        for batch in &corner_batches {
+            let healthy_volume = batch.est_nodes * LOG_LINES_PER_CLOSURE_NODE;
+            let budget = stderr_budget_for_workload(batch.root_drvs.len(), batch.est_nodes);
+            assert!(
+                budget >= healthy_volume,
+                "a legal batch shape ({} roots × {} nodes; {healthy_volume} healthy lines) \
+                 would trip the drain budget ({budget}) — healthy log-heavy batches must never \
+                 be cut off mid-DAG",
+                batch.root_drvs.len(),
+                batch.est_nodes,
+            );
+        }
     }
 
     #[test]
