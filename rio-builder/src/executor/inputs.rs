@@ -364,7 +364,7 @@ pub(super) async fn fetch_drv_from_store(
 /// consumption: every demanded byte WILL be read by the glue, and a
 /// `.drv` that is not UTF-8 ATerm can never become readable by
 /// retrying elsewhere.
-// r[impl builder.result.input-materialization-is-infra+4]
+// r[impl builder.result.input-materialization-is-infra+5]
 // r[impl builder.glue.pure]
 // r[impl builder.glue.drv-table-demand]
 pub(super) async fn fetch_demanded_graph_drvs(
@@ -505,7 +505,7 @@ pub(super) async fn compute_input_closure(
     drv: &Derivation,
     drv_path: &str,
     resolved_input_srcs: &std::collections::BTreeSet<String>,
-) -> Result<Vec<ValidatedPathInfo>, ExecutorError> {
+) -> Result<ResolvedClosure, ExecutorError> {
     use std::collections::HashSet;
 
     // I-106: keep the full PathInfo from each BFS query so downstream
@@ -516,6 +516,7 @@ pub(super) async fn compute_input_closure(
     // PG pool.
     let mut closure: HashSet<String> = HashSet::new();
     let mut metadata: Vec<ValidatedPathInfo> = Vec::new();
+    let mut dropped: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut frontier: Vec<String> = Vec::new();
 
     // Seed: the .drv itself, input_drv paths (so nix-daemon can read them),
@@ -570,7 +571,17 @@ pub(super) async fn compute_input_closure(
                 // A path skipped here is NOT in the JIT allowlist, so
                 // FUSE returns ENOENT (not lazy-fetch — the builder
                 // carries no tenant context to substitute on miss).
+                //
+                // The drop is RECORDED, not silent: a store read lag or
+                // GC race here surfaces later as a deterministic-looking
+                // glue rejection (exportReferencesGraph demands the
+                // path's metadata), and the executor's arbitration must
+                // be able to tell "the store didn't have it at resolve
+                // time" (infra — re-dispatch re-resolves) from "the
+                // declaration is wrong" (input-rejected).
+                // r[impl builder.result.input-materialization-is-infra+5]
                 tracing::debug!(path = %path, "input not in store; dropped from JIT allowlist");
+                dropped.insert(path);
                 continue;
             };
             for r in &info.references {
@@ -583,7 +594,19 @@ pub(super) async fn compute_input_closure(
         }
     }
 
-    Ok(metadata)
+    Ok(ResolvedClosure { metadata, dropped })
+}
+
+/// What the closure BFS resolved — the metadata it found plus the
+/// EVIDENCE of what it could not: members whose `BatchQueryPathInfo`
+/// came back not-found at resolve time. The dropped set travels to the
+/// glue-rejection arbitration so a resolve-time residency gap (store
+/// read lag, GC race) is classified as infrastructure instead of
+/// laundering into a permanent input rejection.
+#[derive(Debug)]
+pub(super) struct ResolvedClosure {
+    pub(super) metadata: Vec<ValidatedPathInfo>,
+    pub(super) dropped: std::collections::BTreeSet<String>,
 }
 
 /// Fetch one BFS layer's metadata via `BatchQueryPathInfo` (one RPC
@@ -932,8 +955,9 @@ mod tests {
     }
 
     /// Project closure metadata to a path set for membership assertions.
-    fn paths_of(closure: Vec<ValidatedPathInfo>) -> std::collections::HashSet<String> {
+    fn paths_of(closure: ResolvedClosure) -> std::collections::HashSet<String> {
         closure
+            .metadata
             .into_iter()
             .map(|m| m.store_path.to_string())
             .collect()
@@ -956,6 +980,7 @@ mod tests {
         let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
 
         let lib = closure
+            .metadata
             .iter()
             .find(|m| m.store_path.as_str() == p_a)
             .expect("p_a in closure");
@@ -1041,6 +1066,16 @@ mod tests {
             .await
             .expect("missing ref is non-fatal");
 
+        // The drop is EVIDENCE, not silence: the dropped set is what the
+        // glue-rejection arbitration consults to tell a resolve-time
+        // residency gap from a genuinely-wrong declaration.
+        // r[verify builder.result.input-materialization-is-infra+5]
+        assert_eq!(
+            closure.dropped.iter().collect::<Vec<_>>(),
+            vec![&p_missing],
+            "the not-found member must be recorded in the dropped set"
+        );
+
         let set = paths_of(closure);
         assert_eq!(set.len(), 2, "closure should be {{drv, A}} without B");
         assert!(set.contains(&p_drv));
@@ -1062,7 +1097,7 @@ mod tests {
         let drv = drv_with_srcs(&[p_a, p_b]);
         let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
 
-        assert_eq!(closure.len(), 4); // drv, A, B, C (once)
+        assert_eq!(closure.metadata.len(), 4); // drv, A, B, C (once)
         Ok(())
     }
 
@@ -1082,7 +1117,7 @@ mod tests {
 
         let drv = drv_with_srcs(std::slice::from_ref(&p_a));
         let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
-        assert_eq!(closure.len(), 4);
+        assert_eq!(closure.metadata.len(), 4);
 
         let batch_calls = store.calls.batch_qpi_calls.load(Ordering::SeqCst);
         assert!(
@@ -1502,7 +1537,7 @@ mod tests {
     /// and a demanded path whose bytes are not UTF-8 ATerm is
     /// permanent (consumption-backed: the glue WILL read these bytes,
     /// and they can never become readable by retrying elsewhere).
-    // r[verify builder.result.input-materialization-is-infra+4]
+    // r[verify builder.result.input-materialization-is-infra+5]
     // r[verify builder.glue.drv-table-demand]
     #[tokio::test]
     async fn demanded_fetch_and_error_classification() -> anyhow::Result<()> {

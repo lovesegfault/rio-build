@@ -679,6 +679,7 @@ pub async fn execute_build(
                 input_paths,
                 input_sized,
                 input_metadata,
+                dropped_inputs,
                 graph_drvs,
             } = resolve_inputs(&*store_client, &drv, drv_path, &drv_text).await?;
 
@@ -777,6 +778,7 @@ pub async fn execute_build(
                 basic_drv: &basic_drv,
                 input_paths: &input_paths,
                 input_metadata: &input_metadata,
+                dropped_inputs: &dropped_inputs,
                 opts,
                 is_fod,
                 log_tx,
@@ -1044,6 +1046,9 @@ struct NativeLifecycleArgs<'a> {
     basic_drv: &'a rio_nix::derivation::BasicDerivation,
     input_paths: &'a [String],
     input_metadata: &'a [ValidatedPathInfo],
+    /// Resolve-time residency gaps (see `ResolvedInputs::dropped_inputs`)
+    /// — consulted by the glue-rejection arbitration.
+    dropped_inputs: &'a std::collections::BTreeSet<String>,
     opts: BuildOpts,
     is_fod: bool,
     log_tx: &'a crate::log_stream::SheddingLogSender,
@@ -1105,6 +1110,7 @@ async fn run_native_lifecycle(
         basic_drv,
         input_paths,
         input_metadata,
+        dropped_inputs,
         opts,
         is_fod,
         log_tx,
@@ -1225,17 +1231,24 @@ async fn run_native_lifecycle(
             // Input-shaped rejection: report through the normal result
             // channel (the caller maps Glue → InputRejected) after the
             // cgroup has been drained below. Every GlueError is a
-            // permanent property of the inputs now — the glue holds no
-            // filesystem capability (`builder.glue.pure`), so there is
-            // no transient-I/O class left in it; resolution I/O faults
-            // were classified infra-transient at the resolve step
-            // (`builder.result.input-materialization-is-infra+4`)
-            // before the glue ever ran.
+            // permanent property of the inputs — EXCEPT one shape the
+            // glue cannot tell apart from inside: a missing-metadata
+            // rejection for a path the resolve step DROPPED as
+            // not-found (store read lag, GC race). The glue holds no
+            // filesystem capability (`builder.glue.pure`) and
+            // resolution I/O *faults* were classified infra-transient
+            // at the resolve step
+            // (`builder.result.input-materialization-is-infra+5`) —
+            // but a not-found is not a fault, so it slipped past that
+            // classification and re-surfaced here as a
+            // deterministic-looking rejection. The arbitration closes
+            // that laundering channel with the resolve step's own
+            // dropped-set evidence.
             monitors.stop();
             drain_build_cgroup(build_cgroup).await;
             scopeguard::ScopeGuard::into_inner(cgroup_kill_guard);
             return Ok(NativeOutcome {
-                build_result: Err(ExecutorError::Glue(e.to_string())),
+                build_result: Err(arbitrate_glue_rejection(e, dropped_inputs)),
                 peak_memory_bytes: 0,
                 peak_cpu_cores: 0.0,
                 final_line_count: opts.batcher_seed,
@@ -1376,7 +1389,7 @@ async fn run_native_lifecycle(
         // and the daemon-era path report it as a permanent build failure
         // in the build log, not as something to retry. Materialization
         // faults stay infra-transient: they surface earlier as bind-mount
-        // failures (r[builder.result.input-materialization-is-infra+4]) or
+        // failures (r[builder.result.input-materialization-is-infra+5]) or
         // as EIO, never as these errnos at exec time — every input bind
         // already succeeded by the time the child execs.
         Err(rio_exec::ExecError::Setup(se))
@@ -1751,6 +1764,14 @@ struct ResolvedInputs {
     /// glue's closure planning and the output policy checks don't need
     /// a second QueryPathInfo pass (I-106).
     input_metadata: Vec<ValidatedPathInfo>,
+    /// Closure members whose `BatchQueryPathInfo` came back not-found
+    /// at resolve time (store read lag, GC race) — dropped from the
+    /// JIT allowlist, but RECORDED: the glue-rejection arbitration
+    /// consults this set so a residency gap surfaces as a re-dispatch
+    /// (`MetadataFetch` infra) instead of laundering into a permanent
+    /// `InputRejected` when exportReferencesGraph demands the path.
+    // r[impl builder.result.input-materialization-is-infra+5]
+    dropped_inputs: std::collections::BTreeSet<String>,
     /// ATerm text for the main `.drv` plus the declaration-demanded
     /// graph `.drv`s: the request glue's only source of derivation
     /// bytes (`builder.glue.pure` — the glue holds no filesystem
@@ -1902,8 +1923,19 @@ async fn resolve_inputs(
     // input_drvs().keys() would miss them. I-043: warm count=8 with
     // the post-BFS merge — autotools-hook (a transitive runtime dep
     // via stdenv-the-output) never reached.
-    let input_metadata =
-        compute_input_closure(store_client, drv, drv_path, &resolved_input_srcs).await?;
+    let inputs::ResolvedClosure {
+        metadata: input_metadata,
+        dropped: dropped_inputs,
+    } = compute_input_closure(store_client, drv, drv_path, &resolved_input_srcs).await?;
+    if !dropped_inputs.is_empty() {
+        // Evidence, not noise: these are exactly the paths a later
+        // glue ExportRefsMissingMetadata rejection arbitrates against.
+        tracing::info!(
+            dropped = dropped_inputs.len(),
+            "input closure members not in store at resolve time; \
+             recorded for glue-rejection arbitration"
+        );
+    }
     let input_paths: Vec<String> = input_metadata
         .iter()
         .map(|m| m.store_path.to_string())
@@ -1937,8 +1969,66 @@ async fn resolve_inputs(
         input_paths,
         input_sized,
         input_metadata,
+        dropped_inputs,
         graph_drvs: std::sync::Arc::new(graph_drvs),
     })
+}
+
+/// Arbitrate a request-glue rejection against the resolve step's
+/// dropped-set evidence: a rejection that hinges on a path the closure
+/// BFS dropped as not-found is a resolve-time RESIDENCY GAP (store
+/// read lag, GC race) wearing a deterministic costume — re-dispatch
+/// re-resolves and plausibly succeeds, so it must be
+/// `MetadataFetch`/InfrastructureFailure, never the permanent
+/// `InputRejected` the same variant earns when the declaration is
+/// genuinely wrong.
+///
+/// Population (every GlueError shape a dropped path can produce — the
+/// glue consults closure state at exactly these three sites):
+/// - `ExportRefsMissingMetadata`: a dropped non-root closure member
+///   reached by the references BFS (canonical path — set membership);
+/// - `ExportRefsDrvOutputMissing`: a dropped output demanded by `.drv`
+///   closure expansion (canonical path — set membership);
+/// - `ExportRefsOutsideClosure`: a dropped ROOT target — the drop
+///   removed it from `input_paths`, so the containment gate misses it;
+///   the error carries the raw declaration target, which CppNix's
+///   `toStorePath()` allows to be a sub-path INSIDE the store path, so
+///   the relation is containment, not equality.
+///
+/// Membership in the dropped set proves the path was part of the
+/// build's declared walk (only frontier members get queried), so the
+/// arbitration cannot misclassify a genuinely-foreign path: had the
+/// store answered, the path would have been inside the closure.
+///
+/// Every other GlueError stays a permanent input property
+/// (`builder.glue.pure` — the glue holds no I/O capability, so no
+/// transient class originates inside it).
+// r[impl builder.result.input-materialization-is-infra+5]
+fn arbitrate_glue_rejection(
+    e: glue::GlueError,
+    dropped_inputs: &std::collections::BTreeSet<String>,
+) -> ExecutorError {
+    let dropped_hit = match &e {
+        glue::GlueError::ExportRefsMissingMetadata { path }
+        | glue::GlueError::ExportRefsDrvOutputMissing { path, .. } => {
+            dropped_inputs.contains(path).then(|| path.clone())
+        }
+        glue::GlueError::ExportRefsOutsideClosure { path } => dropped_inputs
+            .iter()
+            .find(|p| path == *p || path.starts_with(&format!("{p}/")))
+            .cloned(),
+        _ => None,
+    };
+    match dropped_hit {
+        Some(path) => ExecutorError::MetadataFetch {
+            path,
+            source: tonic::Status::not_found(
+                "input closure member was not in the store at resolve time \
+                 (read lag or GC race); re-dispatch re-resolves the closure",
+            ),
+        },
+        None => ExecutorError::Glue(e.to_string()),
+    }
 }
 
 /// Convert a derivation path to a safe build ID for directory names.
@@ -2017,6 +2107,93 @@ pub(crate) fn send_banner_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The glue-rejection arbitration's full population (round-16
+    /// bug_075): each GlueError shape a resolve-time drop can produce
+    /// re-classifies to MetadataFetch (infra → re-dispatch) when its
+    /// path is in the dropped set, and stays a permanent Glue
+    /// rejection otherwise.
+    // r[verify builder.result.input-materialization-is-infra+5]
+    #[test]
+    fn glue_rejection_arbitrated_against_dropped_set() {
+        let dropped: std::collections::BTreeSet<String> =
+            ["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gone".to_string()]
+                .into_iter()
+                .collect();
+
+        // Closure-walk miss on a dropped member: residency gap → infra.
+        let e = glue::GlueError::ExportRefsMissingMetadata {
+            path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gone".into(),
+        };
+        match arbitrate_glue_rejection(e, &dropped) {
+            ExecutorError::MetadataFetch { path, source } => {
+                assert_eq!(path, "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gone");
+                assert_eq!(source.code(), tonic::Code::NotFound);
+            }
+            other => panic!("dropped member must re-dispatch, got {other:?}"),
+        }
+
+        // `.drv` output expansion miss on a dropped member: same.
+        let e = glue::GlueError::ExportRefsDrvOutputMissing {
+            drv: "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-x.drv".into(),
+            path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gone".into(),
+        };
+        assert!(
+            matches!(
+                arbitrate_glue_rejection(e, &dropped),
+                ExecutorError::MetadataFetch { .. }
+            ),
+            "dropped expansion target must re-dispatch"
+        );
+
+        // Dropped ROOT target: the containment gate misses it, and the
+        // error carries the raw declaration target — possibly a
+        // sub-path INSIDE the store path (CppNix toStorePath()).
+        let e = glue::GlueError::ExportRefsOutsideClosure {
+            path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gone/share/info".into(),
+        };
+        assert!(
+            matches!(
+                arbitrate_glue_rejection(e, &dropped),
+                ExecutorError::MetadataFetch { .. }
+            ),
+            "dropped root (sub-path target) must re-dispatch"
+        );
+
+        // Same variant, path NOT dropped: genuinely-wrong declaration —
+        // permanent input rejection, exactly as before.
+        let e = glue::GlueError::ExportRefsMissingMetadata {
+            path: "/nix/store/cccccccccccccccccccccccccccccccc-other".into(),
+        };
+        let arbitrated = arbitrate_glue_rejection(e, &dropped);
+        assert!(
+            matches!(&arbitrated, ExecutorError::Glue(_)) && arbitrated.is_permanent(),
+            "non-dropped miss stays a permanent Glue rejection: {arbitrated:?}"
+        );
+
+        // A prefix that is NOT a path-component boundary must not match
+        // (containment is `p` or `p/…`, never string-prefix).
+        let e = glue::GlueError::ExportRefsOutsideClosure {
+            path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gone-extra".into(),
+        };
+        assert!(
+            matches!(
+                arbitrate_glue_rejection(e, &dropped),
+                ExecutorError::Glue(_)
+            ),
+            "sibling store path sharing a string prefix is not contained"
+        );
+
+        // An unrelated GlueError shape never consults the dropped set.
+        let e = glue::GlueError::StructuredAttrsMissingJson;
+        assert!(
+            matches!(
+                arbitrate_glue_rejection(e, &dropped),
+                ExecutorError::Glue(_)
+            ),
+            "non-residency rejections stay permanent"
+        );
+    }
 
     /// Contract pin: rio-scheduler `handle_infrastructure_failure`
     /// matches `error_msg.contains(rio_proto::CGROUP_OOM_MSG)` to

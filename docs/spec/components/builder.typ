@@ -1698,7 +1698,7 @@ boundary remains best-effort --- a shed terminal batch leaves a bounded
 display gap (#rref("builder.log-limit+3") guarantees its assembly, not its
 delivery).
 
-#r("builder.result.input-materialization-is-infra+4")[
+#r("builder.result.input-materialization-is-infra+5")[
   A build failure caused by an input path that was verified present in
   rio-store during input resolution but could not be materialized on the
   worker (FUSE JIT-fetch error, overlay race) MUST be reported as
@@ -1711,6 +1711,16 @@ delivery).
   request glue's derivation-text table is a `MetadataFetch` infrastructure
   failure, surfaced BEFORE the glue runs --- the glue holds no I/O capability
   (#rref("builder.glue.pure")), so no transient-I/O class exists inside it.
+  A closure member the resolve step DROPS as not-found (store read lag, GC
+  race) MUST carry that fact as evidence to the executor's glue-rejection
+  arbitration: a glue rejection attributable to a dropped member --- by
+  canonical-path membership for closure-walk and `.drv`-expansion misses,
+  by store-path containment for root targets --- is the same residency gap
+  re-surfacing, and MUST be classified `MetadataFetch` infrastructure (a
+  re-dispatch re-resolves), never `InputRejected`. Not-found is not a
+  fault, so it slips past the resolve step's fault classification; without
+  the dropped-set evidence it deterministically launders into a permanent
+  rejection of a build that an immediate re-dispatch would fix.
 ]
 = Shutdown
 
