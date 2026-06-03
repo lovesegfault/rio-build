@@ -196,6 +196,17 @@ pub fn describe_metrics() {
          fails RESOURCE_EXHAUSTED, nothing displaced)"
     );
     describe_counter!(
+        "rio_scheduler_merge_stripped_rejoin_total",
+        "Settled rows REJOINED by a re-creating submission via the M_070 \
+         match bases the pre-strip-preservation matcher refused \
+         (sched.persist.settled-identity-freeze+2), labeled by basis: \
+         preserved_claim (byte-equal preserved stripped claim) or \
+         dual_anchor (byte-anchored row + same declared path, no \
+         contradicting evidence). Each increment is a rebuild that \
+         pre-fix terminated in a deterministic FAILED_PRECONDITION \
+         (merged_bug_038) — the wipe-deploy success signal."
+    );
+    describe_counter!(
         "rio_scheduler_dispatch_claims_source_total",
         "Dispatch-time assignment-claims derivations by byte-bound source \
          (sched.dispatch.claims-derived): inline (ingress-bound inline content), \

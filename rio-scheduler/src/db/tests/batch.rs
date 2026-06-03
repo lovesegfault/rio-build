@@ -819,7 +819,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
     // ── Store-origin row, re-created store-backed ─────────────────────
     // The prior creation parked in a terminal FAILURE state: that is the
     // only settled-adjacent state a conflicting re-creation can reach
-    // (a completed/skipped row is frozen — sched.persist.settled-identity-freeze+1).
+    // (a completed/skipped row is frozen — sched.persist.settled-identity-freeze+2).
     let first = DerivationRow {
         drv_hash: "recreate-store".into(),
         drv_path: format!("/nix/store/{}-recreate-store-old.drv", "d".repeat(32)),
@@ -1108,7 +1108,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
     // Pre-existing terminal-FAILURE authoritative squat row (a prior
     // creation's snapshot that a displacing merge would recreate-refresh
     // — only failure-parked rows are displaceable; completed/skipped
-    // rows are frozen by sched.persist.settled-identity-freeze+1).
+    // rows are frozen by sched.persist.settled-identity-freeze+2).
     let squat = DerivationRow {
         drv_hash: "atomic-squat".into(),
         drv_path: format!("/nix/store/{}-atomic-squat.drv", "a".repeat(32)),
@@ -1529,6 +1529,7 @@ async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::R
     Ok(())
 }
 
+// r[verify sched.persist.settled-identity-freeze+2]
 /// M_070 preservation-column write semantics, all three writers:
 /// the creation upsert (insert + supersede-vs-carry on conflict) and
 /// the dispatch strip mover (single-statement live→stripped move,
@@ -1640,7 +1641,7 @@ async fn test_preserved_stripped_hash_supersede_carry_and_move() -> anyhow::Resu
     Ok(())
 }
 
-// r[verify sched.persist.settled-identity-freeze+1]
+// r[verify sched.persist.settled-identity-freeze+2]
 /// The upsert's settled-row WHERE guard (defense-in-depth twin of the
 /// pre-merge check): a `completed`/`skipped` row whose public identity
 /// conflicts with the incoming re-creation is left completely untouched
@@ -1763,7 +1764,7 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
 }
 
 // r[verify sched.merge.store-evidence-displacement+1]
-// r[verify sched.persist.settled-identity-freeze+1]
+// r[verify sched.persist.settled-identity-freeze+2]
 /// The settled-row WHERE guard's evidence carve-out: a conflicting
 /// re-creation whose hash is in the per-merge approved array (the
 /// actor's store-evidence verdict) updates the settled row — and an

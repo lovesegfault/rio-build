@@ -245,7 +245,7 @@ pub(crate) struct PoisonedDerivationRow {
 
 /// Identity columns of a SETTLED (`completed`/`skipped`) derivation row,
 /// loaded by `load_settled_identity_rows` for the pre-merge
-/// settled-identity freeze (`sched.persist.settled-identity-freeze+1`).
+/// settled-identity freeze (`sched.persist.settled-identity-freeze+2`).
 /// Compared against an incoming submission node by
 /// `actor::merge::settled_row_identity_matches` — the row-level twin of
 /// `dag::verifiable_identity_matches`.
@@ -281,12 +281,11 @@ pub(crate) struct SettledIdentityRow {
     /// Preserved stripped declared hash (`M_070`) — written by the
     /// strip writers (ingress move, dispatch
     /// `persist_evidence_rank_and_strip_modular_hash`); selected here
-    /// so the loader and its first reader (the settled-row matcher's
-    /// preserved-claim basis, `sched.persist.settled-identity-freeze+2`,
-    /// next commit) cannot drift. NEVER evidence: the matcher may
-    /// admit a byte-equal value as match basis but a differing value
-    /// must fall through (an unverified value cannot contradict).
-    #[allow(dead_code)]
+    /// so the loader and its reader (the settled-row matcher's
+    /// preserved-claim basis, `sched.persist.settled-identity-freeze+2`)
+    /// cannot drift. NEVER evidence: the matcher admits a byte-equal
+    /// value as match basis but a differing value falls through (an
+    /// unverified value cannot contradict).
     pub ca_modular_hash_stripped: Option<Vec<u8>>,
 }
 

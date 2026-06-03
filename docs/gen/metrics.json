@@ -133,6 +133,7 @@
     "rio_scheduler_merge_phase_seconds",
     "rio_scheduler_merge_rejoin_edge_skipped_total",
     "rio_scheduler_merge_store_evidence_total",
+    "rio_scheduler_merge_stripped_rejoin_total",
     "rio_scheduler_orphan_builds_cancelled_total",
     "rio_scheduler_phantom_assignments_drained_total",
     "rio_scheduler_phases_rejected_total",
@@ -897,6 +898,11 @@
         "name": "rio_scheduler_merge_store_evidence_total",
         "kind": "counter",
         "help": "Merge-time store-evidence checks for settled identity conflicts (sched.merge.store-evidence-displacement+1), labeled by result: displaced (claim verified — by ingress-byte-bound rank or against the store's text-CA .drv bytes — and the settled squat erased), mismatch (the store derivation contradicts the claim; submission rejected FAILED_PRECONDITION), unavailable (store silent — fetch failed, path absent, or bytes unverifiable — surfaced UNAVAILABLE; or permanently unprovable as submitted — refused with generated remediation), over_budget (per-merge fetch budget exhausted; merge fails RESOURCE_EXHAUSTED, nothing displaced)"
+      },
+      {
+        "name": "rio_scheduler_merge_stripped_rejoin_total",
+        "kind": "counter",
+        "help": "Settled rows REJOINED by a re-creating submission via the M_070 match bases the pre-strip-preservation matcher refused (sched.persist.settled-identity-freeze+2), labeled by basis: preserved_claim (byte-equal preserved stripped claim) or dual_anchor (byte-anchored row + same declared path, no contradicting evidence). Each increment is a rebuild that pre-fix terminated in a deterministic FAILED_PRECONDITION (merged_bug_038) — the wipe-deploy success signal."
       },
       {
         "name": "rio_scheduler_orphan_builds_cancelled_total",

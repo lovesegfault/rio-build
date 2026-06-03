@@ -357,7 +357,7 @@ impl SchedulerDb {
                     WHEN derivations.drv_content IS NOT NULL
                          AND EXCLUDED.drv_content IS DISTINCT FROM derivations.drv_content
                     THEN 0 ELSE derivations.floor_deadline_secs END
-            -- r[impl sched.persist.settled-identity-freeze+1]
+            -- r[impl sched.persist.settled-identity-freeze+2]
             -- Defense-in-depth twin of the pre-merge settled-identity
             -- check (actor/merge.rs): a SETTLED row (completed/skipped —
             -- the durable record of a successful build) whose public

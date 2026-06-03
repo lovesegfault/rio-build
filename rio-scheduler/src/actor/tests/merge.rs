@@ -9466,7 +9466,7 @@ async fn test_completed_authoritative_node_survives_conflicting_submission() -> 
     Ok(())
 }
 
-// r[verify sched.persist.settled-identity-freeze+1]
+// r[verify sched.persist.settled-identity-freeze+2]
 /// After a successful build's node is REAPED (terminal cleanup), its
 /// settled PG row is the only record left — the merge gate cannot see
 /// it. A conflicting resubmission for the same hash must be rejected by
@@ -9553,7 +9553,7 @@ async fn test_settled_row_rejects_conflicting_resubmission_after_reap() -> TestR
     Ok(())
 }
 
-// r[verify sched.persist.settled-identity-freeze+1]
+// r[verify sched.persist.settled-identity-freeze+2]
 /// A MATCHING-identity resubmission of a reaped hash (same system,
 /// output names, flags, and the same declared expected output path as
 /// content evidence) is a legitimate rebuild — e.g. after the store
@@ -10880,7 +10880,7 @@ async fn settle_and_reap_squat(
 }
 
 // r[verify sched.merge.store-evidence-displacement+1]
-// r[verify sched.persist.settled-identity-freeze+1]
+// r[verify sched.persist.settled-identity-freeze+2]
 /// THE bug_076 self-service kill test, row-only form: an authoritative
 /// squat settles at the victim's text-CA `drv_path` and is reaped; the
 /// victim uploads its genuine `.drv` to the store and resubmits

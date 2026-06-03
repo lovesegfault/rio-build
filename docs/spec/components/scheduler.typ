@@ -2365,7 +2365,7 @@ undispatchable (workers would be told to fetch a `.drv` that exists in no
 store). Reap-then-resubmit and crash-retry re-creations get the same
 refresh for free.
 
-#r("sched.persist.settled-identity-freeze+1")[
+#r("sched.persist.settled-identity-freeze+2")[
   A persisted derivation row whose status is `completed` or `skipped`
   MUST NOT be re-created under a conflicting identity: before any state
   is written for a submission, every submitted hash that has no resident
@@ -2373,16 +2373,40 @@ refresh for free.
   whose declared identity does not match a settled row's --- the public
   attributes (system, sorted output names, fixed-output flag,
   content-addressed flag, expected output paths declared by both sides)
-  plus at least one piece of content-bound evidence (a shared non-empty
-  expected output path, or a byte-equal CA modular hash) --- MUST be
+  plus at least one piece of content-bound evidence --- MUST be
   rejected with `FAILED_PRECONDITION`, unless the conflicting
   re-creation was approved by the store-evidence check
-  (#rref("sched.merge.store-evidence-displacement+1")). The persistence
-  layer MUST additionally refuse to update a settled row whose public
-  identity conflicts with the incoming re-creation, independent of the
-  pre-merge check, admitting only the per-merge hash list that check
-  approved.
+  (#rref("sched.merge.store-evidence-displacement+1")). Admissible
+  match bases are: agreement on a shared non-empty expected output
+  path; a byte-equal LIVE CA modular hash; a byte-equal PRESERVED
+  stripped claim (the segregated column a strip writer moved an
+  unverifiable declaration into --- admitted as a positive match basis
+  ONLY: it MUST NOT rank, MUST NOT veto, and a differing preserved
+  value MUST fall through to the remaining bases rather than reject);
+  and, for rows whose persisted evidence rank is byte-anchored
+  (`path_bound_bytes` or `verified_built`), the dual byte-anchor of
+  the declared path itself --- the row's recorded identity was derived
+  from bytes text-CA-bound to the declared path, and an incoming claim
+  of the same path with matching public attributes and no
+  contradicting evidence anchors to the same definition. An
+  undecodable persisted rank MUST NOT grant the dual-anchor basis. The
+  persistence layer MUST additionally refuse to update a settled row
+  whose public identity conflicts with the incoming re-creation,
+  independent of the pre-merge check, admitting only the per-merge
+  hash list that check approved.
 ]
+The two M_070 bases exist because the strip writers (ingress and
+dispatch) leave exactly the rows they processed with NO classical
+evidence: a stripped floating-CA / deferred-IA row has every expected
+output path empty and a NULL live hash, so the pre-M_070 matcher could
+never match ANY resubmission of it --- one successful stripped build
+permanently bricked every rebuild-after-GC of that derivation behind a
+deterministic `FAILED_PRECONDITION` (round-16 merged_bug_038). The
+preserved-claim basis covers re-presentations of the same declaration;
+the dual-anchor basis covers resubmissions that (correctly) no longer
+declare the unverifiable hash at all. Rejoins through either basis are
+counted (#(refs.metric)("rio_scheduler_merge_stripped_rejoin_total"))
+--- each increment is a rebuild the previous matcher refused.
 The freeze covers the window the merge gate cannot:
 #rref("sched.merge.authoritative-conflict") protects a settled node only
 while it is resident in the DAG, but terminal cleanup reaps nodes after
