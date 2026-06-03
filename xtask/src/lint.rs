@@ -75,13 +75,15 @@ pub enum Lint {
     ContractRegistry,
     /// Every external-IO call shape (`.send()` dispatch, awaited
     /// `.collect()`/`.text()` body buffering, `.read_to_end(`) in
-    /// rio-replay's supply/substituter/archive/artifact modules carries an
-    /// adjacent `// bounded-io: <bound>` marker stating its time/size
-    /// bound or deliberate waiver, and every marker annotates such a
-    /// call. Catches a new unbounded arm at introduction — the
-    /// per-arm-guard pattern (deadline added where a problem was
-    /// noticed, sibling arms left exposed) that produced the relay
-    /// header-wait wedge and the unbounded narinfo collect.
+    /// rio-replay's enrolled IO modules (supply, substituter, archive,
+    /// artifact, recorder s3) carries an adjacent `// bounded-io: <bound>`
+    /// marker stating its time/size bound or deliberate waiver, every
+    /// marker annotates such a call, and every rio-replay module holding
+    /// a raw `aws_sdk_s3::Client` is enrolled. Catches a new unbounded
+    /// arm at introduction — the per-arm-guard pattern (deadline added
+    /// where a problem was noticed, sibling arms left exposed) that
+    /// produced the relay header-wait wedge and the unbounded narinfo
+    /// collect.
     BoundedIo,
     /// Every production load of the supply journal (`StateFile::Supply`
     /// via `load_jsonl`) in rio-replay carries an adjacent
@@ -2132,8 +2134,19 @@ const BOUNDED_IO_MARKER: &str = "bounded-io:";
 /// - `rio-replay/src/archive/` (the S3 layout and image backends),
 /// - `rio-replay/src/run/artifact.rs` (the campaign artifact store — the
 ///   module performing the largest single download in the system onto the
-///   most disk-constrained pod; it holds a raw `aws_sdk_s3::Client`, which
-///   is the property that should select scan roots, not incident history);
+///   most disk-constrained pod),
+/// - `rio-replay/src/s3.rs` (the recorder's archive-publication adapter
+///   and by-recipe pointer PUT/GET);
+///
+/// The selection criterion for roots is a PROPERTY, not incident history:
+/// every rio-replay module whose production code holds a raw
+/// `aws_sdk_s3::Client` is enrolled, and the sweep at the end of the scan
+/// enforces that as a standing check — a new raw-S3 module fails the lint
+/// until it is enrolled and its IO sites carry markers. (The crate's
+/// `reqwest` holders are only partially enrolled: `substituter.rs` is a
+/// root; `hydra.rs` and `nixcache.rs` carry their own round-3 deadline+cap
+/// treatment but are not yet swept — extending the property sweep to the
+/// reqwest family rides with the encapsulation TODO below.)
 ///
 /// and EXACTLY this needle alphabet ([`bounded_io_needle`]): `.send()`
 /// (empty-parens HTTP/SDK request dispatch — channel/`mpsc` sends take an
@@ -2185,6 +2198,7 @@ fn bounded_io() -> Result<()> {
         "rio-replay/src/substituter.rs",
         "rio-replay/src/nixcache.rs",
         "rio-replay/src/run/artifact.rs",
+        "rio-replay/src/s3.rs",
     ];
     let dir_roots = ["rio-replay/src/run/supply", "rio-replay/src/archive"];
 
@@ -2214,24 +2228,63 @@ fn bounded_io() -> Result<()> {
         walk_rs(&path, &mut scan)?;
     }
 
-    // Floor guards: ~26 production needles across ~12 files today. A
+    // Standing root-selection sweep: every rio-replay module whose
+    // PRODUCTION code holds a raw `aws_sdk_s3::Client` must be one of the
+    // scan roots above — the property the doc states, enforced as a check
+    // so a new raw-S3 module cannot ship IO the marker gate never sees
+    // (the escape that left run/artifact.rs, and then s3.rs, invisible).
+    // Doc/comment mentions don't count: only the production region is
+    // matched, with comment lines stripped.
+    let enrolled = |rel: &str| -> bool {
+        file_roots.contains(&rel)
+            || dir_roots
+                .iter()
+                .any(|dir| rel.starts_with(&format!("{dir}/")))
+    };
+    let mut sweep = |path: &Path| -> Result<()> {
+        let src =
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        let holds_raw_client = src
+            .lines()
+            .take_while(|line| line.trim() != "#[cfg(test)]")
+            .any(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//") && trimmed.contains("aws_sdk_s3::Client")
+            });
+        if holds_raw_client && !enrolled(&rel) {
+            violations.push(format!(
+                "{rel}: production code holds a raw `aws_sdk_s3::Client` but the module is not \
+                 a bounded-io scan root — enroll it (and mark its IO sites) so its calls cannot \
+                 land unbounded"
+            ));
+        }
+        Ok(())
+    };
+    walk_rs(&root.join("rio-replay/src"), &mut sweep)?;
+
+    // Floor guards: ~29 production needles across ~13 files today. A
     // collapse means the needle detection or the roots regressed, not
     // that the modules stopped doing IO.
     ensure!(
-        files >= 6,
+        files >= 7,
         "bounded-io scan visited only {files} file(s) — a scan root has regressed",
     );
     ensure!(
-        needles >= 17,
+        needles >= 19,
         "bounded-io scan found only {needles} IO call site(s) — suspiciously few; the needle \
          detection or the scan roots have regressed",
     );
     if !violations.is_empty() {
         bail!(
-            "{} bounded-io violation(s):\n    {}\n  every external-IO call in the \
-             supply/substituter/archive/artifact modules needs an adjacent `// {BOUNDED_IO_MARKER} \
-             <time/size bound, or the deliberate waiver>` comment, and every marker must \
-             annotate such a call",
+            "{} bounded-io violation(s):\n    {}\n  every external-IO call in the enrolled \
+             rio-replay IO modules needs an adjacent `// {BOUNDED_IO_MARKER} <time/size bound, \
+             or the deliberate waiver>` comment, every marker must annotate such a call, and \
+             every module holding a raw S3 client must be enrolled",
             violations.len(),
             violations.join("\n    "),
         );

@@ -29,6 +29,23 @@ use crate::archive::s3::{ARCHIVES_PREFIX_SEGMENT, ArchiveStore};
 /// by-recipe idempotency pointers.
 pub const BY_RECIPE_SEGMENT: &str = "by-recipe";
 
+/// Cap on the by-recipe pointer body read (64 KiB).
+///
+/// Trust provenance: the pointer key is a plain last-writer-wins PUT in
+/// the operator-owned bucket — [`ArchiveS3::read_by_recipe_pointer`]'s own
+/// contract already treats torn or FOREIGN writes at the key as in-model
+/// (a non-JSON body degrades to an unusable pointer) — so the bytes at
+/// the key are not necessarily the recorder's, and the read must not
+/// buffer an object sized at a foreign writer's discretion.
+///
+/// Sizing: a recorder-written pointer is a few hundred bytes of JSON
+/// (three short string fields); 64 KiB is two orders of magnitude of
+/// drift headroom for future fields. An over-cap body is treated exactly
+/// like a garbage body — an unusable pointer, warned and overwritten by
+/// the next re-record — so the false-refusal cost of a too-small cap is
+/// one redundant re-record, never an error or a wedge.
+pub(crate) const MAX_BY_RECIPE_POINTER_BYTES: u64 = 64 * 1024;
+
 /// Key of the by-recipe pointer for one recipe digest:
 /// `<prefix>/archives/by-recipe/<recipe_digest>.json` (prefix slashes
 /// trimmed; an empty prefix roots the tree at the bucket root). The pointer
@@ -204,6 +221,9 @@ impl ArchiveS3 {
             .key(&key)
             .content_type("application/json")
             .body(ByteStream::from(body))
+            // bounded-io: dispatch of a pointer PUT whose body is a few
+            // hundred bytes of recorder-serialized JSON, in memory before
+            // the call; SDK connect/dispatch defaults bound the wait
             .send()
             .await
             .with_context(|| format!("PUT s3://{}/{key}", self.bucket))?;
@@ -218,21 +238,27 @@ impl ArchiveS3 {
     ///
     /// Reads are drift-tolerant per [`ByRecipePointer::names_archive`]'s
     /// contract: a body that is not valid JSON (a torn or foreign write
-    /// at the pointer key) degrades to `Some` of an empty — unusable —
-    /// pointer with a warning, never an error. The gate then falls
-    /// through to re-record, whose post-publish pointer write overwrites
-    /// the junk; erroring instead would dead-end every unforced eval of
-    /// the recipe with no in-band recovery.
+    /// at the pointer key) — or one larger than
+    /// `MAX_BY_RECIPE_POINTER_BYTES` (crate-private, 64 KiB), which only
+    /// a foreign write can produce — degrades to `Some` of an empty —
+    /// unusable — pointer with a warning, never an error. The gate then falls through to
+    /// re-record, whose post-publish pointer write overwrites the junk;
+    /// erroring instead would dead-end every unforced eval of the recipe
+    /// with no in-band recovery.
     pub async fn read_by_recipe_pointer(
         &self,
         client: &aws_sdk_s3::Client,
         recipe_digest: &str,
     ) -> anyhow::Result<Option<ByRecipePointer>> {
+        use tokio::io::AsyncReadExt as _;
+
         let key = by_recipe_key(&self.prefix, recipe_digest);
         let resp = match client
             .get_object()
             .bucket(&self.bucket)
             .key(&key)
+            // bounded-io: dispatch/header wait of a pointer-object GET;
+            // the body read below is take-capped
             .send()
             .await
         {
@@ -246,12 +272,33 @@ impl ArchiveS3 {
                 );
             }
         };
-        let bytes = resp
+        let mut bytes = Vec::with_capacity(1024);
+        let mut reader = resp
             .body
-            .collect()
+            .into_async_read()
+            .take(MAX_BY_RECIPE_POINTER_BYTES + 1);
+        reader
+            // bounded-io: size-capped by the take(MAX_BY_RECIPE_POINTER_BYTES
+            // + 1) above — the pointer key is a last-writer-wins plain PUT
+            // this read already treats as foreign-writable, so the body
+            // must not buffer at the foreign writer's discretion; the SDK's
+            // stalled-stream protection bounds a dead peer in time
+            .read_to_end(&mut bytes)
             .await
-            .with_context(|| format!("read s3://{}/{key}", self.bucket))?
-            .into_bytes();
+            .with_context(|| format!("read s3://{}/{key}", self.bucket))?;
+        if bytes.len() as u64 > MAX_BY_RECIPE_POINTER_BYTES {
+            // Same degrade as a garbage body: only a foreign write can
+            // exceed the cap (recorder-written pointers are a few hundred
+            // bytes), and an unusable pointer means "re-record", which
+            // overwrites the junk.
+            tracing::warn!(
+                key = %key,
+                cap = MAX_BY_RECIPE_POINTER_BYTES,
+                "by-recipe pointer body exceeds the size cap; treating it as an unusable \
+                 pointer (a re-record overwrites it)"
+            );
+            return Ok(Some(ByRecipePointer::default()));
+        }
         let pointer: ByRecipePointer = match serde_json::from_slice(&bytes) {
             Ok(pointer) => pointer,
             Err(err) => {
@@ -463,6 +510,43 @@ mod tests {
         assert!(
             !pointer.names_archive(),
             "a garbage pointer is unusable, so the gate falls through to re-record"
+        );
+    }
+
+    /// The size sibling of the garbage-body case: the pointer key is a
+    /// last-writer-wins plain PUT the read already treats as
+    /// foreign-writable, so a body above `MAX_BY_RECIPE_POINTER_BYTES`
+    /// (which only a foreign write can produce — recorder pointers are a
+    /// few hundred bytes) must degrade to the same unusable pointer
+    /// instead of buffering at the writer's discretion or erroring. The
+    /// take-cap stops the read within one byte past the cap, so the
+    /// 1 MiB body here proves the belt without the test ever holding the
+    /// foreign object whole.
+    #[tokio::test]
+    async fn by_recipe_pointer_read_degrades_oversized_bodies_to_an_unusable_pointer() {
+        let digest = "cd".repeat(32);
+        // Valid JSON, hostile size: the refusal must be the size cap, not
+        // a parse failure.
+        let mut body = Vec::with_capacity(1024 * 1024 + 32);
+        body.extend_from_slice(b"{\"archive_id\":\"");
+        body.resize(1024 * 1024, b'a');
+        body.extend_from_slice(b"\"}");
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
+            GetObjectOutput::builder()
+                .body(ByteStream::from(body.clone()))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&get]);
+
+        let layout = ArchiveS3::new("rio-chunks", "replay");
+        let pointer = layout
+            .read_by_recipe_pointer(&client, &digest)
+            .await
+            .expect("an over-sized pointer body must not error")
+            .expect("the pointer object exists, however foreign");
+        assert!(
+            !pointer.names_archive(),
+            "an over-sized pointer is unusable, so the gate falls through to re-record"
         );
     }
 
