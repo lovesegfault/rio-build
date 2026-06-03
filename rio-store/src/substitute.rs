@@ -930,7 +930,7 @@ impl Substituter {
         info.store_path_hash = store_path_hash.to_vec();
         let refs_str: Vec<String> = info.references.iter().map(ToString::to_string).collect();
 
-        // r[impl store.substitute.stale-reclaim+2]
+        // r[impl store.substitute.stale-reclaim+3]
         // Substitution claims carry the stall params: the verified
         // narinfo's NarSize scopes the takeover predicate to
         // mid-download claims (persist phase exempt), and the window
@@ -1006,12 +1006,12 @@ impl Substituter {
         // the decompressed-byte count; the guard's heartbeat carries
         // it to `manifests.fetched_bytes`/`last_progress_at` so
         // competing claimants can discriminate stuck ≠ slow.
-        let progress_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let progress_handle = Arc::new(ingest::ProgressHandle::new());
         let placeholder_guard = ingest::spawn_placeholder_guard(
             self.pool.clone(),
             store_path_hash.to_vec(),
             claim,
-            Some(Arc::clone(&progress_bytes)),
+            Some(Arc::clone(&progress_handle)),
         );
 
         // The remaining steps are fallible AND we own the placeholder;
@@ -1029,7 +1029,7 @@ impl Substituter {
                     ni.nar_size,
                     base,
                     progress,
-                    Some(&progress_bytes),
+                    Some(&progress_handle),
                 )
                 .await?;
 
@@ -1073,6 +1073,11 @@ impl Substituter {
                 .await;
 
             // — Step 5-6: persist via the shared write-ahead core —
+            // merged_bug_003: the NAR is fully fetched; the persist
+            // can legitimately exceed the stall window (S3 multipart,
+            // chunk dedup) with fetched_bytes frozen at nar_size —
+            // exempt AS DATA, not by a size-equality inference.
+            progress_handle.set_phase(ingest::ClaimPhase::Persisting);
             ingest::persist_nar(
                 &self.pool,
                 self.chunk_backend.as_ref(),
@@ -1165,7 +1170,7 @@ impl Substituter {
         expected_nar_size: u64,
         upstream_base: &str,
         progress: Option<&SubstProgressFn>,
-        progress_bytes: Option<&std::sync::atomic::AtomicU64>,
+        progress_handle: Option<&ingest::ProgressHandle>,
     ) -> Result<(Bytes, Vec<OwnedSemaphorePermit>), SubstituteError> {
         // r[impl store.substitute.stall-abort]
         // Owner-side stall watchdog: the NAR GET deliberately has no
@@ -1257,12 +1262,24 @@ impl Substituter {
             if n == 0 {
                 break;
             }
+            // merged_bug_003: blocking on the LOCAL byte budget is
+            // backpressure, not an upstream stall — stamp BudgetParked
+            // so the next heartbeat exempts this owner from the
+            // takeover predicate AS DATA (pre-092 a >stall-window park
+            // froze progress with liveness fresh and a competitor
+            // deposed the live owner, double-downloading the NAR).
+            if let Some(h) = progress_handle {
+                h.set_phase(ingest::ClaimPhase::BudgetParked);
+            }
             let p = self
                 .nar_bytes_budget
                 .clone()
                 .acquire_many_owned((n as u32).max(MIN_NAR_CHUNK_CHARGE))
                 .await
                 .map_err(|_| SubstituteError::Fetch("NAR buffer budget closed".into()))?;
+            if let Some(h) = progress_handle {
+                h.set_phase(ingest::ClaimPhase::Downloading);
+            }
             permits.push(p);
             out.extend_from_slice(&buf[..n]);
             if out.len() as u64 > cap {
@@ -1275,8 +1292,8 @@ impl Substituter {
             // Advance the durable-progress handle per read; the
             // placeholder guard's heartbeat samples it every tick.
             // Relaxed: single writer, freshness-tolerant reader.
-            if let Some(h) = progress_bytes {
-                h.store(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            if let Some(h) = progress_handle {
+                h.store_bytes(out.len() as u64);
             }
             // r[impl store.substitute.progress-stream]
             if let Some(cb) = progress {
@@ -3615,7 +3632,7 @@ mod tests {
         .unwrap();
     }
 
-    // r[verify store.substitute.stale-reclaim+2]
+    // r[verify store.substitute.stale-reclaim+3]
     /// A stale 'uploading' placeholder (crashed prior substitution)
     /// must NOT block a fresh try_substitute. Reclaim → re-insert →
     /// fetch completes.

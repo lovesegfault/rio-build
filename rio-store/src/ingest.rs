@@ -71,7 +71,7 @@ pub struct IngestHooks {
 
 /// Substitution-claim parameters for [`claim_placeholder`]'s
 /// download-stalled takeover arm and owner attribution
-/// (`r[store.substitute.stale-reclaim+2]`). PutPath/PutPathBatch pass
+/// (`r[store.substitute.stale-reclaim+3]`). PutPath/PutPathBatch pass
 /// `None`: builder claims carry no narinfo-declared size and no
 /// progress evidence, so the stall arm is structurally unreachable
 /// for and from them.
@@ -140,7 +140,7 @@ pub async fn claim_placeholder(
         metadata::insert_manifest_uploading_as(pool, store_path_hash, store_path, refs, claimed_by)
             .await?;
 
-    // r[impl store.substitute.stale-reclaim+2]
+    // r[impl store.substitute.stale-reclaim+3]
     // The slot is occupied. Three takeover arms, in precedence order:
     //
     //   (1) released-in-place row (`claim_id` NULL — the owner-side
@@ -297,13 +297,99 @@ pub async fn persist_nar(
 /// ≪ `SUBSTITUTE_STALE_THRESHOLD` (300s), so a live owner survives ≥9
 /// missed heartbeats before stale-reclaim takes it.
 ///
-/// Test override (50ms): the progress-heartbeat tests assert the guard
-/// task's periodic write actually lands; a 30s first tick would make
-/// that untestable. Production cadence is unchanged.
+/// UN-cfg'd (merged_bug_082): this is the PRODUCTION granularity that
+/// `Config::validate`'s `substitute_stall >= 2×` floor references — a
+/// cfg(test) value here would let the validation test a floor
+/// production never enforces. The test-only 50ms override lives in
+/// [`PLACEHOLDER_HEARTBEAT_TICK`] and applies to the guard's TICKER
+/// only.
+pub(crate) const PLACEHOLDER_HEARTBEAT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// The guard task's actual tick period. Production: the heartbeat
+/// interval. Test override (50ms): the progress-heartbeat tests assert
+/// the guard task's periodic write actually lands; a 30s first tick
+/// would make that untestable.
 #[cfg(not(test))]
-const PLACEHOLDER_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const PLACEHOLDER_HEARTBEAT_TICK: std::time::Duration = PLACEHOLDER_HEARTBEAT_INTERVAL;
 #[cfg(test)]
-const PLACEHOLDER_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+const PLACEHOLDER_HEARTBEAT_TICK: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The owner-side claim phase, mirrored durably to
+/// `manifests.claim_phase` by every progress heartbeat (migration 092,
+/// merged_bug_003). The stall-takeover predicate strikes ONLY
+/// `downloading` claims: an owner parked on the local NAR-byte budget
+/// or persisting a fully-fetched NAR is alive and exempt AS DATA — the
+/// pre-092 predicate inferred "persisting" from `fetched_bytes ==
+/// nar_size`, which was only correct when the competitor\'s expected
+/// size matched the owner\'s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ClaimPhase {
+    /// Reading body bytes from the upstream (the only strikeable phase).
+    Downloading = 0,
+    /// Blocked on the local NAR-bytes budget — backpressure, not a
+    /// stall; never strikeable.
+    BudgetParked = 1,
+    /// Fully fetched, persisting to the store — never strikeable.
+    Persisting = 2,
+}
+
+impl ClaimPhase {
+    /// The `manifests.claim_phase` text value (092 CHECK alphabet).
+    pub(crate) fn as_sql(self) -> &'static str {
+        match self {
+            ClaimPhase::Downloading => "downloading",
+            ClaimPhase::BudgetParked => "budget_parked",
+            ClaimPhase::Persisting => "persisting",
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => ClaimPhase::BudgetParked,
+            2 => ClaimPhase::Persisting,
+            _ => ClaimPhase::Downloading,
+        }
+    }
+}
+
+/// The owner\'s live progress: decompressed bytes read plus the claim
+/// phase, both lock-free (the read loop and the heartbeat task share
+/// it). One handle per owned placeholder.
+#[derive(Debug, Default)]
+pub struct ProgressHandle {
+    bytes: std::sync::atomic::AtomicU64,
+    phase: std::sync::atomic::AtomicU8,
+}
+
+impl ProgressHandle {
+    /// Fresh handle: 0 bytes, `Downloading`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Overwrite the byte count (the read loop\'s running total).
+    pub fn store_bytes(&self, n: u64) {
+        self.bytes.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Current byte count.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Stamp the phase (the next heartbeat carries it durably).
+    pub fn set_phase(&self, p: ClaimPhase) {
+        self.phase
+            .store(p as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Current phase.
+    pub fn phase(&self) -> ClaimPhase {
+        ClaimPhase::from_u8(self.phase.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
 
 /// RAII owner of an `'uploading'` placeholder: heartbeats while held,
 /// reaps on drop. See [`spawn_placeholder_guard`].
@@ -389,13 +475,13 @@ pub fn spawn_placeholder_guard(
     pool: PgPool,
     store_path_hash: Vec<u8>,
     claim: Uuid,
-    progress: Option<Arc<std::sync::atomic::AtomicU64>>,
+    progress: Option<Arc<ProgressHandle>>,
 ) -> PlaceholderGuard {
     let heartbeat = {
         let pool = pool.clone();
         let hash = store_path_hash.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(PLACEHOLDER_HEARTBEAT_INTERVAL);
+            let mut tick = tokio::time::interval(PLACEHOLDER_HEARTBEAT_TICK);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await; // first tick fires immediately; skip it
             loop {
@@ -406,7 +492,8 @@ pub fn spawn_placeholder_guard(
                             &pool,
                             &hash,
                             claim,
-                            h.load(std::sync::atomic::Ordering::Relaxed),
+                            h.bytes(),
+                            h.phase().as_sql(),
                         )
                         .await;
                     }
@@ -452,7 +539,6 @@ pub async fn abort_placeholder(pool: &PgPool, store_path_hash: &[u8], claim: Uui
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use rio_test_support::TestDb;
@@ -542,6 +628,227 @@ mod tests {
         vec![tag; 32]
     }
 
+    /// `manifests.claim_phase` of a row (092 battery helper).
+    async fn row_phase(pool: &PgPool, hash: &[u8]) -> Option<String> {
+        sqlx::query_scalar("SELECT claim_phase FROM manifests WHERE store_path_hash = $1")
+            .bind(hash)
+            .fetch_one(pool)
+            .await
+            .expect("row_phase")
+    }
+
+    /// Stamp a phase directly (the production writer is the heartbeat;
+    /// the battery pins the SQL rule, not the task timing).
+    async fn set_phase(pool: &PgPool, hash: &[u8], phase: Option<&str>) {
+        sqlx::query("UPDATE manifests SET claim_phase = $2 WHERE store_path_hash = $1")
+            .bind(hash)
+            .bind(phase)
+            .execute(pool)
+            .await
+            .expect("set_phase");
+    }
+
+    /// Stamp progress evidence directly.
+    async fn set_progress(pool: &PgPool, hash: &[u8], fetched: i64) {
+        sqlx::query(
+            "UPDATE manifests SET fetched_bytes = $2, last_progress_at = now() \
+             WHERE store_path_hash = $1",
+        )
+        .bind(hash)
+        .bind(fetched)
+        .execute(pool)
+        .await
+        .expect("set_progress");
+    }
+
+    // r[verify store.substitute.stale-reclaim+3]
+    /// merged_bug_003 (a): an ALIVE owner parked on the local byte
+    /// budget — progress frozen past the stall window, liveness fresh,
+    /// `claim_phase = 'budget_parked'` — is EXEMPT from takeover as
+    /// data. Pre-092 RED: the predicate had no phase/liveness conjunct
+    /// and deposed the live backpressured owner.
+    #[tokio::test]
+    async fn takeover_exempts_alive_budget_parked_owner() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash = test_hash(0xb1);
+        let _claim = claim_owned(&db.pool, &hash, "/nix/store/b1-parked").await;
+        set_progress(&db.pool, &hash, 100).await;
+        set_phase(&db.pool, &hash, Some("budget_parked")).await;
+        age_row(&db.pool, &hash, 120, false).await; // progress stale, liveness fresh
+
+        let took = crate::metadata::stall_takeover_placeholder(
+            &db.pool,
+            &hash,
+            Some("competitor-pod"),
+            1000,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("takeover query");
+        assert!(took.is_none(), "an alive parked owner is never deposed");
+        let (_, _, _, _, strikes, _, _) = row_state(&db.pool, &hash).await.expect("row");
+        assert_eq!(strikes, 0, "no strike accrued");
+    }
+
+    // r[verify store.substitute.stale-reclaim+3]
+    /// merged_bug_003 (b): a DEAD owner (no heartbeat 200s) is NOT
+    /// striked by the takeover (liveness conjunct fails) and not yet
+    /// reaped (300s threshold) — the competitor sees Concurrent. Past
+    /// 300s the heartbeat-death reap arm wins and the fresh claim
+    /// starts at stall_count 0: reaped, never striked. Pre-092 RED:
+    /// the 180-300s window striked the corpse.
+    #[tokio::test]
+    async fn dead_owner_routes_to_reap_not_strike() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash = test_hash(0xb2);
+        let _claim = claim_owned(&db.pool, &hash, "/nix/store/b2-dead").await;
+        set_progress(&db.pool, &hash, 100).await;
+        set_phase(&db.pool, &hash, Some("downloading")).await;
+        // Progress stale AND liveness stale (200s) — dead, pre-reap.
+        sqlx::query(
+            "UPDATE manifests SET last_progress_at = now() - make_interval(secs => 200), \
+             updated_at = now() - make_interval(secs => 200) WHERE store_path_hash = $1",
+        )
+        .bind(&hash)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let took = crate::metadata::stall_takeover_placeholder(
+            &db.pool,
+            &hash,
+            Some("competitor-pod"),
+            1000,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("takeover query");
+        assert!(took.is_none(), "a dead owner is not striked");
+        match claim_substitute(&db.pool, &hash, "/nix/store/b2-dead").await {
+            PlaceholderClaim::Concurrent => {}
+            _ => panic!("pre-reap dead owner must read Concurrent"),
+        }
+
+        // Past the 300s reap threshold: the death arm reaps and the
+        // fresh claim carries ZERO strikes.
+        sqlx::query(
+            "UPDATE manifests SET updated_at = now() - make_interval(secs => 400) \
+             WHERE store_path_hash = $1",
+        )
+        .bind(&hash)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        match claim_substitute(&db.pool, &hash, "/nix/store/b2-dead").await {
+            PlaceholderClaim::Owned(_) => {}
+            _ => panic!("post-threshold dead owner must be reaped"),
+        }
+        let (_, _, _, _, strikes, _, _) = row_state(&db.pool, &hash).await.expect("row");
+        assert_eq!(
+            strikes, 0,
+            "reaped-not-striked: the fresh claim starts clean"
+        );
+    }
+
+    // r[verify store.substitute.stale-reclaim+3]
+    /// merged_bug_003 (c): a PERSISTING owner is exempt even when the
+    /// competitor expects a BIGGER NAR. Pre-092 RED: the persist
+    /// exemption was the inference `fetched_bytes == nar_size`, which
+    /// only held when the competitor\'s expected size equalled the
+    /// owner\'s — a bigger expectation re-opened the strike.
+    #[tokio::test]
+    async fn takeover_exempts_persisting_owner_regardless_of_competitor_size() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash = test_hash(0xb3);
+        let _claim = claim_owned(&db.pool, &hash, "/nix/store/b3-persist").await;
+        set_progress(&db.pool, &hash, 1000).await; // fully fetched (owner\'s size)
+        set_phase(&db.pool, &hash, Some("persisting")).await;
+        age_row(&db.pool, &hash, 120, false).await;
+
+        let took = crate::metadata::stall_takeover_placeholder(
+            &db.pool,
+            &hash,
+            Some("competitor-pod"),
+            2000, // competitor expects MORE than the owner fetched
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("takeover query");
+        assert!(
+            took.is_none(),
+            "persisting is exempt AS DATA, not by size equality"
+        );
+    }
+
+    // r[verify store.substitute.stale-reclaim+3]
+    /// merged_bug_003 (d): the intended victim — an ALIVE owner whose
+    /// DOWNLOAD is wedged (phase downloading, progress frozen past the
+    /// window, liveness fresh) — IS taken over in place, with the
+    /// strike recorded (non-vacuity of the whole battery).
+    #[tokio::test]
+    async fn takeover_strikes_wedged_downloading_owner() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash = test_hash(0xb4);
+        let claim = claim_owned(&db.pool, &hash, "/nix/store/b4-wedged").await;
+        set_progress(&db.pool, &hash, 500).await;
+        set_phase(&db.pool, &hash, Some("downloading")).await;
+        age_row(&db.pool, &hash, 120, false).await;
+
+        let took = crate::metadata::stall_takeover_placeholder(
+            &db.pool,
+            &hash,
+            Some("competitor-pod"),
+            1000,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("takeover query");
+        let new_claim = took.expect("wedged downloading owner is deposed");
+        assert_ne!(new_claim, claim, "in-place handoff mints a new claim token");
+        let (_, _, fetched, _, strikes, by, _) = row_state(&db.pool, &hash).await.expect("row");
+        assert_eq!(strikes, 1, "one stall, one strike");
+        assert_eq!(fetched, None, "progress reset for the new owner");
+        assert_eq!(by.as_deref(), Some("competitor-pod"));
+        assert_eq!(
+            row_phase(&db.pool, &hash).await.as_deref(),
+            Some("downloading"),
+            "the new owner starts in the downloading phase"
+        );
+    }
+
+    // r[verify store.substitute.progress-heartbeat]
+    /// The guard\'s heartbeat carries the handle\'s PHASE durably (092):
+    /// stamp BudgetParked on the handle and the next tick mirrors it
+    /// to `manifests.claim_phase`.
+    #[tokio::test]
+    async fn guard_heartbeat_carries_claim_phase() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash = test_hash(0xb5);
+        let claim = claim_owned(&db.pool, &hash, "/nix/store/b5-phase").await;
+        let handle = Arc::new(ProgressHandle::new());
+        let guard = spawn_placeholder_guard(
+            db.pool.clone(),
+            hash.clone(),
+            claim,
+            Some(Arc::clone(&handle)),
+        );
+        handle.store_bytes(64);
+        handle.set_phase(ClaimPhase::BudgetParked);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            row_phase(&db.pool, &hash).await.as_deref(),
+            Some("budget_parked"),
+            "the heartbeat mirrors the handle phase"
+        );
+        handle.set_phase(ClaimPhase::Persisting);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            row_phase(&db.pool, &hash).await.as_deref(),
+            Some("persisting")
+        );
+        guard.defuse();
+    }
+
     // r[verify store.substitute.progress-heartbeat]
     /// The with-progress heartbeat is one claim-guarded UPDATE that
     /// writes `fetched_bytes` and advances `last_progress_at` ONLY
@@ -553,14 +860,16 @@ mod tests {
         let hash = test_hash(0xa1);
         let claim = claim_owned(&db.pool, &hash, "/nix/store/aa-progress-hb").await;
 
-        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, claim, 100).await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, claim, 100, "downloading")
+            .await;
         let (_, _, fetched1, lp1, _, _, _) = row_state(&db.pool, &hash).await.expect("row");
         assert_eq!(fetched1, Some(100), "first heartbeat lands fetched_bytes");
         let lp1 = lp1.expect("first progress write sets last_progress_at");
 
         // Same value → liveness bumps, progress clock does NOT.
         tokio::time::sleep(Duration::from_millis(30)).await;
-        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, claim, 100).await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, claim, 100, "downloading")
+            .await;
         let (_, _, fetched2, lp2, _, _, _) = row_state(&db.pool, &hash).await.expect("row");
         assert_eq!(fetched2, Some(100));
         assert_eq!(
@@ -572,7 +881,8 @@ mod tests {
 
         // Larger value → progress clock advances.
         tokio::time::sleep(Duration::from_millis(30)).await;
-        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, claim, 200).await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, claim, 200, "downloading")
+            .await;
         let (_, _, fetched3, lp3, _, _, _) = row_state(&db.pool, &hash).await.expect("row");
         assert_eq!(fetched3, Some(200));
         assert!(
@@ -581,7 +891,14 @@ mod tests {
         );
 
         // Claim guard: a stale owner's heartbeat is a no-op.
-        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, Uuid::new_v4(), 999).await;
+        crate::cas::heartbeat_uploading_with_progress(
+            &db.pool,
+            &hash,
+            Uuid::new_v4(),
+            999,
+            "downloading",
+        )
+        .await;
         let (_, _, fetched4, _, _, _, _) = row_state(&db.pool, &hash).await.expect("row");
         assert_eq!(
             fetched4,
@@ -603,14 +920,14 @@ mod tests {
         // Substitution-shaped guard: progress handle wired.
         let hash_sub = test_hash(0xa2);
         let claim_sub = claim_owned(&db.pool, &hash_sub, "/nix/store/ab-guard-sub").await;
-        let handle = Arc::new(AtomicU64::new(0));
+        let handle = Arc::new(ProgressHandle::new());
         let guard_sub = spawn_placeholder_guard(
             db.pool.clone(),
             hash_sub.clone(),
             claim_sub,
             Some(Arc::clone(&handle)),
         );
-        handle.store(4096, Ordering::Relaxed);
+        handle.store_bytes(4096);
 
         // PutPath-shaped guard: no handle.
         let hash_put = test_hash(0xa3);
@@ -701,7 +1018,7 @@ mod tests {
 
     // ── The four-case stall battery (review-findings watch-item 1) ──
 
-    // r[verify store.substitute.stale-reclaim+2]
+    // r[verify store.substitute.stale-reclaim+3]
     /// Case 1: a frozen mid-download claim (progress evidence present,
     /// `fetched_bytes < nar_size`, progress clock older than the stall
     /// window, heartbeat ALIVE) is taken over IN PLACE: new
@@ -715,7 +1032,8 @@ mod tests {
 
         // Owner reported progress (100 < 1000), then froze 120s ago
         // (window 60s); heartbeat stays fresh (alive-but-wedged).
-        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100).await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100, "downloading")
+            .await;
         age_row(&db.pool, &hash, 120, false).await;
 
         let claim = claim_substitute(&db.pool, &hash, "/nix/store/ba-frozen").await;
@@ -742,7 +1060,7 @@ mod tests {
         assert_eq!(claimed_by.as_deref(), Some("claimant-pod"));
     }
 
-    // r[verify store.substitute.stale-reclaim+2]
+    // r[verify store.substitute.stale-reclaim+3]
     /// Case 2: an ADVANCING download (progress clock fresh) is never
     /// stall-reclaimed — slow ≠ stuck.
     #[tokio::test]
@@ -750,7 +1068,8 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let hash = test_hash(0xb2);
         let owner = claim_owned(&db.pool, &hash, "/nix/store/bb-advancing").await;
-        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100).await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100, "downloading")
+            .await;
         // Progress clock fresh (just heartbeated); no aging.
 
         let claim = claim_substitute(&db.pool, &hash, "/nix/store/bb-advancing").await;
@@ -763,7 +1082,7 @@ mod tests {
         assert_eq!(stalls, 0, "no strike for a healthy transfer");
     }
 
-    // r[verify store.substitute.stale-reclaim+2]
+    // r[verify store.substitute.stale-reclaim+3]
     /// Case 3: a PutPath claim (`fetched_bytes` NULL — no progress
     /// handle) is structurally exempt from the stall arm no matter how
     /// old its progress-free state is, as long as it heartbeats.
@@ -787,7 +1106,7 @@ mod tests {
         assert_eq!(stalls, 0);
     }
 
-    // r[verify store.substitute.stale-reclaim+2]
+    // r[verify store.substitute.stale-reclaim+3]
     /// Case 4: a download-complete (persist-phase) claim
     /// (`fetched_bytes == nar_size`) is NEVER stall-reclaimable — only
     /// the 5-minute heartbeat-death rule applies there. Stealing
@@ -800,7 +1119,8 @@ mod tests {
         // Download complete: fetched == nar_size (1000); progress clock
         // long stale (the persist phase legitimately writes no
         // progress); heartbeat alive (chunk-upload loop keeps it fresh).
-        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 1000).await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 1000, "downloading")
+            .await;
         age_row(&db.pool, &hash, 600, false).await;
 
         let claim = claim_substitute(&db.pool, &hash, "/nix/store/bd-persist").await;
@@ -817,7 +1137,7 @@ mod tests {
 
     // ── Release-in-place / strike-once / reset ──
 
-    // r[verify store.substitute.stale-reclaim+2]
+    // r[verify store.substitute.stale-reclaim+3]
     // r[verify store.substitute.stall-abort]
     /// A released-in-place row (the owner-side stall abort's leavings:
     /// `claim_id` NULL, `stall_count` recorded) is claimable
@@ -828,7 +1148,8 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let hash = test_hash(0xb5);
         let owner = claim_owned(&db.pool, &hash, "/nix/store/be-released").await;
-        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100).await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100, "downloading")
+            .await;
 
         // The owner-side abort releases in place.
         let released = metadata::release_placeholder_in_place(&db.pool, &hash, owner)
@@ -853,7 +1174,7 @@ mod tests {
         assert_eq!(stalls, 1, "stall evidence survives the handoff");
     }
 
-    // r[verify store.substitute.stale-reclaim+2]
+    // r[verify store.substitute.stale-reclaim+3]
     // r[verify store.substitute.stall-abort]
     /// Claim-guarded strike-once, both interleavings:
     /// (a) a competing stall-reclaim lands first → the owner's late
@@ -870,7 +1191,8 @@ mod tests {
         // (a) reclaim first, release late.
         let hash = test_hash(0xb6);
         let owner = claim_owned(&db.pool, &hash, "/nix/store/bf-race-a").await;
-        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100).await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100, "downloading")
+            .await;
         age_row(&db.pool, &hash, 120, false).await;
         let taken = metadata::stall_takeover_placeholder(
             &db.pool,
@@ -895,7 +1217,8 @@ mod tests {
         // (b) release first, takeover late.
         let hash = test_hash(0xb7);
         let owner = claim_owned(&db.pool, &hash, "/nix/store/bg-race-b").await;
-        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100).await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100, "downloading")
+            .await;
         age_row(&db.pool, &hash, 120, false).await;
         let released = metadata::release_placeholder_in_place(&db.pool, &hash, owner)
             .await
@@ -922,7 +1245,7 @@ mod tests {
         assert_eq!(stalls, 1, "one stall event, one strike (release-first)");
     }
 
-    // r[verify store.substitute.stale-reclaim+2]
+    // r[verify store.substitute.stale-reclaim+3]
     /// Heartbeat-death keeps DELETING (the unchanged 5-minute rule),
     /// which RESETS stall evidence: benign churn (deploys, scale-in,
     /// crashes) never accrues strikes. The dead-owner arm wins over
@@ -932,7 +1255,8 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let hash = test_hash(0xb8);
         let owner = claim_owned(&db.pool, &hash, "/nix/store/bh-dead").await;
-        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100).await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash, owner, 100, "downloading")
+            .await;
         // Two prior strikes on the row...
         sqlx::query("UPDATE manifests SET stall_count = 2 WHERE store_path_hash = $1")
             .bind(hash.as_slice())
@@ -954,7 +1278,7 @@ mod tests {
         assert_eq!(fetched, None);
     }
 
-    // r[verify store.substitute.stale-reclaim+2]
+    // r[verify store.substitute.stale-reclaim+3]
     /// The reclaim counter is reason-labeled: `heartbeat` for the
     /// death-DELETE arm, `stall_reclaim` for the in-place takeover.
     /// (`stall_abort` is emitted at the owner-side abort site in
@@ -977,7 +1301,8 @@ mod tests {
         // stall reclaim.
         let hash2 = test_hash(0xba);
         let owner = claim_owned(&db.pool, &hash2, "/nix/store/bj-stalled").await;
-        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash2, owner, 100).await;
+        crate::cas::heartbeat_uploading_with_progress(&db.pool, &hash2, owner, 100, "downloading")
+            .await;
         age_row(&db.pool, &hash2, 120, false).await;
         assert!(matches!(
             claim_substitute(&db.pool, &hash2, "/nix/store/bj-stalled").await,

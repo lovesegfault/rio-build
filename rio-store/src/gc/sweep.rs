@@ -345,26 +345,43 @@ async fn closure_remove_from_unreachable(
 /// already committed (previous iteration), the next batch never
 /// starts. Safe point: no transaction open, no locks held other than
 /// the caller's advisory GC lock (which the caller releases).
+/// What one sweep settled: the stats plus the SET of paths it swept
+/// (deleted live, or WOULD have deleted under dry_run — the per-batch
+/// computation is identical, taken before the savepoint rollback).
+/// The swept set feeds the dry-run collect cycle's simulated-sweep
+/// exclusion (bug_199): the chunk estimate must be computed against
+/// post-sweep state, and the type makes every shadow caller state its
+/// sweep composition.
+pub struct SweepOutcome {
+    pub stats: GcStats,
+    pub swept_paths: Vec<Vec<u8>>,
+}
+
 pub async fn sweep(
     pool: &PgPool,
     _chunk_backend: Option<&Arc<dyn ChunkBackend>>,
     unreachable: Vec<Vec<u8>>,
     dry_run: bool,
     shutdown: &rio_common::signal::Token,
-) -> Result<GcStats, SweepAbort> {
+) -> Result<SweepOutcome, SweepAbort> {
     let mut stats = GcStats::default();
+    let mut swept_paths: Vec<Vec<u8>> = Vec::new();
 
     if unreachable.is_empty() {
         // Skip connection acquire + temp-table setup for no-op sweeps.
-        return Ok(stats);
+        return Ok(SweepOutcome { stats, swept_paths });
     }
 
     // Reset on ANY exit (Ok, SweepAbort, panic). The gauge contract is
-    // 0 between sweeps; before this scopeguard, an abort left it at the
-    // last per-batch set() and read as "sweep stalled".
-    let _gauge_reset = scopeguard::guard((), |()| {
-        metrics::gauge!("rio_store_gc_sweep_paths_remaining").set(0.0);
-    });
+    // 0 between sweeps; without this drop guard, an abort left it at
+    // the last per-batch set() and read as "sweep stalled".
+    struct GaugeReset;
+    impl Drop for GaugeReset {
+        fn drop(&mut self) {
+            metrics::gauge!("rio_store_gc_sweep_paths_remaining").set(0.0);
+        }
+    }
+    let _gauge_reset = GaugeReset;
 
     // Dedicated connection: the sweep_unreachable temp table below is
     // session-scoped and must survive across the batch-transaction
@@ -450,7 +467,7 @@ pub async fn sweep(
         // manifest-row and narinfo locks now, but PG can still 40P01
         // under index-page-split contention). The `?` propagates
         // SweepAbort::Db on the second failure.
-        let delta = match sweep_one_batch(&mut conn, batch, dry_run).await {
+        let (delta, batch_swept) = match sweep_one_batch(&mut conn, batch, dry_run).await {
             Err(e) if is_deadlock(&e) => {
                 warn!(error = %e, "sweep: 40P01 on batch tx; retrying once");
                 tokio::time::sleep(crate::metadata::jitter()).await;
@@ -458,6 +475,7 @@ pub async fn sweep(
             }
             r => r?,
         };
+        swept_paths.extend(batch_swept);
         stats.paths_deleted += delta.paths_deleted;
         stats.paths_resurrected += delta.paths_resurrected;
 
@@ -482,7 +500,7 @@ pub async fn sweep(
         "GC sweep complete (path-level only; chunk collection is the collect cycle's job)"
     );
 
-    Ok(stats)
+    Ok(SweepOutcome { stats, swept_paths })
 }
 
 /// SQLSTATE 40P01 (deadlock_detected). Same check as
@@ -501,8 +519,9 @@ async fn sweep_one_batch(
     conn: &mut sqlx::PgConnection,
     batch: &[Vec<u8>],
     dry_run: bool,
-) -> Result<GcStats, sqlx::Error> {
+) -> Result<(GcStats, Vec<Vec<u8>>), sqlx::Error> {
     let mut delta = GcStats::default();
+    let mut swept: Vec<Vec<u8>> = Vec::new();
     let mut tx = conn.begin().await?;
 
     // Within-batch two-pass: lock + re-check every batch item before
@@ -609,7 +628,7 @@ async fn sweep_one_batch(
     // still_unreachable probe sees Y's resurrection of Z). Without
     // this, dry-run rolled back the closure_remove and re-counted Z in
     // batch N+1 → over-reported paths_deleted.
-    // r[impl store.gc.dry-run+2]
+    // r[impl store.gc.dry-run+3]
     sqlx::query("SAVEPOINT sweep_deletes")
         .execute(&mut *tx)
         .await?;
@@ -626,6 +645,10 @@ async fn sweep_one_batch(
             continue;
         }
         delta.paths_deleted += 1;
+        // The settled swept set — computed BEFORE the dry-run
+        // rollback below, so it is identical under both arms (the
+        // shadow collect's simulated-sweep input, bug_199).
+        swept.push((*store_path_hash).clone());
     }
 
     if dry_run {
@@ -636,7 +659,7 @@ async fn sweep_one_batch(
             .await?;
     }
     tx.commit().await?;
-    Ok(delta)
+    Ok((delta, swept))
 }
 
 #[cfg(test)]
@@ -679,7 +702,8 @@ mod tests {
         // Sweep the path.
         let stats = sweep(&db.pool, None, vec![hash.clone()], false, &no_shutdown())
             .await
-            .unwrap();
+            .unwrap()
+            .stats;
         assert_eq!(stats.paths_deleted, 1);
 
         // narinfo gone (CASCADE took manifests too).
@@ -729,7 +753,8 @@ mod tests {
 
         let stats = sweep(&db.pool, None, vec![p_hash], true, &no_shutdown())
             .await
-            .unwrap();
+            .unwrap()
+            .stats;
         assert_eq!(stats.paths_resurrected, 1, "P resurrected (stats)");
         assert_eq!(stats.paths_deleted, 0);
 
@@ -760,7 +785,8 @@ mod tests {
 
         let stats = sweep(&db.pool, None, vec![h1, h2, h3], false, &no_shutdown())
             .await
-            .unwrap();
+            .unwrap()
+            .stats;
         assert_eq!(stats.paths_deleted, 3);
         assert_eq!(stats.paths_resurrected, 0);
 
@@ -786,7 +812,8 @@ mod tests {
 
         let stats = sweep(&db.pool, None, vec![hash.clone()], true, &no_shutdown())
             .await
-            .unwrap();
+            .unwrap()
+            .stats;
         // Stats SHOW the path would be deleted.
         assert_eq!(stats.paths_deleted, 1);
 
@@ -821,7 +848,8 @@ mod tests {
         // find Q.references=[P] → skip P → paths_resurrected=1.
         let stats = sweep(&db.pool, None, vec![p_hash.clone()], false, &no_shutdown())
             .await
-            .unwrap();
+            .unwrap()
+            .stats;
         assert_eq!(
             stats.paths_deleted, 0,
             "P should NOT be deleted — Q references it"
@@ -895,7 +923,8 @@ mod tests {
         // placeholder narinfo.references @> [Q] → resurrect.
         let stats = sweep(&db.pool, None, vec![q_hash.clone()], false, &no_shutdown())
             .await
-            .unwrap();
+            .unwrap()
+            .stats;
         assert_eq!(
             stats.paths_deleted, 0,
             "Q must NOT be deleted — uploading placeholder P references it"
@@ -975,7 +1004,8 @@ mod tests {
 
         let stats = sweep(&db.pool, None, unreachable, false, &no_shutdown())
             .await
-            .unwrap();
+            .unwrap()
+            .stats;
         assert_eq!(stats.paths_deleted, expected_deleted);
         assert_eq!(stats.paths_resurrected, 2, "Y resurrected by P; Z by Y");
 
@@ -1024,7 +1054,8 @@ mod tests {
             &no_shutdown(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .stats;
         assert_eq!(stats.paths_deleted, 1);
         assert_eq!(stats.paths_resurrected, 1);
 
@@ -1069,7 +1100,8 @@ mod tests {
         // Sweep.
         let stats = sweep(&db.pool, None, vec![hash.clone()], false, &no_shutdown())
             .await
-            .unwrap();
+            .unwrap()
+            .stats;
         assert_eq!(stats.paths_deleted, 1);
 
         // path_tenants row ALSO gone (explicit DELETE, not CASCADE).
@@ -1121,7 +1153,8 @@ mod tests {
             &no_shutdown(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .stats;
         assert_eq!(
             stats.paths_deleted, 3,
             "A↔B cycle + C self-ref all swept (intra-batch referrers excluded)"
@@ -1148,7 +1181,8 @@ mod tests {
 
         let stats = sweep(&db.pool, None, vec![hash], false, &no_shutdown())
             .await
-            .unwrap();
+            .unwrap()
+            .stats;
         assert_eq!(stats.paths_deleted, 1);
         assert_eq!(stats.paths_resurrected, 0);
     }
@@ -1215,7 +1249,8 @@ mod tests {
             &no_shutdown(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .stats;
 
         assert_eq!(stats.paths_deleted, 1);
         assert_eq!(stats.chunks_deleted, 0, "the sweep reports no chunk work");
@@ -1249,6 +1284,7 @@ mod tests {
             Some(&backend),
             CHUNK_GRACE_SECS,
             super::super::collect::CollectMode::Live,
+            None,
         )
         .await
         .unwrap();
@@ -1299,7 +1335,7 @@ mod tests {
     /// `paths_deleted=0` (Z transitively resurrected via the
     /// committed closure_remove).
     // r[verify store.gc.sweep-referrer-order]
-    // r[verify store.gc.dry-run+2]
+    // r[verify store.gc.dry-run+3]
     #[tokio::test]
     async fn sweep_referrer_first_and_dry_run_closure_survives() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -1342,7 +1378,8 @@ mod tests {
             &no_shutdown(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .stats;
         assert_eq!(stats.paths_resurrected, 2, "Y by P; Z by Y");
         assert_eq!(
             stats.paths_deleted, 1,
@@ -1564,7 +1601,8 @@ mod tests {
         // fresh attribution row survives.
         let stats = sweep(&db.pool, None, vec![x_hash.clone()], false, &no_shutdown())
             .await
-            .unwrap();
+            .unwrap()
+            .stats;
         assert_eq!(stats.paths_resurrected, 1);
         assert_eq!(stats.paths_deleted, 0);
 

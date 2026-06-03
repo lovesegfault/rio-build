@@ -2102,7 +2102,7 @@ time; no production code reads or writes a chunk reference counter.
   carry an impl reference; the two collector rules
   (`store.chunk.liveness-derived`, `store.gc.chunk-collect`) are
   impl- and verify-covered; the three invariant-level rules
-  (`store.chunk.no-live-collect`, `store.gc.bounded-garbage-retention+2`,
+  (`store.chunk.no-live-collect`, `store.gc.bounded-garbage-retention+3` (row-retention clause added, bughunt wave D1),
   `store.chunk.liveness-not-presence`) are verify-only by the
   recorded Stage-A decision (model checks verify them; no single code
   site is "the implementation" of an invariant), and they are the

@@ -332,6 +332,12 @@ async fn main() -> anyhow::Result<()> {
         chunk_backend_for_gc.clone(),
         shutdown.clone(),
     );
+    // Every replica publishes the cluster GC gauges from the durable
+    // gc_collect_state row (merged_bug_211): the cycle winner is no
+    // longer the only pod whose gauges move — replicas converge on
+    // the row value within one 60s period. Replicated-fact semantics:
+    // aggregate with max(), never sum() (owner decision Q6).
+    rio_store::gc::state::spawn_gc_gauge_publisher(pool.clone(), shutdown.clone());
     if let Some(backend) = chunk_backend_for_gc {
         rio_store::gc::drain::spawn_drain_task(pool.clone(), backend, shutdown.clone());
     }

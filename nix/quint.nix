@@ -1965,7 +1965,7 @@ in
     # r[verify store.chunk.liveness-derived]
     # r[verify store.gc.chunk-collect]
     # r[verify store.chunk.no-live-collect]
-    # r[verify store.gc.bounded-garbage-retention+2]
+    # r[verify store.gc.bounded-garbage-retention+3]
     # r[verify store.chunk.refcount-txn+2]
     quint-chunk-collect-base = mkQuintCheck {
       name = "chunk-collect-base";
@@ -1992,7 +1992,7 @@ in
     # next writer to re-PUT instead of trusting liveness for presence.
     # r[verify store.chunk.liveness-derived]
     # r[verify store.chunk.no-live-collect]
-    # r[verify store.gc.bounded-garbage-retention+2]
+    # r[verify store.gc.bounded-garbage-retention+3]
     # r[verify store.chunk.liveness-not-presence]
     # r[verify store.cas.upsert-inserted+3]
     # r[verify store.cas.chunk-upload-committed]
@@ -2026,7 +2026,7 @@ in
     # r[verify store.chunk.liveness-derived]
     # r[verify store.gc.chunk-collect]
     # r[verify store.chunk.no-live-collect]
-    # r[verify store.gc.bounded-garbage-retention+2]
+    # r[verify store.gc.bounded-garbage-retention+3]
     # r[verify store.chunk.liveness-not-presence]
     # r[verify store.gc.pending-deletes+2]
     # r[verify store.chunk.grace-ttl+2]
@@ -2056,7 +2056,7 @@ in
     # r[verify store.chunk.liveness-derived]
     # r[verify store.gc.chunk-collect]
     # r[verify store.chunk.no-live-collect]
-    # r[verify store.gc.bounded-garbage-retention+2]
+    # r[verify store.gc.bounded-garbage-retention+3]
     quint-chunk-collect-corrupt = mkQuintCheck {
       name = "chunk-collect-corrupt";
       spec = "chunkCollect";

@@ -1316,6 +1316,11 @@
       "doc": "Drain task: consume `pending_s3_deletes`, call `ChunkBackend::delete_by_key`."
     },
     {
+      "path": "gc/lock.rs",
+      "depth": 1,
+      "doc": "Session-affine PG connections and the GC advisory-lock capability"
+    },
+    {
       "path": "gc/mark.rs",
       "depth": 1,
       "doc": "Mark phase: compute unreachable paths via recursive CTE."
@@ -1329,6 +1334,11 @@
       "path": "gc/orphan.rs",
       "depth": 1,
       "doc": "Orphan scanner: reap stale 'uploading' manifests."
+    },
+    {
+      "path": "gc/state.rs",
+      "depth": 1,
+      "doc": "Durable, cluster-scoped chunk-collect state and the cycle lease"
     },
     {
       "path": "gc/sweep.rs",

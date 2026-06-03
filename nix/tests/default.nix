@@ -295,7 +295,11 @@ let
           extraConfig = ''
             # substitute-stall-abort fixture: shrink the owner-side
             # stall window (default 180 s) so the netem-wedged subtest
-            # aborts in seconds. 15 s is ≫ the per-read cadence under
+            # aborts in about a minute. 60 s is the validation FLOOR
+            # (substitute_stall >= 2x the 30 s placeholder heartbeat,
+            # merged_bug_082; the placeholderClaimSubHeartbeatWindow
+            # quint regime shows sub-2x windows depose live advancing
+            # owners on stamp lag) — still ≫ the per-read cadence under
             # the 8mbit throttle and ≪ the detached fetch's
             # -max-time 240. TOP-LEVEL key — it must precede the [jwt]
             # table header or TOML parses it as jwt.substitute_stall_secs
@@ -304,7 +308,7 @@ let
             # response-header wait and per-read clock — safe on the
             # VM-local network (ms-scale reads), but a future
             # heavyweight subtest in this scenario inherits it.
-            substitute_stall_secs = 15
+            substitute_stall_secs = 60
             [jwt]
             key_path = "${jwtPubkey}"
           '';
@@ -610,7 +614,7 @@ in
   #   warn pair, stale_reclaimed_total{reason="stall_abort"} == 1, row
   #   released in place (claim/progress NULL, stall_count=1,
   #   status='uploading' preserved).
-  # r[verify store.substitute.stale-reclaim+2]
+  # r[verify store.substitute.stale-reclaim+3]
   #   substitute-stall-abort: the post-heal re-claim completes
   #   (status='complete' far below the 300s heartbeat-death threshold
   #   proves the released-in-place arm), with the stall_count=1 strike

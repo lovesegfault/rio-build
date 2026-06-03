@@ -155,6 +155,7 @@
     "rio_store_gc_chunk_resurrected_total",
     "rio_store_gc_chunks_collected_total",
     "rio_store_gc_chunks_live",
+    "rio_store_gc_chunks_reaped_total",
     "rio_store_gc_chunks_would_collect",
     "rio_store_gc_collect_backlog_chunks",
     "rio_store_gc_collect_cycle_seconds",
@@ -999,6 +1000,11 @@
         "name": "rio_store_gc_chunks_live",
         "kind": "gauge",
         "help": "Distinct chunk hashes referenced by at least one existing manifest (any status) at the last collect cycle's mark snapshot (mark-set size)."
+      },
+      {
+        "name": "rio_store_gc_chunks_reaped_total",
+        "kind": "counter",
+        "help": "Tombstone chunk rows hard-DELETEd by the post-pass reap (091, merged_bug_336): soft-deleted at least the grace term ago AND fully drained (no pending_s3_deletes row). Runs only after a COMPLETE collect pass; the resurrect upsert NULLs deleted_at so a re-referenced chunk is never reap-eligible. Sustained zero with a growing deleted-row count means the drain is stuck (check rio_store_s3_deletes_stuck)."
       },
       {
         "name": "rio_store_gc_chunks_would_collect",

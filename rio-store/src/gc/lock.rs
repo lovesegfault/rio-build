@@ -1,0 +1,192 @@
+//! Session-affine PG connections and the GC advisory-lock capability
+//! (bug_213, bughunt wave D1).
+//!
+//! PG session state — an advisory lock, a session temp table — lives
+//! on ONE connection and dies with it. The pre-wave choreography used
+//! `scopeguard` with an explicit DEFUSE before the cleanup await
+//! (`ScopeGuard::into_inner` … `pg_advisory_unlock(...).await`): a
+//! failed OR cancelled cleanup after the defuse returned the
+//! connection to the shared pool WITH the session state still
+//! attached — the next `run_gc` then read "already running" until the
+//! pool happened to recycle that connection. The types here make that
+//! shape inexpressible: there is no public defuse, and the only way a
+//! connection re-enters the pool is through a consuming method whose
+//! contract is "session state is gone".
+
+use sqlx::PgPool;
+use sqlx::pool::PoolConnection;
+use sqlx::postgres::Postgres;
+
+/// A pooled connection whose session carries state that must NOT leak
+/// back into the shared pool.
+///
+/// Drop ⇒ DETACH: the connection is removed from the pool and closed,
+/// so PG frees every piece of session state (locks, temp tables) with
+/// the session. The ONLY pool re-entry is [`SessionConn::release_to_pool`],
+/// which the caller may invoke only once the session state is gone.
+/// "Defuse before the cleanup await" cannot be written.
+pub(crate) struct SessionConn {
+    conn: Option<PoolConnection<Postgres>>,
+}
+
+impl SessionConn {
+    pub(crate) fn new(conn: PoolConnection<Postgres>) -> Self {
+        Self { conn: Some(conn) }
+    }
+
+    /// The live connection. Panics only if called after consumption,
+    /// which the consuming signatures make unreachable.
+    pub(crate) fn conn(&mut self) -> &mut PoolConnection<Postgres> {
+        self.conn
+            .as_mut()
+            .expect("SessionConn is live until consumed")
+    }
+
+    /// Hand the connection back to the pool. Contract: the session
+    /// carries no state any more (lock released / temp table dropped
+    /// in-session).
+    pub(crate) fn release_to_pool(mut self) {
+        // A plain drop of a PoolConnection returns it to the pool;
+        // our Drop impl then sees None and does not detach.
+        drop(self.conn.take());
+    }
+}
+
+impl Drop for SessionConn {
+    fn drop(&mut self) {
+        if let Some(c) = self.conn.take() {
+            // Detach closes the connection: PG frees the session
+            // state. Errors are unobservable here by design — the
+            // session is gone either way.
+            let _ = c.detach();
+        }
+    }
+}
+
+/// A held PG session-scoped advisory lock (capability object).
+///
+/// `try_acquire` is non-blocking: `Ok(None)` means another session
+/// holds the lock. While the value lives, the lock is held on its
+/// dedicated connection ([`Self::conn`] runs cycle statements on it
+/// where session affinity is wanted). Release paths:
+///
+/// - [`Self::release`]: unlock THROUGH the held connection; `Ok` ⇒
+///   the connection returns to the pool; `Err` ⇒ the connection is
+///   detached (closed) and PG frees the lock with the session.
+/// - Drop (incl. future cancellation and panics): detach — never a
+///   pooled connection with the lock held.
+pub(crate) struct PgSessionLock {
+    conn: SessionConn,
+    lock_id: i64,
+}
+
+impl PgSessionLock {
+    /// Acquire `lock_id` non-blockingly on a dedicated pooled
+    /// connection. `Ok(None)` = held elsewhere (the connection used
+    /// for the probe returns to the pool clean — a failed
+    /// `pg_try_advisory_lock` leaves no session state).
+    pub(crate) async fn try_acquire(
+        pool: &PgPool,
+        lock_id: i64,
+    ) -> Result<Option<Self>, sqlx::Error> {
+        let mut conn = pool.acquire().await?;
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(lock_id)
+            .fetch_one(&mut *conn)
+            .await?;
+        if !acquired {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            conn: SessionConn::new(conn),
+            lock_id,
+        }))
+    }
+
+    /// The lock-holding connection (for statements that must share the
+    /// lock's session).
+    pub(crate) fn conn(&mut self) -> &mut PoolConnection<Postgres> {
+        self.conn.conn()
+    }
+
+    /// Unlock through the held connection, then return it to the pool.
+    /// On error the connection is detached instead — the lock can
+    /// never ride a pooled connection. Cancellation mid-await drops
+    /// `self` ⇒ detach, same guarantee.
+    pub(crate) async fn release(mut self) -> Result<(), sqlx::Error> {
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(self.lock_id)
+            .execute(&mut **self.conn.conn())
+            .await?;
+        self.conn.release_to_pool();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rio_test_support::TestDb;
+
+    /// A scratch lock id distinct from the production GC id.
+    const TEST_LOCK_ID: i64 = 0x7252_4c4b_7e57;
+
+    /// (a) release() unlocks and returns the connection: a second
+    /// acquire on the same (size-limited) pool succeeds immediately.
+    #[tokio::test]
+    async fn release_unlocks_and_returns_the_connection() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let lock = PgSessionLock::try_acquire(&db.pool, TEST_LOCK_ID)
+            .await
+            .unwrap()
+            .expect("first acquire wins");
+        lock.release().await.unwrap();
+        let again = PgSessionLock::try_acquire(&db.pool, TEST_LOCK_ID)
+            .await
+            .unwrap();
+        assert!(again.is_some(), "released lock is immediately acquirable");
+        again.unwrap().release().await.unwrap();
+    }
+
+    /// (b) While held, a second acquire reports held-elsewhere.
+    #[tokio::test]
+    async fn second_acquire_is_none_while_held() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let held = PgSessionLock::try_acquire(&db.pool, TEST_LOCK_ID)
+            .await
+            .unwrap()
+            .expect("first acquire wins");
+        let second = PgSessionLock::try_acquire(&db.pool, TEST_LOCK_ID)
+            .await
+            .unwrap();
+        assert!(second.is_none(), "lock is exclusive while held");
+        held.release().await.unwrap();
+    }
+
+    /// (c) Drop (the cancel/panic path) frees the lock via session
+    /// close — a later acquire succeeds without any explicit unlock.
+    #[tokio::test]
+    async fn drop_frees_the_lock_via_session_close() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let held = PgSessionLock::try_acquire(&db.pool, TEST_LOCK_ID)
+            .await
+            .unwrap()
+            .expect("first acquire wins");
+        drop(held);
+        // The detach closes the connection asynchronously; PG frees
+        // the lock when the session terminates. Poll briefly.
+        let mut freed = false;
+        for _ in 0..50 {
+            if let Some(l) = PgSessionLock::try_acquire(&db.pool, TEST_LOCK_ID)
+                .await
+                .unwrap()
+            {
+                l.release().await.unwrap();
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(freed, "dropping the lock must free it via session close");
+    }
+}

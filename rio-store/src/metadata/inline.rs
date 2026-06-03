@@ -95,8 +95,9 @@ pub(crate) async fn insert_manifest_uploading_as(
     let claim_id = uuid::Uuid::new_v4();
     let result = sqlx::query(
         r#"
-        INSERT INTO manifests (store_path_hash, status, claim_id, claimed_by)
-        VALUES ($1, 'uploading', $2, $3)
+        INSERT INTO manifests (store_path_hash, status, claim_id, claimed_by, claim_phase)
+        VALUES ($1, 'uploading', $2, $3,
+                CASE WHEN $3::text IS NOT NULL THEN 'downloading' END)
         ON CONFLICT (store_path_hash) DO NOTHING
         "#,
     )
@@ -118,7 +119,7 @@ pub(crate) async fn insert_manifest_uploading_as(
 /// (the whole point of releasing in place instead of deleting: stall
 /// evidence survives the handoff). Returns the new claim token, or
 /// `None` if no released row exists (live claim, completed, or gone).
-// r[impl store.substitute.stale-reclaim+2]
+// r[impl store.substitute.stale-reclaim+3]
 #[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
 pub(crate) async fn claim_released_placeholder(
     pool: &PgPool,
@@ -132,6 +133,7 @@ pub(crate) async fn claim_released_placeholder(
         r#"
         UPDATE manifests
            SET claim_id = $2, claimed_by = $3,
+               claim_phase = CASE WHEN $3::text IS NOT NULL THEN 'downloading' END,
                fetched_bytes = NULL, last_progress_at = NULL,
                updated_at = now()
          WHERE store_path_hash = $1
@@ -149,14 +151,25 @@ pub(crate) async fn claim_released_placeholder(
 
 /// Take over a **download-stalled** live claim in place: the
 /// download-scoped stall-reclaim arm of
-/// `r[store.substitute.stale-reclaim+2]`. The predicate —
+/// `r[store.substitute.stale-reclaim+3]`. The predicate is
+/// [`STALL_TAKEOVER_PREDICATE`] (single-sourced beside this fn) — the
+/// two-clock, phase-keyed rule (092, merged_bug_003):
 ///
-///   `fetched_bytes IS NOT NULL ∧ fetched_bytes < nar_size ∧
-///    last_progress_at older than the stall window`
+///   `claim_phase = 'downloading'` — parked/persisting owners are
+///   exempt AS DATA (the pre-092 `fetched_bytes < nar_size` inference
+///   made the persist exemption conditional on the COMPETITOR\'s
+///   expected size equalling the owner\'s, and the budget-park froze
+///   progress with liveness fresh for >180s, deposing live
+///   backpressured owners);
+///   `fetched_bytes < $nar_size ∧ last_progress_at stale` — progress
+///   froze;
+///   `updated_at fresh` — the owner is ALIVE (a dead owner falls to
+///   the 300s heartbeat-death reap arm and is reaped, not striked —
+///   pre-092 a crashed owner in the 180–300s window collected a
+///   bogus strike).
 ///
-/// — matches only mid-download claims whose progress clock froze:
-/// PutPath claims (`fetched_bytes` NULL) and persist-phase claims
-/// (`fetched_bytes == nar_size`) are structurally outside it, and an
+/// PutPath claims (`fetched_bytes` NULL, `claim_phase` NULL) stay
+/// structurally outside every conjunct, and an
 /// advancing owner refreshes `last_progress_at` every heartbeat. The
 /// handoff is in place (new `claim_id`/`claimed_by`, progress reset,
 /// `stall_count += 1`) so stall evidence accumulates across owners.
@@ -167,7 +180,7 @@ pub(crate) async fn claim_released_placeholder(
 /// `nar_size` is the caller's verified-narinfo `NarSize` (every
 /// substitution claimant parses the narinfo before claiming); the
 /// row itself stores no expected size while uploading.
-// r[impl store.substitute.stale-reclaim+2]
+// r[impl store.substitute.stale-reclaim+3]
 #[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
 pub(crate) async fn stall_takeover_placeholder(
     pool: &PgPool,
@@ -177,30 +190,48 @@ pub(crate) async fn stall_takeover_placeholder(
     stall_window: std::time::Duration,
 ) -> Result<Option<uuid::Uuid>> {
     let claim_id = uuid::Uuid::new_v4();
-    let result = sqlx::query(
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"
         UPDATE manifests
-           SET claim_id = $2, claimed_by = $3,
+           SET claim_id = $2, claimed_by = $3, claim_phase = 'downloading',
                fetched_bytes = NULL, last_progress_at = NULL,
                stall_count = stall_count + 1,
                updated_at = now()
          WHERE store_path_hash = $1
            AND status = 'uploading'
            AND claim_id IS NOT NULL
-           AND fetched_bytes IS NOT NULL
-           AND fetched_bytes < $4
-           AND last_progress_at < now() - make_interval(secs => $5)
-        "#,
-    )
+           {STALL_TAKEOVER_PREDICATE}
+        "#
+    )))
     .bind(store_path_hash)
     .bind(claim_id)
     .bind(claimed_by)
     .bind(i64::try_from(nar_size).unwrap_or(i64::MAX))
-    .bind(stall_window.as_secs() as i64)
+    .bind(stall_window.as_secs_f64())
     .execute(pool)
     .await?;
     Ok((result.rows_affected() > 0).then_some(claim_id))
 }
+
+/// The single-sourced stall-takeover rule (092, merged_bug_003;
+/// r[store.substitute.stale-reclaim+3]). `$4` = the competitor\'s
+/// verified NarSize, `$5` = the stall window in seconds. Two clocks,
+/// one phase:
+///
+/// - `claim_phase = 'downloading'`: parked/persisting owners exempt
+///   AS DATA;
+/// - progress stale: `fetched_bytes` short of the size and
+///   `last_progress_at` older than the window;
+/// - liveness FRESH: `updated_at` within the window — dead owners
+///   route to the 300s reap arm (reaped, not striked).
+///
+/// Both time conjuncts evaluate on PG `now()` — no cross-replica
+/// clock skew; durability lag of the phase is ≤ one heartbeat
+/// (30s ≪ the validated ≥60s stall floor).
+pub(crate) const STALL_TAKEOVER_PREDICATE: &str = "AND claim_phase = 'downloading'
+           AND fetched_bytes IS NOT NULL AND fetched_bytes < $4
+           AND last_progress_at < now() - make_interval(secs => $5)
+           AND updated_at      >= now() - make_interval(secs => $5)";
 
 /// Owner-side **release-in-place** after a stall abort
 /// (`r[store.substitute.stall-abort]`): relinquish the claim
@@ -223,7 +254,7 @@ pub(crate) async fn release_placeholder_in_place(
     let result = sqlx::query(
         r#"
         UPDATE manifests
-           SET claim_id = NULL, claimed_by = NULL,
+           SET claim_id = NULL, claimed_by = NULL, claim_phase = NULL,
                fetched_bytes = NULL, last_progress_at = NULL,
                stall_count = stall_count + 1,
                updated_at = now()

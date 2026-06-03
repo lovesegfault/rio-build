@@ -50,10 +50,12 @@
 
 pub mod collect;
 pub mod drain;
+pub mod lock;
 mod mark;
 #[cfg(test)]
 mod mark_scan_bench;
 pub mod orphan;
+pub mod state;
 pub mod sweep;
 pub mod tenant;
 
@@ -155,11 +157,12 @@ pub(crate) const GRACE_HOURS_CAP: u32 = 24 * 365;
 /// Held for the full run. Non-blocking — second caller gets a `false`
 /// back → "already running" terminal progress msg.
 ///
-/// Uses `scopeguard::guard(conn, |c| c.detach())` so ANY exit (error,
-/// task cancellation, panic) detaches the pool connection → PG
-/// auto-releases on connection close. The happy path DEFUSES the
-/// guard (`ScopeGuard::into_inner`) and explicitly unlocks (cheaper
-/// than detach — returns conn to pool).
+/// The lease's lock is a `lock::PgSessionLock`: ANY exit that does
+/// not run commit/release (error, task cancellation, panic) detaches
+/// the lock connection → PG auto-releases on connection close;
+/// release goes THROUGH the held connection, and only a clean unlock
+/// returns it to the pool (bug_213 — defuse-before-await is
+/// inexpressible).
 ///
 /// There is no mark-vs-PutPath lock (I-192) — sweep's per-path
 /// reference re-check is the sole concurrency guard. PutPath runs
@@ -181,34 +184,30 @@ pub async fn run_gc(
     shutdown: &rio_common::signal::Token,
 ) -> Result<Option<GcStats>, Status> {
     // --- Concurrency guard: pg_try_advisory_lock ---
-    // Two TriggerGC calls → two concurrent mark+sweep.
+    // Two TriggerGC calls -> two concurrent mark+sweep.
     // Correctness is OK (FOR UPDATE + rows_affected checks
     // in sweep) but it wastes work, produces misleading
     // stats (GC2 finds everything already swept), and
-    // creates lock contention. One-at-a-time via advisory
-    // lock; second caller gets an immediate "already
+    // creates lock contention. One-at-a-time via the GC cycle lease
+    // (the session advisory lock + the durable gc_collect_state
+    // snapshot); the second caller gets an immediate "already
     // running" response.
     //
-    // Session-level advisory locks are CONNECTION-scoped;
-    // pool.acquire() holds one connection for lock/unlock.
-    // If we let the connection return to the pool between
-    // lock and unlock, the unlock would go to a DIFFERENT
-    // connection → no-op, lock held until connection
-    // recycles (leak). Acquiring explicitly prevents that.
-    let mut lock_conn = pool.acquire().await.map_err(|e| {
-        warn!(error = %e, "GC: pool acquire for advisory lock failed");
-        Status::internal(format!("pool acquire: {e}"))
-    })?;
+    // bug_213: the lease's lock is a PgSessionLock — release goes
+    // THROUGH the held connection and a failed/cancelled release
+    // detaches (closes) it, so PG frees the lock with the session.
+    // The pre-wave defuse-then-await choreography could return the
+    // connection to the shared pool with the lock still held (the
+    // next run_gc then read "already running" until the pool happened
+    // to recycle that connection — bounded by the 60s idle_timeout
+    // only on an IDLE pool; a busy pool can keep a pooled connection
+    // alive indefinitely).
     // r[impl store.gc.serialize-lock]
-    let lock_acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-        .bind(GC_LOCK_ID)
-        .fetch_one(&mut *lock_conn)
-        .await
-        .map_err(|e| {
-            warn!(error = %e, "GC: advisory lock query failed");
-            Status::internal(format!("advisory lock: {e}"))
-        })?;
-    if !lock_acquired {
+    let Some(lease) = state::GcCycleLease::try_acquire(pool).await.map_err(|e| {
+        warn!(error = %e, "GC: cycle lease acquire failed");
+        Status::internal(format!("cycle lease: {e}"))
+    })?
+    else {
         info!("GC: another GC is already running, returning early");
         let _ = progress_tx
             .send(Ok(GcProgress {
@@ -220,26 +219,7 @@ pub async fn run_gc(
             }))
             .await;
         return Ok(None);
-    }
-    // lock_conn held for the whole GC; explicit unlock at the end
-    // via gc_unlock.
-    //
-    // scopeguard detaches on ANY exit not going through gc_unlock —
-    // including task cancellation (client drops the stream → tonic
-    // may abort a spawning task) and panics. detach() removes the
-    // connection from the pool; dropping the detached connection
-    // closes it → PG releases the session-scoped lock.
-    //
-    // Without this, cancel/panic would leave the connection in the
-    // pool with the lock held → next run_gc gets "already running"
-    // until sqlx recycles that pooled connection (possibly hours).
-    //
-    // gc_unlock DEFUSES the scopeguard (ScopeGuard::into_inner)
-    // and explicitly unlocks + returns conn to pool (cheaper
-    // than detach on the happy path).
-    let lock_conn = scopeguard::guard(lock_conn, |c| {
-        let _ = c.detach();
-    });
+    };
 
     // --- Mark phase ---
     // No mark-vs-PutPath lock (I-192). Mark's CTE takes a point-in-time
@@ -253,7 +233,7 @@ pub async fn run_gc(
             Ok(u) => u,
             Err(e) => {
                 warn!(error = %e, "GC: mark phase failed");
-                gc_unlock(lock_conn).await;
+                let _ = lease.release().await;
                 return Err(Status::internal(format!("mark phase: {e}")));
             }
         };
@@ -285,7 +265,7 @@ pub async fn run_gc(
     // Shutdown token threaded through: sweep checks it between
     // batches (not mid-transaction — a partial batch ROLLBACKs
     // cleanly via tx drop). Returns SweepAbort::Shutdown if fired.
-    let mut stats = match sweep::sweep(
+    let sweep_outcome = match sweep::sweep(
         pool,
         chunk_backend.as_ref(),
         unreachable,
@@ -298,15 +278,19 @@ pub async fn run_gc(
         // r[impl store.gc.shutdown-abort]
         Err(sweep::SweepAbort::Shutdown) => {
             info!("GC: sweep aborted by shutdown signal");
-            gc_unlock(lock_conn).await;
+            let _ = lease.release().await;
             return Err(Status::aborted("GC aborted: process shutting down"));
         }
         Err(sweep::SweepAbort::Db(e)) => {
             warn!(error = %e, "GC: sweep phase failed");
-            gc_unlock(lock_conn).await;
+            let _ = lease.release().await;
             return Err(Status::internal(format!("sweep phase: {e}")));
         }
     };
+    let sweep::SweepOutcome {
+        mut stats,
+        swept_paths,
+    } = sweep_outcome;
 
     // --- Phase 3: chunk-collect cycle (the live collect arm) ---
     // Runs while GC_LOCK_ID is still held: the cycle uses its own
@@ -318,16 +302,25 @@ pub async fn run_gc(
     // path GC that just committed — log and continue; the daily
     // backstop (and the next GC run) retries. A parse-failure abort is
     // reported inside the cycle (counter + error log), not as an Err.
+    // The dry-run estimate is computed against SIMULATED post-sweep
+    // state (bug_199): the swept set this run's (rolled-back) sweep
+    // settled feeds the shadow mark exclusion, so the report counts
+    // the would-be-swept manifests' chunks exactly as a live run
+    // would leave them.
     let collect_mode = if params.dry_run {
-        collect::CollectMode::Shadow
+        collect::CollectMode::Shadow {
+            simulated_swept: swept_paths,
+        }
     } else {
         collect::CollectMode::Live
     };
+    let resume_cursor = lease.state.cursor.clone();
     match collect::collect_cycle(
         pool,
         chunk_backend.as_ref(),
         sweep::CHUNK_GRACE_SECS,
         collect_mode,
+        resume_cursor,
     )
     .await
     {
@@ -336,25 +329,54 @@ pub async fn run_gc(
             // stats (chunks deleted / bytes freed / S3 keys enqueued)
             // are sourced from the collect cycle, not the path sweep;
             // a dry run reports the would-collect estimate instead.
-            match collect_mode {
-                collect::CollectMode::Live => {
-                    stats.chunks_deleted = report.victims_collected;
-                    stats.bytes_freed = report.victim_bytes;
-                    stats.s3_keys_enqueued = report.s3_keys_enqueued;
-                }
-                collect::CollectMode::Shadow => {
-                    stats.chunks_deleted = report.would_collect;
-                    stats.bytes_freed = report.would_collect_bytes;
-                    stats.s3_keys_enqueued = if chunk_backend.is_some() {
-                        report.would_collect
+            if params.dry_run {
+                stats.chunks_deleted = report.would_collect;
+                stats.bytes_freed = report.would_collect_bytes;
+                stats.s3_keys_enqueued = if chunk_backend.is_some() {
+                    report.would_collect
+                } else {
+                    0
+                };
+            } else {
+                stats.chunks_deleted = report.victims_collected;
+                stats.bytes_freed = report.victim_bytes;
+                stats.s3_keys_enqueued = report.s3_keys_enqueued;
+            }
+
+            // The cycle's observation/work lands in the durable
+            // gc_collect_state row (migration 090) — cadence, cursor,
+            // and the gauge sources every replica publishes from. A
+            // parse-failure abort is NOT a cycle: no stamp, the lock
+            // is simply released (fail-closed; retention stays
+            // visibly stalled until the manifest is repaired).
+            let lease_result = match report.outcome {
+                collect::CollectOutcome::Ok => {
+                    if params.dry_run {
+                        lease
+                            .commit_cycle(state::CycleCommit::Shadow {
+                                would_collect: report.would_collect as i64,
+                                mark_set_size: report.mark_set_size as i64,
+                            })
+                            .await
                     } else {
-                        0
-                    };
+                        lease
+                            .commit_cycle(state::CycleCommit::Live {
+                                cursor_at_stop: report.cursor_at_stop.clone(),
+                                victims_collected: report.victims_collected,
+                                pass_complete: report.pass_complete,
+                                mark_set_size: report.mark_set_size as i64,
+                            })
+                            .await
+                    }
                 }
+                collect::CollectOutcome::ParseFailure => lease.release().await,
+            };
+            if let Err(e) = lease_result {
+                warn!(error = %e, "GC: collect-state commit/release failed (lock freed via session close)");
             }
             info!(
                 outcome = ?report.outcome,
-                mode = ?collect_mode,
+                dry_run = params.dry_run,
                 mark_set_size = report.mark_set_size,
                 would_collect = report.would_collect,
                 victims_collected = report.victims_collected,
@@ -362,6 +384,7 @@ pub async fn run_gc(
                 s3_keys_enqueued = report.s3_keys_enqueued,
                 batches_run = report.batches_run,
                 cap_reached = report.cap_reached,
+                chunks_reaped = report.chunks_reaped,
                 cursor_at_stop = ?report.cursor_at_stop.as_deref().map(hex::encode),
                 cycle_seconds = report.cycle_seconds,
                 "GC: collect phase 3 complete"
@@ -374,6 +397,9 @@ pub async fn run_gc(
             metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "error")
                 .increment(1);
             warn!(error = %e, "GC: collect phase 3 failed");
+            if let Err(e2) = lease.release().await {
+                warn!(error = %e2, "GC: lease release after failed cycle (lock freed via session close)");
+            }
         }
     }
 
@@ -409,28 +435,7 @@ pub async fn run_gc(
         }))
         .await;
 
-    gc_unlock(lock_conn).await;
     Ok(Some(stats))
-}
-
-/// Defuse the scopeguard, explicitly release [`GC_LOCK_ID`], return
-/// connection to pool. Cheaper than letting the guard fire (detach
-/// closes the conn). Called on every exit path from `run_gc` that
-/// reaches a `return` AFTER the lock was acquired.
-async fn gc_unlock(
-    conn: scopeguard::ScopeGuard<
-        sqlx::pool::PoolConnection<Postgres>,
-        impl FnOnce(sqlx::pool::PoolConnection<Postgres>),
-    >,
-) {
-    let mut conn = scopeguard::ScopeGuard::into_inner(conn);
-    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(GC_LOCK_ID)
-        .execute(&mut *conn)
-        .await
-    {
-        warn!(error = %e, "GC: advisory unlock failed");
-    }
 }
 
 /// Enqueue S3 keys for soft-deleted chunks to `pending_s3_deletes` in
@@ -848,7 +853,8 @@ mod tests {
             &rio_common::signal::Token::new(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .stats;
         assert_eq!(stats.paths_deleted, 0, "no referenced path may be swept");
         assert_eq!(
             stats.paths_resurrected, N as u64,

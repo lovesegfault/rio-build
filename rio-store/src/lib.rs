@@ -419,6 +419,16 @@ pub fn describe_metrics() {
          descriptor is fixed."
     );
     describe_counter!(
+        "rio_store_gc_chunks_reaped_total",
+        "Tombstone chunk rows hard-DELETEd by the post-pass reap (091, \
+         merged_bug_336): soft-deleted at least the grace term ago AND \
+         fully drained (no pending_s3_deletes row). Runs only after a \
+         COMPLETE collect pass; the resurrect upsert NULLs deleted_at so \
+         a re-referenced chunk is never reap-eligible. Sustained zero \
+         with a growing deleted-row count means the drain is stuck \
+         (check rio_store_s3_deletes_stuck)."
+    );
+    describe_counter!(
         "rio_store_substitute_integrity_failures_total",
         "Upstream substitution NAR hash or size mismatches, labeled by \
          tenant (UUID). Nonzero is a security-relevant signal: upstream \

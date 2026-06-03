@@ -251,9 +251,11 @@ impl SchedulerDb {
     /// live interested build, always survive. Returns released-row
     /// count.
     ///
-    /// Phase A wires no production caller (the consumption-site and
-    /// build-terminal-site release wiring is Phase B); the function and
-    /// its battery pin the rule.
+    /// Production callers (the Phase-A "no caller" note is history):
+    /// the housekeeping release sweep (actor/materialize.rs), the
+    /// build-terminal release (actor/build.rs via
+    /// release_materialization_pins_best_effort), and the recovery
+    /// sweep (actor/recovery.rs). The battery pins the rule.
     // r[impl sched.materialize.pinning]
     pub async fn release_materialization_pins_for_resolved_jobs(&self) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(

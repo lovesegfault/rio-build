@@ -30,7 +30,7 @@ use uuid::Uuid;
 /// attempts return miss until this scanner reclaims it.
 /// [`Substituter::ingest`](crate::substitute::Substituter) does its
 /// own 5-minute reclaim on the hot path (see
-/// `r[store.substitute.stale-reclaim+2]`); this sweep is the safety
+/// `r[store.substitute.stale-reclaim+3]`); this sweep is the safety
 /// net for placeholders nobody re-requests.
 ///
 /// Safe against reaping live uploads: uploaders heartbeat
@@ -411,7 +411,7 @@ mod tests {
         (chunk_hash, claim)
     }
 
-    // r[verify store.substitute.stale-reclaim+2]
+    // r[verify store.substitute.stale-reclaim+3]
     /// `reap_one` on a CHUNKED placeholder is a pure path-row janitor:
     /// the placeholder rows go (narinfo CASCADE → manifests /
     /// manifest_data) and the chunk rows are left exactly as they

@@ -195,6 +195,7 @@ pub(crate) async fn upgrade_manifest_to_chunked(
                AS t(hash, size)
         ON CONFLICT (blake3_hash) DO UPDATE
             SET deleted = false,
+                deleted_at = NULL,
                 last_referenced_at = now()
         RETURNING blake3_hash, (uploaded_at IS NULL) AS needs_upload
         "#,

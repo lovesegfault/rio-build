@@ -229,7 +229,11 @@ validate the collector against real data, not against a fleet shape).
   #(refs.metric)("rio_store_gc_collect_backlog_chunks"),
   #(refs.metric)("rio_store_gc_collect_cycles_capped_total"),
   #(refs.metric)("rio_store_gc_chunks_collected_total"), and per-cycle
-  durations after the live cutover. Pass: the backlog gauge trends to
+  durations after the live cutover. The three collect gauges are
+  CLUSTER-CONVERGED since migration 090: every replica publishes the
+  durable `gc_collect_state` value within one 60 s period --- aggregate
+  with `max()` across pods, never `sum()` (which now inflates by the
+  replica count). Pass: the backlog gauge trends to
   zero over `ceil(backlog / cap)` cycles, the capped-cycles counter
   goes quiet once the drain completes, durations stay within budget.
   Lever: trigger additional GC runs to accelerate the drain;

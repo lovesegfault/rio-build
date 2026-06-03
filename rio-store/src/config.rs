@@ -158,8 +158,11 @@ pub struct Config {
     /// download-stalled (frozen `last_progress_at`); persist-phase and
     /// PutPath claims are never stall-reclaimed. Default 180 s = 6
     /// missed-progress heartbeats — S3 multipart pauses and admission
-    /// queueing inside a download don't trip it. Env:
-    /// `RIO_SUBSTITUTE_STALL_SECS`.
+    /// queueing inside a download don't trip it. Floor: must be >= 2x
+    /// the 30s placeholder heartbeat (>= 60s) — a window below the
+    /// heartbeat granularity would depose every healthy owner between
+    /// two of its own progress writes (merged_bug_082); 0 would brick
+    /// substitution outright. Env: `RIO_SUBSTITUTE_STALL_SECS`.
     #[serde(rename = "substitute_stall_secs", with = "rio_common::config::secs")]
     #[schemars(with = "u64")]
     pub substitute_stall: std::time::Duration,
@@ -439,6 +442,19 @@ impl rio_common::config::ValidateConfig for Config {
         anyhow::ensure!(
             !self.log_cut_interval.is_zero(),
             "log_cut_interval_secs must be >= 1; set RIO_LOG_CUT_INTERVAL_SECS"
+        );
+        // merged_bug_082: a stall window of 0 disables matching
+        // entirely (bricked substitution: every owner instantly
+        // strikeable / no takeover ever matches NULL comparisons), and
+        // one below 2x the heartbeat granularity deposes healthy
+        // owners between two of their own progress writes. Same 2x
+        // staleness-bound convention as log_cut_interval.
+        anyhow::ensure!(
+            !self.substitute_stall.is_zero()
+                && self.substitute_stall >= 2 * crate::ingest::PLACEHOLDER_HEARTBEAT_INTERVAL,
+            "substitute_stall_secs must be >= {} (2x the placeholder heartbeat); \
+             set RIO_SUBSTITUTE_STALL_SECS",
+            2 * crate::ingest::PLACEHOLDER_HEARTBEAT_INTERVAL.as_secs()
         );
         // 0 → every stream hits the chunk cap at its FIRST cut and
         // aborts: build logs silently stop being stored.
@@ -764,6 +780,53 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("log_cut_interval_secs"), "got: {err}");
+    }
+
+    /// merged_bug_082: a stall window of 0 bricks substitution and one
+    /// below 2x the 30s heartbeat deposes healthy owners between two of
+    /// their own progress writes. Floor: 60s; the boundary value is
+    /// accepted.
+    #[test]
+    fn validate_rejects_zero_substitute_stall() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            substitute_stall: std::time::Duration::ZERO,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("substitute_stall_secs"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_sub_heartbeat_substitute_stall_29s() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            substitute_stall: std::time::Duration::from_secs(29),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("substitute_stall_secs"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_sub_floor_substitute_stall_59s() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            substitute_stall: std::time::Duration::from_secs(59),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("substitute_stall_secs"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_substitute_stall_at_the_60s_floor() {
+        let cfg = Config {
+            database_url: "postgres://x".into(),
+            substitute_stall: std::time::Duration::from_secs(60),
+            ..Default::default()
+        };
+        cfg.validate().expect("60s = 2x heartbeat is the floor");
     }
 
     /// `RIO_LOG_MAX_CHUNKS_PER_EXEC=0` would make every stream abort at

@@ -509,8 +509,8 @@ let
   # tc-netem wedge on a live transfer: rate-throttle so the fetch is
   # reliably mid-flight, then loss-100% so the connection survives but
   # fetched_bytes freezes — the stuck≠slow case the per-read stall clock
-  # exists for. The owner aborts at the 15 s fixture window
-  # (default.nix injects substitute_stall_secs = 15), releases the claim
+  # exists for. The owner aborts at the 60 s fixture window
+  # (default.nix injects substitute_stall_secs = 60), releases the claim
   # IN PLACE (strike recorded), and the post-heal re-claim completes the
   # path with the strike preserved.
   #
@@ -603,12 +603,12 @@ let
         # (per-read clock restarted on every read).
         client.succeed("tc qdisc replace dev eth1 root netem loss 100%")
 
-        # Owner-side abort at the 15 s window (+ slack for the in-flight
+        # Owner-side abort at the 60 s window (+ slack for the in-flight
         # read to drain): journal warn pair → metric → row state.
         ${gatewayHost}.wait_until_succeeds(
             "journalctl -u rio-store --no-pager | "
             "grep -q 'claim released in place'",
-            timeout=60,
+            timeout=120,
         )
         ${gatewayHost}.succeed(
             "journalctl -u rio-store --no-pager | "
@@ -695,7 +695,7 @@ let
         )
         print(
             f"substitute-stall-abort PASS: wedged at "
-            f"{fetched}/{stall_nar_size} bytes, owner abort at the 15 s "
+            f"{fetched}/{stall_nar_size} bytes, owner abort at the 60 s "
             "window, released in place (strike=1), post-heal re-claim "
             "completed with the strike preserved"
         )
@@ -708,8 +708,8 @@ pkgs.testers.runNixOSTest {
   # ~60s boot + cache setup ~10s + grpcurl round-trips + ssh-ng build
   # for substitute-progress-e2e (~40s) + the scheduler-owned direct
   # submission (~30s: local build + publish + submit + mechanism wait +
-  # NAR round-trip copies) + the stall-abort subtest (60-90s typical:
-  # ~35s heartbeat wait + 15s stall window + assertions + the
+  # NAR round-trip copies) + the stall-abort subtest (105-150s typical:
+  # ~35s heartbeat wait + 60s stall window + assertions + the
   # unthrottled ~96MiB re-fetch, tail-budgeted up to its own
   # -max-time 180 re-claim). No worker builds, no k3s.
   globalTimeout = 900 + common.covTimeoutHeadroom;

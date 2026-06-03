@@ -144,19 +144,25 @@ pub(crate) async fn heartbeat_uploading_with_progress(
     store_path_hash: &[u8],
     claim: uuid::Uuid,
     fetched_bytes: u64,
+    claim_phase: &'static str,
 ) {
     // i64 cast: NAR sizes are capped at MAX_NAR_SIZE (4 GiB) ≪ i64::MAX.
     let fetched = i64::try_from(fetched_bytes).unwrap_or(i64::MAX);
+    // claim_phase (092, merged_bug_003): the owner\'s phase rides the
+    // SAME claim-guarded UPDATE — still one statement per heartbeat;
+    // durability lag ≤ one heartbeat ≪ the validated stall floor.
     let _ = sqlx::query(
         "UPDATE manifests SET updated_at = now(), \
              last_progress_at = CASE WHEN fetched_bytes IS DISTINCT FROM $3 \
                                      THEN now() ELSE last_progress_at END, \
-             fetched_bytes = $3 \
+             fetched_bytes = $3, \
+             claim_phase = $4 \
          WHERE store_path_hash = $1 AND status = 'uploading' AND claim_id = $2",
     )
     .bind(store_path_hash)
     .bind(claim)
     .bind(fetched)
+    .bind(claim_phase)
     .execute(pool)
     .await;
 }

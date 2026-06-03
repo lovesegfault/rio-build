@@ -274,7 +274,7 @@ fail-closed mark fold and grace term (#rref("store.gc.chunk-collect"),
 (#rref("store.gc.pending-deletes")). It survived the counter's replacement
 by manifest-derived collection unchanged.
 
-#r("store.gc.bounded-garbage-retention+2")[
+#r("store.gc.bounded-garbage-retention+3")[
   No dead chunk is retained forever: an existing chunk row referenced by no
   existing manifest, and staying unreferenced, MUST eventually be
   soft-deleted and have its backend object deleted --- or have its
@@ -284,11 +284,19 @@ by manifest-derived collection unchanged.
   (#rref("store.gc.chunk-collect"); one cycle in the steady state where the
   eligible backlog fits under the per-cycle cap), plus the grace window, plus
   drain lag, with the worst-case interval between cycles bounded by the daily
-  collect backstop. Carve-out: while any existing manifest's `chunk_list`
-  fails validation, chunk collection is suspended fail-closed and every
-  otherwise-eligible chunk MAY outlive this bound; the suspension MUST be
-  alerted (the parse-failure abort), and the bound resumes within one cycle
-  of the offending manifest being repaired, deleted, or quarantined.
+  collect backstop. The bound covers the ROW too: the chunk-row lifecycle is
+  insert → live → soft-deleted (`deleted_at` stamped, migration 091) →
+  drained (no `pending_s3_deletes` row) → reaped --- a soft-deleted, fully
+  drained row whose `deleted_at` is at least the grace term old MUST be
+  hard-DELETEd by the post-pass reap of a complete collect cycle (capped per
+  cycle like the collect loop; stopping early only retains tombstone rows
+  longer). The resurrect upsert clears `deleted_at` with `deleted`, so a
+  re-referenced chunk is never reap-eligible. Carve-out: while any existing
+  manifest's `chunk_list` fails validation, chunk collection is suspended
+  fail-closed and every otherwise-eligible chunk MAY outlive this bound; the
+  suspension MUST be alerted (the parse-failure abort), and the bound
+  resumes within one cycle of the offending manifest being repaired,
+  deleted, or quarantined.
 ]
 
 The bound was previously one full pass of the applicable legacy reclamation
@@ -1043,9 +1051,12 @@ freezes (#rref("store.substitute.stale-reclaim")).
 The owner-side abort is what makes stall recovery reach the singleflight
 leader: every same-replica caller coalesces behind the owner, so no competing
 `claim_placeholder` would ever observe the stall from outside. Waiting on the
-local NAR-bytes budget is exempt --- backpressure is not an upstream stall.
+local NAR-bytes budget is exempt as durable data --- the owner stamps
+`claim_phase = 'budget_parked'` before blocking on the budget (and
+`'persisting'` before the persist), and the takeover predicate strikes only
+`'downloading'` claims: backpressure is not an upstream stall.
 
-#r("store.substitute.stale-reclaim+2")[
+#r("store.substitute.stale-reclaim+3")[
   When a claim attempt finds an existing `'uploading'` placeholder for the
   requested path, `claim_placeholder` MUST apply three takeover arms in
   precedence order. (1) A **released-in-place** row (`claim_id` IS NULL ---
@@ -1057,14 +1068,25 @@ local NAR-bytes budget is exempt --- backpressure is not an upstream stall.
   never accrues strikes; this arm precedes the stall arm so a dead owner is
   reaped, not striked, when both predicates hold. (3) **Download-stalled**
   (substitution claimants only, which carry the verified narinfo's `NarSize`):
-  a live claim with `fetched_bytes IS NOT NULL` ∧ `fetched_bytes < nar_size` ∧
-  `last_progress_at` older than the stall window is taken over **in place**
-  (new `claim_id`/`claimed_by`, progress reset, `stall_count += 1`) so stall
-  evidence survives ownership changes. Claims with `fetched_bytes == nar_size`
-  (download complete, persist phase) and PutPath claims (`fetched_bytes` NULL,
-  #rref("store.substitute.progress-heartbeat")) are NEVER stall-reclaimable ---
-  they stay under the heartbeat-death rule alone. A placeholder matching no arm
-  indicates a live, advancing uploader and returns a miss. The
+  the takeover predicate is two-clock and PHASE-KEYED over durable data
+  (migration 092) --- `claim_phase = 'downloading'` ∧
+  `fetched_bytes IS NOT NULL` ∧ `fetched_bytes < nar_size` ∧
+  `last_progress_at` older than the stall window ∧ `updated_at` WITHIN the
+  stall window (the owner is alive; a dead owner falls to arm 2 and is
+  reaped, not striked). A matching claim is taken over **in place** (new
+  `claim_id`/`claimed_by`, `claim_phase = 'downloading'`, progress reset,
+  `stall_count += 1`) so stall evidence survives ownership changes. Owners
+  parked on the local NAR-byte budget (`claim_phase = 'budget_parked'`) and
+  persisting owners (`claim_phase = 'persisting'`) are exempt AS DATA ---
+  never by a size-equality inference, which held only when the competitor's
+  expected `NarSize` equalled the owner's. PutPath claims (`fetched_bytes`
+  and `claim_phase` NULL, #rref("store.substitute.progress-heartbeat")) are
+  NEVER stall-reclaimable --- they stay under the heartbeat-death rule
+  alone. The owner's heartbeat carries the phase in the same claim-guarded
+  UPDATE as the progress counter, so phase durability lags at most one
+  heartbeat (30 s, with the validated stall floor at ≥ 2× that). A
+  placeholder matching no arm indicates a live, advancing (or parked, or
+  persisting) uploader and returns a miss. The
   #(refs.metric)("rio_store_substitute_stale_reclaimed_total") counter tracks
   reclaim events, labeled by reason
   (`heartbeat` | `stall_abort` | `stall_reclaim`).
@@ -1247,18 +1269,43 @@ safety-net scan. No full S3 enumeration needed.
   ID).
 ]
 
-#r("store.gc.dry-run+2")[
+#r("store.gc.dry-run+3")[
   `GcRequest.dry_run=true` runs mark + sweep with full stats computation but
   the per-batch transaction's narinfo DELETEs are
   `ROLLBACK TO SAVEPOINT`ed (and the chunk-collect phase stays in its
   report-only shadow arm); the temp-table
   `closure_remove_from_unreachable` mutations COMMIT (so batch N+1 sees Y's
   resurrection of Z and dry-run stats match what a real run would do). The
-  operator sees "would delete N paths, free M bytes" without touching narinfo,
-  chunk rows, or `pending_s3_deletes`. The final progress message's
-  `current_path` reads `"dry-run: no paths actually deleted"`.
+  shadow chunk estimate is computed against SIMULATED post-sweep state: the
+  sweep's settled swept set is excluded from the shadow mark expansion AND
+  its fail-closed validation (`CollectMode::Shadow{simulated_swept}`), so
+  the would-be-swept manifests' now-unreferenced chunks count as collectible
+  exactly as a real run would leave them, and a corrupt manifest the sweep
+  removes cannot abort a dry run it would not abort live. The operator sees
+  "would delete N paths, free M bytes" without touching narinfo, chunk rows,
+  or `pending_s3_deletes`. The final progress message's `current_path` reads
+  `"dry-run: no paths actually deleted"`.
   #(refs.metric)("rio_store_gc_path_swept_total") is NOT incremented on
   dry-run.
+]
+
+#r("store.gc.collect-cadence")[
+  The collect cycle's cadence, resume cursor, and gauge sources are CLUSTER
+  state, durable in the `gc_collect_state` singleton row (migration 090),
+  never process state. The backstop MUST run a live cycle only when
+  `now() - last_live_cycle_at` is at least the backstop interval, evaluated
+  on the database clock against the durable stamp (double-checked under the
+  GC advisory lock); per-replica timers are cheap CHECK ticks --- N replicas
+  MUST NOT yield more than one live backstop cycle per interval. A live
+  cycle commits its stamp, stop cursor, and decremented backlog estimate in
+  one update through the lock's session; a dry-run (shadow) cycle commits
+  its observation WITHOUT the live stamp. Every replica publishes
+  #(refs.metric)("rio_store_gc_collect_backlog_chunks"),
+  #(refs.metric)("rio_store_gc_chunks_live"), and
+  #(refs.metric)("rio_store_gc_chunks_would_collect") from a periodic read
+  of the row (NULL fields leave the pre-registered zero standing): the
+  gauges are a replicated cluster fact --- aggregate with `max()`, never
+  `sum()`.
 ]
 
 #r("store.gc.shutdown-abort")[

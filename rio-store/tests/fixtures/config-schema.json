@@ -147,7 +147,7 @@
         "default": null
       },
       "substitute_stall_secs": {
-        "description": "Owner-side download-stall window for upstream substitution: a\nNAR download with no body bytes for this long is aborted by its\nown owner — the placeholder claim is released in place (claim\ncleared, durable `stall_count` incremented) so the next attempt\nre-claims immediately. Also the threshold competing replicas\napply when deciding whether a live mid-download claim is\ndownload-stalled (frozen `last_progress_at`); persist-phase and\nPutPath claims are never stall-reclaimed. Default 180 s = 6\nmissed-progress heartbeats — S3 multipart pauses and admission\nqueueing inside a download don't trip it. Env:\n`RIO_SUBSTITUTE_STALL_SECS`.",
+        "description": "Owner-side download-stall window for upstream substitution: a\nNAR download with no body bytes for this long is aborted by its\nown owner — the placeholder claim is released in place (claim\ncleared, durable `stall_count` incremented) so the next attempt\nre-claims immediately. Also the threshold competing replicas\napply when deciding whether a live mid-download claim is\ndownload-stalled (frozen `last_progress_at`); persist-phase and\nPutPath claims are never stall-reclaimed. Default 180 s = 6\nmissed-progress heartbeats — S3 multipart pauses and admission\nqueueing inside a download don't trip it. Floor: must be >= 2x\nthe 30s placeholder heartbeat (>= 60s) — a window below the\nheartbeat granularity would depose every healthy owner between\ntwo of its own progress writes (merged_bug_082); 0 would brick\nsubstitution outright. Env: `RIO_SUBSTITUTE_STALL_SECS`.",
         "type": "integer",
         "format": "uint64",
         "minimum": 0,

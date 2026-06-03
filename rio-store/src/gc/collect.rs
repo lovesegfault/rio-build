@@ -34,13 +34,13 @@
 //!
 //! The live arm collects at most [`COLLECT_CYCLE_VICTIM_CAP`] victims
 //! per cycle and carries a process-local keyset cursor across cycles
-//! ([`CollectCursor`]) so a backlog drains across cycles instead of
+//! (durable in `gc_collect_state.cursor`, migration 090) so a backlog drains across cycles instead of
 //! stretching one cycle past the GC-lock-held budget. A cycle that
 //! stops at the cap leaves the remainder for the next cycle (the next
 //! GC run's phase 3 or the daily backstop); stopping early only
 //! retains garbage longer, never collects more.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
@@ -63,7 +63,7 @@ use crate::backend::ChunkBackend;
 /// measurements and adjudications", T-1a.1b / T-1a.1c).
 ///
 /// A cycle that stops at the cap leaves the remainder for the next
-/// cycle (run_gc phase 3 or the daily backstop) via [`CollectCursor`];
+/// cycle (run_gc phase 3 or the backstop) via the durable cursor;
 /// stopping early only retains garbage longer, never collects more.
 /// Not a config field (rollback is by release); changing it is a
 /// one-line, measurement-justified edit.
@@ -104,6 +104,30 @@ pub(crate) const COLLECT_BACKSTOP_INTERVAL: Duration = Duration::from_secs(24 * 
 /// tick-after-one-interval half completes quickly.
 #[cfg(test)]
 pub(crate) const COLLECT_BACKSTOP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Cadence of the backstop CHECK tick (bug_174): each replica wakes
+/// hourly and asks the DURABLE row whether a live cycle is due
+/// (`now() - last_live_cycle_at >= COLLECT_BACKSTOP_INTERVAL` on the
+/// DB clock). COLLECT_BACKSTOP_INTERVAL is the cluster-wide cadence
+/// bound; this is merely how often any replica looks — N replicas
+/// checking hourly still yield at most one live backstop cycle per
+/// interval, because the decision lives in `gc_collect_state`, not in
+/// process timers.
+#[cfg(not(test))]
+pub(crate) const COLLECT_BACKSTOP_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Test override (mirrors COLLECT_BACKSTOP_INTERVAL's rationale).
+#[cfg(test)]
+pub(crate) const COLLECT_BACKSTOP_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Per-cycle cap on reaped (hard-deleted) tombstone rows
+/// (merged_bug_336): same retention-erring shape as
+/// [`COLLECT_CYCLE_VICTIM_CAP`] — stopping early only keeps tombstone
+/// rows longer, never deletes more.
+#[cfg(not(test))]
+pub(crate) const REAP_CYCLE_CAP: u64 = 500_000;
+/// Test override: two test-sized batches.
+#[cfg(test)]
+pub(crate) const REAP_CYCLE_CAP: u64 = 50;
 
 /// `work_mem` for the mark expansion's set-based dedup (and
 /// `maintenance_work_mem` for the one-time index build on the mark
@@ -161,10 +185,10 @@ pub(crate) fn mark_validation_sql() -> String {
         "SELECT COUNT(*) \
            FROM manifest_data md \
            JOIN manifests m USING (store_path_hash) \
-          WHERE octet_length(md.chunk_list) < 1 \
+          WHERE (octet_length(md.chunk_list) < 1 \
              OR substring(md.chunk_list FROM 1 FOR 1) <> '\\x01'::bytea \
              OR (octet_length(md.chunk_list) - 1) % 36 <> 0 \
-             OR (octet_length(md.chunk_list) - 1) / 36 > {}",
+             OR (octet_length(md.chunk_list) - 1) / 36 > {})",
         crate::manifest::MAX_CHUNKS
     )
 }
@@ -237,18 +261,56 @@ pub(crate) const COLLECT_BATCH_SELECT_SQL: &str = "SELECT c.blake3_hash FROM chu
 /// Shared with `gc::mark_scan_bench` (gate (c) measurement runs and
 /// the structural predicate pin exercise this exact statement).
 // r[impl store.chunk.lock-order+2]
-pub(crate) const COLLECT_BATCH_UPDATE_SQL: &str = "UPDATE chunks SET deleted = TRUE, uploaded_at = NULL \
+pub(crate) const COLLECT_BATCH_UPDATE_SQL: &str = "UPDATE chunks SET deleted = TRUE, uploaded_at = NULL, deleted_at = now() \
      WHERE blake3_hash = ANY($1) AND deleted = FALSE \
        AND GREATEST(created_at, last_referenced_at) < $2::timestamptz \
      RETURNING blake3_hash, size";
 
+/// The simulated-sweep exclusion (bug_199), spliced into the shadow
+/// arm\'s validation (`AND`-form — the validation has a WHERE) and
+/// expansion (`WHERE`-form — the shared expansion constant is a pure
+/// join). The shared constants stay bare: the bench\'s EXPLAIN
+/// plan-shape guard exercises the LIVE statements.
+const SHADOW_SWEPT_EXCLUSION_AND: &str = "AND NOT EXISTS \
+    (SELECT 1 FROM shadow_swept ss WHERE ss.store_path_hash = m.store_path_hash)";
+/// `WHERE`-prefixed twin of [`SHADOW_SWEPT_EXCLUSION_AND`].
+const SHADOW_SWEPT_EXCLUSION_WHERE: &str = "WHERE NOT EXISTS \
+    (SELECT 1 FROM shadow_swept ss WHERE ss.store_path_hash = m.store_path_hash)";
+
+/// The post-pass tombstone reap (merged_bug_336): hard-delete chunk
+/// rows that are (a) soft-deleted at least the grace term ago —
+/// `deleted_at`, stamped by [`COLLECT_BATCH_UPDATE_SQL`], NULLed by
+/// the resurrect upsert — and (b) fully drained (no pending outbox
+/// row; the conjunct keeps the drain\'s resurrect-skip exact). Runs
+/// only after a COMPLETE pass (nothing eligible to collect remained),
+/// batched and capped like the collect loop. `$1` = grace seconds,
+/// `$2` = batch limit.
+const REAP_BATCH_DELETE_SQL: &str = "DELETE FROM chunks WHERE blake3_hash IN ( \
+       SELECT c.blake3_hash FROM chunks c \
+        WHERE c.deleted AND c.deleted_at < now() - make_interval(secs => $1) \
+          AND NOT EXISTS (SELECT 1 FROM pending_s3_deletes p \
+                           WHERE p.blake3_hash = c.blake3_hash) \
+        ORDER BY c.blake3_hash LIMIT $2)";
+
 /// Which arm of the collector runs (P6: code-staged, no config field).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The shadow arm CARRIES its sweep composition (bug_199): a dry-run
+/// GC sweeps nothing, so the chunk estimate must be computed against
+/// SIMULATED post-sweep state — the would-be-swept manifests are
+/// excluded from the mark (their now-unreferenced chunks then count
+/// as collectible, exactly as a live run would leave them). The
+/// payload makes every shadow caller state that composition; an
+/// estimate that structurally excludes the swept paths\' chunks is no
+/// longer writable.
+#[derive(Debug, Clone)]
 pub(crate) enum CollectMode {
     /// Mark + report only. No row anywhere is modified. Used by
     /// dry-run GC runs (and available for diagnostics); also the only
-    /// arm the pre-cutover release shipped.
-    Shadow,
+    /// arm the pre-cutover release shipped. `simulated_swept` = the
+    /// store_path_hashes the paired (dry-run) sweep WOULD have deleted
+    /// ([`super::sweep::SweepOutcome::swept_paths`]); empty for a
+    /// standalone observation cycle.
+    Shadow { simulated_swept: Vec<Vec<u8>> },
     /// Mark + report + the capped soft-delete/enqueue loop — the
     /// production arm from the cutover release on.
     Live,
@@ -296,89 +358,15 @@ pub(crate) struct CollectReport {
     /// Keyset cursor at the stop point (None when the pass completed
     /// or in shadow mode).
     pub(crate) cursor_at_stop: Option<Vec<u8>>,
+    /// True when the live arm exhausted the eligible set at this
+    /// cycle\'s snapshot (the durable backlog re-anchors at 0 and the
+    /// tombstone reap runs). Always false in shadow mode.
+    pub(crate) pass_complete: bool,
+    /// Tombstone rows hard-deleted by the post-pass reap
+    /// (merged_bug_336). Nonzero only when `pass_complete`.
+    pub(crate) chunks_reaped: u64,
     /// Wall-clock of the cycle (snapshot through report/collect).
     pub(crate) cycle_seconds: f64,
-}
-
-/// Process-local keyset cursor carried across capped collect cycles
-/// (the collector's only long-lived state). Reset when a pass
-/// completes; never persisted — losing it on restart costs at most a
-/// cheap re-scan of already-collected keyspace (the candidate scan's
-/// `deleted = FALSE` conjunct skips collected rows) and never stalls
-/// the drain.
-pub struct CollectCursor(Mutex<Option<Vec<u8>>>);
-
-impl CollectCursor {
-    /// A cursor at the start of the keyspace.
-    pub const fn new() -> Self {
-        Self(Mutex::new(None))
-    }
-
-    /// Cursor to resume the next cycle's candidate scan from (`None` ⇒
-    /// start of keyspace).
-    pub fn get(&self) -> Option<Vec<u8>> {
-        self.0.lock().expect("collect cursor poisoned").clone()
-    }
-
-    /// Persist the stop point of a capped cycle.
-    pub fn store(&self, cursor: Vec<u8>) {
-        *self.0.lock().expect("collect cursor poisoned") = Some(cursor);
-    }
-
-    /// A pass completed: the next cycle starts from the beginning.
-    pub fn reset(&self) {
-        *self.0.lock().expect("collect cursor poisoned") = None;
-    }
-}
-
-impl Default for CollectCursor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// The process-global collector cursor (see [`CollectCursor`]). The
-/// shadow arm never touches it; the live arm resumes capped cycles
-/// from it and resets it when a pass completes.
-pub static COLLECT_CURSOR: CollectCursor = CollectCursor::new();
-
-/// Process-local backlog estimate behind the
-/// `rio_store_gc_collect_backlog_chunks` gauge (P15: a decremental
-/// estimate for drain visibility, not accounting). A shadow cycle
-/// anchors it at that cycle's would-collect count; each live cycle
-/// subtracts its own collected count; a completed pass re-anchors it
-/// at zero. While unanchored (`None` — e.g. a fresh pod mid-pass) live
-/// cycles leave the gauge alone rather than publish an invented
-/// number; the next pass completion (or dry-run/shadow cycle)
-/// re-anchors it. Never persisted; restarts only delay the estimate,
-/// never the drain.
-static COLLECT_BACKLOG_ESTIMATE: Mutex<Option<u64>> = Mutex::new(None);
-
-/// Anchor the backlog estimate (shadow cycle's would-collect) and
-/// publish the gauge.
-fn backlog_anchor(value: u64) {
-    *COLLECT_BACKLOG_ESTIMATE
-        .lock()
-        .expect("backlog estimate poisoned") = Some(value);
-    metrics::gauge!("rio_store_gc_collect_backlog_chunks").set(value as f64);
-}
-
-/// Subtract a live cycle's collected count from the backlog estimate
-/// (saturating) and publish the gauge if an anchor exists.
-fn backlog_consume(collected: u64) {
-    let mut guard = COLLECT_BACKLOG_ESTIMATE
-        .lock()
-        .expect("backlog estimate poisoned");
-    if let Some(estimate) = guard.as_mut() {
-        *estimate = estimate.saturating_sub(collected);
-        metrics::gauge!("rio_store_gc_collect_backlog_chunks").set(*estimate as f64);
-    }
-}
-
-/// A pass completed: nothing eligible remains at this cycle's
-/// snapshot, so the estimate re-anchors at zero.
-fn backlog_pass_complete() {
-    backlog_anchor(0);
 }
 
 /// Test-only failure injection for the per-batch isolation tests: when
@@ -430,7 +418,7 @@ pub(crate) static COLLECT_FAIL_AFTER_BATCHES: std::sync::atomic::AtomicU64 =
 /// outbox enqueue, all in the same transaction. The loop stops when a
 /// short candidate scan ends the pass (cursor reset) or when
 /// [`COLLECT_CYCLE_VICTIM_CAP`] victims have been collected (cursor
-/// persisted in [`COLLECT_CURSOR`]; the next cycle resumes there).
+/// reported in `cursor_at_stop` and persisted by the caller's CycleCommit; the next cycle resumes there).
 ///
 /// The cycle-duration histogram records completed cycles only; an
 /// aborted (parse-failure) cycle is counted by its own counter and the
@@ -442,8 +430,14 @@ pub(crate) async fn collect_cycle(
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
     grace_secs: i64,
     mode: CollectMode,
+    resume_cursor: Option<Vec<u8>>,
 ) -> Result<CollectReport, sqlx::Error> {
     let cycle_started = Instant::now();
+    // The shadow arm\'s simulated-sweep exclusion set (None = live).
+    let simulated_swept: Option<&[Vec<u8>]> = match &mode {
+        CollectMode::Shadow { simulated_swept } => Some(simulated_swept.as_slice()),
+        CollectMode::Live => None,
+    };
     let mut conn = pool.acquire().await?;
 
     // One read phase = one transaction = one MVCC snapshot (see the
@@ -480,6 +474,26 @@ pub(crate) async fn collect_cycle(
         .execute(&mut *tx)
         .await?;
 
+    // --- Shadow arm: materialize the simulated-sweep exclusion set
+    // (bug_199) --- ON COMMIT DROP: the table exists exactly as long
+    // as the read transaction (the only statements that reference it).
+    if let Some(swept) = simulated_swept {
+        sqlx::query(
+            "CREATE TEMP TABLE shadow_swept (store_path_hash BYTEA PRIMARY KEY) ON COMMIT DROP",
+        )
+        .execute(&mut *tx)
+        .await?;
+        if !swept.is_empty() {
+            sqlx::query(
+                "INSERT INTO shadow_swept \
+                 SELECT * FROM UNNEST($1::bytea[]) ON CONFLICT DO NOTHING",
+            )
+            .bind(swept)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
     // --- Snapshot ---
     // The eligibility cutoff is anchored at the cycle snapshot on the
     // DB clock (the predicate compares against DB-written timestamps),
@@ -492,7 +506,14 @@ pub(crate) async fn collect_cycle(
         .await?;
 
     // --- Mark (i): fail-closed validation pass ---
-    let malformed: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(mark_validation_sql()))
+    // Shadow: a corrupt manifest the simulated sweep removes must not
+    // abort a dry run it would not abort live — the exclusion applies
+    // to the validation exactly as it applies to the expansion.
+    let validation_sql = match simulated_swept {
+        Some(_) => format!("{} {}", mark_validation_sql(), SHADOW_SWEPT_EXCLUSION_AND),
+        None => mark_validation_sql(),
+    };
+    let malformed: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(validation_sql))
         .fetch_one(&mut *tx)
         .await?;
     if malformed > 0 {
@@ -525,6 +546,8 @@ pub(crate) async fn collect_cycle(
             batches_run: 0,
             cap_reached: false,
             cursor_at_stop: None,
+            pass_complete: false,
+            chunks_reaped: 0,
             cycle_seconds: cycle_started.elapsed().as_secs_f64(),
         });
     }
@@ -543,11 +566,15 @@ pub(crate) async fn collect_cycle(
     let expansion_body = MARK_EXPANSION_SQL
         .strip_prefix("CREATE TEMP TABLE live_chunks AS ")
         .expect("MARK_EXPANSION_SQL starts with the live_chunks CTAS prefix");
-    let expansion = match mode {
-        CollectMode::Shadow => {
-            format!("CREATE TEMP TABLE live_chunks ON COMMIT DROP AS {expansion_body}")
+    let expansion = match simulated_swept {
+        Some(_) => {
+            // The exclusion has no existing WHERE to extend (the
+            // shared constant is a pure join) — append one.
+            format!(
+                "CREATE TEMP TABLE live_chunks ON COMMIT DROP AS {expansion_body} {SHADOW_SWEPT_EXCLUSION_WHERE}"
+            )
         }
-        CollectMode::Live => format!("CREATE TEMP TABLE live_chunks AS {expansion_body}"),
+        None => format!("CREATE TEMP TABLE live_chunks AS {expansion_body}"),
     };
     sqlx::query(sqlx::AssertSqlSafe(expansion))
         .execute(&mut *tx)
@@ -572,8 +599,8 @@ pub(crate) async fn collect_cycle(
     // would-collect anti-join count — that scan term is exactly what
     // the per-cycle cap exists to manage (P15); its backlog
     // visibility comes from the decremental estimate below.
-    let (would_collect, would_collect_bytes): (i64, i64) = match mode {
-        CollectMode::Shadow => {
+    let (would_collect, would_collect_bytes): (i64, i64) = match simulated_swept {
+        Some(_) => {
             sqlx::query_as(
                 "SELECT \
                    COUNT(*) FILTER (WHERE NOT in_mark \
@@ -590,7 +617,7 @@ pub(crate) async fn collect_cycle(
             .fetch_one(&mut *tx)
             .await?
         }
-        CollectMode::Live => (0, 0),
+        None => (0, 0),
     };
 
     // Commit ends the cycle's snapshot. In shadow mode the temp table
@@ -598,15 +625,14 @@ pub(crate) async fn collect_cycle(
     // pool; in live mode it survives for the batch loop below.
     tx.commit().await?;
 
-    metrics::gauge!("rio_store_gc_chunks_live").set(mark_set_size as f64);
+    // Gauge publication moved off the cycle (merged_bug_211): the
+    // observation lands in the durable row via the caller\'s
+    // CycleCommit, and EVERY replica\'s gauge publisher reads it back
+    // within 60s — the cycle winner is no longer the only pod whose
+    // gauges move.
 
-    if mode == CollectMode::Shadow {
+    if simulated_swept.is_some() {
         let cycle_seconds = cycle_started.elapsed().as_secs_f64();
-        metrics::gauge!("rio_store_gc_chunks_would_collect").set(would_collect as f64);
-        // Shadow mode: the backlog estimate IS the would-collect count.
-        // Live cycles maintain it decrementally from their own
-        // collected counts instead of re-running this full anti-join.
-        backlog_anchor(would_collect as u64);
         metrics::histogram!("rio_store_gc_collect_cycle_seconds").record(cycle_seconds);
         metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "ok").increment(1);
 
@@ -626,6 +652,8 @@ pub(crate) async fn collect_cycle(
             batches_run: 0,
             cap_reached: false,
             cursor_at_stop: None,
+            pass_complete: false,
+            chunks_reaped: 0,
             cycle_seconds,
         });
     }
@@ -636,11 +664,9 @@ pub(crate) async fn collect_cycle(
     // not reach the cleanup detaches (closes) the connection — the
     // temp table dies with the session instead of leaking into the
     // shared pool.
-    let mut conn = scopeguard::guard(conn, |c| {
-        let _ = c.detach();
-    });
+    let mut conn = super::lock::SessionConn::new(conn);
 
-    let mut cursor: Vec<u8> = COLLECT_CURSOR.get().unwrap_or_default();
+    let mut cursor: Vec<u8> = resume_cursor.unwrap_or_default();
     let mut victims_collected: u64 = 0;
     let mut victim_bytes: u64 = 0;
     let mut s3_keys_enqueued: u64 = 0;
@@ -663,7 +689,7 @@ pub(crate) async fn collect_cycle(
         // One batch = one transaction: candidate scan, predicate-
         // re-checking soft-delete, outbox enqueue. A failure here
         // leaves prior batches committed (per-batch isolation).
-        let mut batch_tx = sqlx::Connection::begin(&mut **conn).await?;
+        let mut batch_tx = sqlx::Connection::begin(&mut **conn.conn()).await?;
         let candidates: Vec<Vec<u8>> = sqlx::query_scalar(COLLECT_BATCH_SELECT_SQL)
             .bind(&cursor)
             .bind(&cutoff)
@@ -711,7 +737,10 @@ pub(crate) async fn collect_cycle(
             let inject_after = COLLECT_FAIL_AFTER_BATCHES.load(Ordering::SeqCst);
             if inject_after > 0 && batches_run >= inject_after {
                 COLLECT_FAIL_AFTER_BATCHES.store(0, Ordering::SeqCst);
-                COLLECT_CURSOR.store(cursor.clone());
+                // No durable cursor write: a failed cycle commits
+                // nothing to gc_collect_state — the next cycle
+                // re-scans (the candidate scan\'s deleted = FALSE
+                // conjunct skips the rows prior batches committed).
                 return Err(sqlx::Error::Protocol(
                     "chunk-collect: injected post-batch failure (test only)".into(),
                 ));
@@ -724,32 +753,53 @@ pub(crate) async fn collect_cycle(
         }
     }
 
-    // Cursor bookkeeping: a capped stop persists the resume point; a
-    // completed pass resets to the start of the keyspace. (A lost
-    // cursor is never a correctness problem — the candidate scan's
-    // `deleted = FALSE` conjunct skips already-collected rows.)
-    let cursor_at_stop = if cap_reached {
-        COLLECT_CURSOR.store(cursor.clone());
-        Some(cursor)
-    } else {
-        COLLECT_CURSOR.reset();
-        None
-    };
+    // Cursor bookkeeping: a capped stop reports the resume point for
+    // the caller's durable CycleCommit (gc_collect_state.cursor); a
+    // completed pass reports None — the next cycle starts from the
+    // top of the keyspace. (A lost cursor is never a correctness
+    // problem — the candidate scan's `deleted = FALSE` conjunct skips
+    // already-collected rows.)
+    let cursor_at_stop = if cap_reached { Some(cursor) } else { None };
 
-    // Cleanup: drop the mark product and hand the connection back to
-    // the pool (defusing the detach guard).
-    sqlx::query("DROP TABLE IF EXISTS live_chunks")
-        .execute(&mut **conn)
-        .await?;
-    drop(scopeguard::ScopeGuard::into_inner(conn));
-
-    // Drain visibility (P15): decrement the backlog estimate by what
-    // this cycle collected; a completed pass re-anchors it at zero.
+    // --- Post-pass tombstone reap (merged_bug_336) ---
+    // Only after a COMPLETE pass: a capped cycle still has collect
+    // work outstanding, and the reap is strictly lower priority than
+    // the drain it trails. Each batch is its own implicit transaction
+    // on the cycle connection.
+    let mut chunks_reaped: u64 = 0;
     if pass_complete {
-        backlog_pass_complete();
-    } else {
-        backlog_consume(victims_collected);
+        loop {
+            let remaining = REAP_CYCLE_CAP.saturating_sub(chunks_reaped);
+            if remaining == 0 {
+                break;
+            }
+            let limit = COLLECT_BATCH_LIMIT.min(remaining) as i64;
+            let reaped = sqlx::query(REAP_BATCH_DELETE_SQL)
+                .bind(grace_secs)
+                .bind(limit)
+                .execute(&mut **conn.conn())
+                .await?
+                .rows_affected();
+            if reaped == 0 {
+                break;
+            }
+            metrics::counter!("rio_store_gc_chunks_reaped_total").increment(reaped);
+            chunks_reaped += reaped;
+        }
     }
+
+    // Cleanup: drop the mark product in-session, then hand the (clean)
+    // connection back to the pool. Any failure or cancellation before
+    // this point detaches via SessionConn\'s Drop — the temp table dies
+    // with the session, never in the shared pool.
+    sqlx::query("DROP TABLE IF EXISTS live_chunks")
+        .execute(&mut **conn.conn())
+        .await?;
+    conn.release_to_pool();
+
+    // Backlog visibility (P15) is durable now: the caller\'s
+    // CycleCommit decrements the row estimate (pass-complete ⇒ 0) and
+    // every replica\'s publisher converges on it.
     if cap_reached {
         metrics::counter!("rio_store_gc_collect_cycles_capped_total").increment(1);
     }
@@ -765,6 +815,7 @@ pub(crate) async fn collect_cycle(
         s3_keys_enqueued,
         batches_run,
         cap_reached,
+        chunks_reaped,
         cycle_seconds,
         "chunk-collect live cycle complete"
     );
@@ -780,85 +831,111 @@ pub(crate) async fn collect_cycle(
         batches_run,
         cap_reached,
         cursor_at_stop,
+        pass_complete,
+        chunks_reaped,
         cycle_seconds,
     })
 }
 
-/// Run one backstop-triggered collect cycle if no GC (or other
-/// backstop tick) is in flight: takes [`super::GC_LOCK_ID`]
-/// non-blocking and skips when held. Returns `Ok(None)` on skip.
-/// Split out from [`spawn_collect_backstop`] so tests drive it
-/// directly.
+/// Run one backstop CHECK (bug_174): consult the DURABLE row for
+/// whether a live cycle is due (`now() - last_live_cycle_at >=`
+/// [`COLLECT_BACKSTOP_INTERVAL`], DB clock), and only then take the
+/// cycle lease and run. Double-checked: the cheap unlocked pre-read
+/// keeps N replicas\' hourly ticks nearly free; the due re-check under
+/// the lock makes the decision exact (two replicas passing the
+/// pre-check race to one lease; the loser skips; the winner re-checks
+/// so a cycle that JUST committed is not repeated). Returns `Ok(None)`
+/// when not due or when another holder has the lease.
+// r[impl store.gc.collect-cadence]
 pub(crate) async fn collect_backstop_once(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
     grace_secs: i64,
 ) -> Result<Option<CollectReport>, sqlx::Error> {
-    let mut lock_conn = pool.acquire().await?;
-    let lock_acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-        .bind(super::GC_LOCK_ID)
-        .fetch_one(&mut *lock_conn)
-        .await?;
-    if !lock_acquired {
-        info!("chunk-collect backstop: GC already running, skipping this tick");
+    if !super::state::backstop_due_unlocked(pool, COLLECT_BACKSTOP_INTERVAL).await? {
         return Ok(None);
     }
-    // Same choreography as run_gc: any exit that does not go through
-    // the explicit unlock below detaches the connection, closing it so
-    // PG releases the session-scoped lock instead of leaking it back
-    // into the pool with the lock held.
-    let lock_conn = scopeguard::guard(lock_conn, |c| {
-        let _ = c.detach();
-    });
-
-    let result = collect_cycle(pool, chunk_backend, grace_secs, CollectMode::Live).await;
-    if result.is_err() {
-        // A DB-error cycle would otherwise be invisible to metrics for
-        // up to a full backstop interval (the parse-failure abort
-        // carries its own outcome and is NOT an error here). run_gc
-        // phase 3 counts its own failures, so the outcomes partition.
-        metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "error").increment(1);
+    let Some(mut lease) = super::state::GcCycleLease::try_acquire(pool).await? else {
+        info!("chunk-collect backstop: GC already running, skipping this tick");
+        return Ok(None);
+    };
+    if !lease.backstop_due(COLLECT_BACKSTOP_INTERVAL).await? {
+        // Lost the pre-check race to a cycle that just committed.
+        lease.release().await?;
+        return Ok(None);
     }
 
-    let mut lock_conn = scopeguard::ScopeGuard::into_inner(lock_conn);
-    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(super::GC_LOCK_ID)
-        .execute(&mut *lock_conn)
-        .await
+    let resume_cursor = lease.state.cursor.clone();
+    match collect_cycle(
+        pool,
+        chunk_backend,
+        grace_secs,
+        CollectMode::Live,
+        resume_cursor,
+    )
+    .await
     {
-        warn!(error = %e, "chunk-collect backstop: advisory unlock failed");
+        Ok(report) => {
+            match report.outcome {
+                CollectOutcome::Ok => {
+                    // Stamp the durable row: the cluster ran its live
+                    // cycle; every replica\'s next hourly check sees it.
+                    lease
+                        .commit_cycle(super::state::CycleCommit::Live {
+                            cursor_at_stop: report.cursor_at_stop.clone(),
+                            victims_collected: report.victims_collected,
+                            pass_complete: report.pass_complete,
+                            mark_set_size: report.mark_set_size as i64,
+                        })
+                        .await?;
+                }
+                CollectOutcome::ParseFailure => {
+                    // Fail-closed: an aborted cycle is NOT a live cycle
+                    // — no stamp, retention stays visibly stalled until
+                    // the corrupt manifest is repaired.
+                    lease.release().await?;
+                }
+            }
+            Ok(Some(report))
+        }
+        Err(e) => {
+            // A DB-error cycle would otherwise be invisible to metrics
+            // for up to a full backstop interval (the parse-failure
+            // abort carries its own outcome and is NOT an error here).
+            // run_gc phase 3 counts its own failures, so the outcomes
+            // partition.
+            metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "error")
+                .increment(1);
+            // lease drops here: detach frees the lock with the session.
+            Err(e)
+        }
     }
-
-    result.map(Some)
 }
 
-/// Spawn the daily collect backstop. Errors are logged and the next
-/// tick retries (`MissedTickBehavior::Skip`, like the other periodic
-/// GC tasks).
+/// Spawn the hourly backstop CHECK tick. Errors are logged and the
+/// next tick retries (`MissedTickBehavior::Skip`, like the other
+/// periodic GC tasks).
 ///
-/// Unlike `spawn_periodic` (whose first tick fires immediately), the
-/// ticker here is armed one full interval after spawn: the collect
-/// cycle is the heaviest query pattern in the system (full
-/// manifest_data expansion + chunks anti-join, multi-GB temp spill at
-/// the design point — invariant map T-1a.1b/T-1a.1c), and rolling
-/// deploys, scale-outs, and crash-loops must not trigger it on every
-/// pod boot — exactly the moments the database is already under
-/// stress. Each store replica arms its own daily timer; concurrent
-/// ticks (and ticks during a GC run) are deduplicated by the
-/// non-blocking [`super::GC_LOCK_ID`] try-lock in
-/// `collect_backstop_once`, so at most one cycle runs cluster-wide
-/// at a time. Accepted trade-off: a store that restarts more often
-/// than once per interval gets its cycles only from `run_gc` phase 3
-/// (the controller GC schedule); the `RioStoreGcCollectStalled` alert
-/// is the detector for a fleet where neither trigger completes.
+/// The tick is a cheap durable-row read; the heavy cycle runs only
+/// when the CLUSTER is due (bug_174: pre-090 each replica armed its
+/// own daily `interval_at(boot + 24h)` timer, so N replicas ⇒ up to N
+/// heavy cycles/day — mutual exclusion, not rate limiting). The first
+/// check fires one full check-interval after spawn: the collect cycle
+/// is the heaviest query pattern in the system (full manifest_data
+/// expansion + chunks anti-join, multi-GB temp spill at the design
+/// point — invariant map T-1a.1b/T-1a.1c), and rolling deploys,
+/// scale-outs, and crash-loops must not even CHECK on every pod boot
+/// — exactly the moments the database is already under stress. A
+/// fleet where neither this nor run_gc phase 3 completes a cycle is
+/// detected by the `RioStoreGcCollectStalled` alert.
 pub fn spawn_collect_backstop(
     pool: PgPool,
     chunk_backend: Option<Arc<dyn ChunkBackend>>,
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
     let mut ticker = tokio::time::interval_at(
-        tokio::time::Instant::now() + COLLECT_BACKSTOP_INTERVAL,
-        COLLECT_BACKSTOP_INTERVAL,
+        tokio::time::Instant::now() + COLLECT_BACKSTOP_CHECK_INTERVAL,
+        COLLECT_BACKSTOP_CHECK_INTERVAL,
     );
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     rio_common::task::spawn_periodic_with("gc-collect-backstop", ticker, shutdown, move || {
@@ -887,16 +964,19 @@ mod tests {
     use rio_test_support::metrics::CountingRecorder;
     use rstest::rstest;
 
-    /// Reset the collector's process-local state (cursor + backlog
-    /// estimate). nextest runs each test in its own process, but the
-    /// statics are shared within one test's multiple cycles — and under
-    /// plain `cargo test` across tests — so every live-arm test starts
-    /// from a known state.
-    fn reset_collector_state() {
-        COLLECT_CURSOR.reset();
-        *COLLECT_BACKLOG_ESTIMATE
-            .lock()
-            .expect("backlog estimate poisoned") = None;
+    /// Reset the durable collector state row (cursor + backlog +
+    /// stamps) to its 090 initial form, so every live-arm test starts
+    /// from a known state regardless of what earlier cycles in the
+    /// same TestDb committed.
+    async fn reset_collector_state(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "UPDATE gc_collect_state SET cycle_epoch = 0, last_live_cycle_at = NULL, \
+             cursor = NULL, backlog_estimate = NULL, last_mark_set_size = NULL, \
+             last_would_collect = NULL WHERE singleton",
+        )
+        .execute(pool)
+        .await
+        .expect("reset gc_collect_state");
     }
 
     /// Serialized manifest referencing the given hashes (duplicates kept).
@@ -986,7 +1066,10 @@ mod tests {
             &db.pool,
             None,
             super::super::sweep::CHUNK_GRACE_SECS,
-            CollectMode::Shadow,
+            CollectMode::Shadow {
+                simulated_swept: Vec::new(),
+            },
+            None,
         )
         .await
         .expect("shadow cycle");
@@ -999,8 +1082,25 @@ mod tests {
         assert!(!report.cap_reached);
         assert!(report.cursor_at_stop.is_none());
 
-        // Gauges mirror the report; the cycle counter and duration
-        // histogram fire for the ok outcome.
+        // merged_bug_211: gauges no longer move on the cycle — the
+        // caller commits the observation to gc_collect_state and EVERY
+        // replica's publisher reads it back. Simulate the caller +
+        // one publisher tick.
+        let lease = super::super::state::GcCycleLease::try_acquire(&db.pool)
+            .await
+            .unwrap()
+            .expect("lock free");
+        lease
+            .commit_cycle(super::super::state::CycleCommit::Shadow {
+                would_collect: report.would_collect as i64,
+                mark_set_size: report.mark_set_size as i64,
+            })
+            .await
+            .unwrap();
+        let row = super::super::state::read_state_unlocked(&db.pool)
+            .await
+            .unwrap();
+        super::super::state::publish_gauges(&row);
         assert_eq!(rec.gauge_value("rio_store_gc_chunks_live{}"), Some(3.0));
         assert_eq!(
             rec.gauge_value("rio_store_gc_chunks_would_collect{}"),
@@ -1110,7 +1210,10 @@ mod tests {
             &db.pool,
             None,
             super::super::sweep::CHUNK_GRACE_SECS,
-            CollectMode::Shadow,
+            CollectMode::Shadow {
+                simulated_swept: Vec::new(),
+            },
+            None,
         )
         .await
         .unwrap();
@@ -1155,7 +1258,10 @@ mod tests {
             &db.pool,
             None,
             super::super::sweep::CHUNK_GRACE_SECS,
-            CollectMode::Shadow,
+            CollectMode::Shadow {
+                simulated_swept: Vec::new(),
+            },
+            None,
         )
         .await
         .expect("abort is not an error");
@@ -1244,7 +1350,10 @@ mod tests {
             &db.pool,
             None,
             super::super::sweep::CHUNK_GRACE_SECS,
-            CollectMode::Shadow,
+            CollectMode::Shadow {
+                simulated_swept: Vec::new(),
+            },
+            None,
         )
         .await
         .expect("cycle");
@@ -1295,7 +1404,10 @@ mod tests {
             &db.pool,
             None,
             super::super::sweep::CHUNK_GRACE_SECS,
-            CollectMode::Shadow,
+            CollectMode::Shadow {
+                simulated_swept: Vec::new(),
+            },
+            None,
         )
         .await;
         assert!(result.is_err(), "the report query must fail without chunks");
@@ -1331,7 +1443,10 @@ mod tests {
                 &db.pool,
                 None,
                 super::super::sweep::CHUNK_GRACE_SECS,
-                CollectMode::Shadow,
+                CollectMode::Shadow {
+                    simulated_swept: Vec::new(),
+                },
+                None,
             )
             .await
             .expect("cycle");
@@ -1349,7 +1464,7 @@ mod tests {
         use tokio::sync::mpsc;
 
         let db = TestDb::new(&crate::MIGRATOR).await;
-        reset_collector_state();
+        reset_collector_state(&db.pool).await;
         let h = ChunkSeed::new(0x42).uploaded().seed(&db.pool).await;
         seed_chunked_manifest(&db.pool, "phase3", "complete", &make_chunk_list(&[h])).await;
         // An old, unreferenced victim the live phase 3 must collect.
@@ -1385,6 +1500,13 @@ mod tests {
             1,
             "phase 3 ran exactly one live cycle"
         );
+        // run_gc committed the cycle to the durable row; the publisher
+        // (any replica) renders it.
+        let row = super::super::state::read_state_unlocked(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.last_mark_set_size, Some(1));
+        super::super::state::publish_gauges(&row);
         assert_eq!(rec.gauge_value("rio_store_gc_chunks_live{}"), Some(1.0));
         assert_eq!(
             stats.chunks_deleted, 1,
@@ -1406,7 +1528,7 @@ mod tests {
         use tokio::sync::mpsc;
 
         let db = TestDb::new(&crate::MIGRATOR).await;
-        reset_collector_state();
+        reset_collector_state(&db.pool).await;
         // An old, unreferenced victim that a LIVE cycle would collect.
         ChunkSeed::new(0x44)
             .with_size(512)
@@ -1447,6 +1569,207 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(enqueued, 0);
+    }
+
+    // r[verify store.gc.dry-run+3]
+    /// bug_199 differential: on identical seeds, the DRY-RUN estimate
+    /// (shadow cycle fed the dry sweep\'s settled swept set) equals
+    /// what a REAL run actually collects. The seed: an unreachable
+    /// closure whose manifests exclusively reference past-grace
+    /// chunks — pre-fix RED: the dry run reported 0 for them (the
+    /// rolled-back sweep left the manifests in place, so their chunks
+    /// stayed marked live).
+    #[tokio::test]
+    async fn dry_run_estimate_matches_real_collection() {
+        // --- World A: dry run ---
+        let db_a = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db_a.pool).await;
+        // --- World B: identical seeds, real run ---
+        let db_b = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db_b.pool).await;
+
+        for db in [&db_a, &db_b] {
+            // An unreachable manifest exclusively referencing two old
+            // chunks (the would-be-swept closure). Backdate the path so
+            // the mark phase (grace_hours=1) finds it unreachable.
+            let c1 = ChunkSeed::new(0xF1)
+                .age_secs(7200)
+                .uploaded()
+                .seed(&db.pool)
+                .await;
+            let c2 = ChunkSeed::new(0xF2)
+                .age_secs(7200)
+                .uploaded()
+                .seed(&db.pool)
+                .await;
+            seed_chunked_manifest(
+                &db.pool,
+                "unreachable-root",
+                "complete",
+                &make_chunk_list(&[c1, c2]),
+            )
+            .await;
+            sqlx::query("UPDATE narinfo SET created_at = now() - interval '3 hours'")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        let params = super::super::GcParams {
+            dry_run: true,
+            grace_hours: 1,
+            extra_roots: vec![],
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let dry = super::super::run_gc(
+            &db_a.pool,
+            None,
+            params,
+            tx,
+            &rio_common::signal::Token::new(),
+        )
+        .await
+        .expect("dry run_gc")
+        .expect("lock free");
+        while rx.recv().await.is_some() {}
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let real = super::super::run_gc(
+            &db_b.pool,
+            None,
+            super::super::GcParams {
+                dry_run: false,
+                grace_hours: 1,
+                extra_roots: vec![],
+            },
+            tx,
+            &rio_common::signal::Token::new(),
+        )
+        .await
+        .expect("real run_gc")
+        .expect("lock free");
+        while rx.recv().await.is_some() {}
+
+        assert_eq!(
+            dry.paths_deleted, real.paths_deleted,
+            "path estimates agree"
+        );
+        assert!(real.chunks_deleted >= 2, "the closure\'s chunks collected");
+        assert_eq!(
+            dry.chunks_deleted, real.chunks_deleted,
+            "the dry-run chunk estimate equals the real collection \
+             (pre-fix RED: dry reported 0 for swept manifests\' chunks)"
+        );
+        assert_eq!(dry.bytes_freed, real.bytes_freed, "byte estimates agree");
+        // And the dry-run world is untouched.
+        let deleted_a: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE deleted")
+            .fetch_one(&db_a.pool)
+            .await
+            .unwrap();
+        assert_eq!(deleted_a, 0, "dry run modified nothing");
+    }
+
+    /// bug_199 unit: Shadow{[h]} excludes h\'s manifest from the mark —
+    /// its exclusively-referenced chunk counts as collectible; an empty
+    /// exclusion preserves the old observation semantics.
+    #[tokio::test]
+    async fn shadow_exclusion_unit() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let c = ChunkSeed::new(0xF3)
+            .age_secs(7200)
+            .uploaded()
+            .seed(&db.pool)
+            .await;
+        seed_chunked_manifest(&db.pool, "excl-path", "complete", &make_chunk_list(&[c])).await;
+        let h: Vec<u8> = sqlx::query_scalar("SELECT store_path_hash FROM manifests LIMIT 1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+
+        let keep = collect_cycle(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Shadow {
+                simulated_swept: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .expect("baseline shadow");
+        assert_eq!(keep.would_collect, 0, "referenced chunk not collectible");
+
+        let excl = collect_cycle(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Shadow {
+                simulated_swept: vec![h],
+            },
+            None,
+        )
+        .await
+        .expect("excluding shadow");
+        assert_eq!(
+            excl.would_collect, 1,
+            "excluding the manifest exposes its chunk as collectible"
+        );
+    }
+
+    /// bug_199: a CORRUPT manifest the simulated sweep removes must
+    /// not abort a dry run it would not abort live — the validation
+    /// applies the same exclusion as the expansion.
+    #[tokio::test]
+    async fn corrupt_swept_manifest_does_not_abort_shadow() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        // A chunked manifest whose chunk_list we then CORRUPT in place.
+        let c = ChunkSeed::new(0xF7).uploaded().seed(&db.pool).await;
+        seed_chunked_manifest(&db.pool, "corrupt-path", "complete", &make_chunk_list(&[c])).await;
+        let h: Vec<u8> = sqlx::query_scalar("SELECT store_path_hash FROM manifests LIMIT 1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE manifest_data SET chunk_list = $2 WHERE store_path_hash = $1")
+            .bind(&h)
+            .bind(vec![0xFFu8; 7]) // wrong version byte + misaligned
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Unexcluded: the fail-closed validation aborts.
+        let aborted = collect_cycle(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Shadow {
+                simulated_swept: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .expect("cycle runs");
+        assert_eq!(aborted.outcome, CollectOutcome::ParseFailure);
+
+        // Swept-excluded: the dry run proceeds (a live run after the
+        // real sweep would not see this manifest either).
+        let ok = collect_cycle(
+            &db.pool,
+            None,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Shadow {
+                simulated_swept: vec![h],
+            },
+            None,
+        )
+        .await
+        .expect("cycle runs");
+        assert_eq!(
+            ok.outcome,
+            CollectOutcome::Ok,
+            "a corrupt manifest the sweep removes cannot abort the dry run"
+        );
     }
 
     /// The backstop skips when GC_LOCK_ID is held, runs a cycle when it
@@ -1503,6 +1826,221 @@ mod tests {
             .execute(&mut *probe)
             .await
             .unwrap();
+    }
+
+    // r[verify store.gc.collect-cadence]
+    /// bug_174: the backstop is CLUSTER-cadenced via the durable row.
+    /// Two consecutive checks ⇒ the first runs a live cycle (never-ran
+    /// cluster: last_live_cycle_at NULL = due) and stamps the row; the
+    /// second SKIPS (not due). Pre-090 RED: both ran — every replica\'s
+    /// boot timer fired its own heavy cycle (mutual exclusion, not
+    /// rate limiting).
+    #[tokio::test]
+    async fn backstop_check_is_cluster_cadenced() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        let first = collect_backstop_once(&db.pool, None, super::super::sweep::CHUNK_GRACE_SECS)
+            .await
+            .unwrap();
+        assert!(first.is_some(), "never-ran cluster: first check is due");
+        assert_eq!(rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"), 1);
+
+        let second = collect_backstop_once(&db.pool, None, super::super::sweep::CHUNK_GRACE_SECS)
+            .await
+            .unwrap();
+        assert!(
+            second.is_none(),
+            "the cluster just ran a live cycle — a second replica\'s check skips"
+        );
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"),
+            1,
+            "exactly one cycle cluster-wide"
+        );
+
+        // Backdate the stamp past the interval ⇒ due again.
+        sqlx::query(
+            "UPDATE gc_collect_state SET last_live_cycle_at = now() - make_interval(secs => $1) \
+             WHERE singleton",
+        )
+        .bind(COLLECT_BACKSTOP_INTERVAL.as_secs() as f64 + 5.0)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let third = collect_backstop_once(&db.pool, None, super::super::sweep::CHUNK_GRACE_SECS)
+            .await
+            .unwrap();
+        assert!(
+            third.is_some(),
+            "past the interval the backstop is due again"
+        );
+    }
+
+    // r[verify store.gc.collect-cadence]
+    /// A live run_gc stamps the durable row, so the backstop\'s next
+    /// check skips: GC-schedule runs and the backstop share ONE
+    /// cluster cadence.
+    #[tokio::test]
+    async fn backstop_skips_after_run_gc_live_cycle() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        super::super::run_gc(
+            &db.pool,
+            None,
+            super::super::GcParams {
+                dry_run: false,
+                grace_hours: 2,
+                extra_roots: vec![],
+            },
+            tx,
+            &rio_common::signal::Token::new(),
+        )
+        .await
+        .expect("run_gc")
+        .expect("lock free");
+        while rx.recv().await.is_some() {}
+
+        let check = collect_backstop_once(&db.pool, None, super::super::sweep::CHUNK_GRACE_SECS)
+            .await
+            .unwrap();
+        assert!(
+            check.is_none(),
+            "run_gc\'s live cycle satisfied the cluster cadence"
+        );
+    }
+
+    /// merged_bug_211: the publisher renders ONLY non-NULL row fields —
+    /// an unanchored cluster leaves the pre-registered 0 standing
+    /// instead of inventing a number.
+    #[tokio::test]
+    async fn gauge_publisher_skips_null_fields() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        let row = super::super::state::read_state_unlocked(&db.pool)
+            .await
+            .unwrap();
+        super::super::state::publish_gauges(&row);
+        assert_eq!(
+            rec.gauge_value("rio_store_gc_collect_backlog_chunks{}"),
+            None,
+            "NULL backlog ⇒ gauge untouched"
+        );
+        assert_eq!(rec.gauge_value("rio_store_gc_chunks_live{}"), None);
+
+        sqlx::query(
+            "UPDATE gc_collect_state SET backlog_estimate = 7, last_mark_set_size = 3, \
+             last_would_collect = 7 WHERE singleton",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let row = super::super::state::read_state_unlocked(&db.pool)
+            .await
+            .unwrap();
+        super::super::state::publish_gauges(&row);
+        assert_eq!(
+            rec.gauge_value("rio_store_gc_collect_backlog_chunks{}"),
+            Some(7.0)
+        );
+        assert_eq!(rec.gauge_value("rio_store_gc_chunks_live{}"), Some(3.0));
+        assert_eq!(
+            rec.gauge_value("rio_store_gc_chunks_would_collect{}"),
+            Some(7.0)
+        );
+    }
+
+    // r[verify store.gc.bounded-garbage-retention+3]
+    /// merged_bug_336 reap battery: a soft-deleted, drained, past-grace
+    /// tombstone is hard-deleted by the post-pass reap; pending-outbox,
+    /// young, and resurrected rows are all kept; the counter emits.
+    /// Pre-091 RED: no reaper existed — tombstones were permanent.
+    #[tokio::test]
+    async fn pass_complete_reap_deletes_drained_aged_tombstones_only() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        reset_collector_state(&db.pool).await;
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        // (1) Reapable: deleted, aged past grace, no outbox row.
+        let reapable = ChunkSeed::new(0xE1).uploaded().seed(&db.pool).await;
+        // (2) Pending outbox: deleted + aged, but the drain has not
+        //     finished (pending_s3_deletes row exists).
+        let pending = ChunkSeed::new(0xE2).uploaded().seed(&db.pool).await;
+        // (3) Young tombstone: deleted recently.
+        let young = ChunkSeed::new(0xE3).uploaded().seed(&db.pool).await;
+        // (4) Resurrected: was deleted, then re-referenced (deleted
+        //     FALSE, deleted_at NULL via the upsert).
+        let resurrected = ChunkSeed::new(0xE4).uploaded().seed(&db.pool).await;
+
+        let grace = super::super::sweep::CHUNK_GRACE_SECS;
+        for (h, age, outbox) in [
+            (&reapable, grace + 100, false),
+            (&pending, grace + 100, true),
+            (&young, 10, false),
+        ] {
+            sqlx::query(
+                "UPDATE chunks SET deleted = TRUE, \
+                 deleted_at = now() - make_interval(secs => $2) \
+                 WHERE blake3_hash = $1",
+            )
+            .bind(&h[..])
+            .bind(age as f64)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            if outbox {
+                sqlx::query("INSERT INTO pending_s3_deletes (blake3_hash, s3_key) VALUES ($1, $2)")
+                    .bind(&h[..])
+                    .bind("k/pending")
+                    .execute(&db.pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        // The resurrected row: tombstone state fully cleared.
+        sqlx::query("UPDATE chunks SET deleted = FALSE, deleted_at = NULL WHERE blake3_hash = $1")
+            .bind(&resurrected[..])
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // A live cycle over an otherwise-clean keyspace: completes the
+        // pass (nothing left to collect except our seeds, which are
+        // either deleted already or referenced/young) and reaps.
+        let report = collect_cycle(&db.pool, Some(&backend), grace, CollectMode::Live, None)
+            .await
+            .expect("live cycle");
+        assert!(report.pass_complete, "clean keyspace ⇒ pass completes");
+        assert_eq!(
+            report.chunks_reaped, 1,
+            "exactly the drained aged tombstone"
+        );
+        assert_eq!(rec.get("rio_store_gc_chunks_reaped_total{}"), 1);
+
+        let remaining: Vec<Vec<u8>> =
+            sqlx::query_scalar("SELECT blake3_hash FROM chunks ORDER BY blake3_hash")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        assert!(
+            !remaining.contains(&reapable.to_vec()),
+            "the drained aged tombstone is GONE"
+        );
+        assert!(remaining.contains(&pending.to_vec()), "pending outbox kept");
+        assert!(remaining.contains(&young.to_vec()), "young tombstone kept");
+        assert!(
+            remaining.contains(&resurrected.to_vec()),
+            "resurrected row never reaped"
+        );
     }
 
     /// A cycle that fails against PostgreSQL is counted by its caller
@@ -1605,70 +2143,10 @@ mod tests {
         handle.await.expect("backstop task shuts down cleanly");
     }
 
-    /// Capped-collect scaffolding: the process-local cursor round-trips
-    /// and resets (the live arm persists/loads it across cycles).
-    #[test]
-    fn collect_cursor_roundtrip_and_reset() {
-        let cursor = CollectCursor::new();
-        assert!(
-            cursor.get().is_none(),
-            "fresh cursor starts at the beginning"
-        );
-        cursor.store(vec![0xAB; 32]);
-        assert_eq!(cursor.get(), Some(vec![0xAB; 32]));
-        cursor.store(vec![0xCD; 32]);
-        assert_eq!(
-            cursor.get(),
-            Some(vec![0xCD; 32]),
-            "a later stop point replaces the earlier one"
-        );
-        cursor.reset();
-        assert!(
-            cursor.get().is_none(),
-            "pass completion resets to the beginning"
-        );
-    }
-
-    // ----------------------------------------------------------------
-    // Live arm (the cutover release's collect arm)
-    // ----------------------------------------------------------------
-
-    /// Seed `n` old, untouched, unreferenced chunks (the collectable
-    /// population) with distinct hashes and the given size.
-    async fn seed_collectable_chunks(pool: &PgPool, n: u16, size: i64) -> Vec<[u8; 32]> {
-        let mut hashes = Vec::with_capacity(n as usize);
-        for i in 0..n {
-            let mut hash = [0u8; 32];
-            hash[0] = (i >> 8) as u8;
-            hash[1] = (i & 0xFF) as u8;
-            hash[2] = 0xC0;
-            sqlx::query(
-                "INSERT INTO chunks (blake3_hash, size, created_at, uploaded_at) \
-                 VALUES ($1, $2, now() - interval '1 hour', now() - interval '1 hour')",
-            )
-            .bind(&hash[..])
-            .bind(size)
-            .execute(pool)
-            .await
-            .expect("seed collectable chunk");
-            hashes.push(hash);
-        }
-        hashes
-    }
-
-    // r[verify store.chunk.liveness-derived]
-    // r[verify store.gc.chunk-collect]
-    /// The historical-leak shape: an uploaded chunk past grace that no
-    /// existing manifest references is soft-deleted and enqueued by a
-    /// live cycle — eligibility is the manifest fold and nothing else
-    /// (the rows the pre-cutover counter leaked are exactly this shape
-    /// once the column is gone). Collected chunks land in
-    /// `pending_s3_deletes` exactly once, and a follow-up cycle finds
-    /// nothing left to collect.
     #[tokio::test]
     async fn live_cycle_collects_unreferenced_chunk_exactly_once() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        reset_collector_state();
+        reset_collector_state(&db.pool).await;
         let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         // The leaked chunk: unreferenced, past grace.
@@ -1689,6 +2167,7 @@ mod tests {
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
+            None,
         )
         .await
         .expect("live cycle");
@@ -1740,6 +2219,7 @@ mod tests {
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
+            None,
         )
         .await
         .expect("second live cycle");
@@ -1749,6 +2229,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending_again, 1, "no duplicate outbox rows");
+    }
+
+    // ----------------------------------------------------------------
+    // Live arm (the cutover release's collect arm)
+    // ----------------------------------------------------------------
+
+    /// Seed `n` old, untouched, unreferenced chunks (the collectable
+    /// population) with distinct hashes and the given size.
+    async fn seed_collectable_chunks(pool: &PgPool, n: u16, size: i64) -> Vec<[u8; 32]> {
+        let mut hashes = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let mut hash = [0u8; 32];
+            hash[0] = (i >> 8) as u8;
+            hash[1] = (i & 0xFF) as u8;
+            hash[2] = 0xC0;
+            sqlx::query(
+                "INSERT INTO chunks (blake3_hash, size, created_at, uploaded_at) \
+                 VALUES ($1, $2, now() - interval '1 hour', now() - interval '1 hour')",
+            )
+            .bind(&hash[..])
+            .bind(size)
+            .execute(pool)
+            .await
+            .expect("seed collectable chunk");
+            hashes.push(hash);
+        }
+        hashes
     }
 
     // r[verify store.chunk.liveness-derived]
@@ -1761,7 +2268,7 @@ mod tests {
     #[tokio::test]
     async fn live_cycle_spares_uploading_grace_and_touched() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        reset_collector_state();
+        reset_collector_state(&db.pool).await;
         let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         // Referenced ONLY by an 'uploading' placeholder, old.
@@ -1790,6 +2297,7 @@ mod tests {
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
+            None,
         )
         .await
         .expect("live cycle");
@@ -1814,7 +2322,7 @@ mod tests {
     #[tokio::test]
     async fn live_cycle_parse_failure_collects_nothing() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        reset_collector_state();
+        reset_collector_state(&db.pool).await;
         let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         // An eligible victim that WOULD be collected.
@@ -1830,6 +2338,7 @@ mod tests {
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
+            None,
         )
         .await
         .expect("abort is not an error");
@@ -1860,7 +2369,7 @@ mod tests {
     #[tokio::test]
     async fn live_cycle_resurrected_chunk_survives_drain() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        reset_collector_state();
+        reset_collector_state(&db.pool).await;
         let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         // An old, unreferenced, S3-confirmed chunk; object present.
@@ -1880,6 +2389,7 @@ mod tests {
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
+            None,
         )
         .await
         .expect("live cycle");
@@ -1941,7 +2451,7 @@ mod tests {
     #[tokio::test]
     async fn live_cycle_multi_batch_below_cap_collects_all() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        reset_collector_state();
+        reset_collector_state(&db.pool).await;
         let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         let n = (COLLECT_BATCH_LIMIT + 5) as u16; // 2 batches: full + short
@@ -1952,6 +2462,7 @@ mod tests {
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
+            None,
         )
         .await
         .expect("live cycle");
@@ -1985,7 +2496,7 @@ mod tests {
     #[tokio::test]
     async fn live_cycle_per_batch_isolation_on_midcycle_failure() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        reset_collector_state();
+        reset_collector_state(&db.pool).await;
         let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         let n = (COLLECT_BATCH_LIMIT + 5) as u16; // 2 batches worth
@@ -1998,6 +2509,7 @@ mod tests {
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
+            None,
         )
         .await;
         assert!(result.is_err(), "the injected failure surfaces as an error");
@@ -2032,6 +2544,7 @@ mod tests {
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
+            None,
         )
         .await
         .expect("recovery cycle");
@@ -2056,7 +2569,7 @@ mod tests {
     #[tokio::test]
     async fn live_cycle_cap_stop_then_cursor_resume_drains_backlog() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        reset_collector_state();
+        reset_collector_state(&db.pool).await;
         let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         let n = (COLLECT_CYCLE_VICTIM_CAP + 10) as u16; // 60 with the test consts
@@ -2066,27 +2579,55 @@ mod tests {
         let _g = metrics::set_default_local_recorder(&rec);
 
         // Anchor the backlog estimate the way production does: a
-        // shadow (dry-run) cycle reports the would-collect count.
+        // shadow (dry-run) cycle reports the would-collect count and
+        // its caller commits the observation to the durable row.
         let shadow = collect_cycle(
             &db.pool,
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
-            CollectMode::Shadow,
+            CollectMode::Shadow {
+                simulated_swept: Vec::new(),
+            },
+            None,
         )
         .await
         .expect("anchor cycle");
         assert_eq!(shadow.would_collect, u64::from(n));
+        let lease = super::super::state::GcCycleLease::try_acquire(&db.pool)
+            .await
+            .unwrap()
+            .expect("lock free");
+        lease
+            .commit_cycle(super::super::state::CycleCommit::Shadow {
+                would_collect: shadow.would_collect as i64,
+                mark_set_size: shadow.mark_set_size as i64,
+            })
+            .await
+            .unwrap();
+        let row = super::super::state::read_state_unlocked(&db.pool)
+            .await
+            .unwrap();
+        super::super::state::publish_gauges(&row);
         assert_eq!(
             rec.gauge_value("rio_store_gc_collect_backlog_chunks{}"),
             Some(f64::from(n))
         );
 
-        // Cycle 1: stops exactly at the cap.
+        // Cycle 1 (replica A): lease -> run with the durable cursor
+        // (None: fresh keyspace) -> commit, exactly the production
+        // choreography.
+        let lease_a = super::super::state::GcCycleLease::try_acquire(&db.pool)
+            .await
+            .unwrap()
+            .expect("lock free");
+        let cursor_a = lease_a.state.cursor.clone();
+        assert!(cursor_a.is_none(), "fresh row: cursor at keyspace start");
         let first = collect_cycle(
             &db.pool,
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
+            cursor_a,
         )
         .await
         .expect("capped cycle");
@@ -2096,7 +2637,19 @@ mod tests {
             first.batches_run,
             COLLECT_CYCLE_VICTIM_CAP.div_ceil(COLLECT_BATCH_LIMIT)
         );
-        assert!(first.cursor_at_stop.is_some(), "cursor persisted");
+        assert!(
+            first.cursor_at_stop.is_some(),
+            "cursor reported at the cap stop"
+        );
+        lease_a
+            .commit_cycle(super::super::state::CycleCommit::Live {
+                cursor_at_stop: first.cursor_at_stop.clone(),
+                victims_collected: first.victims_collected,
+                pass_complete: first.pass_complete,
+                mark_set_size: first.mark_set_size as i64,
+            })
+            .await
+            .unwrap();
         assert_eq!(rec.get("rio_store_gc_collect_cycles_capped_total{}"), 1);
         let deleted_after_first: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE deleted")
@@ -2107,18 +2660,36 @@ mod tests {
             deleted_after_first, COLLECT_CYCLE_VICTIM_CAP as i64,
             "no soft-deletes beyond the cap; the remainder is untouched"
         );
+        let row = super::super::state::read_state_unlocked(&db.pool)
+            .await
+            .unwrap();
+        super::super::state::publish_gauges(&row);
         assert_eq!(
             rec.gauge_value("rio_store_gc_collect_backlog_chunks{}"),
             Some(f64::from(n) - COLLECT_CYCLE_VICTIM_CAP as f64),
-            "backlog gauge decreased by the collected count"
+            "durable backlog decreased by the collected count"
         );
 
-        // Cycle 2: resumes from the cursor and finishes the pass.
+        // Cycle 2 (replica B — a FRESH lease on a different "process"):
+        // resumes from the DURABLE cursor and finishes the pass.
+        // Pre-090 RED: the cursor was a process static, so a different
+        // replica restarted from scratch.
+        let lease_b = super::super::state::GcCycleLease::try_acquire(&db.pool)
+            .await
+            .unwrap()
+            .expect("lock free");
+        let cursor_b = lease_b.state.cursor.clone();
+        assert!(
+            cursor_b.is_some(),
+            "replica B resumes from the durable stop point"
+        );
+        assert_eq!(cursor_b, first.cursor_at_stop, "round-trip exact");
         let second = collect_cycle(
             &db.pool,
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
+            cursor_b,
         )
         .await
         .expect("resume cycle");
@@ -2129,10 +2700,15 @@ mod tests {
             "the resume cycle collects exactly the remainder (no re-collection)"
         );
         assert!(second.cursor_at_stop.is_none(), "pass completed");
-        assert!(
-            COLLECT_CURSOR.get().is_none(),
-            "pass completion resets the cursor"
-        );
+        lease_b
+            .commit_cycle(super::super::state::CycleCommit::Live {
+                cursor_at_stop: None,
+                victims_collected: second.victims_collected,
+                pass_complete: second.pass_complete,
+                mark_set_size: second.mark_set_size as i64,
+            })
+            .await
+            .unwrap();
         let deleted_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE deleted")
             .fetch_one(&db.pool)
             .await
@@ -2143,10 +2719,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending, i64::from(n), "every victim enqueued exactly once");
+        let row = super::super::state::read_state_unlocked(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.cursor, None,
+            "pass completion clears the durable cursor"
+        );
+        super::super::state::publish_gauges(&row);
         assert_eq!(
             rec.gauge_value("rio_store_gc_collect_backlog_chunks{}"),
             Some(0.0),
-            "backlog gauge reads 0 once the pass completes"
+            "durable backlog reads 0 once the pass completes"
         );
         assert_eq!(rec.get("rio_store_gc_collect_cycles_capped_total{}"), 1);
         assert_eq!(rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"), 3);
@@ -2160,7 +2744,7 @@ mod tests {
     #[tokio::test]
     async fn live_cycle_cap_stop_survives_cursor_loss() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        reset_collector_state();
+        reset_collector_state(&db.pool).await;
         let backend: Arc<dyn ChunkBackend> = mem_backend();
 
         let n = (COLLECT_CYCLE_VICTIM_CAP + 10) as u16;
@@ -2171,19 +2755,21 @@ mod tests {
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
+            None,
         )
         .await
         .expect("capped cycle");
         assert!(first.cap_reached);
 
         // Simulated restart: the process-local cursor is gone.
-        reset_collector_state();
+        reset_collector_state(&db.pool).await;
 
         let second = collect_cycle(
             &db.pool,
             Some(&backend),
             super::super::sweep::CHUNK_GRACE_SECS,
             CollectMode::Live,
+            None,
         )
         .await
         .expect("post-restart cycle");

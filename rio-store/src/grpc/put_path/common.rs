@@ -569,7 +569,7 @@ impl StoreServiceImpl {
         // `stall: None` — PutPath claims carry no narinfo-declared size
         // and write no progress evidence; the download-stall takeover
         // arm is structurally unreachable for them
-        // (`r[store.substitute.stale-reclaim+2]`).
+        // (`r[store.substitute.stale-reclaim+3]`).
         let claim = ingest::claim_placeholder(
             &self.pool,
             store_path_hash,

@@ -1880,6 +1880,82 @@ pub const M_083: () = ();
 /// after ~111s of reconnect attempts). NULL columns (pre-087 terminal
 /// rows) degrade to the old empty-payload snapshot — additive only.
 pub const M_087: () = ();
+/// `migrations/090_gc_collect_state.sql`
+///
+/// The chunk-collector's cluster state becomes a durable singleton row
+/// (bughunt wave D1, bug_174 + merged_bug_211):
+///
+/// - Cadence: `last_live_cycle_at` + `cycle_epoch`. The backstop runs
+///   a cycle ONLY when `now() - last_live_cycle_at` crosses the
+///   interval (DB clock) — pre-090 every replica armed its own daily
+///   boot-anchored timer, so N replicas ran up to N heavy cycles/day
+///   (the advisory lock gave mutual exclusion, not rate limiting).
+/// - `cursor`: the keyset resume point of a capped pass — pre-090 a
+///   process static, so a capped pass restarted from scratch on
+///   whichever replica won next.
+/// - `backlog_estimate`, `last_mark_set_size`, `last_would_collect`:
+///   the gauge sources. Every replica publishes
+///   rio_store_gc_{collect_backlog_chunks,chunks_live,chunks_would_collect}
+///   from a 60s read of this row — pre-090 only the cycle-winning pod's
+///   gauges ever moved; the rest sat frozen at their pre-registered 0.
+///   The gauges are a REPLICATED CLUSTER FACT: aggregate with max(),
+///   never sum() (owner decision Q6 2026-06-03; gc-enablement runbook).
+///
+/// Writers: `GcCycleLease::commit_cycle` (epoch+1 + stamps, through
+/// the advisory-lock session) — live cycles stamp `last_live_cycle_at`
+/// and the cursor; shadow (dry-run) cycles anchor the backlog and
+/// observation sizes WITHOUT the live stamp (an observation must not
+/// answer the cadence question).
+pub const M_090: () = ();
+
+/// `migrations/091_chunks_deleted_at.sql`
+///
+/// Tombstone-reap support (bughunt wave D1, merged_bug_336): pre-091,
+/// soft-deleted (`deleted = TRUE`) chunk rows whose S3 objects the
+/// drain had already removed stayed in the table FOREVER — permanent
+/// tombstones with no reaper.
+///
+/// - `deleted_at`: stamped by the collect batch UPDATE alongside
+///   `deleted = TRUE`; NULLed by the resurrect upsert
+///   (metadata/chunked.rs) so a resurrected row is never reap-eligible.
+/// - `idx_chunks_reapable` (partial, `WHERE deleted`): the reap's
+///   age-scan index.
+///
+/// The reaper is the post-pass step of a COMPLETE live collect cycle:
+/// `DELETE … WHERE deleted AND deleted_at < now() - grace AND NOT
+/// EXISTS (pending_s3_deletes)` — the outbox conjunct keeps the
+/// drain's resurrect-skip exact, the grace term gives the drain (and
+/// any in-flight resurrect) time, and batching+capping mirror the
+/// collect loop (stopping early only retains tombstones longer).
+/// Lifecycle: insert → live → soft-deleted (`deleted_at`) → drained
+/// (outbox row gone) → reaped (row gone); spec rule
+/// store.gc.bounded-garbage-retention carries the row-retention
+/// clause.
+pub const M_091: () = ();
+
+/// `migrations/092_manifests_claim_phase.sql`
+///
+/// The owner-side claim phase becomes durable data (bughunt wave D1,
+/// merged_bug_003): `claim_phase IN ('downloading','budget_parked',
+/// 'persisting')`, NULL = non-substitution (PutPath) claim.
+///
+/// Written by: the placeholder claim writers ('downloading' for
+/// substitution claimants, NULL otherwise), every progress heartbeat
+/// (the owner mirrors its in-process `ProgressHandle` phase — same
+/// claim-guarded UPDATE, still one statement per heartbeat), the
+/// stall takeover ('downloading' for the new owner), and the
+/// release-in-place (NULL).
+///
+/// Read by: the stall-takeover predicate (`STALL_TAKEOVER_PREDICATE`,
+/// metadata/inline.rs) — strikes ONLY `'downloading'` claims whose
+/// progress froze while liveness stayed fresh. Pre-092 the persist
+/// exemption was the inference `fetched_bytes == nar_size` (only
+/// correct when the competitor's expected size equalled the owner's),
+/// budget-parked owners were deposed after >stall-window parks (their
+/// progress froze with liveness fresh), and dead owners in the
+/// 180-300s window were striked instead of reaped. See
+/// store.substitute.stale-reclaim+3.
+pub const M_092: () = ();
 
 /// `migrations/093_live_pins_kind_key.sql`
 ///
