@@ -268,7 +268,7 @@ let
       # '5 GiB' and 1fooGiB all matched while the warning promised
       # <integer><unit>). Strictness matters because kache itself is
       # silent on garbage: KACHE_MAX_SIZE parses via bytesize behind
-      # .ok().and_then(parse_size) (v0.4.0 config.rs:166-176,
+      # .ok().and_then(parse_size) (v0.4.0 config.rs:166-177,
       # :702-704), so an unparseable value degrades to the pinned
       # config's local_max_size without a word — this warning is the
       # only loud guard.
