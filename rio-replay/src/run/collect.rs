@@ -4943,6 +4943,87 @@ mod tests {
         );
     }
 
+    /// THE walked-universe enumeration of the source-rot door set, as a
+    /// standing test (the established two-zone pattern —
+    /// `crate::run::crate_sources` directory walk, per-file counts in
+    /// both lint zones): every production consumer of the rot-bar
+    /// predicate and every log-tail fetch site in the crate, audited
+    /// together because the door discipline couples them — a fetch door
+    /// is excused only by channel CONTENT against the bar, never by
+    /// line presence (see `channel_satisfies_rot_bar`'s doc), so a NEW
+    /// log-tail fetch site is a new door and must consult the predicate
+    /// (or be audited here as a non-classification fetch) before the
+    /// count admits it. Until now the three-door totality was guarded
+    /// only by the predicate's single ownership: nothing FAILED when a
+    /// fourth door appeared without consulting it.
+    ///
+    /// The audited production sites in src/run/collect.rs — predicate
+    /// consumers (5): the definition itself, the direct door's own-row
+    /// gate (fixed-output target), the cascade door's two channel gates
+    /// (the trigger's captured relay line AND the dependent's own
+    /// Signal-1 text — the resolver scans both for that row shape), and
+    /// the blanket door's trigger-line gate. Log-tail fetches (4): the
+    /// direct door (Signal-3 / FOD own-row), the cascade trigger fetch,
+    /// the blanket trigger fetch, and the evidence-CAPTURE fetch — the
+    /// one deliberate non-door: it uploads the failing root's tail next
+    /// to the campaign artifacts, reuses the Signal-3 bytes when that
+    /// fetch already happened (never a second fetch racing log
+    /// retention), and feeds no classification channel, so it does not
+    /// consult the bar BY DESIGN; if it ever starts feeding the scan it
+    /// must move into the door set. Test-zone rows are the transport's
+    /// own log-tail retry/trim tests (src/run/grpc.rs), calling the
+    /// production impl.
+    #[test]
+    fn rot_bar_doors_and_log_tail_fetches_are_enumerated() {
+        // Needles built at runtime so this test's own strings cannot
+        // match them (name and call-paren joined here, never adjacent
+        // in this file's source).
+        let rot_bar_needle = format!("{}{}", "channel_satisfies_rot_bar", '(');
+        let log_tail_needle = format!("{}{}", ".log_tail", '(');
+        // file → ((rot-bar prod, rot-bar test), (log-tail prod, log-tail test))
+        type Counts = ((usize, usize), (usize, usize));
+        let allowed: std::collections::BTreeMap<&str, Counts> = [
+            ("src/run/collect.rs", ((5, 0), (4, 0))),
+            ("src/run/grpc.rs", ((0, 0), (0, 3))),
+        ]
+        .into_iter()
+        .collect();
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (file, text) in crate::run::crate_sources() {
+            let (prod, tail) = crate::run::lint_zones(&text);
+            let expected = allowed
+                .get(file.as_str())
+                .copied()
+                .unwrap_or(((0, 0), (0, 0)));
+            assert_eq!(
+                (
+                    (
+                        prod.matches(&rot_bar_needle).count(),
+                        tail.matches(&rot_bar_needle).count()
+                    ),
+                    (
+                        prod.matches(&log_tail_needle).count(),
+                        tail.matches(&log_tail_needle).count()
+                    )
+                ),
+                expected,
+                "{file} ((rot-bar prod, test), (log-tail prod, test)): a new log-tail \
+                 fetch site is a new DOOR — it must consult channel_satisfies_rot_bar \
+                 (channel CONTENT against the bar, never line presence; the needle-free \
+                 producer shapes make presence-gating unsatisfiable) or be audited into \
+                 this enumeration as a non-classification fetch; a new or removed \
+                 rot-bar consumer re-audits the door set the same way"
+            );
+            seen.insert(file);
+        }
+        for file in allowed.keys() {
+            assert!(
+                seen.contains(*file),
+                "{file} is enumerated but no longer exists; drop or move its row"
+            );
+        }
+    }
+
     /// The DAG-fallback blanket detector admits exactly the scheduler's
     /// build-level first-failure summary and nothing else from the
     /// failure vocabulary.
