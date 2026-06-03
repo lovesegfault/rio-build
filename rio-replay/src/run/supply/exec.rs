@@ -89,8 +89,10 @@ const LARGE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// Skip detail recorded for uploads this invocation did not attempt because
 /// the gateway circuit breaker was open. Recorded under
 /// [`SUPPLY_OUTCOME_SKIPPED`], never as a failure: no transport call was
-/// made, so nothing about the path's delivery settled here.
-const GATEWAY_UNREACHABLE: &str = "gateway unreachable; not attempted";
+/// made, so nothing about the path's delivery settled here. `pub(crate)`
+/// so consumers of the journal (the inline-resume deferral fold's tests)
+/// can build breaker-shape rows from the producer's own constant.
+pub(crate) const GATEWAY_UNREACHABLE: &str = "gateway unreachable; not attempted";
 
 /// Skip detail recorded when another request still holds a path's upload
 /// claim (after the bounded `claim_wait_mins` wait and the single re-claim,

@@ -1955,10 +1955,35 @@ mod tests {
                 "{outcome}"
             );
         }
+        // The PRODUCTION breaker shape, by the producer's own constant
+        // (not a synthetic detail string): a deferral followed by the
+        // breaker-open skip row the execute-stage top-up actually appends
+        // (`skipped` + the gateway-unreachable detail) stays OWED. This is
+        // the exact corpus that failed the inline-resume refusal open
+        // before bookkeeping rows were filtered from deferral evidence.
+        let path = "/nix/store/owed";
+        let breaker_skipped = vec![
+            fold_row(
+                path,
+                SUPPLY_MECHANISM_NONE,
+                SUPPLY_OUTCOME_UNAVAILABLE,
+                Some(SUPPLY_DETAIL_DEFERRED_INLINE),
+            ),
+            fold_row(
+                path,
+                SUPPLY_MECHANISM_UPLOAD_BATCH,
+                SUPPLY_OUTCOME_SKIPPED,
+                Some(crate::run::supply::exec::GATEWAY_UNREACHABLE),
+            ),
+        ];
+        assert_eq!(
+            SupplyFold::collapse(&breaker_skipped).outstanding_inline_deferrals(),
+            vec![path],
+            "a breaker-open skip row must not redeem the deferral"
+        );
         // Unknown FUTURE vocabulary (a newer engine's journal read by this
         // build): bookkeeping in every projection — keeps the deferral
         // owed, invisible to settled truth.
-        let path = "/nix/store/owed";
         let future = vec![
             fold_row(
                 path,
