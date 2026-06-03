@@ -54,7 +54,7 @@ mod seccomp;
 mod skeleton;
 
 pub use child::{SetupError, SetupPhase};
-pub use execute::execute;
+pub use execute::{BUILD_SUBCGROUP, execute};
 pub use outcome::{
     ExecEvent, ExecutionOutcome, ExitOutcome, LogStream, OutputFileType, OutputMetadata,
     OutputReport,

@@ -1405,7 +1405,16 @@ impl Drop for ProcessTreeGuard {
 /// `subtree_control` empty), so `<cg>`'s limits and accounting cover
 /// both levels hierarchically while `<cg>/build/cgroup.kill` scopes a
 /// kill to exactly the build.
-const BUILD_SUBCGROUP: &str = "build";
+/// Exported so the builder's own enforcement writers (the log-cap
+/// arms in its stderr loop) can aim at the SAME principal kill scope
+/// instead of the build root: a cap kill that hits `<cg>` kills the
+/// relay with the principal and destroys the forwarded wait status —
+/// the exact evidence-destruction `builder.exec.kill-targets-principal`
+/// exists to forbid. Writers outside rio-exec stay UNCLAIMED (the
+/// verdict authority for a builder cap kill is the builder's own cap
+/// flag, not a kill claim); routing them through the claim machinery
+/// is the named follow-up tail (`KillReason::LogLimit`).
+pub const BUILD_SUBCGROUP: &str = "build";
 
 /// SIGKILL via pidfd: recycle-proof by construction (a pidfd names the
 /// process instance, never a reusable number) and namespace-correct

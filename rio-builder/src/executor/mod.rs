@@ -1605,6 +1605,34 @@ fn exec_errno_is_derivation_caused(errno: i32) -> bool {
     )
 }
 
+/// Kill the build PRINCIPAL's scope (`<cg>/build`) because a log cap
+/// tripped — never the build root, whose recursive kill would take the
+/// rio-exec relay down with the principal and destroy the forwarded
+/// wait status the verdict corroboration is judged by
+/// (round-17 merged_bug_058; the spec MUST is
+/// `builder.exec.kill-targets-principal`).
+///
+/// Ordering argument for why `<cg>/build` exists by the time this can
+/// fire: the cap arms only run on `ExecEvent::Log` lines, and the
+/// sandbox child cannot produce output before the release byte — which
+/// rio-exec writes only AFTER the principal is placed in the build
+/// sub-cgroup. A line that trips the cap therefore proves placement
+/// completed. ENOENT here would mean no tenant instruction ever ran
+/// (nothing to kill); the write stays best-effort like every other
+/// kill path.
+///
+/// The kill is deliberately UNCLAIMED in rio-exec's kill-claim
+/// machinery: the verdict authority for a cap kill is the builder's
+/// own `log_limit_exceeded` flag (the relay forwards the principal's
+/// true 137, and classification overrides it to `LogLimitExceeded`).
+/// Routing this writer through `KillReason::LogLimit` claims is the
+/// named follow-up tail tracked by the kill-writer-conformance
+/// allowlist's transitional entry.
+// r[impl builder.exec.kill-targets-principal]
+fn principal_cap_kill(cgroup_path: &std::path::Path) {
+    crate::cgroup::kill_principal_scope(cgroup_path);
+}
+
 /// What [`native_log_loop`] reports back to the lifecycle.
 struct LogLoopResult {
     final_line_count: u64,
@@ -1697,7 +1725,7 @@ async fn native_log_loop(
                         }
                         AddLineResult::LimitExceeded { .. } => {
                             log_limit_exceeded = true;
-                            let _ = std::fs::write(cgroup_path.join("cgroup.kill"), "1");
+                            principal_cap_kill(&cgroup_path);
                         }
                     },
                     glue::log::LineAction::Phase(phase) => {
@@ -1719,7 +1747,7 @@ async fn native_log_loop(
                     glue::log::LineAction::Consumed => {}
                     glue::log::LineAction::CapExceeded => {
                         log_limit_exceeded = true;
-                        let _ = std::fs::write(cgroup_path.join("cgroup.kill"), "1");
+                        principal_cap_kill(&cgroup_path);
                     }
                 }
             }

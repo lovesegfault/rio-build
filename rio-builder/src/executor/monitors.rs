@@ -197,10 +197,14 @@ pub(super) fn spawn_cgroup_monitors(
                         "cgroup oom_kill incremented during build; killing build cgroup"
                     );
                     flag.store(true, Ordering::SeqCst);
-                    // Break the make-respawn loop. The executor sees the
-                    // build exit; the caller's flag check converts that
-                    // into CgroupOom.
-                    let _ = std::fs::write(kill_path.join("cgroup.kill"), "1");
+                    // Break the make-respawn loop at the PRINCIPAL
+                    // scope so the relay survives to forward the true
+                    // status (merged_bug_058's sibling site — the
+                    // round-17 sweep found this writer the finding
+                    // missed). The executor sees the build exit; the
+                    // caller's flag check converts that into CgroupOom
+                    // regardless of what the forwarded status says.
+                    crate::cgroup::kill_principal_scope(&kill_path);
                     return;
                 }
             }

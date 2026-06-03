@@ -2027,6 +2027,84 @@ in
         check_pin 'Err(e.to_string())' rio-store/src/cas.rs 0 \
           "no carve-out: the singleflight Shared carries the typed Clone FetchFail (W2-S3 c6 dropped the last stringly carrier)"
 
+
+  # Round-17 merged_bug_058 / RC17-09 (kill-writer conformance — the
+  # F2 TRIGGER DEFINITION for the kill-corroboration family): every
+  # cgroup.kill WRITER PRIMITIVE (`join("cgroup.kill")` expression) and
+  # every caller of the two method wrappers must appear here with a
+  # disposition. A NEW writer landing without a same-commit disposition
+  # is the "in-governance recurrence" that activates the family's
+  # pre-registered F2 scope (rio-exec owns ALL enforcement-kill writers
+  # via KillClaim; cgroup.kill unwritable outside it). Dispositions:
+  #   CLAIMED  — routed through rio-exec's kill-claim machinery; the
+  #              wait status corroborates the claim (KillTarget).
+  #   SCOPED   — principal-scoped enforcement kill via
+  #              kill_principal_scope; UNCLAIMED (verdict authority is
+  #              the caller's own flag: log_limit_exceeded /
+  #              oom_detected); TRANSITIONAL until KillReason::LogLimit
+  #              claim routing lands (named follow-up tail).
+  #   TEARDOWN — cancel/drain/abort whole-tree kill; fires only where
+  #              no forwarded-status verdict exists or it is already
+  #              settled, so no evidence can be destroyed.
+  #   TEST     — assertion reads in test code; not a writer.
+  kill-writer-conformance =
+    pkgs.runCommand "rio-kill-writer-conformance"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [ workspaceFileset ];
+        };
+        nativeBuildInputs = [ pkgs.ripgrep ];
+      }
+      ''
+        cd $src
+        fail=0
+        remediation() {
+          echo "  Every cgroup.kill writer needs a same-commit disposition in" >&2
+          echo "  nix/misc-checks.nix kill-writer-conformance. An enforcement" >&2
+          echo "  kill (one that produces or overrides a build verdict) MUST be" >&2
+          echo "  principal-scoped (crate::cgroup::kill_principal_scope) or" >&2
+          echo "  CLAIMED via rio-exec; a bypass is the in-governance trigger" >&2
+          echo "  for this family's F2 escalation (KillClaim ownership)." >&2
+        }
+        # Table 1: writer primitives — join("cgroup.kill") expressions.
+        prim() {
+          f=$1; want=$2; why=$3
+          got=$(rg -c 'join\("cgroup\.kill"\)' "$f" 2>/dev/null || echo 0)
+          if [ "$got" != "$want" ]; then
+            echo "FAIL: $f has $got join(cgroup.kill) primitives, allowlist pins $want ($why)." >&2
+            remediation; fail=1
+          fi
+        }
+        prim rio-exec/src/execute.rs 3 \
+          "CLAIMED principal (KillTarget::Principal, post-placement) + CLAIMED tree (kill_pid_and_cgroup, pre-placement) + TEST read"
+        prim rio-builder/src/cgroup.rs 4 \
+          "kill_principal_scope SCOPED x2 (principal write + pre-placement ENOENT fallback) + BuildCgroup::kill TEARDOWN + kill_cgroup TEARDOWN"
+        prim rio-builder/src/executor/mod.rs 1 \
+          "abort scopeguard TEARDOWN (error-path teardown; no settled verdict exists)"
+        prim rio-builder/src/runtime/mod.rs 1 "TEST read (cancel-registry assertion)"
+        files=$(rg -l 'join\("cgroup\.kill"\)' --type rust . | wc -l)
+        if [ "$files" != "4" ]; then
+          echo "FAIL: join(cgroup.kill) primitives appear in $files rust files; the allowlist registers 4:" >&2
+          rg -l 'join\("cgroup\.kill"\)' --type rust . >&2
+          remediation; fail=1
+        fi
+        # Table 2: method-wrapper callers OUTSIDE the defining module —
+        # the likeliest shape for a new unaudited kill.
+        wrap() {
+          f=$1; want=$2; why=$3
+          got=$(rg -n 'kill_principal_scope\(|kill_cgroup\(|build_cgroup\.kill\(\)' "$f" 2>/dev/null | rg -v ':\s*//' | rg -v 'fn (kill_principal_scope|kill_cgroup)' | wc -l)
+          if [ "$got" != "$want" ]; then
+            echo "FAIL: $f has $got kill-wrapper call sites, allowlist pins $want ($why)." >&2
+            remediation; fail=1
+          fi
+        }
+        wrap rio-builder/src/executor/monitors.rs 3 \
+          "OOM-loop breaker SCOPED (the round-17 sweep-found writer the finding missed) + drain_build_cgroup TEARDOWN (post-settlement drain) + its failure-warn STRING (prose, not a writer)"
+        wrap rio-builder/src/executor/mod.rs 1 \
+          "principal_cap_kill body SCOPED (log-cap arms; both cap arms route through it)"
+        wrap rio-builder/src/runtime/slot.rs 1 \
+          "scheduler cancel TEARDOWN (no verdict; CancelSignal semantics)"
         [ "$fail" = 0 ] || exit 1
         touch $out
       '';

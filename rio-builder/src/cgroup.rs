@@ -199,6 +199,38 @@ impl BuildCgroup {
     }
 }
 
+/// Kill a build's PRINCIPAL scope (`<cg>/build`) for an enforcement
+/// verdict (log cap, OOM-loop breaker), falling back to the build root
+/// only when the principal sub-cgroup does not exist yet.
+///
+/// The two-phase contract mirrors rio-exec's own kill targets
+/// (`builder.exec.kill-targets-principal`): post-placement, killing
+/// `<cg>` recursively would take the relay down with the principal and
+/// destroy the forwarded wait status the verdict corroboration is
+/// judged by (round-17 merged_bug_058). Pre-placement (ENOENT on the
+/// sub-cgroup), no tenant instruction has run and no forwarded status
+/// exists to protect — the root kill is the legacy whole-tree
+/// semantics rio-exec itself uses for that phase.
+///
+/// Both writes are deliberately UNCLAIMED in rio-exec's kill-claim
+/// machinery: the verdict authority for these kills is the caller's
+/// own flag (`log_limit_exceeded` / `oom_detected`), not the wait
+/// status. Routing them through typed claims is the named follow-up
+/// tail (`KillReason::LogLimit`) tracked by kill-writer-conformance's
+/// transitional entries.
+// r[impl builder.exec.kill-targets-principal]
+pub(crate) fn kill_principal_scope(cg_root: &Path) {
+    let principal = cg_root.join(rio_exec::BUILD_SUBCGROUP).join("cgroup.kill");
+    match fs::write(&principal, "1") {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Pre-placement: the sub-cgroup is not created yet.
+            let _ = fs::write(cg_root.join("cgroup.kill"), "1");
+        }
+        Err(_) => {}
+    }
+}
+
 /// Cancel a build by cgroup path (lookup via the cancel registry).
 ///
 /// Static free function instead of a `BuildCgroup` method because the
