@@ -1179,9 +1179,13 @@ in
         # CLI verbs used by the script → IAM action names.
         verbs=$(grep -oE 'aws secretsmanager [a-z-]+' $script | awk '{print $3}' | sort -u)
         [ -n "$verbs" ] || { echo "FAIL: no aws secretsmanager verbs found in script?" >&2; exit 1; }
-        # The rio_bootstrap policy statement (between the policy
-        # resource declaration and its Resource line).
-        block=$(sed -n '/resource "aws_iam_policy" "rio_bootstrap"/,/Resource/p' $policy)
+        # The FULL rio_bootstrap policy resource (to the closing brace
+        # of the jsonencode block). The policy is multi-statement since
+        # the GetSecretValue grant was confined to the signing-key pair
+        # (least privilege) — a single-statement extraction stopping at
+        # the first Resource line would miss actions granted in later
+        # statements and report them as missing.
+        block=$(sed -n '/resource "aws_iam_policy" "rio_bootstrap"/,/^}/p' $policy)
         [ -n "$block" ] || { echo "FAIL: rio_bootstrap policy block not found in secrets.tf" >&2; exit 1; }
         fail=0
         for v in $verbs; do
