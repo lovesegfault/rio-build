@@ -17,7 +17,7 @@ use super::ExecutorError;
 /// declaration (`OutputHashAlgo::parse`, the system-wide FodAlgo
 /// constructor), never from a raw string, so this module cannot
 /// develop its own opinion about spellings or prefixes.
-// r[impl nix.hash.algos+1]
+// r[impl nix.hash.algos+2]
 #[derive(Debug, Clone, Copy)]
 enum FodHashAlgo {
     Sha1,
@@ -157,7 +157,7 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
         // GC'd) between the submission-time probe and dispatch, in
         // which case failing the build is exactly the intended
         // fail-closed behavior.
-        // r[impl nix.hash.algos+1]
+        // r[impl nix.hash.algos+2]
         let Ok(parsed) = rio_nix::hash::OutputHashAlgo::parse(output.hash_algo()) else {
             bail!(
                 "FOD output '{}' declares unsupported hash algorithm '{}' \

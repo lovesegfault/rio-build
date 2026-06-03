@@ -1257,7 +1257,7 @@ async fn test_submit_build_rejects_authoritative_identity_mismatch() {
 /// worker glue, and the oracle's eval (`parseHashAlgo`,
 /// hash.cc:468-490), never a lax-folded alias that one gate accepts
 /// and another rejects.
-// r[verify nix.hash.algos+1]
+// r[verify nix.hash.algos+2]
 #[tokio::test]
 async fn test_submit_build_rejects_authoritative_case_variant_algo() {
     let (_db, grpc, _handle, _task) = setup_grpc().await;

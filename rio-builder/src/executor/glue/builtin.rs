@@ -111,7 +111,7 @@ pub(crate) fn prepare_fetchurl(
     // with the same constructor, so `parsed` cannot be None here in
     // production; the None arm below is the registered raw fallback
     // (defensive, never panicking).
-    // r[impl nix.hash.algos+1]
+    // r[impl nix.hash.algos+2]
     let parsed = rio_nix::hash::OutputHashAlgo::parse(raw_algo).ok();
     let flat = match parsed {
         Some(p) => !p.recursive,
@@ -498,7 +498,7 @@ mod tests {
         // the PARSED declaration (merged_bug_048: the hash component
         // was canonicalized while the raw algo string went into the
         // env).
-        // r[verify nix.hash.algos+1]
+        // r[verify nix.hash.algos+2]
         let hash_algo = pb
             .request
             .env

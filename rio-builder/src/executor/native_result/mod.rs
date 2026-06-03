@@ -488,17 +488,19 @@ fn populate_fixed_output_descriptors(
         else {
             continue;
         };
-        let (recursive, algo_str) = match raw_algo.strip_prefix("r:") {
-            Some(rest) => (true, rest),
-            None => (false, raw_algo),
-        };
-        let algo: HashAlgo =
-            algo_str
-                .parse()
-                .map_err(|_| OutputRejection::FodDeclaredHashInvalid {
-                    output: o.name().to_owned(),
-                    message: format!("unsupported outputHashAlgo '{raw_algo}'"),
-                })?;
+        // Through THE constructor for algo declarations
+        // (r[nix.hash.algos+2]) — this site previously open-coded the
+        // strip+parse, so a prefix-semantics change in the owner would
+        // have silently diverged the descriptor stamping from every
+        // other gate.
+        // r[impl nix.hash.algos+2]
+        let parsed = rio_nix::hash::OutputHashAlgo::parse(raw_algo).map_err(|_| {
+            OutputRejection::FodDeclaredHashInvalid {
+                output: o.name().to_owned(),
+                message: format!("unsupported outputHashAlgo '{raw_algo}'"),
+            }
+        })?;
+        let (recursive, algo): (bool, HashAlgo) = (parsed.recursive, parsed.algo);
         // Shared length-discriminated decode (base16 / nixbase32 / base64).
         // r[impl nix.hash.fod-decode+1]
         let hash = NixHash::parse_nonsri_unprefixed(algo, o.hash()).map_err(|e| {

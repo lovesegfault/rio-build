@@ -894,7 +894,7 @@ pub(crate) fn validate_declared_hash_outputs(
     // `r:` strip. Before this, the declared-hash gate folded case (lax
     // FromStr) while `fod_algo_verifiable` below was exact — the
     // merged_bug_048 disagreement shape INSIDE one component.
-    // r[impl nix.hash.algos+1]
+    // r[impl nix.hash.algos+2]
     let parsed = rio_nix::hash::OutputHashAlgo::parse(raw_algo).map_err(|_| {
         format!(
             "derivation {drv_path} output '{name}' declares unsupported outputHashAlgo '{raw_algo}'"
@@ -930,7 +930,7 @@ pub(crate) fn validate_declared_hash_outputs(
 /// what the worker enforces (it used to be a hand-mirrored set with a
 /// "must stay in sync" comment; merged_bug_048 was the sibling
 /// declared-hash gate disagreeing with it on case).
-// r[impl nix.hash.algos+1]
+// r[impl nix.hash.algos+2]
 pub(crate) fn fod_algo_verifiable(algo: &str) -> bool {
     rio_nix::hash::OutputHashAlgo::parse(algo).is_ok()
 }
@@ -2112,7 +2112,7 @@ mod tests {
         for (algo, digest_len) in [("sha256", 32usize), ("r:sha512", 64)] {
             let digest = vec![0xabu8; digest_len];
             let nix_hash = rio_nix::hash::NixHash::new(
-                algo.strip_prefix("r:").unwrap_or(algo).parse().unwrap(),
+                rio_nix::hash::OutputHashAlgo::parse(algo).unwrap().algo,
                 digest.clone(),
             )
             .unwrap();
@@ -2504,7 +2504,7 @@ mod tests {
     /// screen now delegates to the shared constructor, so these pins
     /// hold for every other gate by construction (the oracle's
     /// `parseHashAlgo`, hash.cc:468-490, rejects the same spellings).
-    // r[verify nix.hash.algos+1]
+    // r[verify nix.hash.algos+2]
     #[test]
     fn fod_algo_verifiable_table() {
         for ok in ["sha1", "sha256", "sha512", "r:sha1", "r:sha256", "r:sha512"] {
@@ -2625,7 +2625,7 @@ mod tests {
         // previously the binding's lax FromStr folded "SHA256" while
         // the screen was exact, a latent disagreement shadowed only by
         // the screen running first.
-        // r[verify nix.hash.algos+1]
+        // r[verify nix.hash.algos+2]
         let honest = StorePath::make_fixed_output("fetch", &nix_hash, false, &[]).unwrap();
         for bad_algo in ["SHA256", "Sha256", "r:SHA256", "R:sha256"] {
             let mut cache = HashMap::new();

@@ -85,14 +85,17 @@ pub fn hash_derivation_modulo_input_form<'c>(
 // r[impl nix.hash.fod-decode+1]
 // r[impl nix.divergence.fod-fallback-fingerprint+1]
 fn canonical_fod_hash(raw_algo: &str, raw_hash: &str) -> String {
-    use crate::hash::{HashAlgo, NixHash};
+    use crate::hash::{NixHash, OutputHashAlgo};
 
-    raw_algo
-        .strip_prefix("r:")
-        .unwrap_or(raw_algo)
-        .parse::<HashAlgo>()
+    // Byte-identical to the previous open-coded strip+parse: the owner
+    // strips at most one case-sensitive "r:" then parses case-exactly,
+    // and an Err here lands in the same raw-string fallback the
+    // open-coded `.ok()` chain produced (the load-bearing
+    // offender-exemption fallback — see the divergence note above).
+    // r[impl nix.hash.algos+2]
+    OutputHashAlgo::parse(raw_algo)
         .ok()
-        .and_then(|algo| NixHash::parse_nonsri_unprefixed(algo, raw_hash).ok())
+        .and_then(|oha| NixHash::parse_nonsri_unprefixed(oha.algo, raw_hash).ok())
         .map(|h| h.to_hex())
         .unwrap_or_else(|| raw_hash.to_owned())
 }

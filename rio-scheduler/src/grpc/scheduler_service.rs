@@ -664,7 +664,7 @@ fn validate_fixed_output_binding(
     // `r:` strip — identical to the gateway gate and the worker glue,
     // so this authoritative validator cannot accept a spelling any
     // other gate rejects (merged_bug_048).
-    // r[impl nix.hash.algos+1]
+    // r[impl nix.hash.algos+2]
     let parsed = rio_nix::hash::OutputHashAlgo::parse(algo).map_err(|_| {
         Status::invalid_argument(format!(
             "{context} output '{out_name}' declares unsupported outputHashAlgo '{algo}'"
@@ -1235,7 +1235,7 @@ pub(crate) fn validate_inline_drv_content(
                     // one, and for a hand-written one the path-equality
                     // + text-CA + store upload verification posture is
                     // exactly the documented junk-algo enforcement.
-                    // r[impl nix.hash.algos+1]
+                    // r[impl nix.hash.algos+2]
                     let algo_supported = rio_nix::hash::OutputHashAlgo::parse(hash_algo).is_ok();
                     if algo_supported {
                         validate_fixed_output_binding(

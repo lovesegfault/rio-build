@@ -600,7 +600,7 @@ fn validate_fixed_output_declarations(
         // spelling any other gate rejects (merged_bug_048: a local
         // case-folding parse here admitted "SHA256" past a gate the
         // gateway and the verify pipeline both enforce exactly).
-        // r[impl nix.hash.algos+1]
+        // r[impl nix.hash.algos+2]
         let parsed = rio_nix::hash::OutputHashAlgo::parse(raw_algo).map_err(|_| {
             GlueError::FixedOutputHashInvalid {
                 output: o.name().to_owned(),
@@ -866,16 +866,10 @@ mod tests {
     /// must declare for the given outputHashAlgo and base16 hash — i.e.
     /// the path `validate_fixed_output_declarations` derives.
     fn fod_path(algo: &str, hash_hex: &str) -> String {
-        let (recursive, plain) = match algo.strip_prefix("r:") {
-            Some(rest) => (true, rest),
-            None => (false, algo),
-        };
-        let hash = rio_nix::hash::NixHash::new(
-            plain.parse::<rio_nix::hash::HashAlgo>().unwrap(),
-            hex::decode(hash_hex).unwrap(),
-        )
-        .unwrap();
-        StorePath::make_fixed_output("demo", &hash, recursive, &[])
+        let parsed = rio_nix::hash::OutputHashAlgo::parse(algo).unwrap();
+        let hash =
+            rio_nix::hash::NixHash::new(parsed.algo, hex::decode(hash_hex).unwrap()).unwrap();
+        StorePath::make_fixed_output("demo", &hash, parsed.recursive, &[])
             .unwrap()
             .as_str()
             .to_owned()
@@ -1118,7 +1112,7 @@ mod tests {
     /// gateway and the verify pipeline reject can no longer slip past
     /// THIS gate into a network-enabled sandbox via a gateway-bypass
     /// submission.
-    // r[verify nix.hash.algos+1]
+    // r[verify nix.hash.algos+2]
     #[test]
     fn fixed_output_with_case_variant_algo_is_rejected() {
         let zeros = "00".repeat(32);

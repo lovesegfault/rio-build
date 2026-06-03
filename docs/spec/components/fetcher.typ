@@ -166,7 +166,7 @@ fetch proceeds unauthenticated and fails with an HTTP status that says
 nothing about netrc. Folding at the comparison (not at parse time)
 keeps stored values byte-faithful. This is the opposite posture from
 fixed-output hash-algorithm spellings, which are case-EXACT
-system-wide (#rref("nix.hash.algos+1")): the two axes answer to
+system-wide (#rref("nix.hash.algos+2")): the two axes answer to
 different oracles --- DNS-case-insensitive hostnames versus an
 exact-set parser --- and MUST NOT share a normalization helper.
 

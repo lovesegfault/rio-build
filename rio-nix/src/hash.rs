@@ -48,7 +48,7 @@ pub enum HashError {
 
 /// Supported hash algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-// r[impl nix.hash.algos+1]
+// r[impl nix.hash.algos+2]
 pub enum HashAlgo {
     SHA256,
     SHA512,
@@ -143,7 +143,7 @@ impl std::fmt::Display for HashAlgo {
 /// unknown-algorithm rejection here, matching the xp-disabled oracle.
 /// `md5` and `blake3` are accepted by the oracle but not by rio — the
 /// registered divergence `nix.divergence.fod-fallback-fingerprint+1`.
-// r[impl nix.hash.algos+1]
+// r[impl nix.hash.algos+2]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OutputHashAlgo {
     /// True for `r:`-prefixed declarations (NAR ingestion — the prefix
@@ -439,7 +439,7 @@ mod tests {
     /// 3. on the case axis specifically: any non-lowercase mask is
     ///    rejected by BOTH sides (a case-fold regression in rio
     ///    violates law 1; one in the port violates law 3).
-    // r[verify nix.hash.algos+1]
+    // r[verify nix.hash.algos+2]
     // r[verify nix.divergence.fod-fallback-fingerprint+1]
     #[test]
     fn algo_parse_differential_spelled_strings() {

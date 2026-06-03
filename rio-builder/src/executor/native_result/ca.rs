@@ -93,7 +93,7 @@ impl FloatingCaSpec {
             // prefix handling as every other gate, so a floating-CA
             // declaration cannot be read differently here than the
             // request glue / gateway read it.
-            // r[impl nix.hash.algos+1]
+            // r[impl nix.hash.algos+2]
             let parsed = rio_nix::hash::OutputHashAlgo::parse(raw).map_err(|_| {
                 OutputRejection::CaUnsupportedAlgo {
                     output: o.name().to_owned(),

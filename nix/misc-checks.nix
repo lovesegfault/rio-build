@@ -1749,6 +1749,16 @@ in
             ../rio-store/src/substitute.rs
             ../rio-cli/src/keygen.rs
             ../nix/bootstrap-job.sh
+            # outputHashAlgo strip-prefix table (carve-outs + must-stay-clean):
+            ../rio-nix/src/hash.rs
+            ../rio-nix/src/hash_oracle.rs
+            ../rio-nix/src/derivation/output.rs
+            ../rio-nix/src/derivation/hash.rs
+            ../rio-gateway/src/handler/opcodes_write.rs
+            ../rio-gateway/src/translate.rs
+            ../rio-builder/src/executor/native_result/mod.rs
+            ../rio-builder/src/executor/glue/mod.rs
+            ../rio-store/src/grpc/put_path/common.rs
           ];
         };
       }
@@ -1810,6 +1820,48 @@ in
             echo "FAIL: signing_keyfmt.rs lost '$sym' — update single-source-conformance with the rename." >&2
             fail=1
           }
+        done
+
+        # ── outputHashAlgo strip-prefix deny-table ──────────────────
+        # OutputHashAlgo::parse (rio-nix/src/hash.rs) is THE
+        # constructor for `outputHashAlgo` declarations
+        # (r[nix.hash.algos+2]). Open-coding `strip_prefix("r:")`
+        # re-creates the pre-round-17 divergence (merged_bug_074: the
+        # descriptor stamping and the modulo fingerprint silently
+        # diverged from every other gate). Carve-outs, one site each:
+        #   rio-nix/src/hash.rs              — the owner itself
+        #   rio-nix/src/hash_oracle.rs       — line-by-line CppNix port
+        #   rio-nix/src/derivation/output.rs — floating_algo keeps the
+        #     RAW string for population classification (not algo parse)
+        #   rio-gateway/.../opcodes_write.rs — ContentAddress WIRE
+        #     format ("fixed:r:" colon descriptor — a different grammar
+        #     that embeds the prefix)
+        #   rio-store/.../put_path/common.rs — same wire grammar
+        check_strip() {
+          file=$1; expected=$2
+          actual=$(grep -c 'strip_prefix("r:")' "$file" 2>/dev/null || true)
+          if [ "$actual" != "$expected" ]; then
+            echo "FAIL: $file has $actual strip_prefix(\"r:\") sites, pinned $expected." >&2
+            echo "  outputHashAlgo declarations parse ONLY through" >&2
+            echo "  rio_nix::hash::OutputHashAlgo::parse (r[nix.hash.algos+2])." >&2
+            echo "  Wire-format/oracle/classification sites: re-pin here WITH a reason comment." >&2
+            fail=1
+          fi
+        }
+        check_strip rio-nix/src/hash.rs 1
+        check_strip rio-nix/src/hash_oracle.rs 1
+        check_strip rio-nix/src/derivation/output.rs 1
+        check_strip rio-gateway/src/handler/opcodes_write.rs 1
+        check_strip rio-store/src/grpc/put_path/common.rs 1
+        # And the previously-divergent files must stay clean.
+        for f in rio-nix/src/derivation/hash.rs \
+                 rio-builder/src/executor/native_result/mod.rs \
+                 rio-builder/src/executor/glue/mod.rs \
+                 rio-gateway/src/translate.rs; do
+          if grep -q 'strip_prefix("r:")' "$f" 2>/dev/null; then
+            echo "FAIL: $f re-introduced an open-coded strip_prefix(\"r:\") — route through OutputHashAlgo::parse." >&2
+            fail=1
+          fi
         done
 
         [ "$fail" = 0 ] || exit 1
