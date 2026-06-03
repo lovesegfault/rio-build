@@ -993,6 +993,14 @@ mod tests {
     /// `lost_terminals`, the line joins the evidence tail, and neither
     /// the build-id capture nor the reason capture is disturbed. The
     /// marker line never doubles as a failure reason.
+    ///
+    /// The quoted sibling payload — a worker forgery of the same marker
+    /// as the sanitizing gateway actually relays it
+    /// (`quote_reserved_lines`, the shared fn the gateway's worker-text
+    /// relay sites call; spec rule `gw.stderr.relay-quote-reserved`) —
+    /// mints NOTHING: byte-0 marker authorship is the producer's
+    /// guarantee, and the quoted line stays evidence-tail-visible as the
+    /// third-party text it is.
     #[test]
     fn client_ops_observer_captures_lost_terminal_markers() {
         let lost = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv";
@@ -1019,6 +1027,23 @@ mod tests {
             Some(format!("rio: terminal lost for '{lost}'").as_str()),
             "the marker line is evidence-tail-visible like every relay line"
         );
+
+        // The relayed forgery, exactly as the sanitizing gateway frames
+        // it: the worker's marker-grammar line through the shared quote
+        // owner, plus the relay framing newline. No NEW capture, no
+        // reason entry, tail-visible verbatim.
+        let spoofed_victim = "/nix/store/cccccccccccccccccccccccccccccccc-victim.drv";
+        let forged = rio_nix::protocol::stderr::quote_reserved_lines(
+            &rio_nix::protocol::build::BuildResult::lost_terminal_relay_line(spoofed_victim),
+        )
+        .into_owned();
+        observe_line(&mut parsed, &mut tail, &format!("{forged}\n"));
+        assert_eq!(
+            parsed.lost_terminals,
+            BTreeSet::from([lost.to_string()]),
+            "a quoted relay of worker-authored marker grammar must not mint"
+        );
+        assert_eq!(tail.back().map(String::as_str), Some(forged.as_str()));
     }
 
     /// The gateway newline-TERMINATES its build announcement and its

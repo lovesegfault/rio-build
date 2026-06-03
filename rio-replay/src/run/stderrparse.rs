@@ -64,12 +64,16 @@ pub(crate) const MAX_CAPTURED_REASON_BYTES: usize = rio_common::limits::MAX_RETA
 /// Cardinality cap on the per-batch `lost_terminals` set — same
 /// provenance and envelope as [`MAX_CAPTURED_REASONS`]: the genuine
 /// producer (the gateway's lost-terminal relay marker) emits at most one
-/// marker per root of the submitted DAG, the marker parser is byte-0
-/// anchored but worker text can still reach byte 0 via the plain
-/// `STDERR_NEXT` fallback (see the trust-bound doc on
-/// `BuildResult::lost_terminal_relay_drv`), and each distinct spoofed
-/// line otherwise grows the uncapped set. Keys are drv paths (~130 B), so
-/// the capped worst case is ~8 MiB.
+/// marker per root of the submitted DAG. On a sanitizing gateway the
+/// marker parser's byte-0 anchor is a producer guarantee — every
+/// worker-text relay site quotes reserved-grammar lines, so byte-0
+/// marker lines are gateway-authored (see the trust-bound doc on
+/// `BuildResult::lost_terminal_relay_drv`) — but the cap is sized for
+/// the channel, not the deployed gateway's hygiene: during the
+/// mixed-fleet skew window an unsanitized gateway still relays raw
+/// worker lines, and each distinct spoofed line would otherwise grow
+/// the uncapped set. Keys are drv paths (~130 B), so the capped worst
+/// case is ~8 MiB.
 pub(crate) const MAX_CAPTURED_LOST_TERMINALS: usize = STDERR_BUDGET_NODE_MULTIPLIER_CAP;
 
 /// `rio: build <uuid>` — emitted once per accepted build by the gateway
@@ -526,8 +530,10 @@ mod tests {
 
         // Must-NOT-capture: the marker text on worker-controllable
         // channels — embedded in a relayed failure message (its first
-        // line, and a daemon-quoted log line inside the same payload) —
-        // and the engine's own evidence-tail rendering of such payloads.
+        // line, and a `> `-quoted line inside the same payload, which is
+        // both the daemon's log-embedding shape AND the relay
+        // sanitizer's output for a worker forgery) — and the engine's
+        // own evidence-tail rendering of such payloads.
         let mut p = ParsedStderr::default();
         for line in [
             format!("derivation '{other}' failed: {marker}"),
@@ -542,54 +548,99 @@ mod tests {
         );
     }
 
-    /// Pins the ACCEPTED spoof surface of the marker capture — the
-    /// documented residual, kept current deliberately so widening or
-    /// closing it is a conscious act, never drift. Worker-controlled
-    /// text CAN reach byte 0 of an observed line on two routes the
-    /// producer-side trust-provenance doc names
-    /// ([`BuildResult::lost_terminal_relay_drv`]): the gateway's
-    /// no-live-activity fallback relay emits raw worker lines as
-    /// single-line payloads, and the observer-boundary split puts the
-    /// non-first lines of a multi-line payload at byte 0. A
-    /// marker-shaped line arriving on either route IS captured — the
-    /// parser cannot distinguish it from the gateway-authored emission,
-    /// and the defense is consumer-enforced instead (the conservative
-    /// evidence-loss flip, priced in that doc at its gate-accounting
-    /// worst case: shared auto-retry budget burn, then an
-    /// infra-indeterminate terminal that trips the regression gate).
-    /// If this test starts failing because the capture grew an
-    /// authenticity conjunct, re-derive the trust-bound doc and this
-    /// pin together.
+    /// Pins the marker capture's trust shape against the SANITIZING
+    /// producer (spec rule `gw.stderr.relay-quote-reserved`): the two
+    /// routes that used to deliver worker-controlled text to byte 0 of
+    /// an observed line — the gateway's no-live-activity fallback relay
+    /// and the observer-boundary split of a multi-line failure payload —
+    /// now arrive QUOTED, because the gateway escapes every relayed line
+    /// that begins with its reserved `rio: ` grammar at every
+    /// worker-text `STDERR_NEXT` ingress. The fixtures are built by the
+    /// producer's own chain across the crate boundary: the shared
+    /// formatter for the forgery bytes
+    /// ([`BuildResult::lost_terminal_relay_line`] — a worker spoofs by
+    /// reproducing exactly those bytes) and the shared sanitizer for the
+    /// relayed shape ([`quote_reserved_lines`], the fn the gateway's
+    /// relay sites call), so this pin and the gateway cannot drift.
+    ///
+    /// The raw byte-0 row at the end is BOTH readings of the same
+    /// parser fact: the parser cannot authenticate a line, so a raw
+    /// marker parses no matter who minted it. On a sanitizing gateway
+    /// only the gateway itself can put one on the channel (that row IS
+    /// the genuine-marker capture); against a pre-sanitization gateway
+    /// — the mixed-fleet skew window, the ONLY remaining residual — a
+    /// raw worker forgery still captures, priced in the trust-bound doc
+    /// (a bounded gate-trip denial-of-measurement, never a success or a
+    /// hidden violation). If this test starts failing because the
+    /// capture grew an authenticity conjunct of its own, re-derive the
+    /// trust-bound doc and this pin together.
     #[test]
-    fn worker_reachable_marker_text_is_captured_by_design() {
+    fn sanitized_relay_routes_cannot_mint_marker_captures() {
+        use rio_nix::protocol::stderr::quote_reserved_lines;
+
         let victim = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv";
-        // The spoof string is the producer formatter's own output: a
-        // worker spoofs by reproducing it byte-for-byte, so the fixture
-        // must be constructed via the same fn the gateway emission calls.
         let marker = BuildResult::lost_terminal_relay_line(victim);
 
-        // Route 1 — observer-boundary split: the marker as a NON-FIRST
-        // line of a multi-line payload (worker-authored body relayed in
-        // one frame), split exactly as the observer splits payloads
-        // (`str::lines`, the documented observer-boundary discipline).
-        let payload = format!("build log tail before the forgery\n{marker}\n");
+        // Route 1 — fallback relay: the worker line is the whole
+        // payload; the gateway relays the sanitizer's output.
+        let relayed = quote_reserved_lines(&marker);
+        assert_eq!(relayed, format!("> {marker}"), "premise: the line quotes");
+        let mut fallback_route = ParsedStderr::default();
+        parse_line(&mut fallback_route, &relayed);
+        assert!(
+            fallback_route.lost_terminals.is_empty(),
+            "a sanitized fallback relay must not mint a capture: {fallback_route:?}"
+        );
+
+        // Route 2 — observer-boundary split: a multi-line worker body
+        // sanitized per line by the gateway, then split exactly as the
+        // observer splits payloads (`str::lines`). The forged line is
+        // quoted, so no split line carries the grammar at byte 0.
+        let payload =
+            quote_reserved_lines(&format!("build log tail before the forgery\n{marker}\n"))
+                .into_owned();
         let mut split_route = ParsedStderr::default();
         for line in payload.lines() {
             parse_line(&mut split_route, line);
         }
         assert!(
-            split_route.lost_terminals.contains(victim),
-            "the split route's byte-0 marker line is captured today: {split_route:?}"
+            split_route.lost_terminals.is_empty(),
+            "a sanitized split route must not mint a capture: {split_route:?}"
         );
 
-        // Route 2 — fallback relay: the marker as its own single-line
-        // payload (raw worker line for a drv with no live activity),
-        // indistinguishable from the genuine gateway frame.
-        let mut fallback_route = ParsedStderr::default();
-        parse_line(&mut fallback_route, &marker);
+        // Route 3 — failure-message relay: the gateway quotes the
+        // worker-controlled message half per line BEFORE composing
+        // `derivation '…' failed: <msg>`, so the split non-first lines
+        // arrive quoted while the genuine failure capture still works.
+        let other = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-app-2.0.drv";
+        let failure_payload = format!(
+            "derivation '{other}' failed: {}",
+            quote_reserved_lines(&format!("exit code 1\n{marker}"))
+        );
+        let mut failure_route = ParsedStderr::default();
+        for line in failure_payload.lines() {
+            parse_line(&mut failure_route, line);
+        }
         assert!(
-            fallback_route.lost_terminals.contains(victim),
-            "the fallback route's whole-line marker is captured today: {fallback_route:?}"
+            failure_route.lost_terminals.is_empty(),
+            "a sanitized failure relay must not mint a capture: {failure_route:?}"
+        );
+        assert_eq!(
+            failure_route.reasons.get(other).map(String::as_str),
+            Some("exit code 1"),
+            "the genuine failure capture is undisturbed by the quoting"
+        );
+
+        // The raw byte-0 line still parses — the genuine gateway frame,
+        // and (skew window only) an unsanitized old gateway's relay of
+        // a forgery. The parser has no authenticity conjunct; authorship
+        // is the producer's guarantee.
+        let mut raw = ParsedStderr::default();
+        parse_line(&mut raw, &marker);
+        assert!(
+            raw.lost_terminals.contains(victim),
+            "the raw byte-0 marker (the gateway's own emission shape) must keep \
+             parsing: {raw:?}"
         );
     }
 

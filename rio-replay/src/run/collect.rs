@@ -946,6 +946,14 @@ pub fn decide(
         // status conjunct is `Substituted` exactly (the only status the
         // producer pairs the marker with; an executed `Built` returned
         // above, and `AlreadyValid`-shaped rows never carry the marker).
+        // Marker authorship is producer-guaranteed on a sanitizing
+        // gateway: every worker-text STDERR_NEXT relay site quotes
+        // reserved-grammar lines (spec rule
+        // `gw.stderr.relay-quote-reserved`), so a captured byte-0 marker
+        // is the gateway speaking — worker forgeries arrive `> `-quoted
+        // and never reach this arm. The residual is the mixed-fleet
+        // skew window only (an unsanitized older gateway), priced in
+        // rio-nix's relay-marker trust-bound doc.
         if status == BuildStatus::Substituted && batch.lost_terminals.contains(&ctx.drv_path) {
             if batch.probe {
                 // Same arm-entry rule as every infra-shaped exit: a
