@@ -178,6 +178,12 @@ pub enum ActorCommand {
         identity: super::pull::AttemptIdentity,
         reason: rio_proto::types::AttemptTerminalReason,
         node_name: Option<String>,
+        /// 124(b): the `resubmit_cycles` value the controller's verdict
+        /// was computed against (`SpawnIntent.resubmit_cycle` echoed
+        /// back). Consumed by the `NoEligibleSource` arm only — a
+        /// stale echo means the derivation re-entered Ready since the
+        /// verdict and the report is acknowledged without poisoning.
+        resubmit_cycle: u32,
         reply: oneshot::Sender<Result<(), super::pull::PullRejection>>,
     },
 

@@ -295,6 +295,7 @@ async fn establishment_skips_synthesized_closed_attempt() -> TestResult {
             },
             reason: rio_proto::types::AttemptTerminalReason::Preempted,
             node_name: Some("node-est-f".into()),
+            resubmit_cycle: 0,
             reply,
         })
         .await

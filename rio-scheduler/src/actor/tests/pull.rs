@@ -541,6 +541,7 @@ async fn report_attempt_outcome(
             },
             reason,
             node_name: Some("node-9".into()),
+            resubmit_cycle: 0,
             reply,
         })
         .await
@@ -1092,6 +1093,7 @@ async fn report_attempt_outcome_with_node(
             },
             reason,
             node_name: Some(node.into()),
+            resubmit_cycle: 0,
             reply,
         })
         .await
@@ -1262,6 +1264,34 @@ async fn attempt_outcome_no_eligible_source_poisons_ready_drv() -> TestResult {
     let (db, handle, _task) = setup().await;
     let _ev = merge_single_node(&handle, Uuid::new_v4(), "nes-a", PriorityClass::Scheduled).await?;
 
+    // A real failed builder first: the verdict guards refuse a
+    // NoEligibleSource for a derivation with nothing excluded.
+    handle
+        .send_unchecked(ActorCommand::AckSpawnedIntents {
+            spawned: vec![],
+            unfulfillable_cells: vec![],
+            registered_cells: vec![],
+            observed_instance_types: vec![],
+            bound_intents: vec![rio_proto::types::BoundIntent {
+                intent_id: "nes-a".into(),
+                node_name: "node-7".into(),
+                deadline_secs: 0,
+            }],
+        })
+        .await?;
+    barrier(&handle).await;
+    let assignment = expect_deliver(pull(&handle, "nes-a", Some("nes-a")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    report(
+        &handle,
+        exec_id,
+        Some("nes-a"),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        None,
+    )
+    .await
+    .expect("failure acked");
+
     report_attempt_outcome(
         &handle,
         Some("nes-a"),
@@ -1279,15 +1309,15 @@ async fn attempt_outcome_no_eligible_source_poisons_ready_drv() -> TestResult {
     );
     assert_eq!(
         ledger_classes(&db.pool, "nes-a").await,
-        vec!["fleet_exhaust".to_string()],
-        "one verdict marker row, no charge rows"
+        vec!["transient".to_string(), "fleet_exhaust".to_string()],
+        "the seeded failure row plus ONE verdict marker row"
     );
     let rows = ledger_rows(&db.pool, "nes-a").await;
+    let marker = rows.last().expect("marker row");
     assert!(
-        rows[0].exec_id.is_none() && rows[0].executor_id.is_none(),
+        marker.exec_id.is_none() && marker.executor_id.is_none(),
         "a verdict marker is not an execution"
     );
-    assert_eq!(info.retry.failure_count, 0, "no budget consumption");
 
     // Idempotent on re-tick: acked, nothing new written.
     report_attempt_outcome(
@@ -1300,7 +1330,7 @@ async fn attempt_outcome_no_eligible_source_poisons_ready_drv() -> TestResult {
     .expect("duplicate spawn-gate report acked");
     assert_eq!(
         ledger_classes(&db.pool, "nes-a").await.len(),
-        1,
+        2,
         "re-report appends nothing"
     );
     let info = expect_drv(&handle, "nes-a").await;
@@ -1318,7 +1348,242 @@ async fn attempt_outcome_no_eligible_source_poisons_ready_drv() -> TestResult {
     let total: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_attempts")
         .fetch_one(&db.pool)
         .await?;
-    assert_eq!(total, 1, "only the nes-a marker row exists");
+    assert_eq!(total, 2, "only the nes-a rows exist");
+    Ok(())
+}
+
+// r[verify sched.dispatch.fleet-exhaust+5]
+/// Guard (124(d) scope): a `NoEligibleSource` for a derivation with NO
+/// failed builders (⇒ no exclusions on the wire) is acknowledged
+/// without poisoning — the controller's verdict raced an exclusion
+/// clear, or was computed for an intent the scheduler no longer
+/// considers excluded anywhere.
+#[tokio::test]
+async fn no_eligible_source_without_exclusions_acks_no_poison() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "nes-g2", PriorityClass::Scheduled).await?;
+
+    report_attempt_outcome(
+        &handle,
+        Some("nes-g2"),
+        None,
+        rio_proto::types::AttemptTerminalReason::NoEligibleSource,
+    )
+    .await
+    .expect("report acked");
+
+    let info = expect_drv(&handle, "nes-g2").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Ready,
+        "no exclusions ⇒ nothing can be exhausted ⇒ ack-no-poison"
+    );
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_attempts")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(total, 0, "no marker row for a refused verdict");
+    Ok(())
+}
+
+// r[verify sched.dispatch.fleet-exhaust+5]
+/// Guard (124(d) staleness): a fresh `acked_spawned` witness — the
+/// controller acknowledged creating a Job for this intent within the
+/// defer window — defers the exhaustion verdict (the report raced its
+/// own spawn).
+#[tokio::test]
+async fn no_eligible_source_defers_on_fresh_acked_spawn() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "nes-g3", PriorityClass::Scheduled).await?;
+
+    // Establish a real failed builder so the exclusion guard passes.
+    handle
+        .send_unchecked(ActorCommand::AckSpawnedIntents {
+            spawned: vec![],
+            unfulfillable_cells: vec![],
+            registered_cells: vec![],
+            observed_instance_types: vec![],
+            bound_intents: vec![rio_proto::types::BoundIntent {
+                intent_id: "nes-g3".into(),
+                node_name: "node-7".into(),
+                deadline_secs: 0,
+            }],
+        })
+        .await?;
+    barrier(&handle).await;
+    let assignment = expect_deliver(pull(&handle, "nes-g3", Some("nes-g3")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    report(
+        &handle,
+        exec_id,
+        Some("nes-g3"),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        None,
+    )
+    .await
+    .expect("failure acked");
+
+    // The controller acks a fresh spawn for the SAME intent…
+    handle
+        .send_unchecked(ActorCommand::AckSpawnedIntents {
+            spawned: vec![rio_proto::types::SpawnIntent {
+                intent_id: "nes-g3".into(),
+                ..Default::default()
+            }],
+            unfulfillable_cells: vec![],
+            registered_cells: vec![],
+            observed_instance_types: vec![],
+            bound_intents: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // …so an exhaustion verdict arriving now is deferred, not poisoned.
+    report_attempt_outcome(
+        &handle,
+        Some("nes-g3"),
+        None,
+        rio_proto::types::AttemptTerminalReason::NoEligibleSource,
+    )
+    .await
+    .expect("report acked");
+    let info = expect_drv(&handle, "nes-g3").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Ready,
+        "fresh acked-spawn witness defers the fleet-exhaust verdict"
+    );
+    assert!(
+        !ledger_classes(&db.pool, "nes-g3")
+            .await
+            .contains(&"fleet_exhaust".to_string()),
+        "no verdict marker while deferred"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.fleet-exhaust+5]
+/// 249 rider (mint backstop): a pull authenticated for an intent whose
+/// controller-bound node is in the derivation's OWN exclusion set
+/// answers NotYetReady — a Pending-at-upgrade pod bound on a
+/// just-excluded node must never receive the retry (the drift reap
+/// replaces the Job next tick).
+#[tokio::test]
+async fn mint_refuses_delivery_to_excluded_bound_node() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "nes-g4", PriorityClass::Scheduled).await?;
+
+    // Bind node-7, fail once on it → node-7 lands in the exclusion set.
+    handle
+        .send_unchecked(ActorCommand::AckSpawnedIntents {
+            spawned: vec![],
+            unfulfillable_cells: vec![],
+            registered_cells: vec![],
+            observed_instance_types: vec![],
+            bound_intents: vec![rio_proto::types::BoundIntent {
+                intent_id: "nes-g4".into(),
+                node_name: "node-7".into(),
+                deadline_secs: 0,
+            }],
+        })
+        .await?;
+    barrier(&handle).await;
+    let assignment = expect_deliver(pull(&handle, "nes-g4", Some("nes-g4")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    report(
+        &handle,
+        exec_id,
+        Some("nes-g4"),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        None,
+    )
+    .await
+    .expect("failure acked");
+    let info = expect_drv(&handle, "nes-g4").await;
+    assert!(
+        info.retry.failed_builders.len() == 1,
+        "the transient failure excluded the bound node"
+    );
+
+    // The STALE binding still says node-7 (the old Pending pod). A
+    // re-pull through it must answer NotYetReady, not deliver.
+    let outcome = pull(&handle, "nes-g4", Some("nes-g4")).await;
+    assert!(
+        matches!(outcome, Ok(PullOutcome::NotYetReady { .. })),
+        "delivery onto an excluded bound node is refused, got {outcome:?}"
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.fleet-exhaust+5]
+/// Guard (124(b) staleness): a `NoEligibleSource` whose echoed
+/// `resubmit_cycle` does not match the derivation's current
+/// `resubmit_cycles` is acknowledged without poisoning — the
+/// derivation re-entered Ready (resubmit reset) since the controller
+/// computed the verdict, so its exclusion set was rebuilt.
+#[tokio::test]
+async fn no_eligible_source_with_stale_cycle_echo_acks_no_poison() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "nes-g5", PriorityClass::Scheduled).await?;
+
+    // Real failed builder (the no-exclusions guard passes; cycles=0).
+    handle
+        .send_unchecked(ActorCommand::AckSpawnedIntents {
+            spawned: vec![],
+            unfulfillable_cells: vec![],
+            registered_cells: vec![],
+            observed_instance_types: vec![],
+            bound_intents: vec![rio_proto::types::BoundIntent {
+                intent_id: "nes-g5".into(),
+                node_name: "node-7".into(),
+                deadline_secs: 0,
+            }],
+        })
+        .await?;
+    barrier(&handle).await;
+    let assignment = expect_deliver(pull(&handle, "nes-g5", Some("nes-g5")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    report(
+        &handle,
+        exec_id,
+        Some("nes-g5"),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        None,
+    )
+    .await
+    .expect("failure acked");
+
+    // Echo cycle 7 against current cycles=0 → refused.
+    handle
+        .query_unchecked(|reply| ActorCommand::ReportAttemptOutcome {
+            identity: crate::actor::pull::AttemptIdentity {
+                intent_id: Some("nes-g5".into()),
+                job_name: None,
+                exec_id: None,
+            },
+            reason: rio_proto::types::AttemptTerminalReason::NoEligibleSource,
+            node_name: None,
+            resubmit_cycle: 7,
+            reply,
+        })
+        .await
+        .expect("actor alive")
+        .expect("report acked");
+    let info = expect_drv(&handle, "nes-g5").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Ready,
+        "stale cycle echo is acknowledged without poisoning"
+    );
+    assert!(
+        !ledger_classes(&db.pool, "nes-g5")
+            .await
+            .contains(&"fleet_exhaust".to_string()),
+        "no verdict marker for a stale echo"
+    );
     Ok(())
 }
 
@@ -1340,6 +1605,7 @@ async fn report_attempt_outcome_job(
             },
             reason,
             node_name: None,
+            resubmit_cycle: 0,
             reply,
         })
         .await
@@ -1364,6 +1630,7 @@ async fn report_attempt_outcome_both(
             },
             reason,
             node_name: Some(node_name.into()),
+            resubmit_cycle: 0,
             reply,
         })
         .await

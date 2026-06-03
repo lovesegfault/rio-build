@@ -1737,44 +1737,103 @@ async fn exempt_infra_cap_terminates_leaked_lock() -> TestResult {
 /// fire before `failure_count=3`. (Padding workers used to be aarch64,
 /// which only worked because the clamp was system-blind — that bug is
 /// now fixed.)
-#[rstest]
-#[case::non_distinct(false, true)]
-#[case::distinct(true, false)]
+/// Flat-counter mode (`require_distinct_workers=false`, the
+/// controller-less dev shape): three identity-less failures (no
+/// binding → no source attribution → flat counters only, decision
+/// P12) poison at the threshold.
 #[tokio::test]
-async fn test_same_worker_poison_threshold_distinct_mode(
-    #[case] require_distinct: bool,
-    #[case] expect_poisoned: bool,
-) -> TestResult {
+async fn test_same_worker_poison_threshold_flat_mode() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.poison = PoisonConfig {
             threshold: 3,
-            require_distinct_workers: require_distinct,
+            require_distinct_workers: false,
         };
-        // Raise max_retries so the retry_count>=2 branch doesn't mask
-        // what we're testing (the threshold branch).
         c.retry_policy.max_retries = 10;
     });
     let _db = db;
 
-    let drv_hash = "distinct-mode-drv";
+    let drv_hash = "flat-mode-drv";
     let _ev =
         merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
 
-    // Three pull attempts bound to the SAME source node: every failure
-    // charges the same exclusion key (the controller-authoritative node
-    // — decision P12) — the pull-mode shape of "the same worker keeps
-    // failing".
-    bind_intent_node(&handle, drv_hash, "same-source-node").await?;
+    // No binding: identity-less attempts charge flat counters only.
     for i in 0..3 {
         pull_complete_failure(
             &handle,
             drv_hash,
             rio_proto::types::BuildResultStatus::TransientFailure,
-            &format!("same-worker failure {i}"),
+            &format!("flat-mode failure {i}"),
         )
         .await?;
     }
+
+    let info = expect_drv(&handle, drv_hash).await;
+    assert_eq!(
+        info.retry.failed_builders.len(),
+        0,
+        "identity-less rows contribute no exclusion keys (P12)"
+    );
+    assert_eq!(info.retry.failure_count, 3, "flat count always increments");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "flat mode: 3× failures → poisoned at threshold"
+    );
+    Ok(())
+}
+
+/// Distinct mode (`require_distinct_workers=true`): a history of three
+/// failures all attributed to ONE source node does NOT poison (one
+/// distinct source < threshold 3). Driven through the recovery fold
+/// over a seeded ledger: with the 249-rider mint backstop, a live
+/// re-pull through a binding on an excluded node answers NotYetReady
+/// — the same-source-repetition shape can no longer be produced by
+/// live pulls (the controller's drift reap + anti-affinity replace
+/// the pod), so the fold semantics are pinned at the recovery
+/// boundary, exactly where production re-encounters such a history.
+#[tokio::test]
+async fn test_same_worker_no_poison_distinct_mode_recovered_history() -> TestResult {
+    let drv_hash = "distinct-mode-drv";
+    let f = RecoveryFixture::run_configured(
+        None,
+        |c| {
+            c.poison = PoisonConfig {
+                threshold: 3,
+                require_distinct_workers: true,
+            };
+            c.retry_policy.max_retries = 10;
+        },
+        async move |handle, pool| {
+            let _ev =
+                merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled)
+                    .await?;
+            barrier(&handle).await;
+            let derivation_id: Uuid =
+                sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+                    .bind(drv_hash)
+                    .fetch_one(&pool)
+                    .await?;
+            let mut tx = pool.begin().await?;
+            for i in 0..3 {
+                let mut row = crate::db::attempts::AttemptRow::new(
+                    derivation_id,
+                    crate::state::OutcomeClass::Transient,
+                    crate::state::ReportingParty::Worker,
+                    crate::state::AttemptKind::Build,
+                );
+                row.executor_id = Some(crate::state::ExecutorId::from(
+                    format!("same-source-exec-{i}").as_str(),
+                ));
+                row.source_node = Some("same-source-node".to_string());
+                crate::db::SchedulerDb::append_attempt(&mut tx, &row).await?;
+            }
+            tx.commit().await?;
+            Ok(())
+        },
+    )
+    .await?;
+    let handle = f.handle;
 
     let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
@@ -1783,10 +1842,10 @@ async fn test_same_worker_poison_threshold_distinct_mode(
         "HashSet: same source inserted once, stays len()=1"
     );
     assert_eq!(info.retry.failure_count, 3, "flat count always increments");
-    assert_eq!(
-        info.status == DerivationStatus::Poisoned,
-        expect_poisoned,
-        "require_distinct_workers={require_distinct}: 3× same-worker → poisoned={expect_poisoned}"
+    assert_ne!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "distinct mode: 3× same-source → NOT poisoned (1 distinct < 3)"
     );
     Ok(())
 }

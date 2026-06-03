@@ -440,6 +440,29 @@ impl DagActor {
                 surface: rio_evidence_kernel::pull::display_class(kind),
             },
         };
+
+        // 249 rider (mint backstop): never deliver onto a node the
+        // derivation has itself excluded. The binding is the OLD
+        // Pending pod's (stamped before the failure that excluded the
+        // node); the controller's drift reap replaces that Job next
+        // tick — the pod polling from it idle-exits on NotYetReady.
+        // r[impl sched.dispatch.fleet-exhaust+5]
+        if let Some(node) = profile.source_node.as_deref()
+            && self
+                .dag
+                .node(drv_hash)
+                .is_some_and(|s| s.excluded_source_nodes().iter().any(|n| n == node))
+        {
+            debug!(
+                drv_hash = %drv_hash,
+                node,
+                "pull refused: the bound node is in the derivation's exclusion set \
+                 (stale Pending pod; the drift reap replaces it)"
+            );
+            return Ok(PullOutcome::NotYetReady {
+                retry_after_secs: NOT_YET_READY_RETRY_AFTER_SECS,
+            });
+        }
         let minted = self
             .db
             .mint_pull_attempt_fenced(
@@ -1013,6 +1036,14 @@ impl DagActor {
     }
 }
 
+/// 124(d): how long after an `AckSpawnedIntents{spawned}` covering an
+/// intent the scheduler defers `NoEligibleSource` verdicts for it (the
+/// verdict raced its own spawn). ~3 controller ticks: long enough for
+/// the new Job's pod to bind or surface as genuinely unschedulable,
+/// short enough that a real exhaustion still poisons promptly (the
+/// controller's persistence gate already adds ~3 ticks in front).
+pub(crate) const ACKED_SPAWNED_DEFER_SECS: f64 = 30.0;
+
 /// The attempt identity carried by `ReportAttemptOutcome` (exec_id
 /// preferred; intent id accepted; the Job name is recorded for
 /// diagnostics — its full resolution arrives with the controller-side
@@ -1066,10 +1097,11 @@ impl DagActor {
         identity: AttemptIdentity,
         reason: rio_proto::types::AttemptTerminalReason,
         node_name: Option<String>,
+        resubmit_cycle: u32,
         reply: oneshot::Sender<Result<(), PullRejection>>,
     ) {
         let result = self
-            .report_attempt_outcome_inner(identity, reason, node_name)
+            .report_attempt_outcome_inner(identity, reason, node_name, resubmit_cycle)
             .await;
         let _ = reply.send(result);
     }
@@ -1079,6 +1111,7 @@ impl DagActor {
         identity: AttemptIdentity,
         reason: rio_proto::types::AttemptTerminalReason,
         node_name: Option<String>,
+        resubmit_cycle: u32,
     ) -> Result<(), PullRejection> {
         if !self.leader.is_leader() {
             return Err(PullRejection::NotLeader);
@@ -1090,7 +1123,9 @@ impl DagActor {
         // for this intent and the fold maps that to the fleet-exhaust
         // poison arm, exactly like the dispatch-time E9 backstop.
         if reason == rio_proto::types::AttemptTerminalReason::NoEligibleSource {
-            return self.handle_no_eligible_source(&identity).await;
+            return self
+                .handle_no_eligible_source(&identity, resubmit_cycle)
+                .await;
         }
         // Resolve the attempt: exec_id first, then the intent's open
         // pull-mode attempt. A Job-name-only report cannot be resolved
@@ -1301,6 +1336,7 @@ impl DagActor {
     async fn handle_no_eligible_source(
         &mut self,
         identity: &AttemptIdentity,
+        resubmit_cycle: u32,
     ) -> Result<(), PullRejection> {
         let Some(intent) = identity.intent_id.as_deref().filter(|s| !s.is_empty()) else {
             debug!(
@@ -1317,6 +1353,49 @@ impl DagActor {
                 ?status,
                 "NoEligibleSource for a non-Ready derivation acknowledged (already resolved, \
                  in flight, or unknown)"
+            );
+            return Ok(());
+        }
+        // 124(d) verdict guards — every miss acknowledges WITHOUT
+        // poisoning (the controller re-evaluates next tick; a genuine
+        // exhaustion re-reports and passes).
+        if let Some(state) = self.dag.node(&drv_hash) {
+            // (i) Scope: no failed builders ⇒ the wire carried no
+            // exclusions ⇒ nothing can be exhausted. The verdict raced
+            // an exclusion clear (resubmit reset, recovery rebuild).
+            if state.retry.failed_builders.is_empty() {
+                debug!(
+                    intent_id = %intent,
+                    "NoEligibleSource for a derivation with no failed builders acknowledged \
+                     (nothing is excluded — stale or raced verdict)"
+                );
+                return Ok(());
+            }
+            // (ii) Staleness: the echoed cycle must match the cycle the
+            // verdict was computed against. A mismatch means the
+            // derivation re-entered Ready (resubmit) since the
+            // controller polled — its exclusion set was rebuilt.
+            if resubmit_cycle != state.retry.resubmit_cycles {
+                debug!(
+                    intent_id = %intent,
+                    echoed = resubmit_cycle,
+                    current = state.retry.resubmit_cycles,
+                    "NoEligibleSource with a stale resubmit-cycle echo acknowledged"
+                );
+                return Ok(());
+            }
+        }
+        // (iii) Spawn race: the controller acked creating a Job for
+        // this intent within the defer window — the gate evaluated a
+        // tick where that Job did not exist yet. Defer; if the spawn
+        // genuinely cannot place, the gate re-fires after the window.
+        if let Some(acked_at) = self.acked_spawned.get(&drv_hash)
+            && crate::db::attempts::epoch_now() - acked_at < ACKED_SPAWNED_DEFER_SECS
+        {
+            debug!(
+                intent_id = %intent,
+                "NoEligibleSource within the spawn-ack defer window acknowledged (verdict \
+                 raced its own spawn)"
             );
             return Ok(());
         }

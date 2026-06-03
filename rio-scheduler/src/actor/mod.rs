@@ -261,6 +261,18 @@ pub struct DagActor {
     /// stale entries until the next non-empty Ack, unread (no matching
     /// executor once the pod is gone).
     pub(crate) authoritative_binding: HashMap<DrvHash, AuthBinding>,
+    /// 124(d): `drv_hash → epoch_secs` of the most recent controller
+    /// `AckSpawnedIntents{spawned}` covering that intent — the "a Job
+    /// was just created for this" witness. A `NoEligibleSource`
+    /// verdict arriving within [`pull::ACKED_SPAWNED_DEFER_SECS`] of
+    /// the ack is deferred (the verdict raced its own spawn: the gate
+    /// evaluated a tick where the Job did not exist yet). Written for
+    /// EVERY spawned intent (unlike `dispatched_cells`, which only
+    /// arms band-targeted ones); entries older than twice the defer
+    /// window are pruned opportunistically at the ack site; cleared
+    /// in the leadership wipe (stale hashes must not defer a
+    /// successor-generation verdict).
+    pub(crate) acked_spawned: HashMap<DrvHash, f64>,
     /// Phase 1b: per-derivation count of re-deliveries of a failure
     /// completion whose appending transaction (attempt row, `decide()`,
     /// status persist) failed. Bounded by
@@ -748,6 +760,7 @@ impl DagActor {
             builds: HashMap::new(),
             events: BuildEventBus::new(),
             authoritative_binding: HashMap::new(),
+            acked_spawned: HashMap::new(),
             attempt_record_retries: HashMap::new(),
             retry_policy: cfg.retry_policy,
             poison_config: cfg.poison,
@@ -873,6 +886,7 @@ impl DagActor {
             attempt_record_retries,
             dispatched_cells,
             authoritative_binding,
+            acked_spawned,
             dag_authoritative,
             materialization_jobs,
             status_outbox,
@@ -958,6 +972,10 @@ impl DagActor {
         // establishment sweep attribute a re-dispatched drv to a
         // previous-generation node.
         authoritative_binding.clear();
+        // Spawn-ack witnesses are tenure-scoped: a previous
+        // generation's ack must not defer the successor's
+        // fleet-exhaust verdicts.
+        acked_spawned.clear();
         // The materialization-job view is a droppable per-tenure cache
         // of PG rows; a new tenure rebuilds it from PG (Phase B) or
         // re-populates it from its own creation paths. Stale entries
@@ -1250,13 +1268,20 @@ impl DagActor {
                     identity,
                     reason,
                     node_name,
+                    resubmit_cycle,
                     reply,
                 } => {
                     // r[sched.lease.standby-drops-writes+3]: the handler
                     // self-gates on is_leader(); its only write is the
                     // first-writer-wins reason fill.
-                    self.handle_report_attempt_outcome(identity, reason, node_name, reply)
-                        .await;
+                    self.handle_report_attempt_outcome(
+                        identity,
+                        reason,
+                        node_name,
+                        resubmit_cycle,
+                        reply,
+                    )
+                    .await;
                 }
                 ActorCommand::AckSpawnedIntents {
                     spawned,

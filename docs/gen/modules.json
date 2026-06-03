@@ -484,6 +484,11 @@
       "doc": "Pool reconciler: spawn/reap one-shot rio-builder Jobs."
     },
     {
+      "path": "reconcilers/pool/candidate.rs",
+      "depth": 2,
+      "doc": "The intent-decided candidate axis set — ONE projection consumed by"
+    },
+    {
       "path": "reconcilers/pool/disruption.rs",
       "depth": 2,
       "doc": "DisruptionTarget watcher: pre-empt builds on evicting workers."

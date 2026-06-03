@@ -6717,6 +6717,7 @@ async fn controller_verdict_never_consumes_materialization_attempt() -> TestResu
             },
             reason: rio_proto::types::AttemptTerminalReason::Reaped,
             node_name: None,
+            resubmit_cycle: 0,
             reply: reply_tx,
         })
         .await?;

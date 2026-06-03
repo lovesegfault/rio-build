@@ -393,7 +393,10 @@ impl DagActor {
          -> rio_proto::types::SpawnIntent {
             let kind = crate::state::kind_for_drv(state.is_fixed_output);
             rio_proto::types::SpawnIntent {
-                resubmit_cycle: 0,
+                // 124(b): the cycle this intent was computed against.
+                // The controller echoes it on NoEligibleSource so a
+                // verdict that raced a resubmit reset is detectable.
+                resubmit_cycle: u64::from(state.retry.resubmit_cycles),
                 intent_id: drv_hash.to_string(),
                 cores: intent.cores,
                 mem_bytes: intent.mem_bytes,
@@ -849,6 +852,20 @@ impl DagActor {
         // DAG-present value sticks. A fall-through executor's
         // spawn-drv leaves the DAG but the Ack keeps shipping its
         // `intent_id` while the pod lives.
+        // 124(d): record the spawn-ack witness for EVERY spawned
+        // intent — a NoEligibleSource verdict landing within the defer
+        // window raced its own spawn. Opportunistic prune keeps the
+        // map bounded (entries older than 2× the window are dead: the
+        // defer read only consults the window).
+        if !spawned.is_empty() {
+            let now = crate::db::attempts::epoch_now();
+            for i in spawned {
+                self.acked_spawned
+                    .insert(DrvHash::from(i.intent_id.as_str()), now);
+            }
+            self.acked_spawned
+                .retain(|_, t| now - *t < 2.0 * crate::actor::pull::ACKED_SPAWNED_DEFER_SECS);
+        }
         if !bound_intents.is_empty() {
             let prev = std::mem::take(&mut self.authoritative_binding);
             for b in bound_intents {

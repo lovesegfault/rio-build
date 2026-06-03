@@ -852,10 +852,28 @@ impl RecoveryFixture {
         F: FnOnce(ActorHandle, sqlx::PgPool) -> Fut,
         Fut: Future<Output = anyhow::Result<()>>,
     {
+        Self::run_configured(store, |_| {}, seed).await
+    }
+
+    /// [`Self::run_with_store`] with a config hook applied to BOTH the
+    /// phase-1 (seeding) and phase-2 (recovering) actors — for tests
+    /// whose recovered-fold semantics depend on retry/poison knobs.
+    pub(crate) async fn run_configured<C, F, Fut>(
+        store: Option<StoreServiceClient<Channel>>,
+        configure: C,
+        seed: F,
+    ) -> anyhow::Result<Self>
+    where
+        C: Fn(&mut DagActorConfig) + Clone + Send + 'static,
+        F: FnOnce(ActorHandle, sqlx::PgPool) -> Fut,
+        Fut: Future<Output = anyhow::Result<()>>,
+    {
         let db = TestDb::new(&MIGRATOR).await;
         // Phase 1: first "leader" writes state.
         {
-            let (handle, task) = setup_actor(db.pool.clone());
+            let phase1_configure = configure.clone();
+            let (handle, task) =
+                setup_actor_configured(db.pool.clone(), None, move |c, _| phase1_configure(c));
             seed(handle, db.pool.clone()).await?;
             // handle dropped at end of seed's scope (moved in); join
             // the task so PG writes are flushed.
@@ -869,7 +887,8 @@ impl RecoveryFixture {
         ));
         let confirmations = spawn_leading_confirmations(leader.clone());
         let phase2_leader = leader.clone();
-        let (handle, task) = setup_actor_configured(db.pool.clone(), store, move |_, p| {
+        let (handle, task) = setup_actor_configured(db.pool.clone(), store, move |c, p| {
+            configure(c);
             p.leader = phase2_leader;
         });
         handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
@@ -1247,6 +1266,7 @@ pub(crate) async fn report_attempt_terminal(
             },
             reason,
             node_name: node.map(Into::into),
+            resubmit_cycle: 0,
             reply,
         })
         .await

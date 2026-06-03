@@ -475,10 +475,12 @@ impl AdminService for AdminServiceImpl {
             .unwrap_or(rio_proto::types::AttemptTerminalReason::Unspecified);
         let node_name = (!req.node_name.is_empty()).then_some(req.node_name);
 
+        let resubmit_cycle = u32::try_from(req.resubmit_cycle).unwrap_or(u32::MAX);
         let result = query_actor(&self.actor, |reply| ActorCommand::ReportAttemptOutcome {
             identity,
             reason,
             node_name,
+            resubmit_cycle,
             reply,
         })
         .await?;
