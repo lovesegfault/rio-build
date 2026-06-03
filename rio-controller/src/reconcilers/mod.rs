@@ -209,6 +209,16 @@ pub struct Ctx {
     /// constants). Entries are pruned when their Job stops being
     /// active.
     pub pull_attempt_seen_open: Mutex<HashMap<String, Instant>>,
+    /// `intent_id` → consecutive ticks the AD2 spawn gate observed
+    /// fleet exhaustion for that intent (`pool/jobs` gate block). The
+    /// NoEligibleSource report — the verdict that POISONS the
+    /// derivation scheduler-side — fires only at
+    /// [`pool::candidate::NO_ELIGIBLE_SOURCE_PERSIST_TICKS`]; a
+    /// single-tick exhaustion (node restart, informer lag) withholds
+    /// the spawn but never poisons. In-process only: a controller
+    /// restart restarts streaks (delays a genuine poison by ≤3 ticks —
+    /// accepted). Pruned when the intent leaves the gated set.
+    pub exhausted_streak: Mutex<HashMap<String, u32>>,
 }
 
 /// ComponentScaler reconciler state.

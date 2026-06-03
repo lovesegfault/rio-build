@@ -1205,7 +1205,7 @@ mod tests {
         );
     }
 
-    // r[verify sched.dispatch.fleet-exhaust+4]
+    // r[verify sched.dispatch.fleet-exhaust+5]
     // r[verify sched.retry.per-executor-budget+4]
     /// AD2 small-fleet clause over the re-keyed inputs: with a single
     /// spawnable source the exhaustion verdict is reachable after that

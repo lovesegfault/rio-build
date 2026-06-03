@@ -369,7 +369,12 @@ pub fn simulate(
         // Already bound → straight to placeable (no fit-check, no
         // free() decrement — its slot is already counted in
         // `requested`).
+        // merged_bug_126: a bound pod on a node the intent has since
+        // excluded is about to be drift-reaped — falling through to the
+        // fit-check places (or mints) its replacement instead of
+        // freezing the stale binding as "placed".
         if let Some(node) = bound.get(&i.intent_id)
+            && !crate::reconcilers::pool::candidate::node_excluded(&i, node)
             && let Some(&(registered, nc_name)) = by_node_name.get(node.as_str())
         {
             placeable.push((i, nc_name.to_string(), !registered));
@@ -402,6 +407,16 @@ pub fn simulate(
                             (a.is_some() || !f.is_empty()) && hw_admits(&c.0, a, f)
                         })
                 })
+            })
+            // merged_bug_126: the intent's exclusion set is a consulted
+            // axis — the rendered pod can never bind on an excluded
+            // node, so simulating a placement there overcounts capacity
+            // and `cover_deficit` under-mints. Unbound claims (no Node
+            // yet) cannot be excluded (exclusions are node-name-keyed).
+            .filter(|n| {
+                n.node_name
+                    .as_deref()
+                    .is_none_or(|nn| !crate::reconcilers::pool::candidate::node_excluded(&i, nn))
             })
             .filter(|n| {
                 free.get(n.name.as_str())
@@ -935,6 +950,60 @@ pub(crate) mod tests {
     /// `unplaced` so `cover_deficit` provisions the replacement on the
     /// SAME tick.
     // r[verify ctrl.nodeclaim.ffd-exclude-terminating]
+    #[test]
+    fn simulate_consults_intent_exclusions() {
+        // merged_bug_126: the only fitting node is in the intent's
+        // exclusion set → the intent must surface as UNPLACED (so
+        // `cover_deficit` mints a replacement). Pre-fix the FFD ignored
+        // `excluded_nodes` entirely and "placed" it there — the
+        // recorded red: deficit=0, no mint, the spawn gate then
+        // poisoned the derivation as fleet-exhausted.
+        let n = node("n1", "h", CapacityType::Spot, 8, 32 * GI, 100 * GI);
+        let mut i = intent("a", 4, GI, &[("h", CapacityType::Spot)]);
+        i.excluded_nodes = vec!["node-n1".into()];
+
+        let (placeable, unplaced) = sim(std::slice::from_ref(&i), std::slice::from_ref(&n));
+        assert!(
+            placeable.is_empty(),
+            "FFD must not simulate capacity on an excluded node"
+        );
+        assert_eq!(
+            unplaced.len(),
+            1,
+            "fully-excluded intent surfaces as unplaced so cover mints"
+        );
+
+        // A non-excluded sibling exists → packs there, never on the
+        // excluded node, even when the excluded node would win
+        // MostAllocated.
+        let mut loaded = node("n1", "h", CapacityType::Spot, 8, 32 * GI, 100 * GI);
+        loaded.requested = (4, 0, 0);
+        let fresh = node("n2", "h", CapacityType::Spot, 8, 32 * GI, 100 * GI);
+        let (placeable, unplaced) = sim(std::slice::from_ref(&i), &[loaded, fresh]);
+        assert_eq!(placed_on(&placeable, "a"), "n2");
+        assert!(unplaced.is_empty());
+
+        // Bound short-circuit: a binding on a since-excluded node falls
+        // through to the fit-check instead of freezing as "placed" —
+        // with no other candidate the intent lands in unplaced and the
+        // replacement is pre-minted before the drift reap evicts it.
+        let n_only = node("n1", "h", CapacityType::Spot, 8, 32 * GI, 100 * GI);
+        let bound: HashMap<String, String> = [("a".to_string(), "node-n1".to_string())].into();
+        let (placeable, unplaced) = simulate(
+            std::slice::from_ref(&i),
+            std::slice::from_ref(&n_only),
+            &CellSketches::default(),
+            &bound,
+            0,
+            any_admit,
+        );
+        assert!(
+            placeable.is_empty(),
+            "bound-on-excluded falls through, does not short-circuit to placed"
+        );
+        assert_eq!(unplaced.len(), 1);
+    }
+
     #[test]
     fn simulate_excludes_terminating_nodes() {
         // Partly loaded so the dying node WINS MostAllocated against

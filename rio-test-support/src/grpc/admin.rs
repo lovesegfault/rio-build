@@ -39,6 +39,10 @@ pub struct MockAdmin {
     /// Programmed `ListOpenAttempts` response — the open-attempt ledger
     /// view that drives the OA2 wedge tracker's evidence retention.
     pub open_attempts: Arc<RwLock<types::ListOpenAttemptsResponse>>,
+    /// Every `ReportAttemptOutcome` request received, in order. Lets
+    /// suites assert verdict wire content (reason, intent, the
+    /// 124(b) `resubmit_cycle` echo) without a live scheduler.
+    pub outcome_calls: Arc<RwLock<Vec<types::ReportAttemptOutcomeRequest>>>,
 }
 
 impl MockAdmin {
@@ -128,6 +132,17 @@ impl AdminService for MockAdmin {
     ) -> Result<Response<()>, Status> {
         self.ack_calls.write().unwrap().push(request.into_inner());
         Ok(Response::new(()))
+    }
+
+    async fn report_attempt_outcome(
+        &self,
+        request: Request<types::ReportAttemptOutcomeRequest>,
+    ) -> Result<Response<types::ReportAttemptOutcomeResponse>, Status> {
+        self.outcome_calls
+            .write()
+            .unwrap()
+            .push(request.into_inner());
+        Ok(Response::new(types::ReportAttemptOutcomeResponse::default()))
     }
 
     async fn list_open_attempts(

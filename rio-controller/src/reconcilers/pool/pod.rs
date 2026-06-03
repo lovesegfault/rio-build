@@ -498,7 +498,7 @@ pub(super) fn proto_term_to_k8s(t: &rio_proto::types::NodeSelectorTerm) -> NodeS
 /// constraining it), or a single new term when the intent carried no
 /// affinity. Empty `excluded_nodes` is a no-op, so intents without
 /// exclusions render byte-identical to today.
-// r[impl sched.dispatch.fleet-exhaust+4]
+// r[impl sched.dispatch.fleet-exhaust+5]
 pub(super) fn apply_excluded_nodes_anti_affinity(pod_spec: &mut PodSpec, excluded: &[String]) {
     if excluded.is_empty() {
         return;

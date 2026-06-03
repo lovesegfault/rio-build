@@ -58,9 +58,10 @@ use prost_types::FileDescriptorSet;
 /// pass-through.
 #[cfg(feature = "full")]
 const MANUAL_METHODS: &[&str] = &[
-    "TriggerGC",    // streaming — sends one is_complete=true frame
-    "ClearPoison",  // records drv_hash to clear_poison_calls
-    "CreateTenant", // echoes tenant_name back in TenantInfo
+    "TriggerGC",            // streaming — sends one is_complete=true frame
+    "ReportAttemptOutcome", // recording — outcome_calls (C2 gate echo asserts)
+    "ClearPoison",          // records drv_hash to clear_poison_calls
+    "CreateTenant",         // echoes tenant_name back in TenantInfo
     // Programmable/recording trio for the nodeclaim-pool
     // lifecycle-invariants suite (rio-controller): tests program the
     // poll/ledger responses and assert on the recorded ack requests.

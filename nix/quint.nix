@@ -3652,7 +3652,7 @@ in
     # regime checks held (the rules' unit-test and kani markers are
     # unchanged).
     # r[verify sched.retry.per-executor-budget+4]
-    # r[verify sched.dispatch.fleet-exhaust+4]
+    # r[verify sched.dispatch.fleet-exhaust+5]
     # r[verify sched.retry.counters-refine-history+2]
     # r[verify sched.retry.no-double-count]
     # r[verify sched.retry.verdict-channel-invariant]

@@ -403,7 +403,7 @@ a derivation whose attempts are never node-attributed is bounded by the
 per-cycle transient/infra/timeout caps and the flat `failure_count` mode, not
 by the distinct-source threshold.
 
-#r("sched.dispatch.fleet-exhaust+4")[
+#r("sched.dispatch.fleet-exhaust+5")[
   The fleet-exhaust verdict is the structural, immediate "every source this
   derivation could run on has already failed it" poison --- evaluated over
   `(excluded_sources, eligible_sources)` by `placeable()`, preserving the
@@ -412,22 +412,29 @@ by the distinct-source threshold.
   defers, because an empty pool/fleet is a provisioning transient
   (autoscaler lag, a deployment rollout in progress), and poisoning on it
   would brick every build submitted during the rollout.
-  (The stream-path evaluation points --- the dispatch-time
-  `find_executor`/E9 backstop and the completion-time check over the
-  in-memory executors map --- retired with that path, per this rule's own
-  "until that path retires" scoping; the spawn-intent gate below is the
-  evaluation point.)
   Pull-mode evaluation point (the spawn-intent gate, AD2): the
   spawnable-source universe is k8s-side knowledge, so the controller ---
   which holds the node informers and renders the intent's `excluded_nodes`
-  as anti-affinity --- detects `excluded_nodes ⊇ spawnable sources` for an
-  intent and reports it through the idempotent `ReportAttemptOutcome` with
-  the distinct reason `NoEligibleSource` instead of spawning an
-  unschedulable Job; the scheduler MUST map that report for a still-Ready
-  derivation to the same fleet-exhaust poison arm (a `fleet_exhaust` marker
-  row plus `Poison(FleetExhausted)`), and MUST treat it as a no-op for a
-  derivation that is no longer Ready (already poisoned, in flight, or
-  resolved) so controller re-ticks stay idempotent.
+  as anti-affinity --- evaluates exhaustion over the intent's CANDIDATE
+  universe: the `pre` set is every schedulable (non-cordoned) node the
+  intent admits ignoring exclusions --- NotReady nodes COUNT (a booting
+  node is a provisioning transient; a Ready-only universe manufactures
+  poisons out of node restarts) and the intent's own placement axes
+  (selector, affinity) narrow it --- and the verdict is `pre` non-empty
+  with `pre ∖ excluded_nodes` empty. The verdict MUST persist for
+  `NO_ELIGIBLE_SOURCE_PERSIST_TICKS` consecutive reconcile ticks before
+  the controller reports it (the spawn is withheld from the first gated
+  tick; only the REPORT --- the poison --- is persistence-gated), and the
+  report MUST echo the intent's `resubmit_cycle`. The scheduler MUST map
+  that report for a still-Ready derivation to the fleet-exhaust poison arm
+  (a `fleet_exhaust` marker row plus `Poison(FleetExhausted)`) only when
+  the echoed cycle matches the derivation's current `resubmit_cycles`,
+  the derivation still carries a non-empty exclusion set, and no spawn
+  acknowledged within the defer window covers the intent (a fresh
+  `acked_spawned` witness defers --- the verdict raced a spawn); on any
+  guard miss and for a derivation that is no longer Ready (already
+  poisoned, in flight, or resolved) it MUST acknowledge without
+  poisoning, so controller re-ticks and stale verdicts stay idempotent.
 ]
 
 ```toml

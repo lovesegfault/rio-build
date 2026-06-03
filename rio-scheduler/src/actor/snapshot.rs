@@ -420,7 +420,7 @@ impl DagActor {
                 // the controller can render anti-affinity and evaluate
                 // the spawn-gate exhaustion check. Empty for histories
                 // with only legacy (pod-name-keyed) failures.
-                // r[impl sched.dispatch.fleet-exhaust+4]
+                // r[impl sched.dispatch.fleet-exhaust+5]
                 excluded_nodes: state.excluded_source_nodes(),
             }
         };

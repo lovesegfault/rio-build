@@ -342,10 +342,23 @@ async fn reap_stale_for_intents_selector_drift_and_terminal() {
             0,
             0,
         ),
-        // Pending, selector=on-demand → matches; the intended dedupe.
+        // Pending, fingerprint matches the current intent → the
+        // intended dedupe. (Every LEGACY-format annotation drifts once
+        // against the v2 RenderInputs fingerprint — the documented
+        // one-time post-deploy churn — so "matching" means stamping
+        // what `build_job` stamps today.)
         job(
             "rio-builder-p-bbb",
-            Some("karpenter.sh/capacity-type=on-demand"),
+            Some(
+                crate::reconcilers::pool::candidate::RenderInputs::from_intent(&SpawnIntent {
+                    intent_id: "bbb".into(),
+                    node_selector: [("karpenter.sh/capacity-type".into(), "on-demand".into())]
+                        .into(),
+                    ..Default::default()
+                })
+                .fingerprint()
+                .leak(),
+            ),
             0,
             0,
         ),
@@ -814,11 +827,17 @@ async fn reap_stale_for_intents_reaps_orphan_pending() {
     };
     // jA,jB Pending old (live, matching selector ""); jC Pending old
     // (orphan); jD Running (orphan, NOT reaped here).
+    // Live Jobs carry the CURRENT fingerprint of a default intent (the
+    // legacy "" stamp would read as drift under the v2 RenderInputs
+    // form and turn this into a drift test instead of an orphan test).
+    let default_fp =
+        crate::reconcilers::pool::candidate::RenderInputs::from_intent(&SpawnIntent::default())
+            .fingerprint();
     let job = |name: &str, ready: i32| {
         let mut j = pending_job(name, ready, 30);
         j.metadata.annotations = Some(BTreeMap::from([(
             INTENT_SELECTOR_ANNOTATION.into(),
-            "".into(),
+            default_fp.clone(),
         )]));
         j
     };
@@ -925,15 +944,16 @@ async fn ctx_with_mock_admin(
     client: kube::Client,
 ) -> (
     std::sync::Arc<crate::reconcilers::Ctx>,
+    rio_test_support::grpc::MockAdmin,
     tokio::task::JoinHandle<()>,
 ) {
-    let (_mock, addr, handle) = rio_test_support::grpc::spawn_mock_admin()
+    let (mock, addr, handle) = rio_test_support::grpc::spawn_mock_admin()
         .await
         .expect("spawn mock admin");
     let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
         .expect("mock admin uri")
         .connect_lazy();
-    (super::test_ctx_with_admin(client, channel), handle)
+    (super::test_ctx_with_admin(client, channel), mock, handle)
 }
 
 // r[verify ctrl.job.synthesize-on-delete]
@@ -991,7 +1011,7 @@ async fn delete_job_synthesizes_report_for_open_pull_attempt() {
     let _g = metrics::set_default_local_recorder(&recorder);
 
     let (client, verifier) = ApiServerVerifier::new();
-    let (ctx, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     let covered = running_job_for_intent("rio-builder-p-pull1", "drv-pull-1");
@@ -1030,7 +1050,7 @@ async fn delete_job_without_open_attempt_attempts_no_rpc() {
     let _g = metrics::set_default_local_recorder(&recorder);
 
     let (client, verifier) = ApiServerVerifier::new();
-    let (ctx, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     let stream_job = running_job_for_intent("rio-builder-p-strm1", "drv-stream-9");
@@ -1125,7 +1145,7 @@ async fn reap_orphan_running_reaps_on_readable_view() {
     let (client, verifier) = ApiServerVerifier::new();
     // In-process MockAdmin: ListOpenAttempts answers Ok with the
     // default (empty) view.
-    let (ctx, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     let job = running_job_for_intent("rio-builder-p-orph2", "drv-orph-2");
@@ -1142,18 +1162,28 @@ async fn reap_orphan_running_reaps_on_readable_view() {
 // AD2 spawn gate (NoEligibleSource)
 // ───────────────────────────────────────────────────────────────────
 
-// r[verify sched.dispatch.fleet-exhaust+4]
-/// The spawn-gate exhaustion predicate: fires exactly when a non-empty
-/// spawnable universe is fully covered by the intent's exclusions —
-/// including the single-node small-fleet case — and never on an empty
-/// universe (provisioning transient) or an intent without exclusions.
+// r[verify sched.dispatch.fleet-exhaust+5]
+/// The spawn-gate exhaustion predicate over the candidate set: fires
+/// exactly when a non-empty admitting universe is fully covered by the
+/// intent's exclusions — including the single-node small-fleet case —
+/// and never on an empty universe (provisioning transient), an intent
+/// without exclusions, or when a schedulable-but-NotReady node remains
+/// admissible (merged_bug_124(a): the pre-fix Ready-only universe
+/// poisoned through node restarts).
 #[test]
 fn no_eligible_source_predicate() {
-    use crate::reconcilers::pool::jobs::no_eligible_source;
-    use std::collections::BTreeSet;
+    use crate::reconcilers::pool::candidate::{CandidateNode, no_eligible_source};
 
-    let nodes =
-        |names: &[&str]| -> BTreeSet<String> { names.iter().map(|n| n.to_string()).collect() };
+    let nodes = |names: &[&str]| -> Vec<CandidateNode> {
+        names
+            .iter()
+            .map(|n| CandidateNode {
+                name: (*n).into(),
+                labels: Default::default(),
+                schedulable: true,
+            })
+            .collect()
+    };
     let intent_with = |excluded: &[&str]| -> SpawnIntent {
         SpawnIntent {
             intent_id: "drv-gated".into(),
@@ -1167,13 +1197,16 @@ fn no_eligible_source_predicate() {
         &intent_with(&["n1", "n2"]),
         &nodes(&["n1", "n2"])
     ));
-    // A non-excluded node exists → spawnable.
+    // A non-excluded node exists → spawnable. This holds REGARDLESS of
+    // the node's Ready condition now — `spawnable_nodes_for_pool` keeps
+    // NotReady nodes and only drops cordoned ones.
     assert!(!no_eligible_source(
         &intent_with(&["n1"]),
         &nodes(&["n1", "n2"])
     ));
     // (c) the small-fleet clause: a single-node universe whose one node
-    // is excluded gates immediately.
+    // is excluded gates immediately (streak persistence rate-limits the
+    // REPORT, not the verdict).
     assert!(no_eligible_source(&intent_with(&["n1"]), &nodes(&["n1"])));
     // No exclusions → never gated.
     assert!(!no_eligible_source(&intent_with(&[]), &nodes(&["n1"])));
@@ -1182,47 +1215,69 @@ fn no_eligible_source_predicate() {
     assert!(!no_eligible_source(&intent_with(&["n1"]), &nodes(&[])));
 }
 
-// r[verify sched.dispatch.fleet-exhaust+4]
+// r[verify sched.dispatch.fleet-exhaust+5]
+// r[verify ctrl.pool.no-eligible-persist]
 /// A gated intent produces exactly one acked `NoEligibleSource` report
-/// (one RPC per gated intent per tick); the gated intent is the one
-/// removed from the spawn set, so no Job is created for it. Cross-tick
+/// carrying the intent's `resubmit_cycle` echo (124(b): the scheduler
+/// ack-no-poisons a stale echo); the gated intent is the one removed
+/// from the spawn set, so no Job is created for it. Cross-tick
 /// idempotency is scheduler-side: the acked report poisons the
 /// derivation, so it stops appearing as an intent at all.
 #[tokio::test]
-async fn gated_intent_reports_no_eligible_source_once() {
-    use crate::reconcilers::pool::jobs::{no_eligible_source, report_no_eligible_source};
-    use std::collections::BTreeSet;
+async fn gated_intent_reports_no_eligible_source_with_cycle_echo() {
+    use crate::reconcilers::pool::candidate::{
+        CandidateNode, exhausted_streak_step, no_eligible_source,
+    };
+    use crate::reconcilers::pool::jobs::report_no_eligible_source;
 
     let (client, _verifier) = ApiServerVerifier::new();
-    let (ctx, _admin_handle) = ctx_with_mock_admin(client).await;
+    let (ctx, mock, _admin_handle) = ctx_with_mock_admin(client).await;
 
     let gated_intent = SpawnIntent {
         intent_id: "drv-gated".into(),
         excluded_nodes: vec!["n1".into()],
+        resubmit_cycle: 4,
         ..Default::default()
     };
     let open_intent = SpawnIntent {
         intent_id: "drv-open".into(),
         ..Default::default()
     };
-    let spawnable: BTreeSet<String> = ["n1".to_string()].into_iter().collect();
+    let candidates = vec![CandidateNode {
+        name: "n1".into(),
+        labels: Default::default(),
+        schedulable: true,
+    }];
 
     // The partition the reconcile applies: gated intents leave the
     // spawn set (no Job is built for them), open ones stay.
     let to_spawn = [gated_intent.clone(), open_intent.clone()];
     let (gated, spawnable_intents): (Vec<&SpawnIntent>, Vec<&SpawnIntent>) = to_spawn
         .iter()
-        .partition(|i| no_eligible_source(i, &spawnable));
+        .partition(|i| no_eligible_source(i, &candidates));
     assert_eq!(gated.len(), 1);
     assert_eq!(spawnable_intents.len(), 1);
     assert_eq!(spawnable_intents[0].intent_id, "drv-open");
 
-    // Exactly one report goes out for the one gated intent, and it is
-    // acked by the (mock) scheduler.
+    // Persistence: the verdict alone does not report on ticks 1-2.
+    let (s1, r1) = exhausted_streak_step(None);
+    let (s2, r2) = exhausted_streak_step(Some(s1));
+    let (_, r3) = exhausted_streak_step(Some(s2));
+    assert!(!r1 && !r2 && r3, "report fires on the third gated tick");
+
+    // Exactly one report goes out for the one gated intent, acked by
+    // the (mock) scheduler, echoing the verdict's resubmit_cycle.
     let acked = report_no_eligible_source(&ctx, "p", &gated).await;
     assert_eq!(
         acked, 1,
         "exactly one NoEligibleSource report per gated intent"
+    );
+    let calls = mock.outcome_calls.read().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].intent_id, "drv-gated");
+    assert_eq!(
+        calls[0].resubmit_cycle, 4,
+        "the verdict echoes the cycle it was computed against"
     );
 }
 
@@ -1437,7 +1492,7 @@ async fn cancel_arm_deletes_job_on_closed_edge() {
     use crate::reconcilers::pool::job::cancel_closed_attempt_jobs;
 
     let (client, verifier) = ApiServerVerifier::new();
-    let (ctx, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let (ctx, _mock, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     let job = running_job_for_intent("rio-builder-p-edge1", "drv-edge");

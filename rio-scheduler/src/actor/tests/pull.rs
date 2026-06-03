@@ -1252,7 +1252,7 @@ async fn unreported_crash_loop_reaches_poison_threshold_with_node_keys() -> Test
     Ok(())
 }
 
-// r[verify sched.dispatch.fleet-exhaust+4]
+// r[verify sched.dispatch.fleet-exhaust+5]
 /// The spawn-gate exhaustion arm: a `NoEligibleSource` report for a
 /// still-Ready derivation poisons it through the fleet-exhaust arm
 /// (one `fleet_exhaust` marker row, no charge), and re-reports are

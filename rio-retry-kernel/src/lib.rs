@@ -729,7 +729,7 @@ pub enum Verdict {
     TtlExpire,
 }
 
-// r[impl sched.dispatch.fleet-exhaust+4]
+// r[impl sched.dispatch.fleet-exhaust+5]
 /// The fleet-exhaust predicate shared by E1's poison check and E9's
 /// dispatch-time backstop: every statically-eligible non-draining
 /// registered worker has already failed this derivation. Returns `false`
@@ -2023,12 +2023,12 @@ pub enum Placement {
     FleetExhausted,
     /// No statically-eligible, non-draining worker is registered at all:
     /// defer, never poison (the empty-fleet clause of
-    /// `sched.dispatch.fleet-exhaust+4` — an empty pool is a
+    /// `sched.dispatch.fleet-exhaust+5` — an empty pool is a
     /// provisioning transient).
     NoEligibleWorkers,
 }
 
-// r[impl sched.dispatch.fleet-exhaust+4]
+// r[impl sched.dispatch.fleet-exhaust+5]
 /// The fleet-exhaust / placement predicate consumed by E1's fleet arm
 /// and the E9 dispatch backstop: intersect [`Decision::exclusion`] with
 /// the caller's snapshot of the statically-eligible, non-draining,
@@ -2039,7 +2039,7 @@ pub enum Placement {
 // ── Kani contract ────────────────────────────────────────────────────
 // The ensures clause is the placement partition stated as an iff per
 // variant: an empty eligible fleet always defers (never poisons — the
-// empty-fleet clause of `sched.dispatch.fleet-exhaust+4`), exhaustion
+// empty-fleet clause of `sched.dispatch.fleet-exhaust+5`), exhaustion
 // requires a non-empty fleet every member of which is excluded AND a
 // non-empty exclusion set, and anything else is placeable. Verified by
 // `check_placeable_contract` in `#[cfg(kani)] mod proofs`.
@@ -3186,7 +3186,7 @@ mod proofs {
     /// and every fleet subset, a `FleetExhausted` poison requires a
     /// non-empty eligible fleet whose every member has already failed
     /// this derivation, and an empty fleet never produces one (the
-    /// empty-fleet defer clause of `sched.dispatch.fleet-exhaust+4`).
+    /// empty-fleet defer clause of `sched.dispatch.fleet-exhaust+5`).
     #[kani::proof]
     #[kani::unwind(7)]
     fn check_fold_fleet_exhaust_arm() {

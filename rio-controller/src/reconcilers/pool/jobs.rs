@@ -42,6 +42,7 @@ use kube::runtime::controller::Action;
 use kube::{Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
+use super::candidate;
 #[cfg(test)]
 use super::job::JOB_TTL_SECS;
 use super::job::{
@@ -326,35 +327,22 @@ impl HwSampledCache {
 /// Status: `replicas` / `readyReplicas` / `desiredReplicas` mean
 /// "active Jobs." `desiredReplicas` is the concurrent-Job ceiling
 /// (`spec.maxConcurrent`).
-/// AD2 spawn-gate exhaustion predicate: every node this pool could
-/// currently schedule onto is already in the intent's `excluded_nodes`.
-/// An empty spawnable universe NEVER reads as exhausted (an empty pool
-/// is a provisioning transient — autoscaling may mint a node that is
-/// not excluded), mirroring `placeable()`'s empty-fleet defer; an
-/// intent with no exclusions is trivially spawnable.
-// r[impl sched.dispatch.fleet-exhaust+4]
-pub(super) fn no_eligible_source(
-    intent: &SpawnIntent,
-    spawnable: &std::collections::BTreeSet<String>,
-) -> bool {
-    !intent.excluded_nodes.is_empty()
-        && !spawnable.is_empty()
-        && spawnable.iter().all(|n| intent.excluded_nodes.contains(n))
-}
-
-/// The spawnable-source universe for `pool`: the names of schedulable,
-/// Ready nodes matching the pool's static placement constraints (the
-/// effective node selector — kind constraints like the fetcher
-/// selector — plus the arch derived from `spec.systems`); the same
+/// The candidate-source universe for `pool`: every node matching the
+/// pool's static placement constraints (the effective node selector —
+/// kind constraints like the fetcher selector — plus the arch derived
+/// from `spec.systems`), with name + labels + cordon state; the same
 /// data the FFD's node view keys on, read lazily from the apiserver
 /// only on ticks where some intent actually carries exclusions.
+/// NotReady nodes are KEPT (merged_bug_124(a)) — the per-intent gate
+/// decides admissibility over [`candidate::RenderInputs::admits`].
 /// `None` when the list fails — callers treat that as "cannot prove
 /// exhaustion" and spawn as today (fail-open: the anti-affinity makes
 /// the pod Pending at worst, exactly the pre-gate behavior).
+// r[impl ctrl.pool.intent-candidate-set]
 pub(super) async fn spawnable_nodes_for_pool(
     client: &kube::Client,
     pool: &Pool,
-) -> Option<std::collections::BTreeSet<String>> {
+) -> Option<Vec<candidate::CandidateNode>> {
     let mut selector: Vec<String> = pod::effective_node_selector(pool)
         .unwrap_or_default()
         .into_iter()
@@ -378,28 +366,27 @@ pub(super) async fn spawnable_nodes_for_pool(
     };
     Some(
         list.items
-            .iter()
-            .filter(|n| {
-                // Schedulable (not cordoned) and Ready: an unschedulable
-                // or NotReady node cannot host the pod, so counting it
-                // would under-fire the gate (fail-open) — acceptable —
-                // but counting only genuinely placeable nodes keeps the
-                // small-fleet clause exact on single-node fixtures.
+            .into_iter()
+            .filter_map(|n| {
+                let name = n.metadata.name.clone()?;
+                // Cordoned (`spec.unschedulable`) nodes can never host
+                // the pod (kube-scheduler will not bind there). NotReady
+                // nodes are kept: a booting/provisioning node is a
+                // transient that will admit pods shortly — the strict
+                // Ready filter manufactured single-tick fleet-exhaust
+                // poisons out of node restarts (merged_bug_124(a)).
                 let schedulable = n
                     .spec
                     .as_ref()
                     .and_then(|s| s.unschedulable)
                     .is_none_or(|u| !u);
-                let ready = n.status.as_ref().is_some_and(|s| {
-                    s.conditions.as_ref().is_some_and(|conds| {
-                        conds
-                            .iter()
-                            .any(|c| c.type_ == "Ready" && c.status == "True")
-                    })
-                });
-                schedulable && ready
+                let labels = n.metadata.labels.clone().unwrap_or_default();
+                Some(candidate::CandidateNode {
+                    name,
+                    labels,
+                    schedulable,
+                })
             })
-            .filter_map(|n| n.metadata.name.clone())
             .collect(),
     )
 }
@@ -412,7 +399,7 @@ pub(super) async fn spawnable_nodes_for_pool(
 /// (fleet-exhaust arm), so it leaves the intent stream and re-ticks
 /// send nothing further; a duplicate ack is a server-side no-op either
 /// way.
-// r[impl sched.dispatch.fleet-exhaust+4]
+// r[impl sched.dispatch.fleet-exhaust+5]
 pub(super) async fn report_no_eligible_source(
     ctx: &Ctx,
     pool: &str,
@@ -422,7 +409,10 @@ pub(super) async fn report_no_eligible_source(
     for intent in gated {
         match admin_call(ctx.admin.clone().report_attempt_outcome(
             rio_proto::types::ReportAttemptOutcomeRequest {
-                resubmit_cycle: 0,
+                // 124(b) staleness witness: echo the cycle this verdict
+                // was computed against; the scheduler ack-no-poisons a
+                // stale echo (the drv re-entered Ready since).
+                resubmit_cycle: intent.resubmit_cycle,
                 intent_id: intent.intent_id.clone(),
                 job_name: String::new(),
                 exec_id: String::new(),
@@ -646,14 +636,40 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         .any(|i| !i.excluded_nodes.is_empty())
     {
         match spawnable_nodes_for_pool(&ctx.client, pool).await {
-            Some(spawnable) => {
+            Some(candidates) => {
                 let (gated, spawnable_intents): (Vec<SpawnIntent>, Vec<SpawnIntent>) =
                     to_spawn_intents
                         .into_iter()
-                        .partition(|i| no_eligible_source(i, &spawnable));
-                if !gated.is_empty() {
-                    let gated_refs: Vec<&SpawnIntent> = gated.iter().collect();
-                    report_no_eligible_source(ctx, &name, &gated_refs).await;
+                        .partition(|i| candidate::no_eligible_source(i, &candidates));
+                // r[impl ctrl.pool.no-eligible-persist]
+                // Withhold the spawn from tick 1 (the Job would sit
+                // unschedulable behind its own anti-affinity) but only
+                // REPORT — i.e. poison — after the exhaustion persists
+                // `NO_ELIGIBLE_SOURCE_PERSIST_TICKS` consecutive ticks:
+                // a single-tick universe blip (node restart, informer
+                // lag, autoscaler churn) must not poison a derivation.
+                // Streaks for intents no longer gated (left the set or
+                // universe un-exhausted) are pruned; an already-acked
+                // report keeps its streak harmlessly until the poisoned
+                // drv leaves the intent stream (duplicate reports are
+                // server-side no-ops).
+                let to_report: Vec<&SpawnIntent> = {
+                    let mut streaks = ctx.exhausted_streak.lock();
+                    let gated_ids: HashSet<&str> =
+                        gated.iter().map(|i| i.intent_id.as_str()).collect();
+                    streaks.retain(|id, _| gated_ids.contains(id.as_str()));
+                    gated
+                        .iter()
+                        .filter(|intent| {
+                            let prev = streaks.get(&intent.intent_id).copied();
+                            let (streak, report) = candidate::exhausted_streak_step(prev);
+                            streaks.insert(intent.intent_id.clone(), streak);
+                            report
+                        })
+                        .collect()
+                };
+                if !to_report.is_empty() {
+                    report_no_eligible_source(ctx, &name, &to_report).await;
                 }
                 spawnable_intents
             }
@@ -874,44 +890,6 @@ async fn queued_for_pool(
     Ok(resp.intents)
 }
 
-/// Stable fingerprint of an intent's scheduler-decided placement:
-/// `node_affinity` when non-empty (ADR-023 §13a — `k=v|k=v;k=v|...`
-/// over sorted requirements per term, terms sorted), else the legacy
-/// `node_selector` map (`k=v,k=v` over sorted keys). Empty → "". Only
-/// the intent-supplied placement is fingerprinted (NOT the pool's base
-/// selector that `build_executor_pod_spec` merges in) so drift
-/// detection compares scheduler decisions, not pool config.
-///
-/// The §13a scheduler emits `node_selector: {}` (snapshot.rs:350), so
-/// the legacy arm only fires on pre-§13a intents and on the
-/// `node_affinity = []` FOD/feature-gated/cold-hw-table path.
-fn selector_fingerprint(intent: &SpawnIntent) -> String {
-    if !intent.node_affinity.is_empty() {
-        let mut terms: Vec<String> = intent
-            .node_affinity
-            .iter()
-            .map(|t| {
-                let mut kv: Vec<_> = t
-                    .match_expressions
-                    .iter()
-                    .map(|r| format!("{}={}", r.key, r.values.join("+")))
-                    .collect();
-                kv.sort_unstable();
-                kv.join("|")
-            })
-            .collect();
-        terms.sort_unstable();
-        return terms.join(";");
-    }
-    let mut kv: Vec<_> = intent
-        .node_selector
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect();
-    kv.sort_unstable();
-    kv.join(",")
-}
-
 /// DNS-1123-safe deterministic suffix from `intent_id`. In production
 /// `intent_id` is the FULL store path `/nix/store/{hash}-{name}.drv`
 /// (translate.rs:`build_node` sets `drv_hash = drv_path`; snapshot.rs
@@ -977,7 +955,7 @@ pub(super) async fn reap_stale_for_intents(
         .map(|i| {
             (
                 pod::job_name(pool, kind, &intent_suffix(&i.intent_id)),
-                selector_fingerprint(i),
+                candidate::RenderInputs::from_intent(i).fingerprint(),
             )
         })
         .collect();
@@ -1174,7 +1152,7 @@ pub(super) fn build_job(
         .get_or_insert_with(BTreeMap::new)
         .insert(
             INTENT_SELECTOR_ANNOTATION.into(),
-            selector_fingerprint(intent),
+            candidate::RenderInputs::from_intent(intent).fingerprint(),
         );
     Ok(job)
 }
@@ -1282,7 +1260,7 @@ fn apply_intent_resources(
         });
     }
 
-    // r[impl sched.dispatch.fleet-exhaust+4]
+    // r[impl sched.dispatch.fleet-exhaust+5]
     // AD2: nodes that already failed this derivation (the intent's
     // node-keyed exclusion set) are rendered as required anti-affinity,
     // ANDed into the per-intent placement above. Applied AFTER the
@@ -1709,12 +1687,13 @@ mod tests {
         }
     }
 
-    /// `selector_fingerprint` is deterministic over key/term order. Empty
-    /// → "". `build_job` stamps it on Job metadata.annotations so
-    /// `reap_stale_for_intents` can compare without dereferencing
-    /// `spec.template`.
+    /// merged_bug_249: `build_job` stamps the COMPLETE RenderInputs
+    /// fingerprint (placement + exclusions + resources + deadline) on
+    /// Job metadata.annotations so `reap_stale_for_intents` sees drift
+    /// on ANY render-decided axis. Deterministic over key/term order;
+    /// field sensitivity is pinned in `candidate::tests`.
     #[test]
-    fn build_job_stamps_selector_fingerprint() {
+    fn build_job_stamps_render_inputs_fingerprint() {
         use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm};
         let term = |kv: &[(&str, &str)]| NodeSelectorTerm {
             match_expressions: kv
@@ -1752,25 +1731,17 @@ mod tests {
             ],
             ..Default::default()
         };
+        let fp = |i: &SpawnIntent| candidate::RenderInputs::from_intent(i).fingerprint();
         assert_eq!(
-            selector_fingerprint(&a),
-            selector_fingerprint(&b),
+            fp(&a),
+            fp(&b),
             "deterministic over both per-term key order and term order"
         );
-        // Legacy `node_selector` arm still works for non-§13a intents.
-        let legacy = SpawnIntent {
-            node_selector: [
-                ("karpenter.sh/capacity-type".into(), "spot".into()),
-                ("rio.build/hw-band".into(), "mid".into()),
-            ]
-            .into(),
-            ..Default::default()
-        };
-        assert_eq!(
-            selector_fingerprint(&legacy),
-            "karpenter.sh/capacity-type=spot,rio.build/hw-band=mid"
-        );
-        assert_eq!(selector_fingerprint(&SpawnIntent::default()), "");
+        // Exclusion drift alone changes the stamp (the legacy
+        // placement-only fingerprint did not — the recorded red).
+        let mut excluded = a.clone();
+        excluded.excluded_nodes = vec!["n1".into()];
+        assert_ne!(fp(&a), fp(&excluded));
 
         let pool = test_pool("p", ExecutorKind::Builder);
         let i = SpawnIntent {
@@ -1784,7 +1755,7 @@ mod tests {
                 .as_ref()
                 .and_then(|a| a.get(INTENT_SELECTOR_ANNOTATION))
                 .map(String::as_str),
-            Some(selector_fingerprint(&i).as_str()),
+            Some(fp(&i).as_str()),
         );
     }
 
@@ -2184,7 +2155,7 @@ mod tests {
         assert_eq!(pod.priority_class_name, None);
     }
 
-    // r[verify sched.dispatch.fleet-exhaust+4]
+    // r[verify sched.dispatch.fleet-exhaust+5]
     /// AD2 anti-affinity render: an intent carrying `excluded_nodes`
     /// gets a `kubernetes.io/hostname NotIn […]` requirement ANDed
     /// into EVERY required nodeAffinity term (terms are OR'd, so a

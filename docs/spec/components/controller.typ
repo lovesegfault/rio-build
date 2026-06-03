@@ -303,6 +303,33 @@ two reads.
   change. A spawn error MUST NOT abort the remainder of the tick.
 ]
 
+#r("ctrl.pool.intent-candidate-set")[
+  Every destructive verdict that depends on "where can this intent run /
+  what did the controller render" MUST consume the ONE intent-decided
+  axis-set projection (`RenderInputs`): the pod render constructs it once
+  and stamps `fingerprint()` --- which MUST cover every render-decided
+  axis (selector, affinity, exclusions, resources, deadline) --- as the
+  drift annotation; the AD2 spawn gate evaluates exhaustion over the same
+  projection's admission predicate; and FFD packing MUST consult the
+  exclusion axis through the same predicate (an excluded node is not
+  simulated capacity, and a binding on a since-excluded node falls
+  through to the fit-check instead of freezing as placed). A render axis
+  absent from the projection is a defect by construction (the
+  field-sensitivity contract test fails).
+]
+
+#r("ctrl.pool.no-eligible-persist")[
+  The AD2 `NoEligibleSource` REPORT --- the verdict that poisons the
+  derivation scheduler-side --- MUST NOT fire on a single-tick exhaustion
+  observation: the gate withholds the spawn from the first gated tick,
+  and reports only after the exhaustion persists
+  `NO_ELIGIBLE_SOURCE_PERSIST_TICKS` consecutive reconcile ticks for that
+  intent. Streak state MUST reset when the intent leaves the gated set
+  (the universe un-exhausted, the intent left the stream, or it fell
+  outside the spawn window). A controller restart MAY restart streaks
+  (delaying a genuine poison by at most the persistence window).
+]
+
 #r("ctrl.pool.ack-spawned-soundness")[
   The Pool reconciler MUST ack `AckSpawnedIntents{spawned}` only for intents
   that have a Job behind them at ack time: intents whose create succeeded

@@ -1285,7 +1285,7 @@ impl DagActor {
         Ok(())
     }
 
-    // r[impl sched.dispatch.fleet-exhaust+4]
+    // r[impl sched.dispatch.fleet-exhaust+5]
     /// The spawn-gate exhaustion arm of `ReportAttemptOutcome`
     /// (`reason = NoEligibleSource`, AD2a): the controller holds the
     /// node informers, so it is the party that can observe "every

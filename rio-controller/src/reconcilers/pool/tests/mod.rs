@@ -86,6 +86,7 @@ pub(crate) fn test_ctx_with_admin(
         hw_config: crate::reconcilers::node_informer::HwClassConfig::default(),
         terminal_report_sampled: Default::default(),
         pull_attempt_seen_open: Default::default(),
+        exhausted_streak: Default::default(),
     })
 }
 
