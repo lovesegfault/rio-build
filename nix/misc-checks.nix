@@ -16,6 +16,9 @@
   # `workspaceFileset` made it rebuild on every `.rs` edit.
   manifestsFileset,
   stubTargetFiles,
+  # crate2nix CLI (flake input build) — crate2nix-drift regenerates
+  # Cargo.json hermetically with it.
+  crate2nixCli,
   rustStable,
   rustPlatformStable,
   traceyPkg,
@@ -171,6 +174,52 @@ in
       export CARGO_NET_OFFLINE=true
       cargo hakari verify || {
         echo 'error: workspace-hack is stale — run `cargo xtask regen hakari`'
+        exit 1
+      }
+    '';
+    installPhase = ''
+      touch $out
+    '';
+  };
+
+  # Hermetic backstop for the pre-commit crate2nix-check: regenerate the
+  # ROOT Cargo.json from manifests + lockfile and diff against the
+  # committed copy. Same cargoSetupHook + importCargoLock recipe as
+  # `deny`/`hakari-drift` — crate2nix shells out to `cargo metadata`,
+  # which resolves against the vendored sources offline, and
+  # stubTargetFiles synthesizes the (empty) target files autodiscovery
+  # needs, so the output depends on manifests + lock only (verified for
+  # crate2nix 0.15.0: relative paths, lock-derived sha256s, no absolute
+  # roots). The two fuzz-workspace Cargo.jsons are NOT covered here
+  # (own lockfiles + fuzz target layout): their backstops are the
+  # pre-commit hook plus the loud build failure a lock/json mismatch
+  # produces in the fuzz derivations themselves.
+  crate2nix-drift = pkgs.stdenv.mkDerivation {
+    pname = "rio-crate2nix-drift";
+    inherit version;
+    src = pkgs.lib.fileset.toSource {
+      root = unfilteredRoot;
+      fileset = pkgs.lib.fileset.unions [
+        manifestsFileset
+        ../Cargo.json
+      ];
+    };
+    cargoDeps = rustPlatformStable.importCargoLock {
+      lockFile = ../Cargo.lock;
+    };
+    nativeBuildInputs = [
+      crate2nixCli
+      rustStable
+      rustPlatformStable.cargoSetupHook
+    ];
+    buildPhase = ''
+      export HOME=$TMPDIR
+      export CARGO_NET_OFFLINE=true
+      ${stubTargetFiles}
+      crate2nix generate --format json -o Cargo.json.check
+      echo >> Cargo.json.check  # match end-of-file-fixer
+      diff -u Cargo.json Cargo.json.check || {
+        echo 'error: Cargo.json is stale — run `cargo xtask regen cargo-json`'
         exit 1
       }
     '';

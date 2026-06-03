@@ -43,13 +43,15 @@
   # flake.nix's sysCrateEnv — single source of truth so devShell
   # and crate2nix see the same linkage.
   sysCrateEnv,
-  # Extra rustc flags injected into EVERY crate in the tree, deps
-  # included. A non-empty value forks the whole dep graph into a
-  # second derivation set, so nothing uses this today — instrumented
-  # trees (coverage, fuzz) restrict their flags to local crates to
-  # keep the dep derivations shared with the plain tree. Kept as the
-  # escape hatch for a flag that genuinely must reach every crate.
-  # Empty = no wrap.
+  # Extra rustc flags injected into every crate in the tree, deps
+  # included — EXCEPT the buildDepOnlyCrates closure, whose rlibs link
+  # into uninstrumented build_script_build binaries and therefore skip
+  # both opts lists (see effectiveTreeOpts). A non-empty value forks
+  # the dep graph into a second derivation set, so nothing uses this
+  # today — instrumented trees (coverage, fuzz) restrict their flags
+  # to local crates to keep the dep derivations shared with the plain
+  # tree. Kept as the escape hatch for a flag that genuinely must
+  # reach (almost) every crate. Empty = no wrap.
   globalExtraRustcOpts ? [ ],
   # Extra rustc flags applied only to crates listed in `memberSrcs`
   # (= local in-tree crates). Dep derivations stay byte-identical to
@@ -88,10 +90,11 @@ let
   # to glibc/lib:gcc-lib/lib (rust-overlay's rustlib doesn't appear).
   #
   # When a crate is compiled with -Cinstrument-coverage (via either
-  # opts list), also set LLVM_PROFILE_FILE=/dev/null: its build script
-  # and any proc-macro it exports are ALSO instrumented and would
-  # otherwise try to write profraws to the RO sandbox CWD when they
-  # execute during a build. Gated on the specific flag — not on
+  # opts list), also set LLVM_PROFILE_FILE=/dev/null: any proc-macro it
+  # exports is ALSO instrumented and would otherwise try to write
+  # profraws to the RO sandbox CWD when it executes during a dependent
+  # build. (Build scripts are NOT instrumented — buildRustCrate compiles
+  # build_script_build without extraRustcOpts; see buildDepOnlyCrates.) Gated on the specific flag — not on
   # "localExtraRustcOpts is non-empty" — so (a) the fuzz tree's
   # sancov-only members don't pick up a pointless env var, and (b) a
   # local-only coverage tree leaves its dep derivations byte-identical
@@ -121,17 +124,55 @@ let
   # would derive an EMPTY set there and silently drop the exemption
   # exactly where it matters most. Membership = a local crate referenced
   # via [build-dependencies] by some crate in this tree and via NO
-  # crate's [dependencies]/[dev-dependencies].
+  # crate's [dependencies]/[dev-dependencies], EXTENDED to the
+  # transitive closure over local [dependencies] edges of those roots
+  # (an exempt crate's runtime deps link into the same uninstrumented
+  # build_script_build binaries). A closure member that is ALSO
+  # runtime/dev-consumed by a non-exempt local crate would have to be
+  # simultaneously instrumented and uninstrumented — impossible with
+  # one derivation per crate — so that conflict fails EVAL with a named
+  # error instead of an undecipherable undefined-__asan_* link failure.
+  # Exported from the return attrset so consumers (the coverage-matrix
+  # exclusion in flake.nix) derive from this binding instead of
+  # hand-mirroring the list.
   buildDepOnlyCrates =
     let
       resolved = builtins.fromJSON (builtins.readFile resolvedJson);
       allCrates = lib.attrValues resolved.crates;
+      localCrates = lib.filter (c: (c.source.type or "") == "local") allCrates;
+      localNames = map (c: c.crateName) localCrates;
+      crateByName = lib.listToAttrs (
+        map (c: {
+          name = c.crateName;
+          value = c;
+        }) localCrates
+      );
       depNames = kind: lib.unique (lib.concatMap (c: map (d: d.name) (c.${kind} or [ ])) allCrates);
       buildNames = depNames "buildDependencies";
       runtimeNames = depNames "dependencies" ++ depNames "devDependencies";
-      localNames = map (c: c.crateName) (lib.filter (c: (c.source.type or "") == "local") allCrates);
+      roots = lib.filter (n: lib.elem n buildNames && !lib.elem n runtimeNames) localNames;
+      closure = builtins.genericClosure {
+        startSet = map (n: { key = n; }) roots;
+        operator =
+          item:
+          map (d: { key = d.name; }) (
+            lib.filter (d: lib.elem d.name localNames) ((crateByName.${item.key} or { }).dependencies or [ ])
+          );
+      };
+      exempt = map (i: i.key) closure;
+      conflicted = lib.filter (
+        n:
+        lib.any (
+          c:
+          !lib.elem c.crateName exempt
+          && lib.any (d: d.name == n) ((c.dependencies or [ ]) ++ (c.devDependencies or [ ]))
+        ) localCrates
+      ) exempt;
     in
-    lib.filter (n: lib.elem n buildNames && !lib.elem n runtimeNames) localNames;
+    if conflicted != [ ] then
+      throw "crate2nix.nix: crate(s) [${toString conflicted}] are in the build-dep-only instrumentation-exempt closure but also runtime-consumed by non-exempt local crates. A crate cannot be both instrumented (for runtime consumers) and uninstrumented (for the build scripts that link it) — restructure the workspace, e.g. split the shared code out of the build-dependency crate."
+    else
+      exempt;
 
   buildRustCrateForPkgs =
     cratePkgs:
@@ -245,8 +286,11 @@ let
   # is needed — the per-member fileset already includes `migrations/`.
   #
   # sqlx offline query cache — content-addressed JSON per query!(...)
-  # callsite. maybeMissing: a fresh clone before the first
-  # `cargo xtask regen sqlx` won't have .sqlx/ yet.
+  # callsite. The cache is COMMITTED (a fresh clone has it);
+  # maybeMissing keeps eval green in the only reachable no-.sqlx
+  # states — `rm -rf .sqlx` recovery and mid-regen swaps — so the
+  # failure surfaces at compile with sqlx's own diagnostic instead
+  # of at eval.
   sqlxCacheFileset = pkgs.lib.fileset.toSource {
     root = ../.;
     fileset = pkgs.lib.fileset.maybeMissing ../.sqlx;
@@ -389,7 +433,7 @@ let
     # pkgs.defaultCrateOverrides here makes build-from-json.nix's
     # `defaultCrateOverrides != pkgs.defaultCrateOverrides` check
     # evaluate to false, skipping its `.override` call. This is needed
-    # for the coverage wrap (globalExtraRustcOpts != []) which returns
+    # for the instrumented wraps (localExtraRustcOpts != []) which return
     # a plain function without a `.override` method.
     inherit (pkgs) defaultCrateOverrides;
   };
@@ -443,4 +487,10 @@ in
   memberBins = lib.mapAttrs (
     name: m: scrubBins "${name}-bin${binSuffix}" "${m.build}/bin"
   ) cargoNix.workspaceMembers;
+
+  # Instrumentation-exempt crate names (build-dep-only closure) — the
+  # single source for every consumer that must agree with the exemption
+  # (coverage-matrix exclusion in flake.nix). See the buildDepOnlyCrates
+  # comment above for membership semantics.
+  instrumentationExemptCrates = buildDepOnlyCrates;
 }

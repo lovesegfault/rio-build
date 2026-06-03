@@ -34,8 +34,11 @@ pub fn run() -> Result<()> {
     // No read-only-restore pre-clean is needed here (unlike regen
     // sqlx): the cap-lints flag set changes cargo's -Cmetadata, so the
     // baseline writes NEW filenames rather than overwriting kache's
-    // restored ones, and same-name rebuilds have cargo unlink stale
-    // outputs first — verified empirically on both shell toolchains.
+    // restored ones. (Cargo's own unlink-before-write covers only
+    // hardlink-uplift destinations like target/debug/lib*.rlib, NOT
+    // rustc-written deps/ outputs — which is exactly why the regen
+    // sqlx EACCES is real; the filename shift is what protects this
+    // flow, verified empirically on both shell toolchains.)
     let _env = sh.push_env("KACHE_DISABLED", "1");
     crate::sh::run_interactive(cmd!(
         sh,

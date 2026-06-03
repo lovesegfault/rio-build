@@ -10,7 +10,7 @@
 #                     tree, so its sancov closure is much larger)
 #
 # Build: per-crate via crate2nix (third + fourth instantiations
-# alongside the main + coverage trees). Same `globalExtraRustcOpts`
+# alongside the main + coverage trees). Same `localExtraRustcOpts`
 # mechanism as crateBuildCov, but with the exact RUSTFLAGS that
 # `cargo fuzz build --release` injects (extracted from cargo-fuzz
 # src/project.rs — see `fuzzRustcOpts` below).

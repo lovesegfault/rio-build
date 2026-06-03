@@ -1,7 +1,7 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: none)
 
-// gen/workspace.json — members + per-crate `deps:{prod,optional,dev}`.
+// gen/workspace.json — members + per-crate `deps:{prod,optional,dev,build}`.
 // Loaded directly (not via refs.typ) so the autograph block can spread
 // `_ws.deps.pairs()`.
 #let _ws = json("/gen/workspace.json")
@@ -84,7 +84,8 @@ derivation is invalidated on `.proto` changes but not on Rust-only commits.
       edge-corner-radius: 8pt,
       // Nodes AND edges derive from gen/workspace.json (each crate's
       // Cargo.toml [dependencies] / [dev-dependencies] /
-      // [target.*.dependencies] rio-* entries). bug_021: the
+      // [build-dependencies] / [target.*.dependencies] (and the
+      // target.<cfg> dev/build forms) rio-* entries). bug_021: the
       // hand-maintained list mis-classified scheduler→store as dev-only
       // and omitted rio-auth/rio-lease nodes entirely.
       .._ws.members.map(m => autograph.node(label(m.name), crate(m.name))),

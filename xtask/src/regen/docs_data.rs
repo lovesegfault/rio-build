@@ -505,17 +505,19 @@ fn workspace() -> Result<serde_json::Value> {
         optional.remove(name);
         dev.remove(name);
         build.remove(name);
-        // Edge precedence: prod > optional > build > dev — each dep
+        // Edge precedence: prod > build > optional > dev — each dep
         // renders exactly one edge, the strongest that applies.
         // (rio-store has rio-test-support in both optional [deps] AND
         // [dev-deps]; without dedup the autograph would render a
-        // dotted+dashed double-edge.) Build outranks dev because a
-        // build-dep shapes the production artifact while a dev-dep is
-        // test-only — a dep in both must not render as "dashed =
-        // [dev-dependencies] only".
-        let build: Vec<_> = build
-            .difference(&prod)
-            .filter(|d| !optional.contains(*d))
+        // dotted+dashed double-edge.) Build outranks optional AND dev:
+        // a [build-dependencies] edge is unconditional and shapes the
+        // production artifact, while an optional dep may never be
+        // compiled and a dev-dep is test-only — a dep in build+optional
+        // must not render as the dotted "maybe enabled" edge alone.
+        let build: Vec<_> = build.difference(&prod).cloned().collect();
+        let optional: std::collections::BTreeSet<_> = optional
+            .iter()
+            .filter(|d| !build.contains(*d))
             .cloned()
             .collect();
         let dev: Vec<_> = dev

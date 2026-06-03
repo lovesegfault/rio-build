@@ -541,6 +541,7 @@
                   workspaceFileset
                   manifestsFileset
                   stubTargetFiles
+                  crate2nixCli
                   rustStable
                   rustPlatformStable
                   traceyPkg
@@ -808,21 +809,17 @@
                       )
                     )
                     (
-                      removeAttrs crateChecks.covLcovs [
-                        # rio-buildhash is build-dependency-only: its rlib
-                        # links into build_script_build binaries that
-                        # buildRustCrate compiles without extraRustcOpts, so
-                        # the whole crate is exempt from
-                        # -Cinstrument-coverage (nix/crate2nix.nix
-                        # buildDepOnlyCrates) and its unit lcov is
-                        # deterministically 0 bytes. coverage-upload.py
-                        # skips empty lcovs, so an included entry would
-                        # leave Codecov waiting at N-1 of after_n_builds
-                        # forever. Same pattern as the vm-* exclusions
-                        # above; codecov-matrix-sync keeps the count
-                        # honest.
-                        "rio-buildhash"
-                      ]
+                      # Instrumentation-exempt crates (build-dep-only
+                      # closure) are exempt from -Cinstrument-coverage, so
+                      # their unit lcovs are deterministically 0 bytes;
+                      # coverage-upload.py skips empty lcovs, and an
+                      # included entry would leave Codecov waiting at N-1
+                      # of after_n_builds forever. Derived from the SAME
+                      # exported binding that drives the exemption — a
+                      # hand list here re-created the drift the derivation
+                      # exists to kill, one consumer over.
+                      # codecov-matrix-sync keeps the count honest.
+                      removeAttrs crateChecks.covLcovs crateBuild.instrumentationExemptCrates
                     )
                   // coverage.perTestLcov;
 

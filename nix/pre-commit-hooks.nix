@@ -7,16 +7,36 @@
   crate2nixCli,
 }:
 let
-  # Shared guard for every hook that spawns cargo: a stale shell can
-  # outlive `nix store gc`, leaving RUSTC_WRAPPER pointing at a collected
-  # store path — and cargo execs `$RUSTC_WRAPPER rustc -vV` even for
-  # `cargo metadata`, so crate2nix-check and hakari-check die exactly
-  # like compile hooks do, just with a less obvious error. Skip with the
-  # real reason instead of letting each hook misattribute the failure.
-  # PATH-aware like cargo's own resolution: a bare-name wrapper (a
-  # user-level RUSTC_WRAPPER=sccache) must be looked up, not tested as a
-  # CWD-relative pathname.
-  rustcWrapperGuard = ''
+  # Shared guard for every hook that spawns cargo (directly or via a
+  # tool that runs `cargo metadata`). Two tests, in order:
+  #
+  # 1. RIO_DEVSHELL sentinel: language=system hooks run in the
+  #    COMMITTING environment, not a sandbox. Outside the dev shell
+  #    (IDE git UIs, bare terminals) the build env is incomplete (no
+  #    LIBCLANG_PATH/PG_BIN, possibly a version-divergent system cargo)
+  #    and any cargo-spawning hook can only fail confusingly — or
+  #    worse, emit a false "stale" verdict from the wrong toolchain.
+  #    The sentinel is the rio-specific RIO_DEVSHELL, not a generic
+  #    tool var like PROTOC: a foreign protobuf project's shell exports
+  #    PROTOC too, and passing the guard there reproduces exactly the
+  #    confusing failure the guard exists to prevent.
+  # 2. Dangling RUSTC_WRAPPER: a stale shell can outlive `nix store
+  #    gc`, leaving RUSTC_WRAPPER pointing at a collected store path —
+  #    and cargo execs `$RUSTC_WRAPPER rustc -vV` even for
+  #    `cargo metadata`, so crate2nix-check and hakari-check die
+  #    exactly like compile hooks do, just with a less obvious error.
+  #    PATH-aware like cargo's own resolution: a bare-name wrapper (a
+  #    user-level RUSTC_WRAPPER=sccache) must be looked up, not tested
+  #    as a CWD-relative pathname.
+  #
+  # Both skip (exit 0) with the real reason: every guarded gate has a
+  # hermetic CI backstop (clippy/nextest for sqlx staleness,
+  # hakari-drift, crate2nix-drift), so fail-open here is honest.
+  cargoEnvGuard = ''
+    if [ -z "''${RIO_DEVSHELL:-}" ]; then
+      echo "''${0##*/}: not in the rio dev shell (RIO_DEVSHELL unset); skipping — CI enforces this gate" >&2
+      exit 0
+    fi
     if [ -n "''${RUSTC_WRAPPER:-}" ]; then
       case "$RUSTC_WRAPPER" in
         */*) wrapper_ok=$([ -x "$RUSTC_WRAPPER" ] && echo 1 || echo 0) ;;
@@ -80,46 +100,54 @@ in
     name = "sqlx-prepare-check";
     entry = toString (
       pkgs.writeShellScript "sqlx-prepare-check" ''
-        # language=system → this runs in the COMMITTING environment, not a
-        # sandbox. Outside the dev shell (IDE git UIs, bare terminals) the
-        # build env is incomplete (no LIBCLANG_PATH/PG_BIN/cmake) and the
-        # check could only fail confusingly. Skip with a note instead —
-        # CI's hermetic checks are the real enforcement. The sentinel is
-        # the rio-specific RIO_DEVSHELL, not a generic tool var like
-        # PROTOC: any other protobuf project's shell exports PROTOC too,
-        # and passing the guard in such a foreign env reproduces exactly
-        # the confusing failure the guard exists to prevent.
-        if [ -z "''${RIO_DEVSHELL:-}" ]; then
-          echo 'sqlx-prepare-check: not in the rio dev shell (RIO_DEVSHELL unset); skipping — CI enforces this gate' >&2
-          exit 0
-        fi
-        ${rustcWrapperGuard}
+        ${cargoEnvGuard}
         # Re-pin the sqlx contract variable from THIS repo's toplevel:
         # the inherited value is frozen at shell entry and may belong to
         # a sibling worktree (tmux pane that cd'd over) — the check must
         # validate the staged queries against this checkout's cache.
         SQLX_OFFLINE_DIR="$(git rev-parse --show-toplevel)/.sqlx"
         export SQLX_OFFLINE_DIR
-        # Only check if any staged .rs file touches a query! macro.
-        # Otherwise this is a no-op (e.g. pure-refactor commits
-        # that don't change SQL).
-        if git diff --cached --name-only -- '*.rs' \
-           | xargs -r grep -l 'query!\|query_as!\|query_scalar!' \
-           | grep -q .; then
-          # --all-targets: cfg(test)/tests/ query! sites are in the
-          # offline cache too (regen sqlx prepares with `-- --all-targets`
-          # for the LivePin contract anchors) — without it a stale
-          # test-only entry sails through commit and fails in CI ~10min
-          # later. Scoped to query!-touching commits, so the wider unit
-          # graph only compiles when it can actually catch something.
-          # Compiler diagnostics stay on stderr (--quiet drops only
-          # cargo's status lines) — the trailer must not claim more than
-          # it knows: EACCES over a kache restore, a gc'd cargo, or a
-          # plain type error all land here too, and "regen sqlx" fixes
-          # none of them.
-          SQLX_OFFLINE=true cargo check --quiet --all-targets -p rio-scheduler -p rio-store -p rio-controller \
-            || { echo 'sqlx-prepare-check failed — if the errors above say `no cached data for query`, run `cargo xtask regen sqlx`; otherwise fix the reported error'; exit 1; }
-        fi
+        # Derive the crate list from the staged hits instead of
+        # hand-listing it: map each query!-matching staged file to its
+        # top-level crate dir. A hand list here was a third independent
+        # mirror of "the set of query! crates" (alongside crate2nix.nix
+        # sqlxOffline and the per-crate build.rs trackers) — a fourth
+        # crate gaining query! would fire the trigger, pass vacuously,
+        # and fail in CI 10min later.
+        crates=$(git diff --cached --name-only -- '*.rs' \
+          | xargs -r grep -l 'query!\|query_as!\|query_scalar!' \
+          | cut -d/ -f1 | sort -u)
+        [ -n "$crates" ] || exit 0
+        args=""
+        for c in $crates; do
+          [ -f "$c/Cargo.toml" ] || continue
+          # A query! crate without the rio-buildhash tracker reopens
+          # the kache stale-replay channel — refuse loudly instead of
+          # checking vacuously. (A doc-comment-only match in a
+          # tracker-less crate also lands here; none exist today, and
+          # the message names the fix either way.)
+          if [ -f "$c/build.rs" ] && grep -q rio_buildhash "$c/build.rs"; then
+            args="$args -p $c"
+          else
+            echo "sqlx-prepare-check: $c has query! callsites but no rio-buildhash tracker in build.rs — wire track_sqlx() first (see CLAUDE.md, out-of-band macro inputs)" >&2
+            exit 1
+          fi
+        done
+        [ -n "$args" ] || exit 0
+        # --all-targets: cfg(test)/tests/ query! sites are in the
+        # offline cache too (regen sqlx prepares with `-- --all-targets`
+        # for the LivePin contract anchors) — without it a stale
+        # test-only entry sails through commit and fails in CI ~10min
+        # later. Scoped to query!-touching commits, so the wider unit
+        # graph only compiles when it can actually catch something.
+        # Compiler diagnostics stay on stderr (--quiet drops only
+        # cargo's status lines) — the trailer must not claim more than
+        # it knows: EACCES over a kache restore, a gc'd cargo, or a
+        # plain type error all land here too, and "regen sqlx" fixes
+        # none of them.
+        # shellcheck disable=SC2086
+        SQLX_OFFLINE=true cargo check --quiet --all-targets $args \
+          || { echo 'sqlx-prepare-check failed — if the errors above say `no cached data for query`, run `cargo xtask regen sqlx`; otherwise fix the reported error'; exit 1; }
       ''
     );
     files = "\\.rs$";
@@ -134,14 +162,18 @@ in
   # the new one — silent divergence until a nix-only build
   # fails with "crate foo not found". File-gated on
   # Cargo.toml/Cargo.lock so unrelated commits don't pay
-  # the ~10s regeneration cost.
+  # the ~10s regeneration cost. The hermetic backstop for the
+  # ROOT Cargo.json is `checks.<system>.crate2nix-drift`
+  # (nix/misc-checks.nix); the fuzz Cargo.jsons rely on this
+  # hook plus the loud lock/json mismatch failure in the fuzz
+  # derivations.
   crate2nix-check = {
     enable = true;
     name = "crate2nix-check";
     entry = toString (
       pkgs.writeShellScript "crate2nix-check" ''
         set -euo pipefail
-        ${rustcWrapperGuard}
+        ${cargoEnvGuard}
         # Gate on staged Cargo.{toml,lock}. In the hermetic
         # check derivation (pre-commit run --all-files on a
         # clean checkout), nothing is staged → no-op. This
@@ -198,7 +230,7 @@ in
     entry = toString (
       pkgs.writeShellScript "hakari-check" ''
         set -euo pipefail
-        ${rustcWrapperGuard}
+        ${cargoEnvGuard}
         if ! git diff --cached --name-only \
            | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
           exit 0

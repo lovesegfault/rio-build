@@ -35,7 +35,8 @@
   # Output of nix/crate2nix.nix: { cargoNix, workspace, members }
   crateBuild,
   # Coverage-instrumented variant of the crate tree (nix/crate2nix.nix
-  # re-imported with globalExtraRustcOpts=["-Cinstrument-coverage"]).
+  # re-imported with localExtraRustcOpts=["-Cinstrument-coverage"] —
+  # local crates only; dep derivations stay shared with the plain tree).
   # Used to produce test binaries that emit .profraw files at runtime.
   crateBuildCov,
   # lcov --extract patterns (one `<crateName>/*` per workspace member,
