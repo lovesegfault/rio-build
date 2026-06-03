@@ -970,3 +970,92 @@ async fn gc_resolved_jobs_sweeps_only_unreferenced_resolved() -> anyhow::Result<
     assert_eq!(job_count(&test_db.pool, drv_fresh).await?, 1, "fresh kept");
     Ok(())
 }
+
+/// bug_266 (kind partition, A2): the recovery view's `claimed_by`
+/// holder join resolves ONLY through a materialization-kind execution.
+/// A live BUILD-kind attempt on the same derivation (the stale-reset
+/// lane: the job is created while a build attempt is still open) must
+/// not be reported as the job's holder — pre-fix the kind-blind
+/// `LEFT JOIN assignments` stamped the builder identity onto the job
+/// and recovery rebuilt a Claimed view nobody held (re-claims answered
+/// `NotYetReady` against a phantom holder).
+// r[verify sched.materialize.job+2]
+#[tokio::test]
+async fn unresolved_job_view_ignores_build_kind_assignments() -> anyhow::Result<()> {
+    let (test_db, db, drv) = setup("job-kindblind-hash").await?;
+
+    db.create_materialization_job_fenced(
+        drv,
+        "job-kindblind-hash",
+        None,
+        JobOrigin::Pruned,
+        None,
+        1,
+    )
+    .await?;
+    // An ACTIVE build-kind attempt on the same derivation — the
+    // production mint shape (assignments + drv_executions rows in one
+    // fenced transaction, attempt_kind='build').
+    let minted = db
+        .mint_pull_attempt_fenced(
+            drv,
+            &crate::state::ExecutorId::from("job-kindblind-hash"),
+            1,
+            Uuid::now_v7(),
+            "kindblindloghash",
+            None,
+            None,
+            crate::state::AttemptKind::Build,
+        )
+        .await?;
+    assert!(
+        matches!(minted, FencedOutcome::Applied(_)),
+        "build mint must apply, got {minted:?}"
+    );
+
+    let rows = db.load_unresolved_materialization_jobs().await?;
+    assert_eq!(rows.len(), 1, "exactly one unresolved job");
+    assert_eq!(
+        rows[0].claimed_by, None,
+        "a build-kind assignment must never resolve as a materialization job's holder"
+    );
+
+    // Green companion: a materialization-kind claim IS the holder.
+    let drv2 = insert_test_derivation(&db, "job-kindheld-hash").await?;
+    db.create_materialization_job_fenced(
+        drv2,
+        "job-kindheld-hash",
+        None,
+        JobOrigin::Pruned,
+        None,
+        1,
+    )
+    .await?;
+    let holder = crate::state::ExecutorId::from("job-kindheld-hash@store-0");
+    let minted = db
+        .mint_pull_attempt_fenced(
+            drv2,
+            &holder,
+            1,
+            Uuid::now_v7(),
+            "kindheldloghash",
+            None,
+            None,
+            crate::state::AttemptKind::Materialization,
+        )
+        .await?;
+    assert!(matches!(minted, FencedOutcome::Applied(_)));
+    let mut rows = db.load_unresolved_materialization_jobs().await?;
+    rows.sort_by(|a, b| a.drv_hash.cmp(&b.drv_hash));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.drv_hash == "job-kindheld-hash")
+            .map(|r| r.claimed_by.as_deref()),
+        Some(Some("job-kindheld-hash@store-0")),
+        "a materialization-kind claim resolves as the holder"
+    );
+
+    drop(test_db);
+    Ok(())
+}

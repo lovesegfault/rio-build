@@ -600,7 +600,7 @@ impl DagActor {
     /// NotYetReady until their durable backoff lapses).
     pub(super) fn rebuild_materialization_job_view(
         &mut self,
-        rows: Vec<crate::db::materialization::RecoveredJobRow>,
+        rows: Vec<crate::db::open_attempts::RecoveredJobRow>,
     ) {
         let entries =
             rows.into_iter().map(|row| {

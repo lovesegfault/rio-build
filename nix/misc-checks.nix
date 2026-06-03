@@ -574,6 +574,55 @@ in
         touch $out
       '';
 
+  # A2 kind-partition-completion (bughunt wave) — bug_266's class:
+  # `assignments` joins are kind-discipline surfaces (a kind-blind
+  # holder join stamps a build attempt's identity onto a
+  # materialization job, or vice versa). db/open_attempts.rs is the
+  # single sanctioned home for assignment joins — every join there
+  # carries its kind discipline in one reviewable file (binding on
+  # A3's later single-row variant too). The allowlist names the
+  # grandfathered NON-HOLDER uses, each with why it is not a holder
+  # join; a new `FROM/JOIN assignments` anywhere else fails the
+  # policy. (Red-verified at introduction: a planted
+  # `JOIN assignments` outside the allowlist fails the pipeline.)
+  assignments-join-policy =
+    pkgs.runCommand "rio-assignments-join-policy"
+      {
+        srcDir = pkgs.lib.fileset.toSource {
+          root = ../rio-scheduler/src;
+          fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src;
+        };
+      }
+      ''
+        set -euo pipefail
+        # Allowlisted non-holder uses:
+        #   db/mod.rs        — claims-floor GREATEST read (fence capability
+        #                      internals; pinned by fence-sql-canonical).
+        #   db/recovery.rs   — DAG-rebuild status/exec loaders + the
+        #                      pool-seeding floor read; they read the
+        #                      DERIVATION's slot (any kind occupies the one
+        #                      active row), never a materialization-job
+        #                      holder identity.
+        #   db/attempts.rs   — GC sweep NOT-EXISTS guard (E4 conjunct):
+        #                      an existence anti-join, no identity read.
+        #   db/derivations.rs — NOT-EXISTS guard, same shape.
+        #   db/materialization.rs — claimable-list NOT-EXISTS anti-join:
+        #                      ANY-kind active assignment occupies the
+        #                      single active-row slot, so the job is not
+        #                      claimable regardless of kind (conservative
+        #                      under-offer by design; no identity read).
+        hits=$(grep -rlE 'FROM assignments|JOIN assignments' $srcDir           | grep -v '/db/open_attempts.rs$'           | grep -v '/db/mod.rs$'           | grep -v '/db/recovery.rs$'           | grep -v '/db/attempts.rs$'           | grep -v '/db/derivations.rs$'           | grep -v '/db/materialization.rs$'           | grep -v '/tests/' || true)
+        if [ -n "$hits" ]; then
+          echo "FAIL: assignments join outside db/open_attempts.rs (the sanctioned join surface):" >&2
+          echo "$hits" >&2
+          echo "Holder/attempt joins against assignments carry kind discipline and live in" >&2
+          echo "db/open_attempts.rs (bug_266); non-holder uses get a why-comment allowlist" >&2
+          echo "entry in nix/misc-checks.nix:assignments-join-policy." >&2
+          exit 1
+        fi
+        touch $out
+      '';
+
   docs-lint =
     pkgs.runCommand "rio-docs-lint"
       {
