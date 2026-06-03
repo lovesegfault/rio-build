@@ -94,12 +94,22 @@
 //     expiry that cuts a chunk after the sweep's manifest DELETE but
 //     whose execution row the same pass then deletes — is reachable
 //     here and violates nothing; it is the same bounded leak.
-//   - The cross-replica TailLog proxy, the live-tail subscription
-//     fan-out, and the `since_line` reconnect cursor. Read-side
-//     plumbing over the same manifest + buffer state the model does
-//     constrain; the history-then-live seam invariant is pinned by
+//   - The cross-replica TailLog proxy. Read-side plumbing over the
+//     same manifest + buffer state the model does constrain; the
+//     history-then-live seam invariant is pinned by
 //     `subscribe_during_in_flight_cut_sees_drained_lines` and the
-//     `log-service` VM scenario.
+//     `log-service` VM scenario. The live-tail subscription fan-out
+//     and the reconnect cursor — EXCLUDED here until the bughunt
+//     wave — are now the served-stream (reader) plane: `ENABLE_READER`
+//     consts/vars/actions below, regime `logServiceServed`, pre-fix
+//     calibration `logServiceCalibReaderAdvance`. The reader plane is
+//     deliberately OUTSIDE the mbt_tests projection: `serve_tail` is
+//     one continuous async loop, not a steppable surface — its
+//     conformance is carried by the store unit tests
+//     (`follow_recovers_fanout_drops_in_stream` and siblings) and the
+//     dashboard's verbatim case-table mirror; the projection replays
+//     the ingest planes only (documented no-op disposition,
+//     log-invariant-map.md "Bughunt-wave B3" close-out).
 //   - The HMAC layer, the token-vs-header derivation match, and the
 //     executor-identity comparison. The gate's checks collapse to "is
 //     the claimed execution the derivation's latest assignment" for
@@ -317,6 +327,32 @@ module logService {
   /// `sweepOnlyTerminalUnreferenced` falsifies under it.
   const CALIB_SWEEP_AGE_ONLY: bool
 
+  /// The served-stream (reader) plane: a live TailLog subscriber over
+  /// execution 1's log — the seam where merged_bug_180/306/311 lived
+  /// (fan-out drops rendered as seamless splices). Disabled (false) in
+  /// every pre-existing regime: the reader actions are guard-disabled
+  /// and the reader vars stay at their init values, so those state
+  /// spaces are unchanged (re-measured byte-identical at the
+  /// introduction).
+  const ENABLE_READER: bool
+
+  /// The live fan-out queue's capacity (`with_tail_subscriber_queue`).
+  /// The adversarial branch: a delivery arriving at a full queue is
+  /// DROPPED (`try_send` Full) — the reader plane exists to prove the
+  /// drop is repaired, never silently spliced. 0 when the reader is
+  /// disabled.
+  const QUEUE_CAP: int
+
+  /// CALIBRATION ONLY (`logServiceCalibReaderAdvance`): the pre-fix
+  /// reader — a delivered line that jumps past the cursor advances it
+  /// WITHOUT back-filling from the manifest/buffers and the final
+  /// stamp performs no catch-up (the silent-splice encoding of
+  /// merged_bug_180's gateway/store seam and merged_bug_306/311's
+  /// frozen one-shot consumers). Production regimes bind false; the
+  /// calibration check pins that `servedStreamNoSilentLoss` falsifies
+  /// under it.
+  const CALIB_READER_ADVANCE_PAST: bool
+
   // --- 3. pure helpers --------------------------------------------------
 
   pure def maxInt(a: int, b: int): int = if (a > b) a else b
@@ -462,6 +498,44 @@ module logService {
     sweptChunks: bool,
     matThenBuildReplayAdmitted: bool,
   }
+
+  /// The reader's terminal observation: the serving session's final
+  /// message, carrying the cursor it closed at and the store's own
+  /// completeness claim (`is_complete`).
+  type ReaderFinal = | NoFinal | Final({ cursor: int, complete: bool })
+
+  // --- 4b. served-stream (reader) plane state ---------------------------
+  // One live TailLog subscriber over execution 1 (the served regimes
+  // bind MAX_EXECS = 1). All vars init-frozen unless ENABLE_READER.
+
+  /// A subscriber is attached (between `readerSubscribe` and
+  /// `readerFinalize`).
+  var readerAttached: bool
+  /// The subscriber's watermark: the next line number it has not yet
+  /// rendered (the `since_line` it would reconnect with).
+  var readerCursor: int
+  /// The set of line numbers actually rendered to the subscriber.
+  var readerServed: Set[int]
+  /// Ghost: the COUNT of render events. `count == served.size()` is
+  /// the at-most-once half of span exactness — a double-render shows
+  /// up as count > size because the set deduplicates.
+  var readerServedCount: int
+  /// The live fan-out queue: accepted lines awaiting delivery to the
+  /// subscriber. Bounded by QUEUE_CAP at JOIN time — the overflow is
+  /// dropped, not queued (`try_send` Full).
+  var pendingFan: Set[int]
+  /// The final message, once sent.
+  var readerFinal: ReaderFinal
+  /// Ghost: lines the full queue dropped (the witness `noFanoutDrop`
+  /// pins the drop reachable).
+  var fanDropped: Set[int]
+  /// Ghost: a delivery jumped past the cursor (the reader OBSERVED a
+  /// gap; witness `noReaderGapObserved` pins it reachable).
+  var readerJumpObserved: bool
+  /// Ghost: a jump was repaired by back-filling from the manifest and
+  /// store buffers (witness `noReaderRecovery` pins the repair
+  /// reachable).
+  var readerRecovered: bool
 
   // --- 5. derived state -------------------------------------------------
 
@@ -884,6 +958,50 @@ module logService {
   val completeLogServesAllProduced = EXECS.forall(e =>
     logIsComplete(e) implies delivered(e).subseteq(readTail(e).served))
 
+  /// `NoSilentLineLoss` lifted to the SERVED plane (the reader's view,
+  /// not the manifest's): a final stamp claiming completeness means
+  /// the subscriber actually rendered every line of the recorded
+  /// final count. Falsifies immediately under the pre-fix
+  /// advance-past-jump encoding (`CALIB_READER_ADVANCE_PAST`): a
+  /// fan-out drop becomes a hole the cursor silently crossed, and the
+  /// completeness claim lies to the one consumer who can no longer
+  /// tell.
+  val servedStreamNoSilentLoss = match readerFinal {
+    | NoFinal => true
+    | Final(f) => f.complete implies match dbFinalCount.get(1) {
+        | NoCount => true
+        | Count(c) => interval(0, c).subseteq(readerServed)
+      }
+  }
+
+  /// Span exactness across the live seam: every rendered line is a
+  /// line the build actually produced (the reader never invents), and
+  /// the render count equals the served set's size (at-most-once — a
+  /// double render of a resent line would push count past size).
+  val servedStreamSpanExact = and {
+    readerServedCount == readerServed.size(),
+    readerServed.forall(n => n < producedEnd.get(1)),
+  }
+
+  /// Reader-plane bounds (the served regimes' boundsOK companion).
+  val readerBoundsOK = and {
+    readerCursor >= 0 and readerCursor <= MAX_LINE,
+    readerServed.forall(n => n >= 0 and n < MAX_LINE),
+    pendingFan.forall(n => n >= 0 and n < MAX_LINE),
+    pendingFan.size() <= QUEUE_CAP,
+    readerServedCount >= readerServed.size(),
+  }
+
+  // Reader-plane witnesses (expect-violation: each scenario must be
+  // REACHABLE or the plane is vacuous).
+  /// Violated when the full queue drops a delivery.
+  val noFanoutDrop = fanDropped == Set()
+  /// Violated when a delivery jumps past the reader's cursor.
+  val noReaderGapObserved = not(readerJumpObserved)
+  /// Violated when a jump (or the final catch-up) is repaired by
+  /// back-filling from the manifest/buffers.
+  val noReaderRecovery = not(readerRecovered)
+
   /// `CompletenessGate` (store.log.completeness-gate's per-append half):
   /// once an ingest session has learned the execution's recorded
   /// `final_line_count`, every line it subsequently accepts is below
@@ -1050,6 +1168,7 @@ module logService {
   // Mirrors: rio-scheduler assign_to_worker -> assignments INSERT +
   //          rio-scheduler/src/db/executions.rs (the dispatch INSERT).
   action dispatch = all {
+    readerUnchanged,
     dispatched < MAX_EXECS,
     EXECS.filter(e => e <= dispatched and execKind.get(e) == KBuild).size() < MAX_BUILD_EXECS,
     dispatched' = dispatched + 1,
@@ -1084,6 +1203,7 @@ module logService {
   // Mirrors: rio-scheduler mint_and_deliver (kind = materialization)
   //          observed by gate.rs as a newer assignments row.
   action dispatchMaterialization = all {
+    readerUnchanged,
     ENABLE_MAT_DISPATCH,
     dispatched < MAX_EXECS,
     dispatched' = dispatched + 1,
@@ -1115,6 +1235,7 @@ module logService {
   // Mirrors: the drv_attempts per-lane GC cut observed by
   //          sweep.rs's eligibility SELECT as zero referencing rows.
   action ledgerReleases(e: int): bool = all {
+    readerUnchanged,
     ENABLE_SWEEP,
     e <= dispatched,
     ledgerReferenced.get(e),
@@ -1145,6 +1266,7 @@ module logService {
   // Mirrors: rio-builder/src/log_stream.rs (the per-line counter) +
   //          log_upload.rs::UploadTask::accept (the buffer push).
   action produceLine(e: int): bool = all {
+    readerUnchanged,
     e <= dispatched,
     execKind.get(e) == KBuild,
     not(buildFinished.get(e)),
@@ -1176,6 +1298,7 @@ module logService {
   // Mirrors: rio-builder/src/runtime/mod.rs (the post-footer
   //          completion report) + log_upload.rs::accept(None).
   action buildFinishes(e: int): bool = all {
+    readerUnchanged,
     e <= dispatched,
     execKind.get(e) == KBuild,
     not(buildFinished.get(e)),
@@ -1213,6 +1336,7 @@ module logService {
   // Mirrors: rio-scheduler/src/actor/completion.rs
   //          (terminal_log_epilogue's `try_from(...).filter(> 0)`).
   action recordFinalLineCount(e: int): bool = all {
+    readerUnchanged,
     e <= dispatched,
     buildFinished.get(e),
     execRowExists.get(e),
@@ -1287,6 +1411,7 @@ module logService {
   //          check_append_open + sessions::acquire +
   //          log_upload.rs::UploadTask::open / drive's `sent = 0`.
   action openSession(e: int): bool = all {
+    readerUnchanged,
     openAdmitted(e),
     uploader.get(e) == Uploading,
     // One AppendLog stream per uploader: the previous session must have
@@ -1350,6 +1475,7 @@ module logService {
   // Mirrors: gate.rs::check_append_open (the no-matching-row arm) +
   //          log_upload.rs::reject_permanently.
   action openRejectedSuperseded(e: int): bool = all {
+    readerUnchanged,
     e <= dispatched,
     execKind.get(e) == KBuild,
     assignmentRowLost.get(e),
@@ -1388,6 +1514,7 @@ module logService {
   // Mirrors: the scheduler's assignment upsert observed by
   //          gate.rs::check_append_open as fetch_optional == None.
   action rewriteAssignment(e: int): bool = all {
+    readerUnchanged,
     e <= dispatched,
     e != dispatched,
     not(assignmentRowLost.get(e)),
@@ -1420,6 +1547,7 @@ module logService {
   // Mirrors: gate.rs::check_append_open (check 4) +
   //          log_upload.rs::reject_permanently.
   action openRejectedComplete(e: int): bool = all {
+    readerUnchanged,
     e <= dispatched,
     e == dispatched,
     execKind.get(e) == KBuild,
@@ -1478,6 +1606,7 @@ module logService {
   //          service.rs::drive (the Batch arm) ->
   //          ingest.rs::IngestSession::accept.
   action appendHonest(e: int): bool = all {
+    readerUnchanged,
     e <= dispatched,
     uploader.get(e) == Uploading,
     val s = openSessionOf(e)
@@ -1550,6 +1679,7 @@ module logService {
   //          truncate-at-ceiling arms) driven by an untrusted
   //          LogBatcher.
   action appendFabricated(e: int, lo: int, hi: int): bool = all {
+    readerUnchanged,
     ENABLE_FABRICATION,
     e <= dispatched,
     lo < hi,
@@ -1618,6 +1748,7 @@ module logService {
   //          sealed_final_line_count refresh) +
   //          ingest.rs::set_final_line_count.
   action refreshCeiling(e: int, s: int): bool = all {
+    readerUnchanged,
     e <= dispatched,
     sessIsOpen(e, s),
     sessCeiling(e, s) == NoCeiling,
@@ -1673,6 +1804,7 @@ module logService {
   // Mirrors: ingest.rs::IngestSession::cut + commit_chunk;
   //          service.rs::do_cut / drain.
   action cutChunk(e: int, s: int): bool = all {
+    readerUnchanged,
     e <= dispatched,
     hasSession(e, s),
     sessBuf(e, s) != Set(),
@@ -1721,6 +1853,7 @@ module logService {
   // Mirrors: service.rs::do_cut (the AppendLogAck send) +
   //          log_upload.rs::trim.
   action deliverAck(e: int): bool = all {
+    readerUnchanged,
     e <= dispatched,
     uploader.get(e) == Uploading,
     val s = openSessionOf(e)
@@ -1767,6 +1900,7 @@ module logService {
   // Mirrors: service.rs::drive (Ok(None) / Err -> ClientFinished) +
   //          AppendDriver::run (the drain arm).
   action builderDisconnects(e: int): bool = all {
+    readerUnchanged,
     e <= dispatched,
     val s = openSessionOf(e)
     all {
@@ -1807,6 +1941,7 @@ module logService {
   //          LeaseLost arms — the drain is skipped and the
   //          deregistration scopeguard drops IngestShared).
   action sessionAborts(e: int, s: int): bool = all {
+    readerUnchanged,
     e <= dispatched,
     hasSession(e, s),
     // An inert detached session (empty buffer) aborting is a no-op
@@ -1845,6 +1980,7 @@ module logService {
   /// manifest cannot cover the abandoned tail).
   // Mirrors: log_upload.rs::run_inner (DeadlineExpired -> abandoned()).
   action uploaderAbandons(e: int): bool = all {
+    readerUnchanged,
     e <= dispatched,
     execKind.get(e) == KBuild,
     uploader.get(e) == Uploading,
@@ -1878,6 +2014,7 @@ module logService {
   /// The retention clock passes the execution's `started_at +
   /// log_retention_days`. Environment action; monotone.
   action executionExpires(e: int): bool = all {
+    readerUnchanged,
     ENABLE_SWEEP,
     e <= dispatched,
     not(expired.get(e)),
@@ -1919,6 +2056,7 @@ module logService {
   // Mirrors: sweep.rs::sweep_expired_logs (the drv_log_chunks DELETE +
   //          delete_batch; the registry DELETE is unmodeled hygiene).
   action sweepChunks(e: int): bool = all {
+    readerUnchanged,
     ENABLE_SWEEP,
     e <= dispatched,
     expired.get(e),
@@ -1962,6 +2100,7 @@ module logService {
   // Mirrors: rio-scheduler/src/db/attempts.rs::gc_exec_rows behind
   //          rio_retry_kernel::exec_row_sweep_eligible.
   action gcExecRow(e: int): bool = all {
+    readerUnchanged,
     ENABLE_SWEEP,
     e <= dispatched,
     execRowSweepEligible(e),
@@ -1985,6 +2124,202 @@ module logService {
     acceptedTotal' = acceptedTotal,
     execKind' = execKind,
     ledgerReferenced' = ledgerReferenced,
+  }
+
+  // --- 7b. served-stream (reader) plane ----------------------------------
+  // The reader consumes execution 1's log through the SAME decision
+  // kernel the consumers adopted (rio-log-kernel::visit_chunk +
+  // tail_next): a delivery at the cursor is contiguous; a delivery past
+  // it names the gap, and the FIXED behavior back-fills the missing
+  // span from the manifest and store buffers before advancing
+  // (rio-store serve_tail's recovery, the gateway's reopen-once, the
+  // dashboard's gap rows all project to this one step). The
+  // CALIB_READER_ADVANCE_PAST encoding is the pre-fix silent splice.
+
+  /// Frame: the reader plane untouched. One line in every
+  /// non-reader action keeps the QNT000 fan-out mechanical.
+  action readerUnchanged = all {
+    readerAttached' = readerAttached,
+    readerCursor' = readerCursor,
+    readerServed' = readerServed,
+    readerServedCount' = readerServedCount,
+    pendingFan' = pendingFan,
+    readerFinal' = readerFinal,
+    fanDropped' = fanDropped,
+    readerJumpObserved' = readerJumpObserved,
+    readerRecovered' = readerRecovered,
+  }
+
+  /// Frame: the core (non-reader) state untouched — the reader's
+  /// actions are read-only over the log state.
+  action coreUnchanged = all {
+    dispatched' = dispatched,
+    producedEnd' = producedEnd,
+    buildFinished' = buildFinished,
+    dbFinalCount' = dbFinalCount,
+    execRowExists' = execRowExists,
+    expired' = expired,
+    assignmentRowLost' = assignmentRowLost,
+    acceptedTotal' = acceptedTotal,
+    sweepChunksDone' = sweepChunksDone,
+    execKind' = execKind,
+    ledgerReferenced' = ledgerReferenced,
+    uploader' = uploader,
+    ackedBelow' = ackedBelow,
+    sentBelow' = sentBelow,
+    sessions' = sessions,
+    sessionsOpened' = sessionsOpened,
+    chunks' = chunks,
+    fabricated' = fabricated,
+    wit' = wit,
+  }
+
+  /// What the store can serve the reader for execution 1 right now:
+  /// a manifest-covered line or a line sitting in an ingest buffer
+  /// (the open-session snapshot phase reads both).
+  def readerHeld(n: int): bool = or {
+    manifestHolds(1, n),
+    storeBufHolds(1, n),
+  }
+
+  /// Subscribe: the manifest walk + open-session snapshot (serve_tail
+  /// phases 1-2) delivers everything currently held; the live
+  /// registration starts with an empty queue. The cursor lands one
+  /// past the highest snapshot line — interior snapshot holes are the
+  /// (already-disclosed) storage-hole story, not this plane's seam.
+  action readerSubscribe = all {
+    ENABLE_READER,
+    not(readerAttached),
+    readerFinal == NoFinal,
+    val held = interval(0, MAX_LINE).filter(n => readerHeld(n))
+    all {
+      readerAttached' = true,
+      readerServed' = held,
+      readerServedCount' = readerServedCount + held.size(),
+      readerCursor' = if (held == Set()) 0 else held.fold(0, (a, b) => maxInt(a, b)) + 1,
+      pendingFan' = Set(),
+      readerFinal' = readerFinal,
+      fanDropped' = fanDropped,
+      readerJumpObserved' = readerJumpObserved,
+      readerRecovered' = readerRecovered,
+    },
+    coreUnchanged,
+  }
+
+  /// One accepted line joins the live fan-out — or is DROPPED at a
+  /// full queue (`try_send` Full, the adversarial branch). Each line
+  /// fans at most once (one broadcast per accept).
+  action fanoutDeliver(n: int): bool = all {
+    ENABLE_READER,
+    readerAttached,
+    readerHeld(n),
+    n >= readerCursor,
+    not(readerServed.contains(n)),
+    not(pendingFan.contains(n)),
+    not(fanDropped.contains(n)),
+    if (pendingFan.size() < QUEUE_CAP) all {
+      pendingFan' = pendingFan.union(Set(n)),
+      fanDropped' = fanDropped,
+    } else all {
+      // Full queue: the delivery is dropped. The reader will only
+      // learn of this line through a later jump (or never — which
+      // the invariants make loud at the final stamp).
+      pendingFan' = pendingFan,
+      fanDropped' = fanDropped.union(Set(n)),
+    },
+    readerAttached' = readerAttached,
+    readerCursor' = readerCursor,
+    readerServed' = readerServed,
+    readerServedCount' = readerServedCount,
+    readerFinal' = readerFinal,
+    readerJumpObserved' = readerJumpObserved,
+    readerRecovered' = readerRecovered,
+    coreUnchanged,
+  }
+
+  action fanoutDeliverAny = {
+    nondet n = interval(0, MAX_LINE).oneOf()
+    fanoutDeliver(n)
+  }
+
+  /// The reader drains the oldest queued delivery through the kernel
+  /// step: at-cursor serves contiguously; below-cursor is a resent
+  /// duplicate and is skipped (never re-rendered); past-cursor is an
+  /// OBSERVED gap — the fixed reader back-fills the missing span from
+  /// the manifest and buffers before advancing, the calibration reader
+  /// advances past it (the pre-fix splice).
+  action readerDrain = all {
+    ENABLE_READER,
+    readerAttached,
+    pendingFan != Set(),
+    val n = setMin(pendingFan)
+    all {
+      pendingFan' = pendingFan.exclude(Set(n)),
+      if (n < readerCursor) all {
+        // Resent duplicate: the watermark already covers it.
+        readerCursor' = readerCursor,
+        readerServed' = readerServed,
+        readerServedCount' = readerServedCount,
+        readerJumpObserved' = readerJumpObserved,
+        readerRecovered' = readerRecovered,
+      } else if (n == readerCursor) all {
+        readerCursor' = n + 1,
+        readerServed' = readerServed.union(Set(n)),
+        readerServedCount' = readerServedCount + 1,
+        readerJumpObserved' = readerJumpObserved,
+        readerRecovered' = readerRecovered,
+      } else all {
+        // Jump past the cursor: [readerCursor, n) is missing from the
+        // live stream.
+        readerJumpObserved' = true,
+        if (CALIB_READER_ADVANCE_PAST) all {
+          // Pre-fix: advance past, serve only the jumped-to line.
+          readerCursor' = n + 1,
+          readerServed' = readerServed.union(Set(n)),
+          readerServedCount' = readerServedCount + 1,
+          readerRecovered' = readerRecovered,
+        } else all {
+          // Fixed: back-fill the held part of the hole first.
+          val backfill = interval(readerCursor, n).filter(m => readerHeld(m))
+          all {
+            readerCursor' = n + 1,
+            readerServed' = readerServed.union(backfill).union(Set(n)),
+            readerServedCount' = readerServedCount + backfill.size() + 1,
+            readerRecovered' = (readerRecovered or backfill != Set()),
+          }
+        },
+      },
+      readerAttached' = readerAttached,
+      readerFinal' = readerFinal,
+      fanDropped' = fanDropped,
+    },
+    coreUnchanged,
+  }
+
+  /// The serving session ends: the fixed reader catches up from the
+  /// manifest and buffers BEFORE the final stamp (serve_tail's
+  /// pre-`send_final` catch-up); the calibration reader stamps as-is.
+  /// The final carries the store's completeness claim.
+  action readerFinalize = all {
+    ENABLE_READER,
+    readerAttached,
+    val catchup = if (CALIB_READER_ADVANCE_PAST) Set()
+      else interval(0, MAX_LINE).filter(m => and { readerHeld(m), not(readerServed.contains(m)) })
+    val served2 = readerServed.union(catchup)
+    val cursor2 = if (served2 == Set()) readerCursor
+      else maxInt(readerCursor, served2.fold(0, (a, b) => maxInt(a, b)) + 1)
+    all {
+      readerAttached' = false,
+      readerServed' = served2,
+      readerServedCount' = readerServedCount + catchup.size(),
+      readerCursor' = cursor2,
+      readerRecovered' = (readerRecovered or catchup != Set()),
+      readerFinal' = Final({ cursor: cursor2, complete: logIsComplete(1) }),
+      pendingFan' = Set(),
+      fanDropped' = fanDropped,
+      readerJumpObserved' = readerJumpObserved,
+    },
+    coreUnchanged,
   }
 
   // --- 8. init ----------------------------------------------------------
@@ -2016,6 +2351,15 @@ module logService {
       sweptChunks: false,
       matThenBuildReplayAdmitted: false,
     },
+    readerAttached' = false,
+    readerCursor' = 0,
+    readerServed' = Set(),
+    readerServedCount' = 0,
+    pendingFan' = Set(),
+    readerFinal' = NoFinal,
+    fanDropped' = Set(),
+    readerJumpObserved' = false,
+    readerRecovered' = false,
   }
 
   // --- 9. step ----------------------------------------------------------
@@ -2083,6 +2427,10 @@ module logService {
     sweepChunksAny,
     gcExecRowAny,
     ledgerReleasesAny,
+    readerSubscribe,
+    fanoutDeliverAny,
+    readerDrain,
+    readerFinalize,
   }
 }
 
@@ -2131,6 +2479,9 @@ module logServiceBase {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
   ).*
 
   // --- deterministic protocol runs --------------------------------------
@@ -2241,6 +2592,9 @@ module logServiceRedispatch {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
   ).*
 
   /// The superseded writer, v2: execution 1's session is open and
@@ -2316,6 +2670,9 @@ module logServiceResend {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
   ).*
 
   /// The ambiguous-disconnect overlap: session 1 commits a chunk for
@@ -2377,6 +2734,9 @@ module logServiceSweep {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
   ).*
 
   /// The TTL sweep deletes a complete log: the manifest and the
@@ -2444,6 +2804,9 @@ module logServiceCalibSessionCaps {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
   ).*
 }
 
@@ -2470,6 +2833,9 @@ module logServiceCalibGateRow {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
   ).*
 }
 
@@ -2501,6 +2867,9 @@ module logServiceKindMix {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
   ).*
 
   /// The displacement scenario, fixed: the build streams and cuts a
@@ -2552,6 +2921,9 @@ module logServiceCalibLatestOnly {
     CALIB_GATE_LATEST_ONLY = true,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
   ).*
 }
 
@@ -2579,6 +2951,9 @@ module logServiceCalibLossEscape {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = true,
     CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
   ).*
 }
 
@@ -2606,5 +2981,129 @@ module logServiceCalibSweepAgeOnly {
     CALIB_GATE_LATEST_ONLY = false,
     CALIB_LOSS_ESCAPE = false,
     CALIB_SWEEP_AGE_ONLY = true,
+    ENABLE_READER = false,
+    QUEUE_CAP = 0,
+    CALIB_READER_ADVANCE_PAST = false,
   ).*
+}
+
+// =========================================================================
+// THE SERVED-STREAM REGIME: one execution, two sessions, a live reader
+// over the fan-out seam with a capacity-1 queue — the smallest shape
+// where a drop, the jump it causes, and the back-fill that repairs it
+// are all reachable (merged_bug_180's fan-out hole, merged_bug_076's
+// premature exit surface, merged_bug_306/311's consumer splice all
+// project onto this plane). Fabrication off: the reader's contract is
+// over honest logs; the fabricated-batch adversary belongs to the
+// ingest planes above. Reconnect on (two sessions): the resend overlap
+// is what exercises the reader's below-cursor skip.
+module logServiceServed {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 2,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = true,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = true,
+    QUEUE_CAP = 1,
+    CALIB_READER_ADVANCE_PAST = false,
+  ).*
+
+  /// The repaired-drop happy path, replayable with
+  /// `quint test --main=logServiceServed --match=fanoutDropRecoveryRun`:
+  /// two lines land durably, the subscriber attaches on the empty log,
+  /// the queue (capacity 1) takes line 0 and DROPS line 1, line 2's
+  /// later delivery jumps the cursor — and the fixed reader back-fills
+  /// the dropped line from the manifest before advancing, so the final
+  /// stamp's completeness claim is honest.
+  run fanoutDropRecoveryRun =
+    init
+      .then(dispatch)
+      .then(readerSubscribe)
+      .then(produceLine(1))
+      .then(produceLine(1))
+      .then(produceLine(1))
+      .then(openSession(1))
+      .then(appendHonest(1))
+      .then(cutChunk(1, 1))
+      .then(fanoutDeliver(0)) // joins (queue 0/1)
+      .then(fanoutDeliver(1)) // queue full -> DROPPED
+      .then(readerDrain) //       serves 0, cursor 1
+      .then(fanoutDeliver(2)) // joins
+      .then(readerDrain) //       2 jumps cursor 1: back-fill 1, serve 2
+      .expect(all {
+        fanDropped == Set(1),
+        readerJumpObserved,
+        readerRecovered,
+        readerServed == Set(0, 1, 2),
+        readerServedCount == 3,
+        readerCursor == 3,
+      })
+}
+
+// CALIBRATION (expect-violation): the pre-fix reader — the cursor
+// advances past a fan-out drop with no back-fill and the final stamp
+// performs no catch-up; `servedStreamNoSilentLoss` falsifies (the
+// completeness claim covers a line the subscriber never rendered).
+// The paired hold check is `quint-log-service-served`.
+module logServiceCalibReaderAdvance {
+  import logService(
+    MAX_EXECS = 1,
+    MAX_BUILD_EXECS = 1,
+    MAX_SESSIONS = 2,
+    MAX_LINE = 3,
+    ENABLE_FABRICATION = false,
+    ENABLE_RECONNECT = true,
+    ENABLE_SWEEP = false,
+    CAP = 9,
+    CALIB_SESSION_SCOPED_CAPS = false,
+    CALIB_GATE_IGNORES_ROW = false,
+    ENABLE_MAT_DISPATCH = false,
+    CALIB_GATE_LATEST_ONLY = false,
+    CALIB_LOSS_ESCAPE = false,
+    CALIB_SWEEP_AGE_ONLY = false,
+    ENABLE_READER = true,
+    QUEUE_CAP = 1,
+    CALIB_READER_ADVANCE_PAST = true,
+  ).*
+
+  /// The recorded pre-fix counterexample, replayable with
+  /// `quint test --main=logServiceCalibReaderAdvance
+  /// --match=fanoutDropSilentLossRun`: same drop as the recovery run,
+  /// but the calibration reader splices — line 1 is never rendered,
+  /// no recovery happens, and the final stamp still claims complete.
+  run fanoutDropSilentLossRun =
+    init
+      .then(dispatch)
+      .then(readerSubscribe)
+      .then(produceLine(1))
+      .then(produceLine(1))
+      .then(produceLine(1))
+      .then(openSession(1))
+      .then(appendHonest(1))
+      .then(cutChunk(1, 1))
+      .then(fanoutDeliver(0)) // joins (queue 0/1)
+      .then(fanoutDeliver(1)) // queue full -> DROPPED
+      .then(readerDrain) //       serves 0, cursor 1
+      .then(fanoutDeliver(2)) // joins
+      .then(readerDrain) //       PRE-FIX: cursor jumps to 3, line 1 spliced
+      .then(buildFinishes(1))
+      .then(recordFinalLineCount(1))
+      .then(readerFinalize) //    no catch-up; stamps complete over the hole
+      .expect(all {
+        fanDropped == Set(1),
+        readerJumpObserved,
+        not(readerRecovered),
+        readerServed == Set(0, 2),
+        readerFinal == Final({ cursor: 3, complete: true }),
+      })
 }

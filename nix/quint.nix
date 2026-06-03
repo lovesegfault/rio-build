@@ -1582,6 +1582,73 @@ in
       witness = "noSweptChunks";
     };
 
+    # The served-stream (reader) plane: a live TailLog subscriber over
+    # the capacity-1 fan-out queue — the seam where merged_bug_180/306/
+    # 311 lived. The hold check pins the FIXED reader: a fan-out drop is
+    # repaired by back-filling from the manifest/buffers (serve_tail's
+    # recovery; the gateway reopen-once and the dashboard gap rows
+    # project to the same kernel step), and a final stamp claiming
+    # completeness means the subscriber rendered every recorded line.
+    # The four pre-existing log-service regimes bind ENABLE_READER =
+    # false and were re-measured BYTE-IDENTICAL at the introduction.
+    # r[verify store.log.tail-fanout-recovery]
+    # r[verify store.log.tail-grace-drain]
+    quint-log-service-served = mkQuintCheck {
+      name = "log-service-served";
+      spec = "logService";
+      main = "logServiceServed";
+      invariants = [
+        "boundsOK"
+        "noCrossExecContamination"
+        "authGateExcludesUnassignedWriters"
+        "noSilentLineLoss"
+        "servedSpanExact"
+        "completeLogServesAllProduced"
+        "completenessGate"
+        "ingestLossCounted"
+        "servedStreamNoSilentLoss"
+        "servedStreamSpanExact"
+        "readerBoundsOK"
+      ];
+    };
+
+    # CALIBRATION (expect-violation): the pre-fix reader — the cursor
+    # advances past a fan-out drop with no back-fill and the final
+    # stamp performs no catch-up (the silent splice the wave closed) —
+    # servedStreamNoSilentLoss falsifies. Paired with
+    # quint-log-service-served; the deterministic counterexample replay
+    # is fanoutDropSilentLossRun in the calibration module.
+    quint-log-service-calib-reader-advance = mkQuintWitnessCheck {
+      name = "log-service-calib-reader-advance";
+      spec = "logService";
+      main = "logServiceCalibReaderAdvance";
+      witness = "servedStreamNoSilentLoss";
+    };
+
+    # Reader-plane non-vacuity: the queue drop, the observed jump, and
+    # the back-fill repair are each REACHABLE in the served regime (the
+    # plane is not vacuously green).
+    quint-log-service-witness-fanout-drop = mkQuintWitnessCheck {
+      name = "log-service-witness-fanout-drop";
+      spec = "logService";
+      main = "logServiceServed";
+      witness = "noFanoutDrop";
+    };
+
+    quint-log-service-witness-reader-gap = mkQuintWitnessCheck {
+      name = "log-service-witness-reader-gap";
+      spec = "logService";
+      main = "logServiceServed";
+      witness = "noReaderGapObserved";
+    };
+
+    quint-log-service-witness-reader-recovery = mkQuintWitnessCheck {
+      name = "log-service-witness-reader-recovery";
+      spec = "logService";
+      main = "logServiceServed";
+      witness = "noReaderRecovery";
+    };
+
     # ------------------------------------------------------------------
     # rio-scheduler's retry/poison/cascade machinery: the post-collapse
     # model (retry-formal Phase 1c). retryPolicy.qnt encodes the code as

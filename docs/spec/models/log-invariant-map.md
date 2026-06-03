@@ -686,3 +686,62 @@ re-introduction path: if the chart's supported Cilium configuration
 gains a working L7 proxy for this edge, flip fragment 29's no-L7
 assertion back to the allow-list form and restore the rules block —
 the assertion failing loudly is the reminder.
+
+## Bughunt-wave B3 close-out — the served-stream plane + the gap-discipline roster (2026-06-03)
+
+The B3 workstream replaced the gap-blind `LineCursor` struct with the
+`#[must_use]` `ChunkVisit` enum (rio-log-kernel) and adopted it at every
+consumer: store manifest walk + live follow loop (back-fill recovery),
+gateway relay (reopen-once then the Q8 marker), CLI (inline marker), and
+dashboard (`lineCursor.ts`, the verbatim case-table mirror; gap rows).
+The exit law (`tail_next`) closed merged_bug_076's premature-exit
+conflations. Formal: the served-stream (reader) plane joined
+`logService.qnt` — regime `logServiceServed` (exhaustive hold:
+`servedStreamNoSilentLoss`, `servedStreamSpanExact`, `readerBoundsOK`
+atop the eight ingest invariants), pre-fix calibration
+`logServiceCalibReaderAdvance` (the advance-past splice;
+`servedStreamNoSilentLoss` falsifies; deterministic replay
+`fanoutDropSilentLossRun`), and three reachability witnesses (drop /
+jump / recovery). The four pre-existing regimes re-measured
+byte-identical with the reader disabled.
+
+### merged_bug_186 — the documented-rationale leg (under-claiming)
+
+The S half (landed fork 1) made the read path's manifest/object
+divergence handling correct in both directions: `visit_object` clamps
+the served range to `min(manifest, object)` BY CONSTRUCTION and
+classifies the divergence; `read_chunk` treats a SHORT object as
+data-loss-grade (`Internal` naming the key + the
+`reason="short_object"` counter — the manifest promised lines that
+cannot be served) and an over-LONG object as clamp-and-count
+(`reason="overlong_object"` — excess trailing lines have no manifest
+identity and serving them would corrupt the next chunk's numbering).
+
+The DR leg records the UNDER-CLAIMING direction as accepted: a manifest
+row that claims FEWER lines than its object holds (a hand-shrunk row,
+an operator edit, a partial-restore artifact) is served at the
+manifest's count — the uniform serving bound at all three decision
+points (manifest walk, follow loop, snapshot) — and the object's excess
+is disclosed by the divergence counter rather than served. This is
+deliberate: the manifest is the authority the completeness fold and the
+sweep already trust; serving past it would re-introduce the
+unattributed-lines hazard the clamp exists to prevent. The loss story
+is symmetric with the over-length arm and observable
+(`rio_store_log_read_divergence_total`), not silent.
+
+### None-sensible records (B3 roster legs with no model plane)
+
+- **merged_bug_051 (peer-URL template)** — deployment topology, not
+  protocol state: the fail-closed empty default, the `{pod}`
+  placeholder validation, and the IPv6 bracket rule are pinned by the
+  config validate unit table and helm fragment 30 (byte-equality
+  against values.yaml's sole default + null→empty env). A model
+  dimension for "which URL template the operator rendered" would
+  restate the fragment.
+- **merged_bug_306 / bug_311 (dashboard + CLI rendering)** — the
+  rendering layer is pinned by the vitest battery (the verbatim
+  case-table mirror in `lineCursor.test.ts`, the follow battery, the
+  gap-row/banner component tests) and the `vm-dashboard-k3s` live-tail
+  subtest; the server-side disclosure those renderers consume is what
+  `logServiceServed` verifies. The model's claim boundary is the wire:
+  what arrives; the pixels are the frontend suites' jurisdiction.
