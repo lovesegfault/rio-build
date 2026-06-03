@@ -1237,3 +1237,91 @@ async fn test_mat_reset_cuts_only_its_own_lane_in_gc() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// The execution-row GC (store.log.sweep-ownership second deleter): the
+// SQL twin of rio_retry_kernel::exec_row_sweep_eligible.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Insert a `drv_executions` row with explicit status and age.
+async fn insert_aged_execution(
+    pool: &sqlx::PgPool,
+    exec_id: Uuid,
+    status: Option<&str>,
+    age_days: f64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO drv_executions \
+             (exec_id, drv_hash, executor_id, started_at, status) \
+         VALUES ($1, 'execgc0000000000000000000000000a', 'builder-0', \
+                 now() - make_interval(secs => $2), $3)",
+    )
+    .bind(exec_id)
+    .bind(age_days * 86_400.0)
+    .bind(status)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// r[verify store.log.sweep-ownership]
+/// The four-conjunct guard against real rows, one fixture per conjunct:
+/// (A) non-terminal + aged → KEPT (may still report; live idempotency
+/// key); (B) terminal + aged + ACTIVE assignment → KEPT (E4 shape);
+/// (C) terminal + aged + referenced by a drv_attempts row → KEPT (the
+/// kind must outlive every ledger row that resolves through it);
+/// (D) terminal + aged + unreferenced → DELETED; (E) terminal + FRESH +
+/// unreferenced → KEPT (the age conjunct binds).
+#[tokio::test]
+async fn test_gc_exec_rows_spares_referenced_and_live() -> anyhow::Result<()> {
+    let (_test_db, db, drv_id) = setup("exec-gc-hash").await?;
+
+    let exec_a = Uuid::now_v7(); // non-terminal, aged
+    let exec_b = Uuid::now_v7(); // terminal, aged, active assignment
+    let exec_c = Uuid::now_v7(); // terminal, aged, ledger-referenced
+    let exec_d = Uuid::now_v7(); // terminal, aged, unreferenced → victim
+    let exec_e = Uuid::now_v7(); // terminal, fresh, unreferenced
+
+    insert_aged_execution(&db.pool, exec_a, None, 60.0).await?;
+    insert_aged_execution(&db.pool, exec_b, Some("succeeded"), 60.0).await?;
+    insert_aged_execution(&db.pool, exec_c, Some("failed"), 60.0).await?;
+    insert_aged_execution(&db.pool, exec_d, Some("succeeded"), 60.0).await?;
+    insert_aged_execution(&db.pool, exec_e, Some("succeeded"), 1.0).await?;
+
+    // B's active assignment.
+    sqlx::query(
+        "INSERT INTO assignments \
+             (derivation_id, builder_id, generation, status, exec_id) \
+         VALUES ($1, 'builder-0', 1, 'acknowledged', $2)",
+    )
+    .bind(drv_id)
+    .bind(exec_b)
+    .execute(&db.pool)
+    .await?;
+
+    // C's ledger reference.
+    let mut row = AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    row.exec_id = Some(exec_c);
+    append_committed(&db, &[row]).await?;
+
+    let deleted = db.gc_exec_rows(30.0 * 86_400.0, 1000).await?;
+    assert_eq!(deleted, 1, "exactly the terminal+aged+unreferenced row");
+
+    let survivors: Vec<Uuid> =
+        sqlx::query_scalar("SELECT exec_id FROM drv_executions ORDER BY started_at")
+            .fetch_all(&db.pool)
+            .await?;
+    for (exec, why) in [
+        (exec_a, "non-terminal may still report"),
+        (exec_b, "active assignment protects the idempotency probe"),
+        (exec_c, "a referenced exec row carries its attempts' kind"),
+        (exec_e, "the age conjunct binds"),
+    ] {
+        assert!(survivors.contains(&exec), "{why}: {exec} must survive");
+    }
+    assert!(
+        !survivors.contains(&exec_d),
+        "the eligible row is collected"
+    );
+    Ok(())
+}

@@ -284,6 +284,7 @@ async fn main() -> anyhow::Result<()> {
             retry_policy: cfg.retry,
             sla: cfg.sla,
             establishment_report_slack: cfg.establishment_report_slack,
+            exec_retention_days: cfg.exec_retention_days,
             materialization: cfg.materialization,
             ..Default::default()
         },

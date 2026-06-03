@@ -276,6 +276,9 @@ pub struct DagActor {
     /// long past the intent deadline the establishment sweep waits for
     /// a terminal report before establishing the attempt.
     establishment_report_slack: std::time::Duration,
+    /// Retention (days) for terminal unreferenced drv_executions rows
+    /// (`store.log.sweep-ownership` second deleter).
+    exec_retention_days: u32,
     /// Poison threshold + distinct-workers config. Replaces the
     /// former `POISON_THRESHOLD` const (3). Default matches prior
     /// behavior: 3 distinct workers.
@@ -749,6 +752,7 @@ impl DagActor {
             retry_policy: cfg.retry_policy,
             poison_config: cfg.poison,
             establishment_report_slack: cfg.establishment_report_slack,
+            exec_retention_days: cfg.exec_retention_days,
             materialization_cfg: cfg.materialization,
             materialization_jobs: materialize::JobView::default(),
             status_outbox: std::collections::VecDeque::new(),
@@ -875,6 +879,7 @@ impl DagActor {
             // Retained: rationale below.
             retry_policy: _,
             establishment_report_slack: _,
+            exec_retention_days: _,
             poison_config: _,
             // Retained: operator deploy config, not per-term state — a
             // leader transition doesn't change the materialization flag.

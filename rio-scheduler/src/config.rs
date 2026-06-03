@@ -27,6 +27,15 @@ pub struct Config {
     #[serde(rename = "tick_interval_secs", with = "rio_common::config::secs")]
     #[schemars(with = "u64")]
     pub tick_interval: std::time::Duration,
+    /// Retention for terminal `drv_executions` lifecycle rows, in days.
+    /// The scheduler's `gc_exec_rows` pass deletes a row only when it is
+    /// terminal, has no active assignment, is referenced by no
+    /// `drv_attempts` ledger row, AND is older than this — the
+    /// kernel-documented conjunction (`exec_row_sweep_eligible`). The
+    /// store's log TTL sweep deletes the row's log artifacts on its own
+    /// `log_retention_days` clock but never the row itself
+    /// (`store.log.sweep-ownership`). Validate: ≥ 1.
+    pub exec_retention_days: u32,
     /// How long past an open pull-mode attempt's intent deadline the
     /// establishment sweep waits for a terminal report before
     /// establishing the attempt as an unreported executor crash
@@ -213,6 +222,7 @@ impl Default for Config {
             database_url: String::new(),
             common: rio_common::config::CommonConfig::new(9091),
             tick_interval: std::time::Duration::from_secs(10),
+            exec_retention_days: 30,
             establishment_report_slack: std::time::Duration::from_secs(120),
             soft_features: Vec::new(),
             hmac_key_path: None,
@@ -290,6 +300,15 @@ impl rio_common::config::ValidateConfig for Config {
         anyhow::ensure!(
             !cfg.tick_interval.is_zero(),
             "tick_interval_secs must be positive (tokio::time::interval panics on ZERO)"
+        );
+        // 0 would make every terminal+unreferenced execution row
+        // instantly collectable — deleting kind/attribution context
+        // out from under operators inspecting same-day builds, and
+        // racing the controller's terminal-observation margin.
+        anyhow::ensure!(
+            cfg.exec_retention_days >= 1,
+            "exec_retention_days must be >= 1 (got {})",
+            cfg.exec_retention_days
         );
         // r[impl sched.retry.per-executor-budget+4]
         // `RetryPolicy::backoff_duration` computes

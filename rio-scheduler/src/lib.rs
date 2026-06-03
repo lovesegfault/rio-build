@@ -195,6 +195,13 @@ pub fn describe_metrics() {
          merged_bug_163): builds long-terminal, plus orphan rows whose build is gone"
     );
     describe_counter!(
+        "rio_scheduler_exec_rows_gc_deleted_total",
+        "drv_executions lifecycle rows deleted by the execution-row GC \
+         (store.log.sweep-ownership second deleter): terminal, no active \
+         assignment, referenced by no drv_attempts row, older than \
+         exec_retention_days. The store's log TTL sweep never deletes these."
+    );
+    describe_counter!(
         "rio_scheduler_resource_floor_bumps_total",
         "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled \
          reason=oom_killed|disk_pressure|cgroup_oom|timeout|deadline_exceeded). Reactive \

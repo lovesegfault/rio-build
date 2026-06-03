@@ -46,6 +46,10 @@ pub struct DagActorConfig {
     /// executor crash. main.rs loads from scheduler.toml
     /// `establishment_report_slack_secs` (default 120 s).
     pub establishment_report_slack: std::time::Duration,
+    /// Retention for terminal `drv_executions` rows in days
+    /// (`exec_retention_days`, default 30) — the execution-row GC
+    /// pass's age conjunct (`store.log.sweep-ownership`).
+    pub exec_retention_days: u32,
     /// Materialization config (`[materialization]` table): the job
     /// budget and park backoff knobs.
     pub materialization: crate::config::MaterializationConfig,
@@ -60,6 +64,7 @@ impl Default for DagActorConfig {
             soft_features: Vec::new(),
             sla: crate::sla::config::SlaConfig::test_default(),
             establishment_report_slack: std::time::Duration::from_secs(120),
+            exec_retention_days: 30,
             materialization: crate::config::MaterializationConfig::default(),
         }
     }

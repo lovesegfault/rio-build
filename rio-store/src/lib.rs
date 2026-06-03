@@ -559,11 +559,6 @@ pub fn describe_metrics() {
          does not match the Service topology."
     );
     describe_counter!(
-        "rio_store_log_sweep_executions_deleted_total",
-        "Expired drv_executions rows deleted by the hourly build-log TTL \
-         sweep (executions older than log_retention_days)."
-    );
-    describe_counter!(
         "rio_store_log_sweep_chunks_deleted_total",
         "drv_log_chunks manifest rows deleted by the build-log TTL sweep."
     );

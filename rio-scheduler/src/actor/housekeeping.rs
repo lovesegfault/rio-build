@@ -531,6 +531,32 @@ impl DagActor {
                 warn!(error = %e, "attempt-ledger GC sweep failed; retrying next interval");
             }
         }
+
+        // The execution-row GC rides the same cadence, AFTER the ledger
+        // pass: it deletes only rows the ledger no longer references,
+        // so one tick can collect an exec row whose last ledger row
+        // aged out in that same pass. Conjunction documented at
+        // rio_retry_kernel::exec_row_sweep_eligible; the SQL twin is
+        // SchedulerDb::gc_exec_rows.
+        // r[impl store.log.sweep-ownership]
+        let retention_secs = f64::from(self.exec_retention_days) * 86_400.0;
+        match self
+            .db
+            .gc_exec_rows(retention_secs, ATTEMPTS_GC_BATCH)
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => {
+                debug!(
+                    deleted = n,
+                    "GC'd terminal unreferenced drv_executions rows past retention"
+                );
+                metrics::counter!("rio_scheduler_exec_rows_gc_deleted_total").increment(n);
+            }
+            Err(e) => {
+                warn!(error = %e, "execution-row GC sweep failed; retrying next interval");
+            }
+        }
     }
 
     /// D1/A6 (merged_bug_163): reap RESOLVED materialization jobs past the

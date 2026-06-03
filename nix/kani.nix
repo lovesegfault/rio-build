@@ -301,7 +301,9 @@ in
   kani-rio-retry-kernel = mkKaniCheck {
     name = "rio-retry-kernel";
     crate = crateBuildKani.members.rio-retry-kernel;
-    expectedHarnesses = 12;
+    # A2's 12 (kind-partition restatements + worker-abort bound) +
+    # B2's check_exec_row_sweep_guards (store.log.sweep-ownership).
+    expectedHarnesses = 13;
   };
 
   # rio-evidence-kernel: the scheduler's closure-evidence decision kernel

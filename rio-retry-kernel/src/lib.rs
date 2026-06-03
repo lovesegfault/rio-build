@@ -1855,6 +1855,38 @@ pub fn admit_worker_abort<Id>(rows: &[LedgerRow<Id>], bound: u32) -> WorkerAbort
     WorkerAbortAdmission::Uncharged
 }
 
+/// Sweep eligibility of one `drv_executions` lifecycle ROW (not a
+/// ledger row): the second deleter of the retention story
+/// (`store.log.sweep-ownership` — the store's log TTL sweep no longer
+/// touches these rows). A pure conjunction, deliberately STRONGER than
+/// "not in the decision suffix":
+///
+/// - `terminal`: a non-terminal row may still receive its report; its
+///   exec_id is a live idempotency key.
+/// - `!has_active_assignment`: protects the report-idempotency probes
+///   exactly as the ledger sweep's E4 conjunct does.
+/// - `!referenced_by_ledger`: an exec row outlives EVERY `drv_attempts`
+///   row that needs its kind — the kind-resolution `COALESCE` decay
+///   (a referenced exec deleted ⇒ its attempts silently re-kind
+///   `'build'`) is unreachable. The ledger GC bounds attempt-row
+///   lifetime, so exec rows stay eventually collectable: parked >30 d
+///   derivations keep their charge rows in the post-reset suffix,
+///   those rows keep their exec rows, and the kind survives the park.
+/// - `aged_out`: past `exec_retention_days` (the SQL twin binds the
+///   configured value).
+///
+/// The SQL twin is `gc_exec_rows` in rio-scheduler `db/attempts.rs`;
+/// its DB tests pin all four conjuncts against real rows.
+// r[impl store.log.sweep-ownership]
+pub fn exec_row_sweep_eligible(
+    terminal: bool,
+    has_active_assignment: bool,
+    referenced_by_ledger: bool,
+    aged_out: bool,
+) -> bool {
+    terminal && !has_active_assignment && !referenced_by_ledger && aged_out
+}
+
 /// The floor-bump outcome as [`classify`] consumes it — a leaf-local
 /// mirror of the actor's `FloorOutcome` so this crate keeps no actor
 /// dependency. `promoted` and `at_cap` are mutually exclusive; both are
@@ -3465,5 +3497,31 @@ mod proofs {
         rows[n].outcome_class = OutcomeClass::Disconnected;
         rows[n].reporting_party = ReportingParty::Worker;
         assert!(trailing_free_run(&rows[..n + 1]) == run + 1);
+    }
+
+    // r[verify store.log.sweep-ownership]
+    /// [`exec_row_sweep_eligible`] is exactly the four-conjunct guard:
+    /// eligibility implies every safety conjunct (terminal, no active
+    /// assignment, no ledger reference, aged out), and any single
+    /// violated conjunct vetoes — the second deleter of execution rows
+    /// can never weaken to a disjunction or drop a guard without this
+    /// harness failing.
+    #[kani::proof]
+    fn check_exec_row_sweep_guards() {
+        let terminal: bool = kani::any();
+        let active: bool = kani::any();
+        let referenced: bool = kani::any();
+        let aged: bool = kani::any();
+
+        let eligible = exec_row_sweep_eligible(terminal, active, referenced, aged);
+        if eligible {
+            assert!(terminal);
+            assert!(!active);
+            assert!(!referenced);
+            assert!(aged);
+        }
+        if !terminal || active || referenced || !aged {
+            assert!(!eligible);
+        }
     }
 }

@@ -184,6 +184,12 @@
         "description": "Tick interval (seconds) for scheduler housekeeping."
       },
       {
+        "key": "exec_retention_days",
+        "type": "uint32",
+        "default": "30",
+        "description": "Retention for terminal `drv_executions` lifecycle rows, in days."
+      },
+      {
         "key": "establishment_report_slack_secs",
         "type": "uint64",
         "default": "120",

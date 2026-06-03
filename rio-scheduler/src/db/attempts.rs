@@ -581,6 +581,57 @@ impl SchedulerDb {
     }
 
     // r[impl sched.db.attempts-gc]
+    /// The execution-row GC sweep — the second deleter of the retention
+    /// story (`store.log.sweep-ownership`; the store's log TTL sweep
+    /// owns log artifacts and never touches `drv_executions`). The SQL
+    /// twin of the kernel conjunction
+    /// `rio_retry_kernel::exec_row_sweep_eligible`: delete a lifecycle
+    /// row only when it is
+    ///
+    /// 1. **terminal** (a non-terminal row may still receive its
+    ///    report; its exec_id is a live idempotency key),
+    /// 2. with **no active assignment** (the report-idempotency probes
+    ///    stay sound — same E4 shape as the ledger sweep),
+    /// 3. **referenced by no `drv_attempts` row** (an exec row outlives
+    ///    every ledger row that needs its kind: the COALESCE re-kinding
+    ///    decay is unreachable; the ledger GC bounds attempt-row
+    ///    lifetime so exec rows stay eventually collectable — a
+    ///    derivation parked past retention keeps its post-reset charge
+    ///    rows, those rows keep their exec rows, the kind survives the
+    ///    park),
+    /// 4. and **older than `retention_secs`**.
+    ///
+    /// One statement, one MVCC snapshot, for the same stability
+    /// argument as [`Self::gc_attempt_ledger`] below; subselect-LIMIT
+    /// per the same precedent. Deliberately stronger than
+    /// "not-in-suffix" — see the kernel doc.
+    // r[impl store.log.sweep-ownership]
+    pub(crate) async fn gc_exec_rows(
+        &self,
+        retention_secs: f64,
+        limit: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM drv_executions e \
+             WHERE e.exec_id IN ( \
+                 SELECT v.exec_id FROM drv_executions v \
+                 WHERE v.status = ANY($3) \
+                   AND v.started_at < now() - make_interval(secs => $1) \
+                   AND NOT EXISTS (SELECT 1 FROM assignments a \
+                                   WHERE a.exec_id = v.exec_id \
+                                     AND a.status IN ('pending', 'acknowledged')) \
+                   AND NOT EXISTS (SELECT 1 FROM drv_attempts t \
+                                   WHERE t.exec_id = v.exec_id) \
+                 LIMIT $2)",
+        )
+        .bind(retention_secs)
+        .bind(limit)
+        .bind(rio_migrations::schema::EXEC_STATUS_TERMINAL)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// The attempt-ledger GC sweep: delete (live arm) attempt-kind rows
     /// strictly before their derivation's last-reset cut OF THEIR OWN
     /// LANE (migration 084: `last_resets` is keyed per

@@ -43,6 +43,13 @@
         "minimum": 0,
         "default": 10
       },
+      "exec_retention_days": {
+        "description": "Retention for terminal `drv_executions` lifecycle rows, in days.\nThe scheduler's `gc_exec_rows` pass deletes a row only when it is\nterminal, has no active assignment, is referenced by no\n`drv_attempts` ledger row, AND is older than this — the\nkernel-documented conjunction (`exec_row_sweep_eligible`). The\nstore's log TTL sweep deletes the row's log artifacts on its own\n`log_retention_days` clock but never the row itself\n(`store.log.sweep-ownership`). Validate: ≥ 1.",
+        "type": "integer",
+        "format": "uint32",
+        "minimum": 0,
+        "default": 30
+      },
       "establishment_report_slack_secs": {
         "description": "How long past an open pull-mode attempt's intent deadline the\nestablishment sweep waits for a terminal report before\nestablishing the attempt as an unreported executor crash\n(pull-mode dispatch only; stream-mode attempts keep the as-built\ncorrelation machinery). Provisional default 120 s (about two\ncontroller ticks plus Job terminal-observation margin);\nre-baselined at deployment time against the controller's\nterminal-report latency histogram.\nEnv: `RIO_ESTABLISHMENT_REPORT_SLACK_SECS`.",
         "type": "integer",
@@ -345,6 +352,7 @@
     "metrics_addr": "[::]:9091",
     "drain_grace_secs": 6,
     "tick_interval_secs": 10,
+    "exec_retention_days": 30,
     "establishment_report_slack_secs": 120,
     "soft_features": [],
     "hmac_key_path": null,

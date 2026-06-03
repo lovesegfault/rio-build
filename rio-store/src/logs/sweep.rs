@@ -9,13 +9,19 @@
 //! 1. the execution's `drv_log_chunks` manifest rows (`RETURNING
 //!    s3_key`),
 //! 2. the chunk objects those rows pointed at,
-//! 3. any stale `log_ingest_sessions` row,
-//! 4. and finally the `drv_executions` row itself.
+//! 3. and any stale `log_ingest_sessions` row.
 //!
-//! **Ordering is load-bearing.** The manifest rows go before the
-//! execution row so a crash mid-batch leaves an *expired execution with
-//! no chunks* (re-found and finished off next hour) rather than a
-//! half-deleted manifest. The manifest rows go before the *objects* so
+//! The `drv_executions` row itself is deliberately NOT deleted here
+//! (`store.log.sweep-ownership`): it is the scheduler-owned execution
+//! lifecycle row — terminality, active assignments, and retry-ledger
+//! references are scheduler facts this sweep cannot see, and deleting
+//! the row by age alone destroyed kind/attribution state behind the
+//! scheduler's back. The scheduler's `gc_exec_rows` pass collects it
+//! once it is terminal, unreferenced, and past `exec_retention_days`.
+//! A stripped execution row is never re-selected: the victim SELECT
+//! requires remaining chunk or session rows.
+//!
+//! **Ordering is load-bearing.** The manifest rows go before the *objects* so
 //! a crash between the two leaves orphaned objects (unreachable from
 //! PG, bounded by the S3 lifecycle rule on `logs/`) rather than
 //! manifest rows pointing at deleted objects — which the read path
@@ -46,8 +52,8 @@ pub const SWEEP_BATCH: i64 = 1000;
 /// What one [`sweep_expired_logs`] pass deleted.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SweepStats {
-    /// `drv_executions` rows deleted.
-    pub executions: u64,
+    /// Expired executions whose log artifacts this pass swept.
+    pub executions_swept: u64,
     /// `drv_log_chunks` manifest rows deleted.
     pub chunks: u64,
     /// Chunk objects successfully deleted from the backend. Lags
@@ -72,11 +78,21 @@ pub async fn sweep_expired_logs(
     loop {
         // The inner SELECT rides `drv_executions_started_at`; no ORDER
         // BY because any `batch` expired rows are equally good to
-        // delete. `make_interval` binds the retention directly so the
-        // SQL cannot drift from the config value.
+        // sweep. `make_interval` binds the retention directly so the
+        // SQL cannot drift from the config value. The EXISTS
+        // disjunction is load-bearing now that the execution row
+        // itself survives the sweep (`store.log.sweep-ownership`):
+        // without it, an already-stripped expired execution would be
+        // re-selected on every pass — the loop would never observe an
+        // empty batch once more than `batch` expired executions exist,
+        // and the swept count would inflate without bound.
         let expired: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT exec_id FROM drv_executions \
-             WHERE started_at < now() - make_interval(secs => $1) \
+            "SELECT exec_id FROM drv_executions e \
+             WHERE e.started_at < now() - make_interval(secs => $1) \
+               AND (EXISTS (SELECT 1 FROM drv_log_chunks c \
+                            WHERE c.exec_id = e.exec_id) \
+                 OR EXISTS (SELECT 1 FROM log_ingest_sessions s \
+                            WHERE s.exec_id = e.exec_id)) \
              LIMIT $2",
         )
         .bind(retention.as_secs_f64())
@@ -130,15 +146,13 @@ pub async fn sweep_expired_logs(
             .execute(pool)
             .await?;
 
-        // The execution rows last: if anything above failed we never
-        // get here and the next pass re-finds the same executions.
-        let deleted = sqlx::query("DELETE FROM drv_executions WHERE exec_id = ANY($1)")
-            .bind(&expired)
-            .execute(pool)
-            .await?
-            .rows_affected();
-        stats.executions += deleted;
-        metrics::counter!("rio_store_log_sweep_executions_deleted_total").increment(deleted);
+        // r[impl store.log.sweep-ownership]
+        // The drv_executions row is NOT deleted: scheduler-owned
+        // lifecycle state (see the module doc). The candidate SELECT's
+        // EXISTS disjunction keeps a stripped row out of every later
+        // pass, so this count is exact (each expired execution is
+        // swept once).
+        stats.executions_swept += expired.len() as u64;
 
         if expired.len() < batch as usize {
             break;
@@ -162,9 +176,9 @@ pub fn spawn_log_sweep(
         let store = Arc::clone(&store);
         async move {
             match sweep_expired_logs(&pool, store.as_ref(), retention, SWEEP_BATCH).await {
-                Ok(stats) if stats.executions > 0 => {
+                Ok(stats) if stats.executions_swept > 0 => {
                     info!(
-                        executions = stats.executions,
+                        executions_swept = stats.executions_swept,
                         chunks = stats.chunks,
                         objects = stats.objects,
                         "log TTL sweep: deleted expired build logs"
@@ -262,6 +276,39 @@ mod tests {
         (execs, chunks, sessions)
     }
 
+    // r[verify store.log.sweep-ownership]
+    /// merged_bug_086 (red-first): the log TTL sweep owns store-side
+    /// log artifacts ONLY — chunks, objects, stale session rows.
+    /// `drv_executions` is the scheduler-owned execution lifecycle row:
+    /// age alone says nothing about whether it is terminal, whether an
+    /// assignment is still active, or whether the retry ledger still
+    /// references it for kind resolution — deleting it here destroyed
+    /// cross-service state behind the scheduler's back. The recorded
+    /// red: the pre-fix sweep deleted the row (execs count 0).
+    #[tokio::test]
+    async fn sweep_leaves_drv_executions_untouched() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let exec = Uuid::now_v7();
+        seed_aged_execution(&db.pool, &store, exec, 31.0, 2).await;
+
+        sweep_expired_logs(
+            &db.pool,
+            &store,
+            Duration::from_secs(30 * 86_400),
+            SWEEP_BATCH,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            counts(&db.pool, exec).await,
+            (1, 0, 0),
+            "chunks and sessions swept; the execution lifecycle row is \
+             the scheduler's to collect (gc_exec_rows)"
+        );
+    }
+
     /// The 31-day-old execution's rows AND objects are gone; the
     /// 1-day-old execution's are untouched.
     #[tokio::test]
@@ -285,14 +332,14 @@ mod tests {
         assert_eq!(
             stats,
             SweepStats {
-                executions: 1,
+                executions_swept: 1,
                 chunks: 2,
                 objects: 2,
             }
         );
-        // The expired execution: every row in every table is gone, and
-        // so are its objects.
-        assert_eq!(counts(&db.pool, old_exec).await, (0, 0, 0));
+        // The expired execution: log artifacts gone (objects too); the
+        // scheduler-owned lifecycle row survives.
+        assert_eq!(counts(&db.pool, old_exec).await, (1, 0, 0));
         for key in &old_keys {
             assert!(
                 matches!(store.get(key).await, Err(LogChunkError::NotFound { .. })),
@@ -334,7 +381,7 @@ mod tests {
         let stats = sweep_expired_logs(&db.pool, &store, Duration::from_secs(30 * 86_400), 2)
             .await
             .unwrap();
-        assert_eq!(stats.executions, 3);
+        assert_eq!(stats.executions_swept, 3);
         assert_eq!(stats.chunks, 3);
         assert!(store.is_empty());
     }
