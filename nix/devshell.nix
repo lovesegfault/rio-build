@@ -113,8 +113,12 @@ let
   # env hygiene done in the shellHook does not survive everything that
   # re-loads user config into a child environment (xtask's dotenvy
   # re-reads .env.local wholesale; IDEs spawn cargo with their own env).
-  # Structured so every policy decision happens ONCE, at the top, before
-  # any exec. Five jobs:
+  # Five jobs. Execution order is 1 (validate + stamp) -> one argv
+  # scan -> 3/4 (bypass arms, which sweep per job 5 and exec the REAL
+  # compiler — kache never runs on those paths, so the job-2 scrub is
+  # irrelevant to them) -> 2 (allowlist + pinned config) -> exec kache.
+  # The invariant is that validation and liveness precede every exec,
+  # and the scrub precedes the only exec that reaches kache:
   #
   #  1. Validate the rio-namespaced knobs (policy in the binary — values
   #     arrive via dotenvy/direnv paths that never saw the shellHook
@@ -601,8 +605,8 @@ let
               unset kache_knob kache_val
             fi
             # (b) Default-store epoch hygiene: seed this salt's stamp
-            #     (the wrapper refreshes it on every compile — see job 4
-            #     in kacheWrapped) and prune sibling epochs whose stamp
+            #     (the wrapper refreshes it on every invocation — see
+            #     job 1b in kacheWrapped) and prune sibling epochs whose stamp
             #     is 14+ days old. Scope and safety rules:
             #     - only 12-hex salt-shaped dirnames are pruned: a
             #       relocated store a user parked under this root must
