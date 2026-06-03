@@ -425,6 +425,17 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   input-bound or output-bound.
 ]
 
+The kill-verdict canary
+(#(refs.metric)("rio_builder_kill_verdict_outputs_present_total")) counts
+limit-kill verdicts whose declared outputs all materialized --- the
+observable signature of a completed build relabeled by a racing deadline.
+The executor's principal-targeted kill contract
+(#rref("builder.exec.kill-targets-principal")) makes that relabel
+structurally impossible, leaving only the natural-137 coincidence
+(#rref("builder.exec.limits-isolated+2"), residual 1), so the expected
+steady-state value is *zero*: alert on any increment and inspect the
+worker's logs for the named derivation.
+
 #r("obs.metric.builder-util")[
   Builder utilization gauges (`rio_builder_{cpu,memory}_fraction`) are polled
   from the builder's parent cgroup every 10s by `utilization_reporter_loop`.

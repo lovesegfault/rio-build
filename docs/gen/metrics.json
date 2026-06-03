@@ -16,6 +16,7 @@
     "rio_builder_fuse_jit_lookup_total",
     "rio_builder_graph_drv_fetch_total",
     "rio_builder_jit_inputs_registered",
+    "rio_builder_kill_verdict_outputs_present_total",
     "rio_builder_log_lines_suppressed_total",
     "rio_builder_log_messages_shed_total",
     "rio_builder_memory_fraction",
@@ -311,6 +312,11 @@
         "name": "rio_builder_jit_inputs_registered",
         "kind": "gauge",
         "help": "Size of the JIT FUSE allowlist (known_inputs.len()) at daemon spawn. Equals compute_input_closure's output count for this build."
+      },
+      {
+        "name": "rio_builder_kill_verdict_outputs_present_total",
+        "kind": "counter",
+        "help": "Limit-kill verdicts (TimedOut/Silent/LogLimitExceeded) whose declared outputs ALL materialized. Expected 0. Any increment is either the natural-137 coincidence (the build exited 137 on its own as a deadline raced it) or a kill-supervision regression re-opening the completed-build relabel window the principal-targeted kill closed — pull the worker's logs for the named drv either way."
       },
       {
         "name": "rio_builder_log_lines_suppressed_total",

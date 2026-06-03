@@ -158,6 +158,16 @@ pub fn describe_metrics() {
          are never shed."
     );
     describe_counter!(
+        "rio_builder_kill_verdict_outputs_present_total",
+        "Limit-kill verdicts (TimedOut/Silent/LogLimitExceeded) whose \
+         declared outputs ALL materialized. Expected 0. Any increment is \
+         either the natural-137 coincidence (the build exited 137 on its \
+         own as a deadline raced it) or a kill-supervision regression \
+         re-opening the completed-build relabel window the \
+         principal-targeted kill closed — pull the worker's logs for the \
+         named drv either way."
+    );
+    describe_counter!(
         "rio_builder_cgroup_oom_total",
         "Builds killed by the cgroup OOM watcher (memory.events oom_kill \
          incremented during build). Reported as InfrastructureFailure for \

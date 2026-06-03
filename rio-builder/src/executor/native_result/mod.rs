@@ -70,6 +70,36 @@ pub(crate) enum ExitClassification {
     },
 }
 
+/// Is this finished execution the canary signature for kill-verdict
+/// misattribution: a limit-kill verdict (`TimedOut`/`Silent`/
+/// `LogLimitExceeded`) whose declared outputs nevertheless ALL
+/// materialized?
+///
+/// A correctly attributed limit kill interrupts the build before it
+/// completes, so its outputs are missing (or partial). A kill verdict
+/// with a full output set means one of exactly two things, both worth
+/// an operator's eyes: the natural-137 coincidence (the build's last
+/// act was to exit 137 on its own while a deadline raced it — residual
+/// 1 of the executor's corroboration contract) or a supervision
+/// regression re-opening the relabel-a-completed-build window the
+/// principal-targeted kill closed (merged_bug_046). The counter this
+/// feeds (`rio_builder_kill_verdict_outputs_present_total`) is
+/// expected to stay at 0.
+///
+/// `outputs` empty is NOT canary territory: nothing materialized, the
+/// verdict is self-consistent.
+// r[impl builder.exec.kill-targets-principal]
+pub(crate) fn kill_verdict_with_outputs_present(
+    exit: ExitOutcome,
+    outputs: &[rio_exec::OutputReport],
+) -> bool {
+    matches!(
+        exit,
+        ExitOutcome::TimedOut | ExitOutcome::Silent | ExitOutcome::LogLimitExceeded
+    ) && !outputs.is_empty()
+        && outputs.iter().all(|o| o.exists)
+}
+
 /// Classify a raw exit outcome into the scheduler-facing status.
 ///
 /// `is_network_dependent` is true for fixed-output (and impure)
@@ -632,6 +662,49 @@ mod tests {
     }
 
     // -- classification ----------------------------------------------------
+
+    /// The canary trips on exactly one shape: kill verdict + every
+    /// declared output present. Partial outputs, no outputs, and
+    /// non-kill exits all stay silent.
+    // r[verify builder.exec.kill-targets-principal]
+    #[test]
+    fn kill_verdict_canary_matrix() {
+        let report = |exists: bool| rio_exec::OutputReport {
+            path: PathBuf::from("/nix/store/x-out"),
+            host_path: PathBuf::from("/scratch/x-out"),
+            exists,
+            metadata: None,
+        };
+
+        for kill in [
+            ExitOutcome::TimedOut,
+            ExitOutcome::Silent,
+            ExitOutcome::LogLimitExceeded,
+        ] {
+            assert!(
+                kill_verdict_with_outputs_present(kill, &[report(true), report(true)]),
+                "{kill:?} with all outputs present must trip the canary"
+            );
+            assert!(
+                !kill_verdict_with_outputs_present(kill, &[report(true), report(false)]),
+                "{kill:?} with a missing output is self-consistent"
+            );
+            assert!(
+                !kill_verdict_with_outputs_present(kill, &[]),
+                "{kill:?} with no declared outputs is not canary territory"
+            );
+        }
+        for natural in [
+            ExitOutcome::Exited(0),
+            ExitOutcome::Exited(1),
+            ExitOutcome::Signaled(9),
+        ] {
+            assert!(
+                !kill_verdict_with_outputs_present(natural, &[report(true)]),
+                "{natural:?} is not a kill verdict"
+            );
+        }
+    }
 
     #[test]
     fn classify_success() {
