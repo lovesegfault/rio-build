@@ -84,12 +84,31 @@ narinfo.
 
 = Content Integrity Verification
 
-#r("store.integrity.verify-on-put")[
-  *On PutPath:* The store independently computes SHA-256 over the uploaded NAR
-  stream and verifies it matches the declared `NarHash`. Rejects the upload on
-  mismatch. This prevents corrupted or tampered uploads from being signed and
-  served.
+#r("store.integrity.verify-on-put+2")[
+  *On NAR-byte ingest (`PutPath`, `PutPathBatch`, the substituter):* the store
+  independently computes SHA-256 over the uploaded NAR stream and rejects the
+  upload on mismatch with the declared `NarHash`.
+  *On `PutPathChunked`:* the store BLAKE3-verifies every chunk body received
+  on the stream against its claimed digest, and length-checks it against the
+  manifest, before the body is stored or referenced. `nar_hash`, `nar_size`,
+  `references`, and per-file digests are computed by the authenticated
+  builder's fused walk over the same bytes it uploads
+  (#rref("builder.upload.fused-walk")) and are committed as claimed; the
+  store does not regenerate the NAR or fetch already-durable chunks to
+  recompute them.
 ]
+
+The asymmetry is a trust-boundary line. The builder is a rio service
+authenticated per-build (HMAC assignment token); its fused walk derives every
+digest from the bytes it is uploading in the same pass, so a server-side
+recompute could only catch rio's own bugs, not an outside party. That
+recompute had a structural cost: NAR SHA-256 is not composable from chunk
+digests, so verifying a fully-deduped upload meant re-fetching every
+already-durable chunk from the backend — O(chunks) serial S3 round-trips on
+an upload that streams no bodies at all, long enough on large outputs to
+exceed the client's stream timeout. Substituted content arrives from
+*outside* the service boundary (an upstream binary cache), so the substituter
+keeps independent NAR-hash verification.
 
 #r("store.integrity.verify-on-get")[
   - *On chunk read (S3 or cache):* Every chunk fetched from S3 or the
@@ -344,21 +363,21 @@ the `pending_s3_deletes` table.
   via a service token --- see #rref("sec.authz.service-token").
 ]
 
-#r("sec.authz.ca-path-derived+2")[
+#r("sec.authz.ca-path-derived+3")[
   For floating-CA derivations (`AssignmentClaims.is_ca = true`),
   `expected_outputs` is unknown at dispatch time. Instead of skipping
-  authorization, the store recomputes the CA store path *server-side* from the
-  SHA-256 it computed over the buffered NAR (via
-  `StorePath::make_fixed_output(name, nar_hash, recursive=true, refs)`) and
+  authorization, the store derives the CA store path *server-side* via
+  `StorePath::make_fixed_output(name, nar_hash, recursive=true, refs)` and
   rejects with `PERMISSION_DENIED` if it does not match the uploaded
-  `store_path`. The server-side CA-path recompute MUST run BEFORE the
-  `'uploading'` placeholder is claimed (#rref("store.put.wal-manifest") step
-  1), so a worker holding an `is_ca` token cannot squat placeholders for paths
-  it has not content-proven (it would otherwise drip-feed chunks while
-  heartbeating an arbitrary path's placeholder fresh, forcing legitimate
-  uploaders into `Aborted`). A worker holding an `is_ca=true` token therefore
-  cannot upload to (or squat the placeholder for) any path other than the
-  content-derived path of the NAR it actually sent.
+  `store_path`. The `nar_hash` input is the SHA-256 the store computed over
+  the buffered NAR for NAR-byte uploads, and the builder-claimed NAR hash for
+  `PutPathChunked` (#rref("store.integrity.verify-on-put")) --- either way the
+  uploaded path must be the fixed-output derivation of the hash and references
+  the same upload asserts. The CA-path check MUST run BEFORE the `'uploading'`
+  placeholder is claimed (#rref("store.put.wal-manifest") step 1), so a worker
+  holding an `is_ca` token cannot squat placeholders for arbitrary paths (it
+  would otherwise drip-feed chunks while heartbeating an arbitrary path's
+  placeholder fresh, forcing legitimate uploaders into `Aborted`).
 ]
 
 #r("sec.authz.service-token")[

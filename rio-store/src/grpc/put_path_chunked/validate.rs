@@ -58,21 +58,22 @@ pub(crate) struct FileRun {
 #[derive(Debug)]
 pub(crate) struct ValidatedOutput {
     pub store_path: StorePath,
-    /// Claimed NAR SHA-256. Recomputed by the verify task before
-    /// commit (`r[store.put.narhash-sync]`).
+    /// NAR SHA-256, computed by the builder's fused walk and committed
+    /// as claimed (`r[store.integrity.verify-on-put+2]`).
     pub nar_hash: [u8; 32],
-    /// Claimed NAR byte count. Verified post-framing-regeneration.
+    /// NAR byte count — builder-computed, committed as claimed.
     pub nar_size: u64,
-    /// Claimed runtime references. Each is a member of
-    /// `input_closure ∪ {sibling outputs}`; the verify task's
-    /// reference scan must reproduce exactly this set
-    /// (`r[store.put.refs-sync]`).
+    /// Runtime references, scanned by the builder's fused walk
+    /// (`r[builder.upload.references-scanned+2]`) and committed as
+    /// claimed. Each is a member of `input_closure ∪ {sibling
+    /// outputs}` (enforced below).
     pub references: Vec<StorePath>,
     pub root_node: RootNode,
     /// `(chunk_digest, size)` in canonical NAR walk order. Sizes are
     /// self-consistent with the attested tree (each file's run sums to
-    /// its `FileEntry.size`) but not yet bound to actual CAS object
-    /// sizes — the verify task asserts that at fetch time.
+    /// its `FileEntry.size`); novel bodies are length-checked against
+    /// them at receive time, and deduped digests were length-checked
+    /// when first uploaded.
     pub chunk_manifest: Vec<([u8; 32], u32)>,
     /// Whether this output's store path is derived from its content
     /// (floating CA). Taken from the **claims**, never from the
@@ -104,8 +105,6 @@ pub(crate) struct ValidatedBegin {
     /// each digest is *actually* absent from the store is a DB
     /// question the verify task answers.
     pub novel: Vec<[u8; 32]>,
-    /// The refscan candidate set (plus the outputs' own paths).
-    pub input_closure: Vec<StorePath>,
 }
 
 /// Validate an untrusted `Begin` frame against the caller's verified
@@ -162,15 +161,17 @@ pub(crate) fn validate_begin(
             )));
         }
     }
-    let input_closure: Vec<StorePath> = begin
-        .input_closure
-        .iter()
-        .map(|p| {
-            StorePath::parse(p).map_err(|e| {
-                Status::invalid_argument(format!("PutPathChunked: invalid input_closure path: {e}"))
-            })
-        })
-        .collect::<Result<_, _>>()?;
+    // Each input_closure path must parse — the refs ⊆ closure check
+    // below compares raw strings, so a malformed entry would otherwise
+    // slip through as an unmatched (harmless) candidate; reject the
+    // builder bug early instead.
+    for p in &begin.input_closure {
+        if let Err(e) = StorePath::parse(p) {
+            return Err(Status::invalid_argument(format!(
+                "PutPathChunked: invalid input_closure path: {e}"
+            )));
+        }
+    }
 
     // ── Deriver ↔ token binding. ─────────────────────────────────────
     // Ties the narinfo's recorded provenance to the build the token was
@@ -251,10 +252,9 @@ pub(crate) fn validate_begin(
         // Same gate as PutPath's `validate_metadata` step 6: a non-CA
         // token authorizes exactly the paths the scheduler signed into
         // it. CA outputs are exempt because the path is not known at
-        // sign time; their authorization is the content-derived path
-        // recompute at commit (`r[sec.authz.ca-path-derived]`), which
-        // a builder cannot satisfy for a path it didn't actually
-        // produce the content for.
+        // sign time; their authorization is the path-derivation check
+        // at commit (`r[sec.authz.ca-path-derived]`), binding the
+        // claimed path to the claimed NAR hash and references.
         if !claims.is_ca
             && !claims
                 .expected_outputs
@@ -414,7 +414,6 @@ pub(crate) fn validate_begin(
         outputs,
         directories,
         novel,
-        input_closure,
     })
 }
 
@@ -849,7 +848,6 @@ mod tests {
 
         assert_eq!(v.outputs.len(), 2);
         assert_eq!(v.directories.len(), 2, "root + bin bodies");
-        assert_eq!(v.input_closure.len(), 2);
         assert_eq!(v.novel, vec![C2.0, C4.0]);
 
         // Output A: walk order is bin/app, empty, lib.so. The empty

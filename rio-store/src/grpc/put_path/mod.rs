@@ -5,7 +5,7 @@
 //! 2. Check idempotency: if path already complete, return success
 // r[impl store.put.wal-manifest]
 // r[impl store.put.idempotent]
-// r[impl store.integrity.verify-on-put]
+// r[impl store.integrity.verify-on-put+2]
 //! 3. Insert manifest placeholder with status='uploading'
 //! 4. Accumulate NAR chunks (bounded by MAX_NAR_SIZE)
 //! 5. Verify SHA-256 matches trailer's declared nar_hash
@@ -141,7 +141,7 @@ impl StoreServiceImpl {
         let store_path_hash = info.store_path_hash.clone();
         debug!(store_path = %info.store_path.as_str(), "PutPath: received metadata");
 
-        // r[impl sec.authz.ca-path-derived+2]
+        // r[impl sec.authz.ca-path-derived+3]
         // For is_ca tokens, validate_put_metadata skips the
         // `store_path ∈ expected_outputs` membership check (the path is
         // content-derived). The CA authorization gate —

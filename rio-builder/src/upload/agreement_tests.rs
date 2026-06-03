@@ -224,8 +224,8 @@ async fn agreement_upload_all_outputs_against_real_store() -> anyhow::Result<()>
         assert_eq!(r.nar_hash, <[u8; 32]>::from(Sha256::digest(&local_nar)));
         assert_eq!(r.nar_size, local_nar.len() as u64);
     }
-    // The claimed references survived the store's refs-sync verification
-    // and are recorded on the narinfo.
+    // The scanned references are committed as claimed and recorded on
+    // the narinfo.
     let out_refs: Vec<String> = results
         .iter()
         .find(|r| r.store_path.as_str() == out_path)

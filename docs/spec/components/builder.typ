@@ -698,8 +698,9 @@ pod's emptyDir.
   references from the derivation's inputs, plus the sibling outputs (for
   self-references and cross-output references). This matches Nix's
   `computeFSClosure` (`derivation-building-goal.cc:444,450` /
-  `derivation-builder.cc:1335-1344`) and is exactly the candidate set the
-  store's verify task re-scans with (#rref("store.put.refs-sync")) --- the
+  `derivation-builder.cc:1335-1344`). The scan is authoritative: the store
+  commits the resolved reference list as claimed
+  (#rref("store.integrity.verify-on-put")) --- the
   closure half is the `Begin.input_closure` echo, preferred from
   `WorkAssignment.input_closure` (the attested list behind the token's
   `input_closure_digest`), falling back to the locally-computed closure when

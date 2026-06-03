@@ -160,10 +160,10 @@ pub(super) async fn collect_outputs(
     // The closure passed here is BOTH the `Begin.input_closure` echo and
     // the reference-scan candidate set (the upload adds the scanned
     // output paths itself, covering self- and cross-output references).
-    // It must mirror what the store's verify task scans the reassembled
-    // NARs with — input_closure ∪ Begin.outputs (`r[store.put.refs-sync]`)
-    // — or the claimed references diverge from the recomputed ones and
-    // the upload is rejected.
+    // The scan is authoritative — the store commits the resolved set as
+    // claimed (`r[store.integrity.verify-on-put+2]`) — so a candidate
+    // set that misses a path silently drops that reference from the
+    // narinfo; input_closure ∪ Begin.outputs is the complete set.
     //
     //   - Preferred: the scheduler-attested WorkAssignment.input_closure.
     //     It is exactly what the assignment token's input_closure_digest

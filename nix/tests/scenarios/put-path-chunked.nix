@@ -4,7 +4,7 @@
 # ssh-ng, the scheduler dispatches with HMAC assignment claims (the
 # fixture sets withHmac = true), the worker's fused walk + HasChunks
 # probe + PutPathChunked client uploads the outputs, and the store's
-# sequential verify walk + single-transaction commit registers them.
+# sequential receive walk + single-transaction commit registers them.
 # The VM test asserts only what the off-VM tests cannot: that this
 # chain holds together on a real cluster and the committed data is
 # usable afterwards.
@@ -14,7 +14,7 @@
 #   2. narinfo                cross-output + input refs and deriver recorded
 #   3. byte-correct read-back gateway content matches the in-sandbox sha256
 #   4. cross-derivation dedup identical payload streams ~no novel chunk bytes
-#   5. floating-CA output     server-side CA recompute commits, reads back
+#   5. floating-CA output     CA path check commits, reads back
 #
 # The builder's HasChunks probe is best-effort (a failed probe falls
 # back to streaming every chunk as novel), so a spurious red in the
@@ -386,10 +386,10 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     with subtest("floating-CA output commits and reads back"):
         # With withHmac the assignment claims carry is_ca=true and an
-        # empty expected_outputs list; the store recomputes the CA path
-        # from its OWN verify-walk nar_hash and rejects a mismatch with
+        # empty expected_outputs list; the store derives the CA path
+        # from the claimed nar_hash + refs and rejects a mismatch with
         # PERMISSION_DENIED — so this build succeeding is the positive
-        # proof of the server-side recompute under real claims.
+        # proof of the CA path check under real claims.
         # --impure mirrors the ca-cutoff scenario's CA builds.
         n_before = len(chunked_commit_lines())
         ca_out = build("${caDrv}", extra_args="--impure")
