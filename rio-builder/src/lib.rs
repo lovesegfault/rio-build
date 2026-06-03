@@ -225,10 +225,12 @@ pub fn describe_metrics() {
     );
     describe_histogram!(
         "rio_builder_castore_fuse_open_seconds",
-        "Wall-clock from open() upcall to reply, labeled hit=node_ssd|remote and \
-         streamed=0|1. The streamed=0 remote tail is a whole-file fetch + \
-         Promote; streamed=1 replies at the first chunk and fills in the \
-         background."
+        "Wall-clock from open() upcall to reply, labeled by the open_case_total \
+         taxonomy: case=hit|wait_fetching|miss_small|miss_stream. hit and \
+         wait_fetching reply from the node cache (wait_fetching first blocks \
+         on a concurrent open's in-flight fetch); miss_small is a whole-file \
+         fetch + Promote; miss_stream replies at the first chunk and fills in \
+         the background."
     );
     describe_counter!(
         "rio_builder_castore_fuse_open_case_total",

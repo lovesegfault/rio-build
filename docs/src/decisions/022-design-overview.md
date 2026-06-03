@@ -334,7 +334,7 @@ r[obs.metric.compat]
 
 | Metric | Meaning |
 |---|---|
-| `rio_builder_castore_fuse_open_seconds` (histogram) | wall-clock from `open()` upcall to reply, labeled `{hit="node_ssd"\|"remote", streamed="0"\|"1"}` |
+| `rio_builder_castore_fuse_open_seconds` (histogram) | wall-clock from `open()` upcall to reply, labeled `{case="hit"\|"wait_fetching"\|"miss_small"\|"miss_stream"}` (the `open_case_total` taxonomy) |
 | `rio_builder_castore_fuse_fetch_bytes_total` | bytes sourced to materialize a file at `open()`, labeled `{hit="remote"\|"node_ssd"}` (rio-store vs the node chunk cache) |
 | `rio_builder_castore_fuse_upcalls_total` | FUSE upcalls by `{op="lookup"\|"getattr"\|"readdir"\|"readlink"\|"open"\|"read"}` |
 | `rio_builder_castore_dag_prefetch_seconds` | `GetDirectory(recursive)` wall-clock per build |
