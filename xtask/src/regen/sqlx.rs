@@ -60,8 +60,14 @@ pub async fn run() -> Result<()> {
     // rustc truncate the store blob in place and poison every future
     // restore of that entry. Unlinking only drops this target's link;
     // cargo rebuilds the missing outputs.
+    //
+    // `! -perm -u+w` (mode bits), NOT `! -writable`: -writable is an
+    // access(2) test, vacuous under uid 0 — root would skip the unlink
+    // and rustc's truncating opens would then silently rewrite the
+    // shared store inode (the exact poisoning forbidden above) instead
+    // of EACCESing.
     if isolated.exists() {
-        sh::run(cmd!(sh, "find {isolated} -type f ! -writable -delete")).await?;
+        sh::run(cmd!(sh, "find {isolated} -type f ! -perm -u+w -delete")).await?;
     }
 
     // `cargo sqlx prepare` bumps src/{lib,main}.rs mtimes on every

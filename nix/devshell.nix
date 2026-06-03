@@ -143,16 +143,45 @@ let
     name = "kache";
     text = ''
       # Any -Z token (joined or two-arg form: a bare "-Z" matches too)
-      # → run the real compiler uncached. See policy job 3.
+      # → run the real compiler uncached. See policy job 3. Watch item:
+      # if a future cargo starts auto-injecting a -Z flag onto rustc
+      # argv (the 1.80-era -Zon-broken-pipe incident that broke
+      # sccache), every compile would silently take this bypass —
+      # symptom: `kache stats` hit/miss counters stop moving. Verified
+      # absent on the current pinned nightly; if it returns, exempt the
+      # known-output-irrelevant flag here.
       for a in "$@"; do
         case "$a" in
           -Z* | --unpretty*) exec "$@" ;;
           *) ;;
         esac
       done
+      # Online sqlx compiles (cargo sqlx prepare, SQLX_OFFLINE=false
+      # checks against a live DB) → passthrough, uncached, regardless of
+      # spawner: DATABASE_URL never reaches a cache key (read via plain
+      # std::env in the macros, invisible to dep-info) and RIO_SQLX_HASH
+      # still hashes the PRE-regen .sqlx, so caching would store
+      # online-typed artifacts under offline-looking keys AND a repeat
+      # prepare could hit-replay without ever running the macros that
+      # write prepare's metadata. xtask's regen flow also sets
+      # KACHE_DISABLED, but this chokepoint covers direct sqlx-cli use
+      # too — the CLI ships in this shell.
+      if [ "''${SQLX_OFFLINE:-}" = "false" ] && [ -x "''${1:-}" ]; then
+        exec "$@"
+      fi
+      # Allowlist notes: KACHE_MAX_SIZE is deliberately NOT allowlisted
+      # (same rationale as KACHE_CACHE_DIR — it is the literal eviction
+      # budget; a foreign project's global export must not shrink ours);
+      # the rio-namespaced RIO_KACHE_MAX_SIZE below is the knob.
+      # KACHE_ACTIVE stays allowlisted as a deliberate trade: it is
+      # kache's own nested-wrapper coordination var, and gating it on a
+      # rio sentinel would break build scripts that spawn cargo inside a
+      # kache compile; the cost is that a rio build launched from inside
+      # ANOTHER project's kache-wrapped build runs uncached (exotic, and
+      # fails open).
       allow=" KACHE_ACTIVE KACHE_VERSION KACHE_CACHE_EXECUTABLES \
         KACHE_CLEAN_INCREMENTAL KACHE_COMPRESSION_LEVEL KACHE_DAEMON_IDLE_TIMEOUT \
-        KACHE_DISABLED KACHE_LOG KACHE_LOG_FILE KACHE_LOG_FILE_PATH KACHE_MAX_SIZE \
+        KACHE_DISABLED KACHE_LOG KACHE_LOG_FILE KACHE_LOG_FILE_PATH \
         KACHE_PROGRESS "
       # Pure-bash prefix expansion — no externals, nothing that can fail
       # silently inside a process substitution.
@@ -163,6 +192,22 @@ let
         esac
       done
       export KACHE_CONFIG=${kacheConfig}
+      if [ -n "''${RIO_KACHE_MAX_SIZE:-}" ]; then
+        export KACHE_MAX_SIZE="$RIO_KACHE_MAX_SIZE"
+      fi
+      # Policy lives in the binary: validate the relocation knob HERE,
+      # not only in the shellHook loader (xtask's dotenvy and direnv
+      # deliver values that never saw the loader). Relative paths would
+      # resolve per-process-cwd and fragment the store per worktree.
+      if [ -n "''${RIO_KACHE_CACHE_DIR:-}" ]; then
+        case "$RIO_KACHE_CACHE_DIR" in
+          /*) ;;
+          *)
+            echo "kache wrapper: ignoring relative RIO_KACHE_CACHE_DIR ($RIO_KACHE_CACHE_DIR) — use an absolute path" >&2
+            unset RIO_KACHE_CACHE_DIR
+            ;;
+        esac
+      fi
       if [ -n "''${RIO_KACHE_CACHE_DIR:-}" ]; then
         export KACHE_CACHE_DIR="$RIO_KACHE_CACHE_DIR"
       elif [ -n "''${HOME:-}" ]; then
@@ -467,7 +512,7 @@ let
             #     uniquely-rio path, not a generic flake-layout file
             #     another repo would also have.
             if [ -f "$rio_root/rio-buildhash/Cargo.toml" ] && [ -f "$rio_root/.env.local" ]; then
-              for kache_knob in KACHE_DISABLED KACHE_MAX_SIZE RIO_KACHE_CACHE_DIR; do
+              for kache_knob in KACHE_DISABLED RIO_KACHE_MAX_SIZE RIO_KACHE_CACHE_DIR; do
                 if [ -z "''${!kache_knob+x}" ]; then
                   kache_val="$(grep -E "^''${kache_knob}=" "$rio_root/.env.local" | tail -n1 | cut -d= -f2-)" || true
                   if [ -n "$kache_val" ]; then
@@ -480,31 +525,51 @@ let
                   fi
                 fi
               done
-              if grep -q '^KACHE_CACHE_DIR=' "$rio_root/.env.local"; then
-                echo "devshell: KACHE_CACHE_DIR in .env.local is no longer honored (foreign kache configs must not repoint our store) — rename it to RIO_KACHE_CACHE_DIR" >&2
+              if grep -qE '^(KACHE_CACHE_DIR|KACHE_MAX_SIZE)=' "$rio_root/.env.local"; then
+                echo "devshell: KACHE_CACHE_DIR/KACHE_MAX_SIZE in .env.local are no longer honored (foreign kache configs must not steer our store) — rename to RIO_KACHE_CACHE_DIR/RIO_KACHE_MAX_SIZE" >&2
               fi
               unset kache_knob kache_val
             fi
             # (b) Default-store epoch hygiene: seed this salt's stamp
             #     (the wrapper refreshes it on every compile — see job 4
             #     in kacheWrapped) and prune sibling epochs whose stamp
-            #     is 14+ days old. A dir missing its stamp is stamped
-            #     now, never deleted, so a recreated epoch cannot become
-            #     invisible to this GC. Skipped under RIO_KACHE_CACHE_DIR
-            #     (that store is user-managed). NUL-delimited: the paths
-            #     live under $HOME, which may contain spaces. (GNU find
-            #     -printf: Linux-only; harmless no-op elsewhere.)
+            #     is 14+ days old. Scope and safety rules:
+            #     - only 12-hex salt-shaped dirnames are pruned: a
+            #       relocated store a user parked under this root must
+            #       never be rm -rf'd (the wrapper only stamps the
+            #       default epoch, so such a store would look idle);
+            #     - a salt-shaped dir missing its stamp is stamped now,
+            #       never deleted (a recreated epoch cannot become
+            #       invisible to this GC);
+            #     - the prune runs even when RIO_KACHE_CACHE_DIR is set
+            #       (only the current-salt seeding is skipped) so
+            #       relocated users still age out their pre-relocation
+            #       epochs instead of leaking 256GiB dirs forever;
+            #     - every command is failure-guarded: a read-only HOME
+            #       or a racing sibling prune must not abort direnv's
+            #       strict-mode env load.
+            #     NUL-delimited (paths under $HOME may contain spaces);
+            #     GNU find -regex/-printf: Linux-only, harmless no-op
+            #     elsewhere.
+            rio_kache_root="$HOME/.cache/rio-build/kache"
             if [ -z "''${RIO_KACHE_CACHE_DIR:-}" ]; then
-              rio_kache_root="$HOME/.cache/rio-build/kache"
-              mkdir -p "$rio_kache_root/${kacheEnvSalt}"
-              touch "$rio_kache_root/${kacheEnvSalt}/.last-used"
+              { mkdir -p "$rio_kache_root/${kacheEnvSalt}" \
+                && touch "$rio_kache_root/${kacheEnvSalt}/.last-used"; } 2>/dev/null || true
+            fi
+            if [ -d "$rio_kache_root" ]; then
               for rio_epoch in "$rio_kache_root"/*/; do
+                rio_epoch_name="$(basename "$rio_epoch")"
+                case "$rio_epoch_name" in
+                  *[!0-9a-f]*) continue ;;
+                esac
+                [ "''${#rio_epoch_name}" -eq 12 ] || continue
                 [ -e "$rio_epoch.last-used" ] || touch "$rio_epoch.last-used" 2>/dev/null || true
               done
               find "$rio_kache_root" -mindepth 2 -maxdepth 2 -name .last-used \
+                -regextype posix-extended -regex '.*/[0-9a-f]{12}/\.last-used' \
                 -mtime +14 -printf '%h\0' 2>/dev/null | xargs -0 -r rm -rf -- || true
-              unset rio_epoch rio_kache_root
             fi
+            unset rio_epoch rio_epoch_name rio_kache_root
             ${preCommitInstall}
           '';
         }

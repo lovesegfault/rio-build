@@ -30,6 +30,12 @@ pub fn run() -> Result<()> {
     // input — so even the unmutated baseline lives in a keyspace no
     // normal build reads. Nothing here is ever a useful hit; don't let
     // it evict artifacts that are.
+    //
+    // No read-only-restore pre-clean is needed here (unlike regen
+    // sqlx): the cap-lints flag set changes cargo's -Cmetadata, so the
+    // baseline writes NEW filenames rather than overwriting kache's
+    // restored ones, and same-name rebuilds have cargo unlink stale
+    // outputs first — verified empirically on both shell toolchains.
     let _env = sh.push_env("KACHE_DISABLED", "1");
     crate::sh::run_interactive(cmd!(
         sh,
