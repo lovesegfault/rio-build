@@ -942,14 +942,134 @@ fn classify_restore_error(e: anyhow::Error) -> FetchError {
     }
 }
 
-/// Minimal netrc lookup, scoped by candidate provenance: an exact
-/// `machine` match (the URL's host) applies to any candidate; the
-/// `default` entry applies to operator-configured mirrors ONLY. A
+/// One parsed netrc entry: a `machine <name>` or `default` block plus
+/// whatever credentials followed it. `machine: None` is the `default`
+/// entry.
+#[derive(Debug, Default)]
+struct NetrcEntry {
+    machine: Option<String>,
+    login: Option<String>,
+    password: Option<String>,
+}
+
+/// Strict whitespace-token netrc parser: ONE cursor, and every keyword
+/// consumes its value in the same step (consume-on-key), so no token
+/// is ever scanned twice and a credential VALUE can never be re-read
+/// as a keyword or an entry delimiter. The oracle's delegated parser
+/// has the same consume shape for the tokens it understands —
+/// `login`/`password` values are stored by keyword state, never
+/// re-matched (curl `netrc.c:275-299`) — and recognizes keywords
+/// ASCII-case-insensitively (`curl_strequal`, `netrc.c:237-318`);
+/// values are taken verbatim.
+///
+/// Where the oracle is lenient, this parser fails closed; the
+/// divergence is deliberate and registered
+/// (`fetcher.divergence.netrc-strict-parse`):
+///
+/// - `macdef`: the macro body runs to a BLANK LINE (`netrc.c:153-156`),
+///   invisible to a whitespace tokenizer — tolerating it would feed
+///   macro text to the credential parser. Rejected.
+/// - quoted tokens: the oracle lexes quotes and escapes
+///   (`netrc.c:163-226`), which `split_whitespace` cannot reproduce;
+///   mis-splitting a quoted password silently truncates it. Rejected.
+/// - unknown tokens: the oracle skips them one at a time, which is
+///   exactly how an unrecognized value-carrying keyword corrupts the
+///   stream (under curl, `account password login Z` stores `login` as
+///   the password, `netrc.c:290-299`). Rejected — except `account`
+///   itself, a real netrc keyword whose value is consumed and ignored.
+// r[impl fetcher.divergence.netrc-strict-parse]
+fn parse_netrc(contents: &str) -> anyhow::Result<Vec<NetrcEntry>> {
+    // Quote rejection applies in EVERY token position, value positions
+    // included: the oracle would unquote `login "u"` to `u`, while a
+    // whitespace tokenizer would store the quotes verbatim — a silent
+    // credential mangle, not a parse. The two rejecters differ in what
+    // they may ECHO: parse errors flow into build-failure logs (tenant-
+    // and operator-visible via the call site's PermanentForCandidate
+    // context), so a token read at a VALUE position — which may BE a
+    // credential (`password "secret"`) — is never interpolated; the
+    // error names the keyword instead. Keyword/machine-name positions
+    // echo the token, which is what makes a typo diagnosable.
+    fn unquoted_keyword(tok: &str) -> anyhow::Result<&str> {
+        if tok.starts_with('"') {
+            anyhow::bail!(
+                "netrc: quoted token {tok:?} is not supported \
+                 (fetcher.divergence.netrc-strict-parse)"
+            );
+        }
+        Ok(tok)
+    }
+    fn unquoted_value<'t>(key: &str, tok: &'t str) -> anyhow::Result<&'t str> {
+        if tok.starts_with('"') {
+            anyhow::bail!(
+                "netrc: quoted value for `{key}` is not supported \
+                 (fetcher.divergence.netrc-strict-parse)"
+            );
+        }
+        Ok(tok)
+    }
+    let mut entries: Vec<NetrcEntry> = Vec::new();
+    let mut tokens = contents.split_whitespace();
+    while let Some(tok) = tokens.next() {
+        let tok = unquoted_keyword(tok)?;
+        // Keyword recognition is case-insensitive like the oracle's
+        // `curl_strequal`; the values consumed below stay verbatim.
+        match tok.to_ascii_lowercase().as_str() {
+            "machine" => {
+                let name = tokens
+                    .next()
+                    .map(unquoted_keyword)
+                    .transpose()?
+                    .context("netrc: `machine` is missing its host name")?;
+                entries.push(NetrcEntry {
+                    machine: Some(name.to_owned()),
+                    ..NetrcEntry::default()
+                });
+            }
+            "default" => entries.push(NetrcEntry::default()),
+            key @ ("login" | "password" | "account") => {
+                let value = tokens
+                    .next()
+                    .map(|t| unquoted_value(key, t))
+                    .transpose()?
+                    .with_context(|| format!("netrc: `{key}` is missing its value"))?;
+                let entry = entries.last_mut().with_context(|| {
+                    format!("netrc: `{key}` before any `machine`/`default` entry")
+                })?;
+                match key {
+                    "login" => entry.login = Some(value.to_owned()),
+                    "password" => entry.password = Some(value.to_owned()),
+                    // `account` is consumed — so its value cannot land
+                    // in keyword position — and ignored.
+                    _ => {}
+                }
+            }
+            "macdef" => anyhow::bail!(
+                "netrc: `macdef` is not supported — its body ends at a blank line, \
+                 which a whitespace tokenizer cannot see \
+                 (fetcher.divergence.netrc-strict-parse)"
+            ),
+            _ => anyhow::bail!(
+                "netrc: unrecognized token {tok:?} \
+                 (fetcher.divergence.netrc-strict-parse)"
+            ),
+        }
+    }
+    Ok(entries)
+}
+
+/// netrc lookup, scoped by candidate provenance: an exact `machine`
+/// match (the URL's host) applies to any candidate; the `default`
+/// entry applies to operator-configured mirrors ONLY. A
 /// tenant-controlled origin URL with no exact `machine` entry gets no
 /// credentials — the operator's catch-all secret must never travel to
-/// a host the tenant chose. Only the token forms emitted by real netrc
-/// writers are recognized (`machine X login Y password Z`, one or more
-/// per file, whitespace/newline separated).
+/// a host the tenant chose. Parsing is strict (see [`parse_netrc`]);
+/// `machine` matching folds ASCII case on both sides like the oracle's
+/// `curl_strequal(host, tok)` (`netrc.c:264`), because the URL host
+/// arrives lowercase-normalized from the URL parser and an uppercase
+/// `machine` entry must still match (`fetcher.netrc-host-case-fold`).
+/// This is the OPPOSITE posture from FOD hash-algo spellings, which
+/// are case-exact (`rio_nix::hash::OutputHashAlgo`) — different axes,
+/// no shared normalization helper.
 ///
 /// Deliberate divergence from CppNix, recorded: the oracle hands its
 /// netrc to curl with `CURL_NETRC_OPTIONAL`
@@ -964,6 +1084,7 @@ fn classify_restore_error(e: anyhow::Error) -> FetchError {
 /// {url}` log lines remain a status oracle for hosts the operator
 /// explicitly listed as exact `machine` entries — a per-host opt-in.
 // r[impl fetcher.fetchurl.netrc-origin-scope]
+// r[impl fetcher.netrc-host-case-fold]
 fn netrc_credentials(
     netrc: Option<&Path>,
     candidate: &Candidate,
@@ -975,42 +1096,29 @@ fn netrc_credentials(
     let Some(host) = host else { return Ok(None) };
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("reading netrc {}", path.display()))?;
+    let entries =
+        parse_netrc(&contents).with_context(|| format!("parsing netrc {}", path.display()))?;
 
-    let tokens: Vec<&str> = contents.split_whitespace().collect();
-    let mut default_entry: Option<(String, String)> = None;
-    let mut i = 0;
-    while i < tokens.len() {
-        let (machine, start) = match tokens[i] {
-            "machine" if i + 1 < tokens.len() => (Some(tokens[i + 1]), i + 2),
-            "default" => (None, i + 1),
-            _ => {
-                i += 1;
-                continue;
-            }
-        };
-        let mut login = None;
-        let mut password = None;
-        let mut j = start;
-        while j + 1 < tokens.len() {
-            match tokens[j] {
-                "login" => login = Some(tokens[j + 1].to_owned()),
-                "password" => password = Some(tokens[j + 1].to_owned()),
-                "machine" | "default" => break,
-                _ => {}
-            }
-            j += 2;
-        }
-        if let (Some(l), Some(p)) = (login, password) {
-            match machine {
-                Some(m) if m == host => return Ok(Some((l, p))),
-                None if default_entry.is_none() => default_entry = Some((l, p)),
-                _ => {}
-            }
-        }
-        i = start;
+    // Only a complete login+password pair authenticates; incomplete
+    // entries are inert (the oracle likewise reports success only once
+    // both are found, `netrc.c:325`).
+    let complete: Vec<&NetrcEntry> = entries
+        .iter()
+        .filter(|e| e.login.is_some() && e.password.is_some())
+        .collect();
+    let creds = |e: &NetrcEntry| Some((e.login.clone()?, e.password.clone()?));
+    if let Some(exact) = complete.iter().find(|e| {
+        e.machine
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case(&host))
+    }) {
+        return Ok(creds(exact));
     }
     match candidate.kind {
-        CandidateKind::Mirror => Ok(default_entry),
+        CandidateKind::Mirror => Ok(complete
+            .iter()
+            .find(|e| e.machine.is_none())
+            .and_then(|e| creds(e))),
         CandidateKind::Origin => Ok(None),
     }
 }
@@ -1175,6 +1283,117 @@ mod tests {
         assert_eq!(fallback, Some(("dlogin".into(), "dpass".into())));
         let exact = netrc_credentials(Some(f.path()), &mirror("https://mirror.example/x")).unwrap();
         assert_eq!(exact, Some(("alice".into(), "s3cret".into())));
+    }
+
+    /// THE bug_024 pin: URL parsers hand us a lowercase-normalized
+    /// host, so an upper/mixed-case `machine` entry must still match
+    /// (curl folds both layers via `curl_strequal`, `netrc.c:264`).
+    /// Keyword recognition folds too (`netrc.c:237-318`); credential
+    /// VALUES stay byte-exact.
+    // r[verify fetcher.netrc-host-case-fold]
+    #[test]
+    fn netrc_machine_match_folds_ascii_case() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "MACHINE Example.ORG LOGIN Alice PASSWORD S3cret").unwrap();
+        let lower = netrc_credentials(Some(f.path()), &origin("https://example.org/x")).unwrap();
+        assert_eq!(
+            lower,
+            Some(("Alice".into(), "S3cret".into())),
+            "mixed-case machine entry + folded keywords must match; values verbatim"
+        );
+        let upper = netrc_credentials(Some(f.path()), &origin("https://EXAMPLE.org/x")).unwrap();
+        assert_eq!(upper, Some(("Alice".into(), "S3cret".into())));
+    }
+
+    /// THE merged_bug_047 pin: one cursor, consume-on-key. Credential
+    /// VALUES that spell keywords (`machine`, `default`, `password`)
+    /// are consumed by their key and never re-enter keyword position:
+    /// no phantom entries, no cross-wired credentials, and no phantom
+    /// `default` leaking to an unmatched host.
+    // r[verify fetcher.divergence.netrc-strict-parse]
+    #[test]
+    fn netrc_values_never_reparsed_as_keywords() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "machine a.example login machine password default\n\
+             machine b.example login bob password pw"
+        )
+        .unwrap();
+        let a = netrc_credentials(Some(f.path()), &origin("https://a.example/x")).unwrap();
+        assert_eq!(a, Some(("machine".into(), "default".into())));
+        let b = netrc_credentials(Some(f.path()), &origin("https://b.example/x")).unwrap();
+        assert_eq!(b, Some(("bob".into(), "pw".into())));
+        // The VALUE "default" must not have minted a default entry.
+        let c = netrc_credentials(Some(f.path()), &mirror("https://c.example/x")).unwrap();
+        assert_eq!(c, None, "value-position `default` minted a phantom entry");
+    }
+
+    /// `account` is a real netrc keyword: its value is consumed (and
+    /// ignored), never left in keyword position. Under the oracle's
+    /// skip-unknown lexing, `account password login p` stores `login`
+    /// as the password (`netrc.c:290-299`) — here it parses cleanly.
+    // r[verify fetcher.divergence.netrc-strict-parse]
+    #[test]
+    fn netrc_account_value_is_consumed() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "machine a.example account password login u password p").unwrap();
+        let got = netrc_credentials(Some(f.path()), &origin("https://a.example/x")).unwrap();
+        assert_eq!(got, Some(("u".into(), "p".into())));
+    }
+
+    /// Strict-parse fail-closed arms: unknown tokens, `macdef`, quoted
+    /// tokens, a keyword at EOF, and credentials before any entry all
+    /// reject the whole file (the call site classifies the error
+    /// permanent — a malformed netrc parses the same way every time).
+    // r[verify fetcher.divergence.netrc-strict-parse]
+    #[test]
+    fn netrc_strict_parse_fails_closed() {
+        for (contents, needle) in [
+            (
+                "machine a.example port 8080 login u password p",
+                "unrecognized token \"port\"",
+            ),
+            ("macdef init\nlogin u password p", "macdef"),
+            (
+                "machine a.example login \"u\" password p",
+                "quoted value for `login`",
+            ),
+            (
+                "\"machine\" a.example login u password p",
+                "quoted token \"\\\"machine\\\"\"",
+            ),
+            ("machine a.example login", "`login` is missing its value"),
+            (
+                "login u password p",
+                "`login` before any `machine`/`default`",
+            ),
+            ("machine", "`machine` is missing its host name"),
+        ] {
+            let err = parse_netrc(contents).unwrap_err();
+            assert!(
+                format!("{err:#}").contains(needle),
+                "{contents:?}: expected {needle:?} in {err:#}"
+            );
+        }
+    }
+
+    /// The error-surface pin: a quoted CREDENTIAL is rejected without
+    /// echoing its bytes. Parse errors flow into build-failure logs
+    /// (PermanentForCandidate context, tenant- and operator-visible),
+    /// so a value-position token — which may BE a credential — is
+    /// never interpolated; the message names the keyword instead.
+    /// Keyword/machine-name positions still echo (typo diagnosis).
+    // r[verify fetcher.divergence.netrc-strict-parse]
+    #[test]
+    fn netrc_quoted_value_error_never_echoes_the_credential() {
+        let err = parse_netrc("machine a.example login u password \"hunter2\"").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("hunter2"),
+            "credential bytes leaked into the parse error: {msg}"
+        );
+        assert!(msg.contains("quoted value for `password`"), "{msg}");
     }
 
     /// All-candidates-skipped arm: an s3 origin with no mirrors still

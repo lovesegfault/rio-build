@@ -123,6 +123,50 @@ sources to the operator-configured map. Accepted residual: per-attempt
 HTTP status log lines remain a status oracle for the explicitly
 opted-in `machine` hosts.
 
+#r("fetcher.netrc-host-case-fold")[
+  netrc `machine` matching MUST compare the entry's host name against
+  the candidate URL's host ASCII-case-insensitively, and netrc keyword
+  recognition MUST be ASCII-case-insensitive, matching both layers of
+  the oracle's delegated parser (`curl_strequal` for keywords,
+  `netrc.c:237-318`, and for the host comparison, `netrc.c:264`).
+  Credential values MUST be used verbatim, never case-folded.
+]
+
+URL parsers normalize the host to lowercase before it reaches
+credential lookup, so a byte-equality comparison silently disables
+every `machine` entry an operator wrote in upper or mixed case --- the
+fetch proceeds unauthenticated and fails with an HTTP status that says
+nothing about netrc. Folding at the comparison (not at parse time)
+keeps stored values byte-faithful. This is the opposite posture from
+fixed-output hash-algorithm spellings, which are case-EXACT
+system-wide (#rref("nix.hash.algos+1")): the two axes answer to
+different oracles --- DNS-case-insensitive hostnames versus an
+exact-set parser --- and MUST NOT share a normalization helper.
+
+#r("fetcher.divergence.netrc-strict-parse")[
+  The netrc parser MUST consume each keyword's value in the same step
+  as its keyword --- one cursor, no token ever scanned twice, so a
+  credential value can never be re-interpreted as a keyword or an
+  entry delimiter --- and MUST fail closed, rejecting the whole file
+  with a permanent error, on `macdef`, on quoted tokens, and on any
+  token that is not a recognized keyword in keyword position. This
+  diverges from the oracle's delegated parser, which skips
+  unrecognized tokens and accepts macro definitions and quoted
+  strings.
+]
+
+The leniencies being refused are the oracle's own confusion channels:
+a skipped value-carrying keyword feeds its value back into keyword
+position (under curl's lexer, `account password login Z` stores
+`login` as the password, `netrc.c:290-299`); a `macdef` body ends at a
+blank line (`netrc.c:153-156`) that a whitespace tokenizer cannot see,
+so tolerating `macdef` would parse macro text as credentials; quoted
+tokens carry escape processing (`netrc.c:163-226`) whose silent
+mis-split truncates passwords. An operator netrc is a handful of
+`machine`/`login`/`password` triples --- rejecting the exotic forms
+loudly at first parse beats authenticating with mangled credentials or
+phantom `default` entries.
+
 #r("fetcher.divergence.s3-transport")[
   `s3://` URLs are not supported as a fetch transport (divergence from
   the oracle, which links aws-sdk). The limitation MUST be applied per
