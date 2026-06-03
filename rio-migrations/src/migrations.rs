@@ -1510,6 +1510,33 @@ pub const M_072: () = ();
 /// re-import the bug for the deploy's inherited rows).
 pub const M_073: () = ();
 
+/// `migrations/074_derivations_modular_hash_width.sql`
+///
+/// Two CHECK constraints pinning `derivations.ca_modular_hash` and
+/// `derivations.ca_modular_hash_stripped` to exactly 32 bytes (or
+/// NULL) — round-17 bug_091.
+///
+/// ## Why a width CHECK
+///
+/// The in-memory matcher's hash domain is `[u8; 32]`
+/// (`dag::modular_hash_evidence` treats any other width as ABSENT —
+/// no veto, no match), while the SQL settled-freeze guard compared
+/// raw bytea (`<>`): a wrong-width persisted blob vetoed in SQL and
+/// was invisible in memory — the parity-enforced twin DIVERGED on a
+/// population neither side was supposed to host. Rather than
+/// transcribing width arithmetic into every future hash comparison,
+/// the CHECKs make the out-of-domain population UNREPRESENTABLE: the
+/// freeze guard's `octet_length(...) = 32` conditions are
+/// belt-and-suspenders over a domain the schema now owns.
+///
+/// ## No backfill, by policy
+///
+/// Wipe-deploy: no deployed database holds wrong-width rows (every
+/// production writer binds `[u8; 32]`); the CHECK validates existing
+/// rows on apply, so a hypothetical out-of-domain row fails the
+/// migration loudly instead of lurking.
+pub const M_074: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

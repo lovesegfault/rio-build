@@ -464,8 +464,18 @@ impl SchedulerDb {
                        ARRAY(SELECT unnest(EXCLUDED.output_names) ORDER BY 1)
                     OR derivations.is_fixed_output IS DISTINCT FROM EXCLUDED.is_fixed_output
                     OR derivations.is_ca IS DISTINCT FROM EXCLUDED.is_ca
+                    -- r[impl sched.persist.settled-identity-freeze+4]
+                    -- Width-transcribed (round-17 bug_091, M_074): the
+                    -- matcher's hash domain is exactly 32 bytes — any
+                    -- other width is ABSENT there, so it must be
+                    -- absent here too. M_074's CHECKs make the
+                    -- out-of-domain population unrepresentable; these
+                    -- conditions keep the twin verbatim-derivable from
+                    -- the matcher regardless.
                     OR (derivations.ca_modular_hash IS NOT NULL
                         AND EXCLUDED.ca_modular_hash IS NOT NULL
+                        AND octet_length(derivations.ca_modular_hash) = 32
+                        AND octet_length(EXCLUDED.ca_modular_hash) = 32
                         AND derivations.ca_modular_hash <> EXCLUDED.ca_modular_hash)
                     OR EXISTS (
                         SELECT 1

@@ -2555,3 +2555,56 @@ async fn test_settled_freeze_guard_matches_matcher_axis_by_axis() -> anyhow::Res
     }
     Ok(())
 }
+
+// r[verify sched.persist.settled-identity-freeze+4]
+/// Round-17 bug_091 / M_074: the persisted modular-hash width domain
+/// is schema-owned. Raw SQL (the only writer class that could ever
+/// produce a wrong width — every production binding is `[u8; 32]`)
+/// is rejected by the CHECKs, in both columns, so the matcher's
+/// 32-byte domain and the SQL twin's can never diverge on a
+/// population that exists.
+#[tokio::test]
+async fn modular_hash_width_checks_reject_out_of_domain_raw_sql() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    let _ = super::insert_test_derivation(&db, "width-pin").await?;
+
+    type Q = (&'static str, &'static str, &'static str);
+    let cols: [Q; 2] = [
+        (
+            "live",
+            "UPDATE derivations SET ca_modular_hash = $2 WHERE drv_hash = $1",
+            "UPDATE derivations SET ca_modular_hash = NULL WHERE drv_hash = $1",
+        ),
+        (
+            "preserved",
+            "UPDATE derivations SET ca_modular_hash_stripped = $2 WHERE drv_hash = $1",
+            "UPDATE derivations SET ca_modular_hash_stripped = NULL WHERE drv_hash = $1",
+        ),
+    ];
+    for (label, set_q, null_q) in cols {
+        for width in [16usize, 31, 33] {
+            let res = sqlx::query(set_q)
+                .bind("width-pin")
+                .bind(vec![0xABu8; width])
+                .execute(&test_db.pool)
+                .await;
+            let err = res.expect_err(&format!("{label} column must reject {width} bytes"));
+            assert!(
+                err.to_string().contains("width"),
+                "{label}/{width}: CHECK names the width constraint; got: {err}"
+            );
+        }
+        // 32 bytes and NULL both pass.
+        sqlx::query(set_q)
+            .bind("width-pin")
+            .bind(vec![0xABu8; 32])
+            .execute(&test_db.pool)
+            .await?;
+        sqlx::query(null_q)
+            .bind("width-pin")
+            .execute(&test_db.pool)
+            .await?;
+    }
+    Ok(())
+}
