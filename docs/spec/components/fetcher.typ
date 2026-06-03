@@ -211,6 +211,34 @@ previous, branch-local hand cleanup was exactly one fallible step too
 narrow: a chmod failure after a successful unpack stranded the
 fully-restored tree.
 
+#r("fetcher.fetchurl.permanence-at-source")[
+  Every fetch failure MUST be classified transient or
+  permanent-for-candidate at the statement that produces it, with the
+  classification derived from that statement's own failure mode --- a
+  boundary `map_err` over a composite multi-source call is forbidden
+  (it re-creates the default bucket the closed permanence enum exists
+  to eliminate). Where one statement's error value interleaves several
+  sources (the unpack restore: payload decode, worker-filesystem I/O,
+  budget exhaustion), the producing function MUST discriminate them
+  structurally --- typed exhaustion by downcast, worker-local
+  filesystem faults by errno presence --- never by matching error
+  text. A deterministic precondition failure (an https candidate in a
+  sandbox with no CA roots, where no attempt can ever verify a
+  certificate) is permanent for the candidate even when it surfaces
+  through a normally-transient transport step.
+]
+
+The motivating regression (round-16 merged_bug_068) had both polarity
+errors at once: a blanket `map_err(PermanentForCandidate)` on the
+whole finalize denied retries to transient `ENOSPC`/`EIO` restore
+faults that the identical download-phase fault would have retried,
+while every `send()` error --- including the deterministic no-roots
+https case the error text itself special-cased --- burned the full
+attempt-and-backoff ladder as "transient". Errno presence is the
+decode/fs discriminator because the decode-side wrappers (xz
+`InvalidData`, the metered-read cap wrapper) carry no OS errno, while
+genuine worker filesystem faults always do.
+
 The cadence and the cap are pinned at the unit level (injected-writer
 cadence, over-cap permanence on both paths, bomb no-retry,
 truncated-transient). The end-to-end composition --- progress line →

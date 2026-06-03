@@ -280,6 +280,25 @@ impl FetchError {
     }
 }
 
+/// Typed budget-exhaustion failure, produced INSIDE
+/// [`TransferMeter::charge`] — the statement that detects it — so every
+/// downstream classification site identifies exhaustion by DOWNCAST,
+/// never by string-matching an error message. Exhaustion is permanent
+/// for the candidate (the same payload exhausts the same budget every
+/// retry); carrying that fact as a type is what lets the unpack
+/// restore's error chain distinguish "the payload is over budget"
+/// (permanent) from "the worker's disk hiccuped" (transient errno)
+/// at the statement that produced each.
+// r[impl fetcher.fetchurl.permanence-at-source]
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{what} exceeded the {cap}-byte per-attempt transfer cap (decompression bomb or unbounded body?)"
+)]
+struct CapExhausted {
+    what: &'static str,
+    cap: u64,
+}
+
 /// Typed per-attempt transfer budget: every byte path charges it, and
 /// it owns the progress cadence — there is no way to move payload
 /// bytes without metering them, because both copy loops read through
@@ -347,22 +366,22 @@ impl TransferMeter {
     }
 
     /// Charge `n` transferred bytes: emit any crossed progress marks,
-    /// fail when the budget is exhausted.
+    /// fail when the budget is exhausted. The only failure is the typed
+    /// [`CapExhausted`] — classification happens where the failure is
+    /// produced, not at a caller boundary.
     // r[impl fetcher.fetchurl.transfer-cap+2]
     // r[impl fetcher.fetchurl.transfer-progress]
-    fn charge(&mut self, n: u64) -> anyhow::Result<()> {
+    fn charge(&mut self, n: u64) -> Result<(), CapExhausted> {
         self.total = self.total.saturating_add(n);
         while self.total >= self.next_mark {
             (self.emit)(self.total);
             self.next_mark = self.next_mark.saturating_add(PROGRESS_INTERVAL_BYTES);
         }
         if self.total > self.cap {
-            bail!(
-                "{} exceeded the {}-byte per-attempt transfer cap \
-                 (decompression bomb or unbounded body?)",
-                self.what,
-                self.cap
-            );
+            return Err(CapExhausted {
+                what: self.what,
+                cap: self.cap,
+            });
         }
         Ok(())
     }
@@ -380,6 +399,8 @@ struct MeteredRead<R> {
 impl<R: std::io::Read> std::io::Read for MeteredRead<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
+        // The typed CapExhausted rides the io chain as the source so
+        // the restore-site classifier can downcast it back out.
         self.meter.charge(n as u64).map_err(std::io::Error::other)?;
         Ok(n)
     }
@@ -601,12 +622,21 @@ async fn try_fetch_one(
     {
         req = req.basic_auth(user, Some(pass));
     }
-    // Transport errors (DNS, connect, TLS, read timeout): transient.
+    // Transport errors (DNS, connect, TLS, read timeout): transient —
+    // EXCEPT an https candidate when the sandbox has no CA roots. With
+    // no roots the verifier rejects every certificate, so no https
+    // attempt can ever succeed in this sandbox: the failure is
+    // deterministic for the candidate regardless of which transport
+    // step surfaced it, and burning the full attempt/backoff ladder on
+    // it is pure waste. Classified at this statement (the predicate is
+    // a property of the request being made, not of the error text).
+    // r[impl fetcher.fetchurl.permanence-at-source]
+    let https_without_roots = url.starts_with("https://") && !tls_roots_available;
     let resp = req
         .send()
         .await
         .with_context(|| {
-            if url.starts_with("https://") && !tls_roots_available {
+            if https_without_roots {
                 format!(
                     "request failed (https URL, but no CA roots are available in the \
                      sandbox: configure RIO_CA_BUNDLE on the worker so a bundle is \
@@ -616,7 +646,11 @@ async fn try_fetch_one(
                 "request failed".to_string()
             }
         })
-        .map_err(FetchError::Transient)?;
+        .map_err(if https_without_roots {
+            FetchError::PermanentForCandidate
+        } else {
+            FetchError::Transient
+        })?;
     let status = resp.status();
     if !status.is_success() {
         let err = anyhow::anyhow!("HTTP {status} from {url}");
@@ -661,15 +695,19 @@ async fn try_fetch_one(
         return Err(e);
     }
 
-    // Finalize failures (bad NAR / bad xz / chmod) are deterministic
-    // for THESE bytes: permanent for this candidate; the next candidate
-    // may serve different (correct) bytes.
+    // Finalize classifies its own failures at the statements that
+    // produce them (payload-decode → permanent for these bytes;
+    // worker-local output-tree I/O → transient): no boundary map_err
+    // here — the deleted blanket `map_err(PermanentForCandidate)` was
+    // exactly the default bucket the FetchError contract forbids, and
+    // it skipped retries for ENOSPC/EIO faults that the identical
+    // download-phase fault would have retried.
     let finalize = finalize_output(&tmp, params, meter).await;
     // The temp file is consumed by rename on the plain path; on the
     // unpack path (and on any failure) it must not linger in the store
     // scratch where the output scan would reject it as a stray.
     let _ = tokio::fs::remove_file(&tmp).await;
-    finalize.map_err(FetchError::PermanentForCandidate)
+    finalize
 }
 
 /// Stream an HTTP response body to `dest`.
@@ -696,7 +734,7 @@ async fn download_to(
             .map_err(FetchError::Transient)?;
         meter
             .charge(chunk.len() as u64)
-            .map_err(FetchError::PermanentForCandidate)?;
+            .map_err(|e| FetchError::PermanentForCandidate(e.into()))?;
         file.write_all(&chunk)
             .await
             .context("writing download")
@@ -720,7 +758,7 @@ async fn finalize_output(
     tmp: &Path,
     params: &FetchurlParams,
     meter: TransferMeter,
-) -> anyhow::Result<()> {
+) -> Result<(), FetchError> {
     // Attempt atomicity is the FUNCTION's property, not each step's:
     // the guard arms over the output path for the whole fallible scope
     // and is disarmed only after every step — including the trailing
@@ -738,11 +776,18 @@ async fn finalize_output(
     // inside the process, which makes attempt-atomicity rio-owned.
     let guard = FreshOutput::arm(&params.output);
     if params.unpack {
+        // Already classified per source inside (decode → permanent,
+        // worker fs errno → transient, cap exhaustion → permanent).
         restore_unpacked(tmp, params, meter).await?;
     } else {
+        // Worker-local output-tree I/O: ENOSPC/EIO/EROFS here is the
+        // worker's disk, not the payload — the identical fault during
+        // the download phase is retried, so this one is too.
+        // r[impl fetcher.fetchurl.permanence-at-source]
         tokio::fs::rename(tmp, &params.output)
             .await
-            .with_context(|| format!("renaming download to {}", params.output.display()))?;
+            .with_context(|| format!("renaming download to {}", params.output.display()))
+            .map_err(FetchError::Transient)?;
     }
     // CppNix's builtinFetchurl applies the `executable = "1"` chmod 0755
     // to the output path AFTER either branch (restorePath for unpack,
@@ -752,10 +797,12 @@ async fn finalize_output(
     // declaring both `unpack = true` and `executable = true` must get the
     // same bit Nix would give it.
     if params.executable {
+        // Same class as the rename: worker-local fs metadata I/O.
         let perms = std::fs::Permissions::from_mode(0o755);
         tokio::fs::set_permissions(&params.output, perms)
             .await
-            .context("chmod 0755 on executable output")?;
+            .context("chmod 0755 on executable output")
+            .map_err(FetchError::Transient)?;
     }
     guard.disarm();
     Ok(())
@@ -809,13 +856,15 @@ async fn restore_unpacked(
     tmp: &Path,
     params: &FetchurlParams,
     mut meter: TransferMeter,
-) -> anyhow::Result<()> {
+) -> Result<(), FetchError> {
     use async_compression::tokio::bufread::XzDecoder;
     use tokio::io::BufReader;
 
+    // Worker-local fs read of our own temp file: transient.
     let file = tokio::fs::File::open(tmp)
         .await
-        .with_context(|| format!("opening {}", tmp.display()))?;
+        .with_context(|| format!("opening {}", tmp.display()))
+        .map_err(FetchError::Transient)?;
     let buf = BufReader::new(file);
 
     // The reader chain is built here (async context) and then driven
@@ -851,8 +900,42 @@ async fn restore_unpacked(
             .with_context(|| format!("restoring NAR to {}", dest.display()))
     })
     .await
-    .context("NAR restore task panicked")??;
+    .context("NAR restore task panicked")
+    .map_err(FetchError::Transient)?
+    .map_err(classify_restore_error)?;
     Ok(())
+}
+
+/// Classify a restore failure AT ITS PRODUCING FUNCTION by walking the
+/// error chain — the restore is one statement whose single error value
+/// interleaves three distinct sources, and each keeps its own
+/// permanence:
+///
+/// - typed [`CapExhausted`] (riding the metered read's io chain): the
+///   payload's nature — permanent for the candidate;
+/// - an `io::Error` carrying a REAL errno (`ENOSPC`/`EIO`/`EROFS`/… —
+///   `raw_os_error().is_some()`): the worker's filesystem — transient,
+///   exactly like the identical fault during the download phase
+///   (decode-side wrappers — xz `InvalidData`, the metered-read
+///   wrapper — carry no errno, so errno presence discriminates);
+/// - everything else (xz format errors, NAR structure errors):
+///   deterministic for these bytes — permanent for the candidate.
+// r[impl fetcher.fetchurl.permanence-at-source]
+fn classify_restore_error(e: anyhow::Error) -> FetchError {
+    if e.chain()
+        .any(|c| c.downcast_ref::<CapExhausted>().is_some())
+    {
+        return FetchError::PermanentForCandidate(e);
+    }
+    let has_errno = e
+        .chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+        .any(|io| io.raw_os_error().is_some());
+    if has_errno {
+        FetchError::Transient(e)
+    } else {
+        FetchError::PermanentForCandidate(e)
+    }
 }
 
 /// Minimal netrc lookup, scoped by candidate provenance: an exact
@@ -1533,6 +1616,104 @@ mod tests {
         assert!(
             hits.load(Ordering::SeqCst) >= 2,
             "the truncated attempt must be retried"
+        );
+    }
+
+    /// The restore classifier's three arms, each pinned on the chain
+    /// shape the real flow produces (round-16 merged_bug_068): typed
+    /// cap exhaustion → permanent; a real errno (worker fs) →
+    /// transient; decode/structure errors (no errno) → permanent.
+    // r[verify fetcher.fetchurl.permanence-at-source]
+    #[test]
+    fn restore_classifier_discriminates_at_source() {
+        // Cap exhaustion rides the metered-read io chain.
+        let cap_chain: anyhow::Error = anyhow::Error::from(rio_nix::nar::NarError::Io(
+            std::io::Error::other(CapExhausted {
+                what: "unpack",
+                cap: 64,
+            }),
+        ))
+        .context("restoring NAR to /out");
+        assert!(
+            matches!(
+                classify_restore_error(cap_chain),
+                FetchError::PermanentForCandidate(_)
+            ),
+            "cap exhaustion is the payload's nature — permanent"
+        );
+
+        // A genuine worker-fs fault carries an errno.
+        let fs_chain: anyhow::Error = anyhow::Error::from(rio_nix::nar::NarError::Io(
+            std::io::Error::from_raw_os_error(libc::ENOSPC),
+        ))
+        .context("restoring NAR to /out");
+        assert!(
+            matches!(classify_restore_error(fs_chain), FetchError::Transient(_)),
+            "ENOSPC during restore is the worker's disk — transient, \
+             like the identical fault during download"
+        );
+
+        // NAR structure errors are deterministic for these bytes.
+        let decode_chain: anyhow::Error =
+            anyhow::Error::from(rio_nix::nar::NarError::InvalidMagic("nope".into()))
+                .context("restoring NAR to /out");
+        assert!(
+            matches!(
+                classify_restore_error(decode_chain),
+                FetchError::PermanentForCandidate(_)
+            ),
+            "bad NAR bytes are permanent for the candidate"
+        );
+    }
+
+    /// The no-roots https predicate classifies at the producing
+    /// statement: with no CA roots in the sandbox no https attempt can
+    /// ever verify a certificate, so the send failure is permanent for
+    /// the candidate (one attempt, no backoff ladder); the same
+    /// transport failure WITH roots available stays transient.
+    // r[verify fetcher.fetchurl.permanence-at-source]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn https_without_roots_is_permanent_for_candidate() {
+        // A listener that accepts and immediately closes: any https
+        // handshake against it dies at the transport layer.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, _) = listener.accept().await.unwrap();
+                drop(sock);
+            }
+        });
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let mut p = params(&format!("https://{addr}/x"), &[]);
+        p.mirrors.clear();
+        p.output = out_dir.path().join("https-out");
+        let candidates = p.candidates();
+        let candidate = &candidates[0];
+
+        // No CA bundle anywhere: build with the no-trust config.
+        let (client, roots) = build_client(Path::new("/nonexistent/ca-bundle.crt")).unwrap();
+        assert!(!roots, "test premise: no roots loaded");
+
+        let err = try_fetch_one(&client, candidate, &p, false)
+            .await
+            .expect_err("https with no roots must fail");
+        assert!(
+            matches!(err, FetchError::PermanentForCandidate(_)),
+            "no-roots https is deterministic for the candidate: {:#}",
+            err.into_inner()
+        );
+
+        // Same failure with roots claimed available: transient (the
+        // transport may genuinely recover).
+        let err = try_fetch_one(&client, candidate, &p, true)
+            .await
+            .expect_err("handshake against a closing socket fails");
+        assert!(
+            matches!(err, FetchError::Transient(_)),
+            "with roots available the transport failure stays transient: {:#}",
+            err.into_inner()
         );
     }
 
