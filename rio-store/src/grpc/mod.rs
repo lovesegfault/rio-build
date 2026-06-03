@@ -146,6 +146,11 @@ pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Stat
             Status::aborted("upload placeholder concurrently deleted; retry")
         }
         M::CorruptManifest { .. } => Status::data_loss("stored manifest data is corrupt"),
+        // Transient chunk-backend failure (round-16 bug_027): retriable
+        // UNAVAILABLE, derived from the variant — NEVER conflated with
+        // the data-integrity verdicts below.
+        M::ChunkBackend(_) => Status::unavailable("chunk backend unavailable; retry"),
+        M::DataLoss(_) => Status::data_loss("stored chunk data is lost or corrupt"),
         // Backpressure: PG pool exhausted, signature count cap, etc.
         // Client should retry with backoff. Distinct from Connection
         // (unavailable → try-another-replica): this is "slow down",
@@ -172,9 +177,12 @@ pub(crate) fn putpath_metadata_status(context: &str, e: metadata::MetadataError)
         M::PlaceholderMissing { .. } => Some("placeholder_missing"),
         M::Connection(_) => Some("connection"),
         M::ResourceExhausted(_) => Some("resource_exhausted"),
+        // Transient chunk-backend failure → unavailable → the worker
+        // upload loop retries it (round-16 bug_027 split).
+        M::ChunkBackend(_) => Some("chunk_backend"),
         // Non-retriable (NotFound/Conflict/Invariant/Malformed/Corrupt/
-        // Other) — not counted; the client won't retry an `internal`/
-        // `data_loss`/`already_exists`.
+        // DataLoss/Other) — not counted; the client won't retry an
+        // `internal`/`data_loss`/`already_exists`.
         _ => None,
     };
     if let Some(reason) = reason {

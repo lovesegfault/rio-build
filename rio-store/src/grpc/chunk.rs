@@ -93,6 +93,12 @@ impl ChunkService for ChunkServiceImpl {
                     "chunk {} failed BLAKE3 verification: {e}",
                     hex::encode(hash)
                 )),
+                // Transient backend failure (round-16 bug_027): retriable,
+                // says nothing about the chunk's existence.
+                ChunkError::Backend { .. } => Status::unavailable(format!(
+                    "chunk {} backend fetch failed; retry: {e}",
+                    hex::encode(hash)
+                )),
             }
         })?;
 

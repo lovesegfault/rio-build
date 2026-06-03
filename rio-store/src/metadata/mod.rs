@@ -739,6 +739,8 @@ mod tests {
                 },
             ),
             MetadataError::ResourceExhausted(s) => MetadataError::ResourceExhausted(s.clone()),
+            MetadataError::ChunkBackend(s) => MetadataError::ChunkBackend(s.clone()),
+            MetadataError::DataLoss(s) => MetadataError::DataLoss(s.clone()),
             MetadataError::Other(_) => MetadataError::Other(sqlx::Error::RowNotFound),
             MetadataError::RealisationConflict {
                 drv_hash,

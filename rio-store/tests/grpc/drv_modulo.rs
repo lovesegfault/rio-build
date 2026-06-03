@@ -947,6 +947,54 @@ mod proof_walk {
             "chunk fetches are charged: {}",
             report.work_used
         );
+
+        // bug_027 wire-class pin: the SAME chunked fixture walked
+        // through an ERRORING backend (S3 outage class) must surface
+        // the transient chunk-backend error — an infrastructure Err,
+        // never an absence verdict, never the corruption/data-loss
+        // class that pre-fix told operators bytes were lost.
+        struct OutageBackend;
+        #[async_trait::async_trait]
+        impl ChunkBackend for OutageBackend {
+            async fn put(&self, _h: &[u8; 32], _d: bytes::Bytes) -> anyhow::Result<()> {
+                anyhow::bail!("put not under test")
+            }
+            async fn get(&self, _h: &[u8; 32]) -> anyhow::Result<Option<bytes::Bytes>> {
+                anyhow::bail!("simulated S3 outage")
+            }
+            async fn exists_batch(&self, hashes: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
+                Ok(vec![false; hashes.len()])
+            }
+            fn key_for(&self, hash: &[u8; 32]) -> String {
+                hex::encode(hash)
+            }
+            async fn delete_by_key(&self, _k: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        sqlx::query("DELETE FROM drv_modulo_cache")
+            .execute(&s.db.pool)
+            .await?;
+        let outage_cache = std::sync::Arc::new(rio_store::cas::ChunkCache::new(
+            std::sync::Arc::new(OutageBackend) as std::sync::Arc<dyn ChunkBackend>,
+        ));
+        let err = proof_walk_for_tests(
+            &s.db.pool,
+            Some(&outage_cache),
+            &drv_path,
+            PROOF_WALK_WORK_MAX_FOR_TESTS,
+        )
+        .await
+        .expect_err("backend outage must be an infrastructure Err, not a verdict");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("chunk backend unavailable"),
+            "transient class carried (got: {msg})"
+        );
+        assert!(
+            !msg.contains("data loss") && !msg.contains("corrupt"),
+            "an S3 blip must not read as corruption/data loss (got: {msg})"
+        );
         Ok(())
     }
 }

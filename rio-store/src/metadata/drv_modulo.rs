@@ -716,12 +716,12 @@ enum FetchedDrv {
 /// `Err(InvariantViolation)` (text-CA-gated at ingestion, so THAT one
 /// is row corruption, not absence).
 ///
-/// Honest caveat (round-16 bug_027): the chunk-FETCH error below is
-/// currently also wrapped as `InvariantViolation`, conflating
-/// transient chunk-backend failures (S3 blips, timeouts) with
-/// corruption — callers and operators must not read that variant as
-/// proof of data loss until the typed `ChunkError` split lands in the
-/// proof-walk work.
+/// Chunk-fetch failures map PER VARIANT at the producing statement
+/// (round-16 bug_027): a transient backend failure (S3 blip, timeout,
+/// task panic) is `ChunkBackend` (UNAVAILABLE — retry); an
+/// authoritative not-found for a manifest-referenced chunk, or a
+/// content-verification failure, is `DataLoss` (DATA_LOSS — the
+/// manifest's claim is broken). Neither is ever an absence verdict.
 async fn own_drv_bytes(
     pool: &PgPool,
     chunks: Option<&crate::cas::ChunkCache>,
@@ -761,10 +761,16 @@ async fn own_drv_bytes(
                 if budget.charge(1).is_err() {
                     return Ok(FetchedDrv::OverBudget);
                 }
-                let chunk = cache.get_verified(hash).await.map_err(|e| {
-                    super::MetadataError::InvariantViolation(format!(
-                        "chunk fetch failed reassembling .drv {drv_path}: {e}"
-                    ))
+                let chunk = cache.get_verified(hash).await.map_err(|e| match e {
+                    crate::cas::ChunkError::Backend { .. } => super::MetadataError::ChunkBackend(
+                        format!("reassembling .drv {drv_path}: {e}"),
+                    ),
+                    crate::cas::ChunkError::NotFound(_)
+                    | crate::cas::ChunkError::Corrupt { .. } => {
+                        super::MetadataError::DataLoss(format!(
+                            "manifest-referenced chunk failed reassembling .drv {drv_path}: {e}"
+                        ))
+                    }
                 })?;
                 nar.extend_from_slice(&chunk);
             }

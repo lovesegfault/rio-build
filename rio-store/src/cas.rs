@@ -568,25 +568,32 @@ pub struct ChunkCache {
     /// spawned task — spawning means even if the first caller is
     /// cancelled, the fetch runs to completion for the N-1 others.
     ///
-    /// Output is `Option<Bytes>`: None covers both "not found" and
-    /// "backend error / task panic" (both log, then return None so
-    /// singleflight cleanup is uniform). Callers that need the
-    /// distinction... don't, actually: both mean "couldn't get the
-    /// chunk". The log captures which for operators.
+    /// Output is `Result<Option<Bytes>, String>`: `Ok(None)` is the
+    /// backend's authoritative not-found; `Err` is a backend error or
+    /// task panic. The distinction is load-bearing (round-16 bug_027):
+    /// callers stamp `NotFound` as data-loss/corruption verdicts, so a
+    /// transient S3 blip must surface as the retriable
+    /// [`ChunkError::Backend`] instead.
     ///
     /// Why BoxFuture instead of `Shared<JoinHandle<...>>` directly:
     /// Shared requires Output: Clone. JoinHandle's output is
     /// `Result<T, JoinError>`; JoinError isn't Clone. So we map the
-    /// JoinHandle through `.ok().flatten()` BEFORE sharing — the
-    /// mapped future's output is `Option<Bytes>`, which IS Clone.
-    /// BoxFuture erases the unnamable `Map<JoinHandle, closure>` type.
+    /// JoinHandle into `Result<Option<Bytes>, String>` BEFORE sharing —
+    /// the mapped output IS Clone. BoxFuture erases the unnamable
+    /// `Map<JoinHandle, closure>` type.
     inflight: DashMap<[u8; 32], InflightFetch>,
 }
 
 /// The Shared-future type stored in `inflight`. Type alias because the
 /// full type is 3 lines of generics that would obscure the struct.
-type InflightFetch =
-    futures_util::future::Shared<futures_util::future::BoxFuture<'static, Option<Bytes>>>;
+///
+/// Output: `Ok(None)` = backend authoritatively says not-found;
+/// `Err(message)` = backend ERROR or task panic (transient — the
+/// `String` is the `Clone`-able error carrier `Shared` requires).
+/// The two were previously conflated into `None` (round-16 bug_027).
+type InflightFetch = futures_util::future::Shared<
+    futures_util::future::BoxFuture<'static, Result<Option<Bytes>, String>>,
+>;
 
 /// Default LRU capacity: 2 GiB. Configurable via `ChunkCache::with_capacity`.
 ///
@@ -595,12 +602,18 @@ type InflightFetch =
 /// smaller deployments, `with_capacity(256 * 1024 * 1024)` is plenty.
 const DEFAULT_CACHE_CAPACITY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Error from `ChunkCache::get_verified`.
+/// Error from `ChunkCache::get_verified`. Three variants, three wire
+/// codes (round-16 bug_027; pattern R1 — an error variant whose
+/// producers span transient and permanent causes is split, with the
+/// code DERIVED from the variant): `NotFound`/`Corrupt` are
+/// data-integrity verdicts (`DATA_LOSS`-class, retrying is pointless);
+/// `Backend` is transient infrastructure (`UNAVAILABLE`-class, retry).
 #[derive(Debug, thiserror::Error)]
 pub enum ChunkError {
-    /// Backend returned None — chunk not in S3. If the manifest says
-    /// this hash exists, this is data loss. Caller should propagate as
-    /// a hard error (not retry — retrying NotFound is pointless).
+    /// Backend AUTHORITATIVELY returned None — the object is not in
+    /// S3. If the manifest says this hash exists, this is data loss.
+    /// Caller should propagate as a hard error (not retry — retrying
+    /// NotFound is pointless).
     #[error("chunk {} not found in backend (data loss if manifest claims it exists)", hex::encode(.0))]
     NotFound([u8; 32]),
 
@@ -613,6 +626,14 @@ pub enum ChunkError {
         expected: [u8; 32],
         actual: [u8; 32],
     },
+
+    /// The backend ERRORED (S3 5xx/timeout/connect failure) or the
+    /// fetch task panicked — nothing is known about the object's
+    /// existence. Transient: retry. MUST NOT be read as data loss
+    /// (the round-16 bug_027 conflation: this used to surface as
+    /// `NotFound`).
+    #[error("chunk {} backend fetch failed (transient): {message}", hex::encode(.hash))]
+    Backend { hash: [u8; 32], message: String },
 }
 
 impl ChunkCache {
@@ -721,9 +742,10 @@ impl ChunkCache {
 
     /// Singleflight: either await an in-progress fetch or start a new one.
     ///
-    /// Returns `Option<Bytes>` from the backend (None = NotFound).
-    /// Errors from the backend propagate through; the inflight entry
-    /// is cleaned up so the next call retries.
+    /// Returns `Ok(None)` ONLY for the backend's authoritative
+    /// not-found; backend errors / task panics are
+    /// [`ChunkError::Backend`] (transient). The inflight entry is
+    /// cleaned up either way so the next call retries.
     async fn singleflight_fetch(&self, hash: &[u8; 32]) -> Result<Option<Bytes>, ChunkError> {
         // Check-then-insert with entry API. DashMap's entry() locks the
         // shard for this key, so two concurrent callers racing on the
@@ -742,35 +764,41 @@ impl ChunkCache {
                 let h = *hash;
                 // Spawn + map + boxed + shared:
                 // - spawn: fetch survives first-caller cancellation
-                // - map: JoinHandle's Result<Opt,JoinError> → Opt (JoinError
-                //   isn't Clone, so Shared can't hold it; .ok().flatten()
-                //   turns panic → None, same as backend error → None)
-                // - boxed: erase the unnamable Map<JoinHandle,closure> type
-                //   so it fits InflightFetch
+                // - map: JoinHandle's Result<Result<Opt,String>,JoinError>
+                //   → Result<Opt,String> (neither JoinError nor
+                //   anyhow::Error is Clone, so Shared carries the error
+                //   as its Display string; producing-statement
+                //   construction per R1(e) — backend error and task
+                //   panic each map at their own statement)
+                // - boxed: erase the unnamable Map<JoinHandle,closure>
+                //   type so it fits InflightFetch
                 // - shared: N callers await the same result
                 //
-                // Error is logged inside the task. None here conflates
-                // "not found" with "backend error" with "task panicked"
-                // — all three mean "couldn't get the chunk"; the log
-                // distinguishes them for operators. Callers retry
-                // uniformly (inflight cleanup below runs either way).
+                // Ok(None) is ONLY the backend's authoritative
+                // not-found; errors/panics are Err (round-16 bug_027 —
+                // the previous None-conflation surfaced S3 blips as
+                // data-loss-class NotFound). Inflight cleanup below
+                // runs either way.
                 tokio::spawn(async move {
                     match backend.get(&h).await {
-                        Ok(opt) => opt,
+                        Ok(opt) => Ok(opt),
                         Err(e) => {
                             warn!(hash = %hex::encode(h), error = %e,
                                   "chunk backend fetch failed");
-                            None
+                            Err(e.to_string())
                         }
                     }
                 })
                 .map(|join_result| {
-                    // Task panic → None. Log here (the task itself
+                    // Task panic → Err. Log here (the task itself
                     // didn't get to log its own panic).
-                    join_result
-                        .inspect_err(|e| warn!(error = %e, "chunk fetch task panicked"))
-                        .ok()
-                        .flatten()
+                    match join_result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(error = %e, "chunk fetch task panicked");
+                            Err(format!("chunk fetch task panicked: {e}"))
+                        }
+                    }
                 })
                 .boxed()
                 .shared()
@@ -809,7 +837,13 @@ impl ChunkCache {
         // self-heal is simpler and proven correct.
         self.inflight.remove(hash);
 
-        Ok(result)
+        // Producing statement (R1(e)): the transient class is
+        // constructed HERE, where the error is known to be a backend
+        // failure/panic — not at some boundary map_err.
+        result.map_err(|message| ChunkError::Backend {
+            hash: *hash,
+            message,
+        })
     }
 
     /// BLAKE3-verify bytes against the expected hash.
@@ -1016,7 +1050,7 @@ mod cache_tests {
         // entry was never removed.
         let stale: InflightFetch = {
             let d = data.clone();
-            async move { Some(d) }.boxed().shared()
+            async move { Ok(Some(d)) }.boxed().shared()
         };
         cache.inflight.insert(hash, stale);
 
@@ -1053,7 +1087,7 @@ mod cache_tests {
 
         // Stale entry with None — the spawned task ran, backend said
         // "not found", awaiter was cancelled before remove().
-        let stale: InflightFetch = async { None }.boxed().shared();
+        let stale: InflightFetch = async { Ok(None) }.boxed().shared();
         cache.inflight.insert(hash, stale);
         assert_eq!(cache.inflight.len(), 1, "precondition: stale None seeded");
 
@@ -1126,6 +1160,58 @@ mod cache_tests {
         assert_eq!(
             second, good_data,
             "second call should fetch fresh good data from backend"
+        );
+    }
+
+    /// Backend whose `get` ERRORS (S3 5xx / timeout class). Distinct
+    /// from an empty backend, whose `get` returns `Ok(None)`.
+    struct ErroringBackend;
+
+    #[async_trait::async_trait]
+    impl ChunkBackend for ErroringBackend {
+        async fn put(&self, _hash: &[u8; 32], _data: Bytes) -> anyhow::Result<()> {
+            anyhow::bail!("put not under test")
+        }
+        async fn get(&self, _hash: &[u8; 32]) -> anyhow::Result<Option<Bytes>> {
+            anyhow::bail!("simulated S3 outage")
+        }
+        async fn exists_batch(&self, hashes: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
+            Ok(vec![false; hashes.len()])
+        }
+        fn key_for(&self, hash: &[u8; 32]) -> String {
+            hex::encode(hash)
+        }
+        async fn delete_by_key(&self, _key: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    // r[verify store.singleflight]
+    /// THE bug_027 split: a backend ERROR surfaces as the transient
+    /// `ChunkError::Backend`, NEVER as `NotFound` (which callers stamp
+    /// into data-loss/corruption verdicts). Pre-fix, the singleflight
+    /// task flattened errors into `None` and every S3 blip read as
+    /// data loss. Inflight cleanup still runs, so recovery retries
+    /// cleanly.
+    #[tokio::test]
+    async fn backend_error_is_transient_not_notfound() {
+        let cache = ChunkCache::with_capacity(Arc::new(ErroringBackend), 1024 * 1024);
+        let (hash, _) = sample_chunk();
+
+        let result = cache.get_verified(&hash).await;
+        match result {
+            Err(ChunkError::Backend { hash: h, message }) => {
+                assert_eq!(h, hash);
+                assert!(
+                    message.contains("simulated S3 outage"),
+                    "carries the producing error: {message}"
+                );
+            }
+            other => panic!("backend error must be ChunkError::Backend (transient), got {other:?}"),
+        }
+        assert!(
+            cache.inflight.is_empty(),
+            "inflight cleaned up after an erroring fetch — next call retries"
         );
     }
 }

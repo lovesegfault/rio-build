@@ -93,6 +93,21 @@ pub enum MetadataError {
         source: crate::manifest::ManifestError,
     },
 
+    /// The chunk BACKEND failed transiently (S3 5xx/timeout/connect)
+    /// while serving a metadata-layer read (e.g. proof-walk `.drv`
+    /// reassembly). Nothing is known about the data's existence —
+    /// retriable. Maps to `unavailable`. Split from data-integrity
+    /// verdicts in round-16 bug_027: this variant MUST NOT be read as
+    /// corruption or data loss.
+    #[error("chunk backend unavailable: {0}")]
+    ChunkBackend(String),
+
+    /// Stored data is verifiably lost or corrupt: a manifest references
+    /// a chunk the backend authoritatively lacks, or fetched bytes fail
+    /// content verification. NOT retriable. Maps to `data_loss`.
+    #[error("data loss: {0}")]
+    DataLoss(String),
+
     /// A narinfo row failed validation (bad store_path, wrong-length
     /// nar_hash). PG's schema doesn't enforce these as CHECK
     /// constraints. Caught at the egress boundary. NOT retriable.
