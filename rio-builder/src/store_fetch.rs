@@ -67,7 +67,8 @@ impl StoreClients {
 /// sizing. I-178: 15 MiB/s is a conservative floor — half the ~30 MB/s
 /// observed in cluster with the pre-ADR-022 FUSE fetch metrics (the
 /// castore equivalents are `rio_builder_castore_fuse_fetch_bytes_total`
-/// against the remote-hit `rio_builder_castore_fuse_open_seconds` sum).
+/// against the `rio_builder_castore_fuse_open_seconds` sum over the
+/// miss cases, `case="miss_small"|"miss_stream"`).
 /// A 1.9 GB NAR at this floor needs ≈127 s; the previous flat 60 s
 /// timeout aborted the fetch mid-stream → daemon ENOENT →
 /// PermanentFailure poison.

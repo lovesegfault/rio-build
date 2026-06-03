@@ -274,7 +274,7 @@ impl Opener {
         if let Some(outcome) = self.reuse_live_backing(&file_digest) {
             metrics::counter!("rio_builder_castore_fuse_open_case_total", "case" => "hit")
                 .increment(1);
-            record_open(started, "node_ssd", false);
+            record_open(started, "hit");
             return Ok(outcome);
         }
 
@@ -284,7 +284,7 @@ impl Opener {
             metrics::counter!("rio_builder_castore_fuse_open_case_total", "case" => "hit")
                 .increment(1);
             let outcome = self.backed_outcome(&file_digest, file);
-            record_open(started, "node_ssd", false);
+            record_open(started, "hit");
             return Ok(outcome);
         }
 
@@ -308,18 +308,19 @@ impl Opener {
             metrics::counter!("rio_builder_castore_fuse_open_case_total", "case" => "wait_fetching")
                 .increment(1);
             let outcome = self.backed_outcome(&file_digest, file);
-            record_open(started, "node_ssd", false);
+            record_open(started, "wait_fetching");
             return Ok(outcome);
         }
-        if contended {
+        // The histogram below shares this case so latency attribution
+        // stays in lockstep with the open_case_total taxonomy.
+        let case = if contended {
             // We waited but the winner failed — fall through and try
             // the fetch ourselves rather than propagating its error.
-            metrics::counter!("rio_builder_castore_fuse_open_case_total", "case" => "wait_fetching")
-                .increment(1);
+            "wait_fetching"
         } else {
-            metrics::counter!("rio_builder_castore_fuse_open_case_total", "case" => "miss_small")
-                .increment(1);
-        }
+            "miss_small"
+        };
+        metrics::counter!("rio_builder_castore_fuse_open_case_total", "case" => case).increment(1);
 
         let (fetched, staged_file) = self.fetch_and_promote(&file_digest, size)?;
         metrics::counter!("rio_builder_castore_fuse_fetch_bytes_total", "hit" => "remote")
@@ -338,7 +339,7 @@ impl Opener {
                 self.keep_cache_outcome(&file_digest, staged_file)
             }
         };
-        record_open(started, "remote", false);
+        record_open(started, case);
         Ok(outcome)
     }
 
@@ -398,7 +399,7 @@ impl Opener {
             drop(active);
             metrics::counter!("rio_builder_castore_fuse_open_case_total", "case" => "wait_fetching")
                 .increment(1);
-            return self.streaming_outcome(&file_digest, state, started);
+            return self.streaming_outcome(&file_digest, state, started, "wait_fetching");
         }
 
         let hexd = hex::encode(file_digest);
@@ -452,7 +453,7 @@ impl Opener {
             Arc::clone(&state),
             Arc::clone(&self.active_fills),
         ));
-        self.streaming_outcome(&file_digest, state, started)
+        self.streaming_outcome(&file_digest, state, started, "miss_stream")
     }
 
     /// Block until `state`'s first chunk is readable, then hand the
@@ -464,6 +465,7 @@ impl Opener {
         digest: &[u8; 32],
         state: Arc<FillState>,
         started: std::time::Instant,
+        case: &'static str,
     ) -> Result<OpenOutcome, Errno> {
         state.wait_first_chunk()?;
         let outcome = match self.note_caching_handle(digest) {
@@ -481,7 +483,7 @@ impl Opener {
                 OpenOutcome::KeepCache { fh }
             }
         };
-        record_open(started, "remote", true);
+        record_open(started, case);
         Ok(outcome)
     }
 
@@ -973,11 +975,15 @@ fn reply_error_counted(reply: ReplyOpen, errno: Errno) {
     reply.error(errno);
 }
 
-fn record_open(started: std::time::Instant, hit: &'static str, streamed: bool) {
+/// `case` mirrors the `open_case_total` increment on the same path, so
+/// the latency histogram and the decision counter cannot disagree about
+/// what kind of open this was. The old `{hit, streamed}` labels are
+/// derivable: hit/wait_fetching served node-local, miss_small fetched
+/// whole-file, miss_stream replied at the first chunk of a fill.
+fn record_open(started: std::time::Instant, case: &'static str) {
     metrics::histogram!(
         "rio_builder_castore_fuse_open_seconds",
-        "hit" => hit,
-        "streamed" => if streamed { "1" } else { "0" },
+        "case" => case,
     )
     .record(started.elapsed().as_secs_f64());
 }

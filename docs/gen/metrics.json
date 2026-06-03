@@ -280,7 +280,7 @@
       {
         "name": "rio_builder_castore_fuse_open_seconds",
         "kind": "histogram",
-        "help": "Wall-clock from open() upcall to reply, labeled hit=node_ssd|remote and streamed=0|1. The streamed=0 remote tail is a whole-file fetch + Promote; streamed=1 replies at the first chunk and fills in the background."
+        "help": "Wall-clock from open() upcall to reply, labeled by the open_case_total taxonomy: case=hit|wait_fetching|miss_small|miss_stream. hit and wait_fetching reply from the node cache (wait_fetching first blocks on a concurrent open's in-flight fetch); miss_small is a whole-file fetch + Promote; miss_stream replies at the first chunk and fills in the background."
       },
       {
         "name": "rio_builder_castore_fuse_upcalls_total",
