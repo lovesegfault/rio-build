@@ -182,7 +182,26 @@ impl Backend {
     }
 
     /// List a directory. `Ok(None)` if the path doesn't exist.
-    pub(crate) fn list_dir(&self, rel: &str) -> Result<Option<Vec<WalkEntry>>> {
+    ///
+    /// `max_entries` is the caller's cardinality bound for the directory
+    /// class being listed — REQUIRED by signature, the same treatment as
+    /// [`read_file`](Self::read_file)'s `max_bytes`, because entry COUNT
+    /// (like every byte the backends serve) is archive-controlled: a
+    /// hostile or foreign index can declare any number of entries, and
+    /// without a bound the names-only `Vec` grows with it (~150 B/entry
+    /// — linear in image bytes, no decompression amplification, but
+    /// unbounded was the one remaining uncapped allocation in this
+    /// alphabet). Listings up to the cap are admitted whole; one entry
+    /// past it REFUSES with an error naming the directory and the cap —
+    /// never silent truncation, which would let a partial listing
+    /// masquerade as the directory's truth to the indexers. Production
+    /// callers pass [`super::MAX_ARCHIVE_DIR_ENTRIES`] for the flat
+    /// `store/`/`narinfo/` listings; the NAR walk passes rio-nix's
+    /// [`MAX_DIRECTORY_ENTRIES`] so its own per-directory fan-out
+    /// refusal (the `>=` comparison below, boundary-identical with
+    /// every rio-nix walker) still decides which trees are
+    /// representable.
+    pub(crate) fn list_dir(&self, rel: &str, max_entries: usize) -> Result<Option<Vec<WalkEntry>>> {
         match self {
             Backend::Dir { root } => {
                 let path = root.join(rel);
@@ -199,6 +218,11 @@ impl Backend {
                     std::fs::read_dir(&path).with_context(|| format!("list {}", path.display()))?
                 {
                     let dirent = dirent.with_context(|| format!("list {}", path.display()))?;
+                    ensure!(
+                        out.len() < max_entries,
+                        "{rel}: more than {max_entries} directory entries for this archive \
+                         directory class — refusing to buffer the listing"
+                    );
                     let name = dirent.file_name().into_string().map_err(|raw| {
                         anyhow!("{}: non-UTF-8 entry name {raw:?}", path.display())
                     })?;
@@ -213,9 +237,17 @@ impl Backend {
                 let dir = inode
                     .as_dir()
                     .ok_or_else(|| anyhow!("{rel}: not a directory in the DwarFS image"))?;
-                Ok(Some(
-                    dir.entries().map(|e| walk_entry_from_dwarfs(&e)).collect(),
-                ))
+                let mut out = Vec::new();
+                for entry in dir.entries() {
+                    ensure!(
+                        out.len() < max_entries,
+                        "{rel}: the DwarFS image's directory table yields more than \
+                         {max_entries} entries for this archive directory class — refusing \
+                         to buffer the listing"
+                    );
+                    out.push(walk_entry_from_dwarfs(&entry));
+                }
+                Ok(Some(out))
             }
         }
     }
@@ -293,8 +325,13 @@ impl Backend {
                 Ok(NarNode::Symlink { target })
             }
             EntryKind::Directory => {
+                // The listing bound is the walker's own fan-out cap: the
+                // `>=` refusal below stays the boundary-deciding check
+                // (admitting exactly the trees every rio-nix walker
+                // admits), while the bound keeps the children `Vec` from
+                // materializing past the cap before that check runs.
                 let mut children = self
-                    .list_dir(rel)?
+                    .list_dir(rel, MAX_DIRECTORY_ENTRIES)?
                     .ok_or_else(|| anyhow!("{rel}: listed but unreadable"))?;
                 // `>=`, matching every rio-nix walker's comparison exactly,
                 // so the backends stay boundary-identical on the entry cap.
@@ -436,7 +473,10 @@ mod tests {
                 .is_none()
         );
 
-        let entries = backend.list_dir(STORE_DIR).unwrap().unwrap();
+        let entries = backend
+            .list_dir(STORE_DIR, crate::archive::MAX_ARCHIVE_DIR_ENTRIES)
+            .unwrap()
+            .unwrap();
         assert_eq!(entries.len(), 3, "got: {entries:?}");
         let drvs = entries
             .iter()
@@ -449,7 +489,12 @@ mod tests {
         assert_eq!(drvs, 2, "got: {entries:?}");
         assert_eq!(dirs, 1, "got: {entries:?}");
 
-        assert!(backend.list_dir("missing").unwrap().is_none());
+        assert!(
+            backend
+                .list_dir("missing", crate::archive::MAX_ARCHIVE_DIR_ENTRIES)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -478,7 +523,7 @@ mod tests {
         // Identical store listings (sorted; backends promise no entry order).
         let sorted_names = |backend: &Backend| {
             let mut names: Vec<String> = backend
-                .list_dir(STORE_DIR)
+                .list_dir(STORE_DIR, crate::archive::MAX_ARCHIVE_DIR_ENTRIES)
                 .unwrap()
                 .unwrap()
                 .into_iter()
@@ -493,7 +538,7 @@ mod tests {
         // NAR-serializes byte-identically from either backend.
         let nar_of_embedded_tree = |backend: &Backend| {
             let entry = backend
-                .list_dir(STORE_DIR)
+                .list_dir(STORE_DIR, crate::archive::MAX_ARCHIVE_DIR_ENTRIES)
                 .unwrap()
                 .unwrap()
                 .into_iter()
@@ -554,7 +599,7 @@ mod tests {
         let image_backend = Backend::open(&image).unwrap();
         let entry_named = |backend: &Backend, name: &str| {
             backend
-                .list_dir(STORE_DIR)
+                .list_dir(STORE_DIR, crate::archive::MAX_ARCHIVE_DIR_ENTRIES)
                 .unwrap()
                 .unwrap()
                 .into_iter()
@@ -687,7 +732,7 @@ mod tests {
         let image_backend = Backend::open(&image).unwrap();
         let entry_of = |backend: &Backend| {
             backend
-                .list_dir(STORE_DIR)
+                .list_dir(STORE_DIR, crate::archive::MAX_ARCHIVE_DIR_ENTRIES)
                 .unwrap()
                 .unwrap()
                 .into_iter()
@@ -717,6 +762,75 @@ mod tests {
                 err.contains("NAR budget") && err.contains("15"),
                 "the refusal names the byte budget: {err}"
             );
+        }
+    }
+
+    /// Resource-limit parity at the listing-cardinality boundary — the
+    /// entry-COUNT sibling of the member-size cap above, because
+    /// `list_dir` materializes one `WalkEntry` per index-declared entry
+    /// before any caller sees the listing. The bound is REQUIRED by
+    /// signature (the `read_file` discipline); the rows here cross it
+    /// in both directions through BOTH backends: a directory of exactly
+    /// the cap's entry count is admitted whole (must-admit, identical
+    /// names), one entry over is refused with an error naming the
+    /// directory and the cap — a refusal, never an OOM abort and never
+    /// a silent truncation, which would let a partial listing
+    /// masquerade as the directory's truth to the indexers
+    /// (`index_narinfos` / `index_store_entries`, which pass the
+    /// flat-listing class cap [`crate::archive::MAX_ARCHIVE_DIR_ENTRIES`]).
+    /// The entry count is archive-controlled (a hostile image's
+    /// directory table declares whatever it likes), which is why the
+    /// caller's cap, not the index's declaration, decides.
+    #[test]
+    fn backends_agree_on_the_list_dir_entry_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        tiny_archive(&root);
+        let image = dir.path().join("archive.dwarfs");
+        pack_with_mkdwarfs(&root, &image).unwrap();
+
+        let dir_backend = Backend::open(&root).unwrap();
+        let image_backend = Backend::open(&image).unwrap();
+
+        // The tiny archive's store dir holds a known entry count; the
+        // boundary rows are exercised AT that count so both sides of
+        // the cap are one fixture apart.
+        let n = std::fs::read_dir(root.join(STORE_DIR)).unwrap().count();
+        assert!(n >= 2, "fixture must hold at least two entries, got {n}");
+
+        // Must-admit: a cap of exactly the entry count lists the full
+        // directory through both backends, name-identically (sorted;
+        // backends promise no entry order).
+        let sorted_names = |backend: &Backend, cap: usize| {
+            let mut names: Vec<String> = backend
+                .list_dir(STORE_DIR, cap)
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            names.sort();
+            names
+        };
+        let at_cap_dir = sorted_names(&dir_backend, n);
+        assert_eq!(at_cap_dir.len(), n);
+        assert_eq!(at_cap_dir, sorted_names(&image_backend, n));
+
+        // Must-block: a cap one entry short, both backends refuse —
+        // an error naming the directory and the cap.
+        let cap = n - 1;
+        for backend in [&dir_backend, &image_backend] {
+            let err = format!("{:#}", backend.list_dir(STORE_DIR, cap).unwrap_err());
+            assert!(
+                err.contains(STORE_DIR) && err.contains(&cap.to_string()),
+                "the refusal names the directory and the cap: {err}"
+            );
+        }
+
+        // Missing directories still answer None under any cap (the
+        // bound gates cardinality, not existence).
+        for backend in [&dir_backend, &image_backend] {
+            assert!(backend.list_dir("missing", 1).unwrap().is_none());
         }
     }
 }

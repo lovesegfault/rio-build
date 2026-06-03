@@ -149,6 +149,41 @@ pub(crate) const MAX_DRV_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
 /// TODO names, or re-recording without the over-cap tree.
 pub(crate) const MAX_EMBEDDED_NAR_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// Cardinality cap on one flat archive directory listing — the bound the
+/// indexers pass to [`backend::Backend::list_dir`] for `store/` and
+/// `narinfo/`: 1,048,576 entries.
+///
+/// Trust provenance: entry COUNT and NAMES come from the archive's own
+/// index (DwarFS directory tables / staging-dir readdir) —
+/// archive-controlled, like every byte the backends serve — so the
+/// listing `Vec` takes an engine-fixed cap instead of trusting the
+/// index. Unlike the member-read axis there is NO decompression
+/// amplification behind this one (~150 B/entry resident, names plus
+/// stat fields: a hostile image inflating the count pays linear image
+/// bytes for linear engine bytes); the cap is the bounded-read belt for
+/// the last unbounded allocation in the backend's primitive alphabet,
+/// not a bomb screen.
+///
+/// Sizing, from real store-dir entry counts: an archive's `store/`
+/// holds one member per embedded drv/source tree and `narinfo/` one
+/// sidecar per recorded output, so both track the campaign closure —
+/// the largest closure the engine's own budgets model is 65,536 nodes
+/// ([`rio_nix::protocol::client::STDERR_BUDGET_NODE_MULTIPLIER_CAP`],
+/// more than 4× a chromium/texlive-class closure), putting real listings in the
+/// 10^5 class. 16× that — which is also exactly rio-nix's
+/// `MAX_DIRECTORY_ENTRIES` NAR fan-out cap, so the flat-listing class
+/// never refuses a directory the NAR walkers themselves would still
+/// consider representable. Worst-case admitted listing: ~150 MiB
+/// resident, the same survivable-and-loud envelope class as the
+/// engine's other capped maps.
+///
+/// False-refusal cost, stated: an over-cap directory fails open/
+/// indexing with an error naming the directory and the cap (a refusal,
+/// never an OOM abort); the remedy is splitting the campaign — the same
+/// remedy the publish and metadata-member caps already name.
+pub(crate) const MAX_ARCHIVE_DIR_ENTRIES: usize =
+    16 * rio_nix::protocol::client::STDERR_BUDGET_NODE_MULTIPLIER_CAP;
+
 /// The hash part of a store path: the basename characters before the first
 /// `-`. Accepts a full `/nix/store/...` path, a basename, or a bare hash.
 pub(crate) fn hash_part(path_or_name: &str) -> &str {
@@ -299,7 +334,9 @@ pub(crate) fn index_narinfos(
     // duplicate-resolution check.
     let mut claimed_by: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    let mut entries = backend.list_dir(NARINFO_DIR)?.unwrap_or_default();
+    let mut entries = backend
+        .list_dir(NARINFO_DIR, MAX_ARCHIVE_DIR_ENTRIES)?
+        .unwrap_or_default();
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     for entry in entries {
         if entry.kind != EntryKind::Regular {

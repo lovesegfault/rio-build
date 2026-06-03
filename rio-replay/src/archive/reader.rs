@@ -1083,7 +1083,12 @@ fn index_store_entries(
     backend: &Backend,
     policy: RecordPolicy,
 ) -> Result<HashMap<String, WalkEntry>> {
-    index_store_listing(backend.list_dir(STORE_DIR)?.unwrap_or_default(), policy)
+    index_store_listing(
+        backend
+            .list_dir(STORE_DIR, super::MAX_ARCHIVE_DIR_ENTRIES)?
+            .unwrap_or_default(),
+        policy,
+    )
 }
 
 /// The fold behind [`index_store_entries`], over the raw backend
@@ -3206,7 +3211,10 @@ mod tests {
         }
 
         let backend = Backend::open(&root).unwrap();
-        let listing = backend.list_dir(STORE_DIR).unwrap().unwrap_or_default();
+        let listing = backend
+            .list_dir(STORE_DIR, crate::archive::MAX_ARCHIVE_DIR_ENTRIES)
+            .unwrap()
+            .unwrap_or_default();
         assert!(
             listing.len() >= 4,
             "fixture + colliders give a 3-way collision plus non-colliding members"
