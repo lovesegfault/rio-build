@@ -255,10 +255,23 @@ fn split_host_port(host_port: &str) -> Result<(String, u16)> {
 /// submitter needs without another derive dependency).
 #[derive(Debug)]
 pub enum TransportError {
-    /// The daemon/gateway refused the operation (or refused it in a way that
-    /// raced session teardown). The request should be retried once on a fresh
-    /// channel and otherwise reported as an upload/build rejection.
+    /// The daemon/gateway refused the operation with the protocol framing
+    /// intact — the wire op completed and the daemon answered. This is the
+    /// only variant that carries a daemon VERDICT; the request should be
+    /// retried once on a fresh channel and otherwise reported as an
+    /// upload/build rejection.
     Refused(String),
+    /// The wire died during an upload op: EITHER the daemon refusing
+    /// mid-payload and tearing the session down before the client finished
+    /// writing, OR a plain transport failure. The two are indistinguishable
+    /// at this layer, so the outcome stays undetermined instead of being
+    /// collapsed into [`Self::Refused`]: callers retry once on a fresh
+    /// channel exactly like a refusal (a genuine refusal re-presents there
+    /// as a clean `Refused`), but without that clean re-presentation the op
+    /// FAILED — it must never settle as a daemon verdict, and it counts as
+    /// a transport failure for circuit-breaker purposes (the only evidence
+    /// in hand is that the connection died).
+    MaybeRefused(String),
     /// The operation exceeded its deadline. The wire position is unknown
     /// afterwards — the channel must not be reused.
     Timeout {
@@ -277,6 +290,10 @@ impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Refused(msg) => write!(f, "daemon refused: {msg}"),
+            Self::MaybeRefused(msg) => write!(
+                f,
+                "transport failed during upload (may be a refusal racing session teardown): {msg}"
+            ),
             Self::Timeout {
                 op,
                 connection,
@@ -293,7 +310,7 @@ impl std::fmt::Display for TransportError {
 impl std::error::Error for TransportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Refused(_) | Self::Timeout { .. } => None,
+            Self::Refused(_) | Self::MaybeRefused(_) | Self::Timeout { .. } => None,
             // Mirror thiserror's `#[error(transparent)]`: delegate to the
             // wrapped error's source so the chain is not duplicated.
             Self::Other(err) => {
@@ -312,18 +329,22 @@ impl From<anyhow::Error> for TransportError {
 
 /// Map a rio-nix [`ClientOpError`] to the transport error taxonomy.
 ///
-/// `Daemon` errors are clean refusals (protocol framing intact). `Wire`
-/// errors normally mean the channel is unusable — except during the two
-/// upload ops (`upload = true`), where the daemon may refuse mid-payload and
-/// tear the session down before the client finishes writing, surfacing as an
-/// I/O error; those are reported as [`TransportError::Refused`] so the
-/// caller treats them like a rejection rather than a transport bug.
+/// `Daemon` errors are clean refusals (protocol framing intact) — the only
+/// shape that maps to [`TransportError::Refused`], because only there did
+/// the daemon actually answer. `Wire` errors normally mean the channel is
+/// unusable — except during the two upload ops (`upload = true`), where the
+/// daemon may refuse mid-payload and tear the session down before the
+/// client finishes writing, surfacing as an I/O error; that ambiguity is
+/// kept as [`TransportError::MaybeRefused`] (`WireError` spans everything
+/// from a TCP reset to client-side framing bugs, so collapsing it into
+/// `Refused` would let a dead data path settle paths as daemon-rejected and
+/// feed the upload circuit breaker false successes).
 fn map_client_op_error(err: ClientOpError, op: &str, upload: bool) -> TransportError {
     match err {
         ClientOpError::Daemon(daemon_err) => TransportError::Refused(daemon_err.message),
-        ClientOpError::Wire(wire_err) if upload => TransportError::Refused(format!(
-            "transport failed during upload (may be a refusal racing session teardown): {wire_err}"
-        )),
+        ClientOpError::Wire(wire_err) if upload => {
+            TransportError::MaybeRefused(wire_err.to_string())
+        }
         ClientOpError::Wire(wire_err) => TransportError::Other(
             anyhow::Error::new(wire_err).context(format!("{op} failed on the daemon channel")),
         ),
@@ -990,13 +1011,16 @@ type GatewayStream = russh::ChannelStream<russh::client::Msg>;
 
 /// Whether an op error leaves the channel's wire position unknown, making
 /// the channel unusable for further ops: timeouts (the op was cut off
-/// mid-read/-write) and transport failures always do; a refusal does only
-/// for upload ops, which may have started writing a framed payload before
-/// the daemon refused.
+/// mid-read/-write), transport failures, and mid-upload wire deaths
+/// ([`TransportError::MaybeRefused`] — the wire died by definition) always
+/// do; a clean refusal does only for upload ops, which may have started
+/// writing a framed payload before the daemon refused.
 fn poisons_channel(err: &TransportError, upload: bool) -> bool {
     match err {
         TransportError::Refused(_) => upload,
-        TransportError::Timeout { .. } | TransportError::Other(_) => true,
+        TransportError::MaybeRefused(_)
+        | TransportError::Timeout { .. }
+        | TransportError::Other(_) => true,
     }
 }
 
@@ -1539,15 +1563,27 @@ mod tests {
         assert_eq!(pick_connection(&[], &[]), None);
     }
 
+    /// The (error shape × upload bit) mapping table, every cell. The
+    /// load-bearing direction: `Refused` is minted ONLY from a clean
+    /// `ClientOpError::Daemon` — the one shape where the daemon actually
+    /// answered — never synthesized from a wire error. A mid-upload wire
+    /// death is `MaybeRefused` (undetermined: refusal-races-teardown OR
+    /// transport death), and `WireError` spans TCP resets AND client-side
+    /// framing errors, so collapsing it into `Refused` would settle paths
+    /// as daemon-rejected on a dead data path.
     #[test]
     fn transport_error_mapping() {
-        // Daemon refusal → Refused carrying the daemon's message.
-        let daemon = ClientOpError::Daemon(StderrError::simple("rio-gateway", "path not allowed"));
-        match map_client_op_error(daemon, "AddToStoreNar /nix/store/x", true) {
-            TransportError::Refused(msg) => {
-                assert!(msg.contains("path not allowed"), "message: {msg}");
+        // Daemon refusal → Refused carrying the daemon's message — on
+        // upload and non-upload ops alike.
+        for upload in [true, false] {
+            let daemon =
+                ClientOpError::Daemon(StderrError::simple("rio-gateway", "path not allowed"));
+            match map_client_op_error(daemon, "AddToStoreNar /nix/store/x", upload) {
+                TransportError::Refused(msg) => {
+                    assert!(msg.contains("path not allowed"), "message: {msg}");
+                }
+                other => panic!("daemon error must map to Refused, got {other:?}"),
             }
-            other => panic!("daemon error must map to Refused, got {other:?}"),
         }
 
         // Wire error on a non-upload op → Other, context names the op.
@@ -1567,17 +1603,23 @@ mod tests {
             other => panic!("wire error on a query must map to Other, got {other:?}"),
         }
 
-        // Wire error during an upload → Refused (refusal racing teardown).
+        // Wire error during an upload → MaybeRefused (undetermined), NOT
+        // Refused: the rendered text names the ambiguity and keeps the
+        // cause, but the variant carries no daemon verdict.
         let wire = ClientOpError::Wire(WireError::Io(std::io::Error::other("connection reset")));
         match map_client_op_error(wire, "AddMultipleToStore (3 entries)", true) {
-            TransportError::Refused(msg) => {
-                assert!(msg.contains("racing session teardown"), "message: {msg}");
+            TransportError::MaybeRefused(msg) => {
+                let rendered = TransportError::MaybeRefused(msg.clone()).to_string();
+                assert!(
+                    rendered.contains("racing session teardown"),
+                    "rendered: {rendered}"
+                );
                 assert!(
                     msg.contains("connection reset"),
                     "message keeps the cause: {msg}"
                 );
             }
-            other => panic!("wire error during upload must map to Refused, got {other:?}"),
+            other => panic!("wire error during upload must map to MaybeRefused, got {other:?}"),
         }
     }
 
@@ -1600,6 +1642,7 @@ mod tests {
     #[test]
     fn op_errors_poison_the_channel_per_wire_position_rules() {
         let refused = TransportError::Refused("path not allowed".into());
+        let maybe_refused = TransportError::MaybeRefused("connection reset".into());
         let timeout = TransportError::Timeout {
             op: "AddMultipleToStore (10 entries)".into(),
             connection: 0,
@@ -1612,7 +1655,10 @@ mod tests {
         // framed payload.
         assert!(!poisons_channel(&refused, false));
         assert!(poisons_channel(&refused, true));
-        // Timeouts and transport failures always desync the wire.
+        // A mid-upload wire death, timeouts, and transport failures always
+        // desync the wire.
+        assert!(poisons_channel(&maybe_refused, false));
+        assert!(poisons_channel(&maybe_refused, true));
         assert!(poisons_channel(&timeout, false));
         assert!(poisons_channel(&timeout, true));
         assert!(poisons_channel(&other, false));

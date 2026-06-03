@@ -233,13 +233,17 @@ impl ClientOpsSubmitter {
     /// Upload one slice of missing drv texts on `chan`, returning the channel
     /// to keep using afterwards.
     ///
-    /// A clean daemon refusal is retried exactly once on a fresh channel: an
-    /// upload refusal can be a quota/policy answer, but it can also be the
-    /// refusal racing session teardown (the wire error surfaces as `Refused`
-    /// for upload ops), and either way the refused channel's wire position is
-    /// unknown, so it is dropped. A second failure — or any timeout/transport
-    /// error — is an engine-side submission failure (infrastructure, never
-    /// charged to the workload): the jobs are re-offered by the submit loop.
+    /// A clean daemon refusal — or a mid-upload wire death
+    /// ([`TransportError::MaybeRefused`]: possibly the refusal racing
+    /// session teardown, possibly plain transport death) — is retried
+    /// exactly once on a fresh channel; either way the first channel's wire
+    /// position is unknown, so it is dropped. A second failure — or any
+    /// timeout/transport error — is an engine-side submission failure
+    /// (infrastructure, never charged to the workload): the jobs are
+    /// re-offered by the submit loop. The two shapes need no separate
+    /// settlement here, unlike the supply arms' (refusals there settle
+    /// paths REFUSED, an irreversible daemon verdict): every exhausted
+    /// outcome of this arm lands in the same engine-side bucket.
     async fn upload_chunk(
         &self,
         mut chan: DaemonChannel,
@@ -253,11 +257,12 @@ impl ClientOpsSubmitter {
         // shares one scaling rule at the transport seam.
         match chan.add_multiple_to_store(entries, self.op_timeout).await {
             Ok(()) => Ok(chan),
-            Err(TransportError::Refused(msg)) => {
+            Err(TransportError::Refused(msg) | TransportError::MaybeRefused(msg)) => {
                 tracing::warn!(
                     connection = chan.connection_index(),
                     error = %msg,
-                    "drv upload refused; retrying once on a fresh gateway channel"
+                    "drv upload refused (or its wire died mid-upload); retrying once on a \
+                     fresh gateway channel"
                 );
                 drop(chan);
                 let mut fresh = self
@@ -378,8 +383,14 @@ impl Submitter for ClientOpsSubmitter {
                 chan.abandon();
                 (Vec::new(), true)
             }
-            Err(err @ (TransportError::Refused(_) | TransportError::Other(_))) => {
-                // Daemon refusal (e.g. quota) or a transport/protocol failure:
+            Err(
+                err @ (TransportError::Refused(_)
+                | TransportError::MaybeRefused(_)
+                | TransportError::Other(_)),
+            ) => {
+                // Daemon refusal (e.g. quota) or a transport/protocol failure
+                // (`MaybeRefused` is unreachable here — it is minted only by
+                // the upload ops — but it would belong in this bucket too):
                 // an engine-side submission failure, recorded on the batch
                 // record and re-offered — never charged to the workload.
                 return Err(anyhow!(

@@ -111,14 +111,28 @@ pub struct PreparedEntry {
     pub nar: NarPayload,
 }
 
-/// Errors the upload arms distinguish: a daemon refusal (retry once on a
-/// fresh channel, then mark refused) vs. everything else (failed).
+/// Errors the upload arms distinguish, three-state because the settlement
+/// they feed is irreversible: a clean daemon refusal (the wire op completed
+/// and the daemon answered — retry once on a fresh channel, then settle
+/// REFUSED, which charges dependents `upload-rejected` and trips the
+/// regression gate), a mid-upload wire death whose meaning is undetermined
+/// (retry once like a refusal — a genuine refusal racing session teardown
+/// re-presents as a clean `Refused` on the fresh channel — but with no
+/// clean refusal observed it settles FAILED: `supply-failed`, excluded
+/// from the gate, because the only evidence is that the connection died),
+/// and everything else (failed immediately). Breaker accounting follows
+/// the evidence the same way: `Refused` proves the gateway answered and
+/// resets the count; `MaybeRefused` and `Other` are transport failures.
 #[derive(Debug, thiserror::Error)]
 pub enum SupplyTransportError {
-    /// The daemon refused the upload (or refused it in a way that raced
-    /// session teardown).
+    /// The daemon refused the upload with the protocol framing intact.
     #[error("daemon refused: {0}")]
     Refused(String),
+    /// The wire died mid-upload: a refusal racing session teardown OR a
+    /// transport failure — indistinguishable here, so neither a daemon
+    /// verdict nor (yet) a settled failure.
+    #[error("transport failed during upload (may be a refusal racing session teardown): {0}")]
+    MaybeRefused(String),
     /// Transport, timeout, or channel-open failure.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -664,6 +678,10 @@ impl SupplyTransport for PoolSupplyTransport {
                 channel.abandon();
                 Err(SupplyTransportError::Refused(message))
             }
+            Err(TransportError::MaybeRefused(message)) => {
+                channel.abandon();
+                Err(SupplyTransportError::MaybeRefused(message))
+            }
             Err(other) => {
                 channel.abandon();
                 Err(SupplyTransportError::Other(
@@ -688,6 +706,10 @@ impl SupplyTransport for PoolSupplyTransport {
             Err(TransportError::Refused(message)) => {
                 channel.abandon();
                 Err(SupplyTransportError::Refused(message))
+            }
+            Err(TransportError::MaybeRefused(message)) => {
+                channel.abandon();
+                Err(SupplyTransportError::MaybeRefused(message))
             }
             Err(other) => {
                 channel.abandon();
@@ -733,13 +755,22 @@ impl SupplyTransport for PoolSupplyTransport {
 /// consecutive attempt fails the gateway is gone, and without a breaker each
 /// remaining sub-batch would burn another connect timeout on a doomed
 /// attempt. Any success (including a clean refusal, which proves the gateway
-/// answered) resets the count; once tripped it stays tripped for the rest of
-/// the invocation and remaining work is recorded `skipped` without further
-/// transport calls — bookkeeping, never settled `failed` rows: a breaker
-/// skip is not a delivery attempt, so it must neither retire dependents nor
-/// contradict a delivery another request already made. The per-submission
-/// top-up gets a fresh breaker per invocation, so skipped paths stay
-/// re-attemptable once the gateway returns.
+/// answered — the daemon's `Refused` verdict requires the wire op to have
+/// completed) resets the count. A mid-upload wire death
+/// ([`SupplyTransportError::MaybeRefused`]) counts as a FAILURE: the only
+/// evidence in hand is that the connection died, and counting it as a
+/// success would blind the breaker — and the operator-PAUSE gate wired to
+/// it — to exactly the data-path outages it exists to catch (transfers
+/// dying while dials still succeed). When the death really was a refusal
+/// racing teardown, the fresh-channel retry's clean refusal resets the
+/// count one op later, so the mis-count is self-correcting. Once tripped it
+/// stays tripped for the rest of the invocation and remaining work is
+/// recorded `skipped` without further transport calls — bookkeeping, never
+/// settled `failed` rows: a breaker skip is not a delivery attempt, so it
+/// must neither retire dependents nor contradict a delivery another request
+/// already made. The per-submission top-up gets a fresh breaker per
+/// invocation, so skipped paths stay re-attemptable once the gateway
+/// returns.
 struct GatewayBreaker {
     /// Consecutive transport failures since the last success.
     consecutive_failures: AtomicUsize,
@@ -1211,10 +1242,16 @@ async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()>
         return recorded;
     }
 
-    // First attempt, then exactly one retry when the daemon refused (the
-    // refusal may be genuine or a transport error racing a refusal; one
-    // retry on a fresh channel distinguishes a flake from a real rejection).
+    // First attempt, then exactly one retry when the daemon refused OR the
+    // wire died mid-upload (the death may be a refusal racing session
+    // teardown; one retry on a fresh channel distinguishes them — a
+    // genuine refusal re-presents there as a clean `Refused`). Settlement
+    // follows the daemon evidence: REFUSED requires at least one CLEAN
+    // refusal across the attempts; exhaustion with only wire deaths in
+    // hand settles FAILED (`supply-failed` for dependents, gate-excluded)
+    // — a dead data path must never be recorded as a daemon verdict.
     let mut refused: Option<String> = None;
+    let mut wire_death: Option<String> = None;
     for attempt in 0..2 {
         let payload = match materialize_stream_payload(env, item).await {
             Ok(payload) => payload,
@@ -1268,6 +1305,21 @@ async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()>
                 }
                 refused = Some(message);
             }
+            Err(SupplyTransportError::MaybeRefused(message)) => {
+                // Transport evidence, not a daemon verdict: the breaker
+                // counts the dead connection (a real refusal's clean
+                // re-presentation on the retry resets it one op later).
+                env.breaker.record_failure();
+                if attempt == 0 {
+                    tracing::debug!(
+                        path = %item.store_path,
+                        error = %message,
+                        "streamed upload's wire died (may be a refusal racing teardown); \
+                         retrying once on a fresh channel"
+                    );
+                }
+                wire_death = Some(message);
+            }
             Err(SupplyTransportError::Other(err)) => {
                 env.breaker.record_failure();
                 // Row first, then release — record_settlement's contract.
@@ -1285,16 +1337,40 @@ async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()>
             }
         }
     }
-    // Refused after the retry: row first, then release.
-    let recorded = record_settlement(
-        env,
-        item,
-        mechanism,
-        SUPPLY_OUTCOME_REFUSED,
-        refused,
-        batch_id,
-        None,
-    );
+    // Settled after the retry: row first, then release —
+    // record_settlement's contract.
+    let recorded = match (refused, wire_death) {
+        // At least one clean refusal: the daemon answered, and that
+        // verdict stands whichever attempt produced it (a wire death on
+        // the other attempt is disclosed alongside).
+        (Some(refusal), wire_death) => record_settlement(
+            env,
+            item,
+            mechanism,
+            SUPPLY_OUTCOME_REFUSED,
+            Some(match wire_death {
+                Some(death) => {
+                    format!("{refusal} (the other attempt's transport failed: {death})")
+                }
+                None => refusal,
+            }),
+            batch_id,
+            None,
+        ),
+        // Wire deaths only: no daemon evidence anywhere — FAILED.
+        (None, wire_death) => record_settlement(
+            env,
+            item,
+            mechanism,
+            SUPPLY_OUTCOME_FAILED,
+            Some(format!(
+                "transport failed during upload on both attempts (no daemon refusal observed): {}",
+                wire_death.as_deref().unwrap_or("no attempt completed")
+            )),
+            batch_id,
+            None,
+        ),
+    };
     env.claims.release(&item.store_path);
     recorded
 }
@@ -1303,12 +1379,22 @@ async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()>
 enum BatchAttempt<'a> {
     /// The daemon accepted these entries.
     Sent(Vec<&'a UploadItem>),
-    /// The daemon refused; `sendable` materialized fine and may be retried.
+    /// The daemon refused cleanly; `sendable` materialized fine and may be
+    /// retried.
     Refused {
         /// Items whose payloads materialized and were part of the attempt.
         sendable: Vec<&'a UploadItem>,
         /// The daemon's refusal message.
         refusal: String,
+    },
+    /// The wire died mid-upload (a refusal racing session teardown OR a
+    /// transport death — undetermined); `sendable` materialized fine and
+    /// gets the same single fresh-channel retry a refusal does.
+    MaybeRefused {
+        /// Items whose payloads materialized and were part of the attempt.
+        sendable: Vec<&'a UploadItem>,
+        /// The wire error's text.
+        detail: String,
     },
     /// Transport failure; `sendable` materialized fine but was not delivered.
     Failed {
@@ -1383,6 +1469,13 @@ async fn attempt_batch<'a>(
             env.breaker.record_success();
             Ok(BatchAttempt::Refused { sendable, refusal })
         }
+        Err(SupplyTransportError::MaybeRefused(detail)) => {
+            // Transport evidence, not a daemon verdict: the breaker counts
+            // the dead connection (a real refusal's clean re-presentation
+            // on the retry resets it one op later).
+            env.breaker.record_failure();
+            Ok(BatchAttempt::MaybeRefused { sendable, detail })
+        }
         Err(SupplyTransportError::Other(err)) => {
             env.breaker.record_failure();
             Ok(BatchAttempt::Failed {
@@ -1453,7 +1546,8 @@ fn settle_batch_undelivered(
 
 /// Upload one sub-batch: claims, failed-reference pre-skip, one wire
 /// attempt, and exactly one retry on a fresh channel when the daemon
-/// refused.
+/// refused or the wire died mid-upload (the undetermined
+/// [`BatchAttempt::MaybeRefused`] shape).
 ///
 /// As in [`upload_stream_one`], the cross-request claims table is consulted
 /// FIRST, before any breaker-based skip: settled rows are minted only
@@ -1543,6 +1637,13 @@ async fn upload_sub_batch(env: &UploadEnv<'_>, items: Vec<&UploadItem>) -> Resul
         return Ok(());
     }
 
+    // Settlement follows the daemon evidence across the two attempts:
+    // REFUSED requires at least one CLEAN refusal (the daemon answered);
+    // a wire death gets the same single fresh-channel retry — a refusal
+    // racing session teardown re-presents there as a clean refusal — but
+    // exhaustion with only wire deaths in hand settles FAILED
+    // (`supply-failed` for dependents, gate-excluded), never a synthesized
+    // daemon verdict.
     match attempt_batch(env, &to_send, batch_id).await? {
         BatchAttempt::Sent(sent) => settle_batch_delivered(env, &sent, batch_id).await,
         BatchAttempt::Failed { sendable, detail } => {
@@ -1563,6 +1664,55 @@ async fn upload_sub_batch(env: &UploadEnv<'_>, items: Vec<&UploadItem>) -> Resul
                     &sendable,
                     SUPPLY_OUTCOME_REFUSED,
                     &refusal,
+                    batch_id,
+                ),
+                // The first attempt's clean refusal is the daemon verdict;
+                // the retry's wire death is disclosed alongside it.
+                BatchAttempt::MaybeRefused { sendable, detail } => settle_batch_undelivered(
+                    env,
+                    &sendable,
+                    SUPPLY_OUTCOME_REFUSED,
+                    &format!("{refusal} (the fresh-channel retry's transport failed: {detail})"),
+                    batch_id,
+                ),
+                BatchAttempt::Failed { sendable, detail } => settle_batch_undelivered(
+                    env,
+                    &sendable,
+                    SUPPLY_OUTCOME_FAILED,
+                    &detail,
+                    batch_id,
+                ),
+                BatchAttempt::Empty => Ok(()),
+            }
+        }
+        BatchAttempt::MaybeRefused { sendable, detail } => {
+            tracing::debug!(
+                paths = sendable.len(),
+                error = %detail,
+                "batch upload's wire died (may be a refusal racing teardown); retrying once \
+                 on a fresh channel with re-materialized payloads"
+            );
+            match attempt_batch(env, &sendable, batch_id).await? {
+                BatchAttempt::Sent(sent) => settle_batch_delivered(env, &sent, batch_id).await,
+                // The retry's clean refusal is the teardown-race salvage:
+                // the first attempt WAS the refusal, observed properly on
+                // the fresh channel.
+                BatchAttempt::Refused { sendable, refusal } => settle_batch_undelivered(
+                    env,
+                    &sendable,
+                    SUPPLY_OUTCOME_REFUSED,
+                    &refusal,
+                    batch_id,
+                ),
+                // Two wire deaths and no daemon evidence: FAILED.
+                BatchAttempt::MaybeRefused { sendable, detail } => settle_batch_undelivered(
+                    env,
+                    &sendable,
+                    SUPPLY_OUTCOME_FAILED,
+                    &format!(
+                        "transport failed during upload on both attempts (no daemon refusal \
+                         observed): {detail}"
+                    ),
                     batch_id,
                 ),
                 BatchAttempt::Failed { sendable, detail } => settle_batch_undelivered(
@@ -2643,6 +2793,18 @@ pub(crate) mod test_support {
     use super::*;
     use crate::run::model::build_status_name;
 
+    /// One scripted reply for an upload attempt, consumed in FIFO order
+    /// from [`FakeSupplyTransport::scripted`] — so tests can drive exact
+    /// per-attempt sequences (clean refusal, then wire death, …) instead
+    /// of homogeneous counters.
+    #[derive(Clone, Copy)]
+    pub enum ScriptedReply {
+        /// A clean daemon refusal ([`SupplyTransportError::Refused`]).
+        Refuse,
+        /// A mid-upload wire death ([`SupplyTransportError::MaybeRefused`]).
+        WireDeath,
+    }
+
     /// See the module-level doc: a fully scripted, in-memory transport.
     #[derive(Default)]
     pub struct FakeSupplyTransport {
@@ -2653,6 +2815,9 @@ pub(crate) mod test_support {
         pub uploaded_batches: Mutex<Vec<Vec<String>>>,
         /// Store paths of every accepted streamed upload, in call order.
         pub uploaded_streamed: Mutex<Vec<String>>,
+        /// Path → FIFO queue of per-attempt replies (consumed before the
+        /// homogeneous knobs below; an exhausted queue accepts).
+        pub scripted: Mutex<HashMap<String, std::collections::VecDeque<ScriptedReply>>>,
         /// Path → number of times to refuse it before accepting.
         pub refusals: Mutex<HashMap<String, u32>>,
         /// Root drv → BuildStatus name returned by `prefetch_build`
@@ -2671,6 +2836,10 @@ pub(crate) mod test_support {
         /// lets a test settle ONE path `failed` while its siblings deliver
         /// and the breaker stays closed).
         pub fail_paths: Mutex<BTreeSet<String>>,
+        /// When set, every upload fails with
+        /// [`SupplyTransportError::MaybeRefused`] (the shape of a data path
+        /// that kills bulk transfers while dials still succeed).
+        pub wire_error_uploads: AtomicBool,
         /// Total upload calls (batch + streamed), accepted or not.
         pub upload_calls: AtomicUsize,
         /// Per-path upload attempts (batch + streamed), accepted or not.
@@ -2684,6 +2853,27 @@ pub(crate) mod test_support {
             for path in paths {
                 *attempts.entry(path.clone()).or_insert(0) += 1;
             }
+        }
+
+        /// Consume one scripted per-attempt reply if any path of the call
+        /// still has a queued one.
+        fn scripted_for(&self, paths: &[String]) -> Option<SupplyTransportError> {
+            let mut scripted = self.scripted.lock().unwrap();
+            for path in paths {
+                if let Some(queue) = scripted.get_mut(path)
+                    && let Some(reply) = queue.pop_front()
+                {
+                    return Some(match reply {
+                        ScriptedReply::Refuse => {
+                            SupplyTransportError::Refused(format!("scripted refusal for {path}"))
+                        }
+                        ScriptedReply::WireDeath => SupplyTransportError::MaybeRefused(format!(
+                            "scripted mid-upload wire death for {path} (connection reset)"
+                        )),
+                    });
+                }
+            }
+            None
         }
 
         /// Consume one scripted refusal if any path of the call still has one.
@@ -2716,6 +2906,14 @@ pub(crate) mod test_support {
                         "scripted per-path transport failure for {path}"
                     )));
                 }
+            }
+            if self.wire_error_uploads.load(Ordering::SeqCst) {
+                return Err(SupplyTransportError::MaybeRefused(
+                    "scripted mid-upload wire death (connection reset)".to_string(),
+                ));
+            }
+            if let Some(err) = self.scripted_for(paths) {
+                return Err(err);
             }
             if let Some(refusal) = self.refusal_for(paths) {
                 return Err(SupplyTransportError::Refused(refusal));
@@ -2904,6 +3102,223 @@ mod tests {
         assert_eq!(report.refused, 1);
         assert_eq!(report.delivered, 0);
         assert!(fake.uploaded_batches.lock().unwrap().is_empty());
+    }
+
+    /// THE upload settlement-evidence lattice: every (first attempt ×
+    /// fresh-channel retry) outcome pair of the upload error vocabulary,
+    /// on BOTH upload mechanisms (batch and streamed implement the same
+    /// rule independently).
+    ///
+    /// QUANTIFICATION DOMAIN: the per-attempt outcomes of
+    /// [`SupplyTransportError`] {Refused, MaybeRefused, Other} plus
+    /// acceptance, sequenced over an arm's two attempts (`Refused` and
+    /// `MaybeRefused` each get the single retry; `Other` settles
+    /// immediately, pinned by its own cells below) — the producing enum
+    /// is matched exhaustively in `attempt_batch`/`upload_stream_one`,
+    /// so a new variant fails compilation there before this corpus can
+    /// lag.
+    ///
+    /// The settlement rule (design §8.4): REFUSED requires at least one
+    /// CLEAN daemon refusal across the attempts — the wire op completed
+    /// and the daemon answered, which is what the upload-rejected
+    /// disposition and its regression-gate trip stand on. A wire death
+    /// is retried like a refusal (the teardown-race salvage: a genuine
+    /// refusal re-presents cleanly on the fresh channel) but NEVER
+    /// settles as one: wire-death-only exhaustion is FAILED
+    /// (supply-failed, gate-excluded). Both directions are pinned —
+    /// must-settle-refused cells carry daemon evidence, must-settle-
+    /// failed cells carry none.
+    #[tokio::test]
+    async fn upload_settlement_requires_daemon_evidence_for_refused() {
+        use super::test_support::ScriptedReply::{self, Refuse, WireDeath};
+        struct Cell {
+            name: &'static str,
+            script: &'static [ScriptedReply],
+            outcome: &'static str,
+            attempts: u32,
+            detail_contains: Option<&'static str>,
+        }
+        let cells = [
+            Cell {
+                name: "wire-death x wire-death",
+                script: &[WireDeath, WireDeath],
+                outcome: SUPPLY_OUTCOME_FAILED,
+                attempts: 2,
+                detail_contains: Some("no daemon refusal observed"),
+            },
+            Cell {
+                name: "wire-death x clean-refusal (teardown-race salvage)",
+                script: &[WireDeath, Refuse],
+                outcome: SUPPLY_OUTCOME_REFUSED,
+                attempts: 2,
+                detail_contains: Some("scripted refusal"),
+            },
+            Cell {
+                name: "clean-refusal x wire-death",
+                script: &[Refuse, WireDeath],
+                outcome: SUPPLY_OUTCOME_REFUSED,
+                attempts: 2,
+                // The daemon's verdict settles; the retry's transport
+                // death is disclosed alongside it.
+                detail_contains: Some("transport failed"),
+            },
+            Cell {
+                name: "clean-refusal x clean-refusal",
+                script: &[Refuse, Refuse],
+                outcome: SUPPLY_OUTCOME_REFUSED,
+                attempts: 2,
+                detail_contains: Some("scripted refusal"),
+            },
+            Cell {
+                name: "wire-death x accepted (transient blip recovers)",
+                script: &[WireDeath],
+                outcome: SUPPLY_OUTCOME_DELIVERED,
+                attempts: 2,
+                detail_contains: None,
+            },
+            Cell {
+                name: "clean-refusal x accepted (refusal flake recovers)",
+                script: &[Refuse],
+                outcome: SUPPLY_OUTCOME_DELIVERED,
+                attempts: 2,
+                detail_contains: None,
+            },
+        ];
+        // Streamed mechanism: the same item routed through
+        // `upload_stream_one` by size (mirrors
+        // `large_items_stream_individually`).
+        let stream_knobs = Knobs {
+            large_nar_threshold_mib: 1,
+            ..Knobs::default()
+        };
+        for (mechanism, knobs, nar) in [
+            (
+                SUPPLY_MECHANISM_UPLOAD_BATCH,
+                Knobs::default(),
+                vec![1u8; 64],
+            ),
+            (
+                SUPPLY_MECHANISM_UPLOAD_STREAM,
+                stream_knobs,
+                vec![3u8; 2 * 1024 * 1024],
+            ),
+        ] {
+            for cell in &cells {
+                let case = format!("[{mechanism} x {}]", cell.name);
+                let (_dir, state) = state();
+                let fake = FakeSupplyTransport::default();
+                fake.scripted.lock().unwrap().insert(
+                    PATH_A.to_string(),
+                    cell.script
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::VecDeque<_>>(),
+                );
+                let ctx = SupplyContext::new(SupplyDependencies::Substituters);
+                let claims = UploadClaims::new();
+                let plan = batch_plan(vec![item(PATH_A, nar.clone(), &[])]);
+                prewarm_uploads(&fake, None, &ctx, &plan, &knobs, &state, &claims)
+                    .await
+                    .unwrap();
+                let entries = entries(&state);
+                let entry = entry_for(&entries, PATH_A);
+                assert_eq!(entry.outcome, cell.outcome, "{case}: {entry:?}");
+                assert_eq!(entry.mechanism, mechanism, "{case}");
+                assert_eq!(
+                    fake.attempts.lock().unwrap()[PATH_A],
+                    cell.attempts,
+                    "{case}: a wire death gets exactly the one retry a refusal does"
+                );
+                if let Some(needle) = cell.detail_contains {
+                    let detail = entry.detail.as_deref().unwrap_or_default();
+                    assert!(detail.contains(needle), "{case}: detail {detail:?}");
+                }
+            }
+            // The `Other` column: a hard transport failure settles FAILED
+            // on the FIRST attempt — no retry is owed (the channel-open /
+            // protocol-failure shape, distinct from the mid-upload
+            // ambiguity).
+            let case = format!("[{mechanism} x hard-failure]");
+            let (_dir, state) = state();
+            let fake = FakeSupplyTransport::default();
+            fake.fail_uploads.store(true, Ordering::SeqCst);
+            let ctx = SupplyContext::new(SupplyDependencies::Substituters);
+            let claims = UploadClaims::new();
+            let knobs = if mechanism == SUPPLY_MECHANISM_UPLOAD_STREAM {
+                Knobs {
+                    large_nar_threshold_mib: 1,
+                    ..Knobs::default()
+                }
+            } else {
+                Knobs::default()
+            };
+            let plan = batch_plan(vec![item(PATH_A, nar.clone(), &[])]);
+            prewarm_uploads(&fake, None, &ctx, &plan, &knobs, &state, &claims)
+                .await
+                .unwrap();
+            let entries = entries(&state);
+            assert_eq!(
+                entry_for(&entries, PATH_A).outcome,
+                SUPPLY_OUTCOME_FAILED,
+                "{case}"
+            );
+            assert_eq!(fake.attempts.lock().unwrap()[PATH_A], 1, "{case}");
+        }
+    }
+
+    /// Standing enumeration of this module's settlement-evidence sites
+    /// (non-test code): where SUPPLY_OUTCOME_REFUSED can be minted and
+    /// where the upload breaker's evidence is recorded.
+    ///
+    /// QUANTIFICATION DOMAIN: every line of exec.rs above the file-level
+    /// `#[cfg(test)]` marker containing the tokens below. REFUSED is an
+    /// irreversible daemon verdict (upload-rejected dependents, gate
+    /// trip), so its sites stay enumerable: the import, two tally reads
+    /// (the invocation totals and the journal refold), and FOUR
+    /// daemon-evidenced settles — the stream arm's refusal-observed
+    /// exhaustion, and the batch arm's refusal x refusal, refusal x
+    /// wire-death, and wire-death x refusal (the teardown-race salvage)
+    /// exhaustions; every settle requires a clean refusal among the
+    /// attempts. The breaker's calls stay balanced across the
+    /// per-attempt vocabulary: success on accepted/Refused (the gateway
+    /// answered), failure on MaybeRefused/Other (the connection died) —
+    /// two arms each, in each of the two upload mechanisms. A new settle
+    /// or breaker call changes a count and fails here until it is
+    /// re-derived against the evidence rule and enumerated.
+    #[test]
+    fn refused_settlements_and_breaker_evidence_sites_are_enumerated() {
+        let source = include_str!("exec.rs");
+        let non_test = source
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("exec.rs has a test module");
+        let count = |token: &str| {
+            non_test
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .filter(|line| line.contains(token))
+                .count()
+        };
+        assert_eq!(
+            count("SUPPLY_OUTCOME_REFUSED"),
+            7,
+            "REFUSED sites: the import + 2 tally reads + the 4 daemon-evidenced settles \
+             (stream exhaustion-with-refusal; batch refusal x refusal, refusal x \
+             wire-death, wire-death x refusal). A new site must carry daemon-refusal \
+             evidence."
+        );
+        assert_eq!(
+            count("breaker.record_success()"),
+            4,
+            "breaker success evidence: accepted + clean refusal, in each upload mechanism \
+             — a clean refusal proves the gateway answered"
+        );
+        assert_eq!(
+            count("breaker.record_failure()"),
+            4,
+            "breaker failure evidence: wire death + hard failure, in each upload mechanism \
+             — a dead connection is never a success"
+        );
     }
 
     #[tokio::test]
@@ -3194,6 +3609,139 @@ mod tests {
         assert!(
             !state2.path("PAUSE").exists(),
             "a healthy prewarm pass must not pause"
+        );
+    }
+
+    /// The breaker's evidence rule on the real stage surface, both
+    /// directions:
+    ///
+    /// Must-trip: a data path that kills bulk transfers while dials still
+    /// succeed — every upload dies mid-wire
+    /// ([`SupplyTransportError::MaybeRefused`]) — latches the breaker and
+    /// writes the campaign PAUSE file, exactly like the channel-open
+    /// collapse in `run_supply_stage_pauses_when_the_upload_breaker_collapses`.
+    /// Before this counted as failure evidence, every wire death recorded
+    /// a breaker SUCCESS (it was synthesized into a refusal), so the
+    /// operator-PAUSE guard was structurally unreachable for data-path
+    /// outages while the stage ground the plan into refused settlements;
+    /// the pre-trip paths must settle FAILED — no daemon answered
+    /// anything — never REFUSED.
+    ///
+    /// Must-not-trip: a clean refusal STORM (the daemon answers every
+    /// attempt with a rejection) settles REFUSED with the full per-path
+    /// retry served, and never trips the breaker or pauses — a clean
+    /// refusal proves the gateway answered, so it is breaker success
+    /// evidence by design.
+    #[tokio::test]
+    async fn wire_death_collapse_trips_the_breaker_but_a_refusal_storm_does_not() {
+        use crate::run::archive_input::write_mini_wide_archive;
+
+        let inputs_for = |archive: Arc<ReplayArchive>, drvs: &[String]| SupplyInputs {
+            workload_outputs: BTreeSet::new(),
+            workload_drvs: drvs.iter().cloned().collect(),
+            prefetch_paths: BTreeMap::new(),
+            prior_valid: BTreeSet::new(),
+            target_coverage: BTreeSet::new(),
+            archive: Some(archive),
+            target_substituters: Vec::new(),
+            relay_substituters: Vec::new(),
+            // Hermetic: no substituter rungs, so the test never probes.
+            dependencies: SupplyDependencies::EmbeddedOnly,
+            delivery: SupplyDelivery::Prewarm,
+        };
+        // One worker, one entry per sub-batch: strictly serial failures,
+        // breaker threshold max(2 × 1, 6) = 6.
+        let knobs = Knobs {
+            upload_workers: 1,
+            upload_batch_max_entries: 1,
+            ..Knobs::default()
+        };
+
+        // ── Must-trip: wire deaths are breaker failure evidence. ───────
+        let archive_dir = tempfile::tempdir().unwrap();
+        let drvs = write_mini_wide_archive(archive_dir.path(), 8);
+        let archive = Arc::new(ReplayArchive::open(archive_dir.path()).unwrap());
+        let (_dir, state) = state();
+        let state = Arc::new(state);
+        let fake = Arc::new(FakeSupplyTransport::default());
+        fake.wire_error_uploads.store(true, Ordering::SeqCst);
+        let report = run_supply_stage(
+            state.clone(),
+            fake.clone(),
+            inputs_for(archive, &drvs),
+            &knobs,
+            Arc::new(AtomicU64::new(1)),
+            false,
+        )
+        .await
+        .unwrap()
+        .report;
+        assert!(
+            report.upload_collapsed,
+            "sustained mid-upload wire deaths must latch the breaker: {report:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.path("PAUSE")).unwrap(),
+            "supply upload collapse\n",
+            "the data-path collapse must reach the operator PAUSE gate"
+        );
+        // Each attempted path burned its attempt and the fresh-channel
+        // retry (2 failures each); the threshold of 6 trips after the
+        // third path, and the rest are skipped without transport calls.
+        assert_eq!(fake.upload_calls.load(Ordering::SeqCst), 6);
+        assert_eq!(report.refused, 0, "no daemon answered: nothing is REFUSED");
+        assert_eq!(report.failed, 3, "{report:?}");
+        assert_eq!(report.skipped, 5, "{report:?}");
+        let rows = entries(&state);
+        for row in rows.iter().filter(|r| r.outcome == SUPPLY_OUTCOME_FAILED) {
+            assert!(
+                row.detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("no daemon refusal observed"),
+                "failed settles disclose the missing daemon evidence: {row:?}"
+            );
+        }
+
+        // ── Must-not-trip: clean refusals are breaker success evidence. ─
+        let archive_dir2 = tempfile::tempdir().unwrap();
+        let drvs2 = write_mini_wide_archive(archive_dir2.path(), 8);
+        let archive2 = Arc::new(ReplayArchive::open(archive_dir2.path()).unwrap());
+        let (_dir2, state2) = state2();
+        let state2 = Arc::new(state2);
+        let fake2 = Arc::new(FakeSupplyTransport::default());
+        {
+            let mut refusals = fake2.refusals.lock().unwrap();
+            for drv in &drvs2 {
+                refusals.insert(drv.clone(), u32::MAX);
+            }
+        }
+        let report = run_supply_stage(
+            state2.clone(),
+            fake2.clone(),
+            inputs_for(archive2, &drvs2),
+            &knobs,
+            Arc::new(AtomicU64::new(1)),
+            false,
+        )
+        .await
+        .unwrap()
+        .report;
+        assert!(
+            !report.upload_collapsed,
+            "a refusal storm proves the gateway alive: {report:?}"
+        );
+        assert!(
+            !state2.path("PAUSE").exists(),
+            "clean refusals must not pause the campaign"
+        );
+        assert_eq!(report.refused, 8, "{report:?}");
+        assert_eq!(report.failed, 0, "{report:?}");
+        assert_eq!(report.skipped, 0, "every path got its full retry");
+        assert_eq!(
+            fake2.upload_calls.load(Ordering::SeqCst),
+            16,
+            "8 paths x (attempt + fresh-channel retry), none short-circuited"
         );
     }
 
