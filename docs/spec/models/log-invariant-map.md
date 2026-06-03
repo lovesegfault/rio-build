@@ -526,3 +526,135 @@ adds the caps axis; recorded here per the formal-delta discipline:
   as_append_target` + the `latest_build_exec` view's DB test — the
   multi-population dispatch regime is the planned `logServiceKindMix`
   extension in B2's remaining scope).
+
+## Bughunt-wave B2 close-out — item 8 formal planes + the 10-finding roster (2026-06-03)
+
+The B2 (log-ingest-authority) workstream's remaining three model axes,
+landed with the close-out; the commit-1 entry above records the first
+(bytes/caps) axis. Measured verdicts live in the introducing commit's
+message; the wired checks in `nix/quint.nix` are the standing evidence.
+
+### The three planes
+
+- **Kind-mix** (`store.log.append-auth+2`'s kind half, merged_bug_101's
+  displacement leg): the execution-kind population is now modeled —
+  `dispatchMaterialization` takes the latest-assignment slot with a
+  `KMat` execution, `openAdmitted` v3 carries the gate's `attempt_kind`
+  conjunct (and the per-exec expiry conjunct, relocated from the open
+  action), and the new regime `logServiceKindMix` (2 execs, 2 sessions,
+  reconnects, no fabrication) proves `buildTailAdmittable`: a mat
+  execution is never admitted, and a build execution with its own row,
+  an incomplete unexpired log, and cap headroom is admitted EVEN while
+  the mat attempt is latest. Witness
+  `quint-log-service-witness-kind-mix-replay` pins the
+  replay-after-mat-dispatch admission reachable;
+  `logServiceCalibLatestOnly` re-adds the pre-fix `e == dispatched`
+  conjunct and falsifies the invariant — the displacement bug,
+  reproduced at the model level.
+- **Loss-conservation** (`builder.log.loss-disclosure`,
+  merged_bug_360): the uploader terminal is now the disclosure lattice
+  `Abandoned({ counted })` — every abandonment arm routes through the
+  `disclose()` chokepoint, and `ingestLossCounted` (asserted in base,
+  redispatch, resend, sweep, and kind-mix) demands that an UNCOUNTED
+  abandonment had nothing real to lose: every produced line store-held.
+  Deliberately stated WITHOUT `noSilentLineLoss`'s not-complete and
+  abandoned escape disjuncts — the pre-fix rejected:true suppression
+  satisfied both while vanishing real lines; `logServiceCalibLossEscape`
+  re-encodes that suppression and falsifies the invariant. Witness
+  `quint-log-service-witness-loss-counted` pins the counted arm
+  reachable.
+- **Sweep ownership** (`store.log.sweep-ownership`, merged_bug_086):
+  re-derived to the as-landed SPLIT — the store's TTL pass
+  (`sweepChunks`) strips manifests age-only and NEVER deletes the
+  lifecycle row (safe precisely because of that); the row reclaim is
+  the SCHEDULER's `gcExecRow` (`gc_exec_rows`) behind the kernel
+  eligibility — `execRowSweepEligible` = terminal AND
+  attempt-ledger-unreferenced AND aged out (the kernel's fourth
+  conjunct, no-active-assignment, is scheduler-side state outside this
+  model; omitting it only WIDENS the modeled reclaim, so safety
+  verdicts transfer). New environment action `ledgerReleases` models
+  the per-lane attempt-GC cut releasing the execution;
+  `sweepOnlyTerminalUnreferenced` (a deleted row implies all three
+  conjuncts, sound from post-states because every input is frozen or
+  monotone once the row is gone) is asserted in the sweep regime.
+  `logServiceCalibSweepAgeOnly` restores the age-only reclaim and
+  falsifies it; witness `quint-log-service-witness-live-exec-survives`
+  pins the v2 refusal (an expired-but-ineligible execution's row
+  surviving the store pass) reachable.
+
+  **Found and fixed while landing this plane**: the d5409f8e3 sweep
+  commit moved row retention scheduler-side in the CODE but left the
+  model's `sweepExecRow` (and its MBT mirror) deleting the row
+  store-side — `mbt_run_sweep_complete_log` diverged at the
+  post-sweep step against the unmodified HEAD model (the row exists
+  in the implementation, deleted in the model). The model now carries
+  the split (`sweepChunks` keeps the row; `gcExecRow` is the
+  scheduler's reclaim, mirrored in the MBT harness as the reclaim's
+  effect with the guard model-side + kani-pinned scheduler-side), and
+  the conformance replay is green. The pass's registry-row DELETE is
+  deliberately unmodeled hygiene: the model's `sessions` variable
+  mirrors the IN-MEMORY ingest sessions, which the pass never touches
+  — a still-open session keeps cutting after the pass and the
+  SELECT's EXISTS disjunction re-finds the new chunks next pass.
+
+State-space discipline: the three untouched regimes are BIT-EXACT under
+the extension (base 19,955 / redispatch 2,448,153 / resend 9,420
+distinct states, identical before and after — the new variables are
+constants there); the sweep regime moves 5,365 → 9,118 (the ownership
+split: the row now survives the store pass, the release/reclaim
+interleaving is explored, and post-pass cutting stays reachable — the
+fix's semantics, not drift). The kind-mix regime is new at 90,302
+distinct states (exhaustive, with `MAX_BUILD_EXECS = 1` bounding the
+build population to the displacement scenario's shape — without the
+bound the regime is the redispatch x resend cross product, measured
+past 300M states). Time stays out of scope per the wave ruling §4.R8
+below.
+
+### The B2 roster (all 10 findings, close-out modes)
+
+| Finding | Mode | Where it closed |
+|---|---|---|
+| merged_bug_207 (session-scoped caps) | S+R | `GateOk`-only construction + durable accounts (commit 1); displaced-driver cancel rider; `acceptedWithinCap` + `logServiceCalibSessionCaps` |
+| merged_bug_101 (latest-assignment displacement) | S | claimed-exec own-row gate v2 + the kind-mix plane above; `logServiceCalibGateRow` + `logServiceCalibLatestOnly` |
+| merged_bug_111 (unpinned TailLog → latest exec) | S | `latest_build_exec` view (the view half); the query-filter direction is the `log-no-raw-latest-exec` policy check + DB test — none-sensible for the model (a SQL projection, no protocol content) |
+| merged_bug_360 (loss-counter holes) | S | `AbandonReason` lattice + single `disclose()` chokepoint + `LossGuard`; the loss-conservation plane above |
+| bug_248 (mid-stream permanent rejections) | S | `SessionEnd::PermanentReject` classification (rides the disclosure lattice) |
+| bug_098 (write/read bound asymmetry) | S | kernel-owned `MAX_CHUNK_PAYLOAD_BYTES` + `bounded_contiguous_prefix_len` (kani contract + fuzz round-trip; byte domain — none-sensible for the line-integer model, priced in the header) |
+| merged_bug_086 (unguarded TTL delete) | S | kernel `exec_row_sweep_eligible` + scheduler-owned `gc_exec_rows`; the sweep-ownership plane above |
+| bug_290 (TailLog unauthenticated) | S+R | per-method `CredentialClass` table + tenant-JWT + ownership (A6); authz topology is tests + golden + VM — none-sensible for this model (trust boundary sits below the modeled writer identity, see the header) |
+| bug_255 (parent-dir fsync) | R | `durable_put` sequence-spy test; POSIX crash semantics — none-sensible (recorded per directive 2) |
+| bug_131 (bitmask-as-clamp) | R | `semaphore_permits` saturating helper; pure arithmetic with a unit table — none-sensible |
+
+### §4.R8 — the thesis narrowed
+
+This workstream's original four-axis claim (bytes/caps, kind
+population, loss conservation, sweep ownership **and the timed axis**)
+is narrowed to the four it funds: the model remains deliberately
+UNTIMED (cuts atomic, no drain deadline clock, no heartbeat staleness
+clock). B1 owns the recorded none-sensible rationale for the timed
+axis (the parked-cut + paced-multirun test pair is merged_bug_119's
+pin); no bughunt-wave workstream models time, per ruling R8.
+
+### The security-rider meta-class (coordinator-mandated record)
+
+The three security findings folded into this workstream's commits are
+one class, not three bugs: **absence or presence treated as a
+verdict at a trust boundary**. (1) The append-authority gate's
+`LEFT JOIN … COALESCE(attempt_kind, 'build')` defaulted a MISSING
+lifecycle row to the authorized kind — absence-as-permission; fixed to
+an INNER JOIN (absence is now unrepresentable in the admitted path) and
+pinned by the row-less-assignment red. (2) The TailLog ownership
+fallback passed `%`/`_` through `LIKE` — a metacharacter PRESENT in
+the hash position widened an exact-ownership predicate to
+any-own-tenant-derivation while authorizing a pinned foreign exec;
+fixed by nixbase32 validation before the query (the
+`QueryPathFromHashPart` precedent), failure indistinguishable from
+not-owned. (3) The authz layer's ServiceOrTenant arm accepted header
+PRESENCE as a credential (`contains_key`, no verification); fixed by
+in-layer HMAC verification with the verifier handle required at
+construction — an unverifying layer is unconstructible. All three are
+the wave's classification-cells thesis applied to authorization:
+the fix in every case made the absent/unverified state
+unrepresentable rather than defaulting it to the permissive arm.
+Provenance: automated security review during the wave (2026-06-03),
+routed in-series; recorded reds in the respective commit bodies.
