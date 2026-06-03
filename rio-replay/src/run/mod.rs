@@ -1311,6 +1311,19 @@ const STALL_PROBE_BUILD_WINDOW: u32 = 32;
 /// — assignment churn from cancel-and-requeue thrash looks exactly like
 /// that, which is why the engine-cancel requeue loop carries its own
 /// explicit cycle budget rather than delegating to this probe.
+///
+/// Newer/older is resolved by walk position: the listing is
+/// most-recent-first ([`AdminApi::list_builds`], backed by the
+/// scheduler's `ORDER BY submitted_at DESC, build_id DESC` —
+/// `rio-scheduler/src/db/builds.rs`), so a holder found before the
+/// snapshotted id is newer and one found after it is older. An OLDER
+/// holder is never progress (the auto-retry guarantees the drv stays
+/// present in the superseded build, so an older hit is expected
+/// residue, not movement) and the snapshot is MONOTONIC — it advances
+/// (same id: statuses refreshed; newer id: replaced) and never
+/// regresses to an older build, so one anomalous walk cannot set up a
+/// second spurious "newer build" verdict when the real newest holder
+/// reappears.
 struct StallProgressProbe {
     admin: Arc<dyn AdminApi>,
     tenant: String,
@@ -1327,13 +1340,24 @@ impl StallProgressProbe {
         }
     }
 
-    /// `Some(true)` = node-status transitions since the prior probe;
-    /// `Some(false)` = the same build shows the same statuses (no
-    /// progress); `None` = no verdict — first observation (baseline
-    /// recorded) or evidence unavailable (RPC failure, no build holds the
-    /// drv). The terminal gate holds on `None`: a record that exists
-    /// because of missing signal must not be justified by more missing
-    /// signal.
+    /// `Some(true)` = positive progress evidence — node-status
+    /// transitions since the prior probe on the same build, or the drv
+    /// holding in a build NEWER than the snapshot's; `Some(false)` = the
+    /// same build shows the same statuses (no progress); `None` = no
+    /// verdict — first observation (baseline recorded), no build holds
+    /// the drv, the holder is OLDER than the snapshot's build, or
+    /// evidence unavailable (ANY constituent RPC failed). The terminal
+    /// gate holds on `None`: a record that exists because of missing
+    /// signal must not be justified by more missing signal — and a
+    /// failed RPC is missing signal, never an observation, so it must
+    /// neither read as progress (a spurious grace resets the stall clock
+    /// for a fresh `batch_timeout_hours` floor) nor as no-progress (a
+    /// spurious terminal). The walk therefore never continues past a
+    /// failed `get_build_graph`: a build that cannot testify leaves the
+    /// newest holder unknowable this tick, and walking on would let an
+    /// older build — where the drv is guaranteed present after the stall
+    /// auto-retry — impersonate the evidence. The level-triggered
+    /// verdict re-fires and the probe retries next tick.
     async fn progressed_since_prior(&mut self, job: &str, drv: &str) -> Option<bool> {
         let builds = match self
             .admin
@@ -1342,10 +1366,15 @@ impl StallProgressProbe {
         {
             Ok(builds) => builds,
             Err(e) => {
-                tracing::warn!(job, error = %format!("{e:#}"), "stall progress probe: list_builds failed");
+                tracing::warn!(job, error = %format!("{e:#}"), "stall progress probe: list_builds failed; no verdict (the gate holds)");
                 return None;
             }
         };
+        let snapshot_id = self.snapshots.get(job).map(|(id, _)| id.clone());
+        // Set once the walk passes the snapshotted build's position in
+        // the most-recent-first listing: any holder found after that
+        // point is older than the snapshot.
+        let mut passed_snapshot = false;
         for (build_id, _submitted_at) in builds {
             let graph = match self.admin.get_build_graph(&build_id).await {
                 Ok(graph) => graph,
@@ -1354,12 +1383,16 @@ impl StallProgressProbe {
                         job,
                         build_id,
                         error = %format!("{e:#}"),
-                        "stall progress probe: get_build_graph failed; trying older builds"
+                        "stall progress probe: get_build_graph failed; no verdict this tick \
+                         (a build that cannot testify must not be walked past — an older \
+                         build's residue would impersonate the evidence)"
                     );
-                    continue;
+                    return None;
                 }
             };
+            let is_snapshot_build = snapshot_id.as_deref() == Some(build_id.as_str());
             if !graph.nodes.iter().any(|node| node.drv_path == drv) {
+                passed_snapshot |= is_snapshot_build;
                 continue;
             }
             let statuses: BTreeMap<String, String> = graph
@@ -1367,13 +1400,35 @@ impl StallProgressProbe {
                 .iter()
                 .map(|node| (node.drv_path.clone(), node.status.clone()))
                 .collect();
-            let verdict = match self.snapshots.get(job) {
-                Some((prior_id, prior)) if *prior_id == build_id => Some(*prior != statuses),
-                Some(_) => Some(true),
-                None => None,
+            return match self.snapshots.get(job) {
+                Some((prior_id, prior)) if *prior_id == build_id => {
+                    let progressed = *prior != statuses;
+                    self.snapshots.insert(job.to_string(), (build_id, statuses));
+                    Some(progressed)
+                }
+                // The holder sits BELOW the snapshotted build in the
+                // most-recent-first listing (the snapshot's own graph no
+                // longer answered for the drv — truncation, or listing
+                // churn): an older holder is not the newer-build
+                // progress license and not a comparable same-build
+                // observation either. No verdict, and the snapshot
+                // stays put — it only ever advances.
+                Some(_) if passed_snapshot => None,
+                // The holder sits ABOVE the snapshotted build (or the
+                // snapshot's build aged out of the listing window
+                // entirely, which also makes every listed build newer):
+                // the drv moved to a newer build. Progress; the
+                // snapshot advances.
+                Some(_) => {
+                    self.snapshots.insert(job.to_string(), (build_id, statuses));
+                    Some(true)
+                }
+                // First observation: record the baseline, no verdict.
+                None => {
+                    self.snapshots.insert(job.to_string(), (build_id, statuses));
+                    None
+                }
             };
-            self.snapshots.insert(job.to_string(), (build_id, statuses));
-            return verdict;
         }
         None
     }
@@ -3886,11 +3941,19 @@ mod tests {
     struct ProbeAdmin {
         builds: std::sync::Mutex<Vec<(String, Option<String>)>>,
         graphs: std::sync::Mutex<HashMap<String, GraphSnapshot>>,
+        /// Build ids whose `get_build_graph` is scripted to fail (a
+        /// transient RPC error), for the probe's error-injection arms.
+        fail_graphs: std::sync::Mutex<HashSet<String>>,
+        /// When set, `list_builds` is scripted to fail.
+        fail_list_builds: AtomicBool,
     }
 
     #[async_trait]
     impl AdminApi for ProbeAdmin {
         async fn get_build_graph(&self, build_id: &str) -> Result<GraphSnapshot> {
+            if self.fail_graphs.lock().unwrap().contains(build_id) {
+                anyhow::bail!("scripted GetBuildGraph failure for {build_id}");
+            }
             Ok(self
                 .graphs
                 .lock()
@@ -3910,6 +3973,9 @@ mod tests {
             _tenant: &str,
             _limit: u32,
         ) -> Result<Vec<(String, Option<String>)>> {
+            if self.fail_list_builds.load(Ordering::SeqCst) {
+                anyhow::bail!("scripted ListBuilds failure");
+            }
             Ok(self.builds.lock().unwrap().clone())
         }
     }
@@ -5871,6 +5937,205 @@ mod tests {
     /// build one over a scripted admin instead.
     fn test_probe() -> StallProgressProbe {
         StallProgressProbe::new(Arc::new(NoLogsAdmin), "replay-leaf".to_string())
+    }
+
+    /// THE stall-probe verdict lattice: `progressed_since_prior`'s full
+    /// observation domain, pinned to the contract its doc states — a
+    /// terminal minted from absence of signal must not be justified by
+    /// more missing signal, progress requires positive evidence (a
+    /// node-status transition on the SAME build, or the drv holding in a
+    /// NEWER build), and the snapshot is monotonic.
+    ///
+    /// QUANTIFICATION DOMAIN: every fallible RPC in the probe's
+    /// observation chain (`list_builds`, then `get_build_graph` per
+    /// listed build — there are no others on the path) crossed with
+    /// {ok, error}, and for the fully-evidenced walks the holder-vs-
+    /// snapshot relation {no snapshot (baseline), same build (same /
+    /// changed statuses), newer build, older build, no holder, snapshot
+    /// aged out of the window}. Newer/older derives from the listing's
+    /// most-recent-first order (`AdminApi::list_builds`, backed by the
+    /// scheduler's `ORDER BY submitted_at DESC, build_id DESC` in
+    /// rio-scheduler/src/db/builds.rs).
+    ///
+    /// The error cells pin the hold direction the stall ladder depends
+    /// on: a transient RPC failure yields `None` (the verdict re-fires
+    /// next tick) — NEVER `Some(true)` (a spurious grace resets the
+    /// stall clock for a fresh `batch_timeout_hours` floor) and NEVER
+    /// `Some(false)` (a spurious terminal). The canonical regression:
+    /// after the stall auto-retry the drv is present in BOTH the fresh
+    /// (snapshotted) build and the superseded older one, so an error on
+    /// the snapshotted build with the walk continuing would let the
+    /// older build's residue mint progress.
+    #[tokio::test]
+    async fn stall_probe_holds_on_rpc_failure_and_grants_only_on_newer_or_changed() {
+        const JOB: &str = "app.x86_64-linux";
+        const DRV: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-app.drv";
+        // Most-recent-first listing ids (NEW above MID above OLD).
+        const NEW: &str = "0193e4a2-0000-7000-8000-000000000003";
+        const MID: &str = "0193e4a2-0000-7000-8000-000000000002";
+        const OLD: &str = "0193e4a2-0000-7000-8000-000000000001";
+
+        let graph_with = |status: &str| GraphSnapshot {
+            nodes: vec![grpc::GraphNodeView {
+                drv_path: DRV.to_string(),
+                status: status.to_string(),
+                exec_id: String::new(),
+                assigned_executor_id: String::new(),
+            }],
+            truncated: false,
+            total_nodes: 1,
+        };
+        // A successfully fetched graph that does NOT answer for the drv
+        // (other work, or the drv truncated out of a capped snapshot).
+        let graph_without = || GraphSnapshot {
+            nodes: vec![grpc::GraphNodeView {
+                drv_path: "/nix/store/cccccccccccccccccccccccccccccccc-other.drv".to_string(),
+                status: "running".to_string(),
+                exec_id: String::new(),
+                assigned_executor_id: String::new(),
+            }],
+            truncated: true,
+            total_nodes: 9,
+        };
+        let probe_over = |admin: &Arc<ProbeAdmin>| {
+            StallProgressProbe::new(admin.clone() as Arc<dyn AdminApi>, "replay-leaf".into())
+        };
+        let snapshot_of = |probe: &StallProgressProbe| {
+            probe
+                .snapshots
+                .get(JOB)
+                .map(|(id, statuses)| (id.clone(), statuses.clone()))
+        };
+        let admin = Arc::new(ProbeAdmin::default());
+        let set_builds = |ids: &[&str]| {
+            *admin.builds.lock().unwrap() = ids.iter().map(|id| (id.to_string(), None)).collect();
+        };
+        let set_graph = |id: &str, graph: GraphSnapshot| {
+            admin.graphs.lock().unwrap().insert(id.to_string(), graph);
+        };
+
+        // ── Fully-evidenced walks ──────────────────────────────────────
+        let mut probe = probe_over(&admin);
+        // Baseline: holder found, no snapshot → None, baseline recorded.
+        set_builds(&[MID]);
+        set_graph(MID, graph_with("created"));
+        assert_eq!(probe.progressed_since_prior(JOB, DRV).await, None);
+        assert_eq!(
+            snapshot_of(&probe).map(|(id, _)| id),
+            Some(MID.to_string()),
+            "first observation records the baseline"
+        );
+        // Same build, same statuses → Some(false).
+        assert_eq!(probe.progressed_since_prior(JOB, DRV).await, Some(false));
+        // Same build, changed statuses → Some(true).
+        set_graph(MID, graph_with("running"));
+        assert_eq!(probe.progressed_since_prior(JOB, DRV).await, Some(true));
+        // Newer holder above the snapshotted build → Some(true), and the
+        // snapshot ADVANCES to the newer id.
+        set_builds(&[NEW, MID]);
+        set_graph(NEW, graph_with("created"));
+        assert_eq!(probe.progressed_since_prior(JOB, DRV).await, Some(true));
+        assert_eq!(snapshot_of(&probe).map(|(id, _)| id), Some(NEW.to_string()));
+        // OLDER holder below the snapshotted build (whose own graph no
+        // longer answers for the drv) → None, never Some(true), and the
+        // snapshot does NOT regress (monotonicity): a later probe still
+        // compares against NEW, so the older build's residue cannot mint
+        // a second spurious grant when NEW reappears.
+        set_graph(NEW, graph_without());
+        assert_eq!(
+            probe.progressed_since_prior(JOB, DRV).await,
+            None,
+            "an older holder is not progress"
+        );
+        assert_eq!(
+            snapshot_of(&probe).map(|(id, _)| id),
+            Some(NEW.to_string()),
+            "the snapshot only ever advances"
+        );
+        // No holder anywhere → None, snapshot retained.
+        set_graph(MID, graph_without());
+        assert_eq!(probe.progressed_since_prior(JOB, DRV).await, None);
+        assert_eq!(snapshot_of(&probe).map(|(id, _)| id), Some(NEW.to_string()));
+        // Snapshot aged out of the window: every listed build is newer,
+        // so a holder reads as progress.
+        set_builds(&[OLD]);
+        set_graph(OLD, graph_with("created"));
+        let mut aged = probe_over(&admin);
+        aged.snapshots.insert(
+            JOB.to_string(),
+            (
+                "0193e4a2-0000-7000-8000-00000000000f".to_string(),
+                BTreeMap::new(),
+            ),
+        );
+        assert_eq!(aged.progressed_since_prior(JOB, DRV).await, Some(true));
+
+        // ── Error injection: list_builds (RPC 1) ───────────────────────
+        let admin = Arc::new(ProbeAdmin::default());
+        let mut probe = probe_over(&admin);
+        *admin.builds.lock().unwrap() = vec![(MID.to_string(), None)];
+        admin
+            .graphs
+            .lock()
+            .unwrap()
+            .insert(MID.to_string(), graph_with("created"));
+        probe.progressed_since_prior(JOB, DRV).await; // baseline at MID
+        admin.fail_list_builds.store(true, Ordering::SeqCst);
+        assert_eq!(
+            probe.progressed_since_prior(JOB, DRV).await,
+            None,
+            "a failed listing holds the gate"
+        );
+        assert_eq!(
+            snapshot_of(&probe).map(|(id, _)| id),
+            Some(MID.to_string()),
+            "a failed listing must not move the snapshot"
+        );
+
+        // ── Error injection: get_build_graph (RPC 2), the canonical
+        // regression — the snapshotted NEWEST holder fails to answer
+        // while an older build still holds the drv (guaranteed after the
+        // stall auto-retry). The walk must stop: None, not Some(true),
+        // and the snapshot must not be overwritten with the older id. ──
+        let admin = Arc::new(ProbeAdmin::default());
+        let mut probe = probe_over(&admin);
+        *admin.builds.lock().unwrap() = vec![(NEW.to_string(), None), (OLD.to_string(), None)];
+        {
+            let mut graphs = admin.graphs.lock().unwrap();
+            graphs.insert(NEW.to_string(), graph_with("created"));
+            graphs.insert(OLD.to_string(), graph_with("created"));
+        }
+        probe.progressed_since_prior(JOB, DRV).await; // baseline at NEW
+        admin.fail_graphs.lock().unwrap().insert(NEW.to_string());
+        assert_eq!(
+            probe.progressed_since_prior(JOB, DRV).await,
+            None,
+            "a build that cannot testify must not let an older holder mint progress"
+        );
+        assert_eq!(
+            snapshot_of(&probe).map(|(id, _)| id),
+            Some(NEW.to_string()),
+            "the failed walk must not regress the snapshot"
+        );
+        // And once the RPC recovers with the SAME graph, the verdict is
+        // the honest no-progress — the blip granted nothing in between.
+        admin.fail_graphs.lock().unwrap().clear();
+        assert_eq!(probe.progressed_since_prior(JOB, DRV).await, Some(false));
+
+        // ── Error injection: get_build_graph mid-walk, below a
+        // successfully-fetched non-holder — the chain is incomplete, so
+        // the verdict still holds. ─────────────────────────────────────
+        let admin = Arc::new(ProbeAdmin::default());
+        let mut probe = probe_over(&admin);
+        *admin.builds.lock().unwrap() = vec![(NEW.to_string(), None), (MID.to_string(), None)];
+        {
+            let mut graphs = admin.graphs.lock().unwrap();
+            graphs.insert(NEW.to_string(), graph_without());
+            graphs.insert(MID.to_string(), graph_with("created"));
+        }
+        admin.fail_graphs.lock().unwrap().insert(MID.to_string());
+        assert_eq!(probe.progressed_since_prior(JOB, DRV).await, None);
+        assert_eq!(snapshot_of(&probe), None, "no baseline from a failed walk");
     }
 
     /// The collect pass's batch-settle supply rollup, quantified over the
