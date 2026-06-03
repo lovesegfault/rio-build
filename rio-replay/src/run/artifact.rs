@@ -1237,8 +1237,13 @@ mod tests {
             self.inner.get_bytes(key).await
         }
 
-        async fn get_to_file(&self, key: &str, dest: &Path) -> Result<Option<(String, u64)>> {
-            self.inner.get_to_file(key, dest).await
+        async fn get_to_file(
+            &self,
+            key: &str,
+            dest: &Path,
+            max_bytes: u64,
+        ) -> Result<Option<(String, u64)>> {
+            self.inner.get_to_file(key, dest, max_bytes).await
         }
 
         async fn exists(&self, key: &str) -> Result<bool> {
