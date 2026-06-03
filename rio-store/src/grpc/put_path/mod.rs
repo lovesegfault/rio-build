@@ -26,8 +26,7 @@ use super::{StoreServiceImpl, putpath_metadata_status};
 
 pub(super) mod common;
 pub(super) use common::{
-    PlaceholderClaim, apply_trailer, validate_put_metadata, verify_ca_store_path,
-    verify_drv_text_path, verify_nar,
+    PlaceholderClaim, apply_trailer, validate_put_metadata, verify_ca_store_path, verify_nar,
 };
 
 /// Drain remaining messages from a streaming request.
@@ -325,7 +324,7 @@ impl StoreServiceImpl {
                 // (C4c2) the gate arms are typed, but the .drv detection sites
                 // remain suffix-keyed; F3 unifies them on a typed PathKind so a
                 // source path NAMED `*.drv` and a real derivation cannot diverge
-                // by call-site discipline. See store.put.drv-text-ca+2.
+                // by call-site discipline. See store.put.drv-text-ca+3.
                 if store_path.ends_with(".drv") {
                     let pool = self.pool.clone();
                     let chunks = self.chunk_cache.clone();

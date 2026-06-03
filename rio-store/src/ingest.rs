@@ -24,6 +24,7 @@ use sqlx::PgPool;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use rio_common::limits::nar_size_cap;
 use rio_proto::validated::ValidatedPathInfo;
 
 use crate::backend::ChunkBackend;
@@ -31,6 +32,314 @@ use crate::cas;
 use crate::gc::orphan::ReapBy;
 use crate::metadata::{self, MetadataError};
 use crate::substitute::SUBSTITUTE_STALE_THRESHOLD;
+
+/// Why [`AdmittedNar::admit`] refused a NAR. The transport layers map
+/// this to their own error domains — the gRPC mapping
+/// (`admit_denial_status`) preserves the wire codes the pre-witness
+/// gates used (`InvalidArgument` for malformed shapes,
+/// `PermissionDenied` for a path that is not the text content-address
+/// of its bytes); substitution maps to `SubstituteError::DrvNotTextCa`
+/// / `TooLarge`.
+#[derive(Debug)]
+pub enum AdmitDenial {
+    /// NAR exceeds the path's class cap
+    /// (`nar_size_cap(is_derivation)`). In the gRPC flows the
+    /// streaming gates (`accumulate_chunk` / `apply_trailer`) fire
+    /// first, so this arm is defense-in-depth there; substitution
+    /// reaches it only if the declared/decompressed gates were
+    /// bypassed (they are not — same cap, checked earlier).
+    OverCap {
+        limit: u64,
+        actual: u64,
+        is_derivation: bool,
+    },
+    /// `.drv` NAR is not a single regular-file NAR.
+    NotSingleFile(String),
+    /// `.drv` content length does not fit this platform's `usize`.
+    LenOverflow,
+    /// The text content-address could not be derived (bad name/refs).
+    TextCaDerive(String),
+    /// `.drv` path is not the text content-address of its bytes with
+    /// the declared references.
+    TextCaMismatch { claimed: String, derived: String },
+}
+
+impl std::fmt::Display for AdmitDenial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdmitDenial::OverCap {
+                limit,
+                actual,
+                is_derivation,
+            } => write!(
+                f,
+                "NAR of {actual} bytes exceeds the {} class cap ({limit} bytes)",
+                if *is_derivation { ".drv" } else { "general" }
+            ),
+            AdmitDenial::NotSingleFile(e) => {
+                write!(f, "a .drv upload must be a single regular-file NAR: {e}")
+            }
+            AdmitDenial::LenOverflow => {
+                write!(f, ".drv content length does not fit this platform")
+            }
+            AdmitDenial::TextCaDerive(e) => {
+                write!(f, "cannot derive the text content-address: {e}")
+            }
+            AdmitDenial::TextCaMismatch { claimed, derived } => write!(
+                f,
+                ".drv path {claimed} is not the text content-address of the uploaded bytes \
+                 with the declared references (derived {derived})"
+            ),
+        }
+    }
+}
+
+/// The NAR-residency admission witness: proof that a byte buffer has
+/// passed every invariant the store demands of bytes it makes
+/// resident. Private fields + a single fallible constructor mean a
+/// persistence primitive that takes `AdmittedNar` CANNOT be handed
+/// unchecked bytes — a new ingest route that skips admission is a
+/// compile error, not a review hope.
+///
+/// Invariants established by [`Self::admit`]:
+///
+/// 1. **Class cap** — `len ≤ nar_size_cap(is_derivation)` (16 MiB for
+///    `.drv` paths, 4 GiB otherwise). An over-cap resident `.drv`
+///    would be permanently unfetchable by every capped consumer.
+/// 2. **Text-CA binding** (`.drv` paths only) — the claimed path
+///    equals `make_text(name, sha256(file bytes), references)`, so a
+///    registered `.drv` path is always the unique preimage of its
+///    bytes. This is the REGISTERED FAIL-CLOSED DIVERGENCE from
+///    CppNix described at #r(store.put.drv-text-ca): the oracle's
+///    `registerValidPath` (`local-store.cc:680-716`) accepts
+///    source-CA byte-copies of derivation files; rio rejects them
+///    because the modulo cache (M_068), the gateway derivation
+///    cache, and the deriver-proof claims chain all key on
+///    "registered `.drv` path ⇒ unique text-CA preimage".
+/// 3. **Single preimage extraction** — for `.drv` paths the
+///    single-file contents are located ONCE here
+///    (`single_file_nar_content_range`) and retained, so no
+///    downstream consumer re-parses the NAR (the pre-witness routes
+///    each ran their own `extract_single_file`, and the one route
+///    that skipped the binding could feed `populate_on_ingest`
+///    forged bytes).
+///
+/// Non-`.drv` paths carry no preimage and no text-CA obligation; the
+/// witness still pins the class cap.
+// r[impl store.put.drv-text-ca+3]
+pub struct AdmittedNar {
+    nar_data: Vec<u8>,
+    /// `.drv` paths: the extracted, text-CA-bound single-file
+    /// contents. `None` for non-derivation paths.
+    drv_preimage: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for AdmittedNar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmittedNar")
+            .field("nar_len", &self.nar_data.len())
+            .field(
+                "drv_preimage_len",
+                &self.drv_preimage.as_ref().map(Vec::len),
+            )
+            .finish()
+    }
+}
+
+impl AdmittedNar {
+    /// Admit `nar_data` for residency at `info.store_path`. The ONLY
+    /// constructor — see the type docs for the invariants.
+    pub fn admit(info: &ValidatedPathInfo, nar_data: Vec<u8>) -> Result<Self, AdmitDenial> {
+        let is_derivation = info.store_path.is_derivation();
+        let limit = nar_size_cap(is_derivation);
+        if nar_data.len() as u64 > limit {
+            return Err(AdmitDenial::OverCap {
+                limit,
+                actual: nar_data.len() as u64,
+                is_derivation,
+            });
+        }
+        let drv_preimage = if is_derivation {
+            let (off, len) =
+                single_file_nar_content_range(&nar_data).map_err(AdmitDenial::NotSingleFile)?;
+            let len = usize::try_from(len).map_err(|_| AdmitDenial::LenOverflow)?;
+            let file_bytes = &nar_data[off..off + len];
+            use std::io::Write as _;
+            let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+            w.write_all(file_bytes)
+                .map_err(|e| AdmitDenial::TextCaDerive(format!(".drv hash: {e}")))?;
+            let hash = w.finish();
+            let expected = rio_nix::store_path::StorePath::make_text(
+                info.store_path.name(),
+                &hash,
+                &info.references,
+            )
+            .map_err(|e| AdmitDenial::TextCaDerive(e.to_string()))?;
+            if expected != info.store_path {
+                return Err(AdmitDenial::TextCaMismatch {
+                    claimed: info.store_path.as_str().to_string(),
+                    derived: expected.as_str().to_string(),
+                });
+            }
+            Some(file_bytes.to_vec())
+        } else {
+            None
+        };
+        Ok(AdmittedNar {
+            nar_data,
+            drv_preimage,
+        })
+    }
+
+    /// Admitted byte length (drives the inline-vs-chunked branch).
+    pub fn len(&self) -> usize {
+        self.nar_data.len()
+    }
+
+    /// True iff the admitted NAR is empty.
+    pub fn is_empty(&self) -> bool {
+        self.nar_data.is_empty()
+    }
+
+    /// The admitted NAR bytes. Reading is unrestricted — the hazard
+    /// the witness exists for is PERSISTING unadmitted bytes, and the
+    /// persistence primitives take the witness itself.
+    pub fn bytes(&self) -> &[u8] {
+        &self.nar_data
+    }
+
+    /// Take the text-CA-bound `.drv` preimage (for
+    /// `populate_on_ingest`), leaving `None`. Callers take it BEFORE
+    /// handing the witness to a persistence primitive — population
+    /// runs after persist, but the NAR is consumed by then.
+    pub fn take_drv_preimage(&mut self) -> Option<Vec<u8>> {
+        self.drv_preimage.take()
+    }
+
+    /// Borrow the `.drv` preimage without consuming it.
+    pub fn drv_preimage(&self) -> Option<&[u8]> {
+        self.drv_preimage.as_deref()
+    }
+
+    /// Consume the witness into its raw bytes — for the persistence
+    /// layer's terminal hand-off (inline blob / chunker input) only.
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.nar_data
+    }
+}
+
+/// Locate the contents of a single-regular-file NAR inside `nar`,
+/// returning `(offset, length)` of the file bytes without copying them
+/// and without the general-purpose parser's per-file size cap.
+///
+/// The framing is validated strictly: magic, `regular` type, zero
+/// padding, a closing parenthesis, and no trailing bytes. Anything
+/// else — directories, symlinks, truncation — is an error.
+///
+/// The `executable` marker is rejected: the flat content hash is over
+/// the file bytes only, so the executable and non-executable variants
+/// of the same content would otherwise verify against the same
+/// content-derived path, and every legitimate flat producer (CppNix,
+/// the builder's flat shape rules in `verify_fod_hashes` /
+/// `finalize_floating_ca`) refuses to mint a flat output that is
+/// executable in the first place.
+pub(crate) fn single_file_nar_content_range(nar: &[u8]) -> Result<(usize, u64), String> {
+    fn read_u64(nar: &[u8], pos: &mut usize) -> Result<u64, String> {
+        let end = pos
+            .checked_add(8)
+            .ok_or_else(|| "length field overflows".to_string())?;
+        let bytes = nar
+            .get(*pos..end)
+            .ok_or_else(|| "truncated NAR: expected a length field".to_string())?;
+        *pos = end;
+        Ok(u64::from_le_bytes(bytes.try_into().expect("8-byte slice")))
+    }
+    fn read_token<'a>(nar: &'a [u8], pos: &mut usize) -> Result<&'a [u8], String> {
+        let len = read_u64(nar, pos)?;
+        let len = usize::try_from(len).map_err(|_| "token length overflows".to_string())?;
+        let end = pos
+            .checked_add(len)
+            .ok_or_else(|| "token length overflows".to_string())?;
+        let tok = nar
+            .get(*pos..end)
+            .ok_or_else(|| "truncated NAR: token".to_string())?;
+        *pos = end;
+        let pad = (8 - len % 8) % 8;
+        let pad_end = pos
+            .checked_add(pad)
+            .ok_or_else(|| "padding overflows".to_string())?;
+        let padding = nar
+            .get(*pos..pad_end)
+            .ok_or_else(|| "truncated NAR: token padding".to_string())?;
+        if padding.iter().any(|b| *b != 0) {
+            return Err("non-zero token padding".to_string());
+        }
+        *pos = pad_end;
+        Ok(tok)
+    }
+    fn expect(nar: &[u8], pos: &mut usize, want: &[u8]) -> Result<(), String> {
+        let tok = read_token(nar, pos)?;
+        if tok != want {
+            return Err(format!(
+                "expected `{}`, found `{}`",
+                std::str::from_utf8(want).unwrap_or("<non-utf8>"),
+                std::str::from_utf8(tok).unwrap_or("<non-utf8>")
+            ));
+        }
+        Ok(())
+    }
+
+    let mut pos = 0usize;
+    expect(nar, &mut pos, b"nix-archive-1")?;
+    expect(nar, &mut pos, b"(")?;
+    expect(nar, &mut pos, b"type")?;
+    let ty = read_token(nar, &mut pos)?;
+    if ty != b"regular" {
+        return Err(format!(
+            "not a regular file (type `{}`)",
+            std::str::from_utf8(ty).unwrap_or("<non-utf8>")
+        ));
+    }
+    let tok = read_token(nar, &mut pos)?;
+    if tok == b"executable" {
+        return Err(
+            "executable single-file NARs are not valid flat content-addressed outputs \
+             (the flat hash ignores the bit; CppNix rejects this shape)"
+                .to_string(),
+        );
+    }
+    if tok != b"contents" {
+        return Err(format!(
+            "expected `contents`, found `{}`",
+            std::str::from_utf8(tok).unwrap_or("<non-utf8>")
+        ));
+    }
+    let len = read_u64(nar, &mut pos)?;
+    let len_usize = usize::try_from(len).map_err(|_| "content length overflows".to_string())?;
+    let offset = pos;
+    let content_end = offset
+        .checked_add(len_usize)
+        .ok_or_else(|| "content length overflows".to_string())?;
+    if nar.len() < content_end {
+        return Err("truncated NAR: contents".to_string());
+    }
+    let pad = (8 - len_usize % 8) % 8;
+    let pad_end = content_end
+        .checked_add(pad)
+        .ok_or_else(|| "content padding overflows".to_string())?;
+    let padding = nar
+        .get(content_end..pad_end)
+        .ok_or_else(|| "truncated NAR: content padding".to_string())?;
+    if padding.iter().any(|b| *b != 0) {
+        return Err("non-zero content padding".to_string());
+    }
+    let mut tail = pad_end;
+    expect(nar, &mut tail, b")")?;
+    if tail != nar.len() {
+        return Err("trailing bytes after the single-file NAR".to_string());
+    }
+    Ok((offset, len))
+}
 
 /// Result of [`claim_placeholder`].
 pub enum PlaceholderClaim {
@@ -164,8 +473,11 @@ pub enum PersistError {
     Inline(MetadataError),
 }
 
-/// Persist a validated, hash-verified NAR for ONE output. Branches on
-/// `nar_data.len()` vs [`cas::INLINE_THRESHOLD`]: inline goes to
+/// Persist an ADMITTED NAR for ONE output — the [`AdmittedNar`]
+/// witness is the only accepted byte carrier, so every persistence
+/// route has passed the class cap and (for `.drv`) the text-CA
+/// binding by construction. Branches on
+/// `nar.len()` vs [`cas::INLINE_THRESHOLD`]: inline goes to
 /// `manifests.inline_blob` in one tx; chunked goes through
 /// [`cas::put_chunked`] (FastCDC + S3 + refcounts, own write-ahead +
 /// rollback).
@@ -178,17 +490,17 @@ pub async fn persist_nar(
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
     info: &ValidatedPathInfo,
     claim: Uuid,
-    nar_data: Vec<u8>,
+    nar: AdmittedNar,
     chunk_upload_max_concurrent: usize,
     hooks: IngestHooks,
 ) -> Result<(), PersistError> {
-    if let Some(backend) = cas::should_chunk(chunk_backend, nar_data.len()) {
+    if let Some(backend) = cas::should_chunk(chunk_backend, nar.len()) {
         let stats = cas::put_chunked(
             pool,
             backend,
             info,
             claim,
-            &nar_data,
+            &nar,
             chunk_upload_max_concurrent,
         )
         .await
@@ -202,7 +514,7 @@ pub async fn persist_nar(
         );
         metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
     } else {
-        metadata::complete_manifest_inline(pool, info, claim, Bytes::from(nar_data))
+        metadata::complete_manifest_inline(pool, info, claim, Bytes::from(nar.into_bytes()))
             .await
             .map_err(PersistError::Inline)?;
         debug!(store_path = %info.store_path.as_str(), "{}: inline upload completed", hooks.ctx_label);
@@ -340,5 +652,96 @@ pub async fn abort_placeholder(
             error = %e,
             "abort_placeholder: cleanup failed; orphan scanner will reclaim",
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rio_test_support::fixtures::{make_path_info_for_nar, test_store_path};
+
+    /// Canonical single-file NAR of `contents`.
+    fn nar_of_file(contents: &[u8]) -> Vec<u8> {
+        let node = rio_nix::nar::NarNode::Regular {
+            executable: false,
+            contents: contents.to_vec(),
+        };
+        let mut nar = Vec::new();
+        rio_nix::nar::serialize(&mut nar, &node).unwrap();
+        nar
+    }
+
+    /// Genuine text-CA `.drv` info for `drv_text` (no references).
+    fn genuine_drv_info(drv_text: &[u8]) -> (ValidatedPathInfo, Vec<u8>) {
+        use std::io::Write as _;
+        let nar = nar_of_file(drv_text);
+        let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+        w.write_all(drv_text).unwrap();
+        let path = rio_nix::store_path::StorePath::make_text("a.drv", &w.finish(), &[]).unwrap();
+        let info = make_path_info_for_nar(path.as_str(), &nar);
+        (info, nar)
+    }
+
+    // r[verify store.put.drv-text-ca+3]
+    /// The witness's three invariants at the constructor: genuine
+    /// text-CA `.drv` admitted with its preimage retained; forged
+    /// path refused; non-single-file `.drv` refused; over-cap `.drv`
+    /// refused at the CLASS bound (16 MiB, not 4 GiB); non-`.drv`
+    /// admitted with no preimage.
+    #[test]
+    fn admit_enforces_class_cap_and_text_ca() {
+        let drv_text = br#"Derive([("out","/nix/store/cccccccccccccccccccccccccccccccc-l","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
+        let (info, nar) = genuine_drv_info(drv_text);
+        let mut admitted = AdmittedNar::admit(&info, nar.clone()).expect("genuine .drv admitted");
+        assert_eq!(
+            admitted.drv_preimage(),
+            Some(drv_text.as_slice()),
+            "preimage extracted once at admission"
+        );
+        assert_eq!(admitted.bytes(), &nar[..]);
+        let taken = admitted.take_drv_preimage().unwrap();
+        assert_eq!(taken, drv_text.to_vec());
+        assert!(admitted.take_drv_preimage().is_none(), "take is one-shot");
+
+        // Forged: same bytes at a different (non-preimage) .drv path.
+        let forged_info = make_path_info_for_nar(&test_store_path("forged.drv"), &nar);
+        let err = AdmittedNar::admit(&forged_info, nar.clone()).unwrap_err();
+        assert!(
+            matches!(err, AdmitDenial::TextCaMismatch { .. }),
+            "got {err:?}"
+        );
+
+        // Not a single-file NAR.
+        let dir_node = rio_nix::nar::NarNode::Directory { entries: vec![] };
+        let mut dir_nar = Vec::new();
+        rio_nix::nar::serialize(&mut dir_nar, &dir_node).unwrap();
+        let dir_info = make_path_info_for_nar(&test_store_path("dir.drv"), &dir_nar);
+        assert!(matches!(
+            AdmittedNar::admit(&dir_info, dir_nar).unwrap_err(),
+            AdmitDenial::NotSingleFile(_)
+        ));
+
+        // Over the .drv CLASS cap (16 MiB + 1 file byte) — refused even
+        // though far under the generic 4 GiB bound.
+        let big = nar_of_file(&vec![0u8; rio_common::limits::MAX_DRV_NAR_BYTES as usize]);
+        let big_info = make_path_info_for_nar(&test_store_path("big.drv"), &big);
+        let err = AdmittedNar::admit(&big_info, big).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AdmitDenial::OverCap {
+                    is_derivation: true,
+                    limit,
+                    ..
+                } if limit == rio_common::limits::MAX_DRV_NAR_BYTES
+            ),
+            "got {err:?}"
+        );
+
+        // Non-.drv: admitted, no preimage, no text-CA obligation.
+        let plain = nar_of_file(b"hello");
+        let plain_info = make_path_info_for_nar(&test_store_path("plain"), &plain);
+        let a = AdmittedNar::admit(&plain_info, plain).expect("non-.drv admitted");
+        assert!(a.drv_preimage().is_none());
     }
 }

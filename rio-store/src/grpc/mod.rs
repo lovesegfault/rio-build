@@ -586,8 +586,14 @@ pub(super) fn substitute_status(e: SubstituteError) -> Status {
         // demoted to build-from-source.
         SubstituteError::RateLimited { .. } => Status::unavailable("upstream rate-limited; retry"),
         SubstituteError::Admission(a) => a.into(),
+        // AdmissionRefused: the upstream served bytes that fail
+        // residency admission (a non-preimage `.drv` NAR — the forged
+        // modulo-row vector, round-17 merged_bug_063). Like the other
+        // per-upstream integrity failures it is hostile-or-corrupt
+        // upstream data, not a caller error.
         SubstituteError::HashMismatch { .. }
         | SubstituteError::SizeMismatch { .. }
+        | SubstituteError::AdmissionRefused(_)
         | SubstituteError::NarInfo(_)
         | SubstituteError::Ingest(_) => Status::internal("substitute ingest failed"),
     }

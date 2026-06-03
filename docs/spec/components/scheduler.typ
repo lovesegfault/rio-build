@@ -2663,7 +2663,7 @@ evidence) proved the settled record is the impostor.
 ]
 This is the self-service path for `bug_076`-class squats: the victim of a
 content-bound squat on its predictable `drv_path` uploads the genuine
-`.drv` (text-CA-enforced at store ingestion, #rref("store.put.drv-text-ca+2"))
+`.drv` (text-CA-enforced at store ingestion, #rref("store.put.drv-text-ca+3"))
 and resubmits store-backed; the scheduler verifies the store derivation
 and erases the squat --- no operator involved. The verification is
 self-contained in the actor because store transport is not part of the

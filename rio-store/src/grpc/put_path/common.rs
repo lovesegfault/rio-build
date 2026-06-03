@@ -272,88 +272,32 @@ pub(in crate::grpc) fn verify_nar(
     Ok(())
 }
 
-/// Verify that a `.drv` upload is the text content-address of its bytes.
+/// Map an [`ingest::AdmitDenial`] to the wire `Status` this gate has
+/// always produced: malformed shapes (`NotSingleFile`, length
+/// overflow, underivable text-CA, over-cap) are `InvalidArgument`; a
+/// well-formed upload whose path does not derive from its bytes is
+/// `PermissionDenied`. The denial messages themselves are stable —
+/// the `drv_text_ca` e2e pins both codes and message fragments.
 ///
-/// CppNix mints every derivation path as
-/// `makeTextPath(name, sha256(text), inputSrcs ∪ inputDrvs)`; rio's
-/// multi-tenant gateway clients (and any worker relay) upload them, so
-/// the store enforces at ingestion: the claimed path MUST equal
-/// `make_text(name, sha256(single-file contents), declared references)`.
-/// This binds the registered bytes to the path for every caller —
-/// including service-token relays — so the derivation a gateway
-/// validated at submission is byte-identical to the one a worker later
-/// fetches from the store (`gw.dag.drv-cache-text-ca` is the cache-side
-/// half of the same invariant).
-///
-/// REGISTERED FAIL-CLOSED DIVERGENCE (bug_084, corrected): the oracle
-/// does NOT enforce this. CppNix's `registerValidPath`
-/// (`local-store.cc:680-716`) parses (`readInvalidDerivation`) and
-/// invariant-checks (`checkInvariants`) every `.drv`-NAMED path — the
-/// invariants cover the derivation's OUTPUT paths, not the `.drv`
-/// path's own derivation — and accepts a source-CA byte-copy of a
-/// derivation file (its `info.ca` is a `fixed:` source CA, satisfied
-/// by `isContentAddressed`). Such paths are reachable in CppNix only
-/// via store surgery (`nix store add` of an existing `.drv`) plus
-/// `builtins.storePath`; no build pipeline emits them. rio rejects
-/// them because its identity chain assumes the stronger property:
-/// the modulo cache (M_068), the gateway derivation cache, and the
-/// deriver-proof claims binding all key on "registered `.drv` path ⇒
-/// unique TEXT-CA preimage of its bytes"; an oracle-style source copy
-/// would let a `*.drv`-named path carry bytes whose text-CA is a
-/// DIFFERENT path. Pinned by the unit test below and the
-/// service-relay e2e (`tests/grpc/drv_text_ca.rs`); deliberately NO
-/// differential-corpus entry — the corpus asserts parity, this is a
-/// registered divergence (`store.put.drv-text-ca+2`).
-///
-/// Non-`.drv` paths are untouched. Error split follows the existing
-/// gate convention: a NAR that is not a single regular file is
-/// `InvalidArgument`; a well-formed upload whose path does not derive
-/// from its bytes is `PermissionDenied`.
-// r[impl store.put.drv-text-ca+2]
-pub(in crate::grpc) fn verify_drv_text_path(
-    info: &ValidatedPathInfo,
-    nar_data: &[u8],
-    ctx_label: &str,
-) -> Result<(), Status> {
-    if !info.store_path.is_derivation() {
-        return Ok(());
+/// The text-CA predicate itself lives in [`ingest::AdmittedNar::admit`]
+/// (round-17 RC17-05 c3): the witness is the ONLY constructor of
+/// persistable bytes, so PutPath/PutPathBatch/substitution cannot
+/// diverge on the binding. The registered fail-closed divergence from
+/// CppNix (`local-store.cc:680-716` accepts source-CA `.drv`
+/// byte-copies; rio rejects) is documented on the witness type.
+// r[impl store.put.drv-text-ca+3]
+pub(in crate::grpc) fn admit_denial_status(d: ingest::AdmitDenial, ctx_label: &str) -> Status {
+    match &d {
+        ingest::AdmitDenial::TextCaMismatch { claimed, derived } => {
+            warn!(
+                claimed = %claimed,
+                derived = %derived,
+                "{ctx_label}: .drv path is not the text content-address of its bytes"
+            );
+            Status::permission_denied(format!("{ctx_label}: {d}"))
+        }
+        _ => Status::invalid_argument(format!("{ctx_label}: {d}")),
     }
-    let (off, len) = single_file_nar_content_range(nar_data).map_err(|e| {
-        Status::invalid_argument(format!(
-            "{ctx_label}: a .drv upload must be a single regular-file NAR: {e}"
-        ))
-    })?;
-    let len = usize::try_from(len).map_err(|_| {
-        Status::invalid_argument(format!(
-            "{ctx_label}: .drv content length does not fit this platform"
-        ))
-    })?;
-    let file_bytes = &nar_data[off..off + len];
-    use std::io::Write as _;
-    let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
-    w.write_all(file_bytes)
-        .map_err(|e| Status::internal(format!("{ctx_label}: .drv hash: {e}")))?;
-    let hash = w.finish();
-    let expected =
-        rio_nix::store_path::StorePath::make_text(info.store_path.name(), &hash, &info.references)
-            .map_err(|e| {
-                Status::invalid_argument(format!(
-                    "{ctx_label}: cannot derive the text content-address: {e}"
-                ))
-            })?;
-    if expected != info.store_path {
-        warn!(
-            claimed = %info.store_path,
-            derived = %expected,
-            "{ctx_label}: .drv path is not the text content-address of its bytes"
-        );
-        return Err(Status::permission_denied(format!(
-            "{ctx_label}: .drv path {} is not the text content-address of the uploaded \
-             bytes with the declared references (derived {})",
-            info.store_path, expected
-        )));
-    }
-    Ok(())
 }
 
 /// Parsed `fixed:` content-address descriptor of a build-output upload
@@ -627,7 +571,7 @@ fn split_self_reference(info: &ValidatedPathInfo) -> (Vec<rio_nix::store_path::S
 /// Locate the single regular file inside a flat-ingestion NAR. Shared
 /// by the flat verification arms; hashes nothing itself.
 fn flat_file_bytes<'a>(nar_data: &'a [u8], ctx_label: &str) -> Result<&'a [u8], Status> {
-    let (off, len) = single_file_nar_content_range(nar_data).map_err(|e| {
+    let (off, len) = ingest::single_file_nar_content_range(nar_data).map_err(|e| {
         Status::invalid_argument(format!(
             "{ctx_label}: flat content-addressed upload is not a single-file NAR: {e}"
         ))
@@ -1070,7 +1014,7 @@ impl StoreServiceImpl {
         // (C4c2) the gate arms are typed, but the .drv detection sites
         // remain suffix-keyed; F3 unifies them on a typed PathKind so a
         // source path NAMED `*.drv` and a real derivation cannot diverge
-        // by call-site discipline. See store.put.drv-text-ca+2.
+        // by call-site discipline. See store.put.drv-text-ca+3.
         if info.store_path.is_derivation() {
             return Ok(()); // .drv text-CA gate owns derivation uploads
         }
@@ -1207,7 +1151,7 @@ impl StoreServiceImpl {
         stream: &mut Streaming<PutPathRequest>,
         info: &mut ValidatedPathInfo,
         hmac_claims: Option<&rio_auth::hmac::AssignmentClaims>,
-    ) -> Result<(Vec<u8>, Vec<tokio::sync::SemaphorePermit<'a>>), Status> {
+    ) -> Result<(ingest::AdmittedNar, Vec<tokio::sync::SemaphorePermit<'a>>), Status> {
         let mut nar_data = Vec::new();
         let mut hasher = Sha256::new();
         let mut trailer: Option<PutPathTrailer> = None;
@@ -1280,10 +1224,15 @@ impl StoreServiceImpl {
             info,
             "PutPath",
         )?;
-        // r[impl store.put.drv-text-ca+2]
-        verify_drv_text_path(info, &nar_data, "PutPath")?;
-        verify_ca_store_path(info, &nar_data, hmac_claims, "PutPath")?;
-        Ok((nar_data, held_permits))
+        // r[impl store.put.drv-text-ca+3]
+        // The admission witness: class cap re-check + the .drv text-CA
+        // binding + the single preimage extraction. Every byte that
+        // reaches a persistence primitive is wrapped here or it does
+        // not compile.
+        let admitted = ingest::AdmittedNar::admit(info, nar_data)
+            .map_err(|d| admit_denial_status(d, "PutPath"))?;
+        verify_ca_store_path(info, admitted.bytes(), hmac_claims, "PutPath")?;
+        Ok((admitted, held_permits))
     }
 
     /// Sign + persist + emit success metrics for a single validated
@@ -1295,35 +1244,26 @@ impl StoreServiceImpl {
         &self,
         mut info: ValidatedPathInfo,
         claim: uuid::Uuid,
-        nar_data: Vec<u8>,
+        mut nar: ingest::AdmittedNar,
         tenant_id: Option<uuid::Uuid>,
     ) -> Result<(), Status> {
         self.maybe_sign(tenant_id, &mut info).await;
-        // Capture the .drv file bytes BEFORE persist_nar consumes the
-        // NAR (store.ingest.drv-modulo-cache+2): the modulo-cache hook
-        // runs only after the persist succeeds, but the bytes are gone
-        // by then. ~KBs for any real .drv; non-derivations skip.
-        // TODO: F3 (round-15 C4 follow-up) — this branch keys on the
-        // `.drv` NAME SUFFIX, not a parsed upload type. After UploadClass
-        // (C4c2) the gate arms are typed, but the .drv detection sites
-        // remain suffix-keyed; F3 unifies them on a typed PathKind so a
-        // source path NAMED `*.drv` and a real derivation cannot diverge
-        // by call-site discipline. See store.put.drv-text-ca+2.
-        let drv_bytes_for_cache: Option<Vec<u8>> = if info.store_path.ends_with(".drv") {
-            rio_nix::nar::extract_single_file(&nar_data).ok()
-        } else {
-            None
-        };
-        if let Err(e) = self.persist_nar(&info, claim, nar_data, "PutPath").await {
+        // Take the .drv preimage BEFORE persist_nar consumes the
+        // witness (store.ingest.drv-modulo-cache+2): the modulo-cache
+        // hook runs only after the persist succeeds, but the bytes are
+        // gone by then. The preimage was extracted ONCE and text-CA
+        // bound at admission — no re-parse here.
+        let drv_bytes_for_cache: Option<Vec<u8>> = nar.take_drv_preimage();
+        if let Err(e) = self.persist_nar(&info, claim, nar, "PutPath").await {
             self.abort_upload(&info.store_path_hash, claim).await;
             return Err(e);
         }
         // r[impl store.ingest.drv-modulo-cache+2]
-        // Best-effort, AFTER the text-CA gate (verify_drv_text_path ran
-        // before this finalize) and AFTER the NAR is durable — a
-        // population failure never fails the upload. Single-shot: a
-        // MissingInput outcome is terminal for THIS upload (no retry
-        // scope), so it records immediately (bug_085 cadence contract).
+        // Best-effort, AFTER the admission witness (text-CA bound at
+        // construction) and AFTER the NAR is durable — a population
+        // failure never fails the upload. Single-shot: a MissingInput
+        // outcome is terminal for THIS upload (no retry scope), so it
+        // records immediately (bug_085 cadence contract).
         if let Some(bytes) = drv_bytes_for_cache
             && metadata::drv_modulo::populate_on_ingest(&self.pool, &info.store_path, &bytes).await
                 == metadata::drv_modulo::PopulateOutcome::MissingInput
@@ -1387,16 +1327,16 @@ impl StoreServiceImpl {
         &self,
         info: &ValidatedPathInfo,
         claim: uuid::Uuid,
-        nar_data: Vec<u8>,
+        nar: ingest::AdmittedNar,
         ctx_label: &str,
     ) -> Result<bool, Status> {
-        let chunked = cas::should_chunk(self.chunk_backend.as_ref(), nar_data.len()).is_some();
+        let chunked = cas::should_chunk(self.chunk_backend.as_ref(), nar.len()).is_some();
         ingest::persist_nar(
             &self.pool,
             self.chunk_backend.as_ref(),
             info,
             claim,
-            nar_data,
+            nar,
             self.chunk_upload_max_concurrent,
             PUTPATH_HOOKS,
         )
@@ -1421,15 +1361,15 @@ impl StoreServiceImpl {
         &self,
         info: &ValidatedPathInfo,
         claim: uuid::Uuid,
-        nar_data: Vec<u8>,
+        nar: ingest::AdmittedNar,
     ) -> Result<NarPersist, Status> {
-        if let Some(backend) = cas::should_chunk(self.chunk_backend.as_ref(), nar_data.len()) {
+        if let Some(backend) = cas::should_chunk(self.chunk_backend.as_ref(), nar.len()) {
             let stats = cas::stage_chunked(
                 &self.pool,
                 backend,
                 info,
                 claim,
-                &nar_data,
+                &nar,
                 self.chunk_upload_max_concurrent,
             )
             .await
@@ -1437,123 +1377,14 @@ impl StoreServiceImpl {
             metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
             Ok(NarPersist::ChunkedStaged)
         } else {
-            Ok(NarPersist::Inline(Bytes::from(nar_data)))
+            Ok(NarPersist::Inline(Bytes::from(nar.into_bytes())))
         }
     }
 }
 
-/// Locate the contents of a single-regular-file NAR inside `nar`,
-/// returning `(offset, length)` of the file bytes without copying them
-/// and without the general-purpose parser's per-file size cap.
-///
-/// The framing is validated strictly: magic, `regular` type, zero
-/// padding, a closing parenthesis, and no trailing bytes. Anything
-/// else — directories, symlinks, truncation — is an error.
-///
-/// The `executable` marker is rejected: the flat content hash is over
-/// the file bytes only, so the executable and non-executable variants
-/// of the same content would otherwise verify against the same
-/// content-derived path, and every legitimate flat producer (CppNix,
-/// the builder's flat shape rules in `verify_fod_hashes` /
-/// `finalize_floating_ca`) refuses to mint a flat output that is
-/// executable in the first place.
-fn single_file_nar_content_range(nar: &[u8]) -> Result<(usize, u64), String> {
-    fn read_u64(nar: &[u8], pos: &mut usize) -> Result<u64, String> {
-        let end = pos
-            .checked_add(8)
-            .ok_or_else(|| "length field overflows".to_string())?;
-        let bytes = nar
-            .get(*pos..end)
-            .ok_or_else(|| "truncated NAR: expected a length field".to_string())?;
-        *pos = end;
-        Ok(u64::from_le_bytes(bytes.try_into().expect("8-byte slice")))
-    }
-    fn read_token<'a>(nar: &'a [u8], pos: &mut usize) -> Result<&'a [u8], String> {
-        let len = read_u64(nar, pos)?;
-        let len = usize::try_from(len).map_err(|_| "token length overflows".to_string())?;
-        let end = pos
-            .checked_add(len)
-            .ok_or_else(|| "token length overflows".to_string())?;
-        let tok = nar
-            .get(*pos..end)
-            .ok_or_else(|| "truncated NAR: token".to_string())?;
-        *pos = end;
-        let pad = (8 - len % 8) % 8;
-        let pad_end = pos
-            .checked_add(pad)
-            .ok_or_else(|| "padding overflows".to_string())?;
-        let padding = nar
-            .get(*pos..pad_end)
-            .ok_or_else(|| "truncated NAR: token padding".to_string())?;
-        if padding.iter().any(|b| *b != 0) {
-            return Err("non-zero token padding".to_string());
-        }
-        *pos = pad_end;
-        Ok(tok)
-    }
-    fn expect(nar: &[u8], pos: &mut usize, want: &[u8]) -> Result<(), String> {
-        let tok = read_token(nar, pos)?;
-        if tok != want {
-            return Err(format!(
-                "expected `{}`, found `{}`",
-                std::str::from_utf8(want).unwrap_or("<non-utf8>"),
-                std::str::from_utf8(tok).unwrap_or("<non-utf8>")
-            ));
-        }
-        Ok(())
-    }
-
-    let mut pos = 0usize;
-    expect(nar, &mut pos, b"nix-archive-1")?;
-    expect(nar, &mut pos, b"(")?;
-    expect(nar, &mut pos, b"type")?;
-    let ty = read_token(nar, &mut pos)?;
-    if ty != b"regular" {
-        return Err(format!(
-            "not a regular file (type `{}`)",
-            std::str::from_utf8(ty).unwrap_or("<non-utf8>")
-        ));
-    }
-    let tok = read_token(nar, &mut pos)?;
-    if tok == b"executable" {
-        return Err(
-            "executable single-file NARs are not valid flat content-addressed outputs \
-             (the flat hash ignores the bit; CppNix rejects this shape)"
-                .to_string(),
-        );
-    }
-    if tok != b"contents" {
-        return Err(format!(
-            "expected `contents`, found `{}`",
-            std::str::from_utf8(tok).unwrap_or("<non-utf8>")
-        ));
-    }
-    let len = read_u64(nar, &mut pos)?;
-    let len_usize = usize::try_from(len).map_err(|_| "content length overflows".to_string())?;
-    let offset = pos;
-    let content_end = offset
-        .checked_add(len_usize)
-        .ok_or_else(|| "content length overflows".to_string())?;
-    if nar.len() < content_end {
-        return Err("truncated NAR: contents".to_string());
-    }
-    let pad = (8 - len_usize % 8) % 8;
-    let pad_end = content_end
-        .checked_add(pad)
-        .ok_or_else(|| "content padding overflows".to_string())?;
-    let padding = nar
-        .get(content_end..pad_end)
-        .ok_or_else(|| "truncated NAR: content padding".to_string())?;
-    if padding.iter().any(|b| *b != 0) {
-        return Err("non-zero content padding".to_string());
-    }
-    let mut tail = pad_end;
-    expect(nar, &mut tail, b")")?;
-    if tail != nar.len() {
-        return Err("trailing bytes after the single-file NAR".to_string());
-    }
-    Ok((offset, len))
-}
+// `single_file_nar_content_range` moved VERBATIM into `crate::ingest`
+// alongside the admission witness that owns the single preimage
+// extraction (round-17 RC17-05 c3).
 
 // r[verify sec.drv.validate]
 // r[verify store.integrity.verify-on-put]
@@ -1881,7 +1712,22 @@ mod verify_nar_tests {
             .expect("flat upload larger than the old parser cap must pass");
     }
 
-    // r[verify store.put.drv-text-ca+2]
+    /// Test shim preserving the old `verify_drv_text_path` call shape:
+    /// the predicate now lives in [`crate::ingest::AdmittedNar::admit`]
+    /// (the admission witness) and the wire mapping in
+    /// [`admit_denial_status`] — these tests pin the COMPOSITION the
+    /// gRPC routes use, codes and message fragments included.
+    fn verify_drv_text_path(
+        info: &ValidatedPathInfo,
+        nar_data: &[u8],
+        ctx_label: &str,
+    ) -> Result<(), Status> {
+        crate::ingest::AdmittedNar::admit(info, nar_data.to_vec())
+            .map(|_| ())
+            .map_err(|d| admit_denial_status(d, ctx_label))
+    }
+
+    // r[verify store.put.drv-text-ca+3]
     /// A `.drv` upload is bound to its bytes: the canonical text-CA path
     /// (with and without references) is accepted, anything else is not.
     #[test]
@@ -1927,7 +1773,7 @@ mod verify_nar_tests {
         verify_drv_text_path(&info, &other_nar, "t").expect("non-.drv paths ignored");
     }
 
-    // r[verify store.put.drv-text-ca+2]
+    // r[verify store.put.drv-text-ca+3]
     /// A `.drv` claiming path with a directory NAR is malformed input.
     #[test]
     fn drv_text_path_requires_single_file_nar() {
@@ -1941,7 +1787,7 @@ mod verify_nar_tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
-    // r[verify store.put.drv-text-ca+2]
+    // r[verify store.put.drv-text-ca+3]
     /// The registered fail-closed divergence pin: a `.drv`-NAMED path
     /// that is the legitimate SOURCE content-address of its bytes
     /// (`make_fixed_output`, recursive-sha256 — exactly what CppNix
@@ -1984,6 +1830,7 @@ mod verify_nar_tests {
 
     #[test]
     fn single_file_nar_content_range_validates_framing() {
+        use crate::ingest::single_file_nar_content_range;
         // Round-trip against the writer for the non-executable shape.
         let node = rio_nix::nar::NarNode::Regular {
             executable: false,

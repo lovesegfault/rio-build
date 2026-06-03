@@ -36,10 +36,10 @@ use rio_proto::validated::ValidatedPathInfo;
 
 use crate::metadata::{self};
 
+use super::put_path::common::admit_denial_status;
 use super::put_path::common::{NarPersist, PlaceholderGuard};
 use super::put_path::{
-    PlaceholderClaim, apply_trailer, validate_put_metadata, verify_ca_store_path,
-    verify_drv_text_path, verify_nar,
+    PlaceholderClaim, apply_trailer, validate_put_metadata, verify_ca_store_path, verify_nar,
 };
 use super::{StoreServiceImpl, putpath_metadata_status};
 use rio_common::limits::{MAX_BATCH_OUTPUTS, MAX_NAR_SIZE};
@@ -144,13 +144,20 @@ impl StoreServiceImpl {
             if let Err(e) = verify_nar(computed, accum.nar_data.len() as u64, info, &ctx) {
                 bail!(e);
             }
-            // r[impl store.put.drv-text-ca+2]
-            if let Err(e) = verify_drv_text_path(info, &accum.nar_data, &ctx) {
-                bail!(e);
-            }
+            // r[impl store.put.drv-text-ca+3]
+            // The admission witness: class cap re-check + the .drv
+            // text-CA binding + the single preimage extraction. The
+            // batch's staging primitive only accepts the witness.
+            let mut admitted = match crate::ingest::AdmittedNar::admit(
+                info,
+                std::mem::take(&mut accum.nar_data),
+            ) {
+                Ok(a) => a,
+                Err(d) => bail!(admit_denial_status(d, &ctx)),
+            };
             // r[impl sec.authz.ca-path-derived+9]
             if let Err(e) =
-                verify_ca_store_path(info, &accum.nar_data, auth.hmac_claims.as_ref(), &ctx)
+                verify_ca_store_path(info, admitted.bytes(), auth.hmac_claims.as_ref(), &ctx)
             {
                 bail!(e);
             }
@@ -173,15 +180,9 @@ impl StoreServiceImpl {
                     // retry signal for rows whose original population
                     // skipped on then-missing inputs. Bytes are in hand;
                     // push them into the same post-commit fixpoint.
-                    // TODO: F3 (round-15 C4 follow-up) — this branch keys on the
-                    // `.drv` NAME SUFFIX, not a parsed upload type. After UploadClass
-                    // (C4c2) the gate arms are typed, but the .drv detection sites
-                    // remain suffix-keyed; F3 unifies them on a typed PathKind so a
-                    // source path NAMED `*.drv` and a real derivation cannot diverge
-                    // by call-site discipline. See store.put.drv-text-ca+2.
-                    if info.store_path.ends_with(".drv")
-                        && let Ok(bytes) = rio_nix::nar::extract_single_file(&accum.nar_data)
-                    {
+                    // The witness extracted (and text-CA-bound) the
+                    // preimage at admission — no re-parse.
+                    if let Some(bytes) = admitted.take_drv_preimage() {
                         drv_cache_candidates.push((info.store_path.as_str().to_string(), bytes));
                     }
                     continue;
@@ -214,22 +215,14 @@ impl StoreServiceImpl {
             }
 
             info.store_path_hash = accum.store_path_hash.clone();
-            let nar_data = std::mem::take(&mut accum.nar_data);
-            // Capture .drv file bytes BEFORE staging consumes the NAR
-            // (store.ingest.drv-modulo-cache+2); populated only after the
-            // batch commit succeeds.
-            // TODO: F3 (round-15 C4 follow-up) — this branch keys on the
-            // `.drv` NAME SUFFIX, not a parsed upload type. After UploadClass
-            // (C4c2) the gate arms are typed, but the .drv detection sites
-            // remain suffix-keyed; F3 unifies them on a typed PathKind so a
-            // source path NAMED `*.drv` and a real derivation cannot diverge
-            // by call-site discipline. See store.put.drv-text-ca+2.
-            if info.store_path.ends_with(".drv")
-                && let Ok(bytes) = rio_nix::nar::extract_single_file(&nar_data)
-            {
+            // Take the witness's .drv preimage BEFORE staging consumes
+            // it (store.ingest.drv-modulo-cache+2); populated only
+            // after the batch commit succeeds. Extracted once and
+            // text-CA-bound at admission.
+            if let Some(bytes) = admitted.take_drv_preimage() {
                 drv_cache_candidates.push((info.store_path.as_str().to_string(), bytes));
             }
-            match self.stage_nar_for_batch(info, claim, nar_data).await {
+            match self.stage_nar_for_batch(info, claim, admitted).await {
                 Ok(p) => accum.staged = Some(p),
                 Err(e) => bail!(e),
             }

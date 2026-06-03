@@ -242,7 +242,7 @@ impl StoreServiceImpl {
             // (C4c2) the gate arms are typed, but the .drv detection sites
             // remain suffix-keyed; F3 unifies them on a typed PathKind so a
             // source path NAMED `*.drv` and a real derivation cannot diverge
-            // by call-site discipline. See store.put.drv-text-ca+2.
+            // by call-site discipline. See store.put.drv-text-ca+3.
             if p.ends_with(".drv") || owned_hashes.contains(h) {
                 visible.insert(p.clone());
             } else if built_not_owned.contains(h) {

@@ -1638,4 +1638,87 @@ in
         }
         touch $out
       '';
+
+  # Round-17 RC17-05 c3 (merged_bug_063): NAR residency is sealed
+  # behind the admission witness (`ingest::AdmittedNar` — class cap +
+  # .drv text-CA binding + single preimage extraction). The persistence
+  # primitives take the witness TYPE, so an unguarded route is a
+  # compile error; this check is the CI half of the seal — it denies
+  # the RAW persistence/extraction forms outside the sealed layer, so
+  # a future "convenience" overload or a copy-pasted extraction cannot
+  # silently re-open a fourth route. Deny-table shape: pattern +
+  # count-pinned per-file carve-outs, each with the reason it is
+  # allowed; counts are exact so a NEW site fails even in an allowed
+  # file (the remediation is in the failure message).
+  store-ingest-conformance =
+    pkgs.runCommand "rio-store-ingest-conformance"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../rio-store;
+          fileset = ../rio-store/src;
+        };
+      }
+      ''
+        cd $src
+        fail=0
+        # check PATTERN FILE EXPECTED REASON
+        check() {
+          local pat="$1" file="$2" want="$3"
+          local got
+          got=$(grep -c -F "$pat" "$file" 2>/dev/null || true)
+          if [ "''${got:-0}" -ne "$want" ]; then
+            echo "FAIL: $file has $got occurrences of '$pat' (pinned: $want)." >&2
+            echo "  New NAR persistence/extraction sites must go through ingest::AdmittedNar" >&2
+            echo "  (the admission witness) — see store.put.drv-text-ca and" >&2
+            echo "  nix/misc-checks.nix store-ingest-conformance for the carve-out registry." >&2
+            fail=1
+          fi
+        }
+        # Total-count check across the tree for a pattern: the sum of
+        # the carve-outs below. A site in a NEW file fails here.
+        total() {
+          local pat="$1" want="$2"
+          local got
+          got=$(grep -r -c -F "$pat" src --include="*.rs" | awk -F: '{n+=$2} END {print n+0}')
+          if [ "$got" -ne "$want" ]; then
+            echo "FAIL: rio-store/src has $got total occurrences of '$pat' (pinned: $want)." >&2
+            echo "  New NAR persistence/extraction sites must take ingest::AdmittedNar." >&2
+            fail=1
+          fi
+        }
+        # -- extract_single_file: ingest routes extract ONCE inside the
+        #    witness. Sole carve-out: the proof-walk READ of an
+        #    already-admitted resident manifest (not an ingest route).
+        check "extract_single_file(" src/metadata/drv_modulo.rs 1
+        total "extract_single_file(" 1
+        # -- complete_manifest_inline: definition (metadata/inline.rs),
+        #    the sealed call in ingest::persist_nar, plus test fixtures
+        #    (metadata/mod.rs x4, grpc/sign.rs x6 — all under
+        #    #[cfg(test)]; they construct rows directly to test
+        #    metadata-layer invariants, not ingest routes).
+        check "complete_manifest_inline(" src/metadata/inline.rs 1
+        check "complete_manifest_inline(" src/ingest.rs 1
+        check "complete_manifest_inline(" src/metadata/mod.rs 4
+        check "complete_manifest_inline(" src/grpc/sign.rs 6
+        total "complete_manifest_inline(" 12
+        # -- chunked staging/persist: definitions + internal call in
+        #    cas.rs (witness-typed), the sealed put_chunked call in
+        #    ingest.rs, and the witness-typed batch staging wrapper.
+        check "stage_chunked(" src/cas.rs 2
+        check "stage_chunked(" src/grpc/put_path/common.rs 1
+        total "stage_chunked(" 3
+        check "put_chunked(" src/cas.rs 2
+        check "put_chunked(" src/ingest.rs 1
+        total "put_chunked(" 3
+        # -- batch atomic completion: definition chain in metadata
+        #    (mod.rs dispatcher, inline.rs + chunked.rs arms) + the one
+        #    batch commit site (bytes witness-derived via NarPersist).
+        check "complete_manifest_in_conn(" src/grpc/put_path_batch.rs 1
+        check "complete_manifest_in_conn(" src/metadata/chunked.rs 1
+        check "complete_manifest_in_conn(" src/metadata/inline.rs 1
+        check "complete_manifest_in_conn(" src/metadata/mod.rs 1
+        total "complete_manifest_in_conn(" 4
+        [ "$fail" = 0 ] || exit 1
+        touch $out
+      '';
 }

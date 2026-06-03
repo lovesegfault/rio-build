@@ -189,7 +189,7 @@ impl<'a> ClosureIndex<'a> {
         // the `.drv` name suffix; a source path named `*.drv` in a graph
         // closure is treated as derivation text (parse fails downstream).
         // Part of the suffix-keyed family F3 unifies on a typed PathKind.
-        // See store.put.drv-text-ca+2.
+        // See store.put.drv-text-ca+3.
         let drvs: Vec<&'a str> = set.members().filter(|p| p.ends_with(".drv")).collect();
         for drv_path in drvs {
             for (output, out_path) in self.drv_outputs(drv_path)? {

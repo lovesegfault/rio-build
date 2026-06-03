@@ -173,19 +173,19 @@ impl PutChunkedStats {
 /// On error in 3-5: `delete_manifest_chunked_uploading` rolls back
 /// refcounts + placeholders. Caller doesn't need to clean up (we consumed
 /// their placeholder; we clean up our own mess).
-#[instrument(skip(pool, backend, info, nar_data), fields(
+#[instrument(skip(pool, backend, info, nar), fields(
     store_path = %info.store_path.as_str(),
-    nar_size = nar_data.len(),
+    nar_size = nar.len(),
 ))]
 pub async fn put_chunked(
     pool: &PgPool,
     backend: &Arc<dyn ChunkBackend>,
     info: &ValidatedPathInfo,
     claim: uuid::Uuid,
-    nar_data: &[u8],
+    nar: &crate::ingest::AdmittedNar,
     max_concurrent: usize,
 ) -> anyhow::Result<PutChunkedStats> {
-    let stats = stage_chunked(pool, backend, info, claim, nar_data, max_concurrent).await?;
+    let stats = stage_chunked(pool, backend, info, claim, nar, max_concurrent).await?;
 
     // --- Step 5: Complete ---
     if let Err(e) = metadata::complete_manifest_chunked(pool, info, claim).await {
@@ -227,18 +227,24 @@ pub async fn put_chunked(
 /// together. On batch-tx failure, `abort_batch` → `reap_one` (chunk-
 /// aware) decrements the staged refcounts; S3 blobs orphan and GC
 /// sweeps them.
-#[instrument(skip(pool, backend, info, nar_data), fields(
+#[instrument(skip(pool, backend, info, nar), fields(
     store_path = %info.store_path.as_str(),
-    nar_size = nar_data.len(),
+    nar_size = nar.len(),
 ))]
 pub async fn stage_chunked(
     pool: &PgPool,
     backend: &Arc<dyn ChunkBackend>,
     info: &ValidatedPathInfo,
     claim: uuid::Uuid,
-    nar_data: &[u8],
+    nar: &crate::ingest::AdmittedNar,
     max_concurrent: usize,
 ) -> anyhow::Result<PutChunkedStats> {
+    // The admission witness is the only byte carrier the chunker
+    // accepts (round-17 RC17-05 c3) — staging is a persistence
+    // primitive: PutPathBatch routes here directly, so taking the
+    // witness HERE (not only in persist_nar) is what keeps the batch
+    // route governed.
+    let nar_data: &[u8] = nar.bytes();
     let store_path_hash = &info.store_path_hash;
 
     // --- Step 1: Chunk ---

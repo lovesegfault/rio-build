@@ -423,20 +423,27 @@ whose refcount drops to 0 become eligible for S3 deletion via
   16-minute upload over 50Mbps would be reaped at the 15-minute mark.
 ]
 
-#r("store.put.drv-text-ca+2")[
-  Every `PutPath` / `PutPathBatch` upload whose claimed path is a `.drv` MUST
-  be verified as a text content-addressed object: the claimed path must equal
-  `make_text(name, sha256(file bytes), declared references)` --- for every
-  caller, including service-token relays --- and mismatches are rejected. A
-  registered `.drv` path is therefore always the unique preimage of its
-  bytes, so the derivation the gateway validates at submission is
-  byte-identical to the one a worker later fetches from the store. This is a
-  REGISTERED FAIL-CLOSED DIVERGENCE from CppNix: the oracle's
-  `registerValidPath` parses and invariant-checks every `.drv`-named path but
-  ACCEPTS source-CA byte-copies (`local-store.cc:680-716` ---
-  `readInvalidDerivation` + `checkInvariants`, with the path's own CA left as
-  declared); rio rejects any `.drv`-named path that is not the text-CA of its
-  bytes, including such oracle-legal source copies.
+#r("store.put.drv-text-ca+3")[
+  Every NAR ingest route whose claimed path is a `.drv` --- `PutPath`,
+  `PutPathBatch` (including service-token relays), and SUBSTITUTION --- MUST
+  pass the residency admission witness (`ingest::AdmittedNar`): the claimed
+  path must equal `make_text(name, sha256(file bytes), declared references)`,
+  and mismatches are rejected. The witness is the ONLY constructor of
+  persistable bytes --- every persistence primitive (`persist_nar`,
+  `stage_chunked`/`put_chunked`, batch staging) accepts the witness type, not
+  raw bytes --- so a future ingest route that skips the binding is a compile
+  error, and the `store-ingest-conformance` check denies the raw persistence
+  and extraction forms outside the sealed layer. A registered `.drv` path is
+  therefore always the unique preimage of its bytes, so the derivation the
+  gateway validates at submission is byte-identical to the one a worker later
+  fetches from the store, and the modulo cache is populated only from
+  path-bound bytes on every route. This is a REGISTERED FAIL-CLOSED
+  DIVERGENCE from CppNix: the oracle's `registerValidPath` parses and
+  invariant-checks every `.drv`-named path but ACCEPTS source-CA byte-copies
+  (`local-store.cc:680-716` --- `readInvalidDerivation` + `checkInvariants`,
+  with the path's own CA left as declared); rio rejects any `.drv`-named path
+  that is not the text-CA of its bytes, including such oracle-legal source
+  copies.
 ]
 The gateway's session derivation cache enforces the same invariant on its
 side (`gw.dag.drv-cache-text-ca`); `store.put.idempotent` is unchanged ---
@@ -475,7 +482,7 @@ This is rio's persistent form of CppNix's `drvHashes` /
 `pathDerivationModulo` (`derivations.cc:856-874`) feeding
 `Store::queryPartialDerivationOutputMap` (`store-api.cc:396-410`): the
 authority for "which output paths does this deriver own" is the store's
-own text-CA-bound bytes (#rref("store.put.drv-text-ca+2") makes a `.drv`
+own text-CA-bound bytes (#rref("store.put.drv-text-ca+3") makes a `.drv`
 path the unique preimage of its bytes), never a client's claim. Rows the
 ingestion pass still skips — a consumer whose inputs have not arrived in
 ANY completed upload yet — are completed read-through at proof time by

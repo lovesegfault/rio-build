@@ -1,4 +1,4 @@
-//! `.drv` uploads are bound to their bytes (`store.put.drv-text-ca+2`).
+//! `.drv` uploads are bound to their bytes (`store.put.drv-text-ca+3`).
 //!
 //! A derivation's store path is the text content-address of its
 //! contents (`make_text(name, sha256(text), references)` — exactly how
@@ -35,7 +35,7 @@ const DRV_TEXT_A: &[u8] =
 const DRV_TEXT_B: &[u8] =
     br#"Derive([("out","/nix/store/cccccccccccccccccccccccccccccccc-b-out","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
 
-// r[verify store.put.drv-text-ca+2]
+// r[verify store.put.drv-text-ca+3]
 /// The honest flow: a `.drv` claimed at its canonical text-CA path is
 /// accepted and registered (service-token relay, the gateway's shape).
 #[tokio::test]
@@ -58,7 +58,7 @@ async fn drv_canonical_path_accepted() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.drv-text-ca+2]
+// r[verify store.put.drv-text-ca+3]
 /// The same bytes claimed under a different `.drv` path are rejected —
 /// even for trusted-plane (service-token) callers, since the binding is
 /// what makes the cached/validated copy and the stored copy identical.
@@ -89,7 +89,7 @@ async fn drv_wrong_path_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.drv-text-ca+2]
+// r[verify store.put.drv-text-ca+3]
 /// The declared references are part of the text-CA derivation: claiming
 /// a path minted with references while declaring none is rejected.
 #[tokio::test]
@@ -114,7 +114,7 @@ async fn drv_wrong_references_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.drv-text-ca+2]
+// r[verify store.put.drv-text-ca+3]
 /// The batch ingestion path enforces the same binding.
 #[tokio::test]
 async fn drv_batch_wrong_path_rejected() -> TestResult {
@@ -203,7 +203,7 @@ async fn drv_already_complete_stays_idempotent() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.drv-text-ca+2]
+// r[verify store.put.drv-text-ca+3]
 /// The registered fail-closed divergence, end-to-end through the
 /// service relay: a `.drv`-named path that is the legitimate SOURCE
 /// content-address of its bytes (what `nix store add` of a `.drv` file

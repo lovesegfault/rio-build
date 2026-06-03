@@ -194,6 +194,17 @@ pub enum SubstituteError {
     #[error("NAR size mismatch: narinfo declared {declared}, got {actual} decompressed bytes")]
     SizeMismatch { declared: u64, actual: u64 },
 
+    /// The NAR failed residency admission (`ingest::AdmittedNar`):
+    /// for `.drv` paths, the bytes are not the text-CA preimage of the
+    /// claimed path (or not a single-file NAR). Upstream signing keys
+    /// are tenant-supplied — a verified sig is NOT a trust boundary —
+    /// so without this gate a hostile upstream could park non-preimage
+    /// bytes at a victim `.drv` path and seed forged
+    /// `drv_modulo_cache` rows consumed as trusted evidence by the IA
+    /// deriver-proof gate (round-17 merged_bug_063).
+    #[error("NAR refused at admission: {0}")]
+    AdmissionRefused(String),
+
     /// Transient placeholder-claim: another uploader holds the slot.
     /// Same-replica `try_substitute*` callers coalesce at the moka
     /// `inflight` singleflight and never reach `claim_placeholder`
@@ -725,7 +736,9 @@ impl Substituter {
                     // reach `grpc/mod.rs`.
                     if matches!(
                         e,
-                        SubstituteError::HashMismatch { .. } | SubstituteError::SizeMismatch { .. }
+                        SubstituteError::HashMismatch { .. }
+                            | SubstituteError::SizeMismatch { .. }
+                            | SubstituteError::AdmissionRefused(_)
                     ) {
                         metrics::counter!(
                             "rio_store_substitute_integrity_failures_total",
@@ -992,17 +1005,28 @@ impl Substituter {
                 .sigs_for_mode(tenant_id, upstream.sig_mode, &ni, &info)
                 .await;
 
+            // r[impl store.put.drv-text-ca+3]
+            // Residency admission (class cap + .drv text-CA binding +
+            // single preimage extraction). Substitution is an ingest
+            // route like PutPath/PutPathBatch: the persistence core
+            // only accepts the witness, so this route can no longer
+            // park non-preimage bytes at a `.drv` path or feed
+            // populate_on_ingest unbound bytes (round-17
+            // merged_bug_063 — the round-16 W2-S7 rider made
+            // substitution a modulo-cache producer without the
+            // binding the other producers' module doc presumes).
+            let mut admitted = ingest::AdmittedNar::admit(&info, nar_bytes.to_vec())
+                .map_err(|d| SubstituteError::AdmissionRefused(d.to_string()))?;
+
             // Substituted .drvs feed the modulo cache too (round-16
             // W2-S7 rider, plan Q8): substitution was the one ingest
             // route that never fired populate_on_ingest, leaving every
             // substituted deriver row-less until a proof-time
-            // read-through paid the cold walk. Extract BEFORE persist
-            // moves the bytes (mirrors finalize_single's ordering).
-            let drv_bytes_for_cache: Option<Vec<u8>> = if store_path.ends_with(".drv") {
-                rio_nix::nar::extract_single_file(&nar_bytes).ok()
-            } else {
-                None
-            };
+            // read-through paid the cold walk. Take the preimage
+            // BEFORE persist consumes the witness (mirrors
+            // finalize_single's ordering); it was extracted once and
+            // text-CA-bound at admission.
+            let drv_bytes_for_cache: Option<Vec<u8>> = admitted.take_drv_preimage();
 
             // — Step 5-6: persist via the shared write-ahead core —
             ingest::persist_nar(
@@ -1010,7 +1034,7 @@ impl Substituter {
                 self.chunk_backend.as_ref(),
                 &info,
                 claim,
-                nar_bytes.into(),
+                admitted,
                 self.chunk_upload_max_concurrent,
                 SUBSTITUTE_HOOKS,
             )
@@ -2034,7 +2058,21 @@ mod tests {
 
         // A LEAF derivation (no inputs) so population cannot defer.
         let drv_text = br#"Derive([("out","/nix/store/cccccccccccccccccccccccccccccccc-leaf","","")],[],[],"x86_64-linux","/bin/sh",["-c","x"],[("name","leaf"),("out","/nix/store/cccccccccccccccccccccccccccccccc-leaf")])"#;
-        let path = rio_test_support::fixtures::test_store_path("substituted-leaf.drv");
+        // GENUINE text-CA path of the fixture bytes (round-17
+        // merged_bug_063): the pre-witness fixture used an arbitrary
+        // test path — the very unbound write the admission witness now
+        // refuses. `make_text(name, sha256(bytes), [])` is what the
+        // gate derives; serving the narinfo at that path is what an
+        // honest upstream does.
+        let path = {
+            use std::io::Write as _;
+            let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+            w.write_all(drv_text).unwrap();
+            rio_nix::store_path::StorePath::make_text("substituted-leaf.drv", &w.finish(), &[])
+                .unwrap()
+                .as_str()
+                .to_string()
+        };
         let (nar, _hash) = rio_test_support::fixtures::make_nar(drv_text);
         let fake = spawn_fake_upstream(&path, nar.clone(), "cache.drvmod").await;
         metadata::upstreams::insert(
@@ -2082,6 +2120,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, 1, "non-.drv substitution adds no modulo rows");
+    }
+
+    // r[verify store.put.drv-text-ca+3]
+    /// merged_bug_063 (binding half): an upstream serving NON-PREIMAGE
+    /// bytes at a victim `.drv` path — valid sig (attacker-configured
+    /// key), valid NarHash (hash of the attacker's own bytes), neither
+    /// of which binds bytes↔path — must be refused at admission:
+    /// nothing registers, and no `drv_modulo_cache` row is minted from
+    /// the forged bytes (pre-witness, the row inserted and was
+    /// consumed as trusted evidence by the IA deriver-proof gate).
+    #[tokio::test]
+    async fn substituted_drv_non_preimage_refused() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-drv-forged").await;
+
+        // Victim path: a syntactically-valid .drv path that is NOT the
+        // text-CA of the served bytes.
+        let victim = rio_test_support::fixtures::test_store_path("victim-deriver.drv");
+        let forged = br#"Derive([("out","/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-evil","","")],[],[],"x86_64-linux","/bin/sh",["-c","x"],[("name","evil"),("out","/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-evil")])"#;
+        let (nar, _hash) = rio_test_support::fixtures::make_nar(forged);
+        let fake = spawn_fake_upstream(&victim, nar, "cache.forged").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let sub = test_substituter(db.pool.clone());
+        // Per-upstream variant: AdmissionRefused with the binding
+        // message (try_upstream is the per-upstream unit; do_substitute
+        // swallows per-upstream errors as try-next).
+        let http = sub.http.as_ref().unwrap();
+        let upstreams = metadata::upstreams::list_for_tenant(&db.pool, tid)
+            .await
+            .unwrap();
+        let hp = StorePath::parse(&victim).unwrap().hash_part();
+        let err = sub
+            .try_upstream(http, tid, &upstreams[0], &victim, &hp, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SubstituteError::AdmissionRefused(m) if m.contains("text content-address")),
+            "non-preimage .drv must be refused at admission, got {err:?}"
+        );
+        // System behavior: the whole substitution treats the hostile
+        // upstream as failed (miss), never ingesting.
+        assert!(
+            sub.try_substitute(tid, &victim).await.unwrap().is_none(),
+            "forged upstream must yield a miss, not a hit"
+        );
+
+        // Nothing registered, nothing minted.
+        assert!(
+            metadata::query_path_info(&db.pool, &victim)
+                .await
+                .unwrap()
+                .is_none(),
+            "victim path must not register"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM drv_modulo_cache")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "no modulo row from forged bytes");
+        // Placeholder cleaned up (explicit-abort path) — the next
+        // honest substitution attempt is not wedged.
+        let sp = StorePath::parse(&victim).unwrap();
+        assert!(
+            metadata::manifest_uploading_age(&db.pool, &sp.sha256_digest())
+                .await
+                .unwrap()
+                .is_none(),
+            "abort_placeholder must run on AdmissionRefused"
+        );
     }
 
     // r[verify store.substitute.progress-stream]
