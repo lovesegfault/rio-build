@@ -18,6 +18,72 @@ pub const STDERR_START_ACTIVITY: u64 = 0x53545254;
 pub const STDERR_STOP_ACTIVITY: u64 = 0x53544f50;
 pub const STDERR_RESULT: u64 = 0x52534c54;
 
+/// The gateway's reserved `STDERR_NEXT` line grammar: every
+/// machine-readable line the gateway authors on that channel begins with
+/// these bytes at byte 0 — the `rio: build <uuid>` announcement and the
+/// lost-terminal relay marker
+/// ([`LOST_TERMINAL_RELAY_PREFIX`](super::build::BuildResult::LOST_TERMINAL_RELAY_PREFIX);
+/// the coupling is pinned by `reserved_grammar_covers_the_marker_and_quote`).
+///
+/// The grammar is RESERVED on that channel: the gateway quotes every
+/// relayed (non-gateway-authored) line that begins with it via
+/// [`quote_reserved_lines`] before relay, and emits its own grammar lines
+/// directly — so on a sanitizing gateway, a byte-0 `rio: ` line on the
+/// `STDERR_NEXT` channel is gateway-authored, which is what lets byte-0
+/// anchored detectors (the lost-terminal marker parser) treat authorship
+/// as producer-guaranteed instead of consumer-priced.
+pub const RESERVED_LINE_PREFIX: &str = "rio: ";
+
+/// Quote prefix [`quote_reserved_lines`] prepends to a relayed line that
+/// begins with [`RESERVED_LINE_PREFIX`] — the `> ` log-quoting convention
+/// stock nix uses for builder output embedded in failure messages, so the
+/// escaped line reads as quoted third-party text to a human. Its byte 0
+/// (`>`) differs from the reserved grammar's (`r`), which is what makes
+/// [`quote_reserved_lines`] idempotent: quoted output never re-enters the
+/// reserved grammar, so an already-escaped line is never double-escaped.
+pub const QUOTED_LINE_PREFIX: &str = "> ";
+
+/// Quote every line of relayed (non-gateway-authored) text that begins
+/// with the gateway's reserved [`RESERVED_LINE_PREFIX`] grammar, by
+/// prepending [`QUOTED_LINE_PREFIX`]. The single owner of relay-channel
+/// grammar hygiene: the gateway applies it at every site that relays
+/// worker-controlled text as a plain `STDERR_NEXT` payload, BEFORE
+/// composing the payload — so no relayed line can reach byte 0 of an
+/// observed line while speaking the gateway's own grammar, and consumer
+/// fixtures can construct the exact relayed shape via the same fn
+/// (producer-mirrored across the crate boundary).
+///
+/// Line discipline matches the consumers': segments are split at `\n`
+/// (the boundary `str::lines` — the observer-side split — recognizes),
+/// the prefix test is byte-anchored at segment start, and everything
+/// else is preserved byte-exactly (interior `\r` bytes, empty segments,
+/// a trailing newline). A `rio: …\r\n` segment therefore quotes — its
+/// segment starts with the reserved bytes even though the observer's
+/// `lines()` strips the `\r` — and a `\rrio: …` segment does not (no
+/// observer split puts its `rio:` at byte 0).
+///
+/// Borrowed pass-through when no segment speaks the grammar — the common
+/// case for every relayed build-log line and failure message.
+pub fn quote_reserved_lines(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text
+        .split('\n')
+        .any(|seg| seg.starts_with(RESERVED_LINE_PREFIX))
+    {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + QUOTED_LINE_PREFIX.len());
+    for (i, seg) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if seg.starts_with(RESERVED_LINE_PREFIX) {
+            out.push_str(QUOTED_LINE_PREFIX);
+        }
+        out.push_str(seg);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Structured error for the STDERR_ERROR wire format.
 #[derive(Debug, Clone)]
 pub struct StderrError {
@@ -898,5 +964,157 @@ mod tests {
         assert!(writer.finish().await.is_err());
         // Exactly one STDERR_LAST in the buffer (8 bytes).
         assert_eq!(buf.len(), 8);
+    }
+
+    /// The reserved-grammar constants cover what they claim: both
+    /// gateway-authored grammar families begin with
+    /// [`RESERVED_LINE_PREFIX`] (the lost-terminal marker via its shared
+    /// formatter, the build announcement via its literal prefix — the
+    /// gateway formats it inline, so the literal is pinned here), and the
+    /// quote prefix's byte 0 differs from the grammar's — the property
+    /// that makes [`quote_reserved_lines`] idempotent and keeps escaped
+    /// output out of the reserved grammar. A grammar family added without
+    /// the reserved prefix would be relayable by a worker verbatim
+    /// (the sanitizer would not catch it); this pin forces the
+    /// re-derivation.
+    #[test]
+    fn reserved_grammar_covers_the_marker_and_quote() {
+        use crate::protocol::build::BuildResult;
+        assert!(
+            BuildResult::LOST_TERMINAL_RELAY_PREFIX.starts_with(RESERVED_LINE_PREFIX),
+            "the lost-terminal marker grammar must live under the reserved prefix \
+             or the relay sanitizer cannot guarantee its authorship"
+        );
+        assert!(
+            BuildResult::lost_terminal_relay_line("/nix/store/x.drv")
+                .starts_with(RESERVED_LINE_PREFIX)
+        );
+        // The announcement grammar (formatted inline by the gateway as
+        // `rio: build {uuid}…`) — pin the literal so a reworded
+        // announcement that leaves the reserved prefix fails here.
+        assert!("rio: build ".starts_with(RESERVED_LINE_PREFIX));
+        assert_ne!(
+            QUOTED_LINE_PREFIX.as_bytes()[0],
+            RESERVED_LINE_PREFIX.as_bytes()[0],
+            "quoted output must not re-enter the reserved grammar at byte 0 — \
+             this is what makes the sanitizer idempotent"
+        );
+    }
+
+    /// [`quote_reserved_lines`] both directions, at the line level:
+    /// reserved-prefix segments quote (whatever their position or
+    /// suffix), everything else passes byte-exactly, and the borrowed
+    /// fast path fires exactly when nothing quotes.
+    #[test]
+    fn quote_reserved_lines_quotes_exactly_the_reserved_segments() {
+        use super::quote_reserved_lines as q;
+        use crate::protocol::build::BuildResult;
+        use std::borrow::Cow;
+
+        let marker = BuildResult::lost_terminal_relay_line("/nix/store/aaa-x.drv");
+
+        // Quote direction: the marker grammar at segment start — alone,
+        // newline-terminated, mid-text, with a \r\n ending (the segment
+        // still starts with the reserved bytes), and the announcement
+        // grammar.
+        assert_eq!(q(&marker), format!("> {marker}"));
+        assert_eq!(q(&format!("{marker}\n")), format!("> {marker}\n"));
+        assert_eq!(
+            q(&format!("tail line\n{marker}\nnext")),
+            format!("tail line\n> {marker}\nnext")
+        );
+        assert_eq!(
+            q("rio: build 0193-spoof\r\n"),
+            "> rio: build 0193-spoof\r\n"
+        );
+        assert_eq!(q("rio: exec     0123"), "> rio: exec     0123");
+
+        // Pass-through direction: ordinary text, the quoted form itself
+        // (idempotence — never double-escaped), prefix not at segment
+        // start, prefix variants that are not the grammar.
+        for benign in [
+            "building foo",
+            "> rio: build 0193 already quoted",
+            &format!("> {marker}"),
+            " rio: leading space",
+            "\rrio: carriage return before the prefix",
+            "rio:no-space",
+            "RIO: build upper",
+            "",
+            "trailing newline only\n",
+        ] {
+            assert!(
+                matches!(q(benign), Cow::Borrowed(b) if b == benign),
+                "benign text must pass through borrowed and byte-exact: {benign:?}"
+            );
+        }
+        // Idempotence end-to-end: quoting quoted output is a no-op.
+        let once = q(&marker).into_owned();
+        assert_eq!(q(&once), once);
+
+        // Mixed payload: only the reserved segments quote; \n structure
+        // (including the trailing terminator) is preserved.
+        let mixed = format!("phase 1\n{marker}\r\nrio: build 0193\nplain\n");
+        assert_eq!(
+            q(&mixed).as_ref(),
+            format!("phase 1\n> {marker}\r\n> rio: build 0193\nplain\n")
+        );
+    }
+
+    mod proptests {
+        use super::super::{QUOTED_LINE_PREFIX, RESERVED_LINE_PREFIX, quote_reserved_lines};
+        use proptest::prelude::*;
+
+        proptest! {
+            /// The sanitizer's contract over arbitrary worker text
+            /// (interior newlines, reserved-prefix injections at any
+            /// segment): segment structure is preserved one-to-one,
+            /// each output segment is its input verbatim or quoted, the
+            /// quote fires exactly on reserved-prefix segments — and
+            /// the security property: NO output segment begins with the
+            /// reserved grammar, and re-applying the sanitizer is a
+            /// no-op (already-quoted text is never double-quoted).
+            #[test]
+            fn quote_reserved_lines_is_total_exact_and_idempotent(
+                segs in proptest::collection::vec(
+                    prop_oneof![
+                        // Arbitrary text (newline-free per segment).
+                        "[^\n]{0,40}",
+                        // Adversarial: reserved grammar at segment start.
+                        "rio: [^\n]{0,40}",
+                        // Adversarial: pre-quoted / near-miss shapes.
+                        "> rio: [^\n]{0,30}",
+                        Just("rio:".to_string()),
+                        Just(" rio: x".to_string()),
+                    ],
+                    0..6,
+                ),
+            ) {
+                let text = segs.join("\n");
+                let out = quote_reserved_lines(&text).into_owned();
+
+                let in_segs: Vec<&str> = text.split('\n').collect();
+                let out_segs: Vec<&str> = out.split('\n').collect();
+                prop_assert_eq!(in_segs.len(), out_segs.len(), "segment structure preserved");
+                for (i, o) in in_segs.iter().zip(&out_segs) {
+                    if i.starts_with(RESERVED_LINE_PREFIX) {
+                        prop_assert_eq!(
+                            o.to_string(),
+                            format!("{QUOTED_LINE_PREFIX}{i}"),
+                            "reserved segment must quote"
+                        );
+                    } else {
+                        prop_assert_eq!(o, i, "non-reserved segment must pass byte-exact");
+                    }
+                    prop_assert!(
+                        !o.starts_with(RESERVED_LINE_PREFIX),
+                        "no output segment may speak the reserved grammar at byte 0: {o:?}"
+                    );
+                }
+                // Idempotence: sanitized output is a fixed point.
+                let again = quote_reserved_lines(&out);
+                prop_assert_eq!(again.as_ref(), out.as_str());
+            }
+        }
     }
 }

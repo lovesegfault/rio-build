@@ -782,6 +782,41 @@ measurement consumer's poison-recovery arm matches on, and resolving that
 cell honestly needs the producer to disambiguate (scheduler-side events for
 merge-seeded nodes), not another consumer-side guess.
 
+The marker's authenticity is producer-owned. The gateway authors the
+stderr framing, so it must never relay forgeable bytes in its own
+authoritative grammar — `rio: ` at byte 0 of an `STDERR_NEXT` line is
+reserved for gateway-authored lines (the build announcement and the
+marker):
+
+#r("gw.stderr.relay-quote-reserved")[
+  Every line of relayed (non-gateway-authored) text the gateway emits as a
+  plain `STDERR_NEXT` payload that begins with the reserved `rio: ` line
+  prefix MUST be quoted with `> ` before relay (the shared rio-nix
+  `quote_reserved_lines` owner, applied per line at every worker-text
+  relay site: the no-live-activity log-relay fallback, including
+  post-terminal stragglers, and the worker-controlled message half of the
+  `derivation '<drv>' failed:` relay); the gateway's own grammar lines —
+  the `rio: build <uuid>` announcement and the lost-terminal relay marker
+  — MUST be emitted directly, never through the quoting path, and
+  already-quoted relayed text MUST NOT be quoted again.
+]
+
+This makes byte-0 `rio: ` authorship a producer guarantee: the engine's
+byte-0-anchored marker detector matches gateway-authored lines only, and a
+worker line reproducing the marker grammar byte-for-byte arrives as
+`> rio: terminal lost …`, which the detector rejects. Worker lines relayed
+on the `STDERR_RESULT`/`BuildLogLine` activity channel are NOT quoted: that
+channel is display-only to nom and structurally invisible to the engine's
+capture (the client drain hands only `STDERR_NEXT` payloads to observers),
+and quoting it would mangle the worker's own `rio:` log banner under the
+build activity. The residual is the mixed-fleet skew window only: a gateway
+deployed from before this rule still relays raw worker lines, so an engine
+newer than its gateway retains the prior consumer-priced exposure (the
+bounded gate-trip denial-of-measurement above) until the gateway is
+upgraded; the other skew direction is safe — an older engine against a
+sanitizing gateway runs the same byte-0 detector, and quoted forgeries
+start `> `.
+
 `wopBuildDerivation` (the build-hook path) is a single-target reply, so the
 batch-aggregation hazards above do not apply, but the client-crash one does:
 an unrealized floating-CA output reported as successful would carry an empty

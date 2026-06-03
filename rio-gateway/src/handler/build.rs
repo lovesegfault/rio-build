@@ -9,7 +9,8 @@ use rio_nix::protocol::build::{
 };
 use rio_nix::protocol::derived_path::{DerivedPath, OutputSpec};
 use rio_nix::protocol::stderr::{
-    ActivityType, ResultField, ResultType, StderrError, StderrWriter, verbosity,
+    ActivityType, ResultField, ResultType, StderrError, StderrWriter, quote_reserved_lines,
+    verbosity,
 };
 use rio_nix::protocol::wire;
 use rio_nix::store_path::StorePath;
@@ -319,8 +320,24 @@ async fn stop_subst_pair<W: AsyncWrite + Unpin>(
 /// activity as `STDERR_RESULT{aid, BuildLogLine, [line]}` so nom and
 /// `--log-format bar` show the last line under the owning build;
 /// fallback to `STDERR_NEXT` when no activity exists for this drv
-/// (logs arriving before `Derivation::Started`, or gateway-originated
-/// diagnostics like the `trace_id` line).
+/// (logs arriving before `Derivation::Started`, post-terminal
+/// stragglers after the activity closed, or a path-key mismatch).
+///
+/// Channel-grammar hygiene differs per arm, deliberately:
+/// - The `STDERR_NEXT` fallback quotes reserved-grammar lines
+///   ([`quote_reserved_lines`]): these payloads land on the same
+///   channel as the gateway's own `rio: ` grammar (the build
+///   announcement, the lost-terminal relay marker), and byte-0
+///   authorship there is a producer guarantee — a worker line
+///   reproducing the marker grammar must arrive `> `-quoted, never
+///   verbatim.
+/// - The `BuildLogLine` activity arm relays VERBATIM: that channel is
+///   display-only to nom and structurally invisible to the engine's
+///   marker capture (the client drain hands only `STDERR_NEXT`
+///   payloads to observers — `drain_stderr_typed_bounded` in
+///   rio-nix's protocol client skips `Result` frames), and quoting it
+///   would mangle the worker's own `rio:` log banner under the build
+///   activity.
 async fn relay_log_batch<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     act: &BuildActivityState,
@@ -344,7 +361,13 @@ async fn relay_log_batch<W: AsyncWrite + Unpin>(
                     )
                     .await?;
             }
-            None => stderr.log(&text).await?,
+            // r[impl gw.stderr.relay-quote-reserved]
+            // Worker text onto the gateway-grammar channel: quote
+            // reserved-prefix lines. Per-line inside the payload too —
+            // a batcher entry carrying an embedded newline would
+            // otherwise put its tail at byte 0 after the observer's
+            // split.
+            None => stderr.log(&quote_reserved_lines(&text)).await?,
         }
     }
     Ok(())
@@ -574,12 +597,29 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             } else {
                 format!("\n  ↳ rio-cli logs '{}'", drv_event.derivation_path)
             };
-            stderr
-                .log(&format!(
-                    "derivation '{}' failed: {}{hint}",
-                    drv_event.derivation_path, drv_event.error_message
-                ))
-                .await?;
+            // r[impl gw.stderr.relay-quote-reserved]
+            // The message half is worker-controlled (the scheduler
+            // relays the worker's error text verbatim, embedded
+            // newlines included) and rides the gateway-grammar
+            // STDERR_NEXT channel: quote its reserved-prefix lines
+            // BEFORE composition, so a multi-line message's split
+            // non-first lines cannot land at byte 0 of an observed
+            // line speaking the gateway's own grammar. The per-line
+            // rule also quotes a reserved-prefix FIRST message line
+            // (mid-line after `failed: `, where byte 0 is already
+            // unreachable) — uniformity costs only a visible `> ` that
+            // reads as the quoting it is. The frame around it
+            // (`derivation '…' failed: ` / the `↳ rio-cli logs` hint)
+            // is gateway-authored and never quoted; the retained
+            // per-root copy (`record_terminal` above) keeps the RAW
+            // message — it feeds the in-band `BuildResult.errorMsg`,
+            // a channel the marker detector never reads.
+            let failure_relay = format!(
+                "derivation '{}' failed: {}{hint}",
+                drv_event.derivation_path,
+                quote_reserved_lines(&drv_event.error_message)
+            );
+            stderr.log(&failure_relay).await?;
         }
         types::DerivationEventKind::Cached => {
             // Record a requested root's own terminal (fetched from a
@@ -1479,12 +1519,11 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                 );
                 // Also surface to the client via STDERR — they see
                 // "reconnecting..." instead of a hang.
-                let _ = stderr
-                    .log(&format!(
-                        "scheduler connection lost (attempt {}/{}); reconnecting...",
-                        reconnect_attempts, MAX_RECONNECT
-                    ))
-                    .await;
+                let reconnect_notice = format!(
+                    "scheduler connection lost (attempt {reconnect_attempts}/{MAX_RECONNECT}); \
+                     reconnecting..."
+                );
+                let _ = stderr.log(&reconnect_notice).await;
                 tokio::time::sleep(backoff).await;
 
                 // Reconnect: need a fresh scheduler client. The
@@ -2620,29 +2659,31 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                     // `stderr.finish()` below, like every relay line of
                     // this opcode.
                     //
-                    // TODO: move this fact into gateway-owned structured
-                    // wire metadata (a per-root field on the result, like
-                    // the wanted-outputs augmentation) instead of an
-                    // in-band stderr line. The marker rides the same
-                    // untrusted display channel as third-party build
-                    // logs, so its trust bound is consumer-enforced (see
-                    // `lost_terminal_relay_drv`'s doc for the accepted
-                    // worst case: a spoofed line from recorded build
-                    // output burns the victim drv's shared auto-retry
-                    // budget and at exhaustion mints an
-                    // infra-indeterminate that trips `report --check`).
-                    // Anchoring cannot close that surface — the relay's
-                    // no-activity fallback and the observer's line split
-                    // both put worker-influenced text at byte 0 — only a
-                    // structured field the gateway alone can populate
-                    // deletes the spoof surface outright.
+                    // GATEWAY-AUTHORED GRAMMAR, emitted directly — never
+                    // through `quote_reserved_lines`. The marker's
+                    // byte-0 authorship is the producer guarantee
+                    // r[gw.stderr.relay-quote-reserved] backs: every
+                    // worker-text relay site quotes reserved-prefix
+                    // lines, so a byte-0 `rio: ` line on this channel is
+                    // this gateway speaking (the relay-site census test
+                    // pins the site classification).
+                    //
+                    // TODO: gateway-owned structured wire metadata (a
+                    // per-root field on the result, like the
+                    // wanted-outputs augmentation) is OPTIONAL HARDENING
+                    // now that relay sanitization owns the line grammar:
+                    // it would close the mixed-fleet skew window (an
+                    // engine newer than an unsanitized gateway — see
+                    // `lost_terminal_relay_drv`'s doc for that window's
+                    // priced worst case) and retire the side channel
+                    // outright. Wire-protocol change; not load-bearing
+                    // for current fleets.
                     if lost_terminal {
-                        stderr
-                            .log(&format!(
-                                "{}\n",
-                                BuildResult::lost_terminal_relay_line(&demand.drv_path)
-                            ))
-                            .await?;
+                        let marker_frame = format!(
+                            "{}\n",
+                            BuildResult::lost_terminal_relay_line(&demand.drv_path)
+                        );
+                        stderr.log(&marker_frame).await?;
                     }
                     results.push(result_with_wanted_outputs(
                         base,
@@ -2679,6 +2720,172 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
 mod tests {
     use super::*;
     use rio_nix::protocol::stderr::{STDERR_RESULT, STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY};
+
+    // r[verify gw.stderr.relay-quote-reserved]
+    /// Standing census of this handler's `STDERR_NEXT` emission surface,
+    /// each site pinned WITH its grammar class and quoting obligation —
+    /// the relay-sanitization sibling of the SourceRot minting census.
+    ///
+    /// QUANTIFICATION DOMAIN, universe 1: every non-comment line
+    /// containing `.log(` in build.rs above the file-level
+    /// `#[cfg(test)]` marker. `StderrWriter::log` is the ONLY
+    /// `STDERR_NEXT` producer (no raw `STDERR_NEXT` writes exist in
+    /// gateway production code), and `.log(` call lines are shaped so
+    /// each is textually unique (named payload locals at the
+    /// `format!`-composed sites) — a NEW `.log(` site fails here until
+    /// a human classifies it into one of three classes:
+    ///
+    /// - WORKER-RELAYED (quoting obligatory): text whose lines a worker
+    ///   can author lands on the gateway-grammar channel only through
+    ///   [`quote_reserved_lines`]. Sites: the `relay_log_batch`
+    ///   no-activity fallback (covers logs-before-`Started`,
+    ///   post-terminal stragglers, and path-key-mismatch cells — one
+    ///   code line, keyed on `act.drv` absence) and the
+    ///   `derivation '…' failed:` relay's message half (quoted before
+    ///   composition; the surrounding frame is gateway-authored).
+    /// - GATEWAY GRAMMAR (reserved-prefix speakers, NEVER quoted): the
+    ///   `rio: build <uuid>` announcement and the lost-terminal relay
+    ///   marker — emitted directly so byte-0 `rio: ` stays
+    ///   gateway-authored.
+    /// - GATEWAY DIAGNOSTIC (gateway-composed, no worker bytes at line
+    ///   starts): the `SubmitBuild RPC failed:` notice (tonic transport
+    ///   error text, scheduler-RPC-layer provenance, composed after a
+    ///   gateway literal mid-line) and the reconnect notice (pure
+    ///   gateway literals + counters). Pinned to NOT begin with the
+    ///   reserved prefix — rewording one INTO `rio: ` grammar must be a
+    ///   conscious act here.
+    ///
+    /// Universe 2: every non-comment line containing
+    /// `quote_reserved_lines(` — the obligation's application sites.
+    /// Removing a quoting call (or detouring worker text around it)
+    /// fails this half even when universe 1 still balances.
+    ///
+    /// Worker text on the `STDERR_RESULT`/`BuildLogLine` activity arm is
+    /// deliberately OUTSIDE both universes (relayed verbatim): the
+    /// engine's capture reads only `STDERR_NEXT` payloads (`Result`
+    /// frames are skipped by the client drain — pinned consumer-side by
+    /// rio-nix's `result_frames_never_reach_the_drain_observer`), and
+    /// quoting would mangle the worker's own `rio:` log banner under
+    /// the build activity. The wire pin for that arm is
+    /// `test_build_paths_log_relay_quotes_only_the_next_fallback_arm`
+    /// in the wire-opcode suite.
+    #[test]
+    fn stderr_next_emission_sites_are_enumerated_with_their_quoting_class() {
+        // (line, class) — class is documentation here; the obligations
+        // the classes carry are asserted below.
+        const WORKER_RELAYED: &[&str] = &[
+            "None => stderr.log(&quote_reserved_lines(&text)).await?,",
+            "stderr.log(&failure_relay).await?;",
+        ];
+        const GATEWAY_GRAMMAR: &[&str] = &[
+            ".log(&format!(\"rio: build {build_id}{trace_suffix}\\n\"))",
+            "stderr.log(&marker_frame).await?;",
+        ];
+        const GATEWAY_DIAGNOSTIC: &[&str] = &[
+            "let _ = stderr.log(&format!(\"SubmitBuild RPC failed: {e}\\n\")).await;",
+            "let _ = stderr.log(&reconnect_notice).await;",
+        ];
+        const QUOTING_SITES: &[&str] = &[
+            // The fallback relay (whole worker line is the payload).
+            "None => stderr.log(&quote_reserved_lines(&text)).await?,",
+            // The failure relay's message half, quoted at composition.
+            "quote_reserved_lines(&drv_event.error_message)",
+        ];
+
+        let source = include_str!("build.rs");
+        let non_test = source
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("build.rs has a test module");
+        let non_comment_lines = || {
+            non_test
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.starts_with("//"))
+        };
+
+        // Universe 1: the .log( emission surface.
+        let log_sites: Vec<&str> = non_comment_lines()
+            .filter(|l| l.contains(".log("))
+            .collect();
+        let allowed: Vec<&str> = [WORKER_RELAYED, GATEWAY_GRAMMAR, GATEWAY_DIAGNOSTIC].concat();
+        for line in &log_sites {
+            assert!(
+                allowed.contains(line),
+                "unenumerated STDERR_NEXT emission site: {line:?} — classify it \
+                 (worker-relayed text MUST go through quote_reserved_lines; \
+                 gateway grammar/diagnostics are emitted directly) and add it \
+                 to the census"
+            );
+        }
+        for line in &allowed {
+            assert!(
+                log_sites.contains(line),
+                "enumerated STDERR_NEXT site no longer present: {line:?} — keep \
+                 the census in lockstep with the emission surface"
+            );
+        }
+        assert_eq!(
+            log_sites.len(),
+            allowed.len(),
+            "duplicate-shaped .log( lines would let a new site hide behind an \
+             enumerated one; keep every call line textually unique"
+        );
+
+        // Universe 2: the quoting-obligation application sites.
+        let quote_sites: Vec<&str> = non_comment_lines()
+            .filter(|l| l.contains("quote_reserved_lines("))
+            .collect();
+        assert_eq!(
+            quote_sites, QUOTING_SITES,
+            "quote_reserved_lines application sites changed — every \
+             worker-text STDERR_NEXT ingress must keep its quoting call"
+        );
+
+        // Crate closure: this file is the handler's ONLY `.log(` caller,
+        // so the file-scoped universes above really are the gateway's
+        // whole STDERR_NEXT surface. A `.log(` call appearing in a
+        // sibling handler file (or the session/server layers, which
+        // construct the writer but emit no lines today) would bypass
+        // the census silently — force it back here, or extend the
+        // census to the new file with its own classification.
+        for (name, sibling) in [
+            ("handler/mod.rs", include_str!("mod.rs")),
+            ("handler/grpc.rs", include_str!("grpc.rs")),
+            ("handler/opcodes_read.rs", include_str!("opcodes_read.rs")),
+            ("handler/opcodes_write.rs", include_str!("opcodes_write.rs")),
+            ("session.rs", include_str!("../session.rs")),
+            ("server/mod.rs", include_str!("../server/mod.rs")),
+        ] {
+            let stray: Vec<&str> = sibling
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.starts_with("//") && l.contains(".log("))
+                .collect();
+            assert!(
+                stray.is_empty(),
+                "{name} gained .log( call(s) outside the censused file: {stray:?} — \
+                 STDERR_NEXT emission must stay in build.rs (or extend this census)"
+            );
+        }
+
+        // Class obligations beyond enumeration:
+        // grammar sites really speak the reserved grammar…
+        assert!("rio: build ".starts_with(rio_nix::protocol::stderr::RESERVED_LINE_PREFIX));
+        assert!(
+            BuildResult::lost_terminal_relay_line("/nix/store/x.drv")
+                .starts_with(rio_nix::protocol::stderr::RESERVED_LINE_PREFIX)
+        );
+        // …and diagnostics don't (their literals are pinned where they
+        // start the payload line).
+        for diagnostic_prefix in ["SubmitBuild RPC failed: ", "scheduler connection lost ("] {
+            assert!(
+                !diagnostic_prefix.starts_with(rio_nix::protocol::stderr::RESERVED_LINE_PREFIX),
+                "a gateway diagnostic must not drift into the reserved grammar: \
+                 {diagnostic_prefix:?}"
+            );
+        }
+    }
 
     // r[verify gw.opcode.build-results-honest+2]
     /// Lattice VALUE audit for [`per_root_verdict`]: every (evidence ×

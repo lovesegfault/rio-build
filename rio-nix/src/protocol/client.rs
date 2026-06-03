@@ -1157,6 +1157,75 @@ mod tests {
         Ok(())
     }
 
+    /// `STDERR_RESULT` payloads are structurally invisible to drain
+    /// observers: only `STDERR_NEXT` payloads are handed to the observer
+    /// callback. This is the consumer-side conjunct the gateway's
+    /// relay-quoting census rests on when it relays worker text VERBATIM
+    /// on the `BuildLogLine` activity arm — text on that channel cannot
+    /// reach the byte-0 line capture (the lost-terminal marker detector)
+    /// no matter what grammar it speaks, so quoting there would be pure
+    /// display damage. The fixture drives the exact frame shape the
+    /// gateway's activity arm produces (`Result{BuildLogLine, [line]}`)
+    /// carrying the marker grammar built by the shared producer
+    /// formatter, alongside an `STDERR_NEXT` control that MUST reach the
+    /// observer.
+    #[tokio::test]
+    async fn result_frames_never_reach_the_drain_observer() -> anyhow::Result<()> {
+        use crate::protocol::stderr::{ResultField, ResultType, StderrWriter};
+
+        let marker = BuildResult::lost_terminal_relay_line(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv",
+        );
+
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let marker_for_server = marker.clone();
+        let server = tokio::spawn(async move {
+            let (_sr, mut sw) = tokio::io::split(server_stream);
+            let mut stderr = StderrWriter::new(&mut sw);
+            let aid = stderr
+                .start_activity(
+                    crate::protocol::stderr::ActivityType::Build,
+                    "building",
+                    crate::protocol::stderr::verbosity::INFO,
+                    0,
+                    &[],
+                )
+                .await?;
+            // The gateway's activity-arm shape, carrying reserved
+            // grammar verbatim.
+            stderr
+                .result(
+                    aid,
+                    ResultType::BuildLogLine,
+                    &[ResultField::String(marker_for_server)],
+                )
+                .await?;
+            // Control: a NEXT payload that must reach the observer.
+            stderr.log("plain next line").await?;
+            stderr.stop_activity(aid).await?;
+            stderr.finish().await?;
+            anyhow::Ok(())
+        });
+
+        let (mut cr, _cw) = tokio::io::split(client_stream);
+        let mut observed: Vec<String> = Vec::new();
+        let mut observer = |line: &str| observed.push(line.to_string());
+        drain_stderr_with_observer(&mut cr, Some(&mut observer)).await?;
+        server.await??;
+
+        assert_eq!(
+            observed,
+            vec!["plain next line".to_string()],
+            "observers see STDERR_NEXT payloads only — Result-carried text \
+             (including reserved grammar) must never reach them"
+        );
+        assert!(
+            !observed.iter().any(|l| l.contains(&marker)),
+            "marker text on the Result channel leaked to the observer"
+        );
+        Ok(())
+    }
+
     /// Test client handshake against our own server handshake.
     #[tokio::test]
     async fn client_handshake_against_server() -> anyhow::Result<()> {

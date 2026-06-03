@@ -250,55 +250,57 @@ impl BuildResult {
     /// raw payload lines (no progress-bar rendering exists on that
     /// channel; prefix tolerance in the older relay regexes is a
     /// nix-CLI-capture artifact this engine-only vocabulary does not
-    /// inherit). Trust provenance: the anchoring NARROWS the spoof
-    /// surface but is not a trust boundary — it rejects the failure
-    /// relay's own first line (`derivation '` prefix) and the daemon's
-    /// `> `-quoted log embeddings, yet worker-influenced text can still
-    /// reach byte 0 of an observed line: the gateway's log relay falls
-    /// back to a plain `STDERR_NEXT` for drvs with no live activity
-    /// (lines arriving before `Started`, post-terminal stragglers —
-    /// `relay_log_batch` in rio-gateway), and the observer's line split
-    /// puts the non-first lines of a multi-line failure payload at
-    /// byte 0.
+    /// inherit).
     ///
-    /// The load-bearing bound is consumer-enforced instead, and its
-    /// accepted worst case is stated here in the consumer's own
-    /// gate-accounting vocabulary (NOT as a gate "exclusion" — it is
-    /// not one). Scope: a spoofed marker can affect only THAT drv's
-    /// same-batch `Substituted` row, flipping it from a recorded
-    /// substitution event to evidence-loss classification. Effect
-    /// strength, per the consumer (rio-replay's collect marker arm; the
-    /// per-cell pins live in its
-    /// `lost_terminal_marker_rows_settle_as_evidence_loss_end_to_end`
-    /// test): in a timeless campaign the flip consumes the
-    /// victim drv's SHARED auto-retry budget (`max_auto_retries`,
-    /// default 1; any prior requeue of any reason already counts
-    /// against it) and at exhaustion terminalizes as
-    /// `TargetFailed{Infra}` → verdict `infra-indeterminate`, whose
-    /// gate accounting is `GateAccounting::TripsRegression` — it FAILS
-    /// `report --check` under both `fail_on: regression` and
-    /// `fail_on: divergence`; in a timed campaign the flip terminalizes
-    /// as `infra-indeterminate` immediately (no timed re-attempt exists
-    /// for a success-shaped row), or `interruption-not-reproduced`
-    /// (`TripsDivergence`) for an armed member. The direction is
-    /// conservative — never minting a success and never hiding a
-    /// violation — so the primitive available to recorded third-party
-    /// build output is a bounded denial-of-measurement (a false alarm
-    /// that costs a retry cycle and can red a gated CI run), not a
-    /// laundering channel. The comparison with the existing
-    /// relayed-reason capture (rio-replay's `DRV_FAILED_RE`, which
-    /// matches anywhere in any line) holds for CHANNEL EXPOSURE only:
-    /// that capture feeds failure attribution and structurally cannot
-    /// flip a success row, so the marker's consumer effect is strictly
-    /// stronger than its channel sibling's.
+    /// Trust provenance: byte-0 authorship is PRODUCER-guaranteed on a
+    /// sanitizing gateway. The marker grammar lives under the gateway's
+    /// reserved `rio: ` line prefix
+    /// ([`stderr::RESERVED_LINE_PREFIX`](super::stderr::RESERVED_LINE_PREFIX)),
+    /// and the gateway quotes every relayed (non-gateway-authored) line
+    /// that begins with it — `> ` prepended via the shared
+    /// [`stderr::quote_reserved_lines`](super::stderr::quote_reserved_lines)
+    /// owner — at every site that relays worker-controlled text as a
+    /// plain `STDERR_NEXT` payload (spec rule
+    /// `gw.stderr.relay-quote-reserved`; the gateway-side census test
+    /// enumerates the sites). The two routes that used to put
+    /// worker-influenced text at byte 0 of an observed line — the log
+    /// relay's no-live-activity `STDERR_NEXT` fallback (lines before
+    /// `Started`, post-terminal stragglers) and the observer's line
+    /// split over a multi-line failure payload — now deliver a
+    /// worker-authored marker forgery as `> rio: terminal lost …`,
+    /// which this byte-0-anchored parser rejects. The parser itself
+    /// still cannot authenticate a line (a raw byte-0 marker parses no
+    /// matter who minted it); what changed is that the producer no
+    /// longer relays forgeable bytes in its own grammar.
     ///
-    /// TODO: only gateway-owned structured wire metadata (a typed
-    /// per-root evidence-loss field on the result, not a stderr line)
-    /// deletes this spoof surface — the fallback relay emits raw
-    /// worker lines as single-line payloads, so no parser-side
-    /// anchoring can distinguish a relayed forgery from the genuine
-    /// gateway-authored marker. Wire-protocol change; priced as above
-    /// until then.
+    /// Residual — mixed-fleet skew window only: a gateway deployed from
+    /// before the relay sanitization still relays raw worker lines, so
+    /// an engine newer than its gateway retains the prior
+    /// consumer-priced exposure until the gateway is upgraded. For that
+    /// window the accepted worst case is unchanged and stated in the
+    /// consumer's gate-accounting vocabulary: a spoofed marker affects
+    /// only THAT drv's same-batch `Substituted` row, flipping it from a
+    /// recorded substitution event to evidence-loss classification —
+    /// timeless, it consumes the victim drv's SHARED auto-retry budget
+    /// (`max_auto_retries`, default 1) and at exhaustion terminalizes
+    /// as `TargetFailed{Infra}` → `infra-indeterminate`
+    /// (`GateAccounting::TripsRegression`, failing `report --check`
+    /// under both gating policies); timed, it terminalizes immediately,
+    /// or `interruption-not-reproduced` (`TripsDivergence`) for an
+    /// armed member. The direction stays conservative — never minting a
+    /// success, never hiding a violation — a bounded
+    /// denial-of-measurement, not a laundering channel. The other skew
+    /// direction is safe: an engine OLDER than a sanitizing gateway
+    /// runs this same byte-0 parser, and quoted forgeries start `> `.
+    ///
+    /// TODO: gateway-owned structured wire metadata (a typed per-root
+    /// evidence-loss field on the result, like the wanted-outputs
+    /// augmentation) is OPTIONAL HARDENING now that the producer owns
+    /// the line grammar: it would close the mixed-fleet skew window
+    /// (its authenticity would not depend on the deployed gateway's
+    /// relay hygiene) and retire the in-band/side-channel split
+    /// outright. Wire-protocol change; not load-bearing for current
+    /// fleets.
     pub fn lost_terminal_relay_drv(line: &str) -> Option<&str> {
         let drv = line
             .strip_prefix(Self::LOST_TERMINAL_RELAY_PREFIX)?
@@ -794,13 +796,21 @@ mod tests {
         // Must-NOT-parse: every non-producer shape.
         for (label, not_marker) in [
             // Prefix not at byte 0: the failure relay embedding the
-            // marker text mid-line, and the daemon's `> `-quoted log
-            // lines inside a relayed failure message.
+            // marker text mid-line, and the `> `-quoted form — both the
+            // daemon's log embeddings inside a relayed failure message
+            // AND, load-bearingly, the relay sanitizer's output for a
+            // worker-authored forgery (`stderr::quote_reserved_lines`,
+            // the fn the gateway applies at every worker-text relay
+            // site): the quoted row here is the consumer half of that
+            // producer guarantee.
             (
                 "embedded in a failure relay",
                 format!("derivation '{drv}' failed: {line}"),
             ),
-            ("daemon-quoted log embedding", format!("> {line}")),
+            (
+                "quoted relay (sanitizer output / daemon log embedding)",
+                format!("{}{line}", crate::protocol::stderr::QUOTED_LINE_PREFIX),
+            ),
             ("leading whitespace", format!(" {line}")),
             // Tail not ending at the closing quote.
             ("trailing text", format!("{line} (trace ab)")),

@@ -3140,6 +3140,382 @@ async fn test_build_paths_with_results_own_cached_terminal_emits_no_marker() -> 
     Ok(())
 }
 
+/// Plain `STDERR_NEXT` payload strings among captured frames (preamble
+/// already stripped by the collectors) — the exact payloads the engine's
+/// observer would be handed.
+fn next_payloads(frames: &[StderrMessage]) -> Vec<String> {
+    frames
+        .iter()
+        .filter_map(|m| match m {
+            StderrMessage::Next(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+// r[verify gw.stderr.relay-quote-reserved]
+/// The no-activity `STDERR_NEXT` fallback of the log relay quotes
+/// worker lines that speak the gateway's reserved grammar — through the
+/// REAL opcode handler, byte-level on both ends. The spoof fixtures are
+/// the producer formatters' own output (`lost_terminal_relay_line`; the
+/// announcement literal): a worker forges by reproducing those bytes,
+/// so the fixture must be exactly them. Both directions per line:
+///
+/// - marker-grammar line  → arrives `> `-quoted; the shared byte-0
+///   detector (what the replay engine's capture applies) finds NOTHING;
+/// - announcement-grammar line → quoted the same (the reserved prefix
+///   covers every gateway grammar family, not just the marker);
+/// - ordinary worker line → byte-identical relay (the quote never
+///   touches non-reserved text — the relayed-text bit alone does not
+///   quote);
+/// - already-quoted worker line (`> rio: …`) → byte-identical relay,
+///   NOT double-quoted into `> > rio: …` (quoting is idempotent because
+///   quoted output starts `>`, outside the reserved grammar).
+#[tokio::test]
+async fn test_build_paths_fallback_relayed_worker_grammar_arrives_quoted() -> anyhow::Result<()> {
+    let victim = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv";
+    let marker_spoof = BuildResult::lost_terminal_relay_line(victim);
+    let announcement_spoof = "rio: build 0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string();
+    let prequoted = format!("> {marker_spoof}");
+
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        })),
+        // No Derivation::Started for this drv — every line takes the
+        // no-activity STDERR_NEXT fallback (the logs-before-Started /
+        // path-key-mismatch cell).
+        ev(build_event::Event::Log(types::BuildLogBatch {
+            derivation_path: String::new(),
+            executor_id: String::new(),
+            lines: vec![
+                marker_spoof.clone().into_bytes(),
+                announcement_spoof.clone().into_bytes(),
+                b"building foo".to_vec(),
+                prequoted.clone().into_bytes(),
+            ],
+            first_line_number: 0,
+        })),
+        ev(build_event::Event::Completed(types::BuildCompleted {
+            output_paths: vec![],
+        })),
+    ]));
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let frames = collect_stderr_frames(&mut h.stream).await;
+
+    // Byte-level relay pin, per line. (The genuine `rio: build` preamble
+    // is stripped by the collector; the QUOTED announcement spoof starts
+    // `> ` and is not.)
+    assert_eq!(
+        next_payloads(&frames),
+        vec![
+            format!("> {marker_spoof}"),
+            format!("> {announcement_spoof}"),
+            "building foo".to_string(),
+            prequoted,
+        ],
+        "reserved-grammar worker lines quote; everything else relays \
+         byte-identical, with no double-quoting"
+    );
+    // The consumer-side detector — the same parser the replay engine's
+    // capture applies — finds no marker anywhere in the relayed stream.
+    assert!(
+        lost_terminal_marker_drvs(&frames).is_empty(),
+        "a relayed worker forgery must not survive to the byte-0 detector: {frames:?}"
+    );
+
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1);
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.stderr.relay-quote-reserved]
+/// One worker line, both relay arms — the conjunct under test is
+/// "activity exists", flipped with the line held constant:
+///
+/// - activity LIVE (between `Started` and `Completed`): the line rides
+///   `STDERR_RESULT{BuildLogLine}` VERBATIM — that channel is
+///   display-only to nom and structurally invisible to the engine's
+///   capture (rio-nix's drain hands only `STDERR_NEXT` payloads to
+///   observers; pinned consumer-side by
+///   `result_frames_never_reach_the_drain_observer`), and quoting it
+///   would mangle the worker's own `rio:` log banner;
+/// - activity CLOSED (the post-terminal straggler cell): the same line
+///   falls back to `STDERR_NEXT` and MUST arrive quoted.
+#[tokio::test]
+async fn test_build_paths_log_relay_quotes_only_the_next_fallback_arm() -> anyhow::Result<()> {
+    let target = "/nix/store/aaa-straggler-test.drv".to_string();
+    let victim = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv";
+    let marker_spoof = BuildResult::lost_terminal_relay_line(victim);
+
+    let log_batch = |lines: Vec<Vec<u8>>| {
+        ev(build_event::Event::Log(types::BuildLogBatch {
+            derivation_path: target.clone(),
+            executor_id: String::new(),
+            lines,
+            first_line_number: 0,
+        }))
+    };
+
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        })),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::started(target.clone(), "w1".into()),
+        )),
+        // Activity live: rides the BuildLogLine result, raw.
+        log_batch(vec![marker_spoof.clone().into_bytes()]),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::completed(target.clone(), vec![]),
+        )),
+        // Post-terminal straggler: activity closed → STDERR_NEXT
+        // fallback → quoted.
+        log_batch(vec![marker_spoof.clone().into_bytes()]),
+        ev(build_event::Event::Completed(types::BuildCompleted {
+            output_paths: vec![],
+        })),
+    ]));
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let frames = collect_stderr_frames(&mut h.stream).await;
+
+    // The live-activity arm: exactly one BuildLogLine result, carrying
+    // the worker's bytes verbatim.
+    let log_line_results: Vec<&Vec<rio_nix::protocol::stderr::ResultField>> = frames
+        .iter()
+        .filter_map(|m| match m {
+            StderrMessage::Result {
+                result_type,
+                fields,
+                ..
+            } if *result_type == rio_nix::protocol::stderr::ResultType::BuildLogLine as u64 => {
+                Some(fields)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        log_line_results,
+        vec![&vec![rio_nix::protocol::stderr::ResultField::String(
+            marker_spoof.clone()
+        )]],
+        "the activity arm relays worker text verbatim on the Result channel"
+    );
+
+    // The straggler arm: the same line as a quoted STDERR_NEXT payload.
+    assert_eq!(
+        next_payloads(&frames),
+        vec![format!("> {marker_spoof}")],
+        "the post-terminal straggler takes the fallback and arrives quoted"
+    );
+    assert!(
+        lost_terminal_marker_drvs(&frames).is_empty(),
+        "neither arm lets the forgery reach the byte-0 detector: {frames:?}"
+    );
+
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1);
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.stderr.relay-quote-reserved]
+/// The failure relay quotes the worker-controlled MESSAGE half per line,
+/// composed inside the gateway-authored frame — through the real opcode
+/// handler. Rows on both sides of every conjunct:
+///
+/// - multi-line message with embedded grammar lines (the
+///   observer-split route: non-first payload lines land at byte 0) →
+///   each embedded grammar line arrives `> `-quoted; the first message
+///   line and the gateway frame are untouched; the relayed reason still
+///   parses for the failure capture;
+/// - message whose FIRST line speaks the grammar → quoted mid-line
+///   after `failed: ` (uniform per-line rule; byte 0 was already
+///   unreachable there);
+/// - plain message → the composed payload is byte-identical to the
+///   pre-sanitizer relay (the quote is invisible until grammar appears).
+#[tokio::test]
+async fn test_build_paths_failure_relay_quotes_embedded_grammar_per_line() -> anyhow::Result<()> {
+    let victim = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv";
+    let marker_spoof = BuildResult::lost_terminal_relay_line(victim);
+    let failed_a = "/nix/store/bbb-failed-a.drv";
+    let failed_b = "/nix/store/bbb-failed-b.drv";
+    let failed_c = "/nix/store/bbb-failed-c.drv";
+
+    let multi_line_msg = format!("exit code 1\n{marker_spoof}\nrio: build 0193-spoof");
+    let first_line_msg = marker_spoof.clone();
+    let plain_msg = "builder failed with exit code 2".to_string();
+
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 3,
+            cached_derivations: 0,
+        })),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::failed(
+                failed_a.to_string(),
+                multi_line_msg,
+                types::BuildResultStatus::PermanentFailure,
+            ),
+        )),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::failed(
+                failed_b.to_string(),
+                first_line_msg,
+                types::BuildResultStatus::PermanentFailure,
+            ),
+        )),
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::failed(
+                failed_c.to_string(),
+                plain_msg.clone(),
+                types::BuildResultStatus::PermanentFailure,
+            ),
+        )),
+        ev(build_event::Event::Completed(types::BuildCompleted {
+            output_paths: vec![],
+        })),
+    ]));
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let frames = collect_stderr_frames(&mut h.stream).await;
+    assert_eq!(
+        next_payloads(&frames),
+        vec![
+            // Embedded grammar lines quoted; first line + frame intact;
+            // the non-cascaded hint still rides the same payload.
+            format!(
+                "derivation '{failed_a}' failed: exit code 1\n> {marker_spoof}\n\
+                 > rio: build 0193-spoof\n  ↳ rio-cli logs '{failed_a}'"
+            ),
+            // First-line grammar: quoted mid-line (uniform per-line rule).
+            format!(
+                "derivation '{failed_b}' failed: > {marker_spoof}\n  ↳ rio-cli logs '{failed_b}'"
+            ),
+            // Plain message: byte-identical to the pre-sanitizer relay.
+            format!("derivation '{failed_c}' failed: {plain_msg}\n  ↳ rio-cli logs '{failed_c}'"),
+        ],
+        "the message half quotes per line; the gateway frame never does"
+    );
+    // The observer-split view (what the engine's capture sees, line by
+    // line): no marker anywhere.
+    assert!(
+        lost_terminal_marker_drvs(&frames).is_empty(),
+        "split non-first payload lines must not carry the grammar at byte 0: {frames:?}"
+    );
+
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1);
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.lost-terminal-relay+2]
+// r[verify gw.stderr.relay-quote-reserved]
+/// Both directions in ONE stream: a worker forgery of the marker for
+/// exactly the root whose terminal IS lost rides the fallback relay and
+/// arrives quoted, while the gateway's own genuine marker for that root
+/// still arrives raw at byte 0 and parses. The detector — fed every
+/// `STDERR_NEXT` payload of the whole stream, exactly like the engine's
+/// capture — sees the marker exactly ONCE, and the producing frame is
+/// the gateway-authored one (the shared formatter's line plus framing
+/// newline), not the relayed forgery.
+#[tokio::test]
+async fn test_build_paths_with_results_genuine_marker_parses_while_relayed_forgery_cannot()
+-> anyhow::Result<()> {
+    let marker_spoof = BuildResult::lost_terminal_relay_line(HONEST_A_DRV);
+
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        })),
+        // The worker's forgery, relayed before the loss settles: no
+        // activity exists for HONEST_A (its Started never arrives in
+        // this stream), so the line takes the STDERR_NEXT fallback.
+        ev(build_event::Event::Log(types::BuildLogBatch {
+            derivation_path: HONEST_A_DRV.into(),
+            executor_id: String::new(),
+            lines: vec![marker_spoof.clone().into_bytes()],
+            first_line_number: 0,
+        })),
+        // Completed DAG with HONEST_A's terminal lost — the genuine
+        // lost-terminal cell (store presence seeded below).
+        ev(build_event::Event::Completed(types::BuildCompleted {
+            output_paths: vec![HONEST_A_OUT.into()],
+        })),
+    ]));
+
+    h.store
+        .seed_with_content(HONEST_A_DRV, HONEST_A_ATERM.as_bytes());
+    h.store.seed_with_content(HONEST_A_OUT, b"a-out");
+
+    let path_a = format!("{HONEST_A_DRV}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: std::slice::from_ref(&path_a),
+        u64: 0,
+    );
+
+    let frames = collect_stderr_frames(&mut h.stream).await;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+
+    // Exactly ONE detector hit — the genuine emission.
+    assert_eq!(
+        lost_terminal_marker_drvs(&frames),
+        vec![HONEST_A_DRV.to_string()],
+        "the genuine gateway marker must keep parsing at byte 0: {frames:?}"
+    );
+    // The forgery's frame is the quoted relay; the genuine frame is the
+    // raw formatter line with the framing newline. Both present, distinct.
+    let payloads = next_payloads(&frames);
+    assert!(
+        payloads.contains(&format!("> {marker_spoof}")),
+        "the relayed forgery arrives quoted: {payloads:?}"
+    );
+    assert!(
+        payloads.contains(&format!("{marker_spoof}\n")),
+        "the gateway-authored marker frame is raw at byte 0: {payloads:?}"
+    );
+
+    // The in-band result is the unchanged lost-terminal presence mint.
+    let (echoed, result) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(echoed, path_a);
+    assert_eq!(result.status, BuildStatus::Substituted, "{result:?}");
+    assert_eq!(result.times_built, 0, "{result:?}");
+
+    h.finish().await;
+    Ok(())
+}
+
 // r[verify gw.opcode.build-results-honest+2]
 /// Event-loss shape, missing cell: a Completed DAG with this root's
 /// terminal lost AND the store positively reporting the wanted output
