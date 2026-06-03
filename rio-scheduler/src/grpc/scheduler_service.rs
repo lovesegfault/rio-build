@@ -233,6 +233,32 @@ impl SchedulerService for SchedulerGrpc {
                     }
                 }
             }
+            // r[impl sched.merge.ingress-output-arity]
+            // Arity sibling of the duplicate-name check above (round-16
+            // bug_098, R5 sibling-invariants: the SAME consumers — the
+            // name⇄path zips in settled_row_identity_matches, the
+            // resident matcher, the HMAC claims allowlist, recovery's
+            // should_resolve_from_expected_paths — assume the two lists
+            // are POSITIONALLY PAIRED, and `zip` silently truncates a
+            // misaligned pair into mis-paired path evidence that can
+            // later manufacture a false SettledIdentityConflict against
+            // an honest, correctly-aligned resubmission). The
+            // byte-carrying validators enforce arity against the parsed
+            // derivation; this covers the BARE proto echo, the exact
+            // shape a direct/hostile submitter uses. Legal forms: equal
+            // length (floating slots as empty strings), or a fully
+            // empty path list (the no-claims form — every name-keyed
+            // zip view degrades to "no path claims" consistently).
+            if !node.expected_output_paths.is_empty()
+                && node.expected_output_paths.len() != node.output_names.len()
+            {
+                return Err(Status::invalid_argument(format!(
+                    "node {} declares {} output_names but {} expected_output_paths;                      the lists are positionally paired (declare equal arity, with                      empty strings for floating slots, or omit the path list                      entirely)",
+                    node.drv_hash,
+                    node.output_names.len(),
+                    node.expected_output_paths.len()
+                )));
+            }
             // Per-node drv_content bound, shared with the gateway
             // (rio_common::limits::MAX_DRV_CONTENT_BYTES = 1 MiB). Two
             // gateway producers fill this field: the inline-.drv

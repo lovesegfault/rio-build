@@ -837,6 +837,32 @@ chokepoint per ingestion surface, and "the other crate validates it"
 is exactly how the Nth surface gets missed. The two layers are
 independent and independently tested.
 
+#r("sched.merge.ingress-output-arity")[
+  SubmitBuild ingress MUST reject any node whose non-empty
+  `expected_output_paths` length differs from its `output_names`
+  length, for every node --- bare store-backed nodes included ---
+  before any DAG state, claims derivation, or store probe consults
+  either list. A fully empty `expected_output_paths` (the no-claims
+  form) MUST remain accepted.
+]
+The arity sibling of #rref("sched.merge.ingress-output-names-unique"),
+added by the round-16 sibling-invariants lesson (bug_098, pattern R5):
+the same name-keyed consumers that assume distinct names also assume
+the two lists are positionally PAIRED --- the
+`output_names ⇄ expected_output_paths` zips in the settled-row and
+resident identity matchers, the HMAC claims allowlist, and recovery's
+deferred-resolve re-derivation all silently TRUNCATE on a misaligned
+pair, so a hostile bare submission with a short or long path list
+could persist mis-paired path evidence and later manufacture a false
+`SettledIdentityConflict` against the honest, correctly-aligned
+resubmission of the same derivation. The byte-carrying validators
+(authoritative and inline) enforce arity against the parsed
+derivation; this rule covers the bare proto echo those validators
+never see. Sweeping per CONSUMER (what else do the zip consumers
+assume?) rather than per invariant across surfaces is what surfaces
+the sibling: distinctness landed in round 15, arity is the same
+consumers' second assumption.
+
 #r("sched.merge.ingress-inline-drv-binding+1")[
   `SubmitBuild` ingress MUST validate every node that carries non-empty
   `drv_content` without the authoritative flag (the gateway's

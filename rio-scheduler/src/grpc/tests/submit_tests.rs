@@ -187,6 +187,11 @@ async fn test_submit_build_accepts_empty_expected_output_paths() {
     let (_db, grpc, _handle, _task) = setup_grpc().await;
     let mut node = make_node("empty-expected-out");
     node.is_content_addressed = true;
+    // Two names for two paths: the arity gate
+    // (sched.merge.ingress-output-arity) demands positional pairing;
+    // this test exercises the per-ENTRY shape gate on the empty/valid
+    // mix.
+    node.output_names = vec!["out".into(), "lib".into()];
     node.expected_output_paths = vec![
         String::new(),
         "/nix/store/ffffffffffffffffffffffffffffffff-real-out".to_owned(),
@@ -239,6 +244,98 @@ async fn test_submit_build_rejects_duplicate_output_names() {
         "error names the duplication: {}",
         status.message()
     );
+}
+
+// r[verify sched.merge.ingress-output-arity]
+/// THE bug_098 proto shape: a bare store-backed node whose
+/// expected_output_paths arity differs from output_names. No
+/// derivation bytes exist for the byte-carrying validators to check
+/// arity against — this ingress scan is the only layer between a
+/// hostile bare submission and the silently-truncating name⇄path zips
+/// (settled-row matcher, resident matcher, HMAC claims allowlist,
+/// recovery deferred-resolve). Both directions rejected; the equal
+/// and no-claims forms stay accepted.
+#[tokio::test]
+async fn test_submit_build_rejects_misaligned_output_arity() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+
+    // Short path list (zip would silently drop the 'dev' pairing).
+    let mut short = make_node("arity-short");
+    short.output_names = vec!["out".into(), "dev".into()];
+    short.expected_output_paths =
+        vec!["/nix/store/ffffffffffffffffffffffffffffffff-a-out".to_owned()];
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![short],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("expected_output_paths"),
+        "error names the arity mismatch: {}",
+        status.message()
+    );
+
+    // Long path list (extra unpaired path).
+    let mut long = make_node("arity-long");
+    long.output_names = vec!["out".into()];
+    long.expected_output_paths = vec![
+        "/nix/store/ffffffffffffffffffffffffffffffff-a-out".to_owned(),
+        "/nix/store/gggggggggggggggggggggggggggggggg-a-dev".to_owned(),
+    ];
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![long],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(status.message().contains("expected_output_paths"));
+
+    // No-claims form (fully empty path list): accepted — every
+    // name-keyed view degrades to "no path claims" consistently.
+    let mut empty = make_node("arity-empty");
+    empty.output_names = vec!["out".into(), "dev".into()];
+    empty.expected_output_paths = vec![];
+    let result = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![empty],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await;
+    if let Err(status) = &result {
+        assert!(
+            !status.message().contains("expected_output_paths"),
+            "no-claims form must not trip the arity gate: {}",
+            status.message()
+        );
+    }
+
+    // Equal arity with floating slots (empty strings): accepted.
+    let mut floating = make_node("arity-float");
+    floating.is_content_addressed = true;
+    floating.output_names = vec!["out".into(), "dev".into()];
+    floating.expected_output_paths = vec![String::new(), String::new()];
+    let result = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![floating],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await;
+    if let Err(status) = &result {
+        assert!(
+            !status.message().contains("expected_output_paths"),
+            "equal-arity floating form must not trip the arity gate: {}",
+            status.message()
+        );
+    }
 }
 
 // r[verify sched.merge.ingress-output-names-unique]
