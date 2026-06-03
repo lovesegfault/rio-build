@@ -667,12 +667,19 @@ pub struct ControllerLeaseHooks {
     /// stale startup-time sketches over the previous leader's
     /// accumulated samples.
     ///
-    /// **Latch-on-Ok-only** (mirrors `cost::poller_tick_prelude`): the
-    /// run loop reads this with `load()`, not `swap()`. On reload `Ok`
-    /// it stores `false`; on `Err` it leaves the flag set so the next
-    /// tick retries. While set, `persist()` is gated off (degraded
-    /// reconcile runs, stale-overwrite prevented).
-    reload: Arc<std::sync::atomic::AtomicBool>,
+    /// bug_346: a monotone ACQUISITION EPOCH, not a boolean — each
+    /// `on_acquire` increments it. The reconciler tracks two cursors
+    /// against it (`edge_seen_epoch`, `reloaded_epoch`), so
+    /// edge-actions fire EXACTLY once per acquisition by construction:
+    /// the per-tick "is the flag still set?" re-execution that
+    /// disabled idle consolidation for a whole PG outage (the
+    /// `prev_idle.clear()` ran every Err tick) is unwritable — there
+    /// is no flag to keep re-reading, only an epoch you have either
+    /// seen or not. Reload retry keeps its latch-on-Ok-only shape via
+    /// `reloaded_epoch` (advanced only on a successful load; persist
+    /// gated until it catches up). A re-acquire mid-Err-loop is a NEW
+    /// epoch and re-fires the edge once (new tenure).
+    acquire_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Set on `on_lose`; run loop `placeable_tx.send_replace(None)`
     /// so an ex-leader's `PlaceableGate` doesn't stay armed with a
     /// stale set (whose stale `queued` would `reap_excess_pending` the
@@ -682,7 +689,8 @@ pub struct ControllerLeaseHooks {
 
 impl rio_lease::LeaseHooks for ControllerLeaseHooks {
     fn on_acquire(&self) {
-        self.reload.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.acquire_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         metrics::counter!("rio_controller_lease_acquired_total").increment(1);
     }
     fn on_lose(&self) {
@@ -753,6 +761,16 @@ pub struct NodeClaimPoolReconciler {
     /// on the lease-acquire edge (a stale buffered ICE-clear from a
     /// previous tenure could mask a genuinely ICE'd cell).
     pending_evidence: PendingSchedulerEvidence,
+    /// bug_346: last acquisition epoch whose EDGE actions ran (the
+    /// amplify-class `prev_idle` clear + the `pending_evidence`
+    /// reset). Compared against `hooks.acquire_epoch` once per tick;
+    /// fires exactly once per acquisition.
+    edge_seen_epoch: u64,
+    /// bug_346: last acquisition epoch whose PG reload SUCCEEDED
+    /// (the suppress-class clears + sketch swap ride the Ok arm).
+    /// `persist()` stays gated while this lags the epoch
+    /// (latch-on-Ok-only, unchanged).
+    reloaded_epoch: u64,
     /// `name → epoch-secs at which the node was first observed idle`
     /// (`requested.0 == 0`). r42 bug_020: the SOLE idle-duration source
     /// — Karpenter v1 does not write `Empty`, so the controller's own
@@ -963,6 +981,8 @@ impl NodeClaimPoolReconciler {
             inflight_created: HashMap::new(),
             consecutive_bot_ticks: 0,
             pending_evidence: PendingSchedulerEvidence::default(),
+            edge_seen_epoch: 0,
+            reloaded_epoch: 0,
             tick_counter: 0,
             wedge: wedge::WedgeTracker::default(),
         }
@@ -975,7 +995,11 @@ impl NodeClaimPoolReconciler {
     /// `persist()` is gated off so it doesn't overwrite the previous
     /// leader's PG rows. Set false only on `CellSketches::load_seeded` Ok.
     fn reload_pending(&self) -> bool {
-        self.hooks.reload.load(std::sync::atomic::Ordering::SeqCst)
+        self.reloaded_epoch
+            != self
+                .hooks
+                .acquire_epoch
+                .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Tick loop. Gated on [`LeaderState::is_leader`] — standby replicas
@@ -1052,8 +1076,22 @@ impl NodeClaimPoolReconciler {
         // `Err` arm under-reap by one cycle (the documented SAFE
         // direction) instead of unboundedly over-reaping.
         // r[impl ctrl.nodeclaim.lease-edge-polarity+3]
-        if self.reload_pending() {
+        // r[impl ctrl.nodeclaim.acquire-edge-token]
+        let epoch = self
+            .hooks
+            .acquire_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if epoch != self.edge_seen_epoch {
+            // EDGE actions: once per acquisition, by construction —
+            // NOT once per Err retry (bug_346: the per-tick re-clear
+            // disabled idle consolidation for the whole PG outage:
+            // every idle clock restarted every tick, so reap_idle
+            // never saw a spell older than one tick).
             self.prev_idle.clear();
+            self.pending_evidence = PendingSchedulerEvidence::default();
+            self.edge_seen_epoch = epoch;
+        }
+        if self.reloaded_epoch != epoch {
             let halflife = Duration::from_secs(self.cfg.sketch_halflife_secs);
             match CellSketches::load_seeded(&self.pg, &self.cfg.lead_time_seed, halflife, now).await
             {
@@ -1092,9 +1130,7 @@ impl NodeClaimPoolReconciler {
                     // state, classify its polarity here and put the
                     // clear (or not-clear) on the matching edge. See
                     // [`gauge_universe`].
-                    self.hooks
-                        .reload
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    self.reloaded_epoch = epoch;
                 }
                 Err(e) => {
                     warn!(
@@ -2859,43 +2895,58 @@ mod tests {
         );
     }
 
-    /// `ControllerLeaseHooks` flags propagate via shared `Arc` — the
-    /// run loop's `load()` sees the lease loop's clone's `store`.
+    /// `ControllerLeaseHooks` epochs propagate via shared `Arc` — the
+    /// run loop's `load()` sees the lease loop's clone's `fetch_add`.
     /// `Clone` (LeaseHooks bound) so it can be passed to both
     /// `run_lease_loop` and `NodeClaimPoolReconciler::new`.
+    // r[verify ctrl.nodeclaim.acquire-edge-token]
     #[test]
     fn lease_hooks_flags_propagate_via_clone() {
         use std::sync::atomic::Ordering::SeqCst;
         let h = ControllerLeaseHooks::default();
         let h2 = h.clone();
         rio_lease::LeaseHooks::on_acquire(&h2);
-        assert!(h.reload.load(SeqCst), "reload set via clone");
-        h.reload.store(false, SeqCst);
+        assert_eq!(h.acquire_epoch.load(SeqCst), 1, "epoch bumped via clone");
         assert!(!h.lose.load(SeqCst));
         rio_lease::LeaseHooks::on_lose(&h2);
         assert!(h.lose.swap(false, SeqCst), "lose set via clone");
     }
 
-    /// Latch-on-Ok-only reload semantics. The run loop's reload block
-    /// is inlined in `run()` (PG-coupled), so this test exercises the
-    /// invariant directly: after `on_acquire`, `reload_pending()` stays
-    /// true (gating `persist()`) until the run loop's Ok-arm explicitly
-    /// stores false. A `swap(false)` BEFORE the load would consume the
-    /// flag on a transient PG error and the next tick's stale
-    /// `persist()` would overwrite the previous leader's PG rows.
+    /// bug_346: the epoch token gives latch-on-Ok-only AND
+    /// edge-actions-fire-once by construction. The two cursors track
+    /// the epoch independently: `reloaded_epoch` lags until a load
+    /// succeeds (persist gated); a re-acquire mid-Err-loop is a NEW
+    /// epoch (re-fires once). There is no boolean to wrongly consume
+    /// on Err or wrongly re-read on every tick.
+    // r[verify ctrl.nodeclaim.acquire-edge-token]
     #[test]
-    fn reload_latch_on_ok_only_gates_persist() {
+    fn acquire_epoch_token_semantics() {
         use std::sync::atomic::Ordering::SeqCst;
         let h = ControllerLeaseHooks::default();
         rio_lease::LeaseHooks::on_acquire(&h);
-        // Tick 1: load() Err — flag stays set (NOT swap), persist gated.
-        assert!(h.reload.load(SeqCst), "tick1: reload still pending on Err");
-        // Tick 2: load() Err — same.
-        assert!(h.reload.load(SeqCst), "tick2: reload still pending on Err");
-        // Tick 3: load() Ok — Ok-arm stores false.
-        h.reload.store(false, SeqCst);
-        assert!(!h.reload.load(SeqCst), "tick3: latched on Ok");
-        // Done-gate: no `swap(false)` callsite remains in the run loop.
+        let (mut edge_seen, mut reloaded) = (0u64, 0u64);
+
+        // Tick 1: edge fires once; load() Err — reloaded lags.
+        let ep = h.acquire_epoch.load(SeqCst);
+        let edge_fired_t1 = ep != edge_seen;
+        edge_seen = ep;
+        assert!(edge_fired_t1, "tick1: edge action fires");
+        assert_ne!(reloaded, ep, "tick1: persist gated on Err");
+
+        // Tick 2: same epoch — edge does NOT re-fire; still gated.
+        let ep2 = h.acquire_epoch.load(SeqCst);
+        assert_eq!(ep2, edge_seen, "tick2: edge does not re-fire");
+        assert_ne!(reloaded, ep2, "tick2: still gated");
+
+        // Tick 3: load() Ok — reloaded catches up; persist ungated.
+        reloaded = ep2;
+        assert_eq!(reloaded, ep2, "tick3: latched on Ok");
+
+        // Re-acquire mid-loop: NEW epoch — edge re-fires exactly once.
+        rio_lease::LeaseHooks::on_acquire(&h);
+        let ep3 = h.acquire_epoch.load(SeqCst);
+        assert_ne!(ep3, edge_seen, "new tenure: edge re-fires once");
+        assert_ne!(reloaded, ep3, "new tenure: persist re-gated");
     }
 
     #[test]

@@ -1258,6 +1258,20 @@ The buffer also closes the pre-existing ≥5-tick loss: observed instance
 types recorded across a long consolidate-only stretch now reach the
 scheduler's cost table when the outage ends.
 
+#r("ctrl.nodeclaim.acquire-edge-token")[
+  Lease-acquire edge state MUST be tracked as a monotone acquisition epoch
+  (incremented by `on_acquire`), with the reconciler holding two cursors:
+  `edge_seen_epoch` (edge actions --- the amplify-class `prev_idle` clear
+  and the `pending_evidence` reset --- fire exactly once per acquisition,
+  never once per retry tick) and `reloaded_epoch` (advanced only on a
+  successful PG sketch reload; `persist()` is gated while it lags ---
+  latch-on-Ok-only, unchanged). A re-acquisition during a reload-error loop
+  is a NEW epoch and re-fires the edge exactly once. A boolean latch is
+  not an acceptable encoding: re-reading it every tick re-executes the
+  edge actions for the whole outage (bug_346 --- every idle clock
+  restarted every tick, so idle consolidation never fired).
+]
+
 #r("ctrl.nodeclaim.wedge-cluster+1")[
   On every full reconcile tick the NodeClaim-pool reconciler MUST compute a
   per-node clustering of pull-mode attempt-deadline expiries from the

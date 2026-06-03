@@ -300,6 +300,8 @@ impl Lab {
             inflight_created: HashMap::new(),
             consecutive_bot_ticks: 0,
             pending_evidence: Default::default(),
+            edge_seen_epoch: 0,
+            reloaded_epoch: 0,
             tick_counter: 0,
             wedge: wedge::WedgeTracker::default(),
         };
@@ -1147,5 +1149,39 @@ async fn pending_evidence_cleared_on_acquire_edge() {
             .all(|a| a.registered_cells.is_empty()),
         "stale pre-tenure evidence must not ship after acquire (Ok-arm clear, \
          suppress polarity — same class as recorded_boot)"
+    );
+}
+
+// r[verify ctrl.nodeclaim.acquire-edge-token]
+/// bug_346's recorded red, kept as the regression pin: an idle spell
+/// seeded during a reload-Err loop must SURVIVE subsequent Err ticks —
+/// pre-fix the boolean latch re-ran `prev_idle.clear()` every tick of
+/// a PG outage ("left: Some(...220.0) / right: Some(...200.0)" — the
+/// seed restarted every tick), disabling idle consolidation entirely
+/// while the under-reap contract claimed one cycle.
+#[tokio::test]
+async fn idle_spell_survives_reload_err_loop() {
+    let mut lab = Lab::new().await;
+    lab.r.hooks.on_acquire();
+    lab.r.pg = lab.closed_pool().await;
+
+    // Tick 1 (reload Err): n1 is idle → seeded into prev_idle at t=600.
+    let idle_nc = || nc_json("n1", 0, Some(10));
+    lab.tick(600, full_tick_scenario(vec![], vec![idle_nc()], vec![]))
+        .await;
+    let seeded = lab.r.prev_idle.get("n1").copied();
+    assert!(seeded.is_some(), "idle spell seeded on the first Err tick");
+
+    // Ticks 2-3 (still Err): the seed must SURVIVE — the acquire-edge
+    // clear fires once per acquisition, not once per Err retry.
+    lab.tick(610, full_tick_scenario(vec![], vec![idle_nc()], vec![]))
+        .await;
+    lab.tick(620, full_tick_scenario(vec![], vec![idle_nc()], vec![]))
+        .await;
+    assert_eq!(
+        lab.r.prev_idle.get("n1").copied(),
+        seeded,
+        "the idle spell survives the reload-Err loop (the clear is an \
+         acquire-EDGE action, not a per-tick action)"
     );
 }
