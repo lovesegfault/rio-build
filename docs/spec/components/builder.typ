@@ -587,6 +587,24 @@ requirement and the display-only / no-pod-identity rationale live in
   to `0` means unlimited.
 ]
 
+#r("builder.log.loss-disclosure")[
+  Every log-upload abandonment MUST be disclosed through one chokepoint that
+  derives the loss from the abandonment reason: an upload that ends with
+  un-acked lines increments
+  #(refs.metric)("rio_builder_log_drain_abandoned_total")`{reason}` and logs
+  at `error!` if and only if the lines are durably lost --- the sole zero-loss
+  reason is the store provably holding the complete `[0, final_line_count)`
+  log. A permanent store rejection arriving mid-stream MUST terminate the
+  session loop (no reconnect can succeed against it), and a panic in the
+  upload task MUST disclose its un-acked lines during unwind, independent of
+  whether any caller awaits the task.
+]
+The reason vocabulary is the `x-rio-log-reject` metadata class the store
+attaches to permanent rejections (`cap`/`complete`/`superseded`) plus the
+builder-local `deadline_expired` and `panic`; bare-code fallbacks
+(`FAILED_PRECONDITION` → complete, `PERMISSION_DENIED` → superseded) keep the
+mapping total against pre-metadata stores.
+
 = Overlay Store Architecture
 
 #r("builder.overlay.per-build")[

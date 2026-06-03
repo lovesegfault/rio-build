@@ -167,8 +167,9 @@ fn lost_lines(reason: AbandonReason, unacked: u64) -> u64 {
     }
 }
 
-/// THE single disclosure site (`builder.log.loss-disclosure`): the only
-/// place `rio_builder_log_drain_abandoned_total` is incremented.
+// r[impl builder.log.loss-disclosure]
+/// THE single disclosure site: the only place
+/// `rio_builder_log_drain_abandoned_total` is incremented.
 /// Counter ⟺ `lost_lines > 0`, by construction — a zero-loss abandon
 /// (CompleteLog, or any reason with nothing un-acked) logs at `debug!`
 /// and fires nothing.
@@ -1510,6 +1511,7 @@ mod tests {
     //    builder.log.loss-disclosure)
     // ------------------------------------------------------------------
 
+    // r[verify builder.log.loss-disclosure]
     /// merged_bug_360 (red-first): PERMISSION_DENIED with un-acked lines
     /// is durable loss — the superseding attempt produces ITS OWN log,
     /// not these lines. Pre-fix, `rejected: true` suppressed the
@@ -1549,6 +1551,7 @@ mod tests {
         );
     }
 
+    // r[verify builder.log.loss-disclosure]
     /// merged_bug_360 (red-first): a panic in the upload task must
     /// disclose the un-acked lines. Pre-fix the counter fired only at
     /// `run()`'s normal exit, which a panicking task never reaches —
@@ -1604,6 +1607,7 @@ mod tests {
         );
     }
 
+    // r[verify builder.log.loss-disclosure]
     /// bug_248 (red-first): a permanent rejection arriving MID-STREAM
     /// (the cap tripping while the stream is open) must stop the
     /// session loop — pre-fix it was classified Reconnect and the
@@ -1653,6 +1657,7 @@ mod tests {
         );
     }
 
+    // r[verify builder.log.loss-disclosure]
     /// Polarity guard: a `complete` rejection (the store provably holds
     /// the full `[0, final)` log) is the ONE zero-loss abandon — no
     /// counter, under any reason label.
