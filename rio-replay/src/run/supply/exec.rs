@@ -3381,7 +3381,9 @@ mod tests {
     /// QUANTIFICATION DOMAIN: every line of exec.rs above the file-level
     /// `#[cfg(test)]` marker containing the tokens below. REFUSED is an
     /// irreversible daemon verdict (upload-rejected dependents, gate
-    /// trip), so its sites stay enumerable: the import, two tally reads
+    /// trip), so its sites stay enumerable: the import, the
+    /// row-before-release assert arm in `record_settlement` (settled
+    /// refused/failed rows demand the claim still held), two tally reads
     /// (the invocation totals and the journal refold), and FOUR
     /// daemon-evidenced settles — the stream arm's refusal-observed
     /// exhaustion, and the batch arm's refusal x refusal, refusal x
@@ -3409,11 +3411,11 @@ mod tests {
         };
         assert_eq!(
             count("SUPPLY_OUTCOME_REFUSED"),
-            7,
-            "REFUSED sites: the import + 2 tally reads + the 4 daemon-evidenced settles \
-             (stream exhaustion-with-refusal; batch refusal x refusal, refusal x \
-             wire-death, wire-death x refusal). A new site must carry daemon-refusal \
-             evidence."
+            8,
+            "REFUSED sites: the import + record_settlement's row-before-release assert \
+             arm + 2 tally reads + the 4 daemon-evidenced settles (stream \
+             exhaustion-with-refusal; batch refusal x refusal, refusal x wire-death, \
+             wire-death x refusal). A new site must carry daemon-refusal evidence."
         );
         assert_eq!(
             count("breaker.record_success()"),
