@@ -388,27 +388,46 @@ impl NixCacheClient {
     /// Fetch a narinfo as raw text. 404 ⇒ `Ok(None)` (path not upstream);
     /// any other non-200 is an error carrying a body snippet. The campaign
     /// engine's upstream-coverage probe uses this form so it can decide how
-    /// to record a body that fails to parse.
+    /// to record a body that fails to parse. The body read is capped at
+    /// [`crate::substituter::MAX_NARINFO_BYTES`] — the same cap both probe
+    /// arms enforce — so an operator cache serving an oversized object
+    /// under a narinfo name errors loudly instead of buffering it.
     pub async fn fetch_narinfo_text(&self, store_path: &str) -> anyhow::Result<Option<String>> {
+        use crate::substituter::MAX_NARINFO_BYTES;
         let url = self.narinfo_url(store_path)?;
         tracing::debug!(%url, "cache GET");
-        let resp = self
+        let mut resp = self
             .http
             .get(url.clone())
             .send()
             .await
             .with_context(|| format!("GET {url}"))?;
-        match resp.status() {
-            reqwest::StatusCode::NOT_FOUND => Ok(None),
-            s if s.is_success() => Ok(Some(
-                resp.text()
-                    .await
-                    .with_context(|| format!("read body from {url}"))?,
-            )),
-            s => anyhow::bail!(
-                "GET {url}: HTTP {s}: {}",
-                crate::body_snippet(&resp.text().await.unwrap_or_default())
-            ),
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        // Accumulate chunks under the shared cap regardless of status so
+        // neither the success body nor an error snippet can over-buffer.
+        let mut bytes: Vec<u8> = Vec::new();
+        // bounded-io: size-capped by the running MAX_NARINFO_BYTES check
+        // below; time-bounded by the client-wide request timeout.
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .with_context(|| format!("read body from {url}"))?
+        {
+            anyhow::ensure!(
+                (bytes.len() + chunk.len()) as u64 <= MAX_NARINFO_BYTES,
+                "{url}: narinfo body exceeds the {MAX_NARINFO_BYTES}-byte cap — narinfos are \
+                 ~1 KB; refusing to buffer a body this large",
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        if status.is_success() {
+            Ok(Some(text))
+        } else {
+            anyhow::bail!("GET {url}: HTTP {status}: {}", crate::body_snippet(&text))
         }
     }
 

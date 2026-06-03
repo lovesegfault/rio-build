@@ -1697,7 +1697,14 @@ fn contract_registry() -> Result<()> {
     let read = |rel: &str| -> Result<String> {
         fs::read_to_string(root.join(rel)).with_context(|| format!("read {rel}"))
     };
-    check_contract_registry(CONTRACT_REGISTRY, &capability_flags, &digest_fields, &read)
+    check_contract_registry(CONTRACT_REGISTRY, &capability_flags, &digest_fields, &read)?;
+    tracing::info!(
+        rows = CONTRACT_REGISTRY.len(),
+        capability_flags = capability_flags.len(),
+        digest_fields = digest_fields.len(),
+        "contract-registry ok"
+    );
+    Ok(())
 }
 
 /// Marker comment tag for [`bounded_io`]: `// bounded-io: <bound>`.

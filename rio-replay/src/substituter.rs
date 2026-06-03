@@ -51,8 +51,10 @@ const NARINFO_TIMEOUT: Duration = Duration::from_secs(30);
 /// names must exhaust its budget here — loudly, naming the cap — instead
 /// of OOMing the engine. NAR fetch bodies are NOT under this cap; they are
 /// bounded by their own declared-size discipline (`fetch_nar`'s
-/// `take(declared_size + 1)`).
-const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
+/// `take(declared_size + 1)`). Shared with the operator-cache narinfo read
+/// in [`crate::nixcache`] so every narinfo buffer in the crate sits under
+/// the one cap.
+pub(crate) const MAX_NARINFO_BYTES: u64 = 1024 * 1024;
 
 /// A binary cache reachable over HTTPS or S3.
 ///

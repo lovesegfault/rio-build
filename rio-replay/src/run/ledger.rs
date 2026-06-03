@@ -696,6 +696,68 @@ mod tests {
         assert_eq!(measured.get("old.x"), Some(&1));
     }
 
+    /// The measurement projection routes by source FIRST: queued-ladder
+    /// entries are watchdog escalation steps for a job that never left the
+    /// pending pool, so they must not appear in the attempts measurement at
+    /// all — while the same journal's collect/stall entries do. This pins
+    /// the projection itself (not the budget counter, which the resume-fold
+    /// test owns): deleting the source exclusion from
+    /// [`measured_attempt_requeues`] makes the starved job report two
+    /// phantom cluster attempts and turns this test red.
+    #[tokio::test]
+    async fn queued_ladder_entries_are_excluded_from_the_attempts_measurement() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        // A starved job: two ladder escalations, zero re-offers.
+        for at in ["2026-01-01T00:00:00Z", "2026-01-01T02:00:00Z"] {
+            state
+                .append_jsonl(
+                    StateFile::Requeues,
+                    &RequeueRecord {
+                        job: "starved.x".to_string(),
+                        source: REQUEUE_SOURCE_QUEUED.to_string(),
+                        why: "queued-watchdog".to_string(),
+                        at: at.to_string(),
+                    },
+                )
+                .unwrap();
+        }
+        // A genuinely re-offered sibling in the same journal: a collect
+        // re-offer and a stall re-offer, both cluster-attempt reasons.
+        for source in [REQUEUE_SOURCE_COLLECT, REQUEUE_SOURCE_STALL] {
+            state
+                .append_jsonl(
+                    StateFile::Requeues,
+                    &RequeueRecord {
+                        job: "resub.x".to_string(),
+                        source: source.to_string(),
+                        why: RequeueReason::InfraAutoRetry.as_str().to_string(),
+                        at: "2026-01-01T01:00:00Z".to_string(),
+                    },
+                )
+                .unwrap();
+        }
+        let measured = measured_attempt_requeues(&state).unwrap();
+        assert_eq!(
+            measured.get("starved.x"),
+            None,
+            "queued ladder steps must not count as cluster attempts"
+        );
+        assert_eq!(
+            measured.get("resub.x"),
+            Some(&2),
+            "collect and stall re-offers still count"
+        );
+        // And the stamping convention over that projection: a stalled-queued
+        // terminal (not currently committed) for the starved job stamps zero
+        // attempts even though the ladder ticked twice while it waited.
+        assert_eq!(
+            stamped_attempts(measured.get("starved.x").copied().unwrap_or(0), false),
+            0,
+            "a stalled-queued record reports the attempts the cluster saw"
+        );
+    }
+
     /// Resume rehydration is a pure fold of the requeue journal: a fresh
     /// ledger built over the same state dir reproduces the previous
     /// process's resubmission counters and the stall slice that gates the

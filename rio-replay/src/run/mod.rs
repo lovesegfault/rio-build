@@ -1091,10 +1091,12 @@ fn write_exclusion_records(
     Ok(())
 }
 
-/// Partial report (deadline/abort): every in-scope job that never reached a
-/// record gets an explicit not-attempted [`JobRecord`] (rio outcome and
-/// disposition "not-attempted", no build/exec fields), so the report's
-/// per-class counts sum to the in-scope total. Returns how many were
+/// Record-completeness backfill, run unconditionally before every report:
+/// every in-scope job that never reached a record gets an explicit
+/// not-attempted [`JobRecord`] (rio outcome and disposition
+/// "not-attempted", no build/exec fields), so the report's per-class
+/// counts sum to the in-scope total whether the campaign drained
+/// normally, hit its deadline, or was aborted. Returns how many were
 /// written.
 fn write_not_attempted_records(
     state: &StateDir,
