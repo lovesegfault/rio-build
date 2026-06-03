@@ -267,7 +267,7 @@ pub(crate) fn verifiable_identity_matches(
     {
         return true;
     }
-    // r[impl sched.persist.settled-identity-freeze+3]
+    // r[impl sched.persist.settled-identity-freeze+4]
     // M_070 bases, resident form — the row matcher's twin clauses
     // (settled_row_identity_matches): a STRIPPED resident node
     // (floating-CA/deferred-IA: every expected path empty, live hash

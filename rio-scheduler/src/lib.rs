@@ -204,11 +204,15 @@ pub fn describe_metrics() {
         "rio_scheduler_merge_stripped_rejoin_total",
         "Settled rows REJOINED by a re-creating submission via the M_070 \
          match bases the pre-strip-preservation matcher refused \
-         (sched.persist.settled-identity-freeze+3), labeled by basis: \
-         preserved_claim (byte-equal preserved stripped claim) or \
-         dual_anchor (byte-anchored row + same declared path, no \
-         contradicting evidence). Each increment is a rebuild that \
-         pre-fix terminated in a deterministic FAILED_PRECONDITION \
+         (sched.persist.settled-identity-freeze+4), labeled by basis: \
+         preserved_claim (byte-equal preserved stripped claim), \
+         stripped_hash_match (byte-anchored row x inline-bound \
+         incoming — both sides text-CA-bound to the declared path), or \
+         dual_anchor (byte-anchored row x identity-SILENT bare \
+         incoming: no declared hash, no non-empty path — a bare \
+         submission ADDING either matches nothing, round-17 \
+         merged_bug_020). Each increment is a rebuild that pre-fix \
+         terminated in a deterministic FAILED_PRECONDITION \
          (merged_bug_038) — the wipe-deploy success signal."
     );
     describe_counter!(

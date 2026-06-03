@@ -1365,7 +1365,7 @@ impl DagActor {
         phase!("0-topdown-roots");
 
         // === Step 0.5: Settled-row identity freeze ===================
-        // r[impl sched.persist.settled-identity-freeze+3]
+        // r[impl sched.persist.settled-identity-freeze+4]
         // A derivation row whose status is completed/skipped is the
         // durable record of a successful build. Once its DAG node is
         // reaped (terminal cleanup) the merge gate
@@ -1433,7 +1433,8 @@ impl DagActor {
                                 build_id = %build_id,
                                 drv_hash = %row.drv_hash,
                                 basis = basis.as_str(),
-                                "settled row rejoined via preserved/dual-anchor identity \
+                                witness = basis.positive_witness(),
+                                "settled row rejoined via an M_070 byte-bound basis \
                                  (would have refused before M_070)"
                             );
                         }
@@ -3445,7 +3446,7 @@ impl DagActor {
         // pre-+3 the guard's missing path/hash axes happened to admit
         // the path-only-conflict shapes by accident, masking that the
         // resident-displacement arm was never carved out (the
-        // settled-identity-freeze+3 axis alignment exposed it: every
+        // settled-identity-freeze+4 axis alignment exposed it: every
         // legitimately arbitrated definition change must be admitted
         // EXPLICITLY, by this list, never by an axis gap).
         let definition_changed: Vec<String> = merge_result

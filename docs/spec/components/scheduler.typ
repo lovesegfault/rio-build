@@ -2563,7 +2563,7 @@ undispatchable (workers would be told to fetch a `.drv` that exists in no
 store). Reap-then-resubmit and crash-retry re-creations get the same
 refresh for free.
 
-#r("sched.persist.settled-identity-freeze+3")[
+#r("sched.persist.settled-identity-freeze+4")[
   A persisted derivation row whose status is `completed` or `skipped`
   MUST NOT be re-created under a conflicting identity: before any state
   is written for a submission, every submitted hash that has no resident
@@ -2582,14 +2582,28 @@ refresh for free.
   ONLY: it MUST NOT rank, MUST NOT veto, and a differing preserved
   value MUST fall through to the remaining bases rather than reject);
   and, for rows whose persisted evidence rank is byte-anchored
-  (`path_bound_bytes` or `verified_built`), the dual byte-anchor of
-  the declared path itself --- the row's recorded identity was derived
-  from bytes text-CA-bound to the declared path, and a
-  NON-authoritative incoming claim of the same path with matching
-  public attributes and no contradicting evidence anchors to the same
-  definition (an authoritative claim's bytes are bound to themselves,
-  not to the declared path, so it has no second anchor and MUST prove
-  identity through the classical bases). An undecodable persisted
+  (`path_bound_bytes` or `verified_built`), two byte-bound bases:
+  the double byte anchor of an INLINE-BOUND incoming (ingress
+  text-CA-bound the submission's non-authoritative bytes to the same
+  declared path --- two anchors to one text-CA path are anchors to
+  one definition, and a differing UNVERIFIED declared hash between
+  them cannot contradict that), and --- for a BARE incoming --- the
+  row's byte anchor crossed with the incoming's IDENTITY-SILENCE: the
+  bare submission MUST present no identity content of its own (no
+  declared modular hash, no non-empty expected path) for the
+  dual-anchor basis to grant. Every match basis MUST declare its
+  positive witness, the basis enumeration MUST be exhaustive over
+  that declaration, and a basis MUST NOT grant on the absence of
+  contradiction over submitter-controlled fields
+  (#rref("sched.evidence.positive-witness") --- round-17
+  merged_bug_020: the pre-+4 dual anchor admitted a bare submission
+  ADDING an uncorroborated hash, which rode the settled join's
+  creation-snapshot refresh as a forged re-creation). An
+  authoritative claim's bytes are bound to themselves, not to the
+  declared path, so it has no second anchor and MUST prove identity
+  through the classical bases --- including against the row's own
+  preserved stripped claim (re-presenting a stripped declaration
+  authoritatively is a self-displacement channel, refused). An undecodable persisted
   rank MUST NOT grant the dual-anchor basis, and on the settled VICTIM
   side an undecodable persisted rank MUST take the refusal arm of the
   displacement arbitration --- never a low-rank floor (flooring a
@@ -2605,9 +2619,19 @@ refresh for free.
   reordered resubmission is NOT a conflict), expected output paths
   compared per output name where both sides declare one, and a
   present-on-both-sides-but-differing live CA modular hash vetoing
-  the update. Axis parity between the two implementations MUST be
-  pinned by a differential test driving both over the same
-  single-axis mutations.
+  the update, plus the adds-data mirrors of the silence gate: an
+  un-arbitrated re-creation that is not inline-bound and ADDS a
+  modular hash the row holds neither live nor preserved-equal, or
+  adds a non-empty expected path where the row's is empty, or
+  presents authoritative content against a row with no classical
+  evidence surface, MUST be refused by the persistence guard exactly
+  as the matcher refuses it. Axis parity between the two
+  implementations MUST be pinned by a differential test driving both
+  over the same single-axis mutations, and the differential MUST
+  include REFUSAL-soundness cells whose expected verdict is asserted
+  absolutely (agreement alone proves nothing when both sides share a
+  hole --- the +3 instrument faithfully ratified the pre-+4 dual
+  anchor).
 ]
 The two M_070 bases exist because the strip writers (ingress and
 dispatch) leave exactly the rows they processed with NO classical

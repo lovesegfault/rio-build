@@ -53,7 +53,7 @@ impl SchedulerDb {
     /// store-evidence displacements
     /// (`sched.merge.store-evidence-displacement+3`). Only these may
     /// pass the settled-identity WHERE guard below
-    /// (`sched.persist.settled-identity-freeze+3`); the actor's
+    /// (`sched.persist.settled-identity-freeze+4`); the actor's
     /// arbitration is the decision, this array is its in-transaction
     /// execution. The same enumeration feeds Batch 1a's
     /// closure-witness clear — assembled ONCE at the caller so the two
@@ -381,7 +381,7 @@ impl SchedulerDb {
                     WHEN derivations.drv_content IS NOT NULL
                          AND EXCLUDED.drv_content IS DISTINCT FROM derivations.drv_content
                     THEN 0 ELSE derivations.floor_deadline_secs END
-            -- r[impl sched.persist.settled-identity-freeze+3]
+            -- r[impl sched.persist.settled-identity-freeze+4]
             -- Defense-in-depth twin of the pre-merge settled-identity
             -- check (actor/settled.rs): a SETTLED row (completed/
             -- skipped — the durable record of a successful build) whose
@@ -434,6 +434,26 @@ impl SchedulerDb {
             -- hash list is per-merge and threaded through the one
             -- transaction, so the guard stays unconditional for every
             -- other writer.
+            -- r[impl sched.persist.settled-identity-freeze+4]
+            -- ADDS-DATA axes (round-17 merged_bug_020, mirrored from
+            -- the matcher's silence gate): a settled row also freezes
+            -- when an UN-arbitrated re-creation ADDS identity content
+            -- the row cannot corroborate. The matcher's twin clauses:
+            -- a bare or authoritative incoming (EXCLUDED.evidence_rank
+            -- <> 'path_bound_bytes' — inline-bound submissions are the
+            -- one ingress shape whose content was text-CA-bound to the
+            -- declared path, the StrippedHashMatch witness) that
+            -- (a) declares a modular hash the row holds neither live
+            --     nor preserved-equal,
+            -- (b) declares a non-empty expected path where the row's
+            --     is empty, or
+            -- (c) presents authoritative content against a row with NO
+            --     classical evidence surface (stripped: live hash NULL,
+            --     no non-empty path) — the matcher's hoisted
+            --     authoritative gate: classical evidence is the only
+            --     authoritative match surface, so the silent upsert
+            --     may not adopt authoritative re-creations there
+            --     (self-displacement channel); arbitration owns it.
             WHERE derivations.drv_hash = ANY($19)
                OR NOT (
                 derivations.status IN ('completed', 'skipped')
@@ -456,6 +476,28 @@ impl SchedulerDb {
                           ON r.name = e.name
                         WHERE r.path <> '' AND e.path <> '' AND r.path <> e.path
                     )
+                    OR (EXCLUDED.evidence_rank <> 'path_bound_bytes'
+                        AND EXCLUDED.ca_modular_hash IS NOT NULL
+                        AND derivations.ca_modular_hash IS NULL
+                        AND (derivations.ca_modular_hash_stripped IS NULL
+                             OR derivations.ca_modular_hash_stripped
+                                <> EXCLUDED.ca_modular_hash))
+                    OR (EXCLUDED.evidence_rank <> 'path_bound_bytes'
+                        AND EXISTS (
+                        SELECT 1
+                        FROM unnest(derivations.output_names,
+                                    derivations.expected_output_paths) AS r(name, path)
+                        JOIN unnest(EXCLUDED.output_names,
+                                    EXCLUDED.expected_output_paths) AS e(name, path)
+                          ON r.name = e.name
+                        WHERE r.path = '' AND e.path <> ''
+                    ))
+                    OR (EXCLUDED.evidence_rank = 'content_bound_claim'
+                        AND derivations.ca_modular_hash IS NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM unnest(derivations.expected_output_paths) AS rp(path)
+                            WHERE rp.path <> ''
+                        ))
                 )
             )
             RETURNING drv_hash, derivation_id,

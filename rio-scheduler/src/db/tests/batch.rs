@@ -925,7 +925,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
     // ── Store-origin row, re-created store-backed ─────────────────────
     // The prior creation parked in a terminal FAILURE state: that is the
     // only settled-adjacent state a conflicting re-creation can reach
-    // (a completed/skipped row is frozen — sched.persist.settled-identity-freeze+3).
+    // (a completed/skipped row is frozen — sched.persist.settled-identity-freeze+4).
     let first = DerivationRow {
         needs_resolve: false,
         drv_hash: "recreate-store".into(),
@@ -1219,7 +1219,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
     // Pre-existing terminal-FAILURE authoritative squat row (a prior
     // creation's snapshot that a displacing merge would recreate-refresh
     // — only failure-parked rows are displaceable; completed/skipped
-    // rows are frozen by sched.persist.settled-identity-freeze+3).
+    // rows are frozen by sched.persist.settled-identity-freeze+4).
     let squat = DerivationRow {
         needs_resolve: false,
         drv_hash: "atomic-squat".into(),
@@ -1643,7 +1643,7 @@ async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::R
     Ok(())
 }
 
-// r[verify sched.persist.settled-identity-freeze+3]
+// r[verify sched.persist.settled-identity-freeze+4]
 /// M_070 preservation-column write semantics, all three writers:
 /// the creation upsert (insert + supersede-vs-carry on conflict) and
 /// the dispatch strip mover (single-statement live→stripped move,
@@ -1758,7 +1758,7 @@ async fn test_preserved_stripped_hash_supersede_carry_and_move() -> anyhow::Resu
     Ok(())
 }
 
-// r[verify sched.persist.settled-identity-freeze+3]
+// r[verify sched.persist.settled-identity-freeze+4]
 /// The upsert's settled-row WHERE guard (defense-in-depth twin of the
 /// pre-merge check): a `completed`/`skipped` row whose public identity
 /// conflicts with the incoming re-creation is left completely untouched
@@ -1884,7 +1884,7 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
 }
 
 // r[verify sched.merge.store-evidence-displacement+3]
-// r[verify sched.persist.settled-identity-freeze+3]
+// r[verify sched.persist.settled-identity-freeze+4]
 /// The settled-row WHERE guard's evidence carve-out: a conflicting
 /// re-creation whose hash is in the per-merge approved array (the
 /// actor's store-evidence verdict) updates the settled row — and an
@@ -2112,7 +2112,7 @@ async fn test_batch_upsert_evidence_rank_roundtrip_and_recreation() -> anyhow::R
     Ok(())
 }
 
-// r[verify sched.persist.settled-identity-freeze+3]
+// r[verify sched.persist.settled-identity-freeze+4]
 /// Round-16 merged_bug_087: AXIS-ISOLATED DIFFERENTIAL CONFORMANCE
 /// between the in-memory settled matcher
 /// (`actor::settled::settled_row_identity_matches`) and the SQL freeze
@@ -2147,6 +2147,15 @@ async fn test_settled_freeze_guard_matches_matcher_axis_by_axis() -> anyhow::Res
         incoming_hash: Option<[u8; 32]>,
         // Hash staged on the settled ROW (None = baseline no-hash).
         row_hash: Option<[u8; 32]>,
+        // Round-17 merged_bug_020 axes: the row's staged shape…
+        row_is_ca: bool,
+        row_paths: Vec<String>,
+        row_preserved: Option<[u8; 32]>,
+        row_rank: crate::state::DefinitionEvidence,
+        // …and the incoming's ingress shape (rank + optional inline
+        // content with its authoritative flag).
+        incoming_rank: crate::state::DefinitionEvidence,
+        incoming_content: Option<(Vec<u8>, bool)>,
         expect_match: bool,
     }
     let base_names = || vec!["dev".to_string(), "out".to_string()];
@@ -2161,6 +2170,12 @@ async fn test_settled_freeze_guard_matches_matcher_axis_by_axis() -> anyhow::Res
             is_ca: false,
             incoming_hash: None,
             row_hash: None,
+            row_is_ca: false,
+            row_paths: base_paths(),
+            row_preserved: None,
+            row_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_content: None,
             expect_match: true,
         },
         Case {
@@ -2172,6 +2187,12 @@ async fn test_settled_freeze_guard_matches_matcher_axis_by_axis() -> anyhow::Res
             is_ca: false,
             incoming_hash: None,
             row_hash: None,
+            row_is_ca: false,
+            row_paths: base_paths(),
+            row_preserved: None,
+            row_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_content: None,
             expect_match: true,
         },
         Case {
@@ -2183,6 +2204,12 @@ async fn test_settled_freeze_guard_matches_matcher_axis_by_axis() -> anyhow::Res
             is_ca: false,
             incoming_hash: None,
             row_hash: None,
+            row_is_ca: false,
+            row_paths: base_paths(),
+            row_preserved: None,
+            row_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_content: None,
             expect_match: false,
         },
         Case {
@@ -2194,6 +2221,12 @@ async fn test_settled_freeze_guard_matches_matcher_axis_by_axis() -> anyhow::Res
             is_ca: false,
             incoming_hash: None,
             row_hash: None,
+            row_is_ca: false,
+            row_paths: base_paths(),
+            row_preserved: None,
+            row_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_content: None,
             expect_match: false,
         },
         Case {
@@ -2205,6 +2238,12 @@ async fn test_settled_freeze_guard_matches_matcher_axis_by_axis() -> anyhow::Res
             is_ca: true,
             incoming_hash: None,
             row_hash: None,
+            row_is_ca: false,
+            row_paths: base_paths(),
+            row_preserved: None,
+            row_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_content: None,
             expect_match: false,
         },
         Case {
@@ -2216,6 +2255,12 @@ async fn test_settled_freeze_guard_matches_matcher_axis_by_axis() -> anyhow::Res
             is_ca: false,
             incoming_hash: None,
             row_hash: None,
+            row_is_ca: false,
+            row_paths: base_paths(),
+            row_preserved: None,
+            row_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_content: None,
             expect_match: false,
         },
         Case {
@@ -2230,6 +2275,12 @@ async fn test_settled_freeze_guard_matches_matcher_axis_by_axis() -> anyhow::Res
             is_ca: false,
             incoming_hash: None,
             row_hash: None,
+            row_is_ca: false,
+            row_paths: base_paths(),
+            row_preserved: None,
+            row_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_content: None,
             expect_match: false,
         },
         Case {
@@ -2241,6 +2292,12 @@ async fn test_settled_freeze_guard_matches_matcher_axis_by_axis() -> anyhow::Res
             is_ca: false,
             incoming_hash: Some([0xBB; 32]),
             row_hash: Some([0xAA; 32]),
+            row_is_ca: false,
+            row_paths: base_paths(),
+            row_preserved: None,
+            row_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_content: None,
             expect_match: false,
         },
         Case {
@@ -2252,6 +2309,151 @@ async fn test_settled_freeze_guard_matches_matcher_axis_by_axis() -> anyhow::Res
             is_ca: false,
             incoming_hash: None,
             row_hash: Some([0xAA; 32]),
+            row_is_ca: false,
+            row_paths: base_paths(),
+            row_preserved: None,
+            row_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_content: None,
+            expect_match: true,
+        },
+        // ── Round-17 merged_bug_020 adds-data + silence axes ──
+        // Staged row below: STRIPPED shape (paths empty, live hash
+        // NULL, rank byte-anchored, preserved [0xCC]) unless noted.
+        Case {
+            label: "m020-bare-forged-differing-hash",
+            names: base_names(),
+            paths: vec![String::new(), String::new()],
+            system: "x86_64-linux",
+            is_fixed_output: false,
+            is_ca: true,
+            incoming_hash: Some([0xDD; 32]),
+            row_hash: None,
+            row_is_ca: true,
+            row_paths: vec![String::new(), String::new()],
+            row_preserved: Some([0xCC; 32]),
+            row_rank: crate::state::DefinitionEvidence::PathBoundBytes,
+            incoming_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_content: None,
+            expect_match: false,
+        },
+        Case {
+            label: "m020-bare-added-hash-no-preserved",
+            names: base_names(),
+            paths: vec![String::new(), String::new()],
+            system: "x86_64-linux",
+            is_fixed_output: false,
+            is_ca: true,
+            incoming_hash: Some([0xCC; 32]),
+            row_hash: None,
+            row_is_ca: true,
+            row_paths: vec![String::new(), String::new()],
+            row_preserved: None,
+            row_rank: crate::state::DefinitionEvidence::PathBoundBytes,
+            incoming_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_content: None,
+            expect_match: false,
+        },
+        Case {
+            label: "m020-bare-preserved-equal-rejoins",
+            names: base_names(),
+            paths: vec![String::new(), String::new()],
+            system: "x86_64-linux",
+            is_fixed_output: false,
+            is_ca: true,
+            incoming_hash: Some([0xCC; 32]),
+            row_hash: None,
+            row_is_ca: true,
+            row_paths: vec![String::new(), String::new()],
+            row_preserved: Some([0xCC; 32]),
+            row_rank: crate::state::DefinitionEvidence::PathBoundBytes,
+            incoming_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_content: None,
+            expect_match: true,
+        },
+        Case {
+            label: "m020-bare-silent-dual-anchor-rejoins",
+            names: base_names(),
+            paths: vec![String::new(), String::new()],
+            system: "x86_64-linux",
+            is_fixed_output: false,
+            is_ca: true,
+            incoming_hash: None,
+            row_hash: None,
+            row_is_ca: true,
+            row_paths: vec![String::new(), String::new()],
+            row_preserved: Some([0xCC; 32]),
+            row_rank: crate::state::DefinitionEvidence::PathBoundBytes,
+            incoming_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_content: None,
+            expect_match: true,
+        },
+        Case {
+            label: "m020-bare-adds-path-to-pathless-row",
+            names: base_names(),
+            paths: base_paths(),
+            system: "x86_64-linux",
+            is_fixed_output: false,
+            is_ca: true,
+            incoming_hash: None,
+            row_hash: None,
+            row_is_ca: true,
+            row_paths: vec![String::new(), String::new()],
+            row_preserved: Some([0xCC; 32]),
+            row_rank: crate::state::DefinitionEvidence::PathBoundBytes,
+            incoming_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_content: None,
+            expect_match: false,
+        },
+        Case {
+            label: "m020-inline-bound-differing-hash-rejoins",
+            names: base_names(),
+            paths: vec![String::new(), String::new()],
+            system: "x86_64-linux",
+            is_fixed_output: false,
+            is_ca: true,
+            incoming_hash: Some([0xDD; 32]),
+            row_hash: None,
+            row_is_ca: true,
+            row_paths: vec![String::new(), String::new()],
+            row_preserved: Some([0xCC; 32]),
+            row_rank: crate::state::DefinitionEvidence::PathBoundBytes,
+            incoming_rank: crate::state::DefinitionEvidence::PathBoundBytes,
+            incoming_content: Some((b"Derive(...)".to_vec(), false)),
+            expect_match: true,
+        },
+        Case {
+            label: "m020-authoritative-preserved-equal-refused",
+            names: base_names(),
+            paths: vec![String::new(), String::new()],
+            system: "x86_64-linux",
+            is_fixed_output: false,
+            is_ca: true,
+            incoming_hash: Some([0xCC; 32]),
+            row_hash: None,
+            row_is_ca: true,
+            row_paths: vec![String::new(), String::new()],
+            row_preserved: Some([0xCC; 32]),
+            row_rank: crate::state::DefinitionEvidence::PathBoundBytes,
+            incoming_rank: crate::state::DefinitionEvidence::ContentBoundClaim,
+            incoming_content: Some((b"Derive(...)".to_vec(), true)),
+            expect_match: false,
+        },
+        Case {
+            label: "m020-authoritative-path-agreement-still-matches",
+            names: base_names(),
+            paths: base_paths(),
+            system: "x86_64-linux",
+            is_fixed_output: false,
+            is_ca: false,
+            incoming_hash: None,
+            row_hash: None,
+            row_is_ca: false,
+            row_paths: base_paths(),
+            row_preserved: None,
+            row_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            incoming_rank: crate::state::DefinitionEvidence::ContentBoundClaim,
+            incoming_content: Some((b"Derive(...)".to_vec(), true)),
             expect_match: true,
         },
     ];
@@ -2267,17 +2469,17 @@ async fn test_settled_freeze_guard_matches_matcher_axis_by_axis() -> anyhow::Res
             system: "x86_64-linux".into(),
             status: DerivationStatus::Created,
             required_features: vec![],
-            expected_output_paths: base_paths(),
+            expected_output_paths: c.row_paths.clone(),
             output_names: base_names(),
             is_fixed_output: false,
-            is_ca: false,
+            is_ca: c.row_is_ca,
             wanted_output_names: vec![],
             topdown_pruned: false,
             closure_hole: false,
             drv_content: None,
             ca_modular_hash: c.row_hash,
-            ca_modular_hash_stripped: None,
-            evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            ca_modular_hash_stripped: c.row_preserved,
+            evidence_rank: c.row_rank,
             needs_resolve: false,
         };
         let mut tx = db.pool().begin().await?;
@@ -2302,6 +2504,12 @@ async fn test_settled_freeze_guard_matches_matcher_axis_by_axis() -> anyhow::Res
             is_fixed_output: c.is_fixed_output,
             is_content_addressed: c.is_ca,
             ca_modular_hash: c.incoming_hash.map(|h| h.to_vec()).unwrap_or_default(),
+            drv_content: c
+                .incoming_content
+                .as_ref()
+                .map(|(b, _)| b.clone())
+                .unwrap_or_default(),
+            drv_content_authoritative: c.incoming_content.as_ref().is_some_and(|&(_, auth)| auth),
             ..Default::default()
         }
         .into();
@@ -2323,10 +2531,10 @@ async fn test_settled_freeze_guard_matches_matcher_axis_by_axis() -> anyhow::Res
             wanted_output_names: vec![],
             topdown_pruned: false,
             closure_hole: false,
-            drv_content: None,
+            drv_content: c.incoming_content.as_ref().map(|(b, _)| b.clone()),
             ca_modular_hash: c.incoming_hash,
             ca_modular_hash_stripped: None,
-            evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
+            evidence_rank: c.incoming_rank,
             needs_resolve: false,
         };
         let mut tx = db.pool().begin().await?;

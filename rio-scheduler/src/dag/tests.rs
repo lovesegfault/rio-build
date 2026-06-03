@@ -5503,7 +5503,7 @@ fn settled_bare_conflict_refuses_without_grant_and_displaces_with() -> anyhow::R
     Ok(())
 }
 
-// r[verify sched.persist.settled-identity-freeze+3]
+// r[verify sched.persist.settled-identity-freeze+4]
 /// Resident-matcher M_070 bases: an honest rebuild against a STRIPPED
 /// settled bare resident (live hash None, every path empty — zero
 /// classical evidence) must JOIN, not refuse: preserved-claim when the

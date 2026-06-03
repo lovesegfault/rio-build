@@ -876,7 +876,7 @@ pub struct CaState {
     /// strip: `VerifiedExceptDeclaredHash`). Preserved — never
     /// destroyed — so a settled row's matcher can admit a byte-equal
     /// re-presentation of the same claim after the node is reaped
-    /// (M_070, `sched.persist.settled-identity-freeze+3`). NEVER
+    /// (M_070, `sched.persist.settled-identity-freeze+4`). NEVER
     /// evidence: no consumer ranks on it, vetoes on it, or keys
     /// realisations/claims by it; a differing preserved value falls
     /// through instead of contradicting (an unverified value cannot

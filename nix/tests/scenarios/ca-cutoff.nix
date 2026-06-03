@@ -230,7 +230,7 @@ pkgs.testers.runNixOSTest {
     #     evidence → byte-anchored Refuse arm → deterministic
     #     FAILED_PRECONDITION, no client-side escape. Post-fix: the
     #     dual-anchor basis rejoins
-    #     (sched.persist.settled-identity-freeze+3) and the build
+    #     (sched.persist.settled-identity-freeze+4) and the build
     #     proceeds; observable on
     #     rio_scheduler_merge_stripped_rejoin_total{basis=dual_anchor}
     #     — the wipe-deploy runbook's success signal.

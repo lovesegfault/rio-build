@@ -35,20 +35,38 @@ pub(crate) enum SettledMatchBasis {
     /// Byte-equal PRESERVED stripped claim (M_070): the incoming
     /// re-presents exactly the claim the strip removed. Match basis
     /// only — never ranked, never vetoing (a differing preserved value
-    /// falls through to the dual-anchor clause instead of rejecting:
-    /// an unverified value cannot contradict anything).
+    /// falls through to the byte-bound clauses instead of rejecting:
+    /// an unverified value cannot contradict anything — but it can no
+    /// longer ride a BARE submission into a match either, round-17
+    /// merged_bug_020).
     PreservedClaim,
-    /// Dual byte-anchor: the row's persisted evidence rank is
-    /// byte-anchored (`path_bound_bytes`/`verified_built` — its
-    /// recorded identity was DERIVED from bytes text-CA-bound to the
-    /// declared path), and the incoming claims the same path with
-    /// matching public attributes and no contradicting evidence. The
-    /// declared `drv_path` is itself a text content-address of the
-    /// definition, so both sides anchor to the same bytes; demanding
-    /// extra positive evidence here is what bricked stripped
-    /// floating-CA rebuilds (merged_bug_038: every expected path
-    /// empty + live hash NULL after the strip = nothing left to
-    /// agree on).
+    /// Both sides byte-anchored to the same declared path, hashes
+    /// undecided: the row's persisted rank is byte-anchored AND the
+    /// incoming is INLINE-BOUND (non-authoritative inline content —
+    /// SubmitBuild ingress text-CA-bound its bytes to the same
+    /// declared path, `sched.merge.ingress-inline-drv-binding`). Two
+    /// byte anchors to one text-CA path are anchors to one
+    /// definition; a differing UNVERIFIED declared hash between them
+    /// (masked vs input form, the round-15 divergence) cannot
+    /// contradict that. This is the warm inline rejoin that
+    /// silence-gating DualAnchor alone would have re-bricked — the
+    /// two clauses land atomically (round-17 merged_bug_020).
+    StrippedHashMatch,
+    /// Row byte-anchor × incoming identity-SILENCE: the row's
+    /// persisted evidence rank is byte-anchored
+    /// (`path_bound_bytes`/`verified_built` — its recorded identity
+    /// was DERIVED from bytes text-CA-bound to the declared path),
+    /// and the incoming claims the same path with matching public
+    /// attributes while presenting NO identity content of its own —
+    /// no declared modular hash, no non-empty expected path. The
+    /// silence IS the gate (round-17 merged_bug_020): nothing
+    /// submitter-controlled enters the match, so nothing can be
+    /// forged through it; a bare submission that ADDS an
+    /// uncorroborated hash or path no longer reaches this clause
+    /// (pre-fix it did — absence-of-veto over submitter-controlled
+    /// fields, the exact shape `sched.evidence.positive-witness`
+    /// forbids). Hash-free resubmission of a stripped byte-anchored
+    /// row (merged_bug_038's remediation shape) still rejoins HERE.
     DualAnchor,
 }
 
@@ -58,6 +76,7 @@ impl SettledMatchBasis {
             Self::PathAgreement => "path_agreement",
             Self::HashMatch => "hash_match",
             Self::PreservedClaim => "preserved_claim",
+            Self::StrippedHashMatch => "stripped_hash_match",
             Self::DualAnchor => "dual_anchor",
         }
     }
@@ -65,7 +84,34 @@ impl SettledMatchBasis {
     /// Bases the pre-M_070 matcher did not admit — the
     /// would-have-bricked population, counted at the Step 0.5 join.
     pub(crate) fn is_stripped_rejoin(self) -> bool {
-        matches!(self, Self::PreservedClaim | Self::DualAnchor)
+        matches!(
+            self,
+            Self::PreservedClaim | Self::StrippedHashMatch | Self::DualAnchor
+        )
+    }
+
+    // r[impl sched.persist.settled-identity-freeze+4]
+    /// The POSITIVE WITNESS each basis grants on — exhaustive, no
+    /// wildcard: a future basis does not compile until its witness is
+    /// declared here, and the witness-enumeration test
+    /// (`every_basis_declares_a_positive_witness`) is this family's
+    /// pre-registered F2 trigger definition (an in-governance
+    /// recurrence = a basis whose declared witness turns out to admit
+    /// submitter-controlled content). "Identity-silence" is a witness
+    /// in the strict sense: it proves NO submitter-controlled operand
+    /// entered the match.
+    pub(crate) fn positive_witness(self) -> &'static str {
+        match self {
+            Self::PathAgreement => "agreed non-empty expected output path",
+            Self::HashMatch => "byte-equal live ca_modular_hash",
+            Self::PreservedClaim => "byte-equal preserved stripped claim (M_070)",
+            Self::StrippedHashMatch => {
+                "ingress text-CA byte binding on both sides                  (byte-anchored row rank x inline-bound incoming)"
+            }
+            Self::DualAnchor => {
+                "byte-anchored row rank x incoming identity-silence                  (no submitter-controlled identity content enters)"
+            }
+        }
     }
 }
 
@@ -73,15 +119,20 @@ impl SettledMatchBasis {
 /// incoming submission node prove the same identity as a SETTLED
 /// (completed/skipped) persisted derivation row?
 ///
-/// r[impl sched.persist.settled-identity-freeze+3]
+/// r[impl sched.persist.settled-identity-freeze+4]
 /// Public attributes must match (system, sorted output names, the
 /// fixed-output flag, the content-addressed flag, and expected output
-/// paths for names where BOTH sides declare one), and at least one piece
-/// of content-bound evidence is required: agreement on a non-empty
+/// paths for names where BOTH sides declare one), and every basis
+/// grants on a declared POSITIVE WITNESS
+/// ([`SettledMatchBasis::positive_witness`]): agreement on a non-empty
 /// expected output path, a byte-equal LIVE CA modular hash, a byte-equal
-/// PRESERVED stripped claim (M_070), or — for byte-anchored rows — the
-/// dual anchor of the declared path itself (see
-/// [`SettledMatchBasis::DualAnchor`]). The live-hash clause is shared
+/// PRESERVED stripped claim (M_070), the double byte anchor of an
+/// inline-bound incoming against a byte-anchored row
+/// ([`SettledMatchBasis::StrippedHashMatch`]), or — for byte-anchored
+/// rows — incoming identity-SILENCE
+/// ([`SettledMatchBasis::DualAnchor`], round-17 merged_bug_020: a bare
+/// incoming that ADDS an uncorroborated hash or path matches nothing).
+/// The live-hash clause is shared
 /// with the resident matcher through
 /// [`crate::dag::modular_hash_evidence`] — present-but-differing LIVE
 /// hashes veto the match outright (`sched.merge.identity-hash-veto`); a
@@ -145,6 +196,18 @@ pub(crate) fn settled_row_identity_matches(
     if hash_evidence == crate::dag::ModularHashEvidence::Match {
         return Some(SettledMatchBasis::HashMatch);
     }
+    // AUTHORITATIVE incomings stop HERE (round-17 merged_bug_020,
+    // hoisted above the preserved clause): authoritative bytes are
+    // bound to themselves, not to the declared path, and a settled
+    // join refreshes the row's creation snapshot — so an authoritative
+    // re-presentation of the row's own stripped claim was a
+    // SELF-DISPLACEMENT channel (strip your claim, re-present it
+    // authoritatively, slip your bytes into the settled record).
+    // Classical evidence (path agreement / live-hash match, both
+    // checked above) remains the only authoritative match surface.
+    if node.drv_content_authoritative {
+        return None;
+    }
     // M_070 preserved-claim basis: only consulted when the LIVE hash
     // produced no decision (row hash NULL post-strip). Positive-only —
     // a differing preserved value falls through (never a veto: the
@@ -172,19 +235,40 @@ pub(crate) fn settled_row_identity_matches(
     // identity admits the re-creation into the settled row's
     // creation-snapshot refresh, which must not be reachable by an
     // evidence-free byte-carrying claim.
-    if node.drv_content_authoritative {
+    // Both byte-bound clauses require the row anchor; the decode is
+    // STRICT (round-16 bug_073): an undecodable persisted rank yields
+    // no anchor BY TYPE.
+    let row_byte_anchored = matches!(
+        row.evidence_rank.parse::<crate::state::DefinitionEvidence>(),
+        Ok(rank) if rank >= crate::state::DefinitionEvidence::PathBoundBytes
+    );
+    if !row_byte_anchored {
         return None;
     }
-    match row
-        .evidence_rank
-        .parse::<crate::state::DefinitionEvidence>()
-    {
-        Ok(rank) if rank >= crate::state::DefinitionEvidence::PathBoundBytes => {
-            Some(SettledMatchBasis::DualAnchor)
-        }
-        Ok(_) => None,
-        Err(_) => None,
+    // r[impl sched.persist.settled-identity-freeze+4]
+    // StrippedHashMatch: the incoming carries inline NON-authoritative
+    // content — ingress text-CA-bound those bytes to this same
+    // declared path (sched.merge.ingress-inline-drv-binding), so both
+    // sides hold a byte anchor to one definition. A differing
+    // unverified declared hash between them (masked vs input form)
+    // cannot contradict that; this is the warm inline rejoin.
+    if !node.drv_content.is_empty() {
+        return Some(SettledMatchBasis::StrippedHashMatch);
     }
+    // r[impl sched.persist.settled-identity-freeze+4]
+    // DualAnchor, SILENCE-GATED (round-17 merged_bug_020): a bare
+    // incoming rejoins a byte-anchored row only when it presents NO
+    // identity content — no declared modular hash, no non-empty
+    // expected path. A bare submission ADDING an uncorroborated hash
+    // or path is not silent and matches nothing here: pre-fix it rode
+    // this clause (absence-of-veto over submitter-controlled fields)
+    // into the settled row's creation-snapshot refresh — the forged
+    // "created" channel sched.evidence.positive-witness exists to
+    // forbid.
+    if node.ca_modular_hash.is_none() && node.expected_output_paths.iter().all(|p| p.is_empty()) {
+        return Some(SettledMatchBasis::DualAnchor);
+    }
+    None
 }
 
 /// Verdict of [`arbitrate_settled_row`]: what a conflicting
@@ -402,7 +486,7 @@ mod matcher_tests {
         }
     }
 
-    // r[verify sched.persist.settled-identity-freeze+3]
+    // r[verify sched.persist.settled-identity-freeze+4]
     /// THE merged_bug_038 kill, matcher half (deploy blocker; depth-3
     /// fix-child of e47c330a0 x 9d83580f6 <- 1c8cc6877 <- f0a8ffcc9):
     /// a stripped floating-CA settled row has zero classical evidence
@@ -437,31 +521,56 @@ mod matcher_tests {
             "hash-free resubmission rejoins a byte-anchored row"
         );
 
-        // DIFFERING preserved value: never a veto — falls through to
-        // dual-anchor (an unverified value cannot contradict).
-        assert_eq!(
+        // INVERTED RESIDUAL PIN (round-17 merged_bug_020): a BARE
+        // incoming carrying a hash that matches nothing recorded is
+        // the forgery shape — pre-fix it fell through to DualAnchor
+        // (this very test pinned that as "not a veto"); now it is
+        // refused. The differing value still does not VETO (the
+        // preserved clause has no veto direction): an INLINE-BOUND
+        // incoming with the same differing hash rejoins via the
+        // double byte anchor below.
+        assert!(
             settled_row_identity_matches(
                 &stripped_floating_row(Some(claim)),
                 &floating_incoming(Some([0xDD; 32]))
-            ),
-            Some(SettledMatchBasis::DualAnchor),
-            "differing preserved value falls through, not a veto"
+            )
+            .is_none(),
+            "bare + uncorroborated differing hash must not match (forgery shape)"
         );
 
-        // Row WITHOUT a preserved value (pre-M_070 history): the
-        // dual anchor still rejoins — the basis is the rank, not the
-        // preserved bytes.
-        assert_eq!(
+        // INVERTED RESIDUAL PIN (round-17 merged_bug_020): bare
+        // incoming ADDING a hash to a row with no preserved value —
+        // also the forgery shape, also refused now.
+        assert!(
             settled_row_identity_matches(
                 &stripped_floating_row(None),
                 &floating_incoming(Some(claim))
-            ),
-            Some(SettledMatchBasis::DualAnchor),
-            "byte-anchored row without preserved bytes still rejoins"
+            )
+            .is_none(),
+            "bare + added hash against a hashless row must not match"
+        );
+
+        // The warm INLINE rejoin those two shapes used to launder
+        // through: an inline-bound incoming (ingress text-CA-bound its
+        // bytes to the declared path) with a DIFFERING unverified hash
+        // — both sides byte-anchored, the hashes cannot contradict.
+        let mut inline_differing = floating_incoming(Some([0xDD; 32]));
+        inline_differing.drv_content = b"Derive(...)".to_vec();
+        assert_eq!(
+            settled_row_identity_matches(&stripped_floating_row(Some(claim)), &inline_differing),
+            Some(SettledMatchBasis::StrippedHashMatch),
+            "inline-bound incoming rejoins on the double byte anchor"
+        );
+        let mut inline_no_hash = floating_incoming(None);
+        inline_no_hash.drv_content = b"Derive(...)".to_vec();
+        assert_eq!(
+            settled_row_identity_matches(&stripped_floating_row(None), &inline_no_hash),
+            Some(SettledMatchBasis::StrippedHashMatch),
+            "inline-bound incoming rejoins a hashless byte-anchored row"
         );
     }
 
-    // r[verify sched.persist.settled-identity-freeze+3]
+    // r[verify sched.persist.settled-identity-freeze+4]
     /// The new bases must NOT widen matching for non-anchored rows:
     /// a bare-claim row (unverified_claim) with no evidence stays
     /// unmatched without classical agreement, an undecodable rank
@@ -520,6 +629,132 @@ mod matcher_tests {
             settled_row_identity_matches(&live_differs, &floating_incoming(Some([0xCC; 32])))
                 .is_none(),
             "live-hash veto precedes preserved-claim"
+        );
+    }
+}
+
+#[cfg(test)]
+mod witness_tests {
+    use super::*;
+
+    // r[verify sched.persist.settled-identity-freeze+4]
+    /// THE F2 TRIGGER DEFINITION for the settled-identity family
+    /// (round-17 bet consequence #2): every match basis declares a
+    /// positive witness, exhaustively — `positive_witness()` is a
+    /// no-wildcard match, so a new basis fails to compile until its
+    /// witness is declared, and this test asserts no declared witness
+    /// is empty or describes submitter-controlled content as its sole
+    /// operand. If a future round finds a basis whose declared witness
+    /// admitted submitter-controlled operands IN GOVERNANCE, the
+    /// pre-registered F2 escalation (typed positive-witness lattice)
+    /// activates for this family.
+    #[test]
+    fn every_basis_declares_a_positive_witness() {
+        let all = [
+            SettledMatchBasis::PathAgreement,
+            SettledMatchBasis::HashMatch,
+            SettledMatchBasis::PreservedClaim,
+            SettledMatchBasis::StrippedHashMatch,
+            SettledMatchBasis::DualAnchor,
+        ];
+        for basis in all {
+            // Exhaustiveness: a new variant must join `all` (the
+            // match inside positive_witness already compile-forces
+            // the declaration).
+            match basis {
+                SettledMatchBasis::PathAgreement
+                | SettledMatchBasis::HashMatch
+                | SettledMatchBasis::PreservedClaim
+                | SettledMatchBasis::StrippedHashMatch
+                | SettledMatchBasis::DualAnchor => {}
+            }
+            let witness = basis.positive_witness();
+            assert!(!witness.is_empty(), "{basis:?} declares no witness");
+            // Every witness names a scheduler- or ingress-owned
+            // operand: byte anchors, recorded claims, or proven
+            // silence. None may be a bare submitter assertion.
+            assert!(
+                witness.contains("byte")
+                    || witness.contains("agreed")
+                    || witness.contains("silence"),
+                "{basis:?} witness must name an owned operand: {witness}"
+            );
+            // Label stability: the metric label is the snake_case of
+            // the variant — a rename breaks dashboards.
+            assert!(!basis.as_str().is_empty());
+        }
+    }
+
+    // r[verify sched.persist.settled-identity-freeze+4]
+    // r[verify sched.evidence.positive-witness]
+    /// SOUNDNESS CELLS (amended R2: parity proves agreement, these
+    /// prove REFUSAL): hostile incomings staged against a row in the
+    /// production strip shape — every cell asserts the absolute
+    /// verdict, not cross-implementation agreement. The Rust matcher
+    /// half; the SQL twin's mirrored cells live in db/tests/batch.rs.
+    #[test]
+    fn hostile_incomings_refused_at_every_silence_breach() {
+        let row = crate::db::SettledIdentityRow {
+            drv_hash: "h".into(),
+            drv_path: "/nix/store/h.drv".into(),
+            system: "x86_64-linux".into(),
+            output_names: vec!["out".into()],
+            expected_output_paths: vec![String::new()],
+            is_fixed_output: false,
+            is_ca: true,
+            ca_modular_hash: None,
+            ca_modular_hash_stripped: Some(vec![0xCC; 32]),
+            evidence_rank: "path_bound_bytes".into(),
+        };
+        let bare = |hash: Option<[u8; 32]>, path: &str| crate::domain::DerivationNode {
+            drv_hash: "h".into(),
+            drv_path: "/nix/store/h.drv".into(),
+            pname: String::new(),
+            system: "x86_64-linux".into(),
+            output_names: vec!["out".into()],
+            expected_output_paths: vec![path.to_string()],
+            is_fixed_output: false,
+            is_content_addressed: true,
+            ca_modular_hash: hash,
+            ca_modular_hash_stripped: None,
+            drv_content: Vec::new(),
+            drv_content_authoritative: false,
+            required_features: Vec::new(),
+            wanted_output_names: Vec::new(),
+            explicitly_requested: false,
+            needs_resolve: false,
+            version: None,
+            enable_parallel_building: None,
+            enable_parallel_checking: None,
+            prefer_local_build: None,
+        };
+
+        // Cell 1: bare + forged hash (differs from preserved) → refuse.
+        assert!(settled_row_identity_matches(&row, &bare(Some([0xDD; 32]), "")).is_none());
+        // Cell 2: bare + added expected path (row has none) → refuse:
+        // a path is identity content; presenting one breaches silence.
+        assert!(
+            settled_row_identity_matches(&row, &bare(None, "/nix/store/attacker-out")).is_none()
+        );
+        // Cell 3: authoritative content + matching preserved hash →
+        // refuse (authoritative bytes bind to themselves, never to the
+        // declared path; rejoin would adopt them into the snapshot).
+        let mut auth = bare(Some([0xCC; 32]), "");
+        auth.drv_content = b"Derive(...)".to_vec();
+        auth.drv_content_authoritative = true;
+        assert!(
+            settled_row_identity_matches(&row, &auth).is_none(),
+            "authoritative-vs-stripped self-displacement refused"
+        );
+        // Cell 4 (the surviving honest shapes): silence rejoins;
+        // byte-equal preserved rejoins.
+        assert_eq!(
+            settled_row_identity_matches(&row, &bare(None, "")),
+            Some(SettledMatchBasis::DualAnchor)
+        );
+        assert_eq!(
+            settled_row_identity_matches(&row, &bare(Some([0xCC; 32]), "")),
+            Some(SettledMatchBasis::PreservedClaim)
         );
     }
 }
