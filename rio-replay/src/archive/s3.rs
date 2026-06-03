@@ -1568,15 +1568,25 @@ mod tests {
         // The refusal must name the converging recovery the partial-prefix
         // data-object arm already names: `replay delete <short>`, then
         // retry.
+        let image_bytes = std::fs::read(&image).unwrap();
         let complete_suffix = format!("/{ARCHIVE_COMPLETE_OBJECT}");
         let head_marker_suffix = complete_suffix.clone();
         let head_marker_404 = mock!(aws_sdk_s3::Client::head_object)
             .match_requests(move |req| req.key().is_some_and(|k| k.ends_with(&head_marker_suffix)))
             .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
-        let head_data_suffix = complete_suffix.clone();
-        let head_data_present = mock!(aws_sdk_s3::Client::head_object)
-            .match_requests(move |req| !req.key().is_some_and(|k| k.ends_with(&head_data_suffix)))
-            .then_output(|| HeadObjectOutput::builder().build());
+        // The pre-marker re-observation must find the data objects
+        // attributable as this publish's own bytes — the race under test
+        // is at the MARKER conditional, not the data prefix.
+        let reval_image = head_object_rule(
+            format!("replay/archives/{short}/{ARCHIVE_IMAGE_OBJECT}"),
+            &identity::sha256_hex(&image_bytes),
+            image_bytes.len() as u64,
+        );
+        let reval_manifest = head_object_rule(
+            format!("replay/archives/{short}/{ARCHIVE_MANIFEST_OBJECT}"),
+            &archive_id,
+            manifest_bytes.len() as u64,
+        );
         let data_suffix = complete_suffix.clone();
         let put_data = mock!(aws_sdk_s3::Client::put_object)
             .match_requests(move |req| !req.key().is_some_and(|k| k.ends_with(&data_suffix)))
@@ -1595,7 +1605,8 @@ mod tests {
             RuleMode::MatchAny,
             &[
                 &head_marker_404,
-                &head_data_present,
+                &reval_image,
+                &reval_manifest,
                 &put_data,
                 &put_complete_412,
                 &get_junk_marker
