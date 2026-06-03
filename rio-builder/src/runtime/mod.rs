@@ -637,16 +637,16 @@ pub async fn spawn_build_task(
             }
             crate::log_upload::DrainStatus::Abandoned {
                 unacked_lines,
-                rejected,
+                reason,
                 ..
             } => {
-                // The uploader already logged (error! for real loss,
-                // warn! for a permanent store rejection); this is just
-                // the build-scoped breadcrumb.
+                // The uploader already disclosed (counter + error! for
+                // real loss, debug! for a zero-loss CompleteLog); this
+                // is just the build-scoped breadcrumb.
                 tracing::debug!(
                     drv_path = %drv_path,
                     unacked_lines,
-                    rejected,
+                    reason = reason.as_label(),
                     "log upload ended without draining"
                 );
             }

@@ -246,9 +246,14 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_builder_log_drain_abandoned_total",
-        "Builds whose log upload gave up with un-acked lines after the \
-         post-completion drain deadline (10 min of store unavailability). \
+        "Builds whose log upload abandoned un-acked lines, labeled by \
+         reason: deadline_expired (the post-completion drain deadline \
+         hit — store unavailable too long), superseded (the execution \
+         was re-dispatched; this attempt's tail is gone), cap_exhausted \
+         (per-execution log cap; overflow is discarded by design but \
+         still disclosed), panic (the upload task died mid-flight). \
          Each increment is durable log loss for one build — the lines \
-         exist nowhere. Alert on any increase."
+         exist nowhere. A zero-loss abandon (the store already holds \
+         the complete log) does NOT count. Alert on any increase."
     );
 }

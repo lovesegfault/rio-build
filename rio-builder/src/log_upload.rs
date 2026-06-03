@@ -30,7 +30,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
@@ -110,6 +110,126 @@ pub struct Progress {
     pub done: bool,
 }
 
+/// Why an upload ended with lines still un-acked. Every variant names a
+/// distinct disposition of those lines; [`lost_lines`] is computed FROM
+/// the variant, so "is this loss?" is a property of the type, not a
+/// judgment call repeated at call sites (`builder.log.loss-disclosure`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbandonReason {
+    /// The drain deadline expired on lines the store would have
+    /// accepted. Real, durable loss.
+    DeadlineExpired,
+    /// The store already holds a complete `[0, final_line_count)` log
+    /// for this execution (`x-rio-log-reject: complete`, or bare
+    /// `FAILED_PRECONDITION` from a pre-metadata store). The un-acked
+    /// lines are a replay of content the store provably has: lost: 0.
+    CompleteLog,
+    /// The execution was superseded (`x-rio-log-reject: superseded`,
+    /// or bare `PERMISSION_DENIED`). THIS execution's un-sent tail is
+    /// durably gone — the superseding attempt produces its own log,
+    /// not these lines.
+    Superseded,
+    /// The execution hit its per-execution byte/chunk cap
+    /// (`x-rio-log-reject: cap`). Everything past the cap is
+    /// deliberately discarded — but it is still loss, and it is
+    /// disclosed as such.
+    CapExhausted,
+    /// The upload task panicked mid-flight (counted by [`LossGuard`]
+    /// during unwind, so even a never-awaited detached task
+    /// discloses).
+    Panicked,
+}
+
+impl AbandonReason {
+    /// The `reason` label value on
+    /// `rio_builder_log_drain_abandoned_total`.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::DeadlineExpired => "deadline_expired",
+            Self::CompleteLog => "complete_log",
+            Self::Superseded => "superseded",
+            Self::CapExhausted => "cap_exhausted",
+            Self::Panicked => "panic",
+        }
+    }
+}
+
+/// How many of `unacked` lines are durably lost under `reason`. Zero
+/// ONLY for [`AbandonReason::CompleteLog`] — the one case where the
+/// store provably holds every line of the finished log.
+fn lost_lines(reason: AbandonReason, unacked: u64) -> u64 {
+    match reason {
+        AbandonReason::CompleteLog => 0,
+        AbandonReason::DeadlineExpired
+        | AbandonReason::Superseded
+        | AbandonReason::CapExhausted
+        | AbandonReason::Panicked => unacked,
+    }
+}
+
+/// THE single disclosure site (`builder.log.loss-disclosure`): the only
+/// place `rio_builder_log_drain_abandoned_total` is incremented.
+/// Counter ⟺ `lost_lines > 0`, by construction — a zero-loss abandon
+/// (CompleteLog, or any reason with nothing un-acked) logs at `debug!`
+/// and fires nothing.
+fn disclose(reason: AbandonReason, unacked_lines: u64, last_acked_line: Option<u64>) {
+    let lost = lost_lines(reason, unacked_lines);
+    if lost == 0 {
+        tracing::debug!(
+            reason = reason.as_label(),
+            "log upload abandoned with nothing durably lost"
+        );
+        return;
+    }
+    metrics::counter!(
+        "rio_builder_log_drain_abandoned_total",
+        "reason" => reason.as_label(),
+    )
+    .increment(1);
+    tracing::error!(
+        reason = reason.as_label(),
+        lost_lines = lost,
+        ?last_acked_line,
+        "log upload abandoned with un-acked lines: those lines were \
+         never durably stored and will be missing from the build log"
+    );
+}
+
+/// Drop-guard that discloses a panic-shaped loss. Armed before the
+/// upload loop runs, defused on every normal exit; if the task unwinds
+/// (or is torn down without reaching its exit path), the guard's `Drop`
+/// reads the last published [`Progress`] and routes through
+/// [`disclose`] with [`AbandonReason::Panicked`]. This covers the
+/// `JoinError` path AND a post-detach panic — nobody has to await the
+/// handle for the loss to be counted.
+struct LossGuard {
+    progress: watch::Receiver<Progress>,
+    armed: bool,
+}
+
+impl LossGuard {
+    fn new(progress: watch::Receiver<Progress>) -> Self {
+        Self {
+            progress,
+            armed: true,
+        }
+    }
+
+    fn defuse(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LossGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let p = *self.progress.borrow();
+        disclose(AbandonReason::Panicked, p.unacked_lines, p.last_acked_line);
+    }
+}
+
 /// The terminal state of a build's log upload, returned by
 /// [`LogUploader::finish`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,21 +249,14 @@ pub enum DrainStatus {
         last_acked_line: Option<u64>,
         unacked_lines: u64,
     },
-    /// The upload ended with lines still un-acked.
+    /// The upload ended with lines still un-acked. Whether that is loss
+    /// — and whether the loss counter fired — is decided by `reason`
+    /// (see [`lost_lines`]); the disclosure itself happened at the
+    /// task's single [`disclose`] site before this status was returned.
     Abandoned {
         last_acked_line: Option<u64>,
         unacked_lines: u64,
-        /// `true`: the store permanently rejected the stream
-        /// (`FAILED_PRECONDITION` = it already holds a complete log for
-        /// this execution; `PERMISSION_DENIED` = the execution has been
-        /// superseded by a re-dispatch). Nothing of value was lost and the
-        /// data-loss metric does not fire.
-        ///
-        /// `false`: the drain deadline expired on lines the store would
-        /// have accepted. Those lines are gone —
-        /// `rio_builder_log_drain_abandoned_total` increments and an
-        /// `error!` is logged.
-        rejected: bool,
+        reason: AbandonReason,
     },
 }
 
@@ -153,7 +266,14 @@ pub struct LogUploader {
     /// closes — and the drain begins — only once this AND every clone
     /// handed out by [`Self::sender`] have been dropped.
     tx: Option<mpsc::Sender<BuildLogBatch>>,
-    handle: JoinHandle<DrainStatus>,
+    /// The monitored task handle. Held for liveness only — the terminal
+    /// status arrives on `status`, and a panic is disclosed by the
+    /// task's own [`LossGuard`] (plus `spawn_monitored`'s `error!`),
+    /// not by awaiting this.
+    _handle: JoinHandle<()>,
+    /// One-shot carrying the task's terminal [`DrainStatus`]. Dropped
+    /// without a send iff the task panicked.
+    status: oneshot::Receiver<DrainStatus>,
     progress: watch::Receiver<Progress>,
 }
 
@@ -218,10 +338,17 @@ impl LogUploader {
             deadline: None,
             progress: progress_tx,
         };
-        let handle = tokio::spawn(task.run().instrument(span));
+        let (status_tx, status_rx) = oneshot::channel();
+        // `spawn_monitored`, not a raw `tokio::spawn`: a panic in the
+        // upload loop is logged with the task name even if nobody ever
+        // awaits the handle (the detached-drain case). The loss itself
+        // is disclosed by the task's `LossGuard` during unwind.
+        let handle =
+            rio_common::task::spawn_monitored("log_upload", task.run(status_tx).instrument(span));
         Self {
             tx: Some(tx),
-            handle,
+            _handle: handle,
+            status: status_rx,
             progress: progress_rx,
         }
     }
@@ -258,23 +385,25 @@ impl LogUploader {
         // gone too, the task's input channel yields `None` and the drain
         // deadline starts.
         self.tx = None;
-        match tokio::time::timeout(grace, &mut self.handle).await {
+        match tokio::time::timeout(grace, &mut self.status).await {
             Ok(Ok(status)) => status,
-            Ok(Err(join_err)) => {
-                // The task panicked. The log is in whatever state the last
-                // ack left it; report what the progress watch last saw.
-                tracing::error!(error = %join_err, "log upload task panicked");
+            Ok(Err(_recv)) => {
+                // The status sender dropped without a send: the task
+                // panicked. ONLY log here — the loss was already
+                // disclosed (counted, error!-ed) by the task's
+                // LossGuard during unwind, and `spawn_monitored` logged
+                // the panic itself; a second disclosure here would
+                // double-count.
+                tracing::error!("log upload task exited without reporting (panic)");
                 let p = *self.progress.borrow();
                 DrainStatus::Abandoned {
                     last_acked_line: p.last_acked_line,
                     unacked_lines: p.unacked_lines,
-                    // A panic is not a store rejection: whatever was
-                    // un-acked when the task died is real loss.
-                    rejected: false,
+                    reason: AbandonReason::Panicked,
                 }
             }
             Err(_elapsed) => {
-                // Detach: dropping the JoinHandle does NOT abort the task;
+                // Detach: dropping the receiver does NOT abort the task;
                 // it keeps draining until the deadline.
                 let p = *self.progress.borrow();
                 DrainStatus::Detached {
@@ -288,13 +417,21 @@ impl LogUploader {
 
 /// Why the current `AppendLog` session stopped being usable.
 enum SessionEnd {
-    /// The stream died (send failed, the ack stream errored or ended with
-    /// lines still un-acked). Reconnect and replay.
+    /// The stream died (send failed, the ack stream errored with a
+    /// retryable status or ended with lines still un-acked). Reconnect
+    /// and replay.
     Reconnect,
     /// Everything accepted has been acked and the input is closed.
     Drained,
     /// The drain deadline expired with lines still un-acked.
     DeadlineExpired,
+    /// The store rejected the stream MID-FLIGHT with a permanent status
+    /// (a cap trip, the completeness seal landing, a supersession).
+    /// Reconnecting can never succeed — without this arm the uploader
+    /// re-opened against the same rejection at 1 Hz until the drain
+    /// deadline (bug_248), burning a connection per second for up to
+    /// ten minutes per finished build.
+    PermanentReject(Status),
 }
 
 /// Why an open attempt did not produce a usable session.
@@ -330,8 +467,12 @@ struct UploadTask {
 }
 
 impl UploadTask {
-    async fn run(mut self) -> DrainStatus {
+    async fn run(mut self, status_tx: oneshot::Sender<DrainStatus>) {
+        // Armed across the whole loop: an unwind anywhere below
+        // discloses {reason="panic"} from the last published progress.
+        let guard = LossGuard::new(self.progress.subscribe());
         let status = self.run_inner().await;
+        guard.defuse();
         // Publish the terminal state so a detached `finish()` caller's
         // progress watch observes the exit.
         self.publish(true);
@@ -339,40 +480,20 @@ impl UploadTask {
             DrainStatus::Drained { final_acked_line } => {
                 tracing::debug!(?final_acked_line, "log upload drained");
             }
-            // A permanent store rejection is NOT data loss: the store
-            // either already holds a complete log for this execution or
-            // the execution has been superseded. The `warn!` at the
-            // rejection site is the operator-facing signal; firing the
-            // data-loss counter here would page someone for a routine
-            // re-dispatch race.
-            DrainStatus::Abandoned {
-                unacked_lines,
-                rejected: true,
-                ..
-            } => {
-                tracing::debug!(
-                    unacked_lines,
-                    "log upload ended after a permanent store rejection"
-                );
-            }
+            // The single disclosure site decides loss-or-not from the
+            // reason: CompleteLog (the store provably holds the full
+            // log) logs at debug and fires nothing; every other reason
+            // counts its un-acked lines as durable loss, reason-labeled.
             DrainStatus::Abandoned {
                 unacked_lines,
                 last_acked_line,
-                rejected: false,
-            } => {
-                metrics::counter!("rio_builder_log_drain_abandoned_total").increment(1);
-                tracing::error!(
-                    unacked_lines,
-                    ?last_acked_line,
-                    "log upload abandoned with un-acked lines: those lines were \
-                     never durably stored and will be missing from the build log"
-                );
-            }
+                reason,
+            } => disclose(*reason, *unacked_lines, *last_acked_line),
             // Unreachable from run_inner (Detached is only constructed by
             // finish()), but harmless.
             DrainStatus::Detached { .. } => {}
         }
-        status
+        let _ = status_tx.send(status);
     }
 
     async fn run_inner(&mut self) -> DrainStatus {
@@ -399,7 +520,9 @@ impl UploadTask {
                         "store permanently rejected the log stream; discarding \
                          this build's log output"
                     );
-                    return self.reject_permanently().await;
+                    return self
+                        .reject_permanently(abandon_reason_for_rejection(&status))
+                        .await;
                 }
                 Err(OpenFailure::Retryable(status)) => {
                     tracing::debug!(
@@ -420,6 +543,17 @@ impl UploadTask {
                     };
                 }
                 SessionEnd::DeadlineExpired => return self.abandoned(),
+                SessionEnd::PermanentReject(status) => {
+                    tracing::warn!(
+                        code = ?status.code(),
+                        message = status.message(),
+                        "store permanently rejected the log stream mid-flight; \
+                         discarding the rest of this build's log output"
+                    );
+                    return self
+                        .reject_permanently(abandon_reason_for_rejection(&status))
+                        .await;
+                }
                 SessionEnd::Reconnect => {
                     metrics::counter!("rio_builder_log_append_reconnects_total").increment(1);
                     tracing::warn!(
@@ -525,6 +659,15 @@ impl UploadTask {
                         return SessionEnd::Reconnect;
                     }
                     Err(status) => {
+                        // Classify before reconnecting (bug_248): a
+                        // permanent code or an `x-rio-log-reject` class
+                        // landing MID-STREAM (the cap tripping, the seal
+                        // landing, a supersession) will reject every
+                        // future open identically — reconnecting against
+                        // it is a 1 Hz storm until the drain deadline.
+                        if is_permanent_rejection(&status) {
+                            return SessionEnd::PermanentReject(status);
+                        }
                         tracing::debug!(code = ?status.code(), message = status.message(),
                             "log ack stream errored");
                         return SessionEnd::Reconnect;
@@ -649,7 +792,12 @@ impl UploadTask {
     /// The store will never accept this stream. Drop the buffer and keep
     /// draining the input to /dev/null until the build finishes, so the
     /// stderr loop never blocks on a log the store will not take.
-    async fn reject_permanently(&mut self) -> DrainStatus {
+    ///
+    /// `reason` carries WHICH permanent class fired; whether the
+    /// discarded lines count as loss is [`lost_lines`]'s decision at
+    /// the single [`disclose`] site (CompleteLog: no — the store
+    /// provably holds the finished log; Superseded/CapExhausted: yes).
+    async fn reject_permanently(&mut self, reason: AbandonReason) -> DrainStatus {
         self.buffer.clear();
         // `unacked_lines` deliberately keeps counting: the Abandoned status
         // reports how many lines were discarded.
@@ -663,23 +811,16 @@ impl UploadTask {
                 None => self.input_open = false,
             }
         }
-        // `rejected: true` keeps `run()`'s exit match from firing the
-        // data-loss metric: that counter means "the deadline expired on
-        // lines the store WOULD have taken", which is actionable data
-        // loss. A permanent rejection means the store already has a
-        // complete log for this execution (FAILED_PRECONDITION) or this
-        // execution has been superseded (PERMISSION_DENIED); the warn! at
-        // the rejection site is the operator-facing signal.
         DrainStatus::Abandoned {
             last_acked_line: self.last_acked_line,
             unacked_lines: self.unacked_lines,
-            rejected: true,
+            reason,
         }
     }
 
     fn abandoned(&self) -> DrainStatus {
         DrainStatus::Abandoned {
-            rejected: false,
+            reason: AbandonReason::DeadlineExpired,
             last_acked_line: self.last_acked_line,
             unacked_lines: self.unacked_lines,
         }
@@ -728,6 +869,44 @@ fn classify_open_failure(status: Status) -> OpenFailure {
     }
 }
 
+/// Is this status one the store will return identically on every future
+/// open? Permanent codes, or any status the store explicitly classed
+/// via `x-rio-log-reject` (the metadata is only ever attached to
+/// permanent rejections).
+fn is_permanent_rejection(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::FailedPrecondition | Code::PermissionDenied
+    ) || status
+        .metadata()
+        .get(rio_proto::LOG_REJECT_METADATA_KEY)
+        .is_some()
+}
+
+/// Map a permanent store rejection onto its [`AbandonReason`]: the
+/// `x-rio-log-reject` class when present (`cap`/`complete`/
+/// `superseded`), else the bare-code fallback for pre-metadata stores —
+/// `FAILED_PRECONDITION` was historically the completeness seal,
+/// `PERMISSION_DENIED` the supersession.
+fn abandon_reason_for_rejection(status: &Status) -> AbandonReason {
+    match status
+        .metadata()
+        .get(rio_proto::LOG_REJECT_METADATA_KEY)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some("cap") => AbandonReason::CapExhausted,
+        Some("complete") => AbandonReason::CompleteLog,
+        Some("superseded") => AbandonReason::Superseded,
+        // An unknown class is still a permanent rejection; Superseded's
+        // disposition (count the loss) is the conservative one.
+        Some(_) => AbandonReason::Superseded,
+        None => match status.code() {
+            Code::FailedPrecondition => AbandonReason::CompleteLog,
+            _ => AbandonReason::Superseded,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -744,8 +923,20 @@ mod tests {
     use rio_proto::store::{AppendLogAck, AppendLogRequest, TailLogChunk, TailLogRequest};
     use rio_proto::types::BuildLogBatch;
     use rio_test_support::grpc::spawn_grpc_server;
+    use rio_test_support::metrics::CountingRecorder;
 
-    use super::{DrainStatus, LogUploader, LogUploaderConfig};
+    use super::{AbandonReason, DrainStatus, LogUploader, LogUploaderConfig};
+
+    /// A permanent rejection carrying the store's `x-rio-log-reject`
+    /// class, exactly as `gate::reject_permanent` constructs it.
+    fn rejection_with_class(class: &'static str, msg: &str) -> Status {
+        let mut status = Status::failed_precondition(msg.to_string());
+        status.metadata_mut().insert(
+            rio_proto::LOG_REJECT_METADATA_KEY,
+            tonic::metadata::MetadataValue::from_static(class),
+        );
+        status
+    }
 
     // ------------------------------------------------------------------
     // The mock LogService
@@ -810,6 +1001,20 @@ mod tests {
         /// stream — the server went away).
         fn close(&self) {
             self.ack_tx.lock().unwrap().take();
+        }
+
+        /// Fail the ack stream with `status` (the client sees
+        /// `Err(status)` mid-stream — the shape of a cap trip, the
+        /// completeness seal landing, or a supersession arriving while
+        /// the stream is open).
+        async fn fail(&self, status: Status) {
+            let tx = self
+                .ack_tx
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("failing a closed session");
+            tx.send(Err(status)).await.expect("fail send");
         }
     }
 
@@ -1194,11 +1399,15 @@ mod tests {
             DrainStatus::Abandoned {
                 unacked_lines,
                 last_acked_line,
-                rejected,
+                reason,
             } => {
                 assert_eq!(unacked_lines, 25, "every line is un-acked loss");
                 assert_eq!(last_acked_line, None);
-                assert!(!rejected, "a hung open is loss, not a store rejection");
+                assert_eq!(
+                    reason,
+                    AbandonReason::DeadlineExpired,
+                    "a hung open is deadline loss, not a store rejection"
+                );
             }
             other => panic!("expected Abandoned at the deadline, got {other:?}"),
         }
@@ -1224,14 +1433,15 @@ mod tests {
             DrainStatus::Abandoned {
                 unacked_lines,
                 last_acked_line,
-                rejected,
+                reason,
             } => {
                 assert_eq!(unacked_lines, 10);
                 assert_eq!(last_acked_line, None);
-                assert!(
-                    !rejected,
-                    "a deadline expiry is real data loss, not a store rejection — \
-                     this is the case that fires rio_builder_log_drain_abandoned_total"
+                assert_eq!(
+                    reason,
+                    AbandonReason::DeadlineExpired,
+                    "a deadline expiry is real data loss — the case that fires \
+                     rio_builder_log_drain_abandoned_total{{reason=deadline_expired}}"
                 );
             }
             other => panic!("expected Abandoned after the drain deadline, got {other:?}"),
@@ -1277,16 +1487,215 @@ mod tests {
 
         drop(tx);
         let status = h.uploader.finish(Duration::from_secs(5)).await;
-        // `rejected: true` is the discriminant `run()`'s exit match
-        // branches on to NOT fire `rio_builder_log_drain_abandoned_total`
-        // (whose description says "each increment is durable log loss —
-        // alert on any increase"). A routine FAILED_PRECONDITION (a late
-        // replay against an already-complete log) or PERMISSION_DENIED (a
-        // re-dispatch race) must be distinguishable from a real
-        // abandonment, or every such race pages an operator.
+        // A bare FAILED_PRECONDITION (a pre-metadata store's
+        // completeness seal) maps to CompleteLog: the store provably
+        // holds the finished log, so `lost_lines` is 0 and the loss
+        // counter stays silent — a routine late replay must be
+        // distinguishable from real abandonment, or every such race
+        // pages an operator.
         assert!(
-            matches!(status, DrainStatus::Abandoned { rejected: true, .. }),
-            "a permanently-rejected upload reports Abandoned{{rejected: true}}, got {status:?}"
+            matches!(
+                status,
+                DrainStatus::Abandoned {
+                    reason: AbandonReason::CompleteLog,
+                    ..
+                }
+            ),
+            "a bare FAILED_PRECONDITION rejection reports CompleteLog, got {status:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // 7. Loss disclosure (merged_bug_360, bug_248,
+    //    builder.log.loss-disclosure)
+    // ------------------------------------------------------------------
+
+    /// merged_bug_360 (red-first): PERMISSION_DENIED with un-acked lines
+    /// is durable loss — the superseding attempt produces ITS OWN log,
+    /// not these lines. Pre-fix, `rejected: true` suppressed the
+    /// counter for every permanent rejection alike; the recorded red
+    /// was `reason=superseded` count 0.
+    #[tokio::test]
+    async fn permission_denied_with_unacked_fires_loss_counter() {
+        let rec = CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let h = harness().await;
+        h.mock
+            .reject_opens_with(Status::permission_denied("superseded"));
+        let tx = h.uploader.sender();
+        tx.send(batch(0, 9)).await.unwrap();
+        wait_for("the rejected open", || h.mock.open_count() >= 1).await;
+
+        drop(tx);
+        let status = h.uploader.finish(Duration::from_secs(5)).await;
+        assert!(
+            matches!(
+                status,
+                DrainStatus::Abandoned {
+                    reason: AbandonReason::Superseded,
+                    unacked_lines: 9,
+                    ..
+                }
+            ),
+            "got {status:?}"
+        );
+        assert_eq!(
+            rec.get("rio_builder_log_drain_abandoned_total{reason=superseded}"),
+            1,
+            "9 un-acked lines died with the superseded execution and must \
+             be disclosed (saw keys: {:?})",
+            rec.all_keys()
+        );
+    }
+
+    /// merged_bug_360 (red-first): a panic in the upload task must
+    /// disclose the un-acked lines. Pre-fix the counter fired only at
+    /// `run()`'s normal exit, which a panicking task never reaches —
+    /// the recorded red was `reason=panic` count 0. The panic seam is
+    /// real arithmetic: a batch at `u64::MAX` overflows the trim's
+    /// last-line computation in debug builds.
+    #[tokio::test]
+    async fn panic_in_upload_task_fires_counter() {
+        let rec = CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let h = harness().await;
+        let tx = h.uploader.sender();
+        // first_line_number = u64::MAX with 2 lines: the ack-trim
+        // computes MAX + 1 and panics (debug overflow) inside the task.
+        // Built inline — the batch() helper's line formatting would
+        // overflow in the TEST thread instead.
+        tx.send(BuildLogBatch {
+            derivation_path: String::new(),
+            lines: vec![b"a".to_vec(), b"b".to_vec()],
+            first_line_number: u64::MAX,
+            executor_id: String::new(),
+        })
+        .await
+        .unwrap();
+        wait_for("the batch to reach the mock", || {
+            h.mock.session_count() == 1 && h.mock.session(0).message_count() == 2
+        })
+        .await;
+        h.mock.session(0).ack(0).await;
+
+        wait_for("the LossGuard to disclose the panic", || {
+            rec.get("rio_builder_log_drain_abandoned_total{reason=panic}") == 1
+        })
+        .await;
+
+        drop(tx);
+        let status = h.uploader.finish(Duration::from_secs(5)).await;
+        assert!(
+            matches!(
+                status,
+                DrainStatus::Abandoned {
+                    reason: AbandonReason::Panicked,
+                    ..
+                }
+            ),
+            "got {status:?}"
+        );
+        assert_eq!(
+            rec.get("rio_builder_log_drain_abandoned_total{reason=panic}"),
+            1,
+            "the disclosure fires exactly once (the guard, not finish())"
+        );
+    }
+
+    /// bug_248 (red-first): a permanent rejection arriving MID-STREAM
+    /// (the cap tripping while the stream is open) must stop the
+    /// session loop — pre-fix it was classified Reconnect and the
+    /// uploader re-opened against the identical rejection at 1 Hz until
+    /// the drain deadline (the recorded red: open_count kept growing).
+    #[tokio::test]
+    async fn midstream_cap_routes_to_permanent() {
+        let rec = CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let h = harness().await;
+        let tx = h.uploader.sender();
+        tx.send(batch(0, 4)).await.unwrap();
+        wait_for("the open to land", || {
+            h.mock.session_count() == 1 && h.mock.session(0).message_count() == 2
+        })
+        .await;
+
+        // The cap trips mid-stream.
+        h.mock
+            .session(0)
+            .fail(rejection_with_class("cap", "per-execution byte cap"))
+            .await;
+
+        drop(tx);
+        let status = h.uploader.finish(Duration::from_secs(5)).await;
+        assert!(
+            matches!(
+                status,
+                DrainStatus::Abandoned {
+                    reason: AbandonReason::CapExhausted,
+                    ..
+                }
+            ),
+            "got {status:?}"
+        );
+        assert_eq!(
+            h.mock.open_count(),
+            1,
+            "a mid-stream permanent rejection must not trigger a single \
+             reconnect — pre-fix this was a 1 Hz open storm"
+        );
+        assert_eq!(
+            rec.get("rio_builder_log_drain_abandoned_total{reason=cap_exhausted}"),
+            1,
+            "capped overflow is discarded by design but still disclosed"
+        );
+    }
+
+    /// Polarity guard: a `complete` rejection (the store provably holds
+    /// the full `[0, final)` log) is the ONE zero-loss abandon — no
+    /// counter, under any reason label.
+    #[tokio::test]
+    async fn complete_log_rejection_stays_silent() {
+        let rec = CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let h = harness().await;
+        h.mock
+            .reject_opens_with(rejection_with_class("complete", "log already complete"));
+        let tx = h.uploader.sender();
+        tx.send(batch(0, 3)).await.unwrap();
+        wait_for("the rejected open", || h.mock.open_count() >= 1).await;
+
+        drop(tx);
+        let status = h.uploader.finish(Duration::from_secs(5)).await;
+        assert!(
+            matches!(
+                status,
+                DrainStatus::Abandoned {
+                    reason: AbandonReason::CompleteLog,
+                    ..
+                }
+            ),
+            "got {status:?}"
+        );
+        for label in [
+            "deadline_expired",
+            "complete_log",
+            "superseded",
+            "cap_exhausted",
+            "panic",
+        ] {
+            assert_eq!(
+                rec.get(&format!(
+                    "rio_builder_log_drain_abandoned_total{{reason={label}}}"
+                )),
+                0,
+                "a complete-log replay loses nothing; the counter must stay \
+                 silent (label {label}; saw keys: {:?})",
+                rec.all_keys()
+            );
+        }
     }
 }
