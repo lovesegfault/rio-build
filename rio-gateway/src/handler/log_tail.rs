@@ -156,6 +156,15 @@ impl LogTailSet {
         )
     }
 
+    /// Test-only visibility: which derivations currently hold a live
+    /// tail subscription. Lets sibling-module tests assert the
+    /// kind-routing contract (materialization running entries must not
+    /// open tails) without reaching into the task map.
+    #[cfg(test)]
+    pub(super) fn tracked_drvs(&self) -> Vec<String> {
+        self.tasks.keys().cloned().collect()
+    }
+
     /// `DerivationEvent::Started` arrived for `derivation_path`.
     ///
     /// - Empty `exec_id` → no subscription (the field is documented as

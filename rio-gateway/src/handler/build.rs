@@ -219,15 +219,34 @@ struct SubstAids {
     copy: u64,
 }
 
+// r[impl gw.display.single-map]
+/// One derivation's display family. A derivation holds exactly ONE
+/// display treatment at a time — either a per-drv `actBuild` activity
+/// (builder executions) or an `actSubstitute`+`actCopyPath` pair
+/// (upstream substitutions / store-side materializations). The old
+/// two-map scheme made omission representable: a reconcile loop that
+/// iterated only one family's map silently skipped the other (a
+/// substitution that completed while the gateway was detached survived
+/// the snapshot gone-reconcile and rendered stuck forever). One map
+/// with a family-valued entry makes every sweep total over THE key
+/// set.
+#[derive(Debug, Clone, Copy)]
+enum DrvDisplay {
+    /// Per-drv `actBuild` activity ID (start/stop, and the attach point
+    /// for `BuildLogLine`/`SetPhase` results).
+    Build(u64),
+    /// `actSubstitute` + child `actCopyPath` pair. Started by
+    /// `DerivationEventKind::Substituting` (or a kinded materialization
+    /// snapshot entry), stopped by `Cached` (success) or `Started`
+    /// (fetch failed → fell through to build).
+    /// r[gw.activity.subst-progress]
+    Subst(SubstAids),
+}
+
 struct BuildActivityState {
-    /// Per-derivation activity IDs (for `actBuild` start/stop and for
-    /// attaching `BuildLogLine`/`SetPhase` results to the right build).
-    drv: HashMap<String, u64>,
-    /// Per-derivation `actSubstitute` + child `actCopyPath` activity
-    /// IDs. Started by `DerivationEventKind::Substituting`, stopped by
-    /// `Cached` (success) or `Started` (fetch failed → fell through to
-    /// build). r[gw.activity.subst-progress]
-    subst: HashMap<String, SubstAids>,
+    /// Per-derivation display family — the ONLY per-drv display
+    /// tracking. See [`DrvDisplay`].
+    display: HashMap<String, DrvDisplay>,
     /// Top-level `actBuilds` activity ID. `None` until `BuildStarted`
     /// arrives. `Progress`/`SetExpected` results attach here.
     builds_root: Option<u64>,
@@ -247,8 +266,7 @@ struct BuildActivityState {
 impl Default for BuildActivityState {
     fn default() -> Self {
         Self {
-            drv: HashMap::default(),
-            subst: HashMap::default(),
+            display: HashMap::default(),
             builds_root: None,
             subst_expected: 0,
             machine_name: rio_common::config::env_or("RIO_GATEWAY_MACHINE_NAME", String::new()),
@@ -265,6 +283,86 @@ async fn stop_subst_pair<W: AsyncWrite + Unpin>(
 ) -> Result<(), StreamProcessError> {
     stderr.stop_activity(aids.copy).await?;
     stderr.stop_activity(aids.subst).await?;
+    Ok(())
+}
+
+/// Start the substitute display family for one derivation: the
+/// `actSubstitute` activity, its `actCopyPath` child, the display-map
+/// entry, and the root's `SetExpected{actCopyPath}` bump. Shared by the
+/// live `Substituting` event arm and the snapshot reconcile's
+/// materialization-running arm — both render the same family.
+///
+/// `out` is the path shown in the activity text: the first output path
+/// when the event carries one, else the drv path (snapshot entries
+/// carry no output paths).
+async fn start_subst_display<W: AsyncWrite + Unpin>(
+    stderr: &mut StderrWriter<&mut W>,
+    act: &mut BuildActivityState,
+    drv_path: &str,
+    out: &str,
+) -> Result<(), StreamProcessError> {
+    // actSubstitute fields per upstream
+    // `substitution-goal.cc`: [storePath, substituterUri].
+    // The store picks the upstream — the scheduler doesn't
+    // know which yet (S2's first SubstituteProgress carries
+    // it), so the URI starts empty (nom omits the "from
+    // <uri>" suffix when fields[1] is empty).
+    let subst = stderr
+        .start_activity(
+            ActivityType::Substitute,
+            &format!("substituting '{out}'"),
+            verbosity::INFO,
+            act.builds_root.unwrap_or(0),
+            &[
+                ResultField::String(out.to_string()),
+                ResultField::String(String::new()),
+            ],
+        )
+        .await?;
+    // r[impl gw.activity.subst-progress]
+    // Child actCopyPath fields per upstream
+    // `store-api.cc copyStorePath`: [storePath, from, to].
+    // `to` is the cluster's stable identifier (same source as
+    // actBuild machineName); `from` is empty until the first
+    // SubstituteProgress arrives — nom renders the bar from
+    // resProgress alone, the from/to are cosmetic. The text
+    // says "fetching closure of" (not "copying path") because
+    // resProgress carries CLOSURE-aggregate bytes from
+    // `walk_substitute_closure`, not single-path bytes.
+    let copy = stderr
+        .start_activity(
+            ActivityType::CopyPath,
+            &format!("fetching closure of '{out}'"),
+            verbosity::INFO,
+            subst,
+            &[
+                ResultField::String(out.to_string()),
+                ResultField::String(String::new()),
+                ResultField::String(act.machine_name.clone()),
+            ],
+        )
+        .await?;
+    act.display.insert(
+        drv_path.to_string(),
+        DrvDisplay::Subst(SubstAids { subst, copy }),
+    );
+    // Bump the root's CopyPath expected so nom's "X/Y copied"
+    // denominator tracks. Idempotent across reconnects: callers guard
+    // on an existing Subst entry, so this counts first-time
+    // substituting per drv per gateway-session.
+    act.subst_expected += 1;
+    if let Some(root) = act.builds_root {
+        stderr
+            .result(
+                root,
+                ResultType::SetExpected,
+                &[
+                    ResultField::Int(ActivityType::CopyPath as u64),
+                    ResultField::Int(act.subst_expected),
+                ],
+            )
+            .await?;
+    }
     Ok(())
 }
 
@@ -285,7 +383,10 @@ async fn relay_log_batch<W: AsyncWrite + Unpin>(
     act: &BuildActivityState,
     log_batch: types::BuildLogBatch,
 ) -> Result<(), StreamProcessError> {
-    let aid = act.drv.get(&log_batch.derivation_path).copied();
+    let aid = match act.display.get(&log_batch.derivation_path) {
+        Some(DrvDisplay::Build(aid)) => Some(*aid),
+        _ => None,
+    };
     for line in &log_batch.lines {
         // Log display, not parse-path. Build log lines are
         // arbitrary builder output (may contain invalid UTF-8
@@ -312,8 +413,8 @@ async fn relay_log_batch<W: AsyncWrite + Unpin>(
 // r[impl gw.stderr.activity+2]
 /// Relay one `DerivationEvent` (Started/Completed/Failed/Cached/Queued)
 /// to the client as `actBuild` start/stop activity frames. Mutates
-/// `act.drv` to track which activity-id belongs to which derivation
-/// across reconnects.
+/// `act.display` to track which display family belongs to which
+/// derivation across reconnects.
 async fn relay_derivation_status<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     act: &mut BuildActivityState,
@@ -321,80 +422,37 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
 ) -> Result<(), StreamProcessError> {
     match drv_event.kind() {
         types::DerivationEventKind::Substituting => {
-            if act.subst.contains_key(&drv_event.derivation_path) {
-                return Ok(());
+            match act.display.get(&drv_event.derivation_path) {
+                // Idempotent across reconnects / duplicate events.
+                Some(DrvDisplay::Subst(_)) => return Ok(()),
+                // The FSM never goes Started → Substituting within one
+                // attempt cycle; if an event-loss window produced this
+                // ordering, keep the build display — the terminal arms
+                // (or the snapshot reconcile) close it.
+                Some(DrvDisplay::Build(_)) => {
+                    debug!(
+                        drv = %drv_event.derivation_path,
+                        "Substituting for a drv with a build display; keeping build"
+                    );
+                    return Ok(());
+                }
+                None => {}
             }
-            // actSubstitute fields per upstream
-            // `substitution-goal.cc`: [storePath, substituterUri].
-            // The store picks the upstream — the scheduler doesn't
-            // know which yet (S2's first SubstituteProgress carries
-            // it), so the URI starts empty (nom omits the "from
-            // <uri>" suffix when fields[1] is empty).
             let out = drv_event
                 .output_paths
                 .first()
                 .cloned()
                 .unwrap_or_else(|| drv_event.derivation_path.clone());
-            let subst = stderr
-                .start_activity(
-                    ActivityType::Substitute,
-                    &format!("substituting '{out}'"),
-                    verbosity::INFO,
-                    act.builds_root.unwrap_or(0),
-                    &[
-                        ResultField::String(out.clone()),
-                        ResultField::String(String::new()),
-                    ],
-                )
-                .await?;
-            // r[impl gw.activity.subst-progress]
-            // Child actCopyPath fields per upstream
-            // `store-api.cc copyStorePath`: [storePath, from, to].
-            // `to` is the cluster's stable identifier (same source as
-            // actBuild machineName); `from` is empty until the first
-            // SubstituteProgress arrives — nom renders the bar from
-            // resProgress alone, the from/to are cosmetic. The text
-            // says "fetching closure of" (not "copying path") because
-            // resProgress carries CLOSURE-aggregate bytes from
-            // `walk_substitute_closure`, not single-path bytes.
-            let copy = stderr
-                .start_activity(
-                    ActivityType::CopyPath,
-                    &format!("fetching closure of '{out}'"),
-                    verbosity::INFO,
-                    subst,
-                    &[
-                        ResultField::String(out.clone()),
-                        ResultField::String(String::new()),
-                        ResultField::String(act.machine_name.clone()),
-                    ],
-                )
-                .await?;
-            act.subst
-                .insert(drv_event.derivation_path.clone(), SubstAids { subst, copy });
-            // Bump the root's CopyPath expected so nom's "X/Y copied"
-            // denominator tracks. Idempotent across reconnects: the
-            // contains_key guard above means we only count first-time
-            // Substituting per drv per gateway-session.
-            act.subst_expected += 1;
-            if let Some(root) = act.builds_root {
-                stderr
-                    .result(
-                        root,
-                        ResultType::SetExpected,
-                        &[
-                            ResultField::Int(ActivityType::CopyPath as u64),
-                            ResultField::Int(act.subst_expected),
-                        ],
-                    )
-                    .await?;
-            }
+            start_subst_display(stderr, act, &drv_event.derivation_path, &out).await?;
         }
         types::DerivationEventKind::Started => {
             // A failed substitute fetch reverts to Ready → may later
             // dispatch as a build. Close the dangling actSubstitute +
             // actCopyPath pair so nom doesn't show it stuck forever.
-            if let Some(aids) = act.subst.remove(&drv_event.derivation_path) {
+            if let Some(DrvDisplay::Subst(aids)) =
+                act.display.get(&drv_event.derivation_path).copied()
+            {
+                act.display.remove(&drv_event.derivation_path);
                 stop_subst_pair(stderr, aids).await?;
             }
             // Re-dispatch (in-connection reassign, or replay after a
@@ -405,7 +463,10 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             // re-dispatch as a new build (live QA: 27 unique drvs →
             // 43 starts → "43/29"). I-206's prior start-then-stop
             // balanced the running count but still inflated total.
-            if act.drv.contains_key(&drv_event.derivation_path) {
+            if matches!(
+                act.display.get(&drv_event.derivation_path),
+                Some(DrvDisplay::Build(_))
+            ) {
                 debug!(
                     drv = %drv_event.derivation_path,
                     "duplicate Started; reusing existing activity"
@@ -442,53 +503,54 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
                     ],
                 )
                 .await?;
-            act.drv.insert(drv_event.derivation_path.clone(), aid);
+            act.display
+                .insert(drv_event.derivation_path.clone(), DrvDisplay::Build(aid));
         }
         types::DerivationEventKind::Completed => {
-            // Terminal: close any dangling actSubstitute + actCopyPath.
+            // Terminal: close whichever display family is open.
             // Substituting → Completed shouldn't happen via the normal
             // scheduler FSM, but terminal-arm symmetry costs nothing
             // and guards future scheduler changes.
-            if let Some(aids) = act.subst.remove(&drv_event.derivation_path) {
-                stop_subst_pair(stderr, aids).await?;
-            }
-            if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
-                stderr.stop_activity(aid).await?;
-                debug!(aid, drv = %drv_event.derivation_path, "stop_activity sent");
-            } else {
-                // Completed for a drv we never (or no
-                // longer) have an aid for — path-key
-                // mismatch (dispatch.rs drv_path vs
-                // completion.rs path_or_hash_fallback), or
-                // Started was dropped by a state-channel
-                // Lagged window. Display-only; the
-                // act.drv terminal-drain below covers it.
-                debug!(
-                    drv = %drv_event.derivation_path,
-                    tracked = act.drv.len(),
-                    "Completed with no tracked activity"
-                );
+            match act.display.remove(&drv_event.derivation_path) {
+                Some(DrvDisplay::Subst(aids)) => stop_subst_pair(stderr, aids).await?,
+                Some(DrvDisplay::Build(aid)) => {
+                    stderr.stop_activity(aid).await?;
+                    debug!(aid, drv = %drv_event.derivation_path, "stop_activity sent");
+                }
+                None => {
+                    // Completed for a drv we never (or no
+                    // longer) have an aid for — path-key
+                    // mismatch (dispatch.rs drv_path vs
+                    // completion.rs path_or_hash_fallback), or
+                    // Started was dropped by a state-channel
+                    // Lagged window. Display-only; the
+                    // terminal drain below covers it.
+                    debug!(
+                        drv = %drv_event.derivation_path,
+                        tracked = act.display.len(),
+                        "Completed with no tracked activity"
+                    );
+                }
             }
         }
         types::DerivationEventKind::Failed => {
-            // Terminal: close any dangling actSubstitute. Scheduler
-            // path Substituting → (silent revert to Queued via
-            // `handle_substitute_complete(ok=false)` with
+            // Terminal: close whichever display family is open.
+            // Scheduler path Substituting → (silent revert to Queued
+            // via `handle_substitute_complete(ok=false)` with
             // `!all_deps_completed`) → DependencyFailed cascade emits
             // Failed without ever emitting Started/Cached — the subst
             // aid was never closed and nom showed a stuck
             // "substituting 'X'" line until build terminus.
-            if let Some(aids) = act.subst.remove(&drv_event.derivation_path) {
-                stop_subst_pair(stderr, aids).await?;
-            }
-            if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
-                stderr.stop_activity(aid).await?;
-            } else {
-                debug!(
-                    drv = %drv_event.derivation_path,
-                    tracked = act.drv.len(),
-                    "Failed with no tracked activity (I-206)"
-                );
+            match act.display.remove(&drv_event.derivation_path) {
+                Some(DrvDisplay::Subst(aids)) => stop_subst_pair(stderr, aids).await?,
+                Some(DrvDisplay::Build(aid)) => stderr.stop_activity(aid).await?,
+                None => {
+                    debug!(
+                        drv = %drv_event.derivation_path,
+                        tracked = act.display.len(),
+                        "Failed with no tracked activity (I-206)"
+                    );
+                }
             }
             // Log failure via STDERR_NEXT, with a copy-pasteable
             // `rio-cli logs` hint for drvs that actually ran. No
@@ -527,8 +589,13 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
         types::DerivationEventKind::Cached => {
             // Substituting → Cached: close the actSubstitute +
             // actCopyPath pair. Merge-time cache hits never went
-            // Substituting → no aids → no-op.
-            if let Some(aids) = act.subst.remove(&drv_event.derivation_path) {
+            // Substituting → no entry → no-op. A Build entry is left
+            // alone (Cached never closes a build activity — preserved
+            // from the two-map scheme).
+            if let Some(DrvDisplay::Subst(aids)) =
+                act.display.get(&drv_event.derivation_path).copied()
+            {
+                act.display.remove(&drv_event.derivation_path);
                 stop_subst_pair(stderr, aids).await?;
             }
         }
@@ -539,9 +606,9 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
 }
 
 // r[impl gw.activity.stop-parity]
-/// Emit `stop_activity` for every aid still tracked in `act.drv` /
-/// `act.subst`. Called once at build terminus before the root
-/// `actBuilds` stop.
+/// Emit `stop_activity` for every aid still tracked in `act.display`
+/// (both display families). Called once at build terminus before the
+/// root `actBuilds` stop.
 ///
 /// A non-empty drain set means an upstream `DerivationEvent` was lost:
 /// scheduler state-channel `Lagged` (rare post-split), a Started/
@@ -553,22 +620,27 @@ async fn drain_unstopped_activities<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     act: &mut BuildActivityState,
 ) -> Result<(), StreamProcessError> {
-    if !act.drv.is_empty() || !act.subst.is_empty() {
+    if !act.display.is_empty() {
         tracing::warn!(
-            drv = act.drv.len(),
-            subst = act.subst.len(),
+            tracked = act.display.len(),
             "draining unstopped activities at terminal (upstream event loss)"
         );
     }
-    for (drv, aids) in act.subst.drain() {
-        stderr.stop_activity(aids.copy).await?;
-        stderr.stop_activity(aids.subst).await?;
-        debug!(subst = aids.subst, copy = aids.copy, %drv,
-               "stop_activity sent (terminal drain, subst pair)");
-    }
-    for (drv, aid) in act.drv.drain() {
-        stderr.stop_activity(aid).await?;
-        debug!(aid, %drv, "stop_activity sent (terminal drain)");
+    // ONE drain over THE key set — both display families, by
+    // construction. r[impl gw.display.single-map]
+    for (drv, display) in act.display.drain() {
+        match display {
+            DrvDisplay::Subst(aids) => {
+                stderr.stop_activity(aids.copy).await?;
+                stderr.stop_activity(aids.subst).await?;
+                debug!(subst = aids.subst, copy = aids.copy, %drv,
+                       "stop_activity sent (terminal drain, subst pair)");
+            }
+            DrvDisplay::Build(aid) => {
+                stderr.stop_activity(aid).await?;
+                debug!(aid, %drv, "stop_activity sent (terminal drain)");
+            }
+        }
     }
     Ok(())
 }
@@ -584,7 +656,7 @@ async fn relay_substitute_progress<W: AsyncWrite + Unpin>(
     act: &BuildActivityState,
     p: types::SubstituteProgress,
 ) -> Result<(), StreamProcessError> {
-    let Some(aids) = act.subst.get(&p.derivation_path) else {
+    let Some(DrvDisplay::Subst(aids)) = act.display.get(&p.derivation_path).copied() else {
         return Ok(());
     };
     // resProgress fields: [done, expected, running, failed]. The latter
@@ -602,6 +674,21 @@ async fn relay_substitute_progress<W: AsyncWrite + Unpin>(
         )
         .await?;
     Ok(())
+}
+
+/// The `resProgress` field array `[done, expected, running, failed]` —
+/// the ONLY producer of the root progress payload. The live `Progress`
+/// arm and the snapshot correction both call this, so the two surfaces
+/// cannot drift (the live arm hardcoded `failed = 0` while the
+/// snapshot carried the real count, and a build's failed column
+/// flickered to 0 on every live update after a reconnect).
+fn build_progress_fields(done: u64, expected: u64, running: u64, failed: u64) -> [ResultField; 4] {
+    [
+        ResultField::Int(done),
+        ResultField::Int(expected),
+        ResultField::Int(running),
+        ResultField::Int(failed),
+    ]
 }
 
 // r[impl gw.stderr.result.progress]
@@ -668,12 +755,12 @@ async fn relay_build_progress<W: AsyncWrite + Unpin>(
                     .result(
                         aid,
                         ResultType::Progress,
-                        &[
-                            ResultField::Int(u64::from(prog.completed)),
-                            ResultField::Int(u64::from(prog.total)),
-                            ResultField::Int(u64::from(prog.running)),
-                            ResultField::Int(0),
-                        ],
+                        &build_progress_fields(
+                            u64::from(prog.completed),
+                            u64::from(prog.total),
+                            u64::from(prog.running),
+                            u64::from(prog.failed),
+                        ),
                     )
                     .await?;
             }
@@ -745,75 +832,113 @@ async fn apply_snapshot<W: AsyncWrite + Unpin>(
             .await?;
     }
 
-    let running: HashMap<&str, &str> = snap
+    let running: HashMap<&str, (&str, types::AttemptKind)> = snap
         .running
         .iter()
-        .map(|r| (r.derivation_path.as_str(), r.exec_id.as_str()))
+        .map(|r| (r.derivation_path.as_str(), (r.exec_id.as_str(), r.kind())))
         .collect();
 
     // Tracked drvs that are no longer running: they reached a terminal
     // state while we were detached (their Completed/Failed event is gone
-    // with the old stream). Stop their activities and arm the log tail's
-    // post-terminal drain so its final lines still land.
+    // with the old stream). ONE sweep over THE key set closes whichever
+    // display family is open — a substitution that completed during the
+    // detach is closed by the same loop that closes finished builds.
+    // r[impl gw.display.single-map]
     let gone: Vec<String> = act
-        .drv
+        .display
         .keys()
         .filter(|drv| !running.contains_key(drv.as_str()))
         .cloned()
         .collect();
     for drv in gone {
-        tails.on_terminal(&drv);
-        if let Some(aids) = act.subst.remove(&drv) {
-            stop_subst_pair(stderr, aids).await?;
-        }
-        if let Some(aid) = act.drv.remove(&drv) {
-            stderr.stop_activity(aid).await?;
-            debug!(%drv, "stop_activity sent (snapshot reconcile: drv no longer running)");
-        }
-    }
-
-    // Running drvs we don't track: they started while we were detached
-    // (their Started event is gone with the old stream). Start activities
-    // and attach log tails — the exec_id in the snapshot is what keys the
-    // tail subscription. `on_started` is idempotent for an unchanged
-    // exec_id and replaces the subscription on a re-dispatch.
-    for (drv, exec_id) in &running {
-        tails.on_started(drv, exec_id);
-        if !act.drv.contains_key(*drv) {
-            // Same actBuild shape as relay_derivation_status's Started arm.
-            if let Some(aids) = act.subst.remove(*drv) {
-                stop_subst_pair(stderr, aids).await?;
+        match act.display.remove(&drv) {
+            Some(DrvDisplay::Build(aid)) => {
+                // Arm the log tail's post-terminal drain so its final
+                // lines still land.
+                tails.on_terminal(&drv);
+                stderr.stop_activity(aid).await?;
+                debug!(%drv, "stop_activity sent (snapshot reconcile: drv no longer running)");
             }
-            let aid = stderr
-                .start_activity(
-                    ActivityType::Build,
-                    &format!("building '{drv}'"),
-                    verbosity::INFO,
-                    act.builds_root.unwrap_or(0),
-                    &[
-                        ResultField::String((*drv).to_string()),
-                        ResultField::String(act.machine_name.clone()),
-                        ResultField::Int(1),
-                        ResultField::Int(1),
-                    ],
-                )
-                .await?;
-            act.drv.insert((*drv).to_string(), aid);
+            Some(DrvDisplay::Subst(aids)) => {
+                stop_subst_pair(stderr, aids).await?;
+                debug!(%drv, "subst pair stopped (snapshot reconcile: no longer running)");
+            }
+            None => {}
         }
     }
 
-    // Correct the aggregate display from the snapshot's absolute counts.
+    // Running drvs, routed by attempt kind. r[impl sched.pull.kinded-running-surface]
+    //
+    // BUILD (and UNSPECIFIED, from a scheduler that predates the wire
+    // field — degrades to the uniform build treatment): start the
+    // actBuild activity and attach the log tail; `on_started` is
+    // idempotent for an unchanged exec_id and replaces the subscription
+    // on a re-dispatch.
+    //
+    // MATERIALIZATION: store-side upstream fetch — the substitute
+    // display family, NO log tail (the execution never logs), NO
+    // actBuild. Mirrors the live event-path split (`Substituting` vs
+    // `Started`).
+    for (drv, (exec_id, kind)) in &running {
+        match kind {
+            types::AttemptKind::Materialization => {
+                if let Some(DrvDisplay::Build(aid)) = act.display.get(*drv).copied() {
+                    // Kind flip while detached (the build re-dispatched
+                    // as a materialization): the old execution is dead —
+                    // close the stale build display and its tail.
+                    act.display.remove(*drv);
+                    tails.on_terminal(drv);
+                    stderr.stop_activity(aid).await?;
+                }
+                if !act.display.contains_key(*drv) {
+                    start_subst_display(stderr, act, drv, drv).await?;
+                }
+            }
+            _ => {
+                tails.on_started(drv, exec_id);
+                if let Some(DrvDisplay::Subst(aids)) = act.display.get(*drv).copied() {
+                    // Kind flip while detached (substitute fell through
+                    // to a build): close the dangling subst pair.
+                    act.display.remove(*drv);
+                    stop_subst_pair(stderr, aids).await?;
+                }
+                if !act.display.contains_key(*drv) {
+                    // Same actBuild shape as relay_derivation_status's
+                    // Started arm.
+                    let aid = stderr
+                        .start_activity(
+                            ActivityType::Build,
+                            &format!("building '{drv}'"),
+                            verbosity::INFO,
+                            act.builds_root.unwrap_or(0),
+                            &[
+                                ResultField::String((*drv).to_string()),
+                                ResultField::String(act.machine_name.clone()),
+                                ResultField::Int(1),
+                                ResultField::Int(1),
+                            ],
+                        )
+                        .await?;
+                    act.display
+                        .insert((*drv).to_string(), DrvDisplay::Build(aid));
+                }
+            }
+        }
+    }
+
+    // Correct the aggregate display from the snapshot's absolute counts —
+    // the same producer as the live Progress arm.
     if let Some(aid) = act.builds_root {
         stderr
             .result(
                 aid,
                 ResultType::Progress,
-                &[
-                    ResultField::Int(u64::from(snap.completed_derivations)),
-                    ResultField::Int(u64::from(snap.total_derivations)),
-                    ResultField::Int(u64::from(snap.running_derivations)),
-                    ResultField::Int(u64::from(snap.failed_derivations)),
-                ],
+                &build_progress_fields(
+                    u64::from(snap.completed_derivations),
+                    u64::from(snap.total_derivations),
+                    u64::from(snap.running_derivations),
+                    u64::from(snap.failed_derivations),
+                ),
             )
             .await?;
     }
@@ -902,7 +1027,9 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
                 // r[impl gw.stderr.result.set-phase]
                 // Builder forwarded the daemon's SetPhase. Attach to the
                 // owning per-drv activity so nom shows the phase column.
-                if let Some(&aid) = act.drv.get(&phase.derivation_path) {
+                if let Some(DrvDisplay::Build(aid)) =
+                    act.display.get(&phase.derivation_path).copied()
+                {
                     stderr
                         .result(
                             aid,
@@ -2363,6 +2490,34 @@ mod tests {
         }
     }
 
+    fn subst_aids(act: &BuildActivityState, drv: &str) -> SubstAids {
+        match act.display.get(drv) {
+            Some(DrvDisplay::Subst(aids)) => *aids,
+            other => panic!("expected subst display for {drv}, got {other:?}"),
+        }
+    }
+
+    fn build_aid(act: &BuildActivityState, drv: &str) -> u64 {
+        match act.display.get(drv) {
+            Some(DrvDisplay::Build(aid)) => *aid,
+            other => panic!("expected build display for {drv}, got {other:?}"),
+        }
+    }
+
+    fn subst_count(act: &BuildActivityState) -> usize {
+        act.display
+            .values()
+            .filter(|d| matches!(d, DrvDisplay::Subst(_)))
+            .count()
+    }
+
+    fn build_count(act: &BuildActivityState) -> usize {
+        act.display
+            .values()
+            .filter(|d| matches!(d, DrvDisplay::Build(_)))
+            .count()
+    }
+
     // r[verify sched.merge.wanted-outputs+3]
     /// Multi-root submissions concatenate per-root node lists, so a drv
     /// reachable from two roots appears twice — each copy carrying the
@@ -2599,13 +2754,13 @@ mod tests {
         relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[out]))
             .await
             .unwrap();
-        let aids = *act.subst.get(drv).expect("subst aids tracked");
+        let aids = subst_aids(&act, drv);
         assert_eq!(act.subst_expected, 1);
 
         relay_derivation_status(&mut stderr, &mut act, ev(Cached, drv, &[out]))
             .await
             .unwrap();
-        assert!(act.subst.is_empty(), "Cached must remove subst aids");
+        assert_eq!(subst_count(&act), 0, "Cached must remove subst aids");
 
         // r[verify gw.activity.subst-progress]
         // Wire: START(Substitute), START(CopyPath child), no SetExpected
@@ -2652,7 +2807,7 @@ mod tests {
         relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
             .await
             .unwrap();
-        let aids = *act.subst.get(drv).unwrap();
+        let aids = subst_aids(&act, drv);
 
         relay_substitute_progress(
             &mut stderr,
@@ -2731,13 +2886,13 @@ mod tests {
         relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
             .await
             .unwrap();
-        let aids = *act.subst.get(drv).unwrap();
+        let aids = subst_aids(&act, drv);
 
         relay_derivation_status(&mut stderr, &mut act, ev(Started, drv, &[]))
             .await
             .unwrap();
-        assert!(act.subst.is_empty(), "Started must clear subst aids");
-        assert!(act.drv.contains_key(drv), "Started must track build aid");
+        assert_eq!(subst_count(&act), 0, "Started must clear subst aids");
+        let _ = build_aid(&act, drv); // Started must track the build display
 
         // Wire order: START(Substitute), START(CopyPath), STOP(copy),
         // STOP(subst), START(Build).
@@ -2770,18 +2925,19 @@ mod tests {
         relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
             .await
             .unwrap();
-        let aids = *act.subst.get(drv).unwrap();
+        let aids = subst_aids(&act, drv);
 
         let mut fail_ev = ev(Failed, drv, &[]);
         fail_ev.error_message = "dependency failed".into();
         relay_derivation_status(&mut stderr, &mut act, fail_ev)
             .await
             .unwrap();
-        assert!(
-            act.subst.is_empty(),
+        assert_eq!(
+            subst_count(&act),
+            0,
             "Failed must clear subst aids (pre-fix: leaked → stuck nom line)"
         );
-        assert!(act.drv.is_empty(), "drv was never Started");
+        assert_eq!(build_count(&act), 0, "drv was never Started");
 
         // Wire order: START(Substitute), START(CopyPath), STOP(copy),
         // STOP(subst), STDERR_NEXT(log). STOP must precede the failure
@@ -2815,13 +2971,14 @@ mod tests {
         relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
             .await
             .unwrap();
-        assert!(act.subst.contains_key(drv));
+        let _ = subst_aids(&act, drv);
 
         relay_derivation_status(&mut stderr, &mut act, ev(Completed, drv, &[]))
             .await
             .unwrap();
-        assert!(
-            act.subst.is_empty(),
+        assert_eq!(
+            subst_count(&act),
+            0,
             "Completed must clear subst aid (terminal-arm symmetry)"
         );
     }
@@ -2850,15 +3007,15 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let aid_a = *act.drv.get(drvs[0]).unwrap();
-        let aid_b = *act.drv.get(drvs[1]).unwrap();
-        let aid_c = *act.drv.get(drvs[2]).unwrap();
+        let aid_a = build_aid(&act, drvs[0]);
+        let aid_b = build_aid(&act, drvs[1]);
+        let aid_c = build_aid(&act, drvs[2]);
 
         // One Completed arrives normally; aids b/c leak.
         relay_derivation_status(&mut stderr, &mut act, ev(Completed, drvs[0], &[]))
             .await
             .unwrap();
-        assert_eq!(act.drv.len(), 2, "two aids leaked into terminal");
+        assert_eq!(build_count(&act), 2, "two aids leaked into terminal");
 
         let pre_drain_len = buf.len();
         let mut w = &mut buf;
@@ -2866,7 +3023,7 @@ mod tests {
         drain_unstopped_activities(&mut stderr, &mut act)
             .await
             .unwrap();
-        assert!(act.drv.is_empty() && act.subst.is_empty(), "maps drained");
+        assert!(act.display.is_empty(), "map drained");
 
         // Wire after the drain point: exactly two STOP_ACTIVITY frames
         // for aids b and c (order is HashMap iteration — accept either).
@@ -2887,5 +3044,224 @@ mod tests {
             "no surplus frames after drain"
         );
         let _ = aid_a;
+    }
+
+    /// Build a [`LogTailSet`] against a lazy (never-connected) channel:
+    /// `on_started` task spawns are observable via `tracked_drvs()`
+    /// without a live LogService.
+    fn lazy_tails() -> (LogTailSet, tokio::sync::mpsc::Receiver<TaggedLogChunk>) {
+        let chan = tonic::transport::Endpoint::from_static("http://127.0.0.1:9").connect_lazy();
+        LogTailSet::new(rio_proto::LogServiceClient::new(chan))
+    }
+
+    fn snap_running(entries: &[(&str, &str, types::AttemptKind)]) -> types::BuildSnapshot {
+        types::BuildSnapshot {
+            running: entries
+                .iter()
+                .map(|(drv, exec, kind)| types::RunningDerivation {
+                    derivation_path: (*drv).to_string(),
+                    exec_id: (*exec).to_string(),
+                    kind: *kind as i32,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    // r[verify gw.display.single-map]
+    /// A substitution that completed while the gateway was detached must
+    /// be closed by the snapshot gone-reconcile: subst-only drv seeded,
+    /// snapshot with empty running set ⇒ the pair's stop frames are
+    /// emitted and the entry is removed from the display map.
+    #[tokio::test]
+    async fn apply_snapshot_closes_substitution_display_on_gone() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/cccccccccccccccccccccccccccccccc-gone.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Substituting, drv, &[]))
+            .await
+            .unwrap();
+        let aids = match act.display.get(drv) {
+            Some(DrvDisplay::Subst(aids)) => *aids,
+            other => panic!("expected subst display, got {other:?}"),
+        };
+
+        let outcome = apply_snapshot(&mut stderr, &mut act, &mut tails, snap_running(&[]))
+            .await
+            .unwrap();
+        assert!(outcome.is_none());
+        assert!(
+            !act.display.contains_key(drv),
+            "gone-reconcile must remove the substitution display entry"
+        );
+
+        // Wire: START(subst), START(copy), then the root's activity from
+        // apply_snapshot, then STOP(copy), STOP(subst) from the reconcile.
+        let mut r = std::io::Cursor::new(buf);
+        let (sa, _) = read_start_activity(&mut r).await;
+        let (ca, _) = read_start_activity(&mut r).await;
+        assert_eq!((sa, ca), (aids.subst, aids.copy));
+        let (_root, rt) = read_start_activity(&mut r).await;
+        assert_eq!(rt, ActivityType::Builds as u64, "snapshot creates root");
+        // Root SetExpected result frame precedes the stops:
+        // aid + type + nfields + 2 int fields (type,value pairs).
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_RESULT);
+        for _ in 0..3 + 2 * 2 {
+            let _ = wire::read_u64(&mut r).await.unwrap();
+        }
+        assert_eq!(read_stop_activity(&mut r).await, aids.copy, "child first");
+        assert_eq!(read_stop_activity(&mut r).await, aids.subst);
+    }
+
+    // r[verify sched.pull.kinded-running-surface]
+    // r[verify gw.display.single-map]
+    /// Snapshot running entries route by kind: BUILD ⇒ actBuild + log
+    /// tail; MATERIALIZATION ⇒ substitute display pair, NO tail, NO
+    /// actBuild.
+    #[tokio::test]
+    async fn apply_snapshot_kinded_running_routes_display() {
+        let bdrv = "/nix/store/dddddddddddddddddddddddddddddddd-build.drv";
+        let mdrv = "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-mat.drv";
+        let bexec = "01900000-0000-7000-8000-0000000000b1";
+        let mexec = "01900000-0000-7000-8000-0000000000a1";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
+
+        let snap = snap_running(&[
+            (bdrv, bexec, types::AttemptKind::Build),
+            (mdrv, mexec, types::AttemptKind::Materialization),
+        ]);
+        apply_snapshot(&mut stderr, &mut act, &mut tails, snap)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(act.display.get(bdrv), Some(DrvDisplay::Build(_))),
+            "build entry gets the actBuild display"
+        );
+        assert!(
+            matches!(act.display.get(mdrv), Some(DrvDisplay::Subst(_))),
+            "materialization entry gets the substitute display pair, not actBuild"
+        );
+        let tracked = tails.tracked_drvs();
+        assert!(
+            tracked.iter().any(|d| d == bdrv),
+            "build entry opens a log tail"
+        );
+        assert!(
+            !tracked.iter().any(|d| d == mdrv),
+            "materialization entry must NOT open a log tail (no execution log exists)"
+        );
+    }
+
+    // r[verify gw.display.single-map]
+    /// A drv whose kind flipped while detached (materialization running
+    /// in the snapshot, but tracked as a build) swaps display families:
+    /// the stale actBuild stops, the substitute pair starts.
+    #[tokio::test]
+    async fn apply_snapshot_kind_flip_swaps_display_family() {
+        use types::DerivationEventKind::*;
+        let drv = "/nix/store/ffffffffffffffffffffffffffffffff-flip.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+        let (mut tails, _rx) = lazy_tails();
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Started, drv, &[]))
+            .await
+            .unwrap();
+        let build_aid = match act.display.get(drv) {
+            Some(DrvDisplay::Build(aid)) => *aid,
+            other => panic!("expected build display, got {other:?}"),
+        };
+
+        let snap = snap_running(&[(
+            drv,
+            "01900000-0000-7000-8000-0000000000c1",
+            types::AttemptKind::Materialization,
+        )]);
+        apply_snapshot(&mut stderr, &mut act, &mut tails, snap)
+            .await
+            .unwrap();
+        assert!(
+            matches!(act.display.get(drv), Some(DrvDisplay::Subst(_))),
+            "kind flip must swap the display family to subst"
+        );
+        let _ = build_aid;
+    }
+
+    /// The live Progress arm and the snapshot correction emit the same
+    /// resProgress array: field 4 (failed) carries the scheduler's
+    /// count on BOTH paths.
+    #[tokio::test]
+    async fn live_progress_carries_failed_count() {
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        relay_build_progress(
+            &mut stderr,
+            &mut act,
+            &types::build_event::Event::Started(types::BuildStarted {
+                total_derivations: 10,
+                cached_derivations: 2,
+            }),
+        )
+        .await
+        .unwrap();
+        relay_build_progress(
+            &mut stderr,
+            &mut act,
+            &types::build_event::Event::Progress(types::BuildProgress {
+                completed: 4,
+                running: 1,
+                queued: 0,
+                total: 10,
+                failed: 5,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Wire: START(Builds root), SetExpected result, then the
+        // Progress result whose 4th int field must be `failed`.
+        let mut r = std::io::Cursor::new(buf);
+        let (root, _) = read_start_activity(&mut r).await;
+        // SetExpected: aid + type + nfields + 2 int fields.
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_RESULT);
+        for _ in 0..3 + 2 * 2 {
+            let _ = wire::read_u64(&mut r).await.unwrap();
+        }
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_RESULT);
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), root);
+        assert_eq!(
+            wire::read_u64(&mut r).await.unwrap(),
+            ResultType::Progress as u64
+        );
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), 4, "four fields");
+        let mut ints = [0u64; 4];
+        for slot in &mut ints {
+            assert_eq!(wire::read_u64(&mut r).await.unwrap(), 0, "int field");
+            *slot = wire::read_u64(&mut r).await.unwrap();
+        }
+        assert_eq!(
+            ints,
+            [4, 10, 1, 5],
+            "resProgress [done, expected, running, failed] — failed must carry the scheduler's count"
+        );
     }
 }

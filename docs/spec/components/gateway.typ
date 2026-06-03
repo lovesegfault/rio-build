@@ -2032,6 +2032,21 @@ still increments (so a pathological resync loop is bounded by
 #(refs.const)("MAX_RECONNECT")) and still resets only on a successfully
 forwarded event.
 
+#r("gw.display.single-map")[
+  The gateway MUST track every derivation's client display through ONE
+  per-derivation map whose value is the display family (per-derivation
+  build activity, or substitute/copy activity pair): a derivation holds
+  exactly one display family at a time, every family transition closes
+  the previous family's activities, and every reconcile sweep (snapshot
+  gone-set, terminal drain) iterates the single map's key set.
+]
+Two independent per-family maps made omission representable: the snapshot
+gone-reconcile iterated only the build map, so a substitution that
+completed while the gateway was detached survived both loops and the
+client showed it stuck forever. One map with a family-valued entry makes
+"swept by every reconcile" a property of the key set rather than of each
+loop's author remembering both families.
+
 #r("gw.reconnect.snapshot-resync")[
   On reconnect, the gateway MUST resynchronize from the `WatchBuild` stream's
   first message — the scheduler's `BuildSnapshot` — before processing live
