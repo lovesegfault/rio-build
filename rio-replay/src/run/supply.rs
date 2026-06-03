@@ -478,6 +478,46 @@ pub enum UploadPayload {
     },
 }
 
+/// Plausibility ceiling on the PEER-declared `NarSize` of a relay narinfo
+/// admitted into an upload plan: 64 GiB. Relay entries declaring more are
+/// skipped at plan time (per-path degrade, never an abort).
+///
+/// Trust provenance: a relay narinfo body is served by the recording cache
+/// — hostile input by this module's own posture (probe bodies are capped at
+/// `MAX_NARINFO_BYTES` for the same reason) — and `NarSize:` parses as any
+/// u64. The declared size steers lane routing (at/above the
+/// `large_nar_threshold_mib` knob it routes to individual streaming) and
+/// parameterizes the streamed wire op (payload reader length, deadline
+/// headroom), so an unscreened fabricated size buys the peer plan- and
+/// op-shaping power; the transport-side headroom clamp bounds the deadline
+/// damage, and this screen stops the fabrication at the one
+/// narinfo-to-plan boundary.
+///
+/// Sizing, from this tree's own size posture: 1024× the default streaming
+/// lane threshold (`large_nar_threshold_mib` = 64 MiB); 12.8× the largest
+/// single object the engine's own publisher will PUT
+/// (`S3_SINGLE_PUT_MAX_BYTES` = 5 GiB); and on the order of an ENTIRE fat
+/// replay archive image ("tens-to-hundreds of GiB" for every embedded NAR
+/// of a campaign combined — see `ensure_archive`'s member-download doc), so
+/// a single store path declaring more than this is far outside anything
+/// the engine ships or the nixpkgs tail (multi-GiB cuda/chromium-class
+/// NARs) actually produces.
+///
+/// False-refusal cost, stated: a legitimately-larger-than-64-GiB relay NAR
+/// is skipped with a reason naming this cap, its dependents degrade
+/// per-path exactly like any other unsupplyable path (the target may still
+/// substitute it itself), and the remedy is embedding the path in the
+/// archive or raising this constant — one degraded supply path, never a
+/// wedged worker or an aborted campaign.
+///
+/// Archive-embedded sidecar narinfos are deliberately NOT screened here:
+/// they come from the operator-published, digest-pinned archive (a
+/// different trust domain), and their declared size is cross-checked
+/// against the actually-materialized local bytes before any wire op (a
+/// check with independent operands — unlike the relay arm, where both
+/// sides of that comparison descend from the same narinfo field).
+pub(crate) const MAX_RELAY_NAR_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
 /// Reference-safe upload plan for one closure.
 #[derive(Debug, Clone)]
 pub struct UploadPlan {
@@ -508,7 +548,11 @@ pub struct UploadPlan {
 /// are the point of the replay and never supplied; paths with no source at
 /// all land in [`UploadPlan::skipped`] and the affected requests degrade.
 /// Relayed paths whose `nar_size` is at or above `large_nar_threshold_bytes`
-/// route to [`UploadPlan::large`] for individual streaming.
+/// route to [`UploadPlan::large`] for individual streaming — after a
+/// plausibility screen on that peer-declared size: entries declaring more
+/// than [`MAX_RELAY_NAR_BYTES`] are skipped (same per-path degrade), so a
+/// fabricated `NarSize` can neither steer lane routing nor parameterize the
+/// streamed wire op.
 ///
 /// Batch ordering: per node, inputSrcs → outputs → the `.drv` itself, nodes
 /// in children-first order, then settled in passes so every reference that
@@ -589,27 +633,46 @@ pub fn plan_uploads(
                 Some(PathSource::Relay {
                     substituter_url,
                     narinfo,
-                }) => match info_from_narinfo(path, narinfo) {
-                    Ok(info) => {
-                        let item = UploadItem {
-                            store_path: path.clone(),
-                            info,
-                            payload: UploadPayload::Relay {
-                                substituter_url: substituter_url.clone(),
-                                narinfo: narinfo.clone(),
-                            },
-                        };
-                        if narinfo.nar_size >= large_nar_threshold_bytes {
-                            large.push(item);
-                        } else {
-                            candidates.push(Candidate {
-                                item,
-                                is_drv: false,
-                            });
-                        }
+                }) => {
+                    // Plausibility screen on the peer-declared size BEFORE
+                    // it can steer lane routing or parameterize the wire op
+                    // (see [`MAX_RELAY_NAR_BYTES`] for provenance, sizing,
+                    // and the stated false-refusal cost).
+                    if narinfo.nar_size > MAX_RELAY_NAR_BYTES {
+                        skipped.push((
+                            path.clone(),
+                            format!(
+                                "relay narinfo declares NarSize {} bytes, above the \
+                                 {MAX_RELAY_NAR_BYTES}-byte (64 GiB) plausibility cap on \
+                                 peer-declared sizes — skipped; embed the path in the archive \
+                                 (or raise the cap) if a NAR this large is real",
+                                narinfo.nar_size
+                            ),
+                        ));
+                        continue;
                     }
-                    Err(reason) => skipped.push((path.clone(), reason)),
-                },
+                    match info_from_narinfo(path, narinfo) {
+                        Ok(info) => {
+                            let item = UploadItem {
+                                store_path: path.clone(),
+                                info,
+                                payload: UploadPayload::Relay {
+                                    substituter_url: substituter_url.clone(),
+                                    narinfo: narinfo.clone(),
+                                },
+                            };
+                            if narinfo.nar_size >= large_nar_threshold_bytes {
+                                large.push(item);
+                            } else {
+                                candidates.push(Candidate {
+                                    item,
+                                    is_drv: false,
+                                });
+                            }
+                        }
+                        Err(reason) => skipped.push((path.clone(), reason)),
+                    }
+                }
             }
         }
 
@@ -1652,6 +1715,103 @@ mod tests {
             assert!(item.info.deriver.is_none());
             assert!(item.info.signatures.is_empty());
             assert!(!item.info.ultimate);
+        }
+    }
+
+    /// The plausibility screen on PEER-declared relay sizes, both
+    /// directions. Universe: every `PathSource::Relay` entry entering
+    /// `plan_uploads` (the one narinfo-to-plan boundary) — the only arm
+    /// whose declared size is peer-controlled; the same plan carries
+    /// archive-embedded and drv-text items to pin that the sibling trust
+    /// domains plan unscreened. The hostile rows are parsed from canned
+    /// narinfo BODIES through `NarInfo::parse` — the same producer chain
+    /// (cache-served text → parser → plan) the live probe path uses — so
+    /// the test proves the parser admits the hostile magnitude and the
+    /// plan refuses it, not that a hand-built struct would be refused.
+    #[test]
+    fn plan_uploads_screens_implausible_relay_nar_sizes() {
+        let archive = open_fixture();
+        let closure = walk_closure(&archive, &[APP_DRV.to_string()]).unwrap();
+
+        // A relay narinfo body as a cache serves it, with the declared
+        // NarSize injected; NarInfo::parse accepts any u64 here — the
+        // screen is the plan's job, not the parser's.
+        let hostile_narinfo = |store_path: &str, nar_size: u64| -> NarInfo {
+            let body = format!(
+                "StorePath: {store_path}\n\
+                 URL: nar/fabricated.nar\n\
+                 Compression: none\n\
+                 NarHash: sha256:{}\n\
+                 NarSize: {nar_size}\n\
+                 References: \n",
+                nixbase32::encode(&[0x42u8; 32])
+            );
+            NarInfo::parse(&body).expect("the parser admits any u64 NarSize")
+        };
+        let plan_with_dep_size = |nar_size: u64| {
+            let mut sources: HashMap<String, PathSource> = HashMap::new();
+            sources.insert(SRC.to_string(), PathSource::Archive);
+            sources.insert(
+                DEP_OUT.to_string(),
+                PathSource::Relay {
+                    substituter_url: "https://cache.example.org".to_string(),
+                    narinfo: hostile_narinfo(DEP_OUT, nar_size),
+                },
+            );
+            sources.insert(
+                APP_OUT.to_string(),
+                PathSource::NotSupplied { workload: true },
+            );
+            plan_uploads(
+                &closure,
+                &sources,
+                &BTreeSet::new(),
+                &archive,
+                LARGE_THRESHOLD,
+            )
+            .unwrap()
+        };
+
+        // Must-block: hostile magnitudes and the first byte past the cap
+        // are skipped with a reason naming the cap — they reach neither
+        // the streaming lane (no peer-minted lane steering, no streamed
+        // wire op parameterized by the fabricated size) nor the batch.
+        for implausible in [MAX_RELAY_NAR_BYTES + 1, 10u64.pow(18), u64::MAX] {
+            let plan = plan_with_dep_size(implausible);
+            let reason = skip_reason(&plan, DEP_OUT);
+            assert!(
+                reason.contains(&MAX_RELAY_NAR_BYTES.to_string()),
+                "the skip reason must name the cap: {reason}"
+            );
+            assert!(
+                reason.contains(&implausible.to_string()),
+                "the skip reason must name the declared size: {reason}"
+            );
+            assert!(
+                plan.large.iter().all(|item| item.store_path != DEP_OUT),
+                "a screened size must not steer the path into the streaming lane"
+            );
+            assert!(
+                plan.batch.iter().all(|item| item.store_path != DEP_OUT),
+                "a screened path must not be batched either"
+            );
+            // Sibling trust domains in the same plan are untouched: the
+            // archive-embedded source and both drv texts still plan (their
+            // declared sizes are operator/archive-controlled and cross-
+            // checked against locally materialized bytes at send time).
+            let batch_paths: Vec<&str> = plan.batch.iter().map(|i| i.store_path.as_str()).collect();
+            assert_eq!(batch_paths, vec![SRC, DEP_DRV, APP_DRV]);
+        }
+
+        // Must-admit: the multi-GiB nixpkgs tail is legitimate. 48 GiB and
+        // the cap boundary itself plan into the streaming lane exactly as
+        // before the screen existed.
+        for legitimate in [48 * 1024 * 1024 * 1024_u64, MAX_RELAY_NAR_BYTES] {
+            let plan = plan_with_dep_size(legitimate);
+            assert!(plan.skipped.is_empty(), "skipped: {:?}", plan.skipped);
+            assert_eq!(plan.large.len(), 1);
+            assert_eq!(plan.large[0].store_path, DEP_OUT);
+            assert_eq!(plan.large[0].info.nar_size, legitimate);
         }
     }
 
