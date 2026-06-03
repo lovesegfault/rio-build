@@ -21,6 +21,43 @@ use super::DagActor;
 #[cfg(test)]
 use super::backdate;
 
+/// Result of the batch store pre-pass ([`DagActor::batch_probe_cached_ready`]):
+/// a PARTITION of the batch's candidate set by what kind of evidence the
+/// pass produced, so the drain loop cannot conflate "probed, definitive
+/// verdict" with "deliberately unprobed". The two sets are disjoint by
+/// construction — a hash is inserted into exactly one of them per pass.
+#[derive(Default)]
+pub(super) struct BatchProbeOutcome {
+    /// Hashes whose dispatch-time store question is CLOSED for this
+    /// pass. Two producer arms insert here:
+    ///
+    /// - FMP success (the per-candidate partition loop): every probed
+    ///   window member — completed inline, routed to substitution,
+    ///   fail-fasted, or definitively found missing (→ dispatch).
+    /// - FMP error/timeout: the unprobed over-cap tail, folded in
+    ///   DELIBERATELY so it dispatches fail-open this pass in parity
+    ///   with the generation-stamped head (which `ready_check_or_spawn`
+    ///   skips via the stamp). Holding the tail behind a dead store
+    ///   would wedge it for as long as the store is down — the
+    ///   I-139/I-140 stall shape the cap belt exists to prevent.
+    ///
+    /// The drain loop skips the per-drv `ready_check_or_spawn` RPC for
+    /// members and proceeds to placement.
+    pub(super) checked: HashSet<DrvHash>,
+    /// Hashes the pass deliberately did NOT probe while the store was
+    /// answering: the over-cap window tail on the FMP-success arm
+    /// (sole producer site — the cap branch of
+    /// `batch_probe_cached_ready`). No verdict exists for these, so
+    /// the drain loop MUST defer them instead of dispatching
+    /// (`r[sched.dispatch.fod-substitute+6]`): dispatching would
+    /// forfeit the derivation's last substitution opportunity — once
+    /// Assigned it leaves Ready and no later batch window ever probes
+    /// it. Deferred members stay Ready and unstamped, so the
+    /// least-recently-probed window ordering picks them up first on
+    /// the next pass.
+    pub(super) probe_deferred: HashSet<DrvHash>,
+}
+
 /// Per-dispatch-pass accumulators + the per-pass solve-input snapshot,
 /// threaded through [`DagActor::try_dispatch_one`]. The drain loop in
 /// [`DagActor::dispatch_ready`] previously closed over five outer
@@ -41,7 +78,14 @@ struct DispatchTickCtx {
     inputs_gen: u64,
     /// Hashes the batch FOD pre-pass already checked (I-163).
     /// `try_dispatch_one` skips the per-FOD store RPC for these.
+    /// See [`BatchProbeOutcome::checked`] for the two producer arms.
     batch_checked: HashSet<DrvHash>,
+    /// Unprobed over-cap window tail ([`BatchProbeOutcome::probe_deferred`]).
+    /// `try_dispatch_one` defers these for the pass — no store verdict
+    /// exists, so neither the per-drv RPC (I-139/I-140: O(N) sequential
+    /// FMP timeouts) nor fail-open dispatch (forfeits the substitution
+    /// verdict) is allowed. Disjoint from `batch_checked`.
+    probe_deferred: HashSet<DrvHash>,
     /// Successful assign_to_worker calls (for the >1s debug log).
     n_assigned: u64,
     // ── per-ITERATION (cleared at top of each outer `while
@@ -170,13 +214,14 @@ impl DagActor {
         // is kept as a fallback for nodes promoted to Ready DURING
         // this pass (from the cascade each completion here triggers).
         //
-        // I-163: returns the set of hashes the batch ALREADY checked
-        // (regardless of outcome). The drain loop skips the per-drv
-        // store-check for these — re-asking the store 200ms later for
-        // the same 211 paths was the ~150ms dominant cost of the
-        // 169ms/Heartbeat that saturated the actor at medium-mixed-32x
-        // scale.
-        let batch_checked = self.batch_probe_cached_ready().await;
+        // I-163: returns a partition of the batch's candidates. The
+        // drain loop skips the per-drv store-check for `checked`
+        // members — re-asking the store 200ms later for the same 211
+        // paths was the ~150ms dominant cost of the 169ms/Heartbeat
+        // that saturated the actor at medium-mixed-32x scale — and
+        // DEFERS `probe_deferred` members (the unprobed over-cap tail;
+        // no verdict, so no dispatch this pass).
+        let probe_outcome = self.batch_probe_cached_ready().await;
         // r33 bug_013: ONE solve-input snapshot for the WHOLE pass —
         // hoisted here from `try_dispatch_one`'s per-drv body. After
         // the batch store RPC so the snapshot is as fresh as the pass
@@ -187,7 +232,8 @@ impl DagActor {
             hw,
             cost,
             inputs_gen,
-            batch_checked,
+            batch_checked: probe_outcome.checked,
+            probe_deferred: probe_outcome.probe_deferred,
             n_assigned: 0,
             deferred: Vec::new(),
             kind_deferred: HashMap::new(),
@@ -275,6 +321,26 @@ impl DagActor {
             return false;
         }
 
+        // r[impl sched.dispatch.fod-substitute+6]
+        // Over-cap probe-window tail: the batch pre-pass deliberately
+        // did NOT probe this node this pass (the store WAS answering —
+        // store-failure folds the tail into `batch_checked` instead,
+        // see `BatchProbeOutcome`). It has no substitutability verdict,
+        // and dispatch-time is its last opportunity to get one: once
+        // Assigned it leaves Ready and no later batch window probes
+        // it. Defer for the pass — same shape as the `must_substitute`
+        // carve-out below — but BEFORE the per-drv store check, which
+        // would otherwise fire one inline FMP per tail node (the
+        // I-139/I-140 O(N)-sequential-RPC stall the cap bounds). The
+        // node stays Ready and unstamped; the least-recently-probed
+        // window ordering picks it up on the next pass (same-generation
+        // inline passes advance the window; tick-driven passes rotate
+        // it), so the deferral is bounded, not a starvation.
+        if ctx.probe_deferred.contains(&drv_hash) {
+            ctx.deferred.push(drv_hash);
+            return false;
+        }
+
         // SLA-solved (cores, mem, disk, deadline) for the resource-fit
         // filter (`r[sched.assign.resource-fit]`): same
         // `solve_intent_for` the snapshot uses, so the controller
@@ -311,12 +377,16 @@ impl DagActor {
         // I-062, or Completed→Ready via verify_preexisting_
         // completed) is never re-checked there. Re-check here.
         // I-163: skip the per-drv RPC if the batch pre-pass already
-        // checked this hash. A node in `batch_checked` that's still
-        // Ready here was found NOT-in-store by the batch (otherwise it
-        // would have completed and the status guard above would have
-        // dropped it) — no need to ask again. Only cascade-promoted
-        // nodes (Ready AFTER the batch ran) hit the per-drv path.
-        // Best-effort: store unreachable → dispatch as before.
+        // closed this hash's store question. A node in `batch_checked`
+        // that's still Ready here either was probed and found
+        // NOT-in-store by the batch (otherwise it would have completed
+        // and the status guard above would have dropped it), or is the
+        // unprobed tail of a batch whose FMP itself failed — folded in
+        // so it dispatches fail-open in parity with the stamped head
+        // (store unreachable → dispatch as before; see
+        // `BatchProbeOutcome::checked`). Either way: no need to ask
+        // again. Only cascade-promoted nodes (Ready AFTER the batch
+        // ran) hit the per-drv path.
         if !ctx.batch_checked.contains(&drv_hash) && self.ready_check_or_spawn(&drv_hash).await {
             return true;
         }
@@ -573,29 +643,32 @@ impl DagActor {
     /// single-threaded so there's no contention; for a 1085-node merge
     /// the scan is sub-ms vs. ~25s of sequential RPCs it replaces.
     ///
-    /// Returns the set of hashes the drain loop must skip
-    /// `ready_check_or_spawn` for (I-163). On success this is the
-    /// batch-probed head (completed here or definitively found-missing
-    /// one RPC ago) plus the truncated tail (deferred to next pass's
-    /// batch). On RPC error/timeout this is the tail only — the
-    /// stamped head is protected via `probed_generation`, so neither
-    /// hits the per-drv fallback.
-    // r[impl sched.dispatch.fod-substitute+5]
+    /// Returns a [`BatchProbeOutcome`] partitioning the candidates by
+    /// the evidence this pass produced (I-163). On FMP success:
+    /// `checked` is the batch-probed head (completed here or
+    /// definitively found-missing one RPC ago) and `probe_deferred` is
+    /// the truncated tail (held un-dispatched; a later window probes
+    /// it). On RPC error/timeout: `checked` is the tail only — folded
+    /// in so it dispatches fail-open alongside the head (which the
+    /// `probed_generation` stamp protects from the per-drv fallback) —
+    /// and `probe_deferred` is empty.
+    // r[impl sched.dispatch.fod-substitute+6]
     // `pub(super)` so the window-determinism tests can drive the full
     // candidate-construction chain (collect → sort → cap → auth mint →
     // FMP) directly and observe the wire artifact at the mock store.
-    pub(super) async fn batch_probe_cached_ready(&mut self) -> HashSet<DrvHash> {
+    pub(super) async fn batch_probe_cached_ready(&mut self) -> BatchProbeOutcome {
         let Some(store) = &self.store_client else {
-            return HashSet::new();
+            return BatchProbeOutcome::default();
         };
         let probe_gen = self.probe_generation;
-        // Candidate set: (drv_hash, output_paths). Collected up-front
-        // so the FindMissingPaths borrow doesn't hold &self.dag across
-        // the .await (and so the completion loop can take &mut self).
-        // Floating-CA (`expected_output_paths == [""]`) is excluded by
-        // the `!is_empty()` + path-known check; the realisations lane
-        // at merge-time handles those.
-        let mut candidates: Vec<(DrvHash, Vec<String>)> = self
+        // Candidate set: (drv_hash, output_paths, probed_generation).
+        // Collected up-front so the FindMissingPaths borrow doesn't
+        // hold &self.dag across the .await (and so the completion loop
+        // can take &mut self). Floating-CA (`expected_output_paths ==
+        // [""]`) is excluded by the `!is_empty()` + path-known check;
+        // the realisations lane at merge-time handles those. The
+        // generation rides along as the primary window-sort key below.
+        let mut candidates: Vec<(DrvHash, Vec<String>, u64)> = self
             .dag
             .iter_nodes()
             .filter(|(_, s)| {
@@ -603,19 +676,40 @@ impl DagActor {
                     && s.probed_generation < probe_gen
                     && s.output_paths_probeable()
             })
-            .map(|(h, s)| (DrvHash::from(h), s.expected_output_paths.clone()))
+            .map(|(h, s)| {
+                (
+                    DrvHash::from(h),
+                    s.expected_output_paths.clone(),
+                    s.probed_generation,
+                )
+            })
             .collect();
         if candidates.is_empty() {
-            return HashSet::new();
+            return BatchProbeOutcome::default();
         }
-        // Belt under the store-side 4096 cap. The truncated tail is
-        // inserted into `checked` (so the drain loop skips the per-drv
-        // `ready_check_or_spawn` fallback) but NOT stamped with
-        // `probed_generation` — the next inline `dispatch_ready` (same
-        // generation) batch-probes that window. Letting the tail fall
-        // through to the per-drv path would be O(N) sequential 30s-
-        // timeout RPCs in the actor (24h+ stall with a wide layer and
-        // an unreachable store; I-139/I-140 invariant).
+        // Belt under the store-side 4096 cap. The truncated tail goes
+        // into `probe_deferred` — NOT probed, NOT stamped with
+        // `probed_generation`, and NOT dispatched this pass (the drain
+        // loop defers members; dispatching without a verdict would
+        // forfeit the node's last substitution opportunity, since
+        // Assigned leaves Ready and no later window would probe it).
+        // A later window picks the tail up: the next inline
+        // `dispatch_ready` (same generation) batch-probes exactly the
+        // unstamped remainder, and once `handle_tick` advances the
+        // generation (1/s, re-opening every Ready node), the
+        // least-recently-probed-first order below puts the
+        // still-unstamped tail at the FRONT of the next window. That
+        // rotation bounds any candidate's wait to ⌈layer/cap⌉ probe
+        // windows even when the rest of the layer never drains (e.g. a
+        // wide cohort deferred for lack of a matching pool) — without
+        // it, a tick-driven pass would re-probe the same head forever
+        // and starve the tail. Letting the tail fall through to the
+        // per-drv path instead would be O(N) sequential 30s-timeout
+        // RPCs in the actor (24h+ stall with a wide layer and an
+        // unreachable store; I-139/I-140 invariant) — that is why the
+        // FMP error/timeout arms below fold the tail into `checked`
+        // (fail-open dispatch parity with the stamped head) rather
+        // than leaving it to the fallback.
         //
         // Sorted BEFORE the cap window: `candidates` carries raw
         // `iter_nodes()` (HashMap) order, so an unsorted truncate would
@@ -626,21 +720,25 @@ impl DagActor {
         // (r[sched.dispatch.probe-tenant-stable] forbids exactly that:
         // the pick must not depend on candidate enumeration order, and
         // when the layer is wider than the cap, window membership IS
-        // enumeration order). Sorting by drv hash makes every window —
-        // head and the stamped-generation remainders probed on later
-        // passes — a pure function of DAG state. The ≤cap path needs no
-        // order: the full set is one window, and every downstream
-        // consumer (the `.min()` tenant fold, the per-path partition)
-        // is order-insensitive.
+        // enumeration order). The key is (probed_generation, drv hash):
+        // generation first for the rotation above, drv hash as the
+        // unique total tie-break. Both are DAG state — recovery resets
+        // every generation to 0, so across leader incarnations on
+        // identical persisted state the first window is pure drv-hash
+        // order, exactly as before. The ≤cap path needs no order: the
+        // full set is one window, and every downstream consumer (the
+        // `.min()` tenant fold, the per-path partition) is
+        // order-insensitive.
         let mut checked = HashSet::with_capacity(candidates.len());
+        let mut probe_deferred = HashSet::new();
         if candidates.len() > super::DISPATCH_PROBE_BATCH_CAP {
-            candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            for (h, _) in &candidates[super::DISPATCH_PROBE_BATCH_CAP..] {
-                checked.insert(h.clone());
+            candidates.sort_unstable_by(|a, b| (a.2, &a.0).cmp(&(b.2, &b.0)));
+            for (h, _, _) in &candidates[super::DISPATCH_PROBE_BATCH_CAP..] {
+                probe_deferred.insert(h.clone());
             }
             candidates.truncate(super::DISPATCH_PROBE_BATCH_CAP);
         }
-        for (h, _) in &candidates {
+        for (h, _, _) in &candidates {
             if let Some(s) = self.dag.node_mut(h) {
                 s.probed_generation = probe_gen;
             }
@@ -657,14 +755,14 @@ impl DagActor {
         // tenant_id=None and substitutable_paths stays empty — the
         // pre-fix behaviour that dispatched FODs already in
         // cache.nixos.org.
-        let auth = self.probe_substitute_auth(candidates.iter().map(|(h, _)| h));
+        let auth = self.probe_substitute_auth(candidates.iter().map(|(h, _, _)| h));
         let probe = auth.mint();
         let probe_meta: Vec<(&'static str, &str)> =
             probe.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
         let store_paths: Vec<String> = candidates
             .iter()
-            .flat_map(|(_, p)| p.iter().cloned())
+            .flat_map(|(_, p, _)| p.iter().cloned())
             .collect();
         // Deliberately NOT gated on `cache_breaker`: dispatch-time
         // probe failure degrades to cache-miss (per-drv fallback
@@ -685,10 +783,23 @@ impl DagActor {
                         "batched Ready store-check FindMissingPaths failed; \
                          dispatching fail-open (next pass batch-retries)"
                     );
-                    // Tail already in `checked`; head protected via the
-                    // probed_generation stamp at `ready_check_or_spawn`.
+                    // No probe answered, so there is no verdict to wait
+                    // for: fold the unprobed tail into `checked` so it
+                    // dispatches fail-open THIS pass in parity with the
+                    // stamped head (protected from the per-drv fallback
+                    // via `probed_generation` at `ready_check_or_spawn`).
+                    // DELIBERATE asymmetry with the success arm's
+                    // deferral: holding the tail here would wedge it
+                    // behind a dead store — the I-139/I-140 liveness
+                    // shape (wide layer + unreachable store) the cap
+                    // belt exists for. Store-down liveness wins over
+                    // the substitution opportunity.
+                    checked.extend(probe_deferred.drain());
                     self.credit_heartbeats_for_stall(fmp_start.elapsed());
-                    return checked;
+                    return BatchProbeOutcome {
+                        checked,
+                        probe_deferred,
+                    };
                 }
                 Err(_) => {
                     debug!(
@@ -697,8 +808,15 @@ impl DagActor {
                         "batched Ready store-check timed out; \
                          dispatching fail-open (next pass batch-retries)"
                     );
+                    // Same fail-open fold as the error arm above
+                    // (I-139/I-140): a timed-out store must not hold
+                    // the unprobed tail hostage.
+                    checked.extend(probe_deferred.drain());
                     self.credit_heartbeats_for_stall(fmp_start.elapsed());
-                    return checked;
+                    return BatchProbeOutcome {
+                        checked,
+                        probe_deferred,
+                    };
                 }
             };
         // Actor was unresponsive for the FMP duration — credit so the
@@ -727,7 +845,7 @@ impl DagActor {
         // inline nor route to substitution: fail fast instead of
         // leaving them Ready (see the arm below).
         let mut to_fail_fast: Vec<DrvHash> = Vec::new();
-        for (drv_hash, paths) in candidates {
+        for (drv_hash, paths, _) in candidates {
             checked.insert(drv_hash.clone());
             let substitute_tried = self.dag.node(&drv_hash).is_some_and(|s| s.substitute_tried);
             // r[impl sched.merge.wanted-outputs+2]
@@ -814,7 +932,10 @@ impl DagActor {
             )
             .await;
         }
-        checked
+        BatchProbeOutcome {
+            checked,
+            probe_deferred,
+        }
     }
 
     /// Resolve auth for dispatch-time store calls. `Jwt(vec![])`
@@ -1819,9 +1940,12 @@ impl DagActor {
     /// Ready at pass start (one RPC). This per-drv check fires only for
     /// nodes promoted to Ready DURING the pass (via `find_newly_ready`
     /// from a completion above) — typically zero, occasionally a
-    /// handful. Deferred nodes (no worker capacity) re-check each Tick
-    /// via the batch, not here; the answer can flip to `true` mid-queue
-    /// (an earlier dispatch on another scheduler/build uploaded it).
+    /// handful. Deferred nodes (no worker capacity) re-check via the
+    /// batch, not here — every Tick while the layer fits one window,
+    /// every ⌈layer/cap⌉ windows when it doesn't (the
+    /// least-recently-probed rotation); the answer can flip to `true`
+    /// mid-queue (an earlier dispatch on another scheduler/build
+    /// uploaded it).
     async fn ready_check_or_spawn(&mut self, drv_hash: &DrvHash) -> bool {
         let probe_gen = self.probe_generation;
         // Live effective wanted set (terminal builds' contributions
@@ -1877,7 +2001,7 @@ impl DagActor {
                 store.clone(),
             )
         };
-        // r[impl sched.dispatch.fod-substitute+5] — same probe-tenant
+        // r[impl sched.dispatch.fod-substitute+6] — same probe-tenant
         // wiring as batch_probe_cached_ready.
         let auth = self.probe_substitute_auth(std::iter::once(drv_hash));
         let probe = auth.mint();

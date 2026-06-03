@@ -1150,11 +1150,14 @@ async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.dispatch.fod-substitute+5]
+// r[verify sched.dispatch.fod-substitute+6]
 /// Dispatch-time substitution: a Ready IA derivation (FOD or non-FOD)
 /// whose output becomes substitutable AFTER merge (so merge-time
 /// `check_cached_outputs` missed it) is completed by
 /// `batch_probe_cached_ready` without dispatching to a worker.
+/// (+5→+6 reviewed: verifies the "probe every Ready IA derivation,
+/// not just FODs and not just local presence" clause — unchanged by
+/// the +6 over-cap windowing correction; this layer is sub-cap.)
 ///
 /// Pre-fix: the batch was FOD-only AND read only `missing_paths` (no
 /// service-token, ignored `substitutable_paths`) → non-FODs relied on
@@ -1452,8 +1455,11 @@ async fn batch_probe_classifies_against_live_builds_effective_wanted(
 /// A Ready force-build root whose output is upstream-substitutable is
 /// dispatched to a builder (assignment sent), not routed to the
 /// substitute lane by the dispatch-time probe.
+/// (+5→+6 reviewed: verifies the force-build exclusion-from-the-
+/// substitute-spawn-arm clause — unchanged by the +6 over-cap
+/// windowing correction; this layer is sub-cap.)
 // r[verify sched.merge.force-build-roots+2]
-// r[verify sched.dispatch.fod-substitute+5]
+// r[verify sched.dispatch.fod-substitute+6]
 #[tokio::test]
 async fn dispatch_time_force_build_root_dispatches_not_substitutes() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -1772,24 +1778,43 @@ fn inject_probe_candidate(actor: &mut DagActor, tag: &str) {
     actor.test_set_probed_generation(tag, 0);
 }
 
-// r[verify sched.dispatch.fod-substitute+5]
+// r[verify sched.dispatch.fod-substitute+6]
 // r[verify sched.dispatch.probe-tenant-stable]
 /// Window membership of an over-cap probe batch is a pure function of
-/// DAG state — invariant to candidate enumeration order. Quantification
-/// domain: every order-sensitive transform feeding the cap, exercised
-/// end-to-end (HashMap `iter_nodes()` iteration → filter → collect →
-/// sort → truncate): two actors hold the same CAP+12 candidate CONTENT
-/// built in opposite insertion orders, with independently re-rolled
-/// hasher seeds (each `HashMap` draws its own `RandomState`). The batch
-/// FMP fails open so the DAG stays untouched, and both the deferred
-/// tail (the return value) and the probed head (the FMP request the
-/// store received, path list in window order) must be identical across
-/// the two actors AND equal to the drv-hash-sorted split. Pre-fix the
-/// truncate windowed raw hash order: the tail was 12 of 2060 hashes by
-/// hasher seed, so this assertion was a coin toss with ~zero pass
-/// probability.
+/// DAG state — invariant to candidate enumeration order — and the
+/// returned PARTITION routes the unprobed tail by FMP arm.
+/// Quantification domain: every order-sensitive transform feeding the
+/// cap, exercised end-to-end (HashMap `iter_nodes()` iteration →
+/// filter → collect → sort → truncate) × both FMP arms (answering /
+/// failing): two actors hold the same CAP+12 candidate CONTENT built
+/// in opposite insertion orders, with independently re-rolled hasher
+/// seeds (each `HashMap` draws its own `RandomState`). All candidates
+/// are `probed_generation = 0`, so the (recency, drv-hash) window key
+/// of `r[sched.dispatch.fod-substitute+6]` degenerates to pure
+/// drv-hash order — the cross-incarnation premise (recovery resets
+/// every generation to 0). Both partition cells and the probed head
+/// (the FMP request the store received, path list in window order)
+/// must be identical across the two actors AND equal to the
+/// drv-hash-sorted split, with the tail routed per arm:
+///
+/// - FMP answers (`fmp_fails=false`): tail → `probe_deferred` (held
+///   un-dispatched; the drain loop defers members), head → `checked`.
+/// - FMP fails (`fmp_fails=true`): tail → `checked` (fail-open
+///   dispatch parity with the stamped head; the deliberate
+///   I-139/I-140 store-down liveness cell), `probe_deferred` empty.
+///
+/// Pre-fix the truncate windowed raw hash order: the tail was 12 of
+/// 2060 hashes by hasher seed, so this assertion was a coin toss with
+/// ~zero pass probability — and pre-partition, the success-arm tail
+/// landed in the same `checked` set as probed members, which the
+/// drain loop read as probe evidence and dispatched from source.
+#[rstest::rstest]
+#[case::fmp_answers(false)]
+#[case::fmp_fails(true)]
 #[tokio::test]
-async fn over_cap_probe_window_is_invariant_to_enumeration_order() -> TestResult {
+async fn over_cap_probe_window_is_invariant_to_enumeration_order(
+    #[case] fmp_fails: bool,
+) -> TestResult {
     use std::sync::atomic::Ordering;
     let db = TestDb::new(&MIGRATOR).await;
     let n = crate::actor::DISPATCH_PROBE_BATCH_CAP + 12;
@@ -1807,28 +1832,59 @@ async fn over_cap_probe_window_is_invariant_to_enumeration_order() -> TestResult
         for tag in order {
             inject_probe_candidate(&mut actor, tag);
         }
-        store.faults.fail_find_missing.store(true, Ordering::SeqCst);
-        let checked = actor.batch_probe_cached_ready().await;
+        store
+            .faults
+            .fail_find_missing
+            .store(fmp_fails, Ordering::SeqCst);
+        let outcome = actor.batch_probe_cached_ready().await;
         let fmp = store.calls.fmp_requests.read().unwrap().clone();
         assert_eq!(fmp.len(), 1, "one batch FMP per dispatch pass");
-        let mut tail: Vec<String> = checked.iter().map(|h| h.to_string()).collect();
-        tail.sort();
-        observed.push((tail, fmp[0].0.clone()));
+        assert!(
+            outcome.checked.is_disjoint(&outcome.probe_deferred),
+            "the outcome is a partition: a hash lands in exactly one cell"
+        );
+        let mut checked: Vec<String> = outcome.checked.iter().map(|h| h.to_string()).collect();
+        checked.sort();
+        let mut deferred: Vec<String> = outcome
+            .probe_deferred
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+        deferred.sort();
+        observed.push((checked, deferred, fmp[0].0.clone()));
     }
 
     // Content-derived expectation (the windowing contract of
-    // r[sched.dispatch.fod-substitute+5]): head = first CAP candidates
-    // in drv-hash order, deferred tail = the rest.
+    // r[sched.dispatch.fod-substitute+6]): head = first CAP candidates
+    // in drv-hash order, unprobed tail = the rest, routed per FMP arm.
     let expected_tail: Vec<String> = tags[crate::actor::DISPATCH_PROBE_BATCH_CAP..].to_vec();
-    let expected_head_paths: Vec<String> = tags[..crate::actor::DISPATCH_PROBE_BATCH_CAP]
+    let expected_head: Vec<String> = tags[..crate::actor::DISPATCH_PROBE_BATCH_CAP].to_vec();
+    let expected_head_paths: Vec<String> = expected_head
         .iter()
         .map(|tag| test_store_path(&format!("{tag}-out")))
         .collect();
-    for (tail, head_paths) in &observed {
-        assert_eq!(
-            tail, &expected_tail,
-            "deferred tail must be the lex-greatest candidates"
-        );
+    for (checked, deferred, head_paths) in &observed {
+        if fmp_fails {
+            assert_eq!(
+                checked, &expected_tail,
+                "FMP-failure arm: the unprobed tail folds into `checked` so it \
+                 dispatches fail-open with the stamped head (I-139/I-140)"
+            );
+            assert!(
+                deferred.is_empty(),
+                "FMP-failure arm: nothing is held back behind a dead store"
+            );
+        } else {
+            assert_eq!(
+                deferred, &expected_tail,
+                "FMP-success arm: the unprobed tail is probe-deferred (held \
+                 un-dispatched), never returned as probe evidence"
+            );
+            assert_eq!(
+                checked, &expected_head,
+                "FMP-success arm: `checked` is exactly the probed head"
+            );
+        }
         assert_eq!(
             head_paths, &expected_head_paths,
             "probed head must be the lex-first CAP candidates, in window order"
@@ -1842,7 +1898,7 @@ async fn over_cap_probe_window_is_invariant_to_enumeration_order() -> TestResult
 }
 
 // r[verify sched.dispatch.probe-tenant-stable]
-// r[verify sched.dispatch.fod-substitute+5]
+// r[verify sched.dispatch.fod-substitute+6]
 /// The minted probe tenant of an over-cap batch is decided by the
 /// DETERMINISTIC window, never by where a tenant's node lands under
 /// hash order: with CAP+1 candidates, the min tenant's ONLY live
@@ -1854,6 +1910,10 @@ async fn over_cap_probe_window_is_invariant_to_enumeration_order() -> TestResult
 /// header the mock store received) — the round-3 two-candidate rstest
 /// pins the pure `.min()` fold but structurally cannot reach the cap
 /// arm; pre-fix, both of these cases were hash-order coin tosses.
+/// (+5→+6 reviewed: all candidates are `probed_generation = 0`, so the
+/// +6 (recency, drv-hash) window key degenerates to the pure drv-hash
+/// order this test's expectations encode — the cross-incarnation
+/// premise. The minted-tenant clause itself is unchanged.)
 #[rstest::rstest]
 #[case::min_tenant_in_the_tail(true)]
 #[case::min_tenant_in_the_head(false)]
@@ -1894,7 +1954,7 @@ async fn over_cap_window_probe_tenant_is_deterministic(#[case] min_on_last: bool
         .insert(b_hi);
 
     store.faults.fail_find_missing.store(true, Ordering::SeqCst);
-    let _checked = actor.batch_probe_cached_ready().await;
+    let _outcome = actor.batch_probe_cached_ready().await;
     let fmp = store.calls.fmp_requests.read().unwrap().clone();
     assert_eq!(fmp.len(), 1, "one batch FMP per dispatch pass");
     let expected = if min_on_last { t_hi } else { t_lo };
@@ -1903,6 +1963,280 @@ async fn over_cap_window_probe_tenant_is_deterministic(#[case] min_on_last: bool
         Some(expected.to_string().as_str()),
         "the head window's minted tenant must be a pure function of the sorted window \
          (min_on_last={min_on_last})"
+    );
+    Ok(())
+}
+
+/// Over-cap scenario with a deliberately ROUTABLE tail:
+/// `DISPATCH_PROBE_BATCH_CAP` aarch64 head nodes (no aarch64 executor
+/// is ever connected, so the head can never dispatch and the layer
+/// stays over-cap) plus three x86_64 nodes whose tags sort lex-LAST —
+/// with every node at `probed_generation = 0`, the (recency, drv-hash)
+/// window key puts exactly those three in the unprobed tail of the
+/// first window. The caller connects an idle warm x86 builder, so
+/// worker capacity for the tail exists the WHOLE time: whether the
+/// tail dispatches is decided purely by the probe partition, never by
+/// placement.
+///
+/// Returns `(nodes, tail_tags, tail_outs)`; the tail vectors are in
+/// drv-hash (= window) order.
+fn over_cap_routable_tail_nodes(
+    prefix: &str,
+) -> (
+    Vec<rio_proto::types::DerivationNode>,
+    Vec<String>,
+    Vec<String>,
+) {
+    let cap = crate::actor::DISPATCH_PROBE_BATCH_CAP;
+    let mut nodes = Vec::with_capacity(cap + 3);
+    for i in 0..cap {
+        let tag = format!("{prefix}-a{i:04}");
+        let mut n = make_test_node(&tag, "aarch64-linux");
+        n.expected_output_paths = vec![test_store_path(&format!("{tag}-out"))];
+        nodes.push(n);
+    }
+    let tail_tags: Vec<String> = (0..3).map(|i| format!("{prefix}-z{i}")).collect();
+    let tail_outs: Vec<String> = tail_tags
+        .iter()
+        .map(|t| test_store_path(&format!("{t}-out")))
+        .collect();
+    for tag in &tail_tags {
+        let mut n = make_test_node(tag, "x86_64-linux");
+        n.expected_output_paths = vec![test_store_path(&format!("{tag}-out"))];
+        nodes.push(n);
+    }
+    (nodes, tail_tags, tail_outs)
+}
+
+/// Drain every queued scheduler→worker message, panicking if any is a
+/// `WorkAssignment`. Non-assignment traffic (PrefetchHint etc.) is
+/// ignored — the assertion is "nothing was DISPATCHED", not "nothing
+/// was sent".
+fn assert_no_assignment_queued(
+    rx: &mut tokio::sync::mpsc::Receiver<rio_proto::types::SchedulerMessage>,
+    ctx: &str,
+) {
+    while let Ok(m) = rx.try_recv() {
+        if let Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) = m.msg {
+            panic!("{ctx}: unexpected WorkAssignment for {}", a.drv_path);
+        }
+    }
+}
+
+// r[verify sched.dispatch.fod-substitute+6]
+/// Consumer fate of the over-cap tail when the probe ANSWERS: held
+/// un-dispatched this pass, probed by the next same-generation window,
+/// and only then dispatched. Quantification domain: the full
+/// `dispatch_ready` pass (batch partition → drain loop → placement) on
+/// both sides of the probe-deferred conjunct — this test is the
+/// `probe_deferred ∧ capacity-available` row (an idle warm x86 builder
+/// is free the whole time; pre-fix the tail dispatched from source
+/// here), and `over_cap_tail_dispatches_fail_open_on_probe_error` is
+/// the `FMP-failed ∧ capacity-available` row where the same tail
+/// MUST dispatch.
+///
+/// Pass 1 (merge-inline): the batch FMP carries only the head's
+/// paths; the three routable tail nodes survive the pass still Ready
+/// with NO assignment — window membership alone is not a store
+/// verdict. Pass 2 (second merge, same generation): the window
+/// advances to exactly the unprobed tail, its all-missing verdict
+/// comes back, and only THEN does the tail dispatch. Pre-fix, pass 1
+/// assigned the tail from source and pass 2's probe never saw it
+/// (Assigned ∉ Ready) — the substitution verdict the rule mandates
+/// for every Ready IA derivation was forfeited permanently.
+#[tokio::test]
+async fn over_cap_tail_held_undispatched_until_probed() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let mut rx = connect_executor(&handle, "octh-w", "x86_64-linux").await?;
+    let (nodes, tail_tags, tail_outs) = over_cap_routable_tail_nodes("octh");
+    let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
+    barrier(&handle).await;
+
+    // Pass 1: the dispatch-time batch FMP is the LAST store request of
+    // the merge (merge-time check_available fires its own, smaller,
+    // chunked requests first; the inline dispatch pass runs at merge
+    // end). It must window the head only.
+    let n_pass1 = {
+        let fmp = store.calls.fmp_requests.read().unwrap();
+        let pass1 = &fmp.last().expect("merge ran the batch probe").0;
+        assert_eq!(
+            pass1.len(),
+            crate::actor::DISPATCH_PROBE_BATCH_CAP,
+            "pass-1 window is the capped head"
+        );
+        for out in &tail_outs {
+            assert!(
+                !pass1.contains(out),
+                "pass-1 window must not contain tail path {out}"
+            );
+        }
+        fmp.len()
+    };
+    // Consumer fate, pass 1: no assignment despite free x86 capacity,
+    // and the tail is still Ready (NOT Assigned) so the next window
+    // structurally can still probe it.
+    assert_no_assignment_queued(&mut rx, "pass 1 (tail unprobed)");
+    for tag in &tail_tags {
+        let st = handle
+            .debug_query_derivation(tag)
+            .await?
+            .expect("tail node exists");
+        assert_eq!(
+            st.status,
+            crate::state::DerivationStatus::Ready,
+            "unprobed tail node {tag} must survive pass 1 still Ready"
+        );
+    }
+
+    // Pass 2: a second merge runs another inline dispatch_ready in the
+    // SAME probe generation (no Tick in between). The decoy node is
+    // unprobeable (no expected output paths) and unroutable (aarch64),
+    // so the only probe candidates are the three unstamped tail nodes:
+    // the window advances to exactly the held tail.
+    let decoy = make_test_node("octh-decoy", "aarch64-linux");
+    let _ev2 = merge_dag(&handle, Uuid::new_v4(), vec![decoy], vec![], false).await?;
+    barrier(&handle).await;
+    {
+        let fmp = store.calls.fmp_requests.read().unwrap();
+        assert!(fmp.len() > n_pass1, "pass 2 must run another batch probe");
+        // Membership, not order: a ≤cap candidate set is a single
+        // window and is deliberately not sorted (every downstream
+        // consumer is order-insensitive there).
+        let mut pass2 = fmp.last().unwrap().0.clone();
+        pass2.sort();
+        assert_eq!(
+            pass2, tail_outs,
+            "pass-2 window must be exactly the held tail's paths"
+        );
+    }
+    // Verdict in hand (all missing) → the tail dispatches NOW.
+    let a = recv_assignment(&mut rx).await;
+    let tail_drv_paths: Vec<String> = tail_tags.iter().map(|t| test_drv_path(t)).collect();
+    assert!(
+        tail_drv_paths.contains(&a.drv_path),
+        "post-probe dispatch must be a tail node, got {}",
+        a.drv_path
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.fod-substitute+6]
+/// Consumer fate of the over-cap tail when the probe FAILS: the tail
+/// folds into `checked` and dispatches fail-open THIS pass — the
+/// other side of the probe-deferred conjunct (same layer shape and
+/// same free capacity as `over_cap_tail_held_undispatched_until_probed`,
+/// only the FMP arm flipped). DELIBERATE store-down asymmetry
+/// (I-139/I-140): with no answering store there is no verdict to wait
+/// for, and holding the tail would wedge it behind the dead store for
+/// as long as the outage lasts — liveness wins over the substitution
+/// opportunity. Pinned as a documented cell so the fold-in reads as
+/// contract, not as a re-discoverable conflation bug.
+#[tokio::test]
+async fn over_cap_tail_dispatches_fail_open_on_probe_error() -> TestResult {
+    use std::sync::atomic::Ordering;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let mut rx = connect_executor(&handle, "octf-w", "x86_64-linux").await?;
+    store.faults.fail_find_missing.store(true, Ordering::SeqCst);
+    let (nodes, tail_tags, _tail_outs) = over_cap_routable_tail_nodes("octf");
+    let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
+    barrier(&handle).await;
+
+    // Pass 1 (merge-inline, FMP failing): the unprobed tail dispatches
+    // from source immediately — fail-open parity with the stamped
+    // head. Only the three tail nodes are x86, so the first (and any)
+    // assignment must be one of them.
+    let a = recv_assignment(&mut rx).await;
+    let tail_drv_paths: Vec<String> = tail_tags.iter().map(|t| test_drv_path(t)).collect();
+    assert!(
+        tail_drv_paths.contains(&a.drv_path),
+        "store-down tail must dispatch fail-open in the same pass, got {}",
+        a.drv_path
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.fod-substitute+6]
+/// The held tail is NOT starvable by generation churn: `handle_tick`
+/// advances `probe_generation` (re-opening every Ready node), and a
+/// tick-driven pass orders candidates least-recently-probed first, so
+/// the never-probed tail goes to the FRONT of the new window even
+/// though the still-Ready once-probed head cohort would refill it
+/// under pure drv-hash order. Quantification domain: the cross-tick
+/// window schedule with a layer pinned over-cap by an undispatchable
+/// head (no aarch64 pool) — the shape where "wait for the layer to
+/// drain" never terminates. A recency-blind window would re-probe the
+/// lex-first head every tick and defer the routable tail forever;
+/// the rotation bounds the wait to ⌈layer/cap⌉ windows.
+#[tokio::test]
+async fn over_cap_probe_window_rotates_to_unprobed_tail_across_ticks() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let mut rx = connect_executor(&handle, "octr-w", "x86_64-linux").await?;
+    let (nodes, tail_tags, tail_outs) = over_cap_routable_tail_nodes("octr");
+    let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
+    barrier(&handle).await;
+    assert_no_assignment_queued(&mut rx, "pass 1 (tail unprobed)");
+    let n_pass1 = store.calls.fmp_requests.read().unwrap().len();
+
+    // Tick-driven pass 2: a steady-state heartbeat (idle→idle, no
+    // became-idle edge) sets dispatch_dirty; the chained Tick advances
+    // the probe generation and drains the flag.
+    send_heartbeat(&handle, "octr-w", "x86_64-linux").await?;
+    barrier(&handle).await;
+
+    let pass2 = {
+        let fmp = store.calls.fmp_requests.read().unwrap();
+        assert!(fmp.len() > n_pass1, "tick must run another batch probe");
+        fmp[n_pass1].0.clone()
+    };
+    assert_eq!(
+        pass2.len(),
+        crate::actor::DISPATCH_PROBE_BATCH_CAP,
+        "the layer is still over-cap, so the tick window is full"
+    );
+    assert_eq!(
+        &pass2[..3],
+        &tail_outs[..],
+        "tick-driven window must lead with the never-probed tail (recency \
+         order), not re-probe the lex-first head"
+    );
+    // Consumer fate: probed (all missing) → dispatches this pass.
+    let a = recv_assignment(&mut rx).await;
+    let tail_drv_paths: Vec<String> = tail_tags.iter().map(|t| test_drv_path(t)).collect();
+    assert!(
+        tail_drv_paths.contains(&a.drv_path),
+        "rotated-in tail must dispatch after its probe, got {}",
+        a.drv_path
+    );
+    Ok(())
+}
+
+// r[verify sched.dispatch.fod-substitute+6]
+/// ≤cap negative control: the whole candidate set is one window —
+/// every member probed and `checked`, nothing probe-deferred. The
+/// hold-for-probe machinery is over-cap-only; sub-cap layers (the
+/// overwhelming steady state) keep the pre-existing single-window
+/// behavior bit-for-bit.
+#[tokio::test]
+async fn sub_cap_probe_partition_has_empty_deferred() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, mut actor, _task) = probe_window_actor(db.pool.clone()).await?;
+    let tags = ["scpc-0", "scpc-1", "scpc-2"];
+    for tag in tags {
+        inject_probe_candidate(&mut actor, tag);
+    }
+    let outcome = actor.batch_probe_cached_ready().await;
+    let fmp = store.calls.fmp_requests.read().unwrap();
+    assert_eq!(fmp.len(), 1, "one batch FMP");
+    let mut checked: Vec<String> = outcome.checked.iter().map(|h| h.to_string()).collect();
+    checked.sort();
+    assert_eq!(
+        checked,
+        vec!["scpc-0", "scpc-1", "scpc-2"],
+        "every sub-cap candidate is probed and checked"
+    );
+    assert!(
+        outcome.probe_deferred.is_empty(),
+        "a sub-cap layer must have no probe-deferred tail"
     );
     Ok(())
 }
@@ -3913,14 +4247,18 @@ async fn rollback_assignment_persists_ready_to_pg() -> TestResult {
 // I-139/I-140: batch-probe truncated tail must NOT hit per-drv FMP fallback
 // ---------------------------------------------------------------------------
 
-// r[verify sched.dispatch.fod-substitute+5]
+// r[verify sched.dispatch.fod-substitute+6]
 /// With > `DISPATCH_PROBE_BATCH_CAP` Ready leaves and the batch RPC
 /// failing-open, the truncated tail must NOT fall through to the
 /// per-drv `ready_check_or_spawn` (one inline-awaited FMP each =
 /// O(N) sequential 30s timeouts in the actor). Pre-fix:
 /// `find_missing_calls == 1 + tail` (tail × 30s ≈ 24h stall with an
-/// unreachable store). Post-fix: 1 batch + 0 per-drv; tail dispatches
-/// fail-open and is batch-probed next pass.
+/// unreachable store). Post-fix: 1 batch + 0 per-drv; on this
+/// FMP-failure arm the tail folds into `checked` and dispatches
+/// fail-open (the +6 store-down liveness cell — consumer fate with a
+/// live worker pinned by `over_cap_tail_dispatches_fail_open_on_probe_error`).
+/// No worker is connected here, so the per-drv-call count is the
+/// whole observable.
 #[tokio::test]
 async fn batch_probe_tail_never_per_drv_fmp() -> TestResult {
     use std::sync::atomic::Ordering;

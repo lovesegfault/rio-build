@@ -236,9 +236,17 @@ pub(crate) const BECAME_IDLE_INLINE_CAP: u32 = 4;
 /// Max Ready candidates per dispatch-time `FindMissingPaths` batch.
 /// Keeps the FMP RPC in the actor's ~100ms budget for very wide DAG
 /// layers — dispatch-time runs under `grpc_timeout` (30s), not
-/// [`MERGE_FMP_TIMEOUT`]. The truncated tail is picked up on the next
-/// inline `dispatch_ready` (same `probe_generation`, so the window
-/// advances rather than re-probing the head).
+/// [`MERGE_FMP_TIMEOUT`]. When the probe ANSWERS, the truncated tail
+/// is held un-dispatched for the pass (no verdict yet — dispatching
+/// would forfeit its substitution opportunity) and picked up by a
+/// later window: the next inline `dispatch_ready` (same
+/// `probe_generation`) probes exactly the unstamped remainder, and
+/// tick-driven passes (generation advanced) order candidates
+/// least-recently-probed first, rotating the window so any candidate
+/// waits at most ⌈layer/cap⌉ windows. When the probe FAILS (store
+/// unreachable/timeout), the tail dispatches fail-open alongside the
+/// stamped head — store-down liveness over substitution
+/// (I-139/I-140). See `BatchProbeOutcome` in dispatch.rs.
 pub(crate) const DISPATCH_PROBE_BATCH_CAP: usize = 2048;
 
 /// Entry in [`DagActor::authoritative_binding`]: kube-authoritative

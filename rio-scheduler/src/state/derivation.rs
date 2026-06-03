@@ -884,7 +884,12 @@ pub struct DerivationState {
     /// time `FindMissingPaths` probe for this node. The batch pre-pass
     /// skips nodes whose `probed_generation == probe_generation` so the
     /// `truncate(DISPATCH_PROBE_BATCH_CAP)` window advances across
-    /// inline `dispatch_ready` calls instead of re-probing the head.
+    /// inline `dispatch_ready` calls instead of re-probing the head,
+    /// and sorts candidates by `(probed_generation, drv_hash)` so
+    /// tick-driven passes (which re-open every Ready node) probe the
+    /// least-recently-probed first — the over-cap window ROTATES
+    /// across ticks instead of pinning the lex-first head, bounding
+    /// any candidate's wait to ⌈layer/cap⌉ windows.
     /// `probe_generation` advances once per `handle_tick` (1/s).
     pub probed_generation: u64,
     /// One-shot suppression for the detached-substitute lane: set on

@@ -996,7 +996,7 @@ can be GC'd before the failover, and without the durable breadcrumb the
 surviving produced siblings would launder the clear and re-arm exactly that
 doomed dispatch.
 
-#r("sched.dispatch.fod-substitute+5")[
+#r("sched.dispatch.fod-substitute+6")[
   The dispatch-time store-check (`batch_probe_cached_ready` and the
   per-derivation `ready_check_or_spawn` fallback) MUST probe upstream
   substitutability for every Ready input-addressed derivation, not just FODs
@@ -1008,10 +1008,22 @@ doomed dispatch.
   opportunity. Per-tick Ready count is bounded by DAG width (the current
   eligible layer), not DAG size; a layer wider than `DISPATCH_PROBE_BATCH_CAP`
   (the warm-restart shape of a large closure) MUST be windowed
-  deterministically --- the candidate set sorted by drv hash before the cap,
-  the head probed and generation-stamped, the tail deferred to the next pass
+  deterministically --- the candidate set ordered least-recently-probed first
+  (probe-generation stamp, then drv hash as the total tie-break) before the
+  cap, the head probed and generation-stamped, the unprobed tail HELD
+  un-dispatched for the pass (deferred Ready; window membership alone is not
+  a store verdict and MUST NOT route a derivation to a from-source dispatch)
   --- so window membership is a pure function of DAG state, never of
-  hash-collection enumeration order. Because the actor has no per-derivation JWT to
+  hash-collection enumeration order, and a held candidate's verdict is only
+  postponed, never skipped: the recency ordering rotates the window across
+  passes, so the wait is bounded by ⌈layer/cap⌉ probe windows even when the
+  rest of the layer never drains. When the batch probe itself fails (store
+  unreachable or timed out) the unprobed tail MUST dispatch fail-open
+  alongside the stamped head: with no answering store there is no verdict to
+  wait for, and holding Ready work behind a dead store would convert the
+  substitution opportunity into a liveness wedge --- the same
+  wide-layer-times-unreachable-store stall the cap exists to bound.
+  Because the actor has no per-derivation JWT to
   forward at dispatch time, the scheduler MUST mint an `x-rio-service-token`
   (`ServiceClaims { caller: "rio-scheduler" }`) and set `x-rio-probe-tenant-id`
   to the deterministically-selected probe tenant

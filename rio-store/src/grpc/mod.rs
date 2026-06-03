@@ -461,7 +461,11 @@ impl StoreServiceImpl {
         {
             return Some(jwt);
         }
-        // r[impl sched.dispatch.fod-substitute+5]
+        // r[impl sched.dispatch.fod-substitute+6]
+        // (+5→+6 reviewed: the service-token gating clause this site
+        // implements — probe-tenant header honoured only behind a
+        // valid allowlisted service token — is unchanged by the +6
+        // over-cap windowing correction.)
         if self.verified_service_caller(request).is_some()
             && let Some(hdr) = request
                 .metadata()
@@ -873,10 +877,12 @@ mod tests {
         assert_eq!(status.message(), "storage operation failed");
     }
 
-    // r[verify sched.dispatch.fod-substitute+5]
+    // r[verify sched.dispatch.fod-substitute+6]
     /// `x-rio-probe-tenant-id` is honoured ONLY behind a valid
     /// allowlisted service-token. An unauthenticated request (or one
     /// from a non-allowlisted caller) cannot self-select a tenant.
+    /// (+5→+6 reviewed: this clause is unchanged by the +6 over-cap
+    /// windowing correction.)
     #[tokio::test]
     async fn request_tenant_id_probe_header_gated_on_service_token() {
         use rio_auth::hmac::{HmacSigner, HmacVerifier, ServiceClaims};
