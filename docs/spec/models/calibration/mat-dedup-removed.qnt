@@ -87,6 +87,7 @@ module matCalibDedupRemoved {
     ffJustifiedAll' = ffJustifiedAll, fsJustifiedAll' = fsJustifiedAll,
     fsReportSoundAll' = fsReportSoundAll, covAtResolveAll' = covAtResolveAll,
     covLiveOnlyAll' = covLiveOnlyAll,
+    chargedAfterCancel' = chargedAfterCancel,
   }
 
   action calibStep = {

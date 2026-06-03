@@ -73,6 +73,7 @@ module matCalibCe17SkipCoverage {
     ffJustifiedAll' = ffJustifiedAll, fsJustifiedAll' = fsJustifiedAll,
     fsReportSoundAll' = fsReportSoundAll,
     creationResolvableAll' = creationResolvableAll,
+    chargedAfterCancel' = chargedAfterCancel,
   }
 
   action calibStep = {

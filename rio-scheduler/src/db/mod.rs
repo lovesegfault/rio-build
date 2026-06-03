@@ -455,7 +455,7 @@ impl FencedOutcome {
 
 /// The fenced-transaction capability: holding a [`FencedTx`] proves
 /// the claims-floor check ran on this transaction's own connection at
-/// construction time ([`SchedulerDb::begin_fenced`]). It is the ONLY
+/// construction time (`SchedulerDb::begin_fenced`). It is the ONLY
 /// way to open a decision-state write transaction — the floor helpers
 /// are private to `db`, so an open-coded actor-side floor compare no
 /// longer compiles.
@@ -469,7 +469,7 @@ pub struct FencedTx {
     serving_generation: i64,
 }
 
-/// Result of [`SchedulerDb::begin_fenced`]: the fence either admitted
+/// Result of `SchedulerDb::begin_fenced`: the fence either admitted
 /// the transaction or refused it at the door (nothing written, the
 /// connection returned).
 pub enum FencedBegin {
@@ -481,7 +481,7 @@ pub enum FencedBegin {
     Fenced { floor: i64 },
 }
 
-/// Outcome of [`FencedTx::commit_refenced`] — the pre-commit floor
+/// Outcome of `FencedTx::commit_refenced` — the pre-commit floor
 /// re-check used by settlement-class writers whose transactions span
 /// long reads (the merge settlement pattern, encapsulated).
 pub enum FencedCommit {
@@ -582,7 +582,7 @@ impl FencedTx {
 /// (no assignments, no claims): nothing to fence against.
 ///
 /// PRIVATE to `db`: the only legitimate consumers are
-/// [`SchedulerDb::begin_fenced`] / [`FencedTx::commit_refenced`] and
+/// `SchedulerDb::begin_fenced` / `FencedTx::commit_refenced` and
 /// the in-module fenced writers. Actor code holds a [`FencedTx`]
 /// instead of comparing floors.
 async fn claims_floor(conn: &mut PgConnection) -> Result<Option<i64>, sqlx::Error> {

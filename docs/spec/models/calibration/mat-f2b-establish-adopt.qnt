@@ -82,6 +82,7 @@ module matCalibF2bEstablishAdopt {
     ffJustifiedAll' = ffJustifiedAll, fsJustifiedAll' = fsJustifiedAll,
     fsReportSoundAll' = fsReportSoundAll, covLiveOnlyAll' = covLiveOnlyAll,
     creationResolvableAll' = creationResolvableAll,
+    chargedAfterCancel' = chargedAfterCancel,
   }
 
   action calibStep = {

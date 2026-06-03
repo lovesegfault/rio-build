@@ -124,6 +124,7 @@ module matCalibF3pUnsoundReport {
     unobChargeBacked' = unobChargeBacked,
     tenureUnchanged,
     creationResolvableAll' = creationResolvableAll,
+    chargedAfterCancel' = chargedAfterCancel,
   }
 
   action calibStep = {
