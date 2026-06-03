@@ -270,6 +270,22 @@ AdminService uses) with caller allowlist `["rio-store"]`; the store mints
 per-request 60s tokens from the serviceHmac key file helm already mounts on
 both. T-6.2's wire test uses exactly this credential.
 
+*Obligation-1 threat-model correction (merged_bug_115, bughunt fix wave
+2026-06-03).* The instance binding's earlier narration overstated what a
+fleet-shared symmetric key can attest: ANY service-key holder can mint a
+`ServiceClaims` carrying ANY `instance` that verifies (pinned by rio-auth's
+`any_key_holder_mints_any_instance` negative test). The binding's honest
+deliverables are (a) cross-service narrowing (instance-less gateway-style
+tokens no longer authorize materialization work), (b) composite-identity
+INJECTION detection (a request asserting an instance its signed claims do
+not carry is rejected — the misconfiguration class), and (c) forgery
+resistance against non-key-holders — explicitly NOT intra-fleet
+attestation. **Key-trust-domain review convention:** any future consumer
+that derives DESTRUCTIVE attribution from `ServiceClaims.instance` must
+first move the mint to a per-replica trust domain; the scheduler's
+`credential_for` family chokepoint is the single landing site for that
+binding. `ServiceClaims::instance`'s rustdoc carries the same scoped model.
+
 ### Discovered-late items (the latent-failure class; all fixed in-phase)
 
 | Item | Discovery | Fix |

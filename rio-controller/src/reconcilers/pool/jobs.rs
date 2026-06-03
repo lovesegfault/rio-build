@@ -654,7 +654,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         to_spawn_intents
     };
 
-    // r[impl sec.executor.identity-token+2]
+    // r[impl sec.executor.identity-token+3]
     // Mint per-intent `RIO_EXECUTOR_TOKEN`s on a controller-only
     // surface — `SpawnIntent` is plain data (dashboard/CLI also read
     // it via `GetSpawnIntents`), so the credential lives here, not on
@@ -1108,7 +1108,7 @@ pub(super) fn build_job(
             priority_bucket(intent.cores)
         ));
     }
-    // r[impl sec.executor.identity-token+2]
+    // r[impl sec.executor.identity-token+3]
     // Pass the scheduler-signed token (from `MintExecutorTokens`, NOT
     // `SpawnIntent`) through verbatim so the builder presents it on
     // `BuildExecution` / `Heartbeat`. Per-intent (not per-Pool), so

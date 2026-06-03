@@ -1254,4 +1254,55 @@ mod tests {
              instead of burning its budget against the pinned standby"
         );
     }
+
+    /// bug_362's client half (A2 rider): the display-only progress
+    /// relay rides the same UNAVAILABLE-abandon discipline. The
+    /// scheduler-side fix gives the standby an `ensure_leader` answer
+    /// on `ReportMaterializationProgress`; this pins the client
+    /// reaction — an UNAVAILABLE progress ack abandons the pinned
+    /// connection so the NEXT progress tick (and every weightier RPC
+    /// sharing the transport) redials toward the leader. Pre-fix the
+    /// standby ACKed progress (Ok), the connection stayed pinned, and
+    /// the client never learned it was talking to a wall.
+    // r[verify store.materialize.executor+3]
+    #[tokio::test]
+    async fn progress_abandons_connection_pinned_to_standby_replica() {
+        let standby_addr = spawn_executor_service(StandbyExecutorService).await;
+        let leader_addr = spawn_executor_service(LeaderExecutorService).await;
+        let (proxy_addr, backend) = spawn_switchable_proxy(standby_addr).await;
+
+        let mut transport =
+            SchedulerTransport::connect_lazy(&proxy_addr.to_string(), None, "store-replica-0")
+                .unwrap();
+
+        // Pin to the standby: the progress tick answers UNAVAILABLE
+        // (the scheduler-side 362 fix) and the transport abandons.
+        let req = ReportMaterializationProgressRequest {
+            exec_id: "exec-rollout-1".into(),
+            upstream_uri: "https://cache.example".into(),
+            bytes_done: 1,
+            bytes_expected: 2,
+        };
+        let first = transport.report_progress(req.clone()).await;
+        assert!(
+            first.is_err(),
+            "a standby must answer the progress tick UNAVAILABLE, not ack it"
+        );
+
+        // The rollout completes; the abandoned connection redials and
+        // the next tick reaches the leader.
+        *backend.lock().unwrap() = leader_addr;
+        let mut acked = false;
+        for _ in 0..5 {
+            if transport.report_progress(req.clone()).await.is_ok() {
+                acked = true;
+                break;
+            }
+        }
+        assert!(
+            acked,
+            "the progress relay must converge on the leader after a rollout \
+             (abandon-on-UNAVAILABLE redial)"
+        );
+    }
 }

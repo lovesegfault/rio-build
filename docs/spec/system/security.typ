@@ -142,30 +142,28 @@
     enhancement could add tenant-scoped read tokens.
 ]
 
-#r("sec.executor.identity-token+2")[
+#r("sec.executor.identity-token+3")[
   The scheduler signs *executor-identity tokens* (`ExecutorClaims { intent_id,
   kind, expiry_unix }`, same HMAC envelope as `AssignmentClaims`, same key) per
   `SpawnIntent`. The controller passes the token through verbatim as the
   `RIO_EXECUTOR_TOKEN` pod env var. Builders MUST present it as
-  `x-rio-executor-token` metadata on `BuildExecution` open and every
-  `Heartbeat`. When the HMAC key is configured, the scheduler MUST reject
-  ExecutorService calls without a valid token, MUST reject a heartbeat whose
-  body `intent_id` OR `kind` differs from the token's, MUST reject a heartbeat
-  whose token-attested `intent_id` differs from the target executor's stored
-  `auth_intent` (set at connect, immutable --- prevents a compromised pod A
-  heartbeating as B with A's own intent), and MUST reject a `BuildExecution`
-  reconnect whose token `intent_id` differs from the executor's stored
-  `auth_intent` or whose existing stream is still live. The `BuildExecution`
-  handler MUST learn the actor's accept/reject decision before spawning the
-  stream-reader task (a body-supplied `executor_id` is otherwise unbound ---
-  `ExecutorClaims` cannot carry it because the scheduler signs before the
-  controller picks a pod name). This binds a stream to the intent AND kind its
-  pod was spawned for: a compromised builder holds a token for ITS OWN
-  intent+kind only and cannot hijack another executor's `stream_tx` (and
-  thereby its `WorkAssignment.assignment_token`), forge `ProcessCompletion` for
-  another executor's build, mutate another executor's heartbeat-driven state,
-  nor self-promote `kind` to receive work routed past its CiliumNetworkPolicy
-  airgap boundary.
+  `x-rio-executor-token` metadata (or the body field where the unary carries
+  one) on every `ExecutorService` unary. The credential FAMILY MUST be
+  selected by the PAYLOAD KIND before any verification, at one chokepoint:
+  build payloads use the executor-identity family --- when the HMAC key is
+  configured the scheduler MUST reject build-family calls without a valid
+  token, MUST bind `PullAssignment` to the token's `intent_id` AND `kind`,
+  and MUST verify the same identity before a `ReportOutcome` consumes an
+  attempt --- while materialization payloads (claim, listing, outcome,
+  progress) use the store-service family: a token that verifies as an
+  executor credential MUST be rejected for them on every carrier, and the
+  store-service gate MUST apply even when no executor key is configured
+  (family selection never consults key presence; the half-configured
+  deployment stays closed). This binds each attempt to the intent AND kind
+  its pod was spawned for: a compromised builder holds a token for ITS OWN
+  intent+kind only and cannot pull or report another pod's work, consume a
+  materialization attempt, nor self-promote `kind` to receive work routed
+  past its CiliumNetworkPolicy airgap boundary.
 ]
 
 #info(title: [Service-token bypass (`r[sec.authz.service-token]`)])[

@@ -154,7 +154,7 @@ pub(super) trait PullTransport {
 fn authed_request<T>(req: T, executor_token: &str) -> tonic::Request<T> {
     let mut request = tonic::Request::new(req);
     if !executor_token.is_empty() {
-        // r[impl sec.executor.identity-token+2]
+        // r[impl sec.executor.identity-token+3]
         let _ = rio_common::grpc::inject_metadata(
             request.metadata_mut(),
             &[(rio_proto::EXECUTOR_TOKEN_HEADER, executor_token)],
@@ -923,7 +923,7 @@ mod tests {
     /// The production transport presents the executor identity token as
     /// call metadata on both unaries (the same header the stream open
     /// and heartbeats use); dev mode (empty token) sends no header.
-    // r[verify sec.executor.identity-token+2]
+    // r[verify sec.executor.identity-token+3]
     #[test]
     fn authed_request_injects_the_identity_header() {
         let req = authed_request(PullAssignmentRequest::default(), "tok-abc");

@@ -6,7 +6,7 @@
 use super::*;
 use rio_proto::{ExecutorServiceClient, ExecutorServiceServer};
 
-// r[verify sec.executor.identity-token+2]
+// r[verify sec.executor.identity-token+3]
 /// With the executor HMAC key configured: `ReportOutcome` without the
 /// `x-rio-executor-token` header is rejected `Unauthenticated`; with a
 /// valid header it passes the identity gate and reaches the actor
@@ -1411,7 +1411,7 @@ async fn call_mat_surface(
 }
 
 // r[verify sched.materialize.job+2]
-// r[verify sec.executor.identity-token+2]
+// r[verify sec.executor.identity-token+3]
 /// T-1.9 / PD-B18: the materialization-surface authentication sweep —
 /// the cross-surface structural pin that catches the NEXT handler
 /// added or completed without the store-credential gate (the
@@ -1489,6 +1489,236 @@ async fn materialization_surface_rejects_unauthenticated_and_executor_credential
                     "{surface:?}: full dev mode must stay open (the uniform exception), got {e:?}"
                 )
             });
+    }
+    Ok(())
+}
+
+// r[verify sec.executor.identity-token+3]
+/// merged_bug_084 (A2): the credential FAMILY is selected by the
+/// payload kind BEFORE verification. The half-configured deployment
+/// {hmac: None, service: Some} must still gate materialization
+/// reports: pre-fix the store gate was nested under require_executor's
+/// Err arm, and with no executor key configured require_executor
+/// answered Ok(None) — a credential-less materialization outcome was
+/// consumed with auth_intent=None.
+#[tokio::test]
+async fn half_configured_deployment_still_gates_materialization_reports() -> anyhow::Result<()> {
+    use rio_auth::hmac::HmacKey;
+    use rio_proto::ExecutorService;
+    let (_db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    let service_key = std::sync::Arc::new(HmacKey::from_key(
+        b"service-key-32-bytes-long-here!!".to_vec(),
+    ));
+    grpc.hmac_key = None; // no executor key family
+    grpc.service_verifier = Some(std::sync::Arc::clone(&service_key));
+
+    // Materialization outcome, NO credential on any carrier.
+    let req = Request::new(rio_proto::types::ReportOutcomeRequest {
+        exec_id: uuid::Uuid::now_v7().to_string(),
+        report: None,
+        materialization_outcome: Some(mat_success_outcome()),
+    });
+    let err = grpc
+        .report_outcome(req)
+        .await
+        .expect_err("a credential-less materialization report must be rejected");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unauthenticated,
+        "the store-service family gates the report even with no executor key configured: {err:?}"
+    );
+
+    // The build shape stays open in the same half-config (no executor
+    // key = dev-mode build identity, byte-identical to the as-built
+    // posture).
+    let req = Request::new(rio_proto::types::ReportOutcomeRequest {
+        exec_id: uuid::Uuid::now_v7().to_string(),
+        report: Some(rio_proto::types::CompletionReport::default()),
+        materialization_outcome: None,
+    });
+    grpc.report_outcome(req)
+        .await
+        .expect("the build report family is unaffected by the service verifier");
+    Ok(())
+}
+
+// r[verify sched.grpc.fence-retryable]
+/// bug_362 (A2): EVERY ExecutorService method runs the standby gate.
+/// Pre-fix report_materialization_progress had no ensure_leader (and no
+/// check_actor_alive): a standby replica ACKed progress, defeating the
+/// store client's UNAVAILABLE-based leader failover.
+#[tokio::test]
+async fn report_materialization_progress_rejected_on_standby() -> anyhow::Result<()> {
+    use rio_proto::ExecutorService;
+    let (_db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    grpc.is_leader = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let err = grpc
+        .report_materialization_progress(Request::new(
+            rio_proto::types::ReportMaterializationProgressRequest {
+                exec_id: uuid::Uuid::now_v7().to_string(),
+                upstream_uri: String::new(),
+                bytes_done: 1,
+                bytes_expected: 2,
+            },
+        ))
+        .await
+        .expect_err("standby must reject progress reports");
+    assert_eq!(err.code(), tonic::Code::Unavailable);
+    Ok(())
+}
+
+// r[verify sched.grpc.fence-retryable]
+/// The descriptor-driven standby sweep (bug_362's structural net):
+/// every method of `rio.types.ExecutorService` — enumerated from the
+/// compiled FILE_DESCRIPTOR_SET, so the NEXT RPC cannot be forgotten —
+/// must answer UNAVAILABLE on a standby replica. A method added to the
+/// proto without an arm here fails the match below.
+#[tokio::test]
+async fn every_executor_service_method_is_standby_gated() -> anyhow::Result<()> {
+    use prost::Message;
+    use rio_proto::ExecutorService;
+    let fds = prost_types::FileDescriptorSet::decode(rio_proto::FILE_DESCRIPTOR_SET)?;
+    let methods: Vec<String> = fds
+        .file
+        .iter()
+        .flat_map(|f| f.service.iter())
+        .filter(|s| s.name() == "ExecutorService")
+        .flat_map(|s| s.method.iter().map(|m| m.name().to_string()))
+        .collect();
+    assert!(
+        !methods.is_empty(),
+        "ExecutorService missing from the descriptor set"
+    );
+
+    let (_db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    grpc.is_leader = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    for method in &methods {
+        let code = match method.as_str() {
+            "PullAssignment" => grpc
+                .pull_assignment(Request::new(rio_proto::types::PullAssignmentRequest {
+                    executor_token: String::new(),
+                    intent_id: "drv-standby".into(),
+                    kind: rio_proto::types::AttemptKind::Build.into(),
+                    executor_instance: String::new(),
+                    resume_exec_id: String::new(),
+                }))
+                .await
+                .expect_err("standby")
+                .code(),
+            "ReportOutcome" => grpc
+                .report_outcome(Request::new(rio_proto::types::ReportOutcomeRequest {
+                    exec_id: uuid::Uuid::now_v7().to_string(),
+                    report: Some(rio_proto::types::CompletionReport::default()),
+                    materialization_outcome: None,
+                }))
+                .await
+                .expect_err("standby")
+                .code(),
+            "ListMaterializationJobs" => grpc
+                .list_materialization_jobs(Request::new(
+                    rio_proto::types::ListMaterializationJobsRequest {
+                        service_token: String::new(),
+                        limit: 1,
+                    },
+                ))
+                .await
+                .expect_err("standby")
+                .code(),
+            "ReportMaterializationProgress" => grpc
+                .report_materialization_progress(Request::new(
+                    rio_proto::types::ReportMaterializationProgressRequest {
+                        exec_id: uuid::Uuid::now_v7().to_string(),
+                        upstream_uri: String::new(),
+                        bytes_done: 0,
+                        bytes_expected: 0,
+                    },
+                ))
+                .await
+                .expect_err("standby")
+                .code(),
+            other => panic!(
+                "ExecutorService method {other:?} has no standby-sweep arm — add the arm \
+                 AND the executor_prologue to its handler"
+            ),
+        };
+        assert_eq!(
+            code,
+            tonic::Code::Unavailable,
+            "method {method} must answer UNAVAILABLE on standby"
+        );
+    }
+    Ok(())
+}
+
+// r[verify sec.executor.identity-token+3]
+/// merged_bug_084's exhaustive matrix: every {executor key} ×
+/// {service verifier} × {payload kind} cell of the credential-less
+/// `ReportOutcome`, through the `credential_for` chokepoint. The
+/// family is selected by the PAYLOAD — never by which keys happen to
+/// be configured — so the materialization column is gated whenever ANY
+/// key family exists, and the build column keeps its as-built
+/// dev/enforced split.
+#[tokio::test]
+async fn report_outcome_credential_matrix() -> anyhow::Result<()> {
+    use rio_auth::hmac::HmacKey;
+    use rio_proto::ExecutorService;
+    let executor_key = || {
+        std::sync::Arc::new(HmacKey::from_key(
+            b"executor-key-32-bytes-long!!!!!!".to_vec(),
+        ))
+    };
+    let service_key = || {
+        std::sync::Arc::new(HmacKey::from_key(
+            b"service-key-32-bytes-long-here!!".to_vec(),
+        ))
+    };
+    // (hmac?, service?, mat-payload?, expected code; None = Ok)
+    let cells: Vec<(bool, bool, bool, Option<tonic::Code>)> = vec![
+        // Full dev mode: both payloads open (the flag gate / actor
+        // ack-ignore handles unknown execs).
+        (false, false, false, None),
+        (false, false, true, None),
+        // Executor-only config: build enforced; materialization closed
+        // (no acceptable credential family exists for it).
+        (true, false, false, Some(tonic::Code::Unauthenticated)),
+        (true, false, true, Some(tonic::Code::Unauthenticated)),
+        // Service-only half-config (THE 084 red cell): build stays
+        // dev-open; credential-less materialization is rejected.
+        (false, true, false, None),
+        (false, true, true, Some(tonic::Code::Unauthenticated)),
+        // Both configured: both columns enforced.
+        (true, true, false, Some(tonic::Code::Unauthenticated)),
+        (true, true, true, Some(tonic::Code::Unauthenticated)),
+    ];
+    for (hmac, service, mat, want) in cells {
+        let (_db, mut grpc, _handle, _task) = setup_grpc().await;
+        grpc.hmac_key = hmac.then(executor_key);
+        grpc.service_verifier = service.then(service_key);
+        let req = Request::new(rio_proto::types::ReportOutcomeRequest {
+            exec_id: uuid::Uuid::now_v7().to_string(),
+            report: (!mat).then(rio_proto::types::CompletionReport::default),
+            materialization_outcome: mat.then(mat_success_outcome),
+        });
+        let got = grpc.report_outcome(req).await;
+        match want {
+            None => {
+                got.unwrap_or_else(|e| {
+                    panic!("cell (hmac={hmac}, service={service}, mat={mat}) must be open: {e:?}")
+                });
+            }
+            Some(code) => {
+                let err = got.expect_err(&format!(
+                    "cell (hmac={hmac}, service={service}, mat={mat}) must be rejected"
+                ));
+                assert_eq!(
+                    err.code(),
+                    code,
+                    "cell (hmac={hmac}, service={service}, mat={mat}): {err:?}"
+                );
+            }
+        }
     }
     Ok(())
 }

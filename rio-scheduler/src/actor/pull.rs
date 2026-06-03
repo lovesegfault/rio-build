@@ -260,7 +260,7 @@ impl DagActor {
 
         match decision {
             PullDecision::RejectToken => {
-                // r[impl sec.executor.identity-token+2]
+                // r[impl sec.executor.identity-token+3]
                 warn!(
                     intent_id = %intent_id,
                     "pull rejected: executor token bound to a different intent"
@@ -702,7 +702,7 @@ impl DagActor {
         if let Some(auth) = auth_intent
             && auth != attempt.core().drv_hash
         {
-            // r[impl sec.executor.identity-token+2]
+            // r[impl sec.executor.identity-token+3]
             warn!(%exec_id, "ReportOutcome rejected: executor token bound to a different intent");
             return Err(PullRejection::TokenMismatch);
         }

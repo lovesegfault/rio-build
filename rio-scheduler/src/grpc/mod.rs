@@ -232,7 +232,7 @@ impl SchedulerGrpc {
         }
     }
 
-    // r[impl sec.executor.identity-token+2]
+    // r[impl sec.executor.identity-token+3]
     /// Extract and verify `x-rio-executor-token`, returning the full
     /// HMAC-attested [`ExecutorClaims`]. Mirrors
     /// [`Self::require_tenant`] for the worker-facing service: when an

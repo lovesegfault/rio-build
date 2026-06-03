@@ -756,7 +756,7 @@ impl DagActor {
     /// Empty map when `hmac_signer` is None (dev mode).
     ///
     /// [`compute_spawn_intents`]: Self::compute_spawn_intents
-    // r[impl sec.executor.identity-token+2]
+    // r[impl sec.executor.identity-token+3]
     pub(crate) fn mint_executor_tokens(&self, intent_ids: &[String]) -> HashMap<String, String> {
         let Some(signer) = &self.hmac_signer else {
             return HashMap::new();

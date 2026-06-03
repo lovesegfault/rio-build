@@ -156,11 +156,29 @@ pub struct ServiceClaims {
     /// Substitution-replacement Phase B (security obligation 1): the
     /// store replica's pod identity (DNS-1123 label), bound into the
     /// signed claims so the scheduler VERIFIES the `executor_instance`
-    /// a materialization pull asserts — a compromised or misconfigured
-    /// replica cannot claim under another replica's identity (the
-    /// composite-identity injection class, Phase A finding 4). `None`
-    /// for every non-materialization mint (gateway PutPath, controller,
-    /// rio-cli, the scheduler's own probe tokens).
+    /// a materialization pull asserts. `None` for every
+    /// non-materialization mint (gateway PutPath, controller, rio-cli,
+    /// the scheduler's own probe tokens).
+    ///
+    /// **Threat model (merged_bug_115, scoped honestly).** The service
+    /// HMAC key is FLEET-SHARED and symmetric: any key holder can mint
+    /// a `ServiceClaims` with ANY `instance` string that verifies
+    /// (`with_instance` takes an arbitrary label; the negative test
+    /// `any_key_holder_mints_any_instance` pins this). What the binding
+    /// delivers is therefore: (a) cross-SERVICE narrowing — a
+    /// gateway-style instance-less token no longer authorizes
+    /// materialization work; (b) composite-identity INJECTION
+    /// detection — a request asserting an instance its own signed
+    /// claims do not carry is rejected (the misconfiguration class,
+    /// Phase A finding 4); (c) forgery resistance against NON-key-
+    /// holders. It is explicitly NOT intra-fleet attestation: one
+    /// compromised store replica can mint claims for a sibling's
+    /// instance. Per-replica keys were considered and deliberately not
+    /// built — no consumer derives destructive attribution from
+    /// `instance`, and `credential_for` (the scheduler's family
+    /// chokepoint) is the single place a future per-replica binding
+    /// would land. Recorded in
+    /// substitution-replacement-invariant-map.md (Phase-B obligation 1).
     ///
     /// **Wire-compat (the bug_011 pattern, same as
     /// [`AssignmentClaims::tenant`] — scoped per the precedent's own
@@ -205,7 +223,7 @@ impl HmacClaims for ServiceClaims {
 /// both are scheduler-minted, scheduler-verified; the serde shape
 /// (`intent_id` vs `drv_hash`/`expected_outputs`) provides the
 /// cross-type isolation (`deny_unknown_fields`).
-// r[impl sec.executor.identity-token+2]
+// r[impl sec.executor.identity-token+3]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutorClaims {
@@ -1168,5 +1186,28 @@ mod tests {
         // failing token by base64-decoding the first part).
         let json_str = String::from_utf8(claims_json).unwrap();
         assert!(json_str.contains("\"executor_id\":\"test-builder\""));
+    }
+
+    /// merged_bug_115's boundary, pinned (no behavior change): the
+    /// service key is fleet-shared and symmetric, so ANY key holder
+    /// mints a `ServiceClaims` carrying ANY instance that verifies —
+    /// the instance binding is cross-service narrowing + injection
+    /// detection, NOT intra-fleet attestation. If this test ever needs
+    /// to change, the threat-model doc on `ServiceClaims::instance`
+    /// (and the Phase-B obligation-1 record) changes with it.
+    #[test]
+    fn any_key_holder_mints_any_instance() {
+        let key = HmacKey::from_key(b"shared-service-key-32-bytes-ok!!".to_vec());
+        // A "compromised sibling replica" (any holder of the shared
+        // key) mints claims for a victim replica's instance...
+        let forged = ServiceClaims {
+            caller: "rio-store".into(),
+            expiry_unix: crate::now_unix().expect("clock") + 60,
+            instance: Some("victim-replica-0".into()),
+        };
+        let token = key.sign(&forged);
+        // ...and it VERIFIES as the victim's instance-bound credential.
+        let verified: ServiceClaims = key.verify(&token).expect("symmetric key verifies");
+        assert_eq!(verified.instance.as_deref(), Some("victim-replica-0"));
     }
 }

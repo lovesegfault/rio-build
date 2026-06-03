@@ -72,7 +72,7 @@ async fn test_get_spawn_intents_reports_ready() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sec.executor.identity-token+2]
+// r[verify sec.executor.identity-token+3]
 /// `MintExecutorTokens` mints a verifiable per-intent `ExecutorClaims`
 /// token; `GetSpawnIntents` does NOT carry one. Proves the credential
 /// lives on a controller-only surface and `SpawnIntent` is plain data
