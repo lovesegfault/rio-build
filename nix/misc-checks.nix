@@ -275,6 +275,15 @@ in
             # the lint reads it, so it must be staged and an edit to
             # it rehashes this check.
             ../docs/dev/2026-05-28-build-replay-design.md
+            # spec-rule-citations reads every docs/dev markdown file
+            # (the citation domain) and every docs/spec .typ file (the
+            # #r() rule universe). Both sides must be staged: a missing
+            # docs/spec fails the walk outright, and an unstaged
+            # citation file would pass vacuously under nix while
+            # failing locally. A tracey bump edits a .typ, so it
+            # rehashes this check — exactly when the lint must re-run.
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "md") ../docs/dev)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "typ") ../docs/spec)
             # seccomp-allowlist validates both Localhost profiles —
             # rio-builder.json and rio-fetcher.json. Both must be in
             # the fileset so an edit to either rehashes this check.
