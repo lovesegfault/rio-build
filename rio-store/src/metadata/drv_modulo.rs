@@ -234,9 +234,14 @@ pub(crate) enum PopulateOutcome {
     /// An input row is still absent — retryable within the same batch
     /// once siblings populate.
     MissingInput,
-    /// Terminal for this attempt set: unparseable bytes, or a DB
-    /// failure (counted separately).
-    Skipped,
+    /// Terminal for this attempt set AND deterministic for these
+    /// bytes: unparseable text. Path evidence (round-17
+    /// merged_bug_056: the heal memo decision branches on this split).
+    SkippedDeterministic,
+    /// Terminal for this attempt set but ENVIRONMENTAL: a DB failure
+    /// during seed load or upsert (counted separately). Says nothing
+    /// about the path.
+    SkippedTransient,
 }
 
 /// Record the TERMINAL `skipped_missing_input` event for one `.drv`
@@ -299,7 +304,7 @@ pub(crate) async fn populate_on_ingest(
                 drv_path,
                 "drv modulo population skipped: bytes do not parse"
             );
-            return PopulateOutcome::Skipped;
+            return PopulateOutcome::SkippedDeterministic;
         }
     };
     let mut seeds = match load_drv_modulo_batch(pool, &inputs).await {
@@ -315,14 +320,14 @@ pub(crate) async fn populate_on_ingest(
             )
             .increment(1);
             warn!(drv_path, error = %e, "drv modulo population skipped: seed load failed");
-            return PopulateOutcome::Skipped;
+            return PopulateOutcome::SkippedTransient;
         }
     };
     match compute_drv_modulo(drv_bytes, drv_path, &mut seeds) {
         Ok(computed) => {
             if let Err(e) = upsert_drv_modulo(pool, drv_path, &computed.row).await {
                 warn!(drv_path, error = %e, "drv modulo upsert failed (best-effort)");
-                return PopulateOutcome::Skipped;
+                return PopulateOutcome::SkippedTransient;
             }
             metrics::counter!(
                 "rio_store_drv_modulo_cache_total",
@@ -337,7 +342,7 @@ pub(crate) async fn populate_on_ingest(
                 "event" => "parse_failed"
             )
             .increment(1);
-            PopulateOutcome::Skipped
+            PopulateOutcome::SkippedDeterministic
         }
         // NOT counted here (bug_085): the caller owns the terminal
         // decision — see [`record_missing_input`].
@@ -398,27 +403,95 @@ pub(crate) async fn heal_if_missing(
         return;
     };
     let mut budget = WorkBudget::new(PROOF_WALK_WORK_MAX, PROOF_WALK_ARENA_BYTES_MAX);
-    let healed = match own_drv_bytes(pool, chunks, drv_path, &mut budget).await {
+    let outcome = match own_drv_bytes(pool, chunks, drv_path, &mut budget).await {
         Ok(FetchedDrv::Bytes(bytes)) => match populate_on_ingest(pool, drv_path, &bytes).await {
-            PopulateOutcome::Populated => true,
+            PopulateOutcome::Populated => HealOutcome::Healed,
             PopulateOutcome::MissingInput => {
                 // The heal is its own (single-attempt) retry scope —
                 // terminal here, so record (bug_085 cadence contract).
                 record_missing_input(drv_path);
-                false
+                HealOutcome::PathNegative
             }
-            PopulateOutcome::Skipped => false,
+            PopulateOutcome::SkippedDeterministic => HealOutcome::PathNegative,
+            PopulateOutcome::SkippedTransient => HealOutcome::Transient,
         },
-        Ok(_) => false,
+        // Absent bytes / unreadable shapes / a .drv whose chunk count
+        // exceeds the heal budget: properties of THIS path until a
+        // re-upload changes them — real memo evidence.
+        Ok(FetchedDrv::Absent | FetchedDrv::Unreadable(_) | FetchedDrv::OverBudget) => {
+            HealOutcome::PathNegative
+        }
         Err(e) => {
             warn!(drv_path, error = %e, "modulo-cache heal fetch failed (best-effort)");
-            false
+            heal_outcome_of_error(&e)
         }
     };
-    if healed {
-        PROOF_ADMISSION.memo_clear(drv_path);
-    } else {
-        PROOF_ADMISSION.memo_record(drv_path);
+    // The 10-minute negative memo asserts EVIDENCE ABOUT THIS PATH
+    // ("this path failed to populate"), which is what lets it suppress
+    // the bug_080 heal stampede for a population that cannot heal. A
+    // transient infra failure carries no such evidence: memoizing it
+    // turned a brief S3/PG blip during an AlreadyComplete re-upload
+    // burst into a 10-minute suppression of every touched path,
+    // deferring heals to the synchronous proof-time read-through on
+    // the PutPath hot path and mislabeling heal_skipped_memo (round-17
+    // merged_bug_056). Transients exit memo-free — the same reasoning
+    // as the saturation arm above ("a global condition, not evidence
+    // about this path").
+    match outcome {
+        HealOutcome::Healed => PROOF_ADMISSION.memo_clear(drv_path),
+        HealOutcome::PathNegative => PROOF_ADMISSION.memo_record(drv_path),
+        HealOutcome::Transient => admission_event("heal_skipped_transient"),
+    }
+}
+
+/// Tri-state heal verdict (round-17 merged_bug_056): the memo decision
+/// is derived from WHAT THE FAILURE SAYS ABOUT THE PATH, never from a
+/// boolean fold of "didn't heal".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealOutcome {
+    /// Row populated — clear any stale memo.
+    Healed,
+    /// The failure is a property of this path (absent bytes,
+    /// unparseable text, corrupt storage, missing inputs): record the
+    /// negative memo so the heal stampede stays suppressed (round-16
+    /// bug_080) until the TTL or a successful heal clears it.
+    PathNegative,
+    /// The failure is environmental (chunk backend, PG availability):
+    /// nothing was learned about this path — exit WITHOUT a memo, like
+    /// the saturation arm.
+    Transient,
+}
+
+/// Exhaustive infra-vs-path classification of a heal fetch error. NO
+/// wildcard arm: a new [`MetadataError`] variant must be placed here
+/// deliberately or the build fails — the memo decision never inherits
+/// a default bucket (R1(e) at the metadata seam).
+fn heal_outcome_of_error(e: &super::MetadataError) -> HealOutcome {
+    use super::MetadataError as E;
+    match e {
+        // Store/DB-environmental: retriable elsewhere, no path
+        // evidence here. Conflict is a concurrent-writer no-op — the
+        // row may now exist; the probe-first arm clears any stale memo
+        // on the next event, and suppressing on a race would penalize
+        // the path for store-side timing. Other is unclassified sqlx —
+        // infra-flavored, and "no evidence" is the conservative read.
+        E::ChunkBackend(_)
+        | E::Connection(_)
+        | E::Serialization
+        | E::Deadlock(_)
+        | E::ResourceExhausted(_)
+        | E::PlaceholderMissing { .. }
+        | E::Conflict(_)
+        | E::Other(_) => HealOutcome::Transient,
+        // Path-deterministic or corruption: real evidence about this
+        // path — these classes STAY memoized (the bug_080 stampede
+        // suppression is exactly for populations that cannot heal).
+        E::NotFound
+        | E::RealisationConflict { .. }
+        | E::DataLoss(_)
+        | E::InvariantViolation(_)
+        | E::CorruptManifest { .. }
+        | E::MalformedRow(_) => HealOutcome::PathNegative,
     }
 }
 
@@ -1340,6 +1413,117 @@ mod tests {
                 .is_none(),
             "expired memo + present row: probe must clear the entry"
         );
+    }
+
+    /// A TRANSIENT heal failure must exit memo-free (round-17
+    /// merged_bug_056): a chunked `.drv` whose chunk backend errors
+    /// (S3 blip) says nothing about the path — the old boolean fold
+    /// stamped it with the 10-minute suppression, deferring its heal
+    /// to the synchronous proof-time read-through and mislabeling
+    /// `heal_skipped_memo`. Path-deterministic failures (the garbage-
+    /// bytes test above) keep recording — the bug_080 stampede
+    /// suppression is exactly for populations that cannot heal.
+    #[tokio::test]
+    async fn heal_transient_failure_exits_memo_free() {
+        struct ErroringBackend;
+        #[async_trait::async_trait]
+        impl crate::backend::ChunkBackend for ErroringBackend {
+            async fn put(&self, _: &[u8; 32], _: bytes::Bytes) -> anyhow::Result<()> {
+                anyhow::bail!("backend down")
+            }
+            async fn get(&self, _: &[u8; 32]) -> anyhow::Result<Option<bytes::Bytes>> {
+                anyhow::bail!("503 service unavailable (simulated S3 blip)")
+            }
+            async fn exists_batch(&self, _: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
+                anyhow::bail!("backend down")
+            }
+            fn key_for(&self, hash: &[u8; 32]) -> String {
+                hex::encode(hash)
+            }
+            async fn delete_by_key(&self, _: &str) -> anyhow::Result<()> {
+                anyhow::bail!("backend down")
+            }
+        }
+
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let path = "/nix/store/dddddddddddddddddddddddddddddddd-blip.drv";
+        let key = rio_nix::store_path::StorePath::parse(path)
+            .unwrap()
+            .sha256_digest();
+        // Chunked manifest: narinfo + manifests(inline_blob NULL) +
+        // manifest_data with one chunk entry — reassembly must hit the
+        // (erroring) backend.
+        sqlx::query(
+            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(key.as_slice())
+        .bind(path)
+        .bind([0u8; 32].as_slice())
+        .bind(64_i64)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'complete')")
+            .bind(key.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let manifest = crate::manifest::Manifest {
+            entries: vec![crate::manifest::ManifestEntry {
+                hash: [9u8; 32],
+                size: 64,
+            }],
+        };
+        sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
+            .bind(key.as_slice())
+            .bind(manifest.serialize())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let cache = crate::cas::ChunkCache::new(std::sync::Arc::new(ErroringBackend));
+        assert!(!PROOF_ADMISSION.memo_fresh(path));
+        heal_if_missing(&db.pool, Some(&cache), path).await;
+        assert!(
+            !PROOF_ADMISSION.memo_fresh(path),
+            "a chunk-backend blip is not evidence about this path — \
+             the heal must exit WITHOUT recording the 10-minute memo"
+        );
+    }
+
+    /// The infra-vs-path classification is exhaustive and pinned arm
+    /// by arm: transients (no memo) vs path evidence (memo). A new
+    /// MetadataError variant fails compilation until placed.
+    #[test]
+    fn heal_outcome_classification_pins() {
+        use super::super::MetadataError as E;
+        // Transient lane — no path evidence.
+        for e in [
+            E::ChunkBackend("s3 blip".into()),
+            E::Connection(sqlx::Error::PoolTimedOut),
+            E::Serialization,
+            E::ResourceExhausted("pool".into()),
+            E::Conflict("concurrent writer".into()),
+        ] {
+            assert_eq!(
+                heal_outcome_of_error(&e),
+                HealOutcome::Transient,
+                "{e:?} carries no path evidence"
+            );
+        }
+        // Path-evidence lane — memoized.
+        for e in [
+            E::NotFound,
+            E::DataLoss("chunk gone".into()),
+            E::InvariantViolation("row corruption".into()),
+        ] {
+            assert_eq!(
+                heal_outcome_of_error(&e),
+                HealOutcome::PathNegative,
+                "{e:?} is real evidence about the path"
+            );
+        }
     }
 
     /// Cadence pin (bug_085; R1(f)): `populate_on_ingest` RETURNS the

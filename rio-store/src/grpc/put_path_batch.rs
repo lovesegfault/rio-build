@@ -262,7 +262,10 @@ impl StoreServiceImpl {
                 {
                     PopulateOutcome::Populated => progressed = true,
                     PopulateOutcome::MissingInput => next.push((drv_path, bytes)),
-                    PopulateOutcome::Skipped => {}
+                    // Both terminal-skip classes drop out of the
+                    // fixpoint identically; the split exists for the
+                    // heal memo decision (round-17 merged_bug_056).
+                    PopulateOutcome::SkippedDeterministic | PopulateOutcome::SkippedTransient => {}
                 }
             }
             if !progressed || next.is_empty() {

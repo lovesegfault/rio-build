@@ -185,7 +185,10 @@ pub fn describe_metrics() {
          failed to populate within the 10-min TTL) | \
          heal_skipped_inflight (another heal of the same path is \
          running) | heal_skipped_saturated (no permit free; heal is \
-         best-effort and the proof-time read-through owns correctness). \
+         best-effort and the proof-time read-through owns correctness) | \
+         heal_skipped_transient (the heal failed on store/DB \
+         availability — no memo recorded, nothing learned about the \
+         path; round-17 merged_bug_056). \
          Sustained heal_skipped_saturated alongside cold-walk latency \
          means walk concurrency is the bottleneck"
     );
