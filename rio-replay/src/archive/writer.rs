@@ -731,19 +731,42 @@ pub(crate) mod test_support {
     );
 
     /// Populate `dir` with the embedded source tree: a plain file, an
-    /// executable file, and a relative symlink, so staging exercises the
-    /// full copy fidelity (mode bits and link targets) that the sidecar
-    /// agreement check in finalize then verifies.
+    /// executable file, a relative symlink, and two non-canonical-mode
+    /// files, so staging exercises the full copy fidelity (mode bits and
+    /// link targets) that the sidecar agreement check in finalize then
+    /// verifies.
+    ///
+    /// The mode set deliberately spans the executable-bit decision
+    /// lattice of `rio_nix::nar::is_nar_executable`, not just the
+    /// canonicalized-store modes: `0o755` (every exec bit — all
+    /// predicates agree), `0o644` (no exec bit), `0o744` (owner-exec
+    /// only), and `0o655` (group/other exec WITHOUT owner exec — the
+    /// exact cell on which an owner-only `& 0o100` predicate diverges
+    /// from the shared any-exec rule). With `0o655` in the tree, every
+    /// byte-parity test over this fixture (backend-vs-backend,
+    /// backend-vs-streaming-dump, dump_nar dir-vs-image against the
+    /// finalize-blessed sidecar) fails loudly if any walker re-forks the
+    /// predicate; before this row the parity suite was vacuous on the
+    /// mode axis.
     pub(crate) fn make_src_tree(dir: &Path) {
         use std::os::unix::fs::PermissionsExt as _;
 
+        let chmod = |path: &Path, mode: u32| {
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(mode);
+            std::fs::set_permissions(path, perms).unwrap();
+        };
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("content.txt"), "hello replay v1\n").unwrap();
         let script = dir.join("run.sh");
         std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
-        let mut perms = std::fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).unwrap();
+        chmod(&script, 0o755);
+        let group_exec = dir.join("group-exec.sh");
+        std::fs::write(&group_exec, "#!/bin/sh\nexit 1\n").unwrap();
+        chmod(&group_exec, 0o655);
+        let owner_exec = dir.join("owner-exec.sh");
+        std::fs::write(&owner_exec, "#!/bin/sh\nexit 2\n").unwrap();
+        chmod(&owner_exec, 0o744);
         std::os::unix::fs::symlink("content.txt", dir.join("latest")).unwrap();
     }
 

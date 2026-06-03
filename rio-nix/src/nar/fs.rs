@@ -26,6 +26,34 @@ use super::{NarEntry, NarNode, writer::serialize};
 /// forward most reads as single gRPC chunks without re-buffering.
 const STREAM_CHUNK: usize = 256 * 1024;
 
+/// THE executable-bit decision for NAR serialization: a regular file is
+/// dumped with the `executable` marker iff ANY execute bit (owner, group,
+/// or other — `0o111`) is set in its permission mode.
+///
+/// This is the single owner of that predicate. Every walker that
+/// serializes a filesystem-shaped tree into NAR form — the two walkers in
+/// this module and any out-of-crate walker over different storage
+/// primitives (e.g. the replay archive's directory/DwarFS backends) —
+/// must call THIS function rather than open-code a mask: two walkers
+/// disagreeing on the predicate serialize the same tree to different NAR
+/// bytes, so a sidecar NarHash recorded over one walker's dump hard-fails
+/// verification against the other's (the same single-source rule as
+/// [`MAX_NAR_DEPTH`](super::MAX_NAR_DEPTH) /
+/// [`MAX_DIRECTORY_ENTRIES`](super::MAX_DIRECTORY_ENTRIES)).
+///
+/// Vocabulary note: upstream Nix's dumper keys on the OWNER bit only
+/// (`st.st_mode & S_IXUSR`, `dumpPath` in libutil's `archive.cc`). The
+/// two predicates coincide on every canonicalized store tree (Nix
+/// canonicalisation forces 0o444/0o555, never a group/other-exec-only
+/// mode), so first-party trees serialize identically either way; rio
+/// deliberately keeps any-exec for non-canonical trees (foreign/v0
+/// recordings) because every NarHash this codebase has ever recorded —
+/// finalize-blessed archive sidecars included — was computed over
+/// any-exec dumps, and flipping the predicate would invalidate them.
+pub fn is_nar_executable(mode: u32) -> bool {
+    mode & 0o111 != 0
+}
+
 /// Canonical Nix store-path mtime: one second past the Epoch. Matches
 /// `mtimeStore` in Nix's `libstore/posix-fs-canonicalise.cc`. Not 0 (some
 /// tools treat 0 as "no timestamp") and never the wall-clock — store paths
@@ -179,7 +207,7 @@ fn stream_node(w: &mut impl Write, path: &std::path::Path, depth: usize) -> Resu
         }
     } else if metadata.file_type().is_file() {
         use std::os::unix::fs::PermissionsExt;
-        let executable = metadata.permissions().mode() & 0o111 != 0;
+        let executable = is_nar_executable(metadata.permissions().mode());
         let len = metadata.len();
 
         write_str(w, "regular")?;
@@ -445,7 +473,7 @@ fn node_from_path(path: &std::path::Path, depth: usize) -> Result<NarNode> {
         Ok(NarNode::Directory { entries })
     } else if metadata.file_type().is_file() {
         use std::os::unix::fs::PermissionsExt;
-        let executable = metadata.permissions().mode() & 0o111 != 0;
+        let executable = is_nar_executable(metadata.permissions().mode());
         let contents = std::fs::read(path)?;
         Ok(NarNode::Regular {
             executable,

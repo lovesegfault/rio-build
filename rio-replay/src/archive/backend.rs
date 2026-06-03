@@ -251,7 +251,12 @@ fn walk_entry_from_fs(path: &Path, name: String) -> Result<WalkEntry> {
         } else {
             0
         },
-        executable: kind == EntryKind::Regular && meta.permissions().mode() & 0o100 != 0,
+        // The shared NAR predicate, NOT an open-coded mask: this entry's
+        // bit feeds `nar_node`, whose bytes must agree with rio-nix's
+        // streaming dump (the sidecar NarHashes are recorded over that
+        // dump) — see `is_nar_executable` for the single-source rule.
+        executable: kind == EntryKind::Regular
+            && rio_nix::nar::is_nar_executable(meta.permissions().mode()),
         symlink_target,
     })
 }
@@ -259,7 +264,13 @@ fn walk_entry_from_fs(path: &Path, name: String) -> Result<WalkEntry> {
 /// Build a [`WalkEntry`] from a DwarFS directory entry.
 fn walk_entry_from_dwarfs(entry: &dwarfs::DirEntry<'_>) -> WalkEntry {
     let inode = entry.inode();
-    let executable = inode.metadata().file_type_mode().permission_bits() & 0o100 != 0;
+    // Same shared predicate as `walk_entry_from_fs` — the two backends
+    // and rio-nix's walkers must mark the same files executable or the
+    // directory form and the image form of one archive NAR-serialize
+    // differently (mkdwarfs preserves modes verbatim, so non-canonical
+    // foreign/v0 modes reach this decision unchanged).
+    let executable =
+        rio_nix::nar::is_nar_executable(inode.metadata().file_type_mode().permission_bits());
     let (kind, size, symlink_target) = match inode.classify() {
         dwarfs::InodeKind::Directory(_) => (EntryKind::Directory, 0, None),
         dwarfs::InodeKind::File(file) => (EntryKind::Regular, file.as_chunks().total_size(), None),

@@ -39,7 +39,7 @@ mod tests;
 #[cfg(any(test, feature = "test-oracle"))]
 #[doc(hidden)]
 pub use fs::{dump_path, extract_to_path};
-pub use fs::{dump_path_streaming, restore_path_streaming};
+pub use fs::{dump_path_streaming, is_nar_executable, restore_path_streaming};
 pub use reader::{extract_single_file, parse};
 pub use writer::serialize;
 

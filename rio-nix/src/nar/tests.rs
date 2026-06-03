@@ -1106,3 +1106,48 @@ fn dump_path_non_utf8_symlink_target_rejected() {
         "dump_path_streaming: expected UTF-8 error, got {err:?}"
     );
 }
+
+/// [`is_nar_executable`] over the FULL execute-bit lattice — all eight
+/// combinations of the owner/group/other bits, each composed with
+/// representative read/write bits. The quantification domain is the
+/// predicate's whole input vocabulary (every mode a filesystem or image
+/// index can present), not just the canonicalized-store modes
+/// (0o444/0o555) where any-exec and owner-exec coincide: the
+/// group/other-exec-only rows (owner bit CLEAR) are exactly the cells on
+/// which an owner-only sibling predicate diverges, and they must read
+/// executable here. Both directions pinned: every no-exec-bit mode is
+/// non-executable regardless of read/write bits.
+#[test]
+fn is_nar_executable_covers_every_exec_bit_combination() {
+    // (mode, expected) — expected = any of 0o100/0o010/0o001 set.
+    let lattice = [
+        // No exec bit anywhere: never executable.
+        (0o000, false),
+        (0o644, false),
+        (0o444, false),
+        (0o666, false),
+        // Single bits: owner, group, other — each alone marks executable.
+        (0o744, true), // owner only
+        (0o654, true), // group only
+        (0o645, true), // other only
+        // Pairs.
+        (0o754, true), // owner+group
+        (0o745, true), // owner+other
+        (0o655, true), // group+other (no owner: the divergence cell)
+        // All three.
+        (0o755, true),
+        (0o555, true),
+    ];
+    for (mode, expected) in lattice {
+        assert_eq!(
+            is_nar_executable(mode),
+            expected,
+            "mode {mode:o}: expected executable={expected}"
+        );
+    }
+    // File-type bits above the permission triad must not leak into the
+    // decision: a regular-file mode word (S_IFREG | perms) decides the
+    // same as its bare permission bits.
+    assert!(is_nar_executable(0o100655));
+    assert!(!is_nar_executable(0o100644));
+}

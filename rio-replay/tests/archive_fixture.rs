@@ -314,7 +314,12 @@ fn collect_tree(root: &Path) -> BTreeMap<String, EntryFingerprint> {
                     EntryFingerprint::Symlink(std::fs::read_link(&path).unwrap()),
                 );
             } else {
-                let exec = entry.metadata().unwrap().permissions().mode() & 0o100 != 0;
+                // The shared NAR predicate (rio_nix::nar::is_nar_executable):
+                // the fingerprint must mark exactly the files the NAR
+                // serialization marks, or a mode the comparison ignores
+                // could drift the fixture's NAR identity unnoticed.
+                let exec =
+                    rio_nix::nar::is_nar_executable(entry.metadata().unwrap().permissions().mode());
                 out.insert(
                     rel,
                     EntryFingerprint::File {
