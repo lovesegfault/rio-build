@@ -134,6 +134,16 @@ pub struct MockStoreFaults {
     /// If true, find_missing_paths returns Unavailable. For scheduler
     /// cache-check error-path tests.
     pub fail_find_missing: Arc<AtomicBool>,
+    /// If true, find_missing_paths NEVER responds (the handler parks on
+    /// a pending future after recording the call): the delay-fault
+    /// sibling of `fail_find_missing`, modeling a network-partitioned or
+    /// wedged store where the RPC neither answers nor errors. The
+    /// caller's own timeout is the only exit, so this knob is for tests
+    /// that pin a timeout arm's behavior (the scheduler's dispatch-time
+    /// FMP under `grpc_timeout`) rather than an error arm's. The parked
+    /// future is dropped when the client hangs up or the mock server
+    /// task is dropped.
+    pub hang_find_missing: Arc<AtomicBool>,
     /// If true, query_path_info returns Unavailable. For worker input-fetch
     /// error-path tests (distinguishing real gRPC errors from NotFound).
     pub fail_query_path_info: Arc<AtomicBool>,
@@ -865,6 +875,12 @@ impl StoreService for MockStore {
             .push((request.get_ref().store_paths.clone(), probe_tenant));
         if self.faults.fail_find_missing.load(Ordering::SeqCst) {
             return Err(Status::unavailable("mock: injected find_missing failure"));
+        }
+        if self.faults.hang_find_missing.load(Ordering::SeqCst) {
+            // Delay fault: the call is recorded above (tests assert the
+            // RPC was attempted) but no response ever leaves the mock —
+            // the caller's timeout decides what happens next.
+            std::future::pending::<()>().await;
         }
         let requested = request.into_inner().store_paths;
         for p in &requested {

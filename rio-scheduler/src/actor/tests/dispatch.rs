@@ -1749,6 +1749,7 @@ async fn probe_tenant_ignores_lingering_terminal_builds() -> TestResult {
 /// at the mock store boundary, where the store actually consumes it.
 async fn probe_window_actor(
     pool: sqlx::PgPool,
+    grpc_timeout: Option<std::time::Duration>,
 ) -> anyhow::Result<(
     rio_test_support::grpc::MockStore,
     DagActor,
@@ -1763,7 +1764,14 @@ async fn probe_window_actor(
         ))),
         ..Default::default()
     };
-    let actor = DagActor::new(SchedulerDb::new(pool), DagActorConfig::default(), plumbing);
+    // `grpc_timeout` override for delay-fault arms (a hung MockStore
+    // makes the actor's own timeout the only exit, so those arms dial
+    // it down from the 30s default to keep the test fast).
+    let mut config = DagActorConfig::default();
+    if let Some(timeout) = grpc_timeout {
+        config.grpc_timeout = timeout;
+    }
+    let actor = DagActor::new(SchedulerDb::new(pool), config, plumbing);
     Ok((store, actor, store_task))
 }
 
@@ -1778,6 +1786,22 @@ fn inject_probe_candidate(actor: &mut DagActor, tag: &str) {
     actor.test_set_probed_generation(tag, 0);
 }
 
+/// How the mock store answers the dispatch-time batch FMP — the full
+/// outcome vocabulary of the RPC await in `batch_probe_cached_ready`
+/// (`tokio::time::timeout(grpc_timeout, find_missing_paths)`): a
+/// response, a fast error (`Ok(Err(_))`), or no response at all until
+/// the timeout fires (`Err(_)`). The third arm is a DELAY fault, not an
+/// error fault: the mock records the request and then parks forever
+/// (`MockStoreFaults::hang_find_missing`), so the only way the test
+/// completes is the actor's own timeout wrapper — the arm previously
+/// pinned only by its code identity with the error arm.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FmpArm {
+    Answers,
+    FailsFast,
+    HangsPastTimeout,
+}
+
 // r[verify sched.dispatch.fod-substitute+6]
 // r[verify sched.dispatch.probe-tenant-stable]
 /// Window membership of an over-cap probe batch is a pure function of
@@ -1785,8 +1809,10 @@ fn inject_probe_candidate(actor: &mut DagActor, tag: &str) {
 /// returned PARTITION routes the unprobed tail by FMP arm.
 /// Quantification domain: every order-sensitive transform feeding the
 /// cap, exercised end-to-end (HashMap `iter_nodes()` iteration →
-/// filter → collect → sort → truncate) × both FMP arms (answering /
-/// failing): two actors hold the same CAP+12 candidate CONTENT built
+/// filter → collect → sort → truncate) × the three FMP arms (the full
+/// producer set of the RPC's outcome vocabulary: answering / failing
+/// fast / hanging past the timeout): two actors hold the same CAP+12
+/// candidate CONTENT built
 /// in opposite insertion orders, with independently re-rolled hasher
 /// seeds (each `HashMap` draws its own `RandomState`). All candidates
 /// are `probed_generation = 0`, so the (recency, drv-hash) window key
@@ -1797,11 +1823,20 @@ fn inject_probe_candidate(actor: &mut DagActor, tag: &str) {
 /// must be identical across the two actors AND equal to the
 /// drv-hash-sorted split, with the tail routed per arm:
 ///
-/// - FMP answers (`fmp_fails=false`): tail → `probe_deferred` (held
+/// - FMP answers ([`FmpArm::Answers`]): tail → `probe_deferred` (held
 ///   un-dispatched; the drain loop defers members), head → `checked`.
-/// - FMP fails (`fmp_fails=true`): tail → `checked` (fail-open
-///   dispatch parity with the stamped head; the deliberate
+/// - FMP fails fast ([`FmpArm::FailsFast`]): tail → `checked`
+///   (fail-open dispatch parity with the stamped head; the deliberate
 ///   I-139/I-140 store-down liveness cell), `probe_deferred` empty.
+/// - FMP hangs past the timeout ([`FmpArm::HangsPastTimeout`]): the
+///   mock store records the request and then NEVER responds, so the
+///   actor's own `grpc_timeout` wrapper is the only exit — the
+///   `Err(_)` timeout arm. Same fail-open routing as the fast-error
+///   arm, asserted against the same content-derived expectation rather
+///   than by the two arms' code identity: a wedged store is the
+///   I-139/I-140 stall shape in its purest form (no error ever comes
+///   back), and holding the tail there would wedge it for as long as
+///   the outage lasts.
 ///
 /// Pre-fix the truncate windowed raw hash order: the tail was 12 of
 /// 2060 hashes by hasher seed, so this assertion was a coin toss with
@@ -1809,11 +1844,12 @@ fn inject_probe_candidate(actor: &mut DagActor, tag: &str) {
 /// landed in the same `checked` set as probed members, which the
 /// drain loop read as probe evidence and dispatched from source.
 #[rstest::rstest]
-#[case::fmp_answers(false)]
-#[case::fmp_fails(true)]
+#[case::fmp_answers(FmpArm::Answers)]
+#[case::fmp_fails(FmpArm::FailsFast)]
+#[case::fmp_hangs(FmpArm::HangsPastTimeout)]
 #[tokio::test]
 async fn over_cap_probe_window_is_invariant_to_enumeration_order(
-    #[case] fmp_fails: bool,
+    #[case] fmp_arm: FmpArm,
 ) -> TestResult {
     use std::sync::atomic::Ordering;
     let db = TestDb::new(&MIGRATOR).await;
@@ -1824,7 +1860,16 @@ async fn over_cap_probe_window_is_invariant_to_enumeration_order(
 
     let mut observed = Vec::new();
     for reversed in [false, true] {
-        let (store, mut actor, _task) = probe_window_actor(db.pool.clone()).await?;
+        // The hang arm dials the actor's grpc timeout down from the 30s
+        // default: the elapsed time IS the timeout (the store never
+        // answers, so there is no slow-machine race in either
+        // direction — load can only delay the firing, never change the
+        // outcome).
+        let grpc_timeout = match fmp_arm {
+            FmpArm::HangsPastTimeout => Some(std::time::Duration::from_millis(500)),
+            FmpArm::Answers | FmpArm::FailsFast => None,
+        };
+        let (store, mut actor, _task) = probe_window_actor(db.pool.clone(), grpc_timeout).await?;
         let mut order: Vec<&String> = tags.iter().collect();
         if reversed {
             order.reverse();
@@ -1832,10 +1877,13 @@ async fn over_cap_probe_window_is_invariant_to_enumeration_order(
         for tag in order {
             inject_probe_candidate(&mut actor, tag);
         }
-        store
-            .faults
-            .fail_find_missing
-            .store(fmp_fails, Ordering::SeqCst);
+        match fmp_arm {
+            FmpArm::Answers => {}
+            FmpArm::FailsFast => store.faults.fail_find_missing.store(true, Ordering::SeqCst),
+            FmpArm::HangsPastTimeout => {
+                store.faults.hang_find_missing.store(true, Ordering::SeqCst);
+            }
+        }
         let outcome = actor.batch_probe_cached_ready().await;
         let fmp = store.calls.fmp_requests.read().unwrap().clone();
         assert_eq!(fmp.len(), 1, "one batch FMP per dispatch pass");
@@ -1864,26 +1912,39 @@ async fn over_cap_probe_window_is_invariant_to_enumeration_order(
         .map(|tag| test_store_path(&format!("{tag}-out")))
         .collect();
     for (checked, deferred, head_paths) in &observed {
-        if fmp_fails {
-            assert_eq!(
-                checked, &expected_tail,
-                "FMP-failure arm: the unprobed tail folds into `checked` so it \
-                 dispatches fail-open with the stamped head (I-139/I-140)"
-            );
-            assert!(
-                deferred.is_empty(),
-                "FMP-failure arm: nothing is held back behind a dead store"
-            );
-        } else {
-            assert_eq!(
-                deferred, &expected_tail,
-                "FMP-success arm: the unprobed tail is probe-deferred (held \
-                 un-dispatched), never returned as probe evidence"
-            );
-            assert_eq!(
-                checked, &expected_head,
-                "FMP-success arm: `checked` is exactly the probed head"
-            );
+        match fmp_arm {
+            // The two no-verdict arms share ONE expectation on purpose:
+            // a fast error and a hang-then-timeout are the same
+            // store-down cell of I-139/I-140, and pinning both against
+            // the same content-derived rows (instead of the timeout arm
+            // against the error arm's code) is what keeps a future
+            // timeout-arm edit from quietly diverging — e.g. holding
+            // the tail in `probe_deferred` behind a store that will
+            // never produce the verdict the deferral waits for.
+            FmpArm::FailsFast | FmpArm::HangsPastTimeout => {
+                assert_eq!(
+                    checked, &expected_tail,
+                    "no-verdict arm ({fmp_arm:?}): the unprobed tail folds into \
+                     `checked` so it dispatches fail-open with the stamped head \
+                     (I-139/I-140)"
+                );
+                assert!(
+                    deferred.is_empty(),
+                    "no-verdict arm ({fmp_arm:?}): nothing is held back behind a \
+                     dead store"
+                );
+            }
+            FmpArm::Answers => {
+                assert_eq!(
+                    deferred, &expected_tail,
+                    "FMP-success arm: the unprobed tail is probe-deferred (held \
+                     un-dispatched), never returned as probe evidence"
+                );
+                assert_eq!(
+                    checked, &expected_head,
+                    "FMP-success arm: `checked` is exactly the probed head"
+                );
+            }
         }
         assert_eq!(
             head_paths, &expected_head_paths,
@@ -1921,7 +1982,7 @@ async fn over_cap_probe_window_is_invariant_to_enumeration_order(
 async fn over_cap_window_probe_tenant_is_deterministic(#[case] min_on_last: bool) -> TestResult {
     use std::sync::atomic::Ordering;
     let db = TestDb::new(&MIGRATOR).await;
-    let (store, mut actor, _task) = probe_window_actor(db.pool.clone()).await?;
+    let (store, mut actor, _task) = probe_window_actor(db.pool.clone(), None).await?;
     let n = crate::actor::DISPATCH_PROBE_BATCH_CAP + 1;
     let tags: Vec<String> = (0..n).map(|i| format!("bpv-{i:04}")).collect();
     for tag in &tags {
@@ -2219,7 +2280,7 @@ async fn over_cap_probe_window_rotates_to_unprobed_tail_across_ticks() -> TestRe
 #[tokio::test]
 async fn sub_cap_probe_partition_has_empty_deferred() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (store, mut actor, _task) = probe_window_actor(db.pool.clone()).await?;
+    let (store, mut actor, _task) = probe_window_actor(db.pool.clone(), None).await?;
     let tags = ["scpc-0", "scpc-1", "scpc-2"];
     for tag in tags {
         inject_probe_candidate(&mut actor, tag);
