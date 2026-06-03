@@ -362,7 +362,7 @@ impl DagActor {
             return true;
         }
 
-        // r[impl sched.merge.substitute-topdown+12]
+        // r[impl sched.merge.substitute-topdown+13]
         // Fail-open carve-out: a topdown-pruned node whose closure
         // evidence is Broken — childless or closure-holed, see
         // `must_substitute` — must never be handed to a worker: its dep
@@ -795,7 +795,7 @@ impl DagActor {
                 // through to build via `substitute_tried`.
                 to_spawn.push((drv_hash, paths));
             } else if self.must_substitute(&drv_hash) {
-                // r[impl sched.merge.substitute-topdown+12]
+                // r[impl sched.merge.substitute-topdown+13]
                 // Truly missing (a wanted output is missing upstream and
                 // not substitutable): every other node is left Ready and
                 // dispatches from source. A topdown-pruned root whose
@@ -1237,7 +1237,7 @@ impl DagActor {
             }
             return;
         }
-        // r[impl sched.merge.substitute-topdown+12]
+        // r[impl sched.merge.substitute-topdown+13]
         // Topdown-pruned root: the dep subgraph was dropped from this
         // submission, so a build dispatch cannot succeed (worker
         // ENOENTs on inputDrvs). Fail every interested build with a
@@ -1480,7 +1480,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.merge.substitute-topdown+12]
+    // r[impl sched.merge.substitute-topdown+13]
     /// Topdown-pruned fail-fast: the node's dep subgraph was dropped
     /// from its submission, so a from-source build dispatch cannot
     /// succeed (the worker ENOENTs on inputDrvs that were never
@@ -1781,7 +1781,7 @@ impl DagActor {
                         .await;
                     return true;
                 }
-                // r[impl sched.merge.substitute-topdown+12]
+                // r[impl sched.merge.substitute-topdown+13]
                 // Truly missing → the caller dispatches from source. A
                 // topdown-pruned root with broken closure evidence
                 // (childless or closure-holed) must not be (its dep

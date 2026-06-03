@@ -376,6 +376,79 @@ let
           )
     '';
 
+    holed-parent-failover = ''
+      # ══════════════════════════════════════════════════════════════════
+      # holed-parent failover — closure witness survives leader change
+      # ══════════════════════════════════════════════════════════════════
+      # Round-16 bug_045/bug_011 lifecycle pin. Stage the EXACT row pair
+      # the merge Batch 1b paired writer (stamp_topdown_pruned_tx +
+      # set_closure_holes_tx) commits for a merely-JOINED pruned parent —
+      # mark + flag together with the 069 witness row, status
+      # non-terminal — then kill the leader and assert the new leader
+      # leaves the witness intact: hydration pairs flag with rows, the
+      # mark-clear candidate gate skips holed rows, and nothing reaps the
+      # state. The pre/post-fix discrimination lives in the hermetic test
+      # (test_joined_pruned_parent_commits_paired_hole_and_recovers_holed
+      # drives the production writer); this subtest pins the witness
+      # lifecycle across a REAL cluster failover. The row is unowned (no
+      # live build), which recovery loads but never recomputes or clears
+      # (orphan gate) — inert by construction, cleaned up at the end.
+      with subtest("holed-parent failover: witness survives leader change"):
+          lehp_drv = "/nix/store/00000000000000000000000000000000-lehp-root.drv"
+          lehp_child = "/nix/store/11111111111111111111111111111111-lehp-dep.drv"
+          psql_k8s(k3s_server,
+              "INSERT INTO derivations "
+              "(drv_hash, drv_path, system, status, topdown_pruned, closure_hole) "
+              f"VALUES ('{lehp_drv}', '{lehp_drv}', 'x86_64-linux', "
+              "'substituting', true, true)")
+          psql_k8s(k3s_server,
+              "INSERT INTO derivation_closure_missing (drv_hash, missing_child) "
+              f"VALUES ('{lehp_drv}', '{lehp_child}')")
+
+          old_leader = leader_pod()
+          print(f"holed-parent failover: killing leader={old_leader}")
+          kubectl(f"delete pod {old_leader} --grace-period=0 --force")
+
+          # Same structural waits as the failover subtest: a non-empty
+          # holder that is not the killed pod, then a fresh renewTime
+          # (the new leader is functioning — LeaderAcquired, and with it
+          # state recovery, precedes steady-state renewal).
+          k3s_server.wait_until_succeeds(
+              "h=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+              "-o jsonpath='{.spec.holderIdentity}'); "
+              f"test -n \"$h\" && test \"$h\" != '{old_leader}'",
+              timeout=45,
+          )
+          age = renew_age_secs()
+          assert age < 10, (
+              f"renewTime is {age}s old after holed-parent failover; "
+              "new leader not renewing?"
+          )
+
+          flags = psql_k8s(k3s_server,
+              "SELECT topdown_pruned, closure_hole FROM derivations "
+              f"WHERE drv_hash = '{lehp_drv}'")
+          assert flags == "t|t", (
+              f"witness flags after failover: {flags!r} (want 't|t' — "
+              "recovery must keep the holed parent marked AND holed)"
+          )
+          rows = psql_k8s(k3s_server,
+              "SELECT count(*) FROM derivation_closure_missing "
+              f"WHERE drv_hash = '{lehp_drv}'")
+          assert rows == "1", (
+              f"witness rows after failover: {rows!r} (want '1' — the 069 "
+              "rows pair with the flag across recovery)"
+          )
+
+          # Clean up the staged rows — later subtests and the next
+          # failover must not inherit them.
+          psql_k8s(k3s_server,
+              "DELETE FROM derivation_closure_missing "
+              f"WHERE drv_hash = '{lehp_drv}'")
+          psql_k8s(k3s_server,
+              f"DELETE FROM derivations WHERE drv_hash = '{lehp_drv}'")
+    '';
+
     build-during-failover = ''
       # ── SSH + busybox prep for build-during-failover ────────────────────
       # Between subtests: gateway scale-bounce (sshKeySetup) doesn't

@@ -1019,7 +1019,7 @@ what it attached). Prior art in the same shape: the displacement
 primitive's evidence ranks (#rref("sched.merge.store-evidence-displacement+2"))
 refuse re-definition unless the incoming claim PROVES rank over the
 recorded row, and the born-holed prune stamp
-(#rref("sched.merge.substitute-topdown+12")) records the dropped closure
+(#rref("sched.merge.substitute-topdown+13")) records the dropped closure
 at the only site that knows it. The `HealWitness` token is the mechanical
 form: mintable only by the coverage branch, demanded by the only clear
 path, so an absence-of-objection upgrade is unwritable rather than merely
@@ -1159,7 +1159,7 @@ submitted after the failover record contributions as usual).
   origin URL.
 ]
 
-#r("sched.merge.substitute-topdown+12")[
+#r("sched.merge.substitute-topdown+13")[
   Before merging a submission's full DAG, the scheduler MUST first check
   whether the submission's *demand set* --- its structural roots (nodes with
   no parent edge in the submission) ∪ every node the client explicitly
@@ -1180,8 +1180,10 @@ submitted after the failover record contributions as usual).
   dependencies are already produced in the DAG, or one with no closure to
   drop, is not marked) are marked `topdown_pruned` AND born holed: the
   prune MUST record the dropped children on the node's closure-hole
-  witness set, persisted in the same transaction as the mark, so the
-  node's closure evidence is Broken from birth and a single junk child
+  witness set --- the flag and its witness rows written by ONE paired
+  transactional writer covering newly created and merely joined kept
+  nodes alike, in the same transaction as the mark --- so the node's
+  closure evidence is Broken from birth and a single junk child
   completing cannot vouch it --- a mark that MUST
   be applied only after the merge has committed, MUST be persisted and
   restored at leader-failover recovery, and MUST be cleared (in PG and in
@@ -1228,6 +1230,14 @@ so the prune can never be more permissive than the post-merge classification
 of a shared node: a submission-only criterion could prune this build's
 dependency closure while another live build's wants keep the node on the
 from-source path, leaving this build hostage to that interest staying alive.
+The +13 paired-writer clause is round-16 bug_045's lesson: the flag rode the
+creation-scoped row bind while the witness rows were inserted for both
+populations, so a merely-joined pruned parent committed `topdown_pruned =
+true, closure_hole = false` plus orphan witness rows --- recovery hydrated it
+un-holed, enrolled it as a mark-clear candidate, and re-armed exactly the
+doomed from-source dispatch the born-holed witness suppresses. One paired
+writer (`set_closure_holes_tx`) makes the two populations congruent by
+construction (fix-discipline R2-PAIRED-WRITERS).
 The own-selector resolvability guard covers the fallback corner where no
 prior interested build is live and post-merge classification degrades to
 exactly this submission's (possibly bogus) selector. The `topdown_pruned`

@@ -348,7 +348,7 @@ async fn wanted_output_names_round_trip_and_union_on_conflict() -> anyhow::Resul
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+12]
+// r[verify sched.merge.substitute-topdown+13]
 /// `topdown_pruned` persists with OR-on-conflict semantics (a pruned
 /// merge sets it; an unrelated non-pruned merge of the same drv never
 /// clears it), is cleared by the tx-scoped
@@ -435,7 +435,7 @@ async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyho
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+12]
+// r[verify sched.merge.substitute-topdown+13]
 /// `closure_hole` (`migrations/064`) column semantics: stamped only via
 /// `set_closure_holes` (the leader's reap hook, the
 /// recovery-time stamp in `load_dag_from_rows`, and the poison-clear

@@ -1023,6 +1023,9 @@ in
       # r[verify sched.lease.deletion-cost]
       "graceful-release"
       "failover"
+      # r[verify sched.closure.witness-epoch]
+      # r[verify sched.merge.substitute-topdown+13]
+      "holed-parent-failover"
     ];
   };
 
