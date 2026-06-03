@@ -649,6 +649,11 @@
       "doc": "Modular derivation hashing (Nix `hashDerivationModulo`)."
     },
     {
+      "path": "derivation/structured_attrs.rs",
+      "depth": 1,
+      "doc": "Canonical structured-attrs-aware reads of derivation user attributes."
+    },
+    {
       "path": "hash.rs",
       "depth": 0,
       "doc": "Nix hash types: SHA-256, SHA-512, SHA-1."
@@ -941,6 +946,11 @@
       "path": "run/classify.rs",
       "depth": 1,
       "doc": "The classifier: ONE pure function over (expected outcome × rio outcome ×"
+    },
+    {
+      "path": "run/closure_gap.rs",
+      "depth": 1,
+      "doc": "THE missing-derivation policy for closure walks."
     },
     {
       "path": "run/collect.rs",

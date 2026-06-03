@@ -217,6 +217,7 @@
       "prod": [
         "rio-common",
         "rio-crds",
+        "rio-nix",
         "rio-proto",
         "rio-replay",
         "rio-scheduler",
