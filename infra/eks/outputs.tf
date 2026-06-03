@@ -67,3 +67,8 @@ output "karpenter_node_role_name" {
   description = "Node IAM role name for Karpenter-provisioned instances (goes into EC2NodeClass.spec.role — xtask passes as --set karpenter.nodeRoleName)"
   value       = module.karpenter.node_iam_role_name
 }
+
+output "pg_max_connections" {
+  description = "Modeled Aurora PG max_connections (rds.tf locals: AWS PG table at aurora_max_capacity, min-capacity cap applied). xtask deploy's pg preflight asserts the live server matches this and derives store.autoscaling.maxReplicas from the measurement."
+  value       = local.expected_pg_max_connections
+}

@@ -47,6 +47,64 @@ resource "aws_security_group" "aurora" {
   # Empty egress = deny-all-outbound, which is correct.
 }
 
+# PG connection budget: tf is the model, the deploy preflight is the
+# measurement. Consumers (xtask deploy, the chart's store ceiling)
+# receive the derived value — they never re-derive it from prose.
+#
+# Source (fetched 2026-06-03): AWS Aurora User Guide, "Performance and
+# scaling for Aurora Serverless v2"
+# (aurora-serverless-v2.setting-capacity.html, section "Maximum
+# connections for Aurora Serverless v2", anchor
+# #aurora-serverless-v2.max-connections), table "default values for
+# max_connections … based on the maximum ACU value", column
+# "Default maximum connections on Aurora PostgreSQL":
+#   1 → 189, 4 → 823, 8 → 1,669, 16 → 3,360, ≥32 → 5,000.
+# Table Note (PostgreSQL): an instance with a minimum capacity of
+# 0 or 0.5 ACUs is CAPPED at 2,000 connections — min_capacity
+# participates in the budget ONLY through that cap.
+#
+# WARNING: the adjacent column in the same AWS table is Aurora MYSQL
+# (16 → 2,000, 32 → 3,000). That column is the source of BOTH prior
+# wrong derivations on this branch (the "~2,800" chain and the
+# "32 ⇒ ~3,000" chain). Do not "correct" the PostgreSQL values back
+# to it.
+#
+# Semantics (both load-bearing for the deploy preflight):
+#   - max_connections is keyed on max_capacity (memory at MAXIMUM
+#     ACUs) and held RUNTIME-CONSTANT — it does NOT scale with the
+#     live ACU; low-ACU operation merely has less memory per
+#     connection.
+#   - it is a STATIC parameter: a capacity-range change takes effect
+#     only after an instance REBOOT, so a capacity flip passes the
+#     preflight's strict-equality check only post-reboot (plan the
+#     reboot into the flip).
+locals {
+  aurora_min_capacity = 1
+  aurora_max_capacity = 32
+
+  # The FULL AWS PostgreSQL column (not just today's value) so the
+  # precondition below never fires on a legitimate resize.
+  aurora_pg_max_connections_by_max_acu = {
+    "1"   = 189
+    "4"   = 823
+    "8"   = 1669
+    "16"  = 3360
+    "32"  = 5000
+    "64"  = 5000
+    "128" = 5000
+    "192" = 5000
+    "256" = 5000
+  }
+
+  # The table-Note cap rule: PostgreSQL with min_capacity <= 0.5 ACU
+  # is capped at 2,000 regardless of max_capacity.
+  expected_pg_max_connections = (
+    local.aurora_min_capacity <= 0.5
+    ? min(2000, local.aurora_pg_max_connections_by_max_acu[tostring(local.aurora_max_capacity)])
+    : local.aurora_pg_max_connections_by_max_acu[tostring(local.aurora_max_capacity)]
+  )
+}
+
 resource "aws_rds_cluster" "rio" {
   cluster_identifier = "${var.cluster_name}-pg"
   engine             = "aurora-postgresql"
@@ -76,26 +134,37 @@ resource "aws_rds_cluster" "rio" {
   network_type = "DUAL"
 
   serverlessv2_scaling_configuration {
-    # 0.5 ACU minimum = ~1 GB RAM, ~$44/mo at idle. Can't go lower
-    # on Serverless v2. If this is too much, the alternative is
-    # db.t3.medium provisioned (~$50/mo, no scale-down) — roughly
-    # a wash for always-on dev.
-    min_capacity = 0.5
+    # Raised 0.5 → 1 ACU (owner decision Q1, 2026-06-03): at
+    # min_capacity ≤ 0.5 the AWS PG table Note caps max_connections
+    # at 2,000 regardless of max_capacity — the 2026-06-02 16→32
+    # max_capacity raise did NOT lift the connection budget because
+    # this knob stayed at 0.5. At 1 ACU the cap no longer applies and
+    # the budget is the table value at max_capacity (5,000 at 32).
+    # Cost: ~2 GB RAM floor, ~$88/mo at idle (was ~$44/mo at 0.5).
+    min_capacity = local.aurora_min_capacity
     # I-110: ephemeral builders' QueryPathInfo burst (~800 QPI ×
     # N builders) saturates connections. At 2 ACU (~360 max_conn),
     # 4×50 store pool conns + scheduler hit the cap → 11s acquire
     # times → builder FUSE circuit opens → builds fail.
     #
-    # Connection-step semantics (Serverless v2): max_connections is
-    # RUNTIME-CONSTANT at the value derived from THIS max_capacity —
-    # 16 ACU ⇒ 2,000, 32 ACU ⇒ ~3,000, absolute Aurora cap 5,000. It
-    # does NOT scale with the live ACU (low-ACU instances merely have
-    # less memory per connection). Raised 16→32 (2026-06-02) to widen
-    # the store-fleet PG backstop: the helm store ceiling (values.yaml
-    # store.autoscaling.maxReplicas) is derived from this parameter —
-    # recompute it if max_capacity changes. Aurora still scales down
-    # to min_capacity at idle, so idle cost is unchanged.
-    max_capacity = 32
+    # Connection budget: see the locals block above — the AWS PG
+    # column is data (aurora_pg_max_connections_by_max_acu), the
+    # min-capacity cap is the encoded rule, and the derived value
+    # (expected_pg_max_connections, exported as the
+    # pg_max_connections output) is what xtask deploy's pg preflight
+    # asserts against the live server and what the store ceiling is
+    # derived from. Change capacity HERE; consumers follow.
+    max_capacity = local.aurora_max_capacity
+  }
+
+  lifecycle {
+    precondition {
+      condition = contains(
+        keys(local.aurora_pg_max_connections_by_max_acu),
+        tostring(local.aurora_max_capacity),
+      )
+      error_message = "aurora_max_capacity has no entry in aurora_pg_max_connections_by_max_acu (rds.tf) — add the AWS PG-column value for this ACU setting before applying."
+    }
   }
 
   # Don't snapshot on destroy — this is dev/test. For prod, set
