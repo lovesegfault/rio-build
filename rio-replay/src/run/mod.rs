@@ -2527,10 +2527,13 @@ pub async fn run_with_backends(
         // re-probing, never correctness.
         let target_coverage: BTreeSet<String> =
             if spec.mode == Mode::Leaf && !plan_output.warm_set.is_empty() {
-                // The probe's single point of use: only here does a missing
-                // probeable substituter become an error, so campaigns that
-                // never probe (non-leaf, empty warm set, resumed past
-                // supply) are not held to a requirement they don't have.
+                // Only probing call sites — this one and the
+                // resumed-past-supply hook rebuild below, which re-probes
+                // under these same leaf + non-empty-warm-set conditions
+                // when its rebuild gates hold — turn a missing probeable
+                // substituter into an error, so campaigns that never
+                // probe (non-leaf, empty warm set) are not held to a
+                // requirement they don't have.
                 let narinfo = backends.narinfo.as_ref().context(
                     "the warm-set upstream-coverage probe needs a public-HTTPS substituter, but \
                      the archive's substituter lists (target, then relay) contain no usable \
@@ -6301,17 +6304,15 @@ mod tests {
             .find(|m| m.job == "appB.x86_64-linux")
             .unwrap()
             .clone();
-        // Both dependency outputs are relayable here: this scenario's
-        // final phase asserts every batch carries a GENUINE delivery
-        // proof, and the proof is the fail-closed collapse of the
-        // top-up's per-path outcome — an unsourceable closure path
-        // (correctly) withholds it, so the happy-path fixture must make
-        // appB's whole closure deliverable.
-        let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
-        let (_stdenv_drv, stdenv_out) = app_b_dep(&archive, "-stdenv-");
-        let mut narinfos = HashMap::new();
-        narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
-        narinfos.insert(stdenv_out.clone(), narinfo_text(&stdenv_out));
+        // No narinfo fixtures: every spec in this scenario is
+        // self-hosted (non-leaf), so the warm-set upstream-coverage
+        // probe never runs and backends.narinfo is never read — supply
+        // is the upload arm (deferred inline, then delivered by the
+        // re-run prewarm stage), not relay sourcing. The final phase
+        // asserts the deferrals were redeemed and both jobs verdicted,
+        // not the wired-hook delivery-proof battery (that lives in the
+        // inline-resume siblings named in the doc comment).
+        let narinfos = HashMap::new();
         let submitter = Arc::new(KeyedSubmitter::default());
         let supply_transport = Arc::new(FakeSupplyTransport::default());
         let store_dir = tempfile::tempdir().unwrap();
