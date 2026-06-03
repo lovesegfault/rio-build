@@ -35,6 +35,10 @@ pub struct Sample {
     pub mountd_promote_bytes: f64,
     pub mountd_request_count: BTreeMap<String, f64>,
     pub mountd_request_sum: BTreeMap<String, f64>,
+    /// Disk-pressure LRU sweep evictions, by dir (cache/chunks). A
+    /// warm-leak verdict reads differently when the node cache was
+    /// actually evicting versus quiet.
+    pub mountd_cache_evicted: BTreeMap<String, f64>,
     /// `None` when the executor scrape failed on this tick (pod
     /// terminating, port hiccup) — mountd (a long-lived DS) is the
     /// resilient half.
@@ -308,6 +312,7 @@ async fn sample_once(
         mountd_promote_bytes: s.sum("rio_mountd_promote_bytes_total"),
         mountd_request_count: by_label(&s, "rio_mountd_request_seconds_count", "op"),
         mountd_request_sum: by_label(&s, "rio_mountd_request_seconds_sum", "op"),
+        mountd_cache_evicted: by_label(&s, "rio_mountd_cache_evicted_bytes_total", "dir"),
         builder: None,
     };
     if let Some(pod) = executor_pod {

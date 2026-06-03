@@ -162,6 +162,14 @@ pub struct MountdDeltas {
     pub promote_bytes_cold_window_delta: Option<f64>,
     pub request_count_delta: BTreeMap<String, f64>,
     pub request_sum_delta_s: BTreeMap<String, f64>,
+    /// Whole-run disk-pressure LRU eviction bytes, by dir
+    /// (cache/chunks). Distinguishes a real warm leak (evictions > 0:
+    /// the node cache was under pressure) from a sampling artifact
+    /// (evictions = 0) without re-deriving it from mountd logs.
+    /// `serde(default)` so results saved before the field existed
+    /// still load.
+    #[serde(default)]
+    pub cache_evicted_bytes_delta: BTreeMap<String, f64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -555,6 +563,10 @@ pub fn cluster_metrics(run: &ParsedRun, report: &CotenancyReport) -> ClusterMetr
         promote_bytes_cold_window_delta: window_delta(cold_w, &|s| Some(s.mountd_promote_bytes)),
         request_count_delta: delta_map(&first.mountd_request_count, &last.mountd_request_count),
         request_sum_delta_s: delta_map(&first.mountd_request_sum, &last.mountd_request_sum),
+        cache_evicted_bytes_delta: delta_map(
+            &first.mountd_cache_evicted,
+            &last.mountd_cache_evicted,
+        ),
     };
     let builder = match (&first.builder, &last.builder) {
         (Some(fb), Some(lb)) => Some(BuilderDeltas {
@@ -817,6 +829,7 @@ mod tests {
             mountd_promote_bytes: promote,
             mountd_request_count: BTreeMap::new(),
             mountd_request_sum: BTreeMap::new(),
+            mountd_cache_evicted: BTreeMap::new(),
             builder: Some(BuilderSample {
                 open_case: BTreeMap::new(),
                 fetch_bytes: BTreeMap::from([("remote".to_string(), 0.0)]),
@@ -831,6 +844,31 @@ mod tests {
             samples,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn eviction_delta_is_stamped_and_old_results_still_load() {
+        // Whole-run eviction delta lands in the mountd block, keyed by
+        // dir — the field that lets a warm-leak verdict distinguish
+        // cache pressure from a sampling artifact.
+        let mut a = sample(500, 0.0);
+        let mut b = sample(70_000, 1000.0);
+        a.mountd_cache_evicted = BTreeMap::from([("cache".to_string(), 100.0)]);
+        b.mountd_cache_evicted = BTreeMap::from([("cache".to_string(), 350.0)]);
+        let cm = cluster_metrics(&honesty_run(), &exact_report(vec![a, b]));
+        assert_eq!(
+            cm.mountd.unwrap().cache_evicted_bytes_delta.get("cache"),
+            Some(&250.0)
+        );
+
+        // Results/baselines saved before the field existed must still
+        // deserialize (serde default → empty map).
+        let old: MountdDeltas = serde_json::from_str(
+            r#"{"promote_bytes_total_delta":1.0,"promote_bytes_cold_window_delta":null,
+                "request_count_delta":{},"request_sum_delta_s":{}}"#,
+        )
+        .unwrap();
+        assert!(old.cache_evicted_bytes_delta.is_empty());
     }
 
     #[test]
