@@ -215,7 +215,7 @@
         }
       },
       "log_retention_days": {
-        "description": "Build-log retention, in days since the execution *started*\n(`drv_executions.started_at` — the only timestamp every\nexecution has). The hourly TTL sweep deletes older executions'\nmanifest rows and chunk objects. On EKS this is deployed from\nthe terraform variable `log_retention_days` (xtask deploy\n`--set store.logRetentionDays`), and the S3 `logs/` lifecycle\nbackstop expires at the SAME variable + 7 days of slack — the\ntwo deleters derive from one source and cannot drift. Operators\noutside that chain must keep any bucket lifecycle ≥ this value\n+ slack (an undercutting lifecycle hard-deletes chunks the read\npath still references). Default 30. Env:\n`RIO_LOG_RETENTION_DAYS`.",
+        "description": "Build-log retention, in days since the execution *started*\n(`drv_executions.started_at` — the only timestamp every\nexecution has). The hourly TTL sweep deletes older executions'\nmanifest rows and chunk objects. On EKS this is deployed from\nthe terraform variable `log_retention_days` (xtask deploy\n`--set store.logRetentionDays`), and the S3 `logs/` lifecycle\nbackstop expires at the SAME variable + 7 days of slack — the\ntwo deleters derive from one source and cannot drift. Operators\noutside that chain must keep any bucket lifecycle at or above\nthis value plus slack (an undercutting lifecycle hard-deletes\nchunks the read path still references). Default 30. Env:\n`RIO_LOG_RETENTION_DAYS`.",
         "type": "integer",
         "format": "uint32",
         "minimum": 0,
