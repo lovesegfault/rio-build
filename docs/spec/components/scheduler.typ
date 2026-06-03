@@ -2950,6 +2950,26 @@ backoff. This prevents unbounded request queueing at the gateway layer.
   set classifies Broken (conservative), never Vouched.
 ]
 
+#r("sched.db.table-retention")[
+  Every public scheduler-owned table MUST have a declared row lifecycle in
+  `rio-migrations/src/retention.rs` (`RETENTION_REGISTRY`): either a named
+  sweeper that deletes its rows or a written keep-forever rationale. A
+  migration that creates a table without a registry row MUST fail CI.
+  Resolved `materialization_jobs` rows MUST be deleted only past the
+  forensic horizon and only when no `scheduler_live_pins` row and no
+  `materialization_interest` row references the job; `pending` jobs MUST
+  never be deleted. `build_wanted_outputs` rows MUST be deleted exactly
+  when their build row is gone or has been terminal past the horizon, and
+  `delete_build` MUST remove the build row and its wanted rows in one
+  transaction.
+]
+
+The registry test (`rio-migrations/tests/retention.rs`) diffs `pg_tables`
+against the registry in both directions, so an undeclared new table and a
+stale registry row are both merge-time failures naming the table — the
+structural close of the class where migration 078 shipped two tables with
+no deletion lifecycle at all (merged_bug_163).
+
 #r("sched.db.attempts-gc")[
   `drv_attempts` rows MUST be deleted only by the leader's periodic
   Tick-driven sweep, and the suffix every ledger loader returns MUST be

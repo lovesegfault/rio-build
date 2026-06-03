@@ -27,5 +27,6 @@ pub fn migrator() -> sqlx::migrate::Migrator {
 
 pub mod migrate;
 pub mod migrations;
+pub mod retention;
 pub mod schema;
 pub mod sql;

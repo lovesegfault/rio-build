@@ -7,7 +7,7 @@
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use super::{BuildListRow, SchedulerDb, list_builds_select};
+use super::{BuildListRow, SchedulerDb, list_builds_select, FencedBegin, FencedOutcome};
 use crate::state::{BuildState, BuildStateExt};
 
 impl SchedulerDb {
@@ -197,11 +197,31 @@ impl SchedulerDb {
     /// build_derivations rows to cascade. The CASCADE is defense-in-depth
     /// for the persist-failed path (where rows exist but the tx rolled
     /// back, so they don't) and for manual admin cleanup.
-    pub async fn delete_build(&self, build_id: Uuid) -> Result<(), sqlx::Error> {
+    /// One FENCED transaction: the build row AND its wanted rows
+    /// (D1/A6 merged_bug_163 composed with A1 fenced-write discipline)
+    /// — the failed-merge rollback can no longer leave
+    /// build_wanted_outputs orphans behind, and a deposed replica's
+    /// late rollback cannot destroy a successor's rows.
+    // r[impl sched.db.table-retention]
+    pub async fn delete_build(
+        &self,
+        build_id: Uuid,
+        serving_generation: i64,
+    ) -> Result<FencedOutcome, sqlx::Error> {
+        let mut tx = match self.begin_fenced(serving_generation).await? {
+            FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
+            FencedBegin::Open(ftx) => ftx,
+        };
+        let n = sqlx::query("DELETE FROM build_wanted_outputs WHERE build_id = $1")
+            .bind(build_id)
+            .execute(tx.conn())
+            .await?
+            .rows_affected();
         sqlx::query!("DELETE FROM builds WHERE build_id = $1", build_id)
-            .execute(&self.pool)
+            .execute(tx.conn())
             .await?;
-        Ok(())
+        tx.commit().await?;
+        Ok(FencedOutcome::Applied(n))
     }
 
     // r[impl sched.evidence.durability+4]

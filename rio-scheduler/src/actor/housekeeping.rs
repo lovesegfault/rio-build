@@ -127,6 +127,8 @@ impl DagActor {
 
         self.tick_gc_orphan_derivations().await;
         self.tick_gc_attempt_ledger().await;
+        self.tick_gc_materialization_jobs().await;
+        self.tick_gc_build_wanted_outputs().await;
         self.tick_sweep_dispatched_cells();
         self.tick_publish_gauges();
         self.tick_flush_status_outbox().await;
@@ -516,6 +518,64 @@ impl DagActor {
             }
             Err(e) => {
                 warn!(error = %e, "attempt-ledger GC sweep failed; retrying next interval");
+            }
+        }
+    }
+
+    /// D1/A6 (merged_bug_163): reap RESOLVED materialization jobs past the
+    /// forensic horizon once unpinned and interest-free. Leader-only via
+    /// handle_tick; same cadence/batch class as the attempt-ledger sweep.
+    pub(super) async fn tick_gc_materialization_jobs(&self) {
+        const MAT_JOBS_GC_EVERY: u64 = 30;
+        const MAT_JOBS_GC_BATCH: i64 = 1000;
+        if !self.tick_count.is_multiple_of(MAT_JOBS_GC_EVERY) {
+            return;
+        }
+        // The same forensic window as the attempt ledger: resolved jobs
+        // are debugging evidence, not decision inputs.
+        let horizon = crate::db::attempts::LEDGER_RETENTION_FLOOR.as_secs();
+        #[allow(clippy::cast_precision_loss)] // horizon ≪ 2^52 s
+        match self
+            .db
+            .gc_resolved_materialization_jobs(horizon as f64, MAT_JOBS_GC_BATCH)
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => {
+                debug!(
+                    deleted = n,
+                    "GC'd resolved materialization jobs past the retention horizon"
+                );
+                metrics::counter!("rio_scheduler_materialization_jobs_gc_total").increment(n);
+            }
+            Err(e) => {
+                warn!(error = %e, "materialization-jobs GC sweep failed; retrying next interval");
+            }
+        }
+    }
+
+    /// D1/A6 (merged_bug_163): reap build_wanted_outputs rows whose build
+    /// is long-terminal (or gone). Leader-only via handle_tick.
+    pub(super) async fn tick_gc_build_wanted_outputs(&self) {
+        const WANTED_GC_EVERY: u64 = 30;
+        const WANTED_GC_BATCH: i64 = 1000;
+        if !self.tick_count.is_multiple_of(WANTED_GC_EVERY) {
+            return;
+        }
+        let horizon = crate::db::attempts::LEDGER_RETENTION_FLOOR.as_secs();
+        #[allow(clippy::cast_precision_loss)] // horizon ≪ 2^52 s
+        match self
+            .db
+            .gc_dead_build_wanted_outputs(horizon as f64, WANTED_GC_BATCH)
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => {
+                debug!(deleted = n, "GC'd wanted-output rows for dead builds");
+                metrics::counter!("rio_scheduler_wanted_outputs_gc_total").increment(n);
+            }
+            Err(e) => {
+                warn!(error = %e, "build-wanted-outputs GC sweep failed; retrying next interval");
             }
         }
     }

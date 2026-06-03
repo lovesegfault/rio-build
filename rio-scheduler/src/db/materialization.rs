@@ -530,6 +530,40 @@ impl SchedulerDb {
         .fetch_all(&self.pool)
         .await
     }
+
+    /// D1/A6 (merged_bug_163): delete RESOLVED materialization jobs past
+    /// the forensic horizon once nothing references them — no live pin
+    /// row (the 093 kind key: pins are released by the resolve path) and
+    /// no remaining interest (the 078 derived view: interest ends when
+    /// every interested build is terminal). `pending` jobs are NEVER
+    /// deleted: claimable is the armed action. The NOT-EXISTS-pins
+    /// conjunct is the ordering guard the schema deliberately has no FK
+    /// for (093 commentary).
+    // r[impl sched.db.table-retention]
+    pub(crate) async fn gc_resolved_materialization_jobs(
+        &self,
+        horizon_secs: f64,
+        limit: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM materialization_jobs WHERE job_id IN (
+                 SELECT j.job_id FROM materialization_jobs j
+                 WHERE j.state <> 'pending'
+                   AND COALESCE(j.resolved_at, j.created_at)
+                       < now() - make_interval(secs => $1)
+                   AND NOT EXISTS (SELECT 1 FROM scheduler_live_pins p
+                                   WHERE p.job_id = j.job_id)
+                   AND NOT EXISTS (SELECT 1 FROM materialization_interest i
+                                   WHERE i.job_id = j.job_id)
+                 ORDER BY COALESCE(j.resolved_at, j.created_at)
+                 LIMIT $2)",
+        )
+        .bind(horizon_secs)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 /// One unresolved job as the recovery view rebuild loads it (T-4.3).

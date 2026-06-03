@@ -178,26 +178,34 @@ impl SchedulerDb {
         .await
     }
 
-    /// Purge a build's contributions (called with the build row's own
-    /// purge — existing lifecycle; in Phase A only tests call it).
-    /// Claims-floor fenced like every other wanted-relation writer: a
-    /// deposed replica's late purge must not destroy a successor's
-    /// live interest rows.
-    pub(crate) async fn delete_wanted_for_build(
+    /// D1/A6 (merged_bug_163): build_wanted_outputs rows die with their
+    /// build — terminal arm (the build finished past the horizon,
+    /// 001_scheduler.sql `builds.finished_at`) UNION orphan arm (no
+    /// builds row at all: pre-wiring failed-merge leaks). DELETE by PK
+    /// (build_id, derivation_id); bounded anti-join per the accepted
+    /// gc_attempt_ledger orphan-arm class. The per-build purge lives in
+    /// [`SchedulerDb::delete_build`]'s fenced one-tx form (fence and
+    /// atomicity together — A1 + D1 composed).
+    // r[impl sched.db.table-retention]
+    pub(crate) async fn gc_dead_build_wanted_outputs(
         &self,
-        build_id: Uuid,
-        serving_generation: i64,
-    ) -> Result<FencedOutcome, sqlx::Error> {
-        let mut tx = match self.begin_fenced(serving_generation).await? {
-            FencedBegin::Fenced { .. } => return Ok(FencedOutcome::Fenced),
-            FencedBegin::Open(ftx) => ftx,
-        };
-        let n = sqlx::query("DELETE FROM build_wanted_outputs WHERE build_id = $1")
-            .bind(build_id)
-            .execute(tx.conn())
-            .await?
-            .rows_affected();
-        tx.commit().await?;
-        Ok(FencedOutcome::Applied(n))
+        horizon_secs: f64,
+        limit: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM build_wanted_outputs WHERE (build_id, derivation_id) IN (
+                 SELECT w.build_id, w.derivation_id
+                 FROM build_wanted_outputs w
+                 LEFT JOIN builds b ON b.build_id = w.build_id
+                 WHERE (b.finished_at IS NOT NULL
+                        AND b.finished_at < now() - make_interval(secs => $1))
+                    OR b.build_id IS NULL
+                 LIMIT $2)",
+        )
+        .bind(horizon_secs)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 }

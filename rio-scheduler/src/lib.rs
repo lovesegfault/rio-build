@@ -184,6 +184,17 @@ pub fn describe_metrics() {
          orphaned histories. The decision suffix is provably unchanged by every increment"
     );
     describe_counter!(
+        "rio_scheduler_materialization_jobs_gc_total",
+        "Resolved materialization_jobs rows deleted by the periodic retention sweep \
+         (D1/A6, merged_bug_163): past the forensic horizon, unpinned, interest-free. \
+         Pending jobs are never deleted"
+    );
+    describe_counter!(
+        "rio_scheduler_wanted_outputs_gc_total",
+        "build_wanted_outputs rows deleted by the periodic retention sweep (D1/A6, \
+         merged_bug_163): builds long-terminal, plus orphan rows whose build is gone"
+    );
+    describe_counter!(
         "rio_scheduler_resource_floor_bumps_total",
         "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled \
          reason=oom_killed|disk_pressure|cgroup_oom|timeout|deadline_exceeded). Reactive \

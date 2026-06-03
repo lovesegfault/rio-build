@@ -333,7 +333,7 @@ async fn wanted_rows_purged_with_build() -> anyhow::Result<()> {
     );
 
     // Purge b1's contributions.
-    let deleted = match db.delete_wanted_for_build(b1, 1).await? {
+    let deleted = match db.delete_build(b1, 1).await? {
         crate::db::FencedOutcome::Applied(n) => n,
         other => panic!("expected Applied, got {other:?}"),
     };
@@ -354,3 +354,89 @@ async fn wanted_rows_purged_with_build() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// D1/A6 (merged_bug_163): the wanted-outputs retention sweep deletes
+/// rows for long-terminal builds and orphan rows whose build is gone;
+/// live builds' rows and freshly-finished builds' rows survive.
+// r[verify sched.db.table-retention]
+#[tokio::test]
+async fn gc_dead_wanted_sweeps_terminal_and_orphans() -> anyhow::Result<()> {
+    let (test_db, db) = setup().await;
+    let d = insert_test_derivation(&db, "gc-wanted-d").await?;
+    let b_old = insert_test_build(&db).await?;
+    let b_live = insert_test_build(&db).await?;
+    let b_fresh = insert_test_build(&db).await?;
+    let b_orphan = Uuid::new_v4(); // never inserted into builds
+
+    for b in [b_old, b_live, b_fresh, b_orphan] {
+        sqlx::query(
+            "INSERT INTO build_wanted_outputs (build_id, derivation_id, wanted_output_names) \
+             VALUES ($1, $2, '{}')",
+        )
+        .bind(b)
+        .bind(d)
+        .execute(&test_db.pool)
+        .await?;
+    }
+    sqlx::query(
+        "UPDATE builds SET status = 'succeeded', finished_at = now() - interval '3 days' \
+         WHERE build_id = $1",
+    )
+    .bind(b_old)
+    .execute(&test_db.pool)
+    .await?;
+    sqlx::query("UPDATE builds SET status = 'succeeded', finished_at = now() WHERE build_id = $1")
+        .bind(b_fresh)
+        .execute(&test_db.pool)
+        .await?;
+
+    let deleted = db.gc_dead_build_wanted_outputs(86_400.0, 1000).await?;
+    assert_eq!(deleted, 2, "terminal-old + orphan");
+    let remaining: Vec<Uuid> =
+        sqlx::query_scalar("SELECT build_id FROM build_wanted_outputs ORDER BY build_id")
+            .fetch_all(&test_db.pool)
+            .await?;
+    let mut expect = vec![b_live, b_fresh];
+    expect.sort_unstable();
+    assert_eq!(remaining, expect, "live + fresh survive");
+    Ok(())
+}
+
+/// D1/A6 (merged_bug_163) composed with A1: delete_build removes the
+/// build row AND its wanted rows in ONE FENCED transaction — the
+/// failed-merge rollback can no longer leak orphans, and a deposed
+/// replica's late rollback is fenced to a no-op.
+// r[verify sched.db.table-retention]
+#[tokio::test]
+async fn delete_build_purges_wanted_rows_same_fenced_tx() -> anyhow::Result<()> {
+    let (test_db, db) = setup().await;
+    let d = insert_test_derivation(&db, "gc-deltx-d").await?;
+    let b = insert_test_build(&db).await?;
+    sqlx::query(
+        "INSERT INTO build_wanted_outputs (build_id, derivation_id, wanted_output_names) \
+         VALUES ($1, $2, '{}')",
+    )
+    .bind(b)
+    .bind(d)
+    .execute(&test_db.pool)
+    .await?;
+
+    assert_eq!(
+        db.delete_build(b, 1).await?,
+        FencedOutcome::Applied(1),
+        "one wanted row purged with the build"
+    );
+
+    let builds: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM builds WHERE build_id = $1")
+        .bind(b)
+        .fetch_one(&test_db.pool)
+        .await?;
+    let wanted: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM build_wanted_outputs WHERE build_id = $1")
+            .bind(b)
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!((builds, wanted), (0, 0), "both gone atomically");
+    Ok(())
+}
+

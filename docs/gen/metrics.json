@@ -106,6 +106,7 @@
     "rio_scheduler_materialization_claims_total",
     "rio_scheduler_materialization_converted_total",
     "rio_scheduler_materialization_jobs_created_total",
+    "rio_scheduler_materialization_jobs_gc_total",
     "rio_scheduler_materialization_jobs_origin_upgraded_total",
     "rio_scheduler_materialization_jobs_resolved_total",
     "rio_scheduler_materialization_stalled",
@@ -146,6 +147,7 @@
     "rio_scheduler_transition_rejected_total",
     "rio_scheduler_undeclared_built_output_total",
     "rio_scheduler_unroutable_features_total",
+    "rio_scheduler_wanted_outputs_gc_total",
     "rio_scheduler_wanted_width_saturated_total",
     "rio_store_check_available_duration_seconds",
     "rio_store_chunk_cache_hits_total",
@@ -755,6 +757,11 @@
         "help": "Materialization jobs created (substitution-replacement campaign), labeled by origin (pruned|cache_opportunity|stale_reset|reprobe). Dedup-found existing jobs do not count; origin upgrades are counted by ..._origin_upgraded_total."
       },
       {
+        "name": "rio_scheduler_materialization_jobs_gc_total",
+        "kind": "counter",
+        "help": "Resolved materialization_jobs rows deleted by the periodic retention sweep (D1/A6, merged_bug_163): past the forensic horizon, unpinned, interest-free. Pending jobs are never deleted"
+      },
+      {
         "name": "rio_scheduler_materialization_jobs_origin_upgraded_total",
         "kind": "counter",
         "help": "Pruned-wins origin upgrades on the creation dedup arm (PD-D1): a topdown prune landed on a node with an existing unresolved non-pruned job and upgraded that row's origin to 'pruned' in the same transaction. Not a creation (jobs_created_total is untouched); psql origin distributions diverge from creation-rate dashboards by exactly this counter."
@@ -953,6 +960,11 @@
         "name": "rio_scheduler_unroutable_features_total",
         "kind": "counter",
         "help": "§13c: solve_intent_for found NO hwClass whose provides_features hosts the drv's required_features (labeled tenant). Debounced once per (tenant, required_features) edge. The intent is unroutable until a `[sla.hw_classes.$h]` with matching providesFeatures is added; the WARN names which features."
+      },
+      {
+        "name": "rio_scheduler_wanted_outputs_gc_total",
+        "kind": "counter",
+        "help": "build_wanted_outputs rows deleted by the periodic retention sweep (D1/A6, merged_bug_163): builds long-terminal, plus orphan rows whose build is gone"
       },
       {
         "name": "rio_scheduler_wanted_width_saturated_total",

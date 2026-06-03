@@ -691,6 +691,11 @@
       "doc": "Migration commentary — the \"living\" half of `migrations/*.sql`."
     },
     {
+      "path": "retention.rs",
+      "depth": 0,
+      "doc": "The table-retention registry (bughunt wave D1, merged_bug_163)."
+    },
+    {
       "path": "schema.rs",
       "depth": 0,
       "doc": "Cross-service row types — compile-time schema contract."

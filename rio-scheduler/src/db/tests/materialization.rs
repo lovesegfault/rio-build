@@ -868,3 +868,103 @@ async fn dedup_upgrade_is_pruned_wins_and_monotone() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// D1/A6 (merged_bug_163): the resolved-jobs retention sweep deletes
+/// ONLY resolved+old+unpinned+interest-free rows — pending jobs, fresh
+/// jobs, pinned jobs, and jobs with live interest all survive.
+// r[verify sched.db.table-retention]
+#[tokio::test]
+async fn gc_resolved_jobs_sweeps_only_unreferenced_resolved() -> anyhow::Result<()> {
+    let (test_db, db, drv_swept) = setup("gc-jobs-swept").await?;
+    let drv_pending = insert_test_derivation(&db, "gc-jobs-pending").await?;
+    let drv_pinned = insert_test_derivation(&db, "gc-jobs-pinned").await?;
+    let drv_interest = insert_test_derivation(&db, "gc-jobs-interest").await?;
+    let drv_fresh = insert_test_derivation(&db, "gc-jobs-fresh").await?;
+
+    let mk = |drv: Uuid, hash: &'static str| {
+        let db = db.clone();
+        async move {
+            let FencedJobCreate::Applied { job_id, .. } = db
+                .create_materialization_job_fenced(drv, hash, None, JobOrigin::Pruned, None, 1)
+                .await?
+            else {
+                anyhow::bail!("create must apply");
+            };
+            anyhow::Ok(job_id)
+        }
+    };
+    let j_swept = mk(drv_swept, "gc-jobs-swept").await?;
+    let _j_pending = mk(drv_pending, "gc-jobs-pending").await?;
+    let j_pinned = mk(drv_pinned, "gc-jobs-pinned").await?;
+    let j_interest = mk(drv_interest, "gc-jobs-interest").await?;
+    let j_fresh = mk(drv_fresh, "gc-jobs-fresh").await?;
+
+    // Resolve everything except the pending one; backdate all but fresh.
+    for (job, old) in [
+        (j_swept, true),
+        (j_pinned, true),
+        (j_interest, true),
+        (j_fresh, false),
+    ] {
+        sqlx::query(
+            "UPDATE materialization_jobs SET state = 'resolved_success', \
+             resolved_at = CASE WHEN $2 THEN now() - interval '3 days' ELSE now() END \
+             WHERE job_id = $1",
+        )
+        .bind(job)
+        .bind(old)
+        .execute(&test_db.pool)
+        .await?;
+    }
+    // Live pin referencing j_pinned (the 093 materialization kind key).
+    sqlx::query(
+        "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash, pin_kind, job_id) \
+         VALUES ('gcpinhash', 'gc-jobs-pinned', 'materialization', $1)",
+    )
+    .bind(j_pinned)
+    .execute(&test_db.pool)
+    .await?;
+    // Live interest for j_interest: an active build wanting the drv.
+    let build = {
+        let build_id = Uuid::new_v4();
+        db.insert_build(
+            build_id,
+            None,
+            crate::state::PriorityClass::Scheduled,
+            true,
+            &Default::default(),
+            None,
+        )
+        .await?;
+        build_id
+    };
+    sqlx::query(
+        "INSERT INTO build_wanted_outputs (build_id, derivation_id, wanted_output_names) \
+         VALUES ($1, $2, '{}')",
+    )
+    .bind(build)
+    .bind(drv_interest)
+    .execute(&test_db.pool)
+    .await?;
+
+    let deleted = db.gc_resolved_materialization_jobs(86_400.0, 1000).await?;
+    assert_eq!(deleted, 1, "exactly the unreferenced resolved-old job");
+    assert_eq!(job_count(&test_db.pool, drv_swept).await?, 0, "swept");
+    assert_eq!(
+        job_count(&test_db.pool, drv_pending).await?,
+        1,
+        "pending kept"
+    );
+    assert_eq!(
+        job_count(&test_db.pool, drv_pinned).await?,
+        1,
+        "pinned kept"
+    );
+    assert_eq!(
+        job_count(&test_db.pool, drv_interest).await?,
+        1,
+        "interest kept"
+    );
+    assert_eq!(job_count(&test_db.pool, drv_fresh).await?, 1, "fresh kept");
+    Ok(())
+}
