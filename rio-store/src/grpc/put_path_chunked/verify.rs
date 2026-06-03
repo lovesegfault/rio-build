@@ -9,9 +9,18 @@
 //!
 //! There is **no whole-NAR buffer** and no `nar_bytes_budget` charge:
 //! the working set is one chunk frame in hand (bounded by the gRPC
-//! message cap) plus the SHA-256/refscan/BLAKE3 accumulator state.
-//! That is the point of this RPC — the standing 40 GiB-RSS hazard of
-//! the buffered `PutPath` path does not exist here.
+//! message cap) plus the SHA-256/refscan/BLAKE3 accumulator state and
+//! at most `chunk_upload_max_concurrent` chunk bodies whose backend
+//! PUTs are still in flight (see [`UploadPipeline`]). That is the
+//! point of this RPC — the standing 40 GiB-RSS hazard of the buffered
+//! `PutPath` path does not exist here.
+//!
+//! The verification walk is strictly sequential over the byte stream
+//! (SHA-256/refscan ordering demands it); only the backend PUTs
+//! overlap. Serial PUTs were the live bottleneck: one S3 PUT per
+//! ~22 ms caps ingest at ~3 MB/s, so a 2.3 GiB output (~30 k FastCDC
+//! chunks) takes ~11 minutes — structurally unable to fit the
+//! client's 300 s stream budget.
 //!
 //! Because `validate_begin` proved `Begin.novel` is ordered by global
 //! first occurrence, the next `Chunk` frame the builder must send is
@@ -120,6 +129,107 @@ pub(super) enum Verdict {
 /// free, fine enough that the executor stays responsive.
 const FRAMING_YIELD_BYTES: usize = 4 * 1024 * 1024;
 
+/// Bounded pipeline of in-flight novel-chunk PUTs.
+///
+/// PUTs are spawned tasks, so they progress while the walk awaits the
+/// next stream frame — the overlap that turns ~22 ms-per-chunk serial
+/// ingest into `max_concurrent`-wide pipelined ingest. The walk's
+/// verification order is untouched: bodies are hashed/scanned inline
+/// before submission, and only the backend write is deferred.
+///
+/// `pending` doubles as the read-your-writes shim: an intra-stream
+/// repeat of a novel chunk (zero-filled pages etc.) can be walked
+/// before its first occurrence's PUT has landed, and the CAS fetch the
+/// dedup branch falls back to would miss. It holds at most
+/// `max_concurrent` bodies (submission blocks at capacity), each
+/// bounded by the gRPC message cap — the memory-bound contract in the
+/// module doc.
+// r[impl store.cas.upload-bounded]
+struct UploadPipeline {
+    backend: Arc<dyn ChunkBackend>,
+    in_flight: tokio::task::JoinSet<([u8; 32], Result<(), String>)>,
+    /// Bodies whose PUT has been spawned but not yet confirmed.
+    pending: std::collections::HashMap<[u8; 32], bytes::Bytes>,
+    /// Digests whose PUT completed successfully — the only digests the
+    /// commit transaction may stamp `uploaded_at` for.
+    uploaded: HashSet<[u8; 32]>,
+    max_concurrent: usize,
+}
+
+impl UploadPipeline {
+    fn new(backend: Arc<dyn ChunkBackend>, max_concurrent: usize, novel_count: usize) -> Self {
+        Self {
+            backend,
+            in_flight: tokio::task::JoinSet::new(),
+            pending: std::collections::HashMap::new(),
+            uploaded: HashSet::with_capacity(novel_count),
+            // .max(1): a zero bound would deadlock submit(); Config
+            // rejects 0 at startup but library callers bypass Config.
+            max_concurrent: max_concurrent.max(1),
+        }
+    }
+
+    /// First-occurrence check: true iff `digest` was already handed to
+    /// the pipeline (confirmed or still in flight). A digest is PUT
+    /// exactly once.
+    fn seen(&self, digest: &[u8; 32]) -> bool {
+        self.uploaded.contains(digest) || self.pending.contains_key(digest)
+    }
+
+    /// The body of a submitted-but-unconfirmed PUT, if any. Repeat
+    /// occurrences read this instead of racing the CAS.
+    fn body_in_flight(&self, digest: &[u8; 32]) -> Option<bytes::Bytes> {
+        self.pending.get(digest).cloned()
+    }
+
+    /// Spawn one PUT, first joining completed ones until below the
+    /// concurrency bound. An error from any joined PUT surfaces here.
+    async fn submit(&mut self, digest: [u8; 32], body: bytes::Bytes) -> Result<(), String> {
+        while self.in_flight.len() >= self.max_concurrent {
+            self.join_one().await?;
+        }
+        self.pending.insert(digest, body.clone());
+        let backend = Arc::clone(&self.backend);
+        self.in_flight.spawn(async move {
+            let result = backend
+                .put(&digest, body)
+                .await
+                .map_err(|e| format!("chunk upload failed: {e:#}"));
+            (digest, result)
+        });
+        Ok(())
+    }
+
+    async fn join_one(&mut self) -> Result<(), String> {
+        match self.in_flight.join_next().await {
+            None => Ok(()),
+            Some(Ok((digest, result))) => {
+                // Evict on failure too: `body_in_flight` must never
+                // serve a body whose write failed.
+                self.pending.remove(&digest);
+                result?;
+                self.uploaded.insert(digest);
+                Ok(())
+            }
+            Some(Err(join)) => Err(format!("chunk upload task failed: {join}")),
+        }
+    }
+
+    /// Join everything still in flight and hand back the confirmed
+    /// set. MUST run before the commit step — `uploaded` only ever
+    /// contains digests whose PUT succeeded.
+    async fn drain(mut self) -> Result<HashSet<[u8; 32]>, String> {
+        while !self.in_flight.is_empty() {
+            self.join_one().await?;
+        }
+        debug_assert!(
+            self.pending.is_empty(),
+            "drained pipeline still has pending bodies"
+        );
+        Ok(self.uploaded)
+    }
+}
+
 /// Run the §6.3 sequential verify walk over the remaining stream
 /// frames.
 ///
@@ -140,12 +250,18 @@ pub(super) async fn run_verify(
     backend: &Arc<dyn ChunkBackend>,
     chunk_cache: &Arc<ChunkCache>,
     max_nodes: usize,
+    chunk_upload_max_concurrent: usize,
 ) -> Result<Verdict, Status> {
     let novel_set: HashSet<[u8; 32]> = validated.novel.iter().copied().collect();
     let mut next_novel = 0usize;
-    // Doubles as the first-occurrence check: a novel digest is received
-    // and PUT exactly once, at its first manifest position.
-    let mut uploaded: HashSet<[u8; 32]> = HashSet::with_capacity(validated.novel.len());
+    // First-occurrence tracking + the eventual commit set both live in
+    // the pipeline: a novel digest is received and PUT exactly once,
+    // at its first manifest position.
+    let mut pipeline = UploadPipeline::new(
+        Arc::clone(backend),
+        chunk_upload_max_concurrent,
+        validated.novel.len(),
+    );
 
     // r[impl store.put.refs-sync]
     // One candidate set for every output: the attested input closure
@@ -167,7 +283,7 @@ pub(super) async fn run_verify(
             // this output; everything else needs no body at all (the
             // existing manifest already proves the content).
             for (digest, len) in &out.chunk_manifest {
-                if novel_set.contains(digest) && !uploaded.contains(digest) {
+                if novel_set.contains(digest) && !pipeline.seen(digest) {
                     let body =
                         match recv_novel_chunk(stream, digest, *len, validated, &mut next_novel)
                             .await?
@@ -175,10 +291,9 @@ pub(super) async fn run_verify(
                             Some(b) => b,
                             None => return Ok(Verdict::Incomplete),
                         };
-                    if let Err(e) = backend.put(digest, body).await {
-                        return Ok(Verdict::Unavailable(format!("chunk upload failed: {e:#}")));
+                    if let Err(e) = pipeline.submit(*digest, body).await {
+                        return Ok(Verdict::Unavailable(e));
                     }
-                    uploaded.insert(*digest);
                 }
             }
             computed.push(None);
@@ -248,48 +363,50 @@ pub(super) async fn run_verify(
                     }
                     let mut file_hasher = blake3::Hasher::new();
                     for (chunk_digest, chunk_len) in &out.chunk_manifest[run.chunks.clone()] {
-                        let body = if novel_set.contains(chunk_digest)
-                            && !uploaded.contains(chunk_digest)
-                        {
-                            let body = match recv_novel_chunk(
-                                stream,
-                                chunk_digest,
-                                *chunk_len,
-                                validated,
-                                &mut next_novel,
-                            )
-                            .await?
-                            {
-                                Some(b) => b,
-                                None => return Ok(Verdict::Incomplete),
-                            };
-                            // r[impl store.cas.upload-bounded]
-                            if let Err(e) = backend.put(chunk_digest, body.clone()).await {
-                                return Ok(Verdict::Unavailable(format!(
-                                    "chunk upload failed: {e:#}"
-                                )));
-                            }
-                            uploaded.insert(*chunk_digest);
-                            body
-                        } else {
-                            // A chunk that is supposed to already exist
-                            // in the CAS (deduped against a prior
-                            // upload, or a repeat of a novel chunk
-                            // received earlier in this stream). The
-                            // cache provides singleflight + LRU +
-                            // BLAKE3 verification. The error is always
-                            // a retryable Unavailable — a missing or
-                            // corrupt deduped chunk means the CAS lost
-                            // it, not that the builder lied.
-                            match chunk_cache.get_verified(chunk_digest).await {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    return Ok(Verdict::Unavailable(format!(
-                                        "deduped chunk fetch failed: {e}"
-                                    )));
+                        let body =
+                            if novel_set.contains(chunk_digest) && !pipeline.seen(chunk_digest) {
+                                let body = match recv_novel_chunk(
+                                    stream,
+                                    chunk_digest,
+                                    *chunk_len,
+                                    validated,
+                                    &mut next_novel,
+                                )
+                                .await?
+                                {
+                                    Some(b) => b,
+                                    None => return Ok(Verdict::Incomplete),
+                                };
+                                if let Err(e) = pipeline.submit(*chunk_digest, body.clone()).await {
+                                    return Ok(Verdict::Unavailable(e));
                                 }
-                            }
-                        };
+                                body
+                            } else if let Some(body) = pipeline.body_in_flight(chunk_digest) {
+                                // An intra-stream repeat of a novel chunk
+                                // whose PUT is still in flight: the CAS may
+                                // not have it yet, but the pipeline holds
+                                // the (already digest-verified) body.
+                                body
+                            } else {
+                                // A chunk that is supposed to already exist
+                                // in the CAS (deduped against a prior
+                                // upload, or a repeat of a novel chunk
+                                // received earlier in this stream whose PUT
+                                // has confirmed). The cache provides
+                                // singleflight + LRU + BLAKE3 verification.
+                                // The error is always a retryable
+                                // Unavailable — a missing or corrupt
+                                // deduped chunk means the CAS lost it, not
+                                // that the builder lied.
+                                match chunk_cache.get_verified(chunk_digest).await {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        return Ok(Verdict::Unavailable(format!(
+                                            "deduped chunk fetch failed: {e}"
+                                        )));
+                                    }
+                                }
+                            };
                         if body.len() != *chunk_len as usize {
                             // The §6.2 manifest lengths are self-
                             // consistent with the tree but not bound to
@@ -364,6 +481,15 @@ pub(super) async fn run_verify(
             "PutPathChunked: extra frame after all novel chunks were received",
         ));
     }
+
+    // Every PUT must be confirmed before the verdict reaches the
+    // commit step — `uploaded` only contains digests whose write
+    // succeeded, so a straggler failure is an Unavailable here, never
+    // a committed manifest referencing a chunk that was never stored.
+    let uploaded = match pipeline.drain().await {
+        Ok(u) => u,
+        Err(e) => return Ok(Verdict::Unavailable(e)),
+    };
 
     Ok(Verdict::Match { computed, uploaded })
 }
@@ -449,5 +575,159 @@ async fn next_message(
             "PutPathChunked: frame has no content",
         )),
         Some(PutPathChunkedRequest { msg: Some(m) }) => Ok(Some(m)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts in-flight PUTs and their high-water mark; a short sleep
+    /// keeps each PUT alive long enough for later submissions to
+    /// overlap it. Mirrors `cas::tests::HighWaterBackend`.
+    #[derive(Default)]
+    struct HighWaterBackend {
+        in_flight: AtomicUsize,
+        high_water: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ChunkBackend for HighWaterBackend {
+        async fn put(&self, _hash: &[u8; 32], _data: Bytes) -> anyhow::Result<()> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.high_water.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn get(&self, _: &[u8; 32]) -> anyhow::Result<Option<Bytes>> {
+            unimplemented!("pipeline tests use put only")
+        }
+        async fn exists_batch(&self, _: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
+            unimplemented!()
+        }
+        fn key_for(&self, _: &[u8; 32]) -> String {
+            unimplemented!()
+        }
+        async fn delete_by_key(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn put_blob(&self, _: &str, _: Bytes) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn get_blob(&self, _: &str) -> anyhow::Result<Option<Bytes>> {
+            unimplemented!()
+        }
+        async fn delete_blob(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    /// Fails the PUT for one specific digest; stores nothing.
+    struct FailDigestBackend {
+        poison: [u8; 32],
+    }
+
+    #[async_trait::async_trait]
+    impl ChunkBackend for FailDigestBackend {
+        async fn put(&self, hash: &[u8; 32], _data: Bytes) -> anyhow::Result<()> {
+            if *hash == self.poison {
+                anyhow::bail!("injected S3 fault");
+            }
+            Ok(())
+        }
+        async fn get(&self, _: &[u8; 32]) -> anyhow::Result<Option<Bytes>> {
+            unimplemented!()
+        }
+        async fn exists_batch(&self, _: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
+            unimplemented!()
+        }
+        fn key_for(&self, _: &[u8; 32]) -> String {
+            unimplemented!()
+        }
+        async fn delete_by_key(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn put_blob(&self, _: &str, _: Bytes) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn get_blob(&self, _: &str) -> anyhow::Result<Option<Bytes>> {
+            unimplemented!()
+        }
+        async fn delete_blob(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    fn digest(i: u8) -> [u8; 32] {
+        let mut d = [0u8; 32];
+        d[0] = i;
+        d
+    }
+
+    // r[verify store.cas.upload-bounded]
+    #[tokio::test]
+    async fn pipeline_overlaps_puts_and_respects_the_bound() {
+        let backend = Arc::new(HighWaterBackend::default());
+        let mut p = UploadPipeline::new(Arc::clone(&backend) as Arc<dyn ChunkBackend>, 8, 32);
+        for i in 0..32u8 {
+            p.submit(digest(i), Bytes::from_static(b"x")).await.unwrap();
+        }
+        let uploaded = p.drain().await.unwrap();
+        assert_eq!(uploaded.len(), 32, "every confirmed PUT is in the set");
+        let hw = backend.high_water.load(Ordering::SeqCst);
+        // Structural, not wall-clock: >1 proves PUTs overlapped (the
+        // serial regression this pipeline exists to fix would read 1);
+        // <=8 proves the concurrency bound held.
+        assert!(hw > 1, "PUTs never overlapped (high_water={hw})");
+        assert!(hw <= 8, "concurrency bound violated (high_water={hw})");
+    }
+
+    #[tokio::test]
+    async fn pipeline_put_failure_surfaces_as_error() {
+        let backend = Arc::new(FailDigestBackend { poison: digest(3) });
+        let mut p = UploadPipeline::new(backend as Arc<dyn ChunkBackend>, 4, 8);
+        // The poisoned PUT's failure surfaces at the next join point —
+        // a later submit or the final drain — never silently.
+        let mut failed = None;
+        for i in 0..8u8 {
+            if let Err(e) = p.submit(digest(i), Bytes::from_static(b"x")).await {
+                failed = Some(e);
+                break;
+            }
+        }
+        let err = match failed {
+            Some(e) => e,
+            None => p
+                .drain()
+                .await
+                .expect_err("poisoned PUT must fail the drain"),
+        };
+        assert!(
+            err.contains("chunk upload failed"),
+            "error keeps the Unavailable message shape: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_pending_body_serves_intra_stream_repeats() {
+        // A repeat occurrence walked while the first occurrence's PUT
+        // is still in flight must read the held body — the CAS may not
+        // have the chunk yet (read-your-writes shim).
+        let backend = Arc::new(HighWaterBackend::default());
+        let mut p = UploadPipeline::new(Arc::clone(&backend) as Arc<dyn ChunkBackend>, 8, 2);
+        let d = digest(1);
+        let body = Bytes::from_static(b"repeated-content");
+        p.submit(d, body.clone()).await.unwrap();
+        assert!(p.seen(&d), "submitted digest counts as seen immediately");
+        assert_eq!(
+            p.body_in_flight(&d).as_deref(),
+            Some(body.as_ref()),
+            "in-flight body must be readable for repeats"
+        );
+        let uploaded = p.drain().await.unwrap();
+        assert!(uploaded.contains(&d));
     }
 }

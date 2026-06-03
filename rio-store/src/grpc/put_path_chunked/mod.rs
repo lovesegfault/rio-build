@@ -305,6 +305,7 @@ impl StoreServiceImpl {
             &backend,
             &chunk_cache,
             MAX_NAR_ENTRIES,
+            self.chunk_upload_max_concurrent,
         )
         .await
         {

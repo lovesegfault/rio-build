@@ -147,6 +147,13 @@ impl StoreSession {
         Ok((s, backend))
     }
 
+    /// Store with a CALLER-SUPPLIED chunk backend — for fault- and
+    /// latency-injecting backends (verify-pipeline tests).
+    pub async fn new_chunked_with_backend(backend: Arc<dyn ChunkBackend>) -> anyhow::Result<Self> {
+        let cache = Arc::new(rio_store::cas::ChunkCache::new(Arc::clone(&backend)));
+        Self::build(|pool| StoreServiceImpl::new(pool).with_chunk_cache(cache)).await
+    }
+
     /// Chunk backend AND assignment-token verifier. `PutPathChunked`
     /// hard-requires a chunk backend, so the HMAC enforcement tests
     /// for it can't use [`Self::new_with_hmac`] (inline-only).

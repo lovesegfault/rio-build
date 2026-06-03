@@ -921,3 +921,148 @@ async fn ca_path_mismatch_rejects() -> TestResult {
     assert_eq!(n, 0, "rejected CA upload must not leave a placeholder");
     Ok(())
 }
+
+// ── verify-pipeline tests (bounded-concurrent chunk PUTs) ──────────
+
+/// Latency-injecting wrapper around the memory backend: tracks the PUT
+/// in-flight high-water mark — the structural "uploads overlapped"
+/// signal. The 15 ms sleep keeps each PUT alive long enough for the
+/// walk to receive and submit later chunks while it runs.
+#[derive(Default)]
+struct LatencyHighWaterBackend {
+    inner: MemoryChunkBackend,
+    in_flight: std::sync::atomic::AtomicUsize,
+    high_water: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ChunkBackend for LatencyHighWaterBackend {
+    async fn put(&self, hash: &[u8; 32], data: bytes::Bytes) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.high_water.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        let r = self.inner.put(hash, data).await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        r
+    }
+    async fn get(&self, hash: &[u8; 32]) -> anyhow::Result<Option<bytes::Bytes>> {
+        self.inner.get(hash).await
+    }
+    async fn exists_batch(&self, hashes: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
+        self.inner.exists_batch(hashes).await
+    }
+    fn key_for(&self, hash: &[u8; 32]) -> String {
+        self.inner.key_for(hash)
+    }
+    async fn delete_by_key(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.delete_by_key(key).await
+    }
+    async fn put_blob(&self, key: &str, data: bytes::Bytes) -> anyhow::Result<()> {
+        self.inner.put_blob(key, data).await
+    }
+    async fn get_blob(&self, key: &str) -> anyhow::Result<Option<bytes::Bytes>> {
+        self.inner.get_blob(key).await
+    }
+    async fn delete_blob(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.delete_blob(key).await
+    }
+}
+
+/// Every PUT fails — the S3-outage-mid-stream case.
+struct FailingPutBackend;
+
+#[async_trait::async_trait]
+impl ChunkBackend for FailingPutBackend {
+    async fn put(&self, _: &[u8; 32], _: bytes::Bytes) -> anyhow::Result<()> {
+        anyhow::bail!("injected S3 outage")
+    }
+    async fn get(&self, _: &[u8; 32]) -> anyhow::Result<Option<bytes::Bytes>> {
+        unimplemented!("PutPathChunked with all-novel chunks never GETs")
+    }
+    async fn exists_batch(&self, _: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
+        unimplemented!()
+    }
+    fn key_for(&self, hash: &[u8; 32]) -> String {
+        hex::encode(hash)
+    }
+    async fn delete_by_key(&self, _: &str) -> anyhow::Result<()> {
+        // The placeholder reaper may try to clean up after the abort.
+        Ok(())
+    }
+    async fn put_blob(&self, _: &str, _: bytes::Bytes) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+    async fn get_blob(&self, _: &str) -> anyhow::Result<Option<bytes::Bytes>> {
+        unimplemented!()
+    }
+    async fn delete_blob(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+// r[verify store.cas.upload-bounded]
+/// The verify walk's chunk PUTs overlap (bounded by
+/// `chunk_upload_max_concurrent`) and the pipelining changes nothing
+/// about what gets stored: the committed path round-trips
+/// byte-identically. Serial PUTs — the regression this guards against
+/// — would hold the high-water mark at exactly 1.
+#[tokio::test]
+async fn verify_walk_pipelines_chunk_puts() -> TestResult {
+    use std::sync::atomic::Ordering;
+
+    let backend = Arc::new(LatencyHighWaterBackend::default());
+    let mut s =
+        StoreSession::new_chunked_with_backend(Arc::clone(&backend) as Arc<dyn ChunkBackend>)
+            .await?;
+
+    // 32 distinct-content files → 32 novel chunks through the walk.
+    let dir = tempfile::TempDir::new()?;
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root)?;
+    for i in 0..32 {
+        std::fs::write(root.join(format!("f{i:02}")), format!("chunk-body-{i:02}"))?;
+    }
+    let path = out_path("plp");
+    let fx = fixture_for_tree(&root, &path, vec![]);
+    let (begin, frames) = assemble_begin(&[&fx], vec![], &Default::default());
+    assert_eq!(
+        send_chunked(&mut s.client, begin, frames, None).await?,
+        vec![true]
+    );
+    assert_eq!(get_path_bytes(&mut s.client, &path).await?, fx.nar);
+
+    let hw = backend.high_water.load(Ordering::SeqCst);
+    assert!(
+        hw > 1,
+        "chunk PUTs never overlapped (high_water={hw}) — the serial-ingest regression"
+    );
+    assert!(
+        hw <= rio_store::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
+        "concurrency bound violated (high_water={hw})"
+    );
+    Ok(())
+}
+
+/// A PUT failure mid-stream surfaces as the same retryable Unavailable
+/// the serial path produced, and nothing commits — `uploaded` must
+/// only ever contain confirmed writes, so a manifest can never
+/// reference a chunk that was not stored.
+#[tokio::test]
+async fn put_failure_mid_stream_is_unavailable_and_uncommitted() -> TestResult {
+    let mut s = StoreSession::new_chunked_with_backend(Arc::new(FailingPutBackend)).await?;
+    let dir = tempfile::TempDir::new()?;
+    let root = dir.path().join("root");
+    write_fixture_tree(&root, &dep_path());
+    let fx = fixture_for_tree(&root, &out_path("plf"), vec![dep_path()]);
+    let (begin, frames) = assemble_begin(&[&fx], vec![dep_path()], &Default::default());
+
+    let err = send_chunked(&mut s.client, begin, frames, None)
+        .await
+        .expect_err("failed chunk PUTs must fail the upload");
+    assert_eq!(err.code(), tonic::Code::Unavailable, "{err:?}");
+
+    let n = poll_scalar_until::<i64>(&s.db.pool, "SELECT COUNT(*) FROM manifests", 0).await;
+    assert_eq!(n, 0, "no manifest may commit when chunk PUTs failed");
+    Ok(())
+}
