@@ -436,6 +436,17 @@ message PullAssignmentRequest {
   // pulls (the store replica's pod name). Ignored for kind=BUILD —
   // build-pull identity remains the attested intent (the as-built rule).
   string executor_instance = 4;
+  // NEW (additive, this wave — merged_bug_158): materialization
+  // re-delivery resume token. A materialization claim that finds the
+  // attempt already Claimed by THIS composite identity is re-delivered
+  // ONLY when this field carries the original assignment's exec_id —
+  // a fresh claim (empty field) answers NotYetReady, so a colliding
+  // identity (two workers folding to one label) can never steal a live
+  // attempt. Empty == absent (proto3 string; both mean "no token").
+  // Build-kind pulls ignore it (lost-ack resume stays tokenless).
+  // Deploy order: scheduler before store (old schedulers ignore it —
+  // delivery stays gated scheduler-side either way).
+  string resume_exec_id = 5;
 }
 
 // The drv is no longer wanted (cancelled, substituted, completed,
@@ -523,10 +534,24 @@ message MaterializationOutcome {
     // is confirmed; never routes from-source, never fail-fasts (B3).
     string detail = 1;
   }
+  message Aborted {
+    // The walk was aborted by the worker (SIGTERM during a store
+    // rollout/drain): nothing is confirmed either way. The scheduler
+    // closes the attempt CHARGE-FREE (AD5 parity for the
+    // materialization kind — owner default Q3, 2026-06-03): no
+    // MaterializationInfra row, job back to pending claimable, so
+    // routine store rollouts never burn the 3-attempt park budget.
+    // Deploy order: scheduler before store (an old scheduler answers
+    // a report carrying this variant with InvalidArgument and the
+    // establishment sweep closes the attempt — bounded skew).
+    string detail = 1;
+  }
   oneof outcome {
     Success success = 1;
     Unobtainable unobtainable = 2;
     InfraFailure infra_failure = 3;
+    // 4 reserved for RetryLater (A4, this wave).
+    Aborted aborted = 5;
   }
 }
 

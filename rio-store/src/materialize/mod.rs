@@ -96,7 +96,7 @@ pub fn spawn_materialization_executor(
     // series from boot and the metrics-registered VM assertion sees them
     // before the first job executes. (Without a scheduler_addr this
     // whole function returned above — no executor, no series.)
-    for outcome in ["success", "unobtainable", "infra"] {
+    for outcome in ["success", "unobtainable", "infra", "aborted"] {
         metrics::counter!(
             "rio_store_materialization_executions_total",
             "outcome" => outcome
@@ -106,6 +106,14 @@ pub fn spawn_materialization_executor(
     metrics::counter!("rio_store_materialization_pinned_paths_total").absolute(0);
     let mut spawned = 0;
     for worker in 0..cfg.executor_concurrency {
+        // merged_bug_158: the concurrency unit is the WORKER, not the
+        // pod — the scheduler's one-winner arbiter keys on the
+        // composite {drv}@{identity}, so two workers sharing one
+        // identity could both believe they hold the same attempt.
+        // Mint `{pod}-w{n}` per worker for BOTH the claim field and
+        // the token binding (T-5.1: claim and credential agree); a
+        // restarted worker n re-claims as the same `…-w{n}`.
+        let worker_instance = format!("{instance}-w{worker}");
         let transport = match client::SchedulerTransport::connect_lazy(
             &cfg.scheduler_addr,
             service_signer.clone(),
@@ -113,7 +121,7 @@ pub fn spawn_materialization_executor(
             // executor_instance is bound INTO every minted service
             // token, so the scheduler verifies the pair instead of
             // trusting the request field.
-            &instance,
+            &worker_instance,
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -131,7 +139,7 @@ pub fn spawn_materialization_executor(
             substituter: std::sync::Arc::clone(&substituter),
         };
         let cfg_for_worker = cfg.clone();
-        let instance_for_worker = instance.clone();
+        let instance_for_worker = worker_instance.clone();
         let shutdown_for_worker = shutdown.clone();
         rio_common::task::spawn_monitored("materialization-executor", async move {
             claim_loop(
@@ -151,14 +159,16 @@ pub fn spawn_materialization_executor(
 
 /// One worker's claim loop: poll → claim (one job at a time) →
 /// execute → report, with jittered pacing; shutdown-aware.
-async fn claim_loop(
+async fn claim_loop<T>(
     worker: usize,
     cfg: crate::config::MaterializationConfig,
     ctx: executor::ExecutorContext,
-    mut transport: client::SchedulerTransport,
+    mut transport: T,
     instance: String,
     shutdown: rio_common::signal::Token,
-) {
+) where
+    T: client::MaterializeTransport + Clone + Send + Sync + 'static,
+{
     info!(worker, instance = %instance, "materialization claim loop started");
     loop {
         if shutdown.is_cancelled() {
@@ -167,7 +177,7 @@ async fn claim_loop(
         // Each worker claims at most one job per pass — concurrency is
         // the worker count, and the scheduler's one-winner arbitration
         // (per-replica composite identity) handles claim races.
-        let claimed = client::poll_and_claim(&mut transport, &instance, 1).await;
+        let claimed = client::poll_and_claim(&mut transport, &instance, 1, &shutdown).await;
         for job in claimed {
             info!(
                 worker,
@@ -182,20 +192,33 @@ async fn claim_loop(
             // contends with the claim/report transport. The sender is
             // owned by the walk's callback; when the execution returns,
             // the callback (and sender) drop → the relay drains and
-            // exits. Report errors are ignored — progress is droppable
-            // by contract (the scheduler-side relay is also try_send).
+            // exits. Each relay send is bounded (10 s) and raced
+            // against shutdown — progress is droppable by contract, so
+            // TimedOut/Shutdown drop the report and Shutdown exits the
+            // relay (merged_bug_189: a black-holed leader used to park
+            // the relay task forever).
             let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<
                 rio_proto::types::ReportMaterializationProgressRequest,
             >(16);
             let mut progress_transport = transport.clone();
+            let shutdown_for_relay = shutdown.clone();
             rio_common::task::spawn_monitored("materialization-progress-relay", async move {
-                use client::MaterializeTransport;
+                use rio_common::transport::{BoundedOutcome, bounded};
                 while let Some(req) = progress_rx.recv().await {
-                    let _ = progress_transport.report_progress(req).await;
+                    match bounded(
+                        &shutdown_for_relay,
+                        Duration::from_secs(10),
+                        progress_transport.report_progress(req),
+                    )
+                    .await
+                    {
+                        BoundedOutcome::Shutdown => return,
+                        BoundedOutcome::TimedOut { .. } | BoundedOutcome::Resolved(_) => {}
+                    }
                 }
             });
             let exec_id_for_progress = job.exec_id.clone();
-            let outcome = executor::execute_job_with_progress(
+            let execute = executor::execute_job_with_progress(
                 &ctx,
                 &job,
                 move |bytes_done, bytes_expected, upstream| {
@@ -208,13 +231,42 @@ async fn claim_loop(
                         },
                     );
                 },
-            )
-            .await;
+            );
+            // SIGTERM aborts the walk by drop (in-flight upstream
+            // fetches are torn down with their futures) and reports
+            // the NEW Aborted outcome through the single bounded
+            // SIGTERM attempt — the scheduler closes the attempt
+            // charge-free (AD5 parity, owner default Q3) instead of
+            // letting the charged establishment sweep classify a
+            // routine rollout as infrastructure failure.
+            let outcome = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    info!(
+                        worker,
+                        drv_hash = %job.drv_hash,
+                        exec_id = %job.exec_id,
+                        "SIGTERM during the materialization walk: aborting and reporting Aborted"
+                    );
+                    rio_proto::types::MaterializationOutcome {
+                        outcome: Some(
+                            rio_proto::types::materialization_outcome::Outcome::Aborted(
+                                rio_proto::types::materialization_outcome::Aborted {
+                                    detail: "walk aborted by SIGTERM (store shutdown/rollout)"
+                                        .into(),
+                                },
+                            ),
+                        ),
+                    }
+                }
+                outcome = execute => outcome,
+            };
             let acked = client::report_until_acked(
                 &mut transport,
                 &job.exec_id,
                 outcome,
                 REPORT_RETRY_BUDGET,
+                &shutdown,
             )
             .await;
             if !acked {
@@ -256,9 +308,31 @@ pub fn executor_instance() -> String {
     sanitize_dns1123_label(&raw)
 }
 
+/// FNV-1a 64 over the raw identity — the deterministic disambiguation
+/// salt for sanitized labels (the same raw always maps to the same
+/// identity across restarts; distinct raws that fold to the same
+/// sanitized base get distinct salts).
+fn fnv1a_64(raw: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in raw.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// Sanitize an arbitrary hostname into a DNS-1123 label (the
 /// scheduler-side validation alphabet — keep in sync with
 /// `is_dns1123_label` in rio-scheduler/src/grpc/executor_service.rs).
+///
+/// merged_bug_158: sanitization must stay injective-enough — `Host_A`,
+/// `host-a` and `host.a` all used to fold to `host-a`, and two
+/// replicas folding to one label can both claim under the same
+/// composite identity. When sanitization ALTERS the raw, a 4-hex
+/// FNV-1a salt of the raw is appended (base truncated to 58 so the
+/// result stays ≤63); an empty/garbage raw gets a per-process random
+/// salt with a loud warning (two unidentifiable replicas must still
+/// not share an identity).
 fn sanitize_dns1123_label(raw: &str) -> String {
     let mut out: String = raw
         .chars()
@@ -271,10 +345,26 @@ fn sanitize_dns1123_label(raw: &str) -> String {
         .collect();
     out = out.trim_matches('-').to_string();
     if out.is_empty() {
-        "rio-store-dev".to_string()
-    } else {
-        out
+        // No usable identity at all: salt randomly (per process) so two
+        // such replicas never collide, and say so loudly.
+        use std::hash::{BuildHasher, Hasher};
+        let nonce = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        warn!(
+            raw,
+            "HOSTNAME provides no usable identity; using a random-salted dev identity"
+        );
+        return format!("rio-store-dev-{:04x}", nonce & 0xffff);
     }
+    if out == raw {
+        return out;
+    }
+    // Sanitization altered the raw: disambiguate with a deterministic
+    // salt so distinct raws cannot fold to one label.
+    out.truncate(58);
+    let out = out.trim_matches('-');
+    format!("{out}-{:04x}", fnv1a_64(raw) & 0xffff)
 }
 
 #[cfg(test)]
@@ -337,12 +427,13 @@ mod tests {
                 && !s.ends_with('-')
         };
 
-        // A real pod name is unchanged.
+        // A real pod name is unchanged (already a valid label — no salt).
         assert_eq!(
             sanitize_dns1123_label("rio-store-7d4b8f9c6-x2vpl"),
             "rio-store-7d4b8f9c6-x2vpl"
         );
-        // Uppercase / dots / underscores are sanitized, not rejected.
+        // Uppercase / dots / underscores are sanitized, not rejected —
+        // and stay valid labels with the disambiguation salt appended.
         for raw in [
             "MyDevBox.local",
             "host_with_underscores",
@@ -350,6 +441,7 @@ mod tests {
             "a".repeat(100).as_str(),
             "-leading-and-trailing-",
             "",
+            "...",
         ] {
             let label = sanitize_dns1123_label(raw);
             assert!(
@@ -357,8 +449,133 @@ mod tests {
                 "sanitize({raw:?}) produced a non-label: {label:?}"
             );
         }
-        // Empty input → the dev fallback.
-        assert_eq!(sanitize_dns1123_label(""), "rio-store-dev");
-        assert_eq!(sanitize_dns1123_label("..."), "rio-store-dev");
+        // merged_bug_158: identities that USED to fold to one label are
+        // now distinct (deterministic FNV salt over the raw).
+        let a = sanitize_dns1123_label("Host_A");
+        let b = sanitize_dns1123_label("host-a");
+        let c = sanitize_dns1123_label("host.a");
+        assert_eq!(
+            b, "host-a",
+            "an already-valid label passes through unsalted"
+        );
+        assert_ne!(a, b, "Host_A no longer folds onto host-a");
+        assert_ne!(c, b, "host.a no longer folds onto host-a");
+        assert_ne!(a, c, "distinct raws get distinct salts");
+        // Determinism: the same raw maps to the same identity across
+        // restarts (re-claims must resume as the same identity).
+        assert_eq!(a, sanitize_dns1123_label("Host_A"));
+        // Empty/garbage input → the dev fallback, randomly salted so two
+        // unidentifiable replicas still cannot share an identity.
+        let e = sanitize_dns1123_label("");
+        assert!(
+            e.starts_with("rio-store-dev-"),
+            "empty input gets the salted dev fallback: {e:?}"
+        );
+    }
+
+    /// merged_bug_189 (the claim-loop SIGTERM arm): SIGTERM landing
+    /// after a claim delivers aborts the walk (the execute future is
+    /// never driven — biased select) and reports exactly one
+    /// MaterializationOutcome::Aborted through the bounded SIGTERM
+    /// attempt, then the loop exits. (The pre-fix loop had no shutdown
+    /// arm around execute at all and report_until_acked took no
+    /// shutdown — this shape was unexpressible: compile-level red.)
+    // r[verify store.materialize.executor+3]
+    #[tokio::test]
+    async fn claim_loop_sigterm_aborts_walk_and_reports_aborted() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct SigtermAfterClaim {
+            shutdown: rio_common::signal::Token,
+            reports: Arc<Mutex<Vec<rio_proto::types::ReportOutcomeRequest>>>,
+        }
+        impl client::MaterializeTransport for SigtermAfterClaim {
+            async fn list_jobs(
+                &mut self,
+                _req: rio_proto::types::ListMaterializationJobsRequest,
+            ) -> Result<rio_proto::types::ListMaterializationJobsResponse, tonic::Status>
+            {
+                Ok(rio_proto::types::ListMaterializationJobsResponse {
+                    jobs: vec![rio_proto::types::MaterializationJobDescriptor {
+                        job_id: uuid::Uuid::now_v7().to_string(),
+                        drv_hash: "sigterm-drv".into(),
+                        tenant_id: String::new(),
+                        origin: "cache_opportunity".into(),
+                    }],
+                })
+            }
+            async fn pull(
+                &mut self,
+                _req: rio_proto::types::PullAssignmentRequest,
+            ) -> Result<rio_proto::types::PullAssignmentResponse, tonic::Status> {
+                // SIGTERM lands right after the claim delivers.
+                self.shutdown.cancel();
+                Ok(rio_proto::types::PullAssignmentResponse {
+                    outcome: Some(
+                        rio_proto::types::pull_assignment_response::Outcome::Assignment(
+                            rio_proto::types::WorkAssignment {
+                                drv_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv"
+                                    .into(),
+                                exec_id: "exec-sigterm-1".into(),
+                                ..Default::default()
+                            },
+                        ),
+                    ),
+                })
+            }
+            async fn report(
+                &mut self,
+                req: rio_proto::types::ReportOutcomeRequest,
+            ) -> Result<(), tonic::Status> {
+                self.reports.lock().unwrap().push(req);
+                Ok(())
+            }
+            async fn report_progress(
+                &mut self,
+                _req: rio_proto::types::ReportMaterializationProgressRequest,
+            ) -> Result<(), tonic::Status> {
+                Ok(())
+            }
+        }
+
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let substituter =
+            std::sync::Arc::new(crate::substitute::Substituter::new(db.pool.clone(), None));
+        let shutdown = rio_common::signal::Token::new();
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let transport = SigtermAfterClaim {
+            shutdown: shutdown.clone(),
+            reports: Arc::clone(&reports),
+        };
+        let ctx = executor::ExecutorContext {
+            pool: db.pool.clone(),
+            substituter,
+        };
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            claim_loop(
+                0,
+                crate::config::MaterializationConfig::default(),
+                ctx,
+                transport,
+                "store-replica-0-w0".into(),
+                shutdown,
+            ),
+        )
+        .await
+        .expect("the loop must exit promptly after the SIGTERM-aborted job");
+
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports.len(), 1, "exactly one Aborted report");
+        assert_eq!(reports[0].exec_id, "exec-sigterm-1");
+        match &reports[0].materialization_outcome {
+            Some(rio_proto::types::MaterializationOutcome {
+                outcome: Some(rio_proto::types::materialization_outcome::Outcome::Aborted(aborted)),
+            }) => {
+                assert!(aborted.detail.contains("SIGTERM"));
+            }
+            other => panic!("expected the Aborted outcome, got {other:?}"),
+        }
     }
 }

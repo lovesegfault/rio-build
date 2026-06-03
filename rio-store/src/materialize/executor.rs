@@ -96,6 +96,10 @@ pub async fn execute_job_with_progress(
         Some(materialization_outcome::Outcome::Success(_)) => "success",
         Some(materialization_outcome::Outcome::Unobtainable(_)) => "unobtainable",
         Some(materialization_outcome::Outcome::InfraFailure(_)) | None => "infra",
+        // Synthesized by the claim loop's SIGTERM arm, never by the
+        // walk itself — but counted here like every other outcome so
+        // the chokepoint stays total over the alphabet.
+        Some(materialization_outcome::Outcome::Aborted(_)) => "aborted",
     };
     metrics::counter!("rio_store_materialization_executions_total", "outcome" => label)
         .increment(1);

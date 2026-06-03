@@ -9,6 +9,8 @@
 
 use std::time::Duration;
 
+use rio_common::grpc::DEFAULT_GRPC_TIMEOUT;
+use rio_common::transport::{AttemptBudget, BoundedOutcome, SIGTERM_FINAL_ATTEMPT, bounded};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -36,6 +38,13 @@ const REPORT_RETRY_ENVELOPE: rio_common::backoff::Backoff = rio_common::backoff:
 /// The four unaries the executor speaks, abstracted for testing
 /// (the builder runtime's `PullTransport` precedent).
 pub trait MaterializeTransport {
+    /// An attempt-level timeout was observed by the caller (the bounded
+    /// await elapsed with no answer). The production transport treats
+    /// this like an UNAVAILABLE answer and abandons the pinned
+    /// connection — a black-holed connection is indistinguishable from
+    /// the standby-pin (finding 18) at the caller. Default: no-op.
+    fn note_timeout(&mut self) {}
+
     fn list_jobs(
         &mut self,
         req: ListMaterializationJobsRequest,
@@ -94,23 +103,41 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
     transport: &mut T,
     executor_instance: &str,
     available_slots: usize,
+    shutdown: &rio_common::signal::Token,
 ) -> Vec<ClaimedJob> {
     if available_slots == 0 {
         return Vec::new();
     }
     // Saturating u32 cast: slots are single-digit in practice.
     let limit = u32::try_from(available_slots).unwrap_or(u32::MAX);
-    let listed = match transport
-        .list_jobs(ListMaterializationJobsRequest {
-            // The credential rides the x-rio-service-token metadata
-            // (attached by the transport); the body field stays empty.
-            service_token: String::new(),
-            limit,
-        })
-        .await
+    let list_req = ListMaterializationJobsRequest {
+        // The credential rides the x-rio-service-token metadata
+        // (attached by the transport); the body field stays empty.
+        service_token: String::new(),
+        limit,
+    };
+    // Every RPC in the pass is bounded and raced against shutdown
+    // (merged_bug_189): a black-holed leader connection becomes a
+    // skipped pass instead of a parked claim loop, and SIGTERM ends
+    // the pass promptly.
+    let listed = match bounded(
+        shutdown,
+        DEFAULT_GRPC_TIMEOUT,
+        transport.list_jobs(list_req),
+    )
+    .await
     {
-        Ok(resp) => resp.jobs,
-        Err(status) => {
+        BoundedOutcome::Shutdown => return Vec::new(),
+        BoundedOutcome::TimedOut { after } => {
+            debug!(
+                after_secs = after.as_secs(),
+                "ListMaterializationJobs unanswered; empty poll pass"
+            );
+            transport.note_timeout();
+            return Vec::new();
+        }
+        BoundedOutcome::Resolved(Ok(resp)) => resp.jobs,
+        BoundedOutcome::Resolved(Err(status)) => {
             debug!(code = ?status.code(), msg = status.message(),
                    "ListMaterializationJobs failed; empty poll pass");
             return Vec::new();
@@ -147,9 +174,21 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             // every claim.
             kind: rio_proto::types::AttemptKind::Materialization.into(),
             executor_instance: executor_instance.to_string(),
+            // Fresh claims NEVER carry a resume token (merged_bug_158:
+            // re-delivery of a Claimed attempt requires the original
+            // exec_id, so a colliding identity cannot steal it).
+            resume_exec_id: String::new(),
         };
-        match transport.pull(req).await {
-            Ok(resp) => match resp.outcome {
+        match bounded(shutdown, DEFAULT_GRPC_TIMEOUT, transport.pull(req)).await {
+            // SIGTERM mid-pass: return what was already claimed so the
+            // caller can abort/report those attempts under the grace.
+            BoundedOutcome::Shutdown => return claimed,
+            BoundedOutcome::TimedOut { after } => {
+                warn!(drv_hash = %descriptor.drv_hash, after_secs = after.as_secs(),
+                      "materialization claim unanswered; skipping (next poll re-lists)");
+                transport.note_timeout();
+            }
+            BoundedOutcome::Resolved(Ok(resp)) => match resp.outcome {
                 Some(pull_assignment_response::Outcome::Assignment(assignment)) => {
                     claimed.push(ClaimedJob {
                         job_id,
@@ -169,7 +208,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
                            "materialization claim not delivered (race lost / job resolved)");
                 }
             },
-            Err(status) => {
+            BoundedOutcome::Resolved(Err(status)) => {
                 warn!(drv_hash = %descriptor.drv_hash,
                       code = ?status.code(), msg = status.message(),
                       "materialization claim RPC failed; skipping (next poll re-lists)");
@@ -193,8 +232,9 @@ pub async fn report_until_acked<T: MaterializeTransport>(
     exec_id: &str,
     outcome: MaterializationOutcome,
     budget: Duration,
+    shutdown: &rio_common::signal::Token,
 ) -> bool {
-    let started = tokio::time::Instant::now();
+    let budget = AttemptBudget::new(budget);
     let mut attempt: u32 = 0;
     loop {
         let req = ReportOutcomeRequest {
@@ -202,16 +242,60 @@ pub async fn report_until_acked<T: MaterializeTransport>(
             report: None,
             materialization_outcome: Some(outcome.clone()),
         };
-        match transport.report(req).await {
-            Ok(()) => return true,
-            Err(status) if is_fatal_rejection(status.code()) => {
+        if shutdown.is_cancelled() {
+            // SIGTERM: one bounded best-effort attempt, then out (the
+            // builder report loop's discipline; the establishment
+            // sweep is the scheduler-side backstop).
+            return matches!(
+                tokio::time::timeout(SIGTERM_FINAL_ATTEMPT, transport.report(req)).await,
+                Ok(Ok(()))
+            );
+        }
+        // Bounded + raced against SIGTERM: hung attempts spend the
+        // budget exactly like answered failures (merged_bug_189; the
+        // pre-fix loop awaited the report bare and checked the budget
+        // only on Err answers). Report acks are idempotent
+        // scheduler-side, so per-attempt-cap retries are safe.
+        let result = bounded(
+            shutdown,
+            budget.attempt_bound(DEFAULT_GRPC_TIMEOUT),
+            transport.report(req),
+        )
+        .await;
+        match result {
+            // Loop back: the next iteration takes the SIGTERM
+            // single-attempt arm.
+            BoundedOutcome::Shutdown => continue,
+            BoundedOutcome::Resolved(Ok(())) => return true,
+            BoundedOutcome::Resolved(Err(status)) if is_fatal_rejection(status.code()) => {
                 warn!(code = ?status.code(), msg = status.message(),
                       "materialization ReportOutcome permanently rejected; giving up \
                        (the establishment sweep is the scheduler-side backstop)");
                 return false;
             }
-            Err(status) => {
-                if started.elapsed() >= budget {
+            BoundedOutcome::TimedOut { after } => {
+                transport.note_timeout();
+                if budget.expired() {
+                    warn!(
+                        after_secs = after.as_secs(),
+                        "materialization ReportOutcome never acknowledged within the budget \
+                           (hung attempts)"
+                    );
+                    return false;
+                }
+                debug!(
+                    after_secs = after.as_secs(),
+                    "materialization ReportOutcome attempt unanswered; retrying"
+                );
+                attempt = attempt.saturating_add(1);
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {}
+                    _ = tokio::time::sleep(REPORT_RETRY_ENVELOPE.duration(attempt - 1)) => {}
+                }
+            }
+            BoundedOutcome::Resolved(Err(status)) => {
+                if budget.expired() {
                     warn!(code = ?status.code(), msg = status.message(),
                           "materialization ReportOutcome never acknowledged within the budget");
                     return false;
@@ -219,7 +303,11 @@ pub async fn report_until_acked<T: MaterializeTransport>(
                 debug!(code = ?status.code(), msg = status.message(),
                        "materialization ReportOutcome not acknowledged; retrying");
                 attempt = attempt.saturating_add(1);
-                tokio::time::sleep(REPORT_RETRY_ENVELOPE.duration(attempt - 1)).await;
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {}
+                    _ = tokio::time::sleep(REPORT_RETRY_ENVELOPE.duration(attempt - 1)) => {}
+                }
             }
         }
     }
@@ -389,6 +477,18 @@ impl SchedulerTransport {
 }
 
 impl MaterializeTransport for SchedulerTransport {
+    /// A bounded await elapsed with no answer: indistinguishable at
+    /// this layer from the standby-pinned connection (finding 18) —
+    /// abandon the channel so the next RPC re-rolls the kube-proxy
+    /// backend choice.
+    fn note_timeout(&mut self) {
+        debug!(
+            "scheduler RPC timed out; abandoning the pinned connection \
+             (rollout/standby/black-hole recovery)"
+        );
+        self.abandon_connection();
+    }
+
     async fn list_jobs(
         &mut self,
         req: ListMaterializationJobsRequest,
@@ -520,6 +620,10 @@ mod tests {
         }
     }
 
+    fn token() -> rio_common::signal::Token {
+        rio_common::signal::Token::new()
+    }
+
     fn descriptor(n: u32) -> rio_proto::types::MaterializationJobDescriptor {
         rio_proto::types::MaterializationJobDescriptor {
             job_id: Uuid::now_v7().to_string(),
@@ -573,7 +677,7 @@ mod tests {
             ],
             vec![],
         );
-        let claimed = poll_and_claim(&mut t, "store-replica-0", 8).await;
+        let claimed = poll_and_claim(&mut t, "store-replica-0", 8, &token()).await;
         assert_eq!(claimed.len(), 2, "both listed jobs are claimed");
         assert_eq!(claimed[0].drv_hash, d1.drv_hash);
         assert_eq!(claimed[0].exec_id, "exec-1");
@@ -626,7 +730,7 @@ mod tests {
             ],
             vec![],
         );
-        let claimed = poll_and_claim(&mut t, "store-replica-0", 8).await;
+        let claimed = poll_and_claim(&mut t, "store-replica-0", 8, &token()).await;
         assert_eq!(
             claimed.len(),
             1,
@@ -648,7 +752,7 @@ mod tests {
             vec![Ok(deliver("exec-x", "/nix/store/xxx.drv"))],
             vec![],
         );
-        let claimed = poll_and_claim(&mut t, "store-replica-0", 2).await;
+        let claimed = poll_and_claim(&mut t, "store-replica-0", 2, &token()).await;
         assert_eq!(claimed.len(), 2);
         assert_eq!(
             t.pull_calls, 2,
@@ -657,7 +761,7 @@ mod tests {
 
         // Zero slots → no RPCs at all.
         let mut idle = MockTransport::new(vec![], vec![], vec![]);
-        let claimed = poll_and_claim(&mut idle, "store-replica-0", 0).await;
+        let claimed = poll_and_claim(&mut idle, "store-replica-0", 0, &token()).await;
         assert!(claimed.is_empty());
         assert_eq!(idle.list_calls, 0, "zero slots never even lists");
     }
@@ -675,7 +779,7 @@ mod tests {
             vec![Ok(deliver("exec-1", "/nix/store/aaa.drv"))],
             vec![],
         );
-        let _ = poll_and_claim(&mut t, "store-replica-7", 8).await;
+        let _ = poll_and_claim(&mut t, "store-replica-7", 8, &token()).await;
         assert_eq!(t.seen_pull_requests.len(), 2);
         for (req, descriptor) in t.seen_pull_requests.iter().zip([&d1, &d2]) {
             assert_eq!(
@@ -724,8 +828,14 @@ mod tests {
                 Ok(()),
             ],
         );
-        let acked =
-            report_until_acked(&mut t, "exec-1", outcome.clone(), Duration::from_secs(600)).await;
+        let acked = report_until_acked(
+            &mut t,
+            "exec-1",
+            outcome.clone(),
+            Duration::from_secs(600),
+            &token(),
+        )
+        .await;
         assert!(acked);
         assert_eq!(t.report_calls, 3);
 
@@ -735,8 +845,14 @@ mod tests {
             vec![],
             vec![Err(tonic::Status::permission_denied("bad credential"))],
         );
-        let acked =
-            report_until_acked(&mut t, "exec-2", outcome.clone(), Duration::from_secs(600)).await;
+        let acked = report_until_acked(
+            &mut t,
+            "exec-2",
+            outcome.clone(),
+            Duration::from_secs(600),
+            &token(),
+        )
+        .await;
         assert!(!acked);
         assert_eq!(t.report_calls, 1, "permanent rejections are never retried");
 
@@ -746,7 +862,8 @@ mod tests {
             vec![],
             vec![Err(tonic::Status::unavailable("scheduler gone"))],
         );
-        let acked = report_until_acked(&mut t, "exec-3", outcome, Duration::from_secs(60)).await;
+        let acked =
+            report_until_acked(&mut t, "exec-3", outcome, Duration::from_secs(60), &token()).await;
         assert!(
             !acked,
             "an unacked report inside the budget is not a success"
@@ -755,6 +872,150 @@ mod tests {
             t.report_calls >= 3,
             "the budget window is spent retrying, saw {}",
             t.report_calls
+        );
+    }
+
+    /// merged_bug_189: a black-holed report (accepted, never answered)
+    /// exhausts the budget instead of pending forever — hung attempts
+    /// spend the budget like answered failures. (The pre-fix loop
+    /// awaited the report bare; this shape was unexpressible — the
+    /// signature change is the compile-level red, and the runtime red
+    /// for the identical loop shape is recorded in the builder's
+    /// report_black_hole_exhausts_budget_without_sigterm.)
+    // r[verify store.materialize.executor+3]
+    #[tokio::test(start_paused = true)]
+    async fn report_black_hole_times_out_within_budget() {
+        struct BlackHole {
+            calls: u32,
+        }
+        impl MaterializeTransport for BlackHole {
+            async fn list_jobs(
+                &mut self,
+                _req: ListMaterializationJobsRequest,
+            ) -> Result<ListMaterializationJobsResponse, tonic::Status> {
+                Err(tonic::Status::unavailable("unused"))
+            }
+            async fn pull(
+                &mut self,
+                _req: PullAssignmentRequest,
+            ) -> Result<PullAssignmentResponse, tonic::Status> {
+                Err(tonic::Status::unavailable("unused"))
+            }
+            async fn report(&mut self, _req: ReportOutcomeRequest) -> Result<(), tonic::Status> {
+                self.calls += 1;
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+            async fn report_progress(
+                &mut self,
+                _req: ReportMaterializationProgressRequest,
+            ) -> Result<(), tonic::Status> {
+                Ok(())
+            }
+        }
+        let mut t = BlackHole { calls: 0 };
+        let shutdown = token();
+        let started = tokio::time::Instant::now();
+        let acked = tokio::time::timeout(
+            Duration::from_secs(3600),
+            report_until_acked(
+                &mut t,
+                "exec-bh",
+                MaterializationOutcome { outcome: None },
+                Duration::from_secs(120),
+                &shutdown,
+            ),
+        )
+        .await
+        .expect("hung report attempts must exhaust the budget, not pend forever");
+        assert!(!acked);
+        assert!(
+            started.elapsed() >= Duration::from_secs(120)
+                && started.elapsed() < Duration::from_secs(400),
+            "the budget bounds the phase (elapsed {:?})",
+            started.elapsed()
+        );
+        assert!(t.calls >= 2, "multiple bounded attempts were made");
+    }
+
+    /// SIGTERM mid-report: exactly one bounded best-effort attempt.
+    // r[verify store.materialize.executor+3]
+    #[tokio::test(start_paused = true)]
+    async fn report_after_sigterm_is_a_single_bounded_attempt() {
+        let mut t = MockTransport::new(
+            vec![],
+            vec![],
+            vec![Err(tonic::Status::unavailable("scheduler unreachable"))],
+        );
+        let shutdown = token();
+        shutdown.cancel();
+        let started = tokio::time::Instant::now();
+        let acked = report_until_acked(
+            &mut t,
+            "exec-sig",
+            MaterializationOutcome { outcome: None },
+            Duration::from_secs(600),
+            &shutdown,
+        )
+        .await;
+        assert!(!acked);
+        assert_eq!(t.report_calls, 1, "exactly one attempt after SIGTERM");
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the bounded attempt fits the grace"
+        );
+    }
+
+    /// SIGTERM mid-pass: poll_and_claim returns the claims already won
+    /// so the caller can settle them under the grace, instead of
+    /// continuing the pass.
+    // r[verify store.materialize.executor+3]
+    #[tokio::test(start_paused = true)]
+    async fn poll_and_claim_sigterm_ends_pass_with_claims_so_far() {
+        struct CancelOnFirstPull {
+            inner: MockTransport,
+            shutdown: rio_common::signal::Token,
+        }
+        impl MaterializeTransport for CancelOnFirstPull {
+            async fn list_jobs(
+                &mut self,
+                req: ListMaterializationJobsRequest,
+            ) -> Result<ListMaterializationJobsResponse, tonic::Status> {
+                self.inner.list_jobs(req).await
+            }
+            async fn pull(
+                &mut self,
+                req: PullAssignmentRequest,
+            ) -> Result<PullAssignmentResponse, tonic::Status> {
+                let resp = self.inner.pull(req).await;
+                // SIGTERM lands right after the first claim delivers.
+                self.shutdown.cancel();
+                resp
+            }
+            async fn report(&mut self, req: ReportOutcomeRequest) -> Result<(), tonic::Status> {
+                self.inner.report(req).await
+            }
+            async fn report_progress(
+                &mut self,
+                req: ReportMaterializationProgressRequest,
+            ) -> Result<(), tonic::Status> {
+                self.inner.report_progress(req).await
+            }
+        }
+        let shutdown = token();
+        let mut t = CancelOnFirstPull {
+            inner: MockTransport::new(
+                vec![Ok(listing(vec![descriptor(1), descriptor(2)]))],
+                vec![Ok(deliver("exec-1", "/nix/store/aaa.drv"))],
+                vec![],
+            ),
+            shutdown: shutdown.clone(),
+        };
+        let claimed = poll_and_claim(&mut t, "store-replica-0", 8, &shutdown).await;
+        assert_eq!(claimed.len(), 1, "the won claim is returned");
+        assert_eq!(
+            t.inner.pull_calls, 1,
+            "the pass ends at SIGTERM instead of claiming more work it cannot run"
         );
     }
 
@@ -918,7 +1179,7 @@ mod tests {
 
         // The executor's connection gets pinned to the standby: the
         // poll pass comes back empty (UNAVAILABLE answers).
-        let claimed = poll_and_claim(&mut transport, "store-replica-0", 1).await;
+        let claimed = poll_and_claim(&mut transport, "store-replica-0", 1, &token()).await;
         assert!(
             claimed.is_empty(),
             "the standby answers UNAVAILABLE — nothing claimable on this pass"
@@ -935,7 +1196,7 @@ mod tests {
         // empty.
         let mut claimed = Vec::new();
         for _ in 0..5 {
-            claimed = poll_and_claim(&mut transport, "store-replica-0", 1).await;
+            claimed = poll_and_claim(&mut transport, "store-replica-0", 1, &token()).await;
             if !claimed.is_empty() {
                 break;
             }
@@ -967,7 +1228,7 @@ mod tests {
                 .unwrap();
 
         // Pin the connection to the standby with one failing pass.
-        let _ = poll_and_claim(&mut transport, "store-replica-0", 1).await;
+        let _ = poll_and_claim(&mut transport, "store-replica-0", 1, &token()).await;
         // The rollout completes mid-execution.
         *backend.lock().unwrap() = leader_addr;
 
@@ -984,6 +1245,7 @@ mod tests {
             "exec-rollout-1",
             outcome,
             Duration::from_secs(20),
+            &token(),
         )
         .await;
         assert!(
