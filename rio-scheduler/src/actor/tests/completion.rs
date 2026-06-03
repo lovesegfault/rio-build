@@ -3023,7 +3023,19 @@ async fn exec_correlation_skips_terminal_builds() -> TestResult {
     };
     let mut info1 = mk(b1);
     info1.transition(BuildState::Active).unwrap();
-    info1.transition(BuildState::Succeeded).unwrap();
+    info1
+        .transition_terminal(crate::state::SettledBuild {
+            counts: crate::state::SettledCounts {
+                total: 1,
+                completed: 1,
+                cached: 0,
+                failed: 0,
+            },
+            outcome: crate::state::TerminalOutcome::Succeeded {
+                output_paths: vec![],
+            },
+        })
+        .unwrap();
     actor.builds.insert(b1, info1);
     let mut info2 = mk(b2);
     info2.transition(BuildState::Active).unwrap();

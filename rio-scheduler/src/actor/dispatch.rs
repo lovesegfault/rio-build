@@ -384,16 +384,14 @@ impl DagActor {
         }
         for build_id in self.get_interested_builds(drv_hash) {
             if let Some(build) = self.builds.get_mut(&build_id) {
-                build.error_summary.get_or_insert_with(|| msg.clone());
-                build
-                    .failed_derivation
-                    .get_or_insert_with(|| drv_hash.to_string());
                 // The message itself says "resubmit to re-probe or
                 // full-merge" — TransientFailure is the wire signal for
-                // "might work if retried".
-                build
-                    .failure_status
-                    .get_or_insert(rio_proto::types::BuildResultStatus::TransientFailure);
+                // "might work if retried". One struct, first wins.
+                build.note_first_failure(crate::state::FirstFailure {
+                    summary: msg.clone(),
+                    failed_drv: Some(drv_hash.to_string()),
+                    status: Some(rio_proto::types::BuildResultStatus::TransientFailure),
+                });
             }
             self.cancel_build_derivations(
                 build_id,

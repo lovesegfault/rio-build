@@ -1984,15 +1984,16 @@ async fn test_terminal_build_frozen_on_dispatch_store_hit() -> TestResult {
         "precondition: B1 built X from source — no cache hits"
     );
 
-    // Drain B1's stream up to (and including) its BuildCompleted. From
-    // here on, no BuildProgress may follow for B1.
-    let mut saw_completed = false;
+    // Drain B1's stream up to (and including) its BuildCompleted,
+    // CAPTURING the emitted payload — the settled snapshot must serve
+    // exactly these bytes later, whatever happens to the shared DAG.
+    let mut live_completed: Option<rio_proto::types::BuildCompleted> = None;
     while let Ok(ev) = b1_events.try_recv() {
-        if matches!(ev.event, Some(Event::Completed(_))) {
-            saw_completed = true;
+        if let Some(Event::Completed(c)) = ev.event {
+            live_completed = Some(c);
         }
     }
-    assert!(saw_completed, "precondition: B1's BuildCompleted observed");
+    let live_completed = live_completed.expect("precondition: B1's BuildCompleted observed");
 
     // B2 re-merges X (+ a sibling root Z so B2 stays live). x_out is NOT
     // in the mock store → the stale-Completed verify resets X to Ready.
@@ -2012,6 +2013,69 @@ async fn test_terminal_build_frozen_on_dispatch_store_hit() -> TestResult {
          missing from the store); got {:?}",
         xs.status
     );
+
+    // merged_bug_097 (settled-payload leg): while X is mid-flight under
+    // B2 — claimed by a worker, Running with B2's exec — the TERMINAL
+    // B1's served surfaces must not re-derive from the mutated DAG:
+    //   - counts stay settled (completed == total, not shrunk by the
+    //     reset),
+    //   - the running set stays EMPTY (not listing B2's execution),
+    //   - output_paths stay the captured emit's (not recomputed from
+    //     the reset node).
+    let b2_assignment = pull_attempt(&handle, "tfz-x").await;
+    barrier(&handle).await;
+    {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::WatchBuild {
+                build_id: b1,
+                caller_tenant: None,
+                reply: reply_tx,
+            })
+            .await?;
+        let (_rx, snapshot) = reply_rx.await??;
+        let Some(Event::Snapshot(mid)) = snapshot.event else {
+            panic!("WatchBuild reply must carry a Snapshot");
+        };
+        assert_eq!(
+            mid.completed_derivations, mid.total_derivations,
+            "settled counts: a terminal build's completed must not \
+             shrink when a shared node is reset under a later build"
+        );
+        assert!(
+            mid.running.is_empty(),
+            "settled running set: a terminal build must not list \
+             another build's execution (got exec {})",
+            b2_assignment.exec_id
+        );
+        assert_eq!(
+            mid.output_paths, live_completed.output_paths,
+            "settled output_paths: the snapshot serves the captured \
+             emit, not a recomputation from the mutated DAG"
+        );
+        // PG: the persisted counts are final at the terminal transition.
+        let row: (i64,) =
+            sqlx::query_as("SELECT completed_drvs::bigint FROM builds WHERE build_id = $1")
+                .bind(b1)
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(
+            row.0, mid.total_derivations as i64,
+            "persisted completed_drvs stays at total after the terminal \
+             transition (no post-terminal overwrite)"
+        );
+    }
+
+    // Release B2's claim: a transient failure requeues X to Ready so the
+    // original dispatch-time store-hit flow below proceeds unchanged.
+    pull_complete_failure(
+        &handle,
+        "tfz-x",
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        "release the claim for the cached-fanout leg",
+    )
+    .await?;
+    wait_for_status(&handle, "tfz-x", DerivationStatus::Ready).await;
 
     // The output appears in the store → the next dispatch sweep's
     // batched Ready probe completes X as cached and fans out to ALL

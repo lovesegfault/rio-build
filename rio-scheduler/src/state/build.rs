@@ -85,6 +85,83 @@ impl BuildStateExt for BuildState {
     }
 }
 
+/// The first failure a build recorded — summary, culprit, and wire
+/// classification captured TOGETHER so they can never name different
+/// failures (the pre-capture trio of independent `Option` fields could).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FirstFailure {
+    /// Human-readable summary (BuildFailed.error_message / builds.error_summary).
+    pub summary: String,
+    /// The derivation that caused it. `None` for build-level failures
+    /// (per-build timeout, recovery-synthesized) — those are about the
+    /// BUILD, not any one derivation, and splicing an unrelated drv hash
+    /// next to a build-level summary was exactly merged_bug_036.
+    pub failed_drv: Option<String>,
+    /// Worker classification for the nix wire. `None` ⇒ wire
+    /// `0`/`Unspecified` ⇒ nix `MiscFailure`.
+    pub status: Option<rio_proto::types::BuildResultStatus>,
+}
+
+/// Terminal outcome payload — which arm is populated IS the terminal
+/// state. Constructing a terminal lifecycle without its payload does not
+/// typecheck; that is the structural close of merged_bug_097/302/036.
+#[derive(Debug, Clone)]
+pub enum TerminalOutcome {
+    Succeeded {
+        /// Final output store paths of the build's root derivations,
+        /// collected at the terminal transition (the DAG may be mutated
+        /// by other builds afterwards; this snapshot is what watchers see).
+        output_paths: Vec<String>,
+    },
+    Failed(FirstFailure),
+    Cancelled {
+        /// Why. Required — the only function able to mark a build
+        /// Cancelled takes it as an argument (merged_bug_302).
+        reason: String,
+    },
+}
+
+impl TerminalOutcome {
+    /// The BuildState this outcome settles into.
+    pub fn build_state(&self) -> BuildState {
+        match self {
+            Self::Succeeded { .. } => BuildState::Succeeded,
+            Self::Failed(_) => BuildState::Failed,
+            Self::Cancelled { .. } => BuildState::Cancelled,
+        }
+    }
+}
+
+/// Aggregate counts frozen at the terminal transition. Live counts are
+/// recomputed from the (shared, mutable) DAG; a finished build's numbers
+/// must stop tracking a DAG other builds keep mutating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettledCounts {
+    pub total: u32,
+    pub completed: u32,
+    pub cached: u32,
+    pub failed: u32,
+}
+
+/// Everything a terminal build serves, captured once at the transition:
+/// settled counts + the outcome payload. Every consumer (live terminal
+/// event, WatchBuild snapshot, QueryBuildStatus, persisted row) reads
+/// THIS, never live state.
+#[derive(Debug, Clone)]
+pub struct SettledBuild {
+    pub counts: SettledCounts,
+    pub outcome: TerminalOutcome,
+}
+
+/// Build lifecycle: terminal state cannot exist without its settled
+/// payload, by construction.
+#[derive(Debug, Clone)]
+enum Lifecycle {
+    Pending,
+    Active,
+    Terminal(SettledBuild),
+}
+
 /// In-memory state for a build request.
 #[derive(Debug, Clone)]
 pub struct BuildInfo {
@@ -95,9 +172,11 @@ pub struct BuildInfo {
     pub tenant_id: Option<Uuid>,
     /// Priority class. Interactive gets INTERACTIVE_BOOST (+1e9) in the ready queue.
     pub priority_class: PriorityClass,
-    /// Current build state. Private: use `state()` to read, `transition()` to mutate.
-    /// This enforces the BuildState transition validation at every write site.
-    state: BuildState,
+    /// Lifecycle. Private: `state()` derives the BuildState;
+    /// `transition()` (non-terminal) / `transition_terminal()` (with
+    /// payload) are the only mutators, enforcing transition validation
+    /// AND payload capture at every write site.
+    lifecycle: Lifecycle,
     /// Whether to continue building independent derivations on failure.
     pub keep_going: bool,
     /// Build options propagated from the client.
@@ -123,23 +202,13 @@ pub struct BuildInfo {
     pub cached_count: u32,
     /// Number of derivations that have failed.
     pub failed_count: u32,
-    /// Error summary (set on failure).
-    pub error_summary: Option<String>,
-    /// The derivation that caused the failure (if any).
-    pub failed_derivation: Option<String>,
-    /// First failure's worker classification, paired with
-    /// `error_summary`/`failed_derivation` (first failure wins under
-    /// keep_going; the trio is recorded by the same
-    /// `handle_derivation_failure` block, so they cannot name different
-    /// failures — the timeout watchdog and the topdown fail-fast set
-    /// their own alongside their summaries). Names the classification
-    /// of the drv recorded in `failed_derivation`. In-memory only, the
-    /// SAME display-only durability posture as `failed_derivation`: a
-    /// build that went terminal-Failed before a failover is never
-    /// resident again (recovery loads only pending/active builds), and
-    /// recovery-synthesized failures deliberately leave this `None` —
-    /// `None` ⇒ wire `0`/`Unspecified` ⇒ nix `MiscFailure`.
-    pub failure_status: Option<rio_proto::types::BuildResultStatus>,
+    /// First failure (summary + culprit + classification, one struct).
+    /// Private: written only through [`Self::note_first_failure`]
+    /// (first wins, the keep_going sticky) and
+    /// [`Self::override_failure_build_level`] (whole-struct overwrite
+    /// for build-level failures whose `failed_drv` is structurally
+    /// `None`). Partial trio writes do not compile any more.
+    first_failure: Option<FirstFailure>,
     /// When the build was submitted (for rio_scheduler_build_duration_seconds).
     pub submitted_at: Instant,
     /// When the orphan-watcher sweep first observed this build's
@@ -170,7 +239,7 @@ impl BuildInfo {
             build_id,
             tenant_id,
             priority_class,
-            state: BuildState::Pending,
+            lifecycle: Lifecycle::Pending,
             keep_going,
             options,
             derivation_hashes,
@@ -179,27 +248,97 @@ impl BuildInfo {
             completed_count: 0,
             cached_count: 0,
             failed_count: 0,
-            error_summary: None,
-            failed_derivation: None,
-            failure_status: None,
+            first_failure: None,
             submitted_at: Instant::now(),
             orphaned_since: None,
         }
     }
 
-    /// Read the current state.
+    /// Read the current state (derived from the lifecycle).
     pub fn state(&self) -> BuildState {
-        self.state
+        match &self.lifecycle {
+            Lifecycle::Pending => BuildState::Pending,
+            Lifecycle::Active => BuildState::Active,
+            Lifecycle::Terminal(s) => s.outcome.build_state(),
+        }
     }
 
-    /// Attempt to transition to a new state, validating against the BuildState
-    /// machine. Returns the old state on success, `TransitionError` on invalid
-    /// transition.
+    /// The settled terminal payload, if the build is terminal. The ONLY
+    /// terminal-data accessor: snapshot, query, terminal events, and the
+    /// persisted row all read this, never live state.
+    pub fn settled(&self) -> Option<&SettledBuild> {
+        match &self.lifecycle {
+            Lifecycle::Terminal(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Attempt a NON-terminal transition (Pending → Active), validating
+    /// against the BuildState machine. Terminal targets are rejected:
+    /// terminal state cannot exist without its settled payload — use
+    /// [`Self::transition_terminal`].
     pub fn transition(&mut self, to: BuildState) -> Result<BuildState, TransitionError> {
-        let from = self.state;
+        let from = self.state();
         from.validate_transition(to)?;
-        self.state = to;
+        if to.is_terminal() {
+            // A terminal lifecycle REQUIRES a SettledBuild payload.
+            return Err(TransitionError::InvalidBuild { from, to });
+        }
+        self.lifecycle = match to {
+            BuildState::Active => Lifecycle::Active,
+            // validate_transition admits only Pending→Active among
+            // non-terminal targets; anything else was rejected above.
+            _ => return Err(TransitionError::InvalidBuild { from, to }),
+        };
         Ok(from)
+    }
+
+    /// Settle the build into a terminal state, capturing counts +
+    /// outcome in one move. Validates the transition from the current
+    /// state to the outcome's BuildState.
+    pub fn transition_terminal(
+        &mut self,
+        settled: SettledBuild,
+    ) -> Result<BuildState, TransitionError> {
+        let from = self.state();
+        from.validate_transition(settled.outcome.build_state())?;
+        self.lifecycle = Lifecycle::Terminal(settled);
+        Ok(from)
+    }
+
+    /// Record the build's FIRST failure (later calls are no-ops — the
+    /// keep_going sticky). The trio (summary/culprit/classification)
+    /// arrives as one struct so the fields cannot name different
+    /// failures.
+    pub fn note_first_failure(&mut self, failure: FirstFailure) {
+        self.first_failure.get_or_insert(failure);
+    }
+
+    /// Overwrite the failure with a BUILD-level one (per-build timeout):
+    /// whole-struct semantics, `failed_drv` structurally `None` — a
+    /// build-level failure cannot splice a derivation hash next to its
+    /// summary (merged_bug_036).
+    pub fn override_failure_build_level(
+        &mut self,
+        summary: String,
+        status: rio_proto::types::BuildResultStatus,
+    ) {
+        self.first_failure = Some(FirstFailure {
+            summary,
+            failed_drv: None,
+            status: Some(status),
+        });
+    }
+
+    /// The recorded first failure, if any.
+    pub fn first_failure(&self) -> Option<&FirstFailure> {
+        self.first_failure.as_ref()
+    }
+
+    /// Derived read: the first failure's summary (the legacy
+    /// `error_summary` surface).
+    pub fn error_summary(&self) -> Option<&str> {
+        self.first_failure.as_ref().map(|f| f.summary.as_str())
     }
 }
 
@@ -280,9 +419,26 @@ mod tests {
         assert_eq!(old, BuildState::Pending);
         assert_eq!(b.state(), BuildState::Active);
 
-        // Valid: Active -> Succeeded
-        b.transition(BuildState::Succeeded)?;
+        // Terminal targets are rejected by `transition` — terminal
+        // state cannot exist without its settled payload.
+        assert!(b.transition(BuildState::Succeeded).is_err());
+        assert_eq!(b.state(), BuildState::Active);
+
+        // Valid: Active -> Succeeded via transition_terminal, which
+        // captures the payload in the same move.
+        b.transition_terminal(SettledBuild {
+            counts: SettledCounts {
+                total: 0,
+                completed: 0,
+                cached: 0,
+                failed: 0,
+            },
+            outcome: TerminalOutcome::Succeeded {
+                output_paths: vec![],
+            },
+        })?;
         assert_eq!(b.state(), BuildState::Succeeded);
+        assert!(b.settled().is_some(), "terminal build carries its payload");
 
         // Invalid: terminal -> anything
         assert!(b.transition(BuildState::Active).is_err());
@@ -304,8 +460,65 @@ mod tests {
             BuildOptions::default(),
             HashSet::new(),
         );
-        // Invalid: Pending -> Succeeded (skips Active)
+        // Invalid: Pending -> Succeeded (skips Active), via either path.
         assert!(b.transition(BuildState::Succeeded).is_err());
+        assert!(
+            b.transition_terminal(SettledBuild {
+                counts: SettledCounts {
+                    total: 0,
+                    completed: 0,
+                    cached: 0,
+                    failed: 0,
+                },
+                outcome: TerminalOutcome::Succeeded {
+                    output_paths: vec![],
+                },
+            })
+            .is_err()
+        );
         assert_eq!(b.state(), BuildState::Pending);
+    }
+
+    #[test]
+    fn test_first_failure_first_wins_and_build_level_override() {
+        let mut b = BuildInfo::new_pending(
+            Uuid::new_v4(),
+            None,
+            PriorityClass::Scheduled,
+            true,
+            BuildOptions::default(),
+            HashSet::new(),
+        );
+        assert!(b.first_failure().is_none());
+        b.note_first_failure(FirstFailure {
+            summary: "derivation aaa failed".into(),
+            failed_drv: Some("aaa".into()),
+            status: Some(rio_proto::types::BuildResultStatus::PermanentFailure),
+        });
+        // Second note is a no-op — first failure wins.
+        b.note_first_failure(FirstFailure {
+            summary: "derivation bbb failed".into(),
+            failed_drv: Some("bbb".into()),
+            status: None,
+        });
+        assert_eq!(b.error_summary(), Some("derivation aaa failed"));
+        assert_eq!(
+            b.first_failure().unwrap().failed_drv.as_deref(),
+            Some("aaa")
+        );
+
+        // Build-level override replaces the whole struct; failed_drv is
+        // structurally None (no spliced derivation hash).
+        b.override_failure_build_level(
+            "build_timeout 10s exceeded".into(),
+            rio_proto::types::BuildResultStatus::TimedOut,
+        );
+        let ff = b.first_failure().unwrap();
+        assert_eq!(ff.summary, "build_timeout 10s exceeded");
+        assert_eq!(ff.failed_drv, None);
+        assert_eq!(
+            ff.status,
+            Some(rio_proto::types::BuildResultStatus::TimedOut)
+        );
     }
 }

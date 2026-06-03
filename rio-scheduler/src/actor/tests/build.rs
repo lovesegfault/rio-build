@@ -112,9 +112,12 @@ async fn test_watch_build_after_terminal_snapshot_reports_outcome(
                 rio_proto::types::BuildState::Cancelled as i32,
                 "snapshot reports Cancelled"
             );
-            assert!(
-                !snap.cancel_reason.is_empty(),
-                "cancel reason populated: {snap:?}"
+            // merged_bug_302: the snapshot must carry the REAL reason
+            // recorded at the cancel, not a fabricated constant — a
+            // re-attaching watcher otherwise loses the actual cause.
+            assert_eq!(
+                snap.cancel_reason, "test cancel",
+                "snapshot serves the recorded cancel reason verbatim"
             );
         }
     }
@@ -845,5 +848,223 @@ async fn cancel_running_drv_records_exec_correlation(
         "cancel must record bd.exec_id so the dashboard fetches the \
          exact log instead of the latest-exec fallback"
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Terminal capture (settled payloads — capture-at-transition)
+// ---------------------------------------------------------------------------
+
+// r[verify sched.build.terminal-payload-captured]
+/// merged_bug_036: a per-build timeout is a BUILD-level failure. It must
+/// not splice an earlier per-derivation failure's culprit hash next to
+/// the timeout summary — `failed_derivation` is structurally empty and
+/// the classification is TIMED_OUT, in BOTH the live BuildFailed event
+/// and the WatchBuild snapshot.
+#[tokio::test]
+async fn test_per_build_timeout_failure_is_build_level() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let build_id = Uuid::new_v4();
+    let x = make_node("to-x");
+    let y = make_node("to-y");
+    let x_path = x.drv_path.clone();
+    let mut events = merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id,
+            tenant_id: None,
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![x, y],
+            edges: vec![],
+            options: BuildOptions {
+                build_timeout: 1,
+                ..Default::default()
+            },
+            keep_going: true,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Per-drv failure on X first: keep_going keeps the build Active and
+    // records the first failure (summary + culprit X + classification).
+    pull_complete_failure(
+        &handle,
+        "to-x",
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "x exploded",
+    )
+    .await?;
+    barrier(&handle).await;
+    let mid = query_status(&handle, build_id).await?;
+    assert_eq!(
+        mid.state,
+        rio_proto::types::BuildState::Active as i32,
+        "precondition: keep_going build stays Active after X's failure"
+    );
+
+    // Wall-clock past the 1s per-build timeout, then tick the watchdog.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    // Live BuildFailed event: TIMED_OUT, no spliced derivation.
+    let mut failed_ev = None;
+    while let Ok(ev) = events.try_recv() {
+        if let Some(Event::Failed(f)) = ev.event {
+            failed_ev = Some(f);
+        }
+    }
+    let f = failed_ev.expect("BuildFailed emitted after the timeout");
+    assert_eq!(
+        f.status,
+        rio_proto::types::BuildResultStatus::TimedOut as i32,
+        "build-level timeout classification on the live event"
+    );
+    assert!(
+        f.failed_derivation.is_empty(),
+        "build-level failure must not name a derivation; got {:?} \
+         (the spliced-culprit bug: an earlier per-drv failure's hash \
+         next to the timeout summary)",
+        f.failed_derivation
+    );
+    assert!(
+        !x_path.is_empty(),
+        "sanity: X had a real path ({x_path}) that must NOT appear above"
+    );
+
+    // Snapshot serves the same settled payload.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::WatchBuild {
+            build_id,
+            caller_tenant: None,
+            reply: reply_tx,
+        })
+        .await?;
+    let (_rx, snapshot) = reply_rx.await??;
+    let Some(Event::Snapshot(snap)) = snapshot.event else {
+        panic!("WatchBuild reply must carry a Snapshot");
+    };
+    assert_eq!(snap.state, rio_proto::types::BuildState::Failed as i32);
+    assert_eq!(
+        snap.failure_status,
+        rio_proto::types::BuildResultStatus::TimedOut as i32,
+        "snapshot carries the build-level TIMED_OUT classification"
+    );
+    assert!(
+        snap.failed_derivation.is_empty(),
+        "snapshot must not splice a derivation into a build-level failure; got {:?}",
+        snap.failed_derivation
+    );
+    assert_eq!(
+        snap.error_message, f.error_message,
+        "snapshot and live event serve the same summary"
+    );
+    Ok(())
+}
+
+// r[verify sched.build.terminal-payload-captured]
+/// The settled snapshot byte-equals the live terminal emit, per terminal
+/// arm: whatever payload the live watcher saw at the transition is
+/// exactly what a late WatchBuild snapshot serves.
+#[rstest::rstest]
+#[case::completed(Terminalize::Success)]
+#[case::failed(Terminalize::PermanentFailure)]
+#[case::cancelled(Terminalize::Cancel)]
+#[tokio::test]
+async fn test_settled_snapshot_equals_live_emit(#[case] how: Terminalize) -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let build_id = Uuid::new_v4();
+    let mut events =
+        merge_single_node(&handle, build_id, "settle-eq", PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+
+    match how {
+        Terminalize::Success => {
+            pull_complete_success(&handle, "settle-eq", &test_store_path("settle-eq-out")).await?;
+        }
+        Terminalize::PermanentFailure => {
+            pull_complete_failure(
+                &handle,
+                "settle-eq",
+                rio_proto::types::BuildResultStatus::PermanentFailure,
+                "settle-eq exploded",
+            )
+            .await?;
+        }
+        Terminalize::Cancel => {
+            let (tx, rx) = oneshot::channel();
+            handle
+                .send_unchecked(ActorCommand::CancelBuild {
+                    build_id,
+                    caller_tenant: None,
+                    reason: "settle-eq cancel reason".into(),
+                    reply: tx,
+                })
+                .await?;
+            let _ = rx.await??;
+        }
+    }
+    barrier(&handle).await;
+
+    // Capture the live terminal emit.
+    let mut live_completed = None;
+    let mut live_failed = None;
+    let mut live_cancelled = None;
+    while let Ok(ev) = events.try_recv() {
+        match ev.event {
+            Some(Event::Completed(c)) => live_completed = Some(c),
+            Some(Event::Failed(f)) => live_failed = Some(f),
+            Some(Event::Cancelled(c)) => live_cancelled = Some(c),
+            _ => {}
+        }
+    }
+
+    // Late snapshot.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::WatchBuild {
+            build_id,
+            caller_tenant: None,
+            reply: reply_tx,
+        })
+        .await?;
+    let (_rx, snapshot) = reply_rx.await??;
+    let Some(Event::Snapshot(snap)) = snapshot.event else {
+        panic!("WatchBuild reply must carry a Snapshot");
+    };
+
+    match how {
+        Terminalize::Success => {
+            let live = live_completed.expect("live BuildCompleted");
+            assert_eq!(
+                snap.output_paths, live.output_paths,
+                "snapshot output_paths == live emit"
+            );
+        }
+        Terminalize::PermanentFailure => {
+            let live = live_failed.expect("live BuildFailed");
+            assert_eq!(snap.error_message, live.error_message);
+            assert_eq!(snap.failed_derivation, live.failed_derivation);
+            assert_eq!(snap.failure_status, live.status);
+        }
+        Terminalize::Cancel => {
+            let live = live_cancelled.expect("live BuildCancelled");
+            assert_eq!(snap.cancel_reason, live.reason);
+        }
+    }
+    // Counts are settled at the transition for every arm.
+    assert_eq!(snap.total_derivations, 1);
+    assert_eq!(
+        snap.running_derivations, 0,
+        "settled snapshot has no running set"
+    );
+    assert!(snap.running.is_empty());
     Ok(())
 }

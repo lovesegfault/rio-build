@@ -5,7 +5,10 @@
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
-use crate::state::{BuildState, BuildStateExt, DerivationStatus, DrvHash};
+use crate::state::{
+    BuildState, BuildStateExt, DerivationStatus, DrvHash, FirstFailure, SettledBuild,
+    SettledCounts, TerminalOutcome,
+};
 
 use super::{ActorCommand, ActorError, DagActor, TERMINAL_CLEANUP_DELAY};
 
@@ -19,6 +22,19 @@ use super::{ActorCommand, ActorError, DagActor, TERMINAL_CLEANUP_DELAY};
 pub(super) enum TransitionOutcome {
     Applied,
     Rejected,
+}
+
+/// Terminal intent for [`DagActor::transition_build`] — the chokepoint
+/// captures everything the terminal state must serve. `Cancel` REQUIRES
+/// its reason, so the only function able to mark a build Cancelled
+/// cannot be called without one (merged_bug_302). Pending→Active is not
+/// here: it goes through `BuildInfo::transition` on the merge/recovery
+/// paths (transactional / rebuild), which cannot reach a terminal state.
+#[derive(Debug, Clone)]
+pub(super) enum BuildTransition {
+    Succeed,
+    Fail,
+    Cancel { reason: String },
 }
 
 impl DagActor {
@@ -203,7 +219,12 @@ impl DagActor {
         // !is_terminal above and we're the single-owner actor) but
         // handled for defence-in-depth.
         if self
-            .transition_build(build_id, BuildState::Cancelled)
+            .transition_build(
+                build_id,
+                BuildTransition::Cancel {
+                    reason: reason.to_string(),
+                },
+            )
             .await?
             == TransitionOutcome::Rejected
         {
@@ -212,11 +233,19 @@ impl DagActor {
             return Ok(false);
         }
 
-        // Emit cancelled event
+        // Emit FROM the settled payload (single-emitter discipline) —
+        // the snapshot serves the same reason string.
+        let settled_reason = match self.builds.get(&build_id).and_then(|b| b.settled()) {
+            Some(SettledBuild {
+                outcome: TerminalOutcome::Cancelled { reason },
+                ..
+            }) => reason.clone(),
+            _ => reason.to_string(),
+        };
         self.events.emit(
             build_id,
             rio_proto::types::build_event::Event::Cancelled(rio_proto::types::BuildCancelled {
-                reason: reason.to_string(),
+                reason: settled_reason,
             }),
         );
 
@@ -244,6 +273,34 @@ impl DagActor {
             return Err(ActorError::PermissionDenied { build_id });
         }
 
+        // Settled builds serve their captured payload — the live DAG is
+        // shared and mutable, and a finished build's numbers must not
+        // track it (merged_bug_097).
+        if let Some(settled) = build.settled() {
+            let error_summary = match &settled.outcome {
+                TerminalOutcome::Failed(ff) => ff.summary.clone(),
+                TerminalOutcome::Succeeded { .. } | TerminalOutcome::Cancelled { .. } => {
+                    String::new()
+                }
+            };
+            return Ok(rio_proto::types::BuildStatus {
+                build_id: build_id.to_string(),
+                state: build.state().into(),
+                total_derivations: settled.counts.total,
+                completed_derivations: settled.counts.completed,
+                cached_derivations: settled.counts.cached,
+                running_derivations: 0,
+                failed_derivations: settled.counts.failed,
+                queued_derivations: 0,
+                submitted_at: None,
+                started_at: None,
+                finished_at: None,
+                error_summary,
+                critical_path_remaining_secs: Some(0),
+                assigned_executors: Vec::new(),
+            });
+        }
+
         let summary = self.dag.build_summary(build_id);
 
         Ok(rio_proto::types::BuildStatus {
@@ -260,7 +317,7 @@ impl DagActor {
             submitted_at: None,
             started_at: None,
             finished_at: None,
-            error_summary: build.error_summary.clone().unwrap_or_default(),
+            error_summary: build.error_summary().unwrap_or_default().to_string(),
             critical_path_remaining_secs: Some(summary.critpath_remaining.round() as u64),
             assigned_executors: summary.assigned_executors,
         })
@@ -319,6 +376,64 @@ impl DagActor {
     ) -> rio_proto::types::BuildEvent {
         use rio_proto::types;
 
+        // Settled builds serve their captured payload, byte-equal to
+        // the live terminal emit and the persisted row. No live DAG
+        // read happens on this branch — the running-set filter below is
+        // unreachable for terminal builds, so a stale-Completed reset +
+        // re-dispatch under a LATER build can neither resurrect entries
+        // in this build's running set nor shrink its counts
+        // (merged_bug_097).
+        if let Some(settled) = build.settled() {
+            // EXHAUSTIVE match — adding a TerminalOutcome variant is a
+            // compile error here, not a silently-empty payload.
+            let (output_paths, error_message, failed_derivation, failure_status, cancel_reason) =
+                match &settled.outcome {
+                    TerminalOutcome::Succeeded { output_paths } => (
+                        output_paths.clone(),
+                        String::new(),
+                        String::new(),
+                        0i32,
+                        String::new(),
+                    ),
+                    TerminalOutcome::Failed(ff) => (
+                        Vec::new(),
+                        ff.summary.clone(),
+                        ff.failed_drv.clone().unwrap_or_default(),
+                        ff.status.map_or(0, |s| s as i32),
+                        String::new(),
+                    ),
+                    TerminalOutcome::Cancelled { reason } => (
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                        0i32,
+                        reason.clone(),
+                    ),
+                };
+            let snapshot = types::BuildSnapshot {
+                state: build.state().into(),
+                total_derivations: settled.counts.total,
+                completed_derivations: settled.counts.completed,
+                cached_derivations: settled.counts.cached,
+                running_derivations: 0,
+                failed_derivations: settled.counts.failed,
+                queued_derivations: 0,
+                critical_path_remaining_secs: Some(0),
+                assigned_executors: Vec::new(),
+                running: Vec::new(),
+                output_paths,
+                error_message,
+                failed_derivation,
+                failure_status,
+                cancel_reason,
+            };
+            return rio_proto::types::BuildEvent {
+                build_id: build_id.to_string(),
+                timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+                event: Some(types::build_event::Event::Snapshot(snapshot)),
+            };
+        }
+
         let summary = self.dag.build_summary(build_id);
 
         // Per-drv running set: derivations currently executing for this
@@ -338,46 +453,14 @@ impl DagActor {
             .map(|(_, s)| types::RunningDerivation {
                 derivation_path: s.drv_path().to_string(),
                 exec_id: s.exec_id.map(|e| e.to_string()).unwrap_or_default(),
+                kind: 0,
             })
             .collect();
         // Deterministic wire order (iter_nodes is HashMap-ordered).
         running.sort_by(|a, b| a.derivation_path.cmp(&b.derivation_path));
 
-        // Terminal payload: which arm is populated mirrors the old
-        // terminal-resend (Completed/Failed/Cancelled events).
-        let state = build.state();
-        let mut output_paths = Vec::new();
-        let mut error_message = String::new();
-        let mut failed_derivation = String::new();
-        let mut failure_status = 0i32;
-        let mut cancel_reason = String::new();
-        match state {
-            BuildState::Succeeded => {
-                // Reconstruct output_paths from DAG roots (same as complete_build).
-                let roots = self.dag.find_roots(build_id);
-                output_paths = roots
-                    .iter()
-                    .flat_map(|h| {
-                        self.dag
-                            .node(h)
-                            .map(|s| s.output_paths.clone())
-                            .unwrap_or_default()
-                    })
-                    .collect();
-            }
-            BuildState::Failed => {
-                error_message = build.error_summary.clone().unwrap_or_default();
-                failed_derivation = build.failed_derivation.clone().unwrap_or_default();
-                failure_status = build.failure_status.map_or(0, |s| s as i32);
-            }
-            BuildState::Cancelled => {
-                cancel_reason = "build was cancelled".to_string();
-            }
-            _ => {}
-        }
-
         let snapshot = types::BuildSnapshot {
-            state: state.into(),
+            state: build.state().into(),
             // I-111: summary.{total,completed} are DAG-relative; after
             // recovery the DAG only holds non-terminal-at-recovery drvs.
             // Absolute counts come from BuildInfo (same as
@@ -391,18 +474,12 @@ impl DagActor {
             critical_path_remaining_secs: Some(summary.critpath_remaining.round() as u64),
             assigned_executors: summary.assigned_executors,
             running,
-            output_paths,
-            error_message,
-            failed_derivation,
-            // First failure's classification, recorded by
-            // handle_derivation_failure next to error_summary/
-            // failed_derivation (the timeout watchdog and the topdown
-            // fail-fast set their own); 0/Unspecified only for failures
-            // recovery synthesized without evidence — display-only, not
-            // persisted, same posture as failed_derivation. Failed-arm-
-            // only population mirrors the payload-arm discipline above.
-            failure_status,
-            cancel_reason,
+            // Active build: no terminal payload arms.
+            output_paths: Vec::new(),
+            error_message: String::new(),
+            failed_derivation: String::new(),
+            failure_status: 0,
+            cancel_reason: String::new(),
         };
 
         rio_proto::types::BuildEvent {
@@ -428,6 +505,16 @@ impl DagActor {
         let Some(build) = self.builds.get_mut(&build_id) else {
             return;
         };
+        // r[impl sched.build.terminal-status-settled+2]
+        // A settled build's accounting is frozen at the terminal
+        // transition — in memory AND in PG. Without this gate, a
+        // dispatch-time store hit on a shared node (stale-Completed
+        // reset under a later build) re-persists the terminal build's
+        // counts from the mutated DAG: `builds.completed_drvs` shrinks
+        // below total on a Succeeded row (merged_bug_097's PG leg).
+        if build.settled().is_some() {
+            return;
+        }
         build.completed_count = summary.completed;
         build.failed_count = summary.failed;
         // I-103: persist denormalized counts so list_builds is O(LIMIT).
@@ -464,9 +551,9 @@ impl DagActor {
         let failed = b.failed_count;
         // Sticky had-failure flag: failed_count is recomputed from the live
         // DAG and drops to 0 if a poisoned node is removed (ClearPoison/TTL).
-        // error_summary is set on first failure and never cleared, so it is
+        // The first failure is recorded once and never cleared, so it is
         // the authoritative "this build had a failure" gate for keep_going.
-        let had_failure = b.error_summary.is_some();
+        let had_failure = b.first_failure().is_some();
 
         let all_completed = completed >= total;
         let all_resolved = (completed + failed) >= total;
@@ -499,7 +586,7 @@ impl DagActor {
         // terminal). Otherwise a double-complete would emit a spurious
         // BuildCompleted event + metric + cleanup schedule.
         if self
-            .transition_build(build_id, BuildState::Succeeded)
+            .transition_build(build_id, BuildTransition::Succeed)
             .await?
             == TransitionOutcome::Rejected
         {
@@ -507,18 +594,15 @@ impl DagActor {
             return Ok(());
         }
 
-        // Collect output paths from root derivations
-        let roots = self.dag.find_roots(build_id);
-        let output_paths: Vec<String> = roots
-            .iter()
-            .flat_map(|h| {
-                self.dag
-                    .node(h)
-                    .map(|s| s.output_paths.clone())
-                    .unwrap_or_default()
-            })
-            .collect();
-
+        // Emit FROM the settled payload — the same paths the snapshot
+        // and the persisted row serve (single-emitter discipline).
+        let output_paths = match self.builds.get(&build_id).and_then(|b| b.settled()) {
+            Some(SettledBuild {
+                outcome: TerminalOutcome::Succeeded { output_paths },
+                ..
+            }) => output_paths.clone(),
+            _ => Vec::new(),
+        };
         self.events.emit(
             build_id,
             rio_proto::types::build_event::Event::Completed(rio_proto::types::BuildCompleted {
@@ -536,31 +620,36 @@ impl DagActor {
         &mut self,
         build_id: Uuid,
     ) -> Result<(), ActorError> {
-        let (error_summary, failed_derivation, failure_status) = self
-            .builds
-            .get(&build_id)
-            .map(|b| {
-                (
-                    b.error_summary.clone().unwrap_or_default(),
-                    b.failed_derivation.clone().unwrap_or_default(),
-                    b.failure_status.map_or(0, |s| s as i32),
-                )
-            })
-            .unwrap_or_default();
-
         // Skip side effects on Rejected (already terminal).
-        if self.transition_build(build_id, BuildState::Failed).await? == TransitionOutcome::Rejected
+        if self
+            .transition_build(build_id, BuildTransition::Fail)
+            .await?
+            == TransitionOutcome::Rejected
         {
             debug!(build_id = %build_id, "transition_build_to_failed: rejected (already terminal), skipping side effects");
             return Ok(());
         }
 
+        // Emit FROM the settled payload (single-emitter discipline) —
+        // byte-equal to what the snapshot and persisted row serve.
+        let (error_message, failed_derivation, status) =
+            match self.builds.get(&build_id).and_then(|b| b.settled()) {
+                Some(SettledBuild {
+                    outcome: TerminalOutcome::Failed(ff),
+                    ..
+                }) => (
+                    ff.summary.clone(),
+                    ff.failed_drv.clone().unwrap_or_default(),
+                    ff.status.map_or(0, |s| s as i32),
+                ),
+                _ => Default::default(),
+            };
         self.events.emit(
             build_id,
             rio_proto::types::build_event::Event::Failed(rio_proto::types::BuildFailed {
-                error_message: error_summary,
+                error_message,
                 failed_derivation,
-                status: failure_status,
+                status,
             }),
         );
         metrics::counter!("rio_scheduler_builds_total", "outcome" => "failure").increment(1);
@@ -569,23 +658,33 @@ impl DagActor {
         Ok(())
     }
 
-    /// Attempt to transition a build to a new state.
+    /// Attempt to transition a build per the intent.
     ///
     /// Returns `Applied` if the transition succeeded (in-memory state
     /// machine + DB update both committed). Returns `Rejected` if the
     /// in-memory state machine rejected the transition (e.g., already
-    /// terminal → Succeeded would double-complete).
+    /// terminal → Succeed would double-complete).
+    ///
+    /// Terminal intents CAPTURE the settled payload here, BEFORE the DB
+    /// write: counts from one `dag.build_summary` scan, the outcome arm
+    /// from the intent (Succeed collects root output paths; Fail
+    /// snapshots the recorded first failure, synthesizing a build-level
+    /// one if none was recorded; Cancel takes the required reason).
+    /// The payload is persisted, then installed in-memory — every later
+    /// consumer (live terminal event, snapshot, query, persisted row)
+    /// reads the SAME `SettledBuild`, never live state (merged_bug_097).
     ///
     /// Ordering is dry-run validate → DB write → in-memory mutate.
     /// A transient DB error therefore leaves in-memory unchanged
-    /// (`is_terminal()` stays false), so a re-call retries cleanly.
-    /// `tick_recheck_stuck_completions` is the retry DRIVER — every
-    /// other `check_build_completion` caller is event-driven, and after
-    /// the last derivation completes there are no more events. The
-    /// previous order (in-mem first) self-defeated retry: in-mem went
-    /// terminal, the `?` propagated, every caller swallowed with
-    /// `error!()`, and re-calling on an already-terminal build returns
-    /// `Rejected` — gateway `WatchBuild` hung forever.
+    /// (`is_terminal()` stays false), so a re-call retries cleanly —
+    /// the retry recomputes the payload. `tick_recheck_stuck_completions`
+    /// is the retry DRIVER — every other `check_build_completion` caller
+    /// is event-driven, and after the last derivation completes there
+    /// are no more events. The previous order (in-mem first)
+    /// self-defeated retry: in-mem went terminal, the `?` propagated,
+    /// every caller swallowed with `error!()`, and re-calling on an
+    /// already-terminal build returns `Rejected` — gateway `WatchBuild`
+    /// hung forever.
     ///
     /// Callers (complete_build, transition_build_to_failed,
     /// handle_cancel_build) check the outcome and skip side effects on
@@ -595,11 +694,16 @@ impl DagActor {
     pub(super) async fn transition_build(
         &mut self,
         build_id: Uuid,
-        new_state: BuildState,
+        intent: BuildTransition,
     ) -> Result<TransitionOutcome, ActorError> {
+        let new_state = match &intent {
+            BuildTransition::Succeed => BuildState::Succeeded,
+            BuildTransition::Fail => BuildState::Failed,
+            BuildTransition::Cancel { .. } => BuildState::Cancelled,
+        };
         // Dry-run validate without mutating. validate_transition is the
-        // exact predicate transition() uses, so the post-DB transition()
-        // below cannot fail.
+        // exact predicate the post-DB install below uses, so it cannot
+        // fail there.
         if let Some(b) = self.builds.get(&build_id)
             && let Err(e) = b.state().validate_transition(new_state)
         {
@@ -613,27 +717,70 @@ impl DagActor {
             return Ok(TransitionOutcome::Rejected);
         }
 
-        let error_summary = self
-            .builds
-            .get(&build_id)
-            .and_then(|b| b.error_summary.as_deref());
+        // Capture the settled payload BEFORE the DB write, from one
+        // summary scan + the recorded first failure.
+        let Some(build) = self.builds.get(&build_id) else {
+            return Err(ActorError::BuildNotFound(build_id));
+        };
+        let summary = self.dag.build_summary(build_id);
+        let counts = SettledCounts {
+            total: build.total_count,
+            // I-111: summary counts are DAG-relative; absolute =
+            // recovered offset + live (same arithmetic the live
+            // snapshot/query surfaces use).
+            completed: build.recovered_completed + summary.completed,
+            cached: build.cached_count,
+            failed: summary.failed,
+        };
+        let outcome = match &intent {
+            BuildTransition::Succeed => {
+                // Collect output paths from root derivations NOW —
+                // the DAG is shared and mutable; watchers must see
+                // the paths as of the terminal transition.
+                let roots = self.dag.find_roots(build_id);
+                let output_paths: Vec<String> = roots
+                    .iter()
+                    .flat_map(|h| {
+                        self.dag
+                            .node(h)
+                            .map(|s| s.output_paths.clone())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                TerminalOutcome::Succeeded { output_paths }
+            }
+            BuildTransition::Fail => {
+                TerminalOutcome::Failed(build.first_failure().cloned().unwrap_or_else(|| {
+                    // No per-drv failure recorded (recovery-
+                    // synthesized paths) — a build-level failure
+                    // with no spliced derivation.
+                    FirstFailure {
+                        summary: "build failed".to_string(),
+                        failed_drv: None,
+                        status: None,
+                    }
+                }))
+            }
+            BuildTransition::Cancel { reason } => TerminalOutcome::Cancelled {
+                reason: reason.clone(),
+            },
+        };
+        let settled = SettledBuild { counts, outcome };
 
         // DB first — if this fails, in-memory is unchanged and retry
-        // remains possible.
+        // remains possible (the retry recomputes the payload).
         self.db
-            .update_build_status(build_id, new_state, error_summary)
+            .update_build_status(build_id, new_state, Some(&settled))
             .await?;
 
         if let Some(build) = self.builds.get_mut(&build_id) {
             // Validated above; the actor is single-threaded and there is
             // no `.await` between the dry-run and here that could observe
             // a state change.
-            let _ = build.transition(new_state);
-            if new_state.is_terminal() {
-                let duration = build.submitted_at.elapsed();
-                metrics::histogram!("rio_scheduler_build_duration_seconds")
-                    .record(duration.as_secs_f64());
-            }
+            let _ = build.transition_terminal(settled);
+            let duration = build.submitted_at.elapsed();
+            metrics::histogram!("rio_scheduler_build_duration_seconds")
+                .record(duration.as_secs_f64());
         }
 
         // r[impl sched.materialize.pinning]

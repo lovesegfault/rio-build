@@ -242,12 +242,16 @@ impl SchedulerDb {
         Ok(())
     }
 
-    /// Update a build's status.
+    /// Update a build's status. Terminal statuses persist the settled
+    /// payload's accounting in the same UPDATE: the counts are FINAL at
+    /// the terminal transition (`update_build_counts_with` no-ops on
+    /// settled builds, so nothing can shrink them afterwards —
+    /// merged_bug_097's PG leg).
     pub async fn update_build_status(
         &self,
         build_id: Uuid,
         status: BuildState,
-        error_summary: Option<&str>,
+        settled: Option<&crate::state::SettledBuild>,
     ) -> Result<(), sqlx::Error> {
         let now_col = match status {
             BuildState::Active => "started_at",
@@ -268,12 +272,24 @@ impl SchedulerDb {
                 .execute(&self.pool)
                 .await?;
         } else {
+            let error_summary = settled.and_then(|s| match &s.outcome {
+                crate::state::TerminalOutcome::Failed(ff) => Some(ff.summary.as_str()),
+                _ => None,
+            });
+            let (completed, cached) = settled
+                .map(|s| (s.counts.completed as i32, s.counts.cached as i32))
+                .unzip();
             sqlx::query(
-                "UPDATE builds SET status = $2, finished_at = now(), error_summary = $3 WHERE build_id = $1",
+                "UPDATE builds SET status = $2, finished_at = now(), error_summary = $3, \
+                 completed_drvs = COALESCE($4, completed_drvs), \
+                 cached_drvs = COALESCE($5, cached_drvs) \
+                 WHERE build_id = $1",
             )
             .bind(build_id)
             .bind(status.as_str())
             .bind(error_summary)
+            .bind(completed)
+            .bind(cached)
             .execute(&self.pool)
             .await?;
         }

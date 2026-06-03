@@ -3670,25 +3670,20 @@ impl DagActor {
         };
 
         // r[impl sched.build.keep-going]
-        // Record FIRST-failure summary regardless of keep_going. The
+        // Record the FIRST failure regardless of keep_going. The
         // previous `!keep_going`-only assignment meant a keep_going
         // build's eventual `BuildFailed` had `error_message=""` and
-        // `failed_derivation=""` (transition_build_to_failed
-        // `.unwrap_or_default()`s both). `get_or_insert` keeps the
-        // first failure across multiple calls under keep_going.
-        build
-            .error_summary
-            .get_or_insert_with(|| format!("derivation {drv_hash} failed"));
-        build
-            .failed_derivation
-            .get_or_insert_with(|| drv_hash.to_string());
-        // Paired with the two fields above: the trio names the SAME
-        // first failure (union-only builds record the TRIGGER's status,
-        // matching the trigger hash failed_derivation records for
-        // them). If failed_derivation's semantics ever change to name
-        // the cascaded node instead, this mapping must change in
-        // lockstep.
-        build.failure_status.get_or_insert(status);
+        // `failed_derivation=""`. `note_first_failure` keeps the first
+        // failure across multiple calls under keep_going, and the trio
+        // (summary/culprit/classification) travels as ONE struct so the
+        // fields cannot name different failures (union-only builds
+        // record the TRIGGER's status, matching the trigger hash the
+        // culprit field records for them).
+        build.note_first_failure(crate::state::FirstFailure {
+            summary: format!("derivation {drv_hash} failed"),
+            failed_drv: Some(drv_hash.to_string()),
+            status: Some(status),
+        });
 
         if !build.keep_going {
             // Fail the entire build immediately. Cancel remaining

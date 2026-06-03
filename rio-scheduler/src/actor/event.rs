@@ -174,6 +174,10 @@ impl BuildEventBus {
                 total: summary.total,
                 critical_path_remaining_secs: Some(summary.critpath_remaining.round() as u64),
                 assigned_executors: summary.assigned_executors.clone(),
+                // The same summary.failed the snapshot serves — a live
+                // Progress can no longer silently zero a failed count
+                // the snapshot just reported (bug_304).
+                failed: summary.failed,
             }),
         );
     }
@@ -224,16 +228,16 @@ impl DagActor {
     }
 
     /// Whether `BuildProgress` emission for this build is frozen because
-    /// the build already reached a terminal state
+    /// the build already settled into its terminal payload
     /// (`sched.build.terminal-status-settled`). Terminal builds stay
     /// resident — and in shared nodes' `interested_builds` — for the
     /// terminal-cleanup window, so aggregate-progress emitters must skip
-    /// them.
+    /// them. Derived from `settled()` — the same capture every other
+    /// terminal consumer reads.
     pub(super) fn build_progress_frozen(&self, build_id: Uuid) -> bool {
-        use crate::state::BuildStateExt;
         self.builds
             .get(&build_id)
-            .is_some_and(|b| b.state().is_terminal())
+            .is_some_and(|b| b.settled().is_some())
     }
 
     /// [`BuildEventBus::emit_progress_with`] behind the terminal-build

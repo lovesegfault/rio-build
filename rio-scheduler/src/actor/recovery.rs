@@ -930,18 +930,21 @@ impl DagActor {
             // error_summary is the sticky; failed_count is not.
             if let Some(b) = self.builds.get_mut(&build_id)
                 && b.failed_count > 0
-                && b.error_summary.is_none()
+                && b.first_failure().is_none()
             {
-                b.error_summary = Some(format!(
-                    "recovered with {} failed derivation(s)",
-                    b.failed_count
-                ));
-                // failure_status deliberately stays None here (like
-                // failed_derivation, which this path never sets): the
+                let failed_count = b.failed_count;
+                // failed_drv and status deliberately stay None: the
                 // per-drv wire classification is not recoverable from
                 // PG, so a recovery-synthesized failure reports
-                // Unspecified → MiscFailure — byte-identical to the
-                // pre-threading behavior for this path.
+                // Unspecified → MiscFailure with no spliced culprit —
+                // byte-identical to the pre-capture behavior for this
+                // path. note_first_failure is first-wins, matching the
+                // is_none() guard above.
+                b.note_first_failure(crate::state::FirstFailure {
+                    summary: format!("recovered with {failed_count} failed derivation(s)"),
+                    failed_drv: None,
+                    status: None,
+                });
             }
             self.check_build_completion(build_id).await;
         }

@@ -221,14 +221,19 @@ impl DagActor {
             warn!(build_id = %build_id, timeout_secs = timeout, "per-build timeout exceeded; cancelling derivations and failing build");
             metrics::counter!("rio_scheduler_build_timeouts_total").increment(1);
 
-            // Set error_summary FIRST so transition_build_to_failed picks it
-            // up for the BuildFailed event + DB error_summary column.
+            // Record the BUILD-level failure FIRST so the terminal
+            // capture in transition_build picks it up for the
+            // BuildFailed event + persisted row. Whole-struct override:
+            // a per-build timeout is about the BUILD, so the culprit
+            // derivation is structurally None — the previous
+            // independent-field overwrite kept a stale failed_derivation
+            // from an earlier per-drv failure spliced next to the
+            // timeout summary (merged_bug_036).
             if let Some(build) = self.builds.get_mut(&build_id) {
-                build.error_summary = Some(reason.clone());
-                // Direct assign (not get_or_insert), mirroring the
-                // overwrite semantics of the summary above so the
-                // status matches the overwritten message.
-                build.failure_status = Some(rio_proto::types::BuildResultStatus::TimedOut);
+                build.override_failure_build_level(
+                    reason.clone(),
+                    rio_proto::types::BuildResultStatus::TimedOut,
+                );
             }
             // Reuse the CancelBuild derivation-cancellation path (sends
             // CancelSignal, transitions drvs to Cancelled, removes build

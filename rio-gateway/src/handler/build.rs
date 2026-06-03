@@ -48,6 +48,13 @@ enum StreamProcessError {
     /// reconnect-worthy — scheduler is fine, client is gone.
     #[error("client disconnected: {0}")]
     Wire(#[from] rio_nix::protocol::wire::WireError),
+    /// The scheduler signalled irrecoverable event loss for this
+    /// watcher (broadcast ring overrun → `BuildEvent.resync_required`).
+    /// Reconnect-worthy with ZERO backoff: the server is healthy, this
+    /// WATCHER fell behind — the fresh WatchBuild's snapshot is the
+    /// recovery (gw.resync.loss-signal).
+    #[error("scheduler signalled event loss; resync via snapshot")]
+    ResyncRequired,
 }
 
 // r[impl gw.reject.build-mode]
@@ -956,6 +963,15 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
                     reason: cancelled.reason,
                 });
             }
+            // r[impl gw.resync.loss-signal]
+            Some(Event::ResyncRequired(_)) => {
+                // The scheduler dropped events for THIS watcher
+                // (broadcast lag). Everything reconciles from a fresh
+                // WatchBuild snapshot — running set (re-opens lagged
+                // tails via the idempotent on_started), activities,
+                // counters. No per-event-type guesswork.
+                return Err(StreamProcessError::ResyncRequired);
+            }
             None => {}
         }
     }
@@ -1217,30 +1233,49 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
             // Ok(None), not Err). vm-le-build-k3s proved the
             // prior "crash = Transport" assumption wrong.
             Err(
-                e @ (StreamProcessError::Transport(_) | StreamProcessError::EofWithoutTerminal),
+                e @ (StreamProcessError::Transport(_)
+                | StreamProcessError::EofWithoutTerminal
+                | StreamProcessError::ResyncRequired),
             ) => {
+                let resync = matches!(e, StreamProcessError::ResyncRequired);
                 reconnect_attempts += 1;
                 if reconnect_attempts > MAX_RECONNECT {
                     break Err(e);
                 }
 
-                let backoff = RECONNECT_BACKOFF.duration(reconnect_attempts - 1);
-                tracing::warn!(
-                    %build_id,
-                    error = %e,
-                    attempt = reconnect_attempts,
-                    backoff_secs = backoff.as_secs(),
-                    "BuildEvent stream error; reconnecting via WatchBuild"
-                );
-                // Also surface to the client via STDERR — they see
-                // "reconnecting..." instead of a hang.
-                let _ = stderr
-                    .log(&format!(
-                        "scheduler connection lost (attempt {}/{}); reconnecting...",
-                        reconnect_attempts, MAX_RECONNECT
-                    ))
-                    .await;
-                tokio::time::sleep(backoff).await;
+                if resync {
+                    // r[impl gw.resync.loss-signal]
+                    // Server-signalled watcher lag: the scheduler is
+                    // healthy, so re-attach IMMEDIATELY (zero backoff)
+                    // and silently — the snapshot reconcile is invisible
+                    // to the nix client. Storm-bounded by the bridge's
+                    // per-streak debounce + MAX_RECONNECT above (the
+                    // counter still resets only on a successfully
+                    // forwarded event).
+                    tracing::debug!(
+                        %build_id,
+                        attempt = reconnect_attempts,
+                        "scheduler signalled event loss (broadcast lag); resyncing via WatchBuild snapshot"
+                    );
+                } else {
+                    let backoff = RECONNECT_BACKOFF.duration(reconnect_attempts - 1);
+                    tracing::warn!(
+                        %build_id,
+                        error = %e,
+                        attempt = reconnect_attempts,
+                        backoff_secs = backoff.as_secs(),
+                        "BuildEvent stream error; reconnecting via WatchBuild"
+                    );
+                    // Also surface to the client via STDERR — they see
+                    // "reconnecting..." instead of a hang.
+                    let _ = stderr
+                        .log(&format!(
+                            "scheduler connection lost (attempt {}/{}); reconnecting...",
+                            reconnect_attempts, MAX_RECONNECT
+                        ))
+                        .await;
+                    tokio::time::sleep(backoff).await;
+                }
 
                 // Reconnect: need a fresh scheduler client. The
                 // original was moved into this function; we can't

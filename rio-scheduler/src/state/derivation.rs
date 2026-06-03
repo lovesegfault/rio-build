@@ -2105,7 +2105,17 @@ mod tests {
         }
         let mut terminal = mk_build(done);
         terminal.transition(BuildState::Active)?;
-        terminal.transition(BuildState::Succeeded)?;
+        terminal.transition_terminal(crate::state::SettledBuild {
+            counts: crate::state::SettledCounts {
+                total: 0,
+                completed: 0,
+                cached: 0,
+                failed: 0,
+            },
+            outcome: crate::state::TerminalOutcome::Succeeded {
+                output_paths: vec![],
+            },
+        })?;
         builds.insert(done, terminal);
 
         let mut s = DerivationState::try_from_node(&dummy_node())?;

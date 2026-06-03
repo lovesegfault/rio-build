@@ -1850,6 +1850,7 @@ async fn test_build_paths_reconnect_snapshot_resumes_state() -> anyhow::Result<(
                 running: vec![types::RunningDerivation {
                     derivation_path: drv_b.clone(),
                     exec_id: "01933333-3333-7333-8333-333333333333".into(),
+                    kind: 0,
                 }],
                 ..Default::default()
             })),
