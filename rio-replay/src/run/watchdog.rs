@@ -1579,8 +1579,11 @@ mod tests {
                 .to_string();
             // The collapsing accessor stays dead everywhere, the owner
             // included. (The needle is assembled at runtime so this
-            // test's own message strings cannot satisfy it.)
-            let dead_accessor = format!("fn {}", "fresh");
+            // test's own message strings cannot satisfy it; the open
+            // paren keeps a `fn fresh_*` sibling — e.g. mod.rs's
+            // fresh-workload-set enumeration test — from matching a
+            // needle that bans only the accessor named `fresh`.)
+            let dead_accessor = format!("fn {}{}", "fresh", "(");
             assert!(
                 !text.contains(&dead_accessor),
                 "{rel}: a Polled-collapsing accessor ({dead_accessor:?}) must not come back \
