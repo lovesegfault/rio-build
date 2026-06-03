@@ -78,6 +78,72 @@ pub(crate) fn ensure_single_put_size(bytes: u64, what: &str) -> anyhow::Result<(
     Ok(())
 }
 
+/// Byte cap on one METADATA member read out of an archive (manifest,
+/// the `.jsonl` members, unknown `manifest.files` entries, the v0
+/// members): 2 GiB.
+///
+/// Trust provenance: archive bytes are ARCHIVE-CONTROLLED — hostile by
+/// the backend's own posture (`Backend::nar_node` threat-models "a
+/// hostile or foreign image", and `xtask replay dev`/`launch` open
+/// arbitrary local and fetched images). The 5 GiB publish cap
+/// ([`S3_SINGLE_PUT_MAX_BYTES`]) bounds only the COMPRESSED image:
+/// DwarFS chunks alias zstd/LZMA blocks, so a well-under-cap image
+/// legally declares a member that decompresses to hundreds of GiB.
+/// Every member read therefore carries a caller-supplied bound
+/// ([`backend::Backend::read_file`]); this constant is the bound for
+/// the metadata member class.
+///
+/// Sizing, from this tree's own size posture: the engine parses every
+/// metadata member into memory wholesale, and the largest modeled
+/// member (closures.jsonl for a campaign at the stderr budget's own
+/// largest recognized closure, 65,536 nodes ×  ~10 KiB/record) is
+/// ~650 MiB — this cap is ~3× that, while still refusing the
+/// decompression-bomb shapes (tens-to-hundreds of GiB) outright.
+///
+/// False-refusal cost, stated: an over-cap member fails `open` with an
+/// error naming the member, its size, and this cap (a refusal, never an
+/// OOM abort); the remedy is splitting the campaign — the same remedy
+/// the publish cap already names.
+pub(crate) const MAX_METADATA_MEMBER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Byte cap on one embedded `.drv` member read: 64 MiB. Same trust
+/// provenance as [`MAX_METADATA_MEMBER_BYTES`] (archive-controlled
+/// bytes, decompression-amplified). Sizing: derivation ATerms are text;
+/// the largest first-party shapes (texlive/chromium-class env dumps)
+/// are single-digit MiB, so 64 MiB is ≥30× the legitimate tail. An
+/// over-cap `.drv` fails `open` (v1 reads every `.drv` for the
+/// embedded-derivation listing digest) or `read_drv` with an error
+/// naming the member and cap.
+pub(crate) const MAX_DRV_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Byte cap on the total DECLARED content of one embedded store-path
+/// tree walked into an in-memory NAR ([`backend::Backend::nar_node`]):
+/// 16 GiB.
+///
+/// Trust provenance: the per-file sizes summed against this budget come
+/// from the archive's own index (DwarFS chunk tables / staging-dir
+/// stat) — archive-controlled, so the budget is an engine-fixed belt,
+/// not a peer-declared figure. It bounds what `dump_nar` will BUFFER
+/// (the supply path materializes whole NARs in memory today — see
+/// `dump_nar`'s streaming TODO), converting the decompression-bomb tree
+/// into a per-path refusal naming this cap.
+///
+/// Sizing: 3.2× the largest single object the publisher PUTs (the 5 GiB
+/// compressed image, [`S3_SINGLE_PUT_MAX_BYTES`]) — a single member
+/// tree legitimately exceeding the WHOLE image's compressed budget by
+/// more than ~3:1 is outside any source-tree compression ratio mkdwarfs
+/// achieves on real recordings — and 4× UNDER the 64 GiB streamed-relay
+/// screen (`run/supply::MAX_RELAY_NAR_BYTES`), because that lane
+/// streams to disk while this one buffers in RAM.
+///
+/// False-refusal cost, stated: an over-budget tree fails its `dump_nar`
+/// with an error naming the path and this cap; the affected path
+/// records a supply failure and its dependents degrade per-path (the
+/// same containment as a sidecar-verification failure), never an
+/// engine abort. The remedy is the streaming supply path the `dump_nar`
+/// TODO names, or re-recording without the over-cap tree.
+pub(crate) const MAX_EMBEDDED_NAR_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
 /// The hash part of a store path: the basename characters before the first
 /// `-`. Accepts a full `/nix/store/...` path, a basename, or a bare hash.
 pub(crate) fn hash_part(path_or_name: &str) -> &str {
@@ -238,8 +304,10 @@ pub(crate) fn index_narinfos(
             continue;
         };
         let rel = format!("{NARINFO_DIR}/{}", entry.name);
+        // Sidecar bodies share the substituter's narinfo size posture:
+        // one cap for "how big can a narinfo be", whoever serves it.
         let bytes = backend
-            .read_file(&rel)?
+            .read_file(&rel, crate::substituter::MAX_NARINFO_BYTES)?
             .ok_or_else(|| anyhow!("{rel}: listed but unreadable"))?;
         let parsed = std::str::from_utf8(&bytes)
             .map_err(anyhow::Error::from)

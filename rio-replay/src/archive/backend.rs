@@ -3,11 +3,11 @@
 //! `read_file`/`list_dir`; NAR packing of embedded trees on the DwarFS
 //! side walks those primitives recursively.
 
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use dwarfs::AsChunks as _;
 use rio_nix::nar::{MAX_DIRECTORY_ENTRIES, MAX_NAR_DEPTH, NarEntry, NarNode};
 
@@ -48,10 +48,12 @@ pub(crate) enum EntryKind {
 pub(crate) struct WalkEntry {
     pub(crate) name: String,
     pub(crate) kind: EntryKind,
-    /// File size in bytes (0 for directories and symlinks).
-    // NAR packing reads file contents directly; the size is kept for
-    // debugging entry listings (Debug derive).
-    #[allow(dead_code)]
+    /// File size in bytes (0 for directories and symlinks), as DECLARED
+    /// by the backend's index (DwarFS chunk table / directory stat) —
+    /// archive-controlled, never verified against content here. The NAR
+    /// walk uses it as each file read's expected size (so a member whose
+    /// content exceeds its own declaration errors instead of growing the
+    /// read) and charges it against the walk's total byte budget.
     size: u64,
     /// Executable bit (regular files only).
     pub(crate) executable: bool,
@@ -80,16 +82,67 @@ impl Backend {
         })))
     }
 
-    /// Read a file's full contents. `Ok(None)` if the path doesn't exist.
-    pub(crate) fn read_file(&self, rel: &str) -> Result<Option<Vec<u8>>> {
+    /// Read a file's full contents, refusing above `max_bytes`. `Ok(None)`
+    /// if the path doesn't exist.
+    ///
+    /// `max_bytes` is the caller's expected-size bound for the member
+    /// class being read — REQUIRED by signature (the same treatment as
+    /// `ArtifactStore::get_to_file`'s `max_bytes`), because archive bytes
+    /// are archive-controlled and decompression-amplified: the 5 GiB
+    /// publish cap bounds the COMPRESSED image, while DwarFS chunks alias
+    /// zstd/LZMA blocks, so an under-cap image legally declares a member
+    /// decompressing to hundreds of GiB. Without a per-read bound, `open`
+    /// OOM-aborts (and the k8s Job retry-loops) instead of refusing with
+    /// an error naming the member — the abort-vs-error gap the sibling
+    /// depth/entry caps on [`Backend::nar_node`] were added to close.
+    ///
+    /// Both arms enforce the bound the same way: refuse when the
+    /// backend's DECLARED size (stat / chunk table) exceeds `max_bytes`,
+    /// then read through a `take(max_bytes + 1)` reader with a post-read
+    /// length check — so a declaration that lies SMALL (a corrupt chunk
+    /// table, a file growing mid-read) is bounded either way, mirroring
+    /// `substituter::fetch_nar`'s anti-bomb discipline on the network
+    /// sibling axis.
+    pub(crate) fn read_file(&self, rel: &str, max_bytes: u64) -> Result<Option<Vec<u8>>> {
         match self {
             Backend::Dir { root } => {
                 let path = root.join(rel);
-                match std::fs::read(&path) {
-                    Ok(bytes) => Ok(Some(bytes)),
-                    Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-                    Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
-                }
+                let declared = match std::fs::metadata(&path) {
+                    Ok(meta) => meta.len(),
+                    Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+                    Err(err) => {
+                        return Err(err).with_context(|| format!("stat {}", path.display()));
+                    }
+                };
+                ensure!(
+                    declared <= max_bytes,
+                    "{rel}: {declared} bytes exceeds the {max_bytes}-byte cap for this archive \
+                     member class — refusing to buffer it"
+                );
+                let file = match std::fs::File::open(&path) {
+                    Ok(file) => file,
+                    // Deleted between stat and open: same answer as a
+                    // missing path observed at stat time.
+                    Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+                    Err(err) => {
+                        return Err(err).with_context(|| format!("open {}", path.display()));
+                    }
+                };
+                // Pre-size from the (archive-controlled) declared size,
+                // capped so a declares-big-delivers-small member can't make
+                // us reserve gigabytes up front (fetch_nar's discipline).
+                let mut bytes = Vec::with_capacity(reserve_for(declared));
+                std::io::Read::take(file, max_bytes.saturating_add(1))
+                    // bounded-io: size-capped by the stat pre-check and the
+                    // take(max_bytes + 1) belt above
+                    .read_to_end(&mut bytes)
+                    .with_context(|| format!("read {}", path.display()))?;
+                ensure!(
+                    bytes.len() as u64 <= max_bytes,
+                    "{rel}: grew past its {declared}-byte stat size while being read, beyond \
+                     the {max_bytes}-byte cap for this archive member class"
+                );
+                Ok(Some(bytes))
             }
             Backend::Dwarfs(dw) => {
                 let Some(inode) = dw.index.get_path(rel.split('/')) else {
@@ -98,12 +151,31 @@ impl Backend {
                 let file = inode
                     .as_file()
                     .ok_or_else(|| anyhow!("{rel}: not a regular file in the DwarFS image"))?;
+                let declared = file.as_chunks().total_size();
+                ensure!(
+                    declared <= max_bytes,
+                    "{rel}: the image's chunk table declares {declared} bytes, exceeding the \
+                     {max_bytes}-byte cap for this archive member class — refusing to buffer it"
+                );
                 // A panic during a read can't corrupt the block cache;
                 // recovering from poisoning keeps later reads working.
                 let mut archive = dw.archive.lock().unwrap_or_else(|e| e.into_inner());
-                let bytes = file
-                    .read_to_vec(&mut *archive)
+                // Capped pre-size, same rationale as the directory arm.
+                let mut bytes = Vec::with_capacity(reserve_for(declared));
+                // `take` rather than the crate's `read_to_vec`: the belt
+                // bounds a chunk table that lies SMALL, and `Take`'s
+                // generic `read_to_end` sidesteps the crate reader's
+                // exact-size assertion (an abort path) on such a lie.
+                std::io::Read::take(file.as_reader(&mut *archive), max_bytes.saturating_add(1))
+                    // bounded-io: size-capped by the chunk-table pre-check
+                    // and the take(max_bytes + 1) belt above
+                    .read_to_end(&mut bytes)
                     .with_context(|| format!("read {rel} from the DwarFS image"))?;
+                ensure!(
+                    bytes.len() as u64 <= max_bytes,
+                    "{rel}: the DwarFS image yielded more than its declared {declared} bytes, \
+                     beyond the {max_bytes}-byte cap for this archive member class"
+                );
                 Ok(Some(bytes))
             }
         }
@@ -160,13 +232,36 @@ impl Backend {
     /// this walk recurses per directory level on a default 2 MiB blocking
     /// thread — without the cap, a deep tree in a hostile or foreign image
     /// stack-overflows (an abort, not an unwind) instead of erroring.
-    pub(crate) fn nar_node(&self, rel: &str, entry: &WalkEntry) -> Result<NarNode> {
-        self.nar_node_at(rel, entry, 0)
+    ///
+    /// The third hostile resource axis — member BYTE SIZE, sibling of the
+    /// depth and fan-out caps above — is bounded by `byte_budget`: the
+    /// whole tree is buffered in memory at once (every file's contents
+    /// live in the returned [`NarNode`]), so each regular file's
+    /// index-declared size is charged against the budget before its read,
+    /// and the read itself is capped at exactly that declared size
+    /// (`read_file`'s belt then catches a declaration that lies small).
+    /// Callers pass [`super::MAX_EMBEDDED_NAR_BYTES`] in production.
+    pub(crate) fn nar_node(
+        &self,
+        rel: &str,
+        entry: &WalkEntry,
+        byte_budget: u64,
+    ) -> Result<NarNode> {
+        let mut remaining = byte_budget;
+        self.nar_node_at(rel, entry, 0, &mut remaining, byte_budget)
     }
 
-    /// [`nar_node`](Self::nar_node) with the depth threaded through the
-    /// recursion.
-    fn nar_node_at(&self, rel: &str, entry: &WalkEntry, depth: usize) -> Result<NarNode> {
+    /// [`nar_node`](Self::nar_node) with the depth and the remaining byte
+    /// budget threaded through the recursion (`byte_budget` rides along
+    /// only so refusals can name the full cap, not the remainder).
+    fn nar_node_at(
+        &self,
+        rel: &str,
+        entry: &WalkEntry,
+        depth: usize,
+        remaining: &mut u64,
+        byte_budget: u64,
+    ) -> Result<NarNode> {
         if depth > MAX_NAR_DEPTH {
             bail!(
                 "{rel}: directory nesting depth {depth} exceeds the NAR walker limit \
@@ -175,8 +270,15 @@ impl Backend {
         }
         match entry.kind {
             EntryKind::Regular => {
+                ensure!(
+                    entry.size <= *remaining,
+                    "{rel}: {} declared bytes exceed the remaining in-memory NAR budget \
+                     ({remaining} of {byte_budget} bytes left) — refusing to buffer this tree",
+                    entry.size
+                );
+                *remaining -= entry.size;
                 let contents = self
-                    .read_file(rel)?
+                    .read_file(rel, entry.size)?
                     .ok_or_else(|| anyhow!("{rel}: listed but unreadable"))?;
                 Ok(NarNode::Regular {
                     executable: entry.executable,
@@ -211,7 +313,13 @@ impl Backend {
                     let child_rel = format!("{rel}/{}", child.name);
                     entries.push(NarEntry {
                         name: child.name.clone(),
-                        node: self.nar_node_at(&child_rel, child, depth + 1)?,
+                        node: self.nar_node_at(
+                            &child_rel,
+                            child,
+                            depth + 1,
+                            remaining,
+                            byte_budget,
+                        )?,
                     });
                 }
                 Ok(NarNode::Directory { entries })
@@ -219,6 +327,16 @@ impl Backend {
             EntryKind::Other => bail!("{rel}: unsupported file type for NAR serialization"),
         }
     }
+}
+
+/// Capped `Vec` pre-allocation for a member read: the declared size, but
+/// never more than 64 MiB up front — a member declaring big and
+/// delivering small must not lever a transient multi-GiB reserve out of
+/// the allocator (the same capped-reserve discipline as
+/// `substituter::fetch_nar`); larger honest members grow the buffer
+/// incrementally under the caller's cap.
+fn reserve_for(declared: u64) -> usize {
+    usize::try_from(declared.min(64 * 1024 * 1024)).unwrap_or(0)
 }
 
 /// Build a [`WalkEntry`] from a filesystem path (directory backend).
@@ -295,6 +413,9 @@ mod tests {
     use crate::archive::writer::test_support::tiny_archive;
     use crate::archive::{MANIFEST_MEMBER, STORE_DIR};
 
+    /// Generous member cap for tests that aren't about the bound itself.
+    const TEST_MEMBER_CAP: u64 = 1024 * 1024;
+
     #[test]
     fn dir_backend_reads_files_and_lists_dirs() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -302,8 +423,18 @@ mod tests {
         tiny_archive(&root);
 
         let backend = Backend::open(&root).unwrap();
-        assert!(backend.read_file(MANIFEST_MEMBER).unwrap().is_some());
-        assert!(backend.read_file("nope.json").unwrap().is_none());
+        assert!(
+            backend
+                .read_file(MANIFEST_MEMBER, TEST_MEMBER_CAP)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            backend
+                .read_file("nope.json", TEST_MEMBER_CAP)
+                .unwrap()
+                .is_none()
+        );
 
         let entries = backend.list_dir(STORE_DIR).unwrap().unwrap();
         assert_eq!(entries.len(), 3, "got: {entries:?}");
@@ -334,8 +465,14 @@ mod tests {
 
         // Identical member bytes through both backends.
         assert_eq!(
-            dir_backend.read_file(MANIFEST_MEMBER).unwrap().unwrap(),
-            image_backend.read_file(MANIFEST_MEMBER).unwrap().unwrap()
+            dir_backend
+                .read_file(MANIFEST_MEMBER, TEST_MEMBER_CAP)
+                .unwrap()
+                .unwrap(),
+            image_backend
+                .read_file(MANIFEST_MEMBER, TEST_MEMBER_CAP)
+                .unwrap()
+                .unwrap()
         );
 
         // Identical store listings (sorted; backends promise no entry order).
@@ -363,7 +500,9 @@ mod tests {
                 .find(|entry| entry.kind == EntryKind::Directory)
                 .expect("the tiny archive embeds one store-path tree");
             let rel = format!("{STORE_DIR}/{}", entry.name);
-            let node = backend.nar_node(&rel, &entry).unwrap();
+            let node = backend
+                .nar_node(&rel, &entry, crate::archive::MAX_EMBEDDED_NAR_BYTES)
+                .unwrap();
             let mut nar = Vec::new();
             rio_nix::nar::serialize(&mut nar, &node).unwrap();
             nar
@@ -429,7 +568,9 @@ mod tests {
         let rel = format!("{STORE_DIR}/tree-at-limit");
         let nar_via = |backend: &Backend| {
             let entry = entry_named(backend, "tree-at-limit");
-            let node = backend.nar_node(&rel, &entry).unwrap();
+            let node = backend
+                .nar_node(&rel, &entry, crate::archive::MAX_EMBEDDED_NAR_BYTES)
+                .unwrap();
             let mut nar = Vec::new();
             rio_nix::nar::serialize(&mut nar, &node).unwrap();
             nar
@@ -446,7 +587,12 @@ mod tests {
         let rel = format!("{STORE_DIR}/tree-too-deep");
         for backend in [&dir_backend, &image_backend] {
             let entry = entry_named(backend, "tree-too-deep");
-            let err = format!("{:#}", backend.nar_node(&rel, &entry).unwrap_err());
+            let err = format!(
+                "{:#}",
+                backend
+                    .nar_node(&rel, &entry, crate::archive::MAX_EMBEDDED_NAR_BYTES)
+                    .unwrap_err()
+            );
             assert!(
                 err.contains(&MAX_NAR_DEPTH.to_string()),
                 "the refusal names the shared cap: {err}"
@@ -459,5 +605,118 @@ mod tests {
             matches!(streamed_err, rio_nix::nar::NarError::NestingTooDeep(_)),
             "the streaming dump refuses the same tree: {streamed_err:?}"
         );
+    }
+
+    /// Resource-limit parity at the member-size boundary — the third
+    /// hostile resource axis of the same walk the depth/entry caps guard
+    /// (`backends_agree_on_the_nar_depth_limit` is the sibling test).
+    /// `read_file`'s bound is REQUIRED by signature; the rows here cross
+    /// it in both directions through BOTH backends: a member exactly at
+    /// the cap is admitted byte-identically (must-admit), one byte over
+    /// is refused with an error naming the member and the cap — a
+    /// refusal, never an OOM abort (must-block). The image's bytes are
+    /// archive-controlled (a hostile image's chunk table declares
+    /// whatever it likes), which is why the caller's cap, not the
+    /// member's declaration, decides.
+    #[test]
+    fn backends_agree_on_the_member_size_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        tiny_archive(&root);
+        let image = dir.path().join("archive.dwarfs");
+        pack_with_mkdwarfs(&root, &image).unwrap();
+
+        let dir_backend = Backend::open(&root).unwrap();
+        let image_backend = Backend::open(&image).unwrap();
+
+        let manifest_len = std::fs::metadata(root.join(MANIFEST_MEMBER)).unwrap().len();
+
+        // Must-admit: a cap of exactly the member's size reads the full
+        // bytes through both backends, byte-identically.
+        let at_cap_dir = dir_backend
+            .read_file(MANIFEST_MEMBER, manifest_len)
+            .unwrap()
+            .unwrap();
+        let at_cap_image = image_backend
+            .read_file(MANIFEST_MEMBER, manifest_len)
+            .unwrap()
+            .unwrap();
+        assert_eq!(at_cap_dir, at_cap_image);
+        assert_eq!(at_cap_dir.len() as u64, manifest_len);
+
+        // Must-block: one byte under the member's size, both backends
+        // refuse — an error naming the member and the cap, never an
+        // abort, and never a silent truncation.
+        let cap = manifest_len - 1;
+        for backend in [&dir_backend, &image_backend] {
+            let err = format!("{:#}", backend.read_file(MANIFEST_MEMBER, cap).unwrap_err());
+            assert!(
+                err.contains(MANIFEST_MEMBER) && err.contains(&cap.to_string()),
+                "the refusal names the member and the cap: {err}"
+            );
+        }
+
+        // Missing members still answer None under any cap (the bound
+        // gates sizes, not existence).
+        for backend in [&dir_backend, &image_backend] {
+            assert!(backend.read_file("nope.json", 1).unwrap().is_none());
+        }
+    }
+
+    /// The in-memory NAR walk's total byte budget — the whole-tree
+    /// sibling of the per-member cap above, because `nar_node` holds
+    /// every file's contents simultaneously: a tree whose summed
+    /// DECLARED sizes fit the budget walks through both backends
+    /// byte-identically (must-admit, exactly at the boundary), one
+    /// declared byte over is refused with an error naming the budget
+    /// (must-block) — so a hostile index declaring many small files
+    /// cannot multiply per-file allowances into an unbounded buffer.
+    #[test]
+    fn backends_agree_on_the_nar_byte_budget() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        let store = root.join(STORE_DIR);
+        let tree = store.join("tree-sized");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("a"), b"12345678").unwrap(); // 8 bytes
+        std::fs::write(tree.join("b"), b"87654321").unwrap(); // 8 bytes
+        let image = dir.path().join("archive.dwarfs");
+        pack_with_mkdwarfs(&root, &image).unwrap();
+
+        let dir_backend = Backend::open(&root).unwrap();
+        let image_backend = Backend::open(&image).unwrap();
+        let entry_of = |backend: &Backend| {
+            backend
+                .list_dir(STORE_DIR)
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.name == "tree-sized")
+                .expect("fixture tree missing")
+        };
+        let rel = format!("{STORE_DIR}/tree-sized");
+
+        // Must-admit at the exact boundary: 16 declared bytes, 16-byte
+        // budget — both backends, identical bytes.
+        let nar_via = |backend: &Backend| {
+            let node = backend.nar_node(&rel, &entry_of(backend), 16).unwrap();
+            let mut nar = Vec::new();
+            rio_nix::nar::serialize(&mut nar, &node).unwrap();
+            nar
+        };
+        assert_eq!(nar_via(&dir_backend), nar_via(&image_backend));
+
+        // Must-block one byte short: the second file's declared size no
+        // longer fits; the refusal names the budget, never aborts.
+        for backend in [&dir_backend, &image_backend] {
+            let err = format!(
+                "{:#}",
+                backend.nar_node(&rel, &entry_of(backend), 15).unwrap_err()
+            );
+            assert!(
+                err.contains("NAR budget") && err.contains("15"),
+                "the refusal names the byte budget: {err}"
+            );
+        }
     }
 }

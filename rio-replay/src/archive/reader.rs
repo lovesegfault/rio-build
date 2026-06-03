@@ -71,12 +71,14 @@ impl ReplayArchive {
     pub fn open(path: &Path) -> Result<Self> {
         let backend = Backend::open(path)?;
 
-        let manifest_bytes = backend.read_file(MANIFEST_MEMBER)?.ok_or_else(|| {
-            anyhow!(
-                "{}: no {MANIFEST_MEMBER} — not a replay archive?",
-                path.display()
-            )
-        })?;
+        let manifest_bytes = backend
+            .read_file(MANIFEST_MEMBER, super::MAX_METADATA_MEMBER_BYTES)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}: no {MANIFEST_MEMBER} — not a replay archive?",
+                    path.display()
+                )
+            })?;
 
         // A manifest without `format_version` is a v0 archive (the contract
         // predating the versioned format) and goes through the
@@ -115,7 +117,7 @@ impl ReplayArchive {
         // its recorded digest. The manifest itself is never listed.
         let mut staged: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
         for member in METADATA_MEMBERS {
-            if let Some(bytes) = backend.read_file(member)? {
+            if let Some(bytes) = backend.read_file(member, super::MAX_METADATA_MEMBER_BYTES)? {
                 staged.insert(member, bytes);
             }
         }
@@ -141,9 +143,13 @@ impl ReplayArchive {
             let bytes = match staged.get(member.as_str()) {
                 Some(bytes) => bytes.as_slice(),
                 None => {
-                    unknown_member_bytes = backend.read_file(member)?.ok_or_else(|| {
-                        anyhow!("{member} is listed in manifest.files but absent from the archive")
-                    })?;
+                    unknown_member_bytes = backend
+                        .read_file(member, super::MAX_METADATA_MEMBER_BYTES)?
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "{member} is listed in manifest.files but absent from the archive"
+                            )
+                        })?;
                     unknown_member_bytes.as_slice()
                 }
             };
@@ -325,7 +331,7 @@ impl ReplayArchive {
             }
             let rel = format!("{STORE_DIR}/{}", entry.name);
             let bytes = backend
-                .read_file(&rel)?
+                .read_file(&rel, super::MAX_DRV_MEMBER_BYTES)?
                 .ok_or_else(|| anyhow!("{rel}: listed in the archive index but unreadable"))?;
             drv_digests.push((
                 format!("{}{}", rio_nix::store_path::STORE_PREFIX, entry.name),
@@ -491,7 +497,7 @@ impl ReplayArchive {
         // requests.jsonl is required in v0 just as in v1: without it there is
         // no workload to replay.
         let requests_bytes = backend
-            .read_file(REQUESTS_MEMBER)?
+            .read_file(REQUESTS_MEMBER, super::MAX_METADATA_MEMBER_BYTES)?
             .ok_or_else(|| anyhow!("{}: no {REQUESTS_MEMBER}", path.display()))?;
         let mut requests: Vec<RequestRecord> =
             super::parse_jsonl::<v0::V0Request>(&requests_bytes, REQUESTS_MEMBER)?
@@ -503,7 +509,8 @@ impl ReplayArchive {
         // builds.jsonl is the v0 truth member; each record maps into the
         // neutral outcome vocabulary, keyed like v1 with the last record
         // winning (a re-recorded outcome supersedes the earlier one).
-        let builds_bytes = backend.read_file(v0::V0_BUILDS_MEMBER)?;
+        let builds_bytes =
+            backend.read_file(v0::V0_BUILDS_MEMBER, super::MAX_METADATA_MEMBER_BYTES)?;
         let has_builds = builds_bytes.is_some();
         let mut outcomes: HashMap<String, BTreeMap<Option<i64>, OutcomeRecord>> = HashMap::new();
         if let Some(bytes) = &builds_bytes {
@@ -516,7 +523,8 @@ impl ReplayArchive {
             }
         }
 
-        let impure_env_bytes = backend.read_file(IMPURE_ENV_MEMBER)?;
+        let impure_env_bytes =
+            backend.read_file(IMPURE_ENV_MEMBER, super::MAX_METADATA_MEMBER_BYTES)?;
         let has_impure_env = impure_env_bytes.is_some();
         let impure_env: ImpureEnv = match &impure_env_bytes {
             Some(bytes) => serde_json::from_slice(bytes)
@@ -622,9 +630,11 @@ impl ReplayArchive {
             "v0 archives have no content-addressed identity, so there are no canonical \
              manifest bytes to expose; only v1 archives can be published"
         );
-        self.backend.read_file(MANIFEST_MEMBER)?.ok_or_else(|| {
-            anyhow!("{MANIFEST_MEMBER} is no longer readable from an archive that was opened")
-        })
+        self.backend
+            .read_file(MANIFEST_MEMBER, super::MAX_METADATA_MEMBER_BYTES)?
+            .ok_or_else(|| {
+                anyhow!("{MANIFEST_MEMBER} is no longer readable from an archive that was opened")
+            })
     }
 
     /// Recorded requests, sorted by `offset_s` ascending, negative offsets
@@ -858,7 +868,7 @@ impl ReplayArchive {
         let rel = format!("{STORE_DIR}/{}", entry.name);
         let bytes = self
             .backend
-            .read_file(&rel)?
+            .read_file(&rel, super::MAX_DRV_MEMBER_BYTES)?
             .ok_or_else(|| anyhow!("{rel}: listed in the archive index but unreadable"))?;
         String::from_utf8(bytes).with_context(|| format!("{rel}: derivation text is not UTF-8"))
     }
@@ -887,9 +897,14 @@ impl ReplayArchive {
                 nar
             }
             Backend::Dwarfs(_) => {
+                // The walk buffers the whole tree; MAX_EMBEDDED_NAR_BYTES
+                // bounds the total declared bytes so a decompression-bomb
+                // tree is refused (per-path, naming the cap) instead of
+                // OOM-aborting — see the constant's doc for sizing and the
+                // false-refusal cost.
                 let node = self
                     .backend
-                    .nar_node(&rel, entry)
+                    .nar_node(&rel, entry, super::MAX_EMBEDDED_NAR_BYTES)
                     .with_context(|| format!("NAR-serialize {rel} from the DwarFS image"))?;
                 let mut nar = Vec::new();
                 rio_nix::nar::serialize(&mut nar, &node)

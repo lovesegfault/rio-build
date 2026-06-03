@@ -74,16 +74,20 @@ pub enum Lint {
     /// produced and documented but never demanded by any consumer.
     ContractRegistry,
     /// Every external-IO call shape (`.send()` dispatch, awaited
-    /// `.collect()`/`.text()` body buffering, `.read_to_end(`) in
-    /// rio-replay's enrolled IO modules (supply, substituter, archive,
-    /// artifact, recorder s3) carries an adjacent `// bounded-io: <bound>`
-    /// marker stating its time/size bound or deliberate waiver, every
-    /// marker annotates such a call, and every rio-replay module holding
-    /// a raw `aws_sdk_s3::Client` is enrolled. Catches a new unbounded
-    /// arm at introduction — the per-arm-guard pattern (deadline added
-    /// where a problem was noticed, sibling arms left exposed) that
-    /// produced the relay header-wait wedge and the unbounded narinfo
-    /// collect.
+    /// `.collect()`/`.text()` body buffering, `.read_to_end(`,
+    /// `.read_to_vec(`) in rio-replay's enrolled IO modules (supply,
+    /// substituter, archive, artifact, recorder s3) carries an adjacent
+    /// `// bounded-io: <bound>` marker stating its time/size bound or
+    /// deliberate waiver, every marker annotates such a call, and every
+    /// rio-replay module holding a raw `aws_sdk_s3::Client` is enrolled.
+    /// External IO here means any byte source the peer or input artifact
+    /// controls — network responses AND local decompression surfaces
+    /// (the DwarFS image backend's `read_to_vec` is how an under-cap
+    /// image's decompression bomb reached an unbounded buffer unmarked).
+    /// Catches a new unbounded arm at introduction — the per-arm-guard
+    /// pattern (deadline added where a problem was noticed, sibling arms
+    /// left exposed) that produced the relay header-wait wedge and the
+    /// unbounded narinfo collect.
     BoundedIo,
     /// Every production load of the supply journal (`StateFile::Supply`
     /// via `load_jsonl`) in rio-replay carries an adjacent
@@ -2379,6 +2383,14 @@ fn bounded_io_needle(lines: &[&str], idx: usize) -> Option<&'static str> {
     if code.contains(".read_to_end(") {
         return Some(".read_to_end(");
     }
+    // The dwarfs crate's whole-member buffering read: decompresses an
+    // image-declared (attacker-sized) byte count into one Vec, so it is
+    // exactly `.read_to_end(` with the network swapped for a local
+    // decompression surface. Out of the alphabet, it landed unbounded in
+    // the image backend while the module sat enrolled as a scan root.
+    if code.contains(".read_to_vec(") {
+        return Some(".read_to_vec(");
+    }
     if code.contains(".chunk()") {
         return Some(".chunk()");
     }
@@ -4025,6 +4037,34 @@ two on one line: `sched.dispatch.fod-substitute+4` `sched.dispatch.fod-substitut
 
         // A channel-style send (argument present) is not in the alphabet.
         let (needles, v) = bio("tx.send(value).await?;\n");
+        assert_eq!((needles, v.len()), (0, 0), "{v:?}");
+    }
+
+    /// `.read_to_vec(` — the dwarfs whole-member buffering read — is in
+    /// the needle alphabet: unmarked it is flagged like any other
+    /// external-IO call (the negative control reproduces the exact shape
+    /// the image backend shipped unbounded), marked it passes, and prose
+    /// mentions in comments neither match nor mask.
+    #[test]
+    fn bounded_io_read_to_vec_is_a_needle() {
+        // The historical unbounded shape, verbatim: flagged.
+        let (needles, v) = bio("let bytes = file\n\
+             \x20   .read_to_vec(&mut *archive)\n\
+             \x20   .with_context(|| format!(\"read {rel}\"))?;\n");
+        assert_eq!((needles, v.len()), (1, 1), "{v:?}");
+        assert!(
+            v[0].contains("synthetic.rs:2") && v[0].contains(".read_to_vec("),
+            "{v:?}"
+        );
+
+        // Marked: blessed.
+        let (needles, v) = bio("let bytes = file\n\
+             \x20   // bounded-io: declared-size pre-check + take(cap + 1) belt\n\
+             \x20   .read_to_vec(&mut *archive)?;\n");
+        assert_eq!((needles, v.len()), (1, 0), "{v:?}");
+
+        // A comment mentioning the call is prose, not a needle.
+        let (needles, v) = bio("// read_to_vec( is unbounded; see the backend\n");
         assert_eq!((needles, v.len()), (0, 0), "{v:?}");
     }
 
