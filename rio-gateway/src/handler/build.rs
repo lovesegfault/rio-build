@@ -2588,8 +2588,12 @@ mod tests {
             own_failure: Option<(BuildStatus, &'static str)>,
             submitted: Option<bool>,
         }
+        type MakeFn = fn() -> RootEvidence;
         type ExpectFn = fn(usize) -> Expected;
-        let evidence_shapes: Vec<(Cell, fn() -> RootEvidence, ExpectFn)> = vec![
+        /// One row of the lattice: the evidence shape's metadata, its
+        /// constructor, and its per-store-state expected output.
+        type Shape = (Cell, MakeFn, ExpectFn);
+        let evidence_shapes: Vec<Shape> = vec![
             (
                 Cell {
                     label: "own Completed terminal",
