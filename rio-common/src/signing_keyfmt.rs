@@ -95,7 +95,7 @@ pub enum KeyFmtError {
     NameForbiddenChar(String),
     /// The part after `:` is not valid standard-alphabet base64.
     #[error("key payload is not valid base64: {0}")]
-    Base64(#[from] base64::DecodeError),
+    Base64(Base64ErrorKind),
     /// Decoded payload is neither 32 (seed) nor 64 (expanded) bytes.
     #[error("secret key must be {SEED_LEN} or {EXPANDED_LEN} bytes, got {0}")]
     KeyLength(usize),
@@ -114,6 +114,59 @@ pub enum KeyFmtError {
     /// Public-entry payload is 32 bytes but not a valid ed25519 point.
     #[error("public key bytes are not a valid ed25519 curve point")]
     InvalidCurvePoint,
+}
+
+/// A SANITIZED base64 decode failure: position and shape only, never
+/// the offending byte value.
+///
+/// `base64::DecodeError`'s `Display` echoes the invalid byte
+/// (`InvalidByte(offset, byte)` → "Invalid symbol 33, offset 5") — for
+/// key-shaped input that is a byte of key material, and these errors
+/// land in bootstrap Job logs and gRPC statuses. The conversion is
+/// type-level (this enum simply has nowhere to put a payload byte), so
+/// no future `Display` change upstream can re-introduce the leak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Base64ErrorKind {
+    /// A byte outside the standard alphabet at this offset. The byte
+    /// VALUE is deliberately dropped.
+    InvalidByte { offset: usize },
+    /// A trailing symbol that cannot occur in valid padded base64 at
+    /// this offset. The byte value is deliberately dropped.
+    InvalidLastSymbol { offset: usize },
+    /// Encoded length is impossible for padded standard base64.
+    InvalidLength { length: usize },
+    /// Padding is malformed.
+    InvalidPadding,
+}
+
+impl From<base64::DecodeError> for Base64ErrorKind {
+    fn from(e: base64::DecodeError) -> Self {
+        match e {
+            base64::DecodeError::InvalidByte(offset, _byte) => Self::InvalidByte { offset },
+            base64::DecodeError::InvalidLastSymbol(offset, _byte) => {
+                Self::InvalidLastSymbol { offset }
+            }
+            base64::DecodeError::InvalidLength(length) => Self::InvalidLength { length },
+            base64::DecodeError::InvalidPadding => Self::InvalidPadding,
+        }
+    }
+}
+
+impl std::fmt::Display for Base64ErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidByte { offset } => {
+                write!(f, "invalid base64 byte at offset {offset}")
+            }
+            Self::InvalidLastSymbol { offset } => {
+                write!(f, "invalid trailing base64 symbol at offset {offset}")
+            }
+            Self::InvalidLength { length } => {
+                write!(f, "invalid base64 length {length}")
+            }
+            Self::InvalidPadding => write!(f, "invalid base64 padding"),
+        }
+    }
 }
 
 /// Validate a key name against the framing rules of every context the
@@ -170,7 +223,9 @@ impl SecretEntry {
         validate_key_name(name)?;
         // STANDARD (not URL_SAFE), with padding: Nix's nix-base64.cc
         // uses the RFC 4648 standard alphabet.
-        let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| KeyFmtError::Base64(e.into()))?;
         let (seed, format) = match bytes.len() {
             SEED_LEN => {
                 let seed: [u8; SEED_LEN] = bytes.as_slice().try_into().expect("checked len == 32");
@@ -282,7 +337,9 @@ impl PublicEntry {
     pub fn parse(entry: &str) -> Result<Self, KeyFmtError> {
         let (name, b64) = entry.split_once(':').ok_or(KeyFmtError::MissingSeparator)?;
         validate_key_name(name)?;
-        let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| KeyFmtError::Base64(e.into()))?;
         let pubkey: [u8; SEED_LEN] = bytes
             .try_into()
             .map_err(|b: Vec<u8>| KeyFmtError::PubKeyLength(b.len()))?;
@@ -465,6 +522,50 @@ mod tests {
         // Errors never carry payload bytes.
         let msg = format!("{}", SecretEntry::parse(&e48).unwrap_err());
         assert!(!msg.contains(&b64().encode([1u8; 48])));
+    }
+
+    /// bug_076 anti-leak pin, moved to the variants CAPABLE of
+    /// leaking: a decode failure on key-shaped input must never echo
+    /// the input — not the raw entry, not the offending byte's value,
+    /// not any base64 window. The raw `base64::DecodeError` echoes the
+    /// byte value ("Invalid symbol 33, offset 5"); the sanitized
+    /// [`Base64ErrorKind`] is position-only by construction.
+    // r[verify store.signing.entry-codec]
+    #[test]
+    fn decode_errors_never_echo_key_material() {
+        // Key-shaped payload with an out-of-alphabet byte mid-stream:
+        // 31 valid base64 chars then '!' (0x21). The error must name
+        // the offset, never the byte or the surrounding payload.
+        let payload = format!("{}!{}", "A".repeat(31), "B".repeat(11));
+        for entry in [
+            format!("rio-t:{payload}"),   // SecretEntry path
+            format!("rio-pub:{payload}"), // PublicEntry path
+        ] {
+            let err = if entry.starts_with("rio-t") {
+                SecretEntry::parse(&entry).unwrap_err()
+            } else {
+                PublicEntry::parse(&entry).unwrap_err()
+            };
+            let msg = format!("{err}");
+            assert!(
+                matches!(
+                    err,
+                    KeyFmtError::Base64(Base64ErrorKind::InvalidByte { offset: 31 })
+                ),
+                "expected sanitized InvalidByte at 31, got {err:?}"
+            );
+            assert!(
+                !msg.contains(&payload) && !msg.contains("33") && !msg.contains('!'),
+                "decode error must not echo payload bytes or the byte value: {msg}"
+            );
+            assert!(
+                msg.contains("offset 31"),
+                "offset survives for diagnosis: {msg}"
+            );
+        }
+        // The Debug form is equally byte-free (no u8 field exists).
+        let err = SecretEntry::parse(&format!("rio-t:{payload}")).unwrap_err();
+        assert!(!format!("{err:?}").contains("33"));
     }
 
     /// merged_bug_093: names containing bytes the consuming contracts

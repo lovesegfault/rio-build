@@ -172,8 +172,13 @@ pub enum SignerError {
     #[error("key name {0:?} contains whitespace or a control byte")]
     InvalidName(String),
 
+    /// Sanitized decode failure (position/shape only). The raw
+    /// `base64::DecodeError` echoes the offending BYTE VALUE in its
+    /// `Display` — for a secret-key file that is a byte of key
+    /// material, and `SignerError` lands in startup logs. Type-level
+    /// sanitization: this variant has nowhere to put a payload byte.
     #[error("base64 decode failed: {0}")]
-    Base64(#[from] base64::DecodeError),
+    Base64(rio_common::signing_keyfmt::Base64ErrorKind),
 
     /// Nix's format is 64 bytes (seed + pubkey). We also accept just the
     /// 32-byte seed. Anything else is malformed.
