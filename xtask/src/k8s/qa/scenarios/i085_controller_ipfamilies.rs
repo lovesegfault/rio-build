@@ -25,6 +25,7 @@ impl Scenario for ControllerIpFamilies {
             i_ref: Some(85),
             isolation: Isolation::Shared,
             timeout: Duration::from_secs(30),
+            exercises: crate::exercises!(),
         }
     }
 

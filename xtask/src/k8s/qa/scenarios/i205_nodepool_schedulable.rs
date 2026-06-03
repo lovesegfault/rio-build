@@ -23,6 +23,7 @@ impl Scenario for NodepoolSchedulable {
             i_ref: Some(205),
             isolation: Isolation::Shared,
             timeout: Duration::from_secs(60),
+            exercises: crate::exercises!(),
         }
     }
 

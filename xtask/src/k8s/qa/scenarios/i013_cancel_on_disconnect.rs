@@ -30,6 +30,7 @@ impl Scenario for CancelOnDisconnect {
             i_ref: Some(13),
             isolation: Isolation::Tenant { count: 1 },
             timeout: Duration::from_secs(180),
+            exercises: crate::exercises!(),
         }
     }
 

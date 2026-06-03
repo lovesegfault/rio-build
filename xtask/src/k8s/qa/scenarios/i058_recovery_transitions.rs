@@ -29,6 +29,7 @@ impl Scenario for RecoveryTransitions {
             },
             // +90s budget for phase2_settle_after_kill
             timeout: Duration::from_secs(390),
+            exercises: crate::exercises!(),
         }
     }
 

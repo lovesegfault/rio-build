@@ -541,7 +541,7 @@ mod tests {
             "i033-zombie-executors",
             "i039-store-kill-survives",
             "i040-chunk-verify",
-            "i046-drain-reaches-leader",
+            "i046-graceful-delete-settles",
             "i047-missing-input-redispatch",
             "i048c-blackhole-self-test",
             "i058-recovery-transitions",

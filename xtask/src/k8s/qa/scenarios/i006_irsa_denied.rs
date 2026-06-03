@@ -24,6 +24,7 @@ impl Scenario for IrsaDenied {
             i_ref: Some(6),
             isolation: Isolation::Tenant { count: 1 },
             timeout: Duration::from_secs(180),
+            exercises: crate::exercises!(),
         }
     }
 

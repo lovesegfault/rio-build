@@ -4,7 +4,7 @@
 //! NLBs, or a tofu destroy that hangs on a stuck Namespace finalizer:
 //!
 //!   1. **Delete pool CRs.** rio-controller's drain finalizer would
-//!      normally block until DrainExecutor completes — but we're about
+//!      normally block until the pool's pods drain — but we're about
 //!      to delete the controller and scheduler too, so trigger delete
 //!      now (controller starts draining), then strip finalizers in
 //!      step 3 once the controller is gone. We don't scale to 0 first:

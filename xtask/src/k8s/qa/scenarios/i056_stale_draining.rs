@@ -26,6 +26,7 @@ impl Scenario for StaleDraining {
             i_ref: Some(56),
             isolation: Isolation::Shared,
             timeout: Duration::from_secs(30),
+            exercises: crate::exercises!(),
         }
     }
 

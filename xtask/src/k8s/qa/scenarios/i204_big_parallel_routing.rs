@@ -26,6 +26,7 @@ impl Scenario for BigParallelRouting {
             i_ref: Some(204),
             isolation: Isolation::Tenant { count: 1 },
             timeout: Duration::from_secs(120),
+            exercises: crate::exercises!(),
         }
     }
 

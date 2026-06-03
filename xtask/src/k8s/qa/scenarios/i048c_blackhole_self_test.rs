@@ -31,6 +31,7 @@ impl Scenario for BlackholeSelfTest {
                 mutates: &[Component::Scheduler, Component::Builders],
             },
             timeout: Duration::from_secs(240),
+            exercises: crate::exercises!(),
         }
     }
 
@@ -39,7 +40,7 @@ impl Scenario for BlackholeSelfTest {
         // holds. The precondition must be IDENTITY-based, not gauge-
         // based: a nonzero fleet gauge alone was satisfied
         // 2.6s into a full-QA run by a leftover from the previous
-        // Exclusive scenario (i046's mid-drain builder) — long before
+        // Exclusive scenario (i046's mid-settle builder) — long before
         // the warmup builder could spawn — and that worker exited or
         // had already been reaped before the CCNP propagated, leaving
         // the keepalive nothing to time out on (observed 2026-05-13:

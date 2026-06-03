@@ -42,6 +42,7 @@ impl Scenario for BatchRpcScale {
             i_ref: Some(110),
             isolation: Isolation::Tenant { count: 1 },
             timeout: Duration::from_secs(300),
+            exercises: crate::exercises!(),
         }
     }
 

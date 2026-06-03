@@ -21,7 +21,7 @@ mod i037_cordoned_control_plane;
 mod i039_store_kill_survives;
 mod i040_chunk_verify;
 mod i043_shared_input_enoent;
-mod i046_drain_reaches_leader;
+mod i046_graceful_delete_settles;
 mod i047_missing_input_redispatch;
 mod i048a_stale_realisation;
 mod i048c_blackhole_self_test;
@@ -100,7 +100,7 @@ pub static ALL: &[&dyn Scenario] = &[
     &i033_zombie_executors::ZombieExecutors,
     &i039_store_kill_survives::StoreKillSurvives,
     &i040_chunk_verify::ChunkVerify,
-    &i046_drain_reaches_leader::DrainReachesLeader,
+    &i046_graceful_delete_settles::GracefulDeleteSettles,
     &i047_missing_input_redispatch::MissingInputRedispatch,
     &i048a_stale_realisation::StaleRealisation,
     &i048c_blackhole_self_test::BlackholeSelfTest,

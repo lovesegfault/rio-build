@@ -25,6 +25,7 @@ impl Scenario for LivenessKill {
             isolation: Isolation::Tenant { count: 1 },
             // build + cold-start headroom
             timeout: Duration::from_secs((BUILD_SECS as u64) + 240),
+            exercises: crate::exercises!(),
         }
     }
 

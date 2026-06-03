@@ -26,6 +26,7 @@ impl Scenario for SchedulerHealth {
             i_ref: Some(26),
             isolation: Isolation::Shared,
             timeout: Duration::from_secs(30),
+            exercises: crate::exercises!(),
         }
     }
 

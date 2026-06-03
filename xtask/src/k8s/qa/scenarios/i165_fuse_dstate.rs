@@ -27,6 +27,7 @@ impl Scenario for FuseDState {
             // ≥1 builder is running rather than Skip on idle cluster.
             isolation: Isolation::Tenant { count: 1 },
             timeout: Duration::from_secs(180),
+            exercises: crate::exercises!(),
         }
     }
 

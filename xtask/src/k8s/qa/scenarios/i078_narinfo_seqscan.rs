@@ -24,6 +24,7 @@ impl Scenario for NarinfoSeqScan {
             i_ref: Some(78),
             isolation: Isolation::Shared,
             timeout: Duration::from_secs(30),
+            exercises: crate::exercises!(),
         }
     }
 

@@ -33,6 +33,7 @@ impl Scenario for HistogramBuckets {
             i_ref: Some(156),
             isolation: Isolation::Shared,
             timeout: Duration::from_secs(30),
+            exercises: crate::exercises!(),
         }
     }
 

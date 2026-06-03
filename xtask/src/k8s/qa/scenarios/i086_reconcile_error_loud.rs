@@ -45,6 +45,7 @@ impl Scenario for ReconcileErrorLoud {
                 mutates: &[Component::Controller],
             },
             timeout: Duration::from_secs(120),
+            exercises: crate::exercises!(),
         }
     }
 

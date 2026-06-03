@@ -23,6 +23,7 @@ impl Scenario for StoreKillSurvives {
                 mutates: &[Component::Store],
             },
             timeout: Duration::from_secs(240),
+            exercises: crate::exercises!(),
         }
     }
 

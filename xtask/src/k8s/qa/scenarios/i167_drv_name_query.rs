@@ -24,6 +24,7 @@ impl Scenario for DrvNameQuery {
             i_ref: Some(167),
             isolation: Isolation::Tenant { count: 1 },
             timeout: Duration::from_secs(90),
+            exercises: crate::exercises!(),
         }
     }
 

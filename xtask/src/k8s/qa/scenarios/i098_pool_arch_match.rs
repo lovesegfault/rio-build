@@ -23,6 +23,7 @@ impl Scenario for PoolArchMatch {
             i_ref: Some(98),
             isolation: Isolation::Shared,
             timeout: Duration::from_secs(30),
+            exercises: crate::exercises!(),
         }
     }
 

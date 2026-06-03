@@ -28,6 +28,7 @@ impl Scenario for StaleUploading {
                 mutates: &[Component::Postgres],
             },
             timeout: Duration::from_secs(30),
+            exercises: crate::exercises!(),
         }
     }
 

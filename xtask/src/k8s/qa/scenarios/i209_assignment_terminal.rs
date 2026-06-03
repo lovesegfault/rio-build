@@ -28,6 +28,7 @@ impl Scenario for AssignmentTerminal {
                 mutates: &[Component::Scheduler, Component::Postgres],
             },
             timeout: Duration::from_secs(180),
+            exercises: crate::exercises!(),
         }
     }
 

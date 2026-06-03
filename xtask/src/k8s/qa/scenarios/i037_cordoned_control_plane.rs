@@ -30,6 +30,7 @@ impl Scenario for CordonedControlPlane {
             i_ref: Some(37),
             isolation: Isolation::Shared,
             timeout: Duration::from_secs(30),
+            exercises: crate::exercises!(),
         }
     }
 

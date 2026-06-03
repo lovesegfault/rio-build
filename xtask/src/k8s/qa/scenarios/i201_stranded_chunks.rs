@@ -37,6 +37,7 @@ impl Scenario for StrandedChunks {
                 mutates: &[Component::Store, Component::Postgres],
             },
             timeout: Duration::from_secs(180),
+            exercises: crate::exercises!(),
         }
     }
 

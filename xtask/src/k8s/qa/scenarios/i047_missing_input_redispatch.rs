@@ -28,6 +28,7 @@ impl Scenario for MissingInputRedispatch {
                 mutates: &[Component::Scheduler, Component::Postgres],
             },
             timeout: Duration::from_secs(240),
+            exercises: crate::exercises!(),
         }
     }
 

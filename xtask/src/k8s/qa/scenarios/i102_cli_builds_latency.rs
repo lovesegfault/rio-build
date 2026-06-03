@@ -24,6 +24,7 @@ impl Scenario for CliBuildsLatency {
             i_ref: Some(102),
             isolation: Isolation::Shared,
             timeout: Duration::from_secs(30),
+            exercises: crate::exercises!(),
         }
     }
 

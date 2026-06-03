@@ -213,6 +213,45 @@ pub struct ScenarioMeta {
     pub i_ref: Option<u16>,
     pub isolation: Isolation,
     pub timeout: Duration,
+    /// RPC methods this scenario exercises (bug_389): populated via
+    /// [`exercises!`], which COMPILE-COUPLES the scenario to the proto
+    /// surface — deleting an RPC breaks the claiming scenario's build
+    /// instead of leaving it green-but-vacuous (the original i046
+    /// failure mode: its RPC was deleted, and the scenario kept passing
+    /// on a grep for an error message nothing could emit). `&[]` is legal
+    /// but explicit: it declares "kubectl/PG-level scenario, no RPC
+    /// claim".
+    #[allow(dead_code)] // surfaced in report() once that grows --json
+    pub exercises: &'static [&'static str],
+}
+
+/// Compile-time RPC coupling for [`ScenarioMeta::exercises`]
+/// (bug_389): `exercises!(Client => method(RequestType), …)` expands
+/// to a never-called `#[allow(dead_code)]` async fn that CALLS each
+/// method on the named tonic client with the named request type — a
+/// deleted RPC (or a renamed/retyped request message) is a BUILD
+/// failure in the claiming scenario, plus the stringified method
+/// list. xtask depends on rio-proto, so the coupling is to the same
+/// generated surface the QA cluster serves.
+///
+/// Shape note: tonic methods take `impl IntoRequest<T>` (argument-
+/// position impl trait), so they CANNOT be referenced as function
+/// items in a const block (E0283 — the work order's anticipated
+/// stable-rust hazard); the dead-code-fn fallback is the sanctioned
+/// alternative and couples strictly more surface (method AND request
+/// message).
+#[macro_export]
+macro_rules! exercises {
+    () => {
+        &[]
+    };
+    ($client:ty => $($method:ident($req:ty)),+ $(,)?) => {{
+        #[allow(dead_code)]
+        async fn _rpc_surface_coupling(mut c: $client) {
+            $(let _ = c.$method(<$req as ::core::default::Default>::default()).await;)+
+        }
+        &[$(stringify!($method)),+]
+    }};
 }
 
 #[async_trait]

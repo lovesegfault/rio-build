@@ -24,6 +24,7 @@ impl Scenario for MetricsReachable {
             i_ref: Some(50),
             isolation: Isolation::Shared,
             timeout: Duration::from_secs(30),
+            exercises: crate::exercises!(),
         }
     }
 

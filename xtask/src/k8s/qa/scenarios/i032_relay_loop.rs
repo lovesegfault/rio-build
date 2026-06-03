@@ -26,6 +26,10 @@ impl Scenario for RelayLoop {
             // log read-back poll, and the qa scheduler hard-kills at
             // meta.timeout — budget for the tail, not the typical run.
             timeout: Duration::from_secs(240),
+            exercises: crate::exercises!(
+                rio_proto::ExecutorServiceClient<tonic::transport::Channel> =>
+                    report_outcome(rio_proto::types::ReportOutcomeRequest)
+            ),
         }
     }
 

@@ -19,6 +19,7 @@ impl Scenario for BuildsTenantName {
             i_ref: Some(11),
             isolation: Isolation::Tenant { count: 1 },
             timeout: Duration::from_secs(120),
+            exercises: crate::exercises!(),
         }
     }
 

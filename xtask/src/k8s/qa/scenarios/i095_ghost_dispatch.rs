@@ -25,6 +25,7 @@ impl Scenario for GhostDispatch {
             i_ref: Some(95),
             isolation: Isolation::Tenant { count: 1 },
             timeout: Duration::from_secs(240),
+            exercises: crate::exercises!(),
         }
     }
 

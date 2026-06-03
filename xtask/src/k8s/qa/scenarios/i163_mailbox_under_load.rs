@@ -26,6 +26,7 @@ impl Scenario for MailboxUnderLoad {
             i_ref: Some(163),
             isolation: Isolation::Tenant { count: 1 },
             timeout: Duration::from_secs(180),
+            exercises: crate::exercises!(),
         }
     }
 

@@ -32,6 +32,7 @@ impl Scenario for AddMultipleSequential {
             i_ref: Some(52),
             isolation: Isolation::Tenant { count: 1 },
             timeout: Duration::from_secs(180),
+            exercises: crate::exercises!(),
         }
     }
 

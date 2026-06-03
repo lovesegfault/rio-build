@@ -62,6 +62,7 @@ impl Scenario for CrossTenantListBuilds {
             i_ref: None,
             isolation: Isolation::Tenant { count: 2 },
             timeout: Duration::from_secs(120),
+            exercises: crate::exercises!(),
         }
     }
 

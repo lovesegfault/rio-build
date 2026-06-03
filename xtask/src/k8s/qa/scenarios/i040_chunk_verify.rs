@@ -36,6 +36,7 @@ impl Scenario for ChunkVerify {
             // margin for the SQL pick + S3 delete + verify-chunks scan
             // (~30-60 s); 420 s keeps ~60 s slack past the cold tail.
             timeout: Duration::from_secs(420),
+            exercises: crate::exercises!(),
         }
     }
 

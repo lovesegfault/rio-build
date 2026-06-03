@@ -26,6 +26,7 @@ impl Scenario for RestartDrainsFods {
             },
             // +90s budget for phase2_settle_after_kill
             timeout: Duration::from_secs(330),
+            exercises: crate::exercises!(),
         }
     }
 

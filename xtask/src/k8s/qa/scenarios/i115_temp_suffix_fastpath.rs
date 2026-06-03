@@ -34,6 +34,7 @@ impl Scenario for TempSuffixFastpath {
             i_ref: Some(115),
             isolation: Isolation::Tenant { count: 1 },
             timeout: Duration::from_secs(180),
+            exercises: crate::exercises!(),
         }
     }
 

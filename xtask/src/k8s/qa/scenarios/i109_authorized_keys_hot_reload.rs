@@ -27,6 +27,7 @@ impl Scenario for AuthorizedKeysHotReload {
                 mutates: &[Component::Gateway],
             },
             timeout: Duration::from_secs(150),
+            exercises: crate::exercises!(),
         }
     }
 

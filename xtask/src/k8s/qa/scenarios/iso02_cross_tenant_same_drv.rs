@@ -31,6 +31,7 @@ impl Scenario for CrossTenantSameDrv {
             i_ref: None,
             isolation: Isolation::Tenant { count: 2 },
             timeout: Duration::from_secs(180),
+            exercises: crate::exercises!(),
         }
     }
 

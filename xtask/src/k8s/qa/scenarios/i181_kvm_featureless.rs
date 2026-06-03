@@ -22,6 +22,7 @@ impl Scenario for KvmFeatureless {
             i_ref: Some(181),
             isolation: Isolation::Tenant { count: 1 },
             timeout: Duration::from_secs(120),
+            exercises: crate::exercises!(),
         }
     }
 

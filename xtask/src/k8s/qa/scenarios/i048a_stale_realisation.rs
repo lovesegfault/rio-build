@@ -29,6 +29,7 @@ impl Scenario for StaleRealisation {
                 mutates: &[Component::Postgres],
             },
             timeout: Duration::from_secs(30),
+            exercises: crate::exercises!(),
         }
     }
 

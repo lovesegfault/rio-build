@@ -26,6 +26,7 @@ impl Scenario for PendingReaped {
                 mutates: &[Component::Controller],
             },
             timeout: Duration::from_secs(180),
+            exercises: crate::exercises!(),
         }
     }
 
