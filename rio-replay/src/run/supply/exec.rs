@@ -152,6 +152,9 @@ pub trait SupplyTransport: Send + Sync {
 /// per-path failure degrades to journal rows (refused/failed/skipped) and
 /// plan-level gaps never error at all, so a breaker-tripped run that
 /// skipped every upload still returns `Ok` with `undelivered > 0`.
+#[must_use = "the delivery evidence is the point of the call: collapse it \
+              (proves_delivery) into the batch's topup_delivered bit — \
+              dropping it re-creates the Ok-as-proof conflation"]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TopupOutcome {
     /// Paths this top-up's plan owed an upload (its large + batch items).
