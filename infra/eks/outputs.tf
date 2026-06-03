@@ -72,3 +72,8 @@ output "pg_max_connections" {
   description = "Modeled Aurora PG max_connections (rds.tf locals: AWS PG table at aurora_max_capacity, min-capacity cap applied). xtask deploy's pg preflight asserts the live server matches this and derives store.autoscaling.maxReplicas from the measurement."
   value       = local.expected_pg_max_connections
 }
+
+output "log_retention_days" {
+  description = "Build-log retention (days) — xtask deploy passes as --set store.logRetentionDays so the store sweep and the S3 lifecycle backstop (this + 7) derive from one variable (bug_326)."
+  value       = var.log_retention_days
+}

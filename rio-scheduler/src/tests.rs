@@ -834,27 +834,8 @@ fn dashboard_loads_from_toml_and_splits_origins() {
         "http://a.example,http://b.example"
     );
 
-    // parse_cors_origins splits on comma, trims, filters empty.
-    // Asserted directly on the extracted helper — CorsLayer's
-    // internal origin list isn't inspectable, so the previous
-    // `let _ = build_cors_layer(...)` form was vacuous.
-    use http::HeaderValue;
-    assert_eq!(
-        parse_cors_origins(" http://a.example , http://b.example ,"),
-        vec![
-            HeaderValue::from_static("http://a.example"),
-            HeaderValue::from_static("http://b.example"),
-        ],
-        "whitespace trimmed, trailing-comma empty dropped"
-    );
-    // Unparseable origins (control bytes are rejected by
-    // HeaderValue::from_str) are dropped, not propagated.
-    assert_eq!(
-        parse_cors_origins("http://ok,\x01bad,http://ok2"),
-        vec![
-            HeaderValue::from_static("http://ok"),
-            HeaderValue::from_static("http://ok2"),
-        ],
-        "invalid origin filtered out, valid siblings kept"
-    );
+    // parse_cors_origins moved to rio_common::cors (single-sourced
+    // dashboard CORS contract, bug_355) WITH its contract tests; this
+    // test keeps only the config-merge assertion above. The layer
+    // builder here is a one-line delegation.
 }

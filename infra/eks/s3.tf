@@ -40,17 +40,20 @@ resource "aws_s3_bucket_public_access_block" "chunks" {
 
 # Build-log expiry backstop. rio-store's hourly TTL sweep is the primary
 # retention mechanism for logs/ (it deletes the PG manifest rows and
-# their S3 objects together, default 30 days — RIO_LOG_RETENTION_DAYS).
-# This rule exists for the objects the sweep can never find because no
-# manifest row references them:
+# their S3 objects together — RIO_LOG_RETENTION_DAYS, deployed from
+# var.log_retention_days via `xtask deploy --set`). This rule exists
+# for the objects the sweep can never find because no manifest row
+# references them:
 #   - a chunk PUT that succeeded but whose manifest INSERT never ran
 #     (store crash between the two; the object is invisible to readers),
-#   - the pre-cutover .log.zst / .partial.log.zst blobs that migration
-#     063's DROP TABLE drv_logs orphaned.
-# 37 = the 30-day default retention + 7 days of headroom so the rule
-# only ever collects objects the sweep has already had every chance to
-# delete — it must never race the sweep on a still-referenced chunk.
-# If RIO_LOG_RETENTION_DAYS is ever raised above 30, raise this too.
+#   - the pre-cutover .log.zst / .partial.log.zst blobs that the
+#     067_drop_drv_logs migration's DROP TABLE orphaned.
+# Expiry = var.log_retention_days + 7 days of slack (bug_326): the
+# rule only ever collects objects the sweep has already had every
+# chance to delete — it can never race the sweep on a still-referenced
+# chunk, BY CONSTRUCTION, because both deleters derive from the same
+# variable. (Pre-variable, this was a hardcoded 37 with a comment
+# begging operators to keep it in sync.)
 resource "aws_s3_bucket_lifecycle_configuration" "chunks" {
   bucket = aws_s3_bucket.chunks.id
 
@@ -63,7 +66,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "chunks" {
     }
 
     expiration {
-      days = 37
+      days = var.log_retention_days + 7
     }
   }
 }

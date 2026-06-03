@@ -60,6 +60,8 @@ rustls = { workspace = true }
 # PEM body validation (tls.rs validate_pem_sections).
 base64 = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
+tower-http = { workspace = true }
+http = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

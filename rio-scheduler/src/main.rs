@@ -575,49 +575,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// CORS layer for browser gRPC-Web. Replaces the Envoy Gateway
-/// `SecurityPolicy` CRD (D3 cascade). Origins come from
-/// `RIO_DASHBOARD__CORS_ALLOW_ORIGINS` (comma-separated); the three
-/// `expose_headers` are what connect-web reads to surface
-/// `Status.code`/`.message` to the SPA — without them the browser
-/// blocks the trailer headers and every RPC error renders as
-/// `Code.Unknown`.
+/// CORS for browser gRPC-Web: the single-sourced dashboard contract
+/// (`rio_common::cors` — shared with rio-store, bug_355). Replaces
+/// the Envoy Gateway `SecurityPolicy` CRD (D3 cascade); origins come
+/// from `RIO_DASHBOARD__CORS_ALLOW_ORIGINS` (comma-separated).
 fn build_cors_layer(cfg: &DashboardConfig) -> tower_http::cors::CorsLayer {
-    use http::{HeaderName, Method};
-    use tower_http::cors::{AllowOrigin, CorsLayer};
-
-    CorsLayer::new()
-        .allow_origin(AllowOrigin::list(parse_cors_origins(
-            &cfg.cors_allow_origins,
-        )))
-        .allow_methods([Method::POST, Method::OPTIONS])
-        .allow_headers([
-            HeaderName::from_static("content-type"),
-            HeaderName::from_static("x-grpc-web"),
-            HeaderName::from_static("x-user-agent"),
-        ])
-        .expose_headers([
-            HeaderName::from_static("grpc-status"),
-            HeaderName::from_static("grpc-message"),
-            HeaderName::from_static("grpc-status-details-bin"),
-        ])
-}
-
-/// Parse a comma-separated CORS origin list (helm renders
-/// `| join ","`): split, trim, drop empties, drop unparseable.
-/// Extracted from `build_cors_layer` so the split/trim/filter chain
-/// is directly assertable — `CorsLayer`'s internal origin list isn't
-/// inspectable, so a constructibility check alone is vacuous.
-pub(crate) fn parse_cors_origins(raw: &str) -> Vec<http::HeaderValue> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|o| {
-            http::HeaderValue::from_str(o)
-                .inspect_err(|e| tracing::warn!(origin = o, error = %e, "invalid CORS origin"))
-                .ok()
-        })
-        .collect()
+    rio_common::cors::dashboard_cors_layer(&cfg.cors_allow_origins)
 }
 
 // ── bootstrap helpers (extracted from main) ──────────────────────────

@@ -103,6 +103,10 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         .parse()
         .context("tf output pg_max_connections is not an integer")?;
     let gateway_dns_fqdn = tf.get_opt("gateway_dns_fqdn");
+    // bug_326: the S3 logs/ lifecycle expires at THIS + 7 (s3.tf) —
+    // deploying the same variable into the store sweep keeps the two
+    // deleters coupled by construction.
+    let log_retention_days = tf.get("log_retention_days")?;
 
     info!("deploy tag={tag} ami={ami_tag} registry={ecr} cluster={cluster}");
 
@@ -355,6 +359,8 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
                 "store.pgMaxConnections",
                 STORE_PG_MAX_CONNECTIONS_PER_REPLICA.to_string(),
             )
+            // bug_326: single-sourced with the S3 lifecycle (tf).
+            .set("store.logRetentionDays", &log_retention_days)
             // I-147/I-150: production-scale resources. values.yaml defaults
             // stay small so VM-test k3s (2-node QEMU) can schedule; EKS
             // gets the real sizing here.

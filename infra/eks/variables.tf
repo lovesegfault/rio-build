@@ -123,3 +123,9 @@ variable "node" {
   description = "NixOS-node AMI pins (kernel, nodeadm, ecr-credential-provider) — consumed by nix/nixos-node/, not terraform."
   type        = any
 }
+
+variable "log_retention_days" {
+  description = "Build-log retention (days). SINGLE SOURCE for the two coupled deleters (bug_326): rio-store's hourly TTL sweep receives this via `xtask deploy --set store.logRetentionDays` (tf output → chart env RIO_LOG_RETENTION_DAYS) and the S3 logs/ lifecycle backstop expires at THIS + 7 days of slack — by construction the lifecycle can never undercut the sweep and hard-delete still-referenced chunks. Raise retention here; both deleters follow on the next apply+deploy."
+  type        = number
+  default     = 30
+}

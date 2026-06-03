@@ -307,6 +307,11 @@
       "doc": "Layered configuration: compiled defaults → TOML file → `RIO_*` env → CLI flags."
     },
     {
+      "path": "cors.rs",
+      "depth": 0,
+      "doc": "Single home for the dashboard gRPC-Web CORS contract (bug_355)."
+    },
+    {
       "path": "grpc.rs",
       "depth": 0,
       "doc": "Proto-agnostic gRPC helpers shared across rio binaries."

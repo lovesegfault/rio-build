@@ -12564,6 +12564,10 @@
           "packageId": "futures-util"
         },
         {
+          "name": "http",
+          "packageId": "http 1.4.0"
+        },
+        {
           "name": "metrics-exporter-prometheus",
           "packageId": "metrics-exporter-prometheus"
         },
@@ -12618,6 +12622,10 @@
         {
           "name": "tonic-health",
           "packageId": "tonic-health"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http"
         },
         {
           "name": "tracing",

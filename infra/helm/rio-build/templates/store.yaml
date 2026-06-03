@@ -172,6 +172,17 @@ spec:
                   fieldPath: status.podIP
             - name: RIO_LOG_PEER_URL_TEMPLATE
               value: {{ $s.logPeerUrlTemplate | default "http://[{pod}]:9002" | quote }}
+            # Dashboard gRPC-Web TailLog CORS (merged_bug_161): the
+            # SAME origin list the scheduler renders — the contract is
+            # single-sourced in rio_common::cors; the env was simply
+            # never wired here, so browser TailLog worked only with an
+            # empty-origin (deny-all) layer.
+            - name: RIO_LOG_CORS_ALLOW_ORIGINS
+              value: {{ .Values.dashboard.cors.allowOrigins | join "," | quote }}
+            # Coupled to the S3 logs/ lifecycle via the tf variable
+            # (bug_326) — see values.yaml logRetentionDays.
+            - name: RIO_LOG_RETENTION_DAYS
+              value: {{ $s.logRetentionDays | default 30 | quote }}
             # P0542: s3.dualstack.{region}.amazonaws.com has AAAA;
             # the default endpoint is v4-only. Without this, v6-only
             # pods reach S3 via DNS64+NAT64 (works, but adds a hop).

@@ -237,9 +237,14 @@ pub struct Config {
     /// Build-log retention, in days since the execution *started*
     /// (`drv_executions.started_at` — the only timestamp every
     /// execution has). The hourly TTL sweep deletes older executions'
-    /// manifest rows and chunk objects. The S3 lifecycle rule on the
-    /// `logs/` prefix is the orphan backstop and should be set to this
-    /// value plus a few days of slack. Default 30. Env:
+    /// manifest rows and chunk objects. On EKS this is deployed from
+    /// the terraform variable `log_retention_days` (xtask deploy
+    /// `--set store.logRetentionDays`), and the S3 `logs/` lifecycle
+    /// backstop expires at the SAME variable + 7 days of slack — the
+    /// two deleters derive from one source and cannot drift. Operators
+    /// outside that chain must keep any bucket lifecycle ≥ this value
+    /// + slack (an undercutting lifecycle hard-deletes chunks the read
+    /// path still references). Default 30. Env:
     /// `RIO_LOG_RETENTION_DAYS`.
     pub log_retention_days: u32,
 }

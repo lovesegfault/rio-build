@@ -412,7 +412,9 @@ async fn main() -> anyhow::Result<()> {
     // usefully without the HMAC tokens those handlers demand.
     rio_common::server::tonic_builder()
         .accept_http1(true)
-        .layer(build_cors_layer(&cfg.log_cors_allow_origins))
+        .layer(rio_common::cors::dashboard_cors_layer(
+            &cfg.log_cors_allow_origins,
+        ))
         .layer(tonic_web::GrpcWebLayer::new())
         // JWT tenant-token verify layer. jwt_pubkey computed above.
         // Installed unconditionally for type stability (see
@@ -481,38 +483,6 @@ async fn pg_preflight() -> anyhow::Result<()> {
 }
 
 // ── bootstrap helpers (extracted from main) ──────────────────────────
-
-/// CORS layer for browser gRPC-Web `TailLog` calls. A duplicate of the
-/// scheduler's `build_cors_layer` (same origins format, same three
-/// exposed trailer headers that connect-web needs to surface
-/// `Status.code` to the SPA) — the two servers expose different RPCs to
-/// the same dashboard and must agree on the CORS contract. An empty
-/// origin list (the default) allows no browser origin; native gRPC
-/// callers are unaffected by CORS entirely.
-fn build_cors_layer(cors_allow_origins: &str) -> tower_http::cors::CorsLayer {
-    use http::{HeaderName, Method};
-    use tower_http::cors::{AllowOrigin, CorsLayer};
-
-    let origins: Vec<http::HeaderValue> = cors_allow_origins
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([Method::POST, Method::OPTIONS])
-        .allow_headers([
-            HeaderName::from_static("content-type"),
-            HeaderName::from_static("x-grpc-web"),
-            HeaderName::from_static("x-user-agent"),
-        ])
-        .expose_headers([
-            HeaderName::from_static("grpc-status"),
-            HeaderName::from_static("grpc-message"),
-            HeaderName::from_static("grpc-status-details-bin"),
-        ])
-}
 
 /// Connect to PostgreSQL and run migrations. URL is logged with
 /// password redacted.

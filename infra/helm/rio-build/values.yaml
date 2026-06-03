@@ -396,6 +396,17 @@ store:
   # (pgMaxConnections × 3).clamp(64, 128). Override only when the
   # derived value mis-tracks the upstream-fetch bottleneck.
   # substituteAdmissionPermits: 128
+  # Build-log retention (days) for the hourly TTL sweep. On EKS this
+  # is OVERWRITTEN every deploy from the terraform variable
+  # log_retention_days (bug_326): the S3 logs/ lifecycle backstop
+  # expires at the SAME variable + 7 days of slack, so the two
+  # deleters cannot drift. Chart-only S3 operators (no xtask/EKS):
+  # change the tf variable if you have the lifecycle, or keep your
+  # bucket's lifecycle ≥ this + slack manually — a lifecycle below
+  # the sweep's window hard-deletes chunks the read path still
+  # references (the loud symptom is rio_store_log_read_data_loss_total
+  # with object-missing causes).
+  logRetentionDays: 30
   # Owner-side download stall window, r[store.substitute.stall-abort].
   # Unset → binary default 180 s (= 6 missed progress heartbeats); also
   # the competing-replica stall-reclaim threshold. Persist-phase and
