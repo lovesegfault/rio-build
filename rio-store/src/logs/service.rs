@@ -1060,7 +1060,7 @@ impl AppendDriver {
                     "AppendLog: chunk cut abandoned by the watchdog (hung past one cut interval)"
                 );
                 self.session.note_cut_abandoned();
-                return CutStep::Failed;
+                CutStep::Failed
             }
             Ok(Ok(None)) => CutStep::Empty,
             Ok(Ok(Some(durable_through_line))) => {
