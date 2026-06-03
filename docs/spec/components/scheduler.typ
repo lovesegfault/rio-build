@@ -3247,6 +3247,29 @@ evaluate against — cannot regress any newer row by construction; it is
 priced in `fence-invariant-map.md` and bounded in `fencedWrites.qnt`
 (`activeRowGenMonotonic` holds even with the residual reachable).
 
+#r("sched.grpc.fence-retryable")[
+  Every refusal a fence or leadership guard produces MUST surface to clients
+  as a RETRYABLE gRPC code, and the code MUST derive from the refusal's
+  retry class: `Retryable ⟺ code ∈ {UNAVAILABLE, RESOURCE_EXHAUSTED}`,
+  exhaustively over every refusal surface (`ActorError`, `PullRejection`).
+  In particular the claims-floor fence's `StaleGeneration` maps to
+  UNAVAILABLE (the `ensure_leader` not-leader family) — never
+  FAILED_PRECONDITION, which no client retries. The gateway MUST retry a
+  refused `SubmitBuild` boundedly while and only while no `x-rio-build-id`
+  metadata has been received (the scheduler sets that header only after the
+  merge commits, and a refused merge rolls back, so the re-submit is
+  idempotent); any other code, a timeout, or a post-metadata failure
+  propagates unchanged.
+]
+The class law is the structural carrier: the per-variant `retry_class()`
+fns are exhaustive matches (a new refusal variant must choose), the status
+constructors are derived next to a `debug_assert` of the law, and the
+`retry_class_code_consistency` unit test pins the biconditional over every
+variant of both enums — so a future refusal surface cannot silently map a
+retryable condition to a terminal code (the bug_393 class). Model-level
+verification: `fenceRefusalAlwaysRetryable` (fencedWrites.qnt) with the
+fence-393-terminal-refusal calibration pin as its falsifiability pair.
+
 A local counter cannot provide the distinctness half of this rule: an
 incremented-in-memory generation seeded from a high-water mark collides
 whenever a leader is deposed before persisting anything (the

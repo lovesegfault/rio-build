@@ -988,30 +988,69 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
     request: tonic::Request<types::SubmitBuildRequest>,
     active_build_ids: &mut HashSet<String>,
 ) -> anyhow::Result<(String, tonic::codec::Streaming<types::BuildEvent>)> {
-    let resp = match rio_common::grpc::with_timeout(
-        "SubmitBuild",
-        rio_common::grpc::SUBMIT_BUILD_TIMEOUT,
-        // no-jwt: `request` is `tonic::Request<_>` — caller wraps via
-        // with_jwt at the submit_and_process_build entry point.
-        scheduler_client.submit_build(request),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            // STDERR_NEXT diagnostic before the Err propagates. Callers
-            // map this to BuildResult::failure (opcodes 36/46) or
-            // stderr_err! (opcode 9) — the client SEES the failure
-            // either way, but without this line the only context is
-            // the tonic Status string with no indication it was the
-            // INITIAL submit that failed (vs. a mid-stream event, vs.
-            // reconnect exhaustion — all three produce anyhow Errs).
-            // NOT STDERR_ERROR: two of three callers (opcodes 36/46)
-            // convert Err → BuildResult::failure → STDERR_LAST.
-            // Sending STDERR_ERROR here would produce the exact
-            // ERROR→LAST desync remediation 07 fixes.
-            let _ = stderr.log(&format!("SubmitBuild RPC failed: {e}\n")).await;
-            return Err(GatewayError::Scheduler(format!("SubmitBuild failed: {e}")).into());
+    // r[impl sched.grpc.fence-retryable]
+    // Bounded pre-build_id retry on UNAVAILABLE only (the fence /
+    // not-leader / actor-dead refusal class — sched.grpc.fence-
+    // retryable maps every retryable scheduler refusal there). Safe
+    // because no build_id metadata has been received: the scheduler
+    // sets the header only AFTER MergeDag commits, and a refused/
+    // fenced merge rolls back — re-submitting is idempotent. Any
+    // other code, a timeout (DEADLINE_EXCEEDED — not provably
+    // pre-merge), or an UNAVAILABLE that somehow carries the build-id
+    // header propagates unchanged. Budget mirrors the deposed-believer
+    // window: 4 retries at 0.5/1/2/4s under the per-attempt timeout.
+    const SUBMIT_RETRIES: u32 = 4;
+    const SUBMIT_RETRY_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
+        base: std::time::Duration::from_millis(500),
+        mult: 2.0,
+        cap: std::time::Duration::from_secs(4),
+        jitter: rio_common::backoff::Jitter::None,
+    };
+    let (meta, _ext, msg) = request.into_parts();
+    let mut attempt: u32 = 0;
+    let resp = loop {
+        let req = tonic::Request::from_parts(meta.clone(), Default::default(), msg.clone());
+        match rio_common::grpc::with_timeout_status(
+            "SubmitBuild",
+            rio_common::grpc::SUBMIT_BUILD_TIMEOUT,
+            // no-jwt: the metadata (incl. the tenant token) was set by
+            // the caller via with_jwt at the submit_and_process_build
+            // entry point and is replayed verbatim on every attempt.
+            scheduler_client.submit_build(req),
+        )
+        .await
+        {
+            Ok(r) => break r,
+            Err(st)
+                if st.code() == tonic::Code::Unavailable
+                    && st.metadata().get(rio_proto::BUILD_ID_HEADER).is_none()
+                    && attempt < SUBMIT_RETRIES =>
+            {
+                let delay = SUBMIT_RETRY_BACKOFF.duration(attempt);
+                attempt += 1;
+                tracing::debug!(
+                    attempt,
+                    delay_ms = delay.as_millis() as u64,
+                    error = %st,
+                    "SubmitBuild refused as retryable (UNAVAILABLE, pre-build_id); retrying"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => {
+                // STDERR_NEXT diagnostic before the Err propagates. Callers
+                // map this to BuildResult::failure (opcodes 36/46) or
+                // stderr_err! (opcode 9) — the client SEES the failure
+                // either way, but without this line the only context is
+                // the tonic Status string with no indication it was the
+                // INITIAL submit that failed (vs. a mid-stream event, vs.
+                // reconnect exhaustion — all three produce anyhow Errs).
+                // NOT STDERR_ERROR: two of three callers (opcodes 36/46)
+                // convert Err → BuildResult::failure → STDERR_LAST.
+                // Sending STDERR_ERROR here would produce the exact
+                // ERROR→LAST desync remediation 07 fixes.
+                let _ = stderr.log(&format!("SubmitBuild RPC failed: {e}\n")).await;
+                return Err(GatewayError::Scheduler(format!("SubmitBuild failed: {e}")).into());
+            }
         }
     };
 

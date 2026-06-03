@@ -717,17 +717,63 @@ pub enum ActorError {
     NotLeader,
 
     // r[impl sched.evidence.durability+4]
+    // r[impl sched.grpc.fence-retryable]
     /// The merge transaction's claims-floor fence rejected the write:
     /// this replica's serving generation sits below the durable floor
     /// (a successor has claimed), so committing the merge would let a
     /// deposed believer write evidence over the new tenure's. Maps to
-    /// gRPC FAILED_PRECONDITION — the client retries against the live
-    /// leader (whose own merge will succeed).
+    /// gRPC UNAVAILABLE (the `ensure_leader` "not leader" family): the
+    /// fence trips exactly in the deposed-believer window — the lease
+    /// loss precedes the successor's claim, so a health-aware balanced
+    /// channel has usually ejected this replica already, and a client
+    /// that still reaches it must RETRY (bounded), not surface a
+    /// terminal error for a request that is perfectly valid on the
+    /// live leader. No client retries FAILED_PRECONDITION; mapping the
+    /// refusal there turned every fence trip into a user-visible
+    /// failure (bug_393).
     #[error(
         "merge fenced: serving generation {serving} is below the durable claims floor {floor} \
          (a newer leader has claimed); retry against the current leader"
     )]
     StaleGeneration { serving: i64, floor: i64 },
+}
+
+// r[impl sched.grpc.fence-retryable]
+/// Whether a refusal is RETRYABLE (the caller should try again — on
+/// this replica after backoff or on another replica) or TERMINAL (the
+/// request itself can never succeed as posed). The gRPC code derives
+/// from this class: `Retryable ⟺ code ∈ {UNAVAILABLE,
+/// RESOURCE_EXHAUSTED}` (pinned by `retry_class_code_consistency`), so
+/// a future refusal surface cannot silently map a retryable condition
+/// to a code no client retries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryClass {
+    /// Transient: another replica (or this one, later) will accept it.
+    Retryable,
+    /// The request can never succeed as posed (bad input, missing
+    /// entity, authz, internal invariant failure).
+    Terminal,
+}
+
+impl ActorError {
+    /// The refusal class — exhaustive (a new variant must choose).
+    pub(crate) fn retry_class(&self) -> RetryClass {
+        match self {
+            // Leadership / load / fence / dependency-outage refusals:
+            // valid requests the cluster can serve elsewhere or later.
+            Self::NotLeader
+            | Self::ChannelSend
+            | Self::Backpressure
+            | Self::StoreUnavailable
+            | Self::StaleGeneration { .. } => RetryClass::Retryable,
+            // The request itself is unservable as posed.
+            Self::BuildNotFound(_)
+            | Self::Database(_)
+            | Self::Dag(_)
+            | Self::MissingDbId { .. }
+            | Self::PermissionDenied { .. } => RetryClass::Terminal,
+        }
+    }
 }
 
 /// Read-only view of the actor's backpressure state.

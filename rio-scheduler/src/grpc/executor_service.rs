@@ -526,25 +526,24 @@ impl ExecutorService for SchedulerGrpc {
                     retry_after_seconds: retry_after_secs,
                 })
             }
-            Err(crate::actor::PullRejection::NotLeader)
-            | Err(crate::actor::PullRejection::StaleGeneration) => {
-                // The same retryable not-leader class `ensure_leader`
-                // produces — the pod retries against the real leader.
-                return Err(Status::unavailable("not leader (standby replica)"));
+            Err(
+                r @ (crate::actor::PullRejection::NotLeader
+                | crate::actor::PullRejection::StaleGeneration),
+            ) => {
+                // Retryable not-leader class (the shared mapping).
+                return Err(super::actor_guards::pull_rejection_to_status(&r));
             }
-            Err(crate::actor::PullRejection::TokenMismatch) => {
+            Err(r @ crate::actor::PullRejection::TokenMismatch) => {
                 metrics::counter!(
                     "rio_scheduler_pull_rejected_total",
                     "rpc" => "pull_assignment",
                     "reason" => "token_mismatch"
                 )
                 .increment(1);
-                return Err(Status::permission_denied(
-                    "executor token is bound to a different intent",
-                ));
+                return Err(super::actor_guards::pull_rejection_to_status(&r));
             }
-            Err(crate::actor::PullRejection::Internal(msg)) => {
-                return Err(Status::internal(msg));
+            Err(r @ crate::actor::PullRejection::Internal(_)) => {
+                return Err(super::actor_guards::pull_rejection_to_status(&r));
             }
         };
         Ok(Response::new(rio_proto::types::PullAssignmentResponse {
@@ -694,22 +693,22 @@ impl ExecutorService for SchedulerGrpc {
             .map_err(|_| Status::internal("actor dropped ReportOutcome reply"))?
         {
             Ok(()) => Ok(Response::new(rio_proto::types::ReportOutcomeResponse {})),
-            Err(crate::actor::PullRejection::NotLeader)
-            | Err(crate::actor::PullRejection::StaleGeneration) => {
-                Err(Status::unavailable("not leader (standby replica)"))
-            }
-            Err(crate::actor::PullRejection::TokenMismatch) => {
+            Err(
+                r @ (crate::actor::PullRejection::NotLeader
+                | crate::actor::PullRejection::StaleGeneration),
+            ) => Err(super::actor_guards::pull_rejection_to_status(&r)),
+            Err(r @ crate::actor::PullRejection::TokenMismatch) => {
                 metrics::counter!(
                     "rio_scheduler_pull_rejected_total",
                     "rpc" => "report_outcome",
                     "reason" => "token_mismatch"
                 )
                 .increment(1);
-                Err(Status::permission_denied(
-                    "executor token is bound to a different intent",
-                ))
+                Err(super::actor_guards::pull_rejection_to_status(&r))
             }
-            Err(crate::actor::PullRejection::Internal(msg)) => Err(Status::internal(msg)),
+            Err(r @ crate::actor::PullRejection::Internal(_)) => {
+                Err(super::actor_guards::pull_rejection_to_status(&r))
+            }
         }
     }
 

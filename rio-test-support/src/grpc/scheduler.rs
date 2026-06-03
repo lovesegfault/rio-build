@@ -104,6 +104,11 @@ pub struct WatchOutcome {
 #[derive(Clone, Default)]
 pub struct MockScheduler {
     pub submit: Arc<RwLock<SubmitOutcome>>,
+    /// One-shot SubmitBuild outcomes, consumed FIFO before `submit`
+    /// applies (empty = fall through to the static outcome). For the
+    /// gateway's bounded submit-retry tests: `Unavailable ×2 then the
+    /// static success`.
+    pub submit_queue: Arc<RwLock<std::collections::VecDeque<SubmitOutcome>>>,
     pub watch: Arc<RwLock<WatchOutcome>>,
     /// Full SubmitBuild requests received (for inspecting DAG contents).
     pub submit_calls: Arc<RwLock<Vec<types::SubmitBuildRequest>>>,
@@ -153,6 +158,12 @@ impl MockScheduler {
         *self.submit.write().unwrap() = outcome;
     }
 
+    /// Queue a ONE-SHOT SubmitBuild outcome (FIFO, consumed before the
+    /// static outcome applies).
+    pub fn push_submit_outcome(&self, outcome: SubmitOutcome) {
+        self.submit_queue.write().unwrap().push_back(outcome);
+    }
+
     pub fn set_watch_outcome(&self, outcome: WatchOutcome) {
         *self.watch.write().unwrap() = outcome;
     }
@@ -178,7 +189,12 @@ impl SchedulerService for MockScheduler {
         let req = request.into_inner();
         self.submit_calls.write().unwrap().push(req);
 
-        let outcome = self.submit.read().unwrap().clone();
+        let outcome = self
+            .submit_queue
+            .write()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| self.submit.read().unwrap().clone());
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let build_id = TEST_BUILD_ID.to_string();
 

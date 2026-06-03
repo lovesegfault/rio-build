@@ -53,7 +53,7 @@ pub(crate) fn ensure_leader(is_leader: &AtomicBool) -> Result<(), Status> {
 /// function so callers don't need the awkward `crate::grpc::SchedulerGrpc::`
 /// path — seven admin submodules + worker_service all call this.
 pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
-    match err {
+    let status = match &err {
         ActorError::BuildNotFound(id) => Status::not_found(format!("build not found: {id}")),
         ActorError::Backpressure => {
             Status::resource_exhausted("scheduler is overloaded, please retry later")
@@ -80,12 +80,56 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         // one signature.
         ActorError::NotLeader => Status::unavailable("not leader (standby replica)"),
         // r[impl sched.evidence.durability+4]
-        // FAILED_PRECONDITION (not UNAVAILABLE): the request itself is
-        // fine, this replica just is not entitled to commit it any
-        // more. Health-aware balanced-channel clients have already
-        // ejected this replica by the time the fence trips (the lease
-        // loss precedes the successor's claim); a client that still
-        // reaches it retries and lands on the live leader.
-        ActorError::StaleGeneration { .. } => Status::failed_precondition(err.to_string()),
-    }
+        // r[impl sched.grpc.fence-retryable]
+        // UNAVAILABLE (the ensure_leader family), NOT
+        // FAILED_PRECONDITION: the fence trips in the deposed-believer
+        // window and the request is perfectly valid on the live
+        // leader — it must surface as a retryable refusal. No client
+        // retries FAILED_PRECONDITION (the gateway's bounded
+        // SubmitBuild retry keys on UNAVAILABLE only), so the previous
+        // mapping turned every fence trip into a user-visible failure.
+        ActorError::StaleGeneration { .. } => Status::unavailable(err.to_string()),
+    };
+    // The code DERIVES from the retry class
+    // (sched.grpc.fence-retryable): pinned exhaustively by the
+    // retry_class_code_consistency unit test; the debug_assert keeps
+    // the derivation honest on every dev-mode mapping.
+    debug_assert_eq!(
+        err.retry_class() == crate::actor::RetryClass::Retryable,
+        matches!(
+            status.code(),
+            tonic::Code::Unavailable | tonic::Code::ResourceExhausted
+        ),
+        "actor_error_to_status: code/class divergence for {err:?}"
+    );
+    status
+}
+
+// r[impl sched.grpc.fence-retryable]
+/// The shared status mapping for [`PullRejection`] — every executor-
+/// facing handler derives its refusal Status here (the per-RPC metrics
+/// stay at the call sites). Same class law as
+/// [`actor_error_to_status`].
+pub(crate) fn pull_rejection_to_status(rejection: &crate::actor::PullRejection) -> Status {
+    use crate::actor::PullRejection;
+    let status = match rejection {
+        // The retryable not-leader class `ensure_leader` produces —
+        // the pod retries against the real leader.
+        PullRejection::NotLeader | PullRejection::StaleGeneration => {
+            Status::unavailable("not leader (standby replica)")
+        }
+        PullRejection::TokenMismatch => {
+            Status::permission_denied("executor token is bound to a different intent")
+        }
+        PullRejection::Internal(msg) => Status::internal(msg.clone()),
+    };
+    debug_assert_eq!(
+        rejection.retry_class() == crate::actor::RetryClass::Retryable,
+        matches!(
+            status.code(),
+            tonic::Code::Unavailable | tonic::Code::ResourceExhausted
+        ),
+        "pull_rejection_to_status: code/class divergence for {rejection:?}"
+    );
+    status
 }

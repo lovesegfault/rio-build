@@ -3315,3 +3315,104 @@ async fn test_build_derivation_store_error_during_verification() -> anyhow::Resu
     h.finish().await;
     Ok(())
 }
+
+// ── A1 Layer 3: bounded SubmitBuild retry (sched.grpc.fence-retryable) ──
+
+// r[verify sched.grpc.fence-retryable]
+/// UNAVAILABLE ×2 then success: the gateway retries the pre-build_id
+/// SubmitBuild boundedly — three attempts total, ONE build (no
+/// duplicate submission), the build completes normally.
+#[tokio::test]
+async fn test_build_paths_submit_retries_unavailable_then_succeeds() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler
+        .push_submit_outcome(SubmitOutcome::Error(tonic::Code::Unavailable));
+    h.scheduler
+        .push_submit_outcome(SubmitOutcome::Error(tonic::Code::Unavailable));
+    // Static outcome: a completing success stream.
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1, "BuildPaths succeeds after the bounded retry");
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        3,
+        "exactly three SubmitBuild attempts (2 refused + 1 accepted), no duplicates"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify sched.grpc.fence-retryable]
+/// A terminal code (FAILED_PRECONDITION) is NOT retried: one attempt,
+/// the failure surfaces.
+#[tokio::test]
+async fn test_build_paths_submit_terminal_code_not_retried() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler
+        .set_submit_outcome(SubmitOutcome::Error(tonic::Code::FailedPrecondition));
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let frames = collect_stderr_frames_terminal(&mut h.stream).await;
+    assert!(
+        matches!(frames.last(), Some(StderrMessage::Error(_))),
+        "terminal code surfaces as STDERR_ERROR. frames: {frames:?}"
+    );
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        1,
+        "FAILED_PRECONDITION is terminal: exactly one SubmitBuild attempt"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify sched.grpc.fence-retryable]
+/// Retry exhaustion: UNAVAILABLE on every attempt → 1 + 4 bounded
+/// retries = 5 attempts, then the failure surfaces (no infinite loop).
+#[tokio::test]
+async fn test_build_paths_submit_retry_budget_exhausts() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler
+        .set_submit_outcome(SubmitOutcome::Error(tonic::Code::Unavailable));
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let frames = collect_stderr_frames_terminal(&mut h.stream).await;
+    let saw_diag = frames
+        .iter()
+        .any(|m| matches!(m, StderrMessage::Next(s) if s.contains("SubmitBuild RPC failed")));
+    assert!(
+        saw_diag,
+        "exhausted retries surface the diagnostic. frames: {frames:?}"
+    );
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        5,
+        "1 initial + 4 bounded retries, then stop"
+    );
+
+    h.finish().await;
+    Ok(())
+}

@@ -78,11 +78,16 @@ fn test_actor_error_to_status_all_arms() {
         (ActorError::NotLeader, Code::Unavailable, "not leader"),
         (
             // r[verify sched.evidence.durability+4]
+            // r[verify sched.grpc.fence-retryable]
+            // UNAVAILABLE, not FAILED_PRECONDITION: the fence refusal
+            // is RETRYABLE (deposed-believer window; the request is
+            // valid on the live leader) and no client retries
+            // FAILED_PRECONDITION (bug_393).
             ActorError::StaleGeneration {
                 serving: 1,
                 floor: 2,
             },
-            Code::FailedPrecondition,
+            Code::Unavailable,
             "below the durable claims floor",
         ),
     ];
@@ -170,4 +175,63 @@ async fn test_not_leader_rejects_all_rpcs() -> anyhow::Result<()> {
     // BuildExecution/Heartbeat RPCs no longer exist.
 
     Ok(())
+}
+
+// r[verify sched.grpc.fence-retryable]
+/// THE class law: `retry_class() == Retryable ⟺ code ∈ {UNAVAILABLE,
+/// RESOURCE_EXHAUSTED}` — exhaustive over both refusal enums, so a new
+/// variant (or a remapped code) cannot silently give a retryable
+/// condition a terminal code or vice versa.
+#[test]
+fn retry_class_code_consistency() {
+    use crate::actor::{PullRejection, RetryClass};
+    use tonic::Code;
+    let actor_errors: Vec<ActorError> = vec![
+        ActorError::BuildNotFound(Uuid::nil()),
+        ActorError::Backpressure,
+        ActorError::ChannelSend,
+        ActorError::Database(sqlx::Error::PoolClosed),
+        ActorError::Dag(crate::dag::DagError::CycleDetected),
+        ActorError::MissingDbId {
+            drv_path: "/nix/store/x".into(),
+        },
+        ActorError::StoreUnavailable,
+        ActorError::PermissionDenied {
+            build_id: Uuid::nil(),
+        },
+        ActorError::NotLeader,
+        ActorError::StaleGeneration {
+            serving: 1,
+            floor: 2,
+        },
+    ];
+    assert_eq!(
+        actor_errors.len(),
+        <ActorError as strum::EnumCount>::COUNT,
+        "case list drifted from the enum"
+    );
+    for err in actor_errors {
+        let class = err.retry_class();
+        let code = crate::grpc::actor_guards::actor_error_to_status(err).code();
+        assert_eq!(
+            class == RetryClass::Retryable,
+            matches!(code, Code::Unavailable | Code::ResourceExhausted),
+            "class/code divergence: {class:?} vs {code:?}"
+        );
+    }
+    let rejections = [
+        PullRejection::NotLeader,
+        PullRejection::StaleGeneration,
+        PullRejection::TokenMismatch,
+        PullRejection::Internal("x".into()),
+    ];
+    for r in rejections {
+        let class = r.retry_class();
+        let code = crate::grpc::actor_guards::pull_rejection_to_status(&r).code();
+        assert_eq!(
+            class == RetryClass::Retryable,
+            matches!(code, Code::Unavailable | Code::ResourceExhausted),
+            "pull class/code divergence: {class:?} vs {code:?}"
+        );
+    }
 }

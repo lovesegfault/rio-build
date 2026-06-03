@@ -64,6 +64,25 @@ pub enum PullRejection {
     Internal(String),
 }
 
+impl PullRejection {
+    // r[impl sched.grpc.fence-retryable]
+    /// The refusal class (the same law as [`ActorError::retry_class`]
+    /// — `Retryable ⟺ code ∈ {UNAVAILABLE, RESOURCE_EXHAUSTED}`,
+    /// pinned by `retry_class_code_consistency`).
+    ///
+    /// [`ActorError::retry_class`]: crate::actor::ActorError::retry_class
+    pub(crate) fn retry_class(&self) -> super::command::RetryClass {
+        use super::command::RetryClass;
+        match self {
+            // Leadership-class refusals: valid pulls another replica
+            // serves.
+            Self::NotLeader | Self::StaleGeneration => RetryClass::Retryable,
+            // Mis-bound token / internal failure: unservable as posed.
+            Self::TokenMismatch | Self::Internal(_) => RetryClass::Terminal,
+        }
+    }
+}
+
 /// The pure admission decision for one pull: the CBMC-verified
 /// [`rio_evidence_kernel::pull::PullAdmission`] alphabet, instantiated
 /// with the scheduler's exec-id type. The decision logic itself lives
