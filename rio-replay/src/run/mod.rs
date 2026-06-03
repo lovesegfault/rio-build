@@ -6502,10 +6502,13 @@ mod tests {
     /// batch's WRITER-INTENT sibling bits: a starved failed root retires
     /// whether the batch was a full wave, a canary probe (the canary
     /// cannot answer the outage question either way — see the helper
-    /// doc), or the timed dispatcher's, and whether or not a disconnect
-    /// deadline fired. The bits are crossed explicitly so a future
-    /// carve-out (e.g. a probe exemption) must flip a pinned row here
-    /// and own the decision, instead of drifting in unobserved.
+    /// doc), or the timed dispatcher's, whether or not the engine
+    /// cancelled the request (a deadline-cut batch can still carry the
+    /// in-band failure row the gap attribution reads), and whether or
+    /// not a disconnect deadline fired. The bits are crossed explicitly
+    /// — 16 rows, the full 2^4 — so a future carve-out (e.g. a probe
+    /// exemption) must flip a pinned row here and own the decision,
+    /// instead of drifting in unobserved.
     #[test]
     fn import_gap_retirement_is_writer_intent_independent() {
         let root = format!("/nix/store/{}-starved.drv", "a".repeat(32));
@@ -6528,39 +6531,43 @@ mod tests {
         )]);
         for kind in [BATCH_KIND_SUBMIT, BATCH_KIND_TIMED] {
             for probe in [false, true] {
-                for disconnect_deadline_fired in [false, true] {
-                    let view = BatchView {
-                        kind: kind.to_string(),
-                        results: vec![model::PathOutcome {
-                            drv_path: root.clone(),
-                            status: build_status_name(
-                                rio_nix::protocol::build::BuildStatus::PermanentFailure,
-                            )
-                            .to_string(),
-                            error_msg: "missing input".into(),
-                            start_time: 1,
-                            stop_time: 2,
-                        }],
-                        probe,
-                        disconnect_deadline_fired,
-                        import_skipped_by_root: BTreeMap::from([(
-                            root.clone(),
-                            vec![missing.clone()],
-                        )]),
-                        ..BatchView::default()
-                    };
-                    let starved = import_gap_retirements(
-                        &view,
-                        &[job.to_string()],
-                        &contexts,
-                        &HashSet::new(),
-                    );
-                    assert_eq!(
-                        starved.keys().collect::<Vec<_>>(),
-                        vec![job],
-                        "kind={kind} probe={probe} ddf={disconnect_deadline_fired}"
-                    );
-                    assert!(starved[job].contains(&missing));
+                for engine_cancelled in [false, true] {
+                    for disconnect_deadline_fired in [false, true] {
+                        let view = BatchView {
+                            kind: kind.to_string(),
+                            results: vec![model::PathOutcome {
+                                drv_path: root.clone(),
+                                status: build_status_name(
+                                    rio_nix::protocol::build::BuildStatus::PermanentFailure,
+                                )
+                                .to_string(),
+                                error_msg: "missing input".into(),
+                                start_time: 1,
+                                stop_time: 2,
+                            }],
+                            probe,
+                            engine_cancelled,
+                            disconnect_deadline_fired,
+                            import_skipped_by_root: BTreeMap::from([(
+                                root.clone(),
+                                vec![missing.clone()],
+                            )]),
+                            ..BatchView::default()
+                        };
+                        let starved = import_gap_retirements(
+                            &view,
+                            &[job.to_string()],
+                            &contexts,
+                            &HashSet::new(),
+                        );
+                        assert_eq!(
+                            starved.keys().collect::<Vec<_>>(),
+                            vec![job],
+                            "kind={kind} probe={probe} ec={engine_cancelled} \
+                             ddf={disconnect_deadline_fired}"
+                        );
+                        assert!(starved[job].contains(&missing));
+                    }
                 }
             }
         }
