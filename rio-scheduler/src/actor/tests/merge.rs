@@ -11112,6 +11112,109 @@ async fn test_store_evidence_displaces_settled_bare_squat() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.persist.settled-identity-freeze+2]
+/// THE merged_bug_038 kill on the HYDRATED row path: Step 0.5 loads
+/// the settled row from PG (load_settled_identity_rows — the
+/// post-reap / post-failover surface) and the M_070 bases admit the
+/// re-presentation. The row is planted via SQL in the exact shape the
+/// strip writers leave behind (live NULL + preserved set + every
+/// expected path empty + byte-anchored rank — pinned against the real
+/// writers by the c1 strip tests), so this covers the full
+/// row -> loader -> matcher -> Step 0.5 counter chain that the unit
+/// matcher tests exercise only with constructed rows. Pre-fix BOTH
+/// cells terminated in SettledIdentityConflict (zero classical
+/// evidence against a byte-anchored row).
+#[tokio::test]
+async fn test_hydrated_stripped_row_rejoins_via_m070_bases() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (db, handle, _task) = setup().await;
+
+    let preserved = [0xCC_u8; 32];
+    let plant = |tag: &str| {
+        let pool = db.pool.clone();
+        let tag = tag.to_owned();
+        async move {
+            let drv_path = rio_test_support::fixtures::test_drv_path(&tag);
+            sqlx::query(
+                "INSERT INTO derivations \
+                 (drv_hash, drv_path, pname, system, status, output_names, \
+                  expected_output_paths, is_ca, ca_modular_hash, \
+                  ca_modular_hash_stripped, evidence_rank) \
+                 VALUES ($1, $2, $3, 'x86_64-linux', 'completed', \
+                         ARRAY['out'], ARRAY[''], TRUE, NULL, $4, \
+                         'path_bound_bytes')",
+            )
+            .bind(&tag)
+            .bind(&drv_path)
+            .bind(&tag)
+            .bind(preserved.as_slice())
+            .execute(&pool)
+            .await
+            .map(|_| ())
+        }
+    };
+
+    // Cell 1: byte-equal re-presentation (the gateway recomputes the
+    // same declared value) -> PreservedClaim.
+    plant("hyd-pc").await?;
+    let mut represent = make_node("hyd-pc");
+    represent.is_content_addressed = true;
+    represent.expected_output_paths = vec![String::new()];
+    represent.ca_modular_hash = preserved.to_vec();
+    let b1 = Uuid::new_v4();
+    merge_dag(&handle, b1, vec![represent], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, b1).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "byte-equal preserved claim rejoins the hydrated row"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_merge_stripped_rejoin_total{basis=preserved_claim}"),
+        1,
+        "rejoin counted on the preserved_claim basis"
+    );
+
+    // Cell 2: hash-less re-presentation (the gateway DEGRADED — no
+    // declared value) -> DualAnchor on the byte-anchored rank.
+    plant("hyd-da").await?;
+    let mut bare = make_node("hyd-da");
+    bare.is_content_addressed = true;
+    bare.expected_output_paths = vec![String::new()];
+    let b2 = Uuid::new_v4();
+    merge_dag(&handle, b2, vec![bare], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, b2).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "hash-less re-presentation rejoins via the dual anchor"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_merge_stripped_rejoin_total{basis=dual_anchor}"),
+        1,
+        "rejoin counted on the dual_anchor basis"
+    );
+
+    // The rejoined re-creations REFRESH the rows (fresh lifecycle) —
+    // and the preserved claim is CARRIED FORWARD by the upsert
+    // (test_preserved_stripped_hash_supersede_carry_and_move pins the
+    // conflict arm), so a second strip-shaped lifecycle stays
+    // matchable too.
+    let (status, carried): (String, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT status, ca_modular_hash_stripped FROM derivations WHERE drv_hash = 'hyd-da'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_ne!(status, "completed", "fresh lifecycle after rejoin");
+    assert_eq!(
+        carried.as_deref(),
+        Some(preserved.as_slice()),
+        "preserved claim carried forward through the re-creation"
+    );
+    Ok(())
+}
+
 // r[verify sched.merge.store-evidence-displacement+2]
 /// A claim the store's own bytes CONTRADICT is rejected outright — the
 /// fetched `.drv` is text-CA-bound to the declared path, so the

@@ -365,6 +365,15 @@ in
 
   # r[verify sched.ca.cutoff-propagate+2]
   # r[verify sched.ca.resolve+3]
+  # r[verify sched.persist.settled-identity-freeze+2]
+  # r[verify sched.merge.store-evidence-displacement+2]
+  #   stripped-ca-resubmit: warm deferred-IA consumer over the realized
+  #   b1 chain is ingress-STRIPPED with M_070 preservation (live NULL +
+  #   ca_modular_hash_stripped set, asserted via psql); after a
+  #   scheduler restart (settled rows become row-only) the resubmission
+  #   REJOINS through the preserved-claim/dual-anchor bases instead of
+  #   bricking FAILED_PRECONDITION (merged_bug_038), observable as
+  #   rio_scheduler_merge_stripped_rejoin_total >= 1.
   #   Build CA-on-CA chain (A→B→C, all __contentAddressed=true),
   #   then resubmit with a different marker (A's drv hash differs,
   #   but A's output content is marker-independent → same nar_hash).
