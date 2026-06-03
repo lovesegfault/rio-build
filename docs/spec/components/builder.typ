@@ -1846,7 +1846,7 @@ boundary remains best-effort --- a shed terminal batch restores its lease
 with no later batch to ride, a bounded display gap
 (#rref("builder.log-limit+4") guarantees its assembly, not its delivery).
 
-#r("builder.result.input-materialization-is-infra+5")[
+#r("builder.result.input-materialization-is-infra+6")[
   A build failure caused by an input path that was verified present in
   rio-store during input resolution but could not be materialized on the
   worker (FUSE JIT-fetch error, overlay race) MUST be reported as
@@ -1868,7 +1868,18 @@ with no later batch to ride, a bounded display gap
   re-dispatch re-resolves), never `InputRejected`. Not-found is not a
   fault, so it slips past the resolve step's fault classification; without
   the dropped-set evidence it deterministically launders into a permanent
-  rejection of a build that an immediate re-dispatch would fix.
+  rejection of a build that an immediate re-dispatch would fix. Resolve-time
+  residency gaps (closure members the store could not answer for at
+  resolve) are typed evidence consulted by EVERY verdict-producing arm:
+  glue rejections hinging on a gap, `execve` ENOENT/ENOTDIR with gaps on
+  record, exit classification of failed gap-dispatched builds (below
+  OOM/disk-full, above network-transient, never overriding kill-class),
+  and registration --- an output whose recorded references include a
+  dropped member MUST NOT register (the gap members ride the reference
+  scan detection-only, and the gate precedes the policy passes so a
+  gap-caused reference cannot re-launder as a policy verdict). All four
+  re-attributions are bounded by the scheduler's infrastructure retry
+  caps.
 ]
 = Shutdown
 

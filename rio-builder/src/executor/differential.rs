@@ -446,7 +446,13 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
         })
         .collect();
 
-    match process_outputs(&drv, &to_process, cfg.uid, &input_metadata) {
+    match process_outputs(
+        &drv,
+        &to_process,
+        cfg.uid,
+        &input_metadata,
+        &crate::executor::dropped::DroppedInputs::default(),
+    ) {
         Ok(processed) => {
             // Fixed-output content check: the declared hash must match the
             // produced content. Mirrors the fail-closed verify_fod_hashes

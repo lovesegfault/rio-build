@@ -1249,7 +1249,7 @@ async fn run_native_lifecycle(
             // filesystem capability (`builder.glue.pure`) and
             // resolution I/O *faults* were classified infra-transient
             // at the resolve step
-            // (`builder.result.input-materialization-is-infra+5`) —
+            // (`builder.result.input-materialization-is-infra+6`) —
             // but a not-found is not a fault, so it slipped past that
             // classification and re-surfaced here as a
             // deterministic-looking rejection. The arbitration closes
@@ -1406,7 +1406,7 @@ async fn run_native_lifecycle(
         // derivation-caused exec errno (EACCES, ENOEXEC, E2BIG, …)
         // requires the file to EXIST, which absence cannot produce —
         // those stay permanent below even with gaps on record.
-        // r[impl builder.result.input-materialization-is-infra+5]
+        // r[impl builder.result.input-materialization-is-infra+6]
         // VerdictArm::ExecErrno consults dropped
         Err(rio_exec::ExecError::Setup(se))
             if !oom_detected
@@ -1437,7 +1437,7 @@ async fn run_native_lifecycle(
         // and the daemon-era path report it as a permanent build failure
         // in the build log, not as something to retry. Materialization
         // faults stay infra-transient: they surface earlier as bind-mount
-        // failures (r[builder.result.input-materialization-is-infra+5]) or
+        // failures (r[builder.result.input-materialization-is-infra+6]) or
         // as EIO, never as these errnos at exec time — every input bind
         // already succeeded by the time the child execs.
         Err(rio_exec::ExecError::Setup(se))
@@ -1536,12 +1536,14 @@ async fn run_native_lifecycle(
                         .collect();
                     let drv_owned = drv.clone();
                     let metadata_owned: Vec<ValidatedPathInfo> = input_metadata.to_vec();
+                    let dropped_owned = dropped_inputs.clone();
                     let processed = tokio::task::spawn_blocking(move || {
                         native_result::process_outputs(
                             &drv_owned,
                             &to_process,
                             SANDBOX_BUILD_UID,
                             &metadata_owned,
+                            &dropped_owned,
                         )
                     })
                     .await;
@@ -1554,6 +1556,24 @@ async fn run_native_lifecycle(
                             start_time,
                             stop_time,
                         }),
+                        Ok(Err(native_result::OutputRejection::DroppedMemberReferenced {
+                            output,
+                            member,
+                        })) => {
+                            // NOT a build fault: the output references a
+                            // member the resolve dropped (read lag / GC
+                            // race) — registering it would record a
+                            // reference the metadata plane cannot see.
+                            // Same re-dispatch channel as the glue arm.
+                            Err(ExecutorError::MetadataFetch {
+                                path: member.clone(),
+                                source: tonic::Status::not_found(format!(
+                                    "output '{output}' references {member}, absent from \
+                                     the store at resolve time; re-dispatch re-resolves \
+                                     the closure"
+                                )),
+                            })
+                        }
                         Ok(Err(rejection)) => {
                             // Every rejection (policy violation, FOD with
                             // references, canonicalisation failure, …)
@@ -1881,7 +1901,7 @@ struct ResolvedInputs {
     /// every verdict-producing arm ([`dropped::VerdictArm`]'s closed
     /// table) so a residency gap surfaces as a re-dispatch instead of
     /// laundering into a permanent verdict at any of them.
-    // r[impl builder.result.input-materialization-is-infra+5]
+    // r[impl builder.result.input-materialization-is-infra+6]
     dropped_inputs: dropped::DroppedInputs,
     /// ATerm text for the main `.drv` plus the declaration-demanded
     /// graph `.drv`s: the request glue's only source of derivation
@@ -2115,7 +2135,7 @@ async fn resolve_inputs(
 /// Every other GlueError stays a permanent input property
 /// (`builder.glue.pure` — the glue holds no I/O capability, so no
 /// transient class originates inside it).
-// r[impl builder.result.input-materialization-is-infra+5]
+// r[impl builder.result.input-materialization-is-infra+6]
 // VerdictArm::GlueRejection consults dropped
 fn arbitrate_glue_rejection(
     e: glue::GlueError,
@@ -2225,7 +2245,7 @@ mod tests {
     /// re-classifies to MetadataFetch (infra → re-dispatch) when its
     /// path is in the dropped set, and stays a permanent Glue
     /// rejection otherwise.
-    // r[verify builder.result.input-materialization-is-infra+5]
+    // r[verify builder.result.input-materialization-is-infra+6]
     #[test]
     fn glue_rejection_arbitrated_against_dropped_set() {
         let dropped = dropped::DroppedInputs::from_resolve(

@@ -365,7 +365,7 @@ pub(super) async fn fetch_drv_from_store(
 /// consumption: every demanded byte WILL be read by the glue, and a
 /// `.drv` that is not UTF-8 ATerm can never become readable by
 /// retrying elsewhere.
-// r[impl builder.result.input-materialization-is-infra+5]
+// r[impl builder.result.input-materialization-is-infra+6]
 // r[impl builder.glue.pure]
 // r[impl builder.glue.drv-table-demand]
 pub(super) async fn fetch_demanded_graph_drvs(
@@ -580,7 +580,7 @@ pub(super) async fn compute_input_closure(
                 // be able to tell "the store didn't have it at resolve
                 // time" (infra — re-dispatch re-resolves) from "the
                 // declaration is wrong" (input-rejected).
-                // r[impl builder.result.input-materialization-is-infra+5]
+                // r[impl builder.result.input-materialization-is-infra+6]
                 tracing::debug!(path = %path, "input not in store; dropped from JIT allowlist");
                 dropped.insert(path);
                 continue;
@@ -1070,7 +1070,7 @@ mod tests {
         // The drop is EVIDENCE, not silence: the dropped set is what the
         // glue-rejection arbitration consults to tell a resolve-time
         // residency gap from a genuinely-wrong declaration.
-        // r[verify builder.result.input-materialization-is-infra+5]
+        // r[verify builder.result.input-materialization-is-infra+6]
         assert_eq!(
             closure.dropped.iter().collect::<Vec<_>>(),
             vec![&p_missing],
@@ -1538,7 +1538,7 @@ mod tests {
     /// and a demanded path whose bytes are not UTF-8 ATerm is
     /// permanent (consumption-backed: the glue WILL read these bytes,
     /// and they can never become readable by retrying elsewhere).
-    // r[verify builder.result.input-materialization-is-infra+5]
+    // r[verify builder.result.input-materialization-is-infra+6]
     // r[verify builder.glue.drv-table-demand]
     #[tokio::test]
     async fn demanded_fetch_and_error_classification() -> anyhow::Result<()> {

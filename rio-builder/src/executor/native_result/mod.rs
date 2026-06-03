@@ -374,6 +374,17 @@ pub(crate) enum OutputRejection {
     PolicyParse(#[from] PolicyParseError),
     #[error("reference scan of output '{output}' failed: {message}")]
     Scan { output: String, message: String },
+    /// An output's recorded references include a member the resolve
+    /// DROPPED (round-17 merged_bug_054 c3): registering it would
+    /// record a reference set whose member is absent from the store's
+    /// metadata plane — the GC-collects-a-live-dep corruption channel.
+    /// NOT a build fault: maps to infrastructure (re-dispatch
+    /// re-resolves) at the call site, never `OutputRejected`.
+    #[error(
+        "output '{output}' references {member}, which was absent from the store at \
+         resolve time (read lag or GC race); re-dispatch re-resolves the closure"
+    )]
+    DroppedMemberReferenced { output: String, member: String },
     #[error(
         "outputs reference each other in a cycle ({involving:?}); cyclic outputs cannot be \
          registered"
@@ -424,8 +435,9 @@ pub(crate) fn process_outputs(
     outputs: &[OutputToProcess],
     build_uid: u32,
     input_closure: &[ValidatedPathInfo],
+    dropped: &crate::executor::dropped::DroppedInputs,
 ) -> Result<ProcessedOutputs, OutputRejection> {
-    let result = process_outputs_inner(drv, outputs, build_uid, input_closure);
+    let result = process_outputs_inner(drv, outputs, build_uid, input_closure, dropped);
     if let Err(rejection) = &result {
         warn!(
             output = %outputs.first().map(|o| o.store_path.as_str()).unwrap_or("<none>"),
@@ -441,13 +453,35 @@ fn process_outputs_inner(
     outputs: &[OutputToProcess],
     build_uid: u32,
     input_closure: &[ValidatedPathInfo],
+    dropped: &crate::executor::dropped::DroppedInputs,
 ) -> Result<ProcessedOutputs, OutputRejection> {
     let policy = OutputPolicy::parse(drv.env())?;
     let ca_spec = ca::FloatingCaSpec::from_outputs(drv.outputs())?;
-    let candidates = reference_candidates(outputs, input_closure);
+    let candidates = reference_candidates(outputs, input_closure, dropped);
 
     // Pass 1: canonicalise + scan each output (one NAR read per output).
     let mut processed = canonicalise_and_scan_outputs(outputs, build_uid, &candidates, &policy)?;
+
+    // DROPPED-MEMBER REFERENCE GATE — placed immediately after the
+    // scan and BEFORE the policy passes, so a gap-caused reference can
+    // never re-launder as a policy verdict (allowedReferences blaming
+    // the derivation for a member the resolve dropped). The candidate
+    // set was augmented with the dropped members DETECTION-ONLY: they
+    // are findable, never registrable.
+    // r[impl builder.result.input-materialization-is-infra+6]
+    // VerdictArm::Registration consults dropped
+    for out in &processed {
+        if let Some(member) = out
+            .references
+            .iter()
+            .find_map(|r| dropped.covering_member(r))
+        {
+            return Err(OutputRejection::DroppedMemberReferenced {
+                output: out.name.clone(),
+                member: member.to_string(),
+            });
+        }
+    }
 
     // Fixed-output (CAFixed) outputs: record the declared content-address
     // descriptor so registration carries the `CA:` field exactly like
@@ -487,12 +521,21 @@ fn process_outputs_inner(
 fn reference_candidates(
     outputs: &[OutputToProcess],
     input_closure: &[ValidatedPathInfo],
+    dropped: &crate::executor::dropped::DroppedInputs,
 ) -> CandidateSet {
     let mut candidate_paths: Vec<String> = input_closure
         .iter()
         .map(|p| p.store_path.to_string())
         .collect();
     candidate_paths.extend(outputs.iter().map(|o| o.store_path.clone()));
+    // Dropped members are DETECTION-ONLY candidates (round-17
+    // merged_bug_054 c3): the resolve removed them from the closure
+    // metadata, so without this the scanner cannot SEE a reference to
+    // one — the omission silently registered an output whose real
+    // runtime reference set includes a path the GC may collect. They
+    // are added post-discard, never re-entering the closure: an output
+    // found referencing one fails the gate above the policy passes.
+    candidate_paths.extend(dropped.iter().map(String::from));
     CandidateSet::from_paths(&candidate_paths)
 }
 
@@ -756,6 +799,10 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    fn no_dropped() -> crate::executor::dropped::DroppedInputs {
+        crate::executor::dropped::DroppedInputs::default()
+    }
+
     fn my_uid() -> u32 {
         nix::unistd::geteuid().as_raw()
     }
@@ -979,7 +1026,7 @@ mod tests {
     /// The dropped-evidence rung's precedence cells (round-17
     /// merged_bug_054 c2): below OOM and disk-full, above
     /// network-transient, never touching kill-class or success.
-    // r[verify builder.result.input-materialization-is-infra+5]
+    // r[verify builder.result.input-materialization-is-infra+6]
     #[test]
     fn dropped_rung_precedence() {
         use BuildResultStatus as S;
@@ -1250,7 +1297,7 @@ mod tests {
         ]);
         let drv = drv_from_aterm(&[("dev", &dev_p), ("out", &out_p)], &[]);
 
-        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[], &no_dropped()).unwrap();
         assert_eq!(processed.outputs.len(), 2);
         assert_eq!(processed.outputs[0].name, "out", "dependency first");
         assert_eq!(processed.outputs[1].name, "dev");
@@ -1267,6 +1314,48 @@ mod tests {
         assert_eq!(meta.permissions().mode() & 0o7777, 0o444);
     }
 
+    /// Registration arm witness (round-17 merged_bug_054 c3): an
+    /// output whose payload references a DROPPED member is detected
+    /// (the member rides the candidate set detection-only) and fails
+    /// registration with the typed rejection — BEFORE any policy pass
+    /// could re-launder it; without the gap the same payload registers
+    /// (the member is then a normal closure ref).
+    // r[verify builder.result.input-materialization-is-infra+6]
+    #[test]
+    fn dropped_member_reference_fails_registration() {
+        let out_p = sp('a', "thing");
+        let gone_p = sp('g', "gone-dep");
+        let (_tmp, outputs) = fake_outputs(&[(
+            "out",
+            &out_p,
+            format!("links against {gone_p}/lib/libgone.so").as_bytes(),
+        )]);
+        let drv = drv_from_aterm(&[("out", &out_p)], &[]);
+        let dropped = crate::executor::dropped::DroppedInputs::from_resolve(
+            [gone_p.clone()].into_iter().collect(),
+        );
+        let err = process_outputs(&drv, &outputs, my_uid(), &[], &dropped).unwrap_err();
+        match err {
+            OutputRejection::DroppedMemberReferenced { output, member } => {
+                assert_eq!(output, "out");
+                assert_eq!(member, gone_p);
+            }
+            other => panic!("expected DroppedMemberReferenced, got {other}"),
+        }
+        // Same payload, no gap, member resident in the closure → registers,
+        // and the reference is RECORDED (the silent-omission half).
+        let info = input_info(&gone_p);
+        let (_tmp2, outputs2) = fake_outputs(&[(
+            "out",
+            &out_p,
+            format!("links against {gone_p}/lib/libgone.so").as_bytes(),
+        )]);
+        let processed = process_outputs(&drv, &outputs2, my_uid(), &[info], &no_dropped()).unwrap();
+        assert!(
+            processed.outputs[0].references.iter().any(|r| r == &gone_p),
+            "with the member resident the reference must be RECORDED"
+        );
+    }
     #[test]
     fn missing_output_rejected() {
         let out_p = sp('a', "thing");
@@ -1276,7 +1365,7 @@ mod tests {
             store_path: out_p,
             host_path: PathBuf::from("/nonexistent/rio-test-output"),
         }];
-        let err = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap_err();
+        let err = process_outputs(&drv, &outputs, my_uid(), &[], &no_dropped()).unwrap_err();
         assert!(matches!(
             err,
             OutputRejection::Canonicalise(CanonicaliseError::Missing { .. })
@@ -1292,7 +1381,7 @@ mod tests {
             ("dev", &dev_p, format!("points at {out_p}").as_bytes()),
         ]);
         let drv = drv_from_aterm(&[("out", &out_p), ("dev", &dev_p)], &[]);
-        let err = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap_err();
+        let err = process_outputs(&drv, &outputs, my_uid(), &[], &no_dropped()).unwrap_err();
         assert!(matches!(err, OutputRejection::Cycle { .. }), "got {err}");
     }
 
@@ -1312,7 +1401,8 @@ mod tests {
         // The embedded path must be a scan candidate → supply it as input
         // closure metadata.
         let input_info = input_info(&input);
-        let err = process_outputs(&drv, &outputs, my_uid(), &[input_info]).unwrap_err();
+        let err =
+            process_outputs(&drv, &outputs, my_uid(), &[input_info], &no_dropped()).unwrap_err();
         assert!(
             matches!(err, OutputRejection::FodHasReferences { .. }),
             "got {err}"
@@ -1330,7 +1420,7 @@ mod tests {
         let declared_hex = "11".repeat(32);
         let drv = drv_from_aterm_ca(&[("out", &out_p, "r:sha256", &declared_hex)], &[]);
 
-        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[], &no_dropped()).unwrap();
 
         let expected = rio_nix::hash::NixHash::new(
             rio_nix::hash::HashAlgo::SHA256,
@@ -1361,7 +1451,7 @@ mod tests {
         let declared_hex = "22".repeat(32);
         let drv = drv_from_aterm_ca(&[("out", &out_p, "sha256", &declared_hex)], &[]);
 
-        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[], &no_dropped()).unwrap();
 
         let expected = rio_nix::hash::NixHash::new(
             rio_nix::hash::HashAlgo::SHA256,
@@ -1419,7 +1509,7 @@ mod tests {
         ];
         let drv = drv_from_aterm_ca(&[("out", &out_p, "", ""), ("doc", &doc_p, "", "")], &[]);
 
-        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[], &no_dropped()).unwrap();
         for p in &processed.outputs {
             assert_eq!(
                 p.content_address, None,
@@ -1435,7 +1525,8 @@ mod tests {
         let (_tmp, outputs) = fake_outputs(&[("out", &out_p, format!("uses {bad}").as_bytes())]);
         let drv = drv_from_aterm(&[("out", &out_p)], &[("disallowedRequisites", &bad)]);
         let bad_info = input_info(&bad);
-        let err = process_outputs(&drv, &outputs, my_uid(), &[bad_info]).unwrap_err();
+        let err =
+            process_outputs(&drv, &outputs, my_uid(), &[bad_info], &no_dropped()).unwrap_err();
         assert!(matches!(err, OutputRejection::Policy(_)), "got {err}");
     }
 
@@ -1448,7 +1539,8 @@ mod tests {
         let json = serde_json::json!({ "unsafeDiscardReferences": { "out": true } }).to_string();
         let drv = drv_from_aterm(&[("out", &out_p)], &[("__json", &json)]);
         let input_info = input_info(&input);
-        let processed = process_outputs(&drv, &outputs, my_uid(), &[input_info]).unwrap();
+        let processed =
+            process_outputs(&drv, &outputs, my_uid(), &[input_info], &no_dropped()).unwrap();
         assert!(
             processed.outputs[0].references.is_empty(),
             "references must be discarded"
@@ -1461,7 +1553,7 @@ mod tests {
         let (_tmp, outputs) = fake_outputs(&[("out", &out_p, &[0u8; 4096])]);
         let json = serde_json::json!({ "outputChecks": { "out": { "maxSize": 16 } } }).to_string();
         let drv = drv_from_aterm(&[("out", &out_p)], &[("__json", &json)]);
-        let err = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap_err();
+        let err = process_outputs(&drv, &outputs, my_uid(), &[], &no_dropped()).unwrap_err();
         assert!(
             matches!(&err, OutputRejection::Policy(v) if v.rule == "maxSize"),
             "got {err}"
@@ -1528,7 +1620,7 @@ mod tests {
         );
         outputs.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic input order
 
-        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[], &no_dropped()).unwrap();
         let out = processed.outputs.iter().find(|o| o.name == "out").unwrap();
         let doc = processed.outputs.iter().find(|o| o.name == "doc").unwrap();
 
@@ -1586,7 +1678,7 @@ mod tests {
             fake_outputs(&[("out", &scratch, format!("I live at {scratch}").as_bytes())]);
         let drv = drv_from_aterm_ca(&[("out", "", "r:sha256", "")], &[]);
 
-        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[], &no_dropped()).unwrap();
         let out = &processed.outputs[0];
         assert_ne!(out.store_path, scratch);
         // The self-reference is recorded at the final path.
@@ -1643,7 +1735,7 @@ mod tests {
             host_path: host,
         }];
         let drv = drv_from_aterm_ca(&[("out", "", "sha256", "")], &[]);
-        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[], &no_dropped()).unwrap();
         let out = &processed.outputs[0];
         assert_ne!(out.store_path, scratch);
         assert_eq!(
@@ -1659,7 +1751,7 @@ mod tests {
         let scratch = sp('s', "blob");
         let (_tmp, outputs) = fake_outputs(&[("out", &scratch, b"inside a dir")]);
         let drv = drv_from_aterm_ca(&[("out", "", "sha256", "")], &[]);
-        let err = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap_err();
+        let err = process_outputs(&drv, &outputs, my_uid(), &[], &no_dropped()).unwrap_err();
         assert!(
             matches!(err, OutputRejection::CaFlatNotSingleFile { .. }),
             "got {err}"
@@ -1709,7 +1801,7 @@ mod tests {
             &[("__json", &json)],
         );
 
-        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[], &no_dropped()).unwrap();
         let dep = processed.outputs.iter().find(|o| o.name == "dep").unwrap();
         let out = processed.outputs.iter().find(|o| o.name == "out").unwrap();
 
@@ -1771,7 +1863,7 @@ mod tests {
         let json = serde_json::json!({ "unsafeDiscardReferences": { "out": true } }).to_string();
         let drv = drv_from_aterm_ca(&[("out", "", "sha256", "")], &[("__json", &json)]);
 
-        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
+        let processed = process_outputs(&drv, &outputs, my_uid(), &[], &no_dropped()).unwrap();
         let out = &processed.outputs[0];
         assert!(out.references.is_empty());
         assert_ne!(out.store_path, scratch);
@@ -1821,7 +1913,7 @@ mod tests {
         let scratch = sp('s', "old");
         let (_tmp, outputs) = fake_outputs(&[("out", &scratch, b"x")]);
         let drv = drv_from_aterm_ca(&[("out", "", "md5", "")], &[]);
-        let err = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap_err();
+        let err = process_outputs(&drv, &outputs, my_uid(), &[], &no_dropped()).unwrap_err();
         assert!(
             matches!(err, OutputRejection::CaUnsupportedAlgo { ref algo, .. } if algo == "md5"),
             "got {err}"
@@ -1876,7 +1968,7 @@ mod tests {
             &[("doc", "", "r:sha256", ""), ("out", "", "r:sha256", "")],
             &[("__json", &json)],
         );
-        let err = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap_err();
+        let err = process_outputs(&drv, &outputs, my_uid(), &[], &no_dropped()).unwrap_err();
         let OutputRejection::Policy(violation) = &err else {
             panic!("expected a policy violation, got {err}");
         };
