@@ -59,6 +59,7 @@ let
   componentscaler = import ./scenarios/componentscaler.nix;
   substitute = import ./scenarios/substitute.nix;
   substitute-scale = import ./scenarios/substitute-scale.nix;
+  replay-ladder = import ./scenarios/replay-ladder.nix;
   sla-sizing = import ./scenarios/sla-sizing.nix;
   forecast-provisioning = import ./scenarios/forecast-provisioning.nix;
   kwok = import ./fixtures/kwok.nix { inherit pkgs; };
@@ -468,6 +469,113 @@ in
         ];
       };
     };
+
+  # ── replay probe ladder (standalone fixture, zero workers) ──────────
+  # The rio-replay campaign engine against the real cluster: a recorded
+  # archive, a scripted engine→gateway partition mid-campaign, and the
+  # canary-probe ladder walked end to end (latch → failed probes →
+  # operator PAUSE → recovery via target substitution → drain). See the
+  # scenario header for the real-vs-scripted inventory.
+  vm-replay-ladder-standalone =
+    let
+      # Relay TLS material for the breaker-neutrality subtest. The
+      # archive format only admits https:// (or s3://) relay
+      # substituters — the engine never relays over cleartext — so the
+      # truncating relay is nginx with a test CA the client VM (where
+      # the engine runs) trusts via security.pki.
+      #
+      # Key generation is NOT deterministic, but unlike the HMAC-key
+      # case (lib/hmac-keys.nix) nothing depends on two derivations
+      # agreeing on the bytes: CA, server cert, and nginx config all
+      # come from THIS one output and its single consumer is the client
+      # VM closure — one realization, internally consistent.
+      relayCerts =
+        pkgs.runCommand "replay-relay-certs"
+          {
+            nativeBuildInputs = [ pkgs.openssl ];
+          }
+          ''
+            mkdir -p $out
+            openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+              -keyout $out/ca.key -out $out/ca.crt -days 36500 -nodes \
+              -subj "/CN=rio-replay-vmtest-ca"
+            openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+              -keyout $out/server.key -out server.csr -nodes -subj "/CN=client"
+            printf 'subjectAltName=DNS:client\n' > san.ext
+            openssl x509 -req -in server.csr -CA $out/ca.crt -CAkey $out/ca.key \
+              -CAcreateserial -out $out/server.crt -days 36500 -extfile san.ext
+          '';
+      replayLadderFixture = standalone {
+        # Zero workers: every resolvable job resolves via the
+        # scheduler's substitution walk; outage-phase jobs can only
+        # fail. Removes builder timing from the latch/probe walk.
+        workers = { };
+        # Service-HMAC so walk_substitute_closure mints service tokens
+        # (without it the store sees an anonymous substitute request
+        # and skips substitution — same wiring as vm-substitute).
+        withHmac = true;
+        # psql for tenant creation + rio-cli upstream add run on
+        # control.
+        extraPackages = [ pkgs.postgresql_18 ];
+        extraClientModules = [
+          {
+            # :8080 = plain-HTTP tenant upstream (rio-store fetches
+            # it); :8443 = the HTTPS truncating relay (the engine
+            # fetches it).
+            networking.firewall.allowedTCPPorts = [
+              8080
+              8443
+            ];
+            security.pki.certificateFiles = [ "${relayCerts}/ca.crt" ];
+            services.nginx = {
+              enable = true;
+              virtualHosts."client" = {
+                onlySSL = true;
+                listen = [
+                  {
+                    addr = "0.0.0.0";
+                    port = 8443;
+                    ssl = true;
+                  }
+                ];
+                sslCertificate = "${relayCerts}/server.crt";
+                sslCertificateKey = "${relayCerts}/server.key";
+                root = "/srv/relay";
+              };
+            };
+          }
+        ];
+      };
+    in
+    (replay-ladder {
+      inherit pkgs common;
+      fixture = replayLadderFixture;
+    }).mkTest
+      {
+        name = "default";
+        subtests = [
+          # r[verify replay.probe.single-job]
+          # r[verify replay.probe.work-evidence]
+          # r[verify replay.probe.escalate-pause]
+          #   The full ladder arc against the real cluster: the latch
+          #   trips on real infra-indeterminate terminals minted by a
+          #   scripted partition; exactly three single-job probe
+          #   batches fail (no journal entries, no budget charges, no
+          #   terminal records for conscripted jobs) before the PAUSE
+          #   file lands; after the operator clears it, the recovery
+          #   probe succeeds VIA TARGET SUBSTITUTION, resets the
+          #   ladder, and the campaign drains with no second PAUSE.
+          "probe-ladder-walk"
+          # r[verify replay.supply.relay-payload-neutral]
+          #   16 serial streamed relay uploads die mid-body (truncated
+          #   NARs behind intact narinfos) — nearly 3× the collapse
+          #   threshold — and the breaker stays closed: per-path
+          #   payload-source FAILED rows, zero "gateway unreachable"
+          #   skip-stamps, no supply-collapse PAUSE, and the campaign
+          #   completes with both roots substituted.
+          "relay-breaker-neutrality"
+        ];
+      };
 
   # ── sla-sizing (standalone fixture, scripted-telemetry worker) ───────
   vm-sla-sizing-standalone =
