@@ -412,7 +412,7 @@ let
   # (an inlined function from a dep shows up in the caller's profile;
   # without instrumented dep rlib, llvm-cov can't map it back). The
   # parallel tree is a second `cargoNix` instantiation (crateBuildCov)
-  # with globalExtraRustcOpts=["-Cinstrument-coverage"] — see
+  # with localExtraRustcOpts=["-Cinstrument-coverage"] — see
   # crate2nix.nix. devDepsForCov (defined alongside devDepsFor above)
   # dereferences crateBuildCov's builtCrates so instrumented rlibs
   # link together.

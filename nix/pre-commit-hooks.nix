@@ -6,6 +6,30 @@
   pkgs,
   crate2nixCli,
 }:
+let
+  # Shared guard for every hook that spawns cargo: a stale shell can
+  # outlive `nix store gc`, leaving RUSTC_WRAPPER pointing at a collected
+  # store path — and cargo execs `$RUSTC_WRAPPER rustc -vV` even for
+  # `cargo metadata`, so crate2nix-check and hakari-check die exactly
+  # like compile hooks do, just with a less obvious error. Skip with the
+  # real reason instead of letting each hook misattribute the failure.
+  # PATH-aware like cargo's own resolution: a bare-name wrapper (a
+  # user-level RUSTC_WRAPPER=sccache) must be looked up, not tested as a
+  # CWD-relative pathname.
+  rustcWrapperGuard = ''
+    if [ -n "''${RUSTC_WRAPPER:-}" ]; then
+      case "$RUSTC_WRAPPER" in
+        */*) wrapper_ok=$([ -x "$RUSTC_WRAPPER" ] && echo 1 || echo 0) ;;
+        *) wrapper_ok=$(command -v "$RUSTC_WRAPPER" >/dev/null 2>&1 && echo 1 || echo 0) ;;
+      esac
+      if [ "$wrapper_ok" = 0 ]; then
+        echo "''${0##*/}: RUSTC_WRAPPER does not resolve (stale shell after nix store gc?); skipping — re-enter the dev shell. CI enforces this gate" >&2
+        exit 0
+      fi
+      unset wrapper_ok
+    fi
+  '';
+in
 {
   # Reject commits containing cargo-mutants dirty markers.
   # `cargo xtask mutants` mutates source in-place; if it crashes or is
@@ -44,9 +68,10 @@
   # Reject commits that change a query! SQL string without
   # regenerating .sqlx/. With SQLX_OFFLINE=true, any query!
   # whose SQL hash no longer matches a .sqlx/*.json file
-  # fails to compile — so `cargo check` on the crates that
-  # use query! is the definitive staleness check. ~5s
-  # incremental. Fires only on .rs changes to skip docs-only
+  # fails to compile — so `cargo check --all-targets` on the
+  # crates that use query! is the definitive staleness check
+  # (seconds warm; the unit-test graph of three crates when
+  # cold). Fires only on .rs changes to skip docs-only
   # commits. CI catches the same failure via the clippy/nextest
   # builds, so this hook is dev-ergonomics:
   # fail at commit time instead of 10min later.
@@ -68,15 +93,7 @@
           echo 'sqlx-prepare-check: not in the rio dev shell (RIO_DEVSHELL unset); skipping — CI enforces this gate' >&2
           exit 0
         fi
-        # A stale shell can outlive `nix store gc`: RUSTC_WRAPPER then
-        # points at a collected store path and every cargo spawn dies
-        # before kache's fail-open could run — which the || branch below
-        # would misread as a stale sqlx cache and block the commit with
-        # the wrong message. Skip with the real reason instead.
-        if [ -n "''${RUSTC_WRAPPER:-}" ] && [ ! -x "''${RUSTC_WRAPPER}" ]; then
-          echo 'sqlx-prepare-check: RUSTC_WRAPPER does not resolve (stale shell after nix store gc?); skipping — re-enter the dev shell. CI enforces this gate' >&2
-          exit 0
-        fi
+        ${rustcWrapperGuard}
         # Re-pin the sqlx contract variable from THIS repo's toplevel:
         # the inherited value is frozen at shell entry and may belong to
         # a sibling worktree (tmux pane that cd'd over) — the check must
@@ -95,8 +112,13 @@
           # test-only entry sails through commit and fails in CI ~10min
           # later. Scoped to query!-touching commits, so the wider unit
           # graph only compiles when it can actually catch something.
+          # Compiler diagnostics stay on stderr (--quiet drops only
+          # cargo's status lines) — the trailer must not claim more than
+          # it knows: EACCES over a kache restore, a gc'd cargo, or a
+          # plain type error all land here too, and "regen sqlx" fixes
+          # none of them.
           SQLX_OFFLINE=true cargo check --quiet --all-targets -p rio-scheduler -p rio-store -p rio-controller \
-            || { echo 'sqlx query cache stale — run `cargo xtask regen sqlx`'; exit 1; }
+            || { echo 'sqlx-prepare-check failed — if the errors above say `no cached data for query`, run `cargo xtask regen sqlx`; otherwise fix the reported error'; exit 1; }
         fi
       ''
     );
@@ -119,6 +141,7 @@
     entry = toString (
       pkgs.writeShellScript "crate2nix-check" ''
         set -euo pipefail
+        ${rustcWrapperGuard}
         # Gate on staged Cargo.{toml,lock}. In the hermetic
         # check derivation (pre-commit run --all-files on a
         # clean checkout), nothing is staged → no-op. This
@@ -175,12 +198,17 @@
     entry = toString (
       pkgs.writeShellScript "hakari-check" ''
         set -euo pipefail
+        ${rustcWrapperGuard}
         if ! git diff --cached --name-only \
            | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
           exit 0
         fi
-        ${pkgs.cargo-hakari}/bin/cargo-hakari hakari verify 2>/dev/null || {
-          echo 'error: workspace-hack is stale — run `cargo xtask regen hakari`'
+        # No stderr redirect: hakari verify's diff (and any environment
+        # failure, e.g. a dead cargo) must reach the committer — a
+        # swallowed cause with a confident "regen hakari" trailer sends
+        # people down the wrong path.
+        ${pkgs.cargo-hakari}/bin/cargo-hakari hakari verify || {
+          echo 'error: workspace-hack is stale — run `cargo xtask regen hakari` (if the output above shows a different failure, fix that instead)'
           exit 1
         }
       ''

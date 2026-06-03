@@ -306,7 +306,7 @@
               rio-crates = crateBuild.memberBins;
 
               # Coverage-instrumented workspace. crate2nix parallel tree
-              # with globalExtraRustcOpts=["-Cinstrument-coverage"]. Used
+              # with localExtraRustcOpts=["-Cinstrument-coverage"]. Used
               # by vmTestsCov + nix/coverage.nix. NOT stripped (stripping
               # removes the __llvm_covfun/__llvm_covmap sections llvm-cov
               # needs). remap-path-prefix at compile time collapses the

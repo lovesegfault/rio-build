@@ -492,6 +492,11 @@ fn workspace() -> Result<serde_json::Value> {
                 if let Some(d) = cfg.get("dev-dependencies").and_then(|v| v.as_table()) {
                     dev.extend(internal(d).0);
                 }
+                if let Some(d) = cfg.get("build-dependencies").and_then(|v| v.as_table()) {
+                    let (r, o) = internal(d);
+                    build.extend(r);
+                    build.extend(o);
+                }
             }
         }
         // Self-dep (rio-store has `path = "."` under dev-deps to enable
@@ -500,20 +505,22 @@ fn workspace() -> Result<serde_json::Value> {
         optional.remove(name);
         dev.remove(name);
         build.remove(name);
-        // Dep in prod+dev → solid only; in optional+dev → dotted only
+        // Edge precedence: prod > optional > build > dev — each dep
+        // renders exactly one edge, the strongest that applies.
         // (rio-store has rio-test-support in both optional [deps] AND
-        // [dev-deps]; without this filter the autograph would render a
-        // dotted+dashed double-edge). Build edges dedup the same way:
-        // a dep that is also a runtime dep renders only its stronger
-        // runtime edge.
-        let dev: Vec<_> = dev
+        // [dev-deps]; without dedup the autograph would render a
+        // dotted+dashed double-edge.) Build outranks dev because a
+        // build-dep shapes the production artifact while a dev-dep is
+        // test-only — a dep in both must not render as "dashed =
+        // [dev-dependencies] only".
+        let build: Vec<_> = build
             .difference(&prod)
             .filter(|d| !optional.contains(*d))
             .cloned()
             .collect();
-        let build: Vec<_> = build
+        let dev: Vec<_> = dev
             .difference(&prod)
-            .filter(|d| !optional.contains(*d) && !dev.contains(*d))
+            .filter(|d| !optional.contains(*d) && !build.contains(*d))
             .cloned()
             .collect();
         deps.insert(
