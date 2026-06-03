@@ -272,17 +272,41 @@ impl SchedulerDb {
                 .execute(&self.pool)
                 .await?;
         } else {
-            let error_summary = settled.and_then(|s| match &s.outcome {
-                crate::state::TerminalOutcome::Failed(ff) => Some(ff.summary.as_str()),
-                _ => None,
-            });
+            // Terminal: persist the WHOLE settled payload in ONE
+            // UPDATE with the status flip — counts, outcome arm, and
+            // finished_at land atomically, so the row a post-cleanup /
+            // post-failover WatchBuild reads (migration 087,
+            // sched.watch.terminal-from-durable-row) is never a
+            // half-written verdict.
+            use crate::state::TerminalOutcome;
+            let (error_summary, failed_derivation, failure_status, cancel_reason, output_paths) =
+                match settled.map(|s| &s.outcome) {
+                    Some(TerminalOutcome::Failed(ff)) => (
+                        Some(ff.summary.as_str()),
+                        ff.failed_drv.as_deref(),
+                        ff.status.map(|st| st.as_str_name()),
+                        None,
+                        None,
+                    ),
+                    Some(TerminalOutcome::Cancelled { reason }) => {
+                        (None, None, None, Some(reason.as_str()), None)
+                    }
+                    Some(TerminalOutcome::Succeeded { output_paths }) => {
+                        (None, None, None, None, Some(output_paths.as_slice()))
+                    }
+                    None => (None, None, None, None, None),
+                };
             let (completed, cached) = settled
                 .map(|s| (s.counts.completed as i32, s.counts.cached as i32))
                 .unzip();
+            let failed = settled.map(|s| s.counts.failed as i32);
             sqlx::query(
                 "UPDATE builds SET status = $2, finished_at = now(), error_summary = $3, \
                  completed_drvs = COALESCE($4, completed_drvs), \
-                 cached_drvs = COALESCE($5, cached_drvs) \
+                 cached_drvs = COALESCE($5, cached_drvs), \
+                 failed_drvs = $6, \
+                 failed_derivation = $7, failure_status = $8, \
+                 cancel_reason = $9, output_paths = $10 \
                  WHERE build_id = $1",
             )
             .bind(build_id)
@@ -290,10 +314,51 @@ impl SchedulerDb {
             .bind(error_summary)
             .bind(completed)
             .bind(cached)
+            .bind(failed)
+            .bind(failed_derivation)
+            .bind(failure_status)
+            .bind(cancel_reason)
+            .bind(output_paths)
             .execute(&self.pool)
             .await?;
         }
 
         Ok(())
     }
+
+    /// Fetch the terminal row of a build the actor no longer holds
+    /// (post-cleanup or post-failover). `None` when the row is missing
+    /// OR not terminal — callers fall back to `NotFound` then.
+    // r[impl sched.watch.terminal-from-durable-row]
+    pub(crate) async fn get_build_terminal_row(
+        &self,
+        build_id: Uuid,
+    ) -> Result<Option<BuildTerminalRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT status, error_summary, failed_derivation, failure_status, \
+                    cancel_reason, output_paths, \
+                    total_drvs, completed_drvs, cached_drvs, failed_drvs \
+             FROM builds \
+             WHERE build_id = $1 AND status IN ('succeeded','failed','cancelled')",
+        )
+        .bind(build_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+}
+
+/// One terminal `builds` row — the durable settled payload
+/// (migration 087) a late `WatchBuild` synthesizes its snapshot from.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct BuildTerminalRow {
+    pub status: String,
+    pub error_summary: Option<String>,
+    pub failed_derivation: Option<String>,
+    pub failure_status: Option<String>,
+    pub cancel_reason: Option<String>,
+    pub output_paths: Option<Vec<String>>,
+    pub total_drvs: Option<i32>,
+    pub completed_drvs: Option<i32>,
+    pub cached_drvs: Option<i32>,
+    pub failed_drvs: Option<i32>,
 }

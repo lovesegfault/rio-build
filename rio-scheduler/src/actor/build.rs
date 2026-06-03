@@ -505,7 +505,7 @@ impl DagActor {
         let Some(build) = self.builds.get_mut(&build_id) else {
             return;
         };
-        // r[impl sched.build.terminal-status-settled+2]
+        // r[impl sched.build.terminal-status-settled+3]
         // A settled build's accounting is frozen at the terminal
         // transition — in memory AND in PG. Without this gate, a
         // dispatch-time store hit on a shared node (stale-Completed

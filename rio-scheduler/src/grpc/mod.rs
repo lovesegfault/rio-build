@@ -318,8 +318,11 @@ pub(crate) async fn resolve_tenant_name(
 /// burst > 4096). Log-channel `Lagged` is expected under chatty parallel
 /// builds and is debug-level: S3 + AdminService is the authoritative log
 /// path. A *state-channel* terminal lost to `Lagged` is recovered by the
-/// Closed → `EofWithoutTerminal` → WatchBuild reconnect → snapshot path
-/// (the snapshot reports the terminal state directly).
+/// Closed → `EofWithoutTerminal` → WatchBuild reconnect → snapshot path —
+/// the snapshot reports the terminal state directly while the build is
+/// resident, and from the durable builds row after cleanup
+/// (`r[sched.watch.terminal-from-durable-row]`), so the recovery holds
+/// unconditionally.
 pub(crate) fn bridge_build_events(
     task_name: &'static str,
     rx: BuildEventReceivers,

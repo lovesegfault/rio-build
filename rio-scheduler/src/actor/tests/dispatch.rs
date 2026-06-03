@@ -1934,7 +1934,7 @@ async fn compute_spawn_intents_carries_ice_masked_cells() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.build.terminal-status-settled+2]
+// r[verify sched.build.terminal-status-settled+3]
 /// A dispatch-time store hit that fans out to a resident terminal build
 /// must not mutate its served accounting and must not emit a
 /// post-terminal `BuildProgress` to its watchers.

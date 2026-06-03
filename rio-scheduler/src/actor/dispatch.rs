@@ -621,7 +621,7 @@ impl DagActor {
             }
         }
         for (build_id, n) in cached_per_build {
-            // r[impl sched.build.terminal-status-settled+2]
+            // r[impl sched.build.terminal-status-settled+3]
             // Dispatch-time store hits can fan out to resident terminal
             // builds that retained interest on the shared node (a
             // stale-Completed reset under a later build re-dispatched

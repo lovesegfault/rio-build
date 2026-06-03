@@ -200,7 +200,7 @@ impl DagActor {
     /// dumb — no stateful reconstruction from the DerivationEvent
     /// stream.
     pub(super) fn emit_progress(&mut self, build_id: Uuid) {
-        // r[impl sched.build.terminal-status-settled+2]
+        // r[impl sched.build.terminal-status-settled+3]
         // A terminal build's served progress is settled at its terminal
         // transition: shared-node fan-outs (release_downstream,
         // dispatch-time store hits, failure cascades) can still reach a
@@ -246,7 +246,7 @@ impl DagActor {
     /// the still-mutating DAG — live watchers (and any later WatchBuild
     /// snapshot) would see totals shrunk by mutations the finished build
     /// no longer describes.
-    // r[impl sched.build.terminal-status-settled+2]
+    // r[impl sched.build.terminal-status-settled+3]
     pub(super) fn emit_progress_with(
         &mut self,
         build_id: Uuid,

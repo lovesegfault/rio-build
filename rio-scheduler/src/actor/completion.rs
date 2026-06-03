@@ -1884,7 +1884,7 @@ impl DagActor {
                 );
                 for build_id in interested {
                     self.events.emit(build_id, event.clone());
-                    // r[impl sched.build.terminal-status-settled+2]
+                    // r[impl sched.build.terminal-status-settled+3]
                     // A resident terminal build's served accounting is
                     // frozen — the per-drv DerivationCached event above
                     // still flows, but its cached_derivations count must
@@ -3646,7 +3646,7 @@ impl DagActor {
         drv_hash: &DrvHash,
         status: rio_proto::types::BuildResultStatus,
     ) {
-        // r[impl sched.build.terminal-status-settled+2]
+        // r[impl sched.build.terminal-status-settled+3]
         // A build that already reached a terminal state keeps its
         // settled outcome: a shared node failing later (re-dispatched by
         // another build during the cleanup window) must not rewrite this

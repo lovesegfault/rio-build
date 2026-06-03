@@ -1855,6 +1855,32 @@ pub const M_082: () = ();
 /// window has zero behavioral delta.
 pub const M_083: () = ();
 
+/// `migrations/087_build_terminal_payload.sql`
+///
+/// Durable terminal payload for builds (bughunt fix wave C1
+/// terminal-capture, merged_bug_323; spec rule
+/// `sched.watch.terminal-from-durable-row`). Five nullable columns on
+/// `builds`, written ONCE by the terminal arm of
+/// `update_build_status` in the same UPDATE as the status flip:
+///
+/// - `failed_derivation TEXT` / `failure_status TEXT` (CHECK over the
+///   proto `BuildResultStatus` `as_str_name()` set): the captured
+///   first failure. Build-level failures (per-build timeout) leave
+///   `failed_derivation` NULL by construction.
+/// - `cancel_reason TEXT`: the REQUIRED reason of the cancel intent.
+/// - `output_paths TEXT[]`: root output paths captured at the
+///   terminal transition (Succeeded arm).
+/// - `failed_drvs INTEGER`: the settled failed count, completing the
+///   persisted accounting (total/completed/cached pre-existed).
+///
+/// This deliberately UPGRADES the documented in-memory-only posture of
+/// the failure trio: a post-cleanup or post-failover `WatchBuild` now
+/// answers from the `builds` row with the recorded verdict instead of
+/// `NotFound` (which the gateway converted into a fabricated failure
+/// after ~111s of reconnect attempts). NULL columns (pre-087 terminal
+/// rows) degrade to the old empty-payload snapshot — additive only.
+pub const M_087: () = ();
+
 /// `migrations/093_live_pins_kind_key.sql`
 ///
 /// Pin kinds become DISJOINT ROW SETS (bughunt wave, bug_253/bug_233;

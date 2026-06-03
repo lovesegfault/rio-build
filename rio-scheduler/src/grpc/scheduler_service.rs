@@ -296,7 +296,34 @@ impl SchedulerService for SchedulerGrpc {
         // the stream's first message followed by the live broadcast is
         // gap-free by construction — no sequence numbers, no PG replay,
         // no dedup.
-        let (bcast, snapshot) = self.send_and_await(cmd, reply_rx).await?;
+        let (bcast, snapshot) = match self.send_and_await(cmd, reply_rx).await {
+            Ok(x) => x,
+            // r[impl sched.watch.terminal-from-durable-row]
+            // The actor no longer holds the build (terminal cleanup ran,
+            // or this is a fresh post-failover leader that only recovers
+            // non-terminal builds). The builds row carries the settled
+            // verdict (migration 087) — answer with ONE synthesized
+            // terminal snapshot instead of NotFound, which the gateway
+            // would convert into a fabricated failure after burning
+            // ~111s of reconnect attempts (merged_bug_323).
+            Err(status) if status.code() == tonic::Code::NotFound => {
+                let Some(db) = &self.db else {
+                    return Err(status);
+                };
+                let Some(row) = db
+                    .get_build_terminal_row(build_id)
+                    .await
+                    .map_err(|e| Status::internal(format!("terminal-row lookup failed: {e}")))?
+                else {
+                    return Err(status);
+                };
+                let event = synthesize_terminal_snapshot(build_id, row);
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                let _ = tx.send(Ok(event)).await;
+                return Ok(Response::new(ReceiverStream::new(rx)));
+            }
+            Err(e) => return Err(e),
+        };
 
         Ok(Response::new(bridge_build_events(
             "watch-build-bridge",
@@ -417,5 +444,48 @@ impl SchedulerService for SchedulerGrpc {
         Ok(Response::new(rio_proto::scheduler::ResolveTenantResponse {
             tenant_id: tenant_id.to_string(),
         }))
+    }
+}
+
+/// Synthesize the one-message terminal snapshot for a build whose actor
+/// state is gone but whose `builds` row records the settled verdict
+/// (migration 087). Pre-087 terminal rows have NULL payload columns and
+/// degrade to the old empty-payload snapshot — the state itself is
+/// always correct.
+// r[impl sched.watch.terminal-from-durable-row]
+fn synthesize_terminal_snapshot(
+    build_id: Uuid,
+    row: crate::db::BuildTerminalRow,
+) -> rio_proto::types::BuildEvent {
+    use crate::state::{BuildState, BuildStateExt};
+    use rio_proto::types;
+
+    let state = BuildState::parse_db(&row.status).unwrap_or(BuildState::Unspecified);
+    let failure_status = row
+        .failure_status
+        .as_deref()
+        .and_then(types::BuildResultStatus::from_str_name)
+        .map_or(0, |s| s as i32);
+    let snapshot = types::BuildSnapshot {
+        state: state.into(),
+        total_derivations: row.total_drvs.unwrap_or(0).max(0) as u32,
+        completed_derivations: row.completed_drvs.unwrap_or(0).max(0) as u32,
+        cached_derivations: row.cached_drvs.unwrap_or(0).max(0) as u32,
+        running_derivations: 0,
+        failed_derivations: row.failed_drvs.unwrap_or(0).max(0) as u32,
+        queued_derivations: 0,
+        critical_path_remaining_secs: Some(0),
+        assigned_executors: Vec::new(),
+        running: Vec::new(),
+        output_paths: row.output_paths.unwrap_or_default(),
+        error_message: row.error_summary.unwrap_or_default(),
+        failed_derivation: row.failed_derivation.unwrap_or_default(),
+        failure_status,
+        cancel_reason: row.cancel_reason.unwrap_or_default(),
+    };
+    types::BuildEvent {
+        build_id: build_id.to_string(),
+        timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+        event: Some(types::build_event::Event::Snapshot(snapshot)),
     }
 }

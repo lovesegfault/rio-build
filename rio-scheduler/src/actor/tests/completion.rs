@@ -4045,7 +4045,7 @@ async fn phase1b_e1_transient_threshold_non_distinct_mode_poisons() -> TestResul
     Ok(())
 }
 
-// r[verify sched.build.terminal-status-settled+2]
+// r[verify sched.build.terminal-status-settled+3]
 /// A late shared-node failure must not rewrite a settled build's outcome:
 /// `handle_derivation_failure` for a resident terminal build is a no-op.
 ///

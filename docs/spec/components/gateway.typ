@@ -2018,6 +2018,20 @@ every established session on the instance with it.
   doesn't prove the stream will yield events).
 ]
 
+#r("gw.resync.loss-signal")[
+  On receiving the scheduler's `resync_required` event (server-signalled
+  irrecoverable event loss for this watcher), the gateway MUST re-attach via
+  a fresh `WatchBuild` with ZERO backoff and no client-visible error, and
+  recover ALL display state from the snapshot reconcile --- no per-event-type
+  gap compensation is permitted.
+]
+The signal replaces guesswork about which event types a broadcast-lag gap
+may have contained: the snapshot reconcile (running set, kinded display
+entries, tails, counters) is the single recovery path. The reconnect counter
+still increments (so a pathological resync loop is bounded by
+#(refs.const)("MAX_RECONNECT")) and still resets only on a successfully
+forwarded event.
+
 #r("gw.reconnect.snapshot-resync")[
   On reconnect, the gateway MUST resynchronize from the `WatchBuild` stream's
   first message — the scheduler's `BuildSnapshot` — before processing live

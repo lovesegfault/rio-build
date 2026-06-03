@@ -22,6 +22,7 @@ mod assignments;
 pub(crate) mod attempts;
 mod batch;
 mod builds;
+pub(crate) use builds::BuildTerminalRow;
 mod derivations;
 mod executions;
 mod history;

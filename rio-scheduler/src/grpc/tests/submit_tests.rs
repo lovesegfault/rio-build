@@ -750,3 +750,81 @@ async fn revoked_jti_rejected_by_cancel_watch_query() {
     assert_eq!(s.code(), tonic::Code::Unauthenticated);
     assert!(s.message().contains("revoked"), "got: {}", s.message());
 }
+
+// r[verify sched.watch.terminal-from-durable-row]
+/// merged_bug_323: a WatchBuild AFTER terminal cleanup (or against a
+/// fresh post-failover leader) must answer with the recorded verdict
+/// from the builds row — one synthesized terminal snapshot — never
+/// NotFound, which the gateway converts into a fabricated failure.
+#[tokio::test]
+async fn watch_build_after_cleanup_serves_durable_terminal_snapshot() {
+    use crate::actor::tests::{barrier, merge_single_node, pull_complete_failure, wait_for_status};
+    use crate::state::{DerivationStatus, PriorityClass};
+    use rio_proto::types::build_event::Event;
+    use tokio_stream::StreamExt;
+
+    let (_db, grpc, handle, _task) = setup_grpc_with_pool().await;
+
+    let build_id = uuid::Uuid::new_v4();
+    let _events = merge_single_node(
+        &handle,
+        build_id,
+        "durable-row-hash",
+        PriorityClass::Scheduled,
+    )
+    .await
+    .expect("merge");
+    barrier(&handle).await;
+    pull_complete_failure(
+        &handle,
+        "durable-row-hash",
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "durable-row test failure",
+    )
+    .await
+    .expect("fail the drv");
+    wait_for_status(&handle, "durable-row-hash", DerivationStatus::Poisoned).await;
+    barrier(&handle).await;
+
+    // Cleanup removes the build from the actor's maps entirely.
+    handle
+        .send_unchecked(crate::actor::ActorCommand::CleanupTerminalBuild { build_id })
+        .await
+        .expect("cleanup send");
+    barrier(&handle).await;
+
+    // WatchBuild now: the actor says NotFound; the durable row answers.
+    let resp = grpc
+        .watch_build(Request::new(rio_proto::types::WatchBuildRequest {
+            build_id: build_id.to_string(),
+        }))
+        .await
+        .expect("WatchBuild after cleanup must serve the durable terminal snapshot, not NotFound");
+    let mut stream = resp.into_inner();
+    let first = stream.next().await.expect("one message").expect("ok event");
+    let Some(Event::Snapshot(snap)) = first.event else {
+        panic!("expected terminal Snapshot, got {:?}", first.event);
+    };
+    assert_eq!(
+        snap.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "snapshot reports the persisted terminal state"
+    );
+    assert_eq!(
+        snap.error_message, "derivation durable-row-hash failed",
+        "snapshot carries the persisted first-failure summary"
+    );
+    assert_eq!(
+        snap.failed_derivation, "durable-row-hash",
+        "snapshot carries the persisted culprit"
+    );
+    assert_eq!(
+        snap.failure_status,
+        rio_proto::types::BuildResultStatus::PermanentFailure as i32,
+        "snapshot carries the persisted classification"
+    );
+    assert_eq!(snap.total_derivations, 1);
+    // The stream ends after the single message (no live broadcast for a
+    // cleaned-up build).
+    assert!(stream.next().await.is_none(), "exactly one message");
+}

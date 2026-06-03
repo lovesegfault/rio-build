@@ -1,0 +1,23 @@
+-- Commentary: see rio-migrations/src/migrations.rs M_087
+ALTER TABLE builds
+    ADD COLUMN failed_derivation TEXT,
+    ADD COLUMN failure_status TEXT
+        CHECK (failure_status IS NULL OR failure_status IN (
+            'BUILD_RESULT_STATUS_UNSPECIFIED',
+            'BUILD_RESULT_STATUS_BUILT',
+            'BUILD_RESULT_STATUS_SUBSTITUTED',
+            'BUILD_RESULT_STATUS_ALREADY_VALID',
+            'BUILD_RESULT_STATUS_PERMANENT_FAILURE',
+            'BUILD_RESULT_STATUS_TRANSIENT_FAILURE',
+            'BUILD_RESULT_STATUS_CACHED_FAILURE',
+            'BUILD_RESULT_STATUS_DEPENDENCY_FAILED',
+            'BUILD_RESULT_STATUS_LOG_LIMIT_EXCEEDED',
+            'BUILD_RESULT_STATUS_OUTPUT_REJECTED',
+            'BUILD_RESULT_STATUS_INFRASTRUCTURE_FAILURE',
+            'BUILD_RESULT_STATUS_CANCELLED',
+            'BUILD_RESULT_STATUS_TIMED_OUT',
+            'BUILD_RESULT_STATUS_NOT_DETERMINISTIC',
+            'BUILD_RESULT_STATUS_INPUT_REJECTED')),
+    ADD COLUMN cancel_reason TEXT,
+    ADD COLUMN output_paths TEXT[],
+    ADD COLUMN failed_drvs INTEGER;

@@ -2033,15 +2033,47 @@ is emitted, so there is no missed state to summarize.
     or API call).
 ]
 
-#r("sched.build.terminal-status-settled+2")[
+#r("sched.build.terminal-status-settled+3")[
   Once a build reaches a terminal state, its externally served progress and
   outcome are settled: no further `BuildProgress` event may be emitted for
   it, its served progress accounting (`cached_derivations`) MUST NOT be
   mutated, and a later failure of a shared derivation MUST NOT rewrite its
   settled error summary or re-run its per-build failure handling ---
   aggregate fan-outs (dispatch-time store hits, completion release, failure
-  cascades) MUST skip interested builds that are already terminal.
+  cascades) MUST skip interested builds that are already terminal. The
+  settled surface MUST be a payload captured AT the terminal transition
+  (counts, outcome arm, output paths / first failure / cancel reason), and
+  every consumer --- the live terminal event, the `WatchBuild` snapshot,
+  `QueryBuildStatus`, and the persisted row --- MUST serve that one capture,
+  never a recomputation from live state.
 ]
+
+#r("sched.build.terminal-payload-captured")[
+  The terminal payload MUST be capturable only together with the terminal
+  transition: marking a build terminal without its settled counts and
+  outcome payload, marking it `cancelled` without a reason, or recording a
+  build-level failure that names a culprit derivation MUST NOT be
+  representable in the scheduler's build-state API.
+]
+The payload travels as one structure (`SettledBuild`); the failure trio
+(summary, culprit, classification) is one struct written through first-wins
+or whole-struct-override setters, so partial writes that pair a stale
+culprit with a new summary are unrepresentable.
+
+#r("sched.watch.terminal-from-durable-row")[
+  A `WatchBuild` for a build the actor no longer holds MUST be answered
+  from the durable `builds` row when that row records a terminal state: one
+  synthesized terminal `BuildSnapshot` carrying the persisted verdict
+  (state, settled counts, outcome payload). `NotFound` is reserved for
+  builds Postgres does not know terminal.
+]
+The terminal arm of the status UPDATE persists the whole settled payload
+atomically with the status flip (migration 087), so the synthesized
+snapshot is never a half-written verdict. Pre-087 terminal rows degrade to
+an empty payload with the correct state. This deliberately upgrades the old
+in-memory-only failure-trio posture: post-cleanup and post-failover
+watchers get the recorded verdict instead of the gateway's
+reconnect-exhaustion fabrication.
 Terminal builds stay resident --- and re-subscribable via `WatchBuild` ---
 for the terminal-cleanup window while the global DAG keeps evolving for
 other builds that share their nodes (a stale-Completed reset, a re-dispatch,
