@@ -359,8 +359,34 @@ fn map_client_op_error(err: ClientOpError, op: &str, upload: bool) -> TransportE
 /// bound.
 const UPLOAD_FLOOR_BYTES_PER_SEC: u64 = 1024 * 1024;
 
+/// Ceiling on the payload-proportional headroom of [`upload_deadline`]:
+/// 4 hours, i.e. the floor-rate guarantee covers payloads up to ~14 GiB
+/// (`UPLOAD_HEADROOM_MAX_SECS × UPLOAD_FLOOR_BYTES_PER_SEC`).
+///
+/// The ceiling exists because the headroom input is not uniformly
+/// trustworthy (see [`upload_deadline`] for the per-arm provenance): on the
+/// streamed relay arm the payload length is the relay cache's own narinfo
+/// `NarSize`, so without a ceiling the peer being bounded would mint the
+/// deadline that bounds it — `NarSize: 10^18` yields a ~30,000-year wire-op
+/// deadline, and a cache that then stalls the body wedges the upload worker
+/// with no other bound (the substituter client deliberately sets no overall
+/// body timeout; this wire-op deadline is the only one).
+///
+/// Sizing: the engine's own bulk ops stay far below the ceiling — the
+/// default batch byte cap (`upload_batch_max_mib` = 256 MiB) needs 256 s of
+/// headroom, and the multi-GiB nixpkgs-tail NARs the streamed lane exists
+/// for (the lane threshold is `large_nar_threshold_mib` = 64 MiB) fit the
+/// floor-rate guarantee up to ~14 GiB. Beyond the ceiling the deadline
+/// stays finite: a (legitimate) larger transfer must average better than
+/// `payload / (base + 4 h)` — e.g. ~4 MiB/s for a 56 GiB NAR, well below
+/// in-cluster S3/HTTP throughput — so the cost of the clamp is a tighter
+/// effective floor for outsized transfers, never a mass-failure of the
+/// payload sizes the engine actually ships.
+const UPLOAD_HEADROOM_MAX_SECS: u64 = 4 * 3600;
+
 /// Deadline for one upload op: the caller's metadata-scale base deadline
-/// plus payload-proportional headroom at [`UPLOAD_FLOOR_BYTES_PER_SEC`].
+/// plus payload-proportional headroom at [`UPLOAD_FLOOR_BYTES_PER_SEC`],
+/// clamped to [`UPLOAD_HEADROOM_MAX_SECS`].
 ///
 /// Derived INSIDE the two NAR-payload-bearing wire ops
 /// ([`DaemonChannel::add_multiple_to_store`],
@@ -368,10 +394,29 @@ const UPLOAD_FLOOR_BYTES_PER_SEC: u64 = 1024 * 1024;
 /// send — that pair is the complete set of bulk-payload daemon ops, so no
 /// caller can hand a flat metadata-tuned `Duration` to a bulk op and have
 /// it bound the payload phase. Callers pass only the base (their op-class
-/// deadline); the payload bytes are the entries' NAR lengths, which the op
-/// verifies against the declared `nar_size` before writing anyway.
+/// deadline).
+///
+/// Trust provenance of `payload_bytes`, per arm — the parameter sets a
+/// resource bound, so WHO controls it matters:
+///
+/// - batch arm ([`DaemonChannel::add_multiple_to_store`]): the summed
+///   lengths of locally materialized `NarPayload::Bytes` buffers — engine-
+///   measured, trustworthy;
+/// - streamed arm ([`DaemonChannel::add_to_store_nar`]) with a local
+///   payload (drv text, archive-embedded): a locally materialized buffer,
+///   engine-measured;
+/// - streamed arm with a relay payload (`NarPayload::Reader`): the reader
+///   length is the relay narinfo's declared `NarSize` — PEER-declared by
+///   the cache whose transfer this deadline is supposed to bound, with the
+///   wire op's own `nar_size` cross-check vacuous on this arm (both
+///   operands descend from the same narinfo field).
+///
+/// The peer-declared arm is why the headroom is clamped: a declared length
+/// can loosen the deadline only up to the ceiling, never past it.
 fn upload_deadline(base: Duration, payload_bytes: u64) -> Duration {
-    base + Duration::from_secs(payload_bytes / UPLOAD_FLOOR_BYTES_PER_SEC)
+    base + Duration::from_secs(
+        (payload_bytes / UPLOAD_FLOOR_BYTES_PER_SEC).min(UPLOAD_HEADROOM_MAX_SECS),
+    )
 }
 
 /// Run one rio-nix client op under a deadline and map its outcome.
@@ -1337,13 +1382,18 @@ mod tests {
     /// originally stated for the drv-text import ("a large
     /// AddMultipleToStore chunk is never cut off by a deadline tuned
     /// for metadata-sized ops") and now owned by the transport seam for
-    /// BOTH bulk ops. Universe of the bound: every AddMultipleToStore /
-    /// AddToStoreNar call — the only NAR-payload-bearing daemon ops —
-    /// derives its deadline through `upload_deadline`, so the engine's
-    /// default 256 MiB batch cap gets ≥256s of payload headroom beyond
-    /// the 120s metadata base instead of being cut off at 120s flat.
+    /// BOTH bulk ops — and the headroom clamps at
+    /// `UPLOAD_HEADROOM_MAX_SECS`, because on the streamed relay arm
+    /// the payload length is the relay narinfo's PEER-declared
+    /// `NarSize` (see `upload_deadline`'s provenance table): a bound
+    /// parameter the bounded peer controls must not be able to loosen
+    /// the bound without limit. Universe of the bound: every
+    /// AddMultipleToStore / AddToStoreNar call — the only
+    /// NAR-payload-bearing daemon ops — derives its deadline through
+    /// `upload_deadline`. Both directions are pinned: payloads below
+    /// the clamp knee scale at the floor, payloads above it CLAMP.
     #[test]
-    fn upload_deadline_scales_with_payload_at_the_floor() {
+    fn upload_deadline_scales_at_the_floor_and_clamps_at_the_headroom_ceiling() {
         let base = Duration::from_secs(120);
         // Metadata-sized payloads add nothing measurable.
         assert_eq!(upload_deadline(base, 0), base);
@@ -1356,7 +1406,8 @@ mod tests {
         // The engine's default batch byte cap (256 MiB, knobs
         // `upload_batch_max_mib`) needs 256s at the floor — strictly
         // more than the 120s metadata base that previously bounded the
-        // whole op.
+        // whole op, and far below the 4h headroom ceiling: the clamp
+        // never binds for the batch arm's engine-measured payloads.
         let batch_cap = 256 * 1024 * 1024;
         assert_eq!(
             upload_deadline(base, batch_cap),
@@ -1369,11 +1420,32 @@ mod tests {
             upload_deadline(large_base, 4 * 1024 * 1024 * 1024),
             large_base + Duration::from_secs(4096)
         );
-        // The scaled deadline is never tighter than the base: the
-        // change can only loosen bounds relative to the flat-deadline
-        // behavior it replaces, so it cannot mass-fail ops that fit
-        // the old bound.
-        for payload in [0u64, 1, 1024, batch_cap, u64::MAX / 2] {
+        // Scale-vs-clamp knee: the largest payload still under the
+        // floor-rate guarantee scales; one floor-unit past it clamps.
+        let knee = UPLOAD_HEADROOM_MAX_SECS * UPLOAD_FLOOR_BYTES_PER_SEC;
+        let ceiling = Duration::from_secs(UPLOAD_HEADROOM_MAX_SECS);
+        assert_eq!(upload_deadline(large_base, knee), large_base + ceiling);
+        assert_eq!(
+            upload_deadline(large_base, knee + UPLOAD_FLOOR_BYTES_PER_SEC),
+            large_base + ceiling,
+            "one floor-unit past the knee must clamp, not scale"
+        );
+        // Hostile-magnitude declared sizes CLAMP — they must not scale.
+        // These are reachable inputs, not theoretical ones: the streamed
+        // relay arm feeds the peer-declared narinfo `NarSize` (any u64
+        // parses) into `payload_bytes`, so an unclamped formula would let
+        // the cache mint a ~30,000-year deadline for its own stalled
+        // transfer.
+        for hostile in [10u64.pow(18), u64::MAX / 2, u64::MAX] {
+            assert_eq!(
+                upload_deadline(large_base, hostile),
+                large_base + ceiling,
+                "a peer-declared payload of {hostile} bytes must clamp at the headroom ceiling"
+            );
+        }
+        // The scaled deadline is never tighter than the base — the
+        // headroom only ever loosens the caller's op-class bound.
+        for payload in [0u64, 1, 1024, batch_cap, knee, u64::MAX] {
             assert!(upload_deadline(base, payload) >= base);
         }
     }
