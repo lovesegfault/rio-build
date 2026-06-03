@@ -6181,6 +6181,7 @@ dependencies = [
  "hex",
  "metrics",
  "nix 0.31.3",
+ "proptest",
  "prost-types",
  "regex",
  "rio-common",

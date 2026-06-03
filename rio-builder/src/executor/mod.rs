@@ -698,10 +698,11 @@ pub async fn execute_build(
             // I-166: the cgroup doesn't exist yet (created post-spawn below),
             // so a Cancel that arrived during overlay/resolve/prepare landed
             // as ENOENT in `try_cancel_build` — which now LEAVES the flag
-            // set. Check it here. The pre-cgroup window is now overlay →
-            // resolve → prepare_sandbox → register + prefetch (sub-second);
-            // the cancel_poll select that covered the warm hang is no longer
-            // needed.
+            // set. Check it here AND again after the prefetch RPC below:
+            // overlay → resolve → prepare_sandbox is sub-second, but
+            // prefetch_manifests is a network RPC bounded only by the
+            // store-client timeout — a cancel landing during it would
+            // otherwise ride into the daemon spawn (bug_377 rider).
             if env.cancelled.load(Ordering::Acquire) {
                 tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup)");
                 return Err(ExecutorError::Cancelled);
@@ -718,6 +719,14 @@ pub async fn execute_build(
                 // Unimplemented (old store) or any error, the per-path
                 // `GetPath` queries PG as before.
                 prefetch_manifests(store_client, cache, &input_paths).await;
+            }
+            // Second pre-cgroup checkpoint: prefetch_manifests is the one
+            // bounded-but-slow RPC in the pre-cgroup window; consult the
+            // cancel flag after it so SIGTERM/Cancel during the prefetch
+            // aborts before the daemon spawn (bug_377 rider).
+            if env.cancelled.load(Ordering::Acquire) {
+                tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup, post-prefetch)");
+                return Err(ExecutorError::Cancelled);
             }
 
             // 5. Spawn nix-daemon --stdio --store 'local?root={build_dir}'.

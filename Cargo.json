@@ -19464,6 +19464,10 @@
       ],
       "devDependencies": [
         {
+          "name": "proptest",
+          "packageId": "proptest"
+        },
+        {
           "name": "rio-nix",
           "packageId": "rio-nix"
         },

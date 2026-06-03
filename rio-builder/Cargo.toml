@@ -62,6 +62,9 @@ regex = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
+# IdleClock pair-sum property (runtime/idle.rs) — kani none-sensible
+# for a bin crate; the proptest is the recorded coverage.
+proptest = { workspace = true }
 rstest = { workspace = true }
 # upload.rs tests use the eager `nar::dump_path` as a byte-exact oracle for
 # the streaming upload pipeline.

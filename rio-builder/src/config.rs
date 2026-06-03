@@ -195,9 +195,12 @@ pub struct Config {
     /// long. Controller spawns N Jobs based on queue depth; if the
     /// queue drains before all Jobs receive work, the unlucky ones
     /// would otherwise idle until activeDeadlineSeconds. Env:
-    /// `RIO_IDLE_SECS`. Default 120. In pull mode this is the
-    /// NotYetReady bound: a pod that has only ever received
-    /// `NotYetReady` for this long exits 0, charge-free.
+    /// `RIO_IDLE_SECS`. Default 120. In pull mode this bounds
+    /// accumulated told-not-deliverable time: only `NotYetReady`
+    /// answers advance the idle clock (each interval capped at twice
+    /// the previous answer's suggested pacing), so scheduler outages
+    /// between answers do not count and a pod exits 0 charge-free only
+    /// after this much *answered* idle time.
     #[serde(rename = "idle_secs", with = "rio_common::config::secs")]
     #[schemars(with = "u64")]
     pub idle_timeout: std::time::Duration,

@@ -178,6 +178,11 @@
       "doc": "Worker runtime: the pull-mode lifecycle and build-task spawning."
     },
     {
+      "path": "runtime/idle.rs",
+      "depth": 1,
+      "doc": "The idle clock: how long has the scheduler been *telling* this pod"
+    },
+    {
       "path": "runtime/pull.rs",
       "depth": 1,
       "doc": "The pull client loop — the builder runtime's delivery path."
@@ -360,6 +365,11 @@
       "path": "test_jail.rs",
       "depth": 0,
       "doc": "Private test-only env/cwd sandbox for rio-common's own tests."
+    },
+    {
+      "path": "transport.rs",
+      "depth": 0,
+      "doc": "Bounded, cancellable unary-RPC awaits — the transport discipline"
     },
     {
       "path": "wanted_outputs.rs",

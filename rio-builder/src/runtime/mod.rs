@@ -11,6 +11,7 @@
 //! - `pull`: the pull client loop (the runtime entry)
 //! - `result`: completion construction + the send chokepoint
 
+mod idle;
 pub mod pull;
 mod result;
 mod setup;

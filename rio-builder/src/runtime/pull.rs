@@ -45,6 +45,12 @@ use rio_proto::types::{
     WorkAssignment, pull_assignment_response,
 };
 
+use rio_common::grpc::DEFAULT_GRPC_TIMEOUT;
+use rio_common::transport::{
+    AttemptBudget, BoundedOutcome, GraceBudget, SIGTERM_FINAL_ATTEMPT, bounded,
+};
+
+use super::idle::IdleClock;
 use super::{BuilderRuntime, run_teardown, spawn_build_task, try_cancel_build};
 use crate::executor::BuildTaskMessage;
 
@@ -76,9 +82,21 @@ const RETRY_ENVELOPE: rio_common::backoff::Backoff = rio_common::backoff::Backof
 /// holding a node forever.
 const REPORT_RETRY_BUDGET: Duration = Duration::from_secs(600);
 
-/// SIGTERM best-effort report: one final attempt with this timeout
-/// (decision P5; inside the AD5 grace once 1b sets it).
-const SIGTERM_REPORT_TIMEOUT: Duration = Duration::from_secs(10);
+/// AD5 grace partition: the pod's `terminationGracePeriodSeconds`
+/// (the controller stamps the same constant on the pod spec) split
+/// into the abort-drain slice — how long the SIGTERM path waits for a
+/// killed build to surface its completion before synthesizing one —
+/// and the reserved report slice for the final best-effort
+/// `ReportOutcome`. Reserving the report window structurally is what
+/// guarantees the report phase always runs before the kubelet's
+/// SIGKILL, even when the build task is parked on a pre-cgroup RPC or
+/// a wedged daemon (bug_377).
+const PULL_GRACE: GraceBudget = GraceBudget::new(
+    Duration::from_secs(rio_common::limits::PULL_MODE_TERMINATION_GRACE_SECS),
+    Duration::from_secs(15),
+);
+// The reserved report slice always covers the SIGTERM final attempt.
+const _: () = assert!(PULL_GRACE.report().as_secs() >= SIGTERM_FINAL_ATTEMPT.as_secs());
 
 /// What the pull phase resolved to.
 #[derive(Debug)]
@@ -203,10 +221,14 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
     shutdown: &rio_common::signal::Token,
 ) -> PullPhaseOutcome {
     let mut attempt: u32 = 0;
-    // Set at the FIRST NotYetReady; the idle bound measures how long
-    // the pod has been told "wanted but not deliverable" — transport
-    // errors neither start nor reset it (they are not an answer).
-    let mut not_ready_since: Option<tokio::time::Instant> = None;
+    // The idle bound measures accumulated "told wanted-but-not-
+    // deliverable" time — only NotYetReady ANSWERS advance it, capped
+    // at 2x the previous answer's suggested pacing, so transport
+    // errors and leader outages between answers are structurally
+    // uncounted (merged_bug_209: wall-clock-since-first-NYR matured
+    // whole cohorts through a 5-minute failover and exited them en
+    // masse on the first post-recovery answer).
+    let mut idle = IdleClock::default();
     loop {
         if shutdown.is_cancelled() {
             return PullPhaseOutcome::Shutdown;
@@ -219,8 +241,23 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
             // wire, so this request encodes byte-identically to before.
             ..Default::default()
         };
-        let delay = match transport.pull(req).await {
-            Ok(resp) => match resp.outcome {
+        // The pull is a promptly-answered unary: bound it so an
+        // accepted-never-answered request (black-holed leader) becomes
+        // a retryable timeout instead of pinning the pod, and race it
+        // against SIGTERM so an in-flight pull yields to shutdown
+        // (merged_bug_167's pull half).
+        let delay = match bounded(shutdown, DEFAULT_GRPC_TIMEOUT, transport.pull(req)).await {
+            BoundedOutcome::Shutdown => return PullPhaseOutcome::Shutdown,
+            BoundedOutcome::TimedOut { after } => {
+                warn!(
+                    after_secs = after.as_secs(),
+                    "PullAssignment unanswered; retrying"
+                );
+                idle.on_non_answer();
+                attempt = attempt.saturating_add(1);
+                RETRY_ENVELOPE.duration(attempt - 1)
+            }
+            BoundedOutcome::Resolved(Ok(resp)) => match resp.outcome {
                 Some(pull_assignment_response::Outcome::Assignment(a)) => {
                     return PullPhaseOutcome::Assigned(Box::new(a));
                 }
@@ -228,10 +265,6 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
                     return PullPhaseOutcome::Gone;
                 }
                 Some(pull_assignment_response::Outcome::NotYetReady(nyr)) => {
-                    let started = *not_ready_since.get_or_insert_with(tokio::time::Instant::now);
-                    if started.elapsed() >= idle_timeout {
-                        return PullPhaseOutcome::IdleExit;
-                    }
                     // A NotYetReady answer is contact with the leader:
                     // reset the unservable backoff curve.
                     attempt = 0;
@@ -240,24 +273,30 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
                     } else {
                         Duration::from_secs(u64::from(nyr.retry_after_seconds))
                     };
+                    idle.on_answer(tokio::time::Instant::now(), suggested);
+                    if idle.idle_for() >= idle_timeout {
+                        return PullPhaseOutcome::IdleExit;
+                    }
                     RETRY_AFTER_JITTER.apply(suggested)
                 }
                 // Defensive: an empty oneof from a newer/older server is
                 // not an answer — treat like an unservable pull.
                 None => {
                     warn!("PullAssignment returned an empty outcome; retrying");
+                    idle.on_non_answer();
                     attempt = attempt.saturating_add(1);
                     RETRY_ENVELOPE.duration(attempt - 1)
                 }
             },
-            Err(status) if is_fatal_rejection(status.code()) => {
+            BoundedOutcome::Resolved(Err(status)) if is_fatal_rejection(status.code()) => {
                 tracing::error!(code = ?status.code(), msg = status.message(),
                     "PullAssignment permanently rejected; exiting instead of holding the node");
                 return PullPhaseOutcome::Rejected(status);
             }
-            Err(status) => {
+            BoundedOutcome::Resolved(Err(status)) => {
                 warn!(code = ?status.code(), msg = status.message(),
                     "PullAssignment unservable; retrying");
+                idle.on_non_answer();
                 attempt = attempt.saturating_add(1);
                 RETRY_ENVELOPE.duration(attempt - 1)
             }
@@ -292,7 +331,7 @@ pub(super) async fn report_until_acked<T: PullTransport>(
     budget: Duration,
     shutdown: &rio_common::signal::Token,
 ) -> bool {
-    let started = tokio::time::Instant::now();
+    let budget = AttemptBudget::new(budget);
     let mut attempt: u32 = 0;
     loop {
         let req = ReportOutcomeRequest {
@@ -304,34 +343,61 @@ pub(super) async fn report_until_acked<T: PullTransport>(
             ..Default::default()
         };
         if shutdown.is_cancelled() {
-            // SIGTERM: one bounded best-effort attempt, then out.
+            // SIGTERM: one bounded best-effort attempt, then out
+            // (plain timeout — the shutdown token is already
+            // cancelled, so racing it again would never poll the RPC).
             return matches!(
-                tokio::time::timeout(SIGTERM_REPORT_TIMEOUT, transport.report(req)).await,
+                tokio::time::timeout(SIGTERM_FINAL_ATTEMPT, transport.report(req)).await,
                 Ok(Ok(()))
             );
         }
-        // Race the in-flight RPC against SIGTERM so a black-holed
-        // scheduler (request never answered) cannot pin the process
-        // past the pull-mode grace: when shutdown wins, loop back and
-        // take the bounded single-attempt arm above.
-        let result = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => None,
-            r = transport.report(req) => Some(r),
-        };
-        let Some(result) = result else {
-            continue;
-        };
-        match result {
-            Ok(()) => return true,
-            Err(status) if is_fatal_rejection(status.code()) => {
+        // Each attempt is bounded by the per-attempt cap clamped to
+        // the remaining phase budget, and raced against SIGTERM. An
+        // accepted-never-answered report (black-holed scheduler) now
+        // spends the budget exactly like an answered failure does —
+        // the 600 s bound fires on hung attempts too, instead of only
+        // on Err answers (merged_bug_167's report half). Report acks
+        // are idempotent scheduler-side, so a timed-out-but-actually-
+        // applied attempt retried later answers Ok.
+        let outcome = bounded(
+            shutdown,
+            budget.attempt_bound(DEFAULT_GRPC_TIMEOUT),
+            transport.report(req),
+        )
+        .await;
+        match outcome {
+            // Loop back: the next iteration takes the SIGTERM
+            // single-attempt arm.
+            BoundedOutcome::Shutdown => continue,
+            BoundedOutcome::Resolved(Ok(())) => return true,
+            BoundedOutcome::Resolved(Err(status)) if is_fatal_rejection(status.code()) => {
                 tracing::error!(code = ?status.code(), msg = status.message(),
                     "ReportOutcome permanently rejected; exiting nonzero (establishment sweep \
                      remains the backstop)");
                 return false;
             }
-            Err(status) => {
-                if started.elapsed() >= budget {
+            BoundedOutcome::TimedOut { after } => {
+                if budget.expired() {
+                    warn!(
+                        after_secs = after.as_secs(),
+                        "ReportOutcome never acknowledged within the retry budget (hung attempts)"
+                    );
+                    return false;
+                }
+                warn!(
+                    after_secs = after.as_secs(),
+                    "ReportOutcome attempt unanswered; retrying"
+                );
+                attempt = attempt.saturating_add(1);
+                let delay = RETRY_ENVELOPE.duration(attempt - 1);
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {}
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            BoundedOutcome::Resolved(Err(status)) => {
+                if budget.expired() {
                     warn!(code = ?status.code(), msg = status.message(),
                         "ReportOutcome never acknowledged within the retry budget");
                     return false;
@@ -392,7 +458,37 @@ async fn build_phase_with_abort(
                 "SIGTERM during the build: aborting (cgroup-kill) and reporting Cancelled"
             );
             try_cancel_build(slot, drv_path);
-            wait_for_completion(sink_rx).await
+            // Bound the post-kill drain to the grace partition's
+            // abort-drain slice. A build task parked where the cancel
+            // flag is not consulted (pre-cgroup store RPC, wedged
+            // daemon) never surfaces a completion — synthesize the
+            // Cancelled report so the report phase STRUCTURALLY runs
+            // inside the reserved slice and the scheduler takes the
+            // AD5 charge-free close instead of the charged
+            // establishment sweep (bug_377).
+            match tokio::time::timeout(PULL_GRACE.abort_drain(), wait_for_completion(sink_rx))
+                .await
+            {
+                Ok(completion) => completion,
+                Err(_elapsed) => {
+                    warn!(
+                        drv_path = %drv_path,
+                        drain_secs = PULL_GRACE.abort_drain().as_secs(),
+                        "abort-drain budget elapsed; synthesizing the Cancelled report"
+                    );
+                    Some(CompletionReport {
+                        drv_path: drv_path.to_owned(),
+                        result: Some(rio_proto::types::BuildResult {
+                            status: rio_proto::types::BuildResultStatus::Cancelled.into(),
+                            error_msg: "abort-drain budget elapsed; build task parked \
+                                        (pre-cgroup RPC or wedged daemon); pod exiting under grace"
+                                .into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })
+                }
+            }
         }
     }
 }
@@ -912,6 +1008,130 @@ mod tests {
             "the abandoned in-flight call plus the bounded single attempt"
         );
     }
+
+    /// merged_bug_167 (pull half, red-first): a black-holed PULL
+    /// (accepted, never answered) yields to SIGTERM instead of pinning
+    /// the pod past the pull-mode grace.
+    // r[verify builder.pull.retry-loop+2]
+    #[tokio::test(start_paused = true)]
+    async fn pull_in_flight_black_hole_yields_to_sigterm() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct BlackHolePull {
+            calls: Arc<AtomicU32>,
+        }
+        impl PullTransport for BlackHolePull {
+            async fn pull(
+                &mut self,
+                _req: PullAssignmentRequest,
+            ) -> Result<PullAssignmentResponse, tonic::Status> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                unreachable!("the black hole never answers")
+            }
+            async fn report(&mut self, _req: ReportOutcomeRequest) -> Result<(), tonic::Status> {
+                Err(tonic::Status::unavailable("unused"))
+            }
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut t = BlackHolePull {
+            calls: Arc::clone(&calls),
+        };
+        let shutdown = token();
+        let shutdown_for_task = shutdown.clone();
+        let task = tokio::spawn(async move {
+            pull_until_resolved(&mut t, "intent-bh", "tok", IDLE, &shutdown_for_task).await
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        shutdown.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("an in-flight pull must yield to SIGTERM, not hang")
+            .expect("task not panicked");
+        assert!(matches!(outcome, PullPhaseOutcome::Shutdown));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// merged_bug_167 (report half, red-first): a black-holed report
+    /// loop WITHOUT SIGTERM exhausts the retry budget — hung attempts
+    /// spend the budget exactly like answered failures.
+    // r[verify builder.pull.retry-loop+2]
+    // r[verify builder.completion.exactly-once-or-death+2]
+    #[tokio::test(start_paused = true)]
+    async fn report_black_hole_exhausts_budget_without_sigterm() {
+        struct BlackHoleReport;
+        impl PullTransport for BlackHoleReport {
+            async fn pull(
+                &mut self,
+                _req: PullAssignmentRequest,
+            ) -> Result<PullAssignmentResponse, tonic::Status> {
+                Err(tonic::Status::unavailable("unused"))
+            }
+            async fn report(&mut self, _req: ReportOutcomeRequest) -> Result<(), tonic::Status> {
+                std::future::pending::<()>().await;
+                unreachable!("the black hole never answers")
+            }
+        }
+
+        let mut t = BlackHoleReport;
+        let shutdown = token();
+        let started = tokio::time::Instant::now();
+        let acked = tokio::time::timeout(
+            Duration::from_secs(3600),
+            report_until_acked(
+                &mut t,
+                "exec-bh-budget",
+                CompletionReport::default(),
+                REPORT_RETRY_BUDGET,
+                &shutdown,
+            ),
+        )
+        .await
+        .expect("hung attempts must exhaust the budget, not pend forever");
+        assert!(!acked);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= REPORT_RETRY_BUDGET
+                && elapsed < REPORT_RETRY_BUDGET + Duration::from_secs(120),
+            "the budget bounds the hung-report phase (elapsed {elapsed:?})"
+        );
+    }
+
+    /// merged_bug_209 (red-first): a 300 s scheduler outage between two
+    /// NotYetReady answers does NOT mature the idle bound — only
+    /// answered told-not-deliverable time counts; afterwards ~120 s of
+    /// paced answers exits charge-free.
+    // r[verify builder.pull.retry-loop+2]
+    // r[verify builder.pull.exit-codes]
+    #[tokio::test(start_paused = true)]
+    async fn idle_outage_gap_does_not_count() {
+        // Script: NYR(5), then ~300s of unavailable answers, then NYR(5)
+        // forever. ScriptedTransport repeats the last entry once
+        // exhausted, so: one NYR, 60 errors (~300s under the 1→30s
+        // envelope... errors back off to 30s cap), then NYR forever.
+        let mut pulls: Vec<Result<PullAssignmentResponse, tonic::Status>> =
+            vec![Ok(not_yet_ready_resp(5))];
+        // 14 errors ≈ 1+2+4+8+16+30*9 ≈ 300 s of outage.
+        for _ in 0..14 {
+            pulls.push(Err(tonic::Status::unavailable("leader failover")));
+        }
+        pulls.push(Ok(not_yet_ready_resp(5)));
+        let mut t = ScriptedTransport::new(pulls, vec![]);
+        let shutdown = token();
+        let outcome = pull_until_resolved(&mut t, "intent-idle", "tok", IDLE, &shutdown).await;
+        assert!(matches!(outcome, PullPhaseOutcome::IdleExit));
+        // Structural assertion (jitter-proof): if the outage counted,
+        // the FIRST post-outage answer would exit (1 NYR + 14 errors +
+        // 1 NYR = 16 calls). Told-time accumulation requires ~120 s of
+        // answered 5 s pacing AFTER the outage: ≥ 20 more answers.
+        assert!(
+            t.pull_calls >= 33,
+            "the idle exit must NOT fire on outage time (exited after only {} pulls)",
+            t.pull_calls
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1076,5 +1296,50 @@ mod abort_tests {
         .await;
         assert!(acked);
         assert_eq!(ok.report_calls, 1);
+    }
+
+    /// bug_377 (red-first): SIGTERM with the build task parked where
+    /// the cancel flag is not consulted (pre-cgroup RPC / wedged
+    /// daemon) — the sink never yields. The phase must synthesize the
+    /// Cancelled completion within the abort-drain slice so the report
+    /// phase structurally runs inside the grace.
+    // r[verify builder.cancel.cgroup-kill+2]
+    // r[verify builder.shutdown.sigint+4]
+    #[tokio::test(start_paused = true)]
+    async fn sigterm_with_parked_build_synthesizes_cancelled_within_grace() {
+        let drv = "/nix/store/cccccccccccccccccccccccccccccccc-z.drv";
+        let slot = Arc::new(super::super::BuildSlot::default());
+        let guard = slot.try_claim(drv).expect("fresh slot claims");
+        let (_sink_tx, mut sink_rx) = mpsc::channel::<BuildTaskMessage>(8);
+        let shutdown = rio_common::signal::Token::new();
+        shutdown.cancel();
+
+        let started = tokio::time::Instant::now();
+        // The sink sender is held open and never yields a completion —
+        // the parked-build shape.
+        let completion = tokio::time::timeout(
+            Duration::from_secs(44),
+            build_phase_with_abort(&slot, drv, &mut sink_rx, &shutdown),
+        )
+        .await
+        .expect("the phase must resolve within the abort-drain slice, never ride to SIGKILL")
+        .expect("a synthesized completion is always produced");
+        assert!(
+            started.elapsed() <= Duration::from_secs(35),
+            "resolution must fit the abort-drain slice (30 s), leaving the report reserve"
+        );
+        assert_eq!(
+            completion.result.as_ref().map(|r| r.status),
+            Some(i32::from(rio_proto::types::BuildResultStatus::Cancelled)),
+        );
+        assert!(
+            completion
+                .result
+                .as_ref()
+                .is_some_and(|r| r.error_msg.contains("abort-drain budget elapsed")),
+            "the synthesized report names the parked-build cause"
+        );
+        assert_eq!(completion.drv_path, drv);
+        drop(guard);
     }
 }
