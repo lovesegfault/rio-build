@@ -979,6 +979,18 @@ impl Substituter {
                 .sigs_for_mode(tenant_id, upstream.sig_mode, &ni, &info)
                 .await;
 
+            // Substituted .drvs feed the modulo cache too (round-16
+            // W2-S7 rider, plan Q8): substitution was the one ingest
+            // route that never fired populate_on_ingest, leaving every
+            // substituted deriver row-less until a proof-time
+            // read-through paid the cold walk. Extract BEFORE persist
+            // moves the bytes (mirrors finalize_single's ordering).
+            let drv_bytes_for_cache: Option<Vec<u8>> = if store_path.ends_with(".drv") {
+                rio_nix::nar::extract_single_file(&nar_bytes).ok()
+            } else {
+                None
+            };
+
             // — Step 5-6: persist via the shared write-ahead core —
             ingest::persist_nar(
                 &self.pool,
@@ -993,13 +1005,28 @@ impl Substituter {
             .map_err(|e| match e {
                 PersistError::Chunked(e) => SubstituteError::Ingest(e.to_string()),
                 PersistError::Inline(e) => SubstituteError::Ingest(e.to_string()),
-            })
+            })?;
+            // Carried out for the post-persist modulo population.
+            Ok(drv_bytes_for_cache)
         }
         .await;
 
         match persist {
-            Ok(()) => {
+            Ok(drv_bytes_for_cache) => {
                 placeholder_guard.defuse();
+                // Best-effort, AFTER the NAR is durable — population
+                // failure never fails the substitution. Single-shot
+                // scope: MissingInput records terminally (bug_085
+                // cadence contract), same as finalize_single.
+                if let Some(bytes) = drv_bytes_for_cache
+                    && crate::metadata::drv_modulo::populate_on_ingest(
+                        &self.pool, store_path, &bytes,
+                    )
+                    .await
+                        == crate::metadata::drv_modulo::PopulateOutcome::MissingInput
+                {
+                    crate::metadata::drv_modulo::record_missing_input(store_path);
+                }
                 Ok(UpstreamOutcome::Hit(Box::new(info)))
             }
             Err(e) => {
@@ -1915,6 +1942,71 @@ mod tests {
             .expect("path should be in narinfo table");
         assert_eq!(stored.nar_size, nar.len() as u64);
         assert_eq!(stored.signatures.len(), 1);
+    }
+
+    // r[verify store.ingest.drv-modulo-cache+2]
+    /// THE W2-S7 substitution rider (plan Q8): a substituted `.drv`
+    /// populates the modulo cache like every other ingest route.
+    /// Pre-fix, substitution was the ONE completion path that never
+    /// fired populate_on_ingest — every substituted deriver landed
+    /// row-less and the first IA proof against it paid a cold
+    /// read-through walk (the systematic row-less source behind
+    /// bug_083's trigger).
+    #[tokio::test]
+    async fn substituted_drv_populates_modulo_cache() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-drv-modulo").await;
+
+        // A LEAF derivation (no inputs) so population cannot defer.
+        let drv_text = br#"Derive([("out","/nix/store/cccccccccccccccccccccccccccccccc-leaf","","")],[],[],"x86_64-linux","/bin/sh",["-c","x"],[("name","leaf"),("out","/nix/store/cccccccccccccccccccccccccccccccc-leaf")])"#;
+        let path = rio_test_support::fixtures::test_store_path("substituted-leaf.drv");
+        let (nar, _hash) = rio_test_support::fixtures::make_nar(drv_text);
+        let fake = spawn_fake_upstream(&path, nar.clone(), "cache.drvmod").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let sub = test_substituter(db.pool.clone());
+        let got = sub.try_substitute(tid, &path).await.unwrap();
+        assert!(got.is_some(), "upstream has the .drv");
+
+        let row: i64 =
+            sqlx::query_scalar("SELECT count(*)::bigint FROM drv_modulo_cache WHERE drv_path = $1")
+                .bind(&path)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row, 1,
+            "substitution must populate the modulo cache (pre-fix: row-less)"
+        );
+
+        // Non-.drv substitution stays population-free (no spurious rows).
+        let (path2, nar2) = make_path();
+        let fake2 = spawn_fake_upstream(&path2, nar2, "cache.drvmod2").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake2.url,
+            60,
+            std::slice::from_ref(&fake2.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+        sub.try_substitute(tid, &path2).await.unwrap();
+        let total: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM drv_modulo_cache")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "non-.drv substitution adds no modulo rows");
     }
 
     // r[verify store.substitute.progress-stream]

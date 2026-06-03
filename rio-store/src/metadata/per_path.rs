@@ -95,6 +95,36 @@ pub(crate) enum Bind {
     PathText,
 }
 
+/// Who writes rows into a per-path table, and how those writes
+/// serialize against the two deletion paths (round-16 W2-S7 c4: a
+/// registry entry is a LIFECYCLE CONTRACT, not just a deletion
+/// policy — bug_044's race and merged_bug_001's clock both lived in
+/// the producer half nobody declared).
+#[allow(dead_code)] // documentation payloads; liveness pinned by every_producer_documents_itself
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Producers {
+    /// Production write sites (`module::fn`, audit-greppable). Test
+    /// seeders and psql fixtures are deliberately NOT listed.
+    pub(crate) sites: &'static [&'static str],
+    /// Serialization regime vs the deletion paths.
+    pub(crate) lock_class: LockClass,
+}
+
+/// How a producer's writes order against the sweep's per-path batch
+/// transaction and post-lock invalidation (both hold the path's
+/// `manifests` row `FOR UPDATE`).
+#[allow(dead_code)] // documentation payloads; liveness pinned by every_producer_documents_itself
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LockClass {
+    /// Writes commit while holding (or serialized behind) the path's
+    /// `manifests` row lock — cannot interleave with a deletion
+    /// transaction for the same path.
+    ManifestRow,
+    /// Writes are NOT ordered by the manifest lock; the named residual
+    /// states what a post-deletion write means and why it is safe.
+    Unserialized { residual: &'static str },
+}
+
 impl PerPathTable {
     /// Execution order — see the type doc.
     pub(crate) const ALL: [PerPathTable; 8] = [
@@ -253,6 +283,86 @@ impl PerPathTable {
             },
         }
     }
+
+    /// The producer half of the lifecycle contract: who writes this
+    /// table and under which serialization regime. Reviewed when a
+    /// deletion policy changes (the bug_044 class: a policy that is
+    /// correct against one producer set silently rots when a new
+    /// producer lands — the conformance direction is "new producer →
+    /// edit THIS declaration → reviewer sees the lock class").
+    /// Documentation payload like the policy rationales: read by the
+    /// liveness test and reviewers, not by the deletion loops.
+    // r[impl store.db.per-path-registry+2]
+    #[allow(dead_code)] // liveness pinned by every_producer_documents_itself
+    pub(crate) fn producers(self) -> Producers {
+        match self {
+            PerPathTable::RealisationDeps => Producers {
+                sites: &["metadata::realisations::insert_deps (scheduler resolve)"],
+                lock_class: LockClass::Unserialized {
+                    residual: "an edge committed after a deletion references only \
+                               realisations rows that survived it (composite FK, \
+                               RESTRICT both roles) — a post-delete edge for a \
+                               purged realisation is unwritable at the DB layer",
+                },
+            },
+            PerPathTable::Realisations => Producers {
+                sites: &[
+                    "grpc::realisations::register (gateway wopRegisterRealisation)",
+                    "substitute (CA narinfo ingest)",
+                ],
+                lock_class: LockClass::Unserialized {
+                    residual: "a realisation committed after invalidation is a \
+                               point-in-time miss; the operator remediation is the \
+                               documented idempotent re-run (invalidate.rs module \
+                               doc); the sweep never targets live output paths",
+                },
+            },
+            PerPathTable::PathTenants => Producers {
+                sites: &["scheduler completion upsert (sched.gc.path-tenants-upsert)"],
+                lock_class: LockClass::Unserialized {
+                    residual: "an upsert after a sweep re-creates attribution for a \
+                               path whose narinfo is gone — harmless to GC (the mark \
+                               CTE arm JOINs narinfo) and re-purged by the next \
+                               sweep/invalidation of the path",
+                },
+            },
+            PerPathTable::DrvModuloCache => Producers {
+                sites: &[
+                    "metadata::drv_modulo::populate_on_ingest (PutPath/Batch finalize, \
+                     substitution ingest, heal)",
+                    "metadata::drv_modulo::ProofWalk::persist (proof-time read-through)",
+                ],
+                lock_class: LockClass::Unserialized {
+                    residual: "rows are content-derived immutable facts; a write after \
+                               any deletion is a benign re-derivation (M_073: the \
+                               conflict arm clears orphaned_at, never alters values)",
+                },
+            },
+            PerPathTable::SchedulerLivePins => Producers {
+                sites: &["scheduler dispatch auto-pin (store-side: none)"],
+                lock_class: LockClass::Unserialized {
+                    residual: "scheduler-owned liveness; the store only READS pins \
+                               (sweep re-check) and never deletes them — both \
+                               policies are Survive",
+                },
+            },
+            PerPathTable::ManifestData => Producers {
+                sites: &["ingest::persist_nar (chunked arm)"],
+                lock_class: LockClass::ManifestRow,
+            },
+            PerPathTable::Manifests => Producers {
+                sites: &[
+                    "ingest::claim_placeholder ('uploading' insert)",
+                    "ingest::persist_nar",
+                ],
+                lock_class: LockClass::ManifestRow,
+            },
+            PerPathTable::Narinfo => Producers {
+                sites: &["ingest::claim_placeholder (placeholder narinfo, refs at insert)"],
+                lock_class: LockClass::ManifestRow,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -296,6 +406,259 @@ mod tests {
                 }
                 InvalidatePolicy::Cascade { via } => assert!(!via.is_empty(), "{t:?}"),
                 InvalidatePolicy::Survive { rationale } => assert!(!rationale.is_empty(), "{t:?}"),
+            }
+        }
+    }
+
+    /// The producer half is declared for every table: at least one
+    /// named site, and Unserialized producers carry a non-empty
+    /// residual (the lifecycle contract's "what does a post-deletion
+    /// write mean" clause).
+    #[test]
+    fn every_producer_documents_itself() {
+        for t in PerPathTable::ALL {
+            let p = t.producers();
+            assert!(!p.sites.is_empty(), "{t:?}: no producer sites declared");
+            for site in p.sites {
+                assert!(!site.is_empty(), "{t:?}: empty site string");
+            }
+            if let LockClass::Unserialized { residual } = p.lock_class {
+                assert!(
+                    !residual.is_empty(),
+                    "{t:?}: Unserialized producers must name their residual"
+                );
+            }
+        }
+    }
+
+    // r[verify store.db.per-path-registry+2]
+    /// THE registry-driven producer x deleter cell test: ONE path
+    /// seeded into EVERY registered table, then each deletion path
+    /// run, with each table's expected fate DERIVED FROM ITS DECLARED
+    /// POLICY — a policy change (or a new table variant) updates the
+    /// expectation automatically, so this test verifies BEHAVIOR ==
+    /// DECLARATION for all 16 cells (8 tables x 2 deletion paths)
+    /// rather than a hand-picked subset. bug_069 was a cell whose
+    /// declared policy ("nothing, FK guards") did not survive contact
+    /// with its producer population; this closes the whole grid.
+    #[tokio::test]
+    async fn producer_deleter_cells_match_declared_policies() {
+        use crate::test_helpers::{StoreSeed, seed_tenant};
+        use rio_test_support::fixtures::test_store_path;
+
+        // Seed EVERY table for `path`. drv-suffixed so the modulo row
+        // is plausible; the live realisation partner makes the deps
+        // edges real (both roles).
+        async fn seed_all(pool: &sqlx::PgPool, path: &str, tenant: uuid::Uuid, tag: u8) {
+            let hash: Vec<u8> = {
+                use sha2::Digest as _;
+                sha2::Sha256::digest(path.as_bytes()).to_vec()
+            };
+            // narinfo + manifests (complete, inline) via the standard
+            // seeder; manifest_data needs a chunked shape — insert the
+            // row directly (CASCADE fate is what's under test, not
+            // chunk semantics).
+            StoreSeed::raw_path(path)
+                .with_inline_blob(b"cell".to_vec())
+                .seed(pool)
+                .await;
+            sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
+                .bind(&hash)
+                .bind(Vec::<u8>::new())
+                .execute(pool)
+                .await
+                .unwrap();
+            for (drv, out) in [(tag, path), (tag + 1, "/nix/store/cell-partner")] {
+                sqlx::query(
+                    "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash) \
+                     VALUES ($1, 'out', $2, $3)",
+                )
+                .bind(vec![drv; 32])
+                .bind(out)
+                .bind(vec![0x22u8; 32])
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            for (a, b) in [(tag, tag + 1), (tag + 1, tag)] {
+                sqlx::query(
+                    "INSERT INTO realisation_deps \
+                     (drv_hash, output_name, dep_drv_hash, dep_output_name) \
+                     VALUES ($1, 'out', $2, 'out')",
+                )
+                .bind(vec![a; 32])
+                .bind(vec![b; 32])
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+                .bind(&hash)
+                .bind(tenant)
+                .execute(pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO drv_modulo_cache \
+                 (drv_path_hash, drv_path, modulo_hash, ia_output_paths, deferred) \
+                 VALUES ($1, $2, $3, '{}'::jsonb, FALSE)",
+            )
+            .bind(&hash)
+            .bind(path)
+            .bind([0u8; 32].as_slice())
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash) VALUES ($1, 'cell')",
+            )
+            .bind(&hash)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        // Rows present for `path` in table `t`? Exhaustive over the
+        // registry: a new variant fails compilation HERE too, keeping
+        // the grid total.
+        async fn present(pool: &sqlx::PgPool, t: PerPathTable, path: &str, tag: u8) -> bool {
+            let hash: Vec<u8> = {
+                use sha2::Digest as _;
+                sha2::Sha256::digest(path.as_bytes()).to_vec()
+            };
+            let by_hash = |sql: &'static str| {
+                let hash = hash.clone();
+                async move {
+                    sqlx::query_scalar::<_, i64>(sql)
+                        .bind(hash)
+                        .fetch_one(pool)
+                        .await
+                        .unwrap()
+                }
+            };
+            let n: i64 = match t {
+                PerPathTable::Realisations => sqlx::query_scalar(
+                    "SELECT count(*)::bigint FROM realisations WHERE output_path = $1",
+                )
+                .bind(path)
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+                PerPathTable::RealisationDeps => sqlx::query_scalar(
+                    "SELECT count(*)::bigint FROM realisation_deps \
+                     WHERE drv_hash = $1 OR dep_drv_hash = $1",
+                )
+                .bind(vec![tag; 32])
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+                PerPathTable::PathTenants => {
+                    by_hash("SELECT count(*)::bigint FROM path_tenants WHERE store_path_hash = $1")
+                        .await
+                }
+                PerPathTable::DrvModuloCache => {
+                    by_hash(
+                        "SELECT count(*)::bigint FROM drv_modulo_cache WHERE drv_path_hash = $1",
+                    )
+                    .await
+                }
+                PerPathTable::SchedulerLivePins => by_hash(
+                    "SELECT count(*)::bigint FROM scheduler_live_pins WHERE store_path_hash = $1",
+                )
+                .await,
+                PerPathTable::ManifestData => {
+                    by_hash("SELECT count(*)::bigint FROM manifest_data WHERE store_path_hash = $1")
+                        .await
+                }
+                PerPathTable::Manifests => {
+                    by_hash("SELECT count(*)::bigint FROM manifests WHERE store_path_hash = $1")
+                        .await
+                }
+                PerPathTable::Narinfo => {
+                    by_hash("SELECT count(*)::bigint FROM narinfo WHERE store_path_hash = $1").await
+                }
+            };
+            n > 0
+        }
+
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "cell-grid").await;
+
+        // ── Sweep column of the grid ──
+        let p_sweep = test_store_path("cell-sweep.drv");
+        seed_all(&db.pool, &p_sweep, tenant, 0x61).await;
+        let hash: Vec<u8> = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(p_sweep.as_bytes()).to_vec()
+        };
+        // The pin row would resurrect the path in a REAL sweep
+        // (recheck consults pins) — drop it for the sweep run; its
+        // Survive cell is asserted on the invalidate column where
+        // pins don't block. Same for tenant retention (re-check arm
+        // iii): backdate first_referenced_at past any window so the
+        // sweep proceeds while the path_tenants Delete cell is still
+        // witnessed (rows exist at sweep time).
+        sqlx::query("DELETE FROM scheduler_live_pins WHERE store_path_hash = $1")
+            .bind(&hash)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE path_tenants SET first_referenced_at = now() - interval '2000 hours' \
+             WHERE store_path_hash = $1",
+        )
+        .bind(&hash)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let stats = crate::gc::sweep::sweep(
+            &db.pool,
+            None,
+            vec![hash.clone()],
+            false,
+            &rio_common::signal::Token::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.paths_deleted, 1, "sweep ran");
+        for t in PerPathTable::ALL {
+            if t == PerPathTable::SchedulerLivePins {
+                continue; // dropped above; covered in the invalidate column
+            }
+            let is_present = present(&db.pool, t, &p_sweep, 0x61).await;
+            match t.sweep_policy() {
+                SweepPolicy::Delete { .. } | SweepPolicy::Cascade { .. } => {
+                    assert!(!is_present, "{t:?}: declared sweep-deleted but rows remain")
+                }
+                SweepPolicy::Survive { .. } => {
+                    assert!(is_present, "{t:?}: declared sweep-survivor but rows gone")
+                }
+            }
+        }
+
+        // ── Invalidate column of the grid ──
+        let p_inv = test_store_path("cell-invalidate.drv");
+        seed_all(&db.pool, &p_inv, tenant, 0x63).await;
+        let sp = rio_nix::store_path::StorePath::parse(&p_inv).unwrap();
+        let counts = crate::metadata::invalidate::invalidate_path(&db.pool, &sp, false, None)
+            .await
+            .unwrap();
+        assert!(counts.found());
+        for t in PerPathTable::ALL {
+            let is_present = present(&db.pool, t, &p_inv, 0x63).await;
+            match t.invalidate_policy() {
+                InvalidatePolicy::Delete { .. }
+                | InvalidatePolicy::DeleteUnlessKeptRealisations { .. }
+                | InvalidatePolicy::Cascade { .. } => assert!(
+                    !is_present,
+                    "{t:?}: declared invalidate-deleted but rows remain"
+                ),
+                InvalidatePolicy::Survive { .. } => {
+                    assert!(
+                        is_present,
+                        "{t:?}: declared invalidate-survivor but rows gone"
+                    )
+                }
             }
         }
     }
