@@ -1,7 +1,7 @@
 # Store scaling surface (decision 5): one-replica-per-node placement +
 # the KEDA ScaledObject as the SINGLE owner of the store replica count.
 #
-# r[verify infra.store.autoscaling+2] (documentary — .sh is not
+# r[verify infra.store.autoscaling+3] (documentary — .sh is not
 # tracey-scanned; this fragment is the merge-gate render proof of the
 # rule's chart half)
 #
@@ -164,50 +164,61 @@ test -z "$cs" || {
   exit 1
 }
 
-# ── floor asymmetry (mirrors 25-gateway-antiaffinity-autoscaling-floor):
-# anti-affinity gates on the CEILING, the PDB on the FLOOR ─────────────
-floor=$TMPDIR/store-scaling-floor.yaml
-helm template rio . --set global.image.tag=test \
-  --set podDisruptionBudget.enabled=true \
-  --set store.autoscaling.minReplicas=1 >"$floor"
-
-# Required aff still PRESENT at a 1-pod floor (KEDA can still scale to
-# maxReplicas pods that would otherwise bin-pack onto one node).
-aff_floor=$(yq -N 'select(.kind=="Deployment" and .metadata.name=="rio-store") | .spec.template.spec.affinity.podAntiAffinity' "$floor")
-grep -q 'requiredDuringSchedulingIgnoredDuringExecution' <<<"$aff_floor" || {
-  echo "FAIL: rio-store lost required podAntiAffinity at autoscaling minReplicas=1 — the gate must key on the CEILING" >&2
-  exit 1
+# ── disruption render-property matrix (merged_bug_378): every rule on
+# its NAMED axis. PDB present in ALL store-enabled configs (percentage
+# rounds up — harmless at 1); strategy iff FLOOR>1
+# (rio.alwaysRunsMultiple); required anti-affinity iff CEILING>1
+# (rio.mayRunMultiple). Red-first evidence: against the pre-change
+# chart the (floor=1, ceiling=173) row FAILS — strategy rendered on
+# the ceiling axis, marking a 1-replica store Available at zero ready
+# pods; and the same row's PDB row FAILS — the floor gate left
+# KEDA-scaled pods unprotected.
+matrix_check() {
+  # args: name, extra --set args..., want_strategy(y/n), want_aff(y/n), want_pdb(y/n)
+  local name="$1"; shift
+  local want_strategy="$1"; shift
+  local want_aff="$1"; shift
+  local want_pdb="$1"; shift
+  local f=$TMPDIR/matrix-$name.yaml
+  helm template rio . --set global.image.tag=test \
+    --set podDisruptionBudget.enabled=true "$@" >"$f"
+  local strat aff pdb
+  strat=$(yq -N 'select(.kind=="Deployment" and .metadata.name=="rio-store") | .spec.strategy' "$f")
+  aff=$(yq -N 'select(.kind=="Deployment" and .metadata.name=="rio-store") | .spec.template.spec.affinity.podAntiAffinity' "$f")
+  pdb=$(yq -N 'select(.kind=="PodDisruptionBudget" and .metadata.name=="rio-store")' "$f")
+  local got_strategy=n got_aff=n got_pdb=n
+  test "$strat" != "null" && test -n "$strat" && got_strategy=y
+  test "$aff" != "null" && test -n "$aff" && got_aff=y
+  test -n "$pdb" && got_pdb=y
+  test "$got_strategy" = "$want_strategy" || {
+    echo "FAIL[matrix:$name]: strategy rendered=$got_strategy want=$want_strategy (strategy must key on the FLOOR — rio.alwaysRunsMultiple)" >&2
+    exit 1
+  }
+  test "$got_aff" = "$want_aff" || {
+    echo "FAIL[matrix:$name]: required anti-affinity rendered=$got_aff want=$want_aff (aff must key on the CEILING — rio.mayRunMultiple)" >&2
+    exit 1
+  }
+  test "$got_pdb" = "$want_pdb" || {
+    echo "FAIL[matrix:$name]: store PDB rendered=$got_pdb want=$want_pdb (PDB renders unconditionally on the scale axes — percentage rounds up)" >&2
+    exit 1
+  }
 }
+#            name                 strategy aff pdb   overrides
+matrix_check defaults             y        y   y
+matrix_check floor1-ceiling-many  n        y   y     --set store.autoscaling.minReplicas=1
+matrix_check floor1-ceiling1      n        n   y     --set store.autoscaling.minReplicas=1 --set store.autoscaling.maxReplicas=1
+matrix_check off-replicas1        n        n   y     --set store.autoscaling.enabled=false
+matrix_check off-replicas3        y        y   y     --set store.autoscaling.enabled=false --set store.replicas=3
 
-# Premise guard for the absence assertion below (the 25-gateway trick):
-# the scheduler keeps chart-default replicas=2 here, so its PDB must
-# render — proves pdb.yaml was evaluated.
-sched_pdb=$(yq -N 'select(.kind=="PodDisruptionBudget" and .metadata.name=="rio-scheduler")' "$floor")
+# Premise guard for the matrix's PDB assertions: the scheduler PDB
+# renders in the same pass (proves pdb.yaml was evaluated, the
+# 25-gateway trick).
+sched_pdb=$(yq -N 'select(.kind=="PodDisruptionBudget" and .metadata.name=="rio-scheduler")' "$TMPDIR/matrix-defaults.yaml")
 test -n "$sched_pdb" || {
-  echo "FAIL: rio-scheduler PDB did not render at default replicas=2 — pdb.yaml is not being evaluated, the rio-store PDB-absence assertion would be vacuous" >&2
+  echo "FAIL: rio-scheduler PDB did not render — pdb.yaml not evaluated, matrix PDB assertions vacuous" >&2
   exit 1
 }
-
-# Store PDB ABSENT at the 1-pod floor (floor-gated: a disruption budget
-# against a single pod either blocks every drain or is a no-op).
-pdb_floor=$(yq -N 'select(.kind=="PodDisruptionBudget" and .metadata.name=="rio-store")' "$floor")
-test -z "$pdb_floor" || {
-  echo "FAIL: rio-store PDB rendered at autoscaling minReplicas=1 — the PDB must gate on the FLOOR" >&2
-  exit 1
-}
-
-# At chart defaults (floor 2) the store PDB IS present, in the store
-# namespace, with the percentage budget (rounds UP: 1 allowed at the
-# floor of 2, ~4-5 at Karpenter-bound scale — drains never blocked,
-# large rotations parallelize).
-pdbout=$TMPDIR/store-scaling-pdb.yaml
-helm template rio . --set global.image.tag=test \
-  --set podDisruptionBudget.enabled=true >"$pdbout"
-pdb_def=$(yq -N 'select(.kind=="PodDisruptionBudget" and .metadata.name=="rio-store")' "$pdbout")
-test -n "$pdb_def" || {
-  echo "FAIL: rio-store PDB absent at chart defaults (floor 2, podDisruptionBudget.enabled=true)" >&2
-  exit 1
-}
+pdb_def=$(yq -N 'select(.kind=="PodDisruptionBudget" and .metadata.name=="rio-store")' "$TMPDIR/matrix-defaults.yaml")
 grep -q 'maxUnavailable: 10%' <<<"$pdb_def" || {
   echo "FAIL: rio-store PDB lost maxUnavailable: 10% (percentage rounds UP — 1 at floor 2, parallelizes large rotations)" >&2
   exit 1
@@ -229,7 +240,8 @@ test "$reps_off" = "1" || {
 }
 
 # Single-node k3s safety: with autoscaling off and replicas 1, NO
-# podAntiAffinity renders (the ceiling-gate's other side).
+# podAntiAffinity renders (the ceiling-gate's other side; the matrix
+# above pins the strategy/PDB cells for this config too).
 aff_off=$(yq -N 'select(.kind=="Deployment" and .metadata.name=="rio-store") | .spec.template.spec.affinity.podAntiAffinity' "$off")
 test "$aff_off" = "null" || {
   echo "FAIL: rio-store renders podAntiAffinity with autoscaling off + replicas 1 — single-node k3s fixtures would deadlock" >&2

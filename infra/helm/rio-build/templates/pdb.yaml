@@ -39,7 +39,7 @@ spec:
        the PDB for replicas=1 + autoscaling-on (≥2 KEDA-managed pods
        left unprotected) and render a drain-blocking PDB for replicas=2
        + minReplicas=1 (minAvailable=1 against a single pod). */}}
-{{- if and $g.enabled (gt (int (ternary $g.autoscaling.minReplicas $g.replicas $g.autoscaling.enabled)) 1) }}
+{{- if and $g.enabled (include "rio.alwaysRunsMultiple" $g) }}
 ---
 # minAvailable (not maxUnavailable): SSH ingress must stay up. Killing both
 # gateways = no way to submit builds (SSH is the only submission path).
@@ -58,11 +58,15 @@ spec:
 {{- end }}
 
 {{- $s := .Values.store }}
-{{- /* Floor-gated, mirroring the gateway PDB's gate (ceiling gates the
-       anti-affinity in store.yaml; the PDB keys on the FLOOR — a
-       disruption budget against a 1-pod floor either blocks every
-       drain or is a no-op). */}}
-{{- if and $s.enabled (gt (int (ternary $s.autoscaling.minReplicas ($s.replicas | default 1) $s.autoscaling.enabled)) 1) }}
+{{- /* UNCONDITIONAL on the scale axes (merged_bug_378): a PERCENTAGE
+       maxUnavailable rounds UP in the disruption controller, so at
+       N=1 it allows 1 (drains never blocked — a no-op, not a
+       blocker); the floor gate this used to carry protected against
+       a hazard percentage budgets do not have, while leaving a
+       floor-1 ceiling-many config's KEDA-scaled pods unprotected.
+       The gateway PDB above legitimately keeps its floor gate: its
+       minAvailable:1 form DOES block every drain at one pod. */}}
+{{- if $s.enabled }}
 ---
 # maxUnavailable: 10% — the percentage rounds UP in the disruption
 # controller, so 1 is allowed at the floor of 2 (drains never blocked)

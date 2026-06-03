@@ -1,6 +1,6 @@
 {{- if and .Values.store.enabled .Values.store.autoscaling.enabled }}
 {{- $a := .Values.store.autoscaling -}}
-# r[impl infra.store.autoscaling+2] (documentary — .yaml is not tracey-
+# r[impl infra.store.autoscaling+3] (documentary — .yaml is not tracey-
 # scanned; the scannable anchors are xtask deploy.rs and the helm-lint
 # fragment 26-store-scaling.sh asserts this render)
 #

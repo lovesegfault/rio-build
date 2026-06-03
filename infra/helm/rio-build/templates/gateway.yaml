@@ -103,7 +103,7 @@ spec:
              Deliberate asymmetry with the rio-gateway PDB (pdb.yaml),
              which keys on the FLOOR: a minAvailable:1 budget against a
              1-pod floor would block every node drain. */}}
-      {{- if gt (int (ternary $g.autoscaling.maxReplicas $g.replicas $g.autoscaling.enabled)) 1 }}
+      {{- if include "rio.mayRunMultiple" $g }}
       # r37 bug_020 (sweep): rio-gateway is the only build-submission
       # path (SSH ingress). Both replicas on one node → drain stalls
       # behind the PDB but every NLB target is gone for the eviction

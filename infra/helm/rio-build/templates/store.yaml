@@ -65,17 +65,20 @@ spec:
   #      mints a node in ~30-60s, up to the pool's limits.cpu — which
   #      IS the intended operative scale bound (the KEDA ceiling is
   #      only the PG backstop).
-  {{- /* Gated on the same ceiling as the anti-affinity below: the
-         explicit maxUnavailable: 1 exists to satisfy the merged_021
-         rollout-deadlock rule for the REQUIRED-aff render. On a
-         single-replica render (k3s fixtures, dev) it must NOT apply:
-         replicas=1 with maxUnavailable=1 makes the Deployment count
-         as Available at ZERO ready pods, turning every
-         `kubectl wait --for=condition=Available` into a vacuous pass
-         while the store is still starting (the apps/v1 default 25%
-         rounds down to 0 there, which is exactly right for one
-         replica). */}}
-  {{- if gt (int (ternary $s.autoscaling.maxReplicas ($s.replicas | default 1) $s.autoscaling.enabled)) 1 }}
+  {{- /* FLOOR-gated (rio.alwaysRunsMultiple — merged_bug_378's axis
+         swap): the explicit maxUnavailable: 1 exists to satisfy the
+         merged_021 rollout-deadlock rule, but it is only SAFE when a
+         second pod is guaranteed. Its own safety note already said
+         so — at one LIVE replica, maxUnavailable=1 makes the
+         Deployment count as Available at ZERO ready pods, turning
+         every `kubectl wait --for=condition=Available` into a vacuous
+         pass while the store is still starting — yet the old gate
+         keyed on the CEILING, so any floor-1 ceiling-many config
+         (minReplicas=1, or KEDA scaled to 1) shipped exactly that
+         state. The apps/v1 default (25% rounds down to 0) is right
+         for a 1-pod floor; the explicit strategy is right from a
+         guaranteed 2. */}}
+  {{- if include "rio.alwaysRunsMultiple" $s }}
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -116,8 +119,10 @@ spec:
              autoscaling off accepts Pending-on-small-cluster — the same
              documented trade as the gateway. IgnoredDuringExecution:
              already-stacked live pods are not evicted; placement
-             converges on the next rollout/scale event. */}}
-      {{- if gt (int (ternary $s.autoscaling.maxReplicas ($s.replicas | default 1) $s.autoscaling.enabled)) 1 }}
+             converges on the next rollout/scale event.
+             (rio.mayRunMultiple = the same ceiling ternary, named —
+             behavior-identical re-key, merged_bug_378.) */}}
+      {{- if include "rio.mayRunMultiple" $s }}
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:

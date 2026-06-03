@@ -97,7 +97,7 @@ The EKS reference deployment (`infra/eks/`) uses Karpenter: the `executors` mana
 
 == Store autoscaling
 
-#r("infra.store.autoscaling+2")[
+#r("infra.store.autoscaling+3")[
   The rio-store Deployment's replica count MUST have exactly one writer ---
   the KEDA ScaledObject (`templates/store-scaledobject.yaml`): when
   `store.autoscaling.enabled` the chart MUST NOT render a static
@@ -106,17 +106,28 @@ The EKS reference deployment (`infra/eks/`) uses Karpenter: the `executors` mana
   chart MUST define no ComponentScaler CR targeting the store. The
   ScaledObject scales on three triggers --- substitution backlog
   (#(refs.metric)("rio_scheduler_substituting_derivations") per replica,
-  the leading signal), builders-per-replica
+  the leading signal, thresholded in JOB units by
+  `targetBacklogJobsPerReplica`), builders-per-replica
   (#(refs.metric)("rio_scheduler_open_attempts") per replica), and CPU
-  utilization (reactive corrective) --- with scale-up unstabilized,
-  scale-down damped (1800 s window, max(25 %, 1 pod) / 600 s), and a
-  floor of 2 with a values-configurable ceiling (default 105) that MUST
-  be the PG-connection backstop (derived from the provisioned Aurora
-  `max_connections` / `pgMaxConnections` with headroom), not a product
-  cap --- the operative scale limit MUST be the Karpenter `rio-general`
-  pool; the store pods MUST carry required one-per-node `podAntiAffinity`
-  (`kubernetes.io/hostname`) gated on the autoscaling ceiling, plus a
-  PodDisruptionBudget (`maxUnavailable` 10 %) gated on the floor.
+  utilization (reactive corrective); every prometheus trigger MUST
+  render through the unit-checking helper (`rio.promTrigger` ×
+  `files/metric-units.json` --- a metric/knob unit mismatch MUST fail
+  the render). Scale-up unstabilized, scale-down damped (1800 s window,
+  max(25 %, 1 pod) / 600 s); floor 2 with a values-configurable ceiling
+  (default 173, overridden on every EKS deploy by the pg preflight's
+  derivation from the MEASURED Aurora `max_connections`) that MUST be
+  the PG-connection backstop (`derive_store_ceiling`: 70 % of the
+  budget minus non-store consumers, over `pgMaxConnections`), not a
+  product cap --- the operative scale limit MUST be the Karpenter
+  `rio-general` pool. Disruption rules key on NAMED axis predicates:
+  required one-per-node `podAntiAffinity` (`kubernetes.io/hostname`)
+  gated on the CEILING (`rio.mayRunMultiple`); the explicit
+  `maxUnavailable: 1` rollout strategy gated on the FLOOR
+  (`rio.alwaysRunsMultiple` --- at one live replica it would mark the
+  Deployment Available at zero ready pods); the store
+  PodDisruptionBudget (`maxUnavailable` 10 %) rendered UNCONDITIONALLY
+  on the scale axes (a percentage budget rounds up --- harmless at one
+  replica, protective at every scale).
 ]
 The store carries three superimposed load classes --- substitution ingest
 (upstream → store → S3; leading indicator: the scheduler's materialization

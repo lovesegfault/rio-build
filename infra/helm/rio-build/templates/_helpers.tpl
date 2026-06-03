@@ -343,3 +343,34 @@ cannot ship.
     query: {{ $query }}
     threshold: {{ $threshold | quote }}
 {{- end -}}
+
+{{/*
+Disruption-gate predicates (merged_bug_378): name the AXIS a
+multi-replica rule keys on, so call sites say WHICH question they ask
+instead of repeating raw ternaries that silently pick the wrong axis.
+Both take a component values dict (.autoscaling.{enabled,minReplicas,
+maxReplicas} + .replicas) and return "true"/"" for use under `if`.
+
+rio.mayRunMultiple — CEILING: true when MORE THAN ONE pod may exist
+(autoscaling ceiling, else static replicas). For rules that must hold
+whenever multiple pods are POSSIBLE: required one-per-node
+anti-affinity (constrains nothing while one pod exists, must already
+hold when the autoscaler adds the second).
+*/}}
+{{- define "rio.mayRunMultiple" -}}
+{{- $c := . -}}
+{{- if gt (int (ternary $c.autoscaling.maxReplicas ($c.replicas | default 1) $c.autoscaling.enabled)) 1 -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+rio.alwaysRunsMultiple — FLOOR: true when MORE THAN ONE pod is
+GUARANTEED (autoscaling floor, else static replicas). For rules that
+are safe ONLY with a guaranteed second pod: an explicit
+maxUnavailable:1 rollout strategy (at one live replica it makes the
+Deployment Available at zero ready pods) and minAvailable-style
+budgets (against one pod they block every drain).
+*/}}
+{{- define "rio.alwaysRunsMultiple" -}}
+{{- $c := . -}}
+{{- if gt (int (ternary $c.autoscaling.minReplicas ($c.replicas | default 1) $c.autoscaling.enabled)) 1 -}}true{{- end -}}
+{{- end -}}
