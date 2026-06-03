@@ -80,6 +80,7 @@
 //!   verified by a `proof_for_contract` harness over the full evidence
 //!   alphabet).
 
+pub mod establish;
 pub mod pull;
 
 /// Trust classification of a node's current DAG child set as evidence

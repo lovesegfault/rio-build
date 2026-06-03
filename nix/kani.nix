@@ -364,6 +364,8 @@ in
   kani-rio-evidence-kernel = mkKaniCheck {
     name = "rio-evidence-kernel";
     crate = crateBuildKani.members.rio-evidence-kernel;
-    expectedHarnesses = 10;
+    # 10 → 11: + check_cancelled_never_charged (establish.rs — the
+    # shared establishment kernel's node axis; §4.R2).
+    expectedHarnesses = 11;
   };
 }
