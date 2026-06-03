@@ -62,6 +62,17 @@ pub enum Lint {
     /// silently dropped `requiredSystemFeatures` for `__structuredAttrs`
     /// derivations).
     StructuredAttrReads,
+    /// Every declared replay-trust contract row (capability gates,
+    /// content digests, the gate's coverage witness, provenance
+    /// classification, closure completeness) resolves to a NAMED
+    /// consumer-side contract test that exists and exercises the row's
+    /// artifact, or carries an explicit waiver with a reason. The row
+    /// universe is parsed from the schema source (Capabilities /
+    /// ContentDigests fields), so a new capability flag or digest field
+    /// fails this lint until its enforcement test (or waiver) is
+    /// registered. Catches write-only witnesses: contracts that are
+    /// produced and documented but never demanded by any consumer.
+    ContractRegistry,
 }
 
 impl Lint {
@@ -81,6 +92,7 @@ impl Lint {
             Lint::BookkeepingMarker,
             Lint::ReplayCnpPreflight,
             Lint::StructuredAttrReads,
+            Lint::ContractRegistry,
         ]
     }
 }
@@ -94,6 +106,7 @@ pub fn run(lint: &Lint) -> Result<()> {
         Lint::BookkeepingMarker => bookkeeping_marker(),
         Lint::ReplayCnpPreflight => replay_cnp_preflight(),
         Lint::StructuredAttrReads => structured_attr_reads(),
+        Lint::ContractRegistry => contract_registry(),
     }
 }
 
@@ -1228,6 +1241,453 @@ fn structured_attr_reads() -> Result<()> {
     Ok(())
 }
 
+/// How one declared-contract row is enforced.
+#[derive(Debug, Clone, Copy)]
+enum Enforcement {
+    /// A consumer-side contract test: `test_fn` in `file` must exist and
+    /// the file must contain every `artifact_needles` entry — strings
+    /// taken from the test's canned hostile artifact (the flipped digest,
+    /// the `checked: 0` gate document, the withdrawn-claim manifest edit),
+    /// so the row cannot be satisfied by pointing at an unrelated test
+    /// name. A call site is deliberately NOT acceptable enforcement: a
+    /// consumer that parses-and-ignores resolves names just fine.
+    Test {
+        file: &'static str,
+        test_fn: &'static str,
+        artifact_needles: &'static [&'static str],
+    },
+    /// Deliberately unenforced, with the reason on record. The declared
+    /// contract text must still exist (a waiver may not outlive its
+    /// contract). Currently unused by the live registry — every row has a
+    /// consumer-side test today, which is the desired steady state — but
+    /// the variant (validated in this module's tests) is the only
+    /// sanctioned way to register a row whose enforcement is consciously
+    /// deferred, instead of leaving the row off the registry entirely.
+    #[allow(dead_code)]
+    Waived { reason: &'static str },
+}
+
+/// One row of the declared-contract registry: a trust contract the replay
+/// design publishes (a capability gate, a content digest, a witness
+/// field, a provenance classification), where its normative text lives,
+/// and the consumer-side test that demands it.
+#[derive(Debug, Clone, Copy)]
+struct ContractRow {
+    /// Stable row key. `capability.<flag>` and `content-digest.<field>`
+    /// rows are REQUIRED by the parsed schema vocabulary; other keys are
+    /// free-form.
+    key: &'static str,
+    /// `(file, needle)`: the file that declares the contract and a
+    /// substring of its normative text. The lint fails when the needle
+    /// disappears — a registry row may not outlive the contract it
+    /// enforces.
+    declared: (&'static str, &'static str),
+    enforcement: Enforcement,
+}
+
+/// The declared-contract registry. Quantification domain: every
+/// `Capabilities` flag and every `ContentDigests` field parsed from
+/// `rio-replay/src/archive/schema.rs` (the schema structs ARE the
+/// vocabulary — `Capability::enabled_in`'s exhaustive destructuring
+/// couples the enum to the struct, and `ContentDigests::verify_at_open`
+/// destructures every digest field), plus the named cross-crate witness
+/// rows below. [`contract_registry`] fails when a vocabulary item has no
+/// row, when a `capability.*`/`content-digest.*` row names a vocabulary
+/// item that no longer exists, or when a row's named test/needles/
+/// declaration cannot be resolved.
+const CONTRACT_REGISTRY: &[ContractRow] = &[
+    // ── Capability gates: one row per flag, all resolved by the
+    // Capability::ALL behavioral flip test (its exhaustive match refuses
+    // to compile for a new variant, and its artifact is the
+    // withdrawn-claim manifest edit `set_capability_false`). ──
+    ContractRow {
+        key: "capability.timed",
+        declared: (
+            "rio-replay/src/archive/schema.rs",
+            "The timed scheduling mode",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/archive/reader.rs",
+            test_fn: "capability_flags_gate_their_documented_engine_behavior",
+            artifact_needles: &["set_capability_false", "ensure_timed_capability"],
+        },
+    },
+    ContractRow {
+        key: "capability.expected_outcomes",
+        declared: (
+            "rio-replay/src/archive/schema.rs",
+            "Verdict comparison (§7 Comparison model)",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/archive/reader.rs",
+            test_fn: "capability_flags_gate_their_documented_engine_behavior",
+            artifact_needles: &["set_capability_false", "expected_outcomes_for_units"],
+        },
+    },
+    ContractRow {
+        key: "capability.output_hashes",
+        declared: (
+            "rio-replay/src/archive/schema.rs",
+            "Output-divergence verdicts (§7 Comparison model)",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/archive/reader.rs",
+            test_fn: "capability_flags_gate_their_documented_engine_behavior",
+            artifact_needles: &["set_capability_false", "unclaimed hashes are withheld"],
+        },
+    },
+    ContractRow {
+        key: "capability.embedded_store_paths",
+        declared: (
+            "rio-replay/src/archive/schema.rs",
+            "The archive rung of the supply ladder",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/archive/reader.rs",
+            test_fn: "capability_flags_gate_their_documented_engine_behavior",
+            artifact_needles: &["set_capability_false", "has_embedded"],
+        },
+    },
+    ContractRow {
+        key: "capability.impure_env",
+        declared: (
+            "rio-replay/src/archive/schema.rs",
+            "Impure demotion (§7, §8)",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/archive/reader.rs",
+            test_fn: "capability_flags_gate_their_documented_engine_behavior",
+            artifact_needles: &["set_capability_false", "demoted_impure"],
+        },
+    },
+    ContractRow {
+        key: "capability.dependency_closures",
+        declared: (
+            "rio-replay/src/archive/schema.rs",
+            "Plan-time closure computation",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/archive/reader.rs",
+            test_fn: "capability_flags_gate_their_documented_engine_behavior",
+            artifact_needles: &["set_capability_false", "SENTINEL_SRC"],
+        },
+    },
+    // ── Content digests: one row per ContentDigests field, each with a
+    // canned corrupted-artifact test at its designated verification
+    // site (open-time recomputation, or the per-path dump check the
+    // open-time waiver names). ──
+    ContractRow {
+        key: "content-digest.drvs",
+        declared: (
+            "rio-replay/src/archive/schema.rs",
+            "digest = SHA-256 of the ATerm bytes",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/archive/reader.rs",
+            test_fn: "drv_listing_digest_mismatch_is_detected",
+            artifact_needles: &["cp -r $src $oux"],
+        },
+    },
+    ContractRow {
+        key: "content-digest.narinfo",
+        declared: (
+            "rio-replay/src/archive/schema.rs",
+            "SHA-256 of the sidecar file's bytes",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/archive/reader.rs",
+            test_fn: "narinfo_listing_digest_mismatch_is_detected",
+            artifact_needles: &["narinfo listing digest mismatch"],
+        },
+    },
+    ContractRow {
+        key: "content-digest.embedded_store_paths",
+        declared: (
+            "rio-replay/src/archive/schema.rs",
+            "SHA-256 of the uncompressed NAR serialization",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/archive/reader.rs",
+            test_fn: "dump_nar_detects_sidecar_disagreement",
+            artifact_needles: &["tampered after finalize"],
+        },
+    },
+    // ── The regression gate's coverage witness: demanded at the design-
+    // named CI consumption point (consumer side, across the JSON
+    // boundary) AND derived on an evidence axis (producer side). ──
+    ContractRow {
+        key: "gate.checked-consumed",
+        declared: (
+            "docs/dev/2026-05-28-build-replay-design.md",
+            "the single CI consumption point",
+        ),
+        enforcement: Enforcement::Test {
+            file: "xtask/src/replay/report.rs",
+            test_fn: "check_gate_demands_the_coverage_witness_across_the_wire",
+            artifact_needles: &["\"tripped\":false,\"checked\":0"],
+        },
+    },
+    ContractRow {
+        key: "gate.checked-axis",
+        declared: (
+            "docs/dev/2026-05-28-build-replay-design.md",
+            "is the gate's coverage witness",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/run/report.rs",
+            test_fn: "gate_coverage_counts_evidence_not_classification_totality",
+            artifact_needles: &["backfill must not mint coverage"],
+        },
+    },
+    ContractRow {
+        key: "gate.trip-table",
+        declared: (
+            "docs/dev/2026-05-28-build-replay-design.md",
+            "| `regression` | `unexpected-failure`",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/run/report.rs",
+            test_fn: "gate_trip_sets_match_the_design_doc_table",
+            artifact_needles: &["row_classes"],
+        },
+    },
+    ContractRow {
+        key: "gate.supply-failed-confidence",
+        declared: (
+            "docs/dev/2026-05-28-build-replay-design.md",
+            "Counted against run confidence via the `supply-failed-units` low-confidence flag",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/run/report.rs",
+            test_fn: "supply_failed_units_flag_low_confidence",
+            artifact_needles: &["FLAG_SUPPLY_FAILED_UNITS"],
+        },
+    },
+    // ── Provenance classification of campaign-spec fields (relaunch
+    // guard) and its era-constant class. ──
+    ContractRow {
+        key: "spec.provenance-classification",
+        declared: (
+            "xtask/src/replay/launch.rs",
+            "The strip list answers one question",
+        ),
+        enforcement: Enforcement::Test {
+            file: "xtask/src/replay/launch.rs",
+            test_fn: "spec_identity_strips_every_cluster_observed_field",
+            artifact_needles: &["ERA_CONSTANTS", "IDENTITY_BEARING"],
+        },
+    },
+    ContractRow {
+        key: "spec.era-constants",
+        declared: (
+            "xtask/src/replay/launch.rs",
+            "One more class is stripped: ERA CONSTANTS",
+        ),
+        enforcement: Enforcement::Test {
+            file: "xtask/src/replay/launch.rs",
+            test_fn: "guard_admits_old_era_records_and_still_blocks_intent_drift",
+            artifact_needles: &["upstreams_verified"],
+        },
+    },
+    // ── Drv-closure completeness: consumer-side membership cross-check
+    // at plan time, plus the import-skip surfacing belt. ──
+    ContractRow {
+        key: "drv-closure.completeness",
+        declared: (
+            "docs/dev/2026-05-28-build-replay-design.md",
+            "MUST be embedded",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/run/archive_input.rs",
+            test_fn: "adjacency_closure_with_unembedded_member_is_a_plan_time_error",
+            artifact_needles: &["not embedded in the archive"],
+        },
+    },
+    ContractRow {
+        key: "drv-closure.import-skip",
+        declared: (
+            "rio-replay/src/run/drv_import.rs",
+            "its absence is REPORTED, not swallowed",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/run/drv_import.rs",
+            test_fn: "closure_skips_inputs_the_archive_does_not_embed",
+            artifact_needles: &["the non-embedded input is reported"],
+        },
+    },
+    // ── Plan-time demotion pin (resume classification stability). ──
+    ContractRow {
+        key: "plan.demotion-pin",
+        declared: (
+            "docs/dev/2026-05-28-build-replay-design.md",
+            "Plan-time dispositions are pinned by the first plan",
+        ),
+        enforcement: Enforcement::Test {
+            file: "rio-replay/src/run/mod.rs",
+            test_fn: "demotion_membership_pins_at_first_plan",
+            artifact_needles: &["resolve_demoted_impure"],
+        },
+    },
+];
+
+/// Field names of one struct in `src`: the `pub <name>: <..>` lines
+/// between `pub struct <name> {` and its closing brace (attribute and
+/// comment lines skipped). Brace-counting is naive on purpose — the
+/// schema structs are flat field lists.
+fn struct_field_names(src: &str, struct_name: &str) -> Result<BTreeSet<String>> {
+    let header = format!("pub struct {struct_name} {{");
+    let start = src
+        .find(&header)
+        .with_context(|| format!("struct {struct_name} not found"))?;
+    let body = &src[start + header.len()..];
+    let end = body
+        .find("\n}")
+        .with_context(|| format!("struct {struct_name} has no closing brace"))?;
+    let mut fields = BTreeSet::new();
+    for line in body[..end].lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("pub ")
+            && let Some((name, _)) = rest.split_once(':')
+        {
+            fields.insert(name.trim().to_string());
+        }
+    }
+    Ok(fields)
+}
+
+/// Validate the registry against the parsed vocabulary and a file reader.
+/// Split from [`contract_registry`] so tests can feed synthetic sources.
+fn check_contract_registry(
+    rows: &[ContractRow],
+    capability_flags: &BTreeSet<String>,
+    digest_fields: &BTreeSet<String>,
+    read: &dyn Fn(&str) -> Result<String>,
+) -> Result<()> {
+    let mut violations: Vec<String> = Vec::new();
+    let keys: BTreeSet<&str> = rows.iter().map(|row| row.key).collect();
+    ensure!(
+        keys.len() == rows.len(),
+        "contract registry has duplicate row keys"
+    );
+
+    // Vocabulary totality: every schema item has a row; every prefixed
+    // row names a live schema item.
+    for flag in capability_flags {
+        let key = format!("capability.{flag}");
+        if !keys.contains(key.as_str()) {
+            violations.push(format!(
+                "Capabilities field `{flag}` has no `{key}` contract-registry row — register \
+                 its gate's consumer-side test (or a waiver with the reason)"
+            ));
+        }
+    }
+    for field in digest_fields {
+        let key = format!("content-digest.{field}");
+        if !keys.contains(key.as_str()) {
+            violations.push(format!(
+                "ContentDigests field `{field}` has no `{key}` contract-registry row — register \
+                 its verifier's test (or a waiver with the reason)"
+            ));
+        }
+    }
+    for row in rows {
+        if let Some(flag) = row.key.strip_prefix("capability.")
+            && !capability_flags.contains(flag)
+        {
+            violations.push(format!(
+                "registry row `{}` names a Capabilities field that no longer exists",
+                row.key
+            ));
+        }
+        if let Some(field) = row.key.strip_prefix("content-digest.")
+            && !digest_fields.contains(field)
+        {
+            violations.push(format!(
+                "registry row `{}` names a ContentDigests field that no longer exists",
+                row.key
+            ));
+        }
+    }
+
+    // Per-row resolution: the declaration text and the named test (with
+    // its canned-artifact needles) must exist.
+    for row in rows {
+        let (declared_file, declared_needle) = row.declared;
+        match read(declared_file) {
+            Err(e) => violations.push(format!(
+                "row `{}`: declaration file {declared_file} unreadable: {e:#}",
+                row.key
+            )),
+            Ok(text) if !text.contains(declared_needle) => violations.push(format!(
+                "row `{}`: {declared_file} no longer contains the declared contract text \
+                 {declared_needle:?} — update the row alongside the contract",
+                row.key
+            )),
+            Ok(_) => {}
+        }
+        match row.enforcement {
+            Enforcement::Waived { reason } => {
+                if reason.trim().is_empty() {
+                    violations.push(format!("row `{}`: waiver has no reason", row.key));
+                }
+            }
+            Enforcement::Test {
+                file,
+                test_fn,
+                artifact_needles,
+            } => match read(file) {
+                Err(e) => violations.push(format!(
+                    "row `{}`: test file {file} unreadable: {e:#}",
+                    row.key
+                )),
+                Ok(text) => {
+                    if !text.contains(&format!("fn {test_fn}(")) {
+                        violations.push(format!(
+                            "row `{}`: named contract test `{test_fn}` does not exist in {file}",
+                            row.key
+                        ));
+                    }
+                    for needle in artifact_needles {
+                        if !text.contains(needle) {
+                            violations.push(format!(
+                                "row `{}`: {file} no longer contains the artifact needle \
+                                 {needle:?} — the named test may have stopped exercising the \
+                                 row's artifact",
+                                row.key
+                            ));
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    ensure!(
+        violations.is_empty(),
+        "contract-registry violations:\n  {}",
+        violations.join("\n  ")
+    );
+    Ok(())
+}
+
+/// Declared-contract registry guard — see [`CONTRACT_REGISTRY`] and
+/// [`Lint::ContractRegistry`].
+fn contract_registry() -> Result<()> {
+    let root = repo_root();
+    let schema = fs::read_to_string(root.join("rio-replay/src/archive/schema.rs"))
+        .context("read rio-replay/src/archive/schema.rs")?;
+    let capability_flags = struct_field_names(&schema, "Capabilities")?;
+    let digest_fields = struct_field_names(&schema, "ContentDigests")?;
+    ensure!(
+        !capability_flags.is_empty() && !digest_fields.is_empty(),
+        "schema parse produced an empty vocabulary (parser drift?)"
+    );
+    let read = |rel: &str| -> Result<String> {
+        fs::read_to_string(root.join(rel)).with_context(|| format!("read {rel}"))
+    };
+    check_contract_registry(CONTRACT_REGISTRY, &capability_flags, &digest_fields, &read)
+}
+
 /// Recursive `.rs` walk via `std` (no `walkdir` dep). Follows symlinks
 /// — under the nix flake check, the corpus dirs are staged into a
 /// store-path source tree and may be symlinked.
@@ -1251,6 +1711,163 @@ fn walk_rs(dir: &Path, f: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One synthetic registry row for the negative checks below.
+    fn synthetic_row(enforcement: Enforcement) -> ContractRow {
+        ContractRow {
+            key: "capability.alpha",
+            declared: ("schema.rs", "alpha gates the frobnicator"),
+            enforcement,
+        }
+    }
+
+    /// File reader over an in-memory map.
+    fn reader<'a>(
+        files: &'a std::collections::BTreeMap<&'static str, &'static str>,
+    ) -> impl Fn(&str) -> Result<String> + 'a {
+        move |rel: &str| {
+            files
+                .get(rel)
+                .map(|text| (*text).to_string())
+                .with_context(|| format!("no such file {rel}"))
+        }
+    }
+
+    #[test]
+    fn contract_registry_resolves_rows_to_real_tests() {
+        let vocab: BTreeSet<String> = BTreeSet::from(["alpha".to_string()]);
+        let digests: BTreeSet<String> = BTreeSet::new();
+        let files = std::collections::BTreeMap::from([
+            ("schema.rs", "alpha gates the frobnicator"),
+            (
+                "tests.rs",
+                "#[test]\nfn alpha_gate_flip() { let artifact = \"flipped-alpha\"; }",
+            ),
+        ]);
+
+        // A complete row resolves: declaration + test fn + artifact needle.
+        let good = synthetic_row(Enforcement::Test {
+            file: "tests.rs",
+            test_fn: "alpha_gate_flip",
+            artifact_needles: &["flipped-alpha"],
+        });
+        check_contract_registry(&[good], &vocab, &digests, &reader(&files)).unwrap();
+
+        // A vocabulary item with no row fails naming the missing key.
+        let err = check_contract_registry(&[], &vocab, &digests, &reader(&files))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("capability.alpha"), "{err}");
+
+        // A row whose named test does not exist fails — name resolution
+        // to a CALL SITE (or to nothing) is not enforcement.
+        let missing_test = synthetic_row(Enforcement::Test {
+            file: "tests.rs",
+            test_fn: "nonexistent_test",
+            artifact_needles: &[],
+        });
+        let err = check_contract_registry(&[missing_test], &vocab, &digests, &reader(&files))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nonexistent_test"), "{err}");
+
+        // A row whose artifact needle vanished fails: the named test may
+        // have stopped exercising the row's artifact.
+        let stale_needle = synthetic_row(Enforcement::Test {
+            file: "tests.rs",
+            test_fn: "alpha_gate_flip",
+            artifact_needles: &["needle-that-was-removed"],
+        });
+        let err = check_contract_registry(&[stale_needle], &vocab, &digests, &reader(&files))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needle-that-was-removed"), "{err}");
+
+        // A row may not outlive its contract text.
+        let files_without_decl = std::collections::BTreeMap::from([
+            ("schema.rs", "the contract moved away"),
+            ("tests.rs", "fn alpha_gate_flip() { \"flipped-alpha\"; }"),
+        ]);
+        let good = synthetic_row(Enforcement::Test {
+            file: "tests.rs",
+            test_fn: "alpha_gate_flip",
+            artifact_needles: &["flipped-alpha"],
+        });
+        let err = check_contract_registry(&[good], &vocab, &digests, &reader(&files_without_decl))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("declared contract text"), "{err}");
+
+        // A stale row naming a dead vocabulary item fails.
+        let empty_vocab: BTreeSet<String> = BTreeSet::new();
+        let err = check_contract_registry(
+            &[synthetic_row(Enforcement::Waived { reason: "n/a" })],
+            &empty_vocab,
+            &digests,
+            &reader(&files),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no longer exists"), "{err}");
+
+        // Waivers carry a reason; an empty one fails.
+        let err = check_contract_registry(
+            &[synthetic_row(Enforcement::Waived { reason: "  " })],
+            &vocab,
+            &digests,
+            &reader(&files),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("waiver has no reason"), "{err}");
+        check_contract_registry(
+            &[synthetic_row(Enforcement::Waived {
+                reason: "verified per path at dump time instead",
+            })],
+            &vocab,
+            &digests,
+            &reader(&files),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn struct_field_names_parses_flat_schema_structs() {
+        let src = "/// doc\npub struct Capabilities {\n    #[serde(default)]\n    pub timed: bool,\n    // comment\n    #[serde(default)]\n    pub impure_env: bool,\n}\n\npub struct Other {\n    pub x: u64,\n}\n";
+        assert_eq!(
+            struct_field_names(src, "Capabilities").unwrap(),
+            BTreeSet::from(["timed".to_string(), "impure_env".to_string()])
+        );
+        assert_eq!(
+            struct_field_names(src, "Other").unwrap(),
+            BTreeSet::from(["x".to_string()])
+        );
+        assert!(struct_field_names(src, "Absent").is_err());
+    }
+
+    /// The real registry against the real tree: every published
+    /// capability flag and digest field is registered, every named test
+    /// exists, every needle resolves. Skipped (with a note) where the
+    /// sibling crates are not in the staged source tree — the
+    /// `xtask-lint` flake check runs against the full workspace and is
+    /// the enforcement point.
+    #[test]
+    fn contract_registry_passes_on_the_real_tree() {
+        match contract_registry() {
+            Ok(()) => {}
+            Err(e) => {
+                let message = format!("{e:#}");
+                if message.contains("read rio-replay/src/archive/schema.rs") {
+                    eprintln!(
+                        "sibling crate sources not present in this build's tree; the \
+                         xtask-lint flake check enforces the registry"
+                    );
+                } else {
+                    panic!("{message}");
+                }
+            }
+        }
+    }
 
     /// `Lint::all()` must list every enum variant, or `xtask lint`
     /// (and the `xtask-lint` flake check) silently skip the new lint.
