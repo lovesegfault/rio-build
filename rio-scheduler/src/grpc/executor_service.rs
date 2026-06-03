@@ -596,6 +596,21 @@ impl ExecutorService for SchedulerGrpc {
             }
             rio_evidence_kernel::pull::PullKind::Build => None,
         };
+        // merged_bug_158: the re-delivery resume token. Parse-don't-
+        // validate at the boundary: a malformed token is treated as
+        // ABSENT (deny-by-default — the kernel answers NotYetReady and
+        // the establishment window settles the attempt), never as an
+        // error the caller can distinguish (no probe oracle). Build
+        // pulls never carry one (the field is ignored if set — build
+        // re-delivery stays tokenless per the as-built contract).
+        let resume_exec_id = match kind {
+            rio_evidence_kernel::pull::PullKind::Materialization => {
+                (!req.resume_exec_id.is_empty())
+                    .then(|| req.resume_exec_id.parse::<uuid::Uuid>().ok())
+                    .flatten()
+            }
+            rio_evidence_kernel::pull::PullKind::Build => None,
+        };
 
         // send_unchecked: a dropped pull would park the pod for a full
         // backoff interval; the pod retries anyway, so backpressure
@@ -607,6 +622,7 @@ impl ExecutorService for SchedulerGrpc {
                 auth_intent,
                 kind,
                 executor_instance,
+                resume_exec_id,
                 reply: reply_tx,
             })
             .await

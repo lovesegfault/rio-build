@@ -218,6 +218,7 @@ mod tests {
             MaterializationInputs {
                 kind: PullKind::Build,
                 job: JobView::None,
+                resume_exec_id: None,
             },
         )
     }
@@ -372,6 +373,7 @@ mod proofs {
             MaterializationInputs {
                 kind: PullKind::Build,
                 job: JobView::None,
+                resume_exec_id: None,
             },
         )
     }
@@ -540,11 +542,25 @@ pub enum JobView {
 
 /// The materialization-side inputs of one kinded admission.
 #[derive(Debug, Clone, Copy)]
-pub struct MaterializationInputs {
+pub struct MaterializationInputs<ExecId> {
     /// The pull's claimed kind.
     pub kind: PullKind,
     /// The node's job state (the scheduler's in-memory job view).
     pub job: JobView,
+    /// merged_bug_158: the materialization re-delivery resume token —
+    /// `Some(exec_id)` is the puller's proof that it already holds the
+    /// open attempt (the exec id the original `WorkAssignment` carried);
+    /// `None` is a fresh claim and NEVER re-delivers. The
+    /// `(Materialization, Claimed{held_by_puller})` DELIVERY arm
+    /// requires identity AND token agreement (BC-1 deepened: a
+    /// colliding executor identity — sanitize-fold, restarted pod —
+    /// cannot resume an attempt it did not open, because it cannot
+    /// know the exec id). Tokenless same-identity re-pulls answer
+    /// `NotYetReady` and settle through the establishment window —
+    /// the T-0e.6 rule-4 amendment (executor-invariant-map.md),
+    /// PENDING owner counter-signature. Build-kind re-delivery is
+    /// untouched (lost-ack resume keeps working tokenlessly).
+    pub resume_exec_id: Option<ExecId>,
 }
 
 // r[impl sched.materialize.job+2]
@@ -574,11 +590,12 @@ pub struct MaterializationInputs {
 ///     job Claimed{held:f}   → NotYetReady (the one-winner arbiter, BC-1)
 pub fn admit_pull<IntentId, ExecutorIdent, ExecId>(
     request: PullRequest<'_, IntentId, ExecutorIdent, ExecId>,
-    mat: MaterializationInputs,
+    mat: MaterializationInputs<ExecId>,
 ) -> PullAdmission<ExecId>
 where
     IntentId: PartialEq + ?Sized,
     ExecutorIdent: PartialEq + ?Sized,
+    ExecId: PartialEq,
 {
     match (mat.kind, mat.job) {
         // Build pulls while a job is unresolved: refuse (A1/A11 successor).
@@ -690,13 +707,29 @@ where
                 PullAdmission::RejectToken => PullAdmission::RejectToken,
                 PullAdmission::RejectStaleGeneration => PullAdmission::RejectStaleGeneration,
                 PullAdmission::Gone => PullAdmission::Gone,
-                PullAdmission::DeliverExisting { exec_id } if held_by_puller => {
+                // merged_bug_158: the DELIVERY cell additionally
+                // requires the resume token — identity agreement alone
+                // is forgeable (a sanitize-fold collision or a
+                // restarted pod re-pulls under the same composite
+                // identity without ever having held the attempt). The
+                // token is the open attempt's own exec id, known only
+                // to the puller the original WorkAssignment answered.
+                // Tokenless/mismatched same-identity re-pulls answer
+                // NotYetReady and settle through the establishment
+                // window (the T-0e.6 rule-4 amendment, PENDING owner
+                // counter-signature). Pinned by
+                // `check_materialization_redelivery_requires_resume_token`.
+                PullAdmission::DeliverExisting { exec_id }
+                    if held_by_puller && mat.resume_exec_id.as_ref() == Some(&exec_id) =>
+                {
                     PullAdmission::DeliverExisting { exec_id }
                 }
                 // Named cells: DeliverExisting to a NON-holder is the
-                // one-winner arbiter's refusal (BC-1); DeliverNew
-                // under a claimed job is the dual-claim window. Both
-                // deliberately NotYetReady (merged_bug_307).
+                // one-winner arbiter's refusal (BC-1); DeliverExisting
+                // WITHOUT the resume token is the colliding-identity
+                // window (158); DeliverNew under a claimed job is the
+                // dual-claim window. All deliberately NotYetReady
+                // (merged_bug_307 + merged_bug_158).
                 PullAdmission::DeliverNew
                 | PullAdmission::DeliverExisting { .. }
                 | PullAdmission::NotYetReady => PullAdmission::NotYetReady,
@@ -748,6 +781,7 @@ mod kinded_tests {
             let mat = MaterializationInputs {
                 kind: PullKind::Build,
                 job,
+                resume_exec_id: None,
             };
             // Ready (deliverable as-built) → refused.
             assert_eq!(
@@ -776,6 +810,71 @@ mod kinded_tests {
         }
     }
 
+    // r[verify sched.materialize.job+2]
+    /// merged_bug_158: materialization re-delivery requires the resume
+    /// token. A puller reaching the (Materialization,
+    /// Claimed{held_by_puller:true}) arm with the base table offering a
+    /// re-delivery gets it ONLY when `resume_exec_id` matches the open
+    /// attempt's exec id: a fresh claim (None — a colliding identity, a
+    /// restarted pod, a lost-ack retry) answers NotYetReady and settles
+    /// through the establishment window; a mismatched token likewise.
+    /// RED (recorded, pre-fix): the None case DELIVERED — identity
+    /// agreement alone re-opened the attempt to any same-named puller
+    /// (`left: DeliverExisting { exec_id: 9 } / right: NotYetReady`).
+    #[test]
+    fn colliding_identity_fresh_claim_gets_not_yet_ready() {
+        use PullNodeStatus as S;
+        let me = 1u8;
+        let mat = |resume| MaterializationInputs {
+            kind: PullKind::Materialization,
+            job: JobView::Claimed {
+                held_by_puller: true,
+            },
+            resume_exec_id: resume,
+        };
+        // Fresh claim (no token): refused.
+        assert_eq!(
+            admit_pull(request(Some(S::Assigned), Some((&me, 9)), &me), mat(None)),
+            PullAdmission::NotYetReady,
+            "tokenless re-pull must wait for the establishment window"
+        );
+        // Mismatched token: refused.
+        assert_eq!(
+            admit_pull(
+                request(Some(S::Assigned), Some((&me, 9)), &me),
+                mat(Some(7))
+            ),
+            PullAdmission::NotYetReady,
+            "a wrong exec id never resumes"
+        );
+        // The legitimate resume: matching token → re-delivery.
+        assert_eq!(
+            admit_pull(
+                request(Some(S::Assigned), Some((&me, 9)), &me),
+                mat(Some(9))
+            ),
+            PullAdmission::DeliverExisting { exec_id: 9 },
+            "the original holder resumes with its exec id"
+        );
+        // Token agreement never overrides identity disagreement: the
+        // one-winner refusal (held_by_puller=false) stands even with a
+        // "matching" token.
+        assert_eq!(
+            admit_pull(
+                request(Some(S::Assigned), Some((&me, 9)), &me),
+                MaterializationInputs {
+                    kind: PullKind::Materialization,
+                    job: JobView::Claimed {
+                        held_by_puller: false,
+                    },
+                    resume_exec_id: Some(9),
+                }
+            ),
+            PullAdmission::NotYetReady,
+            "BC-1: the view projection still arbitrates"
+        );
+    }
+
     /// Flag-on: the materialization claim table (design §2.3), including
     /// PD-6 (Phase B, the PDQ-6 amendment's prescribed flip):
     /// materialization claims deliver from Ready AND from Queued — a
@@ -790,6 +889,7 @@ mod kinded_tests {
         let mat = |job| MaterializationInputs {
             kind: PullKind::Materialization,
             job,
+            resume_exec_id: None,
         };
         // No job → Gone (nothing to materialize).
         assert_eq!(
@@ -856,6 +956,7 @@ mod kinded_tests {
                 MaterializationInputs {
                     kind: PullKind::Build,
                     job: JobView::Pending { parked: false },
+                    resume_exec_id: None,
                 }
             ),
             PullAdmission::NotYetReady
@@ -876,14 +977,31 @@ mod kinded_tests {
             ),
             PullAdmission::NotYetReady
         );
-        // Claimed held-by-puller → DeliverExisting (re-delivery; consumes
-        // request.open_attempt's exec id).
+        // Claimed held-by-puller → re-delivery REQUIRES the resume
+        // token (merged_bug_158, the rule-4 amendment): the closure's
+        // tokenless inputs park; presenting the open attempt's exec id
+        // resumes. Behavioral re-pin — this assertion documented the
+        // pre-158 tokenless contract (`DeliverExisting { exec_id: 9 }`).
         assert_eq!(
             admit_pull(
                 request(Some(S::Running), Some((&me, 9)), &me),
                 mat(JobView::Claimed {
                     held_by_puller: true
                 })
+            ),
+            PullAdmission::NotYetReady,
+            "tokenless re-pull settles via the establishment window"
+        );
+        assert_eq!(
+            admit_pull(
+                request(Some(S::Running), Some((&me, 9)), &me),
+                MaterializationInputs {
+                    kind: PullKind::Materialization,
+                    job: JobView::Claimed {
+                        held_by_puller: true
+                    },
+                    resume_exec_id: Some(9),
+                }
             ),
             PullAdmission::DeliverExisting { exec_id: 9 }
         );
@@ -979,6 +1097,7 @@ mod kinded_tests {
             MaterializationInputs {
                 kind: PullKind::Build,
                 job: JobView::None,
+                resume_exec_id: None,
             },
         );
         assert_eq!(build, PullAdmission::DeliverNew);
@@ -989,6 +1108,7 @@ mod kinded_tests {
             MaterializationInputs {
                 kind: PullKind::Materialization,
                 job: JobView::None,
+                resume_exec_id: None,
             },
         );
         assert_ne!(
@@ -1003,6 +1123,7 @@ mod kinded_tests {
             MaterializationInputs {
                 kind: PullKind::Build,
                 job: JobView::Pending { parked: false },
+                resume_exec_id: None,
             },
         );
         assert_eq!(got, PullAdmission::NotYetReady);
@@ -1110,7 +1231,18 @@ mod kinded_proofs {
         }
     }
 
-    fn run_kinded(inputs: &Inputs, mat: MaterializationInputs) -> PullAdmission<u8> {
+    /// Symbolic resume token: absent, matching-shaped, or arbitrary.
+    fn any_resume() -> Option<u8> {
+        if kani::any() {
+            let t: u8 = kani::any();
+            kani::assume(t < 16);
+            Some(t)
+        } else {
+            None
+        }
+    }
+
+    fn run_kinded(inputs: &Inputs, mat: MaterializationInputs<u8>) -> PullAdmission<u8> {
         admit_pull(
             PullRequest {
                 intent_id: &inputs.intent,
@@ -1141,6 +1273,9 @@ mod kinded_proofs {
             MaterializationInputs {
                 kind: PullKind::Build,
                 job,
+                // Widened domain (158): the build arms must hold for
+                // every token value — the field is materialization-only.
+                resume_exec_id: any_resume(),
             },
         );
 
@@ -1191,6 +1326,7 @@ mod kinded_proofs {
             MaterializationInputs {
                 kind: PullKind::Build,
                 job: JobView::None,
+                resume_exec_id: None,
             },
         );
 
@@ -1204,12 +1340,17 @@ mod kinded_proofs {
     fn check_kinded_one_winner_arbitration() {
         let inputs = any_inputs();
         let job = any_job_view();
+        let mat_resume = any_resume();
 
         let decision = run_kinded(
             &inputs,
             MaterializationInputs {
                 kind: PullKind::Materialization,
                 job,
+                // Widened domain (158): one-winner holds for every
+                // token value; the DeliverExisting branch additionally
+                // proves the token matched.
+                resume_exec_id: mat_resume,
             },
         );
 
@@ -1232,11 +1373,13 @@ mod kinded_proofs {
             PullAdmission::DeliverExisting { exec_id } => {
                 // Re-deliveries happen only to the identity already
                 // holding the claim (the Claimed{held_by_puller} arm),
-                // and carry exactly the open attempt's exec id — which
+                // carry exactly the open attempt's exec id — which
                 // must itself be bound to the pulling identity (the
                 // request-level comparison and the view projection must
                 // BOTH hold; a stale view never re-delivers another
-                // identity's attempt).
+                // identity's attempt) — and require the resume token
+                // (merged_bug_158): the puller proved it holds the
+                // attempt by presenting its exec id.
                 assert!(matches!(
                     job,
                     JobView::Claimed {
@@ -1250,6 +1393,11 @@ mod kinded_proofs {
                     }
                     None => unreachable!("DeliverExisting requires an open attempt"),
                 }
+                // 158: a materialization re-delivery REQUIRES the
+                // matching resume token (build-kind re-delivery is
+                // tokenless by contract — this harness is the
+                // materialization arm).
+                assert_eq!(mat_resume, Some(exec_id));
                 // And it never escapes the identity/fence gates.
                 assert!(!inputs.auth.is_some_and(|a| a != inputs.intent));
                 assert!(
@@ -1277,6 +1425,45 @@ mod kinded_proofs {
         }
     }
 
+    // r[verify sched.materialize.job+2]
+    /// merged_bug_158: over the full kinded domain, a materialization
+    /// re-delivery is produced ONLY when the resume token matches the
+    /// open attempt's exec id — tokenless and mismatched same-identity
+    /// re-pulls are refused (NotYetReady; the establishment window
+    /// settles the attempt). The contrapositive of the one-winner
+    /// branch assertion, stated as its own pin so the gating conjunct
+    /// cannot be weakened without a named proof failing.
+    #[kani::proof]
+    fn check_materialization_redelivery_requires_resume_token() {
+        let inputs = any_inputs();
+        let job = any_job_view();
+        let mat_resume = any_resume();
+
+        let decision = run_kinded(
+            &inputs,
+            MaterializationInputs {
+                kind: PullKind::Materialization,
+                job,
+                resume_exec_id: mat_resume,
+            },
+        );
+
+        if let PullAdmission::DeliverExisting { exec_id } = decision {
+            assert_eq!(mat_resume, Some(exec_id));
+            assert!(matches!(
+                job,
+                JobView::Claimed {
+                    held_by_puller: true
+                }
+            ));
+        }
+        // And the refusal direction: with NO token, no re-delivery
+        // exists anywhere in the materialization table.
+        if mat_resume.is_none() {
+            assert!(!matches!(decision, PullAdmission::DeliverExisting { .. }));
+        }
+    }
+
     /// The dominance order of the two rejections holds over the FULL
     /// flag-on (kind × job-view) domain — every arm of the kinded
     /// table, including the Claimed re-delivery arm: a mismatched token
@@ -1297,7 +1484,14 @@ mod kinded_proofs {
         };
         let job = any_job_view();
 
-        let decision = run_kinded(&inputs, MaterializationInputs { kind, job });
+        let decision = run_kinded(
+            &inputs,
+            MaterializationInputs {
+                kind,
+                job,
+                resume_exec_id: any_resume(),
+            },
+        );
 
         let token_mismatch = inputs.auth.is_some_and(|a| a != inputs.intent);
         let below_floor = inputs

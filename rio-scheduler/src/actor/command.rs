@@ -140,6 +140,11 @@ pub enum ActorCommand {
         /// store replica's pod name; BC-1). `None` for build pulls —
         /// build-pull identity remains the attested intent (as-built).
         executor_instance: Option<String>,
+        /// merged_bug_158: the materialization re-delivery resume token
+        /// (`PullAssignmentRequest.resume_exec_id`), parsed at the gRPC
+        /// boundary (unparseable ⇒ `None` = deny-by-default fresh
+        /// claim). Always `None` for build pulls.
+        resume_exec_id: Option<uuid::Uuid>,
         reply: oneshot::Sender<Result<super::pull::PullOutcome, super::pull::PullRejection>>,
     },
 

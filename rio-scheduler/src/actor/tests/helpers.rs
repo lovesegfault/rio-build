@@ -1040,6 +1040,7 @@ pub(crate) async fn try_pull_attempt(
             // Mechanical flag-off defaults (carve-out 1c).
             kind: rio_evidence_kernel::pull::PullKind::Build,
             executor_instance: None,
+            resume_exec_id: None,
             reply,
         })
         .await

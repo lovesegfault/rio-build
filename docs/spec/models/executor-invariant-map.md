@@ -2656,6 +2656,44 @@ Nothing else moves: the unary signatures, the frozen-invariant list,
 the disposition table, AD1–AD6 and the coexistence invariant read
 exactly as frozen — build pulls bind, charge, and arbitrate unchanged.
 
+#### Addendum extension — bughunt fix wave (2026-06-03, B1 first-lander)
+
+Per the row-4 procedure (`4da4ca4d2`): the frozen text above is
+untouched; this dated block EXTENDS the wire-deltas table and records
+one semantic amendment. B1 (bounded-await-transport) lands first;
+A4's two allocated rows — `MaterializationOutcome.RetryLater
+retry_later = 4` and `Unobtainable.missing_reference_paths = 4` — are
+NOT on the wire at this writing and land with A4's own closer, which
+completes this table (the §4.R2 second-lander rule).
+
+Wire deltas (B1):
+
+| Field / surface | Number | Semantics + deploy posture |
+|---|---|---|
+| `MaterializationOutcome.Aborted` | `Aborted aborted = 5` (oneof) | SIGTERM mid-walk: the worker aborts the walk by drop and reports once under the termination grace. Settlement: charge-free close (owner Q3 default, 2026-06-03) — the attempt closes with NO `materialization_infra` row, the claim is released through `release_claim`, and the job returns to pending claimable (AD5 parity for the materialization kind: routine store rollouts stop burning the park budget). Skew: an old scheduler decodes the unknown oneof arm as unset and rejects the report shape it cannot settle; the attempt then settles via the establishment window — degraded to the pre-field behavior, never wedged |
+| `PullAssignmentRequest.resume_exec_id` | `string resume_exec_id = 5` | The materialization re-delivery resume token: the exec id the puller's original delivery carried, presented as proof it holds the open attempt. Fresh claims send empty; build pulls ignore the field entirely (build re-delivery stays tokenless, as frozen). Skew: an old store replica never sets it — its same-identity re-pulls answer `NotYetReady` and settle via the establishment window (the rule-4 amendment's posture; fail-safe, see below) |
+
+**Rule-4 amendment (PENDING owner counter-signature — §4.4 item 7,
+the follow-up-ledger row-4 / 2026-06-02 batch procedure; never
+fabricated):** rule 4's re-delivery clause is amended from "the
+kernel's open-attempt arm re-delivers to the same composite identity"
+to "re-delivers to the same composite identity PRESENTING the original
+exec_id resume token (`resume_exec_id`)". Tokenless or mismatched
+same-identity re-pulls answer `NotYetReady` and settle through the
+establishment window. This is a BEHAVIOR CHANGE for senders without
+the new field — identity agreement alone no longer resumes — and is
+therefore NOT covered by extends-never-modifies; it is recorded here
+as the contract's own amendment awaiting the owner's counter-signature.
+Rationale: identity agreement is forgeable (merged_bug_158 — a
+sanitize-fold collision or a restarted pod re-pulls under the same
+composite identity without ever having held the attempt); the token is
+known only to the puller the original `WorkAssignment` answered.
+Pinned: `check_materialization_redelivery_requires_resume_token` +
+the widened `check_kinded_one_winner_arbitration` (CBMC, both
+re-proven over the widened domain, 13/13), the kinded unit table, and
+the failover re-delivery test (the holder now presents its token; the
+tokenless same-identity re-pull is asserted `NotYetReady`).
+
 ### The go/no-go evaluation (T-0e.7)
 
 Every design §6 no-go condition (nine bullets) plus the plan's

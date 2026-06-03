@@ -572,6 +572,7 @@ async fn flag_on_infra_failure_charges_and_rearms() -> TestResult {
             auth_intent: Some("maton-infra".into()),
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-0".into()),
+            resume_exec_id: None,
             reply,
         })
         .await
@@ -675,6 +676,7 @@ async fn aborted_outcome_closes_attempt_uncharged() -> TestResult {
             auth_intent: Some("maton-abort".into()),
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-0-w0".into()),
+            resume_exec_id: None,
             reply,
         })
         .await
@@ -737,6 +739,7 @@ async fn aborted_outcome_closes_attempt_uncharged() -> TestResult {
             auth_intent: Some("maton-abort".into()),
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-1-w0".into()),
+            resume_exec_id: None,
             reply,
         })
         .await
@@ -776,6 +779,7 @@ async fn establishment_writes_materialization_infra_never_adopts() -> TestResult
             auth_intent: Some("maton-est".into()),
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-0".into()),
+            resume_exec_id: None,
             reply,
         })
         .await
@@ -852,6 +856,7 @@ async fn cancellation_closes_open_attempt_charge_free() -> TestResult {
             auth_intent: Some("maton-cancel".into()),
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some("store-replica-0".into()),
+            resume_exec_id: None,
             reply,
         })
         .await
@@ -958,6 +963,29 @@ async fn claim_materialization(
             auth_intent: Some(drv.into()),
             kind: rio_evidence_kernel::pull::PullKind::Materialization,
             executor_instance: Some(instance.into()),
+            resume_exec_id: None,
+            reply,
+        })
+        .await
+        .expect("actor alive")
+}
+
+/// [`claim_materialization`] presenting the merged_bug_158 resume token
+/// — the re-pull of a replica that already holds the open attempt and
+/// proves it with the original delivery's exec id.
+async fn resume_materialization(
+    handle: &ActorHandle,
+    drv: &str,
+    instance: &str,
+    exec_id: Uuid,
+) -> Result<PullOutcome, PullRejection> {
+    handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: drv.into(),
+            auth_intent: Some(drv.into()),
+            kind: rio_evidence_kernel::pull::PullKind::Materialization,
+            executor_instance: Some(instance.into()),
+            resume_exec_id: Some(exec_id),
             reply,
         })
         .await
@@ -3709,8 +3737,19 @@ async fn flag_on_recovery_rebuilds_job_view_and_jobs_survive() -> TestResult {
     );
 
     // (2) The claimed job: the original holder's re-pull re-delivers the
-    //     SAME open attempt across the failover.
-    let reclaim = claim_materialization(&handle, "rcv-claimed", "store-test-0").await;
+    //     SAME open attempt across the failover — presenting the
+    //     merged_bug_158 resume token (the exec id its original
+    //     delivery carried; the replica survived the SCHEDULER
+    //     failover, so its in-process claim state still has it). A
+    //     tokenless re-pull — even from the holder — parks and settles
+    //     via the establishment window (the rule-4 amendment).
+    let tokenless = claim_materialization(&handle, "rcv-claimed", "store-test-0").await;
+    assert!(
+        matches!(tokenless, Ok(PullOutcome::NotYetReady { .. })),
+        "a tokenless same-identity re-pull must NOT re-deliver (158), got {tokenless:?}"
+    );
+    let reclaim =
+        resume_materialization(&handle, "rcv-claimed", "store-test-0", claimed_exec).await;
     match reclaim {
         Ok(PullOutcome::Deliver(a)) => {
             let re_exec: Uuid = a.exec_id.parse()?;

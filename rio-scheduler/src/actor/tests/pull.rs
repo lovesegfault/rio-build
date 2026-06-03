@@ -19,6 +19,7 @@ async fn pull(
             // no per-replica instance — the as-built pull shape.
             kind: rio_evidence_kernel::pull::PullKind::Build,
             executor_instance: None,
+            resume_exec_id: None,
             reply,
         })
         .await

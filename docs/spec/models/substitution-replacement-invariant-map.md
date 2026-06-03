@@ -1906,6 +1906,22 @@ Claimed{held_by_puller})` DELIVERY arm — a different cell from these
 refusal catch-alls, which stay unconditional; B1's landed T-0e.6
 addendum extension records that amendment (executor-invariant-map.md).
 
+*Amendment landed (2026-06-03, B1-s2):* the DELIVERY cell now carries the
+conjunct `held_by_puller && resume_exec_id == open_attempt.exec_id`
+(rio-evidence-kernel/src/pull.rs, the `(Materialization, Claimed)` arm).
+The refusal catch-alls above are byte-unchanged — the gate narrows only
+the delivery cell, exactly as this entry's pointer scoped it. Pinned by
+`check_materialization_redelivery_requires_resume_token` (both
+directions: a delivery implies a matching token; no token ⇒ no
+re-delivery anywhere in the materialization table) and the widened
+`check_kinded_one_winner_arbitration` (the DeliverExisting branch now
+also proves the token matched); the kinded unit table re-pinned the
+tokenless contract change (`colliding_identity_fresh_claim_gets_not_yet_ready`,
+plus the failover re-delivery test now presenting the token). The
+canonical contract record is the T-0e.6 addendum extension's rule-4
+amendment (executor-invariant-map.md, PENDING owner counter-signature
+per §4.4 item 7).
+
 ### The A3 model re-derivation — invariants, calibrations, measurements
 
 `materializationJob.qnt` is re-derived FROM CONTRACTS (the encoding

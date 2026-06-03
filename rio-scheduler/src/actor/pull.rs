@@ -159,6 +159,10 @@ pub(crate) struct PullInputs<'a> {
     /// when none is set) — bug_282: gates the fresh from-source mint
     /// in the kernel's `(Build, JobView::None)` arm.
     pub build_backoff_expired: bool,
+    /// merged_bug_158: the materialization re-delivery resume token
+    /// (`PullAssignmentRequest.resume_exec_id`, parsed at the gRPC
+    /// boundary; unparseable ⇒ `None` = deny-by-default fresh claim).
+    pub resume_exec_id: Option<Uuid>,
 }
 
 // r[impl sched.executor.pull-gone]
@@ -193,6 +197,7 @@ pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
         rio_evidence_kernel::pull::MaterializationInputs {
             kind: inputs.pull_kind,
             job: inputs.job_view,
+            resume_exec_id: inputs.resume_exec_id,
         },
     )
 }
@@ -228,6 +233,7 @@ impl DagActor {
         auth_intent: Option<String>,
         kind: rio_evidence_kernel::pull::PullKind,
         executor_instance: Option<String>,
+        resume_exec_id: Option<Uuid>,
         reply: oneshot::Sender<Result<PullOutcome, PullRejection>>,
     ) {
         let result = self
@@ -236,6 +242,7 @@ impl DagActor {
                 auth_intent.as_deref(),
                 kind,
                 executor_instance.as_deref(),
+                resume_exec_id,
             )
             .await;
         let _ = reply.send(result);
@@ -248,6 +255,7 @@ impl DagActor {
         auth_intent: Option<&str>,
         kind: rio_evidence_kernel::pull::PullKind,
         executor_instance: Option<&str>,
+        resume_exec_id: Option<Uuid>,
     ) -> Result<PullOutcome, PullRejection> {
         // Standby replicas answer nothing (the gRPC layer already
         // gates; this closes the in-flight-deposed window).
@@ -314,6 +322,7 @@ impl DagActor {
             // The job view: projected from the actor's in-memory job map
             // (Unavailable projects Pending{parked:true} — fail-closed).
             job_view: self.materialization_job_view(&drv_hash, &pulling_identity),
+            resume_exec_id,
         });
 
         // merged_bug_246, the Gone half of the fail-closed posture: a
@@ -666,6 +675,7 @@ mod kernel_tests {
             pull_kind: rio_evidence_kernel::pull::PullKind::Build,
             job_view: rio_evidence_kernel::pull::JobView::None,
             build_backoff_expired: true,
+            resume_exec_id: None,
         }
     }
 

@@ -386,6 +386,6 @@ in
     # 11 → 12: + check_no_build_mint_inside_backoff_window (A3/282 —
     # the named (Build, None) backoff cell; the wide partition proofs
     # already cover it, the named harness pins the conjunct).
-    expectedHarnesses = 12;
+    expectedHarnesses = 13;
   };
 }

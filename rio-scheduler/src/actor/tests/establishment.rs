@@ -15,6 +15,7 @@ async fn pull_deliver(handle: &ActorHandle, intent: &str) -> rio_proto::types::W
             // Mechanical flag-off defaults (carve-out 1c).
             kind: rio_evidence_kernel::pull::PullKind::Build,
             executor_instance: None,
+            resume_exec_id: None,
             reply,
         })
         .await

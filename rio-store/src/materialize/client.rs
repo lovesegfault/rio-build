@@ -193,7 +193,11 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
             executor_instance: executor_instance.to_string(),
             // Fresh claims NEVER carry a resume token (merged_bug_158:
             // re-delivery of a Claimed attempt requires the original
-            // exec_id, so a colliding identity cannot steal it).
+            // exec_id, so a colliding identity cannot steal it). A
+            // crashed-and-restarted worker has no exec id either: its
+            // tokenless re-pull answers NotYetReady and the attempt
+            // settles through the establishment window (the T-0e.6
+            // rule-4 amendment, PENDING owner counter-signature).
             resume_exec_id: String::new(),
         };
         match bounded(shutdown, DEFAULT_GRPC_TIMEOUT, transport.pull(req)).await {
