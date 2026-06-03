@@ -145,6 +145,11 @@ async fn materialization_pins_released_only_after_all_interest_terminal() -> any
         None,
     )
     .await?;
+    sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+        .bind(build_id)
+        .bind(drv_id)
+        .execute(&test_db.pool)
+        .await?;
     let fenced_outcome = db
         .record_wanted_fenced(
             1,
@@ -393,5 +398,84 @@ async fn pin_at_ingest_writes_disjoint_materialization_row() -> anyhow::Result<(
         1,
         "the materialization pin survives the original build's terminal release paths"
     );
+    Ok(())
+}
+
+/// merged_bug_176 (bughunt wave): a resolved job's pins survive while a
+/// ROW-LESS live build is interested — interest derives from
+/// `build_derivations` membership (which every build has), not from
+/// the optional `build_wanted_outputs` row. Pre-fix the
+/// `materialization_interest` view joined the wanted relation, so a
+/// live build without a row was invisible and the §5.3 release
+/// predicate dropped pins a live build still needed.
+// r[verify sched.materialize.pinning]
+#[tokio::test]
+async fn pins_survive_rowless_live_interest() -> anyhow::Result<()> {
+    use crate::db::materialization::FencedJobCreate;
+    use crate::state::{JobOrigin, JobState};
+
+    let (test_db, db) = setup().await;
+    let drv_id = insert_test_derivation(&db, "pin-rowless-drv").await?;
+
+    // A live build that is a MEMBER (build_derivations) but recorded
+    // no wanted row (legacy gap / row-less submission shape).
+    let build_id = Uuid::new_v4();
+    db.insert_build(
+        build_id,
+        None,
+        crate::state::PriorityClass::Scheduled,
+        true,
+        &Default::default(),
+        None,
+    )
+    .await?;
+    sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+        .bind(build_id)
+        .bind(drv_id)
+        .execute(&test_db.pool)
+        .await?;
+
+    let FencedJobCreate::Applied { job_id, .. } = db
+        .create_materialization_job_fenced(
+            drv_id,
+            "pin-rowless-drv",
+            None,
+            JobOrigin::Pruned,
+            None,
+            1,
+        )
+        .await?
+    else {
+        anyhow::bail!("job create must apply");
+    };
+    db.pin_materialized_paths(
+        job_id,
+        &DrvHash::from("pin-rowless-drv"),
+        &["/nix/store/eee-rowless-root".to_string()],
+    )
+    .await?;
+
+    let fenced_outcome = db
+        .resolve_materialization_job_fenced(
+            job_id,
+            Some(Uuid::now_v7()),
+            JobState::ResolvedSuccess,
+            1,
+        )
+        .await?;
+    assert!(fenced_outcome.settled());
+
+    let released = db.release_materialization_pins_for_resolved_jobs().await?;
+    assert_eq!(
+        released, 0,
+        "a row-less live member is interest — its pins must survive the sweep"
+    );
+
+    sqlx::query("UPDATE builds SET status = 'succeeded' WHERE build_id = $1")
+        .bind(build_id)
+        .execute(&test_db.pool)
+        .await?;
+    let released = db.release_materialization_pins_for_resolved_jobs().await?;
+    assert_eq!(released, 1, "interest gone -> released");
     Ok(())
 }

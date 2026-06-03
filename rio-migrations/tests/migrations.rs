@@ -229,6 +229,7 @@ fn migration_checksums_frozen() {
         (83, "ab24359b888bf9565682fb8a11d636dc19f44cd2f60a0ca15eef4355241f3ed9aca2cd5feb7580608c7b4f73374e35a0"),
         (84, "6c3152482ae12cc583843f9f65cdf66eabb5e6de4ceb9aed8c9e79975d98fe51927d38fc96b0de74f052c8a8d11dd20c"),
         (85, "b6f613676739870e7bd8305b7cbf507229af4301d4b05bdde30ee1473a460bdabafa07de22421cb455f49051633931f1"),
+        (86, "300674a4976131530bcb7455f92962807ae9fb29bfdd11b12c02120166e04ad1a13ea5e80f96af06510a4651ecdb35b9"),
         (87, "77abeb4469311da1409b815ba37a67e1c5db4e43df7c293a728e559651080f4f61186ad9eac30a68acc01f05562f4e4d"),
     (88, "ffc918db47cd782757451292b3096e8ebafc128edcd52826bc557a9df0a3c702235e61a89a85ccbc7889ef93c511bd99"),
         (89, "b86bc43a0f76241cf5bcc11e794ed3104837e35558bd9817c511450d3d2281f62e635ce931dbffe4ad2acde0a4ec1fc3"),
@@ -558,10 +559,21 @@ async fn build_wanted_outputs_pk_isolation() {
     .await
     .unwrap();
 
+    // The production upsert shape (db/wanted.rs since 086): saturating
+    // union on conflict — either side '{}' saturates, else sorted
+    // distinct union. PK isolation across builds is what this pins.
     let upsert = "INSERT INTO build_wanted_outputs \
                   (build_id, derivation_id, wanted_output_names) VALUES ($1, $2, $3) \
                   ON CONFLICT (build_id, derivation_id) DO UPDATE \
-                  SET wanted_output_names = EXCLUDED.wanted_output_names, recorded_at = now()";
+                  SET wanted_output_names = CASE \
+                          WHEN build_wanted_outputs.wanted_output_names = '{}'::text[] \
+                            OR EXCLUDED.wanted_output_names = '{}'::text[] THEN '{}'::text[] \
+                          ELSE ARRAY(SELECT DISTINCT x \
+                                       FROM UNNEST(build_wanted_outputs.wanted_output_names \
+                                                   || EXCLUDED.wanted_output_names) AS t(x) \
+                                      ORDER BY x) \
+                      END, \
+                      recorded_at = now()";
 
     // Both builds contribute a row for the same derivation.
     sqlx::query(upsert)
@@ -606,8 +618,8 @@ async fn build_wanted_outputs_pk_isolation() {
     };
     assert_eq!(
         names_of(b1),
-        vec!["out".to_string(), "lib".to_string()],
-        "b1's upsert replaced b1's row"
+        vec!["lib".to_string(), "out".to_string()],
+        "b1's upsert unioned into b1's row (sorted, distinct)"
     );
     assert_eq!(
         names_of(b2),
@@ -624,7 +636,15 @@ async fn build_wanted_outputs_pk_isolation() {
 async fn materialization_interest_view_liveness() {
     let db = rio_test_support::TestDb::new(&MIGRATOR).await;
 
-    let drv = uuid::Uuid::now_v7();
+    let drv: sqlx::types::Uuid = sqlx::query_scalar(
+        "INSERT INTO derivations \
+             (drv_hash, drv_path, system, status, output_names, expected_output_paths) \
+         VALUES ('h-interest', '/nix/store/h-interest.drv', 'x', 'ready', '{out}', '{/nix/store/x-out}') \
+         RETURNING derivation_id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
     let job = uuid::Uuid::now_v7();
 
     sqlx::query(
@@ -652,6 +672,14 @@ async fn materialization_interest_view_liveness() {
         .unwrap();
 
     for b in [b_active, b_pending, b_done] {
+        // 086: interest derives from MEMBERSHIP; the wanted row only
+        // narrows the width.
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(b)
+            .bind(drv)
+            .execute(&db.pool)
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO build_wanted_outputs (build_id, derivation_id) VALUES ($1, $2)")
             .bind(b)
             .bind(drv)

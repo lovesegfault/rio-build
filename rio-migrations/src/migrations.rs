@@ -1913,6 +1913,21 @@ pub const M_084: () = ();
 /// row of another class).
 pub const M_085: () = ();
 
+/// 086 — `live_wanted_interest`: one durable home for live interest
+/// (bughunt wave, merged_bug_176). Interest derives from
+/// `build_derivations` MEMBERSHIP (which row-less builds DO have),
+/// LEFT-JOINed to the optional `build_wanted_outputs` contribution; a
+/// missing row contributes the saturating `'{}'` ("all declared
+/// outputs wanted") default, surfaced as `saturated_default` so
+/// readers can record the width saturation. `materialization_interest`
+/// is re-created over the new view with its 078 column shape preserved
+/// (job_id, build_id, wanted_output_names) — the §5.3 pin-release
+/// predicate and its sqlx pins are unchanged. Closes the
+/// under-statement class where a live build without a wanted row was
+/// invisible to interest, pin retention, tenant resolution, and the
+/// effective-wanted union.
+pub const M_086: () = ();
+
 /// `migrations/087_build_terminal_payload.sql`
 ///
 /// Durable terminal payload for builds (bughunt fix wave C1

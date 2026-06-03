@@ -939,6 +939,11 @@ async fn gc_resolved_jobs_sweeps_only_unreferenced_resolved() -> anyhow::Result<
         .await?;
         build_id
     };
+    sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+        .bind(build)
+        .bind(drv_interest)
+        .execute(&test_db.pool)
+        .await?;
     sqlx::query(
         "INSERT INTO build_wanted_outputs (build_id, derivation_id, wanted_output_names) \
          VALUES ($1, $2, '{}')",

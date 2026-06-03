@@ -314,14 +314,16 @@ async fn resolve_tenant(
     ctx: &ExecutorContext,
     claimed: &ClaimedJob,
 ) -> Result<Option<Uuid>, sqlx::Error> {
+    // 086: live interest derives from build_derivations membership
+    // (the live_wanted_interest view) — a row-less live build's tenant
+    // is discoverable (merged_bug_176).
     let live: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT DISTINCT b.tenant_id \
+        "SELECT DISTINCT i.tenant_id \
            FROM materialization_jobs j \
-           JOIN build_wanted_outputs w USING (derivation_id) \
-           JOIN builds b ON b.build_id = w.build_id \
+           JOIN live_wanted_interest i USING (derivation_id) \
           WHERE j.drv_hash = $1 \
-            AND b.status IN ('pending', 'active') \
-            AND b.tenant_id IS NOT NULL",
+            AND i.tenant_id IS NOT NULL \
+          ORDER BY i.tenant_id",
     )
     .bind(&claimed.drv_hash)
     .fetch_all(&ctx.pool)
@@ -348,12 +350,10 @@ async fn live_wanted_paths(
     claimed: &ClaimedJob,
 ) -> Result<Vec<String>, sqlx::Error> {
     let rows: Vec<(Vec<String>, Vec<String>, Vec<String>)> = sqlx::query_as(
-        "SELECT d.output_names, d.expected_output_paths, w.wanted_output_names \
+        "SELECT d.output_names, d.expected_output_paths, i.wanted_output_names \
            FROM derivations d \
-           JOIN build_wanted_outputs w USING (derivation_id) \
-           JOIN builds b ON b.build_id = w.build_id \
-          WHERE d.drv_hash = $1 \
-            AND b.status IN ('pending', 'active')",
+           JOIN live_wanted_interest i USING (derivation_id) \
+          WHERE d.drv_hash = $1",
     )
     .bind(&claimed.drv_hash)
     .fetch_all(&ctx.pool)
@@ -682,6 +682,14 @@ mod tests {
             .await
             .expect("build seeded");
 
+        // 086: interest derives from membership; production records it
+        // at merge (db/batch.rs).
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(build_id)
+            .bind(derivation_id)
+            .execute(pool)
+            .await
+            .expect("membership seeded");
         let wanted: Vec<String> = wanted_names.iter().map(|s| s.to_string()).collect();
         sqlx::query(
             "INSERT INTO build_wanted_outputs (build_id, derivation_id, wanted_output_names) \
@@ -981,6 +989,12 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(build2)
+            .bind(seeded.derivation_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
 
         let ctx = make_ctx(db.pool.clone());
         let outcome = execute_job(&ctx, &seeded.claimed).await;
@@ -1089,6 +1103,12 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(live_build)
+            .bind(seeded.derivation_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
 
         let ctx = make_ctx(db.pool.clone());
         let outcome = execute_job(&ctx, &seeded.claimed).await;
@@ -1470,6 +1490,85 @@ mod tests {
         assert_eq!(
             pinned, 2,
             "both closure members pinned at ingest are counted"
+        );
+    }
+
+    /// merged_bug_176 (bughunt wave): tenant re-resolution discovers a
+    /// LIVE build that is a member (`build_derivations`) but has no
+    /// `build_wanted_outputs` row. Pre-fix the query joined the wanted
+    /// relation, so a row-less live build's tenant was invisible and
+    /// the executor reported InfraFailure ("no tenant context") for a
+    /// job a live build genuinely wants.
+    #[tokio::test]
+    async fn resolve_tenants_discovers_rowless_live_build() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "rowless").await;
+
+        // Seed the derivation + job WITHOUT the wanted row: a build
+        // that is a member only.
+        let drv_hash = "rowless-tenant-drv";
+        let derivation_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO derivations \
+                 (drv_hash, drv_path, system, status, output_names, expected_output_paths) \
+             VALUES ($1, $2, 'x86_64-linux', 'ready', $3, $4) \
+             RETURNING derivation_id",
+        )
+        .bind(drv_hash)
+        .bind(format!("/nix/store/{drv_hash}.drv"))
+        .bind(vec!["out".to_string()])
+        .bind(vec!["/nix/store/aaa-rowless".to_string()])
+        .fetch_one(&db.pool)
+        .await
+        .expect("derivation seeded");
+        let build_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO builds (build_id, tenant_id, status) VALUES ($1, $2, 'active')")
+            .bind(build_id)
+            .bind(tenant)
+            .execute(&db.pool)
+            .await
+            .expect("build seeded");
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(build_id)
+            .bind(derivation_id)
+            .execute(&db.pool)
+            .await
+            .expect("membership seeded");
+        let job_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO materialization_jobs \
+                 (job_id, derivation_id, drv_hash, tenant_id, origin, created_generation) \
+             VALUES ($1, $2, $3, NULL, 'cache_opportunity', 1)",
+        )
+        .bind(job_id)
+        .bind(derivation_id)
+        .bind(drv_hash)
+        .execute(&db.pool)
+        .await
+        .expect("job seeded");
+
+        let ctx = make_ctx(db.pool.clone());
+        let claimed = ClaimedJob {
+            job_id,
+            drv_hash: drv_hash.to_string(),
+            tenant_hint: None,
+            origin: "cache_opportunity".to_string(),
+            exec_id: Uuid::now_v7().to_string(),
+            drv_path: format!("/nix/store/{drv_hash}.drv"),
+        };
+        let resolved = resolve_tenant(&ctx, &claimed).await.expect("query ok");
+        assert_eq!(
+            resolved,
+            Some(tenant),
+            "a row-less live member's tenant is discoverable for the walk"
+        );
+
+        // The live wanted set saturates to all declared outputs for the
+        // row-less member (the '{}' default), not to nothing.
+        let paths = live_wanted_paths(&ctx, &claimed).await.expect("query ok");
+        assert_eq!(
+            paths,
+            vec!["/nix/store/aaa-rowless".to_string()],
+            "row-less live interest saturates the wanted width to all declared"
         );
     }
 }

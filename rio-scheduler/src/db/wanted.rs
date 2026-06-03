@@ -53,12 +53,25 @@ impl SchedulerDb {
             .iter()
             .map(|r| encode_pg_text_array(r.wanted_output_names))
             .collect();
+        // Saturating UNION on conflict (merged_bug_176): the in-memory
+        // DAG fold and the gateway dedup union per-build contributions
+        // with `union_wanted_saturating`; the SQL row must agree or a
+        // multi-root submission's second record drops the first root's
+        // demand. Either side '{}' (= all declared) saturates; else
+        // sorted distinct union.
         sqlx::query(
             "INSERT INTO build_wanted_outputs (build_id, derivation_id, wanted_output_names) \
              SELECT b, d, w::text[] \
                FROM UNNEST($1::uuid[], $2::uuid[], $3::text[]) AS t(b, d, w) \
              ON CONFLICT (build_id, derivation_id) DO UPDATE \
-                 SET wanted_output_names = EXCLUDED.wanted_output_names, \
+                 SET wanted_output_names = CASE \
+                         WHEN build_wanted_outputs.wanted_output_names = '{}'::text[] \
+                           OR EXCLUDED.wanted_output_names = '{}'::text[] THEN '{}'::text[] \
+                         ELSE ARRAY(SELECT DISTINCT x \
+                                      FROM UNNEST(build_wanted_outputs.wanted_output_names \
+                                                  || EXCLUDED.wanted_output_names) AS t(x) \
+                                     ORDER BY x) \
+                     END, \
                      recorded_at = now()",
         )
         .bind(&build_ids)
@@ -99,12 +112,15 @@ impl SchedulerDb {
         &self,
         derivation_id: Uuid,
     ) -> Result<Option<Vec<String>>, sqlx::Error> {
-        let rows: Vec<(Vec<String>,)> = sqlx::query_as(
-            "SELECT w.wanted_output_names \
-               FROM build_wanted_outputs w \
-               JOIN builds b ON b.build_id = w.build_id \
-              WHERE w.derivation_id = $1 \
-                AND b.status IN ('pending', 'active')",
+        // 086: read through `live_wanted_interest` — interest derives
+        // from build_derivations MEMBERSHIP, so a live build without a
+        // wanted row contributes the saturating '{}' default
+        // (merged_bug_176). `saturated_default` marks those rows so the
+        // width saturation is observable.
+        let rows: Vec<(Uuid, Vec<String>, bool)> = sqlx::query_as(
+            "SELECT build_id, wanted_output_names, saturated_default \
+               FROM live_wanted_interest \
+              WHERE derivation_id = $1",
         )
         .bind(derivation_id)
         .fetch_all(&self.pool)
@@ -114,8 +130,11 @@ impl SchedulerDb {
         }
         // Saturating union: any '{}' contribution saturates to "all".
         let mut union: Vec<String> = Vec::new();
-        for (names,) in rows {
+        for (build_id, names, saturated_default) in rows {
             if names.is_empty() {
+                if saturated_default {
+                    crate::state::note_wanted_width_saturated(&build_id);
+                }
                 return Ok(Some(Vec::new()));
             }
             for n in names {

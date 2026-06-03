@@ -48,9 +48,10 @@ async fn raw_rows(
 }
 
 /// (a) `record_wanted_fenced` writes one row per (build, derivation)
-/// pair; re-recording the same build replaces its row (last-write-wins
-/// per build) and never touches another build's row (PK isolation —
-/// the B5-supersession semantics, design §6/PP-5).
+/// pair; re-recording the same build UNIONS into its row (saturating,
+/// sorted-distinct — the multi-root accumulation semantics shared with
+/// `union_wanted_saturating`, merged_bug_176) and never touches
+/// another build's row (PK isolation, design §6/PP-5).
 // r[verify sched.materialize.job+2]
 #[tokio::test]
 async fn wanted_rows_recorded_and_isolated_per_build() -> anyhow::Result<()> {
@@ -115,8 +116,8 @@ async fn wanted_rows_recorded_and_isolated_per_build() -> anyhow::Result<()> {
     };
     assert_eq!(
         names_of(b1),
-        vec!["out".to_string(), "doc".to_string()],
-        "b1's re-record replaced b1's row (last-write-wins per build)"
+        vec!["doc".to_string(), "out".to_string()],
+        "b1's re-record unioned into b1's row (sorted, distinct)"
     );
     assert_eq!(
         names_of(b2),
@@ -137,7 +138,7 @@ async fn wanted_rows_recorded_and_isolated_per_build() -> anyhow::Result<()> {
 // r[verify sched.materialize.job+2]
 #[tokio::test]
 async fn effective_wanted_union_is_live_only_and_saturating() -> anyhow::Result<()> {
-    let (_test_db, db) = setup().await;
+    let (test_db, db) = setup().await;
     let d = insert_test_derivation(&db, "wanted-union-d").await?;
     let b1 = insert_test_build(&db).await?;
     let b2 = insert_test_build(&db).await?;
@@ -146,6 +147,13 @@ async fn effective_wanted_union_is_live_only_and_saturating() -> anyhow::Result<
     // b1/b2 live (pending counts as live), b3 terminal.
     db.update_build_status(b3, BuildState::Succeeded, None)
         .await?;
+    for b in [b1, b2, b3] {
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(b)
+            .bind(d)
+            .execute(&test_db.pool)
+            .await?;
+    }
 
     for (b, names) in [
         (b1, vec!["out".to_string()]),
@@ -326,6 +334,13 @@ async fn wanted_rows_purged_with_build() -> anyhow::Result<()> {
         anyhow::Ok(rows.into_iter().map(|(b,)| b).collect::<Vec<_>>())
     };
 
+    for b in [b1, b2] {
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(b)
+            .bind(d)
+            .execute(&test_db.pool)
+            .await?;
+    }
     let before = interested(test_db.pool.clone()).await?;
     assert!(
         before.contains(&b1) && before.contains(&b2),
@@ -437,5 +452,110 @@ async fn delete_build_purges_wanted_rows_same_fenced_tx() -> anyhow::Result<()> 
             .fetch_one(&test_db.pool)
             .await?;
     assert_eq!((builds, wanted), (0, 0), "both gone atomically");
+    Ok(())
+}
+
+/// merged_bug_176 (bughunt wave): a LIVE build that is a member of the
+/// derivation (`build_derivations`) but has NO `build_wanted_outputs`
+/// row contributes the saturating "all declared outputs" default — the
+/// effective union must saturate to `Some(vec![])`, not let another
+/// build's narrow row win. Pre-fix: the union read joined
+/// `build_wanted_outputs` directly, so the row-less build was
+/// invisible and the narrow row decided the width.
+// r[verify sched.materialize.job+2]
+#[tokio::test]
+async fn effective_wanted_union_saturates_for_rowless_live_build() -> anyhow::Result<()> {
+    let (test_db, db) = setup().await;
+    let d1 = insert_test_derivation(&db, "wanted-rowless-d1").await?;
+    let b1 = insert_test_build(&db).await?;
+    let b2 = insert_test_build(&db).await?;
+
+    // b1 contributes a narrow row; b2 is a member with NO wanted row.
+    let fenced_outcome = db
+        .record_wanted_fenced(
+            1,
+            &[WantedRow {
+                build_id: b1,
+                derivation_id: d1,
+                wanted_output_names: &["out".to_string()],
+            }],
+        )
+        .await?;
+    assert!(fenced_outcome.settled());
+    for b in [b1, b2] {
+        sqlx::query("INSERT INTO build_derivations (build_id, derivation_id) VALUES ($1, $2)")
+            .bind(b)
+            .bind(d1)
+            .execute(&test_db.pool)
+            .await?;
+    }
+
+    assert_eq!(
+        db.effective_wanted_union(d1).await?,
+        Some(Vec::new()),
+        "a row-less live member saturates the union to all-declared"
+    );
+
+    // The row-less build going terminal un-saturates: b1's narrow row wins again.
+    sqlx::query("UPDATE builds SET status = 'succeeded' WHERE build_id = $1")
+        .bind(b2)
+        .execute(&test_db.pool)
+        .await?;
+    assert_eq!(
+        db.effective_wanted_union(d1).await?,
+        Some(vec!["out".to_string()]),
+        "saturation is live-scoped"
+    );
+    Ok(())
+}
+
+/// merged_bug_176 (bughunt wave): the per-(build, derivation) upsert is
+/// a SATURATING UNION on conflict, matching
+/// `rio_common::wanted_outputs::union_wanted_saturating` — a multi-root
+/// submission recording the same derivation twice within one build must
+/// accumulate demand, never replace it (the in-memory DAG fold and the
+/// gateway dedup already union; the SQL row was the one LWW outlier).
+// r[verify sched.materialize.job+2]
+#[tokio::test]
+async fn record_wanted_upsert_unions_not_replaces() -> anyhow::Result<()> {
+    let (test_db, db) = setup().await;
+    let d1 = insert_test_derivation(&db, "wanted-union-d1").await?;
+    let b1 = insert_test_build(&db).await?;
+
+    for names in [&["out".to_string()][..], &["doc".to_string()][..]] {
+        let fenced_outcome = db
+            .record_wanted_fenced(
+                1,
+                &[WantedRow {
+                    build_id: b1,
+                    derivation_id: d1,
+                    wanted_output_names: names,
+                }],
+            )
+            .await?;
+        assert!(fenced_outcome.settled());
+    }
+    let rows = raw_rows(&test_db.pool, d1).await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].1,
+        vec!["doc".to_string(), "out".to_string()],
+        "conflict unions (sorted, distinct) instead of replacing"
+    );
+
+    // Either side '{}' saturates the stored row to '{}' (= all).
+    let fenced_outcome = db
+        .record_wanted_fenced(
+            1,
+            &[WantedRow {
+                build_id: b1,
+                derivation_id: d1,
+                wanted_output_names: &[],
+            }],
+        )
+        .await?;
+    assert!(fenced_outcome.settled());
+    let rows = raw_rows(&test_db.pool, d1).await?;
+    assert_eq!(rows[0].1, Vec::<String>::new(), "empty saturates the union");
     Ok(())
 }
