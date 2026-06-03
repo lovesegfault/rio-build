@@ -353,7 +353,7 @@ the `pending_s3_deletes` table.
     opt out of content verification by omitting its descriptor.
   - *Input-addressed* (`is_ca = false`, not fixed-output-flagged): authorized
     by `expected_outputs` membership (plus
-    #rref("store.put.ia-deriver-proof+3")); a voluntarily attached `fixed:`
+    #rref("store.put.ia-deriver-proof+4")); a voluntarily attached `fixed:`
     descriptor is verified with the same no-modulo-retry semantics as the
     fixed-output class, a non-`fixed:` descriptor on any worker upload is
     rejected, and daemon-era descriptor-less uploads remain membership-only.
@@ -484,7 +484,7 @@ under its work budget and warms the cache. Resolvers in the hash walk
 are synchronous by design; all I/O happens before the walk (cache-row
 seeding at ingestion; arena pre-fetch at proof time).
 
-#r("store.put.ia-deriver-proof+3")[
+#r("store.put.ia-deriver-proof+4")[
   A descriptor-less upload under signed assignment claims that are
   neither content-addressed nor fixed-output (plain input-addressed)
   MUST additionally prove deriver membership against the store's OWN
@@ -494,18 +494,30 @@ seeding at ingestion; arena pre-fetch at proof time).
   derives from its own copy via the modulo cache. On a cache miss the
   store MUST complete the chain itself with a budgeted, MONOTONE
   read-through walk over its own resident bytes: every operation
-  (cache probe, `.drv` fetch, chunk reassembly) charges one typed work
-  budget; every exit --- including budget exhaustion --- first persists
-  every row whose input closure completed, so retries resume from
-  durable progress rather than re-deriving (or forever re-failing) the
-  same prefix; budget exhaustion is `RESOURCE_EXHAUSTED` (retriable,
-  with the persisted-row count named), never an authorization verdict.
+  (cache probe, `.drv` fetch, chunk reassembly) charges a typed
+  two-dimensional budget (work units AND retained arena bytes, the
+  byte ledger charged before each retention); cold walks are admitted
+  under a fixed permit pool (the cached-row probe runs before
+  admission, so warm traffic never queues) bounding the process
+  aggregate of retained arenas; EVERY exit --- typed verdicts, budget
+  exhaustion of either dimension, AND infrastructure-error
+  propagation --- first persists every row whose input closure
+  completed, through one persist chokepoint whose count equals the
+  rows made durable, so retries resume from durable progress rather
+  than re-deriving (or forever re-failing) the same prefix; budget
+  exhaustion is `RESOURCE_EXHAUSTED` (retriable, with the persisted-row
+  count named), never an authorization verdict. The walk applies the
+  oracle's fixed-output base case (`hashDerivationModulo`,
+  derivations.cc:864-874): a fixed-output node is a LEAF --- its modulo
+  hash derives from its own declaration, and the walk MUST NOT probe,
+  descend into, or require residency of anything below it.
   Residency is judged on the store's own manifests regardless of
   storage form (inline or chunked) and regardless of ingestion order.
   Closure verdicts are typed and fail-closed (`PERMISSION_DENIED`
   naming the reason: a non-resident `.drv`, unusable resident bytes, or
-  cyclic input metadata); infrastructure failures are `INTERNAL` and
-  MUST NOT surface as any closure verdict. Derivers whose own output paths are not
+  cyclic input metadata); infrastructure failures are `INTERNAL` (or
+  the retriable transport class for transient chunk-backend failures)
+  and MUST NOT surface as any closure verdict. Derivers whose own output paths are not
   statically derivable (deferred) are membership-only. The scheduler's
   service token MUST NOT bypass PutPath or PutPathBatch (probe rights
   only); the gate applies to both upload RPCs per output. Idempotency
@@ -1313,7 +1325,7 @@ Operator invalidation is the remediation for wrong-content incidents; a
 surviving modulo-cache row would keep proving IA outputs of a `.drv` whose
 narinfo the operator just removed, so "invalidate" must mean *every* table.
 The sweep, by contrast, preserves `drv_modulo_cache` by design
-(#rref("store.put.ia-deriver-proof+3") --- proofs survive deriver GC). The
+(#rref("store.put.ia-deriver-proof+4") --- proofs survive deriver GC). The
 per-table policy split is the registry's job
 (#rref("store.db.per-path-registry")).
 

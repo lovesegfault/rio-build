@@ -1324,7 +1324,7 @@ pub const M_067: () = ();
 /// re-upload of the same path carries identical bytes by construction.
 ///
 /// Lifecycle (round-15 C10, bug_102): rows are deliberately PRESERVED
-/// by the per-path GC sweep (`store.put.ia-deriver-proof+3` — proofs
+/// by the per-path GC sweep (`store.put.ia-deriver-proof+4` — proofs
 /// survive deriver GC, so an IA upload remains provable after its
 /// deriver `.drv` ages out) and deleted on exactly two paths: operator
 /// `InvalidatePath` (`store.admin.invalidate-total`, path-scoped,

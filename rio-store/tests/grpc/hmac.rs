@@ -80,7 +80,7 @@ fn sign_claims_fod(executor_id: &str, outputs: Vec<String>, expiry_offset_secs: 
 /// the IA proof gate — the text-CA gate owns it — but must still pass
 /// membership). Returns `(deriver_drv_path, derived_out_path)` so
 /// callers can claim a path the STORE can prove belongs to the deriver
-/// (`store.put.ia-deriver-proof+3`).
+/// (`store.put.ia-deriver-proof+4`).
 async fn stage_ia_deriver(
     client: &mut StoreServiceClient<Channel>,
     tag: &str,
@@ -275,7 +275,7 @@ async fn hmac_no_token_rejected() -> TestResult {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-// r[verify store.put.ia-deriver-proof+3]
+// r[verify store.put.ia-deriver-proof+4]
 async fn hmac_valid_token_accepted() -> TestResult {
     let mut s = StoreSession::new_with_hmac(TEST_KEY.to_vec()).await?;
 
@@ -1138,7 +1138,7 @@ async fn hmac_store_path_hash_mismatch_ignored() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.ia-deriver-proof+3]
+// r[verify store.put.ia-deriver-proof+4]
 /// THE forged-claims kill test (compromised-scheduler simulation): a
 /// VALIDLY SIGNED token whose expected_outputs (membership) include the
 /// victim's path, naming a resident deriver that does NOT derive it —
@@ -1162,7 +1162,7 @@ async fn ia_proof_rejects_membership_passing_underivable_path() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.ia-deriver-proof+3]
+// r[verify store.put.ia-deriver-proof+4]
 /// Deriver absent → unverifiable → fail closed; once the deriver is
 /// ingested (read-through warms from resident bytes) the same upload
 /// succeeds.
@@ -1199,7 +1199,7 @@ async fn ia_proof_unverifiable_until_deriver_resident() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.ia-deriver-proof+3]
+// r[verify store.put.ia-deriver-proof+4]
 /// The PutPathBatch path enforces the same gate per output (the unary
 /// fix alone would leave the batch door open).
 #[tokio::test]
@@ -1246,7 +1246,7 @@ async fn ia_proof_batch_rejects_underivable_output() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.ia-deriver-proof+3]
+// r[verify store.put.ia-deriver-proof+4]
 /// The capability split: a SCHEDULER service token is no PutPath bypass
 /// (probe rights only) — even though "rio-scheduler" stays in the
 /// general allowlist.
@@ -1275,7 +1275,7 @@ async fn scheduler_service_token_has_no_putpath_bypass() -> TestResult {
 // C1c2 (bug_092): idempotency precedence over the deriver proof
 // ---------------------------------------------------------------------------
 
-// r[verify store.put.ia-deriver-proof+3]
+// r[verify store.put.ia-deriver-proof+4]
 /// Re-upload of an already-complete path under IA claims naming a
 /// NON-resident deriver must succeed with `created: false`: the path is
 /// complete, so the proof is never consulted. Pre-fix, the proof ran
@@ -1316,7 +1316,7 @@ async fn reupload_after_claimsless_completion_returns_created_false() -> TestRes
     Ok(())
 }
 
-// r[verify store.put.ia-deriver-proof+3]
+// r[verify store.put.ia-deriver-proof+4]
 /// Batch sibling: an already-complete output inside a PutPathBatch is
 /// skipped (created=false) without consulting the proof, even when the
 /// claims name a non-resident deriver.
@@ -1375,7 +1375,7 @@ async fn batch_already_complete_skips_proof() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.ia-deriver-proof+3]
+// r[verify store.put.ia-deriver-proof+4]
 /// A FRESH (not-yet-registered) path under unprovable claims is still
 /// denied — and the denial releases the placeholder it claimed, leaving
 /// no `'uploading'` squat behind.

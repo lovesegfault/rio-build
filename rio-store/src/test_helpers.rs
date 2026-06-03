@@ -489,7 +489,7 @@ impl ChunkSeed {
 }
 
 // ---------------------------------------------------------------------------
-// Deriver-proof walk probe (store.put.ia-deriver-proof+3 test seam)
+// Deriver-proof walk probe (store.put.ia-deriver-proof+4 test seam)
 // ---------------------------------------------------------------------------
 
 /// Structural report from one proof walk, for integration tests that

@@ -326,7 +326,7 @@ fn ia_claims_token(deriver: &str, outputs: Vec<String>) -> String {
     HmacSigner::from_key(TEST_KEY.to_vec()).sign(&claims)
 }
 
-// r[verify store.put.ia-deriver-proof+3]
+// r[verify store.put.ia-deriver-proof+4]
 /// Row corruption is an INTERNAL error, never an authorization verdict:
 /// a `status='complete'` deriver `.drv` whose inline NAR does not parse
 /// (text-CA-gated at ingestion, so this is row corruption) must surface
@@ -379,7 +379,7 @@ async fn corrupt_inline_drv_nar_yields_internal_not_permission_denied() -> TestR
     Ok(())
 }
 
-// r[verify store.put.ia-deriver-proof+3]
+// r[verify store.put.ia-deriver-proof+4]
 /// Duplicate-output derivation bytes fail the deriver proof CLOSED:
 /// the parse boundary (nix.drv.type-classify+1, fail-closed divergence
 /// #4) rejects duplicates, so the walk reports the deriver as
@@ -446,7 +446,7 @@ async fn duplicate_output_deriver_fails_proof_closed() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.ia-deriver-proof+3]
+// r[verify store.put.ia-deriver-proof+4]
 /// The residency clause end-to-end: after the deriver `.drv` is GC'd
 /// (narinfo gone) its proof row SURVIVES, and an IA upload claiming its
 /// output is still ACCEPTED — "previously verified against resident
@@ -512,7 +512,7 @@ async fn ia_proof_survives_deriver_gc() -> TestResult {
     Ok(())
 }
 
-// r[verify store.put.ia-deriver-proof+3]
+// r[verify store.put.ia-deriver-proof+4]
 /// Database failure during the proof lookup is an INTERNAL error, never
 /// `PERMISSION_DENIED`: with the cache table dropped, the proof's own
 /// SELECT fails — pre-fix the `.ok()??` fold reported "deriver closure
@@ -646,7 +646,7 @@ mod proof_walk {
             .unwrap()
     }
 
-    // r[verify store.put.ia-deriver-proof+3]
+    // r[verify store.put.ia-deriver-proof+4]
     /// A 300-deep pure chain — 9.4× past the OLD depth bound of 32 that
     /// rejected the measured real-world class — converges in one cold
     /// walk with every row persisted.
@@ -676,7 +676,7 @@ mod proof_walk {
         Ok(())
     }
 
-    // r[verify store.put.ia-deriver-proof+3]
+    // r[verify store.put.ia-deriver-proof+4]
     /// THE deploy-blocker merge gate (merged_bug_002): a 2,048-node
     /// closure at the measured real-world shape class (spine depth
     /// 2,048 ≥ the measured 236; cross edges for fan) proves in ONE
@@ -720,7 +720,7 @@ mod proof_walk {
         Ok(())
     }
 
-    // r[verify store.put.ia-deriver-proof+3]
+    // r[verify store.put.ia-deriver-proof+4]
     /// Over-budget exits persist what they proved, and identical
     /// retries CONVERGE instead of re-failing forever (the
     /// merged_bug_002 zero-progress pathology): a 60-leaf star under a
@@ -776,7 +776,80 @@ mod proof_walk {
         Ok(())
     }
 
-    // r[verify store.put.ia-deriver-proof+3]
+    // r[verify store.put.ia-deriver-proof+4]
+    /// THE bug_083 oracle-parity cut: the walk must NOT descend below a
+    /// fixed-output node (`hashDerivationModulo`'s FOD base case,
+    /// derivations.cc:864-874 — the `fixed:out:…` fingerprint is
+    /// derived from the FOD's own declaration; inputs are never
+    /// visited). Fixture: an IA parent whose input is a FOD whose own
+    /// input (`ghost`) is NOT resident anywhere. Pre-fix the walk
+    /// demanded ghost and the whole proof failed
+    /// `NotResident{ghost}` — a verdict the oracle cannot produce.
+    #[tokio::test]
+    async fn fod_inputs_are_never_required_resident() -> TestResult {
+        let s = StoreSession::new().await?;
+        let mut minted = HashMap::new();
+        let mut dc = HashMap::new();
+
+        let ghost = format!("/nix/store/{}-ghost.drv", "a".repeat(32));
+        let fod_text = format!(
+            r#"Derive([("out","/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed","sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")],[("{ghost}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed"),("outputHash","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#
+        );
+        let h = NixHash::new(
+            HashAlgo::SHA256,
+            Sha256::digest(fod_text.as_bytes()).to_vec(),
+        )
+        .unwrap();
+        let fod_path = StorePath::make_text("fod-cut.drv", &h, &[])
+            .unwrap()
+            .as_str()
+            .to_owned();
+        minted.insert(
+            fod_path.clone(),
+            (fod_text.clone(), Derivation::parse(&fod_text).unwrap()),
+        );
+        let parent = mint_node(
+            "fodcut-parent",
+            std::slice::from_ref(&fod_path),
+            &mut minted,
+            &mut dc,
+        );
+
+        // Stage parent + FOD only. ghost is resident NOWHERE.
+        for (path, (text, _)) in &minted {
+            stage_drv_sql(&s.db.pool, path, text).await?;
+        }
+
+        let report =
+            proof_walk_for_tests(&s.db.pool, None, &parent, PROOF_WALK_WORK_MAX_FOR_TESTS).await?;
+        assert!(
+            report.proven,
+            "IA parent of a FOD proves without the FOD's inputs: {report:?}"
+        );
+        assert_eq!(
+            cache_rows(&s.db.pool).await,
+            2,
+            "exactly parent + FOD rows; nothing below the FOD is walked"
+        );
+        let ghost_row: i64 =
+            sqlx::query_scalar("SELECT count(*)::bigint FROM drv_modulo_cache WHERE drv_path = $1")
+                .bind(&ghost)
+                .fetch_one(&s.db.pool)
+                .await?;
+        assert_eq!(ghost_row, 0, "ghost never derived");
+
+        // The FOD also proves DIRECTLY (membership-only row).
+        sqlx::query("DELETE FROM drv_modulo_cache")
+            .execute(&s.db.pool)
+            .await?;
+        let direct =
+            proof_walk_for_tests(&s.db.pool, None, &fod_path, PROOF_WALK_WORK_MAX_FOR_TESTS)
+                .await?;
+        assert!(direct.proven, "FOD proves standalone: {direct:?}");
+        Ok(())
+    }
+
+    // r[verify store.put.ia-deriver-proof+4]
     /// THE bug_084 exit-class witness: an INFRASTRUCTURE error
     /// mid-discovery must still drain the arena — every subtree whose
     /// inputs completed before the error is persisted on the `Err`
@@ -890,7 +963,7 @@ mod proof_walk {
         Ok(())
     }
 
-    // r[verify store.put.ia-deriver-proof+3]
+    // r[verify store.put.ia-deriver-proof+4]
     /// THE byte-flood scale test (bug_079, R4 SCALE-PER-DIMENSION): a
     /// padded mid-tier (8 mids × 1 MiB env padding, each over its own
     /// leaf) under a 3.5 MiB arena cap. The WORK budget never binds
@@ -965,7 +1038,7 @@ mod proof_walk {
         Ok(())
     }
 
-    // r[verify store.put.ia-deriver-proof+3]
+    // r[verify store.put.ia-deriver-proof+4]
     /// Diamond dedup: A→{B,C}, B→D, C→D — D is fetched and probed ONCE.
     /// Exact op accounting (1 pre-admission probe + 1 post-admission
     /// probe + 4 fetches + 2 input probes = 8): a regression that
@@ -993,7 +1066,7 @@ mod proof_walk {
         Ok(())
     }
 
-    // r[verify store.put.ia-deriver-proof+3]
+    // r[verify store.put.ia-deriver-proof+4]
     /// A chunked `.drv` (≥256 KiB forces FastCDC chunking) is reassembled
     /// through the chunk cache and proves — chunked storage is no longer
     /// a verifiability boundary.

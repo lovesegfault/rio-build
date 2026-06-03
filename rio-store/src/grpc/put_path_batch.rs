@@ -199,7 +199,7 @@ impl StoreServiceImpl {
             placeholder_guards
                 .push(self.spawn_placeholder_guard(accum.store_path_hash.clone(), claim));
             accum.claim = Some(claim);
-            // r[impl store.put.ia-deriver-proof+3]
+            // r[impl store.put.ia-deriver-proof+4]
             // Owned-arm only, AFTER the AlreadyComplete short-circuit
             // (idempotency precedence — see PutPath): descriptor-less IA
             // outputs must prove deriver membership against the store's

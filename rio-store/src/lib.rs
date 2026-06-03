@@ -159,7 +159,7 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_ia_proof_total",
         "IA deriver-proof gate outcomes on descriptor-less input-addressed \
-         uploads (store.put.ia-deriver-proof+3). Gate-level results: ok | \
+         uploads (store.put.ia-deriver-proof+4). Gate-level results: ok | \
          rejected (claimed path is not store-derived from the named \
          deriver) | deferred_exempt (deriver's own paths come from \
          realisations; membership-only). Walk-level results: proven | \

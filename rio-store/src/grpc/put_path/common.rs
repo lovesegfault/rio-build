@@ -1028,7 +1028,7 @@ impl StoreServiceImpl {
         })
     }
 
-    // r[impl store.put.ia-deriver-proof+3]
+    // r[impl store.put.ia-deriver-proof+4]
     /// Descriptor-less INPUT-ADDRESSED uploads must prove deriver
     /// membership against the store's OWN bytes: the claims' deriver
     /// `.drv` (claims.drv_hash == its store path, bound at scheduler
@@ -2459,7 +2459,7 @@ mod verify_nar_tests {
             .expect("self-referencing IA upload with honest descriptor is accepted");
     }
 
-    // r[verify store.put.ia-deriver-proof+3]
+    // r[verify store.put.ia-deriver-proof+4]
     /// gRPC code bijection over the absence verdicts: closure verdicts
     /// are PERMISSION_DENIED with the reason named; budget exhaustion
     /// is RESOURCE_EXHAUSTED (retriable) and names the persisted

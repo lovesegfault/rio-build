@@ -150,7 +150,7 @@ impl PerPathTable {
                 sql: "DELETE FROM path_tenants WHERE store_path_hash = $1",
             },
             PerPathTable::DrvModuloCache => SweepPolicy::Survive {
-                rationale: "store.put.ia-deriver-proof+3: proofs survive deriver GC \
+                rationale: "store.put.ia-deriver-proof+4: proofs survive deriver GC \
                             ('previously verified against resident bytes'); growth is \
                             bounded by the DRV_MODULO_ORPHAN_TTL_DAYS reclaim in the GC \
                             tail, not the per-path sweep",

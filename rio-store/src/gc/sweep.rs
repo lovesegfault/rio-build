@@ -956,7 +956,7 @@ mod tests {
         );
     }
 
-    // r[verify store.put.ia-deriver-proof+3]
+    // r[verify store.put.ia-deriver-proof+4]
     /// The sweep PRESERVES drv_modulo_cache rows by design: proofs
     /// survive deriver GC ("resident or previously verified against
     /// resident bytes" — the gate's residency clause). This is the
@@ -1000,7 +1000,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             modulo, 1,
-            "the proof row must SURVIVE the sweep (ia-deriver-proof+3 residency clause)"
+            "the proof row must SURVIVE the sweep (ia-deriver-proof+4 residency clause)"
         );
     }
 

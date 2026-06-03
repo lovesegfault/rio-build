@@ -22,7 +22,7 @@
 //! are `ON DELETE RESTRICT`, and an explicit operator invalidation is
 //! precisely the case where removing the edges is intended rather than
 //! a bug to surface — and `drv_modulo_cache`, which the sweep
-//! deliberately PRESERVES (`store.put.ia-deriver-proof+3`: proofs
+//! deliberately PRESERVES (`store.put.ia-deriver-proof+4`: proofs
 //! survive deriver GC) but which "invalidate everything about this
 //! path" must purge: a surviving modulo row would keep proving IA
 //! outputs of a `.drv` whose narinfo the operator just removed.

@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 
+use rio_nix::derivation::DerivationLike as _;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::{debug, warn};
@@ -246,6 +247,14 @@ pub(crate) async fn populate_on_ingest(
         .ok()
         .and_then(|t| rio_nix::derivation::Derivation::parse(t).ok())
     {
+        // FOD base case (bug_083; derivations.cc:864-874): a
+        // fixed-output subject's modulo hash never consults its
+        // inputs, so no seeds are loaded — population cannot be
+        // deferred (or seed-load-failed) by input rows the hash does
+        // not need. (The compute itself already applied this cut via
+        // the rio_nix walk; this makes the module's FOD handling
+        // explicit end-to-end.)
+        Some(drv) if drv.is_fixed_output() => Vec::new(),
         Some(drv) => drv.input_drvs().keys().cloned().collect(),
         None => {
             metrics::counter!(
@@ -385,7 +394,7 @@ pub(crate) async fn heal_if_missing(
 }
 
 /// Total work budget for one proof-time read-through walk
-/// (`store.put.ia-deriver-proof+3`). UNITS, charged at call time by the
+/// (`store.put.ia-deriver-proof+4`). UNITS, charged at call time by the
 /// owning [`WorkBudget`]: 1 per cache probe (the initial row lookup and
 /// one BATCHED input probe per expanded node), 1 per own-backend `.drv`
 /// fetch, 1 per chunk fetched during chunked-`.drv` reassembly. Metered
@@ -952,6 +961,18 @@ impl<'a> ProofWalk<'a> {
                 .ok()
                 .and_then(|t| rio_nix::derivation::Derivation::parse(t).ok())
             {
+                // FOD base case (round-16 bug_083; oracle parity:
+                // `hashDerivationModulo`, derivations.cc:864-874 — the
+                // fixed-output branch returns the `fixed:out:…`
+                // fingerprint WITHOUT recursing into inputDrvs, and the
+                // rio_nix walk's Visit arm applies the same cut). A
+                // fixed-output node's modulo hash needs nothing below
+                // it, so the walk treats it as a leaf: its inputs are
+                // never probed, queued, fetched, or required resident.
+                // Pre-fix, a FOD whose fetch-tooling inputs were GC'd
+                // (or never uploaded) failed the whole proof
+                // NotResident on a node the oracle never visits.
+                Some(d) if d.is_fixed_output() => Vec::new(),
                 Some(d) => d.input_drvs().keys().cloned().collect(),
                 None => {
                     return Ok(Some(AbsentReason::Unparseable {
@@ -1026,13 +1047,13 @@ impl<'a> ProofWalk<'a> {
     }
 }
 
-/// Proof-time read-through (`store.put.ia-deriver-proof+3`): return the
+/// Proof-time read-through (`store.put.ia-deriver-proof+4`): return the
 /// deriver's cached row, computing it (and its missing ancestors) from
 /// the store's own backend when absent — a single budgeted, MONOTONE
 /// walk (every exit persists what it proved). One batched membership
 /// probe per expanded node; frontier dedup-on-push; eager leaf-first
 /// compute keeps the in-memory arena small.
-// r[impl store.put.ia-deriver-proof+3]
+// r[impl store.put.ia-deriver-proof+4]
 pub(crate) async fn prove_drv_modulo(
     pool: &PgPool,
     chunks: Option<&crate::cas::ChunkCache>,
@@ -1292,6 +1313,30 @@ mod tests {
         );
     }
 
+    /// FOD base-case pin (bug_083; oracle derivations.cc:864-874): a
+    /// fixed-output subject computes with ZERO seeds even when its
+    /// `inputDrvs` is non-empty — the modulo walk never consults
+    /// inputs below a FOD, so neither population nor the proof walk
+    /// may demand them.
+    #[test]
+    fn fod_subject_computes_without_input_seeds() {
+        let ghost = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ghost.drv";
+        let fod = format!(
+            r#"Derive([("out","/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed","sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")],[("{ghost}",["out"])],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/hf9x46xx06qmkj0ivfqdswgi2qzd2cwz-fixed"),("outputHash","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#
+        );
+        let mut empty_seeds = HashMap::new();
+        let computed = compute_drv_modulo(
+            fod.as_bytes(),
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-fixed.drv",
+            &mut empty_seeds,
+        )
+        .expect("FOD computes without any input seeds (base case)");
+        assert!(
+            computed.row.ia_output_paths.is_empty() && !computed.row.deferred,
+            "FOD rows are membership-only, not deferred"
+        );
+    }
+
     /// THE masked-form regression (vm-ca-cutoff class, store edition):
     /// a floating-CA derivation consumed as an INPUT must contribute
     /// its `mask_outputs=false` digest to the parent's walk — the
@@ -1301,7 +1346,7 @@ mod tests {
     /// against a full-resolution reference walk; before the
     /// input-form fix the cached composition diverged for floating
     /// inputs and silently mis-derived every downstream IA path.
-    // r[verify store.put.ia-deriver-proof+3]
+    // r[verify store.put.ia-deriver-proof+4]
     #[test]
     fn cached_floating_input_matches_full_resolution_walk() {
         use rio_nix::derivation::{Derivation, input_addressed_output_paths};
