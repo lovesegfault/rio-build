@@ -459,8 +459,14 @@ impl UploadTask {
         let mut client = self.client.clone();
         let call = client.append_log(req);
         match self.await_while_buffering(call).await {
-            Ok(resp) => Ok((out_tx, resp.into_inner())),
-            Err(status) => Err(classify_open_failure(status)),
+            Some(Ok(resp)) => Ok((out_tx, resp.into_inner())),
+            Some(Err(status)) => Err(classify_open_failure(status)),
+            // Drain deadline expired while the open hung: surface as
+            // retryable — run_inner's loop-top deadline check converts
+            // it to the counted Abandoned exit.
+            None => Err(OpenFailure::Retryable(Status::deadline_exceeded(
+                "drain deadline expired while AppendLog open was awaited",
+            ))),
         }
     }
 
@@ -562,23 +568,36 @@ impl UploadTask {
     /// retransmit buffer. Used for the open call and the reconnect backoff
     /// so that a store outage never stalls the stderr loop behind a full
     /// input channel.
-    async fn await_while_buffering<F>(&mut self, fut: F) -> F::Output
+    ///
+    /// Returns `None` when the drain deadline expires while awaiting
+    /// (merged_bug_181): the deadline used to be enforced only inside an
+    /// OPEN session and at the loop top, so a hung `open()` — a server
+    /// that accepts the connection but withholds response headers —
+    /// parked the drain forever past its 600 s bound.
+    async fn await_while_buffering<F>(&mut self, fut: F) -> Option<F::Output>
     where
         F: std::future::Future,
     {
         tokio::pin!(fut);
         loop {
+            // Re-created per iteration (the deadline_sleep pattern):
+            // the deadline arms when accept(None) observes the input
+            // close, which can happen INSIDE this loop — a snapshot at
+            // entry would miss it.
+            let expiry = self.deadline_sleep();
             tokio::select! {
-                out = &mut fut => return out,
+                out = &mut fut => return Some(out),
                 batch = self.input.recv(), if self.input_open => self.accept(batch),
+                _ = expiry, if self.deadline.is_some() => return None,
             }
         }
     }
 
-    /// Sleep the reconnect backoff (still draining the input).
+    /// Sleep the reconnect backoff (still draining the input). Returns
+    /// early when the drain deadline expires mid-backoff.
     async fn backoff(&mut self) {
         let sleep = tokio::time::sleep(self.config.reconnect_backoff);
-        self.await_while_buffering(sleep).await;
+        let _ = self.await_while_buffering(sleep).await;
     }
 
     /// Record one input-channel recv result: push a batch onto the
@@ -803,6 +822,10 @@ mod tests {
 
     #[derive(Default)]
     struct MockInner {
+        /// When true, `append_log` reads the header then withholds the
+        /// response headers forever (the hung-open shape of
+        /// merged_bug_181).
+        hang_open: std::sync::atomic::AtomicBool,
         sessions: Mutex<Vec<Arc<MockSession>>>,
         /// If `Some`, every `append_log` open is rejected with this status
         /// (cloned). The open never produces a session record.
@@ -814,6 +837,12 @@ mod tests {
     impl MockLogService {
         fn reject_opens_with(&self, status: Status) {
             *self.inner.reject_open.lock().unwrap() = Some(status);
+        }
+
+        fn hang_opens(&self) {
+            self.inner
+                .hang_open
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn session(&self, idx: usize) -> Arc<MockSession> {
@@ -859,6 +888,16 @@ mod tests {
                 .message()
                 .await?
                 .ok_or_else(|| Status::invalid_argument("stream ended before the header"))?;
+
+            if self
+                .inner
+                .hang_open
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                // Withhold response headers forever: the open is
+                // accepted at the transport level but never answered.
+                std::future::pending::<()>().await;
+            }
 
             let (ack_tx, ack_rx) = mpsc::channel::<Result<AppendLogAck, Status>>(16);
             let session = Arc::new(MockSession {
@@ -1128,6 +1167,42 @@ mod tests {
     // ------------------------------------------------------------------
     // 5. The drain deadline
     // ------------------------------------------------------------------
+
+    /// merged_bug_181 (red-first): the store accepts the AppendLog
+    /// connection but withholds response headers — `open()` hangs. The
+    /// drain deadline must still fire (third select arm in
+    /// await_while_buffering) and the task must exit Abandoned with the
+    /// loss counted, instead of parking forever.
+    #[tokio::test]
+    async fn hung_open_abandons_at_drain_deadline() {
+        let h = harness().await;
+        h.mock.hang_opens();
+        let tx = h.uploader.sender();
+        tx.send(batch(0, 25)).await.unwrap();
+        wait_for("the hung open to be attempted", || h.mock.open_count() >= 1).await;
+
+        let started = std::time::Instant::now();
+        drop(tx); // input closes → the 400 ms drain deadline arms
+        let status = h.uploader.finish(Duration::from_secs(5)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the drain must abandon at the deadline while open() is awaited, \
+             not park forever (took {:?})",
+            started.elapsed()
+        );
+        match status {
+            DrainStatus::Abandoned {
+                unacked_lines,
+                last_acked_line,
+                rejected,
+            } => {
+                assert_eq!(unacked_lines, 25, "every line is un-acked loss");
+                assert_eq!(last_acked_line, None);
+                assert!(!rejected, "a hung open is loss, not a store rejection");
+            }
+            other => panic!("expected Abandoned at the deadline, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn gives_up_after_drain_deadline() {
