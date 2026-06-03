@@ -38,6 +38,7 @@ pub(super) async fn insert_test_derivation(
 ) -> anyhow::Result<Uuid> {
     let mut tx = db.pool.begin().await?;
     let row = DerivationRow {
+        needs_resolve: false,
         drv_hash: drv_hash.into(),
         drv_path: rio_test_support::fixtures::test_drv_path(drv_hash),
         pname: Some("test-pkg".into()),

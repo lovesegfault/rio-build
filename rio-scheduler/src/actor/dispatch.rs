@@ -2705,6 +2705,11 @@ impl DagActor {
                         .persist_evidence_rank(
                             drv_hash.as_str(),
                             crate::state::DefinitionEvidence::PathBoundBytes,
+                            // M_071: the byte-derived resolve flag rides
+                            // the raise — one statement, so the
+                            // persisted rank can never outlive a lossy
+                            // re-derivation of the flag (bug_053).
+                            Some(def.needs_resolve),
                         )
                         .await
                     {
@@ -2803,6 +2808,9 @@ impl DagActor {
                         .persist_evidence_rank_and_strip_modular_hash(
                             drv_hash.as_str(),
                             crate::state::DefinitionEvidence::PathBoundBytes,
+                            // M_071: same one-statement pairing as the
+                            // plain raise arm above.
+                            Some(def.needs_resolve),
                         )
                         .await
                     {
@@ -3176,9 +3184,9 @@ impl DagActor {
         // The lossy-on-recovery pattern still applies to
         // `pending_realisation_deps` (best-effort cache, reconstituted
         // here on each resolve); `ca_modular_hash` and `needs_resolve`
-        // are no longer lossy — recovery restores the persisted hash
-        // and re-derives the resolve flag
-        // (sched.persist.ca-modular-hash, sched.recovery.deferred-resolve).
+        // are no longer lossy — recovery restores BOTH from their
+        // persisted columns (sched.persist.ca-modular-hash,
+        // sched.recovery.deferred-resolve+1 / M_071 verbatim restore).
         //
         // r[impl sched.ca.resolve+3]
         let drv_content = if let Some(bytes) = verified_bytes {

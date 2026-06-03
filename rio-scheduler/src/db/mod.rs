@@ -376,6 +376,14 @@ pub(crate) struct RecoveryDerivationRow {
     /// authoritative bytes are present; unparseable values degrade to
     /// the `unverified_claim` floor (`DefinitionEvidence::parse_lossy`).
     pub evidence_rank: String,
+    /// Persisted dispatch-resolve flag (`M_071`, round-16 bug_053).
+    /// `Some` is restored VERBATIM by `from_recovery_row` — it is the
+    /// byte-derived value the creation upsert or a dispatch raise
+    /// recorded; `None` marks a pre-071 legacy row, the only case the
+    /// lossy `should_resolve_from_expected_paths` degrade still
+    /// covers (it cannot see a FOD's floating inputs, which is the
+    /// exact under-approximation that poisoned post-failover FODs).
+    pub needs_resolve: Option<bool>,
     /// Per-execution identifier from the active `assignments` row
     /// (`migrations/061`). `None` unless the drv is currently dispatched
     /// (`assigned_builder_id IS NOT NULL`) — a reset drv's assignments row
@@ -415,6 +423,7 @@ impl RecoveryDerivationRow {
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,
             evidence_rank: "unverified_claim".into(),
+            needs_resolve: None,
             drv_content: None,
             ca_modular_hash: None,
             ca_modular_hash_stripped: None,
@@ -545,6 +554,12 @@ pub(crate) struct DerivationRow {
     /// own ingress rank). Settle/dispatch upgrades use the separate
     /// runtime `persist_evidence_rank` writer.
     pub evidence_rank: crate::state::DefinitionEvidence,
+    /// M_071 dispatch-resolve flag — the merge-time authoritative
+    /// value (store-evidence grant's byte-derived flag for verified
+    /// creations, gateway echo otherwise). Always present at creation;
+    /// the column is nullable only to mark pre-071 legacy rows for
+    /// recovery's degrade fallback.
+    pub needs_resolve: bool,
     /// Preserved stripped declared hash (`M_070`). `Some` only when
     /// the creating submission's INGRESS strip removed an unverifiable
     /// declared hash; the dispatch strip writes the column through its

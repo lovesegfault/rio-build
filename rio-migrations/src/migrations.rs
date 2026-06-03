@@ -1430,6 +1430,37 @@ pub const M_069: () = ();
 /// stripped → live.
 pub const M_070: () = ();
 
+/// `071_derivations_needs_resolve.sql` — persisted dispatch-resolve
+/// flag (round-16 bug_053; class dispatch-state-fidelity).
+///
+/// `needs_resolve` decides whether `maybe_resolve_ca` rewrites a
+/// derivation's input placeholders before dispatch. The shared
+/// predicate (`rio_nix::derivation::should_resolve`) has three
+/// clauses; the third — "a FIXED drv whose env embeds a floating
+/// child's placeholder MUST resolve" — is byte-derived (it needs the
+/// children's path-knowledge), and recovery used to RE-DERIVE the
+/// flag from `should_resolve_from_expected_paths`, a degrade that
+/// only sees the row's own expected-path emptiness. A FOD's expected
+/// paths are all concrete, so the flag recovered as `false`; the
+/// persisted `path_bound_bytes` rank then made dispatch skip the byte
+/// re-derivation, and the FOD dispatched post-failover with literal
+/// placeholder strings in env/args — deterministic failure to poison
+/// for a build that succeeded before the failover.
+///
+/// The column persists the flag at every site that computes it
+/// authoritatively: the creation upsert (merge-time value — the
+/// store-evidence grant's byte-derived flag for verified creations,
+/// the gateway echo otherwise) and the two dispatch-raise writers
+/// (`persist_evidence_rank{,_and_strip_modular_hash}` with
+/// `COALESCE($n, needs_resolve)` — the settle chokepoint passes NULL
+/// and never touches it). Recovery restores the column VERBATIM when
+/// non-NULL; `should_resolve_from_expected_paths` is demoted to the
+/// NULL-legacy fallback only (rows created before this migration).
+/// Nullable by design: NULL distinguishes "never persisted" from
+/// `false` ("persisted: does not need resolve"), so the fallback can
+/// never shadow an authoritative false.
+pub const M_071: () = ();
+
 /// `migrations/073_drv_modulo_orphaned_at.sql`
 ///
 /// Adds `drv_modulo_cache.orphaned_at TIMESTAMPTZ` (NULL = deriver

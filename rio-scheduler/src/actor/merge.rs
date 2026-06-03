@@ -3596,6 +3596,17 @@ impl DagActor {
                         .node(node.drv_hash.as_str())
                         .map(|s| s.ca.modular_hash_stripped)
                         .unwrap_or(node.ca_modular_hash_stripped),
+                    // M_071 (round-16 bug_053): same DAG-first read as
+                    // the rank above — a store-evidence-verified
+                    // creation persists the BYTE-DERIVED resolve flag
+                    // the grant stamped, not the submitter's echo, so
+                    // recovery restores exactly what dispatch would
+                    // have computed.
+                    needs_resolve: self
+                        .dag
+                        .node(node.drv_hash.as_str())
+                        .map(|s| s.ca.needs_resolve)
+                        .unwrap_or(node.needs_resolve),
                 }
             })
             .collect();

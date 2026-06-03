@@ -5221,12 +5221,13 @@ async fn test_recovery_registers_realisation_for_authoritative_ca_fallback() -> 
 /// input-addressed derivation whose output path is deferred (floating-CA
 /// input ⇒ empty expected output path) carries a gateway-computed
 /// modular hash precisely so its completion can register the realisation
-/// `wopQueryDerivationOutputMap` serves. Both the hash (persisted column)
-/// and the resolve flag (re-derived from the persisted empty expected
-/// output path) must survive a leader failover, or the post-failover
-/// completion silently skips the realisation insert and the client can
-/// never learn the deferred output's path.
-// r[verify sched.recovery.deferred-resolve]
+/// `wopQueryDerivationOutputMap` serves. Both the hash and the resolve
+/// flag (M_071: persisted by the creation upsert from the merge-time
+/// value, restored verbatim — sched.recovery.deferred-resolve+1) must
+/// survive a leader failover, or the post-failover completion silently
+/// skips the realisation insert and the client can never learn the
+/// deferred output's path.
+// r[verify sched.recovery.deferred-resolve+1]
 // r[verify sched.recovery.inline-drv-ca-hash+3]
 // r[verify sched.persist.ca-modular-hash+2]
 #[tokio::test]
@@ -5278,6 +5279,48 @@ async fn test_recovery_registers_realisation_for_deferred_ia_node() -> TestResul
     assert_eq!(
         path, "/nix/store/cccccccccccccccccccccccccccccccc-deferred-ia-out",
         "post-failover deferred-IA completion must register the realisation under the persisted key"
+    );
+    Ok(())
+}
+
+// r[verify sched.recovery.deferred-resolve+1]
+/// Round-16 bug_053 production-writer roundtrip: a FIXED-OUTPUT node
+/// with a floating input (gateway stamps `needs_resolve=true`; its own
+/// expected paths are CONCRETE) merges → the creation upsert persists
+/// the flag (M_071) → leader failover → the recovered node must carry
+/// `needs_resolve=true` VERBATIM. Pre-fix, recovery re-derived the
+/// flag from expected-path emptiness — all-concrete FOD paths →
+/// `false` — and the persisted `path_bound_bytes` rank then made
+/// dispatch skip the byte re-derivation: the FOD shipped with literal
+/// placeholder strings and poisoned deterministically.
+#[tokio::test]
+async fn test_recovery_restores_fod_needs_resolve_verbatim() -> TestResult {
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        let mut node = make_node("fod-resolve-rt");
+        node.is_fixed_output = true;
+        node.is_content_addressed = true; // FOD: fixed-CA
+        node.needs_resolve = true; // gateway: floating input in env
+        node.expected_output_paths = vec![rio_test_support::fixtures::test_store_path(
+            "fod-resolve-rt-out",
+        )];
+        merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+        barrier(&handle).await;
+        // The creation upsert persisted the merge-time flag.
+        let (col,): (Option<bool>,) =
+            sqlx::query_as("SELECT needs_resolve FROM derivations WHERE drv_hash = $1")
+                .bind("fod-resolve-rt")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(col, Some(true), "creation upsert must persist the flag");
+        Ok(())
+    })
+    .await?;
+
+    let info = expect_drv(&f.handle, "fod-resolve-rt").await;
+    assert!(
+        info.ca.needs_resolve,
+        "recovered FOD must keep needs_resolve=true verbatim (pre-M_071 the \
+         all-concrete expected paths re-derived it to false)"
     );
     Ok(())
 }

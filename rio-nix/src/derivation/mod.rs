@@ -257,18 +257,28 @@ pub fn should_resolve(
             .any(|child| child_has_unknown_output_paths(child).unwrap_or(false))
 }
 
-/// Recovery-side degrade of [`should_resolve`], owned in the same
-/// place as the full predicate: when the derivation bytes are gone
-/// (post-failover row hydration), an empty persisted expected output
-/// path means the path is unknown until placeholder resolution
+/// LEGACY-ONLY degrade of [`should_resolve`], owned in the same place
+/// as the full predicate: an empty persisted expected output path
+/// means the path is unknown until placeholder resolution
 /// (floating-CA self, or deferred-IA whose floating input has not
-/// resolved) — exactly the population the gateway stamps.
+/// resolved).
 ///
-/// Two documented asymmetries vs the full predicate, both
-/// consequence-free at the dispatch gate:
+/// Since M_071 (`sched.recovery.deferred-resolve+1`), the scheduler
+/// PERSISTS the authoritative flag and recovery restores it verbatim;
+/// this function is consulted only for pre-071 rows whose persisted
+/// flag is NULL, and by the scheduler's live `child_unknown` probe
+/// shape (which reads the same emptiness signal off RESIDENT
+/// children's preserved ingress paths — round-16 bug_094).
+///
+/// Two asymmetries vs the full predicate — the reason it was demoted
+/// (round-16 bug_053 falsified the old "consequence-free" claim):
 /// - a FOD with a floating input is UNDER-approximated (its expected
-///   path is statically known) — the dispatch-unresolved degrade,
-///   covered by `is_ca` at the realisation gate;
+///   path is statically known): at a persisted `path_bound_bytes`
+///   rank the dispatch gate trusts the recorded flag, so the
+///   recovered-false FOD shipped with literal placeholders in
+///   env/args and poisoned deterministically. NOT consequence-free —
+///   the realisation-gate `is_ca` coverage applies to completion-time
+///   REGISTRATION, not the dispatch-time placeholder REWRITE.
 /// - a floating leaf with no inputs is OVER-approximated (clause 1
 ///   needs `input_drvs`, which the row no longer carries) — the
 ///   resolve walk visits zero children and is a no-op.

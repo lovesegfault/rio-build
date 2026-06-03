@@ -490,6 +490,7 @@ impl SchedulerDb {
                    floor_mem_bytes, floor_disk_bytes, floor_deadline_secs,
                    drv_content, ca_modular_hash, ca_modular_hash_stripped,
                    evidence_rank,
+                   needs_resolve,
                    NULL::uuid AS exec_id,
                    COALESCE(
                        EXTRACT(EPOCH FROM (now() - poisoned_at))::float8,
@@ -576,16 +577,25 @@ impl SchedulerDb {
     /// commit. Best-effort at every call site — a lost write degrades
     /// to the persisted ingress rank at recovery, which never weakens
     /// a victim (no displacer outranks `path_bound_bytes`).
+    /// `needs_resolve`: `Some` from the dispatch claims derivation —
+    /// the byte-derived flag computed alongside the raised rank (M_071,
+    /// round-16 bug_053) — persisted in the SAME statement so a
+    /// failover between rank and flag cannot leave a `path_bound_bytes`
+    /// row whose recovered flag re-derives from the lossy expected-path
+    /// degrade. `None` from the settle chokepoint (no re-derivation
+    /// happens there): COALESCE leaves the column untouched.
     pub(crate) async fn persist_evidence_rank(
         &self,
         drv_hash: &str,
         rank: crate::state::DefinitionEvidence,
+        needs_resolve: Option<bool>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE derivations SET evidence_rank = $2, updated_at = now() WHERE drv_hash = $1",
+            "UPDATE derivations SET evidence_rank = $2,              needs_resolve = COALESCE($3, needs_resolve),              updated_at = now() WHERE drv_hash = $1",
         )
         .bind(drv_hash)
         .bind(rank.as_str())
+        .bind(needs_resolve)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -608,19 +618,25 @@ impl SchedulerDb {
     /// PostgreSQL evaluates both SET expressions against the OLD row,
     /// and COALESCE keeps an earlier preserved claim when the live
     /// column is already NULL (re-strip idempotence).
+    /// `needs_resolve` rides the same statement as the plain raise
+    /// writer above (M_071) — the strip arm derives it from the same
+    /// verified bytes.
     pub(crate) async fn persist_evidence_rank_and_strip_modular_hash(
         &self,
         drv_hash: &str,
         rank: crate::state::DefinitionEvidence,
+        needs_resolve: Option<bool>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE derivations SET evidence_rank = $2, \
+             needs_resolve = COALESCE($3, needs_resolve), \
              ca_modular_hash_stripped = COALESCE(ca_modular_hash, ca_modular_hash_stripped), \
              ca_modular_hash = NULL, \
              updated_at = now() WHERE drv_hash = $1",
         )
         .bind(drv_hash)
         .bind(rank.as_str())
+        .bind(needs_resolve)
         .execute(&self.pool)
         .await?;
         Ok(())

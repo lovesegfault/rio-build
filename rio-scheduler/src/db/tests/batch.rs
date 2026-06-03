@@ -93,6 +93,7 @@ async fn test_batch_upsert_10k_nodes() -> anyhow::Result<()> {
     const N: usize = 10_000;
     let rows: Vec<DerivationRow> = (0..N)
         .map(|i| DerivationRow {
+            needs_resolve: false,
             drv_hash: format!("{i:032x}"), // 32-hex-char fake hash
             drv_path: format!("/nix/store/{}-test-{i}.drv", "a".repeat(32)),
             pname: Some(format!("pkg-{i}")),
@@ -185,6 +186,7 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
 
     let rows: Vec<DerivationRow> = (0..N)
         .map(|i| DerivationRow {
+            needs_resolve: false,
             drv_hash: format!("fk{i:030x}"),
             drv_path: format!("/nix/store/{}-fk{i}.drv", "a".repeat(32)),
             pname: Some(format!("p{i}")),
@@ -264,6 +266,7 @@ async fn wanted_output_names_round_trip_and_union_on_conflict() -> anyhow::Resul
     // then read the column back.
     let upsert_and_read = async |wanted: &[&str]| -> anyhow::Result<Vec<String>> {
         let row = DerivationRow {
+            needs_resolve: false,
             drv_hash: drv_hash.into(),
             drv_path: rio_test_support::fixtures::test_drv_path(drv_hash),
             pname: Some("test-pkg".into()),
@@ -365,6 +368,7 @@ async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyho
 
     let drv_hash = "topdown-pruned-test";
     let mk = |pruned: bool| DerivationRow {
+        needs_resolve: false,
         drv_hash: drv_hash.into(),
         drv_path: rio_test_support::fixtures::test_drv_path(drv_hash),
         pname: Some("test-pkg".into()),
@@ -457,6 +461,7 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
 
     let drv_hash = "closure-hole-test";
     let mk = |pruned: bool| DerivationRow {
+        needs_resolve: false,
         drv_hash: drv_hash.into(),
         drv_path: rio_test_support::fixtures::test_drv_path(drv_hash),
         pname: Some("test-pkg".into()),
@@ -628,6 +633,7 @@ async fn closure_hole_tx_writers_pair_flag_and_rows() -> anyhow::Result<()> {
 
     let drv_hash = "closure-hole-tx-test";
     let row = DerivationRow {
+        needs_resolve: false,
         drv_hash: drv_hash.into(),
         drv_path: rio_test_support::fixtures::test_drv_path(drv_hash),
         pname: Some("test-pkg".into()),
@@ -727,6 +733,7 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
     const N: usize = 10_000;
     let rows: Vec<DerivationRow> = (0..N)
         .map(|i| DerivationRow {
+            needs_resolve: false,
             drv_hash: format!("{i:032x}"),
             drv_path: format!("/nix/store/{}-e{i}.drv", "a".repeat(32)),
             pname: None,
@@ -782,6 +789,7 @@ async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Resul
     let db = SchedulerDb::new(test_db.pool.clone());
 
     let row = |hash: &str, content: Option<Vec<u8>>| DerivationRow {
+        needs_resolve: false,
         drv_hash: hash.into(),
         drv_path: format!("/nix/store/{}-{hash}.drv", "c".repeat(32)),
         pname: Some("hook-fallback".into()),
@@ -919,6 +927,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
     // only settled-adjacent state a conflicting re-creation can reach
     // (a completed/skipped row is frozen — sched.persist.settled-identity-freeze+2).
     let first = DerivationRow {
+        needs_resolve: false,
         drv_hash: "recreate-store".into(),
         drv_path: format!("/nix/store/{}-recreate-store-old.drv", "d".repeat(32)),
         pname: Some("old".into()),
@@ -946,6 +955,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
     // different .drv path; both must win in the persisted snapshot.
     let new_path = format!("/nix/store/{}-recreate-store-new.drv", "e".repeat(32));
     let recreator = DerivationRow {
+        needs_resolve: false,
         drv_hash: "recreate-store".into(),
         drv_path: new_path.clone(),
         pname: Some("new".into()),
@@ -1013,6 +1023,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
 
     // ── Authoritative row, re-created with byte-identical content ─────
     let auth = |status: DerivationStatus| DerivationRow {
+        needs_resolve: false,
         drv_hash: "recreate-auth".into(),
         drv_path: format!("/nix/store/{}-recreate-auth.drv", "f".repeat(32)),
         pname: Some("hook".into()),
@@ -1071,6 +1082,7 @@ async fn test_batch_upsert_resets_accumulators_on_definition_change() -> anyhow:
     let db = SchedulerDb::new(test_db.pool.clone());
 
     let auth_row = |hash: &str, content: &[u8]| DerivationRow {
+        needs_resolve: false,
         drv_hash: hash.into(),
         drv_path: format!("/nix/store/{}-{hash}-squat.drv", "a".repeat(32)),
         pname: Some("squat".into()),
@@ -1103,6 +1115,7 @@ async fn test_batch_upsert_resets_accumulators_on_definition_change() -> anyhow:
 
     let victim_path = format!("/nix/store/{}-defchange-store.drv", "b".repeat(32));
     let store_backed = DerivationRow {
+        needs_resolve: false,
         drv_hash: "defchange-store".into(),
         drv_path: victim_path.clone(),
         pname: Some("victim".into()),
@@ -1208,6 +1221,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
     // — only failure-parked rows are displaceable; completed/skipped
     // rows are frozen by sched.persist.settled-identity-freeze+2).
     let squat = DerivationRow {
+        needs_resolve: false,
         drv_hash: "atomic-squat".into(),
         drv_path: format!("/nix/store/{}-atomic-squat.drv", "a".repeat(32)),
         pname: Some("squat".into()),
@@ -1243,6 +1257,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
     .await?;
 
     let displacer = DerivationRow {
+        needs_resolve: false,
         drv_hash: "atomic-squat".into(),
         drv_path: format!("/nix/store/{}-atomic-squat.drv", "a".repeat(32)),
         pname: Some("victim".into()),
@@ -1520,6 +1535,7 @@ async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::R
     let db = SchedulerDb::new(test_db.pool.clone());
 
     let row = |hash: &str, ca_hash: Option<[u8; 32]>| DerivationRow {
+        needs_resolve: false,
         drv_hash: hash.into(),
         drv_path: format!("/nix/store/{}-{hash}.drv", "d".repeat(32)),
         pname: Some("ca-evidence".into()),
@@ -1638,6 +1654,7 @@ async fn test_preserved_stripped_hash_supersede_carry_and_move() -> anyhow::Resu
     let db = SchedulerDb::new(test_db.pool.clone());
 
     let row = |live: Option<[u8; 32]>, stripped: Option<[u8; 32]>| DerivationRow {
+        needs_resolve: false,
         drv_hash: "strip-sem".into(),
         drv_path: format!("/nix/store/{}-strip-sem.drv", "d".repeat(32)),
         pname: Some("strip-sem".into()),
@@ -1717,6 +1734,7 @@ async fn test_preserved_stripped_hash_supersede_carry_and_move() -> anyhow::Resu
     db.persist_evidence_rank_and_strip_modular_hash(
         "strip-sem",
         crate::state::DefinitionEvidence::PathBoundBytes,
+        None,
     )
     .await?;
     assert_eq!(
@@ -1729,6 +1747,7 @@ async fn test_preserved_stripped_hash_supersede_carry_and_move() -> anyhow::Resu
     db.persist_evidence_rank_and_strip_modular_hash(
         "strip-sem",
         crate::state::DefinitionEvidence::PathBoundBytes,
+        None,
     )
     .await?;
     assert_eq!(
@@ -1753,6 +1772,7 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
 
     let settled_path = format!("/nix/store/{}-settled-guard.drv", "a".repeat(32));
     let settled = DerivationRow {
+        needs_resolve: false,
         drv_hash: "settled-guard".into(),
         drv_path: settled_path.clone(),
         pname: Some("victim".into()),
@@ -1779,6 +1799,7 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
 
     // ── Conflicting re-creation: different system + output names ──────
     let conflicting = DerivationRow {
+        needs_resolve: false,
         drv_hash: "settled-guard".into(),
         drv_path: format!("/nix/store/{}-settled-guard-evil.drv", "c".repeat(32)),
         pname: Some("attacker".into()),
@@ -1828,6 +1849,7 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
 
     // ── Matching re-creation: same public identity → updates normally ─
     let matching = DerivationRow {
+        needs_resolve: false,
         drv_hash: "settled-guard".into(),
         drv_path: settled_path.clone(),
         pname: Some("victim".into()),
@@ -1875,6 +1897,7 @@ async fn settled_row_upsert_guard_admits_evidence_approved_hash() -> anyhow::Res
     let db = SchedulerDb::new(test_db.pool.clone());
 
     let settled = DerivationRow {
+        needs_resolve: false,
         drv_hash: "evidence-carveout".into(),
         drv_path: format!("/nix/store/{}-evidence-carveout.drv", "a".repeat(32)),
         pname: Some("squat".into()),
@@ -1898,6 +1921,7 @@ async fn settled_row_upsert_guard_admits_evidence_approved_hash() -> anyhow::Res
     tx.commit().await?;
 
     let genuine = DerivationRow {
+        needs_resolve: false,
         drv_hash: "evidence-carveout".into(),
         drv_path: format!("/nix/store/{}-evidence-carveout.drv", "a".repeat(32)),
         pname: Some("victim".into()),
@@ -1969,6 +1993,7 @@ async fn test_batch_upsert_evidence_rank_roundtrip_and_recreation() -> anyhow::R
     let db = SchedulerDb::new(test_db.pool.clone());
 
     let row = |hash: &str, rank: DefinitionEvidence| DerivationRow {
+        needs_resolve: false,
         drv_hash: hash.into(),
         drv_path: format!("/nix/store/{}-{hash}.drv", "e".repeat(32)),
         pname: Some("evidence-rank".into()),
@@ -2014,13 +2039,48 @@ async fn test_batch_upsert_evidence_rank_roundtrip_and_recreation() -> anyhow::R
     }
 
     // The runtime upgrade writer is what settle/dispatch use.
-    db.persist_evidence_rank("ev-unverified", DefinitionEvidence::PathBoundBytes)
+    db.persist_evidence_rank("ev-unverified", DefinitionEvidence::PathBoundBytes, None)
         .await?;
     let (rank,): (String,) =
         sqlx::query_as("SELECT evidence_rank FROM derivations WHERE drv_hash = 'ev-unverified'")
             .fetch_one(&test_db.pool)
             .await?;
     assert_eq!(rank, "path_bound_bytes", "runtime writer persists upgrades");
+
+    // M_071 COALESCE tri-state on the same writer (round-16 bug_053):
+    // Some sets the flag with the rank in one statement; None (the
+    // settle chokepoint's shape) leaves whatever is there untouched.
+    let flag = || async {
+        let (f,): (Option<bool>,) = sqlx::query_as(
+            "SELECT needs_resolve FROM derivations WHERE drv_hash = 'ev-unverified'",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+        anyhow::Ok(f)
+    };
+    assert_eq!(
+        flag().await?,
+        Some(false),
+        "creation upsert binds the merge-time flag (non-NULL from birth)"
+    );
+    db.persist_evidence_rank(
+        "ev-unverified",
+        DefinitionEvidence::PathBoundBytes,
+        Some(true),
+    )
+    .await?;
+    assert_eq!(
+        flag().await?,
+        Some(true),
+        "Some(_) writes the byte-derived flag"
+    );
+    db.persist_evidence_rank("ev-unverified", DefinitionEvidence::VerifiedBuilt, None)
+        .await?;
+    assert_eq!(
+        flag().await?,
+        Some(true),
+        "None (settle) leaves the persisted flag untouched (COALESCE)"
+    );
 
     // Re-creation applies EXCLUDED (creation-snapshot) semantics —
     // deliberately NOT MAX: the verified_built row re-created by a

@@ -739,10 +739,11 @@ impl RetryState {
 /// (`sched.recovery.inline-drv-ca-hash`), and any other node that
 /// persisted one — store-backed CA and deferred-IA alike — restores the
 /// ingress-provided value from its row (`sched.persist.ca-modular-hash`).
-/// `needs_resolve` is re-derived at recovery from the persisted expected
-/// output paths (`sched.recovery.deferred-resolve`) — so the merge
-/// gate's content-bound evidence, post-failover placeholder resolution,
-/// and post-failover realisation registration keep working.
+/// `needs_resolve` is restored verbatim from its persisted column
+/// (`sched.recovery.deferred-resolve+1`, M_071; the expected-path
+/// re-derivation survives only as the NULL-legacy fallback) — so the
+/// merge gate's content-bound evidence, post-failover placeholder
+/// resolution, and post-failover realisation registration keep working.
 #[derive(Debug, Clone, Default)]
 pub struct CaState {
     /// Whether this derivation is content-addressed (fixed-output OR
@@ -769,12 +770,14 @@ pub struct CaState {
     /// has a known output path. `is_ca` gates cutoff-compare;
     /// `needs_resolve` gates `maybe_resolve_ca`.
     ///
-    /// Survives failover by re-derivation, not persistence: recovery
-    /// sets it when any persisted expected output path is empty
-    /// (`sched.recovery.deferred-resolve`), which reproduces the
-    /// gateway's value for floating-CA and deferred-IA nodes (the
-    /// FOD-with-floating-CA-input case is under-approximated and keeps
-    /// the documented dispatch-unresolved degrade).
+    /// Survives failover by PERSISTENCE (M_071,
+    /// `sched.recovery.deferred-resolve+1`): the creation upsert and
+    /// the dispatch-raise writers record the authoritative value;
+    /// recovery restores it verbatim. The expected-path re-derivation
+    /// is the NULL-legacy fallback only — round-16 bug_053: it cannot
+    /// see a FOD's floating inputs, and the under-approximation was
+    /// NOT consequence-free (the recovered-false flag at the persisted
+    /// path_bound_bytes rank shipped FODs with literal placeholders).
     pub needs_resolve: bool,
     /// The modular derivation hash (`hashDerivationModulo` SHA-256).
     /// Realisations table PK half. Set at DAG merge from proto
@@ -1549,8 +1552,9 @@ impl DerivationState {
     /// realisation (`sched.recovery.inline-drv-ca-hash`); rows without
     /// authoritative bytes restore the persisted `ca_modular_hash`
     /// column instead (CA and deferred-IA rows carry one), and the
-    /// dispatch-time resolve flag is re-derived from the persisted
-    /// expected output paths (`sched.recovery.deferred-resolve`).
+    /// dispatch-time resolve flag is restored verbatim from its M_071
+    /// column (`sched.recovery.deferred-resolve+1`; expected-path
+    /// re-derivation only for NULL-legacy rows).
     ///
     /// Errors: `drv_path` doesn't parse as StorePath. Shouldn't
     /// happen (it was validated at merge time before persist) but
@@ -1634,19 +1638,27 @@ impl DerivationState {
                 .as_deref()
                 .and_then(|b| <[u8; 32]>::try_from(b).ok())
         };
-        // r[impl sched.recovery.deferred-resolve]
-        // Re-derive the dispatch-time resolve flag through the shared
-        // recovery degrade owned next to the full oracle predicate
-        // (`rio_nix::derivation::should_resolve` — see its doc for the
-        // two documented asymmetries, both consequence-free here:
-        // FOD-with-floating-input under-approximated and covered by
-        // `is_ca` at the realisation gate; no-input floating leaf
-        // over-approximated into a no-op resolve walk). Without this
-        // the flag was lost to `..Default::default()` and a
-        // post-failover completion of a deferred-IA node skipped
-        // realisation registration even though its hash was persisted.
-        let needs_resolve =
-            rio_nix::derivation::should_resolve_from_expected_paths(&row.expected_output_paths);
+        // r[impl sched.recovery.deferred-resolve+1]
+        // M_071 (round-16 bug_053): restore the persisted resolve flag
+        // VERBATIM — it is the byte-derived value the creation upsert
+        // or a dispatch raise recorded, computed by the full
+        // three-clause `should_resolve` predicate. The lossy
+        // expected-path degrade survives ONLY as the NULL-legacy
+        // fallback (pre-071 rows): it cannot see a FOD's floating
+        // inputs (clause 3 — a FIXED drv whose env embeds a floating
+        // child's placeholder MUST resolve), so re-deriving for a row
+        // that HAD a persisted value recovered exactly those FODs as
+        // `false`; the persisted `path_bound_bytes` rank then skipped
+        // the dispatch-time byte re-derivation and the FOD shipped
+        // with literal placeholders in env/args — deterministic
+        // failure to poison after every failover. (The old comment's
+        // "consequence-free, covered by `is_ca` at the realisation
+        // gate" claim conflated completion-time realisation
+        // REGISTRATION with the dispatch-time placeholder REWRITE;
+        // bug_053 falsified it.)
+        let needs_resolve = row.needs_resolve.unwrap_or_else(|| {
+            rio_nix::derivation::should_resolve_from_expected_paths(&row.expected_output_paths)
+        });
         let recovered_input_srcs: Vec<String> = parsed_content
             .as_ref()
             .map(|d| d.input_srcs().iter().cloned().collect())
@@ -1674,8 +1686,9 @@ impl DerivationState {
                 // that carried one (CA or deferred-IA); None only when
                 // neither source exists.
                 modular_hash,
-                // Re-derived above from expected-output-path emptiness
-                // (sched.recovery.deferred-resolve).
+                // Restored verbatim above (M_071), with the
+                // expected-path re-derivation as the NULL-legacy
+                // fallback (sched.recovery.deferred-resolve+1).
                 needs_resolve,
                 // Preserved stripped claim (M_070): restored verbatim;
                 // wrong-length values degrade to unset like the live
@@ -2966,6 +2979,7 @@ mod tests {
             ca_modular_hash: None,
             ca_modular_hash_stripped: None,
             evidence_rank: "unverified_claim".into(),
+            needs_resolve: None,
             exec_id: None,
         };
         let state = DerivationState::from_recovery_row(row, DerivationStatus::Queued).unwrap();
@@ -3416,16 +3430,19 @@ mod tests {
         );
     }
 
-    /// Deferred-IA failover regression (merged_bug_003): a deferred
-    /// input-addressed row (is_ca=false, empty expected output path,
-    /// persisted hash) must come back with BOTH the modular hash and the
-    /// dispatch-time resolve flag, so its post-failover completion still
-    /// registers the realisation `wopQueryDerivationOutputMap` serves.
-    /// Plain-IA rows stay hash-less with the flag clear; floating-CA
-    /// store-backed rows regain the flag; wrong-length values on non-CA
-    /// rows still degrade to unset.
+    /// Deferred-IA failover regression (merged_bug_003), now scoped to
+    /// the NULL-LEGACY fallback arm of `sched.recovery.deferred-resolve+1`:
+    /// every row here carries `needs_resolve: None` (`test_default`),
+    /// the pre-M_071 shape, so the expected-path re-derivation still
+    /// fires — a deferred-IA row (is_ca=false, empty expected output
+    /// path, persisted hash) comes back with BOTH the modular hash and
+    /// the dispatch-time resolve flag. Plain-IA rows stay hash-less
+    /// with the flag clear; floating-CA store-backed rows regain the
+    /// flag; wrong-length values on non-CA rows still degrade to
+    /// unset. The verbatim-restore arm (persisted flag present) is
+    /// pinned by `from_recovery_row_restores_persisted_needs_resolve_verbatim`.
     // r[verify sched.recovery.inline-drv-ca-hash+3]
-    // r[verify sched.recovery.deferred-resolve]
+    // r[verify sched.recovery.deferred-resolve+1]
     #[test]
     fn from_recovery_row_restores_deferred_ia_hash_and_needs_resolve() {
         let persisted = [9u8; 32];
@@ -3495,6 +3512,70 @@ mod tests {
         .expect("hydrates");
         assert_eq!(short.ca.modular_hash, None, "wrong length degrades to None");
         assert!(short.ca.needs_resolve, "flag re-derivation is independent");
+    }
+
+    // r[verify sched.recovery.deferred-resolve+1]
+    /// Round-16 bug_053: the M_071 persisted flag is restored VERBATIM
+    /// — the lossy expected-path re-derivation must never shadow it.
+    /// Tri-state:
+    /// - `Some(true)` on a FOD with CONCRETE expected paths (the bug
+    ///   shape: re-derivation says false — pre-fix the FOD recovered
+    ///   unresolvable and shipped literal placeholders);
+    /// - `Some(false)` on an empty-expected-path row (a no-input
+    ///   floating leaf the gateway stamped false: re-derivation would
+    ///   over-approximate to true — persisted false wins);
+    /// - `None` (legacy row) → re-derivation fallback.
+    #[test]
+    fn from_recovery_row_restores_persisted_needs_resolve_verbatim() {
+        let fod = DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow {
+                is_fixed_output: true,
+                needs_resolve: Some(true),
+                expected_output_paths: vec![
+                    "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-fod-out".to_string(),
+                ],
+                ..crate::db::RecoveryDerivationRow::test_default(
+                    "fod-floating-input",
+                    "x86_64-linux",
+                )
+            },
+            DerivationStatus::Ready,
+        )
+        .expect("hydrates");
+        assert!(
+            fod.ca.needs_resolve,
+            "persisted true must survive a FOD's all-concrete expected paths \
+             (the re-derivation under-approximation that poisoned post-failover FODs)"
+        );
+
+        let leaf = DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow {
+                is_ca: true,
+                needs_resolve: Some(false),
+                expected_output_paths: vec![String::new()],
+                ..crate::db::RecoveryDerivationRow::test_default("ca-leaf", "x86_64-linux")
+            },
+            DerivationStatus::Ready,
+        )
+        .expect("hydrates");
+        assert!(
+            !leaf.ca.needs_resolve,
+            "persisted false must not be shadowed by the empty-path over-approximation"
+        );
+
+        let legacy = DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow {
+                needs_resolve: None,
+                expected_output_paths: vec![String::new()],
+                ..crate::db::RecoveryDerivationRow::test_default("legacy-row", "x86_64-linux")
+            },
+            DerivationStatus::Ready,
+        )
+        .expect("hydrates");
+        assert!(
+            legacy.ca.needs_resolve,
+            "NULL-legacy row still takes the expected-path re-derivation"
+        );
     }
 
     // r[verify sched.derivation.evidence-rank]

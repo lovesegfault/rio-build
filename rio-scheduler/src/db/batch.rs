@@ -99,6 +99,7 @@ impl SchedulerDb {
         let mut ca_modular_hash = Vec::with_capacity(rows.len());
         let mut ca_modular_hash_stripped = Vec::with_capacity(rows.len());
         let mut evidence_rank = Vec::with_capacity(rows.len());
+        let mut needs_resolve = Vec::with_capacity(rows.len());
         for r in rows {
             drv_hash.push(r.drv_hash.as_str());
             drv_path.push(r.drv_path.as_str());
@@ -121,6 +122,7 @@ impl SchedulerDb {
                     .unwrap_or_default(),
             );
             evidence_rank.push(r.evidence_rank.as_str());
+            needs_resolve.push(r.needs_resolve);
         }
 
         // r[impl sched.persist.recreate-refresh+2]
@@ -204,7 +206,8 @@ impl SchedulerDb {
                 (drv_hash, drv_path, pname, system, status, required_features,
                  expected_output_paths, output_names, is_fixed_output, is_ca,
                  wanted_output_names, topdown_pruned, closure_hole, drv_content,
-                 ca_modular_hash, evidence_rank, ca_modular_hash_stripped)
+                 ca_modular_hash, evidence_rank, ca_modular_hash_stripped,
+                 needs_resolve)
             SELECT
                 drv_hash, drv_path, pname, system, status,
                 required_features::text[],
@@ -216,17 +219,18 @@ impl SchedulerDb {
                 NULLIF(drv_content, ''::bytea),
                 NULLIF(ca_modular_hash, ''::bytea),
                 evidence_rank,
-                NULLIF(ca_modular_hash_stripped, ''::bytea)
+                NULLIF(ca_modular_hash_stripped, ''::bytea),
+                needs_resolve
             FROM UNNEST(
                 $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
                 $6::text[], $7::text[], $8::text[], $9::bool[], $10::bool[],
                 $11::text[], $12::bool[], $13::bool[], $14::bytea[], $15::bytea[],
-                $16::text[], $17::bytea[]
+                $16::text[], $17::bytea[], $18::bool[]
             ) AS t(drv_hash, drv_path, pname, system, status,
                    required_features, expected_output_paths, output_names,
                    is_fixed_output, is_ca, wanted_output_names, topdown_pruned,
                    closure_hole, drv_content, ca_modular_hash, evidence_rank,
-                   ca_modular_hash_stripped)
+                   ca_modular_hash_stripped, needs_resolve)
             -- is_ca rides the same creation-snapshot refresh as the
             -- other identity columns: rows are written only by
             -- submissions that (re)create the node, and a displacing
@@ -310,6 +314,17 @@ impl SchedulerDb {
                 -- refresh as the columns above — NOT the
                 -- definition-change accumulator reset below.
                 ca_modular_hash = EXCLUDED.ca_modular_hash,
+                -- M_071 dispatch-resolve flag: creation-snapshot
+                -- semantics like evidence_rank/is_ca above — the flag
+                -- is identity-derived (a function of the definition's
+                -- bytes/type, byte-derived for verified creations),
+                -- so the re-creating submission's value wins. The
+                -- dispatch-raise upgrades go through the runtime
+                -- persist_evidence_rank writers (COALESCE — the settle
+                -- chokepoint passes NULL), not this upsert. Always
+                -- non-NULL from this statement; NULL marks pre-071
+                -- legacy rows only (recovery's degrade fallback).
+                needs_resolve = EXCLUDED.needs_resolve,
                 -- M_070 preserved stripped claim: superseded by a live
                 -- (verifiable) hash on the re-creating submission —
                 -- strictly better evidence — else carried forward
@@ -372,13 +387,13 @@ impl SchedulerDb {
             -- racing writer settles the row between check and upsert.
             --
             -- r[impl sched.merge.store-evidence-displacement+2]
-            -- The $18 carve-out is the SAME pre-merge check approving a
+            -- The $19 carve-out is the SAME pre-merge check approving a
             -- conflicting re-creation it verified — by ingress-byte-bound
             -- rank or against the store's own text-CA .drv bytes
             -- (sched.merge.store-evidence-displacement+2). The hash list is
             -- per-merge and threaded through the one transaction, so the
             -- guard stays unconditional for every other writer.
-            WHERE derivations.drv_hash = ANY($18)
+            WHERE derivations.drv_hash = ANY($19)
                OR NOT (
                 derivations.status IN ('completed', 'skipped')
                 AND (
@@ -409,6 +424,7 @@ impl SchedulerDb {
         .bind(&ca_modular_hash)
         .bind(&evidence_rank)
         .bind(&ca_modular_hash_stripped)
+        .bind(&needs_resolve)
         .bind(evidence_displaced)
         .fetch_all(&mut *tx)
         .await?;

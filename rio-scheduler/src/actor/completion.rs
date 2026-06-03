@@ -110,7 +110,9 @@ impl DagActor {
             }
             if let Err(e) = self
                 .db
-                .persist_evidence_rank(hash, DefinitionEvidence::VerifiedBuilt)
+                // M_071: None — the settle upgrade re-derives nothing;
+                // COALESCE leaves the persisted resolve flag untouched.
+                .persist_evidence_rank(hash, DefinitionEvidence::VerifiedBuilt, None)
                 .await
             {
                 error!(drv_hash = %hash, error = %e,
@@ -1272,11 +1274,13 @@ impl DagActor {
         // .drv on disk has `path=""`, so the gateway's
         // `wopQueryDerivationOutputMap` realisation-lookup is the only
         // way the client learns the post-resolve output path. Both
-        // conjuncts survive failover: the hash is restored from the
-        // persisted column and `needs_resolve` is re-derived from the
-        // persisted expected output paths
-        // (sched.recovery.deferred-resolve), so a post-failover
-        // completion registers the realisation exactly like a live one.
+        // conjuncts survive failover: the hash AND the resolve flag
+        // are restored from their persisted columns
+        // (sched.persist.ca-modular-hash,
+        // sched.recovery.deferred-resolve+1 / M_071 — verbatim, with
+        // the expected-path re-derivation demoted to the NULL-legacy
+        // fallback), so a post-failover completion registers the
+        // realisation exactly like a live one.
         if let Some(state) = self.dag.node(drv_hash)
             && (state.ca.is_ca || state.ca.needs_resolve)
         {

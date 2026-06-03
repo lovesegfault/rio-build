@@ -2109,22 +2109,32 @@ store-backed CA nodes and deferred input-addressed nodes alike --- has no
 bytes to recompute from, so the persisted ingress value is the only
 faithful source of the evidence and of the realisation key.
 
-#r("sched.recovery.deferred-resolve")[
-  A recovered derivation whose persisted expected output paths contain an
-  empty entry MUST be restored with its dispatch-time resolve flag set, so
-  post-failover dispatch re-attempts placeholder resolution and a
-  post-failover completion still registers its realisation row --- for
-  deferred input-addressed derivations exactly as for floating-CA ones.
+#r("sched.recovery.deferred-resolve+1")[
+  The dispatch-time resolve flag MUST be persisted at every site that
+  computes it authoritatively --- the creation upsert (the store-evidence
+  grant's byte-derived value for verified creations, the gateway echo
+  otherwise) and the dispatch-raise writers, in the same statement as the
+  evidence rank they accompany --- and a recovered derivation MUST be
+  restored with the persisted flag VERBATIM. The expected-output-path
+  re-derivation (an empty entry means "unknown until placeholder
+  resolution") is permitted ONLY as the fallback for legacy rows whose
+  persisted flag is absent; it MUST NOT shadow a persisted value, because
+  it cannot see a fixed-output derivation's floating inputs.
 ]
-The flag is re-derived from the persisted creation snapshot (an empty
-expected output path is precisely "unknown until placeholder resolution"),
-so no schema change is needed. A fixed-output derivation whose only
-floating-CA involvement is an input keeps a statically-known output path
-and is therefore under-approximated by this re-derivation; that preserves
-the documented dispatch-unresolved degrade and its realisation
-registration is already covered by the content-addressed flag. This
-supersedes the earlier posture that the resolve flag was wholly lossy on
-recovery.
+The +1 verbatim-restore clause is round-16 bug_053's lesson: the
+re-derivation under-approximates exactly the FOD-with-floating-input
+population (its own expected paths are all concrete), and the prior
+posture's "consequence-free --- covered by the content-addressed flag at
+the realisation gate" justification conflated completion-time realisation
+REGISTRATION with the dispatch-time placeholder REWRITE. A FOD recovered
+with the flag false at the persisted `path_bound_bytes` rank skips the
+byte re-derivation, dispatches with literal placeholder strings in
+env/args, and poisons deterministically --- a build that succeeded before
+the failover. M_071 makes the column nullable so NULL ("never persisted",
+pre-071 row) is distinguishable from an authoritative false; the COALESCE
+raise writers and the always-bound creation snapshot keep every post-071
+row authoritative. This supersedes both the earlier wholly-lossy posture
+and the re-derivation posture.
 
 #r("sched.merge.authoritative-conflict+6")[
   A node whose in-memory state carries authoritative inline derivation
