@@ -2975,17 +2975,110 @@ fn rule_declaration_regex() -> regex::Regex {
     regex::Regex::new(r#"\A#r\(\s*"([a-z0-9.+-]+)"\s*,?\s*\)"#).expect("static regex")
 }
 
+/// Byte ranges of the comment regions in one Typst source, mirroring the
+/// Typst lexer's precedence just far enough for the universe scan: raw
+/// spans are opaque (a backtick run opens raw text until a matching run,
+/// so the spec's `path/*.glob` and `nix run .#x` spellings cannot open
+/// phantom comments), `//` opens a line comment to end-of-line UNLESS
+/// immediately preceded by `:` (the URL shape — Typst's lexer consumes
+/// `https://…` as a link before comment lexing can see its slashes), and
+/// `/* … */` opens a block comment with Typst's nesting rule. An
+/// unterminated block or raw span runs to end-of-file, conservatively
+/// matching the lexer. A stray `*/` with no open block is plain text.
+///
+/// Deliberately NOT modeled: Typst string literals (only meaningful in
+/// code mode, while spec prose is markup where `"` is plain text — naive
+/// quote tracking would phase-flip on prose quotation marks and mis-hide
+/// real comments). A code-mode string containing `//` or `/*` before a
+/// declaration on the same line would mis-screen it; the failure is LOUD
+/// (the declaration leaves the universe and its citations false-red),
+/// and no spec file has that shape.
+fn typ_comment_spans(src: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = src.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            // Raw span: a run of N backticks is closed by the next run of
+            // >= N backticks. Comments never start inside raw text.
+            b'`' => {
+                let open_len = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+                i += open_len;
+                // N == 2 is an EMPTY inline raw (`` ``) per the lexer; the
+                // two backticks already consumed are the whole span.
+                if open_len == 2 {
+                    continue;
+                }
+                loop {
+                    match bytes[i..].iter().position(|&b| b == b'`') {
+                        None => {
+                            i = bytes.len();
+                            break;
+                        }
+                        Some(offset) => {
+                            i += offset;
+                            let close_len = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+                            i += close_len;
+                            if close_len >= open_len {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            // Line comment: `//` to end-of-line, with the `:`-guard for
+            // URLs (`https://…`, `ssh-ng://…`).
+            b'/' if bytes.get(i + 1) == Some(&b'/') && (i == 0 || bytes[i - 1] != b':') => {
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                spans.push(start..i);
+            }
+            // Block comment, nested per the Typst lexer; unterminated
+            // runs to end-of-file.
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let start = i;
+                let mut depth = 1usize;
+                i += 2;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                spans.push(start..i);
+            }
+            _ => i += 1,
+        }
+    }
+    spans
+}
+
 /// Collect every `#r("…")` rule declaration from one spec file into
 /// `universe`, with an inventory-parity guarantee: EVERY `#r(` token in
-/// the file must either parse as a declaration ([`rule_declaration_regex`]
-/// anchored at the token) or sit behind a `//` line comment (a prose
-/// mention). Anything else is a violation — a declaration style this
-/// matcher does not parse — so a third style fails the lint loudly
-/// instead of silently shrinking the universe (the original inline-only
-/// matcher missed all 19 multi-line declarations and would have
-/// false-redded citations of perfectly live rules). Returns the number
-/// of declaration tokens parsed, so callers can assert the full
-/// accounting: parsed + commented + violations == `#r(` tokens.
+/// the file must either sit inside a comment ([`typ_comment_spans`]: a
+/// `//` line comment or a `/* */` block comment — a prose mention or
+/// dead text) or parse as a declaration ([`rule_declaration_regex`]
+/// anchored at the token). Anything else is a violation — a declaration
+/// style this matcher does not parse — so a third style fails the lint
+/// loudly instead of silently shrinking the universe (the original
+/// inline-only matcher missed all 19 multi-line declarations and would
+/// have false-redded citations of perfectly live rules).
+///
+/// The comment screen runs BEFORE the parse attempt, in that order
+/// deliberately: a commented-out declaration is dead text however
+/// cleanly it parses, and admitting it would keep its id alive in the
+/// universe — prose citations of a rule the spec no longer declares
+/// would silently stay green (the lint's one job is catching exactly
+/// that dangle). Returns the number of declaration tokens parsed, so
+/// callers can assert the full accounting: parsed + commented +
+/// violations == `#r(` tokens.
 fn collect_spec_rules(
     src: &str,
     rel: &str,
@@ -2993,27 +3086,25 @@ fn collect_spec_rules(
     violations: &mut Vec<String>,
 ) -> usize {
     let decl_re = rule_declaration_regex();
+    let comment_spans = typ_comment_spans(src);
     let mut parsed = 0usize;
     for (pos, _) in src.match_indices("#r(") {
+        // Commented (line or block): a tolerated mention, never a
+        // declaration — classification first, interpretation second.
+        if comment_spans.iter().any(|span| span.contains(&pos)) {
+            continue;
+        }
         if let Some(cap) = decl_re.captures(&src[pos..]) {
             universe.insert(cap[1].to_string());
             parsed += 1;
             continue;
         }
-        // Not a parseable declaration: tolerate ONLY a `//`-commented
-        // mention on the same line. Anything else (a new declaration
-        // style, a block-commented declaration, prose markup) must be
-        // looked at by a human — loud beats a silently partial universe.
-        let line_start = src[..pos].rfind('\n').map_or(0, |i| i + 1);
-        if src[line_start..pos].contains("//") {
-            continue;
-        }
         let line_no = src[..pos].matches('\n').count() + 1;
         violations.push(format!(
-            "{rel}:{line_no}: `#r(` token is neither a declaration this matcher parses nor a \
-             `//`-commented mention — if a new declaration style was introduced, extend \
-             `rule_declaration_regex` (the citation universe would otherwise silently shrink \
-             and live citations would false-red)",
+            "{rel}:{line_no}: `#r(` token is neither a comment-screened mention nor a \
+             declaration this matcher parses — if a new declaration style was introduced, \
+             extend `rule_declaration_regex` (the citation universe would otherwise silently \
+             shrink and live citations would false-red)",
         ));
     }
     parsed
@@ -3059,8 +3150,9 @@ fn check_spec_rule_citations(
 /// - universe: every `#r("<id>")` declaration in `docs/spec/**/*.typ`,
 ///   inline or multi-line ([`rule_declaration_regex`]), with
 ///   inventory parity enforced per `#r(` token
-///   ([`collect_spec_rules`]: parse it, or it must be `//`-commented,
-///   or the lint is red).
+///   ([`collect_spec_rules`]: comment-screened mention (line or block,
+///   [`typ_comment_spans`]) or parsed declaration, or the lint is red —
+///   commented-out declarations are dead text, never universe entries).
 ///
 /// Each citation must name an id+revision the spec declares verbatim.
 /// One-directional by design (prose → spec): the spec owes prose
@@ -3552,7 +3644,7 @@ impl Other {\n\
     /// universe equals the grep-derived declaration inventory by
     /// construction. (The same accounting runs inside the lint over the
     /// REAL docs/spec tree on every `xtask lint` / xtask-lint CI run —
-    /// 548 declarations + 1 commented mention today — which is where
+    /// 549 declarations + 1 commented mention today — which is where
     /// the real-tree parity is enforced; the nextest sandbox stages no
     /// docs/spec, so a unit test cannot see the real tree without going
     /// vacuous.)
@@ -3565,19 +3657,125 @@ impl Other {\n\
   \"c.d\",
 )[y]
 #r(\"a.b+1\")[duplicate id, second token]
+/* a block-commented mention: #r() */
 ";
         let tokens = src.matches("#r(").count();
-        let commented = 1usize;
+        let commented = 2usize;
         let mut universe = BTreeSet::new();
         let mut violations = Vec::new();
         let parsed = collect_spec_rules(src, "docs/spec/z.typ", &mut universe, &mut violations);
-        assert_eq!(tokens, 4);
+        assert_eq!(tokens, 5);
         // The full accounting: every token is parsed, commented, or a
         // violation — nothing falls through silently.
         assert_eq!(parsed + commented + violations.len(), tokens);
         assert!(violations.is_empty(), "{violations:?}");
         assert_eq!(parsed, 3, "3 declaration tokens (one id declared twice)");
         assert_eq!(universe.len(), 2);
+    }
+
+    /// Commented-out declarations stay OUT of the universe, in every
+    /// comment style Typst has — `//` line comments, `/* */` block
+    /// comments (same-line and spanning the declaration), and nested
+    /// blocks. A dead declaration that still parsed would keep its id
+    /// alive in the universe and silently green-light prose citations of
+    /// a rule the spec no longer declares — so the comment screen runs
+    /// BEFORE the parse attempt, and parseability cannot resurrect dead
+    /// text. Both directions are pinned: the dead ids are absent (and a
+    /// citation of one is flagged), while a live declaration in the same
+    /// file — including one followed by a trailing comment, and one on a
+    /// line after a closed block comment — is still admitted and
+    /// satisfies its citation.
+    #[test]
+    fn commented_out_declarations_never_enter_the_universe() {
+        let src = "\
+// #r(\"dead.line+3\")[stale copy kept after a bump]
+/* #r(\"dead.block+1\")[same-line block comment] */
+/*
+#r(\"dead.spanned+2\")[multi-line block comment]
+/* #r(\"dead.nested+4\")[nested block comment] */
+still inside the outer block
+*/
+#r(\"live.rule+1\")[a live declaration] // trailing comment
+/* closed */ #r(\"live.after-block+1\")[after a closed block]
+";
+        let mut universe = BTreeSet::new();
+        let mut violations = Vec::new();
+        let parsed = collect_spec_rules(src, "docs/spec/c.typ", &mut universe, &mut violations);
+        assert!(violations.is_empty(), "{violations:?}");
+        let expected: BTreeSet<String> = ["live.rule+1", "live.after-block+1"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(universe, expected, "only the live declarations are rules");
+        assert_eq!(parsed, 2);
+        // Accounting: 6 tokens = 2 parsed + 4 commented + 0 violations.
+        assert_eq!(src.matches("#r(").count(), 6);
+
+        // Citation direction: a prose pin of a commented-out rule is now
+        // a dangling citation; pins of the live rules pass.
+        let prose = "\
+dead: `dead.line+3` and `dead.block+1` and `dead.spanned+2`.
+live: `live.rule+1` and `live.after-block+1`.";
+        let mut cite_violations = Vec::new();
+        let citations =
+            check_spec_rule_citations(&universe, "docs/dev/c.md", prose, &mut cite_violations);
+        assert_eq!(citations, 5);
+        assert_eq!(cite_violations.len(), 3, "{cite_violations:?}");
+        for (violation, dead_id) in
+            cite_violations
+                .iter()
+                .zip(["dead.line+3", "dead.block+1", "dead.spanned+2"])
+        {
+            assert!(violation.contains(dead_id), "{violation}");
+        }
+    }
+
+    /// The comment screen mirrors the Typst lexer's precedence, so prose
+    /// shapes that LOOK like comment introducers do not screen (or
+    /// swallow) live declarations: a `//` that is part of a URL (always
+    /// preceded by `:`) is not a line comment, and a `/*` inside a
+    /// backtick raw span (the spec's `path/*.glob` spellings) does not
+    /// open a phantom block comment. The URL case is also pinned in the
+    /// violation direction: an unparseable token after a URL is a LOUD
+    /// violation, not a silently tolerated mention — the whole-line
+    /// `contains(\"//\")` screen this replaces swallowed it.
+    #[test]
+    fn url_and_raw_span_slashes_are_not_comment_introducers() {
+        // Live declarations after URL `//` and after a raw-span glob.
+        let src = "\
+see https://example.org for context #r(\"live.after-url+1\")[x]
+generated from `proto/*.proto` files
+#r(\"live.after-glob+1\")[the glob's `/*` must not swallow this]
+";
+        let mut universe = BTreeSet::new();
+        let mut violations = Vec::new();
+        let parsed = collect_spec_rules(src, "docs/spec/u.typ", &mut universe, &mut violations);
+        assert!(violations.is_empty(), "{violations:?}");
+        assert_eq!(parsed, 2);
+        let expected: BTreeSet<String> = ["live.after-url+1", "live.after-glob+1"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(universe, expected);
+
+        // Violation direction: a URL on the line must not silently
+        // excuse an unparseable token.
+        let mut universe = BTreeSet::new();
+        let mut violations = Vec::new();
+        let parsed = collect_spec_rules(
+            "see https://example.org #r(unparsed mention)\n",
+            "docs/spec/v.typ",
+            &mut universe,
+            &mut violations,
+        );
+        assert_eq!(parsed, 0);
+        assert!(universe.is_empty(), "{universe:?}");
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].starts_with("docs/spec/v.typ:1:")
+                && violations[0].contains("extend `rule_declaration_regex`"),
+            "{violations:?}"
+        );
     }
 
     /// Both directions of the citation check on synthetic prose: a
