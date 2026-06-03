@@ -989,7 +989,7 @@ mod tests {
     /// a free-running race here can't distinguish "P_i committed
     /// before re-check" from "P_i committed after Q_i's DELETE"
     /// (the latter is a legitimate post-GC dangling ref, not a bug).
-    // r[verify store.db.per-path-registry]
+    // r[verify store.db.per-path-registry+2]
     /// The GC-tail orphan reclaim: orphans older than the TTL are
     /// deleted; YOUNG orphans and RESIDENT derivers' rows are spared
     /// (the continuity guard — a worker mid-flight on an output of a

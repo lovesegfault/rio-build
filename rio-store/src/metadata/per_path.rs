@@ -28,7 +28,8 @@ pub(crate) const DRV_MODULO_ORPHAN_TTL_DAYS: i64 = 90;
 /// One per-path table. Iteration order of [`PerPathTable::ALL`] is the
 /// EXECUTION order of both deletion paths and is load-bearing:
 /// `RealisationDeps` first (its FKs are `ON DELETE RESTRICT` — the
-/// junction rows must go before the realisations they pin) and
+/// junction rows must be deleted before the realisations they pin, on
+/// BOTH deletion paths since round-16 bug_069) and
 /// `Narinfo` last (it is the `ON DELETE CASCADE` root; everything that
 /// reads pre-CASCADE state, e.g. the invalidate path's manifest
 /// `FOR UPDATE` hoist, must run before it).
@@ -49,6 +50,15 @@ pub(crate) enum PerPathTable {
 /// The `via`/`rationale` payloads are the registry's self-description:
 /// read by the policy-documentation test (and reviewers), not by the
 /// deletion loops — the loops only execute `Delete` statements.
+///
+/// There is deliberately NO "rely on the FK to abort" variant
+/// (round-16 bug_069 removed `RestrictGuard` from the type): a sweep
+/// policy that executes nothing while an `ON DELETE RESTRICT` FK can
+/// fire is not a guard, it is a standing wedge — the first aged
+/// dep-linked CA chain aborted EVERY subsequent GC run permanently
+/// (the same chain re-aborts each retry; nothing ever reclaims it).
+/// Tables whose rows must outlive the swept path use `Survive`;
+/// everything else declares its statement or its CASCADE parent.
 #[allow(dead_code)] // documentation payloads; liveness pinned by every_policy_documents_itself
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SweepPolicy {
@@ -56,12 +66,6 @@ pub(crate) enum SweepPolicy {
     Delete { sql: &'static str },
     /// Rows follow another table's delete via `ON DELETE CASCADE`.
     Cascade { via: &'static str },
-    /// No statement BY DESIGN: the `ON DELETE RESTRICT` FK is the
-    /// guard. Migration 015's intent: "a realisation delete that would
-    /// orphan deps is a scheduler/GC bug to surface loudly, not
-    /// silently cascade through" — the sweep deliberately lets the
-    /// RESTRICT abort the batch instead of quietly unlinking edges.
-    RestrictGuard { rationale: &'static str },
     /// Rows survive the sweep BY DESIGN.
     Survive { rationale: &'static str },
 }
@@ -120,12 +124,39 @@ impl PerPathTable {
         }
     }
 
-    // r[impl store.db.per-path-registry]
+    // r[impl store.db.per-path-registry+2]
     pub(crate) fn sweep_policy(self) -> SweepPolicy {
         match self {
-            PerPathTable::RealisationDeps => SweepPolicy::RestrictGuard {
-                rationale: "migration 015: orphaning dependency edges is a bug to surface, \
-                            not silently unlink",
+            // Step 2a-pre: DELETE realisation_deps in BOTH FK roles
+            // BEFORE the realisations delete (round-16 bug_069). Both
+            // FKs are ON DELETE RESTRICT; with no statement here, a
+            // swept path whose realisation participates in any edge
+            // (either role) aborted the whole sweep transaction — and
+            // since the same aged chain stays unreachable, EVERY
+            // subsequent GC run re-aborted: a permanent wedge, not a
+            // surfaced bug. Migration 015's RESTRICT intent
+            // ("orphaning edges is a bug to surface") still holds for
+            // every NON-sweep deleter — the FK fires for any writer
+            // that did not first declare an edge policy here. The
+            // reverse-role subselect is fast via
+            // realisation_deps_reverse_idx; the forward role rides the
+            // PK prefix.
+            PerPathTable::RealisationDeps => SweepPolicy::Delete {
+                sql: r#"
+        DELETE FROM realisation_deps
+         WHERE (drv_hash, output_name) IN (
+                 SELECT drv_hash, output_name FROM realisations
+                  WHERE output_path = (
+                    SELECT store_path FROM narinfo WHERE store_path_hash = $1
+                  )
+               )
+            OR (dep_drv_hash, dep_output_name) IN (
+                 SELECT drv_hash, output_name FROM realisations
+                  WHERE output_path = (
+                    SELECT store_path FROM narinfo WHERE store_path_hash = $1
+                  )
+               )
+        "#,
             },
             // Step 2a: DELETE realisations. NOT via CASCADE — realisations
             // has NO FK to narinfo (002_store.sql:134). Without this,
@@ -169,7 +200,7 @@ impl PerPathTable {
         }
     }
 
-    // r[impl store.db.per-path-registry]
+    // r[impl store.db.per-path-registry+2]
     pub(crate) fn invalidate_policy(self) -> InvalidatePolicy {
         match self {
             // Junction rows first: their FKs are ON DELETE RESTRICT, so
@@ -245,8 +276,8 @@ mod tests {
     }
 
     /// Every policy carries its own documentation: Delete carries the
-    /// statement, Cascade names its parent, RestrictGuard/Survive carry
-    /// the rationale. Reading them here keeps the payloads live (they
+    /// statement, Cascade names its parent, Survive carries the
+    /// rationale. Reading them here keeps the payloads live (they
     /// are the registry's self-description, not dead metadata).
     #[test]
     fn every_policy_documents_itself() {
@@ -254,7 +285,7 @@ mod tests {
             match t.sweep_policy() {
                 SweepPolicy::Delete { sql } => assert!(sql.contains("DELETE"), "{t:?}"),
                 SweepPolicy::Cascade { via } => assert!(!via.is_empty(), "{t:?}"),
-                SweepPolicy::RestrictGuard { rationale } | SweepPolicy::Survive { rationale } => {
+                SweepPolicy::Survive { rationale } => {
                     assert!(!rationale.is_empty(), "{t:?}")
                 }
             }
@@ -269,7 +300,7 @@ mod tests {
         }
     }
 
-    // r[verify store.db.per-path-registry]
+    // r[verify store.db.per-path-registry+2]
     /// `information_schema` conformance, both directions:
     ///
     /// 1. Every table in the migrated schema with a path-shaped column

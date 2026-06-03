@@ -205,17 +205,18 @@ async fn select_sweep_order(conn: &mut sqlx::PgConnection) -> Result<Vec<Vec<u8>
     Ok(out)
 }
 
-/// Delete one swept path's metadata: realisations + path_tenants +
-/// narinfo (CASCADE → manifests/manifest_data). Runs inside the
-/// caller's batch transaction.
+/// Delete one swept path's metadata: realisation_deps (both FK roles,
+/// first — bug_069) + realisations + path_tenants + narinfo (CASCADE →
+/// manifests/manifest_data). Runs inside the caller's batch
+/// transaction.
 ///
 /// Returns `false` if narinfo was already gone (defensive; shouldn't
 /// happen under FOR UPDATE). Chunk refcount handling
 /// ([`decrement_and_enqueue`]) is the caller's responsibility — this
 /// only touches the path-keyed tables.
-// r[impl store.realisation.gc-sweep]
+// r[impl store.realisation.gc-sweep+2]
 // r[impl store.gc.sweep-path-tenants]
-// r[impl store.db.per-path-registry]
+// r[impl store.db.per-path-registry+2]
 async fn delete_swept_path(
     tx: &mut Transaction<'_, Postgres>,
     store_path_hash: &[u8],
@@ -224,9 +225,12 @@ async fn delete_swept_path(
 
     // Iterate the lifecycle registry in its pinned execution order.
     // The SQL strings (and the per-statement rationale) live with the
-    // policies in `metadata/per_path.rs`; Cascade / RestrictGuard /
-    // Survive variants execute no statement BY DESIGN — see each
-    // variant's rationale.
+    // policies in `metadata/per_path.rs`; Cascade / Survive variants
+    // execute no statement BY DESIGN — see each variant's rationale.
+    // (RestrictGuard no longer exists: round-16 bug_069 — a no-op
+    // policy over a RESTRICT FK wedged every GC run on the first aged
+    // dep-linked CA chain; realisation_deps is now an explicit
+    // both-roles Delete, first in the pinned order.)
     let mut narinfo_deleted = false;
     for table in PerPathTable::ALL {
         match table.sweep_policy() {
@@ -239,9 +243,7 @@ async fn delete_swept_path(
                     narinfo_deleted = r.rows_affected() > 0;
                 }
             }
-            SweepPolicy::Cascade { .. }
-            | SweepPolicy::RestrictGuard { .. }
-            | SweepPolicy::Survive { .. } => {}
+            SweepPolicy::Cascade { .. } | SweepPolicy::Survive { .. } => {}
         }
     }
     Ok(narinfo_deleted)
@@ -913,7 +915,7 @@ mod tests {
     /// realisations has NO FK to narinfo (002_store.sql:134); without
     /// the explicit DELETE, dangling rows → wopQueryRealisation returns
     /// a path that 404s on fetch.
-    // r[verify store.realisation.gc-sweep]
+    // r[verify store.realisation.gc-sweep+2]
     #[tokio::test]
     async fn sweep_deletes_realisations() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -954,6 +956,89 @@ mod tests {
             realisations_count, 0,
             "sweep should delete realisations pointing to swept path (no FK CASCADE)"
         );
+    }
+
+    // r[verify store.realisation.gc-sweep+2]
+    // r[verify store.db.per-path-registry+2]
+    /// THE bug_069 regression: a swept path whose realisation
+    /// participates in dependency edges (EITHER FK role) must be
+    /// reclaimed, not wedge the sweep. Pre-fix, the registry's no-op
+    /// RestrictGuard policy let the realisations DELETE hit the
+    /// ON DELETE RESTRICT FK -> the whole sweep transaction aborted ->
+    /// and because the same aged chain stayed unreachable, EVERY
+    /// subsequent GC run re-aborted on it: a permanent GC outage from
+    /// one aged dep-linked CA chain.
+    #[tokio::test]
+    async fn sweep_deletes_dep_edges_both_roles_instead_of_wedging() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Victim path + its realisation R_v.
+        let victim = test_store_path("dep-wedge-victim");
+        let victim_hash = StoreSeed::raw_path(&victim).seed(&db.pool).await;
+        // A LIVE realisation R_l (its output path is not being swept;
+        // realisations has no FK to narinfo, so no narinfo row needed).
+        let live = test_store_path("dep-wedge-live");
+        for (drv, out_path) in [(0x11u8, &victim), (0x33u8, &live)] {
+            sqlx::query(
+                "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash) \
+                 VALUES ($1, 'out', $2, $3)",
+            )
+            .bind(vec![drv; 32])
+            .bind(out_path)
+            .bind(vec![0x22u8; 32])
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        // Edges in BOTH roles for R_v:
+        //   R_l depends on R_v  (R_v in the REVERSE/dep role -- the
+        //   wedge case: deleting R_v violates the dep-side FK), and
+        //   R_v depends on R_l  (R_v in the FORWARD role).
+        for (a, b) in [(0x33u8, 0x11u8), (0x11u8, 0x33u8)] {
+            sqlx::query(
+                "INSERT INTO realisation_deps \
+                 (drv_hash, output_name, dep_drv_hash, dep_output_name) \
+                 VALUES ($1, 'out', $2, 'out')",
+            )
+            .bind(vec![a; 32])
+            .bind(vec![b; 32])
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        // Sweep the victim. Pre-fix: Err (FK restrict) -- and the SAME
+        // Err on every retry, the permanent-wedge signature.
+        let stats = sweep(&db.pool, None, vec![victim_hash], false, &no_shutdown())
+            .await
+            .expect("sweep must reclaim a dep-linked path, not wedge");
+        assert_eq!(stats.paths_deleted, 1);
+
+        // Both edges gone (the registry's both-roles DELETE).
+        let edges: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM realisation_deps")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            edges, 0,
+            "edges touching the swept realisation, either role, deleted"
+        );
+
+        // The victim's realisation gone; the LIVE realisation intact.
+        let rows: Vec<(Vec<u8>,)> =
+            sqlx::query_as("SELECT drv_hash FROM realisations ORDER BY drv_hash")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 1, "only the live realisation survives");
+        assert_eq!(rows[0].0, vec![0x33u8; 32], "live realisation untouched");
+
+        // CONVERGENCE (the wedge's negation): a second sweep run over
+        // an empty unreachable set succeeds trivially.
+        let again = sweep(&db.pool, None, vec![], false, &no_shutdown())
+            .await
+            .expect("subsequent GC runs are not poisoned");
+        assert_eq!(again.paths_deleted, 0);
     }
 
     // r[verify store.put.ia-deriver-proof+4]

@@ -328,4 +328,81 @@ scope: with scope; ''
             "out_tenant swept")
 
       print("gc-sweep PASS: pin protected, backdated path deleted, unpin round-trip OK")
+
+  # ══════════════════════════════════════════════════════════════════
+  # gc-sweep: dep-linked chain reclaims instead of wedging (bug_069)
+  # ══════════════════════════════════════════════════════════════════
+  # r-marker lives at the default.nix subtests wiring (vm-lifecycle-gc).
+  # psql-seeded dep-chain: a backdated victim path whose realisation
+  # participates in realisation_deps edges in BOTH FK roles (a live
+  # realisation depends on it; it depends on the live one). Both FKs
+  # are ON DELETE RESTRICT — pre-fix the sweep had NO edge statement,
+  # so the realisations DELETE aborted the whole sweep transaction,
+  # and every later GC run re-aborted on the same aged chain: a
+  # permanent GC outage. Post-fix the registry deletes edges (both
+  # roles) first; the live realisation survives.
+  with subtest("gc-sweep: dep-linked chain reclaims instead of wedging"):
+      wedge_victim = "/nix/store/" + "a" * 32 + "-dep-wedge-victim"
+      hx_victim = "11" * 32
+      hx_live = "33" * 32
+      hx_out = "22" * 32
+      hx_nar = "00" * 32
+      psql_k8s(k3s_server,
+          f"INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size, created_at) "
+          f"VALUES (sha256(convert_to('{wedge_victim}', 'UTF8')), '{wedge_victim}', "
+          f"decode('{hx_nar}', 'hex'), 16, now() - interval '25 hours')"
+      )
+      # Mark only nominates candidates with a COMPLETE manifest
+      # (compute_unreachable JOINs manifests m WHERE m.status =
+      # 'complete') — without this row the victim is invisible to GC
+      # and the wedge never reproduces.
+      psql_k8s(k3s_server,
+          f"INSERT INTO manifests (store_path_hash, status, inline_blob) "
+          f"VALUES (sha256(convert_to('{wedge_victim}', 'UTF8')), 'complete', "
+          f"decode('{hx_nar}', 'hex'))"
+      )
+      # Victim realisation (drv_hash 0x11…) + live realisation
+      # (0x33…, output_path = out_pin which is pinned and in-grace).
+      psql_k8s(k3s_server,
+          f"INSERT INTO realisations (drv_hash, output_name, output_path, output_hash) VALUES "
+          f"(decode('{hx_victim}', 'hex'), 'out', '{wedge_victim}', decode('{hx_out}', 'hex')), "
+          f"(decode('{hx_live}', 'hex'), 'out', '{out_pin}', decode('{hx_out}', 'hex'))"
+      )
+      psql_k8s(k3s_server,
+          f"INSERT INTO realisation_deps (drv_hash, output_name, dep_drv_hash, dep_output_name) VALUES "
+          f"(decode('{hx_live}', 'hex'), 'out', decode('{hx_victim}', 'hex'), 'out'), "
+          f"(decode('{hx_victim}', 'hex'), 'out', decode('{hx_live}', 'hex'), 'out')"
+      )
+
+      # The victim is the sole >grace unreachable path (out_tenant was
+      # swept above; everything else is in-grace or pinned). Pre-fix
+      # this TriggerGC run FAILS (FK restrict aborts the sweep tx).
+      collected_wedge = trigger_gc_get_collected()
+      assert collected_wedge == "1", (
+          f"dep-linked victim must be reclaimed, not wedge the sweep; "
+          f"got pathsCollected={collected_wedge!r}. If the GC stream "
+          f"errored, the realisation_deps RESTRICT wedge is back "
+          f"(bug_069): check the registry's both-roles edge DELETE."
+      )
+      edges_left = int(psql_k8s(k3s_server,
+          "SELECT COUNT(*) FROM realisation_deps"
+      ))
+      assert edges_left == 0, (
+          f"both edge roles must be deleted with the swept path; "
+          f"{edges_left} realisation_deps rows remain"
+      )
+      live_left = int(psql_k8s(k3s_server,
+          f"SELECT COUNT(*) FROM realisations "
+          f"WHERE drv_hash = decode('{hx_live}', 'hex')"
+      ))
+      assert live_left == 1, (
+          "the LIVE realisation (edges' other endpoint) must survive "
+          "the victim's sweep"
+      )
+      victim_left = int(psql_k8s(k3s_server,
+          f"SELECT COUNT(*) FROM narinfo WHERE store_path = '{wedge_victim}'"
+      ))
+      assert victim_left == 0, "victim narinfo gone"
+      print("dep-wedge PASS: dep-linked chain swept, edges unlinked "
+            "both roles, live realisation intact")
 ''

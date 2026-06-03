@@ -869,13 +869,25 @@ populations cannot drift again.
   psql can't poison the response.
 ]
 
-#r("store.realisation.gc-sweep")[
-  GC sweep MUST `DELETE FROM realisations WHERE output_path = $swept_path` in
-  the same transaction as the `narinfo` DELETE. The `realisations` table has NO
-  foreign key to `narinfo` (migration 002) so CASCADE does not cover it;
+#r("store.realisation.gc-sweep+2")[
+  GC sweep MUST, in the same transaction as the `narinfo` DELETE and in this
+  order, (1) `DELETE FROM realisation_deps` rows touching the swept path's
+  realisations in EITHER FK role (forward `(drv_hash, output_name)` and
+  reverse `(dep_drv_hash, dep_output_name)`), then (2) `DELETE FROM
+  realisations WHERE output_path = $swept_path`. The `realisations` table has
+  NO foreign key to `narinfo` (migration 002) so CASCADE does not cover it;
   without explicit cleanup, stale rows would point to swept paths and
   `QueryRealisation` would claim a CA cache hit for an output no longer in the
-  store. The `realisations_output_idx` index makes the per-path DELETE fast.
+  store. The edge deletion MUST precede it because both `realisation_deps`
+  FKs are `ON DELETE RESTRICT` (migration 015): with no edge statement, a
+  swept path whose realisation participated in any dependency edge aborted
+  the whole sweep transaction --- and since the aged chain stayed
+  unreachable, every subsequent GC run re-aborted on the same chain, a
+  permanent GC wedge (round-16 bug_069). Migration 015's surface-loudly
+  intent still governs every non-sweep, non-invalidation deleter: the
+  RESTRICT fires for any writer that has not declared an edge policy in the
+  per-path registry. `realisations_output_idx` makes the per-path DELETEs
+  fast; the reverse edge role rides `realisation_deps_reverse_idx`.
 ]
 
 CA `Realisation` objects carry their own ed25519 signatures over the tuple
@@ -1327,19 +1339,21 @@ narinfo the operator just removed, so "invalidate" must mean *every* table.
 The sweep, by contrast, preserves `drv_modulo_cache` by design
 (#rref("store.put.ia-deriver-proof+4") --- proofs survive deriver GC). The
 per-table policy split is the registry's job
-(#rref("store.db.per-path-registry")).
+(#rref("store.db.per-path-registry+2")).
 
 = PostgreSQL Schema
 <store-schema>
 
-#r("store.db.per-path-registry")[
+#r("store.db.per-path-registry+2")[
   Every store table keyed by a store path (directly or via its
   `sha256(store_path)` digest) MUST be enumerated in the per-path lifecycle
   registry (`metadata/per_path.rs`) with an explicit GC-sweep policy AND an
   explicit operator-invalidation policy (`Delete` with the statement,
-  `Cascade` naming the parent, `RestrictGuard`, or `Survive` with the
-  rationale). Both deletion paths MUST iterate the registry in its pinned
-  order (`RESTRICT`-guarded junction rows first, the `CASCADE` root last),
+  `Cascade` naming the parent, or `Survive` with the rationale --- there is
+  deliberately NO rely-on-the-FK-to-abort sweep policy since round-16
+  bug_069: a no-op policy over a `RESTRICT` FK is a standing GC wedge, not a
+  guard). Both deletion paths MUST iterate the registry in its pinned
+  order (`RESTRICT`-FK junction rows first, the `CASCADE` root last),
   and a schema-conformance test MUST fail when a path-keyed table exists
   without a registry entry or a registry entry without a table.
 ]

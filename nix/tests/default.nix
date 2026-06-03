@@ -790,6 +790,7 @@ in
     subtests = [
       "gc-dry-run"
       # r[verify store.gc.tenant-retention]
+      # r[verify store.realisation.gc-sweep+2]
       "gc-sweep"
       # r[verify builder.upload.references-scanned+2]
       # r[verify builder.upload.deriver-populated]

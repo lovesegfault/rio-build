@@ -15,16 +15,16 @@
 //! `delete_swept_path` (`gc/sweep.rs`): realisations have no FK to
 //! narinfo and must be deleted explicitly, as must `path_tenants`
 //! (orphaned rows would grant stale tenant visibility on a later
-//! re-upload of the same path); `manifests` / `manifest_data` follow
-//! the narinfo row via `ON DELETE CASCADE`.
-//! Beyond the sweep, this also removes `realisation_deps` junction
-//! rows touching the deleted realisations in either role — their FKs
-//! are `ON DELETE RESTRICT`, and an explicit operator invalidation is
-//! precisely the case where removing the edges is intended rather than
-//! a bug to surface — and `drv_modulo_cache`, which the sweep
-//! deliberately PRESERVES (`store.put.ia-deriver-proof+4`: proofs
-//! survive deriver GC) but which "invalidate everything about this
-//! path" must purge: a surviving modulo row would keep proving IA
+//! re-upload of the same path) and `realisation_deps` junction rows
+//! touching the deleted realisations in either role (their FKs are
+//! `ON DELETE RESTRICT`; both deletion paths unlink edges first since
+//! round-16 bug_069 — the sweep's previous no-op policy wedged GC on
+//! the first aged dep-linked chain); `manifests` / `manifest_data`
+//! follow the narinfo row via `ON DELETE CASCADE`.
+//! Beyond the sweep, this also removes `drv_modulo_cache`, which the
+//! sweep deliberately PRESERVES (`store.put.ia-deriver-proof+4`:
+//! proofs survive deriver GC) but which "invalidate everything about
+//! this path" must purge: a surviving modulo row would keep proving IA
 //! outputs of a `.drv` whose narinfo the operator just removed.
 
 use std::sync::Arc;
@@ -90,7 +90,7 @@ pub(crate) async fn invalidate_path(
     let path_str = store_path.as_str();
     let path_hash = store_path.sha256_digest().to_vec();
 
-    // r[impl store.db.per-path-registry]
+    // r[impl store.db.per-path-registry+2]
     // Iterate the lifecycle registry in its pinned execution order
     // (RESTRICT-guarded junction rows first, the CASCADE root last).
     // The SQL strings and per-table rationale live with the policies in

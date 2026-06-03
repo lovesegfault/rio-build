@@ -81,6 +81,30 @@ pub const M_008: () = ();
 /// and can't be corrected in-place; this const is the correction.
 pub const M_009: () = ();
 
+/// `migrations/015_realisation_deps.sql`
+///
+/// CA-depends-on-CA junction (`realisation_deps`), composite FKs to
+/// `realisations` on both sides, `ON DELETE RESTRICT`.
+///
+/// ## The RESTRICT-intent comment is superseded for the deletion paths
+///
+/// The frozen `.sql` says RESTRICT exists so "a realisation delete
+/// that would orphan deps is a scheduler/GC bug to surface loudly,
+/// not silently cascade through". Round-16 bug_069: for the GC SWEEP
+/// that posture was a standing wedge, not a guard — the sweep had no
+/// edge statement, so the first swept path whose realisation
+/// participated in any dependency edge aborted the sweep transaction,
+/// and every subsequent GC run re-aborted on the same aged chain
+/// (permanent GC outage; nothing ever reclaims an unreachable chain).
+/// Both deletion paths now unlink edges in BOTH FK roles before the
+/// realisations delete, as declared in the per-path lifecycle
+/// registry (`rio-store/src/metadata/per_path.rs`,
+/// `store.realisation.gc-sweep+2`). The RESTRICT itself stays and
+/// still serves the original intent for every OTHER deleter: any
+/// writer that has not declared an edge policy in the registry
+/// surfaces loudly.
+pub const M_015: () = ();
+
 /// `migrations/018_chunk_tenants.sql`
 ///
 /// Adds `chunk_tenants(blake3_hash, tenant_id)` junction for
