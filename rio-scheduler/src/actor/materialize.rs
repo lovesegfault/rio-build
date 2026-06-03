@@ -941,6 +941,31 @@ impl DagActor {
                     .await;
                 Ok(())
             }
+            Some(Outcome::Aborted(a)) => {
+                // Charge-free close (owner default Q3, 2026-06-03 — AD5
+                // parity for the materialization kind): the worker was
+                // told to stop (SIGTERM during a store rollout/drain),
+                // which is evidence about the WORKER's lifecycle, not
+                // about the upstream or the job. NO ledger row of any
+                // class — routine store rollouts must not burn the
+                // 3-attempt park budget (merged_bug_189) — and the
+                // budget keeps its flapping-replica blindness by
+                // decision. The job returns to pending claimable and
+                // the node leaves the mint's Running state (re-arm
+                // without the reassign is the documented wedge).
+                tracing::info!(
+                    %exec_id,
+                    drv_hash = %drv_hash,
+                    detail = %a.detail,
+                    "materialization walk aborted by the worker; closing charge-free"
+                );
+                self.close_materialization_attempt(exec_id, &drv_hash, None, serving_generation)
+                    .await;
+                self.rearm_materialization_job(&drv_hash, &executor).await;
+                self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
+                    .await;
+                Ok(())
+            }
             None => {
                 warn!(%exec_id, "materialization outcome with no payload; acknowledged-and-ignored");
                 Ok(())

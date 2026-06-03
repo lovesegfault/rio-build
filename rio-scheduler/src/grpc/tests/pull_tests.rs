@@ -115,6 +115,7 @@ async fn materialization_pull_with_empty_instance_rejected() -> anyhow::Result<(
             intent_id: "drv-materialization-no-instance".into(),
             kind: rio_proto::types::AttemptKind::Materialization.into(),
             executor_instance: String::new(),
+            resume_exec_id: String::new(),
         }))
         .await
         .expect_err("a materialization pull without executor_instance must be rejected");
@@ -182,6 +183,7 @@ async fn materialization_pull_with_executor_token_rejected() -> anyhow::Result<(
             intent_id: "drv-mat-authz".into(),
             kind: rio_proto::types::AttemptKind::Materialization.into(),
             executor_instance: "store-replica-0".into(),
+            resume_exec_id: String::new(),
         }))
         .await
         .expect_err("a builder-kind executor token must not authorize a materialization pull");
@@ -197,6 +199,7 @@ async fn materialization_pull_with_executor_token_rejected() -> anyhow::Result<(
         intent_id: "drv-mat-authz".into(),
         kind: rio_proto::types::AttemptKind::Materialization.into(),
         executor_instance: "store-replica-0".into(),
+        resume_exec_id: String::new(),
     });
     req.metadata_mut()
         .insert(rio_proto::EXECUTOR_TOKEN_HEADER, token.parse()?);
@@ -324,6 +327,7 @@ async fn materialization_pull_instance_validated_as_dns_label() -> anyhow::Resul
                 intent_id: "drv-instance-validation".into(),
                 kind: rio_proto::types::AttemptKind::Materialization.into(),
                 executor_instance: bad.into(),
+                resume_exec_id: String::new(),
             }))
             .await
             .expect_err("malformed executor_instance must be rejected");
@@ -341,6 +345,7 @@ async fn materialization_pull_instance_validated_as_dns_label() -> anyhow::Resul
             intent_id: "drv-instance-validation".into(),
             kind: rio_proto::types::AttemptKind::Materialization.into(),
             executor_instance: "store-replica-0".into(),
+            resume_exec_id: String::new(),
         }))
         .await
         .expect("a valid DNS-1123 instance is accepted")
@@ -395,6 +400,7 @@ async fn pull_intent_id_with_separator_rejected() -> anyhow::Result<()> {
             intent_id: ambiguous.into(),
             kind: rio_proto::types::AttemptKind::Build.into(),
             executor_instance: String::new(),
+            resume_exec_id: String::new(),
         }))
         .await
         .expect_err("a build pull whose attested intent contains '@' must be rejected");
@@ -415,6 +421,7 @@ async fn pull_intent_id_with_separator_rejected() -> anyhow::Result<()> {
             intent_id: ambiguous.into(),
             kind: rio_proto::types::AttemptKind::Materialization.into(),
             executor_instance: "store-replica-0".into(),
+            resume_exec_id: String::new(),
         }))
         .await
         .expect_err("a materialization pull whose intent contains '@' must be rejected");
@@ -536,6 +543,7 @@ async fn materialization_ops_accept_store_service_credential() -> anyhow::Result
         intent_id: "drv-store-credential".into(),
         kind: rio_proto::types::AttemptKind::Materialization.into(),
         executor_instance: "store-replica-0".into(),
+        resume_exec_id: String::new(),
     });
     req.metadata_mut()
         .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
@@ -610,6 +618,7 @@ async fn store_service_credential_scoping_is_exact() -> anyhow::Result<()> {
         intent_id: "drv-wrong-caller".into(),
         kind: rio_proto::types::AttemptKind::Materialization.into(),
         executor_instance: "store-replica-0".into(),
+        resume_exec_id: String::new(),
     });
     req.metadata_mut().insert(
         rio_common::grpc::SERVICE_TOKEN_HEADER,
@@ -711,6 +720,7 @@ async fn materialization_claim_with_mismatched_instance_rejected() -> anyhow::Re
         intent_id: "drv-instance-mismatch".into(),
         kind: rio_proto::types::AttemptKind::Materialization.into(),
         executor_instance: "store-b".into(),
+        resume_exec_id: String::new(),
     });
     req.metadata_mut()
         .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, token_a.parse()?);
@@ -737,6 +747,7 @@ async fn materialization_claim_with_mismatched_instance_rejected() -> anyhow::Re
         intent_id: "drv-instance-mismatch".into(),
         kind: rio_proto::types::AttemptKind::Materialization.into(),
         executor_instance: "store-a".into(),
+        resume_exec_id: String::new(),
     });
     req.metadata_mut()
         .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, token_a.parse()?);
@@ -784,6 +795,7 @@ async fn materialization_claim_without_instance_claim_rejected() -> anyhow::Resu
         intent_id: "drv-unbound-token".into(),
         kind: rio_proto::types::AttemptKind::Materialization.into(),
         executor_instance: "store-replica-0".into(),
+        resume_exec_id: String::new(),
     });
     req.metadata_mut()
         .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, unbound.parse()?);
@@ -1115,6 +1127,7 @@ async fn flag_on_materialization_lifecycle_through_grpc() -> anyhow::Result<()> 
         intent_id: "mat-wire".into(),
         kind: rio_proto::types::AttemptKind::Materialization.into(),
         executor_instance: String::new(),
+        resume_exec_id: String::new(),
     });
     req.metadata_mut()
         .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
@@ -1131,6 +1144,7 @@ async fn flag_on_materialization_lifecycle_through_grpc() -> anyhow::Result<()> 
         intent_id: "mat-wire".into(),
         kind: rio_proto::types::AttemptKind::Materialization.into(),
         executor_instance: "store-test-0".into(),
+        resume_exec_id: String::new(),
     });
     req.metadata_mut()
         .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
@@ -1259,6 +1273,7 @@ async fn flag_on_progress_relay_reaches_build_events() -> anyhow::Result<()> {
         intent_id: "mat-progress".into(),
         kind: rio_proto::types::AttemptKind::Materialization.into(),
         executor_instance: "store-test-0".into(),
+        resume_exec_id: String::new(),
     });
     req.metadata_mut()
         .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
@@ -1360,6 +1375,7 @@ async fn call_mat_surface(
                 intent_id: "sweep-drv".into(),
                 kind: rio_proto::types::AttemptKind::Materialization.into(),
                 executor_instance: "store-replica-0".into(),
+                resume_exec_id: String::new(),
             }))
             .await
             .map(|_| ()),

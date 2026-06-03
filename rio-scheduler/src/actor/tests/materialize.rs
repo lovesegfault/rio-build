@@ -650,6 +650,103 @@ async fn flag_on_infra_failure_charges_and_rearms() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.materialize.routing+3]
+/// merged_bug_189 / owner Q3 (charge-free Aborted): a worker-aborted
+/// walk (SIGTERM during a store rollout) closes the attempt with ZERO
+/// ledger rows of any class, the job returns to pending claimable, and
+/// the node returns to Ready — routine rollouts never burn the park
+/// budget. (Pre-fix RED: the proto variant did not exist; the
+/// exhaustive consumption match is the compile-level red.)
+#[tokio::test]
+async fn aborted_outcome_closes_attempt_uncharged() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("maton-abort-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("maton-abort");
+    n.expected_output_paths = vec![out.clone()];
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    let outcome = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "maton-abort".into(),
+            auth_intent: Some("maton-abort".into()),
+            kind: rio_evidence_kernel::pull::PullKind::Materialization,
+            executor_instance: Some("store-replica-0-w0".into()),
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    let assignment = match outcome {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("flag-on materialization claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+
+    // The worker reports Aborted (SIGTERM mid-walk).
+    let result = handle
+        .query_unchecked(|reply| ActorCommand::ReportPullOutcome {
+            exec_id,
+            auth_intent: Some("maton-abort".into()),
+            payload: crate::actor::pull::PullReportPayload {
+                result: rio_proto::types::BuildResult::default(),
+                peak_memory_bytes: 0,
+                peak_cpu_cores: 0.0,
+                node_name: None,
+                hw_class: None,
+                final_resources: None,
+                final_line_count: 0,
+                materialization_outcome: Some(rio_proto::types::MaterializationOutcome {
+                    outcome: Some(rio_proto::types::materialization_outcome::Outcome::Aborted(
+                        rio_proto::types::materialization_outcome::Aborted {
+                            detail: "walk aborted by SIGTERM (store shutdown/rollout)".into(),
+                        },
+                    )),
+                }),
+            },
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    assert!(result.is_ok(), "consumption must succeed: {result:?}");
+    barrier(&handle).await;
+
+    // CHARGE-FREE: zero ledger rows of any class.
+    let charges: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_attempts")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(charges, 0, "an aborted walk charges nothing (owner Q3)");
+
+    // The job is pending and claimable again.
+    let jobs = sdb(&db.pool)
+        .list_claimable_materialization_jobs(16)
+        .await?;
+    assert_eq!(jobs.len(), 1, "the job re-armed, got {jobs:?}");
+
+    // The node returned to Ready.
+    let drv = expect_drv(&handle, "maton-abort").await;
+    assert_eq!(drv.status, DerivationStatus::Ready, "the node requeued");
+
+    // And a fresh claim delivers again (no wedge: rearm + reassign).
+    let outcome = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "maton-abort".into(),
+            auth_intent: Some("maton-abort".into()),
+            kind: rio_evidence_kernel::pull::PullKind::Materialization,
+            executor_instance: Some("store-replica-1-w0".into()),
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    assert!(
+        matches!(outcome, Ok(PullOutcome::Deliver(_))),
+        "the next claim must deliver after an aborted close, got {outcome:?}"
+    );
+    Ok(())
+}
+
 // ── Establishment + cancellation (T-3.6) ───────────────────────────────
 
 // r[verify sched.materialize.routing+3]
