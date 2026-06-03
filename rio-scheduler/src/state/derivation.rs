@@ -229,6 +229,20 @@ impl DerivationStatus {
         )
     }
 
+    // r[impl sched.retry.revival-total-reset+2]
+    /// Whether a node revived FROM this status (its output turned out to
+    /// exist: cache-hit, deferred re-probe, or substitutable-upstream)
+    /// resets its failure-tracking state — the ONE population predicate
+    /// every revival site consumes at BOTH durability tiers (in-memory
+    /// `RetryState::clear()` + PG `clear_revival_history`), round-17
+    /// merged_bug_073: per-site status subsets let a `Failed`-origin
+    /// revival keep its persisted history and resurrect it at failover.
+    /// Mirrors the FSM's revival arms (`Poisoned | DependencyFailed |
+    /// Failed → Substituting/Queued/Completed`).
+    pub fn is_revival_resettable(self) -> bool {
+        matches!(self, Self::Poisoned | Self::DependencyFailed | Self::Failed)
+    }
+
     /// Whether a resubmit of this derivation should reset it for re-dispatch.
     ///
     /// `Cancelled`: explicit cancel OR worker-side timeout (`BuildResultStatus::
@@ -745,7 +759,7 @@ impl RetryState {
 }
 
 impl RetryState {
-    // r[impl sched.retry.revival-total-reset]
+    // r[impl sched.retry.revival-total-reset+2]
     /// Reset ALL failure-tracking state. Call after a cache-hit
     /// transition from Poisoned/DependencyFailed/Failed to Completed
     /// (I-099/I-094) — the prior failures are moot once the output
@@ -2334,7 +2348,7 @@ pub const POISON_TTL: std::time::Duration = std::time::Duration::from_millis(100
 #[cfg(test)]
 mod tests {
 
-    // r[verify sched.retry.revival-total-reset]
+    // r[verify sched.retry.revival-total-reset+2]
     /// merged_bug_022: clear() must reset EVERY field. The construction
     /// below populates every field non-default through the same
     /// exhaustive-destructure discipline as clear() itself — adding a
@@ -2392,7 +2406,38 @@ mod tests {
         assert_eq!(unseeded_inputs_count, 0);
     }
 
-    // r[verify sched.retry.revival-total-reset]
+    // r[verify sched.retry.revival-total-reset+2]
+    /// merged_bug_073: the revival origin population is ONE predicate.
+    /// Exhaustive over every status so adding a variant forces a
+    /// disposition decision here (the same compile-forced shape as
+    /// `clear()`'s destructure).
+    #[test]
+    fn revival_resettable_population_is_exact() {
+        use super::DerivationStatus as S;
+        for s in [
+            S::Created,
+            S::Queued,
+            S::Ready,
+            S::Assigned,
+            S::Running,
+            S::Substituting,
+            S::Completed,
+            S::Failed,
+            S::Poisoned,
+            S::DependencyFailed,
+            S::Cancelled,
+            S::Skipped,
+        ] {
+            let expect = matches!(s, S::Poisoned | S::DependencyFailed | S::Failed);
+            assert_eq!(
+                s.is_revival_resettable(),
+                expect,
+                "revival population must be exactly {{Poisoned, DependencyFailed, Failed}}; {s:?} diverged"
+            );
+        }
+    }
+
+    // r[verify sched.retry.revival-total-reset+2]
     /// The harm path: a node whose claims budget was EXHAUSTED before
     /// revival must get the full ladder again — first post-revival
     /// store blip charges as Backoff(0), never instant Exhausted (the

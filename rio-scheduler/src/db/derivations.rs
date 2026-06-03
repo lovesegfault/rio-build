@@ -303,6 +303,35 @@ impl SchedulerDb {
         .map(|_| ())
     }
 
+    // r[impl sched.retry.revival-total-reset+2]
+    /// Persisted-tier half of a REVIVAL reset (round-17 merged_bug_073):
+    /// zeroes exactly the failure-history columns the recovery hydration
+    /// reads back into `RetryState` (`retry_count`, `failed_builders`,
+    /// `resubmit_cycles`, `poisoned_at`) WITHOUT touching `status` —
+    /// every revival site owns its own status flow (cache-hit persists
+    /// `Completed`, the deferred re-probe persists `Queued`, the
+    /// substitutable lane persists on `SubstituteComplete`), and a
+    /// status write here would race those. Distinct from
+    /// [`Self::clear_poison`] (admin/TTL full reset, status='created')
+    /// and [`Self::clear_poison_batch`] (resubmit: increments
+    /// `resubmit_cycles` instead of zeroing — the bound accumulates).
+    /// Like [`Self::clear_poison`], floors are deliberately preserved
+    /// (same-definition sizing memory survives revival).
+    /// Plain runtime query (no `query!`) per the runtime-bound-SQL
+    /// convention for new statements — `.sqlx/` is unaffected.
+    pub async fn clear_revival_history(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE derivations
+             SET poisoned_at = NULL, failed_builders = '{}', retry_count = 0,
+                 resubmit_cycles = 0, updated_at = now()
+             WHERE drv_hash = $1",
+        )
+        .bind(drv_hash.as_str())
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+    }
+
     // r[impl sched.db.clear-poison-batch]
     /// Batch poison clear for the resubmit-reset path: one round-trip
     /// for N hashes via `WHERE drv_hash = ANY($1)`. Clears per-cycle

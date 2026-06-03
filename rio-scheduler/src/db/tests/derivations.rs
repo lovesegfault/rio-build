@@ -529,3 +529,45 @@ async fn input_form_read_through_floors_sub_anchor_ranks() -> anyhow::Result<()>
     assert_eq!(rows.len(), 2);
     Ok(())
 }
+
+// r[verify sched.retry.revival-total-reset+2]
+/// merged_bug_073: `clear_revival_history` zeroes exactly the persisted
+/// failure-history columns (the ones recovery hydrates back into
+/// `RetryState`) and leaves `status` to the caller's own flow — unlike
+/// `clear_poison`, a revival never flips the row to 'created'.
+#[tokio::test]
+async fn test_clear_revival_history_resets_columns_not_status() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    let drv_hash: DrvHash = "revival-hist-hash".into();
+    let _ = insert_test_derivation(&db, drv_hash.as_str()).await?;
+
+    sqlx::query(
+        "UPDATE derivations SET status = 'failed', retry_count = 3, \
+         resubmit_cycles = 2, failed_builders = ARRAY['w1','w2'], \
+         poisoned_at = now() WHERE drv_hash = $1",
+    )
+    .bind(drv_hash.as_str())
+    .execute(&test_db.pool)
+    .await?;
+
+    db.clear_revival_history(&drv_hash).await?;
+
+    let (status, retry, cycles, builders, poison_null): (String, i32, i32, Vec<String>, bool) =
+        sqlx::query_as(
+            "SELECT status, retry_count, resubmit_cycles, failed_builders, \
+             poisoned_at IS NULL FROM derivations WHERE drv_hash = $1",
+        )
+        .bind(drv_hash.as_str())
+        .fetch_one(&test_db.pool)
+        .await?;
+    assert_eq!(
+        status, "failed",
+        "status untouched — the caller owns its flow"
+    );
+    assert_eq!(retry, 0);
+    assert_eq!(cycles, 0);
+    assert!(builders.is_empty());
+    assert!(poison_null);
+    Ok(())
+}

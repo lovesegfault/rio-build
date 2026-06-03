@@ -464,13 +464,19 @@ epilogue in the success path).
   (now() - poisoned_at))`, so the 24h TTL check survives scheduler restart.
 ]
 
-#r("sched.retry.revival-total-reset")[
-  A cache-hit revival of a previously-failed derivation
-  (`Poisoned`/`DependencyFailed`/`Failed` transitioning to `Completed`
-  because the output now exists) MUST reset the COMPLETE
-  failure-tracking state --- every retry counter, every capped deferral
-  budget, every backoff deadline, and the failure attribution set ---
-  not an enumerated subset. The reset MUST be implemented so that
+#r("sched.retry.revival-total-reset+2")[
+  A revival of a previously-failed derivation (any revival-resettable
+  origin --- `Poisoned`, `DependencyFailed`, or `Failed` --- revived
+  because the output now exists: cache-hit, deferred re-probe, or
+  substitutable-upstream) MUST reset the COMPLETE failure-tracking
+  state --- every retry counter, every capped deferral budget, every
+  backoff deadline, and the failure attribution set --- not an
+  enumerated subset, AND MUST reset it at BOTH durability tiers: the
+  in-memory `RetryState` and the persisted failure-history columns,
+  so a leader failover between the revival and the next status
+  persist cannot resurrect moot failure history. The origin-status
+  population MUST be one shared predicate consumed by every revival
+  site at both tiers; the in-memory reset MUST be implemented so that
   adding a failure-tracking field without deciding its revival
   disposition fails compilation.
 ]
@@ -484,7 +490,15 @@ stale pre-revival backoff deadline silently deferred the re-probe
 dispatch by up to a full backoff window. Exhaustive destructuring in
 `clear()` makes the omission a compile error; a future field that must
 survive revival gets an explicit no-op arm with rationale, never a
-silent omission.
+silent omission. The `+2` tier extension exists because the same
+omission shape recurred one level up (round-17 merged_bug_073): the
+in-memory reset ran at every revival site while the persisted
+`retry_count`/`failed_builders`/`resubmit_cycles`/`poisoned_at`
+columns were cleared only on a per-site status subset — a failover
+after a `Failed`-origin revival restored the moot history verbatim,
+and the substitutable lane never cleared PG at all. One population
+predicate (`DerivationStatus::is_revival_resettable`) and one
+history-column reset (`clear_revival_history`) now span both tiers.
 
 #r("sched.retry.per-executor-budget")[
   `BuildResultStatus::InfrastructureFailure` does NOT count toward the poison

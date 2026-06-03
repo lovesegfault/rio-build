@@ -7768,6 +7768,40 @@ async fn test_reprobe_existing_poisoned_unpoisons_on_cache_hit() -> TestResult {
         "build #2 should succeed via re-probe unpoisoning"
     );
 
+    // r[verify sched.retry.revival-total-reset+2]
+    // Round-17 merged_bug_073: the revival reset spans BOTH tiers — the
+    // persisted per-attempt failure history is clean after the flow, so
+    // a leader failover cannot resurrect it. `resubmit_cycles` is the
+    // ONE deliberate exception in THIS flow: build #2 is a user
+    // resubmit, and the I-169 poison-resubmit bound accumulates across
+    // resubmits by design (`clear_poison_batch` increments it; the
+    // in-memory tier carries the same 1 — tiers agree, which is what
+    // the +2 rule demands).
+    let probe = make_node("reprobe-poison");
+    let (retry_count, resubmit_cycles, failed_builders, poison_cleared): (
+        i32,
+        i32,
+        Vec<String>,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT retry_count, resubmit_cycles, failed_builders, poisoned_at IS NULL \
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(&probe.drv_hash)
+    .fetch_one(&_db.pool)
+    .await?;
+    assert_eq!(retry_count, 0, "PG retry_count zeroed at revival");
+    assert_eq!(
+        resubmit_cycles, 1,
+        "the I-169 resubmit bound accumulates across user resubmits — \
+         it is a cycle bound, not per-attempt history"
+    );
+    assert!(
+        failed_builders.is_empty(),
+        "PG failed_builders cleared at revival"
+    );
+    assert!(poison_cleared, "PG poisoned_at cleared at revival");
+
     Ok(())
 }
 
@@ -8706,6 +8740,102 @@ async fn test_deferred_reprobe_hit_on_poisoned_at_limit_unsticks() -> TestResult
         ),
         "after dep completes, X (Queued) promotes; got {:?}",
         xs2.status
+    );
+    Ok(())
+}
+
+// r[verify sched.retry.revival-total-reset+2]
+/// Round-17 merged_bug_073 — OUTCOME pin for the FAILED origin: after a
+/// Failed node with dirty persisted history is revived (output present,
+/// dep in-flight), PG carries no per-attempt failure history on ANY
+/// route through the merge. Honest scope note: in this flow the
+/// resubmit-reset path (`Failed` is unconditionally
+/// `is_retriable_on_resubmit`) cleanses X before the deferred-re-probe
+/// stanza can, so this test does NOT discriminate the stanza's own gate
+/// — that per-site population is pinned by
+/// `revival_resettable_population_is_exact` plus the stanza calling the
+/// shared predicate (the only gate form left in the code). What this
+/// test pins is the end-to-end invariant the +2 rule states: no
+/// Failed-origin revival flow leaves resurrectable history in PG.
+#[tokio::test]
+async fn test_deferred_reprobe_failed_origin_clears_pg_history() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let mut rx = connect_executor(&handle, "df-w", "x86_64-linux").await?;
+
+    let x_out = test_store_path("df-x-out");
+    let y_out = test_store_path("df-y-out");
+    let mut x = make_node("df-x");
+    x.expected_output_paths = vec![x_out.clone()];
+    let mut y = make_node("df-y");
+    y.expected_output_paths = vec![y_out.clone()];
+
+    // Build 1: X→Y. Y dispatches (leaf). Hold Y running.
+    let b1 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b1,
+        vec![x.clone(), y.clone()],
+        vec![make_test_edge("df-x", "df-y")],
+        false,
+    )
+    .await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert!(assn.drv_path.ends_with("df-y.drv"));
+
+    // Force X to Failed in memory and seed dirty failure history in PG
+    // (what a transient-failure cycle would have persisted).
+    assert!(
+        handle
+            .debug_force_status("df-x", DerivationStatus::Failed)
+            .await?
+    );
+    sqlx::query(
+        "UPDATE derivations SET status = 'failed', retry_count = 2, \
+         failed_builders = ARRAY['df-w'] WHERE drv_hash = $1",
+    )
+    .bind(&x.drv_hash)
+    .execute(&_db.pool)
+    .await?;
+
+    // X's output now locally present; build 2 re-merges → Failed X is in
+    // cached_hits with dep Y in-flight → deferred re-probe stanza.
+    store.seed_with_content(&x_out, b"x");
+    let b2 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b2,
+        vec![x.clone(), y],
+        vec![make_test_edge("df-x", "df-y")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let xs = expect_drv(&handle, "df-x").await;
+    assert_eq!(
+        xs.status,
+        DerivationStatus::Queued,
+        "Failed-origin deferred re-probe resets to Queued"
+    );
+    assert_eq!(xs.retry.count, 0, "in-memory history cleared");
+
+    let (status, retry, builders): (String, i32, Vec<String>) = sqlx::query_as(
+        "SELECT status, retry_count, failed_builders FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(&x.drv_hash)
+    .fetch_one(&_db.pool)
+    .await?;
+    assert_eq!(
+        status, "queued",
+        "the revival flow's own status persist ran (resubmit or stanza route)"
+    );
+    assert_eq!(
+        retry, 0,
+        "PG retry_count cleared for the FAILED origin (the merged_bug_073 gap)"
+    );
+    assert!(
+        builders.is_empty(),
+        "PG failed_builders cleared for the FAILED origin"
     );
     Ok(())
 }

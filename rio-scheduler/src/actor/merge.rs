@@ -2377,12 +2377,9 @@ impl DagActor {
                     state.never_forgive_paths.clear();
                     // I-099/I-094: re-probe hit on a previously-failed node
                     // — failure history is moot now we have the output.
-                    if matches!(
-                        from,
-                        DerivationStatus::Poisoned
-                            | DerivationStatus::DependencyFailed
-                            | DerivationStatus::Failed
-                    ) {
+                    // Shared revival population (round-17 merged_bug_073);
+                    // the PG tier resets below with the SAME gate.
+                    if from.is_revival_resettable() {
                         state.retry.clear();
                     }
                     from
@@ -2392,17 +2389,23 @@ impl DagActor {
                 metrics::counter!("rio_scheduler_cache_hits_total", "source" => source)
                     .increment(1);
 
-                // I-094: PG-side poison clear (status='created', NULLs
-                // poisoned_at/retry_count/failed_builders) so recovery
-                // doesn't resurrect the poison. Best-effort like the
-                // status update below.
-                if matches!(
-                    from_status,
-                    DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
-                ) && let Err(e) = self.db.clear_poison(drv_hash).await
+                // I-094: PG-side revival reset (NULLs poisoned_at and
+                // zeroes retry_count/failed_builders/resubmit_cycles)
+                // so recovery doesn't resurrect the moot history —
+                // SAME population as the in-memory clear (round-17
+                // merged_bug_073: the old {Poisoned, DependencyFailed}
+                // clear_poison gate skipped Failed-origin hits, so a
+                // failover restored their full failure history). The
+                // Completed status batch below owns the status write;
+                // a failover between the two recovers the origin
+                // status with clean history and the re-probe lane
+                // converges it again. Best-effort like the status
+                // update below.
+                if from_status.is_revival_resettable()
+                    && let Err(e) = self.db.clear_revival_history(drv_hash).await
                 {
                     warn!(drv_hash = %drv_hash, error = %e,
-                      "failed to clear poison in PG after re-probe cache hit");
+                      "failed to clear revival history in PG after re-probe cache hit");
                 }
                 completed_batch.push(drv_hash.clone());
 
@@ -2467,12 +2470,10 @@ impl DagActor {
                 continue;
             };
             let from = state.status();
-            if !matches!(
-                from,
-                DerivationStatus::Poisoned
-                    | DerivationStatus::Failed
-                    | DerivationStatus::DependencyFailed
-            ) {
+            // Shared revival population (round-17 merged_bug_073) —
+            // the same predicate gates the in-memory clear AND the PG
+            // history reset below.
+            if !from.is_revival_resettable() {
                 continue;
             }
             if let Err(e) = state.transition(DerivationStatus::Queued) {
@@ -2484,13 +2485,14 @@ impl DagActor {
             info!(drv_hash = %h, ?from,
                   "deferred re-probe: pre-existing failed node's output present \
                    but inputDrv in-flight; reset to Queued (failure history moot)");
-            if matches!(
-                from,
-                DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
-            ) && let Err(e) = self.db.clear_poison(h).await
-            {
+            // PG tier, same gate (the old {Poisoned, DependencyFailed}
+            // clear_poison left a Failed-origin node's persisted
+            // history to resurrect at failover). The Queued persist
+            // below owns the status write — clear_poison's
+            // status='created' flip was redundant with it.
+            if let Err(e) = self.db.clear_revival_history(h).await {
                 warn!(drv_hash = %h, error = %e,
-                      "failed to clear poison in PG after deferred re-probe reset");
+                      "failed to clear revival history in PG after deferred re-probe reset");
             }
             if let Err(e) = self
                 .db

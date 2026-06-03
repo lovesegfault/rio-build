@@ -974,10 +974,19 @@ impl DagActor {
             // DependencyFailed) and may get one more dispatch attempt
             // — acceptable, since substitutability is evidence the
             // world changed (Hydra/another tenant built it).
-            if matches!(
-                from,
-                DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
-            ) {
+            //
+            // Round-17 merged_bug_073: the gate is the shared revival
+            // population (`is_revival_resettable`), not a per-site
+            // subset — WIDENED from {Poisoned, DependencyFailed} to
+            // include Failed, whose →Substituting arm the FSM has
+            // always allowed; the old gate silently kept a
+            // Failed-origin substitution's stale history. Observable
+            // delta is confined to post-substitution-failure retry
+            // budgets (one more dispatch attempt possible — the same
+            // acceptability argument above). The PG tier resets below,
+            // outside the node borrow.
+            let revive = from.is_revival_resettable();
+            if revive {
                 state.retry.clear();
             }
             // r[impl sched.merge.wanted-outputs+2]
@@ -1033,16 +1042,20 @@ impl DagActor {
             };
             let drv_path = state.drv_path().to_string();
             let interested = state.interested_builds.clone();
-            // Best-effort PG clear so recovery doesn't resurrect the
-            // poison. After last use of `state` so the &mut self.dag
-            // borrow ends before &self.db.
-            if matches!(
-                from,
-                DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
-            ) && let Err(e) = self.db.clear_poison(&drv_hash).await
-            {
+            // Best-effort PG tier of the revival reset (the SAME
+            // population as the in-memory clear above — round-17
+            // merged_bug_073) so recovery doesn't resurrect the moot
+            // history. After last use of `state` so the &mut self.dag
+            // borrow ends before &self.db. `clear_revival_history`
+            // leaves `status` alone: PG keeps the origin status until
+            // SubstituteComplete persists the outcome, and a failover
+            // in the window recovers the origin with CLEAN history —
+            // the I-094 re-probe lane re-discovers substitutability.
+            // (The old `clear_poison` call's status='created' flip
+            // bought nothing: both flows converge on re-probe.)
+            if revive && let Err(e) = self.db.clear_revival_history(&drv_hash).await {
                 warn!(%drv_hash, error = %e,
-                      "failed to clear poison in PG after re-probe substitutable hit");
+                      "failed to clear revival history in PG after re-probe substitutable hit");
             }
             let output_paths = paths.clone();
             let store = store.clone();
