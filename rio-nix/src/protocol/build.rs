@@ -622,6 +622,22 @@ mod tests {
     /// must be the message's first byte, not merely a substring.
     #[test]
     fn lost_terminal_unverified_claims_neither_execution_nor_presence() {
+        // The prefix LITERAL is pinned, not just its position: rows
+        // carrying it are persisted (results/batches JSONL in resumable
+        // campaign state) and produced by whatever gateway binary was
+        // deployed when the row was written, so the detector must keep
+        // matching yesterday's spelling. Rewording the constant would
+        // compile, pass every shape check, and silently reclassify
+        // already-recorded evidence-loss rows as genuine failures on
+        // resume. If the wording ever must change, the consumer needs to
+        // accept BOTH spellings (old rows never get rewritten) — change
+        // this assertion only together with that compatibility arm.
+        assert_eq!(
+            BuildResult::LOST_TERMINAL_UNVERIFIED_PREFIX,
+            "per-root terminal lost under a completed DAG",
+            "persisted classification-bearing prefix changed; old recorded rows \
+             would silently stop classifying as evidence loss"
+        );
         let lost = BuildResult::lost_terminal_unverified();
         assert_eq!(lost.status, BuildStatus::TransientFailure);
         assert!(
