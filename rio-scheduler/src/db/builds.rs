@@ -323,6 +323,19 @@ impl SchedulerDb {
     /// edges — `sched.persist.atomic-activation`: "the build was accepted"
     /// and "its rows are durable" are one commit point. Plain runtime
     /// queries (no `query!`) so `.sqlx/` is unaffected.
+    ///
+    /// The terminal arm's `error_summary` write is the FOURTH writer
+    /// tier of the M_072 failure-evidence pair (round-17 bug_043): it
+    /// COALESCEs exactly like [`Self::persist_build_error_summary_tx`],
+    /// so a terminal transition can never displace or blank the sticky
+    /// at-source pair — a Cancel after a derivation failure keeps the
+    /// failure evidence, and a timeout's reconstructed reason loses to
+    /// an earlier at-source summary on every ordering. It deliberately
+    /// writes only the summary half: a status transition carries no
+    /// derivation hash, and a NULL second half is the documented
+    /// backstop shape (never an empty-string tombstone). The
+    /// `paired-writer-seal` check denies any plain-bind write of either
+    /// pair column outside this file's two COALESCE statements.
     // r[impl sched.persist.atomic-activation+2]
     pub(crate) async fn update_build_status_tx(
         conn: &mut sqlx::PgConnection,
@@ -350,7 +363,8 @@ impl SchedulerDb {
                 .await?;
         } else {
             sqlx::query(
-                "UPDATE builds SET status = $2, finished_at = now(), error_summary = $3 WHERE build_id = $1",
+                "UPDATE builds SET status = $2, finished_at = now(), \
+                 error_summary = COALESCE(error_summary, $3) WHERE build_id = $1",
             )
             .bind(build_id)
             .bind(status.as_str())

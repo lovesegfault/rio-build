@@ -509,10 +509,18 @@ impl DagActor {
             warn!(build_id = %build_id, timeout_secs = timeout, "per-build timeout exceeded; cancelling derivations and failing build");
             metrics::counter!("rio_scheduler_build_timeouts_total").increment(1);
 
-            // Set error_summary FIRST so transition_build_to_failed picks it
-            // up for the BuildFailed event + DB error_summary column.
+            // Seed error_summary FIRST so transition_build_to_failed picks
+            // it up for the BuildFailed event + DB error_summary column —
+            // through the chokepoint form (round-17 bug_043): first-failure
+            // wins, so a timeout on a build that already recorded a
+            // derivation failure keeps the at-source evidence and the
+            // timeout reason only fills a previously-evidence-free build.
+            // The DB tier converges identically via COALESCE in both
+            // `persist_build_error_summary_tx` and the terminal arm of
+            // `update_build_status_tx`. (`paired-writer-seal` denies the
+            // plain `= Some(..)` assignment form outside the chokepoint.)
             if let Some(build) = self.builds.get_mut(&build_id) {
-                build.error_summary = Some(reason.clone());
+                build.error_summary.get_or_insert_with(|| reason.clone());
             }
             // Reuse the CancelBuild derivation-cancellation path (sends
             // CancelSignal, transitions drvs to Cancelled, removes build

@@ -1042,12 +1042,13 @@ impl DagActor {
             // below before the new leader serves traffic.
             if let Some(b) = self.builds.get_mut(&build_id)
                 && b.failed_count > 0
-                && b.error_summary.is_none()
             {
-                b.error_summary = Some(format!(
-                    "recovered with {} failed derivation(s)",
-                    b.failed_count
-                ));
+                // Chokepoint form (round-17 bug_043): first-failure wins —
+                // a row-hydrated at-source summary is never displaced by
+                // the failed_count reconstruction.
+                let n = b.failed_count;
+                b.error_summary
+                    .get_or_insert_with(|| format!("recovered with {n} failed derivation(s)"));
             }
             self.check_build_completion(build_id).await;
         }

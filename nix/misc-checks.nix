@@ -2107,6 +2107,86 @@ in
           "principal_cap_kill body SCOPED (log-cap arms; both cap arms route through it)"
         wrap rio-builder/src/runtime/slot.rs 1 \
           "scheduler cancel TEARDOWN (no verdict; CancelSignal semantics)"
+
+        [ "$fail" = 0 ] || exit 1
+        touch $out
+      '';
+
+
+  # Round-17 bug_043 (RC17-08 mechanism): the M_072 failure-evidence
+  # pair (builds.error_summary, builds.failed_derivation) is sealed
+  # per COLUMN, not per helper — round-16's R2 sweep keyed to the
+  # helper name (persist_build_error_summary) and missed the plain
+  # bind in update_build_status_tx's terminal arm 75 lines below it.
+  # Three deny patterns over non-test scheduler sources:
+  #   P1 — raw SQL bind `<col> = $N`: ZERO sites. Both legal SQL
+  #        assignments COALESCE, and live in db/builds.rs (pinned 3:
+  #        two halves of the pair statement + the terminal-arm
+  #        backstop).
+  #   P2 — in-memory `.{col} = Some(..)`: ZERO sites. The chokepoint
+  #        form is get_or_insert_with — first-failure wins on every
+  #        ordering (at-source, dispatch echo, timeout, recovery
+  #        reconstruction).
+  #   P3 — any other direct field assignment: carve-out for the two
+  #        recovery HYDRATION sites only (restoring the row's own
+  #        value is not a new observation).
+  paired-writer-seal =
+    pkgs.runCommand "rio-paired-writer-seal"
+      {
+        nativeBuildInputs = [ pkgs.ripgrep ];
+        src = pkgs.lib.fileset.toSource {
+          root = ../rio-scheduler/src;
+          fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src;
+        };
+      }
+      ''
+        cd $src
+        fail=0
+        nontest() { grep -v '/tests/' || true; }
+
+        # P1: raw SQL plain bind of a pair column.
+        hits=$(rg -n '(error_summary|failed_derivation) = \$' --type rust . | nontest || true)
+        if [ -n "$hits" ]; then
+          echo "FAIL: plain SQL bind of a failure-evidence pair column (must COALESCE through db/builds.rs):" >&2
+          echo "$hits" >&2
+          echo "  remediation: route through persist_build_error_summary_tx, or COALESCE like the terminal arm." >&2
+          fail=1
+        fi
+
+        # P1b: COALESCE assignments allowed only in db/builds.rs, pinned at 3.
+        co=$(rg -c '(error_summary|failed_derivation) = COALESCE' db/builds.rs || true); co=''${co:-0}
+        if [ "$co" != "3" ]; then
+          echo "FAIL: db/builds.rs has $co COALESCE pair-column assignments, pinned 3 (pair statement x2 + terminal arm)." >&2
+          echo "  A new writer tier must update this pin WITH its first-write-wins reasoning." >&2
+          fail=1
+        fi
+        outside=$(rg -ln '(error_summary|failed_derivation) = COALESCE' --type rust . | sed 's|^\./||' | nontest | grep -v '^db/builds.rs$' || true)
+        if [ -n "$outside" ]; then
+          echo "FAIL: COALESCE pair-column SQL outside db/builds.rs (the pair's sole SQL owner):" >&2
+          echo "$outside" >&2
+          fail=1
+        fi
+
+        # P2: in-memory plain Some-assignment.
+        hits=$(rg -n '\.(error_summary|failed_derivation) = Some\(' --type rust . | nontest || true)
+        if [ -n "$hits" ]; then
+          echo "FAIL: plain Some-assignment to a failure-evidence field (chokepoint form is get_or_insert_with):" >&2
+          echo "$hits" >&2
+          fail=1
+        fi
+
+        # P3: any remaining direct assignment — hydration carve-out only.
+        hits=$(rg -n '\.(error_summary|failed_derivation) = ' --type rust . | sed 's|^\./||' | nontest | grep -v 'get_or_insert' || true)
+        n=$(printf '%s' "$hits" | grep -c . || true); n=''${n:-0}
+        nrec=$(printf '%s' "$hits" | grep -c '^actor/recovery.rs:' || true); nrec=''${nrec:-0}
+        if [ "$n" != "2" ] || [ "$nrec" != "2" ]; then
+          echo "FAIL: direct pair-field assignments outside the 2 pinned recovery hydration sites:" >&2
+          echo "$hits" >&2
+          echo "  hydration restores the row's own value; any NEW observation goes through" >&2
+          echo "  record_failure_evidence / get_or_insert_with (first-failure wins)." >&2
+          fail=1
+        fi
+
         [ "$fail" = 0 ] || exit 1
         touch $out
       '';

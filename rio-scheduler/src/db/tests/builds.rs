@@ -198,3 +198,95 @@ async fn test_persist_build_error_summary_tx_first_failure_wins() -> anyhow::Res
     assert_eq!(f.as_deref(), Some("drv-a"));
     Ok(())
 }
+
+/// Round-17 bug_043: the terminal arm of `update_build_status_tx` is the
+/// FOURTH writer tier of the M_072 pair and must converge with the
+/// chokepoint on every ordering — a terminal transition (Failed after a
+/// recorded failure, Cancelled mid-failure, or a timeout's reconstructed
+/// reason) can neither displace nor blank the sticky at-source pair, and
+/// a terminal write on an evidence-free build still lands its summary
+/// (the backstop role the plain bind used to serve).
+#[tokio::test]
+async fn test_terminal_status_write_never_displaces_failure_evidence() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let read = |build_id: Uuid| {
+        let pool = test_db.pool.clone();
+        async move {
+            let (s, f): (Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT error_summary, failed_derivation FROM builds WHERE build_id = $1",
+            )
+            .bind(build_id)
+            .fetch_one(&pool)
+            .await?;
+            anyhow::Ok((s, f))
+        }
+    };
+
+    // Case 1: at-source pair persisted, then a timeout-shaped terminal
+    // Failed write with a LATER summary — pair untouched.
+    let b1 = Uuid::new_v4();
+    db.insert_build(
+        b1,
+        None,
+        crate::state::PriorityClass::Scheduled,
+        true,
+        &Default::default(),
+        None,
+    )
+    .await?;
+    db.persist_build_error_summary(b1, "derivation a failed", Some("drv-a"))
+        .await?;
+    db.update_build_status(b1, BuildState::Failed, Some("build_timeout 60s exceeded"))
+        .await?;
+    assert_eq!(
+        read(b1).await?,
+        (Some("derivation a failed".into()), Some("drv-a".into())),
+        "terminal Failed write must not displace the at-source pair"
+    );
+
+    // Case 2: at-source pair persisted, then Cancelled with NO summary —
+    // the old plain bind blanked the evidence here; COALESCE keeps it.
+    let b2 = Uuid::new_v4();
+    db.insert_build(
+        b2,
+        None,
+        crate::state::PriorityClass::Scheduled,
+        true,
+        &Default::default(),
+        None,
+    )
+    .await?;
+    db.persist_build_error_summary(b2, "derivation b failed", Some("drv-b"))
+        .await?;
+    db.update_build_status(b2, BuildState::Cancelled, None)
+        .await?;
+    assert_eq!(
+        read(b2).await?,
+        (Some("derivation b failed".into()), Some("drv-b".into())),
+        "cancel-after-failure must not blank the evidence pair"
+    );
+
+    // Case 3: evidence-free build, terminal Failed with a summary — the
+    // backstop role still lands it (pair half stays NULL, never "").
+    let b3 = Uuid::new_v4();
+    db.insert_build(
+        b3,
+        None,
+        crate::state::PriorityClass::Scheduled,
+        true,
+        &Default::default(),
+        None,
+    )
+    .await?;
+    db.update_build_status(b3, BuildState::Failed, Some("build_timeout 60s exceeded"))
+        .await?;
+    assert_eq!(
+        read(b3).await?,
+        (Some("build_timeout 60s exceeded".into()), None),
+        "terminal write on an evidence-free build still provides the summary backstop"
+    );
+
+    Ok(())
+}
