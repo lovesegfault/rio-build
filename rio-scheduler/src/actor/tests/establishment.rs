@@ -53,7 +53,7 @@ async fn assignment_statuses(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<String>
     .expect("assignment statuses")
 }
 
-// r[verify sched.attempt.establishment-window+3]
+// r[verify sched.attempt.establishment-window+4]
 /// (a) An open pull-mode attempt past deadline + slack with no terminal
 /// row is established exactly once as executor_crash/unreported,
 /// charged to failure_count, and the drv requeues.
@@ -106,7 +106,7 @@ async fn establishment_charges_and_requeues_after_window() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+3]
+// r[verify sched.attempt.establishment-window+4]
 /// (b) The same attempt with its outputs present in the store is
 /// adopted as completed (store-probe arm) and never charged.
 #[tokio::test]
@@ -149,7 +149,7 @@ async fn establishment_store_probe_adopts_completed_attempt() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+3]
+// r[verify sched.attempt.establishment-window+4]
 /// (c) An attempt inside the window is never established.
 #[tokio::test]
 async fn establishment_never_fires_inside_window() -> TestResult {
@@ -174,7 +174,7 @@ async fn establishment_never_fires_inside_window() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+3]
+// r[verify sched.attempt.establishment-window+4]
 /// (d) The establishment transaction at a below-floor serving
 /// generation writes nothing (the fence applies to establishment too).
 #[tokio::test]
@@ -211,7 +211,7 @@ async fn establishment_below_floor_writes_nothing() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+3]
+// r[verify sched.attempt.establishment-window+4]
 /// (g) The window is anchored to the deadline the attempt was
 /// dispatched with: a sweep-time re-solve that is smaller than the
 /// persisted deadline must NOT shrink the window (no establishment
@@ -319,5 +319,74 @@ async fn establishment_skips_synthesized_closed_attempt() -> TestResult {
         info.retry.failure_count, 0,
         "still uncharged after the sweep"
     );
+    Ok(())
+}
+
+// r[verify sched.attempt.cancel-close-driven]
+/// Cancelled work is NEVER charged, even when the cancel's terminal
+/// persist fails: the failed batch latches in the status outbox
+/// (assignment stays open meanwhile), the next tick's flush re-drives
+/// it to durability, and the end state is the assignment closed
+/// `cancelled` with ZERO attempt-ledger rows —
+/// `pull_establishments_total` never moves for this drv.
+///
+/// Pre-fix red: the failed persist was dropped (best-effort error
+/// log), the open attempt aged past the window, and the establishment
+/// sweep charged it `executor_crash` — an exclusion-ledger and
+/// OA2-clustering verdict about work nobody wanted.
+#[tokio::test]
+async fn cancelled_attempt_is_never_charged_and_close_is_redriven() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "est-cancel", PriorityClass::Scheduled).await?;
+    let assignment = pull_deliver(&handle, "est-cancel").await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    backdate_assignment(&db.pool, exec_id).await?;
+
+    // Deterministic persist failure: hide the derivations table so the
+    // cancel's terminal status batch (and everything else touching it)
+    // fails. The cancel still transitions in-memory.
+    sqlx::query("ALTER TABLE derivations RENAME TO derivations_hidden")
+        .execute(&db.pool)
+        .await?;
+    cancel_build(&handle, build_id).await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM assignments WHERE exec_id = $1")
+            .bind(exec_id)
+            .fetch_one(&db.pool)
+            .await?,
+        "pending",
+        "the failed persist leaves the assignment open (latched, not lost)"
+    );
+
+    // One tick while PG is still broken: nothing can flush, nothing
+    // may charge.
+    tick(&handle).await?;
+
+    // Heal PG: the next tick's flush re-drives the latched batch.
+    sqlx::query("ALTER TABLE derivations_hidden RENAME TO derivations")
+        .execute(&db.pool)
+        .await?;
+    tick(&handle).await?;
+
+    assert_eq!(
+        attempt_rows_for(&db.pool, "est-cancel").await.len(),
+        0,
+        "cancelled work must never be charged (no executor_crash establishment)"
+    );
+    assert_eq!(
+        assignment_statuses(&db.pool, "est-cancel").await,
+        vec!["cancelled"],
+        "the re-driven persist closes the assignment as cancelled"
+    );
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = 'est-cancel'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(status, "cancelled", "the derivation status persisted");
+
+    // Subsequent sweeps stay silent.
+    tick(&handle).await?;
+    assert_eq!(attempt_rows_for(&db.pool, "est-cancel").await.len(), 0);
     Ok(())
 }

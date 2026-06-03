@@ -54,10 +54,14 @@ impl DagActor {
     /// derivation-cancellation path but end in Failed.
     ///
     /// The pod side of a pull-mode cancel is the controller's job: it
-    /// observes the closed attempt (the cancel verdict closes it at the
-    /// fold) and deletes the owning Job, whose SIGTERM aborts the build
-    /// inside the AD5 grace — there is no scheduler→executor signal
-    /// path. `signal_reason` is recorded for diagnostics only.
+    /// observes the closed attempt and deletes the owning Job, whose
+    /// SIGTERM aborts the build inside the AD5 grace — there is no
+    /// scheduler→executor signal path. What closes the attempt is the
+    /// terminal status persist below (`persist_status_batch`: the same
+    /// statement closes the assignment rows), re-driven by the status
+    /// outbox until durable if the first persist fails
+    /// (`sched.attempt.cancel-close-driven`). `signal_reason` is
+    /// recorded for diagnostics only.
     ///
     /// [`handle_cancel_build`]: Self::handle_cancel_build
     pub(super) async fn cancel_build_derivations(&mut self, build_id: Uuid, signal_reason: &str) {
@@ -99,10 +103,11 @@ impl DagActor {
         }
 
         // Transition Cancelled + stamp the cancelled execution. The pod
-        // is stopped by the controller deleting its Job (the cancel
-        // verdict closes the open attempt at the fold; the deletion's
-        // SIGTERM cgroup-kills the build inside the AD5 grace) — the
-        // scheduler has no executor channel to signal.
+        // is stopped by the controller deleting its Job (the terminal
+        // status persist below closes the open attempt — assignment
+        // rows close in the same statement, outbox-backed on failure;
+        // the deletion's SIGTERM cgroup-kills the build inside the AD5
+        // grace) — the scheduler has no executor channel to signal.
         //
         // PG writes are batched AFTER the loop (persist_status_batch
         // + unpin_best_effort_batch). The per-item variant caused an

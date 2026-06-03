@@ -212,6 +212,15 @@ pub(crate) struct AuthBinding {
 }
 
 /// The DAG actor state.
+/// One failed terminal-status persist, owned for the outbox.
+/// See `DagActor::status_outbox`.
+#[derive(Debug)]
+pub(super) struct StatusBatch {
+    pub(super) drv_hashes: Vec<String>,
+    pub(super) status: crate::state::DerivationStatus,
+    pub(super) enqueued_at: std::time::Instant,
+}
+
 pub struct DagActor {
     /// The global derivation DAG.
     dag: DerivationDag,
@@ -278,6 +287,16 @@ pub struct DagActor {
     /// (`materialization_jobs` + the partial-unique dedup index);
     /// recovery rebuild is Phase B.
     materialization_jobs: materialize::JobView,
+    // r[impl sched.attempt.cancel-close-driven]
+    /// Terminal-status batches whose persist FAILED, latched for the
+    /// housekeeping tick to re-drive until a persist succeeds ("latch
+    /// on Ok only"). The persist is what closes the batch's assignment
+    /// rows — losing it left cancelled derivations' attempts open
+    /// forever, to be mis-charged as executor crashes by the
+    /// establishment sweep (bug_347). Leader-scoped: cleared on
+    /// leadership loss (the new leader's recovery + the charge-free
+    /// establishment arm own the rows).
+    status_outbox: std::collections::VecDeque<StatusBatch>,
     /// Database handle.
     db: SchedulerDb,
     /// Store service client for scheduler-side cache checks. `None` in tests
@@ -724,6 +743,7 @@ impl DagActor {
             establishment_report_slack: cfg.establishment_report_slack,
             materialization_cfg: cfg.materialization,
             materialization_jobs: materialize::JobView::default(),
+            status_outbox: std::collections::VecDeque::new(),
             db,
             store_client: plumbing.store_client,
             grpc_timeout: cfg.grpc_timeout,
@@ -843,6 +863,7 @@ impl DagActor {
             authoritative_binding,
             dag_authoritative,
             materialization_jobs,
+            status_outbox,
             // Retained: rationale below.
             retry_policy: _,
             establishment_report_slack: _,
@@ -929,6 +950,13 @@ impl DagActor {
         // re-populates it from its own creation paths. Stale entries
         // would project job state for a DAG this wipe just discarded.
         materialization_jobs.wipe();
+        // r[impl sched.attempt.cancel-close-driven]
+        // The outbox is leader-scoped: a deposed leader must not
+        // re-drive status writes (they would be fenced anyway); the
+        // rows now belong to the successor's recovery + the
+        // charge-free establishment arm.
+        status_outbox.clear();
+        metrics::gauge!("rio_scheduler_status_outbox_depth").set(0.0);
         // The DAG this fn just emptied no longer reflects PG; only the
         // next successful recovery (handle_leader_acquired's Ok arm)
         // re-asserts authoritativeness. Clearing HERE covers all four

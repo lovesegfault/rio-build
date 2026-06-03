@@ -3074,7 +3074,7 @@ in
     # classification dedup.
     # r[verify sched.executor.one-shot+2]
     # r[verify sched.executor.pull-not-ready+2]
-    # r[verify sched.attempt.establishment-window+3]
+    # r[verify sched.attempt.establishment-window+4]
     quint-executor-session-base = mkQuintCheck {
       name = "executor-session-base";
       spec = "executorSession";

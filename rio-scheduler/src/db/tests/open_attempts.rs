@@ -172,7 +172,7 @@ async fn open_attempt_view_respects_terminal_fill_alone() -> anyhow::Result<()> 
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+3]
+// r[verify sched.attempt.establishment-window+4]
 /// The dispatched deadline persisted by the fenced mint round-trips
 /// through the open-attempt view (the establishment window's anchor).
 #[tokio::test]

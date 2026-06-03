@@ -130,6 +130,13 @@ pub fn describe_metrics() {
     );
     describe_gauge!("rio_scheduler_builds_active", "Currently active builds");
     describe_gauge!(
+        "rio_scheduler_status_outbox_depth",
+        "Failed terminal-status persist batches awaiting the housekeeping tick's \
+         re-drive. Nonzero means PG persists are failing; a sustained nonzero \
+         depth means cancelled derivations' attempts stay open (their close \
+         rides the persist) until the flush succeeds."
+    );
+    describe_gauge!(
         "rio_scheduler_derivations_queued",
         "Ready derivations waiting for a worker (DAG-status count; the per-system \
          split is queued_by_system on ClusterStatus/GetSpawnIntents)"

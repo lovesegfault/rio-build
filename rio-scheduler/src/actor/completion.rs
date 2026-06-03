@@ -453,19 +453,39 @@ impl DagActor {
     ///
     /// [`persist_status`]: Self::persist_status
     // r[impl sched.evidence.durability+4]
-    pub(super) async fn persist_status_batch(&self, drv_hashes: &[&str], status: DerivationStatus) {
+    pub(super) async fn persist_status_batch(
+        &mut self,
+        drv_hashes: &[&str],
+        status: DerivationStatus,
+    ) {
         match self
             .db
             .update_derivation_status_batch(drv_hashes, status, self.serving_generation())
             .await
         {
             Ok(crate::db::FencedOutcome::Fenced) => {
+                // Deposed: the successor owns these rows. NOT outboxed —
+                // re-driving a fenced write only re-fences.
                 self.note_fenced_evidence_write("derivation status batch persist");
             }
             Ok(_) => {}
             Err(e) => {
                 error!(count = drv_hashes.len(), ?status, error = %e,
-                       "failed to batch-persist derivation status");
+                       "failed to batch-persist derivation status; latched in the outbox");
+                // r[impl sched.attempt.cancel-close-driven]
+                // The persist is what closes the batch's assignment
+                // rows: latch the owned batch for the housekeeping
+                // tick's flusher, dropped only on a later Ok. This is
+                // idempotent to re-drive — the UPDATE is absolute and
+                // the assignment close is guarded by
+                // status IN ('pending','acknowledged').
+                self.status_outbox.push_back(super::StatusBatch {
+                    drv_hashes: drv_hashes.iter().map(|s| s.to_string()).collect(),
+                    status,
+                    enqueued_at: std::time::Instant::now(),
+                });
+                metrics::gauge!("rio_scheduler_status_outbox_depth")
+                    .set(self.status_outbox.len() as f64);
             }
         }
     }

@@ -2768,7 +2768,7 @@ closure. Pod-initiated aborts of still-wanted work are platform terminations
 them as infrastructure failures would burn the infra budget on disruptions
 the design accepts as charge-free.
 
-#r("sched.attempt.establishment-window+3")[
+#r("sched.attempt.establishment-window+4")[
   The establishment sweep MUST visit every open attempt (active assignment ⋈
   execution, no terminal classification) on every sweep, and MUST establish
   an attempt only after its deadline plus the configured
@@ -2776,12 +2776,15 @@ the design accepts as charge-free.
   deadline is anchored to the value the attempt was dispatched with (the
   solved deadline persisted by the pull mint): a sweep-time re-solve may
   widen the window but MUST never shrink it below the dispatched deadline
-  while the attempt is open. The store-probe arm adopts the attempt as
-  completed when its outputs are present, otherwise the establishment
-  appends exactly one executor-crash/unreported classification (charged per
-  the existing C2 discipline) and requeues the derivation. Establishment
-  MUST never fire inside the window, and the establishing transaction MUST
-  apply the same generation-floor fence as the pull transaction.
+  while the attempt is open. Every expired attempt MUST be dispositioned
+  through the single total establishment kernel
+  (`establish_expired_attempt`): the store-probe arm adopts the attempt as
+  completed when its outputs are verifiably present; a live-wanted build
+  attempt otherwise establishes exactly one executor-crash/unreported
+  classification (charged per the existing C2 discipline) and requeues the
+  derivation. Establishment MUST never fire inside the window, and the
+  establishing transaction MUST apply the same generation-floor fence as
+  the pull transaction.
 ]
 The sweep reads durable rows --- not an in-memory claim a one-shot timer can
 forget --- so the post-failover "deferred claim forgotten" defect class is
@@ -2790,7 +2793,29 @@ closed structurally. Anchoring the window to the dispatched deadline (072's
 mid-flight from establishing a healthy attempt that is still inside the
 deadline its pod really runs under; the residual gap between the Job's
 `activeDeadlineSeconds` render and the mint-time solve is covered by the
-report slack.
+report slack. The kernel routing makes the decision axes explicit; the
+cancelled/absent-node row is normative below.
+
+#r("sched.attempt.cancel-close-driven")[
+  A cancel-driven attempt close MUST be driven to durability: when the
+  terminal status persist that closes the attempt's assignment row fails,
+  the scheduler MUST retain the batch in a leader-scoped outbox and retry
+  it on the housekeeping tick until a persist succeeds (dropping the entry
+  on success only); the outbox MUST be cleared on leadership loss. And the
+  establishment sweep MUST close an expired attempt whose node is
+  cancelled or absent from the DAG charge-free: the assignment row closes,
+  no attempt row is appended, no exclusion is seeded, and no establishment
+  metric increments.
+]
+The two halves are one liveness property (the `openAttempts.qnt` model's
+`openAttemptHasDriver`): an open attempt for cancelled work always has a
+driver --- the outbox retry while this leader lives, the charge-free sweep
+arm after failover (the new leader's recovery rebuilds no interest for the
+cancelled node, so the sweep sees `Absent`). Without the outbox, one failed
+persist left the assignment open forever on the happy path; without the
+charge-free arm, the sweep then established it as `executor_crash` ---
+seeding the exclusion ledger and the OA2 wedge clustering with verdicts
+about work nobody wanted.
 
 #r("sched.admin.list-open-attempts+2")[
   `AdminService.ListOpenAttempts` MUST return every open attempt --- an

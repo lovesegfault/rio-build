@@ -129,6 +129,7 @@ impl DagActor {
         self.tick_gc_attempt_ledger().await;
         self.tick_sweep_dispatched_cells();
         self.tick_publish_gauges();
+        self.tick_flush_status_outbox().await;
         self.tick_sweep_open_pull_attempts().await;
         // Materialization sweeps: cancel jobs whose derivation has no
         // live interest left, closing open attempts charge-free; then
@@ -574,7 +575,58 @@ impl DagActor {
     /// it counts). Leader-only via the `handle_tick` early-return; the
     /// establishing transaction additionally carries the same
     /// generation-floor fence as the pull transaction.
-    // r[impl sched.attempt.establishment-window+3]
+    // r[impl sched.attempt.establishment-window+4]
+    // r[impl sched.attempt.cancel-close-driven]
+    /// Re-drive failed terminal-status persists: FIFO, ONE batch per
+    /// tick attempt (a dead PG fails fast once per tick instead of
+    /// stalling the actor on N retries), entry dropped on Ok ONLY.
+    /// Leader-gated by `handle_tick`; the outbox itself is cleared on
+    /// leadership loss in `clear_persisted_state`.
+    async fn tick_flush_status_outbox(&mut self) {
+        let Some(front) = self.status_outbox.front() else {
+            return;
+        };
+        let age = front.enqueued_at.elapsed();
+        if age > std::time::Duration::from_secs(300) {
+            warn!(
+                depth = self.status_outbox.len(),
+                age_secs = age.as_secs(),
+                "status outbox head is old; PG persists keep failing                  (cancelled derivations' attempts stay open until this drains)"
+            );
+        }
+        let batch = self
+            .status_outbox
+            .pop_front()
+            .expect("front() was Some above");
+        let refs: Vec<&str> = batch.drv_hashes.iter().map(String::as_str).collect();
+        match self
+            .db
+            .update_derivation_status_batch(&refs, batch.status, self.serving_generation())
+            .await
+        {
+            Ok(crate::db::FencedOutcome::Fenced) => {
+                // Deposed mid-tick: keep the entry for visibility;
+                // LeaderLost clears the whole outbox momentarily.
+                self.note_fenced_evidence_write("status outbox flush");
+                self.status_outbox.push_front(batch);
+            }
+            Ok(_) => {
+                info!(
+                    count = batch.drv_hashes.len(),
+                    status = ?batch.status,
+                    remaining = self.status_outbox.len(),
+                    "status outbox: batch flushed (attempt rows closed)"
+                );
+            }
+            Err(e) => {
+                warn!(count = batch.drv_hashes.len(), error = %e,
+                      "status outbox: flush failed; retrying next tick");
+                self.status_outbox.push_front(batch);
+            }
+        }
+        metrics::gauge!("rio_scheduler_status_outbox_depth").set(self.status_outbox.len() as f64);
+    }
+
     pub(super) async fn tick_sweep_open_pull_attempts(&mut self) {
         let opens = match self.db.list_open_pull_attempts().await {
             Ok(rows) => rows,
@@ -649,48 +701,119 @@ impl DagActor {
         if !self.leader.is_leader() {
             return;
         }
-        // Substitution-replacement (design §2.4 / findings BC-2, BC-3):
-        // the materialization kind has NO adopt arm (a mid-walk crash
-        // leaves outputs present but the closure incomplete — adopting
-        // would fabricate a closure-incomplete completion), and its
-        // charge class is materialization_infra (counts toward the
-        // materialization budget and toward NOTHING else), never
-        // executor_crash. The branch is an early return for a kind no
-        // build attempt carries — the as-built arms below are untouched.
-        // r[impl sched.materialize.routing+3]
-        if attempt.attempt_kind == crate::state::AttemptKind::Materialization.as_str() {
-            self.establish_materialization_attempt(attempt).await;
-            return;
-        }
         let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
         let executor = ExecutorId::from(attempt.executor_id.as_str());
 
-        // Store-probe arm: every verifiable wanted output present →
-        // adopt as completed; the attempt is closed and never charged.
+        // ONE kernel call dispositions the attempt
+        // (sched.attempt.establishment-window+4: every expired attempt
+        // routes through the total establishment kernel; §4.R2: this is
+        // the kernel's single scheduler call site).
+        use rio_evidence_kernel::establish::{
+            EstablishmentDisposition, NodeDisposition, ProbeEvidence, establish_expired_attempt,
+        };
+        let kind = if attempt.attempt_kind == crate::state::AttemptKind::Materialization.as_str() {
+            rio_evidence_kernel::pull::PullKind::Materialization
+        } else {
+            rio_evidence_kernel::pull::PullKind::Build
+        };
+        // Node axis: a charge needs a wanting node. Cancelled covers
+        // the failed-persist window (the cancel transitioned in-memory
+        // but the closing persist is still outboxed); Absent covers
+        // post-failover (the new leader rebuilt no interest for the
+        // cancelled node) and cleaned-up builds.
+        let node = match self.dag.node(&drv_hash) {
+            None => NodeDisposition::Absent,
+            Some(s) if s.status() == DerivationStatus::Cancelled => NodeDisposition::Cancelled,
+            Some(_) => NodeDisposition::WantedLive,
+        };
+        // Probe axis — conservative caller stub per §4.R2: the
+        // evidence-classification workstream owns the probe-axis split
+        // (its caller mapping distinguishes probe-failure ⇒ Unavailable
+        // ⇒ Defer from no-store ⇒ ChargeExecutorCrash); this mapping
+        // reproduces the pre-kernel behavior (any probe absence
+        // charges) so the two workstreams compose without a behavior
+        // gap between their landings.
+        let probe = match missing {
+            Some(m) => ProbeEvidence::Verified(m),
+            None => ProbeEvidence::NoStoreConfigured,
+        };
         // The wanted set is the LIVE effective resolution (T-D2.3: the
         // rebuilt in-memory union over live builds' durable
-        // contributions, saturating-absent — the design's
-        // establishment-sweep successor in its in-memory form; the
-        // stored-union read is gone).
-        if let Some(state) = self.dag.node(&drv_hash) {
+        // contributions, saturating-absent). Owned so the kernel call
+        // borrows nothing from the DAG.
+        let verifiable_owned: Option<Vec<String>> = self.dag.node(&drv_hash).and_then(|state| {
             let eff = crate::state::effective_wanted(state, &self.builds);
-            let adopt = verifiable_wanted_paths(
+            verifiable_wanted_paths(
                 &state.output_names,
                 &state.expected_output_paths,
                 eff.as_deref().unwrap_or(&[]),
             )
-            .is_some_and(|verifiable| {
-                missing.is_some_and(|m| verifiable.iter().all(|p| !m.contains(*p)))
-            });
-            if adopt {
-                let expected = state.expected_output_paths.clone();
-                self.adopt_orphan_completion(&drv_hash, &Some(executor.clone()), expected)
-                    .await;
+            .map(|v| v.iter().map(|p| p.to_string()).collect())
+        });
+        let verifiable_refs: Option<Vec<&str>> = verifiable_owned
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+
+        match establish_expired_attempt(kind, node, probe, verifiable_refs.as_deref()) {
+            EstablishmentDisposition::CloseChargeFree => {
+                // r[impl sched.attempt.cancel-close-driven]
+                // Nobody wants this work any more: close the assignment
+                // row and write NOTHING else — no AttemptRow (no
+                // exclusion seed), no pull_establishments_total (the
+                // OA2 clustering and the alert population stay clean),
+                // no push_attempt_record. Fenced + exec_id-scoped (the
+                // FencedTx capability): a deposed leader closes
+                // nothing.
+                match self
+                    .db
+                    .close_assignment_fenced(
+                        attempt.exec_id,
+                        crate::db::AssignmentCloseStatus::Cancelled,
+                        self.serving_generation(),
+                    )
+                    .await
+                {
+                    Ok(o) if o.settled() => info!(
+                        drv_hash = %attempt.drv_hash, exec_id = %attempt.exec_id,
+                        node = ?node,
+                        "establishment sweep: cancelled/absent node; assignment closed charge-free"
+                    ),
+                    Ok(_) => {
+                        self.note_fenced_evidence_write("establishment charge-free close");
+                    }
+                    Err(e) => warn!(
+                        drv_hash = %attempt.drv_hash, error = %e,
+                        "establishment sweep: charge-free close failed; the attempt stays open for this pass"
+                    ),
+                }
+                return;
+            }
+            EstablishmentDisposition::ChargeMaterializationInfra => {
+                // Substitution-replacement (design §2.4 / findings
+                // BC-2, BC-3): the materialization kind has NO adopt
+                // arm (a mid-walk crash leaves outputs present but the
+                // closure incomplete — adopting would fabricate a
+                // closure-incomplete completion), and its charge class
+                // is materialization_infra (counts toward the
+                // materialization budget and toward NOTHING else),
+                // never executor_crash.
+                // r[impl sched.materialize.routing+3]
+                self.establish_materialization_attempt(attempt).await;
+                return;
+            }
+            EstablishmentDisposition::AdoptCompleted => {
+                // Store-probe arm: every verifiable wanted output
+                // present → adopt as completed; the attempt is closed
+                // and never charged.
+                if let Some(state) = self.dag.node(&drv_hash) {
+                    let expected = state.expected_output_paths.clone();
+                    self.adopt_orphan_completion(&drv_hash, &Some(executor.clone()), expected)
+                        .await;
+                }
                 // r[impl sched.evidence.durability+4]
                 // Fenced + exec_id-scoped: a deposed replica's sweep
                 // can no longer close a successor's re-minted
-                // assignment row (the derivation_id-keyed unfenced
-                // closer this replaces could).
+                // assignment row.
                 match self
                     .db
                     .close_assignment_fenced(
@@ -712,6 +835,18 @@ impl DagActor {
                 info!(drv_hash = %drv_hash, exec_id = %attempt.exec_id,
                       "establishment sweep: outputs present in store, adopted as completed (no charge)");
                 return;
+            }
+            EstablishmentDisposition::Defer => {
+                // No probe evidence in either direction: the attempt
+                // stays open for a pass with a working probe. (The
+                // current caller mapping cannot produce this arm —
+                // §4.R2's probe-axis owner wires it.)
+                debug!(drv_hash = %attempt.drv_hash, exec_id = %attempt.exec_id,
+                       "establishment sweep: probe evidence unavailable; attempt stays open");
+                return;
+            }
+            EstablishmentDisposition::ChargeExecutorCrash => {
+                // Fall through to the C2 charge arm below.
             }
         }
 
