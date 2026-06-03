@@ -286,9 +286,10 @@ pub enum MockBehavior {
     Park,
 }
 
-/// One request held by [`MockBehavior::Park`]: method + body bytes +
-/// the open reply slot, kept until [`MockApiServer::release_parked`].
-type ParkedCall = (http::Method, Vec<u8>, SendResponse<Response<Body>>);
+/// One request held by [`MockBehavior::Park`]: method + path + body
+/// bytes + the open reply slot, kept until
+/// [`MockApiServer::release_parked`].
+type ParkedCall = (http::Method, String, Vec<u8>, SendResponse<Response<Body>>);
 
 /// The stored side of [`MockApiServer`]: at most one Lease object plus
 /// the resourceVersion source the handler stamps writes from.
@@ -297,6 +298,13 @@ type ParkedCall = (http::Method, Vec<u8>, SendResponse<Response<Body>>);
 struct LeaseStore {
     /// The currently stored Lease object, if any.
     stored: Option<serde_json::Value>,
+    /// Pod objects by name, served on `/pods/` paths (GET + merge
+    /// PATCH + label-selector LIST) so the leader-marks reconcile and
+    /// its verify pass can run against the same mock as the election.
+    /// Absent from a test's setup ⇒ pod requests 404 (the marks task
+    /// fails and retries — the pre-pod-support behavior, minus the
+    /// 405).
+    pods: std::collections::BTreeMap<String, serde_json::Value>,
     /// Monotonic resourceVersion source mirroring the etcd global
     /// revision: the highest rv ever issued (or seeded) by this
     /// instance. Never reset, not even by DELETE/[`MockApiServer::clear`],
@@ -390,6 +398,9 @@ impl MockApiServer {
                     .lock()
                     .expect("mock apiserver request log lock")
                     .push((method.clone(), request.uri().to_string()));
+                // (path captured again below for dispatch; uri() is
+                // still borrowable here — into_body() consumes later.)
+                let path = request.uri().to_string();
                 match behavior {
                     MockBehavior::Healthy => {
                         let body_bytes = request
@@ -398,7 +409,7 @@ impl MockApiServer {
                             .await
                             .expect("request body collectible")
                             .to_bytes();
-                        send.send_response(Self::handle(&task_state, &method, &body_bytes));
+                        send.send_response(Self::handle(&task_state, &method, &path, &body_bytes));
                     }
                     MockBehavior::FailFast => send.send_response(Self::status(
                         503,
@@ -416,7 +427,7 @@ impl MockApiServer {
                         task_parked
                             .lock()
                             .expect("mock apiserver parked lock")
-                            .push((method, body_bytes.to_vec(), send));
+                            .push((method, path, body_bytes.to_vec(), send));
                     }
                 }
             }
@@ -449,8 +460,8 @@ impl MockApiServer {
             parked.drain(..).collect()
         };
         let n = drained.len();
-        for (method, body, send) in drained {
-            send.send_response(Self::handle(&self.state, &method, &body));
+        for (method, path, body, send) in drained {
+            send.send_response(Self::handle(&self.state, &method, &path, &body));
         }
         n
     }
@@ -477,8 +488,20 @@ impl MockApiServer {
 
     /// Dispatch one request against the stored state. Synchronous so the
     /// mutex is never held across an await.
-    fn handle(state: &Mutex<LeaseStore>, method: &http::Method, body: &[u8]) -> Response<Body> {
+    fn handle(
+        state: &Mutex<LeaseStore>,
+        method: &http::Method,
+        path: &str,
+        body: &[u8],
+    ) -> Response<Body> {
         let mut store = state.lock().expect("mock apiserver state lock");
+        // Pod surface (the leader-marks reconcile + verify): GET /pods/
+        // {name}, merge PATCH /pods/{name}, label-selector LIST /pods.
+        // Everything else falls through to the Lease method table below
+        // (whose tests never touch /pods paths).
+        if path.contains("/pods") {
+            return Self::handle_pods(&mut store, method, path, body);
+        }
         match *method {
             http::Method::GET => match store.stored.as_ref() {
                 Some(obj) => Self::json(200, obj.to_string()),
@@ -536,6 +559,97 @@ impl MockApiServer {
                 }
             }
             ref other => Self::status(405, "MethodNotAllowed", &format!("{other} not handled")),
+        }
+    }
+
+    /// The pod surface: enough of the API for the leader-marks
+    /// reconcile (merge PATCH), the peer sweep (label-selector LIST +
+    /// PATCH), and the marks verify (GET own pod).
+    fn handle_pods(
+        store: &mut LeaseStore,
+        method: &http::Method,
+        path: &str,
+        body: &[u8],
+    ) -> Response<Body> {
+        // `/api/v1/namespaces/{ns}/pods/{name}?...` vs a LIST on
+        // `/api/v1/namespaces/{ns}/pods?labelSelector=...`.
+        let after = path.split("/pods").nth(1).unwrap_or("");
+        let name = after
+            .strip_prefix('/')
+            .map(|rest| rest.split('?').next().unwrap_or("").to_owned())
+            .filter(|n| !n.is_empty());
+        match (method, name) {
+            (&http::Method::GET, Some(name)) => match store.pods.get(&name) {
+                Some(pod) => Self::json(200, pod.to_string()),
+                None => Self::status(404, "NotFound", "pod not found"),
+            },
+            (&http::Method::GET, None) => {
+                // Label-selector LIST: serve every pod whose
+                // metadata.labels contains the selector's key=value.
+                // Single-equality selectors only — all the sweep uses.
+                let selector = path
+                    .split("labelSelector=")
+                    .nth(1)
+                    .and_then(|q| q.split('&').next())
+                    .map(|kv| {
+                        let decoded = kv.replace("%3D", "=");
+                        let mut it = decoded.splitn(2, '=');
+                        (
+                            it.next().unwrap_or("").to_owned(),
+                            it.next().unwrap_or("").to_owned(),
+                        )
+                    });
+                let items: Vec<&serde_json::Value> = store
+                    .pods
+                    .values()
+                    .filter(|pod| match &selector {
+                        Some((k, v)) => {
+                            pod["metadata"]["labels"][k.as_str()].as_str() == Some(v.as_str())
+                        }
+                        None => true,
+                    })
+                    .collect();
+                Self::json(
+                    200,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "metadata": {},
+                        "items": items,
+                    })
+                    .to_string(),
+                )
+            }
+            (&http::Method::PATCH, Some(name)) => {
+                let Some(pod) = store.pods.get_mut(&name) else {
+                    return Self::status(404, "NotFound", "pod not found");
+                };
+                let patch: serde_json::Value =
+                    serde_json::from_slice(body).expect("PATCH body is JSON");
+                // RFC 7396 merge semantics for the two metadata maps the
+                // marks patch touches: null removes the key.
+                for map in ["annotations", "labels"] {
+                    if let Some(obj) = patch["metadata"][map].as_object() {
+                        for (k, v) in obj {
+                            if v.is_null() {
+                                if let Some(m) = pod["metadata"][map].as_object_mut() {
+                                    m.remove(k);
+                                }
+                            } else {
+                                if !pod["metadata"][map].is_object() {
+                                    pod["metadata"][map] = serde_json::json!({});
+                                }
+                                pod["metadata"][map]
+                                    .as_object_mut()
+                                    .expect("just ensured object")
+                                    .insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                }
+                Self::json(200, pod.to_string())
+            }
+            _ => Self::status(405, "MethodNotAllowed", "pod method not handled"),
         }
     }
 
@@ -604,6 +718,27 @@ impl MockApiServer {
         let mut store = self.state.lock().expect("mock apiserver state lock");
         store.next_rv = store.next_rv.max(seeded_rv);
         store.stored = Some(lease);
+    }
+
+    /// Pre-populate (or out-of-band overwrite — `kubectl label`, a
+    /// foreign sweep) a pod object served on `/pods/{name}`.
+    pub fn seed_pod(&self, name: &str, pod: serde_json::Value) {
+        self.state
+            .lock()
+            .expect("mock apiserver state lock")
+            .pods
+            .insert(name.to_owned(), pod);
+    }
+
+    /// The stored pod object, if any — for assertions on the marks the
+    /// reconcile/verify wrote.
+    pub fn pod(&self, name: &str) -> Option<serde_json::Value> {
+        self.state
+            .lock()
+            .expect("mock apiserver state lock")
+            .pods
+            .get(name)
+            .cloned()
     }
 
     /// Clear the stored lease out of band — an operator's

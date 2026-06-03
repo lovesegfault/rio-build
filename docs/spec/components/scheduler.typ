@@ -3311,7 +3311,7 @@ complete, so the ordering is trivially satisfied there.
   logs a warning and observed-record expiry is the fallback.
 ]
 
-#r("sched.lease.rebound")[
+#r("sched.lease.rebound+2")[
   A renew round that resolves Leading while this replica already believes it
   leads, but whose observed `leaseTransitions` count differs from the count
   recorded at this replica's most recent acquire edge or rebound, MUST be
@@ -3319,7 +3319,10 @@ complete, so the ordering is trivially satisfied there.
   observed count, re-derive the generation from it via `fetch_max`, clear
   `recovery_complete`, and re-fire the acquire hook so recovery re-runs
   against the post-change state; `is_leader` MUST NOT be cleared by this
-  transition.
+  transition. The lease loop MUST also mark the leader marks dirty: a foreign
+  term that ran to completion inside the observation gap guarantees the
+  foreign holder's reconcile swept this pod's marks, so the unchanged-polarity
+  argument for skipping the re-patch does not apply.
 ]
 
 The shapes this catches land entirely inside this replica's observation gap
@@ -3369,7 +3372,7 @@ acquisition-shaped event --- and no separate counter is added.
   the leader.
 ]
 
-#r("sched.lease.deletion-cost+2")[
+#r("sched.lease.deletion-cost+3")[
   On the acquire transition, the lease loop reconciles both leader marks onto
   its own Pod in one merge patch: the annotation
   `controller.kubernetes.io/pod-deletion-cost: "1"` and, when configured, the
@@ -3382,7 +3385,12 @@ acquisition-shaped event --- and no separate counter is added.
   first, new pod comes up, acquires (old leader step_down on SIGTERM), no
   double leadership churn. While leading, the same retried reconcile also
   strips the leader marks from any other Pod still carrying them (a partitioned
-  ex-leader cannot remove its own); a failed sweep leaves the marks unconverged
+  ex-leader cannot remove its own) --- and that sweep MUST spare the current
+  Lease holder: the sweep reads the Lease in the same reconcile pass and
+  excludes the holder from its targets, so a peer that re-acquired while this
+  reconcile was in flight does not have its fresh label stripped (a failed
+  holder read fails the sweep --- keep dirty and retry --- rather than
+  sweeping blind); a failed sweep leaves the marks unconverged
   and the reconcile retried, exactly like a failed own-Pod patch. The reconcile
   is level-triggered, not fire-and-forget: the patch is spawned so the lease
   loop never blocks on the apiserver, at most one marks-reconcile attempt is in
@@ -3396,6 +3404,29 @@ acquisition-shaped event --- and no separate counter is added.
   dashboard data path that resolves it (the label half); the warning repeated
   on each failed attempt is the operator signal.
 ]
+
+#r("sched.lease.marks-verify")[
+  The leader-marks reconcile MUST be backed by a bounded-cadence
+  verification: every `MARKS_VERIFY_EVERY` election rounds (12 renews, ~60s),
+  a leading loop whose marks are clean and whose reconcile slot is free reads
+  its OWN Pod and compares the stored marks (deletion-cost annotation; leader
+  label when configured) against its current leadership; on divergence it
+  re-marks the reconcile dirty so the next round-trip repairs them. This
+  bounds the staleness from ANY marks falsifier --- a foreign sweep racing a
+  re-acquisition (the sweep's read-then-patch TOCTOU), `kubectl label`, or
+  any future actor outside the edge-writer set --- to one verify interval
+  plus one reconcile, replacing the previous contract in which a divergence
+  not caused by an enumerated edge writer persisted until the next leadership
+  transition.
+]
+
+The verify pass shares the reconcile's single-flight slot (verify and patch
+never interleave) and is leader-only: a standby's marks are converged by its
+own lose-edge reconcile and swept by the live holder, so verifying them too
+would double the fleet's read load for marks nothing routes on. The pass
+costs one Pod GET per leader per interval; a GET failure is benign (the next
+interval retries) and a divergence verdict is always safe to act on (the
+repair is one idempotent merge patch).
 
 *Deployment strategy interaction:* Readiness is decoupled from leadership
 (#rref("sched.grpc.leader-guard")): both pods are Ready (TCP probe = process

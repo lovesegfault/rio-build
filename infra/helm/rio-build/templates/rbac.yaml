@@ -241,8 +241,9 @@ rules:
   # remove itself (rio-lease sweep_peer_leader_marks). `list` exists for
   # that peer sweep — it lists pods by the leader label; RBAC cannot
   # label-scope a list, so it is namespace-wide like the patch. `get`
-  # needed: kube-rs's Api::patch GETs first for resourceVersion (Merge
-  # doesn't strictly need it but client does GET-before-PATCH anyway).
+  # carries the bounded-cadence marks verify (sched.lease.marks-verify:
+  # the leader re-reads its OWN pod every MARKS_VERIFY_EVERY rounds and
+  # re-dirties on divergence) and kube-rs's GET-before-PATCH.
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, patch]

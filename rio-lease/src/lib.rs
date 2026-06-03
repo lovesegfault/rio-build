@@ -50,6 +50,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::serde_json::json;
 use kube::api::{Api, ListParams, Patch, PatchParams};
@@ -230,6 +231,18 @@ const _: () = {
         "the leader must get at least one renew attempt before fencing"
     );
 };
+
+/// Verify cadence for the leader-marks reconcile: every Nth election
+/// round (N renews ≈ 60s at the 5s interval) a clean-and-leading loop
+/// re-reads its OWN Pod and compares the stored marks against its
+/// leadership — re-dirtying on divergence. This converts the marks
+/// machinery from edge-triggered-with-enumerated-writers to genuinely
+/// level-triggered: ANY falsifier (a foreign sweep racing a re-acquire,
+/// `kubectl label`, a future actor nobody enumerated) is repaired
+/// within one verify interval plus one reconcile, instead of lingering
+/// until the next leadership transition.
+// r[impl sched.lease.marks-verify]
+pub const MARKS_VERIFY_EVERY: u64 = 12;
 
 /// Annotation key the leader stamps on its own Pod so the ReplicaSet
 /// controller evicts the standby first during scale-down/RollingUpdate.
@@ -823,7 +836,7 @@ impl LeaderState {
     /// on the recorded one — is undetectable here by construction; that
     /// residual is priced at the recovery gate's entry-snapshot comment
     /// in rio-scheduler.
-    // r[impl sched.lease.rebound]
+    // r[impl sched.lease.rebound+2]
     // r[impl sched.lease.generation-fence+3]
     pub fn on_rebound(&self, lease_transitions: u64) -> u64 {
         self.recovery_completed_for
@@ -1001,6 +1014,12 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
     // freed slot always means the flag already reflects that task's
     // outcome.
     let marks_patch_in_flight = Arc::new(AtomicBool::new(false));
+    // R3: the in-flight marks task's handle (reconcile or verify; the
+    // single-flight slot means at most one). Aborted at loop exit so a
+    // parked round-trip cannot outlive the loop and write marks (or
+    // sweep a successor's) after shutdown; SlotRelease's Drop runs on
+    // abort, so the slot is released either way.
+    let mut inflight_marks: Option<tokio::task::JoinHandle<()>> = None;
     // Blind-window clock on the injected fence clock (production:
     // CLOCK_BOOTTIME — advances across host suspend, so a suspend
     // straddling SELF_FENCE_AFTER fences at the first post-resume
@@ -1095,7 +1114,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                             "acquired leadership"
                         );
 
-                        // r[impl sched.lease.deletion-cost+2]
+                        // r[impl sched.lease.deletion-cost+3]
                         // The leader marks (pod-deletion-cost=1 so K8s
                         // kills the standby first on scale-down, plus
                         // the optional leader label the
@@ -1181,18 +1200,31 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                         // re-recovery. Hook delivery is ordered
                         // (sched.lease.hook-order), so skipping the
                         // lose is about avoiding wasted work, not a
-                        // reordering hazard. The leader marks are not
-                        // dirtied either — leadership polarity is
-                        // unchanged, so cost=1 and the leader label
-                        // already match. The count-coincidence ABA (the
-                        // observed value lands back exactly on the
-                        // recorded one) remains the accepted residual —
-                        // see the recovery gate's entry-snapshot comment
-                        // in rio-scheduler. Equal counts stay a silent
-                        // no-op (a log every 5s would be noisy).
-                        // r[impl sched.lease.rebound]
+                        // reordering hazard. The leader MARKS, by
+                        // contrast, MUST be re-dirtied: a moved
+                        // transition count means a foreign term ran to
+                        // completion inside our observation gap, and a
+                        // foreign holder's reconcile GUARANTEES a sweep
+                        // stripped our label and zeroed our cost — the
+                        // polarity we *want* is unchanged, but the
+                        // stored marks are gone. Re-dirtying costs one
+                        // no-op PATCH in the (unreachable-in-practice)
+                        // case the marks survived. The count-
+                        // coincidence ABA (the observed value lands
+                        // back exactly on the recorded one) remains the
+                        // accepted residual — see the recovery gate's
+                        // entry-snapshot comment in rio-scheduler; for
+                        // the marks half it is additionally bounded by
+                        // the periodic verify (sched.lease.marks-
+                        // verify). Equal counts stay a silent no-op (a
+                        // log every 5s would be noisy).
+                        // r[impl sched.lease.rebound+2]
                         let recorded = state.acquired_transitions();
                         if transitions != recorded {
+                            // The rebound re-dirty: a guaranteed-
+                            // foreign-sweep falsifier handled at its
+                            // edge; the verify pass bounds the rest.
+                            marks_dirty.store(true, Ordering::SeqCst);
                             let new_gen = state.on_rebound(transitions);
                             warn!(
                                 recorded,
@@ -1223,7 +1255,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                     state.confirm_leading_round(round);
                 }
 
-                // r[impl sched.lease.deletion-cost+2]
+                // r[impl sched.lease.deletion-cost+3]
                 // Level-triggered leader-marks reconcile. Runs AFTER
                 // the edge detection so a transition on THIS tick
                 // patches the post-transition state (and the self-fence
@@ -1239,7 +1271,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 // pod PATCH (same constraint as the hooks); each
                 // attempt is bounded by the renew deadline so a wedged
                 // PATCH cannot hold the single-flight slot forever.
-                let _ = maybe_spawn_leader_marks(
+                if let Some(task) = maybe_spawn_leader_marks(
                     &pod_patch_client,
                     &cfg,
                     now_leading,
@@ -1247,7 +1279,35 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                     &marks_patch_in_flight,
                     state.is_leader_arc(),
                     renew_deadline,
-                );
+                ) {
+                    inflight_marks = Some(task);
+                }
+
+                // r[impl sched.lease.marks-verify]
+                // Bounded-cadence verification: every MARKS_VERIFY_EVERY
+                // rounds a clean-and-leading loop re-reads its OWN Pod
+                // and compares the stored marks against its leadership,
+                // re-dirtying on divergence — the level-triggered
+                // closure over falsifiers nobody enumerated (a foreign
+                // sweep racing a re-acquire, kubectl, a future actor).
+                // Shares the marks single-flight slot, so verify and
+                // reconcile never interleave; the dirty short-circuit
+                // inside the gate means a divergence found here is
+                // repaired by the ordinary reconcile on the NEXT
+                // round-trip.
+                if now_leading
+                    && round.is_multiple_of(MARKS_VERIFY_EVERY)
+                    && let Some(task) = maybe_spawn_verify_leader_marks(
+                        &pod_patch_client,
+                        &cfg,
+                        &marks_dirty,
+                        &marks_patch_in_flight,
+                        state.is_leader_arc(),
+                        renew_deadline,
+                    )
+                {
+                    inflight_marks = Some(task);
+                }
             }
             outcome @ (Ok(Err(_)) | Err(_)) => {
                 // Either apiserver returned an error (Ok(Err)) or
@@ -1302,6 +1362,15 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 }
             }
         }
+    }
+
+    // R3: abort the in-flight marks task BEFORE the graceful release —
+    // the loop's lifetime owns it, and a parked reconcile surviving the
+    // loop could land marks writes (or sweep the successor) long after
+    // this replica stopped mattering. Abort-safety is pinned by
+    // aborting_inflight_marks_task_releases_slot_and_keeps_dirty.
+    if let Some(task) = inflight_marks.take() {
+        task.abort();
     }
 
     // r[impl sched.lease.graceful-release+2]
@@ -1631,7 +1700,7 @@ fn leader_marks_patch(
     }
 }
 
-// r[impl sched.lease.deletion-cost+2]
+// r[impl sched.lease.deletion-cost+3]
 /// Detached PATCH of the leader marks on our own Pod:
 ///
 /// - `controller.kubernetes.io/pod-deletion-cost`: K8s's ReplicaSet
@@ -1691,6 +1760,7 @@ fn spawn_patch_leader_marks(
 ) -> tokio::task::JoinHandle<()> {
     let namespace = cfg.namespace.clone();
     let pod_name = cfg.holder_id.clone();
+    let lease_name = cfg.lease_name.clone();
     let label = cfg.leader_pod_label.clone();
     tokio::spawn(async move {
         // Release the single-flight slot on every exit — success,
@@ -1707,7 +1777,8 @@ fn spawn_patch_leader_marks(
         }
         let _slot = SlotRelease(patch_in_flight);
 
-        let pods: Api<Pod> = Api::namespaced(client, &namespace);
+        let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+        let leases: Api<Lease> = Api::namespaced(client, &namespace);
         let patch = leader_marks_patch(leading, label.as_ref());
         match tokio::time::timeout(
             patch_timeout,
@@ -1728,7 +1799,15 @@ fn spawn_patch_leader_marks(
                 // patch.
                 let sweep_ok = match (leading, label.as_ref()) {
                     (true, Some(l)) => {
-                        sweep_peer_leader_marks(&pods, &pod_name, l, patch_timeout).await
+                        sweep_peer_leader_marks(
+                            &pods,
+                            &leases,
+                            &lease_name,
+                            &pod_name,
+                            l,
+                            patch_timeout,
+                        )
+                        .await
                     }
                     _ => true,
                 };
@@ -1801,13 +1880,152 @@ fn spawn_patch_leader_marks(
     })
 }
 
+/// Pure marks comparison for the verify pass: do the pod's stored
+/// leader marks match this leadership polarity?
+///
+/// - Annotation half: leading requires `pod-deletion-cost: "1"`;
+///   not-leading accepts `"0"` OR an absent annotation (a fresh pod has
+///   none — absence ≡ cost 0, the same equivalence the init-dirty
+///   comment in `run_lease_loop` documents).
+/// - Label half (when configured): leading requires `key=value`
+///   present; not-leading requires the key ABSENT (absence — not
+///   `standby` — is the non-leader state, per `leader_marks_patch`).
+fn marks_match(
+    meta: &kube::api::ObjectMeta,
+    leading: bool,
+    label: Option<&(String, String)>,
+) -> bool {
+    let cost = meta
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(POD_DELETION_COST_ANNOTATION))
+        .map(String::as_str);
+    let cost_ok = if leading {
+        cost == Some("1")
+    } else {
+        matches!(cost, None | Some("0"))
+    };
+    let label_ok = match label {
+        None => true,
+        Some((key, value)) => {
+            let stored = meta
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(key))
+                .map(String::as_str);
+            if leading {
+                stored == Some(value.as_str())
+            } else {
+                stored.is_none()
+            }
+        }
+    };
+    cost_ok && label_ok
+}
+
+// r[impl sched.lease.marks-verify]
+/// Detached verify pass: GET our OWN Pod (timeout-bounded; RBAC `get
+/// pods` — granted alongside the existing `patch pods`/`list pods`
+/// verbs), compare the stored marks against the leadership polarity
+/// captured at spawn, and on divergence re-dirty the marks + warn —
+/// the repair itself reuses the level-triggered reconcile on the next
+/// round-trip. A GET failure changes nothing (the next verify interval
+/// retries); a polarity gone stale mid-flight is caught by the same
+/// post-clear re-check discipline the reconcile uses — here the
+/// comparison simply re-runs against the captured polarity, and a
+/// wrong-capture verdict at worst re-dirties, which is always safe
+/// (one no-op PATCH).
+fn spawn_verify_leader_marks(
+    client: kube::Client,
+    cfg: &LeaseConfig,
+    leading: bool,
+    marks_dirty: Arc<AtomicBool>,
+    patch_in_flight: Arc<AtomicBool>,
+    call_timeout: Duration,
+) -> tokio::task::JoinHandle<()> {
+    let namespace = cfg.namespace.clone();
+    let pod_name = cfg.holder_id.clone();
+    let label = cfg.leader_pod_label.clone();
+    tokio::spawn(async move {
+        // Same slot-release discipline as the reconcile task.
+        struct SlotRelease(Arc<AtomicBool>);
+        impl Drop for SlotRelease {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _slot = SlotRelease(patch_in_flight);
+
+        let pods: Api<Pod> = Api::namespaced(client, &namespace);
+        match tokio::time::timeout(call_timeout, pods.get(&pod_name)).await {
+            Ok(Ok(pod)) => {
+                if !marks_match(&pod.metadata, leading, label.as_ref()) {
+                    warn!(
+                        %pod_name, leading,
+                        "leader-marks verify found divergence (external strip/foreign \
+                         sweep?); re-dirtying for the next reconcile"
+                    );
+                    marks_dirty.store(true, Ordering::SeqCst);
+                }
+            }
+            Ok(Err(e)) => {
+                debug!(%pod_name, error = %e, "leader-marks verify GET failed; next interval retries");
+            }
+            Err(_) => {
+                debug!(%pod_name, timeout = ?call_timeout, "leader-marks verify GET timed out; next interval retries");
+            }
+        }
+    })
+}
+
+/// Spawn gate for the verify pass: spawns [`spawn_verify_leader_marks`]
+/// iff the marks are CLEAN and no marks task is in flight, taking the
+/// same single-flight slot as the reconcile. Dirty marks need no
+/// verification — the reconcile already owes a patch; a taken slot
+/// means a reconcile/verify is mid-flight and this round skips
+/// (level-triggered: the next multiple retries).
+///
+/// Always called with `leading == true` (the loop gates on
+/// `now_leading`): a standby's marks are converged by its own lose-edge
+/// reconcile and swept by the live holder; verifying them too would
+/// double the fleet's GET load for marks nobody routes on.
+fn maybe_spawn_verify_leader_marks(
+    client: &kube::Client,
+    cfg: &LeaseConfig,
+    marks_dirty: &Arc<AtomicBool>,
+    patch_in_flight: &Arc<AtomicBool>,
+    _is_leader: Arc<AtomicBool>,
+    call_timeout: Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !marks_dirty.load(Ordering::SeqCst) && !patch_in_flight.swap(true, Ordering::SeqCst) {
+        Some(spawn_verify_leader_marks(
+            client.clone(),
+            cfg,
+            true,
+            Arc::clone(marks_dirty),
+            Arc::clone(patch_in_flight),
+            call_timeout,
+        ))
+    } else {
+        None
+    }
+}
+
 /// Pure target selection for the peer sweep: every labeled pod except
-/// our own. The own-name exclusion is the one mistake that could strip
-/// the real leader's label, so it is pinned by its own unit test.
-fn peer_sweep_targets(labeled_pod_names: Vec<String>, own_name: &str) -> Vec<String> {
+/// our own AND except the current Lease holder. The own-name exclusion
+/// is the one mistake that could strip the real leader's label when WE
+/// are it; the holder exclusion closes the same mistake for a peer
+/// that re-acquired while our reconcile was in flight (sweeping the
+/// live holder downs the leader-only Service until the victim's own
+/// next reconcile). Pinned by its own unit tests.
+fn peer_sweep_targets(
+    labeled_pod_names: Vec<String>,
+    own_name: &str,
+    lease_holder: Option<&str>,
+) -> Vec<String> {
     labeled_pod_names
         .into_iter()
-        .filter(|name| name != own_name)
+        .filter(|name| name != own_name && Some(name.as_str()) != lease_holder)
         .collect()
 }
 
@@ -1816,9 +2034,18 @@ fn peer_sweep_targets(labeled_pod_names: Vec<String>, own_name: &str) -> Vec<Str
 /// remove its own (its self-fence only defers its own reconcile), so
 /// the new holder is the only replica that can bound that stale
 /// label's lifetime. Runs inside the single in-flight reconcile task,
-/// after the own-pod patch. Returns `false` if the list or any peer
-/// patch failed; the caller then keeps the marks dirty so the whole
-/// reconcile (self + sweep) retries on the next successful round-trip.
+/// after the own-pod patch. Returns `false` if the holder read, the
+/// list, or any peer patch failed; the caller then keeps the marks
+/// dirty so the whole reconcile (self + sweep) retries on the next
+/// successful round-trip.
+///
+/// HOLDER-AWARE: the sweep first GETs the Lease (same reconcile pass,
+/// timeout-bounded) and spares the CURRENT holder — a peer that
+/// re-acquired while this reconcile was in flight must not have its
+/// fresh label stripped (that would down the leader-only Service until
+/// the victim's own next reconcile; with the verify cadence that is
+/// bounded, but the right bound is zero). A failed holder read fails
+/// the sweep — keep dirty, retry — rather than sweeping blind.
 ///
 /// The peer is demoted with the same body a standby writes for itself
 /// ([`leader_marks_patch`] with `leading=false`): label removed AND
@@ -1830,16 +2057,40 @@ fn peer_sweep_targets(labeled_pod_names: Vec<String>, own_name: &str) -> Vec<Str
 /// holder's first SUCCESSFUL reconcile and only while it can reach the
 /// apiserver; a pre-partition own-patch landing after the sweep is made
 /// unreachable by the per-call timeout (far below the steal threshold);
-/// the sweep can strip a just-re-acquired leader's label, which that
-/// victim's own level-triggered reconcile re-asserts on its next dirty
-/// event; in a symmetric partition there is no holder to sweep and
-/// nothing can be scheduled anyway.
+/// the holder read and the peer patches are not one transaction, so a
+/// holder change BETWEEN them can still strip a just-re-acquired
+/// leader (the read-then-patch TOCTOU) — that residual is now BOUNDED
+/// by the verify cadence (`sched.lease.marks-verify`): the victim
+/// re-discovers the strip within MARKS_VERIFY_EVERY rounds instead of
+/// waiting for its next leadership transition; in a symmetric
+/// partition there is no holder to sweep and nothing can be scheduled
+/// anyway.
 async fn sweep_peer_leader_marks(
     pods: &Api<Pod>,
+    leases: &Api<Lease>,
+    lease_name: &str,
     own_name: &str,
     label: &(String, String),
     call_timeout: Duration,
 ) -> bool {
+    // r[impl sched.lease.deletion-cost+3]
+    // The holder read that makes the sweep spare the live holder.
+    let holder = match tokio::time::timeout(call_timeout, leases.get_opt(lease_name)).await {
+        Ok(Ok(lease)) => lease
+            .and_then(|l| l.spec)
+            .and_then(|spec| spec.holder_identity),
+        Ok(Err(e)) => {
+            warn!(error = %e, "peer-sweep holder read failed; keeping leader marks dirty to retry");
+            return false;
+        }
+        Err(_) => {
+            warn!(
+                timeout = ?call_timeout,
+                "peer-sweep holder read timed out; keeping leader marks dirty to retry"
+            );
+            return false;
+        }
+    };
     let (key, value) = label;
     let lp = ListParams::default().labels(&format!("{key}={value}"));
     let labeled = match tokio::time::timeout(call_timeout, pods.list(&lp)).await {
@@ -1862,7 +2113,7 @@ async fn sweep_peer_leader_marks(
         .filter_map(|p| p.metadata.name)
         .collect();
     let mut all_ok = true;
-    for peer in peer_sweep_targets(names, own_name) {
+    for peer in peer_sweep_targets(names, own_name, holder.as_deref()) {
         let patch = leader_marks_patch(false, Some(label));
         match tokio::time::timeout(
             call_timeout,
@@ -2157,7 +2408,7 @@ mod tests {
     /// in-flight recovery result is still valid — that is the recovery
     /// gate's documented keep case, preserved by keying on the epoch
     /// rather than a session counter.
-    // r[verify sched.lease.rebound]
+    // r[verify sched.lease.rebound+2]
     #[test]
     fn stale_completion_does_not_override_rebound_clear() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
@@ -2244,7 +2495,7 @@ mod tests {
     /// generation via `fetch_max` (a no-op in the saturated regime),
     /// clears `recovery_complete` so recovery re-runs, refreshes
     /// `leader_for()`, and never touches `is_leader`.
-    // r[verify sched.lease.rebound]
+    // r[verify sched.lease.rebound+2]
     #[test]
     fn on_rebound_records_count_and_reruns_recovery() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
@@ -2484,7 +2735,7 @@ mod tests {
     /// the leader-only Service routes to two pods. Regression:
     /// maybe_self_fence previously consumed the `was_leading` edge
     /// without arranging the deferred patch.
-    // r[verify sched.lease.deletion-cost+2]
+    // r[verify sched.lease.deletion-cost+3]
     #[test]
     fn self_fence_sets_marks_dirty() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(2)));
@@ -2535,7 +2786,7 @@ mod tests {
     // assertion are the end-to-end coverage for it.
 
     /// Acquire: cost=1 and the label is present with its value.
-    // r[verify sched.lease.deletion-cost+2]
+    // r[verify sched.lease.deletion-cost+3]
     #[test]
     fn leader_marks_patch_sets_label_on_acquire() {
         let label = (
@@ -2660,7 +2911,7 @@ mod tests {
     /// (no single-flight gate), the lose-while-in-flight schedule below
     /// ended with the flag clear over leader marks stored on a
     /// non-leader.
-    // r[verify sched.lease.deletion-cost+2]
+    // r[verify sched.lease.deletion-cost+3]
     #[tokio::test]
     async fn marks_reconcile_single_flight_couples_flag_to_stored_polarity() {
         let (client, mut park) = RequestPark::new();
@@ -2726,9 +2977,23 @@ mod tests {
         applied.push(req_a.body.clone());
         req_a.respond_ok(pod_ok("us"));
         // A wrote the leader polarity, so its task also runs the peer
-        // sweep inside the same single-flight slot (own patch + list);
-        // answer the label-selected LIST with no peers so A's handler
-        // can reach its flag decision.
+        // sweep inside the same single-flight slot (holder read + own
+        // patch + list); answer the holder read, then the
+        // label-selected LIST with no peers, so A's handler can reach
+        // its flag decision.
+        let req_holder = park.next().await;
+        assert!(
+            req_holder.path.contains("/leases/rio-sched"),
+            "holder-aware sweep reads the Lease first, got {}",
+            req_holder.path
+        );
+        req_holder.respond_ok(serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "rio-sched", "namespace": "default",
+                          "resourceVersion": "5" },
+            "spec": { "holderIdentity": "us", "leaseTransitions": 1 },
+        }));
         let req_list = park.next().await;
         assert!(
             req_list.path.contains("labelSelector="),
@@ -2904,17 +3169,86 @@ mod tests {
 
     use rio_test_support::kube_mock::{Method, Scenario};
 
-    /// Pure target selection: never our own pod, every other labeled
-    /// pod. The own-name exclusion is the one mistake that could strip
-    /// the real leader's label.
+    /// Pure target selection: never our own pod, never the current
+    /// Lease holder, every other labeled pod. The own-name exclusion is
+    /// the one mistake that could strip the real leader's label when WE
+    /// are it; the holder exclusion is the same mistake for a peer that
+    /// re-acquired mid-reconcile.
+    // r[verify sched.lease.deletion-cost+3]
     #[test]
-    fn peer_sweep_targets_excludes_own_name() {
+    fn peer_sweep_targets_excludes_own_name_and_holder() {
         assert_eq!(
-            peer_sweep_targets(vec!["other-1".into(), "us".into(), "other-2".into()], "us"),
+            peer_sweep_targets(
+                vec!["other-1".into(), "us".into(), "other-2".into()],
+                "us",
+                None
+            ),
             vec!["other-1".to_string(), "other-2".to_string()]
         );
-        assert!(peer_sweep_targets(vec!["us".into()], "us").is_empty());
-        assert!(peer_sweep_targets(vec![], "us").is_empty());
+        assert!(peer_sweep_targets(vec!["us".into()], "us", None).is_empty());
+        assert!(peer_sweep_targets(vec![], "us", None).is_empty());
+        // The current holder is spared even when labeled.
+        assert_eq!(
+            peer_sweep_targets(vec!["b".into(), "us".into(), "old".into()], "us", Some("b")),
+            vec!["old".to_string()]
+        );
+        // Holder == us: the own-name arm already covers it; no
+        // double-exclusion surprises.
+        assert_eq!(
+            peer_sweep_targets(vec!["us".into(), "old".into()], "us", Some("us")),
+            vec!["old".to_string()]
+        );
+        // An UNHELD lease (holder None, e.g. graceful vacate mid-sweep)
+        // spares nobody extra.
+        assert_eq!(
+            peer_sweep_targets(vec!["old".into()], "us", None),
+            vec!["old".to_string()]
+        );
+    }
+
+    /// Pure marks comparison driving the verify pass: all four
+    /// (leading, stored-marks) quadrants plus the absent-annotation and
+    /// no-label-configured arms.
+    // r[verify sched.lease.marks-verify]
+    #[test]
+    fn marks_match_quadrants() {
+        let label = ("role".to_owned(), "leader".to_owned());
+        let meta = |cost: Option<&str>, lbl: Option<&str>| kube::api::ObjectMeta {
+            annotations: cost.map(|c| {
+                [(POD_DELETION_COST_ANNOTATION.to_owned(), c.to_owned())]
+                    .into_iter()
+                    .collect()
+            }),
+            labels: lbl.map(|v| [("role".to_owned(), v.to_owned())].into_iter().collect()),
+            ..Default::default()
+        };
+        // Converged leader.
+        assert!(marks_match(
+            &meta(Some("1"), Some("leader")),
+            true,
+            Some(&label)
+        ));
+        // Converged standby: cost 0 + label absent; and the fresh pod
+        // (everything absent) is equivalent.
+        assert!(marks_match(&meta(Some("0"), None), false, Some(&label)));
+        assert!(marks_match(&meta(None, None), false, Some(&label)));
+        // Stripped leader: label gone (the external-strip divergence).
+        assert!(!marks_match(&meta(Some("1"), None), true, Some(&label)));
+        // Zeroed leader cost.
+        assert!(!marks_match(
+            &meta(Some("0"), Some("leader")),
+            true,
+            Some(&label)
+        ));
+        // Stale standby still carrying leader marks.
+        assert!(!marks_match(
+            &meta(Some("1"), Some("leader")),
+            false,
+            Some(&label)
+        ));
+        // No label configured: annotation half alone decides.
+        assert!(marks_match(&meta(Some("1"), None), true, None));
+        assert!(!marks_match(&meta(None, None), true, None));
     }
 
     /// PodList response body whose items all carry the leader label.
@@ -2943,7 +3277,7 @@ mod tests {
     /// must carry the demote body (label removed via merge-patch null,
     /// cost "0"), and the flag clears only after own patch + sweep all
     /// landed.
-    // r[verify sched.lease.deletion-cost+2]
+    // r[verify sched.lease.deletion-cost+3]
     #[tokio::test]
     async fn leading_reconcile_sweeps_stale_peer_label() {
         let (client, verifier) = ApiServerVerifier::new();
@@ -2954,6 +3288,21 @@ mod tests {
 
         let guard = verifier.run(vec![
             Scenario::ok(Method::PATCH, "/pods/us", pod_ok("us").to_string()),
+            // The holder-aware sweep reads the Lease first (holder =
+            // us: nobody extra is spared — the original intent of this
+            // test is unchanged).
+            Scenario::ok(
+                Method::GET,
+                "/leases/rio-sched",
+                serde_json::json!({
+                    "apiVersion": "coordination.k8s.io/v1",
+                    "kind": "Lease",
+                    "metadata": { "name": "rio-sched", "namespace": "default",
+                                  "resourceVersion": "5" },
+                    "spec": { "holderIdentity": "us", "leaseTransitions": 1 },
+                })
+                .to_string(),
+            ),
             Scenario::ok(
                 Method::GET,
                 "labelSelector=",
@@ -3002,6 +3351,21 @@ mod tests {
 
         let guard = verifier.run(vec![
             Scenario::ok(Method::PATCH, "/pods/us", pod_ok("us").to_string()),
+            // The holder-aware sweep reads the Lease first (holder =
+            // us: nobody extra is spared — the original intent of this
+            // test is unchanged).
+            Scenario::ok(
+                Method::GET,
+                "/leases/rio-sched",
+                serde_json::json!({
+                    "apiVersion": "coordination.k8s.io/v1",
+                    "kind": "Lease",
+                    "metadata": { "name": "rio-sched", "namespace": "default",
+                                  "resourceVersion": "5" },
+                    "spec": { "holderIdentity": "us", "leaseTransitions": 1 },
+                })
+                .to_string(),
+            ),
             Scenario::ok(
                 Method::GET,
                 "labelSelector=",
@@ -3277,6 +3641,283 @@ mod tests {
 
         shutdown.cancel();
         loop_task.await.expect("lease loop task exits cleanly");
+    }
+
+    /// Rider R1 of merged_bug_138: a rebound (still-leading round whose
+    /// observed leaseTransitions moved — a foreign term ended entirely
+    /// inside our observation gap) GUARANTEES a foreign reconcile swept
+    /// our leader marks, so the rebound MUST re-dirty them. Pre-fix the
+    /// arm stored nothing ("leadership polarity is unchanged") and the
+    /// label stayed missing until the next leadership transition — a
+    /// dashboard outage with no bound.
+    // r[verify sched.lease.rebound+2]
+    #[tokio::test(start_paused = true)]
+    async fn rebound_marks_leader_marks_dirty() {
+        let (client, mock) = MockApiServer::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = marks_test_cfg();
+        mock.seed_pod("us", pod_ok("us"));
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // t=0 acquire; the init-dirty reconcile patches our pod's marks.
+        settle().await;
+        assert!(state.is_leader.load(Ordering::Relaxed), "t=0 acquire");
+        let pod = mock.pod("us").expect("pod seeded");
+        assert_eq!(
+            pod["metadata"]["labels"][LEADER_ROLE_LABEL],
+            json!(LEADER_ROLE_LEADER),
+            "the acquire reconcile must have asserted the leader label"
+        );
+
+        // A foreign term lands ENTIRELY inside our observation gap: the
+        // foreign holder's reconcile swept our marks (label gone, cost
+        // zeroed), then the lease came back to us with the transition
+        // count bumped. Out-of-band seeds model both.
+        mock.seed_pod("us", pod_ok("us")); // marks swept by the foreign reconcile
+        let rv: u64 = mock
+            .resource_version()
+            .expect("lease exists")
+            .parse()
+            .expect("numeric rv");
+        let transitions = 7;
+        mock.seed(serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "rio-sched", "namespace": "default",
+                          "resourceVersion": (rv + 1).to_string() },
+            "spec": { "holderIdentity": "us", "leaseTransitions": transitions },
+        }));
+
+        // Next tick: still-leading round observes the moved count — the
+        // rebound. It must re-dirty the marks; the same tick's reconcile
+        // re-asserts the label.
+        tokio::time::advance(RENEW_INTERVAL).await;
+        settle().await;
+        assert_eq!(
+            hooks.acquires.lock().expect("acquires lock").len(),
+            2,
+            "the rebound must re-fire the acquire hook"
+        );
+        let pod = mock.pod("us").expect("pod still stored");
+        assert_eq!(
+            pod["metadata"]["labels"][LEADER_ROLE_LABEL],
+            json!(LEADER_ROLE_LEADER),
+            "the rebound must re-dirty the leader marks so the swept label is re-asserted \
+             (a foreign term guarantees a foreign sweep ran)"
+        );
+
+        shutdown.cancel();
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// Rider R2 of merged_bug_138: the peer sweep must spare the
+    /// CURRENT Lease holder. Pre-fix the sweep stripped every labeled
+    /// pod except our own — including a pod that just re-acquired the
+    /// lease (our reconcile completing late, after a fence): stripping
+    /// the real holder's label downs the leader-only Service until that
+    /// victim's own next reconcile.
+    // r[verify sched.lease.deletion-cost+3]
+    #[tokio::test]
+    async fn peer_sweep_spares_current_lease_holder() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let cfg = marks_test_cfg();
+        let marks_dirty = Arc::new(AtomicBool::new(true));
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let is_leader = Arc::new(AtomicBool::new(true));
+
+        let guard = verifier.run(vec![
+            Scenario::ok(Method::PATCH, "/pods/us", pod_ok("us").to_string()),
+            // The holder-aware sweep reads the Lease FIRST: the current
+            // holder is B — B's label must survive the sweep.
+            Scenario::ok(
+                Method::GET,
+                "/leases/rio-sched",
+                serde_json::json!({
+                    "apiVersion": "coordination.k8s.io/v1",
+                    "kind": "Lease",
+                    "metadata": { "name": "rio-sched", "namespace": "default",
+                                  "resourceVersion": "9" },
+                    "spec": { "holderIdentity": "b", "leaseTransitions": 3 },
+                })
+                .to_string(),
+            ),
+            Scenario::ok(
+                Method::GET,
+                "labelSelector=",
+                labeled_pod_list(&["us", "b", "old-leader"]),
+            ),
+            Scenario {
+                body_contains: Some(r#""rio.build/scheduler-role":null"#),
+                ..Scenario::ok(
+                    Method::PATCH,
+                    "/pods/old-leader",
+                    pod_ok("old-leader").to_string(),
+                )
+            },
+        ]);
+
+        let handle = maybe_spawn_leader_marks(
+            &client,
+            &cfg,
+            true,
+            &marks_dirty,
+            &in_flight,
+            Arc::clone(&is_leader),
+            Duration::from_secs(60),
+        )
+        .expect("dirty + free slot must spawn");
+        handle.await.expect("reconcile task");
+        guard.verified().await;
+
+        assert!(
+            !marks_dirty.load(Ordering::SeqCst),
+            "own patch + holder-aware sweep all landed → flag clears"
+        );
+    }
+
+    /// The structural close of merged_bug_138: a bounded-cadence verify
+    /// pass re-reads our own pod every MARKS_VERIFY_EVERY rounds and
+    /// re-dirties on divergence — so ANY falsifier (foreign sweep,
+    /// kubectl, future actor) is bounded to one verify interval plus
+    /// one reconcile, instead of "until the next leadership
+    /// transition". Pre-fix: steady state spawned nothing, ever.
+    // r[verify sched.lease.marks-verify]
+    #[tokio::test(start_paused = true)]
+    async fn nth_renew_verify_redirties_on_external_strip() {
+        let (client, mock) = MockApiServer::new();
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        let cfg = marks_test_cfg();
+        mock.seed_pod("us", pod_ok("us"));
+        let hooks = RecordingHooks::default();
+        let shutdown = rio_common::signal::Token::new();
+        let loop_task = tokio::spawn(run_lease_loop_with_client(
+            client,
+            cfg,
+            state.clone(),
+            hooks.clone(),
+            shutdown.clone(),
+            {
+                let a = Instant::now();
+                move || a.elapsed()
+            },
+        ));
+
+        // Acquire; the init reconcile converges the marks.
+        settle().await;
+        assert!(state.is_leader.load(Ordering::Relaxed));
+        assert_eq!(
+            mock.pod("us").expect("pod")["metadata"]["labels"][LEADER_ROLE_LABEL],
+            json!(LEADER_ROLE_LEADER),
+            "marks converged after acquire"
+        );
+
+        // External strip: kubectl/foreign actor removes the label and
+        // zeroes the cost, with NO leadership transition — the
+        // edge-writer enumeration sees nothing.
+        mock.seed_pod("us", pod_ok("us"));
+
+        // Advance MARKS_VERIFY_EVERY healthy rounds: the verify pass
+        // must GET our pod, observe the divergence, re-dirty, and the
+        // following reconcile re-asserts the label.
+        for _ in 0..(MARKS_VERIFY_EVERY + 1) {
+            tokio::time::advance(RENEW_INTERVAL).await;
+            settle().await;
+        }
+        let verify_gets = mock
+            .requests()
+            .iter()
+            .filter(|(m, p)| *m == http::Method::GET && p.contains("/pods/us"))
+            .count();
+        assert!(
+            verify_gets >= 1,
+            "the bounded-cadence verify must GET our own pod at least once \
+             in MARKS_VERIFY_EVERY healthy rounds (got {verify_gets} GETs)"
+        );
+        assert_eq!(
+            mock.pod("us").expect("pod")["metadata"]["labels"][LEADER_ROLE_LABEL],
+            json!(LEADER_ROLE_LEADER),
+            "an externally-stripped leader label must be re-asserted within one \
+             verify interval + one reconcile"
+        );
+
+        shutdown.cancel();
+        loop_task.await.expect("lease loop exits");
+    }
+
+    /// Rider R3 of merged_bug_138: the abort contract the loop's exit
+    /// path relies on — aborting an in-flight marks task releases the
+    /// single-flight slot (SlotRelease's Drop runs on abort) and leaves
+    /// `marks_dirty` set, so nothing wedges and nothing lies. The loop-
+    /// level wiring (keep the JoinHandle, abort before step_down) is a
+    /// compile-level close: pre-fix the handle was dropped (`let _ =`)
+    /// and no abort site existed; a black-box loop test cannot
+    /// distinguish abort from the task's own timeout under paused-time
+    /// auto-advance, so the contract is pinned here and the wiring by
+    /// the abort call's existence.
+    #[tokio::test(start_paused = true)]
+    async fn aborting_inflight_marks_task_releases_slot_and_keeps_dirty() {
+        let (client, mock) = MockApiServer::new();
+        mock.seed_pod("us", pod_ok("us"));
+        mock.set_behavior(MockBehavior::Park);
+        let cfg = marks_test_cfg();
+        let marks_dirty = Arc::new(AtomicBool::new(true));
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let is_leader = Arc::new(AtomicBool::new(true));
+
+        let handle = maybe_spawn_leader_marks(
+            &client,
+            &cfg,
+            true,
+            &marks_dirty,
+            &in_flight,
+            Arc::clone(&is_leader),
+            Duration::from_secs(600), // far beyond the test: abort, not timeout, ends it
+        )
+        .expect("dirty + free slot must spawn");
+        assert!(in_flight.load(Ordering::SeqCst), "slot taken");
+
+        // The own-pod PATCH is in flight (parked).
+        while !mock
+            .requests()
+            .iter()
+            .any(|(m, p)| *m == http::Method::PATCH && p.contains("/pods/us"))
+        {
+            tokio::task::yield_now().await;
+        }
+
+        // What the loop's exit path now does.
+        handle.abort();
+        assert!(handle.await.expect_err("aborted").is_cancelled());
+
+        assert!(
+            !in_flight.load(Ordering::SeqCst),
+            "SlotRelease must run on abort — a held slot would wedge every \
+             future reconcile of a (hypothetical) successor user of the Arcs"
+        );
+        assert!(
+            marks_dirty.load(Ordering::SeqCst),
+            "an aborted reconcile proved nothing — the marks stay dirty"
+        );
+        let sweep_issued = mock
+            .requests()
+            .iter()
+            .any(|(m, p)| *m == http::Method::GET && p.contains("labelSelector"));
+        assert!(
+            !sweep_issued,
+            "the aborted task must not reach its sweep round-trips"
+        );
     }
 
     /// The release-gate half of bug_387: a self-fence is a LOCAL belief
@@ -3687,7 +4328,7 @@ mod tests {
     /// value is equally undetectable — that count coincidence is the
     /// accepted residual (see the recovery gate's entry-snapshot comment
     /// in rio-scheduler).
-    // r[verify sched.lease.rebound]
+    // r[verify sched.lease.rebound+2]
     #[tokio::test(start_paused = true)]
     async fn still_leading_rounds_rebound_on_moved_transition_count() {
         let (client, mock) = MockApiServer::new();
