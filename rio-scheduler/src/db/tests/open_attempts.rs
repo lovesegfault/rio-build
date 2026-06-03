@@ -98,7 +98,7 @@ async fn open_attempt_view_filters_terminal_and_unminted_rows() -> anyhow::Resul
     db.insert_assignment(bare_drv, &ExecutorId::from("oa-bare"), 7, Uuid::now_v7())
         .await?;
 
-    let rows = db.list_open_pull_attempts().await?;
+    let rows = db.list_open_pull_attempts().await?.build;
     assert_eq!(
         rows.len(),
         1,
@@ -166,7 +166,7 @@ async fn open_attempt_view_respects_terminal_fill_alone() -> anyhow::Result<()> 
 
     let rows = db.list_open_pull_attempts().await?;
     assert!(
-        rows.is_empty(),
+        rows.build.is_empty() && rows.materialization.is_empty(),
         "terminal-filled attempt must not be listed as open, got {rows:?}"
     );
     Ok(())
@@ -200,7 +200,7 @@ async fn mint_persists_dispatched_deadline_and_view_returns_it() -> anyhow::Resu
         "the fenced mint commits on a fresh cluster"
     );
 
-    let rows = db.list_open_pull_attempts().await?;
+    let rows = db.list_open_pull_attempts().await?.build;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].exec_id, exec);
     assert_eq!(

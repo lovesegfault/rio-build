@@ -6862,3 +6862,54 @@ async fn materialization_mint_leaves_ice_mask_untouched() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.admin.snapshot-substituting+3]
+/// bug_217 (A2.4 typed split): the snapshot's EXECUTOR view counts
+/// builder pods only — a materialization-claimed node is store-side
+/// work holding no builder slot. Pre-fix `total/active_executors`
+/// counted M+N (every Assigned|Running node), so substitution waves
+/// inflated the busy-fleet view (and every consumer sized off it) by
+/// the store-claim count. `running_derivations` deliberately keeps
+/// counting both work classes (the derivation IS running; documented
+/// at the claim-intake).
+#[tokio::test]
+async fn cluster_snapshot_executors_exclude_materialization_claims() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // One materialization claim (store-side).
+    let out = test_store_path("mat217-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut m = make_node("mat217");
+    m.expected_output_paths = vec![out.clone()];
+    let _ev1 = merge_dag(&handle, Uuid::new_v4(), vec![m], vec![], false).await?;
+    barrier(&handle).await;
+    let claim = claim_materialization(&handle, "mat217", "store-test-0").await;
+    assert!(
+        matches!(claim, Ok(PullOutcome::Deliver(_))),
+        "claim: {claim:?}"
+    );
+
+    // One build attempt (builder-side).
+    let _ev2 = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "build217",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let _assignment = pull_attempt(&handle, "build217").await;
+
+    tick(&handle).await?;
+    let snap = handle.cluster_snapshot_cached();
+    assert_eq!(
+        snap.running_derivations, 2,
+        "both work classes run (the running bucket is kind-blind by design)"
+    );
+    assert_eq!(
+        (snap.total_executors, snap.active_executors),
+        (1, 1),
+        "the executor view counts the builder pod only — a store claim \
+         holds no builder slot (pre-fix: M+N)"
+    );
+    Ok(())
+}

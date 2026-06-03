@@ -112,6 +112,7 @@
     "rio_scheduler_materialization_stalled",
     "rio_scheduler_merge_phase_seconds",
     "rio_scheduler_open_attempts",
+    "rio_scheduler_open_materialization_attempts",
     "rio_scheduler_orphan_builds_cancelled_total",
     "rio_scheduler_poison_fleet_exhausted_total",
     "rio_scheduler_pull_establishments_total",
@@ -784,7 +785,12 @@
       {
         "name": "rio_scheduler_open_attempts",
         "kind": "gauge",
-        "help": "Open pull-mode attempts (active assignment + execution pair minted by PullAssignment, no terminal classification yet). The busy-fleet gauge (successor of the retired stream-era workers_active)."
+        "help": "Open pull-mode BUILD attempts (active assignment + execution pair minted by PullAssignment, no terminal classification yet) — one attempt per builder pod. The busy-fleet gauge (successor of the retired stream-era workers_active). Store materialization claims are counted by rio_scheduler_open_materialization_attempts instead (A2.4)."
+      },
+      {
+        "name": "rio_scheduler_open_materialization_attempts",
+        "kind": "gauge",
+        "help": "Open store materialization claims (kind=materialization attempts: active assignment + execution pair, no terminal classification yet). Store-side work — never a builder slot; the build lane is rio_scheduler_open_attempts."
       },
       {
         "name": "rio_scheduler_orphan_builds_cancelled_total",

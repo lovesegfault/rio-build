@@ -239,9 +239,17 @@ pub fn describe_metrics() {
     );
     describe_gauge!(
         "rio_scheduler_open_attempts",
-        "Open pull-mode attempts (active assignment + execution pair minted by \
-         PullAssignment, no terminal classification yet). The busy-fleet gauge \
-         (successor of the retired stream-era workers_active)."
+        "Open pull-mode BUILD attempts (active assignment + execution pair minted \
+         by PullAssignment, no terminal classification yet) — one attempt per \
+         builder pod. The busy-fleet gauge (successor of the retired stream-era \
+         workers_active). Store materialization claims are counted by \
+         rio_scheduler_open_materialization_attempts instead (A2.4)."
+    );
+    describe_gauge!(
+        "rio_scheduler_open_materialization_attempts",
+        "Open store materialization claims (kind=materialization attempts: active \
+         assignment + execution pair, no terminal classification yet). Store-side \
+         work — never a builder slot; the build lane is rio_scheduler_open_attempts."
     );
     describe_counter!(
         "rio_scheduler_assignments_total",

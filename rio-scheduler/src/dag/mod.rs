@@ -283,10 +283,6 @@ impl DerivationDag {
         self.nodes.iter().map(|(k, v)| (k.as_str(), v))
     }
 
-    /// Iterate all derivation states (without keys).
-    pub fn iter_values(&self) -> impl Iterator<Item = &DerivationState> {
-        self.nodes.values()
-    }
 
     /// Merge a set of nodes and edges from a new build into the global DAG.
     ///

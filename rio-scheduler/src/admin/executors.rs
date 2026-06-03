@@ -41,10 +41,16 @@ pub(super) async fn list_executors(
     status_filter: &str,
     leader_for: Option<Duration>,
 ) -> Result<ListExecutorsResponse, Status> {
+    // A2.4 (bug_217): the executors view IS the builder fleet — a
+    // store replica's materialization claim is not an executor (the
+    // OA5 successor view sizes pods, and store pods are sized by their
+    // own deployment). The materialization lane is visible via
+    // ListOpenAttempts' kinded rows instead.
     let rows = db
         .list_open_pull_attempts()
         .await
-        .status_internal("list_open_pull_attempts")?;
+        .status_internal("list_open_pull_attempts")?
+        .build;
 
     // Empty filter = all. "alive" = all (every entry is alive). Any
     // other known status = none (not producible here). Unknown filter

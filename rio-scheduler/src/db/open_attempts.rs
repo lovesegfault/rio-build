@@ -428,7 +428,14 @@ impl SchedulerDb {
     /// The pull transaction is the only execution writer, so the plain
     /// join needs no discriminator — terminality (the `drv_attempts`
     /// fill) is the only filter.
-    pub(crate) async fn list_open_pull_attempts(&self) -> Result<Vec<OpenAttemptRow>, sqlx::Error> {
+    /// One open-attempts read, partitioned by work class at the loader
+    /// (A2.4, bug_217): every consumer states WHICH lane it reads —
+    /// kind-blindness-by-omission (iterating "all attempts" where only
+    /// builder slots were meant) does not compile once the flat Vec is
+    /// gone. The establishment sweep visits both lanes; the busy-fleet
+    /// gauge / ListExecutors / ClusterSnapshot executor view read
+    /// `build` only.
+    pub(crate) async fn list_open_pull_attempts(&self) -> Result<OpenAttemptsByKind, sqlx::Error> {
         let rows: Vec<OpenAttemptRow> = sqlx::query_as(
             "SELECT d.derivation_id, d.drv_hash, d.drv_path, d.system, d.is_fixed_output, \
                     a.exec_id, a.builder_id AS executor_id, a.generation, \
@@ -450,8 +457,25 @@ impl SchedulerDb {
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows)
+        let (materialization, build): (Vec<_>, Vec<_>) = rows
+            .into_iter()
+            .partition(|r| r.attempt_kind == crate::state::AttemptKind::Materialization.as_str());
+        Ok(OpenAttemptsByKind {
+            build,
+            materialization,
+        })
     }
+}
+
+/// The open pull-mode attempts, partitioned by work class (A2.4).
+#[derive(Debug, Default)]
+pub(crate) struct OpenAttemptsByKind {
+    /// Builder-pod attempts: the busy-fleet population (one attempt =
+    /// one builder slot).
+    pub build: Vec<OpenAttemptRow>,
+    /// Store-replica materialization claims: store-side work, never a
+    /// builder slot.
+    pub materialization: Vec<OpenAttemptRow>,
 }
 
 impl SchedulerDb {

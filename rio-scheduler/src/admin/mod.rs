@@ -525,8 +525,14 @@ impl AdminService for AdminServiceImpl {
             .list_open_pull_attempts()
             .await
             .status_internal("list_open_pull_attempts")?;
+        // BOTH lanes, deliberately: this is the whole-fleet OA5 view
+        // (and the OA2 wedge feed) — the kinded rows let consumers
+        // partition; the build-only views are ListExecutors and the
+        // busy-fleet gauge (A2.4).
         let attempts = rows
+            .build
             .into_iter()
+            .chain(rows.materialization)
             .map(|r| rio_proto::types::OpenAttempt {
                 intent_id: r.drv_hash,
                 derivation: r.drv_path,

@@ -245,6 +245,7 @@ impl DagActor {
         // Assigned is the just-minted pull attempt; for "how busy are
         // workers" they're equivalent.
         let mut running_derivations = 0u32;
+        let mut build_executors = 0u32;
         let mut queued_derivations = 0u32;
         let mut substituting_derivations = 0u32;
         let mut queued_by_system: HashMap<String, u32> = HashMap::new();
@@ -259,7 +260,18 @@ impl DagActor {
         for (drv_hash, s) in self.dag.iter_nodes() {
             match s.status() {
                 DerivationStatus::Assigned | DerivationStatus::Running => {
+                    // The running bucket is kind-blind by design (the
+                    // derivation IS being worked); the EXECUTOR view
+                    // below is builders-only (A2.4, bug_217) — a
+                    // materialization claim holds a store replica's
+                    // walk slot, not a builder pod. Single
+                    // kind-to-surface source: the open_attempt_kind
+                    // captured at the mint
+                    // (r[sched.pull.kinded-running-surface]).
                     running_derivations += 1;
+                    if s.open_attempt_kind != Some(crate::state::AttemptKind::Materialization) {
+                        build_executors += 1;
+                    }
                 }
                 DerivationStatus::Ready => {
                     // r[impl sched.materialize.job+2]
@@ -308,10 +320,11 @@ impl DagActor {
         }
 
         ClusterSnapshot {
-            // The busy view: one open attempt per in-flight derivation,
-            // one attempt per pod (P0537).
-            total_executors: running_derivations,
-            active_executors: running_derivations,
+            // The busy view: one open BUILD attempt per builder pod
+            // (P0537); materialization claims are excluded (A2.4 —
+            // store-side work holds no builder slot).
+            total_executors: build_executors,
+            active_executors: build_executors,
             draining_executors: 0,
             pending_builds,
             active_builds,

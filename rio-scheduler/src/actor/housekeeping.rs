@@ -130,7 +130,6 @@ impl DagActor {
         self.tick_gc_materialization_jobs().await;
         self.tick_gc_build_wanted_outputs().await;
         self.tick_sweep_dispatched_cells();
-        self.tick_publish_gauges();
         self.tick_flush_status_outbox().await;
         self.tick_sweep_open_pull_attempts().await;
         // Materialization sweeps: cancel jobs whose derivation has no
@@ -173,6 +172,18 @@ impl DagActor {
         // zeroed once by handle_leader_lost.
         metrics::gauge!("rio_scheduler_substituting_derivations")
             .set(f64::from(snapshot.substituting_derivations));
+        // A2.4 (bug_217): the state gauges are single-sourced from the
+        // SAME snapshot the proto fields serve — gauge and
+        // `ClusterStatus` cannot diverge (pre-fix tick_publish_gauges
+        // recomputed them independently and counted pending-job Ready
+        // nodes as builder-queue depth, the has_pending_unclaimed_job
+        // omission). Leader-gated by the handle_tick early-return;
+        // zeroed by handle_leader_lost.
+        metrics::gauge!("rio_scheduler_derivations_queued")
+            .set(f64::from(snapshot.queued_derivations));
+        metrics::gauge!("rio_scheduler_builds_active").set(f64::from(snapshot.active_builds));
+        metrics::gauge!("rio_scheduler_derivations_running")
+            .set(f64::from(snapshot.running_derivations));
         self.snapshot_tx.send_replace(snapshot);
     }
 
@@ -588,47 +599,6 @@ impl DagActor {
         }
     }
 
-    /// Update metrics. All gauges are set from ground-truth state on each
-    /// Tick — this is self-healing against any counting bugs elsewhere.
-    ///
-    /// Leader-only via the `handle_tick` early-return above. A fresh
-    /// standby never reaches here so it exports no series (see
-    /// `test_not_leader_does_not_set_gauges`). A was-leader-now-standby
-    /// has its gauges zeroed once by `handle_leader_lost` so its frozen
-    /// last-tick values don't sit in Prometheus indefinitely. Net:
-    /// queries see one non-zero series per gauge, no max() wrapper
-    /// needed.
-    ///
-    /// `derivations_queued` is the DAG `Ready` count — the same
-    /// population `ClusterStatus.queued_derivations` and
-    /// `queued_by_system` report (the legacy ready-queue membership a
-    /// pull mint never dequeued is no longer a metric source).
-    ///
-    /// The stream-era `workers_active` gauge is gone (removed with the
-    /// proto sweep once its deletion-gate role ended);
-    /// `rio_scheduler_open_attempts` (set by the establishment sweep)
-    /// is the busy-fleet gauge.
-    // r[impl obs.metric.scheduler-leader-gate+4]
-    fn tick_publish_gauges(&self) {
-        let mut queued = 0usize;
-        let mut running = 0usize;
-        for s in self.dag.iter_values() {
-            match s.status() {
-                DerivationStatus::Ready => queued += 1,
-                DerivationStatus::Running | DerivationStatus::Assigned => running += 1,
-                _ => {}
-            }
-        }
-        metrics::gauge!("rio_scheduler_derivations_queued").set(queued as f64);
-        metrics::gauge!("rio_scheduler_builds_active").set(
-            self.builds
-                .values()
-                .filter(|b| b.state() == BuildState::Active)
-                .count() as f64,
-        );
-        metrics::gauge!("rio_scheduler_derivations_running").set(running as f64);
-    }
-
     /// Establishment sweep for open pull-mode attempts — the single
     /// scheduler-side time-based repair the pull path keeps. Every open
     /// attempt (the durable view) is visited every sweep; one whose age
@@ -703,8 +673,16 @@ impl DagActor {
                 return;
             }
         };
-        metrics::gauge!("rio_scheduler_open_attempts").set(opens.len() as f64);
-        if opens.is_empty() {
+        // A2.4 (bug_217): the busy-fleet gauge is the BUILD lane only —
+        // one open build attempt = one builder pod slot (the
+        // workers_active successor and the one-attempt-per-pod
+        // ScaledObject contract). Store materialization claims get
+        // their own series; counting them here inflated every consumer
+        // sized off the builder fleet during substitution waves.
+        metrics::gauge!("rio_scheduler_open_attempts").set(opens.build.len() as f64);
+        metrics::gauge!("rio_scheduler_open_materialization_attempts")
+            .set(opens.materialization.len() as f64);
+        if opens.build.is_empty() && opens.materialization.is_empty() {
             return;
         }
         let slack_secs = self.establishment_report_slack.as_secs_f64();
@@ -719,7 +697,15 @@ impl DagActor {
         // the column existed (and a node evicted from the DAG) fall
         // back to whichever anchor is available.
         let (hw, cost, inputs_gen) = self.solve_inputs();
-        let expired: Vec<crate::db::open_attempts::OpenAttemptRow> = opens
+        // Per-kind windows (A2.4): the BUILD window is
+        // max(persisted, sweep-time re-solve) — widen-only, as before.
+        // The MATERIALIZATION window is persisted-only: a store walk
+        // runs under `materialization.attempt_deadline_secs`, never a
+        // build pod's solve — re-solving a BUILD deadline for a store
+        // claim either widened the window by a minutes-scale solve or
+        // (post-A2.3) compared apples to the store anchor.
+        let mut expired: Vec<crate::db::open_attempts::OpenAttemptRow> = opens
+            .build
             .into_iter()
             .filter(|attempt| {
                 let dispatched_deadline = attempt.deadline_secs.unwrap_or(0.0);
@@ -737,6 +723,9 @@ impl DagActor {
                 attempt.age_secs > deadline_secs + slack_secs
             })
             .collect();
+        expired.extend(opens.materialization.into_iter().filter(|attempt| {
+            attempt.age_secs > attempt.deadline_secs.unwrap_or(0.0) + slack_secs
+        }));
         if expired.is_empty() {
             return;
         }
