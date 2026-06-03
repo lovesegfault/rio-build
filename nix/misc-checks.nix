@@ -509,6 +509,71 @@ in
   # typst itself can't see raw backticks. Each pattern catches a class
   # that has produced ≥1 bughunter finding (Nth-strike close for
   # merged_001/028/032 et al.; tightened per merged_015/bug_005).
+  # A1 fenced-write-discipline (bughunt wave) — the two textual policy
+  # nets behind the FencedTx capability (the in-crate
+  # db/tests/fence_coverage.rs enumeration pins db/'s own statements;
+  # these pin the rest of the crate against re-introduction).
+  #
+  # fence-sql-canonical: the claims-floor GREATEST read
+  # (MAX(generation) over assignments + leader_generation_claims)
+  # exists in exactly two production files — db/mod.rs (claims_floor,
+  # private to the capability) and db/recovery.rs
+  # (max_known_generation, the pool-seeding read, allowlisted by
+  # design). Any other occurrence is an open-coded floor read the
+  # capability was built to delete (bug_269's class).
+  fence-sql-canonical =
+    pkgs.runCommand "rio-fence-sql-canonical"
+      {
+        srcDir = pkgs.lib.fileset.toSource {
+          root = ../rio-scheduler/src;
+          fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src;
+        };
+      }
+      ''
+        set -euo pipefail
+        # The SQL literal signature: MAX(generation) FROM
+        # leader_generation_claims (whitespace-insensitive via -z would
+        # overfit; the FROM clause is the stable token).
+        hits=$(grep -rl 'MAX(generation) FROM leader_generation_claims' $srcDir           | grep -v '/db/mod.rs$'           | grep -v '/db/recovery.rs$'           | grep -v '/tests/' || true)
+        if [ -n "$hits" ]; then
+          echo "FAIL: open-coded claims-floor SQL outside db/mod.rs + db/recovery.rs:" >&2
+          echo "$hits" >&2
+          echo "Decision-state writes go through SchedulerDb::begin_fenced (the FencedTx" >&2
+          echo "capability); the floor read is private to it. See sched.evidence.durability." >&2
+          exit 1
+        fi
+        touch $out
+      '';
+
+  # fence-no-raw-decision-sql: no raw write-verb SQL on the decision
+  # tables (assignments, derivations, materialization_jobs,
+  # build_wanted_outputs, drv_attempts) outside rio-scheduler/src/db/
+  # — actor/grpc/admin code calls the fenced db-layer fns
+  # (FencedTx::close_assignment, the *_fenced writers), never inline
+  # SQL (merged_bug_231's class: the derivation-keyed close lived in
+  # housekeeping.rs).
+  fence-no-raw-decision-sql =
+    pkgs.runCommand "rio-fence-no-raw-decision-sql"
+      {
+        srcDir = pkgs.lib.fileset.toSource {
+          root = ../rio-scheduler/src;
+          fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-scheduler/src;
+        };
+      }
+      ''
+        set -euo pipefail
+        hits=$(grep -rlE 'UPDATE (assignments|derivations|materialization_jobs|build_wanted_outputs)|INSERT INTO drv_attempts|DELETE FROM (assignments|materialization_jobs|build_wanted_outputs)' $srcDir           | grep -v '/db/'           | grep -v '/tests/' || true)
+        if [ -n "$hits" ]; then
+          echo "FAIL: raw decision-table SQL outside rio-scheduler/src/db/:" >&2
+          echo "$hits" >&2
+          echo "Use the fenced db-layer writers (FencedTx::close_assignment," >&2
+          echo "SchedulerDb::*_fenced) — see sched.evidence.durability +" >&2
+          echo "db/tests/fence_coverage.rs." >&2
+          exit 1
+        fi
+        touch $out
+      '';
+
   docs-lint =
     pkgs.runCommand "rio-docs-lint"
       {

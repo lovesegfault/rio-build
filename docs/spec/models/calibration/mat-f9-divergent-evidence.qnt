@@ -38,7 +38,8 @@ module matCalibF9DivergentEvidence {
     ENABLE_FAILOVER = false,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
   ).* from "../materializationJob"
 
   /// PRE-FIX Unobtainable consumption: arm 1/2 fires on EVERY non-moot

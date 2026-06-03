@@ -35,7 +35,8 @@ module matCalibB5aRefeedOverwrite {
     ENABLE_FAILOVER = false,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
   ).* from "../materializationJob"
 
   /// PRE-FIX dedup re-feed: overwrites the view entry fresh.

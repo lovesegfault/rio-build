@@ -37,7 +37,8 @@ module matCalibB2NoPinAtIngest {
     ENABLE_FAILOVER = false,
     ENABLE_GC = true,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
   ).* from "../materializationJob"
 
   /// PRE-FIX ingest: no pin INSERT.

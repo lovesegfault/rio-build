@@ -36,7 +36,8 @@ module matCalibF11UnfencedResolve {
     ENABLE_FAILOVER = true,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = true
+    ENABLE_STALE_TENURE = true,
+    ENABLE_RESOLVE_FAULTS = false
   ).* from "../materializationJob"
 
   /// PRE-FIX stale-tenure write: the apply (no fence discard).

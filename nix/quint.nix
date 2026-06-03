@@ -118,6 +118,12 @@ let
     "atMostOneUnresolvedJobPerDrv"
     "atMostOneClaimWinner"
     "wrongfulFailFastBoundedPerJob"
+    # A1 fenced-write-discipline (bughunt wave): the view-settlement
+    # pair — view mirrors the durable unresolved relation (133) and a
+    # cancelled job's history is frozen (276). Single-owner: A1 lands
+    # both; A3 extends calibration sets only (§4.F13).
+    "viewMatchesDurableUnresolved"
+    "chargeFreeCancellation"
     "creationLeavesTenantResolvable"
     "materializationCrashChargedOnce"
     "crossBuildWantedIsolation"
@@ -3883,6 +3889,99 @@ in
       extraSpecs = [ "materializationJob" ];
       step = "calibStep";
       witness = "noCoveredCreationJob";
+    };
+
+    # ------------------------------------------------------------------
+    # A1 fenced-write-discipline (bughunt wave) — view settlement.
+    #
+    # The resolve-faults regime exposes the durable resolve's FAULT
+    # arms (fenced/errored) as steps; the two A1 invariants
+    # (viewMatchesDurableUnresolved, chargeFreeCancellation — in
+    # matJobInvariants for every regime) bind the view to the durable
+    # unresolved relation and freeze a cancelled job's history. The
+    # paired calibration pins re-find the pre-fix view discard (133)
+    # and the split-cancel attempt leak (276).
+    # ------------------------------------------------------------------
+    # r[verify sched.materialize.view-settlement]
+    quint-materialization-holds-resolve-faults = mkQuintSimHoldsCheck {
+      name = "materialization-holds-resolve-faults";
+      spec = "materializationJob";
+      main = "materializationJobResolveFaults";
+      invariants = matJobInvariants;
+      maxSamples = 2000000;
+      maxSteps = 15;
+    };
+    # 133: the fenced/errored resolve still discarded the view entry.
+    quint-materialization-calib-133-discarded-outcome = mkQuintWitnessCheck {
+      name = "materialization-calib-133-discarded-outcome";
+      spec = "calibration/mat-133-discarded-outcome";
+      main = "matCalib133DiscardedOutcome";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "viewMatchesDurableUnresolved";
+    };
+    # 276: the split cancel leaked the open attempt to the
+    # establishment charge.
+    quint-materialization-calib-276-dag-absent-cancel = mkQuintWitnessCheck {
+      name = "materialization-calib-276-dag-absent-cancel";
+      spec = "calibration/mat-276-dag-absent-cancel";
+      main = "matCalib276DagAbsentCancel";
+      extraSpecs = [ "materializationJob" ];
+      step = "calibStep";
+      witness = "chargeFreeCancellation";
+    };
+
+    # ------------------------------------------------------------------
+    # A1 fenced-write-discipline — the fence over interleaved
+    # transactions (docs/spec/models/fencedWrites.qnt): READ COMMITTED
+    # modeled precisely (begin-time floor snapshot vs the in-statement
+    # EvalPlanQual predicate). Tier-1 exhaustive at MAX_GEN=3 /
+    # 2 replicas / 1 drv; the four calibration pins are the
+    # falsifiability pairs (261 TOCTOU, 231 deposed close, 273 floor
+    # regression, 393 terminal refusal). The fresh-insert-below-floor
+    # residual is deliberately reachable (priced in
+    # fence-invariant-map.md) — activeRowGenMonotonic holds with it.
+    # ------------------------------------------------------------------
+    # r[verify sched.evidence.durability+4]
+    # r[verify sched.lease.fence-statement-guard]
+    # r[verify sched.grpc.fence-retryable]
+    quint-fenced-writes = mkQuintCheck {
+      name = "fenced-writes";
+      spec = "fencedWrites";
+      main = "fencedWritesT1";
+      invariants = [ "fencedWritesAll" ];
+    };
+    quint-fence-calib-261-unguarded-upsert = mkQuintWitnessCheck {
+      name = "fence-calib-261-unguarded-upsert";
+      spec = "calibration/fence-261-unguarded-upsert";
+      main = "fenceCalib261UnguardedUpsert";
+      extraSpecs = [ "fencedWrites" ];
+      step = "calibStep";
+      witness = "activeRowGenMonotonic";
+    };
+    quint-fence-calib-231-unfenced-close = mkQuintWitnessCheck {
+      name = "fence-calib-231-unfenced-close";
+      spec = "calibration/fence-231-unfenced-close";
+      main = "fenceCalib231UnfencedClose";
+      extraSpecs = [ "fencedWrites" ];
+      step = "calibStep";
+      witness = "openAttemptViewStableUnderDeposedClose";
+    };
+    quint-fence-calib-273-plain-floor-set = mkQuintWitnessCheck {
+      name = "fence-calib-273-plain-floor-set";
+      spec = "calibration/fence-273-plain-floor-set";
+      main = "fenceCalib273PlainFloorSet";
+      extraSpecs = [ "fencedWrites" ];
+      step = "calibStep";
+      witness = "resourceFloorMonotonic";
+    };
+    quint-fence-calib-393-terminal-refusal = mkQuintWitnessCheck {
+      name = "fence-calib-393-terminal-refusal";
+      spec = "calibration/fence-393-terminal-refusal";
+      main = "fenceCalib393TerminalRefusal";
+      extraSpecs = [ "fencedWrites" ];
+      step = "calibStep";
+      witness = "fenceRefusalAlwaysRetryable";
     };
 
     # ------------------------------------------------------------------

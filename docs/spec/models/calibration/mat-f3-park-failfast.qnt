@@ -36,7 +36,8 @@ module matCalibF3ParkFailFast {
     ENABLE_FAILOVER = false,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
   ).* from "../materializationJob"
 
   /// PRE-FIX InfraFailure consumption: at the budget the node FAILS

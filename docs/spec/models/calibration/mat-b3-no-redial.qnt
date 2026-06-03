@@ -42,7 +42,8 @@ module matCalibB3NoRedial {
     ENABLE_FAILOVER = true,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
   ).* from "../materializationJob"
 
   action calibStep = {

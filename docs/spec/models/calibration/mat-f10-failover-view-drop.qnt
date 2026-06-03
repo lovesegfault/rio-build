@@ -36,7 +36,8 @@ module matCalibF10FailoverViewDrop {
     ENABLE_FAILOVER = true,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
   ).* from "../materializationJob"
 
   /// PRE-FIX failover: the view is dropped, not rebuilt.

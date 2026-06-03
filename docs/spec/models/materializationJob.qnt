@@ -258,6 +258,11 @@ module materializationJob {
   const ENABLE_GC: bool
   const ENABLE_CRASH: bool
   const ENABLE_STALE_TENURE: bool
+  /// A1 fenced-write-discipline (bughunt wave): expose the durable
+  /// resolve's FAULT arms (fenced/errored) as separate steps so the
+  /// view-settlement gate is checkable. Default false — every
+  /// pre-existing regime is state-space-identical.
+  const ENABLE_RESOLVE_FAULTS: bool
 
   // --- 3. pure defs ---------------------------------------------------------
 
@@ -380,6 +385,12 @@ module materializationJob {
   /// GHOST (F11): a stale-generation job write APPLIED. Unreachable as
   /// built (the fence discards); the unfenced-resolve override latches.
   var staleJobWriteApplied: bool
+  /// GHOST (A1, merged_bug_276): a materialization-infra charge landed
+  /// on a drv whose job was ALREADY cancelled (or gone) — the
+  /// leaked-attempt establishment conversion. Unreachable as built
+  /// post-fix (the single-tx cancel closes the attempt with the row);
+  /// the mat-276-dag-absent-cancel override latches it.
+  var chargedAfterCancel: bool
   /// Delta 2a: the executor replica's scheduler channel is pinned to a
   /// deposed/standby replica (answers UNAVAILABLE). Set for every
   /// replica by failover; cleared per replica by redialChannel.
@@ -586,6 +597,26 @@ module materializationJob {
   /// claims-floor fence discards them (staleWriteDiscarded is the
   /// non-vacuity ghost; this latch is the violation).
   val fencedJobWritesOnly = not(staleJobWriteApplied)
+
+  // r[A1 view-settlement — sched.materialize.view-settlement]
+  /// The in-memory view mirrors the durable unresolved relation under
+  /// a stable leader: an entry exists iff an unresolved job row does.
+  /// Scope: stable-leader (failover view reconstruction is
+  /// failoverPreservesJobs' subject; the resolve-faults regime runs
+  /// failover-disabled so this binds everywhere there). The
+  /// mat-133-discarded-outcome override (a fenced/errored resolve
+  /// that still discards the view entry) is its falsifiability pair.
+  val viewMatchesDurableUnresolved = DRVS.forall(d => or {
+    failedOver,
+    (view.get(d) != VNone) == hasUnresolvedJob(d),
+  })
+
+  /// A cancelled job's history is FROZEN: no materialization-infra
+  /// charge ever lands after (or without) an unresolved job — the
+  /// leaked-attempt establishment conversion is unreachable
+  /// (merged_bug_276). The mat-276-dag-absent-cancel override (the
+  /// pre-fix split cancel) is its falsifiability pair.
+  val chargeFreeCancellation = not(chargedAfterCancel)
 
   /// §3.6: the attempt kind matches the worker class.
   val kindMatchesWorker = DRVS.forall(d =>
@@ -836,6 +867,7 @@ module materializationJob {
     fsReportSoundAll' = fsReportSoundAll, covAtResolveAll' = covAtResolveAll,
     covLiveOnlyAll' = covLiveOnlyAll,
     creationResolvableAll' = creationResolvableAll,
+    chargedAfterCancel' = chargedAfterCancel,
   }
   /// Job-core vars unchanged.
   action jobCoreUnchanged = all {
@@ -947,6 +979,7 @@ module materializationJob {
     ffJustifiedAll' = ffJustifiedAll, fsJustifiedAll' = fsJustifiedAll,
     fsReportSoundAll' = fsReportSoundAll, covAtResolveAll' = covAtResolveAll,
     covLiveOnlyAll' = covLiveOnlyAll,
+    chargedAfterCancel' = chargedAfterCancel,
   }
 
   /// Delta 5: the dispatch-probe dedup re-encounters an existing
@@ -1098,6 +1131,7 @@ module materializationJob {
     ffJustifiedAll' = ffJustifiedAll, fsJustifiedAll' = fsJustifiedAll,
     fsReportSoundAll' = fsReportSoundAll,
     creationResolvableAll' = creationResolvableAll,
+    chargedAfterCancel' = chargedAfterCancel,
   }
 
   /// §2.4: the executor's Unobtainable report + the four-arm
@@ -1210,6 +1244,7 @@ module materializationJob {
     unobChargeBacked' = unobChargeBacked,
     tenureUnchanged,
     creationResolvableAll' = creationResolvableAll,
+    chargedAfterCancel' = chargedAfterCancel,
   }
 
   /// §2.5: the executor's InfraFailure report — the charge rides the
@@ -1290,7 +1325,23 @@ module materializationJob {
     relUnchanged, storeUnchanged, envUnchanged,
     matUnobtainableLedger' = matUnobtainableLedger,
     unobChargeBacked' = unobChargeBacked,
-    tenureUnchanged, ghostsUnchanged,
+    tenureUnchanged,
+    failFastCount' = failFastCount,
+    ffJustifiedAll' = ffJustifiedAll, fsJustifiedAll' = fsJustifiedAll,
+    fsReportSoundAll' = fsReportSoundAll, covAtResolveAll' = covAtResolveAll,
+    covLiveOnlyAll' = covLiveOnlyAll,
+    creationResolvableAll' = creationResolvableAll,
+    // The 276 ghost: a mat charge against a job that is no longer
+    // unresolved (cancelled or gone) is the leaked-attempt
+    // conversion. Unreachable as built (cancel closes the attempt in
+    // the same tx); the dag-absent-cancel override reaches it.
+    chargedAfterCancel' = or {
+      chargedAfterCancel,
+      match attempts.get(d) {
+        | NoAttempt => false
+        | OpenAttempt(a) => a.kind == KMaterialization and not(hasUnresolvedJob(d))
+      },
+    },
   }
 
   /// §2.4 / BC-2: zero live in-memory interest cancels the job and
@@ -1298,6 +1349,15 @@ module materializationJob {
   /// row, and post-D-prime the pruned fact has no other carrier — the
   /// ghost ends with the row's unresolved state (delta 1: production
   /// has no mark column to outlive the row, migration 080).
+  ///
+  /// A1 (merged_bug_276): job + attempt close in ONE step — the
+  /// production mirror is cancel_job_and_close_attempt_fenced, a
+  /// single fenced transaction keyed on durable state. The action
+  /// reads NO node status (total over the DAG-absent arm); the
+  /// chargeFreeCancellation invariant pins that no materialization
+  /// charge ever follows the cancellation (the calibration's split
+  /// cancel leaves the attempt open and the establishment converts
+  /// the leak into a charge).
   action cancelOnZeroInterest(d: str): bool = all {
     hasUnresolvedJob(d),
     memInterest(d) == Set(),
@@ -1310,6 +1370,38 @@ module materializationJob {
     nodeStatus' = nodeStatus,
     topdownPruned' = topdownPruned.put(d, false),
     dupJob' = dupJob, execsMinted' = execsMinted,
+    relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged, ghostsUnchanged,
+  }
+
+  /// A1 resolve-fault arms (ENABLE_RESOLVE_FAULTS; the view-settlement
+  /// gate, sched.materialize.view-settlement). The FIXED system:
+  ///   - resolveApplied: the settled durable resolution — modeled as
+  ///     the single-tx zero-interest cancel (the one resolution arm
+  ///     with no other justification input).
+  ///   - resolveFenced / resolveErr: the durable write was REFUSED
+  ///     (claims-floor fence) or ERRORED — the fixed system keeps the
+  ///     job row, the VIEW ENTRY, and the attempt untouched (the
+  ///     disposition gates every companion); both are observational
+  ///     stutters here. The mat-133-discarded-outcome override
+  ///     replaces them with the pre-fix view discard.
+  action resolveApplied(d: str): bool = all {
+    ENABLE_RESOLVE_FAULTS,
+    cancelOnZeroInterest(d),
+  }
+
+  action resolveFenced(d: str): bool = all {
+    ENABLE_RESOLVE_FAULTS,
+    hasUnresolvedJob(d),
+    jobCoreUnchanged,
+    relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged, ghostsUnchanged,
+  }
+
+  action resolveErr(d: str): bool = all {
+    ENABLE_RESOLVE_FAULTS,
+    hasUnresolvedJob(d),
+    jobCoreUnchanged,
     relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
     tenureUnchanged, ghostsUnchanged,
   }
@@ -1366,6 +1458,7 @@ module materializationJob {
     fsReportSoundAll' = fsReportSoundAll, covAtResolveAll' = covAtResolveAll,
     covLiveOnlyAll' = covLiveOnlyAll,
     creationResolvableAll' = creationResolvableAll,
+    chargedAfterCancel' = chargedAfterCancel,
   }
 
   /// Delta 3 arm 2: the durable backoff lapses — the job un-parks for
@@ -1611,6 +1704,7 @@ module materializationJob {
     leaseGen' = 0,
     staleWriteDiscarded' = false,
     staleJobWriteApplied' = false,
+    chargedAfterCancel' = false,
     channelStale' = REPLICAS.mapBy(r => false),
     failedOver' = false,
     claimAfterFailover' = false,
@@ -1654,6 +1748,9 @@ module materializationJob {
       reportInfra(d),
       establishCrashedAttempt(d),
       cancelOnZeroInterest(d),
+      resolveApplied(d),
+      resolveFenced(d),
+      resolveErr(d),
       obsoleteOnProduced(d),
       parkReevaluate(d),
       parkBackoffExpires(d),
@@ -1932,7 +2029,8 @@ module materializationJobBase {
     ENABLE_FAILOVER = false,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
   ).*
 }
 
@@ -1953,7 +2051,8 @@ module materializationJobBaseEx {
     ENABLE_FAILOVER = false,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
   ).*
 }
 
@@ -1974,7 +2073,8 @@ module materializationJobFailover {
     ENABLE_FAILOVER = true,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
   ).*
 }
 
@@ -1994,7 +2094,8 @@ module materializationJobFailoverEx {
     ENABLE_FAILOVER = true,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
   ).*
 }
 
@@ -2015,7 +2116,8 @@ module materializationJobAdversarialStore {
     ENABLE_FAILOVER = false,
     ENABLE_GC = true,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
   ).*
 }
 
@@ -2035,7 +2137,8 @@ module materializationJobAdversarialStoreEx {
     ENABLE_FAILOVER = false,
     ENABLE_GC = true,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
   ).*
 }
 
@@ -2057,7 +2160,8 @@ module materializationJobStaleTenure {
     ENABLE_FAILOVER = true,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = true
+    ENABLE_STALE_TENURE = true,
+    ENABLE_RESOLVE_FAULTS = false
   ).*
 }
 
@@ -2077,7 +2181,8 @@ module materializationJobStaleTenureEx {
     ENABLE_FAILOVER = true,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = true
+    ENABLE_STALE_TENURE = true,
+    ENABLE_RESOLVE_FAULTS = false
   ).*
 }
 
@@ -2100,7 +2205,8 @@ module materializationJobCrashLoop {
     ENABLE_FAILOVER = false,
     ENABLE_GC = false,
     ENABLE_CRASH = true,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
   ).*
 }
 
@@ -2120,6 +2226,33 @@ module materializationJobCrashLoopEx {
     ENABLE_FAILOVER = false,
     ENABLE_GC = false,
     ENABLE_CRASH = true,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
+  ).*
+}
+
+/// A1 resolve-faults regime (bughunt wave): the durable-resolve fault
+/// arms are live (fenced/errored resolves interleave with every
+/// consumption and cancellation), failover disabled so
+/// viewMatchesDurableUnresolved binds unconditionally. The two A1
+/// invariants join the conjunction here and in every other regime
+/// (where the fault arms are simply disabled).
+module materializationJobResolveFaults {
+  import materializationJob(
+    BUILDS = Set("b1", "b2"),
+    DRVS = Set("d1", "d2"),
+    OUTPUTS = Set("o1", "o2"),
+    REPLICAS = Set("r1", "r2"),
+    BUILDERS = Set("w1"),
+    MAT_BUDGET = 2,
+    MAX_EXECS = 4,
+    MAX_GEN = 0,
+    MAX_UPSTREAM_FLIPS = 2,
+    MAX_LEGACY = 1,
+    ENABLE_FAILOVER = false,
+    ENABLE_GC = false,
+    ENABLE_CRASH = true,
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = true
   ).*
 }

@@ -34,7 +34,8 @@ module matCalibDedupRemoved {
     ENABLE_FAILOVER = false,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
   ).* from "../materializationJob"
 
   /// PRE-FIX creation: no dedup guard; a second unresolved row latches

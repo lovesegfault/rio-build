@@ -43,7 +43,8 @@ module matCalibF1NoPresenceRecheck {
     ENABLE_FAILOVER = false,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
   ).* from "../materializationJob"
 
   /// The pre-fix-only delta: creation on a COVERED node (the state the

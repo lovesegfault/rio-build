@@ -37,7 +37,8 @@ module matCalibF2bEstablishAdopt {
     ENABLE_FAILOVER = false,
     ENABLE_GC = false,
     ENABLE_CRASH = true,
-    ENABLE_STALE_TENURE = false
+    ENABLE_STALE_TENURE = false,
+    ENABLE_RESOLVE_FAULTS = false
   ).* from "../materializationJob"
 
   /// PRE-FIX establishment: adopt-on-presence for the materialization
