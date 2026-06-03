@@ -218,10 +218,16 @@ struct SubstAids {
 /// per-root `BuildResult.errorMsg`, and the scheduler puts the failure
 /// cause first (`dependency '<drv>' failed: …`, `max_infra_retries=…`),
 /// so capping the tail loses nothing that identifies the failure.
-/// Scheduler-side messages run up to 16 KiB (its `MAX_ERROR_MSG_LEN`
-/// per-event cap); 4 KiB here bounds a multi-root batch's retention at
-/// roots × 4 KiB even when a cascade saturates that cap.
-const RETAINED_ERROR_MSG_CAP: usize = 4 * 1024;
+///
+/// The VALUE is the shared retained-evidence cap
+/// ([`rio_common::limits::MAX_RETAINED_ERROR_BYTES`]) — the same
+/// constant the engine applies to the failure reasons it captures from
+/// this handler's relayed lines (`MAX_CAPTURED_REASON_BYTES` in
+/// rio-replay's stderr parser), so the two retention postures cannot
+/// drift apart. Sizing rationale (the scheduler's 16 KiB
+/// `MAX_ERROR_MSG_LEN` ingress cap, cause-first message layout) lives
+/// on the shared constant.
+const RETAINED_ERROR_MSG_CAP: usize = rio_common::limits::MAX_RETAINED_ERROR_BYTES;
 
 struct BuildActivityState {
     /// Per-derivation activity IDs (for `actBuild` start/stop and for
@@ -3991,6 +3997,14 @@ mod tests {
     /// text up to the scheduler's 16 KiB per-event cap — while the
     /// stderr relay still carries the FULL text to the client at the
     /// moment the event arrives, so nothing the client sees is lost.
+    ///
+    /// The realized truncation length is asserted against the SHARED
+    /// constant ([`rio_common::limits::MAX_RETAINED_ERROR_BYTES`]), not
+    /// the local alias: the engine's stderr parser caps its captured
+    /// copy of these relayed lines with the same constant, and this pin
+    /// is what fails if the gateway's retention is ever re-pointed at a
+    /// local literal again (the pre-hoist mirror-by-literal drift
+    /// surface).
     #[tokio::test]
     async fn terminal_failed_root_error_message_capped() {
         use rio_nix::protocol::stderr::STDERR_NEXT;
@@ -4016,8 +4030,9 @@ mod tests {
         let retained = &act.terminal[root];
         assert_eq!(
             retained.error_msg.len(),
-            RETAINED_ERROR_MSG_CAP,
-            "retained message must be capped"
+            rio_common::limits::MAX_RETAINED_ERROR_BYTES,
+            "retained message must be capped at the SHARED retained-evidence \
+             constant (the engine-side capture uses the same one)"
         );
         assert!(
             huge.starts_with(&retained.error_msg),

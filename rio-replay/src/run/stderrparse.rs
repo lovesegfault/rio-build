@@ -36,14 +36,17 @@ use rio_nix::protocol::client::STDERR_BUDGET_NODE_MULTIPLIER_CAP;
 /// the engine pod, and loud (the drop warning names the cap).
 pub(crate) const MAX_CAPTURED_REASONS: usize = STDERR_BUDGET_NODE_MULTIPLIER_CAP;
 
-/// Per-value byte cap on a captured failure reason: 4 KiB, mirroring the
-/// gateway's own retained-evidence posture (`RETAINED_ERROR_MSG_CAP` in
-/// rio-gateway's build handler — the cap it applies to the per-root
-/// `BuildResult` messages it RETAINS, while relaying the full text only
-/// as stream traffic). This map is likewise retained state — persisted to
-/// batches.jsonl and reloaded every pass — so it takes the retained cap,
-/// and the full line remains available as stream evidence in the capped
-/// stderr tail whenever it was among the last 200 lines.
+/// Per-value byte cap on a captured failure reason: the SHARED
+/// retained-evidence cap, [`rio_common::limits::MAX_RETAINED_ERROR_BYTES`]
+/// — the same constant the gateway applies to the per-root `BuildResult`
+/// messages it RETAINS (`RETAINED_ERROR_MSG_CAP` in its build handler),
+/// while relaying the full text only as stream traffic. Referencing the
+/// one constant (instead of mirroring its literal, the pre-hoist shape)
+/// makes the two retention postures structurally unable to drift. This
+/// map is likewise retained state — persisted to batches.jsonl and
+/// reloaded every pass — so it takes the retained cap, and the full line
+/// remains available as stream evidence in the capped stderr tail
+/// whenever it was among the last 200 lines.
 ///
 /// Cost on genuine evidence, named: a genuine relayed reason can reach
 /// ~16 KiB (the scheduler truncates worker `error_message`s at its
@@ -56,7 +59,7 @@ pub(crate) const MAX_CAPTURED_REASONS: usize = STDERR_BUDGET_NODE_MULTIPLIER_CAP
 /// classification is unaffected; a needle scan over the retained value
 /// could miss a needle past 4 KiB, exactly as it already does for the
 /// gateway-retained in-band result messages capped at the same constant.
-pub(crate) const MAX_CAPTURED_REASON_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_CAPTURED_REASON_BYTES: usize = rio_common::limits::MAX_RETAINED_ERROR_BYTES;
 
 /// Cardinality cap on the per-batch `lost_terminals` set — same
 /// provenance and envelope as [`MAX_CAPTURED_REASONS`]: the genuine
@@ -787,6 +790,12 @@ mod tests {
     /// String valid), and — the other side — a reason of exactly the cap
     /// is retained whole, as is every genuine scheduler-corpus reason
     /// (all far under the cap; the corpus is the producer vocabulary).
+    ///
+    /// The hostile-magnitude clamp is asserted against the SHARED
+    /// constant ([`rio_common::limits::MAX_RETAINED_ERROR_BYTES`]) — the
+    /// one the gateway's own retention uses — so re-pointing this
+    /// crate's alias at a local literal (the pre-hoist mirror) fails
+    /// here, not in a code review.
     #[test]
     fn reason_values_clamp_at_the_retained_byte_cap() {
         let drv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv";
@@ -795,7 +804,10 @@ mod tests {
         let mut p = ParsedStderr::default();
         let huge = "y".repeat(1024 * 1024);
         parse_line(&mut p, &format!("derivation '{drv}' failed: {huge}"));
-        assert_eq!(p.reasons[drv].len(), MAX_CAPTURED_REASON_BYTES);
+        assert_eq!(
+            p.reasons[drv].len(),
+            rio_common::limits::MAX_RETAINED_ERROR_BYTES
+        );
 
         // Char-boundary clamp: a 3-byte char straddling the cap backs
         // off to the boundary before it.

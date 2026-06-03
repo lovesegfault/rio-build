@@ -70,6 +70,38 @@ pub const fn nar_chunk_charge(len: usize) -> u64 {
     }
 }
 
+/// Byte cap on RETAINED copies of relayed per-derivation failure text:
+/// 4 KiB.
+///
+/// One posture, two holders — the gateway's per-root
+/// `BuildResult.error_msg` retention (`RETAINED_ERROR_MSG_CAP` in
+/// rio-gateway's build handler) and the engine's captured per-drv
+/// failure reasons (`MAX_CAPTURED_REASON_BYTES` in rio-replay's stderr
+/// parser) — which previously mirrored the literal and could drift
+/// silently. Both cap a long-lived RETAINED copy (per-root results held
+/// for the final `BuildResult`; reason maps persisted to batches.jsonl
+/// and reloaded every collect pass) of text whose FULL body already
+/// reached the client in-stream at relay time, so the cap loses nothing
+/// the stream carried.
+///
+/// Trust provenance: the text originates as worker build output and
+/// scheduler error messages relayed over the stderr channel —
+/// peer-influenced, so both holders CLAMP (via
+/// [`crate::grpc::truncate_utf8`], the shared boundary-safe truncation)
+/// rather than reject: dropping the whole record would strand the
+/// derivation or discard the failure evidence entirely.
+///
+/// Sizing: the scheduler truncates worker `error_message`s at its
+/// 16 KiB ingress cap (`MAX_ERROR_MSG_LEN`) and puts the failure cause
+/// FIRST (`dependency '<drv>' failed: …`, `max_infra_retries=…`), so a
+/// 4 KiB head always identifies the failure; 4 KiB bounds a multi-root
+/// batch's retention at roots × 4 KiB even when a cascade saturates the
+/// scheduler cap. Cost on genuine evidence: only the tail of a >4 KiB
+/// reason is lost from the RETAINED copy — every classification
+/// consumer reads prefixes, and the stream/log channels keep the full
+/// text.
+pub const MAX_RETAINED_ERROR_BYTES: usize = 4 * 1024;
+
 /// Maximum length of a `hw_class` string accepted by `AppendHwPerfSample`.
 ///
 /// Real values are controller-stamped via downward-API as
