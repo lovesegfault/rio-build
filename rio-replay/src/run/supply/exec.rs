@@ -115,16 +115,22 @@ pub struct PreparedEntry {
 
 /// Errors the upload arms distinguish, three-state because the settlement
 /// they feed is irreversible: a clean daemon refusal (the wire op completed
-/// and the daemon answered — retry once on a fresh channel, then settle
-/// REFUSED, which charges dependents `upload-rejected` and trips the
-/// regression gate), a mid-upload wire death whose meaning is undetermined
-/// (retry once like a refusal — a genuine refusal racing session teardown
-/// re-presents as a clean `Refused` on the fresh channel — but with no
-/// clean refusal observed it settles FAILED: `supply-failed`, excluded
-/// from the gate, because the only evidence is that the connection died),
-/// and everything else (failed immediately). Breaker accounting follows
-/// the evidence the same way: `Refused` proves the gateway answered and
-/// resets the count; `MaybeRefused` and `Other` are transport failures.
+/// and the daemon answered — retried once on a fresh channel; daemon
+/// evidence is NECESSARY for settling REFUSED, never sufficient: a pair
+/// whose attempts produced only refusals and wire deaths, with at least
+/// one clean refusal among them, settles REFUSED — `upload-rejected` for
+/// dependents, regression-gate trip — while a hard transport or
+/// materialization failure settles FAILED at once whatever the other
+/// attempt carried, the held refusal disclosed in the detail rather than
+/// promoted to the verdict), a mid-upload wire death whose meaning is
+/// undetermined (retry once like a refusal — a genuine refusal racing
+/// session teardown re-presents as a clean `Refused` on the fresh channel
+/// — but with no clean refusal observed it settles FAILED:
+/// `supply-failed`, excluded from the gate, because the only evidence is
+/// that the connection died), and everything else (failed immediately).
+/// Breaker accounting follows the evidence the same way: `Refused` proves
+/// the gateway answered and resets the count; `MaybeRefused` and `Other`
+/// are transport failures.
 #[derive(Debug, thiserror::Error)]
 pub enum SupplyTransportError {
     /// The daemon refused the upload with the protocol framing intact.
@@ -138,6 +144,30 @@ pub enum SupplyTransportError {
     /// Transport, timeout, or channel-open failure.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+/// Append a held daemon refusal to a FAILED settlement's detail — THE one
+/// disclosure formatter for the refusal-then-hard-death exits (streamed
+/// materialization and `Other` arms, batch retry rows minted inside
+/// [`attempt_batch`]).
+///
+/// Disclosure, never promotion: the settlement-evidence rule keeps daemon
+/// evidence NECESSARY for REFUSED — not sufficient — so a clean refusal
+/// followed by a hard transport or materialization failure settles FAILED
+/// (the deliberate, lattice-pinned (refusal × hard-failure) cell;
+/// `upload_settlement_requires_daemon_evidence_for_refused`). The refusal
+/// the daemon DID voice must not vanish from the record with that choice:
+/// it rides the FAILED row's detail so an operator triaging a masked
+/// refusal window sees the daemon's words next to the transport's, while
+/// the row's outcome stays `supply-failed` (gate-excluded) and the
+/// REFUSED-sites enumeration stays at its four daemon-evidenced settles.
+fn with_held_refusal(detail: String, refusal: Option<&str>) -> String {
+    match refusal {
+        Some(refusal) => {
+            format!("{detail} (daemon refusal observed on the other attempt: {refusal})")
+        }
+        None => detail,
+    }
 }
 
 /// The daemon/cluster operations the supply stage needs, behind a seam so
@@ -1264,12 +1294,16 @@ async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()>
             Ok(payload) => payload,
             Err(detail) => {
                 // Row first, then release — record_settlement's contract.
+                // A retry-side materialization failure settles FAILED even
+                // after a clean first-attempt refusal (daemon evidence is
+                // necessary for REFUSED, not sufficient); the held refusal
+                // is disclosed, not promoted.
                 let recorded = record_settlement(
                     env,
                     item,
                     mechanism,
                     SUPPLY_OUTCOME_FAILED,
-                    Some(detail),
+                    Some(with_held_refusal(detail, refused.as_deref())),
                     batch_id,
                     None,
                 );
@@ -1330,12 +1364,18 @@ async fn upload_stream_one(env: &UploadEnv<'_>, item: &UploadItem) -> Result<()>
             Err(SupplyTransportError::Other(err)) => {
                 env.breaker.record_failure();
                 // Row first, then release — record_settlement's contract.
+                // The hard-dying retry settles FAILED whatever the first
+                // attempt carried; a held clean refusal is disclosed in
+                // the detail, never promoted to the verdict.
                 let recorded = record_settlement(
                     env,
                     item,
                     mechanism,
                     SUPPLY_OUTCOME_FAILED,
-                    Some(format!("streamed upload failed: {err:#}")),
+                    Some(with_held_refusal(
+                        format!("streamed upload failed: {err:#}"),
+                        refused.as_deref(),
+                    )),
                     batch_id,
                     None,
                 );
@@ -1416,10 +1456,20 @@ enum BatchAttempt<'a> {
 
 /// One wire attempt of a batch upload: materialize every payload (failures
 /// drop the item individually), send the rest as one AddMultipleToStore.
+///
+/// `prior_refusal` is the clean daemon refusal a PRECEDING attempt of the
+/// same items observed (the fresh-channel retry after
+/// [`BatchAttempt::Refused`]); any FAILED row this attempt mints — a
+/// per-item materialization failure or the hard-failure shape — discloses
+/// it via [`with_held_refusal`], never promotes it: daemon evidence stays
+/// necessary for REFUSED, not sufficient. A wire death is not daemon
+/// evidence, so the retry after [`BatchAttempt::MaybeRefused`] passes
+/// `None`.
 async fn attempt_batch<'a>(
     env: &UploadEnv<'_>,
     items: &[&'a UploadItem],
     batch_id: u64,
+    prior_refusal: Option<&str>,
 ) -> Result<BatchAttempt<'a>> {
     let mut sendable: Vec<&UploadItem> = Vec::with_capacity(items.len());
     let mut entries: Vec<PreparedEntry> = Vec::with_capacity(items.len());
@@ -1455,7 +1505,7 @@ async fn attempt_batch<'a>(
                     item,
                     SUPPLY_MECHANISM_UPLOAD_BATCH,
                     SUPPLY_OUTCOME_FAILED,
-                    Some(detail),
+                    Some(with_held_refusal(detail, prior_refusal)),
                     batch_id,
                     None,
                 );
@@ -1487,7 +1537,7 @@ async fn attempt_batch<'a>(
             env.breaker.record_failure();
             Ok(BatchAttempt::Failed {
                 sendable,
-                detail: format!("batch upload failed: {err:#}"),
+                detail: with_held_refusal(format!("batch upload failed: {err:#}"), prior_refusal),
             })
         }
     }
@@ -1651,7 +1701,7 @@ async fn upload_sub_batch(env: &UploadEnv<'_>, items: Vec<&UploadItem>) -> Resul
     // exhaustion with only wire deaths in hand settles FAILED
     // (`supply-failed` for dependents, gate-excluded), never a synthesized
     // daemon verdict.
-    match attempt_batch(env, &to_send, batch_id).await? {
+    match attempt_batch(env, &to_send, batch_id, None).await? {
         BatchAttempt::Sent(sent) => settle_batch_delivered(env, &sent, batch_id).await,
         BatchAttempt::Failed { sendable, detail } => {
             settle_batch_undelivered(env, &sendable, SUPPLY_OUTCOME_FAILED, &detail, batch_id)
@@ -1664,7 +1714,11 @@ async fn upload_sub_batch(env: &UploadEnv<'_>, items: Vec<&UploadItem>) -> Resul
                 "batch upload refused; retrying once on a fresh channel with re-materialized \
                  payloads"
             );
-            match attempt_batch(env, &sendable, batch_id).await? {
+            // The retry carries the held refusal so any FAILED row it
+            // mints discloses the daemon's words alongside the
+            // transport's (necessary-not-sufficient: the verdict stays
+            // FAILED).
+            match attempt_batch(env, &sendable, batch_id, Some(&refusal)).await? {
                 BatchAttempt::Sent(sent) => settle_batch_delivered(env, &sent, batch_id).await,
                 BatchAttempt::Refused { sendable, refusal } => settle_batch_undelivered(
                     env,
@@ -1699,7 +1753,10 @@ async fn upload_sub_batch(env: &UploadEnv<'_>, items: Vec<&UploadItem>) -> Resul
                 "batch upload's wire died (may be a refusal racing teardown); retrying once \
                  on a fresh channel with re-materialized payloads"
             );
-            match attempt_batch(env, &sendable, batch_id).await? {
+            // No prior_refusal here: a wire death is transport evidence,
+            // not a daemon verdict — there is nothing daemon-voiced to
+            // disclose.
+            match attempt_batch(env, &sendable, batch_id, None).await? {
                 BatchAttempt::Sent(sent) => settle_batch_delivered(env, &sent, batch_id).await,
                 // The retry's clean refusal is the teardown-race salvage:
                 // the first attempt WAS the refusal, observed properly on
@@ -3240,18 +3297,34 @@ mod tests {
     /// settles as one: wire-death-only exhaustion is FAILED
     /// (supply-failed, gate-excluded), and a retry that dies hard
     /// settles FAILED whatever preceded it carried — a first-attempt
-    /// wire death contributes no daemon evidence for the pair. Both
-    /// directions are pinned — must-settle-refused cells carry daemon
-    /// evidence, must-settle-failed cells carry none.
+    /// wire death contributes no daemon evidence for the pair, and a
+    /// first-attempt clean refusal is DISCLOSED in the FAILED detail
+    /// (`with_held_refusal`), never promoted to the verdict. The
+    /// (refusal × hard-failure) = FAILED cell is a deliberate, pinned
+    /// policy choice — REFUSED stays necessary-on-daemon-evidence, not
+    /// sufficient — accepted with its asymmetry on record; flipping it
+    /// toward REFUSED must re-derive the four-settles enumeration
+    /// (`refused_settlements_and_breaker_evidence_sites_are_enumerated`)
+    /// and this lattice together, consciously. Both directions are
+    /// pinned — must-settle-refused cells carry daemon evidence,
+    /// must-settle-failed cells carry none as a verdict, and the
+    /// disclosure needles assert the held-refusal text appears exactly
+    /// when a clean refusal preceded the hard death (`detail_lacks` on
+    /// every other cell).
     #[tokio::test]
     async fn upload_settlement_requires_daemon_evidence_for_refused() {
         use super::test_support::ScriptedReply::{self, Other, Refuse, WireDeath};
+        /// The disclosure marker `with_held_refusal` appends; lacks-side
+        /// needle everywhere a FAILED row must NOT claim daemon evidence
+        /// (note: "no daemon refusal observed" does not contain it).
+        const HELD_REFUSAL: &str = "daemon refusal observed on the other attempt";
         struct Cell {
             name: &'static str,
             script: &'static [ScriptedReply],
             outcome: &'static str,
             attempts: u32,
-            detail_contains: Option<&'static str>,
+            detail_contains: &'static [&'static str],
+            detail_lacks: &'static [&'static str],
         }
         let cells = [
             Cell {
@@ -3259,21 +3332,26 @@ mod tests {
                 script: &[WireDeath, WireDeath],
                 outcome: SUPPLY_OUTCOME_FAILED,
                 attempts: 2,
-                detail_contains: Some("no daemon refusal observed"),
+                detail_contains: &["no daemon refusal observed"],
+                detail_lacks: &[HELD_REFUSAL],
             },
             Cell {
                 name: "wire-death x clean-refusal (teardown-race salvage)",
                 script: &[WireDeath, Refuse],
                 outcome: SUPPLY_OUTCOME_REFUSED,
                 attempts: 2,
-                detail_contains: Some("scripted refusal"),
+                detail_contains: &["scripted refusal"],
+                detail_lacks: &[HELD_REFUSAL],
             },
             Cell {
+                // SR row: hard death with NO prior daemon evidence — the
+                // FAILED detail must not claim a refusal was observed.
                 name: "wire-death x hard-failure",
                 script: &[WireDeath, Other],
                 outcome: SUPPLY_OUTCOME_FAILED,
                 attempts: 2,
-                detail_contains: Some("scripted hard transport failure"),
+                detail_contains: &["scripted hard transport failure"],
+                detail_lacks: &[HELD_REFUSAL],
             },
             Cell {
                 name: "clean-refusal x wire-death",
@@ -3282,39 +3360,50 @@ mod tests {
                 attempts: 2,
                 // The daemon's verdict settles; the retry's transport
                 // death is disclosed alongside it.
-                detail_contains: Some("transport failed"),
+                detail_contains: &["transport failed"],
+                detail_lacks: &[HELD_REFUSAL],
             },
             Cell {
                 name: "clean-refusal x clean-refusal",
                 script: &[Refuse, Refuse],
                 outcome: SUPPLY_OUTCOME_REFUSED,
                 attempts: 2,
-                detail_contains: Some("scripted refusal"),
+                detail_contains: &["scripted refusal"],
+                detail_lacks: &[HELD_REFUSAL],
             },
             Cell {
                 // The hard-dying retry settles FAILED even though the
                 // first attempt was a clean refusal: the retry exists to
                 // confirm-or-recover, and a channel-level death on it is
                 // settled transport evidence, not a second daemon answer.
+                // The refusal the daemon DID voice rides the detail —
+                // disclosure, not promotion.
                 name: "clean-refusal x hard-failure",
                 script: &[Refuse, Other],
                 outcome: SUPPLY_OUTCOME_FAILED,
                 attempts: 2,
-                detail_contains: Some("scripted hard transport failure"),
+                detail_contains: &[
+                    "scripted hard transport failure",
+                    HELD_REFUSAL,
+                    "scripted refusal",
+                ],
+                detail_lacks: &[],
             },
             Cell {
                 name: "wire-death x accepted (transient blip recovers)",
                 script: &[WireDeath],
                 outcome: SUPPLY_OUTCOME_DELIVERED,
                 attempts: 2,
-                detail_contains: None,
+                detail_contains: &[],
+                detail_lacks: &[HELD_REFUSAL],
             },
             Cell {
                 name: "clean-refusal x accepted (refusal flake recovers)",
                 script: &[Refuse],
                 outcome: SUPPLY_OUTCOME_DELIVERED,
                 attempts: 2,
-                detail_contains: None,
+                detail_contains: &[],
+                detail_lacks: &[HELD_REFUSAL],
             },
         ];
         // Streamed mechanism: the same item routed through
@@ -3362,9 +3451,15 @@ mod tests {
                     cell.attempts,
                     "{case}: a wire death gets exactly the one retry a refusal does"
                 );
-                if let Some(needle) = cell.detail_contains {
-                    let detail = entry.detail.as_deref().unwrap_or_default();
+                let detail = entry.detail.as_deref().unwrap_or_default();
+                for needle in cell.detail_contains {
                     assert!(detail.contains(needle), "{case}: detail {detail:?}");
+                }
+                for needle in cell.detail_lacks {
+                    assert!(
+                        !detail.contains(needle),
+                        "{case}: detail must not claim {needle:?}: {detail:?}"
+                    );
                 }
             }
             // The `Other` column: a hard transport failure settles FAILED
@@ -3474,6 +3569,26 @@ mod tests {
             "a clean refusal resets the breaker between hard failures: {report:?}"
         );
         assert_eq!(report.failed, 6, "{report:?}");
+    }
+
+    /// Both directions of the one disclosure formatter every
+    /// refusal-dropping FAILED exit routes through: the lattice above
+    /// pins it end-to-end through the wire arms (clean-refusal ×
+    /// hard-failure, both mechanisms); the two materialization exits
+    /// (streamed retry-side, batch per-item) call the same fn with the
+    /// same operands, so this pin covers their formatting without a
+    /// materialization-failure harness.
+    #[test]
+    fn held_refusal_disclosure_appends_exactly_when_held() {
+        assert_eq!(
+            with_held_refusal("payload gone".into(), None),
+            "payload gone",
+            "no held refusal, no claim"
+        );
+        assert_eq!(
+            with_held_refusal("payload gone".into(), Some("store is read-only")),
+            "payload gone (daemon refusal observed on the other attempt: store is read-only)"
+        );
     }
 
     /// Standing enumeration of this module's settlement-evidence sites
