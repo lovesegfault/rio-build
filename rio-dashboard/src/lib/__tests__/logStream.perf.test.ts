@@ -40,13 +40,16 @@ async function flush(rounds: number): Promise<void> {
 const enc = new TextEncoder();
 const LINE = enc.encode('line');
 
-function chunk(width: number, isComplete = false) {
+// firstLineNumber threads a running counter: the cursor dedups by line
+// number, so chunks must claim consecutive ranges or the walk would
+// (correctly) skip them as resent.
+function chunk(width: number, firstLineNumber: bigint, isComplete = false) {
   const lines: Uint8Array[] = [];
   for (let i = 0; i < width; i++) lines.push(LINE);
   return {
     execId: '',
     lines,
-    firstLineNumber: 0n,
+    firstLineNumber,
     isComplete,
   };
 }
@@ -61,8 +64,9 @@ describe('createLogStream perf', () => {
     const CHUNKS = 200;
     const WIDTH = 100;
     tailLog.mockImplementation(async function* () {
-      for (let i = 0; i < CHUNKS - 1; i++) yield chunk(WIDTH);
-      yield chunk(WIDTH, true);
+      for (let i = 0; i < CHUNKS - 1; i++)
+        yield chunk(WIDTH, BigInt(i * WIDTH));
+      yield chunk(WIDTH, BigInt((CHUNKS - 1) * WIDTH), true);
     });
 
     const start = performance.now();
@@ -73,7 +77,7 @@ describe('createLogStream perf', () => {
     const elapsed = performance.now() - start;
 
     expect(s.done).toBe(true);
-    expect(s.lines.length).toBe(CHUNKS * WIDTH);
+    expect(s.rows.length).toBe(CHUNKS * WIDTH);
     // Generous upper bound — spread-reassign on the same input took
     // ~1500ms on CI; push() takes ~30-50ms. A 200ms ceiling tolerates
     // slow CI runners without letting the O(n²) regression through.
@@ -90,8 +94,9 @@ describe('createLogStream perf', () => {
     const CHUNKS = 550;
     const WIDTH = 100;
     tailLog.mockImplementation(async function* () {
-      for (let i = 0; i < CHUNKS - 1; i++) yield chunk(WIDTH);
-      yield chunk(WIDTH, true);
+      for (let i = 0; i < CHUNKS - 1; i++)
+        yield chunk(WIDTH, BigInt(i * WIDTH));
+      yield chunk(WIDTH, BigInt((CHUNKS - 1) * WIDTH), true);
     });
 
     const s = createLogStream();
@@ -104,7 +109,7 @@ describe('createLogStream perf', () => {
     // exactly MAX_LINES - DROP_LINES), so assert the exact count for
     // parity with the sibling tests below — catches regressions to the
     // splice formula that the loose range would have masked.
-    expect(s.lines.length).toBe(44_900);
+    expect(s.rows.length).toBe(44_900);
   });
 
   it('stays under cap with a single oversized chunk', async () => {
@@ -114,7 +119,7 @@ describe('createLogStream perf', () => {
     // final burst (cat of a large file) hits this path — the cap holds
     // at the MAX_LINES - DROP_LINES target, not just -DROP_LINES.
     tailLog.mockImplementation(async function* () {
-      yield chunk(60_000, true);
+      yield chunk(60_000, 0n, true);
     });
 
     const s = createLogStream();
@@ -122,7 +127,7 @@ describe('createLogStream perf', () => {
 
     expect(s.done).toBe(true);
     expect(s.truncated).toBe(true);
-    expect(s.lines.length).toBe(40_000);
+    expect(s.rows.length).toBe(40_000);
   });
 
   // r[verify dash.stream.log-tail+3]
@@ -132,7 +137,7 @@ describe('createLogStream perf', () => {
   // MAX_LINES - DROP_LINES = 40K regardless of chunk magnitude.
   it('caps a single oversized chunk to the target, not just -DROP_LINES', async () => {
     tailLog.mockImplementation(async function* () {
-      yield chunk(70_000, true);
+      yield chunk(70_000, 0n, true);
     });
 
     const s = createLogStream();
@@ -142,7 +147,7 @@ describe('createLogStream perf', () => {
     expect(s.truncated).toBe(true);
     // 70K > 50K → excess = 70K - 40K = 30K → splice(0, 30K) → 40K.
     // Pre-fix this was 70K - 10K = 60K — still over the cap.
-    expect(s.lines.length).toBe(40_000);
+    expect(s.rows.length).toBe(40_000);
   });
 
   // rev-p392 correctness: 100K-line chunk doesn't RangeError on spread.
@@ -152,7 +157,7 @@ describe('createLogStream perf', () => {
   // assertion proves the result is bounded.
   it('handles a 100K-line chunk without RangeError', async () => {
     tailLog.mockImplementation(async function* () {
-      yield chunk(100_000, true);
+      yield chunk(100_000, 0n, true);
     });
 
     const s = createLogStream();
@@ -163,6 +168,6 @@ describe('createLogStream perf', () => {
     expect(s.err).toBeNull();
     expect(s.done).toBe(true);
     expect(s.truncated).toBe(true);
-    expect(s.lines.length).toBe(40_000);
+    expect(s.rows.length).toBe(40_000);
   });
 });

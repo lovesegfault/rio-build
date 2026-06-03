@@ -55,7 +55,9 @@
     // watched (`build_derivations.exec_id` via `GraphNode.exec_id`).
     // Empty for Cached / never-ran terminals / non-terminal — the log
     // fetch falls back to "latest exec" and labels itself approximate.
-    ondrvclick?: (drvPath: string, execId: string) => void;
+    // status rides along so the drawer can seed the log stream's
+    // terminality closure from the clicked node.
+    ondrvclick?: (drvPath: string, execId: string, status: string) => void;
   } = $props();
 
   // Module-level const — Svelte 5 doesn't have React's "inline nodeTypes
@@ -289,7 +291,7 @@
         {#each layout.nodes as n (n.drvPath)}
           <tr
             data-testid="graph-table-row"
-            onclick={() => ondrvclick?.(n.drvPath, n.execId)}
+            onclick={() => ondrvclick?.(n.drvPath, n.execId, n.status)}
           >
             <td>{n.pname}</td>
             <td><span class={`pill ${statusClass(n.status)}`}>{n.status}</span></td>
@@ -309,7 +311,11 @@
       fitView
       nodesDraggable={false}
       onnodeclick={({ node }) =>
-        ondrvclick?.(node.id, (node.data?.execId as string) ?? '')}
+        ondrvclick?.(
+          node.id,
+          (node.data?.execId as string) ?? '',
+          (node.data?.status as string) ?? '',
+        )}
     >
       <Background />
       <Controls />

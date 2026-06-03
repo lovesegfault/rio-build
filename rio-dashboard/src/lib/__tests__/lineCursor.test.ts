@@ -1,0 +1,137 @@
+// THE SHARED CASE TABLE — these vectors duplicate
+// rio-log-kernel/src/lib.rs `mod tests::visit_chunk_table` VERBATIM
+// (same inputs, same expected variants/ranges); change them together.
+// The Rust side additionally carries the kani contracts; this side pins
+// the TypeScript mirror to the same decisions so a semantic drift fails
+// one table or the other. The skip rows pin the two skip causes
+// (zero-line chunk; chunk entirely below the watermark) leaving the
+// watermark untouched; the gap rows pin the forward-jump split,
+// including a cursor strictly inside the gap and the BIGINT edge.
+import { describe, expect, it } from 'vitest';
+
+import {
+  tailNext,
+  visitChunk,
+  type ChunkVisit,
+  type TailStopCause,
+} from '../lineCursor';
+
+const I64_MAX = 9223372036854775807n; // i64::MAX, the manifest BIGINT bound
+
+describe('visitChunk', () => {
+  it('matches the rio-log-kernel visit_chunk_table vectors verbatim', () => {
+    type Case = [[bigint, bigint, bigint], ChunkVisit];
+    const cases: Case[] = [
+      // Fresh cursor, chunk at it: contiguous serve.
+      [
+        [0n, 0n, 4n],
+        { kind: 'serve', yieldFrom: 0n, yieldUntil: 4n, nextLine: 4n },
+      ],
+      // Fresh cursor, chunk strictly ahead: the jump is a gap.
+      [
+        [0n, 10n, 4n],
+        {
+          kind: 'gapThenServe',
+          gapFrom: 0n,
+          gapUntil: 10n,
+          yieldFrom: 10n,
+          yieldUntil: 14n,
+          nextLine: 14n,
+        },
+      ],
+      // Cursor inside the chunk: leading lines deduped, no gap.
+      [
+        [12n, 10n, 4n],
+        { kind: 'serve', yieldFrom: 12n, yieldUntil: 14n, nextLine: 14n },
+      ],
+      // Cursor strictly inside a forward jump: gap is exactly
+      // [cursor, first).
+      [
+        [47n, 50n, 3n],
+        {
+          kind: 'gapThenServe',
+          gapFrom: 47n,
+          gapUntil: 50n,
+          yieldFrom: 50n,
+          yieldUntil: 53n,
+          nextLine: 53n,
+        },
+      ],
+      // One-line jump: minimal non-empty gap.
+      [
+        [9n, 10n, 1n],
+        {
+          kind: 'gapThenServe',
+          gapFrom: 9n,
+          gapUntil: 10n,
+          yieldFrom: 10n,
+          yieldUntil: 11n,
+          nextLine: 11n,
+        },
+      ],
+      // Chunk entirely below the watermark: skipped, no advance.
+      [[20n, 10n, 4n], { kind: 'skip', nextLine: 20n }],
+      // Last line exactly at the watermark boundary: 10..14 with
+      // cursor 14 is fully served already.
+      [[14n, 10n, 4n], { kind: 'skip', nextLine: 14n }],
+      // Zero-line chunk past the cursor must NOT advance the watermark
+      // (the doc-comment swallow hazard) — and must NOT report a gap
+      // either: it holds no lines to serve after one.
+      [[3n, 50n, 0n], { kind: 'skip', nextLine: 3n }],
+      // BIGINT-edge chunk reached by a gap: exact arithmetic at the
+      // precondition boundary (first + n == i64::MAX is the largest
+      // representable end here).
+      [
+        [0n, I64_MAX - 3n, 3n],
+        {
+          kind: 'gapThenServe',
+          gapFrom: 0n,
+          gapUntil: I64_MAX - 3n,
+          yieldFrom: I64_MAX - 3n,
+          yieldUntil: I64_MAX,
+          nextLine: I64_MAX,
+        },
+      ],
+      // BIGINT-edge contiguous serve.
+      [
+        [I64_MAX - 3n, I64_MAX - 3n, 3n],
+        {
+          kind: 'serve',
+          yieldFrom: I64_MAX - 3n,
+          yieldUntil: I64_MAX,
+          nextLine: I64_MAX,
+        },
+      ],
+    ];
+    for (const [[cursor, first, n], expected] of cases) {
+      expect(visitChunk(cursor, first, n), `visitChunk(${cursor}, ${first}, ${n})`).toEqual(
+        expected,
+      );
+    }
+  });
+});
+
+describe('tailNext', () => {
+  it('matches the rio-log-kernel tail_next decision table', () => {
+    // Exit cells: every grace_expired row, plus exactly
+    // (naturalEnd, terminal, !grace_expired, served_complete).
+    const causes: TailStopCause[] = ['naturalEnd', 'transportErr', 'openFailed'];
+    for (const cause of causes) {
+      for (const terminal of [false, true]) {
+        for (const graceExpired of [false, true]) {
+          for (const servedComplete of [false, true]) {
+            const got = tailNext(cause, terminal, graceExpired, servedComplete);
+            const want =
+              graceExpired || (cause === 'naturalEnd' && terminal && servedComplete)
+                ? 'exit'
+                : 'reopen';
+            expect(
+              got,
+              `tailNext(${cause}, ${terminal}, ${graceExpired}, ${servedComplete})`,
+            ).toBe(want);
+          }
+        }
+      }
+    }
+  });
+});

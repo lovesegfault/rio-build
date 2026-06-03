@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { BuildInfo } from '../api/types';
   import { progress, fmtTsAbs } from '../lib/buildInfo';
+  import { TERMINAL } from '../lib/graphLayout';
   import Graph from './Graph.svelte';
   import BuildStatePill from './BuildStatePill.svelte';
   import LogViewer from './LogViewer.svelte';
@@ -30,6 +31,26 @@
   // banner for those.
   let focusedDrv = $state<string | undefined>(undefined);
   let focusedExecId = $state<string>('');
+  // The focused node's status, captured at click time alongside
+  // drv/execId. Snapshot semantics are fine: the {#key} below remounts
+  // LogViewer on focus change, and a node that was terminal at click
+  // stays terminal (TERMINAL is absorbing).
+  let focusedStatus = $state<string | undefined>(undefined);
+
+  // BuildInfo.state wire values (BuildStatePill.STATE_META): 3 =
+  // succeeded, 4 = failed, 5 = cancelled — the build-level terminal
+  // set. A terminal build implies no derivation will print again even
+  // when the focused node's own status was captured pre-terminal.
+  const buildTerminal = $derived(
+    build.state === 3 || build.state === 4 || build.state === 5,
+  );
+  // Live terminality closure for the log stream's tail_next exit law:
+  // reads the reactive build state at call time (the drawer's `build`
+  // prop refreshes with the list poll), plus the focused node's
+  // captured status. Whole-build view: build state alone.
+  const isTerminal = () =>
+    buildTerminal ||
+    (focusedStatus !== undefined && TERMINAL.has(focusedStatus));
 </script>
 
 <button
@@ -114,7 +135,7 @@
            the IIFE inside createLogStream keeps draining the prior
            build's fetch. -->
       {#key `${build.buildId}:${focusedDrv ?? ''}:${focusedExecId}`}
-        <LogViewer drvPath={focusedDrv} execId={focusedExecId} />
+        <LogViewer drvPath={focusedDrv} execId={focusedExecId} {isTerminal} />
       {/key}
     {:else}
       <!-- Keyed on buildId for the same reason as LogViewer: Graph's
@@ -124,9 +145,10 @@
       {#key build.buildId}
         <Graph
           buildId={build.buildId}
-          ondrvclick={(drv, execId) => {
+          ondrvclick={(drv, execId, status) => {
             focusedDrv = drv;
             focusedExecId = execId;
+            focusedStatus = status;
             activeTab = 'logs';
           }}
         />

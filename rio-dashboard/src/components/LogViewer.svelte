@@ -31,6 +31,11 @@
     // banner so the user knows the log may be from a different
     // execution than the one this build observed.
     execId = '',
+    // Live terminality closure (BuildDrawer passes one over the build
+    // state + the focused node's status). Feeds the stream's tail_next
+    // exit law: a non-terminal stream re-opens forever; a terminal one
+    // drains within the armed-once grace.
+    isTerminal = undefined,
     // @internal test-only hook: jsdom layout is all-zeros so the
     // scroll-derived viewport range can't be exercised. A test stubs
     // this to assert slice bounds directly. Production never passes it.
@@ -39,6 +44,7 @@
   }: {
     drvPath?: string;
     execId?: string;
+    isTerminal?: () => boolean;
     /** @internal test-only — jsdom layout is all-zeros; tests stub the viewport directly. */
     _viewportOverride?: { start: number; end: number };
   } = $props();
@@ -54,7 +60,7 @@
   // expecting us to reconnect mid-flight. Reacting to prop churn here
   // would double up with that key and leak the prior AbortController.
   // svelte-ignore state_referenced_locally
-  const stream: LogStream = createLogStream(drvPath, execId);
+  const stream: LogStream = createLogStream(drvPath, execId, { isTerminal });
 
   // The build view's GraphNode.exec_id is empty for Cached, never-ran
   // terminals (e.g. a never-dispatched cascaded DependencyFailed,
@@ -122,7 +128,7 @@
   // falls through to scroll math. The Math.min on endIdx clamps to the
   // array length so a near-bottom scroll doesn't slice past the end.
   const viewport = $derived.by(() => {
-    const n = stream.lines.length;
+    const n = stream.rows.length;
     if (_viewportOverride) {
       return {
         start: Math.max(0, Math.min(_viewportOverride.start, n)),
@@ -144,7 +150,7 @@
   // layout is all-zeros so this is a no-op under vitest — the
   // follow-tail behavior is covered manually.
   $effect(() => {
-    void stream.lines.length;
+    void stream.rows.length;
     if (follow && container) {
       container.scrollTop = container.scrollHeight;
       // Sync the reactive mirror so the viewport $derived reruns. The
@@ -186,25 +192,41 @@
        splices the head, keyed nodes get new content without re-mount.
        Invisible today (no animate:); don't add animate: without
        rekeying on a stable offset like stream.firstLineNumber. -->
-  {#each stream.lines.slice(viewport.start, viewport.end) as line, i (viewport.start + i)}
-    <pre class="line" title={line}>{line}</pre>
+  {#each stream.rows.slice(viewport.start, viewport.end) as row, i (viewport.start + i)}
+    {#if row.kind === 'gap'}
+      <!-- An explicit hole in the served stream (dropped fan-out batch,
+           hand-deleted chunk, swept manifest rows): rendered as a marked
+           row, never a seamless splice. Fixed .line height keeps the
+           virtualization spacer math exact. -->
+      <pre class="line gap" data-testid="log-gap">— lines {row.from}–{row.until - 1n} missing (durable log gap) —</pre>
+    {:else}
+      <pre class="line" title={row.text}>{row.text}</pre>
+    {/if}
   {/each}
   <div
     class="spacer"
-    style:height="{(stream.lines.length - viewport.end) * lineH}px"
+    style:height="{(stream.rows.length - viewport.end) * lineH}px"
     aria-hidden="true"
   ></div>
   {#if !stream.done}
     <div class="tail" data-testid="log-tail">
       <span class="spinner" aria-hidden="true"></span> streaming…
     </div>
-  {:else if stream.lines.length === 0 && !stream.err}
+  {:else if stream.rows.length === 0 && !stream.err}
     <div class="empty">no log output</div>
+  {/if}
+  {#if stream.gapCount > 0}
+    <div class="incomplete" data-testid="log-gap-banner">
+      — {stream.gapCount === 1
+        ? 'an interior span of this log is'
+        : `${stream.gapCount} interior spans of this log are`} missing from
+      durable storage; the holes are marked inline —
+    </div>
   {/if}
   {#if stream.incomplete}
     <div class="incomplete" data-testid="log-incomplete">
-      — log incomplete: the build is still running or its final flush is
-      pending —
+      — log incomplete: the stored log ends before the final line (the
+      missing tail usually holds the build error) —
     </div>
   {/if}
 </div>
@@ -236,6 +258,10 @@
   }
   .spacer {
     flex-shrink: 0;
+  }
+  .gap {
+    color: #94a3b8;
+    font-style: italic;
   }
   .truncated,
   .approximate {

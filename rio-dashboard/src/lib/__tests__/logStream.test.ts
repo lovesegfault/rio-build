@@ -7,6 +7,10 @@
 // because we're not testing reactivity tracking, just the value
 // progression as the generator drains. Each yield lands on the next
 // microtask, so `await Promise.resolve()` steps the for-await one chunk.
+//
+// The follow/reconnect/gap battery lives in logStream.follow.test.ts
+// (fake timers); this file pins the timer-free basics: accumulation,
+// lossy decode, request shape, abort hygiene, completion semantics.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const { tailLog } = vi.hoisted(() => ({ tailLog: vi.fn() }));
@@ -34,14 +38,22 @@ function u8(...bytes: number[]): Uint8Array {
 
 // Structural-shape fixture for TailLogChunk. The generated type is a
 // branded Message<...> intersection; tests only hit the iteration path
-// so a plain object matching the field layout is sufficient.
-function chunk(lines: Uint8Array[], isComplete = false) {
+// so a plain object matching the field layout is sufficient. Chunks
+// thread firstLineNumber: the cursor dedups by line number, so a second
+// chunk re-claiming line 0 is (correctly) skipped as resent.
+function chunk(lines: Uint8Array[], isComplete = false, firstLineNumber = 0n) {
   return {
     execId: '',
     lines,
-    firstLineNumber: 0n,
+    firstLineNumber,
     isComplete,
   };
+}
+
+function texts(s: {
+  rows: readonly { kind: string; text: string }[];
+}): string[] {
+  return s.rows.filter((r) => r.kind === 'line').map((r) => r.text);
 }
 
 describe('createLogStream', () => {
@@ -49,22 +61,24 @@ describe('createLogStream', () => {
     tailLog.mockReset();
   });
 
-  it('accumulates lines across chunks and flips done on isComplete', async () => {
+  it('accumulates rows across chunks and flips done on isComplete', async () => {
     tailLog.mockImplementation(async function* () {
       yield chunk([u8(0x68, 0x65, 0x6c, 0x6c, 0x6f)]); // "hello"
       yield chunk(
         [u8(0x77, 0x6f, 0x72, 0x6c, 0x64), u8(0x21)], // "world", "!"
         true,
+        1n,
       );
     });
 
     const s = createLogStream();
-    expect(s.lines).toEqual([]);
+    expect(s.rows).toEqual([]);
     expect(s.done).toBe(false);
 
     await flush(3);
 
-    expect(s.lines).toEqual(['hello', 'world', '!']);
+    expect(texts(s)).toEqual(['hello', 'world', '!']);
+    expect(s.gapCount).toBe(0);
     expect(s.done).toBe(true);
     // Final log (isComplete chunk seen) → no incomplete banner.
     expect(s.incomplete).toBe(false);
@@ -80,10 +94,10 @@ describe('createLogStream', () => {
     expect(req.execId).toBe('');
     expect(req.derivation).toBe('');
     expect(req.sinceLine).toBe(0n);
-    // One-shot drain, not a live follow — the viewer's stream lives and
-    // dies with the component; a follow-mode would re-open on premature
-    // end with sinceLine = last_received + 1.
-    expect(req.follow).toBe(false);
+    // Live follow (merged_bug_306/bug_311): the stream re-opens at the
+    // watermark on premature end instead of freezing on a one-shot
+    // snapshot — the reconnect battery is logStream.follow.test.ts.
+    expect(req.follow).toBe(true);
     expect(opts.signal).toBeInstanceOf(AbortSignal);
   });
 
@@ -92,10 +106,7 @@ describe('createLogStream', () => {
     // high bytes followed by "!". With {fatal:false} the decoder emits
     // U+FFFD per invalid sequence rather than throwing a TypeError.
     tailLog.mockImplementation(async function* () {
-      yield chunk(
-        [u8(0x48, 0x69), u8(0xff, 0xfe, 0x21)],
-        true,
-      );
+      yield chunk([u8(0x48, 0x69), u8(0xff, 0xfe, 0x21)], true);
     });
 
     const s = createLogStream();
@@ -105,30 +116,37 @@ describe('createLogStream', () => {
     expect(s.err).toBeNull();
     expect(s.done).toBe(true);
 
-    expect(s.lines).toHaveLength(2);
-    expect(s.lines[0]).toBe('Hi');
+    const lines = texts(s);
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toBe('Hi');
     // The invalid bytes became replacement characters. We assert on
     // inclusion rather than exact count — different JS engines emit
     // one U+FFFD per byte vs per maximal-subpart (both are
     // spec-conformant for WHATWG TextDecoder).
-    expect(s.lines[1]).toContain('\ufffd');
-    expect(s.lines[1].endsWith('!')).toBe(true);
+    expect(lines[1]).toContain('�');
+    expect(lines[1].endsWith('!')).toBe(true);
   });
 
-  it('surfaces transport errors when not self-aborted', async () => {
+  it('keeps streaming when the generator exhausts on a running build', async () => {
+    // Server closed the stream early (session rotation, store restart)
+    // while the build still runs. Pre-fix this froze the tab as
+    // done+incomplete; now the loop schedules a re-open at the
+    // watermark and the spinner stays honest. (The reconnect itself is
+    // driven under fake timers in logStream.follow.test.ts — here we
+    // pin only "not done, not incomplete, no error".)
     tailLog.mockImplementation(async function* () {
-      yield chunk([u8(0x61)]);
-      throw new Error('upstream reset');
+      yield chunk([u8(0x7a)]);
+      // No isComplete chunk, just end.
     });
 
     const s = createLogStream();
     await flush(3);
 
-    // First chunk landed before the throw — partial output is preserved.
-    expect(s.lines).toEqual(['a']);
-    expect(s.err?.message).toBe('upstream reset');
-    // done flips so the viewer's spinner stops.
-    expect(s.done).toBe(true);
+    expect(texts(s)).toEqual(['z']);
+    expect(s.done).toBe(false);
+    expect(s.incomplete).toBe(false);
+    expect(s.err).toBeNull();
+    s.destroy();
   });
 
   it('destroy() flips the AbortSignal and swallows the resulting error', async () => {
@@ -153,7 +171,7 @@ describe('createLogStream', () => {
 
     const s = createLogStream();
     await flush(2);
-    expect(s.lines).toEqual(['x']);
+    expect(texts(s)).toEqual(['x']);
     expect(seenSignal?.aborted).toBe(false);
 
     s.destroy();
@@ -169,28 +187,6 @@ describe('createLogStream', () => {
     // actually drove execution through the catch block (a parked-forever
     // mock would leave done false and err null for the wrong reason).
     expect(s.done).toBe(true);
-  });
-
-  // r[verify obs.log.incomplete-surfaced+2]
-  it('marks done when the generator exhausts without isComplete', async () => {
-    // Server closed the stream early (shutdown, abort observed), the
-    // build is still running (ring-buffer snapshot), or the stored blob
-    // is a `.partial` whose final flush never landed. We shouldn't leave
-    // the spinner spinning, but the content is incomplete — the viewer
-    // renders a banner so the missing tail (usually the build error)
-    // isn't read as the whole log.
-    tailLog.mockImplementation(async function* () {
-      yield chunk([u8(0x7a)]);
-      // No isComplete chunk, just end.
-    });
-
-    const s = createLogStream();
-    await flush(3);
-
-    expect(s.lines).toEqual(['z']);
-    expect(s.done).toBe(true);
-    expect(s.incomplete).toBe(true);
-    expect(s.err).toBeNull();
   });
 
   it('passes drvPath through when provided', async () => {

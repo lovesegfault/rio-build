@@ -171,8 +171,11 @@ against --- includes them. Pod and node identity are deliberately excluded
 The gateway opens a `TailLog` subscription per building derivation of a
 watched build and relays the lines to the `nix build -L` client; it owns
 re-subscription when a stream ends before the derivation is terminal
-(#rref("store.log.tail-reconnect")). The dashboard and the CLI issue one-shot
-(non-follow) reads.
+(#rref("store.log.tail-reconnect")). The dashboard follows the same
+discipline through its TypeScript cursor mirror (`lineCursor.ts`):
+`follow: true`, reconnect-at-watermark, and explicit gap rows for spans
+the store could not serve. The CLI issues one-shot (non-follow) reads
+and renders interior gaps as inline marker lines.
 
 = Metrics
 

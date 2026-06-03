@@ -22,6 +22,14 @@ vi.mock('../../lib/logStream.svelte', () => ({ createLogStream }));
 // Importing after the mock so LogViewer picks up the stubbed factory.
 import LogViewer from '../LogViewer.svelte';
 
+// Monomorphic row constructors mirroring logStream's LogRow shape.
+function lineRows(texts: string[]) {
+  return texts.map((text) => ({ kind: 'line', text, from: 0n, until: 0n }));
+}
+function gapRow(from: bigint, until: bigint) {
+  return { kind: 'gap', text: '', from, until };
+}
+
 describe('LogViewer', () => {
   afterEach(() => {
     createLogStream.mockReset();
@@ -29,7 +37,7 @@ describe('LogViewer', () => {
 
   it('renders error alert when stream.err is set', () => {
     createLogStream.mockReturnValue({
-      lines: [],
+      rows: [],
       done: true,
       err: new Error('boom'),
       destroy: vi.fn(),
@@ -49,7 +57,7 @@ describe('LogViewer', () => {
 
   it('renders empty-state when done && lines empty && no err', () => {
     createLogStream.mockReturnValue({
-      lines: [],
+      rows: [],
       done: true,
       err: null,
       destroy: vi.fn(),
@@ -66,7 +74,7 @@ describe('LogViewer', () => {
     // {#if !stream.done} branch: spinner + "streaming…" text present
     // even with some lines already rendered.
     createLogStream.mockReturnValue({
-      lines: ['line1', 'line2'],
+      rows: lineRows(['line1', 'line2']),
       done: false,
       err: null,
       destroy: vi.fn(),
@@ -84,7 +92,7 @@ describe('LogViewer', () => {
     // Complement to the above: done=true with non-empty lines →
     // neither spinner nor empty-state renders.
     createLogStream.mockReturnValue({
-      lines: ['final line'],
+      rows: lineRows(['final line']),
       done: true,
       err: null,
       destroy: vi.fn(),
@@ -114,7 +122,7 @@ describe('LogViewer', () => {
     // the test to the exact constant.
     const lines = Array.from({ length: 5000 }, (_, i) => `L${i}`);
     createLogStream.mockReturnValue({
-      lines,
+      rows: lineRows(lines),
       done: true,
       err: null,
       truncated: false,
@@ -136,7 +144,7 @@ describe('LogViewer', () => {
     // same $derived + {#each lines.slice(start, end)} rendering.
     const lines = Array.from({ length: 1000 }, (_, i) => `L${i}`);
     createLogStream.mockReturnValue({
-      lines,
+      rows: lineRows(lines),
       done: true,
       err: null,
       truncated: false,
@@ -170,7 +178,7 @@ describe('LogViewer', () => {
     // gone — not an error, just a memory cap. Asserting testid rather
     // than the exact em-dash string so the copy can change freely.
     createLogStream.mockReturnValue({
-      lines: ['tail line'],
+      rows: lineRows(['tail line']),
       done: true,
       err: null,
       truncated: true,
@@ -191,7 +199,7 @@ describe('LogViewer', () => {
     // build error) may be missing. Asserting the testid rather than the
     // exact copy, same as the truncation test.
     createLogStream.mockReturnValue({
-      lines: ['some line'],
+      rows: lineRows(['some line']),
       done: true,
       err: null,
       truncated: false,
@@ -225,7 +233,7 @@ describe('LogViewer', () => {
       }) as CSSStyleDeclaration) as typeof window.getComputedStyle;
     try {
       createLogStream.mockReturnValue({
-        lines: Array.from({ length: 100 }, (_, i) => `L${i}`),
+        rows: lineRows(Array.from({ length: 100 }, (_, i) => `L${i}`)),
         done: true,
         err: null,
         truncated: false,
@@ -245,5 +253,49 @@ describe('LogViewer', () => {
     } finally {
       window.getComputedStyle = orig;
     }
+  });
+
+  it('renders gap rows inline with the missing range named', () => {
+    // merged_bug_306 dashboard half: a forward jump in the served
+    // stream renders as an explicit marked row between the lines —
+    // never a seamless splice. The range is inclusive in the copy
+    // (lines 2–9 == [2, 10)).
+    createLogStream.mockReturnValue({
+      rows: [...lineRows(['l0', 'l1']), gapRow(2n, 10n), ...lineRows(['l10'])],
+      done: true,
+      err: null,
+      truncated: false,
+      incomplete: false,
+      gapCount: 1,
+      destroy: vi.fn(),
+    });
+    render(LogViewer, { props: {} });
+
+    const gap = screen.getByTestId('log-gap');
+    expect(gap.textContent).toContain('lines 2–9 missing');
+    // The interior-gap banner names the count; the missing-tail banner
+    // stays absent (the log is complete apart from the interior hole).
+    expect(screen.getByTestId('log-gap-banner')).toBeInTheDocument();
+    expect(screen.queryByTestId('log-incomplete')).toBeNull();
+  });
+
+  it('splits the banner copy: interior gaps vs missing tail', () => {
+    // Both failure stories at once: interior holes AND an incomplete
+    // tail. Each banner names its own story — the user can tell "lines
+    // are missing in the middle" from "the end never made it".
+    createLogStream.mockReturnValue({
+      rows: [...lineRows(['l0']), gapRow(1n, 4n), ...lineRows(['l4'])],
+      done: true,
+      err: null,
+      truncated: false,
+      incomplete: true,
+      gapCount: 1,
+      destroy: vi.fn(),
+    });
+    render(LogViewer, { props: {} });
+
+    expect(screen.getByTestId('log-gap-banner')).toBeInTheDocument();
+    const tail = screen.getByTestId('log-incomplete');
+    expect(tail.textContent).toContain('missing tail');
   });
 });
