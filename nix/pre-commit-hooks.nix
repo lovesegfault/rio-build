@@ -77,6 +77,12 @@
           echo 'sqlx-prepare-check: RUSTC_WRAPPER does not resolve (stale shell after nix store gc?); skipping — re-enter the dev shell. CI enforces this gate' >&2
           exit 0
         fi
+        # Re-pin the sqlx contract variable from THIS repo's toplevel:
+        # the inherited value is frozen at shell entry and may belong to
+        # a sibling worktree (tmux pane that cd'd over) — the check must
+        # validate the staged queries against this checkout's cache.
+        SQLX_OFFLINE_DIR="$(git rev-parse --show-toplevel)/.sqlx"
+        export SQLX_OFFLINE_DIR
         # Only check if any staged .rs file touches a query! macro.
         # Otherwise this is a no-op (e.g. pure-refactor commits
         # that don't change SQL).

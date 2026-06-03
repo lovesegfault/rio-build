@@ -25,30 +25,46 @@
 //! hash and the macros can never disagree about which directory is in
 //! play. Every supported build context sets it explicitly:
 //!
-//! - the dev shell exports `<worktree>/.sqlx` (nix/devshell.nix shellHook);
+//! - the dev shell exports `<worktree>/.sqlx` (nix/devshell.nix shellHook,
+//!   gated on a rio checkout marker);
 //! - crate2nix sandbox builds set it as a derivation env var pointing at
-//!   the `.sqlx` fileset (nix/crate2nix.nix `sqlxOffline`).
+//!   the `.sqlx` fileset (nix/crate2nix.nix `sqlxOffline`);
+//! - the pre-commit `sqlx-prepare-check` re-pins it from its own
+//!   toplevel, so a shell entered in another worktree cannot make the
+//!   hook validate against the wrong cache.
 //!
-//! Unset (bare cargo outside any supported context) degrades to an
-//! `untracked` sentinel with a build warning — the same blind spot plain
-//! cargo always had there. Set-but-missing degrades to an `absent`
-//! sentinel: the macros are the authority on whether a missing cache is
-//! fatal, and they produce the better diagnostic (this also keeps
-//! `rm -rf .sqlx && cargo xtask regen sqlx` buildable — a build-script
-//! panic here would make the tool that *recreates* `.sqlx` impossible to
-//! compile). One residual asymmetry: sqlx-macros fall through their own
-//! chain past a missing `SQLX_OFFLINE_DIR` (manifest dir, then workspace
-//! root), so a hand-set override pointing at nothing while the real
-//! `.sqlx` exists leaves the macros working and the hash pinned at
-//! `absent`. Only reachable by deliberately mis-pointing the variable in
-//! an ad-hoc environment; every supported context sets it to the
-//! directory that exists.
+//! Degradations are loud and pin sentinels (constants — they deliberately
+//! make the tracker inert rather than wrong): unset → `untracked`
+//! (bare cargo outside supported contexts — plain cargo's pre-existing
+//! blind spot); set-but-empty → `untracked`; relative → `untracked`
+//! (refused: the build script would resolve it against the package dir
+//! while sqlx-macros resolve it inside rustc against the workspace root —
+//! two different directories); set-but-missing → `absent` (the macros own
+//! the real diagnostic).
+//!
+//! The `absent` arm keeps the BUILD SCRIPT from panicking when `.sqlx` is
+//! deleted, but note the macros themselves still fail without a cache:
+//! the hash flip to `absent` re-keys the consumers, forcing recompiles
+//! whose `query!` has nothing to read — so after `rm -rf .sqlx`, even
+//! `cargo xtask regen sqlx` cannot build (xtask prod-depends on
+//! rio-scheduler). Recover with `git checkout -- .sqlx` (the cache is
+//! committed) or run an already-built `target/debug/xtask` directly.
 //!
 //! Hashing covers exactly the macro-visible sets — top-level
-//! `query-*.json` for the offline cache, top-level `*.sql` for
-//! migrations — so editor swap files and stray artifacts never churn the
-//! key, and a file vanishing mid-walk (concurrent regen) is skipped
-//! rather than fatal: cargo re-runs the script once mtimes settle.
+//! `query-*.json` for the offline cache, top-level `<digits>_*.sql` for
+//! migrations (`sqlx::migrate!`'s filename grammar) — so editor swap
+//! files and stray artifacts never churn the key. Concurrency: a file
+//! vanishing mid-read is skipped, a directory vanishing mid-hash degrades
+//! to `absent`, and the hash is computed twice — if the listing churns
+//! between passes (a cache rewrite racing this script), the build is
+//! keyed with a unique value so it can never be replayed and the next
+//! build re-hashes the settled state. Residual race, by construction
+//! unobservable from a build script: the macros re-read the directory
+//! later, inside rustc — a swap landing in *that* window mislabels one
+//! compile. Exposure requires an exit-0 compile against a half-rewritten
+//! cache; `regen sqlx` itself runs kache-disabled, so the racing writer
+//! is typically a background checker (rust-analyzer) whose artifacts the
+//! next settled build re-keys away locally.
 //!
 //! The hash is FNV-1a 64: dependency-free and deterministic across
 //! platforms, runs, and toolchains. It only needs to *change* when content
@@ -81,27 +97,47 @@ pub fn track_sqlx() {
             );
             "untracked".to_string()
         }
+        SqlxResolution::EmptyValue => {
+            println!(
+                "cargo:warning=rio-buildhash: SQLX_OFFLINE_DIR is set but empty — the sqlx \
+                 macros will fall through to their own discovery while this hash stays \
+                 pinned; unset it or point it at the real .sqlx"
+            );
+            "untracked".to_string()
+        }
+        SqlxResolution::NonAbsolute(dir) => {
+            println!(
+                "cargo:warning=rio-buildhash: refusing relative SQLX_OFFLINE_DIR ({}) — the \
+                 build script resolves it against the package dir but sqlx-macros resolve \
+                 it inside rustc against the workspace root; set an absolute path",
+                dir.display()
+            );
+            "untracked".to_string()
+        }
         SqlxResolution::Absent(dir) => {
-            // Watch the missing path: cargo re-runs the script when it
-            // appears (e.g. after `cargo xtask regen sqlx` recreates it).
+            // Watch the missing path. Cargo treats a nonexistent watched
+            // path as always-stale, so this script re-runs (and re-warns)
+            // on EVERY build until the directory exists — deliberate:
+            // the state is broken-but-recoverable and should stay loud.
             println!("cargo:rerun-if-changed={}", dir.display());
             println!(
                 "cargo:warning=rio-buildhash: SQLX_OFFLINE_DIR={} does not exist — \
-                 offline query expansion will fail if this crate needs it",
+                 offline query expansion will fail if this crate needs it \
+                 (recover with: git checkout -- .sqlx)",
                 dir.display()
             );
             "absent".to_string()
         }
         SqlxResolution::Track(dir) => {
             println!("cargo:rerun-if-changed={}", dir.display());
-            hash_matching_files(&dir, is_sqlx_query_file)
+            settled_hash(&dir, is_sqlx_query_file)
         }
     };
     println!("cargo:rustc-env=RIO_SQLX_HASH={value}");
 }
 
-/// Track the crate's `migrations/` directory (top-level `*.sql`, the set
-/// `sqlx::migrate!` embeds) as the `RIO_MIGRATIONS_HASH` env-dep.
+/// Track the crate's `migrations/` directory (top-level `<digits>_*.sql`,
+/// the set `sqlx::migrate!` accepts) as the `RIO_MIGRATIONS_HASH` env-dep.
 ///
 /// The directory is part of the crate (committed); its absence is a broken
 /// checkout, so this one does panic.
@@ -115,7 +151,7 @@ pub fn track_migrations() {
     println!("cargo:rerun-if-changed={}", dir.display());
     println!(
         "cargo:rustc-env=RIO_MIGRATIONS_HASH={}",
-        hash_matching_files(dir, is_sql_file)
+        settled_hash(dir, is_migration_file)
     );
 }
 
@@ -125,7 +161,12 @@ pub fn track_migrations() {
 enum SqlxResolution {
     /// Variable unset — unsupported context, pin a sentinel.
     Untracked,
-    /// Variable set but the directory does not exist.
+    /// Variable set but empty — sqlx falls through; refuse to guess.
+    EmptyValue,
+    /// Variable set but relative — the two readers would resolve it
+    /// against different working directories; refuse.
+    NonAbsolute(PathBuf),
+    /// Variable set, absolute, but the directory does not exist.
     Absent(PathBuf),
     /// Variable set and resolvable.
     Track(PathBuf),
@@ -134,7 +175,8 @@ enum SqlxResolution {
 fn sqlx_resolution(var: Option<PathBuf>) -> SqlxResolution {
     match var {
         None => SqlxResolution::Untracked,
-        Some(dir) if dir.as_os_str().is_empty() => SqlxResolution::Untracked,
+        Some(dir) if dir.as_os_str().is_empty() => SqlxResolution::EmptyValue,
+        Some(dir) if dir.is_relative() => SqlxResolution::NonAbsolute(dir),
         Some(dir) if dir.is_dir() => SqlxResolution::Track(dir),
         Some(dir) => SqlxResolution::Absent(dir),
     }
@@ -144,21 +186,67 @@ fn is_sqlx_query_file(name: &str) -> bool {
     name.starts_with("query-") && name.ends_with(".json")
 }
 
-fn is_sql_file(name: &str) -> bool {
-    name.ends_with(".sql")
+/// `sqlx::migrate!` filename grammar: `<version>_<description>.sql`
+/// (including the `.up.sql`/`.down.sql` reversible forms, which still end
+/// in `.sql`). Anything else — `scratch.sql~`, editor swap files, README —
+/// is silently skipped by the macro and must not churn the hash.
+fn is_migration_file(name: &str) -> bool {
+    let Some(rest) = name.strip_suffix(".sql") else {
+        return false;
+    };
+    let Some((version, _description)) = rest.split_once('_') else {
+        return false;
+    };
+    !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Hash the matching set twice; if the listing or contents churn between
+/// passes (a cache rewrite racing this build script), key this build with
+/// a unique value: it can never be replayed from a wrapper cache, and the
+/// changed env value re-runs the script on the next build, which hashes
+/// the settled state.
+fn settled_hash(dir: &Path, pred: fn(&str) -> bool) -> String {
+    let first = hash_matching_files(dir, pred);
+    let second = hash_matching_files(dir, pred);
+    match (first, second) {
+        (Some(a), Some(b)) if a == b => a,
+        (None, None) => "absent".to_string(),
+        _ => {
+            println!(
+                "cargo:warning=rio-buildhash: {} changed while hashing — keying this \
+                 build uniquely; the next build re-hashes the settled state",
+                dir.display()
+            );
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("churn-{nanos}")
+        }
+    }
 }
 
 /// Content hash of the top-level files in `dir` whose names match `pred`:
 /// names + contents, independent of mtimes, ownership, listing order, and
-/// non-matching files. Files that vanish between listing and read
-/// (concurrent rewrites) are skipped — cargo re-runs the build script once
-/// the watched directory settles.
-fn hash_matching_files(dir: &Path, pred: fn(&str) -> bool) -> String {
-    let entries = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("rio-buildhash: read_dir({}) failed: {e}", dir.display()));
+/// non-matching files. `None` when the directory itself has vanished
+/// (degrade, don't panic — the same race tolerance as the per-file skip).
+/// Per-entry iterator errors PANIC: silently dropping one would emit a
+/// plausible-looking truncated hash that could alias a legitimately
+/// smaller set and replay a stale artifact with zero diagnostics.
+fn hash_matching_files(dir: &Path, pred: fn(&str) -> bool) -> Option<String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => panic!("rio-buildhash: read_dir({}) failed: {e}", dir.display()),
+    };
     let mut names: Vec<String> = entries
         .filter_map(|entry| {
-            let entry = entry.ok()?;
+            let entry = entry.unwrap_or_else(|e| {
+                panic!(
+                    "rio-buildhash: dir entry under {} failed: {e}",
+                    dir.display()
+                )
+            });
             let name = entry.file_name().into_string().ok()?;
             (pred(&name) && !entry.path().is_dir()).then_some(name)
         })
@@ -172,8 +260,8 @@ fn hash_matching_files(dir: &Path, pred: fn(&str) -> bool) -> String {
             Ok(c) => c,
             // TOCTOU: deleted (or a dangling symlink) between listing and
             // read — e.g. `cargo sqlx prepare` swapping the cache while a
-            // parallel build script runs. Skip; rerun-if-changed re-keys
-            // once the churn settles.
+            // parallel build script runs. Skip; the settled-hash double
+            // pass and rerun-if-changed re-key once the churn settles.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => panic!("rio-buildhash: read({}) failed: {e}", path.display()),
         };
@@ -184,19 +272,20 @@ fn hash_matching_files(dir: &Path, pred: fn(&str) -> bool) -> String {
         state = fnv1a(state, &(contents.len() as u64).to_le_bytes());
         state = fnv1a(state, &contents);
     }
-    format!("{state:016x}")
+    Some(format!("{state:016x}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        SqlxResolution, hash_matching_files, is_sql_file, is_sqlx_query_file, sqlx_resolution,
+        SqlxResolution, hash_matching_files, is_migration_file, is_sqlx_query_file, settled_hash,
+        sqlx_resolution,
     };
     use std::fs;
     use std::path::PathBuf;
 
     fn sqlx_hash(dir: &std::path::Path) -> String {
-        hash_matching_files(dir, is_sqlx_query_file)
+        hash_matching_files(dir, is_sqlx_query_file).expect("dir exists")
     }
 
     fn setup() -> tempfile::TempDir {
@@ -210,6 +299,11 @@ mod tests {
     fn stable_across_calls() {
         let dir = setup();
         assert_eq!(sqlx_hash(dir.path()), sqlx_hash(dir.path()));
+        // And the settled (double-pass) wrapper agrees on a quiet dir.
+        assert_eq!(
+            settled_hash(dir.path(), is_sqlx_query_file),
+            sqlx_hash(dir.path())
+        );
     }
 
     #[test]
@@ -268,13 +362,16 @@ mod tests {
     }
 
     #[test]
-    fn sql_filter_matches_migrations_shape() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("001_init.sql"), b"CREATE TABLE t ();").unwrap();
-        fs::write(dir.path().join("001_init.sql~"), b"junk").unwrap();
-        let with_junk = hash_matching_files(dir.path(), is_sql_file);
-        fs::remove_file(dir.path().join("001_init.sql~")).unwrap();
-        assert_eq!(with_junk, hash_matching_files(dir.path(), is_sql_file));
+    fn migration_filter_matches_migrate_grammar() {
+        assert!(is_migration_file("001_init.sql"));
+        assert!(is_migration_file("20240101000000_widgets.up.sql"));
+        assert!(is_migration_file("2_two.down.sql"));
+        // Skipped by sqlx::migrate! — must not churn the hash.
+        assert!(!is_migration_file("scratch.sql"));
+        assert!(!is_migration_file("001_init.sql~"));
+        assert!(!is_migration_file("_no_version.sql"));
+        assert!(!is_migration_file("a1_bad.sql"));
+        assert!(!is_migration_file("README.md"));
     }
 
     #[test]
@@ -286,6 +383,16 @@ mod tests {
         let with_dangling = sqlx_hash(dir.path());
         fs::remove_file(dir.path().join("query-dd.json")).unwrap();
         assert_eq!(with_dangling, sqlx_hash(dir.path()));
+    }
+
+    #[test]
+    fn vanished_dir_degrades_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        fs::create_dir(&gone).unwrap();
+        fs::remove_dir(&gone).unwrap();
+        assert_eq!(hash_matching_files(&gone, is_sqlx_query_file), None);
+        assert_eq!(settled_hash(&gone, is_sqlx_query_file), "absent");
     }
 
     #[test]
@@ -303,7 +410,11 @@ mod tests {
         assert!(matches!(sqlx_resolution(None), SqlxResolution::Untracked));
         assert!(matches!(
             sqlx_resolution(Some(PathBuf::new())),
-            SqlxResolution::Untracked
+            SqlxResolution::EmptyValue
+        ));
+        assert!(matches!(
+            sqlx_resolution(Some(PathBuf::from("relative/.sqlx"))),
+            SqlxResolution::NonAbsolute(_)
         ));
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(

@@ -440,11 +440,19 @@ let
             # rio-buildhash's RIO_SQLX_HASH tracker read, so the offline
             # cache the macros expand against and the one the cache key
             # hashes are the same directory by construction. Exported
-            # UNCONDITIONALLY — the value is the contract, not a knob; a
-            # stale inherited value would silently retarget both readers.
-            # Per-invocation override (SQLX_OFFLINE_DIR=… cargo check)
+            # whenever rio_root IS a rio checkout (same uniquely-rio
+            # marker as the knob loader below): a foreign-repo
+            # invocation must not export a bogus path — the macros would
+            # fall through their chain to a real .sqlx while the tracker
+            # pinned a constant sentinel. Left unset instead, the
+            # tracker's `untracked` warning makes the state loud. The
+            # export overrides any inherited value on purpose (a stale
+            # sibling-worktree value would retarget both readers); a
+            # per-invocation override (SQLX_OFFLINE_DIR=… cargo check)
             # still works for debugging after shell entry.
-            export SQLX_OFFLINE_DIR="$rio_root/.sqlx"
+            if [ -f "$rio_root/rio-buildhash/Cargo.toml" ]; then
+              export SQLX_OFFLINE_DIR="$rio_root/.sqlx"
+            fi
             # (a) Honor the supported per-user knobs from .env.local even
             #     without direnv (`nix develop -c …` from a bare shell).
             #     Already-exported values win (direnv loads .env.local
@@ -455,8 +463,10 @@ let
             #     readers disagree. Skipped when the invoker's git
             #     toplevel is not a rio-build checkout (`nix develop
             #     /path/to/rio` from inside a foreign repo must not
-            #     import that repo's knobs).
-            if [ -f "$rio_root/nix/devshell.nix" ] && [ -f "$rio_root/.env.local" ]; then
+            #     import that repo's knobs) — the marker is a
+            #     uniquely-rio path, not a generic flake-layout file
+            #     another repo would also have.
+            if [ -f "$rio_root/rio-buildhash/Cargo.toml" ] && [ -f "$rio_root/.env.local" ]; then
               for kache_knob in KACHE_DISABLED KACHE_MAX_SIZE RIO_KACHE_CACHE_DIR; do
                 if [ -z "''${!kache_knob+x}" ]; then
                   kache_val="$(grep -E "^''${kache_knob}=" "$rio_root/.env.local" | tail -n1 | cut -d= -f2-)" || true
