@@ -177,7 +177,10 @@ let
       # and via [dependencies]/[dev-dependencies]. By construction not
       # in `roots` (those exclude runtime-consumed crates), so the
       # `conflicted` throw above — which polices only the exempt
-      # closure — never sees them: a dual-use crate is built
+      # closure — misses any dual-use crate not reached through that
+      # closure (one reachable via an exempt root's runtime deps IS
+      # caught there first; both throws are conservative): such a
+      # crate is built
       # INSTRUMENTED (for its runtime consumers) and its rlib also
       # links into uninstrumented build_script_build binaries. Fine
       # for -Cinstrument-coverage (rustc injects profiler_builtins

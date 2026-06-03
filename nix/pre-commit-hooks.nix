@@ -116,14 +116,21 @@ in
         # every out-of-crate match is a pure //-comment line (xtask +
         # rio-buildhash + rio-migrations doc-comments) — the previous
         # whole-file grep hard-blocked commits on exactly those.
-        # Residuals, accepted: a block comment or string literal shaped
-        # like `sqlx::query…!` still trips this; a future UNqualified
-        # `query!(` behind a use-import under-triggers and the hook
-        # silently skips — CI clippy/nextest remains the staleness
-        # backstop either way (this hook is dev-ergonomics, per the
-        # header above).
+        # `//`-to-EOL is stripped BEFORE matching, so both full-line
+        # and trailing inline comments (`foo(); // see sqlx::query!`)
+        # are invisible — the latter would otherwise refuse spuriously
+        # in a tracker-less sqlx crate. Residuals, accepted, all of
+        # which fail OPEN (skip, never block): a `//` inside a string
+        # literal on a real callsite line hides that line; a block
+        # comment or string literal shaped like `sqlx::query…!` still
+        # trips the trigger (harmless: tracker-wired crates just get
+        # checked, and no tracker-less crate can reach the REFUSE arm
+        # without a non-comment match); a future UNqualified `query!(`
+        # behind a use-import under-triggers. CI clippy/nextest
+        # remains the staleness backstop either way (this hook is
+        # dev-ergonomics, per the header above).
         real_callsite() {
-          grep -Ev '^[[:space:]]*//' -- "$1" 2>/dev/null \
+          sed 's@//.*@@' -- "$1" 2>/dev/null \
             | grep -Eq 'sqlx::query[a-z_]*!'
         }
         # Owning crate = nearest ancestor dir with a Cargo.toml.
