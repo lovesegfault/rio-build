@@ -887,7 +887,9 @@ fn verify_fixed_output(
         )
         .increment(1);
         return Err(Status::permission_denied(format!(
-            "{ctx_label}: fixed-output upload declares a self-reference;              fixed-output paths derive from the declared hash and cannot              reference themselves"
+            "{ctx_label}: fixed-output upload declares a self-reference; \
+             fixed-output paths derive from the declared hash and cannot \
+             reference themselves"
         )));
     }
 
