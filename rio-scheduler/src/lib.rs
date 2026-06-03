@@ -429,6 +429,19 @@ pub fn describe_metrics() {
          (dropped at handle_completion boundary); alert if rate > 0"
     );
     describe_counter!(
+        "rio_scheduler_completion_path_binding_total",
+        "Completion-admission slot binding (sched.completion.\
+         output-membership+1, round-17 bug_100), labeled by result: \
+         bound (reported path equals the scheduler-held claim for that \
+         slot), mismatch_dropped (worker-reported path contradicted the \
+         claim — forged or confused report, dropped before any \
+         trusted-plane consumer), accepted_floating_ca (CA output, path \
+         unknowable pre-build — explicit accept cell), \
+         accepted_unresolved_slot (deferred-IA claim did not survive; \
+         expected ~0 once claim persistence (M_075) lands — that \
+         stream's done-signal)."
+    );
+    describe_counter!(
         "rio_scheduler_undeclared_built_output_total",
         "Worker-supplied BuiltOutput.output_name not in derivation's output_names \
          (dropped at handle_completion membership filter); alert if rate > 0"

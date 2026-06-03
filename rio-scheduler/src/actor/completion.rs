@@ -35,12 +35,31 @@ impl AdmittedOutputs {
     /// 2. Name MEMBERSHIP + dedup: only outputs the `.drv` declares
     ///    (parsed at DAG-merge time), at most once each — bounds the
     ///    list at `declared.len()` against report stuffing.
+    /// 3. SLOT BINDING (round-17 bug_100): for every output whose
+    ///    slot the scheduler holds a path for — the dispatch claim
+    ///    (`claim_output_paths`, exactly what the assignment token's
+    ///    HMAC signs) — the worker-reported path MUST equal it,
+    ///    INDEX-ALIGNED by the slot, never set-membership (a
+    ///    permutation across slots is a forgery, not a match). Slots
+    ///    the scheduler holds no path for are admitted through
+    ///    explicit per-reason accept cells, each counted:
+    ///    `accepted_floating_ca` (CA outputs get content-derived
+    ///    paths the scheduler cannot know pre-build — verifying the
+    ///    path against the reported NAR hash needs the output
+    ///    descriptor, which scheduler state does not hold; see
+    ///    [`Self::verify_built_output_store_evidence`]) and
+    ///    `accepted_unresolved_slot` (a deferred-IA claim that did
+    ///    not survive — the W2-S1/M_075 persistence closes this cell;
+    ///    its counter staying ~0 after that lands is that stream's
+    ///    done-signal).
     pub(super) fn admit(
         raw: Vec<crate::domain::BuiltOutput>,
-        declared: &[String],
+        state: &crate::state::DerivationState,
         executor_id: &ExecutorId,
         drv_hash: &DrvHash,
     ) -> Self {
+        let declared = &state.output_names;
+        let claims = state.claim_output_paths();
         let mut seen: HashSet<String> = HashSet::with_capacity(declared.len());
         let admitted = raw
             .into_iter()
@@ -56,7 +75,7 @@ impl AdmittedOutputs {
                     metrics::counter!("rio_scheduler_malformed_built_output_total").increment(1);
                     return false;
                 }
-                if !declared.contains(&o.output_name) {
+                let Some(slot) = declared.iter().position(|n| n == &o.output_name) else {
                     warn!(
                         executor_id = %executor_id,
                         drv_hash = %drv_hash,
@@ -65,12 +84,80 @@ impl AdmittedOutputs {
                     );
                     metrics::counter!("rio_scheduler_undeclared_built_output_total").increment(1);
                     return false;
+                };
+                // r[impl sched.completion.output-membership+1]
+                // Slot binding: the claim list is index-aligned with
+                // output_names (the dispatch invariant the HMAC
+                // signs); names are pairwise-distinct by ingress
+                // invariant, so `position` IS the slot.
+                match claims.get(slot).map(String::as_str) {
+                    Some(trusted) if !trusted.is_empty() => {
+                        if o.output_path != trusted {
+                            warn!(
+                                executor_id = %executor_id,
+                                drv_hash = %drv_hash,
+                                output_name = %o.output_name,
+                                reported = %o.output_path,
+                                trusted = %trusted,
+                                "dropping worker-reported output path contradicting the scheduler-held claim"
+                            );
+                            metrics::counter!(
+                                "rio_scheduler_completion_path_binding_total",
+                                "result" => "mismatch_dropped"
+                            )
+                            .increment(1);
+                            return false;
+                        }
+                        metrics::counter!(
+                            "rio_scheduler_completion_path_binding_total",
+                            "result" => "bound"
+                        )
+                        .increment(1);
+                    }
+                    _ => {
+                        // Typed accept cells — the scheduler holds no
+                        // path for this slot; admission is explicit
+                        // and counted, never a silent fall-through.
+                        let reason = if state.ca.is_ca && !state.is_fixed_output {
+                            "accepted_floating_ca"
+                        } else {
+                            "accepted_unresolved_slot"
+                        };
+                        metrics::counter!(
+                            "rio_scheduler_completion_path_binding_total",
+                            "result" => reason
+                        )
+                        .increment(1);
+                    }
                 }
                 // Dedup by output_name (keep first).
                 seen.insert(o.output_name.clone())
             })
             .collect();
         Self(admitted)
+    }
+
+    /// FOD / floating-CA STORE-EVIDENCE binding — deliberately
+    /// unimplemented (R1(c) dangling symbol, round-17 bug_100):
+    /// `BuiltOutput.output_hash` is the NAR hash of what the worker
+    /// SAYS it built; binding a content-derived output path to it
+    /// requires the output descriptor (`r:sha256` method + declared
+    /// digest for FODs, the realisation chain for floating-CA), which
+    /// scheduler state does not hold — the store's upload admission
+    /// (`store.put.*`) is where those bytes are actually verified.
+    /// The accept cells above name this symbol; the deliberately
+    /// UNCOVERED rule `sched.completion.store-evidence-binding`
+    /// (visible in `tracey query uncovered`) is the wiring checklist:
+    /// implementing this without the store-side descriptor read
+    /// surface would launder a worker claim into evidence.
+    #[expect(
+        dead_code,
+        reason = "store-evidence binding restorer skeleton — the accept \
+                  cells doc names this symbol; wiring requires the store \
+                  descriptor read surface (see doc)"
+    )]
+    fn verify_built_output_store_evidence() {
+        // Deliberately unimplemented; see the doc comment.
     }
 
     pub(super) fn as_slice(&self) -> &[crate::domain::BuiltOutput] {
@@ -892,7 +979,7 @@ impl DagActor {
         // after this statement.
         let admitted = AdmittedOutputs::admit(
             std::mem::take(&mut result.built_outputs),
-            &state.output_names,
+            state,
             executor_id,
             drv_hash,
         );

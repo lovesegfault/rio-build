@@ -1195,7 +1195,7 @@
       "name": "SettledIdentityConflict",
       "crate": "rio-scheduler",
       "msg": "derivation {drv_path} has a settled (successfully built) record with a different identity; re-creating it would erase that record. {remediation}",
-      "doc": "`r[sched.persist.settled-identity-freeze+3]`: a submission tried to (re)create a derivation whose persisted row is SETTLED (completed/skipped — the durable record of a successful build, possibly already reaped from the DAG) under a conflicting identity. Maps to FAILED_PRECONDITION (client-actionable conflict). The `remediation` is GENERATED from the arbitration verdict's refuse arm (`sched.merge.store-evidence-displacement+3`, fix-discipline R6) — a refused class structurally cannot emit a remediation its verdict does not support."
+      "doc": "`r[sched.persist.settled-identity-freeze+4]`: a submission tried to (re)create a derivation whose persisted row is SETTLED (completed/skipped — the durable record of a successful build, possibly already reaped from the DAG) under a conflicting identity. Maps to FAILED_PRECONDITION (client-actionable conflict). The `remediation` is GENERATED from the arbitration verdict's refuse arm (`sched.merge.store-evidence-displacement+3`, fix-discipline R6) — a refused class structurally cannot emit a remediation its verdict does not support."
     },
     {
       "enum": "ActorError",

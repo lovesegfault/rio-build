@@ -4895,3 +4895,105 @@ async fn test_live_deferred_ia_completion_registers_realisation() -> TestResult 
     );
     Ok(())
 }
+
+// r[verify sched.completion.output-membership+1]
+/// Round-17 bug_100: the completion admission binds each
+/// worker-reported output_path to the scheduler-held claim for that
+/// output's SLOT (index-aligned — exactly what the assignment token's
+/// HMAC signs). Cells: forged path on a known slot → dropped+counted;
+/// permutation across two known slots → both dropped (set-membership
+/// would have admitted them); honest report → bound; floating-CA
+/// empty slot → explicit accept cell; deferred-IA lost claim →
+/// explicit unresolved_slot accept cell (the W2-S1/M_075 done-signal
+/// counter).
+#[test]
+fn admission_binds_reported_paths_to_claim_slots() {
+    use crate::actor::completion::AdmittedOutputs;
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let mk_state = |tag: &str, names: &[&str], paths: &[&str], is_ca: bool| {
+        let mut node = make_node(tag);
+        node.output_names = names.iter().map(|s| s.to_string()).collect();
+        node.expected_output_paths = paths.iter().map(|s| s.to_string()).collect();
+        node.is_content_addressed = is_ca;
+        crate::state::DerivationState::try_from_node(&node.into()).expect("state")
+    };
+    let out = |name: &str, path: &str| crate::domain::BuiltOutput {
+        output_name: name.into(),
+        output_path: path.into(),
+        output_hash: vec![0u8; 32],
+    };
+    let exec: crate::state::ExecutorId = "bind-w".into();
+    let drv: crate::state::DrvHash = "bind-drv".into();
+
+    let p_out = test_store_path("bind-out");
+    let p_dev = test_store_path("bind-dev");
+    let p_evil = test_store_path("bind-evil");
+
+    // Cell 1: forged path on a known slot → dropped + counted.
+    let state = mk_state("bind1", &["out"], &[&p_out], false);
+    let admitted = AdmittedOutputs::admit(vec![out("out", &p_evil)], &state, &exec, &drv);
+    assert!(
+        admitted.as_slice().is_empty(),
+        "forged path must be dropped"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_completion_path_binding_total{result=mismatch_dropped}"),
+        1
+    );
+
+    // Cell 2: permutation across two known slots → BOTH dropped
+    // (index-aligned binding; set-membership would admit both).
+    let state = mk_state("bind2", &["dev", "out"], &[&p_dev, &p_out], false);
+    let admitted = AdmittedOutputs::admit(
+        vec![out("dev", &p_out), out("out", &p_dev)],
+        &state,
+        &exec,
+        &drv,
+    );
+    assert!(
+        admitted.as_slice().is_empty(),
+        "cross-slot permutation is a forgery, not a match"
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_completion_path_binding_total{result=mismatch_dropped}"),
+        3,
+        "1 (cell 1) + 2 (both permuted slots)"
+    );
+
+    // Cell 3: honest report → bound + admitted.
+    let state = mk_state("bind3", &["dev", "out"], &[&p_dev, &p_out], false);
+    let admitted = AdmittedOutputs::admit(
+        vec![out("dev", &p_dev), out("out", &p_out)],
+        &state,
+        &exec,
+        &drv,
+    );
+    assert_eq!(admitted.as_slice().len(), 2);
+    assert_eq!(
+        recorder.get("rio_scheduler_completion_path_binding_total{result=bound}"),
+        2
+    );
+
+    // Cell 4: floating-CA — slot path unknowable pre-build; explicit
+    // accept cell, never silent.
+    let state = mk_state("bind4", &["out"], &[""], true);
+    let admitted = AdmittedOutputs::admit(vec![out("out", &p_out)], &state, &exec, &drv);
+    assert_eq!(admitted.as_slice().len(), 1, "floating-CA report admitted");
+    assert_eq!(
+        recorder.get("rio_scheduler_completion_path_binding_total{result=accepted_floating_ca}"),
+        1
+    );
+
+    // Cell 5: deferred-IA (not CA) whose claim did not survive —
+    // unresolved_slot accept cell (the M_075 done-signal counter).
+    let state = mk_state("bind5", &["out"], &[""], false);
+    let admitted = AdmittedOutputs::admit(vec![out("out", &p_out)], &state, &exec, &drv);
+    assert_eq!(admitted.as_slice().len(), 1);
+    assert_eq!(
+        recorder
+            .get("rio_scheduler_completion_path_binding_total{result=accepted_unresolved_slot}"),
+        1
+    );
+}

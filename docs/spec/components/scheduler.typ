@@ -180,6 +180,25 @@ any critical-path value).
   reason.
 ]
 
+#r("sched.completion.store-evidence-binding")[
+  A completion admission MUST NOT treat a worker-reported NAR hash as
+  evidence binding a content-derived output path (FOD or floating-CA)
+  to its content: that binding requires the output descriptor (the
+  declared method and digest for a fixed output; the realisation chain
+  for floating-CA), and any consumer holding only the report MUST
+  delegate the verification to the store's upload admission rather
+  than re-deriving it from worker-controlled fields.
+]
+
+This rule is DELIBERATELY UNCOVERED (no `impl` marker; it appears in
+`tracey query uncovered` by design): the scheduler's accept cells
+(`accepted_floating_ca` / `accepted_unresolved_slot`) name the dormant
+restorer `verify_built_output_store_evidence`, and wiring it without
+the store-side descriptor read surface would launder a worker claim
+into evidence --- the rule IS the wiring checklist, kept visible until
+the store grows that surface (round-17 bug_100; the same posture as
+`fetcher.netrc.delivery-unwired`).
+
 #r("sched.log.batch-binding")[
   The `BuildLogBatch` ingestion path MUST drop batches whose `derivation_path`
   does not match an active assignment held by the calling executor's stream. A
