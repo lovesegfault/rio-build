@@ -810,20 +810,184 @@ fn is_marker_comment(trimmed: &str) -> bool {
 /// Does this code or attribute line carry the marker in a TRAILING `//`
 /// comment? Whole-line comments (including doc comments) are
 /// [`is_marker_comment`]'s domain, not this one's; a marker token before
-/// the `//` (e.g. inside a string literal) is code, not a justification.
-/// Naive about `//` inside string literals, like [`strip_line_comment`].
+/// the comment (e.g. inside a string literal) is code, not a
+/// justification — comment detection is string-aware ([`line_comment`]).
 fn has_trailing_marker(line: &str) -> bool {
     !line.trim_start().starts_with("//")
-        && line
-            .split_once("//")
-            .is_some_and(|(_, comment)| comment.contains(BOOKKEEPING_MARKER))
+        && line_comment(line).is_some_and(|comment| comment.contains(BOOKKEEPING_MARKER))
 }
 
-/// Code part of a line: everything before a `//` comment. Naive about
-/// `//` inside string literals — fine for a lint over call sites that
-/// never embed one.
+/// Scan one line of Rust source: where its `//` LINE COMMENT starts (a
+/// `//` inside a string or char literal — `"s3://…"` — is code, never a
+/// comment start), plus the comment-stripped code with every literal
+/// INTERIOR blanked to spaces (same byte length, quotes kept), so
+/// `;`/`{`/`}` and call-shape tokens inside string literals are never
+/// read as statement structure.
+///
+/// Lexed per line, honestly scoped: regular and byte strings honor
+/// backslash escapes, raw strings (`r"…"`, `br#"…"#`) honor their hash
+/// fences, and a `'` is consumed as a char literal only when a closing
+/// quote follows (escape-aware), so lifetimes never open a phantom
+/// literal. A literal SPANNING lines is out of model: the opening line
+/// blanks to its end and reports no comment, but a continuation line is
+/// scanned from column 0 with no carried state, so its interior may be
+/// misread as code. That failure direction is loud, not silent — a stray
+/// `;`/`{`/`}` on such an interior can only BOUND a marker walk early
+/// (an unblessed-needle or stale-marker violation), never extend a
+/// blessing across a real statement boundary.
+fn scan_line(line: &str) -> (Option<usize>, String) {
+    let bytes = line.as_bytes();
+    let mut blanked = bytes.to_vec();
+    let blank = |blanked: &mut Vec<u8>, from: usize, to: usize| {
+        for b in &mut blanked[from..to] {
+            *b = b' ';
+        }
+    };
+    let ident = |b: u8| b == b'_' || b.is_ascii_alphanumeric();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                blanked.truncate(i);
+                let code = String::from_utf8(blanked).expect("blanking preserves UTF-8");
+                return (Some(i), code);
+            }
+            b'"' => {
+                let start = i + 1;
+                let mut j = start;
+                let end = loop {
+                    match bytes.get(j) {
+                        None => break None,
+                        Some(b'\\') => j += 2,
+                        Some(b'"') => break Some(j),
+                        Some(_) => j += 1,
+                    }
+                };
+                match end {
+                    // Unterminated: the literal spans lines (or the line is
+                    // a fragment); the rest of the line is string interior.
+                    None => {
+                        blank(&mut blanked, start.min(bytes.len()), bytes.len());
+                        break;
+                    }
+                    Some(j) => {
+                        blank(&mut blanked, start, j);
+                        i = j + 1;
+                    }
+                }
+            }
+            b'r' | b'b' if !(i > 0 && ident(bytes[i - 1])) => {
+                // Possible literal prefix: `b"…"`, `b'…'`, `r"…"`,
+                // `br#…#"…"#…#`. Anything else starting with r/b is a
+                // plain identifier.
+                let mut j = i;
+                if bytes[j] == b'b' {
+                    j += 1;
+                }
+                let mut hashes = 0usize;
+                let raw = bytes.get(j) == Some(&b'r');
+                if raw {
+                    j += 1;
+                    while bytes.get(j) == Some(&b'#') {
+                        hashes += 1;
+                        j += 1;
+                    }
+                }
+                match bytes.get(j) {
+                    Some(b'"') if raw => {
+                        // Raw string: closes at `"` + the same hash fence;
+                        // backslashes are literal.
+                        let start = j + 1;
+                        let mut k = start;
+                        let end = loop {
+                            match bytes.get(k) {
+                                None => break None,
+                                Some(b'"')
+                                    if bytes.len() >= k + 1 + hashes
+                                        && bytes[k + 1..k + 1 + hashes]
+                                            .iter()
+                                            .all(|b| *b == b'#') =>
+                                {
+                                    break Some(k);
+                                }
+                                Some(_) => k += 1,
+                            }
+                        };
+                        match end {
+                            None => {
+                                blank(&mut blanked, start.min(bytes.len()), bytes.len());
+                                break;
+                            }
+                            Some(k) => {
+                                blank(&mut blanked, start, k);
+                                i = k + 1 + hashes;
+                            }
+                        }
+                    }
+                    // `b"…"` / `b'…'`: re-scan from the quote — the plain
+                    // string/char arms handle the body.
+                    Some(b'"' | b'\'') if !raw => i = j,
+                    _ => i += 1,
+                }
+            }
+            b'\'' => {
+                // Char literal vs lifetime: a literal closes with a `'`
+                // within its longest form (`'\u{10FFFF}'`); a lifetime
+                // (`'a`, `'static`, `'_`) never does.
+                let start = i + 1;
+                let end = match bytes.get(start) {
+                    Some(b'\\') => {
+                        let mut j = start + 2;
+                        loop {
+                            match bytes.get(j) {
+                                Some(b'\'') => break Some(j),
+                                Some(_) if j - start <= 10 => j += 1,
+                                _ => break None,
+                            }
+                        }
+                    }
+                    Some(_) if bytes.get(start + 1) == Some(&b'\'') => Some(start + 1),
+                    _ => None,
+                };
+                match end {
+                    Some(j) => {
+                        blank(&mut blanked, start, j);
+                        i = j + 1;
+                    }
+                    None => i += 1,
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    (
+        None,
+        String::from_utf8(blanked).expect("blanking preserves UTF-8"),
+    )
+}
+
+/// The `//` line comment of `line` (comment markers included), if one
+/// exists outside every string/char literal. See [`scan_line`].
+fn line_comment(line: &str) -> Option<&str> {
+    scan_line(line).0.map(|i| &line[i..])
+}
+
+/// Code part of a line: everything before its real `//` comment, string
+/// contents kept VERBATIM (a `//` inside a string literal is code). For
+/// statement-structure questions — boundaries, call shapes — use
+/// [`code_blanked`] instead, which also blanks literal interiors.
 fn strip_line_comment(line: &str) -> &str {
-    line.split("//").next().unwrap_or(line)
+    match scan_line(line).0 {
+        Some(i) => &line[..i],
+        None => line,
+    }
+}
+
+/// Structural view of a line's code: comment stripped AND every
+/// string/char-literal interior blanked, so `contains(';')`-style
+/// boundary tests and call-site regexes only ever see real code tokens.
+fn code_blanked(line: &str) -> String {
+    scan_line(line).1
 }
 
 /// Upward adjacency: does a `Bookkeeping lookup:` marker bless the
@@ -834,11 +998,12 @@ fn strip_line_comment(line: &str) -> &str {
 /// `}` in its code part bounds the statement — a marker beyond it,
 /// including one trailing the bounding line itself, belongs to a
 /// different statement and does NOT bless this call. The boundary is
-/// therefore checked on the comment-stripped code part BEFORE a
-/// trailing marker is honored; the reverse order would let one
-/// statement's justification bless its neighbor.
+/// therefore checked on the structural code view ([`code_blanked`]:
+/// comments stripped, string interiors blanked) BEFORE a trailing
+/// marker is honored; the reverse order would let one statement's
+/// justification bless its neighbor.
 fn marker_blesses_call(lines: &[&str], call_idx: usize) -> bool {
-    if lines[call_idx].contains(BOOKKEEPING_MARKER) {
+    if has_trailing_marker(lines[call_idx]) {
         return true;
     }
     let mut budget = 30usize;
@@ -863,7 +1028,7 @@ fn marker_blesses_call(lines: &[&str], call_idx: usize) -> bool {
             }
             continue;
         }
-        let code = strip_line_comment(line);
+        let code = code_blanked(line);
         if code.contains(';') || code.contains('{') || code.contains('}') {
             return false;
         }
@@ -887,8 +1052,8 @@ fn marker_blesses_call(lines: &[&str], call_idx: usize) -> bool {
 /// be blessed by it. (Whole-line comment markers have no code part, so
 /// the own-line boundary check never fires for them.)
 fn marker_annotates_call(lines: &[&str], marker_idx: usize, call_re: &regex::Regex) -> bool {
-    let own_code = strip_line_comment(lines[marker_idx]);
-    if call_re.is_match(own_code) {
+    let own_code = code_blanked(lines[marker_idx]);
+    if call_re.is_match(&own_code) {
         return true;
     }
     // Attribute lines never bound the statement (mirrors the upward
@@ -909,8 +1074,8 @@ fn marker_annotates_call(lines: &[&str], marker_idx: usize, call_re: &regex::Reg
         if trimmed.starts_with("//") || trimmed.starts_with("#[") {
             continue;
         }
-        let code = strip_line_comment(line);
-        if call_re.is_match(code) {
+        let code = code_blanked(line);
+        if call_re.is_match(&code) {
             return true;
         }
         if code.contains(';') || code.contains('{') || code.contains('}') {
@@ -1134,8 +1299,9 @@ fn check_cnp_preflight_file(
 }
 
 /// Structured-attrs read guard: no first-party code reads a
-/// `STRING_LIST_USER_ATTRS` key straight off an env map with a literal
-/// key — every read routes through the canonical
+/// `STRING_LIST_USER_ATTRS` key straight off an env map — with the key
+/// written literally OR named via the class's own `*_ATTR` consts —
+/// every read routes through the canonical
 /// `rio_nix::derivation::structured_attrs::string_list_attr` precedence
 /// rule (or a carrier adapter feeding it).
 ///
@@ -1147,9 +1313,14 @@ fn check_cnp_preflight_file(
 /// copy was structured-attrs-blind — under a prose comment claiming
 /// parity with another site. The shared function ends the divergence;
 /// this lint keeps a new open-coded sibling from re-introducing it. The
-/// historical bug shape is a literal-keyed map read, which is exactly
-/// the needle; the canonical rule and its adapters take the key as a
-/// parameter, so no conforming line matches.
+/// needle alphabet covers BOTH ways such a read gets written: the
+/// historical literal-keyed shape, and the const-keyed shape
+/// (`env.get(REQUIRED_SYSTEM_FEATURES_ATTR)`) that the module's own
+/// `pub const` names — house style at every conforming call site —
+/// make the natural way to write the next raw read. The canonical rule
+/// and its adapters take the key as a parameter, so no conforming line
+/// matches either shape; a read through a freshly-bound local alias is
+/// outside the alphabet (a textual tripwire, not a type system).
 ///
 /// Quantification domain: every `.rs` file under `src/`, `tests/`, and
 /// `fuzz_targets/` of every root-manifest workspace member AND every
@@ -1157,22 +1328,13 @@ fn check_cnp_preflight_file(
 /// Cargo.toml, not hand-listed, so a new crate joins the domain when it
 /// joins the workspace. A member with none of those directories staged
 /// is a hard error (the nix check stages a fileset; a partial tree must
-/// fail loud, not pass vacuously). Needles derive from
-/// `STRING_LIST_USER_ATTRS` itself, so an attr added to the const is
-/// enforced without touching this lint.
+/// fail loud, not pass vacuously). Literal needles derive from
+/// `STRING_LIST_USER_ATTRS` itself; const-name needles derive from
+/// [`STRING_LIST_ATTR_CONSTS`], whose totality against the class is
+/// enforced at scan time — an attr added to the class without its const
+/// name registered here fails the lint loudly.
 fn structured_attr_reads() -> Result<()> {
-    use rio_nix::derivation::structured_attrs::STRING_LIST_USER_ATTRS;
-
-    // Floor guard: the class currently lists 2 attrs. An empty/shrunken
-    // const means the class definition moved — fail loud instead of
-    // scanning for nothing.
-    ensure!(
-        STRING_LIST_USER_ATTRS.len() >= 2,
-        "rio_nix::derivation::structured_attrs::STRING_LIST_USER_ATTRS has only {} entries \
-         — the class definition moved or shrank; update `structured_attr_reads` in \
-         xtask/src/lint.rs",
-        STRING_LIST_USER_ATTRS.len(),
-    );
+    let needles = structured_attr_needles()?;
 
     #[derive(serde::Deserialize)]
     struct RootManifest {
@@ -1205,13 +1367,6 @@ fn structured_attr_reads() -> Result<()> {
         crates.len(),
     );
 
-    // The two literal-keyed raw-read shapes per attr: a map lookup
-    // (`env.get("attr")`) and a JSON index (`payload["attr"]`).
-    let needles: Vec<String> = STRING_LIST_USER_ATTRS
-        .iter()
-        .flat_map(|key| [format!(".get(\"{key}\")"), format!("[\"{key}\"]")])
-        .collect();
-
     let mut files = 0usize;
     let mut violations: Vec<String> = Vec::new();
     for crate_dir in &crates {
@@ -1228,18 +1383,7 @@ fn structured_attr_reads() -> Result<()> {
                 let src =
                     fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
                 let rel = p.strip_prefix(root).unwrap_or(p).display().to_string();
-                for (idx, line) in src.lines().enumerate() {
-                    // Comment lines may cite the hazardous shape when
-                    // explaining it; only code lines count.
-                    if line.trim_start().starts_with("//") {
-                        continue;
-                    }
-                    for needle in &needles {
-                        if line.contains(needle.as_str()) {
-                            violations.push(format!("{rel}:{}: `{needle}`", idx + 1));
-                        }
-                    }
-                }
+                check_structured_attr_file(&src, &rel, &needles, &mut violations);
                 Ok(())
             })?;
         }
@@ -1261,8 +1405,8 @@ fn structured_attr_reads() -> Result<()> {
     if !violations.is_empty() {
         bail!(
             "{} structured-attrs raw read(s):\n    {}\n  these attrs live in env[\"__json\"] \
-             for __structuredAttrs derivations, so a literal-keyed flat read silently returns \
-             nothing for them; route the read through \
+             for __structuredAttrs derivations, so a flat read (literal-keyed or via the \
+             *_ATTR consts) silently returns nothing for them; route the read through \
              rio_nix::derivation::structured_attrs::string_list_attr (via AtermEnv or a \
              carrier adapter)",
             violations.len(),
@@ -1270,7 +1414,8 @@ fn structured_attr_reads() -> Result<()> {
         );
     }
     tracing::info!(
-        attrs = STRING_LIST_USER_ATTRS.len(),
+        attrs = rio_nix::derivation::structured_attrs::STRING_LIST_USER_ATTRS.len(),
+        needles = needles.len(),
         crates = crates.len(),
         files,
         "structured-attr-reads ok"
@@ -1278,16 +1423,119 @@ fn structured_attr_reads() -> Result<()> {
     Ok(())
 }
 
+/// `(const name, value)` for every `STRING_LIST_USER_ATTRS` member —
+/// the const-keyed half of the [`structured_attr_reads`] needle
+/// alphabet. The VALUES are the real consts (a rename refuses to
+/// compile), and [`structured_attr_needles`] enforces totality against
+/// the class const at scan time, so an attr added to
+/// `STRING_LIST_USER_ATTRS` without its const name registered here
+/// fails the lint loudly instead of silently scanning a smaller
+/// alphabet.
+const STRING_LIST_ATTR_CONSTS: [(&str, &str); 2] = [
+    (
+        "REQUIRED_SYSTEM_FEATURES_ATTR",
+        rio_nix::derivation::structured_attrs::REQUIRED_SYSTEM_FEATURES_ATTR,
+    ),
+    (
+        "IMPURE_ENV_VARS_ATTR",
+        rio_nix::derivation::structured_attrs::IMPURE_ENV_VARS_ATTR,
+    ),
+];
+
+/// The [`structured_attr_reads`] needle alphabet: per attr, the two
+/// literal-keyed raw-read shapes — a map lookup (`env.get("attr")`) and
+/// a JSON index (`payload["attr"]`) — plus the same two shapes keyed by
+/// the attr's `pub const` name, bare and `structured_attrs::`-qualified
+/// (the two spellings `use` conventions produce; a deeper path still
+/// ends in one of them only when it ends in the bare const, which the
+/// bare needle's `(`/`[` anchor deliberately does NOT match — the
+/// alphabet is exact shapes, never substrings of identifiers).
+fn structured_attr_needles() -> Result<Vec<String>> {
+    use rio_nix::derivation::structured_attrs::STRING_LIST_USER_ATTRS;
+
+    // Floor guard: the class currently lists 2 attrs. An empty/shrunken
+    // const means the class definition moved — fail loud instead of
+    // scanning for nothing.
+    ensure!(
+        STRING_LIST_USER_ATTRS.len() >= 2,
+        "rio_nix::derivation::structured_attrs::STRING_LIST_USER_ATTRS has only {} entries \
+         — the class definition moved or shrank; update `structured_attr_reads` in \
+         xtask/src/lint.rs",
+        STRING_LIST_USER_ATTRS.len(),
+    );
+    // Totality: every class member has exactly one registered const name.
+    for key in STRING_LIST_USER_ATTRS {
+        ensure!(
+            STRING_LIST_ATTR_CONSTS
+                .iter()
+                .filter(|(_, value)| *value == key)
+                .count()
+                == 1,
+            "STRING_LIST_USER_ATTRS entry {key:?} has no (or several) const-name registrations \
+             in STRING_LIST_ATTR_CONSTS (xtask/src/lint.rs) — the const-keyed needle alphabet \
+             would silently not cover it",
+        );
+    }
+    ensure!(
+        STRING_LIST_ATTR_CONSTS.len() == STRING_LIST_USER_ATTRS.len(),
+        "STRING_LIST_ATTR_CONSTS registers {} const names but STRING_LIST_USER_ATTRS has {} \
+         members — remove the stale registration",
+        STRING_LIST_ATTR_CONSTS.len(),
+        STRING_LIST_USER_ATTRS.len(),
+    );
+
+    let mut needles = Vec::new();
+    for key in STRING_LIST_USER_ATTRS {
+        needles.push(format!(".get(\"{key}\")"));
+        needles.push(format!("[\"{key}\"]"));
+    }
+    for (name, _) in STRING_LIST_ATTR_CONSTS {
+        needles.push(format!(".get({name})"));
+        needles.push(format!(".get(structured_attrs::{name})"));
+        needles.push(format!("[{name}]"));
+        needles.push(format!("[structured_attrs::{name}]"));
+    }
+    Ok(needles)
+}
+
+/// Scan one file's lines for [`structured_attr_reads`] needles. Comment
+/// lines may cite the hazardous shape when explaining it; only code
+/// lines count.
+fn check_structured_attr_file(
+    src: &str,
+    rel: &str,
+    needles: &[String],
+    violations: &mut Vec<String>,
+) {
+    for (idx, line) in src.lines().enumerate() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        for needle in needles {
+            if line.contains(needle.as_str()) {
+                violations.push(format!("{rel}:{}: `{needle}`", idx + 1));
+            }
+        }
+    }
+}
+
 /// How one declared-contract row is enforced.
 #[derive(Debug, Clone, Copy)]
 enum Enforcement {
-    /// A consumer-side contract test: `test_fn` in `file` must exist and
-    /// the file must contain every `artifact_needles` entry — strings
-    /// taken from the test's canned hostile artifact (the flipped digest,
-    /// the `checked: 0` gate document, the withdrawn-claim manifest edit),
-    /// so the row cannot be satisfied by pointing at an unrelated test
-    /// name. A call site is deliberately NOT acceptable enforcement: a
-    /// consumer that parses-and-ignores resolves names just fine.
+    /// A consumer-side contract test: `test_fn` must exist in `file`'s
+    /// TEST REGION (everything from the first `#[cfg(test)]` line on;
+    /// the whole file for integration-test files without one), and that
+    /// region's CODE — comment lines and trailing comments excluded —
+    /// must contain every `artifact_needles` entry: strings from the
+    /// test's canned hostile artifact or its artifact-driving calls (the
+    /// flipped digest, the `checked: 0` gate document, the
+    /// withdrawn-claim manifest edit). Production code is deliberately
+    /// outside the search scope, so a needle that happens to name a
+    /// production identifier cannot be satisfied by the production code
+    /// itself surviving while the test decays — needles must live in the
+    /// test, or the row fails. A call site is deliberately NOT
+    /// acceptable enforcement: a consumer that parses-and-ignores
+    /// resolves names just fine.
     Test {
         file: &'static str,
         test_fn: &'static str,
@@ -1358,7 +1606,7 @@ const CONTRACT_REGISTRY: &[ContractRow] = &[
         enforcement: Enforcement::Test {
             file: "rio-replay/src/archive/reader.rs",
             test_fn: "capability_flags_gate_their_documented_engine_behavior",
-            artifact_needles: &["set_capability_false", "expected_outcomes_for_units"],
+            artifact_needles: &["set_capability_false", "expected_outcomes_for_units(&gated"],
         },
     },
     ContractRow {
@@ -1382,7 +1630,7 @@ const CONTRACT_REGISTRY: &[ContractRow] = &[
         enforcement: Enforcement::Test {
             file: "rio-replay/src/archive/reader.rs",
             test_fn: "capability_flags_gate_their_documented_engine_behavior",
-            artifact_needles: &["set_capability_false", "has_embedded"],
+            artifact_needles: &["set_capability_false", "!gated.has_embedded(SRC_PATH)"],
         },
     },
     ContractRow {
@@ -1523,7 +1771,7 @@ const CONTRACT_REGISTRY: &[ContractRow] = &[
         enforcement: Enforcement::Test {
             file: "xtask/src/replay/launch.rs",
             test_fn: "guard_admits_old_era_records_and_still_blocks_intent_drift",
-            artifact_needles: &["upstreams_verified"],
+            artifact_needles: &["[\"tenants\"][\"upstreams_verified\"]"],
         },
     },
     // ── Drv-closure completeness: consumer-side membership cross-check
@@ -1562,7 +1810,7 @@ const CONTRACT_REGISTRY: &[ContractRow] = &[
         enforcement: Enforcement::Test {
             file: "rio-replay/src/run/mod.rs",
             test_fn: "demotion_membership_pins_at_first_plan",
-            artifact_needles: &["resolve_demoted_impure"],
+            artifact_needles: &["resolve_demoted_impure(Some(&pinned)"],
         },
     },
 ];
@@ -1678,18 +1926,21 @@ fn check_contract_registry(
                     row.key
                 )),
                 Ok(text) => {
-                    if !text.contains(&format!("fn {test_fn}(")) {
+                    let searchable = test_region_code(&text);
+                    if !searchable.contains(&format!("fn {test_fn}(")) {
                         violations.push(format!(
-                            "row `{}`: named contract test `{test_fn}` does not exist in {file}",
+                            "row `{}`: named contract test `{test_fn}` does not exist in \
+                             {file}'s test region",
                             row.key
                         ));
                     }
                     for needle in artifact_needles {
-                        if !text.contains(needle) {
+                        if !searchable.contains(needle) {
                             violations.push(format!(
-                                "row `{}`: {file} no longer contains the artifact needle \
-                                 {needle:?} — the named test may have stopped exercising the \
-                                 row's artifact",
+                                "row `{}`: {file}'s test region no longer contains the \
+                                 artifact needle {needle:?} in code — the named test stopped \
+                                 exercising the row's artifact (or the needle moved into \
+                                 production/comments, where it proves nothing about the test)",
                                 row.key
                             ));
                         }
@@ -1705,6 +1956,40 @@ fn check_contract_registry(
         violations.join("\n  ")
     );
     Ok(())
+}
+
+/// The searchable CODE of a file's test region, for [`Enforcement::Test`]
+/// resolution: lines from the first `#[cfg(test)]` line on (the whole
+/// file when none exists — integration-test files are all test), with
+/// whole-line comments dropped and trailing comments stripped
+/// (string-aware: an artifact needle inside a string literal — the
+/// normal place for one — survives; a needle that only ever appeared in
+/// prose does not). Joined with `\n` so needles can span a line's full
+/// code but never cross lines.
+///
+/// Files that interleave `#[cfg(test)]` test-support items with
+/// production code (e.g. archive_input.rs) get a region wider than
+/// their tests module — the line-oriented scan cannot tell where a
+/// cfg-gated item ends. The registry's needle discipline carries the
+/// rest of the guarantee there: needles are strings unique to the named
+/// test's body (canned-artifact text, test-local bindings), never bare
+/// production identifiers, so surviving production code between
+/// test-support items cannot satisfy a row whose test decayed.
+fn test_region_code(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.trim() == "#[cfg(test)]")
+        .unwrap_or(0);
+    let mut code = String::new();
+    for line in &lines[start..] {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        code.push_str(strip_line_comment(line));
+        code.push('\n');
+    }
+    code
 }
 
 /// Declared-contract registry guard — see [`CONTRACT_REGISTRY`] and
@@ -1743,17 +2028,30 @@ const BOUNDED_IO_MARKER: &str = "bounded-io:";
 ///
 /// - `rio-replay/src/run/supply/` (the upload/prefetch execution arms),
 /// - `rio-replay/src/substituter.rs` (the binary-cache client),
+/// - `rio-replay/src/nixcache.rs` (the operator binary-cache client the
+///   upstream-coverage probe rides),
 /// - `rio-replay/src/archive/` (the S3 layout and image backends);
 ///
 /// and EXACTLY this needle alphabet ([`bounded_io_needle`]): `.send()`
 /// (empty-parens HTTP/SDK request dispatch — channel/`mpsc` sends take an
 /// argument and do not match), `.collect()`/`.text()` immediately awaited
-/// (wholesale body buffering; iterator collects are never awaited), and
-/// `.read_to_end(` (reader draining). These are the modules where the
-/// resource-bound defect class clustered and the call shapes it wore: a
-/// deadline or size cap added at the arm where a problem was noticed
-/// while sibling arms stayed exposed (the narinfo collect outliving its
-/// send-only timeout, the relay header wait with no deadline at all).
+/// (wholesale body buffering; iterator collects are never awaited),
+/// `.chunk()` (reqwest's per-chunk body streaming — the accumulation
+/// loop must state its cap; iterator `.chunks(n)` takes an argument and
+/// never matches), and `.read_to_end(` (reader draining). These are the
+/// modules where the resource-bound defect class clustered and the call
+/// shapes it wore: a deadline or size cap added at the arm where a
+/// problem was noticed while sibling arms stayed exposed (the narinfo
+/// collect outliving its send-only timeout, the relay header wait with
+/// no deadline at all).
+///
+/// Needle detection and the statement-boundary walks all read the
+/// structural code view ([`code_blanked`]): the scanned modules are
+/// saturated with `s3://`/`https://` string literals, and a naive
+/// `split("//")` comment strip would eat a real `;`/`{`/`}` after such a
+/// literal — letting one statement's marker bless its neighbor — while a
+/// one-line `client.get("https://…").send()` would lose its needle
+/// entirely and land unmarked.
 ///
 /// The gate is two-directional:
 ///
@@ -1780,7 +2078,10 @@ const BOUNDED_IO_MARKER: &str = "bounded-io:";
 fn bounded_io() -> Result<()> {
     let root = repo_root();
     // Module allowlist — see the doc comment for why exactly these.
-    let file_roots = ["rio-replay/src/substituter.rs"];
+    let file_roots = [
+        "rio-replay/src/substituter.rs",
+        "rio-replay/src/nixcache.rs",
+    ];
     let dir_roots = ["rio-replay/src/run/supply", "rio-replay/src/archive"];
 
     let mut needles = 0usize;
@@ -1809,7 +2110,7 @@ fn bounded_io() -> Result<()> {
         walk_rs(&path, &mut scan)?;
     }
 
-    // Floor guards: ~19 production needles across ~12 files today. A
+    // Floor guards: ~21 production needles across ~11 files today. A
     // collapse means the needle detection or the roots regressed, not
     // that the modules stopped doing IO.
     ensure!(
@@ -1863,10 +2164,10 @@ fn check_bounded_io_file(src: &str, rel: &str, violations: &mut Vec<String>) -> 
         }
         // Staleness covers BOTH marker placements — pure comment lines
         // AND markers trailing code — so a refactor cannot leave either
-        // shape vouching for nothing.
-        if lines[i].contains(BOUNDED_IO_MARKER)
-            && !trimmed.starts_with("///")
-            && !trimmed.starts_with("//!")
+        // shape vouching for nothing. The marker token must sit in a real
+        // comment ([`line_comment`]); a string literal mentioning the tag
+        // is code, neither a blessing nor a staleness candidate.
+        if (is_bounded_io_marker_comment(trimmed) || has_trailing_bounded_io_marker(lines[i]))
             && !bounded_io_marker_annotates(lines, i)
         {
             violations.push(format!(
@@ -1879,20 +2180,26 @@ fn check_bounded_io_file(src: &str, rel: &str, violations: &mut Vec<String>) -> 
     needles
 }
 
-/// Needle test for [`bounded_io`] at line `idx`: the comment-stripped
-/// code's external-IO call shape, if any.
+/// Needle test for [`bounded_io`] at line `idx`: the structural code
+/// view's external-IO call shape, if any. Reads [`code_blanked`], so a
+/// needle token inside a string literal (a log message quoting
+/// `.send()`, an inline `https://…` URL hiding the rest of the line)
+/// neither matches nor masks.
 ///
 /// `.collect()`/`.text()` count only when immediately awaited (same line,
 /// or the next non-empty/non-comment line starts with `.await`) — that is
 /// the body-buffering shape; iterator collects are never awaited, so the
 /// adjacency requirement is what keeps them out of the alphabet.
 fn bounded_io_needle(lines: &[&str], idx: usize) -> Option<&'static str> {
-    let code = strip_line_comment(lines[idx]);
+    let code = code_blanked(lines[idx]);
     if code.contains(".send()") {
         return Some(".send()");
     }
     if code.contains(".read_to_end(") {
         return Some(".read_to_end(");
+    }
+    if code.contains(".chunk()") {
+        return Some(".chunk()");
     }
     for (token, name) in [
         (".collect()", ".collect().await"),
@@ -1928,6 +2235,14 @@ fn is_bounded_io_marker_comment(trimmed: &str) -> bool {
         && trimmed.contains(BOUNDED_IO_MARKER)
 }
 
+/// Does this code line carry the bounded-io marker in a TRAILING `//`
+/// comment? String-aware like [`has_trailing_marker`]: a marker token
+/// inside a string literal is code, not a bound statement.
+fn has_trailing_bounded_io_marker(line: &str) -> bool {
+    !line.trim_start().starts_with("//")
+        && line_comment(line).is_some_and(|comment| comment.contains(BOUNDED_IO_MARKER))
+}
+
 /// Upward adjacency: does a `bounded-io:` marker bless the needle at
 /// `needle_idx`? The marker may trail the needle line itself, or sit
 /// above it separated only by comment/attribute/statement-continuation
@@ -1937,7 +2252,7 @@ fn is_bounded_io_marker_comment(trimmed: &str) -> bool {
 /// (honoring the trailing marker before the boundary would let one
 /// statement's justification leak onto its neighbor).
 fn bounded_io_marker_blesses(lines: &[&str], needle_idx: usize) -> bool {
-    if lines[needle_idx].contains(BOUNDED_IO_MARKER) {
+    if has_trailing_bounded_io_marker(lines[needle_idx]) {
         return true;
     }
     let mut budget = 30usize;
@@ -1956,11 +2271,11 @@ fn bounded_io_marker_blesses(lines: &[&str], needle_idx: usize) -> bool {
         if trimmed.starts_with("#[") {
             continue;
         }
-        let code = strip_line_comment(line);
+        let code = code_blanked(line);
         if code.contains(';') || code.contains('{') || code.contains('}') {
             return false;
         }
-        if line.contains(BOUNDED_IO_MARKER) {
+        if has_trailing_bounded_io_marker(line) {
             // Trailing marker on a continuation line of this statement.
             return true;
         }
@@ -1994,7 +2309,7 @@ fn bounded_io_marker_annotates(lines: &[&str], marker_idx: usize) -> bool {
             if bounded_io_needle(lines, j).is_some() {
                 return true;
             }
-            let code = strip_line_comment(line);
+            let code = code_blanked(line);
             if code.contains(';') || code.contains('{') || code.contains('}') {
                 return false;
             }
@@ -2013,7 +2328,7 @@ fn bounded_io_marker_annotates(lines: &[&str], marker_idx: usize) -> bool {
             if bounded_io_needle(lines, j).is_some() {
                 return true;
             }
-            let code = strip_line_comment(lines[j]);
+            let code = code_blanked(lines[j]);
             if code.contains(';') || code.contains('{') || code.contains('}') {
                 return false;
             }
@@ -2552,6 +2867,67 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("needle-that-was-removed"), "{err}");
+
+        // The decayed-test bypass: the row's needle surviving in
+        // PRODUCTION code (or in comments) proves nothing about the
+        // test, so resolution is scoped to the test region's code. A
+        // gutted test body fails the row even though the file as a
+        // whole still contains both the fn name shape and the needle.
+        let files_gutted = std::collections::BTreeMap::from([
+            ("schema.rs", "alpha gates the frobnicator"),
+            (
+                "tests.rs",
+                "pub fn flip_helper() { let artifact = \"flipped-alpha\"; }\n\
+                 // prose mention: flipped-alpha\n\
+                 #[cfg(test)]\n\
+                 mod tests {\n\
+                 \x20   #[test]\n\
+                 \x20   fn alpha_gate_flip() { assert!(true); }\n\
+                 }\n",
+            ),
+        ]);
+        let gutted = synthetic_row(Enforcement::Test {
+            file: "tests.rs",
+            test_fn: "alpha_gate_flip",
+            artifact_needles: &["flipped-alpha"],
+        });
+        let err = check_contract_registry(&[gutted], &vocab, &digests, &reader(&files_gutted))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("flipped-alpha"), "{err}");
+        assert!(err.contains("test region"), "{err}");
+
+        // …and a needle INSIDE the test region resolves even when the
+        // file has a production region above it; one in a test-region
+        // comment still does not (prose is not exercise).
+        let files_split = std::collections::BTreeMap::from([
+            ("schema.rs", "alpha gates the frobnicator"),
+            (
+                "tests.rs",
+                "pub fn production() {}\n\
+                 #[cfg(test)]\n\
+                 mod tests {\n\
+                 \x20   // commentary: decoy-needle\n\
+                 \x20   #[test]\n\
+                 \x20   fn alpha_gate_flip() { let artifact = \"flipped-alpha\"; }\n\
+                 }\n",
+            ),
+        ]);
+        let good_split = synthetic_row(Enforcement::Test {
+            file: "tests.rs",
+            test_fn: "alpha_gate_flip",
+            artifact_needles: &["flipped-alpha"],
+        });
+        check_contract_registry(&[good_split], &vocab, &digests, &reader(&files_split)).unwrap();
+        let comment_only = synthetic_row(Enforcement::Test {
+            file: "tests.rs",
+            test_fn: "alpha_gate_flip",
+            artifact_needles: &["decoy-needle"],
+        });
+        let err = check_contract_registry(&[comment_only], &vocab, &digests, &reader(&files_split))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("decoy-needle"), "{err}");
 
         // A row may not outlive its contract text.
         let files_without_decl = std::collections::BTreeMap::from([
@@ -3391,6 +3767,242 @@ two on one line: `sched.dispatch.fod-substitute+4` `sched.dispatch.fod-substitut
              pub struct Client;\n",
         );
         assert_eq!((needles, v.len()), (0, 0), "{v:?}");
+    }
+
+    /// The realistic evasion the scanned modules are saturated with: the
+    /// `//` of a URL **string literal**. A naive `split("//")` strip read
+    /// everything after `"https:` as a comment, so an inline-URL one-liner
+    /// lost its `.send()` needle (new unbounded IO landed unmarked) and a
+    /// URL-bearing line lost its `;` terminator (one statement's marker
+    /// blessed its neighbor). Both directions must hold against the
+    /// string-aware lexer.
+    #[test]
+    fn bounded_io_url_literals_neither_mask_needles_nor_eat_boundaries() {
+        // Inline-URL dispatch: the needle must still be seen and flagged.
+        let (needles, v) =
+            bio("let resp = client.get(\"https://cache.example.org/x\").send().await?;\n");
+        assert_eq!((needles, v.len()), (1, 1), "{v:?}");
+        assert!(v[0].contains(".send()"), "{v:?}");
+
+        // A URL-bearing terminated statement between a marker and the
+        // next statement's needle is a BOUNDARY: the marker must not
+        // bless across it (and goes stale, having no needle of its own).
+        // This is the `.with_context(|| format!("s3://…"))?;` shape the
+        // archive backends use on almost every call.
+        let (needles, v) = bio("// bounded-io: belongs to the statement below only\n\
+             let base = parse(\"s3://{}/{key}\", bucket);\n\
+             let resp = client.get(base).send().await?;\n");
+        assert_eq!(needles, 1);
+        assert_eq!(v.len(), 2, "unblessed needle AND stale marker: {v:?}");
+        assert!(v.iter().any(|m| m.contains("without an adjacent")), "{v:?}");
+        assert!(v.iter().any(|m| m.contains("stale")), "{v:?}");
+
+        // Conversely: a URL inside a CONTINUATION line of one statement
+        // (no real terminator outside the string) does not bound the
+        // walk — the marker above still blesses its own needle, and
+        // braces inside the literal are not statement structure.
+        let (needles, v) = bio(
+            "// bounded-io: dispatch only; body streamed under its own cap\n\
+             let resp = client\n\
+             \x20   .get_object(format!(\"s3://{}/{key};{}\", bucket, extra))\n\
+             \x20   .send()\n\
+             \x20   .await?;\n",
+        );
+        assert_eq!((needles, v.len()), (1, 0), "{v:?}");
+
+        // A needle token inside a string literal is a log message, not an
+        // IO call: no marker demanded, and a marker annotating only it is
+        // stale.
+        let (needles, v) = bio("tracing::warn!(\"retrying .send() after backoff\");\n");
+        assert_eq!((needles, v.len()), (0, 0), "{v:?}");
+        let (_, v) = bio(
+            "// bounded-io: stale — the needle below is inside a string\n\
+             tracing::warn!(\"retrying .send() after backoff\");\n",
+        );
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].contains("stale"), "{v:?}");
+
+        // A marker token inside a string literal is code, not a blessing:
+        // the needle next to it still demands a real marker.
+        let (needles, v) = bio("let tag = \"// bounded-io: not a real marker\";\n\
+             let resp = client.get(url).send().await?;\n");
+        assert_eq!((needles, v.len()), (1, 1), "{v:?}");
+    }
+
+    /// `.chunk()` is in the alphabet: the per-chunk accumulation loop is
+    /// the body-buffering shape one step removed (the narinfo cap rider's
+    /// loop), so it must state its bound like any other body read.
+    #[test]
+    fn bounded_io_chunk_loop_is_a_needle() {
+        let (needles, v) = bio("while let Some(chunk) = resp.chunk().await? {\n\
+             \x20   bytes.extend_from_slice(&chunk);\n\
+             }\n");
+        assert_eq!((needles, v.len()), (1, 1), "{v:?}");
+        assert!(v[0].contains(".chunk()"), "{v:?}");
+
+        // The real nixcache shape: marker above the loop statement.
+        let (needles, v) = bio(
+            "// bounded-io: size-capped by the running MAX_NARINFO_BYTES check\n\
+             // below; time-bounded by the client-wide request timeout.\n\
+             while let Some(chunk) = resp\n\
+             \x20   .chunk()\n\
+             \x20   .await?\n\
+             {\n\
+             \x20   bytes.extend_from_slice(&chunk);\n\
+             }\n",
+        );
+        assert_eq!((needles, v.len()), (1, 0), "{v:?}");
+
+        // Iterator `.chunks(n)` takes an argument and never matches.
+        let (needles, v) = bio("for chunk in xs.chunks(500) { upload(chunk); }\n");
+        assert_eq!((needles, v.len()), (0, 0), "{v:?}");
+    }
+
+    // ── shared line lexer ──────────────────────────────────────────
+
+    /// The string-aware lexer behind every marker lint: `//` inside
+    /// string/char literals is code; real comments are found behind any
+    /// literal shape; literal interiors are blanked out of the structural
+    /// view.
+    #[test]
+    fn line_lexer_distinguishes_strings_chars_and_comments() {
+        // Plain comment.
+        assert_eq!(strip_line_comment("let x = 1; // c"), "let x = 1; ");
+        // URL literal: no comment on the line at all.
+        let url = ".with_context(|| format!(\"s3://{}/{key}\", self.bucket))?;";
+        assert_eq!(strip_line_comment(url), url);
+        assert_eq!(line_comment(url), None);
+        // The structural view keeps the real `;` but blanks the braces
+        // inside the literal.
+        let blanked = code_blanked(url);
+        assert!(blanked.ends_with("?;"), "{blanked:?}");
+        assert!(!blanked.contains('{'), "{blanked:?}");
+        // Real comment after a URL literal.
+        assert_eq!(
+            strip_line_comment("let u = \"https://x\"; // note"),
+            "let u = \"https://x\"; "
+        );
+        // Escaped quote inside a string does not end it.
+        assert_eq!(
+            strip_line_comment("let s = \"a\\\"b//c\"; // d"),
+            "let s = \"a\\\"b//c\"; "
+        );
+        // A quote CHAR literal does not open a string.
+        assert_eq!(
+            strip_line_comment("if c == '\"' { x(); } // e"),
+            "if c == '\"' { x(); } "
+        );
+        // …and a brace char literal is not statement structure.
+        assert!(!code_blanked("let open = '{';").contains('{'));
+        // Raw strings honor their hash fences.
+        assert_eq!(
+            strip_line_comment("let r = r#\"// not a comment\"#; // f"),
+            "let r = r#\"// not a comment\"#; "
+        );
+        // Byte strings too.
+        assert_eq!(
+            strip_line_comment("let b = b\"//\"; // h"),
+            "let b = b\"//\"; "
+        );
+        // Lifetimes are not char literals: the comment is still found.
+        assert_eq!(
+            strip_line_comment("fn f<'a>(x: &'a str) {} // g"),
+            "fn f<'a>(x: &'a str) {} "
+        );
+        // An unterminated string (a literal spanning lines) swallows the
+        // rest of the line: no comment, interior blanked.
+        assert_eq!(line_comment("let s = \"abc // not"), None);
+        assert!(!code_blanked("let s = \"abc ; {").contains(';'));
+        // Identifiers starting with r/b are not literal prefixes.
+        assert_eq!(
+            strip_line_comment("let radius = r * 2; // c"),
+            "let radius = r * 2; "
+        );
+    }
+
+    /// The bookkeeping lint rides the same lexer: a marker token inside a
+    /// string is code (neither blesses nor goes stale), and a URL literal
+    /// before a real trailing marker does not hide it.
+    #[test]
+    fn bookkeeping_marker_detection_is_string_aware() {
+        assert!(has_trailing_marker(
+            "let url = \"http://x\"; // Bookkeeping lookup: audit view"
+        ));
+        assert!(!has_trailing_marker(
+            "let s = \"// Bookkeeping lookup: not a marker\";"
+        ));
+    }
+
+    // ── structured-attr reads ──────────────────────────────────────
+
+    /// Run [`check_structured_attr_file`] over a synthetic source.
+    /// Fixture lines are assembled by CONCATENATION so this file never
+    /// contains a contiguous needle — the real lint scans xtask/src too.
+    fn sar(src: &str) -> Vec<String> {
+        let needles = structured_attr_needles().unwrap();
+        let mut violations = Vec::new();
+        check_structured_attr_file(src, "synthetic.rs", &needles, &mut violations);
+        violations
+    }
+
+    /// Every raw-read shape in the alphabet trips: the historical
+    /// literal-keyed reads AND the const-keyed style the canonical
+    /// module's own `pub const` names made the house standard — the
+    /// realistic way the next bypassing read gets written in a crate
+    /// that already imports rio-nix.
+    #[test]
+    fn structured_attr_alphabet_catches_literal_and_const_keyed_reads() {
+        let attr = "requiredSystemFeatures";
+        let attr2 = "impureEnvVars";
+        let konst = "REQUIRED_SYSTEM_FEATURES_ATTR";
+        let konst2 = "IMPURE_ENV_VARS_ATTR";
+        let cases = [
+            format!("let f = env.get({:?});\n", attr),
+            format!("let v = payload[{:?}].clone();\n", attr2),
+            format!("let f = env.get({konst});\n"),
+            format!("let f = env.get(structured_attrs::{konst2});\n"),
+            format!("let v = payload[{konst}].as_array();\n"),
+            format!("let v = payload[structured_attrs::{konst2}];\n"),
+        ];
+        for case in &cases {
+            let v = sar(case);
+            assert_eq!(v.len(), 1, "must trip: {case:?} -> {v:?}");
+        }
+
+        // Conforming shapes stay clean: the canonical rule and adapters
+        // take the key as a parameter, comments may cite the hazard, and
+        // the class const's own definition list is not a read.
+        let clean = format!(
+            "let names = string_list_attr(&view, structured_attrs::{konst});\n\
+             // explaining the hazard: env.get({:?}) would be blind\n\
+             pub const STRING_LIST_USER_ATTRS: [&str; 2] = [{konst}, {konst2}];\n",
+            attr
+        );
+        assert_eq!(sar(&clean), Vec::<String>::new());
+    }
+
+    /// The needle alphabet's totality guard: the const-name registry must
+    /// cover the class exactly (values are the real consts, so a rename
+    /// refuses to compile; this pins the count side).
+    #[test]
+    fn structured_attr_const_registry_is_total() {
+        use rio_nix::derivation::structured_attrs::STRING_LIST_USER_ATTRS;
+        assert_eq!(STRING_LIST_ATTR_CONSTS.len(), STRING_LIST_USER_ATTRS.len());
+        for key in STRING_LIST_USER_ATTRS {
+            assert_eq!(
+                STRING_LIST_ATTR_CONSTS
+                    .iter()
+                    .filter(|(_, value)| *value == key)
+                    .count(),
+                1,
+                "{key} must have exactly one const-name registration"
+            );
+        }
+        // 2 literal + 4 const-keyed shapes per attr.
+        assert_eq!(
+            structured_attr_needles().unwrap().len(),
+            STRING_LIST_USER_ATTRS.len() * 6
+        );
     }
 
     // As with the other file-walking lints, `bounded_io` itself (root

@@ -22,7 +22,11 @@
 //!
 //! The `structured-attr-reads` workspace lint (xtask) enforces that no
 //! call site reads a [`STRING_LIST_USER_ATTRS`] key straight off an env
-//! map; every read routes through this module.
+//! map with the key written literally or via this module's `*_ATTR`
+//! consts; every read routes through this module. The lint is a textual
+//! tripwire over those exact shapes — a read through a freshly-bound
+//! local alias of a key is outside its alphabet and stays a review
+//! concern, not a CI-stopped one.
 
 use std::collections::BTreeMap;
 

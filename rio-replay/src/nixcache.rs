@@ -399,6 +399,9 @@ impl NixCacheClient {
         use crate::substituter::MAX_NARINFO_BYTES;
         let url = self.narinfo_url(store_path)?;
         tracing::debug!(%url, "cache GET");
+        // bounded-io: dispatch and headers run under the client-wide 60s
+        // request timeout (`with_base`); the body is drained separately
+        // under the MAX_NARINFO_BYTES cap below.
         let mut resp = self
             .http
             .get(url.clone())
