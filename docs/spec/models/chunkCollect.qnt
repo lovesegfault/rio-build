@@ -171,11 +171,19 @@ module chunkCollect {
   /// `last_referenced_at = now()` touch), i.e. the model image of
   /// `now() - GREATEST(created_at, last_referenced_at)`, saturating
   /// just past the grace TTL. There is no refcount.
+  ///
+  /// `deletedAge` (bughunt wave D1, merged_bug_336): ticks since the
+  /// soft-delete stamp — the model image of `now() - deleted_at`,
+  /// stamped 0 by the collect batch (`deleted_at = now()` in
+  /// COLLECT_BATCH_UPDATE_SQL), reset by the resurrect upsert
+  /// (`deleted_at = NULL`, metadata/chunked.rs), saturating just past
+  /// the reap grace. Meaningful only while `deleted`; 0 otherwise.
   type ChunkRec = {
     present: bool,
     uploadedAt: bool,
     deleted: bool,
     refAge: int,
+    deletedAge: int,
   }
 
   /// Uploader program counter. UTxOpen exists only in the
@@ -254,6 +262,19 @@ module chunkCollect {
   const HOTPATH_AFTER: int
   const SCANNER_AFTER: int
   const GRACE_TICKS: int
+  /// The tombstone-reap grace term in ticks (bughunt wave D1,
+  /// merged_bug_336; production CHUNK_GRACE_SECS re-used as the reap
+  /// grace — REAP_BATCH_DELETE_SQL's `deleted_at < now() - grace`).
+  /// REAP_GRACE_TICKS >= 1, like GRACE_TICKS.
+  const REAP_GRACE_TICKS: int
+  /// The shadow arm's simulated-sweep exclusion (bughunt wave D1,
+  /// bug_199): TRUE = the shipped anti-join (`shadow_swept` temp
+  /// table excluded from mark + would-collect), FALSE = the pre-fix
+  /// estimate computed against UN-swept state — the
+  /// chunkCollectShadowNoExclusion falsification regime. Read only by
+  /// the shadow-equivalence invariant below, never by an action: the
+  /// dry run has no state effects to model.
+  const ENABLE_SHADOW_EXCLUSION: bool
   /// Replacement-mechanism switches (each is a load-bearing guard of
   /// the design; the main regimes set all of them to the as-designed
   /// value and each §4.6 falsification module flips exactly one):
@@ -298,11 +319,13 @@ module chunkCollect {
   pure val STALE_CAP = SCANNER_AFTER
   pure val AGE_CAP = GRACE_TICKS + 1
   pure val SNAP_CAP = GRACE_TICKS + WRITER_TX_BOUND + 1
+  /// deletedAge saturates just past the reap grace.
+  pure val REAP_AGE_CAP = REAP_GRACE_TICKS + 1
 
   pure def minInt(a: int, b: int): int = if (a < b) a else b
 
   /// An absent chunks row (canonical dead-field values).
-  pure val NO_CHUNK: ChunkRec = { present: false, uploadedAt: false, deleted: false, refAge: 0 }
+  pure val NO_CHUNK: ChunkRec = { present: false, uploadedAt: false, deleted: false, refAge: 0, deletedAge: 0 }
   /// An absent manifests row (gen survives row deletion).
   pure def emptyPath(g: int): PathRec =
     { status: PNone, gen: g, staleness: 0, mdata: NoMd, corrupt: false }
@@ -363,6 +386,15 @@ module chunkCollect {
   ///     batch while an unmarked, still-referenced chunk that was
   ///     already past grace at the snapshot was retained ONLY by its
   ///     post-snapshot touch — the §4.6 mark-stale reachability state.
+  ///   - tombstoneReaped: the post-pass reap hard-deleted a tombstone
+  ///     row (merged_bug_336 non-vacuity — the pre-fix model had no
+  ///     delete action at all; rows were permanent).
+  ///   - reapedUnsafely: a reap fired against a row that was live
+  ///     (`deleted = FALSE`), still pending drain (outbox row), or
+  ///     still referenced by an existing manifest — reapSafety's
+  ///     action-form sensor (the first two are statically excluded by
+  ///     the action's own predicate, mirroring the single-statement
+  ///     SQL; the referenced case is what the interleavings probe).
   var wit: {
     deletedWhileReferenced: bool,
     skippedPutWithoutPresence: bool,
@@ -378,6 +410,8 @@ module chunkCollect {
     parseFailureAborted: bool,
     quarantined: bool,
     markMissSavedByTouch: bool,
+    tombstoneReaped: bool,
+    reapedUnsafely: bool,
   }
 
   // --- 5. derived state (the ghost truth and the code's predicates) ------
@@ -493,8 +527,11 @@ module chunkCollect {
       val c = cm.get(h)
       if (not(list.contains(h))) c
       else if (c.present)
-        { ...c, deleted: false, refAge: if (withTouch) minInt(c.refAge, minInt(backdate, ageCap)) else c.refAge }
-      else { present: true, uploadedAt: false, deleted: false, refAge: minInt(backdate, ageCap) })
+        // The resurrect arm clears the soft-delete AND its stamp
+        // (`deleted = false, deleted_at = NULL` — metadata/chunked.rs;
+        // the reap-vs-resurrect race order, merged_bug_336).
+        { ...c, deleted: false, deletedAge: 0, refAge: if (withTouch) minInt(c.refAge, minInt(backdate, ageCap)) else c.refAge }
+      else { present: true, uploadedAt: false, deleted: false, refAge: minInt(backdate, ageCap), deletedAge: 0 })
 
   // --- 7. invariants ------------------------------------------------------
   //
@@ -516,6 +553,8 @@ module chunkCollect {
         c.refAge >= 0 and c.refAge <= AGE_CAP,
         not(c.present) implies (not(c.uploadedAt) and not(c.deleted) and c.refAge == 0),
         c.deleted implies not(c.uploadedAt),
+        c.deletedAge >= 0 and c.deletedAge <= REAP_AGE_CAP,
+        not(c.deleted) implies c.deletedAge == 0,
       }),
     PATHS.forall(p =>
       val r = paths.get(p)
@@ -651,6 +690,86 @@ module chunkCollect {
   /// chunk to do harm, and that is exactly what this forbids.
   val noReferencedChunkSwept = not(wit.referencedChunkSwept)
 
+  /// Tombstone-reap safety (bughunt wave D1, merged_bug_336;
+  /// store.gc.bounded-garbage-retention+3's row-retention clause): the
+  /// post-pass reap never removes a live (`deleted = FALSE`) row, a
+  /// row still pending drain (outbox), or a row some existing manifest
+  /// references. The first two are the DELETE statement's own
+  /// conjuncts (single-statement re-evaluation under the row lock —
+  /// the resurrect-vs-reap race order); the referenced case is the
+  /// cross-mechanism content the interleavings probe: a referenced row
+  /// is only ever `deleted` transiently pre-resurrect, and the reap
+  /// grace + the atomic resurrect (deleted = FALSE, deleted_at NULL in
+  /// one statement) keep the reap off it. Sensor recorded at the
+  /// reapOne site.
+  val reapSafety = not(wit.reapedUnsafely)
+
+  // --- shadow-equivalence (bughunt wave D1, bug_199) ----------------------
+  //
+  // The dry run's chunk estimate must be computed against SIMULATED
+  // post-sweep state: the savepoint-rolled-back path sweep leaves the
+  // would-be-swept manifests in place, so the shadow arm anti-joins
+  // them out of the mark (`shadow_swept` temp table appended to both
+  // MARK_EXPANSION_SQL and the validation/would-collect statements).
+  // The theorem: for every subset S of currently-sweepable manifests,
+  // the anti-join estimate equals the estimate computed over the
+  // post-sweep state transform (the manifests in S actually emptied) —
+  // i.e. the exclusion IS the simulation. Checked per reachable state,
+  // quantified over the powerset; the per-cycle victim cap is
+  // scheduling above this equality (both sides are the un-capped
+  // eligible sets — "modulo cap"). The pre-fix estimate (no exclusion;
+  // ENABLE_SHADOW_EXCLUSION = false) breaks the equality exactly when
+  // some swept manifest exclusively referenced past-grace chunks — the
+  // chunkCollectShadowNoExclusion falsification regime.
+
+  /// Manifests a dry run's simulated sweep may take (pathSweepOne's
+  /// own precondition: only 'complete' manifests are ever swept;
+  /// unreachability is an environment choice above this model).
+  def sweepableNow: Set[int] = PATHS.filter(p => paths.get(p).status == PComplete)
+
+  /// The mark with the manifests in `excluded` anti-joined out — the
+  /// shipped shadow form (collect.rs MARK_EXPANSION_SHADOW_SUFFIX).
+  def markOver(excluded: Set[int]): Set[int] =
+    HASHES.filter(h => PATHS.exists(p => and {
+      not(excluded.contains(p)),
+      paths.get(p).status != PNone,
+      not(paths.get(p).corrupt),
+      listOf(p).contains(h),
+    }))
+
+  /// The mark computed over the post-sweep state transform: the
+  /// manifests in `swept` actually emptied (pathSweepOne's effect),
+  /// then the UNMODIFIED mark formula — what a live sweep-then-collect
+  /// at the same snapshot would mark.
+  def markOverSimulated(swept: Set[int]): Set[int] =
+    val mod = PATH_KEYS.mapBy(p =>
+      if (swept.contains(p)) emptyPath(paths.get(p).gen) else paths.get(p))
+    HASHES.filter(h => PATHS.exists(p => and {
+      mod.get(p).status != PNone,
+      not(mod.get(p).corrupt),
+      (match mod.get(p).mdata { | NoMd => Set() | Md(l) => l }).contains(h),
+    }))
+
+  /// The un-capped victim set for a given mark product: present, not
+  /// already soft-deleted, past grace, unmarked (the collect batch
+  /// predicate minus the in-cycle scheduling conjuncts).
+  def victimsGiven(mark: Set[int]): Set[int] =
+    HASHES.filter(h => and {
+      chunks.get(h).present,
+      not(chunks.get(h).deleted),
+      chunks.get(h).refAge > GRACE_TICKS,
+      not(mark.contains(h)),
+    })
+
+  /// THE shadow-equivalence invariant: for every sweepable subset, the
+  /// shadow estimate (anti-join when ENABLE_SHADOW_EXCLUSION, the
+  /// pre-fix full mark otherwise) equals the simulated post-sweep
+  /// estimate.
+  val shadowEstimateMatchesLive =
+    sweepableNow.powerset().forall(s =>
+      victimsGiven(if (ENABLE_SHADOW_EXCLUSION) markOver(s) else markOver(Set()))
+        == victimsGiven(markOverSimulated(s)))
+
   // --- expect-violation witnesses (non-vacuity probes) --------------------
   //
   // The vals below are NOT invariants and must never appear in a regime
@@ -694,6 +813,13 @@ module chunkCollect {
   /// witness (i). Without this state being reachable, "CR-1 holds"
   /// says nothing about the race `last_referenced_at` exists to close.
   val noMarkMissSavedByTouch = not(wit.markMissSavedByTouch)
+
+  /// Violated when the post-pass reap actually hard-deletes a
+  /// tombstone row (merged_bug_336's liveness witness — the pre-fix
+  /// model had no chunks-row delete action at all: soft-deleted rows
+  /// were permanent). Without this state being reachable, reapSafety
+  /// holds vacuously.
+  val noTombstoneReaped = not(wit.tombstoneReaped)
 
   /// Violated when an uploader has crashed while holding a claimed but
   /// not-yet-upgraded placeholder (C1).
@@ -1099,7 +1225,9 @@ module chunkCollect {
   /// with these effects withheld.
   action collectSweep(h: int): bool = all {
     sweepEligible(h),
-    chunks' = chunks.set(h, { ...chunks.get(h), deleted: true, uploadedAt: false }),
+    // `deleted_at = now()` rides the same UPDATE
+    // (COLLECT_BATCH_UPDATE_SQL) — the reap clock starts here.
+    chunks' = chunks.set(h, { ...chunks.get(h), deleted: true, uploadedAt: false, deletedAge: 0 }),
     outbox' = outbox.union(Set(h)),
     cycle' = { ...cycle, swept: true },
     wit' = { ...wit,
@@ -1204,6 +1332,39 @@ module chunkCollect {
     paths' = paths, chunks' = chunks, outbox' = outbox, ups' = ups, cycle' = cycle,
   }
 
+  /// One post-pass tombstone-reap batch row (bughunt wave D1,
+  /// merged_bug_336; `REAP_BATCH_DELETE_SQL`): hard-DELETE a chunks
+  /// row that is soft-deleted at least the reap grace ago and fully
+  /// drained (no pending outbox row). One atomic action = the one
+  /// DELETE statement — its WHERE re-evaluates under the row lock, so
+  /// a resurrect that lands first (deleted = FALSE, deleted_at NULL)
+  /// makes the row ineligible, exactly as in PG. Modeled at the most
+  /// adversarial granularity: production runs the reap only post-pass
+  /// under the cycle lock; the model lets it interleave freely — if
+  /// safety holds here it holds under the stricter schedule. After
+  /// the reap the hash is an absent row: a later upsert of the same
+  /// content is a fresh INSERT (PutPath on an absent hash).
+  action reapOne(h: int): bool = all {
+    val c = chunks.get(h)
+    and {
+      c.present,
+      c.deleted,
+      c.deletedAge > REAP_GRACE_TICKS,
+      not(outbox.contains(h)),
+    },
+    chunks' = chunks.set(h, NO_CHUNK),
+    wit' = { ...wit,
+      tombstoneReaped: true,
+      reapedUnsafely: or {
+        wit.reapedUnsafely,
+        not(chunks.get(h).deleted),
+        outbox.contains(h),
+        refs(h) != Set(),
+      },
+    },
+    paths' = paths, s3' = s3, outbox' = outbox, ups' = ups, cycle' = cycle,
+  }
+
   /// Process death (C1/C2/C5/C6/C7 by phase; UTxOpen = death inside
   /// the upgrade transaction, which therefore never commits).
   /// Crash-regime only.
@@ -1248,7 +1409,10 @@ module chunkCollect {
       if (r.status == PUploading) { ...r, staleness: minInt(r.staleness + 1, STALE_CAP) } else r),
     chunks' = HASHES.mapBy(h =>
       val c = chunks.get(h)
-      if (c.present) { ...c, refAge: minInt(c.refAge + 1, AGE_CAP) } else c),
+      if (c.present) { ...c,
+        refAge: minInt(c.refAge + 1, AGE_CAP),
+        deletedAge: if (c.deleted) minInt(c.deletedAge + 1, REAP_AGE_CAP) else 0,
+      } else c),
     ups' = UPLOADERS.mapBy(u =>
       val r = ups.get(u)
       if (r.pc == UTxOpen) { ...r, txAge: minInt(r.txAge + 1, WRITER_TX_BOUND) } else r),
@@ -1284,6 +1448,8 @@ module chunkCollect {
       parseFailureAborted: false,
       quarantined: false,
       markMissSavedByTouch: false,
+      tombstoneReaped: false,
+      reapedUnsafely: false,
     },
   }
 
@@ -1320,6 +1486,8 @@ module chunkCollect {
       quarantineCorrupt(p),
       // the drain
       drainOne(h),
+      // the post-pass tombstone reap (merged_bug_336)
+      reapOne(h),
       // the fault alphabet
       crash(u),
       drainCrashAfterS3(h),
@@ -1349,6 +1517,8 @@ module chunkCollectBase {
     HOTPATH_AFTER = 2,
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
+    REAP_GRACE_TICKS = 1,
+    ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
     ENABLE_MARK_DELETED_GUARD = true,
@@ -1472,6 +1642,8 @@ module chunkCollectCrash {
     HOTPATH_AFTER = 2,
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
+    REAP_GRACE_TICKS = 1,
+    ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
     ENABLE_MARK_DELETED_GUARD = true,
@@ -1551,6 +1723,8 @@ module chunkCollectContend {
     HOTPATH_AFTER = 2,
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
+    REAP_GRACE_TICKS = 1,
+    ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
     ENABLE_MARK_DELETED_GUARD = true,
@@ -1650,6 +1824,8 @@ module chunkCollectCorrupt {
     HOTPATH_AFTER = 2,
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
+    REAP_GRACE_TICKS = 1,
+    ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
     ENABLE_MARK_DELETED_GUARD = true,
@@ -1764,6 +1940,8 @@ module chunkCollectThresholdOrder {
     HOTPATH_AFTER = 1,
     SCANNER_AFTER = 2,
     GRACE_TICKS = 1,
+    REAP_GRACE_TICKS = 1,
+    ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
     ENABLE_MARK_DELETED_GUARD = true,
@@ -1798,6 +1976,8 @@ module chunkCollectNoTouch {
     HOTPATH_AFTER = 2,
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
+    REAP_GRACE_TICKS = 1,
+    ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = false,
     ENABLE_FAIL_CLOSED = true,
     ENABLE_MARK_DELETED_GUARD = true,
@@ -1830,6 +2010,8 @@ module chunkCollectParseSkip {
     HOTPATH_AFTER = 2,
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
+    REAP_GRACE_TICKS = 1,
+    ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = false,
     ENABLE_MARK_DELETED_GUARD = true,
@@ -1872,6 +2054,8 @@ module chunkCollectWriterBounded {
     HOTPATH_AFTER = 2,
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
+    REAP_GRACE_TICKS = 1,
+    ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
     ENABLE_MARK_DELETED_GUARD = true,
@@ -1893,6 +2077,8 @@ module chunkCollectWriterOverrun {
     HOTPATH_AFTER = 2,
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
+    REAP_GRACE_TICKS = 1,
+    ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
     ENABLE_MARK_DELETED_GUARD = true,
@@ -1951,6 +2137,8 @@ module chunkCollectLateMarkGuarded {
     HOTPATH_AFTER = 2,
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
+    REAP_GRACE_TICKS = 1,
+    ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
     ENABLE_MARK_DELETED_GUARD = true,
@@ -1972,11 +2160,289 @@ module chunkCollectLateMarkUnguarded {
     HOTPATH_AFTER = 2,
     SCANNER_AFTER = 3,
     GRACE_TICKS = 1,
+    REAP_GRACE_TICKS = 1,
+    ENABLE_SHADOW_EXCLUSION = true,
     ENABLE_TOUCH = true,
     ENABLE_FAIL_CLOSED = true,
     ENABLE_MARK_DELETED_GUARD = false,
     ENABLE_HB_CONTRACT = false,
     ENABLE_SPLIT_UPGRADE = false,
     WRITER_TX_BOUND = 1
+  ).*
+}
+
+// =========================================================================
+// THE SHADOW-EQUIVALENCE PAIR (bughunt wave D1, bug_199): the dry run's
+// chunk estimate is computed against simulated post-sweep state — the
+// shadow_swept anti-join — and must equal, for every sweepable subset,
+// the estimate over the state with those manifests actually swept.
+//
+//   - chunkCollectShadowEquivalence: the shipped exclusion
+//     (ENABLE_SHADOW_EXCLUSION = true). shadowEstimateMatchesLive holds
+//     for every reachable state — the holds-half, pinning the formula
+//     the shadow arm implements (r[store.gc.dry-run+3]'s model image).
+//   - chunkCollectShadowNoExclusion: the pre-fix estimate (no
+//     exclusion — the savepoint-rolled-back sweep left the would-be-
+//     swept manifests in the mark). Expected counterexample: a
+//     'complete' manifest exclusively referencing a past-grace chunk —
+//     the live run would collect it, the dry run reports zero
+//     (structurally, for the dominant term). Wired expect-violation.
+//
+// Two writers / two paths / two hashes with exclusive AND shared lists
+// so subset exclusion has both polarities to get wrong.
+// =========================================================================
+module chunkCollectShadowEquivalence {
+  import chunkCollect(
+    MAX_HASHES = 2,
+    MAX_PATHS = 2,
+    MAX_UPLOADERS = 2,
+    ENABLE_CRASH = false,
+    ENABLE_CORRUPT = false,
+    LIST_CHOICES = Set(Set(1), Set(2), Set(1, 2)),
+    HB_DEADLINE = 1,
+    HOTPATH_AFTER = 2,
+    SCANNER_AFTER = 3,
+    GRACE_TICKS = 1,
+    REAP_GRACE_TICKS = 1,
+    ENABLE_SHADOW_EXCLUSION = true,
+    ENABLE_TOUCH = true,
+    ENABLE_FAIL_CLOSED = true,
+    ENABLE_MARK_DELETED_GUARD = true,
+    ENABLE_HB_CONTRACT = true,
+    ENABLE_SPLIT_UPGRADE = false,
+    WRITER_TX_BOUND = 1
+  ).*
+}
+
+module chunkCollectShadowNoExclusion {
+  import chunkCollect(
+    MAX_HASHES = 2,
+    MAX_PATHS = 2,
+    MAX_UPLOADERS = 2,
+    ENABLE_CRASH = false,
+    ENABLE_CORRUPT = false,
+    LIST_CHOICES = Set(Set(1), Set(2), Set(1, 2)),
+    HB_DEADLINE = 1,
+    HOTPATH_AFTER = 2,
+    SCANNER_AFTER = 3,
+    GRACE_TICKS = 1,
+    REAP_GRACE_TICKS = 1,
+    ENABLE_SHADOW_EXCLUSION = false,
+    ENABLE_TOUCH = true,
+    ENABLE_FAIL_CLOSED = true,
+    ENABLE_MARK_DELETED_GUARD = true,
+    ENABLE_HB_CONTRACT = true,
+    ENABLE_SPLIT_UPGRADE = false,
+    WRITER_TX_BOUND = 1
+  ).*
+}
+
+// =========================================================================
+// GC COORDINATION (bughunt wave D1, bug_174 + merged_bug_211; migration
+// 090): the cluster-scoped collect cadence, cursorless here — the
+// durable gc_collect_state row vs the pre-fix per-replica process
+// facts. Two replicas, a bounded DB clock, cycles as atomic stamped
+// events (the GC advisory lock serializes them; atomicity models the
+// lock), the row's backlog estimate as distinct stamped values, and a
+// per-replica published-gauge map fed by a 60s row read
+// (spawn_gc_gauge_publisher).
+//
+//   - cadenceBound: no two LIVE cycles ever land closer than the
+//     backstop interval — the durable last_live_cycle_at gate
+//     (GcCycleLease::backstop_due, both the unlocked pre-check and the
+//     under-lock double-check collapse onto the one due-predicate).
+//     The gapViolated ghost reads the DURABLE truth in every regime,
+//     so the falsification is attributable to the gate alone.
+//   - publishedFromDurableOnly: every replica's published gauge value
+//     is a value the durable row has actually held (bounded staleness
+//     between 60s reads is allowed; a process-local anchor the row
+//     never held is unrepresentable).
+//   - Shadow commits stamp a fresh estimate WITHOUT touching
+//     last_live_cycle_at (a dry run is not a live cycle) — the
+//     211/199 compounding fix's cadence half.
+//
+// gcCoordinationLocalTimers (ENABLE_DURABLE_CADENCE = false) restores
+// the pre-fix per-replica interval_at timers: each replica's due
+// predicate consults only its own local stamp, so the second replica
+// fires immediately after the first — cadenceBound falsifies; this is
+// bug_174's machine-checked counterexample (N heavy cycles/day at KEDA
+// scale). Wired expect-violation.
+//
+// remoteReplicaPublishesPostCycleEstimate (expect-violation on the
+// main regime): a replica OTHER than the committer publishes the
+// current row estimate — merged_bug_211's convergence witness,
+// unreachable pre-fix (the anchor lived in the winner's process; every
+// other replica's gauge sat frozen at its pre-registered zero).
+// =========================================================================
+module gcCoordination {
+  /// Backstop interval in ticks (production: COLLECT_BACKSTOP_INTERVAL).
+  const INTERVAL: int
+  /// Bounded clock horizon.
+  const MAX_TIME: int
+  /// Bound on committed estimates (live + shadow stamps).
+  const MAX_STAMPS: int
+  /// TRUE = the due predicate reads the durable row (post-090); FALSE
+  /// = each replica reads its own local timer (the pre-fix bug).
+  const ENABLE_DURABLE_CADENCE: bool
+
+  type TimeOpt = | TNone | TAt(int)
+  type ValOpt = | VNone | VAt(int)
+  type RepOpt = | RNone | RAt(int)
+
+  pure val REPLICAS = Set(1, 2)
+
+  /// The DB clock (PG now() — both cadence conjuncts evaluate on it;
+  /// no cross-replica clock enters the decision).
+  var clock: int
+  /// gc_collect_state.last_live_cycle_at.
+  var lastLive: TimeOpt
+  /// The pre-fix per-replica timer view (read only when
+  /// ENABLE_DURABLE_CADENCE = false; maintained in both regimes so the
+  /// falsify twin differs in exactly the due predicate).
+  var localLast: int -> TimeOpt
+  /// gc_collect_state.backlog_estimate (NULL until first commit).
+  var backlog: ValOpt
+  /// Distinct-estimate generator (the cycle_epoch image: every commit,
+  /// live or shadow, writes a fresh value).
+  var stamps: int
+  /// Every value the durable row has held (ghost; publishers must
+  /// never invent one).
+  var rowHistory: Set[int]
+  /// Per-replica last published gauge value (VNone = the
+  /// pre-registered zero / never published).
+  var published: int -> ValOpt
+  /// Which replica committed the CURRENT backlog value (ghost, for the
+  /// convergence witness).
+  var lastStamper: RepOpt
+  /// Ghost: a live cycle landed closer than INTERVAL after the
+  /// previous one — evaluated against the DURABLE stamp in every
+  /// regime.
+  var gapViolated: bool
+
+  /// The backstop due-predicate (BACKSTOP_DUE_SQL /
+  /// GcCycleLease::backstop_due under the durable gate; the per-replica
+  /// interval timer pre-fix).
+  def dueFor(r: int): bool =
+    if (ENABLE_DURABLE_CADENCE)
+      match lastLive { | TNone => true | TAt(t) => clock - t >= INTERVAL }
+    else
+      match localLast.get(r) { | TNone => true | TAt(t) => clock - t >= INTERVAL }
+
+  action tick = all {
+    clock < MAX_TIME,
+    clock' = clock + 1,
+    lastLive' = lastLive, localLast' = localLast, backlog' = backlog,
+    stamps' = stamps, rowHistory' = rowHistory, published' = published,
+    lastStamper' = lastStamper, gapViolated' = gapViolated,
+  }
+
+  /// One BACKSTOP live cycle as an atomic stamped event: the due
+  /// check, the cycle, and commit_cycle(Live{..}) — epoch+1, fresh
+  /// estimate, last_live_cycle_at = now() — under the advisory lock.
+  action backstopRun(r: int): bool = all {
+    stamps < MAX_STAMPS,
+    dueFor(r),
+    gapViolated' = (gapViolated or
+      (match lastLive { | TNone => false | TAt(t) => clock - t < INTERVAL })),
+    lastLive' = TAt(clock),
+    localLast' = localLast.set(r, TAt(clock)),
+    stamps' = stamps + 1,
+    backlog' = VAt(stamps + 1),
+    rowHistory' = rowHistory.union(Set(stamps + 1)),
+    lastStamper' = RAt(r),
+    clock' = clock, published' = published,
+  }
+
+  /// One SHADOW (dry-run) cycle commit: commit_cycle(Shadow{..})
+  /// anchors a fresh durable estimate but does NOT stamp
+  /// last_live_cycle_at — a dry run never answers the cadence
+  /// question.
+  action shadowRun(r: int): bool = all {
+    stamps < MAX_STAMPS,
+    stamps' = stamps + 1,
+    backlog' = VAt(stamps + 1),
+    rowHistory' = rowHistory.union(Set(stamps + 1)),
+    lastStamper' = RAt(r),
+    clock' = clock, lastLive' = lastLive, localLast' = localLast,
+    published' = published, gapViolated' = gapViolated,
+  }
+
+  /// One 60s gauge-publisher read on replica `r`
+  /// (spawn_gc_gauge_publisher): SELECT the row, set the gauges from
+  /// it. Skips a NULL estimate (the gauge stays unset), exactly as the
+  /// publisher skips NULL.
+  action publishGauges(r: int): bool = all {
+    backlog != VNone,
+    published' = published.set(r, backlog),
+    clock' = clock, lastLive' = lastLive, localLast' = localLast,
+    backlog' = backlog, stamps' = stamps, rowHistory' = rowHistory,
+    lastStamper' = lastStamper, gapViolated' = gapViolated,
+  }
+
+  action init = all {
+    clock' = 0,
+    lastLive' = TNone,
+    localLast' = REPLICAS.mapBy(r => TNone),
+    backlog' = VNone,
+    stamps' = 0,
+    rowHistory' = Set(),
+    published' = REPLICAS.mapBy(r => VNone),
+    lastStamper' = RNone,
+    gapViolated' = false,
+  }
+
+  action step = {
+    nondet r = REPLICAS.oneOf()
+    any {
+      tick,
+      backstopRun(r),
+      shadowRun(r),
+      publishGauges(r),
+    }
+  }
+
+  val gcBoundsOK = and {
+    clock >= 0 and clock <= MAX_TIME,
+    stamps >= 0 and stamps <= MAX_STAMPS,
+    rowHistory == 1.to(stamps),
+    backlog == (if (stamps == 0) VNone else VAt(stamps)),
+    (stamps == 0) implies (lastStamper == RNone and lastLive == TNone),
+  }
+
+  /// No two live cycles closer than the backstop interval.
+  val cadenceBound = not(gapViolated)
+
+  /// Published gauge values are durable-row values only.
+  val publishedFromDurableOnly = REPLICAS.forall(r =>
+    match published.get(r) {
+      | VNone => true
+      | VAt(v) => rowHistory.contains(v)
+    })
+
+  /// Expect-violation convergence witness: violated when a replica
+  /// OTHER than the committer of the current estimate has published
+  /// exactly that estimate.
+  val remoteReplicaPublishesPostCycleEstimate = not(REPLICAS.exists(r =>
+    match lastStamper {
+      | RNone => false
+      | RAt(w) => and { r != w, published.get(r) == backlog, backlog != VNone }
+    }))
+}
+
+module gcCoordinationMain {
+  import gcCoordination(
+    INTERVAL = 2,
+    MAX_TIME = 5,
+    MAX_STAMPS = 3,
+    ENABLE_DURABLE_CADENCE = true
+  ).*
+}
+
+module gcCoordinationLocalTimers {
+  import gcCoordination(
+    INTERVAL = 2,
+    MAX_TIME = 5,
+    MAX_STAMPS = 3,
+    ENABLE_DURABLE_CADENCE = false
   ).*
 }

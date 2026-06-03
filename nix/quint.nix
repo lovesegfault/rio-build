@@ -1980,6 +1980,11 @@ in
         "s5LiveOwnerNeverReaped"
         "l3NoForeignFreshen"
         "noReferencedChunkSwept"
+        # bughunt wave D1 (merged_bug_336): the post-pass tombstone
+        # reap joined the shared alphabet — the row-retention clause of
+        # bounded-garbage-retention+3, exhaustively beside CR-1/CR-2/
+        # CR-4 (the resurrect-vs-reap race coverage).
+        "reapSafety"
       ];
     };
 
@@ -2168,6 +2173,82 @@ in
       witness = "deadOwnerReapedW";
     };
 
+    # ── gcCoordination: the cluster-scoped collect cadence and gauge
+    # publication over the durable gc_collect_state row (bughunt wave
+    # D1, bug_174 + merged_bug_211; migration 090). Two replicas, a
+    # bounded DB clock, cycles as atomic stamped events under the
+    # advisory lock; the backstop's due predicate reads
+    # last_live_cycle_at on the DB clock (GcCycleLease::backstop_due —
+    # the unlocked pre-check and the under-lock double-check collapse
+    # onto one predicate); shadow commits stamp a fresh estimate
+    # WITHOUT answering the cadence question; every replica publishes
+    # its gauges from a 60s row read (spawn_gc_gauge_publisher).
+    # r[verify store.gc.collect-cadence]
+    quint-gc-coordination-main = mkQuintCheck {
+      name = "gc-coordination-main";
+      spec = "chunkCollect";
+      main = "gcCoordinationMain";
+      invariants = [
+        "gcBoundsOK"
+        "cadenceBound"
+        "publishedFromDurableOnly"
+      ];
+    };
+
+    # Falsification twin: the pre-fix per-replica interval_at timers —
+    # each replica's due predicate consults only its own local stamp,
+    # so the second replica fires immediately after the first's live
+    # cycle; cadenceBound violates. bug_174's machine-checked
+    # counterexample (N heavy cycles/day at KEDA scale, mutual
+    # exclusion without rate limiting).
+    quint-gc-coordination-falsify-local-timers = mkQuintWitnessCheck {
+      name = "gc-coordination-falsify-local-timers";
+      spec = "chunkCollect";
+      main = "gcCoordinationLocalTimers";
+      witness = "cadenceBound";
+    };
+
+    # Convergence witness on the main regime: a replica OTHER than the
+    # committer of the current estimate publishes exactly that estimate
+    # — merged_bug_211's convergence, unreachable pre-fix (the dry-run
+    # anchor lived in the winning pod's process statics; every other
+    # replica's gauge sat frozen at its pre-registered zero forever).
+    quint-gc-coordination-witness-remote-publish = mkQuintWitnessCheck {
+      name = "gc-coordination-witness-remote-publish";
+      spec = "chunkCollect";
+      main = "gcCoordinationMain";
+      witness = "remoteReplicaPublishesPostCycleEstimate";
+    };
+
+    # ── shadow equivalence (bughunt wave D1, bug_199): the dry run's
+    # chunk estimate must equal the live sweep-then-collect estimate at
+    # the same snapshot for EVERY sweepable subset — the shadow_swept
+    # anti-join IS the post-sweep simulation (modulo the per-cycle
+    # victim cap, which is scheduling above the eligible-set equality).
+    # r[verify store.gc.dry-run+3]
+    quint-chunk-collect-shadow-equivalence = mkQuintCheck {
+      name = "chunk-collect-shadow-equivalence";
+      spec = "chunkCollect";
+      main = "chunkCollectShadowEquivalence";
+      invariants = [
+        "boundsOK"
+        "shadowEstimateMatchesLive"
+      ];
+    };
+
+    # Falsification twin: the pre-fix estimate (no exclusion — the
+    # savepoint-rolled-back sweep left the would-be-swept manifests in
+    # the mark, so their chunks counted as live): a 'complete' manifest
+    # exclusively referencing a past-grace chunk makes the dry run
+    # report zero where the live run collects — structurally zero for
+    # the dominant term of the estimate.
+    quint-chunk-collect-falsify-shadow-no-exclusion = mkQuintWitnessCheck {
+      name = "chunk-collect-falsify-shadow-no-exclusion";
+      spec = "chunkCollect";
+      main = "chunkCollectShadowNoExclusion";
+      witness = "shadowEstimateMatchesLive";
+    };
+
     # The late-mark holds-half (Phase-1 input list item 1): under a
     # relaxed heartbeat contract (a live owner may stall past the
     # reclaim thresholds), the T-pre.1 `AND deleted = FALSE` guard on
@@ -2259,6 +2340,16 @@ in
       spec = "chunkCollect";
       main = "chunkCollectBase";
       witness = "noChunkCollected";
+    };
+    # The post-pass reap actually hard-deletes a tombstone (bughunt
+    # wave D1, merged_bug_336's liveness witness — the pre-fix model
+    # had no chunks-row delete action at all; without this state
+    # reapSafety holds vacuously).
+    quint-chunk-collect-witness-tombstone-reaped = mkQuintWitnessCheck {
+      name = "chunk-collect-witness-tombstone-reaped";
+      spec = "chunkCollect";
+      main = "chunkCollectBase";
+      witness = "noTombstoneReaped";
     };
 
     # The crash regime's fault alphabet is reachable: the C1/C2/C5

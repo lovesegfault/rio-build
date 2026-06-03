@@ -1307,7 +1307,10 @@ crash 14,918,067 (1,078,114,529, depth 34), contend 5,174,327
 (340,993,537, depth 35), corrupt 17,603,367 (1,227,786,977, depth 41),
 writer-bounded 329,689 (2,161,071, depth 33), latemark-guarded
 6,365,559 (334,165,889, depth 35). Every HOLDS is an exhaustive TLC
-result over that regime's full reachable space.
+result over that regime's full reachable space. (Base and contend were
+re-measured after the bughunt-wave D1 reap/shadow extensions widened
+the state space — see the "chunkCollect extensions" addendum at the
+end of this map.)
 
 | Design invariant (§3.3) | Model form | base | crash | contend | corrupt |
 |---|---|---|---|---|---|
@@ -2395,10 +2398,65 @@ Budgets: all six checks converge in seconds at the default samples
 (state space: one owner, one competitor, 14-16 bounded ticks); no
 bounded-coverage rows needed.
 
-Remaining model work recorded for this workstream: the `gcCoordination`
-sibling module (cluster cadence/cursor/gauges over the durable
-`gc_collect_state` row), the `shadowEquivalence` regime
-(`CollectMode::Shadow` exclusion vs live), and the `reap` action joining
-the `chunkCollect` base alphabet (`reapSafety`, `noTombstoneReaped`
-witness) — scoped in the wave log; the code they model shipped in this
-workstream with its differential/property test batteries.
+### chunkCollect extensions (D1 formal successor, executed 2026-06-03)
+
+The three model extensions scoped at the D1 close are LANDED — the
+interleaving argument over the code this workstream shipped (whose
+differential/property batteries were already pinned). All checks wired
+in `nix/quint.nix`; verdicts and budgets measured at the wiring's TLC
+defaults on the integration tree:
+
+1. **`gcCoordination` sibling module** (bug_174 + merged_bug_211;
+   migration 090): two replicas, a bounded DB clock, cycles as atomic
+   stamped events under the advisory lock, the durable row image, the
+   per-replica published-gauge map; shadow commits stamp fresh
+   estimates WITHOUT answering the cadence question. `cadenceBound` +
+   `publishedFromDurableOnly` + `gcBoundsOK` HOLD exhaustively
+   (`quint-gc-coordination-main`: 4,262 distinct / 18,223 generated,
+   ~1.3 s — the protocol is deliberately small; the content is the
+   falsify attribution). Falsify twin `gcCoordinationLocalTimers`
+   (the pre-fix per-replica `interval_at` timers) **violates
+   `cadenceBound`** (~0.9 s) — bug_174's machine-checked
+   counterexample, attributable to the due predicate alone: the
+   gapViolated ghost reads the DURABLE stamp in both regimes.
+   Convergence witness `remoteReplicaPublishesPostCycleEstimate`
+   **violates** (reachable, ~0.9 s) — merged_bug_211's fix image,
+   unreachable pre-fix (the anchor lived in the winning pod's process
+   statics). `r[verify store.gc.collect-cadence]` rides the main
+   check's wiring — the rule's pending quint leg, now closed.
+
+2. **Shadow equivalence** (bug_199): for every subset of currently
+   sweepable manifests, the `shadow_swept` anti-join estimate equals
+   the estimate over the post-sweep state transform — the exclusion
+   IS the simulation, modulo the victim cap (scheduling above the
+   eligible-set equality), quantified over the powerset per reachable
+   state. `shadowEstimateMatchesLive` HOLDS exhaustively
+   (`quint-chunk-collect-shadow-equivalence`: 27,930,641 distinct /
+   2,751,596,209 generated, ~193 s — within the ≤5 min wiring
+   budget). Falsify twin `chunkCollectShadowNoExclusion` (the
+   pre-fix, no-exclusion estimate) **violates** in ~1.4 s: a
+   'complete' manifest exclusively referencing a past-grace chunk —
+   the live run collects it, the dry run reports zero (structurally,
+   for the dominant term). `r[verify store.gc.dry-run+3]` rides the
+   holds check — the amended sentence's model image beside the Rust
+   differential test.
+
+3. **`reap` in the base alphabet** (merged_bug_336): `deletedAge`
+   joined `ChunkRec` (the `now() - deleted_at` image — stamped 0 by
+   the collect batch, cleared by the resurrect upsert, advanced by
+   `tick`, saturating past the reap grace); `reapOne` mirrors
+   `REAP_BATCH_DELETE_SQL` as one atomic statement at the most
+   adversarial granularity (free interleaving — production's
+   post-pass-only schedule under the cycle lock is strictly tighter).
+   `reapSafety` joined the base regime's exhaustive list beside
+   CR-1/CR-2/CR-4: re-measured HOLDS at 181,031 distinct /
+   29,546,581 generated, ~4.3 s (pre-extension base: 26,335 distinct
+   — the deletedAge dimension and the reap arm are the growth;
+   contend re-measured 16,144,919 distinct / ~90 s vs 5,174,327
+   pre-extension; both within budget, no bounded-coverage rows
+   needed). Witness `noTombstoneReaped` **violates** (reachable,
+   ~1.9 s) — the pre-fix model had no chunks-row delete action at
+   all; without it `reapSafety` would hold vacuously. The
+   resurrect-vs-reap order is carried by the atomic actions plus the
+   `deletedAge: 0` reset on BOTH the resurrect arm and the sweep
+   stamp.
