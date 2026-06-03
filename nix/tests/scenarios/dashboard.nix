@@ -374,12 +374,22 @@ in
       # client re-opens) — the gate removes that race rather than
       # looping the curl.
       b64_line1 = "ZGFzaC1saXZlLTAwMDAx"  # b64("dash-live-00001")
+      # timeout budget: the one-shot rides a port-forward that can land
+      # on the NON-owning replica; the cross-replica tail proxy degrades
+      # to the history-only view on relay failure (by design —
+      # rio_store_log_tail_proxy_failures_total), and history-only means
+      # batch 1 is visible only after the periodic chunk cut
+      # (DEFAULT_CUT_INTERVAL = 60s). A 60s wait sat exactly ON that
+      # period (observed timeouts 60.67s/60.91s — pure phase luck);
+      # 150s = one full cut interval + grpc/scrape slack + builder-load
+      # headroom. The fast path (owning replica / healthy proxy) still
+      # exits in ~1s.
       k3s_server.wait_until_succeeds(
           "${grpcurl} -plaintext -max-time 10 "
           "-protoset ${protoset}/rio.protoset "
           "-d '{\"derivation\":\"${liveDrvFullPath}\",\"follow\":false}' "
           "localhost:19510 rio.store.LogService/TailLog "
-          "| grep -q " + b64_line1, timeout=60,
+          "| grep -q " + b64_line1, timeout=150,
       )
 
       try:
