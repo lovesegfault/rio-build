@@ -52,11 +52,11 @@ let
   # whose closure ships the probe's build-time dependencies into the VM
   # store. See the header of differential-stdenv-probe.nix.
   stdenvProbeFile = ../lib/derivations/differential-stdenv-probe.nix;
-  stdenvProbe =
-    (import stdenvProbeFile {
-      pkgsPath = pkgs.path;
-      inherit (pkgs.stdenv.hostPlatform) system;
-    }).stdenv-probe;
+  stdenvProbeSet = import stdenvProbeFile {
+    pkgsPath = pkgs.path;
+    inherit (pkgs.stdenv.hostPlatform) system;
+  };
+  stdenvProbe = stdenvProbeSet.stdenv-probe;
 
   # Per-entry expectations, consumed by the testScript.
   #
@@ -70,7 +70,44 @@ let
   #                            the oracle's behaviour, `rio_status` /
   #                            `rio_glue_error` the native side's; the
   #                            entry is reported, not failed
-  entryMeta = {
+  #
+  # ── Anti-vacuity guard (r16 merged_bug_055) ──────────────────────
+  # The testScript's entry loop is driven solely by entryMeta, and a
+  # missing corpus attr fails loudly at nix-instantiate — but the
+  # DANGEROUS drift direction was silent: a corpus entry added without
+  # its sibling entryMeta record was simply never instantiated, built,
+  # or compared while this designated parity gate stayed green.
+  # `entryMeta` is therefore wrapped in an eval-time set-equality
+  # check against the corpus attrNames ∪ the stdenv-probe attrNames:
+  # any mismatch (either direction) aborts evaluation of the scenario
+  # — including `driverInteractive` — naming the offending entries.
+  # attrNames forces only the keys, so passing nulls for the corpus
+  # builders is safe (entry VALUES are never evaluated host-side).
+  entryMeta =
+    let
+      corpusNames = builtins.attrNames (
+        import corpusFile {
+          busybox = null;
+          bash = null;
+          busybox32 = null;
+        }
+      );
+      coveredNames = corpusNames ++ builtins.attrNames stdenvProbeSet;
+      metaNames = builtins.attrNames entryMetaRaw;
+      uncovered = builtins.filter (n: !(builtins.elem n metaNames)) coveredNames;
+      unbacked = builtins.filter (n: !(builtins.elem n coveredNames)) metaNames;
+    in
+    if uncovered == [ ] && unbacked == [ ] then
+      entryMetaRaw
+    else
+      throw ''
+        differential gate coverage mismatch (r16 merged_bug_055):
+          corpus/probe entries with no entryMeta record (would be silently skipped): ${builtins.toJSON uncovered}
+          entryMeta records with no corpus/probe entry (would fail at instantiate): ${builtins.toJSON unbacked}
+        Every corpus entry needs a sibling entryMeta record in
+        nix/tests/scenarios/differential.nix, and vice versa.
+      '';
+  entryMetaRaw = {
     trivial = {
       expect = "parity";
     };
