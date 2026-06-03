@@ -2,7 +2,7 @@
 //!
 //! Write path: `put_chunked()` — FastCDC + write-ahead + parallel upload.
 //! Read path: `ChunkCache` — moka LRU + singleflight + BLAKE3 verify.
-// r[impl store.singleflight]
+// r[impl store.singleflight+2]
 // r[impl store.integrity.verify-on-get]
 //!
 //! The gRPC layer owns request parsing and the inline/chunked branch;
@@ -584,22 +584,53 @@ pub struct ChunkCache {
     /// Why BoxFuture instead of `Shared<JoinHandle<...>>` directly:
     /// Shared requires Output: Clone. JoinHandle's output is
     /// `Result<T, JoinError>`; JoinError isn't Clone. So we map the
-    /// JoinHandle into `Result<Option<Bytes>, String>` BEFORE sharing —
-    /// the mapped output IS Clone. BoxFuture erases the unnamable
-    /// `Map<JoinHandle, closure>` type.
-    inflight: DashMap<[u8; 32], InflightFetch>,
+    /// JoinHandle into `Result<Option<Bytes>, FetchFail>` BEFORE
+    /// sharing — the mapped output IS Clone. BoxFuture erases the
+    /// unnamable `Map<JoinHandle, closure>` type.
+    ///
+    /// `Arc` because the PRODUCER owns cleanup: the spawned fetch task
+    /// removes its own entry at terminal, so a completed `Shared` is
+    /// never discoverable in the map (round-17 merged_bug_061 — the
+    /// per-awaiter remove leaked a completed entry when the sole
+    /// awaiter was cancelled, and the "self-heal" served that entry's
+    /// MEMOIZED verdict to the next caller with zero backend I/O: a
+    /// stale `Ok(None)` became a spurious non-retriable NotFound for a
+    /// chunk uploaded since; a stale `Err` re-served an S3 blip after
+    /// recovery).
+    inflight: Arc<DashMap<[u8; 32], InflightFetch>>,
 }
 
 /// The Shared-future type stored in `inflight`. Type alias because the
 /// full type is 3 lines of generics that would obscure the struct.
 ///
 /// Output: `Ok(None)` = backend authoritatively says not-found;
-/// `Err(message)` = backend ERROR or task panic (transient — the
-/// `String` is the `Clone`-able error carrier `Shared` requires).
-/// The two were previously conflated into `None` (round-16 bug_027).
+/// `Err(FetchFail)` = backend ERROR, auth refusal, or task panic. The
+/// not-found/error split is round-16 bug_027; the typed error carrier
+/// is round-17 merged_bug_061.
 type InflightFetch = futures_util::future::Shared<
-    futures_util::future::BoxFuture<'static, Result<Option<Bytes>, String>>,
+    futures_util::future::BoxFuture<'static, Result<Option<Bytes>, FetchFail>>,
 >;
+
+/// `Clone`-able error carrier across the singleflight `Shared`
+/// boundary, classified AT THE PRODUCING STATEMENT — inside the
+/// spawned task, where the live `anyhow` chain (and its
+/// [`BackendAuthError`] root, when present) is still in hand. The old
+/// carrier was `e.to_string()`, which flattened the chain BEFORE
+/// `ChunkError` construction: the auth root was unrecoverable
+/// downstream, so `storage_error`'s BackendAuthError→FailedPrecondition
+/// fail-fast was structurally unreachable for every read — a read-side
+/// IAM/KMS misconfiguration retried as UNAVAILABLE forever (round-17
+/// merged_bug_061).
+///
+/// [`BackendAuthError`]: crate::backend::BackendAuthError
+#[derive(Debug, Clone)]
+enum FetchFail {
+    /// [`crate::backend::BackendAuthError`] was in the chain:
+    /// deterministic until an operator fixes the role.
+    Auth(String),
+    /// Everything else (S3 5xx/timeout/connect, task panic): transient.
+    Transient(String),
+}
 
 /// Default LRU capacity: 2 GiB. Configurable via `ChunkCache::with_capacity`.
 ///
@@ -644,6 +675,21 @@ pub enum ChunkError {
     /// `NotFound`).
     #[error("chunk {} backend fetch failed (transient): {message}", hex::encode(.hash))]
     Backend { hash: [u8; 32], message: String },
+
+    /// The backend REFUSED the fetch with an authentication/authorization
+    /// failure (IRSA/IAM/KMS misconfiguration — [`BackendAuthError`] was
+    /// the root). Deterministic until an operator fixes the role:
+    /// FAILED_PRECONDITION class at every reader, never silent-retried —
+    /// the read-side twin of the write path's auth fail-fast
+    /// (round-17 merged_bug_061; the incident class grpc/mod.rs cites:
+    /// 12 derivations × 146 retry cycles in 6 minutes).
+    ///
+    /// [`BackendAuthError`]: crate::backend::BackendAuthError
+    #[error(
+        "chunk {} backend fetch auth-failed (check S3 credentials/IAM permissions): {message}",
+        hex::encode(.hash)
+    )]
+    AuthFailed { hash: [u8; 32], message: String },
 }
 
 impl ChunkCache {
@@ -676,7 +722,7 @@ impl ChunkCache {
         Self {
             backend,
             lru,
-            inflight: DashMap::new(),
+            inflight: Arc::new(DashMap::new()),
         }
     }
 
@@ -765,8 +811,10 @@ impl ChunkCache {
     ///
     /// Returns `Ok(None)` ONLY for the backend's authoritative
     /// not-found; backend errors / task panics are
-    /// [`ChunkError::Backend`] (transient). The inflight entry is
-    /// cleaned up either way so the next call retries.
+    /// [`ChunkError::Backend`] (transient) and auth refusals are
+    /// [`ChunkError::AuthFailed`] (FAILED_PRECONDITION class). The
+    /// PRODUCER (the spawned task) removes the inflight entry at
+    /// terminal, so no completed verdict is ever re-served from the map.
     async fn singleflight_fetch(&self, hash: &[u8; 32]) -> Result<Option<Bytes>, ChunkError> {
         // Check-then-insert with entry API. DashMap's entry() locks the
         // shard for this key, so two concurrent callers racing on the
@@ -782,15 +830,16 @@ impl ChunkCache {
             .entry(*hash)
             .or_insert_with(|| {
                 let backend = Arc::clone(&self.backend);
+                let inflight = Arc::clone(&self.inflight);
                 let h = *hash;
                 // Spawn + map + boxed + shared:
                 // - spawn: fetch survives first-caller cancellation
-                // - map: JoinHandle's Result<Result<Opt,String>,JoinError>
-                //   → Result<Opt,String> (neither JoinError nor
-                //   anyhow::Error is Clone, so Shared carries the error
-                //   as its Display string; producing-statement
-                //   construction per R1(e) — backend error and task
-                //   panic each map at their own statement)
+                // - map: JoinHandle's Result<Result<Opt,FetchFail>,JoinError>
+                //   → Result<Opt,FetchFail> (neither JoinError nor
+                //   anyhow::Error is Clone; FetchFail is the typed
+                //   Clone carrier — classified at the producing
+                //   statement per R1(e), where the live anyhow chain
+                //   still holds the BackendAuthError root)
                 // - boxed: erase the unnamable Map<JoinHandle,closure>
                 //   type so it fits InflightFetch
                 // - shared: N callers await the same result
@@ -798,26 +847,61 @@ impl ChunkCache {
                 // Ok(None) is ONLY the backend's authoritative
                 // not-found; errors/panics are Err (round-16 bug_027 —
                 // the previous None-conflation surfaced S3 blips as
-                // data-loss-class NotFound). Inflight cleanup below
-                // runs either way.
+                // data-loss-class NotFound).
+                //
+                // PRODUCER-OWNED CLEANUP (round-17 merged_bug_061): the
+                // task removes its own entry as its LAST act, before
+                // any awaiter can observe the result through the map a
+                // second time. The old per-awaiter remove leaked a
+                // completed Shared when the sole awaiter was cancelled,
+                // and the next caller was served that entry's MEMOIZED
+                // verdict with zero backend I/O — a stale Ok(None)
+                // became a spurious non-retriable NotFound for a chunk
+                // uploaded since (reachable via the PutPath write-ahead
+                // window); a stale Err re-served an S3 blip after
+                // recovery. A caller racing the removal still awaits
+                // the live Shared it already cloned (consistent — that
+                // verdict was produced by a fetch that overlapped the
+                // caller); a caller arriving after removal starts a
+                // FRESH fetch.
                 tokio::spawn(async move {
-                    match backend.get(&h).await {
+                    let result = match backend.get(&h).await {
                         Ok(opt) => Ok(opt),
+                        // Producing statement: the auth bit is read off
+                        // the LIVE anyhow chain (BackendAuthError is
+                        // planted as the root by S3ChunkBackend), not
+                        // off a flattened string.
+                        Err(e)
+                            if e.downcast_ref::<crate::backend::BackendAuthError>()
+                                .is_some() =>
+                        {
+                            warn!(hash = %hex::encode(h), error = %e,
+                                  "chunk backend fetch AUTH-failed (IAM/KMS misconfiguration)");
+                            Err(FetchFail::Auth(format!("{e:#}")))
+                        }
                         Err(e) => {
                             warn!(hash = %hex::encode(h), error = %e,
                                   "chunk backend fetch failed");
-                            Err(e.to_string())
+                            Err(FetchFail::Transient(e.to_string()))
                         }
-                    }
+                    };
+                    inflight.remove(&h);
+                    result
                 })
                 .map(|join_result| {
                     // Task panic → Err. Log here (the task itself
-                    // didn't get to log its own panic).
+                    // didn't get to log its own panic). The panicked
+                    // task never reached its own remove — but a panic
+                    // also means the closure above unwound, and the
+                    // entry is removed by the FIRST awaiter that sees
+                    // the JoinError (below in singleflight_fetch).
                     match join_result {
                         Ok(r) => r,
                         Err(e) => {
                             warn!(error = %e, "chunk fetch task panicked");
-                            Err(format!("chunk fetch task panicked: {e}"))
+                            Err(FetchFail::Transient(format!(
+                                "chunk fetch task panicked: {e}"
+                            )))
                         }
                     }
                 })
@@ -828,42 +912,31 @@ impl ChunkCache {
 
         // Await the shared fetch. The task continues even if we're
         // cancelled here (it's spawned); the shared handle is just
-        // our window into its result.
+        // our window into its result. Cleanup is the PRODUCER's (the
+        // spawned task removes its own entry at terminal — see above);
+        // the one terminal the producer cannot cover is its own PANIC
+        // (the closure unwound before the remove), so that single case
+        // is swept here by whichever awaiter observes the JoinError
+        // first. An awaiter cancelled during this await leaks nothing:
+        // the producer's remove already ran or will run.
         let result = shared.await;
+        if matches!(&result, Err(FetchFail::Transient(m)) if m.starts_with("chunk fetch task panicked"))
+        {
+            self.inflight.remove(hash);
+        }
 
-        // Cleanup: remove from inflight. Runs once per AWAITER, not
-        // once per fetch — N callers all call remove. DashMap::remove
-        // on a missing key is a cheap no-op; first one removes, rest
-        // no-op.
-        //
-        // Why remove-after not remove-before? Remove-before means the
-        // next caller starts a duplicate fetch while we're awaiting.
-        // Remove-after means the window between fetch-complete and
-        // remove is tiny, and a caller in that window awaits an
-        // already-complete Shared (instant return).
-        //
-        // Cancellation edge case: if THIS awaiter is cancelled during
-        // `shared.await` (the only await point above), remove() never
-        // runs and the entry persists. SELF-HEALING (proven by
-        // `inflight_leak_self_heals_on_next_get`): the spawned task
-        // runs to completion regardless (it's detached), so the next
-        // caller's `entry().or_insert_with()` finds the completed
-        // Shared, awaits it instantly (no I/O — output is cached), and
-        // THAT caller's remove() fires. Bound: ~100-byte DashMap entry
-        // per cancelled awaiter, cleared on next get for the same hash.
-        //
-        // NO scopeguard: a `defer!` here would hold a reference across
-        // `shared.await`, changing when the last Shared clone drops.
-        // Drop-ordering with the DashMap entry is subtle; the
-        // self-heal is simpler and proven correct.
-        self.inflight.remove(hash);
-
-        // Producing statement (R1(e)): the transient class is
-        // constructed HERE, where the error is known to be a backend
-        // failure/panic — not at some boundary map_err.
-        result.map_err(|message| ChunkError::Backend {
-            hash: *hash,
-            message,
+        // The typed carrier maps to the typed verdict 1:1 — no
+        // re-classification at this boundary (the classification
+        // happened at the producing statement inside the task).
+        result.map_err(|fail| match fail {
+            FetchFail::Auth(message) => ChunkError::AuthFailed {
+                hash: *hash,
+                message,
+            },
+            FetchFail::Transient(message) => ChunkError::Backend {
+                hash: *hash,
+                message,
+            },
         })
     }
 
@@ -885,7 +958,7 @@ impl ChunkCache {
     }
 }
 
-// r[verify store.singleflight]
+// r[verify store.singleflight+2]
 // r[verify store.integrity.verify-on-get]
 #[cfg(test)]
 mod cache_tests {
@@ -1058,67 +1131,154 @@ mod cache_tests {
     /// The backend is EMPTY for this hash. If `or_insert_with` had
     /// somehow NOT found the entry (spawned a fresh fetch), the get
     /// would return `NotFound` — so getting the data proves the stale
-    /// Shared was reused.
+    /// PRODUCER-OWNED cleanup (round-17 merged_bug_061): the spawned
+    /// fetch task removes its own inflight entry at terminal, so a
+    /// cancelled sole awaiter leaks nothing — and, decisively, no
+    /// LATER caller can be served the completed fetch's MEMOIZED
+    /// verdict from the map. The pre-fix "self-heal" did exactly that:
+    /// the next get found the completed Shared and consumed its stale
+    /// result with zero backend I/O.
+    // r[verify store.singleflight+2]
     #[tokio::test]
-    async fn inflight_leak_self_heals_on_next_get() {
-        let (_backend, cache) = make_cache();
+    async fn producer_removes_entry_when_sole_awaiter_cancelled() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        /// Backend that counts fetches, answers None on the first and
+        /// the real bytes afterwards — the PutPath write-ahead shape
+        /// (chunk uploaded between two reads).
+        struct FlakyCountingBackend {
+            data: Bytes,
+            hash: [u8; 32],
+            gets: AtomicU32,
+        }
+        #[async_trait::async_trait]
+        impl ChunkBackend for FlakyCountingBackend {
+            async fn put(&self, _: &[u8; 32], _: Bytes) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn get(&self, hash: &[u8; 32]) -> anyhow::Result<Option<Bytes>> {
+                let n = self.gets.fetch_add(1, Ordering::SeqCst);
+                // Slow enough that the first awaiter can be cancelled
+                // mid-await deterministically.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if n == 0 {
+                    Ok(None)
+                } else if hash == &self.hash {
+                    Ok(Some(self.data.clone()))
+                } else {
+                    Ok(None)
+                }
+            }
+            async fn exists_batch(&self, hashes: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
+                Ok(vec![false; hashes.len()])
+            }
+            fn key_for(&self, hash: &[u8; 32]) -> String {
+                hex::encode(hash)
+            }
+            async fn delete_by_key(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
         let (hash, data) = sample_chunk();
+        let backend = Arc::new(FlakyCountingBackend {
+            data: data.clone(),
+            hash,
+            gets: AtomicU32::new(0),
+        });
+        let cache = Arc::new(ChunkCache::new(
+            Arc::clone(&backend) as Arc<dyn ChunkBackend>
+        ));
 
-        // Directly construct the leaked state: a completed Shared
-        // holding the chunk bytes. This is exactly what inflight looks
-        // like after a cancelled awaiter's inner spawned task ran to
-        // completion — the Shared caches the task's output, the map
-        // entry was never removed.
-        let stale: InflightFetch = {
-            let d = data.clone();
-            async move { Ok(Some(d)) }.boxed().shared()
-        };
-        cache.inflight.insert(hash, stale);
+        // First caller: starts the fetch, gets CANCELLED mid-await.
+        let c = Arc::clone(&cache);
+        let awaiter = tokio::spawn(async move { c.get_verified(&hash).await });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        awaiter.abort();
+        let _ = awaiter.await;
 
-        // PRECONDITION: the leak is seeded. If InflightFetch's type
-        // changes and the manual insert stops compiling, this test
-        // breaks loudly at the right spot.
-        assert_eq!(cache.inflight.len(), 1, "precondition: stale entry seeded");
+        // The detached fetch task runs to completion and removes ITS
+        // OWN entry — no awaiter needed.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !cache.inflight.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("producer must remove its own inflight entry after a cancelled awaiter");
 
-        // SELF-HEAL: get_verified → LRU miss → singleflight_fetch →
-        // `entry().or_insert_with()` finds the existing Shared (does
-        // NOT spawn a fresh fetch) → awaits it (instant — already
-        // complete) → THIS get's remove() fires.
-        let got = cache.get_verified(&hash).await.unwrap();
+        // STALE-VERDICT REGRESSION: the chunk now exists (second
+        // backend answer). The next get must perform a FRESH fetch and
+        // see it — under the pre-fix leak it consumed the completed
+        // Shared's stale Ok(None) and returned a spurious
+        // non-retriable NotFound with zero backend I/O.
+        let got = cache
+            .get_verified(&hash)
+            .await
+            .expect("fresh fetch must see the now-present chunk, not a stale NotFound");
+        assert_eq!(got, data);
         assert_eq!(
-            got, data,
-            "data came from the stale Shared (backend is empty — \
-             a fresh fetch would have returned NotFound)"
-        );
-
-        assert!(
-            cache.inflight.is_empty(),
-            "self-heal: get_verified's remove() cleared the stale entry"
+            backend.gets.load(Ordering::SeqCst),
+            2,
+            "the second get performed a real backend fetch (no memoized verdict)"
         );
     }
 
-    /// Same self-heal, but for the other leak shape: the inner task
-    /// found nothing (backend miss) → stale Shared holds `None`.
-    /// The next get must still clear the entry AND propagate NotFound
-    /// cleanly (not hang, not panic).
+    /// Read-side auth refusals carry their class through the Shared
+    /// boundary: BackendAuthError at the root of the backend's error
+    /// chain surfaces as ChunkError::AuthFailed (FAILED_PRECONDITION
+    /// at every reader), never as the retriable Backend variant — the
+    /// pre-fix e.to_string() carrier flattened the chain and made the
+    /// auth fail-fast structurally unreachable for reads.
+    // r[verify store.singleflight+2]
     #[tokio::test]
-    async fn inflight_leak_self_heals_on_none() {
-        let (_backend, cache) = make_cache();
+    async fn auth_refusal_is_typed_through_the_shared_boundary() {
+        struct AuthRefusingBackend;
+        #[async_trait::async_trait]
+        impl ChunkBackend for AuthRefusingBackend {
+            async fn put(&self, _: &[u8; 32], _: Bytes) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn get(&self, _: &[u8; 32]) -> anyhow::Result<Option<Bytes>> {
+                Err(anyhow::Error::new(crate::backend::BackendAuthError)
+                    .context("GetObject: AccessDenied (simulated IRSA misconfiguration)"))
+            }
+            async fn exists_batch(&self, hashes: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
+                Ok(vec![false; hashes.len()])
+            }
+            fn key_for(&self, hash: &[u8; 32]) -> String {
+                hex::encode(hash)
+            }
+            async fn delete_by_key(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let cache = ChunkCache::new(Arc::new(AuthRefusingBackend));
         let (hash, _) = sample_chunk();
-
-        // Stale entry with None — the spawned task ran, backend said
-        // "not found", awaiter was cancelled before remove().
-        let stale: InflightFetch = async { Ok(None) }.boxed().shared();
-        cache.inflight.insert(hash, stale);
-        assert_eq!(cache.inflight.len(), 1, "precondition: stale None seeded");
-
-        // get_verified → stale Shared → None → NotFound. Entry cleared
-        // BEFORE the error propagates (remove is unconditional).
-        let result = cache.get_verified(&hash).await;
-        assert!(matches!(result, Err(ChunkError::NotFound(_))));
+        let err = cache.get_verified(&hash).await.unwrap_err();
+        match err {
+            ChunkError::AuthFailed { message, .. } => {
+                assert!(
+                    message.contains("AccessDenied"),
+                    "the producing context survives the boundary: {message}"
+                );
+            }
+            other => {
+                panic!("auth refusal must be AuthFailed (FAILED_PRECONDITION class), got {other:?}")
+            }
+        }
+        // And the producer cleaned up: the next call retries (fails the
+        // same way, but through a FRESH fetch — not a memoized verdict).
         assert!(
-            cache.inflight.is_empty(),
-            "self-heal runs even when the stale Shared held None"
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !cache.inflight.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .is_ok(),
+            "producer removes the entry on the auth-failure terminal too"
         );
     }
 
@@ -1244,7 +1404,7 @@ mod cache_tests {
         }
     }
 
-    // r[verify store.singleflight]
+    // r[verify store.singleflight+2]
     /// THE bug_027 split: a backend ERROR surfaces as the transient
     /// `ChunkError::Backend`, NEVER as `NotFound` (which callers stamp
     /// into data-loss/corruption verdicts). Pre-fix, the singleflight

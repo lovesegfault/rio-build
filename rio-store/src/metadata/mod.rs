@@ -727,6 +727,7 @@ mod tests {
             MetadataError::PlaceholderMissing { store_path } => MetadataError::PlaceholderMissing {
                 store_path: store_path.clone(),
             },
+            MetadataError::BackendAuth(s) => MetadataError::BackendAuth(s.clone()),
             MetadataError::InvariantViolation(s) => MetadataError::InvariantViolation(s.clone()),
             MetadataError::CorruptManifest { store_path, .. } => MetadataError::CorruptManifest {
                 store_path: store_path.clone(),

@@ -476,6 +476,7 @@ fn heal_outcome_of_error(e: &super::MetadataError) -> HealOutcome {
         // the path for store-side timing. Other is unclassified sqlx —
         // infra-flavored, and "no evidence" is the conservative read.
         E::ChunkBackend(_)
+        | E::BackendAuth(_)
         | E::Connection(_)
         | E::Serialization
         | E::Deadlock(_)
@@ -874,6 +875,9 @@ async fn own_drv_bytes(
                 }
                 let chunk = cache.get_verified(hash).await.map_err(|e| match e {
                     crate::cas::ChunkError::Backend { .. } => super::MetadataError::ChunkBackend(
+                        format!("reassembling .drv {drv_path}: {e}"),
+                    ),
+                    crate::cas::ChunkError::AuthFailed { .. } => super::MetadataError::BackendAuth(
                         format!("reassembling .drv {drv_path}: {e}"),
                     ),
                     crate::cas::ChunkError::NotFound(_)
@@ -1501,6 +1505,7 @@ mod tests {
         // Transient lane — no path evidence.
         for e in [
             E::ChunkBackend("s3 blip".into()),
+            E::BackendAuth("AccessDenied".into()),
             E::Connection(sqlx::Error::PoolTimedOut),
             E::Serialization,
             E::ResourceExhausted("pool".into()),

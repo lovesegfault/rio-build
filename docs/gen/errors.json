@@ -1360,6 +1360,13 @@
     },
     {
       "enum": "ChunkError",
+      "name": "AuthFailed",
+      "crate": "rio-store",
+      "msg": "chunk {} backend fetch auth-failed (check S3 credentials/IAM permissions): {message}",
+      "doc": "The backend REFUSED the fetch with an authentication/authorization failure (IRSA/IAM/KMS misconfiguration — [`BackendAuthError`] was the root). Deterministic until an operator fixes the role: FAILED_PRECONDITION class at every reader, never silent-retried — the read-side twin of the write path's auth fail-fast (round-17 merged_bug_061; the incident class grpc/mod.rs cites: 12 derivations × 146 retry cycles in 6 minutes). [`BackendAuthError`]: crate::backend::BackendAuthError"
+    },
+    {
+      "enum": "ChunkError",
       "name": "Backend",
       "crate": "rio-store",
       "msg": "chunk {} backend fetch failed (transient): {message}",
@@ -1406,6 +1413,13 @@
       "crate": "rio-store",
       "msg": "unknown manifest version {0} (expected {VERSION})",
       "doc": ""
+    },
+    {
+      "enum": "MetadataError",
+      "name": "BackendAuth",
+      "crate": "rio-store",
+      "msg": "chunk backend authentication failed (check S3 credentials/IAM permissions): {0}",
+      "doc": "The chunk backend REFUSED a metadata-layer read with an auth failure (IRSA/IAM/KMS misconfiguration). Deterministic until an operator fixes the role: maps to `failed_precondition` so the caller fail-fasts with the remediation instead of retrying as `unavailable` forever (round-17 merged_bug_061 — the read-side twin of the write path's BackendAuthError fail-fast)."
     },
     {
       "enum": "MetadataError",

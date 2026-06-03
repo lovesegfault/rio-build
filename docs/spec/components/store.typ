@@ -734,22 +734,32 @@ AlreadyComplete-re-upload heal stampedes to one attempt per window
 
 = Request Coalescing (Singleflight)
 
-#r("store.singleflight")[
+#r("store.singleflight+2")[
   When multiple concurrent requests need the same chunk from S3 (common during
   cold starts or thundering herd scenarios), rio-store coalesces them into a
-  single in-flight fetch using a singleflight pattern:
+  single in-flight fetch using a singleflight pattern, with these
+  obligations:
 
-  - A `DashMap<[u8; 32], Shared<BoxFuture<'static, Option<Bytes>>>>` tracks
-    in-flight S3 GETs (the fetch is spawned as a tokio task and its
-    `JoinHandle` is mapped to `Option<Bytes>` before `.shared()`, since
-    `JoinError` is not `Clone`)
-  - First request for chunk X spawns the fetch task and inserts the shared
-    future
-  - Subsequent requests for chunk X `.await` the existing shared future instead
-    of issuing duplicate S3 GETs
-  - On completion (success or failure), the entry is removed from the map
-  - Failed fetches (including task panics) resolve to `None`, and removal from
-    the map means the next request retries cleanly
+  - The fetch is spawned as a detached task (it survives caller
+    cancellation) and its result crosses the shared boundary as a
+    `Clone`-able TYPED carrier: the backend's authoritative not-found,
+    a transient backend error / task panic, and an authentication
+    refusal are three distinct outcomes --- never conflated, never
+    flattened to a string that erases the auth root. Auth refusals
+    surface as `FAILED_PRECONDITION` with remediation at every reader
+    (the read-side twin of the write path's auth fail-fast); transient
+    errors as retriable `UNAVAILABLE`; not-found as the data-loss-class
+    verdict its consumers stamp.
+  - Subsequent requests for an in-flight chunk await the existing
+    shared future instead of issuing duplicate S3 GETs.
+  - The PRODUCER (the spawned task) removes the in-flight entry as its
+    terminal act --- cleanup MUST NOT depend on any awaiter surviving
+    to do it. A completed fetch's memoized verdict is therefore never
+    discoverable in the map: a caller that did not overlap the fetch
+    performs a fresh one (a stale not-found must not mask a chunk
+    uploaded since; a stale error must not outlive backend recovery).
+    Sole exception: a producer PANIC cannot run its own removal --- the
+    first awaiter that observes the join error sweeps the entry.
 ]
 
 This is critical for cold start thundering herd: when many builds start

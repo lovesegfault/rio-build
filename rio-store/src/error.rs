@@ -102,6 +102,15 @@ pub enum MetadataError {
     #[error("chunk backend unavailable: {0}")]
     ChunkBackend(String),
 
+    /// The chunk backend REFUSED a metadata-layer read with an auth
+    /// failure (IRSA/IAM/KMS misconfiguration). Deterministic until an
+    /// operator fixes the role: maps to `failed_precondition` so the
+    /// caller fail-fasts with the remediation instead of retrying as
+    /// `unavailable` forever (round-17 merged_bug_061 — the read-side
+    /// twin of the write path's BackendAuthError fail-fast).
+    #[error("chunk backend authentication failed (check S3 credentials/IAM permissions): {0}")]
+    BackendAuth(String),
+
     /// Stored data is verifiably lost or corrupt: a manifest references
     /// a chunk the backend authoritatively lacks, or fetched bytes fail
     /// content verification. NOT retriable. Maps to `data_loss`.

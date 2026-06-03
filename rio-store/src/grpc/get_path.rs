@@ -369,6 +369,19 @@ impl StoreServiceImpl {
                                         .await;
                                     return;
                                 }
+                                // Auth refusal: FAILED_PRECONDITION with
+                                // the remediation — NOT the data-loss
+                                // catch-all below, and NOT retried
+                                // (round-17 merged_bug_061).
+                                Err(e @ cas::ChunkError::AuthFailed { .. }) => {
+                                    // Full chain server-side ONLY; the
+                                    // client gets the single-sourced
+                                    // static remediation (round-15
+                                    // scrub rule, 9075dcd8b precedent).
+                                    error!(error = %e, "GetPath: chunk backend auth failed");
+                                    let _ = tx.send(Err(crate::grpc::backend_auth_status())).await;
+                                    return;
+                                }
                                 Err(e) => {
                                     error!(error = %e, "GetPath: chunk fetch/verify failed");
                                     // DATA_LOSS: the manifest says this

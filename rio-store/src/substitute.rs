@@ -323,8 +323,13 @@ pub struct Substituter {
     /// modes fall back to `keep` behavior (we can't sign without a
     /// key). Per-tenant key resolution inside.
     signer: Option<Arc<TenantSigner>>,
-    // r[impl store.singleflight]
-    /// Singleflight: `(tenant_id, store_path)` → cached result. TTL
+    // NOT a store.singleflight implementation site: that rule's +2
+    // obligations (typed Clone error carrier, producer-owned inflight
+    // cleanup, auth fail-fast) describe the CHUNK-fetch coalescer in
+    // cas.rs. This is a moka TTL result cache that happens to coalesce
+    // — its contract is the substitution admission machinery
+    // (store.substitute.admission), not the chunk singleflight.
+    /// Singleflight-shaped: `(tenant_id, store_path)` → cached result. TTL
     /// keeps a recently-substituted path hot for the next caller
     /// without re-checking PG. Entries are cheap (the `PathInfo` is
     /// already in narinfo; this is just the gRPC-shaped copy). moka

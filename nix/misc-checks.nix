@@ -2024,8 +2024,8 @@ in
         # construction, making the BackendAuthError fail-fast
         # unreachable — round-17 merged_bug_061; replaced by the typed
         # Clone carrier at W2-S3 c6, when this pin drops to 0).
-        check_pin 'Err(e.to_string())' rio-store/src/cas.rs 1 \
-          "singleflight Shared error carrier — drops to 0 at W2-S3 c6"
+        check_pin 'Err(e.to_string())' rio-store/src/cas.rs 0 \
+          "no carve-out: the singleflight Shared carries the typed Clone FetchFail (W2-S3 c6 dropped the last stringly carrier)"
 
         [ "$fail" = 0 ] || exit 1
         touch $out

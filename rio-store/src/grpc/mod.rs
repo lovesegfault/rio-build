@@ -116,6 +116,19 @@ pub(crate) fn storage_error(context: &str, e: anyhow::Error) -> Status {
 ///
 /// Logs the full error (including sqlx source chain) server-side; the
 /// gRPC message is a scrubbed summary.
+/// The ONE client-facing message for backend auth refusals: static
+/// remediation, NOTHING from the error chain. AWS error chains carry
+/// endpoint URLs, request IDs, and key-shaped identifiers; untrusted
+/// callers must not receive them (round-15 trusted-plane scrub rule,
+/// the 9075dcd8b precedent — full chains go to server-side logs only).
+/// Single-sourced so every reader (GetChunk, GetPath, metadata_status)
+/// serves byte-identical text and the no-leak pin covers all of them.
+pub(crate) fn backend_auth_status() -> Status {
+    Status::failed_precondition(
+        "chunk backend authentication failed; check S3 credentials/IAM permissions",
+    )
+}
+
 pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Status {
     use metadata::MetadataError as M;
     match &e {
@@ -150,6 +163,11 @@ pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Stat
         // UNAVAILABLE, derived from the variant — NEVER conflated with
         // the data-integrity verdicts below.
         M::ChunkBackend(_) => Status::unavailable("chunk backend unavailable; retry"),
+        // Auth refusal (round-17 merged_bug_061): FAILED_PRECONDITION
+        // with the static remediation — deterministic until an operator
+        // fixes the role; retrying as unavailable hides the
+        // misconfiguration. The chain was already logged above.
+        M::BackendAuth(_) => backend_auth_status(),
         M::DataLoss(_) => Status::data_loss("stored chunk data is lost or corrupt"),
         // Backpressure: PG pool exhausted, signature count cap, etc.
         // Client should retry with backoff. Distinct from Connection
