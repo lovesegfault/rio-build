@@ -165,6 +165,13 @@ pub enum SignerError {
     #[error("key name is empty")]
     EmptyName,
 
+    /// Name carries whitespace or a control byte — it would fragment
+    /// the whitespace-tokenized `trusted-public-keys` entry this key's
+    /// public half is published as, or corrupt `Sig:` line framing.
+    /// Refused at load (the codec refuses it at every constructor).
+    #[error("key name {0:?} contains whitespace or a control byte")]
+    InvalidName(String),
+
     #[error("base64 decode failed: {0}")]
     Base64(#[from] base64::DecodeError),
 
@@ -226,6 +233,7 @@ impl Signer {
         let entry = SecretEntry::parse(content).map_err(|e| match e {
             KeyFmtError::MissingSeparator => SignerError::Format(content.matches(':').count() + 1),
             KeyFmtError::EmptyName | KeyFmtError::NameContainsColon => SignerError::EmptyName,
+            KeyFmtError::NameForbiddenChar(n) => SignerError::InvalidName(n),
             KeyFmtError::Base64(b) => SignerError::Base64(b),
             KeyFmtError::KeyLength(n) | KeyFmtError::PubKeyLength(n) => SignerError::KeyLength(n),
             KeyFmtError::StaleTail | KeyFmtError::InvalidCurvePoint => {

@@ -79,6 +79,20 @@ pub enum KeyFmtError {
     /// Key name contains `:` (would corrupt the `name:base64` framing).
     #[error("key name must not contain ':' (it separates name from key material)")]
     NameContainsColon,
+    /// Key name contains a byte that fragments or corrupts the entry in
+    /// its consuming contexts. The published entry lands in Nix's
+    /// `trusted-public-keys` — "a whitespace-separated list of public
+    /// keys" (`globals.hh:239-266`) tokenized on `" \t\n\r"`
+    /// (`strings.hh:28`) — and in line-framed `Sig:` narinfo fields, so
+    /// a space-bearing name silently splits into two garbage tokens and
+    /// a control byte corrupts line framing. Rejected at every
+    /// constructor; the name is echoed (escaped) because key names are
+    /// public identifiers, not key material.
+    #[error(
+        "key name {0:?} contains whitespace or a control byte (it would fragment the \
+             whitespace-tokenized trusted-public-keys entry or corrupt Sig: line framing)"
+    )]
+    NameForbiddenChar(String),
     /// The part after `:` is not valid standard-alphabet base64.
     #[error("key payload is not valid base64: {0}")]
     Base64(#[from] base64::DecodeError),
@@ -102,6 +116,37 @@ pub enum KeyFmtError {
     InvalidCurvePoint,
 }
 
+/// Validate a key name against the framing rules of every context the
+/// codec's encodings land in. Population defined by the CONSUMING
+/// contracts (round-16 R5 amendment), not by what producers happen to
+/// emit:
+///
+/// - Nix `trusted-public-keys` is "a whitespace-separated list of
+///   public keys" (pinned oracle `globals.hh:239-266`), parsed by
+///   `tokenizeString` with separators `" \t\n\r"` (`strings.hh:28`) —
+///   ASCII whitespace FRAGMENTS the published entry into garbage
+///   tokens.
+/// - narinfo `Sig:` fields and the secret/pub files are line-framed —
+///   any ASCII control byte (incl. `\n`, DEL) corrupts framing.
+/// - `:` separates name from payload ([`KeyFmtError::NameContainsColon`]).
+///
+/// The boundary is exactly the oracle tokenizer's: non-ASCII
+/// whitespace (e.g. NBSP U+00A0) does NOT fragment Nix's tokenizer and
+/// is ACCEPTED — pinned by `nbsp_name_boundary` below. Rejecting it
+/// here would refuse names the consuming contract handles fine.
+fn validate_key_name(name: &str) -> Result<(), KeyFmtError> {
+    if name.is_empty() {
+        return Err(KeyFmtError::EmptyName);
+    }
+    if name.contains(':') {
+        return Err(KeyFmtError::NameContainsColon);
+    }
+    if name.chars().any(|c| c == ' ' || c.is_ascii_control()) {
+        return Err(KeyFmtError::NameForbiddenChar(name.to_string()));
+    }
+    Ok(())
+}
+
 /// A parsed signing-key SECRET entry. Construction is the only way to
 /// get one, and every constructor validates the full byte contract —
 /// downstream code can no longer observe a malformed or internally
@@ -122,9 +167,7 @@ impl SecretEntry {
     /// codec stays a pure byte contract.
     pub fn parse(entry: &str) -> Result<Self, KeyFmtError> {
         let (name, b64) = entry.split_once(':').ok_or(KeyFmtError::MissingSeparator)?;
-        if name.is_empty() {
-            return Err(KeyFmtError::EmptyName);
-        }
+        validate_key_name(name)?;
         // STANDARD (not URL_SAFE), with padding: Nix's nix-base64.cc
         // uses the RFC 4648 standard alphabet.
         let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
@@ -157,12 +200,7 @@ impl SecretEntry {
     /// Construct from a name and raw seed (the keygen path). Validates
     /// the name framing rules.
     pub fn from_seed(name: &str, seed: &[u8; SEED_LEN]) -> Result<Self, KeyFmtError> {
-        if name.is_empty() {
-            return Err(KeyFmtError::EmptyName);
-        }
-        if name.contains(':') {
-            return Err(KeyFmtError::NameContainsColon);
-        }
+        validate_key_name(name)?;
         Ok(Self {
             name: name.to_string(),
             seed: *seed,
@@ -243,9 +281,7 @@ impl PublicEntry {
     /// bytes form a valid ed25519 curve point.
     pub fn parse(entry: &str) -> Result<Self, KeyFmtError> {
         let (name, b64) = entry.split_once(':').ok_or(KeyFmtError::MissingSeparator)?;
-        if name.is_empty() {
-            return Err(KeyFmtError::EmptyName);
-        }
+        validate_key_name(name)?;
         let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
         let pubkey: [u8; SEED_LEN] = bytes
             .try_into()
@@ -429,6 +465,72 @@ mod tests {
         // Errors never carry payload bytes.
         let msg = format!("{}", SecretEntry::parse(&e48).unwrap_err());
         assert!(!msg.contains(&b64().encode([1u8; 48])));
+    }
+
+    /// merged_bug_093: names containing bytes the consuming contracts
+    /// cannot frame are refused at EVERY constructor — a published
+    /// `trusted-public-keys` entry whose name carries a space would
+    /// silently fragment into two garbage tokens in Nix's
+    /// whitespace-tokenized setting (`globals.hh:239-266`,
+    /// `tokenizeString` separators `" \t\n\r"`, `strings.hh:28`); a
+    /// control byte corrupts `Sig:`/file line framing.
+    // r[verify store.signing.entry-codec]
+    #[test]
+    fn forbidden_name_bytes_refused_at_every_constructor() {
+        let seed = [5u8; 32];
+        for bad in [
+            "rio key",  // space — the tokenizer separator
+            "rio\tkey", // tab
+            "rio\nkey", // newline
+            "rio\rkey", // carriage return
+            "rio\x07k", // C0 control (BEL)
+            "rio\x7fk", // DEL
+            "\nrio",    // leading control
+        ] {
+            // Constructor 1: SecretEntry::parse.
+            let entry = format!("{bad}:{}", b64().encode(seed));
+            assert!(
+                matches!(
+                    SecretEntry::parse(&entry),
+                    Err(KeyFmtError::NameForbiddenChar(_))
+                ),
+                "SecretEntry::parse must refuse {bad:?}"
+            );
+            // Constructor 2: SecretEntry::from_seed (the keygen intake).
+            assert!(
+                matches!(
+                    SecretEntry::from_seed(bad, &seed),
+                    Err(KeyFmtError::NameForbiddenChar(_))
+                ),
+                "SecretEntry::from_seed must refuse {bad:?}"
+            );
+            // Constructor 3: PublicEntry::parse.
+            let derived = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+            let pub_entry = format!("{bad}:{}", b64().encode(derived));
+            assert!(
+                matches!(
+                    PublicEntry::parse(&pub_entry),
+                    Err(KeyFmtError::NameForbiddenChar(_))
+                ),
+                "PublicEntry::parse must refuse {bad:?}"
+            );
+        }
+    }
+
+    /// The boundary pin: the rejection population is exactly the
+    /// oracle tokenizer's separator set plus ASCII control. NBSP
+    /// (U+00A0) is NOT in `tokenizeString`'s `" \t\n\r"` separators —
+    /// it does not fragment the published entry — so it is ACCEPTED.
+    /// Rejecting wider than the consuming contract would refuse names
+    /// Nix itself handles.
+    #[test]
+    fn nbsp_name_boundary() {
+        let seed = [6u8; 32];
+        let name = "rio\u{00A0}key"; // NBSP: non-ASCII whitespace
+        let e = SecretEntry::from_seed(name, &seed).expect("NBSP name accepted");
+        assert_eq!(e.name(), name);
+        // Round-trips through the canonical encoding and re-parse.
+        assert_eq!(SecretEntry::parse(&e.encode()).unwrap().name(), name);
     }
 
     /// Debug never prints the seed.
