@@ -257,24 +257,35 @@ impl BuildResult {
     /// byte 0.
     ///
     /// The load-bearing bound is consumer-enforced instead, and its
-    /// worst case is a GATE TRIP, not an exclusion: a spoofed marker
-    /// flips THAT drv's same-batch `Substituted` row from a recorded
-    /// substitution event to the evidence-loss leg, which CONSUMES the
-    /// drv's shared auto-retry budget per occurrence (any-reason
-    /// consumption, default `max_auto_retries = 1`) and at exhaustion
-    /// terminalizes as infra-indeterminate —
-    /// `GateAccounting::TripsRegression`, failing `report --check`
-    /// under both gating `fail_on` policies (regression and
-    /// divergence). The conservative half still holds — never minting a
-    /// success or a violation, so a spoof can never launder a real
-    /// failure into a pass — which makes the surface a bounded
-    /// denial-of-measurement primitive (CI-red, budget burn) available
-    /// to recorded third-party build output, accepted with that price
-    /// on record. The comparison with the relayed-reason capture
-    /// (rio-replay's `DRV_FAILED_RE`, strictly looser — it matches
-    /// anywhere in any line) holds for CHANNEL EXPOSURE only, not
-    /// effect strength: a forged failure reason cannot flip a
-    /// success-shaped row, a forged marker can.
+    /// accepted worst case is stated here in the consumer's own
+    /// gate-accounting vocabulary (NOT as a gate "exclusion" — it is
+    /// not one). Scope: a spoofed marker can affect only THAT drv's
+    /// same-batch `Substituted` row, flipping it from a recorded
+    /// substitution event to evidence-loss classification. Effect
+    /// strength, per the consumer (rio-replay's collect marker arm; the
+    /// per-cell pins live in its
+    /// `lost_terminal_marker_rows_settle_as_evidence_loss_end_to_end`
+    /// test): in a timeless campaign the flip consumes the
+    /// victim drv's SHARED auto-retry budget (`max_auto_retries`,
+    /// default 1; any prior requeue of any reason already counts
+    /// against it) and at exhaustion terminalizes as
+    /// `TargetFailed{Infra}` → verdict `infra-indeterminate`, whose
+    /// gate accounting is `GateAccounting::TripsRegression` — it FAILS
+    /// `report --check` under both `fail_on: regression` and
+    /// `fail_on: divergence`; in a timed campaign the flip terminalizes
+    /// as `infra-indeterminate` immediately (no timed re-attempt exists
+    /// for a success-shaped row), or `interruption-not-reproduced`
+    /// (`TripsDivergence`) for an armed member. The direction is
+    /// conservative — never minting a success and never hiding a
+    /// violation — so the primitive available to recorded third-party
+    /// build output is a bounded denial-of-measurement (a false alarm
+    /// that costs a retry cycle and can red a gated CI run), not a
+    /// laundering channel. The comparison with the existing
+    /// relayed-reason capture (rio-replay's `DRV_FAILED_RE`, which
+    /// matches anywhere in any line) holds for CHANNEL EXPOSURE only:
+    /// that capture feeds failure attribution and structurally cannot
+    /// flip a success row, so the marker's consumer effect is strictly
+    /// stronger than its channel sibling's.
     ///
     /// TODO: only gateway-owned structured wire metadata (a typed
     /// per-root evidence-loss field on the result, not a stderr line)

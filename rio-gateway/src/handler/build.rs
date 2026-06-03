@@ -2488,6 +2488,23 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                     // a substitution event. Emitted before
                     // `stderr.finish()` below, like every relay line of
                     // this opcode.
+                    //
+                    // TODO: move this fact into gateway-owned structured
+                    // wire metadata (a per-root field on the result, like
+                    // the wanted-outputs augmentation) instead of an
+                    // in-band stderr line. The marker rides the same
+                    // untrusted display channel as third-party build
+                    // logs, so its trust bound is consumer-enforced (see
+                    // `lost_terminal_relay_drv`'s doc for the accepted
+                    // worst case: a spoofed line from recorded build
+                    // output burns the victim drv's shared auto-retry
+                    // budget and at exhaustion mints an
+                    // infra-indeterminate that trips `report --check`).
+                    // Anchoring cannot close that surface — the relay's
+                    // no-activity fallback and the observer's line split
+                    // both put worker-influenced text at byte 0 — only a
+                    // structured field the gateway alone can populate
+                    // deletes the spoof surface outright.
                     if lost_terminal {
                         stderr
                             .log(&format!(
