@@ -198,6 +198,9 @@ rstest = { workspace = true }
 # feature is the only way they see `test_helpers` / `MIGRATOR`.
 rio-store = { path = ".", features = ["test-utils"] }
 rio-test-support = { workspace = true }
+# concurrent.rs installs a CountingRecorder and latches on the wait-arm
+# entry counter (structural race scheduling instead of sleeps).
+metrics = { workspace = true }
 tempfile = { workspace = true }
 # DebuggingRecorder/Snapshotter for metric-emission assertions
 # (materialize executor T-6.2 lifecycle counters).

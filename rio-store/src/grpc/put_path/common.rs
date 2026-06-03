@@ -1280,6 +1280,12 @@ impl StoreServiceImpl {
         let budget = self.concurrent_put_wait;
         let start = std::time::Instant::now();
         let mut attempt = 0u32;
+        // Entry marker, before the first poll: operators see waiters
+        // that are still parked (the outcome labels below only fire on
+        // resolution), and tests latch on it instead of sleeping.
+        metrics::counter!("rio_store_putpath_concurrent_wait_total",
+            "outcome" => "waiting")
+        .increment(1);
         loop {
             let elapsed = start.elapsed();
             if elapsed >= budget {

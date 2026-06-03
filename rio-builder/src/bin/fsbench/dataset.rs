@@ -458,7 +458,10 @@ mod tests {
     fn reserve_is_largest_and_storm_excludes_it() {
         let (_s, _o, m) = gen_fixture("seed-1");
         let reserve = m.randread_reserve().expect("reserve resolves");
-        assert_eq!(reserve.bytes, 9 * 1024 * 1024, "largest fixture file");
+        // The PROPERTY, not the fixture constant: the reserve is the
+        // largest file in the manifest.
+        let largest = m.files.iter().map(|f| f.bytes).max().unwrap();
+        assert_eq!(reserve.bytes, largest, "reserve must be the largest file");
         assert!(reserve.bytes > STREAM_THRESHOLD_BYTES);
         assert!(m.read_storm_files().iter().all(|f| f.path != m.reserve));
         assert_eq!(m.read_storm_files().len(), m.files.len() - 1);

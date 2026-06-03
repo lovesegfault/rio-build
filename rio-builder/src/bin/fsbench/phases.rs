@@ -145,6 +145,18 @@ pub struct RandreadOut {
     pub direct: bool,
 }
 
+/// The 4 KiB-aligned offset sequence a randread pass visits, derived
+/// purely from the seed. Factored out so the offset generation is
+/// testable for determinism and in-bounds without doing any I/O, and
+/// so `randread` has a single definition of the sequence.
+fn randread_offsets(file_bytes: u64, ios: u64, prng_seed: u64) -> Vec<u64> {
+    let blocks = file_bytes / RANDREAD_IO_BYTES;
+    let mut state = prng_seed;
+    (0..ios)
+        .map(|_| (splitmix64(&mut state) % blocks) * RANDREAD_IO_BYTES)
+        .collect()
+}
+
 /// `ios` psync 4 KiB reads at uniform random 4 KiB-aligned offsets.
 /// Deterministic offset sequence per `prng_seed` so every rep (and
 /// every run of the same seed) visits the same offsets.
@@ -160,12 +172,9 @@ pub fn randread(path: &Path, file_bytes: u64, ios: u64, prng_seed: u64) -> Resul
     let off = raw.as_ptr().align_offset(RANDREAD_IO_BYTES as usize);
     let buf = &mut raw[off..off + RANDREAD_IO_BYTES as usize];
 
-    let blocks = file_bytes / RANDREAD_IO_BYTES;
-    let mut state = prng_seed;
     let started = Instant::now();
     let mut io_ns = Vec::with_capacity(ios as usize);
-    for _ in 0..ios {
-        let offset = (splitmix64(&mut state) % blocks) * RANDREAD_IO_BYTES;
+    for offset in randread_offsets(file_bytes, ios, prng_seed) {
         let t0 = Instant::now();
         f.read_exact_at(buf, offset)
             .with_context(|| format!("pread {} @{offset}", path.display()))?;
@@ -362,13 +371,26 @@ mod tests {
         let big = m.randread_reserve().unwrap();
         let path = d.path().join(&big.path);
 
-        let a = randread(&path, big.bytes, 64, 7).unwrap();
-        let b = randread(&path, big.bytes, 64, 7).unwrap();
-        assert_eq!(a.ios, 64);
-        // Same prng seed → same offset sequence → byte-identical work.
-        // (Latencies differ; the structural part is the offsets, which
-        // read_exact_at would fail on if any went out of bounds.)
-        assert_eq!(a.io_ns.len(), b.io_ns.len());
+        // The seeded offset sequence, checked directly (no I/O):
+        // same seed → identical sequence (reps must do byte-identical
+        // work); a different seed must diverge — a stuck PRNG would
+        // silently turn every "random" pass into a cache-friendly
+        // replay.
+        let a = randread_offsets(big.bytes, 64, 7);
+        let b = randread_offsets(big.bytes, 64, 7);
+        let c = randread_offsets(big.bytes, 64, 8);
+        assert_eq!(a.len(), 64);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        // Every offset 4 KiB-aligned and inside the file.
+        for &off in &a {
+            assert_eq!(off % RANDREAD_IO_BYTES, 0);
+            assert!(off + RANDREAD_IO_BYTES <= big.bytes);
+        }
+        // And the real pass runs those offsets without an out-of-bounds
+        // pread.
+        let out = randread(&path, big.bytes, 64, 7).unwrap();
+        assert_eq!(out.ios, 64);
     }
 
     #[test]

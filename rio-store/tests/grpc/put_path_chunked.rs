@@ -981,7 +981,10 @@ impl ChunkBackend for FailingPutBackend {
         anyhow::bail!("injected S3 outage")
     }
     async fn get(&self, _: &[u8; 32]) -> anyhow::Result<Option<bytes::Bytes>> {
-        unimplemented!("PutPathChunked with all-novel chunks never GETs")
+        // PutPathChunked never GETs chunks at all (the verify walk
+        // checks received bodies only — pinned by
+        // fully_deduped_upload_commits_with_zero_chunk_reads).
+        unimplemented!("PutPathChunked never GETs")
     }
     async fn exists_batch(&self, _: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
         unimplemented!()

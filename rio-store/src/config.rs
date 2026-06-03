@@ -906,34 +906,10 @@ mod tests {
     use super::*;
     use rio_common::config::ValidateConfig as _;
 
-    #[test]
-    fn config_defaults_are_stable() {
-        let d = Config::default();
-        assert_eq!(d.listen_addr.to_string(), "[::]:9002");
-        assert_eq!(d.common.metrics_addr.to_string(), "[::]:9092");
-        assert!(d.database_url.is_empty());
-        // Chunk backend off by default for backward-compat with pre-chunking configs.
-        assert!(matches!(d.chunk_backend, ChunkBackendKind::Inline));
-        // Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES. If that
-        // constant changes, update this — the test catches drift.
-        assert_eq!(d.chunk_cache_capacity_bytes, 2 * 1024 * 1024 * 1024);
-        // NAR budget override: None → DEFAULT_NAR_BUDGET (grpc/mod.rs).
-        assert!(d.nar_buffer_budget_bytes.is_none());
-        assert!(d.signing_key_path.is_none());
-        // with the pre-allowlist hardcoded CN check).
-        assert_eq!(d.common.drain_grace, std::time::Duration::from_secs(6));
-        // JWT verification off by default (interceptor inert until
-        // ConfigMap mount configured via RIO_JWT__KEY_PATH).
-        assert!(d.jwt.key_path.is_none());
-        assert!(!d.jwt.required);
-        assert_eq!(d.max_batch_paths, crate::grpc::DEFAULT_MAX_BATCH_PATHS);
-        // r[verify store.get.chunk-prefetch]
-        assert_eq!(d.chunk_prefetch_k, 64);
-        assert_eq!(d.stream_drain, std::time::Duration::from_secs(90));
-        assert_eq!(d.pg_max_connections, DEFAULT_PG_MAX_CONNECTIONS);
-        // None → main.rs derives via derive_substitute_admission_cap.
-        assert!(d.substitute_admission_permits.is_none());
-    }
+    // Default VALUES are pinned once, by the config-schema fixture
+    // (`config_schema_frozen!` in tests/config_schema.rs); the
+    // `jail_defaults!` block below covers env-clean parsing. A third
+    // hand-written pin of the same defaults only added drift surface.
 
     #[test]
     fn derive_admission_cap_clamps() {
@@ -1812,6 +1788,8 @@ mod tests {
             crate::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY
         );
         assert_eq!(cfg.s3_max_attempts, DEFAULT_S3_MAX_ATTEMPTS);
+        // r[verify store.get.chunk-prefetch]
+        assert_eq!(cfg.chunk_prefetch_k, 64);
     });
 
     // -----------------------------------------------------------------------
