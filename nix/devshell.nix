@@ -103,24 +103,34 @@ let
   # env hygiene done in the shellHook does not survive everything that
   # re-loads user config into a child environment (xtask's dotenvy
   # re-reads .env.local wholesale; IDEs spawn cargo with their own env).
-  # Three jobs:
+  # Four jobs:
   #
   #  1. Local-only by ALLOWLIST: every KACHE_* var not explicitly allowed
   #     is dropped, so S3/planner/manifest knobs can never reach kache no
   #     matter who spawned it — and a future kache release that grows new
   #     remote vars is denied by default instead of silently honored.
   #     (KACHE_ACTIVE/KACHE_VERSION pass through: internal coordination
-  #     for nested-wrapper detection.)
-  #  2. Pin KACHE_CONFIG and default the store to the repo-scoped,
-  #     environment-salted epoch. Repo-scoped means our 256GiB budget and
-  #     provenance are ours alone — no other kache consumer on the machine
-  #     can evict our artifacts down to ITS cap, and artifacts from other
-  #     projects' (possibly remote-enabled) configs can never be hit from
-  #     here. KACHE_CACHE_DIR stays user-overridable (allowlisted).
+  #     for nested-wrapper detection.) KACHE_CACHE_DIR is deliberately
+  #     NOT allowlisted: it is kache's own standard variable, so a
+  #     machine-global export from another kache-using project would
+  #     silently repoint OUR store — foreign eviction budget, foreign
+  #     (possibly remote-fetched) artifacts. The store-relocation knob
+  #     is the rio-namespaced RIO_KACHE_CACHE_DIR, which only rio-aware
+  #     contexts set.
+  #  2. Pin KACHE_CONFIG and the store location: RIO_KACHE_CACHE_DIR if
+  #     set, else the repo-scoped, environment-salted epoch (see
+  #     kacheEnvSalt) — our 256GiB budget and provenance stay ours
+  #     alone. No HOME (some spawners scrub it) → fail OPEN: bypass to
+  #     the real compiler instead of aborting under nounset.
   #  3. Pass -Zunpretty (cargo expand) straight to the real compiler:
   #     kache v0.4.0 does not key the flag (no -Z parse arm in
   #     src/args.rs), so a warm cache would "hit" the ordinary compile's
   #     entry and expansion output would be silently empty.
+  #  4. Stamp the default store epoch's .last-used on every invocation:
+  #     the shellHook prune decides "abandoned" from this stamp, and
+  #     long-lived sessions (tmux panes, IDE-captured envs) compile for
+  #     weeks without re-entering a shell — liveness must ride the
+  #     compile, not the shell entry.
   kacheWrapped = pkgs.writeShellApplication {
     name = "kache";
     text = ''
@@ -136,7 +146,7 @@ let
         esac
         prev=""
       done
-      allow=" KACHE_ACTIVE KACHE_VERSION KACHE_CACHE_DIR KACHE_CACHE_EXECUTABLES \
+      allow=" KACHE_ACTIVE KACHE_VERSION KACHE_CACHE_EXECUTABLES \
         KACHE_CLEAN_INCREMENTAL KACHE_COMPRESSION_LEVEL KACHE_DAEMON_IDLE_TIMEOUT \
         KACHE_DISABLED KACHE_LOG KACHE_LOG_FILE KACHE_LOG_FILE_PATH KACHE_MAX_SIZE \
         KACHE_PROGRESS "
@@ -149,7 +159,23 @@ let
         esac
       done
       export KACHE_CONFIG=${kacheConfig}
-      export KACHE_CACHE_DIR="''${KACHE_CACHE_DIR:-$HOME/.cache/rio-build/kache/${kacheEnvSalt}}"
+      if [ -n "''${RIO_KACHE_CACHE_DIR:-}" ]; then
+        export KACHE_CACHE_DIR="$RIO_KACHE_CACHE_DIR"
+      elif [ -n "''${HOME:-}" ]; then
+        export KACHE_CACHE_DIR="$HOME/.cache/rio-build/kache/${kacheEnvSalt}"
+        # Liveness stamp for the shellHook's epoch prune. Failures must
+        # never break a compile (read-only HOME, racing a prune) — the
+        # store itself fails open inside kache too.
+        { mkdir -p "$KACHE_CACHE_DIR" && touch "$KACHE_CACHE_DIR/.last-used"; } 2>/dev/null || true
+      else
+        # No HOME, no override: nowhere sane for a store. In wrapper
+        # usage argv[1] is the real compiler — bypass kache entirely
+        # rather than abort; CLI usage falls through disabled.
+        if [ -x "''${1:-}" ]; then
+          exec "$@"
+        fi
+        export KACHE_DISABLED=1
+      fi
       exec ${kachePkg}/bin/kache "$@"
     '';
   };
@@ -336,22 +362,28 @@ let
           # Content-addressed RUSTC_WRAPPER: blake3 keys are path-
           # normalized (workspace root → sentinel), so byte-identical
           # sources in sibling worktrees share one artifact store. All
-          # policy lives in kacheWrapped + kacheConfig above; the wrapper
-          # itself is exported by the shellHook below via a STABLE
-          # symlink. (Empirically, current cargo does NOT hash the
-          # RUSTC_WRAPPER value into unit fingerprints — verified by
-          # toggling the wrapper on a warm target, zero recompiles — but
-          # cargo has varied here historically; a constant value is free
-          # insurance and keeps `nix develop` env diffs quiet across
-          # bumps.) Devshell-only, same contract as the mold override:
-          # crate2nix builds run in the hermetic sandbox and never see
-          # this env.
+          # policy lives in kacheWrapped + kacheConfig above; the value
+          # here is the wrapper's own store path — per-shell and
+          # immutable, so each environment atomically carries the
+          # salt+config it was evaluated with, and sibling worktrees on
+          # different revs cannot cross-contaminate store epochs (any
+          # shared mutable indirection — a state-dir symlink, say — is
+          # last-writer-wins across concurrent shells). Empirically,
+          # current cargo does NOT hash the RUSTC_WRAPPER value into
+          # unit fingerprints (verified: toggling it on a warm target →
+          # zero recompiles), so per-rev paths cost nothing; if a future
+          # cargo starts hashing it, the cost is one rebuild per rev
+          # hop, never a correctness issue. Devshell-only, same contract
+          # as the mold override: crate2nix builds run in the hermetic
+          # sandbox and never see this env.
+          RUSTC_WRAPPER = "${kacheWrapped}/bin/kache";
           #
           # Verified against kache v0.4.0 source (cache_key.rs, args.rs,
           # link.rs, wrapper.rs):
           #  - fail-open: cache/store errors fall back to real rustc, so
           #    the pre-commit sqlx-prepare-check leak path cannot block
-          #    commits (it also skips outside the shell — see
+          #    commits (it also skips outside the shell and when
+          #    RUSTC_WRAPPER no longer resolves after a store gc — see
           #    nix/pre-commit-hooks.nix);
           #  - KACHE_DISABLED=1 toggles caching with zero rebuild cost
           #    (and works on any cargo, fingerprinting or not);
@@ -390,13 +422,9 @@ let
             # `nix develop` from a subdirectory also resolves correctly.
             export RIO_TYPST_XDG="$(git rev-parse --show-toplevel)/docs/.cache/typst-xdg"
             # kache wiring. Policy (local-only allowlist, pinned config,
-            # salted store) lives in the kacheWrapped script — three
-            # shell-side jobs remain:
-            #
-            # (a) Honor the supported per-user knobs from .env.local even
-            #     without direnv (`nix develop -c …` from a bare shell).
-            #     Single-line VAR=value entries only; already-exported
-            #     values win (direnv loads .env.local before the flake).
+            # salted store) lives in the kacheWrapped script — two
+            # shell-side jobs remain, plus the sqlx contract export
+            # (all three need the worktree root).
             rio_root="$(git rev-parse --show-toplevel)"
             # Single-channel sqlx contract: this is the one variable both
             # sqlx-macros-core (first in its own discovery chain) and
@@ -408,32 +436,56 @@ let
             # Per-invocation override (SQLX_OFFLINE_DIR=… cargo check)
             # still works for debugging after shell entry.
             export SQLX_OFFLINE_DIR="$rio_root/.sqlx"
-            for kache_knob in KACHE_DISABLED KACHE_MAX_SIZE KACHE_CACHE_DIR; do
-              if [ -z "''${!kache_knob+x}" ] && [ -f "$rio_root/.env.local" ]; then
-                kache_line="$(grep -E "^''${kache_knob}=" "$rio_root/.env.local" | tail -n1)" || true
-                if [ -n "$kache_line" ]; then export "$kache_line"; fi
+            # (a) Honor the supported per-user knobs from .env.local even
+            #     without direnv (`nix develop -c …` from a bare shell).
+            #     Already-exported values win (direnv loads .env.local
+            #     before the flake). Plain values only — direnv and
+            #     xtask's dotenvy parse quotes/escapes, a raw shell
+            #     export would not, so anything outside [A-Za-z0-9_/.+-]
+            #     is rejected with a warning rather than letting three
+            #     readers disagree. Skipped when the invoker's git
+            #     toplevel is not a rio-build checkout (`nix develop
+            #     /path/to/rio` from inside a foreign repo must not
+            #     import that repo's knobs).
+            if [ -f "$rio_root/nix/devshell.nix" ] && [ -f "$rio_root/.env.local" ]; then
+              for kache_knob in KACHE_DISABLED KACHE_MAX_SIZE RIO_KACHE_CACHE_DIR; do
+                if [ -z "''${!kache_knob+x}" ]; then
+                  kache_val="$(grep -E "^''${kache_knob}=" "$rio_root/.env.local" | tail -n1 | cut -d= -f2-)" || true
+                  if [ -n "$kache_val" ]; then
+                    case "$kache_val" in
+                      *[!A-Za-z0-9_/.+-]*)
+                        echo "devshell: ignoring $kache_knob from .env.local — plain unquoted values only (see .env.local.example)" >&2
+                        ;;
+                      *) export "$kache_knob=$kache_val" ;;
+                    esac
+                  fi
+                fi
+              done
+              if grep -q '^KACHE_CACHE_DIR=' "$rio_root/.env.local"; then
+                echo "devshell: KACHE_CACHE_DIR in .env.local is no longer honored (foreign kache configs must not repoint our store) — rename it to RIO_KACHE_CACHE_DIR" >&2
               fi
-            done
-            unset kache_knob kache_line
-            # (b) STABLE wrapper path — see the env-attr comment above.
-            #     direnv's flake-profile gc-root keeps the target alive;
-            #     after a `nix store gc` without direnv, re-enter the
-            #     shell to refresh the link.
-            rio_state="''${XDG_STATE_HOME:-$HOME/.local/state}/rio-build"
-            mkdir -p "$rio_state"
-            ln -sfT ${kacheWrapped}/bin/kache "$rio_state/rustc-wrapper"
-            export RUSTC_WRAPPER="$rio_state/rustc-wrapper"
-            # (c) Stamp this env-salt store epoch; prune sibling epochs
-            #     untouched for 14+ days. Every shell entry stamps its own
-            #     epoch, so only genuinely abandoned toolchain epochs
-            #     expire; a build racing a prune fails open to real
-            #     compiles. (GNU find -printf: Linux-only; harmless no-op
-            #     elsewhere.)
-            rio_kache_root="$HOME/.cache/rio-build/kache"
-            mkdir -p "$rio_kache_root/${kacheEnvSalt}"
-            touch "$rio_kache_root/${kacheEnvSalt}/.last-used"
-            find "$rio_kache_root" -mindepth 2 -maxdepth 2 -name .last-used \
-              -mtime +14 -printf '%h\n' 2>/dev/null | xargs -r rm -rf -- || true
+              unset kache_knob kache_val
+            fi
+            # (b) Default-store epoch hygiene: seed this salt's stamp
+            #     (the wrapper refreshes it on every compile — see job 4
+            #     in kacheWrapped) and prune sibling epochs whose stamp
+            #     is 14+ days old. A dir missing its stamp is stamped
+            #     now, never deleted, so a recreated epoch cannot become
+            #     invisible to this GC. Skipped under RIO_KACHE_CACHE_DIR
+            #     (that store is user-managed). NUL-delimited: the paths
+            #     live under $HOME, which may contain spaces. (GNU find
+            #     -printf: Linux-only; harmless no-op elsewhere.)
+            if [ -z "''${RIO_KACHE_CACHE_DIR:-}" ]; then
+              rio_kache_root="$HOME/.cache/rio-build/kache"
+              mkdir -p "$rio_kache_root/${kacheEnvSalt}"
+              touch "$rio_kache_root/${kacheEnvSalt}/.last-used"
+              for rio_epoch in "$rio_kache_root"/*/; do
+                [ -e "$rio_epoch.last-used" ] || touch "$rio_epoch.last-used" 2>/dev/null || true
+              done
+              find "$rio_kache_root" -mindepth 2 -maxdepth 2 -name .last-used \
+                -mtime +14 -printf '%h\0' 2>/dev/null | xargs -0 -r rm -rf -- || true
+              unset rio_epoch rio_kache_root
+            fi
             ${preCommitInstall}
           '';
         }

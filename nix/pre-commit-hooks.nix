@@ -66,6 +66,15 @@
           echo 'sqlx-prepare-check: not in the dev shell (PROTOC unset); skipping — CI enforces this gate' >&2
           exit 0
         fi
+        # A stale shell can outlive `nix store gc`: RUSTC_WRAPPER then
+        # points at a collected store path and every cargo spawn dies
+        # before kache's fail-open could run — which the || branch below
+        # would misread as a stale sqlx cache and block the commit with
+        # the wrong message. Skip with the real reason instead.
+        if [ -n "''${RUSTC_WRAPPER:-}" ] && [ ! -x "''${RUSTC_WRAPPER}" ]; then
+          echo 'sqlx-prepare-check: RUSTC_WRAPPER does not resolve (stale shell after nix store gc?); skipping — re-enter the dev shell. CI enforces this gate' >&2
+          exit 0
+        fi
         # Only check if any staged .rs file touches a query! macro.
         # Otherwise this is a no-op (e.g. pure-refactor commits
         # that don't change SQL).
