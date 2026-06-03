@@ -1118,7 +1118,7 @@ impl DaemonChannel {
     ///
     /// `base_timeout` is the caller's metadata-scale deadline; the effective
     /// deadline adds payload-proportional headroom for the batch's summed
-    /// NAR bytes (see [`upload_deadline`]), so a 256 MiB batch is never cut
+    /// NAR bytes (see `upload_deadline`), so a 256 MiB batch is never cut
     /// off by a bound calibrated for probe-sized ops.
     pub async fn add_multiple_to_store(
         &mut self,
@@ -1146,7 +1146,7 @@ impl DaemonChannel {
     ///
     /// `base_timeout` is the caller's deadline for the op's non-payload
     /// phases; the effective deadline adds payload-proportional headroom
-    /// for the entry's NAR length (see [`upload_deadline`]), so a multi-GB
+    /// for the entry's NAR length (see `upload_deadline`), so a multi-GB
     /// streamed NAR gets time to actually transfer.
     pub async fn add_to_store_nar(
         &mut self,

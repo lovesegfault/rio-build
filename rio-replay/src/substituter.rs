@@ -209,8 +209,8 @@ impl Substituter {
     /// `AccessDenied`) are errors — they must stay visible, never silently
     /// become "not present".
     ///
-    /// Bounded in time by [`NARINFO_TIMEOUT`] (dispatch + body, both arms)
-    /// and in size by [`MAX_NARINFO_BYTES`] (both arms).
+    /// Bounded in time by `NARINFO_TIMEOUT` (dispatch + body, both arms)
+    /// and in size by `MAX_NARINFO_BYTES` (both arms).
     pub async fn narinfo(&self, hash_part: &str) -> Result<Option<NarInfo>> {
         self.narinfo_at(hash_part, NARINFO_TIMEOUT).await
     }
