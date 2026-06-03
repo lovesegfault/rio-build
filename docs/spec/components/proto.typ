@@ -289,8 +289,8 @@ to the batcher's 100ms / 64-line buffering.
 
 === BuildLogBatch
 
-Log lines are *batched* for efficiency rather than sent per-line. The executor
-buffers up to 64 lines or 100ms (whichever comes first) and sends a batch. Use
+Log lines are *batched* for efficiency rather than sent per-line, on the
+cadence and caps defined by #rref("obs.log.batch-64-100ms+1"). Use
 `bytes` (not `string`) for log content since build output may contain non-UTF-8
 data.
 

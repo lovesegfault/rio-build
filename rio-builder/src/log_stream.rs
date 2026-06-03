@@ -1,8 +1,10 @@
 //! Build log streaming via gRPC.
 //!
 //! Buffers captured build-output lines and batches them into
-//! `BuildLogBatch` messages (64 lines or 100ms, whichever comes first).
-//! Batches are sent on the scheduler `BuildExecution` stream.
+//! `BuildLogBatch` messages (64 lines or 100ms, whichever comes first;
+//! a batch may additionally carry up to [`MARKER_HEADROOM`] out-of-band
+//! marker lines). Batches are sent on the scheduler `BuildExecution`
+//! stream.
 //!
 //! Also enforces per-build log limits. `total_bytes` is a hard cap:
 //! exceeding it returns [`AddLineResult::LimitExceeded`] and the caller
@@ -23,6 +25,30 @@ use tokio::sync::mpsc;
 
 /// Maximum lines per batch.
 const MAX_BATCH_LINES: usize = 64;
+
+/// Out-of-band marker headroom per emitted batch, on top of
+/// [`MAX_BATCH_LINES`]: one rate-suppression marker plus one relay-shed
+/// marker. An emitted batch holds at most `MAX_BATCH_LINES +
+/// MARKER_HEADROOM` lines (`obs.log.batch-64-100ms+1` sanctions the
+/// overshoot — markers are never deferred to a later batch, because
+/// deferral detaches the count from the batch whose assembly drained
+/// it, and never trigger an early flush).
+///
+/// Why the bound holds (enforced at [`LogBatcher::push_marker`], the
+/// sole marker-insertion chokepoint): `add_line` flushes at
+/// `MAX_BATCH_LINES`, so the buffer holds ≤ 63 lines at `add_line`
+/// entry; a window-reset marker brings it to ≤ 64, the incoming line
+/// to ≤ 65, which trips the flush; `flush` adds at most one shed
+/// marker on top (the tally is drained exactly once per assembled
+/// batch) → ≤ 66 lines emitted.
+const MARKER_HEADROOM: usize = 2;
+
+/// The rate-suppression marker line, shared by `add_line`'s
+/// window-reset and [`LogBatcher::finish`]'s terminal drain so the two
+/// sites cannot drift apart.
+fn rate_suppression_marker(dropped: u64, rate_lines_per_sec: u64) -> String {
+    format!("[rio: {dropped} lines suppressed by log_rate_limit ({rate_lines_per_sec} lines/s)]")
+}
 
 /// Maximum time to wait before flushing a partial batch.
 pub(crate) const BATCH_TIMEOUT: Duration = Duration::from_millis(100);
@@ -184,20 +210,19 @@ impl LogBatcher {
                 self.lines_this_window = 0;
                 if dropped > 0 {
                     metrics::counter!("rio_builder_log_lines_suppressed_total").increment(dropped);
-                    // Marker is pushed directly (not via add_line) so it
-                    // can't recurse and always lands ahead of `line`. It
-                    // counts toward `total_bytes` (it IS transmitted; may
-                    // overshoot the size limit by ~one marker) but NOT
-                    // toward `lines_this_window` — at any R≥1 the window
+                    // push_marker (the sole marker mechanic) lands the
+                    // marker ahead of `line`, never recurses through
+                    // add_line, counts it toward `total_bytes`, and —
+                    // when the buffer is empty — initializes
+                    // `batch_start`, so a marker opening a batch waits
+                    // out the full 100ms window instead of inheriting a
+                    // stale `batch_start` and tick-flushing immediately.
+                    // The marker does NOT count toward
+                    // `lines_this_window` — at any R≥1 the window
                     // delivers R real lines + ≤1 marker, and `rate=1`
                     // doesn't degenerate into a marker-only loop.
-                    let marker = format!(
-                        "[rio: {dropped} lines suppressed by log_rate_limit ({} lines/s)]",
-                        self.limits.rate_lines_per_sec
-                    )
-                    .into_bytes();
-                    self.total_bytes += marker.len() as u64;
-                    self.lines.push(marker);
+                    let marker = rate_suppression_marker(dropped, self.limits.rate_lines_per_sec);
+                    self.push_marker(marker);
                 }
             }
             if self.lines_this_window >= self.limits.rate_lines_per_sec {
@@ -311,13 +336,8 @@ impl LogBatcher {
         let dropped = std::mem::take(&mut self.lines_dropped_this_window);
         if dropped > 0 {
             metrics::counter!("rio_builder_log_lines_suppressed_total").increment(dropped);
-            let marker = format!(
-                "[rio: {dropped} lines suppressed by log_rate_limit ({} lines/s)]",
-                self.limits.rate_lines_per_sec
-            )
-            .into_bytes();
-            self.total_bytes += marker.len() as u64;
-            self.lines.push(marker);
+            let marker = rate_suppression_marker(dropped, self.limits.rate_lines_per_sec);
+            self.push_marker(marker);
         }
         // flush() drains the relay-shed tally (when attached), so the
         // terminal batch also carries the trailing shed marker that
@@ -343,15 +363,32 @@ impl LogBatcher {
         !self.lines.is_empty()
     }
 
-    /// Inject an out-of-band marker line (the relay shed marker).
+    /// Inject an out-of-band marker line. THE sole marker-insertion
+    /// chokepoint: the rate-suppression markers (`add_line`'s
+    /// window-reset, [`finish`](Self::finish)'s terminal drain) and the
+    /// relay-shed marker ([`flush`](Self::flush)) all land here —
+    /// private, so no path outside the batcher can grow a batch past
+    /// the cap or skip the mechanics below.
     ///
-    /// Mirrors the rate-suppression marker mechanics exactly: the line
-    /// is pushed directly — never through [`add_line`](Self::add_line),
-    /// so it cannot recurse and cannot itself be rate-dropped — counts
-    /// toward `total_bytes` (it IS transmitted; the same accepted
-    /// ~one-marker overshoot of the size limit applies), and consumes a
-    /// line number through the normal flush path.
-    pub fn push_marker(&mut self, text: String) {
+    /// Mechanics, uniform for every marker:
+    /// - pushed directly — never through [`add_line`](Self::add_line),
+    ///   so it cannot recurse and cannot itself be rate-dropped;
+    /// - counts toward `total_bytes` (it IS transmitted; the same
+    ///   accepted ~one-marker overshoot of the size limit applies) and
+    ///   consumes a line number through the normal flush path;
+    /// - initializes `batch_start` when it opens a batch, so a
+    ///   marker-opened batch waits out the full 100ms window instead of
+    ///   inheriting a stale `batch_start` and tick-flushing immediately;
+    /// - keeps the emitted batch within `MAX_BATCH_LINES +
+    ///   MARKER_HEADROOM` lines (see [`MARKER_HEADROOM`] for why the
+    ///   bound holds structurally; the debug assert pins it under
+    ///   test).
+    fn push_marker(&mut self, text: String) {
+        debug_assert!(
+            self.lines.len() < MAX_BATCH_LINES + MARKER_HEADROOM,
+            "marker would exceed the sanctioned batch headroom: {} lines buffered",
+            self.lines.len(),
+        );
         let marker = text.into_bytes();
         if self.lines.is_empty() {
             self.batch_start = Instant::now();
@@ -440,7 +477,7 @@ impl SheddingLogSender {
     }
 }
 
-// r[verify obs.log.batch-64-100ms]
+// r[verify obs.log.batch-64-100ms+1]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1031,6 +1068,119 @@ mod tests {
         assert!(b.has_pending());
         let batch = b.flush();
         assert_eq!(batch.lines.len(), 1);
+    }
+
+    /// merged_bug_026 worst case, sanctioned: a batch already at 63
+    /// real lines takes the window-reset rate marker (64), the incoming
+    /// real line (65, trips the flush), and the relay-shed marker (66)
+    /// — exactly `MAX_BATCH_LINES + MARKER_HEADROOM`, never more, with
+    /// 64 real lines. The `push_marker` debug assert runs live on every
+    /// insertion in this test.
+    // r[verify obs.log.batch-64-100ms+1]
+    #[test]
+    fn emitted_batch_caps_at_max_plus_marker_headroom() {
+        let (tx, _rx) = mpsc::channel(1);
+        let sender = SheddingLogSender::new(tx);
+        let mut b = mk(LogLimits {
+            rate_lines_per_sec: 63,
+            total_bytes: 0,
+        });
+        b.attach_relay_shed(&sender);
+
+        // Window 0: 63 accepted (quota exactly), 7 dropped.
+        for _ in 0..70 {
+            assert!(matches!(b.add_line(b"x".to_vec()), AddLineResult::Buffered));
+        }
+        assert_eq!(b.lines.len(), 63, "63 buffered, none flushed yet");
+        assert_eq!(b.lines_dropped_this_window, 7);
+
+        // One display message shed since the last flush.
+        assert_eq!(
+            sender.try_send_phase(BuildPhase {
+                derivation_path: "/rio/store/aaa-x.drv".into(),
+                phase: "buildPhase".into(),
+            }),
+            LogSendOutcome::Sent
+        );
+        assert_eq!(
+            sender.try_send_phase(BuildPhase {
+                derivation_path: "/rio/store/aaa-x.drv".into(),
+                phase: "buildPhase".into(),
+            }),
+            LogSendOutcome::Shed
+        );
+
+        // Force the window reset; the next real line stacks marker +
+        // line onto the 63-line buffer and trips the flush, which adds
+        // the shed marker.
+        b.window_start = Instant::now() - Duration::from_secs(2);
+        let batch = match b.add_line(b"final".to_vec()) {
+            AddLineResult::BatchReady(batch) => batch,
+            other => panic!("65 buffered lines must trip the flush, got {other:?}"),
+        };
+
+        assert_eq!(
+            batch.lines.len(),
+            MAX_BATCH_LINES + MARKER_HEADROOM,
+            "the sanctioned worst case is exactly 64 real + 2 markers"
+        );
+        let markers: Vec<_> = batch
+            .lines
+            .iter()
+            .filter(|l| l.starts_with(b"[rio:"))
+            .collect();
+        assert_eq!(markers.len(), MARKER_HEADROOM);
+        assert_eq!(
+            batch.lines.len() - markers.len(),
+            MAX_BATCH_LINES,
+            "real lines never exceed the cap — only markers ride above it"
+        );
+        assert!(
+            std::str::from_utf8(markers[0])
+                .unwrap()
+                .contains("7 lines suppressed"),
+        );
+        assert!(
+            std::str::from_utf8(markers[1])
+                .unwrap()
+                .contains("1 log messages shed"),
+        );
+        // All 66 lines consumed line numbers through the normal path.
+        b.add_line(b"next".to_vec());
+        assert_eq!(b.flush().first_line_number, 66);
+    }
+
+    /// merged_bug_026 secondary heal: the window-reset rate marker now
+    /// goes through `push_marker`, which initializes `batch_start` when
+    /// the marker opens the batch. Pre-fix the raw push left
+    /// `batch_start` stale from the previous batch, so the next 100ms
+    /// tick flushed the marker-opened batch immediately instead of
+    /// waiting out the window.
+    // r[verify obs.log.batch-64-100ms+1]
+    #[test]
+    fn window_reset_marker_initializes_batch_start() {
+        let mut b = mk(LogLimits {
+            rate_lines_per_sec: 2,
+            total_bytes: 0,
+        });
+        // 2 accepted + 2 dropped, then the accepted lines tick-flush:
+        // empty buffer, drops pending.
+        for _ in 0..4 {
+            b.add_line(b"x".to_vec());
+        }
+        assert_eq!(b.flush().lines.len(), 2);
+        assert!(!b.has_pending());
+
+        // Stale batch_start (from the flushed batch) + due window reset.
+        b.batch_start = Instant::now() - Duration::from_secs(5);
+        b.window_start = Instant::now() - Duration::from_secs(2);
+        b.add_line(b"z".to_vec());
+        assert!(b.has_pending(), "marker + line buffered");
+        assert!(
+            b.maybe_flush().is_none(),
+            "the marker-opened batch must wait out its own 100ms window — \
+             a stale batch_start here means the marker bypassed push_marker"
+        );
     }
 
     /// Display sends shed on a full sink (counted, metric'd) and report

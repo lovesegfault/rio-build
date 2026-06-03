@@ -266,10 +266,17 @@ holds at the log level too.
 
 == Log Lifecycle
 
-#r("obs.log.batch-64-100ms")[
+#r("obs.log.batch-64-100ms+1")[
   Log lines are batched (up to 64 lines or 100ms, whichever first) in
-  `BuildLogBatch` messages.
+  `BuildLogBatch` messages. A batch MAY additionally carry up to two
+  out-of-band marker lines (one rate-suppression marker, one relay-shed
+  marker) beyond the 64-line cap; markers MUST NOT be deferred to a
+  later batch and MUST NOT trigger an early flush.
 ]
+
+Markers ride the batch whose assembly drained their count --- deferral
+would detach the count from its batch, and an early flush would let
+marker traffic change the delivery cadence the cap exists to bound.
 
 #r("obs.log.ring-byte-cap")[
   The scheduler-side per-derivation ring buffer is bounded by both line count
@@ -294,7 +301,7 @@ holds at the log level too.
     _seq(
       "Executor",
       "Scheduler",
-      comment: [`BuildLogBatch` (batched, ≤64 lines or 100ms)],
+      comment: [`BuildLogBatch` (batched, 64-line/100ms cadence)],
     )
     _note(
       "over",
@@ -309,8 +316,8 @@ holds at the log level too.
 )
 
 + Executors stream log lines to the scheduler via `BuildLogBatch` messages in
-  the `BuildExecution` stream. Lines are batched (up to 64 lines or 100ms,
-  whichever comes first) for efficiency.
+  the `BuildExecution` stream. Lines are batched per
+  #rref("obs.log.batch-64-100ms+1") for efficiency.
 + The scheduler buffers logs in an in-memory ring buffer per active
   derivation.
 + On derivation completion, the scheduler asynchronously flushes the buffer
