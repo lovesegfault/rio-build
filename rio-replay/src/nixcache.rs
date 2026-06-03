@@ -386,9 +386,11 @@ impl NixCacheClient {
     }
 
     /// Fetch a narinfo as raw text. 404 ⇒ `Ok(None)` (path not upstream);
-    /// any other non-200 is an error carrying a body snippet. The campaign
-    /// engine's upstream-coverage probe uses this form so it can decide how
-    /// to record a body that fails to parse. The body read is capped at
+    /// any other non-200 is an error naming the HTTP status — with a body
+    /// snippet when the error body fits the cap, without one when the cap
+    /// (or a transport error) stops the read first. The campaign engine's
+    /// upstream-coverage probe uses this form so it can decide how to
+    /// record a body that fails to parse. The body read is capped at
     /// `substituter::MAX_NARINFO_BYTES` (private to that module) — the
     /// same cap both probe arms enforce — so an operator cache serving an
     /// oversized object under a narinfo name errors loudly instead of
@@ -407,6 +409,17 @@ impl NixCacheClient {
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
+        // On a non-success status the loop below is reading an ERROR
+        // body, not a narinfo, so both failure arms inside it must carry
+        // the status: without it a 403/503 block page tripping the cap
+        // is misreported as an oversized narinfo, and a transport error
+        // mid-error-body loses the status entirely (the status-bearing
+        // bail at the bottom is unreachable in both cases).
+        let status_note = if status.is_success() {
+            String::new()
+        } else {
+            format!(" (HTTP {status})")
+        };
         // Accumulate chunks under the shared cap regardless of status so
         // neither the success body nor an error snippet can over-buffer.
         let mut bytes: Vec<u8> = Vec::new();
@@ -415,13 +428,20 @@ impl NixCacheClient {
         while let Some(chunk) = resp
             .chunk()
             .await
-            .with_context(|| format!("read body from {url}"))?
+            .with_context(|| format!("read body from {url}{status_note}"))?
         {
-            anyhow::ensure!(
-                (bytes.len() + chunk.len()) as u64 <= MAX_NARINFO_BYTES,
-                "{url}: narinfo body exceeds the {MAX_NARINFO_BYTES}-byte cap — narinfos are \
-                 ~1 KB; refusing to buffer a body this large",
-            );
+            if (bytes.len() + chunk.len()) as u64 > MAX_NARINFO_BYTES {
+                if status.is_success() {
+                    anyhow::bail!(
+                        "{url}: narinfo body exceeds the {MAX_NARINFO_BYTES}-byte cap — narinfos \
+                         are ~1 KB; refusing to buffer a body this large",
+                    );
+                }
+                anyhow::bail!(
+                    "GET {url}: HTTP {status}: error body exceeds the {MAX_NARINFO_BYTES}-byte \
+                     cap; refusing to buffer more of it",
+                );
+            }
             bytes.extend_from_slice(&chunk);
         }
         if status.is_success() {
@@ -1178,6 +1198,63 @@ NarSize: 4242
                     "cache backend exploded",
                 )
                     .into_response()
+            } else if file == "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk.narinfo" {
+                // A 403 whose error body (a WAF/block page) exceeds the
+                // narinfo cap — the read must surface the status, not
+                // misdiagnose the page as an oversized narinfo.
+                (
+                    axum::http::StatusCode::FORBIDDEN,
+                    vec![b'x'; (crate::substituter::MAX_NARINFO_BYTES + 1) as usize],
+                )
+                    .into_response()
+            } else if file == "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr.narinfo" {
+                // A 403 whose error body dies mid-read: the status and a
+                // first chunk go out, then the stream errors, so the
+                // client's body read fails AFTER it has seen the 403.
+                use futures_util::StreamExt as _;
+                let stream = futures_util::stream::iter(vec![
+                    Ok(axum::body::Bytes::from_static(b"access denied by policy ")),
+                    Err(std::io::Error::other("backend reset mid-body")),
+                ])
+                .then(|item| async move {
+                    if item.is_err() {
+                        // Let the first chunk (and with it the response
+                        // head) flush before the connection dies, so the
+                        // client reliably observes the status first.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    item
+                });
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::FORBIDDEN)
+                    .body(axum::body::Body::from_stream(stream))
+                    .unwrap()
+            } else if file == "ssssssssssssssssssssssssssssssss.narinfo" {
+                // A 200 serving an oversized object under a narinfo name —
+                // the cap diagnosis is the right one here.
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/x-nix-narinfo")],
+                    vec![b'x'; (crate::substituter::MAX_NARINFO_BYTES + 1) as usize],
+                )
+                    .into_response()
+            } else if file == "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww.narinfo" {
+                // A 200 whose body dies mid-read — the read error must NOT
+                // grow a status note (there is no failure status to name).
+                use futures_util::StreamExt as _;
+                let stream = futures_util::stream::iter(vec![
+                    Ok(axum::body::Bytes::from_static(b"StorePath: /nix/store/")),
+                    Err(std::io::Error::other("backend reset mid-body")),
+                ])
+                .then(|item| async move {
+                    if item.is_err() {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    item
+                });
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .body(axum::body::Body::from_stream(stream))
+                    .unwrap()
             } else {
                 (axum::http::StatusCode::NOT_FOUND, "404").into_response()
             }
@@ -1226,6 +1303,90 @@ NarSize: 4242
             "got: {msg}"
         );
         assert!(msg.contains("cache backend exploded"), "got: {msg}");
+    }
+
+    /// An oversized NON-success body is an HTTP failure first and a cap
+    /// trip second: the refusal must lead with the status instead of
+    /// misdiagnosing a 403 block page as an oversized narinfo (the
+    /// "narinfos are ~1 KB" wording is reserved for 2xx bodies, where
+    /// the object really did claim to be a narinfo).
+    #[tokio::test]
+    async fn oversized_error_body_reports_the_status_not_a_narinfo_cap_trip() {
+        let (base, _srv) = spawn_fake_cache().await;
+        let c = client(&base);
+        let err = c
+            .fetch_narinfo_text("/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-blocked-1.0")
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("403"), "the HTTP status is named: {msg}");
+        assert!(
+            !msg.contains("narinfos are"),
+            "a non-2xx body must not be misdiagnosed as an oversized narinfo: {msg}"
+        );
+        assert!(
+            msg.contains("exceeds the"),
+            "the cap that stopped the read is still disclosed: {msg}"
+        );
+    }
+
+    /// A transport error while draining a non-success body must keep the
+    /// status in the error chain — the read error alone ("read body
+    /// from …") would hide that the response was already a failure.
+    #[tokio::test]
+    async fn mid_body_read_error_keeps_the_http_status() {
+        let (base, _srv) = spawn_fake_cache().await;
+        let c = client(&base);
+        let err = c
+            .fetch_narinfo_text("/nix/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-reset-1.0")
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("403"), "the HTTP status is named: {msg}");
+        assert!(
+            msg.contains("read body from"),
+            "the failing phase (body read) is still named: {msg}"
+        );
+    }
+
+    /// The other half of the status axis at the read-error arm: a 2xx
+    /// body dying mid-read names the phase but grows no status note —
+    /// there is no failure status to thread, and "(HTTP 200 OK)" inside
+    /// an error would only mislead.
+    #[tokio::test]
+    async fn mid_body_read_error_on_success_carries_no_status_note() {
+        let (base, _srv) = spawn_fake_cache().await;
+        let c = client(&base);
+        let err = c
+            .fetch_narinfo_text("/nix/store/wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww-cut-1.0")
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("read body from"),
+            "the failing phase is named: {msg}"
+        );
+        assert!(
+            !msg.contains("(HTTP"),
+            "no status note on a success response: {msg}"
+        );
+    }
+
+    /// The sibling direction: on a 2xx response the cap trip really is
+    /// about an oversized narinfo, and the message keeps saying so.
+    #[tokio::test]
+    async fn oversized_success_body_keeps_the_narinfo_cap_diagnosis() {
+        let (base, _srv) = spawn_fake_cache().await;
+        let c = client(&base);
+        let err = c
+            .fetch_narinfo_text("/nix/store/ssssssssssssssssssssssssssssssss-huge-1.0")
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("narinfo body exceeds the") && msg.contains("narinfos are"),
+            "the 2xx cap trip names the narinfo cap: {msg}"
+        );
     }
 
     #[tokio::test]
