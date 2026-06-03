@@ -86,7 +86,7 @@ pub enum AddLineResult {
     /// way the caller continues). Batch not yet full.
     Buffered,
     /// Line completed a batch. Caller must send it.
-    BatchReady(BuildLogBatch),
+    BatchReady(AssembledBatch),
     /// `total_bytes` limit tripped. Caller must abort the build with
     /// `BuildStatus::LogLimitExceeded` and the given reason in `error_msg`.
     ///
@@ -127,8 +127,10 @@ pub struct LogBatcher {
     /// display messages shed since the last delivery — the
     /// `builder.relay.log-shed` "next delivered batch MUST carry a
     /// single suppression marker" clause holds at every call site by
-    /// construction instead of by per-caller discipline. `None` only
-    /// for batchers tested in isolation.
+    /// construction instead of by per-caller discipline. The drain is
+    /// provisional: it travels as the [`AssembledBatch`] shed lease and
+    /// is restored by the sender if the carrier batch itself fails to
+    /// deliver. `None` only for batchers tested in isolation.
     relay_shed: Option<Arc<AtomicU64>>,
 }
 
@@ -268,7 +270,7 @@ impl LogBatcher {
     }
 
     /// Check if the batch timeout has elapsed and flush if so.
-    pub fn maybe_flush(&mut self) -> Option<BuildLogBatch> {
+    pub fn maybe_flush(&mut self) -> Option<AssembledBatch> {
         if !self.lines.is_empty() && self.batch_start.elapsed() >= BATCH_TIMEOUT {
             Some(self.flush())
         } else {
@@ -286,6 +288,14 @@ impl LogBatcher {
     /// phase-boundary flush, and [`finish`](Self::finish) — instead of
     /// depending on each delivery site remembering to inject it.
     ///
+    /// The drain is a destructive read of shared evidence UPSTREAM of
+    /// the authoritative event the spec's marker clause names (the next
+    /// **delivered** batch), so the drained count travels WITH the
+    /// batch as [`AssembledBatch::shed_lease`] and is settled by
+    /// [`SheddingLogSender::try_send_batch`]: sink-accepted → consumed;
+    /// shed/closed → restored to the tally so the count rides the next
+    /// delivered batch's marker instead of dying with its carrier.
+    ///
     /// Does NOT drain `lines_dropped_this_window` — drops belong to the
     /// rate window, not the batch. Draining here would let the 100ms
     /// `flush_tick` emit a fragmentary marker mid-window whenever some
@@ -295,14 +305,15 @@ impl LogBatcher {
     /// `add_line`'s window-reset and [`finish`](Self::finish) drain
     /// drops.
     // r[impl builder.relay.log-shed]
-    pub fn flush(&mut self) -> BuildLogBatch {
-        if let Some(shed) = &self.relay_shed {
-            let shed = shed.swap(0, Ordering::Relaxed);
-            if shed > 0 {
-                self.push_marker(format!(
-                    "[rio: {shed} log messages shed (scheduler link backpressure)]"
-                ));
-            }
+    pub fn flush(&mut self) -> AssembledBatch {
+        let shed_lease = match &self.relay_shed {
+            Some(shed) => shed.swap(0, Ordering::Relaxed),
+            None => 0,
+        };
+        if shed_lease > 0 {
+            self.push_marker(format!(
+                "[rio: {shed_lease} log messages shed (scheduler link backpressure)]"
+            ));
         }
 
         let first_line_number = self.next_line_number;
@@ -310,11 +321,14 @@ impl LogBatcher {
 
         let lines = std::mem::take(&mut self.lines);
 
-        BuildLogBatch {
-            derivation_path: self.drv_path.clone(),
-            lines,
-            first_line_number,
-            executor_id: self.executor_id.clone(),
+        AssembledBatch {
+            batch: BuildLogBatch {
+                derivation_path: self.drv_path.clone(),
+                lines,
+                first_line_number,
+                executor_id: self.executor_id.clone(),
+            },
+            shed_lease,
         }
     }
 
@@ -332,7 +346,7 @@ impl LogBatcher {
     /// terminal drain gated on buffered lines loses them exactly when
     /// the buffer happens to be empty.
     // r[impl builder.log-limit+3]
-    pub fn finish(mut self) -> (Option<BuildLogBatch>, u64) {
+    pub fn finish(mut self) -> (Option<AssembledBatch>, u64) {
         let dropped = std::mem::take(&mut self.lines_dropped_this_window);
         if dropped > 0 {
             metrics::counter!("rio_builder_log_lines_suppressed_total").increment(dropped);
@@ -345,6 +359,10 @@ impl LogBatcher {
         let batch = self.flush();
         let count = self.next_line_number;
         if batch.lines.is_empty() {
+            // An empty batch cannot carry a lease: a nonzero drain
+            // pushes a marker line, making the batch nonempty — so
+            // dropping it here loses nothing.
+            debug_assert_eq!(batch.shed_lease, 0);
             (None, count)
         } else {
             (Some(batch), count)
@@ -398,6 +416,55 @@ impl LogBatcher {
     }
 }
 
+/// A batch as assembled by [`LogBatcher::flush`], carrying the
+/// relay-shed count its assembly drained from the shared tally — the
+/// **shed lease**.
+///
+/// `flush` performs a destructive read (`swap(0)`) of the tally and
+/// bakes the count into a marker line, but whether that batch is ever
+/// *delivered* is decided later, by
+/// [`SheddingLogSender::try_send_batch`]. The lease keeps the
+/// subtraction provisional until that settlement: sink-accepted →
+/// consumed (the marker is the count's carrier of record); shed or
+/// closed → restored to the tally via `fetch_add`, so the count rides
+/// the next delivered batch's marker instead of vanishing with its
+/// carrier (round-16 bug_065).
+///
+/// Constructible only by `flush` (private fields): a raw
+/// [`BuildLogBatch`] cannot reach [`SheddingLogSender::try_send_batch`]
+/// at all, so no assembly path can opt out of settlement. Banners —
+/// batches built outside the batcher, with no drained count — go
+/// through the lease-free [`SheddingLogSender::try_send_banner`].
+/// Read access is via `Deref`; there is deliberately no way to take
+/// the inner batch out without settling.
+///
+/// The lease must be settled against the sender whose tally it was
+/// drained from ([`LogBatcher::attach_relay_shed`] shares exactly that
+/// `Arc`, and clones share one tally — in the executor there is one
+/// tally per build's display stream).
+#[must_use = "an unsent AssembledBatch strands its shed lease — settle it via try_send_batch"]
+#[derive(Debug)]
+pub struct AssembledBatch {
+    batch: BuildLogBatch,
+    shed_lease: u64,
+}
+
+impl AssembledBatch {
+    /// The drained relay-shed count this batch's marker carries.
+    #[cfg(test)]
+    pub(crate) fn shed_lease(&self) -> u64 {
+        self.shed_lease
+    }
+}
+
+impl std::ops::Deref for AssembledBatch {
+    type Target = BuildLogBatch;
+
+    fn deref(&self) -> &BuildLogBatch {
+        &self.batch
+    }
+}
+
 /// Outcome of a [`SheddingLogSender`] submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogSendOutcome {
@@ -420,8 +487,10 @@ pub enum LogSendOutcome {
 /// `try_send`: a full sink (scheduler-link backpressure filling the
 /// permanent 256-slot buffer) sheds the message, counts it in
 /// `rio_builder_log_messages_shed_total`, and the next delivered batch
-/// carries one suppression marker line — so a degraded scheduler link
-/// degrades the log stream, never the build or its enforcement.
+/// carries one suppression marker line — guaranteed across carrier
+/// death by the [`AssembledBatch`] shed lease, settled in
+/// [`try_send_batch`](Self::try_send_batch) — so a degraded scheduler
+/// link degrades the log stream, never the build or its enforcement.
 ///
 /// Clones share one shed tally: the banner senders and the log loop
 /// report through the same counter, and the loop's marker covers both.
@@ -440,13 +509,48 @@ impl SheddingLogSender {
         }
     }
 
-    pub fn try_send_batch(&self, batch: BuildLogBatch) -> LogSendOutcome {
-        self.try_send(
+    /// Submit an assembled batch and SETTLE its shed lease at the
+    /// authoritative event — the delivery decision (`r[builder.relay.log-shed]`
+    /// says the marker rides the next **delivered** batch; assembly is
+    /// not delivery):
+    ///
+    /// - `Sent`: the sink accepted the carrier; the lease is consumed —
+    ///   the marker line is now the count's carrier of record.
+    /// - `Shed`: the carrier died between the tally read and
+    ///   settlement; the lease is restored to the tally (plus the usual
+    ///   `+1` for the carrier itself), so the next delivered batch's
+    ///   marker reports the full count. No metric increment for the
+    ///   restore — those messages were already counted in
+    ///   `rio_builder_log_messages_shed_total` when they originally
+    ///   shed; the tally only feeds marker display.
+    /// - `Closed`: worker shutdown; the lease is restored for
+    ///   accounting honesty (`Closed` is not a shed: no `+1`, no
+    ///   metric). If the loop exits before another delivery, the
+    ///   restored count is bounded display loss — the metric retains
+    ///   the truth.
+    pub fn try_send_batch(&self, batch: AssembledBatch) -> LogSendOutcome {
+        let AssembledBatch { batch, shed_lease } = batch;
+        let outcome = self.try_send(
             ExecutorMessage {
                 msg: Some(executor_message::Msg::LogBatch(batch)),
             },
             "log_batch",
-        )
+        );
+        if outcome != LogSendOutcome::Sent && shed_lease > 0 {
+            self.shed.fetch_add(shed_lease, Ordering::Relaxed);
+        }
+        outcome
+    }
+
+    /// Submit a banner batch — built outside the [`LogBatcher`], so it
+    /// carries no shed lease. The ONLY way a non-`flush` batch reaches
+    /// the sink; routing a flushed batch through here is impossible
+    /// (its lease is locked inside [`AssembledBatch`]).
+    pub fn try_send_banner(&self, batch: BuildLogBatch) -> LogSendOutcome {
+        self.try_send_batch(AssembledBatch {
+            batch,
+            shed_lease: 0,
+        })
     }
 
     pub fn try_send_phase(&self, phase: BuildPhase) -> LogSendOutcome {
@@ -458,8 +562,12 @@ impl SheddingLogSender {
         )
     }
 
-    /// Drain the shed tally (for suppression-marker injection).
-    pub fn take_shed(&self) -> u64 {
+    /// Drain the shed tally. Test-only: in production the tally is
+    /// drained exclusively by [`LogBatcher::flush`] into an
+    /// [`AssembledBatch`] lease — a second destructive reader would
+    /// race counts away from the marker path.
+    #[cfg(test)]
+    pub(crate) fn take_shed(&self) -> u64 {
         self.shed.swap(0, Ordering::Relaxed)
     }
 
@@ -1198,8 +1306,8 @@ mod tests {
             first_line_number: 0,
             lines: vec![b"l".to_vec()],
         };
-        assert_eq!(sender.try_send_batch(batch()), LogSendOutcome::Sent);
-        assert_eq!(sender.try_send_batch(batch()), LogSendOutcome::Shed);
+        assert_eq!(sender.try_send_banner(batch()), LogSendOutcome::Sent);
+        assert_eq!(sender.try_send_banner(batch()), LogSendOutcome::Shed);
         assert_eq!(
             sender.try_send_phase(BuildPhase {
                 derivation_path: "/rio/store/aaa-x.drv".into(),
@@ -1220,8 +1328,160 @@ mod tests {
 
         // Closed sink: the loop-exit signal, not a shed.
         rx.close();
-        assert_eq!(sender.try_send_batch(batch()), LogSendOutcome::Closed);
+        assert_eq!(sender.try_send_banner(batch()), LogSendOutcome::Closed);
         assert_eq!(sender.take_shed(), 0, "Closed is not tallied as shed");
+    }
+
+    /// THE bug_065 carrier-kill pin (fix-discipline R2 AUTHORITATIVE
+    /// EVENT: a chokepoint performing a destructive read of shared
+    /// evidence upstream of settlement MUST carry a typed restore path
+    /// proven by a test that kills the carrier between read and
+    /// settlement — this is that test). `flush()` swaps the tally (the
+    /// destructive read) and bakes the count into the carrier batch;
+    /// the carrier is then killed (shed on the full sink) BEFORE the
+    /// delivery decision; the lease must flow back so the next
+    /// DELIVERED marker reports every shed message. Pre-fix the count
+    /// died with the carrier: the tenant saw "1 message shed" when ≥6
+    /// were.
+    // r[verify builder.relay.log-shed]
+    #[test]
+    fn shed_lease_restored_when_carrier_killed_between_read_and_settlement() {
+        let rec = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let sender = SheddingLogSender::new(tx);
+        let mut b = mk(LogLimits::UNLIMITED);
+        b.attach_relay_shed(&sender);
+
+        let phase = || BuildPhase {
+            derivation_path: "/rio/store/aaa-x.drv".into(),
+            phase: "buildPhase".into(),
+        };
+        // Occupy the only sink slot, then shed 5 display messages.
+        assert_eq!(sender.try_send_phase(phase()), LogSendOutcome::Sent);
+        for _ in 0..5 {
+            assert_eq!(sender.try_send_phase(phase()), LogSendOutcome::Shed);
+        }
+
+        // The destructive read: assembly drains the tally into the
+        // carrier's marker + lease.
+        b.add_line(b"real".to_vec());
+        let carrier = b.flush();
+        assert_eq!(carrier.shed_lease(), 5);
+        assert!(
+            std::str::from_utf8(&carrier.lines[1])
+                .unwrap()
+                .contains("5 log messages shed"),
+        );
+
+        // Kill the carrier between read and settlement: the sink is
+        // still full, so the batch itself sheds.
+        assert_eq!(sender.try_send_batch(carrier), LogSendOutcome::Shed);
+        // The restore did NOT re-increment the metric — only the
+        // carrier's own shed did (the 5 were counted when they
+        // originally shed).
+        assert_eq!(
+            rec.get("rio_builder_log_messages_shed_total{kind=log_batch}"),
+            1
+        );
+        assert_eq!(
+            rec.get("rio_builder_log_messages_shed_total{kind=phase}"),
+            5
+        );
+
+        // Sink drains; the next delivered batch's marker carries the
+        // FULL count: 5 restored + 1 for the dead carrier. Conservation:
+        // every shed message is reported by exactly one delivered
+        // marker.
+        let _ = rx.try_recv().expect("slot frees");
+        b.add_line(b"after".to_vec());
+        let next = b.flush();
+        assert_eq!(next.shed_lease(), 6, "5 restored + 1 carrier");
+        assert!(
+            std::str::from_utf8(&next.lines[1])
+                .unwrap()
+                .contains("6 log messages shed"),
+        );
+        assert_eq!(sender.try_send_batch(next), LogSendOutcome::Sent);
+        assert_eq!(
+            sender.take_shed(),
+            0,
+            "settled: nothing strands in the tally"
+        );
+    }
+
+    /// Settlement consumes the lease on `Sent`: once the carrier is
+    /// sink-accepted, the tally stays drained — no double-count on the
+    /// following batch.
+    // r[verify builder.relay.log-shed]
+    #[test]
+    fn shed_lease_consumed_on_sent() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sender = SheddingLogSender::new(tx);
+        let mut b = mk(LogLimits::UNLIMITED);
+        b.attach_relay_shed(&sender);
+
+        let phase = || BuildPhase {
+            derivation_path: "/rio/store/aaa-x.drv".into(),
+            phase: "buildPhase".into(),
+        };
+        assert_eq!(sender.try_send_phase(phase()), LogSendOutcome::Sent);
+        for _ in 0..3 {
+            assert_eq!(sender.try_send_phase(phase()), LogSendOutcome::Shed);
+        }
+        let _ = rx.try_recv().expect("slot frees");
+
+        b.add_line(b"real".to_vec());
+        let carrier = b.flush();
+        assert_eq!(carrier.shed_lease(), 3);
+        assert_eq!(sender.try_send_batch(carrier), LogSendOutcome::Sent);
+        assert_eq!(sender.take_shed(), 0, "lease consumed at delivery");
+        // The following batch carries no marker.
+        b.add_line(b"next".to_vec());
+        assert_eq!(b.flush().lines.len(), 1);
+    }
+
+    /// `Closed` settlement: the lease is restored (accounting honesty —
+    /// the count was never delivered) but `Closed` is NOT a shed: no
+    /// `+1` for the carrier, no metric increment. Bounded display loss
+    /// at worker shutdown; the metric retains the truth.
+    // r[verify builder.relay.log-shed]
+    #[test]
+    fn shed_lease_restored_on_closed_without_shed_count() {
+        let rec = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let sender = SheddingLogSender::new(tx);
+        let mut b = mk(LogLimits::UNLIMITED);
+        b.attach_relay_shed(&sender);
+
+        let phase = || BuildPhase {
+            derivation_path: "/rio/store/aaa-x.drv".into(),
+            phase: "buildPhase".into(),
+        };
+        assert_eq!(sender.try_send_phase(phase()), LogSendOutcome::Sent);
+        for _ in 0..2 {
+            assert_eq!(sender.try_send_phase(phase()), LogSendOutcome::Shed);
+        }
+
+        b.add_line(b"real".to_vec());
+        let carrier = b.flush();
+        assert_eq!(carrier.shed_lease(), 2);
+
+        rx.close();
+        assert_eq!(sender.try_send_batch(carrier), LogSendOutcome::Closed);
+        assert_eq!(
+            sender.take_shed(),
+            2,
+            "lease restored verbatim — Closed adds no carrier count"
+        );
+        assert_eq!(
+            rec.get("rio_builder_log_messages_shed_total{kind=log_batch}"),
+            0,
+            "Closed is not a shed"
+        );
     }
 
     /// The guaranteed path is the raw sink sender: a CompletionReport
@@ -1236,7 +1496,7 @@ mod tests {
         // Fill the sink with a display message.
         let shedder = SheddingLogSender::new(tx.clone());
         assert_eq!(
-            shedder.try_send_batch(BuildLogBatch {
+            shedder.try_send_banner(BuildLogBatch {
                 derivation_path: "/rio/store/aaa-x.drv".into(),
                 executor_id: "w0".into(),
                 first_line_number: 0,

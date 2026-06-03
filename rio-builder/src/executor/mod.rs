@@ -1607,10 +1607,13 @@ struct LogLoopResult {
 /// Marker injection is NOT this function's job: the relay-shed
 /// suppression marker is drained and injected inside
 /// [`LogBatcher::flush`], so every assembled batch already carries it —
-/// no delivery site can forget.
+/// no delivery site can forget. Settlement isn't either: the batch's
+/// shed lease is consumed/restored inside `try_send_batch` at the
+/// delivery decision, so a shed carrier's count automatically rides
+/// the next delivered batch's marker.
 fn deliver_batch(
     log_tx: &crate::log_stream::SheddingLogSender,
-    batch: rio_proto::types::BuildLogBatch,
+    batch: crate::log_stream::AssembledBatch,
 ) -> bool {
     !matches!(
         log_tx.try_send_batch(batch),
@@ -1724,9 +1727,12 @@ async fn native_log_loop(
     // drains the final suppression window AND the relay-shed tally —
     // markers are emitted even when the line buffer is empty (the gap
     // the old `has_pending()` gate fell through). Delivery of the
-    // terminal batch is still best-effort: a shed here leaves a bounded
-    // display gap, and the scheduler ring buffer accepts forward
-    // line-number gaps.
+    // terminal batch is still best-effort: a shed here restores the
+    // batch's shed lease to the tally, but the loop is exiting and no
+    // later batch will deliver it — bounded display loss at the very
+    // end of a build, with the truth retained by
+    // rio_builder_log_messages_shed_total; the scheduler ring buffer
+    // accepts forward line-number gaps.
     let (final_batch, final_line_count) = batcher.finish();
     if let Some(batch) = final_batch {
         let _ = log_tx.try_send_batch(batch);
@@ -2112,7 +2118,7 @@ pub(crate) fn send_banner_batch(
         first_line_number,
         lines,
     };
-    if log_tx.try_send_batch(batch) == crate::log_stream::LogSendOutcome::Closed {
+    if log_tx.try_send_banner(batch) == crate::log_stream::LogSendOutcome::Closed {
         tracing::debug!(
             drv_path = %drv_path,
             "banner batch dropped: log channel closed (worker shutting down)"

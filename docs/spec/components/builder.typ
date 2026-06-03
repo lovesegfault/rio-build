@@ -1747,7 +1747,8 @@ is stable (post Phase 3).
 ]
 
 The type is the boundary: `SheddingLogSender` exposes only
-`try_send_batch`/`try_send_phase`, so routing a control message through the
+`try_send_batch`/`try_send_phase` (plus the lease-free `try_send_banner` for
+batches built outside the batcher), so routing a control message through the
 best-effort path is a compile error, not a review catch. Every display
 construction site goes through it --- the log loop's five sends and
 `send_banner_batch` with both its callers (the executor header, the runtime
@@ -1758,13 +1759,19 @@ delivery. The marker clause holds by construction, not by delivery-site
 discipline: the shed tally is drained inside the batcher's `flush()`, so
 every assembled batch --- batch-full, tick, phase boundary, terminal
 `finish` --- carries the marker for everything shed since the last flush.
-The marker consumes a line number and counts toward the byte cap exactly
-like the rate-suppression marker, so persisted logs show a forward
-line-number gap over the shed span (the `obs.log.gap-span` shape the
+The drain is provisional until the rule's own quantifier --- the next
+*delivered* batch --- is decided: the drained count travels with the
+assembled batch as a shed lease and is settled by the sender at the sink
+boundary (accepted: consumed; shed or closed: restored to the tally), so a
+suppression marker whose carrier batch itself sheds re-emerges, with the
+dead carrier added, in the next delivered batch's marker instead of dying
+with its carrier. The marker consumes a line number and counts toward the
+byte cap exactly like the rate-suppression marker, so persisted logs show a
+forward line-number gap over the shed span (the `obs.log.gap-span` shape the
 scheduler ring buffer already accepts); marker *delivery* at the terminal
-boundary remains best-effort --- a shed terminal batch leaves a bounded
-display gap (#rref("builder.log-limit+3") guarantees its assembly, not its
-delivery).
+boundary remains best-effort --- a shed terminal batch restores its lease
+with no later batch to ride, a bounded display gap
+(#rref("builder.log-limit+3") guarantees its assembly, not its delivery).
 
 #r("builder.result.input-materialization-is-infra+5")[
   A build failure caused by an input path that was verified present in
