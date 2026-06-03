@@ -511,10 +511,21 @@ impl DefinitionEvidence {
 
     /// Decode a persisted rank. Unknown / corrupted values degrade to
     /// the [`Self::UnverifiedClaim`] floor with a warning instead of
-    /// failing recovery — rank is protection metadata, and the floor is
-    /// the conservative direction for a DISPLACER (a victim's floor is
-    /// re-raised by [`DerivationState::from_recovery_row`]'s
-    /// content-presence floor and the settled-row checks).
+    /// failing recovery.
+    ///
+    /// The floor is conservative ONLY for a DISPLACER (an incoming
+    /// claim decoded low cannot displace anything it should not). On
+    /// the settled-row VICTIM side it is the OPPOSITE of conservative:
+    /// flooring a victim's unrecognized rank to `UnverifiedClaim`
+    /// makes the row maximally displaceable, demoting exactly the
+    /// protection the persisted rank exists to provide (round-16
+    /// bug_073; weaponized by 9d83580f6's settled arbitration, which
+    /// consumes this decode on the victim axis). The
+    /// [`DerivationState::from_recovery_row`] content-presence floor
+    /// re-raises some victims, not all. Until the fail-closed decode
+    /// replaces this floor (the settled-identity work tracks it),
+    /// callers on a victim/protection axis must not treat this decode
+    /// as safe.
     pub(crate) fn parse_lossy(s: &str) -> Self {
         s.parse().unwrap_or_else(|_| {
             tracing::warn!(
