@@ -2191,9 +2191,12 @@ pub async fn run_with_backends(
             // Units whose cross-session truth disagreement the reader's
             // collapse resolves by informativeness rank: recorded next to
             // the exclusion counts so collapse-shaped truth travels with
-            // every report, not only engine logs.
-            record.comparability.truth_collapse_conflicts =
-                Some(archive.truth_collapse_conflicts());
+            // every report, not only engine logs. The reader withholds the
+            // count (None) when the archive does not claim
+            // expected_outcomes — no truth is collapse-resolved on a
+            // load/exercise campaign, so the field stays "not measured"
+            // instead of asserting a measurement that never ran.
+            record.comparability.truth_collapse_conflicts = archive.truth_collapse_conflicts();
             // Archive provenance: when the archive was recorded and how old
             // it was when this campaign started, both part of what makes two
             // reports comparable.

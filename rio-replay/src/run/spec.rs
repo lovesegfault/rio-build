@@ -894,8 +894,11 @@ pub struct ComparabilityBlock {
     /// by informativeness rank, discarding recorded information (see
     /// `ReplayArchive::truth_collapse_conflicts`). Part of comparability
     /// because the headline's truth for these units is a policy choice,
-    /// not a plain recording. `None` for campaign records written before
-    /// the field existed.
+    /// not a plain recording. `None` means NOT MEASURED: a campaign
+    /// record written before the field existed, or an archive without
+    /// the `expected_outcomes` capability — the reader withholds the
+    /// count there, since no truth is collapse-resolved when the
+    /// recorder vouched for no outcomes (every unit's truth is Unknown).
     pub truth_collapse_conflicts: Option<usize>,
     /// The supply stage's planned-but-missing prefetch percentage, recorded
     /// even when it stayed below the pause threshold (any nonzero shortfall

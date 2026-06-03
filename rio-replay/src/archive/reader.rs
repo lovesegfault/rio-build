@@ -386,8 +386,11 @@ impl ReplayArchive {
         ] {
             if member_present && !flag_set {
                 tracing::warn!(
-                    "archive carries {staged_what} but capability `{flag}` is not set; the \
-                     engine gates on the flag, so the staged data will not be used"
+                    "archive carries {staged_what} but capability `{flag}` is not set; every \
+                     consumer of the claim this flag vouches for gates on it, so the data is \
+                     withheld from those uses (a member shared by several claims — e.g. \
+                     outcomes.jsonl under `timed` — is still usable under the claims the \
+                     archive does make)"
                 );
             }
         }
@@ -715,25 +718,41 @@ impl ReplayArchive {
     /// comparability block so collapse-resolved truth is visible next to
     /// the headline it shapes, not only in engine logs.
     ///
+    /// Gated on the `expected_outcomes` capability INSIDE the owner, like
+    /// every other outcomes-as-truth consumer (`Capability::gates()`:
+    /// the flag claims "verdict comparison"): `None` when the claim is
+    /// withdrawn — the metric's documented meaning is "the units whose
+    /// one truth slot the cross-session collapse RESOLVED", and under a
+    /// withdrawn claim no truth is resolved at all (every unit's truth is
+    /// Unknown), so any count would assert a measurement that never
+    /// happened. Stamping `None` keeps the comparability field honest:
+    /// not measured, rather than a fabricated `Some` over staged records
+    /// the recorder declined to vouch for.
+    ///
     /// A unit whose scoped records disagree UNDER a session-less record
     /// does not count: the format gives the session-less form authority
     /// over every request of the unit, so that resolution is supersession
     /// by contract, not an information-losing pick.
-    pub fn truth_collapse_conflicts(&self) -> usize {
-        self.workload_units
-            .iter()
-            .filter(|drv| {
-                let Some(by_session) = self.outcomes.get(*drv) else {
-                    return false;
-                };
-                if by_session.contains_key(&None) {
-                    return false;
-                }
-                let mut outcomes = by_session.values().map(|record| record.outcome);
-                let first = outcomes.next();
-                outcomes.any(|outcome| Some(outcome) != first)
-            })
-            .count()
+    pub fn truth_collapse_conflicts(&self) -> Option<usize> {
+        if !Capability::ExpectedOutcomes.enabled_in(self.capabilities()) {
+            return None;
+        }
+        Some(
+            self.workload_units
+                .iter()
+                .filter(|drv| {
+                    let Some(by_session) = self.outcomes.get(*drv) else {
+                        return false;
+                    };
+                    if by_session.contains_key(&None) {
+                        return false;
+                    }
+                    let mut outcomes = by_session.values().map(|record| record.outcome);
+                    let first = outcomes.next();
+                    outcomes.any(|outcome| Some(outcome) != first)
+                })
+                .count(),
+        )
     }
 
     /// Per-unit metadata keyed by drv path (empty when units.jsonl absent).
@@ -1579,6 +1598,37 @@ mod tests {
                             .all(|t| t.outcome == crate::run::model::ExpectedOutcome::Unknown),
                         "{without:?}"
                     );
+                    // Same gate, sibling consumer: the truth-collapse
+                    // conflict count is an outcomes-as-truth measurement
+                    // too. Seed a real cross-session disagreement (two
+                    // scoped records, no session-less supersede) so the
+                    // baseline measures a NONZERO count and the withheld
+                    // side is distinguishable from "measured, none found":
+                    // claimed → Some(>0), withdrawn → None (the campaign
+                    // record stamps "not measured" instead of asserting a
+                    // collapse that never ran).
+                    let conflict_dir = tempfile::TempDir::new().unwrap();
+                    let (conflict_root, _) = staged_tiny_archive(conflict_dir.path());
+                    let path = conflict_root.join(OUTCOMES_MEMBER);
+                    let mut text = std::fs::read_to_string(&path).unwrap();
+                    text.push_str(&format!(
+                        "{{\"session\":5,\"drv\":\"{APP_DRV}\",\"outcome\":\"built\"}}\n"
+                    ));
+                    std::fs::write(&path, text).unwrap();
+                    refresh_files_entry(&conflict_root, OUTCOMES_MEMBER);
+                    let claimed = ReplayArchive::open(&conflict_root).unwrap();
+                    assert_eq!(
+                        claimed.truth_collapse_conflicts(),
+                        Some(1),
+                        "the disagreement is measured under the claim"
+                    );
+                    set_capability_false(&conflict_root, capability.flag());
+                    let withheld = ReplayArchive::open(&conflict_root).unwrap();
+                    assert_eq!(
+                        withheld.truth_collapse_conflicts(),
+                        None,
+                        "the withdrawn claim withholds the measurement at the reader"
+                    );
                 }
                 // Gates output-divergence verdicts: per-output hashes are
                 // withheld when unclaimed, so the comparator sees
@@ -1641,6 +1691,122 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Standing enumeration of EVERY production consumer of the reader's
+    /// outcome-derived surface (`outcome_records` / `expected_outcome` /
+    /// `expected_outcome_across_sessions` / `truth_collapse_conflicts`),
+    /// each named with the capability gate that licenses it.
+    /// Quantification domain: call-shaped occurrences in every
+    /// `rio-replay/src/**/*.rs` production region (each file truncated at
+    /// its first `#[cfg(test)]` line — the bounded-io scan's rule).
+    ///
+    /// outcomes.jsonl is the one member whose claims split across THREE
+    /// capability flags (expected_outcomes / output_hashes / timed), so
+    /// it is exempt from the reader's structural withholding and relies
+    /// on per-consumer gates — the discipline that decays exactly when a
+    /// new consumer lands outside any battery. This test is the decay
+    /// stop: a new call site fails the count until it is enumerated here
+    /// WITH its gate, and the per-flag flip battery
+    /// (`capability_flags_gate_their_documented_engine_behavior`) is
+    /// where its behavioral delta then gets pinned.
+    #[test]
+    fn outcome_surface_consumers_are_enumerated_with_their_gates() {
+        // (file, call needle, expected production call sites, gate) —
+        // needles are dot-prefixed so definitions don't count, and built
+        // by concatenation so this test's own source cannot match.
+        let surface = |name: &str| format!(".{name}(");
+        let expected: &[(&str, String, usize, &str)] = &[
+            (
+                "run/truth.rs",
+                surface("expected_outcome_across_sessions"),
+                1,
+                "ExpectedOutcomes: expected_outcomes_for_units returns all-Unknown before \
+                 this call when the flag is withdrawn",
+            ),
+            (
+                "run/mod.rs",
+                surface("expected_outcome"),
+                1,
+                "Timed: timing_index is reachable only inside the ScheduleMode::Timed arm \
+                 after ensure_timed_capability",
+            ),
+            (
+                "run/mod.rs",
+                surface("outcome_records"),
+                1,
+                "Timed: the interruption arming scan runs only inside the \
+                 ScheduleMode::Timed arm after ensure_timed_capability",
+            ),
+            (
+                "run/mod.rs",
+                surface("truth_collapse_conflicts"),
+                1,
+                "ExpectedOutcomes: the reader withholds the count (None) when the claim \
+                 is withdrawn; the stamp passes the Option through",
+            ),
+        ];
+        let needles: Vec<String> = vec![
+            surface("outcome_records"),
+            surface("expected_outcome"),
+            surface("expected_outcome_across_sessions"),
+            surface("truth_collapse_conflicts"),
+        ];
+
+        fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, files);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src_root, &mut files);
+        assert!(files.len() > 10, "the source walk must visit the crate");
+
+        let mut found: std::collections::BTreeMap<(String, String), usize> = Default::default();
+        for path in &files {
+            let rel = path
+                .strip_prefix(&src_root)
+                .unwrap()
+                .display()
+                .to_string()
+                .replace('\\', "/");
+            // The reader is the surface's owner: its own file defines the
+            // methods and tests them; consumers live elsewhere.
+            if rel == "archive/reader.rs" {
+                continue;
+            }
+            let src = std::fs::read_to_string(path).unwrap();
+            let prod = src
+                .split("#[cfg(test)]")
+                .next()
+                .expect("split always yields at least one piece");
+            for needle in &needles {
+                // The needles are mutually exclusive by construction: the
+                // trailing `(` keeps `.expected_outcome(` from matching
+                // `.expected_outcome_across_sessions(`.
+                let count = prod.matches(needle.as_str()).count();
+                if count > 0 {
+                    *found.entry((rel.clone(), needle.clone())).or_default() += count;
+                }
+            }
+        }
+
+        let expected_map: std::collections::BTreeMap<(String, String), usize> = expected
+            .iter()
+            .map(|(file, needle, count, _gate)| (((*file).to_string(), needle.clone()), *count))
+            .collect();
+        assert_eq!(
+            found, expected_map,
+            "outcome-derived consumers changed: every production call site of the reader's \
+             outcome surface must be enumerated here with the capability gate that licenses \
+             it (and its behavioral delta pinned in the flip battery)"
+        );
     }
 
     #[test]
@@ -2082,7 +2248,7 @@ mod tests {
                 .is_none()
         );
         // Nothing disagrees yet: no conflicts to disclose.
-        assert_eq!(archive.truth_collapse_conflicts(), 0);
+        assert_eq!(archive.truth_collapse_conflicts(), Some(0));
 
         // Add a later session's `built` record for app.drv: with no
         // session-less form, the collapse keeps the most informative scoped
@@ -2106,7 +2272,7 @@ mod tests {
         // The disagreement is now countable for the comparability block:
         // app.drv's scoped records disagree with no session-less supersede;
         // dep.drv (session-less authority) never counts.
-        assert_eq!(archive.truth_collapse_conflicts(), 1);
+        assert_eq!(archive.truth_collapse_conflicts(), Some(1));
     }
 
     /// The bug shape the rank exists for, pinned at the archive level in
@@ -2153,7 +2319,7 @@ mod tests {
                 !collapsed.outputs.is_empty(),
                 "the comparison-driving hashes ride along"
             );
-            assert_eq!(archive.truth_collapse_conflicts(), 1);
+            assert_eq!(archive.truth_collapse_conflicts(), Some(1));
         }
     }
 
