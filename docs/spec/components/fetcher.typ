@@ -304,7 +304,7 @@ previous, branch-local hand cleanup was exactly one fallible step too
 narrow: a chmod failure after a successful unpack stranded the
 fully-restored tree.
 
-#r("fetcher.fetchurl.permanence-at-source")[
+#r("fetcher.fetchurl.permanence-at-source+2")[
   Every fetch failure MUST be classified transient or
   permanent-for-candidate at the statement that produces it, with the
   classification derived from that statement's own failure mode --- a
@@ -315,10 +315,22 @@ fully-restored tree.
   budget exhaustion), the producing function MUST discriminate them
   structurally --- typed exhaustion by downcast, worker-local
   filesystem faults by errno presence --- never by matching error
-  text. A deterministic precondition failure (an https candidate in a
-  sandbox with no CA roots, where no attempt can ever verify a
-  certificate) is permanent for the candidate even when it surfaces
-  through a normally-transient transport step.
+  text. Deterministic predicates MUST be evaluated against the
+  EFFECTIVE request and the error's own typed properties, never the
+  literal candidate string alone: scheme tests are ASCII-case-
+  insensitive (RFC 3986 schemes are case-insensitive --- `S3://` and
+  `HTTPS://` candidates take the same arm as their lowercase forms),
+  request-construction failures (malformed URL, unsupported scheme)
+  are permanent for the candidate (oracle parity:
+  `filetransfer.cc:689-707` classifies `CURLE_URL_MALFORMAT` /
+  `CURLE_UNSUPPORTED_PROTOCOL` as non-retriable `Misc`), and a
+  precondition that is deterministic for the request --- an https
+  request in a sandbox with no CA roots, where no attempt can ever
+  verify a certificate --- is judged at the URL where the failure
+  actually occurred (redirects are followed inside the send, so an
+  `http://` candidate that redirects into https is still
+  TLS-impossible) and is permanent for the candidate even when it
+  surfaces through a normally-transient transport step.
 ]
 
 The motivating regression (round-16 merged_bug_068) had both polarity

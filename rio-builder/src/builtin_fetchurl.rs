@@ -293,7 +293,7 @@ impl FetchError {
 /// restore's error chain distinguish "the payload is over budget"
 /// (permanent) from "the worker's disk hiccuped" (transient errno)
 /// at the statement that produced each.
-// r[impl fetcher.fetchurl.permanence-at-source]
+// r[impl fetcher.fetchurl.permanence-at-source+2]
 #[derive(Debug, thiserror::Error)]
 #[error(
     "{what} exceeded the {cap}-byte per-attempt transfer cap (decompression bomb or unbounded body?)"
@@ -410,6 +410,21 @@ impl<R: std::io::Read> std::io::Read for MeteredRead<R> {
     }
 }
 
+/// ASCII-case-insensitive scheme test. RFC 3986 §3.1: scheme names
+/// are case-insensitive (`S3://bucket` names the same transport as
+/// `s3://bucket`), so every scheme-keyed verdict in this module MUST
+/// match through this helper — a literal `starts_with("s3://")` lets
+/// one uppercased letter route a candidate around its skip/permanence
+/// arm and into the transient retry ladder (round-17 merged_bug_017;
+/// the `verdict-fold-policy` check denies the literal form).
+fn has_scheme(url: &str, scheme: &str) -> bool {
+    let n = scheme.len();
+    url.len() >= n + 3
+        && url.is_char_boundary(n)
+        && url[..n].eq_ignore_ascii_case(scheme)
+        && url[n..].starts_with("://")
+}
+
 /// Fetch `params.url` (or a mirror) to `params.output`.
 async fn fetch(params: &FetchurlParams) -> anyhow::Result<()> {
     let (client, tls_roots_available) = build_client(Path::new(SANDBOX_CA_BUNDLE))?;
@@ -426,7 +441,7 @@ async fn fetch(params: &FetchurlParams) -> anyhow::Result<()> {
         // population that hits this). Skip-with-log, no attempt or
         // backoff budget consumed; if every candidate is skipped the
         // remembered error still names the limitation.
-        if url.starts_with("s3://") {
+        if has_scheme(url, "s3") {
             eprintln!(
                 "builtin:fetchurl: skipping {url}: s3:// URLs are not \
                  supported by the native builtin:fetchurl (use an \
@@ -491,8 +506,6 @@ async fn fetch(params: &FetchurlParams) -> anyhow::Result<()> {
 fn build_client(ca_bundle: &Path) -> anyhow::Result<(reqwest::Client, bool)> {
     let mut builder = reqwest::Client::builder()
         .user_agent(concat!("rio-build/", env!("CARGO_PKG_VERSION")))
-        // Redirects are common for source tarballs (GitHub → S3).
-        .redirect(reqwest::redirect::Policy::limited(10))
         .connect_timeout(Duration::from_secs(30))
         // A server that stalls mid-body should fail the attempt (and
         // fall through to the next mirror/origin) instead of hanging
@@ -522,9 +535,43 @@ fn build_client(ca_bundle: &Path) -> anyhow::Result<(reqwest::Client, bool)> {
         }
     };
 
+    // Redirects are common for source tarballs (GitHub → S3). The
+    // policy is where a redirect TARGET is first known, so the
+    // rootless-sandbox determinism verdict for redirected-into-https
+    // requests is minted HERE, as a typed error the send-site
+    // classifier downcasts back out — reqwest attaches the ORIGINAL
+    // request URL to redirect-target failures, so classifying by
+    // `e.url()` after the fact would mistake the redirected https
+    // failure for a plain-http transient (round-17 merged_bug_017).
+    // r[impl fetcher.fetchurl.permanence-at-source+2]
+    builder = builder.redirect(if tls_roots_available {
+        reqwest::redirect::Policy::limited(10)
+    } else {
+        reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.url().scheme() == "https" {
+                let url = attempt.url().clone();
+                attempt.error(HttpsRedirectWithoutRoots(url.to_string()))
+            } else if attempt.previous().len() > 10 {
+                attempt.error("too many redirects")
+            } else {
+                attempt.follow()
+            }
+        })
+    });
+
     let client = builder.build().context("constructing HTTP client")?;
     Ok((client, tls_roots_available))
 }
+
+/// Typed marker minted by the redirect policy when a request is
+/// redirected to an https URL in a sandbox with no CA roots: no such
+/// request can ever verify a certificate, so following the redirect
+/// could only burn the retry ladder on a deterministic failure.
+/// Carried through reqwest's error source chain and downcast back out
+/// by [`classify_send_error`].
+#[derive(Debug, thiserror::Error)]
+#[error("redirected to {0}, an https URL, but no CA roots are available in the sandbox")]
+struct HttpsRedirectWithoutRoots(String);
 
 /// A rustls config whose certificate verifier rejects every server
 /// certificate, used when no CA bundle is mounted in the sandbox. This
@@ -627,34 +674,12 @@ async fn try_fetch_one(
         req = req.basic_auth(user, Some(pass));
     }
     // Transport errors (DNS, connect, TLS, read timeout): transient —
-    // EXCEPT an https candidate when the sandbox has no CA roots. With
-    // no roots the verifier rejects every certificate, so no https
-    // attempt can ever succeed in this sandbox: the failure is
-    // deterministic for the candidate regardless of which transport
-    // step surfaced it, and burning the full attempt/backoff ladder on
-    // it is pure waste. Classified at this statement (the predicate is
-    // a property of the request being made, not of the error text).
-    // r[impl fetcher.fetchurl.permanence-at-source]
-    let https_without_roots = url.starts_with("https://") && !tls_roots_available;
-    let resp = req
-        .send()
-        .await
-        .with_context(|| {
-            if https_without_roots {
-                format!(
-                    "request failed (https URL, but no CA roots are available in the \
-                     sandbox: configure RIO_CA_BUNDLE on the worker so a bundle is \
-                     mounted at {SANDBOX_CA_BUNDLE}, or use an http:// origin/mirror)"
-                )
-            } else {
-                "request failed".to_string()
-            }
-        })
-        .map_err(if https_without_roots {
-            FetchError::PermanentForCandidate
-        } else {
-            FetchError::Transient
-        })?;
+    // with the deterministic exceptions classified per error in
+    // [`classify_send_error`].
+    let resp = match req.send().await {
+        Ok(resp) => resp,
+        Err(e) => return Err(classify_send_error(e, url, tls_roots_available)),
+    };
     let status = resp.status();
     if !status.is_success() {
         let err = anyhow::anyhow!("HTTP {status} from {url}");
@@ -712,6 +737,68 @@ async fn try_fetch_one(
     // scratch where the output scan would reject it as a stray.
     let _ = tokio::fs::remove_file(&tmp).await;
     finalize
+}
+
+/// Classify a `send()` failure AT THE PRODUCING STATEMENT, by the
+/// error's own properties — never by the literal candidate string the
+/// attempt started from:
+///
+/// - **Builder errors** (`e.is_builder()`: malformed URL, unsupported
+///   scheme — reqwest validates lazily, so the candidate's own defects
+///   surface here): deterministic per candidate, permanent. Oracle
+///   parity: the pinned CppNix transfer loop classifies
+///   `CURLE_URL_MALFORMAT` / `CURLE_UNSUPPORTED_PROTOCOL` as `Misc`
+///   (`filetransfer.cc:689-707`) and only `Transient` codes re-enter
+///   its retry loop (`filetransfer.cc:747`).
+/// - **TLS-impossible candidates**: with no CA roots in the sandbox,
+///   no https request can EVER verify a certificate, so the failure is
+///   deterministic regardless of which transport step surfaced it.
+///   The https test covers the EFFECTIVE request, not just the
+///   candidate string: redirects are followed inside `send()`, and a
+///   redirect into https in a rootless sandbox is refused BY THE
+///   REDIRECT POLICY — the one place the redirect target is first
+///   known (reqwest attaches the ORIGINAL request URL to
+///   redirect-target failures, so `e.url()` cannot make this call) —
+///   as the typed [`HttpsRedirectWithoutRoots`], downcast back out
+///   here. The candidate-string scheme (matched case-insensitively)
+///   covers the direct-https form. The chart-default mirror
+///   `http://tarballs.nixos.org/` hits the redirect form on every
+///   flat-FOD fetch in a rootless sandbox.
+/// - Everything else (DNS, connect, timeouts, TLS with roots
+///   available): transient.
+// r[impl fetcher.fetchurl.permanence-at-source+2]
+fn classify_send_error(
+    e: reqwest::Error,
+    candidate_url: &str,
+    tls_roots_available: bool,
+) -> FetchError {
+    if e.is_builder() {
+        return FetchError::PermanentForCandidate(anyhow::Error::new(e).context(
+            "request could not be constructed for this candidate \
+             (malformed URL or unsupported scheme)",
+        ));
+    }
+    let redirected_https = {
+        let mut src = std::error::Error::source(&e);
+        let mut found = false;
+        while let Some(s) = src {
+            if s.downcast_ref::<HttpsRedirectWithoutRoots>().is_some() {
+                found = true;
+                break;
+            }
+            src = s.source();
+        }
+        found
+    };
+    if (redirected_https || has_scheme(candidate_url, "https")) && !tls_roots_available {
+        return FetchError::PermanentForCandidate(anyhow::Error::new(e).context(format!(
+            "request failed (https effective URL, but no CA roots are available in \
+             the sandbox: configure RIO_CA_BUNDLE on the worker so a bundle is \
+             mounted at {SANDBOX_CA_BUNDLE}, or use an http:// origin/mirror that \
+             does not redirect to https)"
+        )));
+    }
+    FetchError::Transient(anyhow::Error::new(e).context("request failed"))
 }
 
 /// Stream an HTTP response body to `dest`.
@@ -787,7 +874,7 @@ async fn finalize_output(
         // Worker-local output-tree I/O: ENOSPC/EIO/EROFS here is the
         // worker's disk, not the payload — the identical fault during
         // the download phase is retried, so this one is too.
-        // r[impl fetcher.fetchurl.permanence-at-source]
+        // r[impl fetcher.fetchurl.permanence-at-source+2]
         tokio::fs::rename(tmp, &params.output)
             .await
             .with_context(|| format!("renaming download to {}", params.output.display()))
@@ -924,7 +1011,7 @@ async fn restore_unpacked(
 ///   wrapper — carry no errno, so errno presence discriminates);
 /// - everything else (xz format errors, NAR structure errors):
 ///   deterministic for these bytes — permanent for the candidate.
-// r[impl fetcher.fetchurl.permanence-at-source]
+// r[impl fetcher.fetchurl.permanence-at-source+2]
 fn classify_restore_error(e: anyhow::Error) -> FetchError {
     if e.chain()
         .any(|c| c.downcast_ref::<CapExhausted>().is_some())
@@ -1411,6 +1498,104 @@ mod tests {
         assert!(err.to_string().contains("s3://"), "{err}");
     }
 
+    /// RFC 3986 scheme case-insensitivity: `S3://` is the same
+    /// transport as `s3://` and takes the same skip arm — an
+    /// uppercased letter must not route the candidate into the
+    /// transient retry ladder (round-17 merged_bug_017).
+    // r[verify fetcher.fetchurl.permanence-at-source+2]
+    #[test]
+    fn s3_scheme_skip_is_case_insensitive() {
+        for url in ["S3://bucket/key", "s3://bucket/key", "S3://BUCKET/key"] {
+            let p = params(url, &[]);
+            let err = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(fetch(&p))
+                .unwrap_err();
+            // The full chain ({err:#}) — the skip-arm message is the
+            // INNER error; the outer context merely echoes the URL,
+            // which would make a literal-prefix miss invisible here.
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("s3:// URLs are not supported"),
+                "case variant {url} must take the s3 skip arm: {msg}"
+            );
+        }
+    }
+
+    /// A candidate whose request cannot be CONSTRUCTED (unsupported
+    /// scheme — reqwest validates lazily, so it surfaces at `send()`)
+    /// is permanent for the candidate: one attempt, no backoff ladder.
+    /// Oracle parity: `CURLE_UNSUPPORTED_PROTOCOL` is non-retriable
+    /// `Misc` in the pinned transfer loop (`filetransfer.cc:689-707`).
+    // r[verify fetcher.fetchurl.permanence-at-source+2]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn builder_error_is_permanent_for_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = params("ftp://example.invalid/file", &[]);
+        p.mirrors.clear();
+        p.output = dir.path().join("out");
+        let candidates = p.candidates();
+        let (client, _) = build_client(Path::new("/nonexistent/ca-bundle.crt")).unwrap();
+        let err = try_fetch_one(&client, &candidates[0], &p, false)
+            .await
+            .expect_err("unsupported scheme must fail");
+        assert!(
+            matches!(err, FetchError::PermanentForCandidate(_)),
+            "builder errors are deterministic per candidate: {:#}",
+            err.into_inner()
+        );
+    }
+
+    /// The TLS-impossible verdict keys on the EFFECTIVE request: an
+    /// `http://` candidate that 301s into https (followed inside
+    /// `send()`) is just as deterministic in a rootless sandbox as a
+    /// literal https candidate — the chart-default
+    /// `http://tarballs.nixos.org/` mirror hits exactly this shape
+    /// (round-17 merged_bug_017).
+    // r[verify fetcher.fetchurl.permanence-at-source+2]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_redirect_into_https_without_roots_is_permanent() {
+        use axum::{Router, routing::get};
+
+        let app = Router::new().route(
+            "/file",
+            get(|| async {
+                (
+                    axum::http::StatusCode::MOVED_PERMANENTLY,
+                    [(axum::http::header::LOCATION, "https://127.0.0.1:1/file")],
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = params(&format!("http://{addr}/file"), &[]);
+        p.mirrors.clear();
+        p.output = dir.path().join("out");
+        let candidates = p.candidates();
+        let (client, roots) = build_client(Path::new("/nonexistent/ca-bundle.crt")).unwrap();
+        assert!(!roots, "test premise: no roots loaded");
+        let err = try_fetch_one(&client, &candidates[0], &p, false)
+            .await
+            .expect_err("redirect into https with no roots must fail");
+        match err {
+            FetchError::PermanentForCandidate(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("CA roots"),
+                    "remediation must name the CA-roots fix: {msg}"
+                );
+            }
+            FetchError::Transient(e) => {
+                panic!("https-effective failure must not re-enter the retry ladder: {e:#}")
+            }
+        }
+    }
+
     /// The skip is per-candidate: an s3 origin must not veto hashed
     /// mirrors. A local server playing the mirror serves the hash
     /// path; the fetch succeeds without ever touching the s3 URL.
@@ -1846,7 +2031,7 @@ mod tests {
     /// shape the real flow produces (round-16 merged_bug_068): typed
     /// cap exhaustion → permanent; a real errno (worker fs) →
     /// transient; decode/structure errors (no errno) → permanent.
-    // r[verify fetcher.fetchurl.permanence-at-source]
+    // r[verify fetcher.fetchurl.permanence-at-source+2]
     #[test]
     fn restore_classifier_discriminates_at_source() {
         // Cap exhaustion rides the metered-read io chain.
@@ -1894,7 +2079,7 @@ mod tests {
     /// ever verify a certificate, so the send failure is permanent for
     /// the candidate (one attempt, no backoff ladder); the same
     /// transport failure WITH roots available stays transient.
-    // r[verify fetcher.fetchurl.permanence-at-source]
+    // r[verify fetcher.fetchurl.permanence-at-source+2]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn https_without_roots_is_permanent_for_candidate() {
         // A listener that accepts and immediately closes: any https

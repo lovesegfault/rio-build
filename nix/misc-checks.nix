@@ -1941,4 +1941,95 @@ in
         [ "$fail" = 0 ] || exit 1
         touch $out
       '';
+  # Round-17 merged_bug_017 (RC17-10 mechanism): verdict folds at
+  # composite seams must key on TYPED error properties / effective
+  # request state, never on literal-string forms that silently route a
+  # population around its arm. Three open-coded regression forms are
+  # denied (comments stripped before matching); each carve-out is
+  # count-pinned with its reason, and pins are expected to ratchet DOWN
+  # within this stream (raw_os_error -> 0 at c3, e.to_string -> 0 at
+  # c6) — a pin that can only grow is a deny-table that has stopped
+  # denying.
+  verdict-fold-policy =
+    pkgs.runCommand "rio-verdict-fold-policy"
+      {
+        nativeBuildInputs = [ pkgs.ripgrep ];
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-builder/src)
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "rs") ../rio-store/src)
+          ];
+        };
+      }
+      ''
+        cd $src
+        fail=0
+
+        # Strip line comments so prose mentioning a form does not count.
+        match_count() {
+          # $1 = file, $2 = fixed-string needle. Occurrences, not lines
+          # (an admission gate tests two schemes on one line). Only
+          # LINE-LEADING comments are excluded — a sed comment-strip
+          # would truncate URL literals at the '//' inside 'https://'.
+          # stdenv sets pipefail: a zero-match grep would fail the whole
+          # pipeline under set -e, killing the script before any FAIL
+          # line — neutralize inside the braces, count outside.
+          { grep -v '^[[:space:]]*//' "$1" | grep -oF -- "$2" || true; } | wc -l
+        }
+
+        check_pin() {
+          # $1 = needle, $2 = file, $3 = expected, $4 = reason
+          got=$(match_count "$2" "$1")
+          if [ "$got" != "$3" ]; then
+            echo "FAIL: $2 has $got occurrences of '$1' (pinned: $3 — $4)." >&2
+            echo "  Scheme tests go through has_scheme() (ASCII-case-insensitive); errno" >&2
+            echo "  transience uses the classify_restore_error allowlist; singleflight" >&2
+            echo "  verdicts cross the Shared boundary as the typed Clone carrier." >&2
+            echo "  (Pins live in nix/misc-checks.nix verdict-fold-policy.)" >&2
+            fail=1
+          fi
+        }
+
+        # ── 1. Case-sensitive scheme literals (RFC 3986: schemes are
+        # case-insensitive; the literal form lets S3:// / HTTPS:// skip
+        # their verdict arm — round-17 merged_bug_017).
+        for f in $(find . -name '*.rs' | sed 's|^\./||'); do
+          case "$f" in
+            rio-store/src/grpc/admin.rs)
+              check_pin 'starts_with("http' "$f" 2 \
+                "fail-closed admission accept-gate: case-variant URLs are refused outright, never misclassified into a retry arm" ;;
+            rio-store/src/substitute.rs)
+              check_pin 'starts_with("http' "$f" 1 "test fixture URL probe" ;;
+            *)
+              check_pin 'starts_with("http' "$f" 0 "no carve-out" ;;
+          esac
+          check_pin 'starts_with("s3' "$f" 0 "no carve-out: has_scheme() owns scheme tests"
+        done
+
+        # ── 2. Errno-PRESENCE-as-transience (payload-composable errnos
+        # like ENAMETOOLONG inherit Transient through it — round-17
+        # merged_bug_022; narrowed to the errno allowlist by W2-S3 c3,
+        # when this pin drops to 0).
+        for f in $(find . -name '*.rs' | sed 's|^\./||'); do
+          case "$f" in
+            rio-builder/src/builtin_fetchurl.rs)
+              check_pin 'raw_os_error().is_some()' "$f" 1 \
+                "classify_restore_error errno-presence discrimination — drops to 0 at W2-S3 c3" ;;
+            *)
+              check_pin 'raw_os_error().is_some()' "$f" 0 "no carve-out" ;;
+          esac
+        done
+
+        # ── 3. Stringly verdict erasure across the singleflight Shared
+        # boundary (flattens the anyhow chain before ChunkError
+        # construction, making the BackendAuthError fail-fast
+        # unreachable — round-17 merged_bug_061; replaced by the typed
+        # Clone carrier at W2-S3 c6, when this pin drops to 0).
+        check_pin 'Err(e.to_string())' rio-store/src/cas.rs 1 \
+          "singleflight Shared error carrier — drops to 0 at W2-S3 c6"
+
+        [ "$fail" = 0 ] || exit 1
+        touch $out
+      '';
 }
