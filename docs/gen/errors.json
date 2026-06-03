@@ -940,6 +940,13 @@
     },
     {
       "enum": "SupplyTransportError",
+      "name": "MaybeRefused",
+      "crate": "rio-replay",
+      "msg": "transport failed during upload (may be a refusal racing session teardown): {0}",
+      "doc": "The wire died mid-upload: a refusal racing session teardown OR a transport failure — indistinguishable here, so neither a daemon verdict nor (yet) a settled failure."
+    },
+    {
+      "enum": "SupplyTransportError",
       "name": "Other",
       "crate": "rio-replay",
       "msg": "(transparent — delegates to inner error)",
@@ -950,7 +957,7 @@
       "name": "Refused",
       "crate": "rio-replay",
       "msg": "daemon refused: {0}",
-      "doc": "The daemon refused the upload (or refused it in a way that raced session teardown)."
+      "doc": "The daemon refused the upload with the protocol framing intact."
     },
     {
       "enum": "ActorError",
@@ -1475,7 +1482,7 @@
     {
       "name": "SupplyTransportError",
       "crate": "rio-replay",
-      "doc": "Errors the upload arms distinguish: a daemon refusal (retry once on a fresh channel, then mark refused) vs. everything else (failed)."
+      "doc": "Errors the upload arms distinguish, three-state because the settlement they feed is irreversible: a clean daemon refusal (the wire op completed and the daemon answered — retry once on a fresh channel, then settle REFUSED, which charges dependents `upload-rejected` and trips the regression gate), a mid-upload wire death whose meaning is undetermined (retry once like a refusal — a genuine refusal racing session teardown re-presents as a clean `Refused` on the fresh channel — but with no clean refusal observed it settles FAILED: `supply-failed`, excluded from the gate, because the only evidence is that the connection died), and everything else (failed immediately). Breaker accounting follows the evidence the same way: `Refused` proves the gateway answered and resets the count; `MaybeRefused` and `Other` are transport failures."
     },
     {
       "name": "TransportError",
