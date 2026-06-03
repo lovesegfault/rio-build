@@ -104,6 +104,19 @@ pub enum Lint {
     /// markdown citations are invisible to it, so a bump silently
     /// orphans them.
     SpecRuleCitations,
+    /// The replay engine's job scheduling-state transition ops are
+    /// called only from their owner chokepoints: the watchdog's per-job
+    /// mutations (`observe_job` / `confirm_queued_requeue` /
+    /// `remove_job` / `grant_stall_grace`) only from the `JobLedger`,
+    /// and in-flight reservation mutations only from the ledger's
+    /// transitions and the owner-keyed settlement release in
+    /// `submit.rs`. The chokepoints carry the staleness re-checks
+    /// (owner/phase verified before any journal append or reservation
+    /// strip), so a new direct caller would silently re-open the
+    /// stale-watchdog-verdict class — phantom journal entries, stripped
+    /// live reservations — that the chokepoints close. Catches the new
+    /// consumer at introduction instead of at the next audit.
+    ReplayTransitionOps,
 }
 
 impl Lint {
@@ -127,6 +140,7 @@ impl Lint {
             Lint::BoundedIo,
             Lint::SupplyFoldOwner,
             Lint::SpecRuleCitations,
+            Lint::ReplayTransitionOps,
         ]
     }
 }
@@ -144,6 +158,7 @@ pub fn run(lint: &Lint) -> Result<()> {
         Lint::BoundedIo => bounded_io(),
         Lint::SupplyFoldOwner => supply_fold_owner(),
         Lint::SpecRuleCitations => spec_rule_citations(),
+        Lint::ReplayTransitionOps => replay_transition_ops(),
     }
 }
 
@@ -2657,6 +2672,151 @@ fn supply_fold_marker_above(lines: &[&str], load_idx: usize) -> Option<SupplyFol
         }
     }
     None
+}
+
+/// Transition-ops chokepoint gate over the replay engine — see
+/// [`Lint::ReplayTransitionOps`].
+///
+/// Quantification domain (stated): production code — everything before a
+/// file's first `#[cfg(test)]` line, the same cut [`bounded_io`] uses —
+/// in every `.rs` file under `rio-replay/src/`, against two needle sets:
+///
+/// - watchdog per-job mutation calls
+///   (`.observe_job(` / `.confirm_queued_requeue(` / `.remove_job(` /
+///   `.grant_stall_grace(`): allowed only in `run/ledger.rs`. The
+///   definitions in `run/watchdog.rs` don't match (no receiver dot), so
+///   the definition file needs no carve-out.
+/// - in-flight reservation mutations (an `in_flight` binding or field
+///   followed by `insert`/`remove`/`clear`/`retain`/`drain`/`entry`/
+///   `get_mut` on one line): allowed in `run/ledger.rs` (commit /
+///   stall-requeue / retire) and `run/submit.rs` (the owner-keyed
+///   `release_after_settle`). Reads (`get`, `contains_key`, `len`,
+///   iteration) are unrestricted.
+///
+/// HONESTY CLAUSE: textual tripwire, not a by-construction guarantee — a
+/// mutation through a renamed binding (`let m = &mut *tracker.in_flight
+/// .lock().await;`) or a helper would evade it. The by-construction
+/// version is field privacy on `SubmitTracker.in_flight` with mutation
+/// methods only; that refactor touches every wave-assembly read site and
+/// is deliberately deferred — this lint is the standing consumer
+/// enumeration until then.
+fn replay_transition_ops() -> Result<()> {
+    // (needle regex, sanctioned files, label) per op family. Each
+    // sanctioned entry carries the rationale for WHY that file may
+    // perform the op.
+    let phase_re = regex::Regex::new(
+        r"\.(observe_job|confirm_queued_requeue|remove_job|grant_stall_grace)\s*\(",
+    )
+    .unwrap();
+    let in_flight_re = regex::Regex::new(
+        r"\bin_flight\b[^;]*\.(insert|remove|clear|retain|drain|entry|get_mut)\s*\(",
+    )
+    .unwrap();
+    const PHASE_SANCTIONED: &[(&str, &str)] = &[(
+        "rio-replay/src/run/ledger.rs",
+        "the JobLedger is the single owner of job-state transitions; every phase op rides a \
+         journaled, staleness-checked transition",
+    )];
+    const IN_FLIGHT_SANCTIONED: &[(&str, &str)] = &[
+        (
+            "rio-replay/src/run/ledger.rs",
+            "commit_batch reserves, requeue_stalled releases owner-keyed under the lock it \
+             re-checks, retire releases on terminal authority",
+        ),
+        (
+            "rio-replay/src/run/submit.rs",
+            "SubmitTracker owns the map; release_after_settle is the owner-keyed settlement \
+             release",
+        ),
+    ];
+
+    let root = repo_root();
+    let scan_root = root.join("rio-replay/src");
+    ensure!(
+        scan_root.is_dir(),
+        "replay-transition-ops scan root {} not found",
+        scan_root.display()
+    );
+    let mut phase_sites = 0usize;
+    let mut in_flight_sites = 0usize;
+    let mut violations: Vec<String> = Vec::new();
+    walk_rs(&scan_root, &mut |path| {
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        let src =
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let lines: Vec<&str> = src.lines().collect();
+        let prod_end = lines
+            .iter()
+            .position(|line| line.trim() == "#[cfg(test)]")
+            .unwrap_or(lines.len());
+        let phase_ok = PHASE_SANCTIONED.iter().any(|(f, _)| *f == rel);
+        let in_flight_ok = IN_FLIGHT_SANCTIONED.iter().any(|(f, _)| *f == rel);
+        for (i, line) in lines[..prod_end].iter().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let code = strip_line_comment(line);
+            for found in phase_re.find_iter(code) {
+                // The JobLedger's pass-through API shares one method
+                // name with the raw watchdog op (`grant_stall_grace`);
+                // a call through a `*ledger` receiver IS the
+                // chokepoint, not a bypass of it.
+                if code[..found.start()].trim_end().ends_with("ledger") {
+                    continue;
+                }
+                phase_sites += 1;
+                if !phase_ok {
+                    violations.push(format!(
+                        "{rel}:{}: watchdog phase op outside the JobLedger chokepoint",
+                        i + 1
+                    ));
+                }
+            }
+            if in_flight_re.is_match(code) {
+                in_flight_sites += 1;
+                if !in_flight_ok {
+                    violations.push(format!(
+                        "{rel}:{}: in-flight reservation mutation outside the sanctioned \
+                         owners",
+                        i + 1
+                    ));
+                }
+            }
+        }
+        Ok(())
+    })?;
+    // Floor guards: 8 phase ops and 4 reservation mutations live in the
+    // sanctioned files today. Near-zero means the needle detection or
+    // the scan root regressed, not that the engine stopped scheduling.
+    ensure!(
+        phase_sites >= 5,
+        "replay-transition-ops found only {phase_sites} watchdog phase-op call site(s) — \
+         suspiciously few; the needle detection or scan root has regressed",
+    );
+    ensure!(
+        in_flight_sites >= 3,
+        "replay-transition-ops found only {in_flight_sites} in-flight mutation site(s) — \
+         suspiciously few; the needle detection or scan root has regressed",
+    );
+    if !violations.is_empty() {
+        bail!(
+            "{} replay-transition-ops violation(s):\n    {}\n  job scheduling-state \
+             transitions go through their owner chokepoints — JobLedger methods for phase \
+             changes (journal + staleness re-check + observation together), \
+             SubmitTracker::release_after_settle for settlement releases. A direct call \
+             re-opens the stale-watchdog-verdict class (phantom journal entries, stripped \
+             live reservations). Route through the ledger, or — for a genuinely new owner — \
+             extend the sanctioned table in xtask/src/lint.rs with the rationale",
+            violations.len(),
+            violations.join("\n    "),
+        );
+    }
+    tracing::info!(phase_sites, in_flight_sites, "replay-transition-ops ok");
+    Ok(())
 }
 
 fn walk_rs(dir: &Path, f: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {

@@ -375,8 +375,11 @@ impl Watchdog {
     /// The job ledger reports phases at the transition sites (batch
     /// commitment → Active, collect/stall requeue → Queued). A phase
     /// change resets the clock (but keeps the requeue count); terminal
-    /// jobs are removed via [`Self::remove_job`].
-    pub fn observe_job(&mut self, job: &str, phase: JobPhase) {
+    /// jobs are removed via [`Self::remove_job`]. `pub(crate)` like every
+    /// per-job mutation on this type: the `JobLedger` is the only
+    /// production caller (the transition-ops lint pins that), so a phase
+    /// can never move without its journal/tracker bookkeeping.
+    pub(crate) fn observe_job(&mut self, job: &str, phase: JobPhase) {
         match self.jobs.get_mut(job) {
             Some(clock) if clock.phase == phase => {}
             Some(clock) => {
@@ -399,7 +402,7 @@ impl Watchdog {
     }
 
     /// Stop tracking a job (it reached a terminal record).
-    pub fn remove_job(&mut self, job: &str) {
+    pub(crate) fn remove_job(&mut self, job: &str) {
         self.jobs.remove(job);
     }
 
@@ -417,7 +420,7 @@ impl Watchdog {
     /// probe), so the member earns a fresh accrual window instead of a
     /// terminal record — a residence heuristic must yield to a positive
     /// progress observation.
-    pub fn grant_stall_grace(&mut self, job: &str) {
+    pub(crate) fn grant_stall_grace(&mut self, job: &str) {
         if let Some(clock) = self.jobs.get_mut(job) {
             clock.accrued_secs = 0.0;
         }
@@ -432,12 +435,16 @@ impl Watchdog {
     }
 
     /// Commit one queued-watchdog re-enqueue: increment the job's consumed
-    /// ladder budget and reset its clock. Called by the run loop AFTER the
-    /// transition is journaled — the QueuedRequeue verdict stays armed
+    /// ladder budget and reset its clock. Called by
+    /// [`super::ledger::JobLedger::requeue_queued`] AFTER the transition
+    /// is journaled, inside the same watchdog-lock critical section as
+    /// its phase re-check — the QueuedRequeue verdict stays armed
     /// (re-firing each tick) until this commits, exactly like the other
     /// deferred arms, so a failed journal append can never consume a
-    /// ladder step that resume would not see.
-    pub fn confirm_queued_requeue(&mut self, job: &str) {
+    /// ladder step that resume would not see. The phase condition here is
+    /// a belt: the ledger already skipped (and did not journal) a stale
+    /// verdict before calling.
+    pub(crate) fn confirm_queued_requeue(&mut self, job: &str) {
         if let Some(clock) = self.jobs.get_mut(job)
             && clock.phase == JobPhase::Queued
         {
@@ -446,11 +453,11 @@ impl Watchdog {
         }
     }
 
-    /// Test-only view of a job's current phase (`None` = not tracked), so
-    /// transition-site tests can assert observations without reaching into
-    /// the private clock map.
-    #[cfg(test)]
-    pub fn phase_of(&self, job: &str) -> Option<JobPhase> {
+    /// A job's current phase (`None` = not tracked). Read by the
+    /// ledger's stale-verdict re-checks (a queued-watchdog verdict for a
+    /// job no longer `Queued` is moot) and by transition-site tests, so
+    /// neither reaches into the private clock map.
+    pub(crate) fn phase_of(&self, job: &str) -> Option<JobPhase> {
         self.jobs.get(job).map(|clock| clock.phase)
     }
 

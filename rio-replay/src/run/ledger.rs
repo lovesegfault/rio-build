@@ -28,11 +28,15 @@
 //!   queued-watchdog path designed for it).
 //! - [`JobLedger::requeue_stalled`]: the active-stall auto-retry — the
 //!   in-flight reservation is released, the resubmission counted, and the
-//!   job observed `Queued`.
+//!   job observed `Queued`. Owner-keyed: the caller passes the batch id
+//!   the verdict was computed against, and a changed/absent owner makes
+//!   the whole transition a no-op (stale verdict).
 //! - [`JobLedger::requeue_queued`]: a queued-watchdog re-enqueue — the
 //!   ladder step is journaled, then the watchdog's consumed-requeue count
-//!   moves and the clock resets. NOT a resubmission: the job is already
-//!   pending and nothing is re-offered.
+//!   moves and the clock resets, atomically against phase changes. NOT a
+//!   resubmission: the job is already pending and nothing is re-offered.
+//!   A job no longer `Queued` (committed since the verdict was emitted)
+//!   makes the whole transition a no-op (stale verdict).
 //! - [`JobLedger::defer_settled`]: collect deliberately left a settled
 //!   member to another owner — its stall clock is released (unless a
 //!   newer batch holds a live reservation), because a deferred member has
@@ -71,10 +75,21 @@
 //! retired one retry early, never granted an extra retry or spun), and it
 //! converges because the fold and the in-memory counters inflate together.
 //!
-//! Lock discipline: every method takes its locks strictly sequentially
-//! (acquire, update, release — never two at once), so the ledger can be
-//! called from the submit loop, the collect pass, and the poller without
-//! ordering constraints against the poller's own watchdog lock.
+//! Lock discipline: methods take their locks sequentially (acquire,
+//! update, release) wherever possible. Two deliberate exceptions hold ONE
+//! scheduling lock across the journal append (the StateDir's internal
+//! file lock nests inside it): [`JobLedger::requeue_queued`] holds the
+//! watchdog lock across {phase re-check → journal → confirm} and
+//! [`JobLedger::requeue_stalled`] holds the in-flight lock across
+//! {owner re-check → journal → release}. Watchdog verdicts are computed
+//! at one poll tick and applied later (the level-triggered design), so
+//! a check-unlock-journal-relock shape would re-open the very
+//! staleness window the re-check exists to close: a concurrent
+//! `commit_batch` between journal and commit would journal a ladder
+//! step (or strip a reservation) for a job the cluster just took back.
+//! The nesting is acyclic — the StateDir lock is leaf-level (file I/O
+//! only, never calls back into scheduling state), and no path acquires
+//! a scheduling lock while holding it.
 //!
 //! [`process_settled_batch`]: super::collect::process_settled_batch
 
@@ -396,13 +411,35 @@ impl JobLedger {
     /// in-flight reservation, count the resubmission, and observe the job
     /// `Queued` so its wait for the fresh batch is charged to the queued
     /// clock, not a stale `Active` one.
-    pub async fn requeue_stalled(&self, job: &str) -> Result<()> {
-        self.journal_requeue(
-            job,
-            REQUEUE_SOURCE_STALL,
-            RequeueReason::ActiveStall.as_str(),
-        )?;
-        self.tracker.in_flight.lock().await.remove(job);
+    ///
+    /// Owner-keyed, like [`SubmitTracker::release_after_settle`]: `owner`
+    /// is the batch id the stall verdict was computed against (the
+    /// poller's pre-emission snapshot). Stall verdicts are emitted at one
+    /// poll tick and applied later, so by apply time the stuck batch can
+    /// have settled — and a successor can own the job. Applying anyway
+    /// would journal a phantom cluster-attempt, burn the single stall
+    /// auto-retry, double-charge the resubmission budget, and (in the
+    /// successor case) strip a live batch's reservation and flip its
+    /// Active clock to Queued. A changed or absent owner therefore makes
+    /// the WHOLE transition a no-op (`Ok(false)`, nothing journaled,
+    /// nothing moved): the in-flight lock is held across
+    /// {re-check → journal → release} so a concurrent commit/settle
+    /// cannot interleave between them, and a journal append failure
+    /// (`Err`) leaves the reservation intact so the armed verdict
+    /// re-fires and retries next tick.
+    pub async fn requeue_stalled(&self, job: &str, owner: u64) -> Result<bool> {
+        {
+            let mut in_flight = self.tracker.in_flight.lock().await;
+            if in_flight.get(job) != Some(&owner) {
+                return Ok(false);
+            }
+            self.journal_requeue(
+                job,
+                REQUEUE_SOURCE_STALL,
+                RequeueReason::ActiveStall.as_str(),
+            )?;
+            in_flight.remove(job);
+        }
         *self
             .tracker
             .resubmissions
@@ -414,20 +451,39 @@ impl JobLedger {
             .lock()
             .await
             .observe_job(job, JobPhase::Queued);
-        Ok(())
+        Ok(true)
     }
 
     /// A queued-watchdog re-enqueue (the non-terminal ladder step):
-    /// journal the transition, then commit the watchdog's consumed-requeue
-    /// increment and clock reset. Journal-then-commit, like every other
-    /// budget move — a failed append leaves the clock over its limit so
-    /// the armed verdict re-fires next tick, and resume can never see
-    /// fewer consumed steps than the live ladder. Touches NO tracker
-    /// counter: the job is already pending; nothing is re-offered.
-    pub async fn requeue_queued(&self, job: &str) -> Result<()> {
+    /// re-verify the job is still `Queued`, journal the transition, then
+    /// commit the watchdog's consumed-requeue increment and clock reset —
+    /// all under ONE watchdog lock acquisition. Journal-then-commit, like
+    /// every other budget move — a failed append (`Err`) leaves the clock
+    /// over its limit so the armed verdict re-fires next tick, and resume
+    /// can never see fewer consumed steps than the live ladder. Touches
+    /// NO tracker counter: the job is already pending; nothing is
+    /// re-offered.
+    ///
+    /// The phase re-check is the staleness guard: the verdict was emitted
+    /// at one poll tick and is applied later, and a concurrent
+    /// `commit_batch` in that window flips the job `Active` — the
+    /// starvation the verdict reported just ended. Journaling anyway
+    /// (the pre-check shape: append, then a confirm that silently
+    /// no-ops on the phase mismatch) would put a ladder step in the
+    /// journal that the live watchdog never consumed: durable
+    /// journal/live divergence outside the sanctioned crash-window
+    /// asymmetry, terminalizing a merely-starved job one window early
+    /// after a restart seeds the fold. Stale verdicts return
+    /// `Ok(false)` with nothing journaled; holding the lock across
+    /// journal+confirm means no commit can interleave between them.
+    pub async fn requeue_queued(&self, job: &str) -> Result<bool> {
+        let mut wd = self.watchdog.lock().await;
+        if wd.phase_of(job) != Some(JobPhase::Queued) {
+            return Ok(false);
+        }
         self.journal_requeue(job, REQUEUE_SOURCE_QUEUED, "queued-watchdog")?;
-        self.watchdog.lock().await.confirm_queued_requeue(job);
-        Ok(())
+        wd.confirm_queued_requeue(job);
+        Ok(true)
     }
 
     /// A settled batch's member was deliberately left unresolved by
@@ -461,6 +517,16 @@ impl JobLedger {
     /// stop tracking it. Removing an absent in-flight entry is a no-op, so
     /// retirement is uniform across collect terminals (reservation already
     /// released at settle) and stall terminals (reservation still held).
+    ///
+    /// Deliberately NOT owner-keyed, unlike the requeue transitions: a
+    /// terminal record outranks any reservation. If a successor batch
+    /// holds the job when an older batch's terminal lands (the sanctioned
+    /// stall-retry overlap), stripping the successor's reservation is
+    /// harmless in every direction — terminal jobs are never re-offered
+    /// (the wave excludes them), the successor's own settle releases via
+    /// the owner-keyed `release_after_settle` no-op, and its in-band
+    /// duplicate is belt-dropped as `AlreadyTerminal`. Keeping the
+    /// reservation would only leave an unwatched clock to leak.
     pub async fn retire(&self, job: &str) {
         self.watchdog.lock().await.remove_job(job);
         self.tracker.in_flight.lock().await.remove(job);
@@ -599,7 +665,7 @@ mod tests {
     async fn stall_requeue_releases_and_observes_queued() {
         let (_dir, ledger, tracker, watchdog) = ledger();
         ledger.commit_batch(1, &["stuck.x".to_string()]).await;
-        ledger.requeue_stalled("stuck.x").await.unwrap();
+        assert!(ledger.requeue_stalled("stuck.x", 1).await.unwrap());
         assert!(!tracker.in_flight.lock().await.contains_key("stuck.x"));
         assert_eq!(ledger.tracker().resubmission_count("stuck.x").await, 1);
         assert_eq!(
@@ -859,7 +925,7 @@ mod tests {
             .await
             .unwrap();
         ledger.commit_batch(1, &["b.x".to_string()]).await;
-        ledger.requeue_stalled("b.x").await.unwrap();
+        assert!(ledger.requeue_stalled("b.x", 1).await.unwrap());
 
         // "Pod restart": rebuild from the same state dir.
         let state = StateDir::new(dir.path()).unwrap();
@@ -903,7 +969,7 @@ mod tests {
         // B1 reserves the job; the active-stall auto-retry releases it
         // (the owner-initiated release) and re-offers.
         ledger.commit_batch(1, std::slice::from_ref(&job)).await;
-        ledger.requeue_stalled(&job).await.unwrap();
+        assert!(ledger.requeue_stalled(&job, 1).await.unwrap());
         assert!(!tracker.in_flight.lock().await.contains_key(&job));
 
         // The re-offer lands in B2: the job is live in TWO batches now
@@ -964,14 +1030,14 @@ mod tests {
             .await
             .unwrap();
         ledger.commit_batch(1, &["resub.x".to_string()]).await;
-        ledger.requeue_stalled("resub.x").await.unwrap();
+        assert!(ledger.requeue_stalled("resub.x", 1).await.unwrap());
         ledger.commit_batch(1, &["starved.x".to_string()]).await;
         ledger
             .requeue_collected("starved.x", RequeueReason::InfraAutoRetry)
             .await
             .unwrap();
-        ledger.requeue_queued("starved.x").await.unwrap();
-        ledger.requeue_queued("starved.x").await.unwrap();
+        assert!(ledger.requeue_queued("starved.x").await.unwrap());
+        assert!(ledger.requeue_queued("starved.x").await.unwrap());
 
         // "Pod restart".
         let state = StateDir::new(dir.path()).unwrap();

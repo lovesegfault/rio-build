@@ -1454,6 +1454,19 @@ impl StallProgressProbe {
 /// consumed-requeue increment — the job itself stays in the pending set;
 /// nothing is re-offered or counted as a resubmission.
 ///
+/// Staleness: verdicts are computed at the poll tick (`on_tick`) and
+/// applied here, seconds later under load — the loop runs an admin RPC
+/// per terminal candidate — and the submit/collect tasks keep committing
+/// and settling batches in that window. Every arm therefore re-verifies
+/// the job's owner/phase against `in_flight_owners` (the poller's
+/// PRE-emission snapshot of the in-flight reservations) and the live
+/// state before journaling, stripping a reservation, or writing a
+/// terminal record; a stale verdict is skipped with a log line and costs
+/// nothing (if its condition still holds it re-fires next tick, computed
+/// against fresh state). The requeue transitions re-check atomically
+/// inside the ledger; the terminal arms re-check here, where the
+/// emission-time owner is in hand.
+///
 /// Failure handling is per-job, log-and-continue: one job's append failure
 /// must never forfeit its siblings' verdicts (wave-committed batch members
 /// cross thresholds on the same tick, so multi-verdict ticks are the
@@ -1470,6 +1483,7 @@ async fn apply_stall_actions(
     results: &tokio::sync::Mutex<BTreeMap<String, JobRecord>>,
     stall_retries: &mut HashMap<String, u32>,
     stalled: &[StallVerdict],
+    in_flight_owners: &HashMap<String, u64>,
     mode: &str,
     schedule_mode: ScheduleMode,
     knobs: &Knobs,
@@ -1499,13 +1513,21 @@ async fn apply_stall_actions(
                 // is durable before the clock moves, so the consumed
                 // escalation budget survives a pod restart (the resume
                 // fold seeds the watchdog with it). A failed append leaves
-                // the verdict armed — re-fired and retried next tick.
+                // the verdict armed — re-fired and retried next tick. The
+                // ledger re-checks the phase atomically: a job committed
+                // in the emission-to-apply window returns Ok(false) with
+                // nothing journaled (the starvation just ended).
                 match ledger.requeue_queued(&stall.job).await {
-                    Ok(()) => tracing::info!(
+                    Ok(true) => tracing::info!(
                         job = %stall.job,
                         requeues_used = stall.requeues_used,
                         "queued watchdog: clock reset, job stays pending (non-terminal \
                          re-enqueue)"
+                    ),
+                    Ok(false) => tracing::info!(
+                        job = %stall.job,
+                        "queued-watchdog verdict is stale (the job was committed since \
+                         emission); skipping — no ladder step journaled"
                     ),
                     Err(e) => tracing::warn!(
                         job = %stall.job,
@@ -1516,6 +1538,35 @@ async fn apply_stall_actions(
                 }
             }
             StallKind::ActiveStall => {
+                // Stale-verdict guard: an ActiveStall verdict carries
+                // residence evidence about the batch that owned the job
+                // at EMISSION. If that reservation settled — or a
+                // successor took the job — in the emission-to-apply
+                // window, the evidence belongs to a batch that no longer
+                // runs: the settle's in-band result (classified by
+                // collect within one poll window) outranks the residence
+                // heuristic, and a successor's fresh batch must keep its
+                // reservation and clock. Both halves compare against the
+                // pre-emission owner snapshot; the retry path re-checks
+                // atomically inside the ledger as well.
+                let owner = in_flight_owners.get(&stall.job).copied();
+                let current = ledger
+                    .tracker()
+                    .in_flight
+                    .lock()
+                    .await
+                    .get(&stall.job)
+                    .copied();
+                let Some(owner) = owner.filter(|owner| current == Some(*owner)) else {
+                    tracing::info!(
+                        job = %stall.job,
+                        emission_owner = ?owner,
+                        current_owner = ?current,
+                        "active-stall verdict is stale (the owning batch settled or changed \
+                         since emission); skipping — collect classifies the settle in-band"
+                    );
+                    continue;
+                };
                 let used = stall_retries.get(&stall.job).copied().unwrap_or(0);
                 // The auto-retry is a re-offer into the timeless pending
                 // pool; timed mode has no such pool (design §9.4), so a
@@ -1528,14 +1579,23 @@ async fn apply_stall_actions(
                     // committed Queued observation), so the next poll tick
                     // re-fires and retries — the job can never go terminal
                     // without the auto-retry the gate exists to grant.
-                    match ledger.requeue_stalled(&stall.job).await {
-                        Ok(()) => {
+                    match ledger.requeue_stalled(&stall.job, owner).await {
+                        Ok(true) => {
                             stall_retries.insert(stall.job.clone(), 1);
                             tracing::warn!(
                                 job = %stall.job,
                                 "active stall: single auto-retry — in-flight reservation \
                                  released, job re-offered in a fresh batch next wave; the stuck \
                                  batch runs into the batch-timeout backstop"
+                            );
+                        }
+                        Ok(false) => {
+                            tracing::info!(
+                                job = %stall.job,
+                                owner,
+                                "active-stall auto-retry is stale (the owning batch settled \
+                                 between the guard and the transition); skipping — budget \
+                                 unspent, nothing journaled"
                             );
                         }
                         Err(e) => {
@@ -1604,6 +1664,30 @@ async fn apply_stall_actions(
                             );
                         }
                         Some(false) => {
+                            // The probe call above is an RPC: re-verify
+                            // the owner once more right before the write,
+                            // so a settle landing during the probe cannot
+                            // race collect's in-band classification with
+                            // a stalled-active record (which would
+                            // belt-drop the real result).
+                            if ledger
+                                .tracker()
+                                .in_flight
+                                .lock()
+                                .await
+                                .get(&stall.job)
+                                .copied()
+                                != Some(owner)
+                            {
+                                tracing::info!(
+                                    job = %stall.job,
+                                    owner,
+                                    "active-stall terminal is stale (the owning batch settled \
+                                     during the progress probe); skipping — collect classifies \
+                                     the settle in-band"
+                                );
+                                continue;
+                            }
                             match write_terminal_stall(
                                 state,
                                 contexts,
@@ -1641,6 +1725,28 @@ async fn apply_stall_actions(
                 }
             }
             StallKind::QueuedEscalate => {
+                // Stale-verdict guard, the escalate arm's mirror of the
+                // collect Requeue guard: a queued-escalate job holding a
+                // live reservation was committed in the emission-to-apply
+                // window — the starvation the ladder measured just ended.
+                // Writing the terminal would mint a spurious
+                // stalled-queued infra record (TripsRegression) for a job
+                // the cluster is actively running, strip the live batch's
+                // reservation, and belt-drop its real result.
+                if ledger
+                    .tracker()
+                    .in_flight
+                    .lock()
+                    .await
+                    .contains_key(&stall.job)
+                {
+                    tracing::info!(
+                        job = %stall.job,
+                        "queued-escalate verdict is stale (the job was committed since \
+                         emission); skipping — the fresh batch owns the clock now"
+                    );
+                    continue;
+                }
                 match write_terminal_stall(
                     state,
                     contexts,
@@ -2777,6 +2883,19 @@ pub async fn run_with_backends(
                 // neither set (a re-queued job kept accruing Active time in
                 // the pending pool), and a clock keyed on anything but the
                 // job's own transitions could start before its first offer.
+                //
+                // Owner snapshot BEFORE the verdicts are computed: the
+                // submit/collect tasks keep committing and settling while
+                // this tick runs, and apply_stall_actions re-verifies each
+                // verdict's job against the owner it was (at latest)
+                // computed under — a commit/settle landing after this
+                // line, anywhere in the emission-to-apply window, makes
+                // the verdict visibly stale instead of silently applying
+                // against the wrong batch. Snapshotting early only errs
+                // conservative: a verdict skipped for a pre-emission
+                // change re-fires next tick against fresh state.
+                let in_flight_owners: HashMap<String, u64> =
+                    ledger.tracker().in_flight.lock().await.clone();
                 let outcome = watchdog.lock().await.on_tick(&tick);
                 // Backpressure: dispatch-gap pause and queue-depth
                 // threshold both come from the watchdog's tick outcome —
@@ -2978,6 +3097,7 @@ pub async fn run_with_backends(
                         &results,
                         &mut stall_retries,
                         &outcome.stalled,
+                        &in_flight_owners,
                         &mode,
                         schedule_mode,
                         &knobs,
@@ -3772,7 +3892,7 @@ mod tests {
     use crate::run::grpc::test_support::FakeStoreApi;
     use crate::run::grpc::{ClusterCounts, GraphSnapshot, IceSnapshot, PoisonedView};
     use crate::run::model::{
-        DispatchEntry, ExpectedOutcome, PathOutcome, SUPPLY_OUTCOME_DELEGATED,
+        DispatchEntry, ExpectedOutcome, PathOutcome, RequeueReason, SUPPLY_OUTCOME_DELEGATED,
         SUPPLY_OUTCOME_DELIVERED, SUPPLY_OUTCOME_FAILED, SUPPLY_OUTCOME_REFUSED,
         SUPPLY_OUTCOME_UNAVAILABLE, SupplyEntry, build_status_name,
     };
@@ -6687,6 +6807,7 @@ mod tests {
         // The watchdog's stall auto-retry, applied through the production
         // stall path (journal + increment + gate update together).
         live.commit_batch(1, &[jc.to_string()]).await;
+        let owners = live.tracker().in_flight.lock().await.clone();
         apply_stall_actions(
             &state,
             &live,
@@ -6698,6 +6819,7 @@ mod tests {
                 kind: watchdog::StallKind::ActiveStall,
                 requeues_used: 0,
             }],
+            &owners,
             "leaf",
             ScheduleMode::Timeless,
             &Knobs::default(),
@@ -8625,9 +8747,12 @@ mod tests {
             ice: IcePoll::NotPolled,
             engine_paused: false,
         };
+        // Owner snapshot at apply time == emission time for these
+        // synchronous drives (no concurrent committer).
         let apply = async |stalled: &[StallVerdict],
                            stall_retries: &mut HashMap<String, u32>,
                            probe: &mut StallProgressProbe| {
+            let owners = job_ledger.tracker().in_flight.lock().await.clone();
             apply_stall_actions(
                 &state,
                 &job_ledger,
@@ -8635,6 +8760,7 @@ mod tests {
                 &results,
                 stall_retries,
                 stalled,
+                &owners,
                 "leaf",
                 ScheduleMode::Timeless,
                 &knobs,
@@ -8853,6 +8979,16 @@ mod tests {
         )]));
         job_ledger.commit_batch(21, &[recorded.to_string()]).await;
         job_ledger.commit_batch(22, &[starved.to_string()]).await;
+        // Both batches settled (reservations released, the production
+        // precondition for queued-ladder verdicts): an escalation for a
+        // job still holding a reservation is the STALE shape and is
+        // skipped — pinned by stale_queued_escalate_verdict_is_skipped.
+        tracker
+            .release_after_settle(21, &[recorded.to_string()], std::time::Duration::ZERO)
+            .await;
+        tracker
+            .release_after_settle(22, &[starved.to_string()], std::time::Duration::ZERO)
+            .await;
 
         // Both verdicts arrive on one tick: the leaked clock's escalation
         // and a genuinely starved job's.
@@ -8868,6 +9004,7 @@ mod tests {
                 requeues_used: 2,
             },
         ];
+        let owners = job_ledger.tracker().in_flight.lock().await.clone();
         apply_stall_actions(
             &state,
             &job_ledger,
@@ -8875,6 +9012,7 @@ mod tests {
             &results,
             &mut stall_retries,
             &verdicts,
+            &owners,
             "leaf",
             ScheduleMode::Timeless,
             &Knobs::default(),
@@ -8907,6 +9045,293 @@ mod tests {
             Some(Verdict::MatchBuilt.as_str()),
             "the in-memory view keeps the real verdict too"
         );
+    }
+
+    /// Shared fixture for the stale-watchdog-verdict tests: a state dir,
+    /// ledger (tracker + watchdog), one job with a context, and empty
+    /// results.
+    #[allow(clippy::type_complexity)]
+    fn stale_verdict_fixture(
+        dir: &tempfile::TempDir,
+        job: &str,
+    ) -> (
+        StateDir,
+        Arc<SubmitTracker>,
+        Arc<tokio::sync::Mutex<Watchdog>>,
+        ledger::JobLedger,
+        HashMap<String, JobContext>,
+    ) {
+        let state = StateDir::new(dir.path()).unwrap();
+        let tracker = Arc::new(SubmitTracker::default());
+        let wd = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let job_ledger = ledger::JobLedger::new(state.clone(), tracker.clone(), wd.clone());
+        let contexts: HashMap<String, JobContext> = [(
+            job.to_string(),
+            fold_ctx(job, &format!("/nix/store/{}-stale.drv", "d".repeat(32))),
+        )]
+        .into();
+        (state, tracker, wd, job_ledger, contexts)
+    }
+
+    /// Stale QueuedRequeue verdict: a commit_batch lands in the
+    /// emission-to-apply window (the job's starvation just ended), so
+    /// applying the ladder step must be a complete no-op — NO
+    /// REQUEUE_SOURCE_QUEUED journal entry (pre-fix the entry was
+    /// journaled before confirm_queued_requeue's phase check silently
+    /// no-opped, leaving durable journal/live divergence: the restart
+    /// fold then seeds a ladder step the live watchdog never consumed
+    /// and terminalizes a merely-starved job one window early), no
+    /// clock reset, phase still Active for the fresh batch. The legit
+    /// direction (still Queued at apply) journals exactly one step —
+    /// both directions in one test.
+    #[tokio::test]
+    async fn stale_queued_requeue_journals_nothing_after_a_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = "starved.x86_64-linux";
+        let (state, _tracker, wd, job_ledger, contexts) = stale_verdict_fixture(&dir, job);
+        let results = tokio::sync::Mutex::new(BTreeMap::new());
+        let mut stall_retries: HashMap<String, u32> = HashMap::new();
+
+        // Production path to a Queued clock: committed, settled, re-queued.
+        job_ledger.commit_batch(1, &[job.to_string()]).await;
+        job_ledger
+            .tracker()
+            .release_after_settle(1, &[job.to_string()], std::time::Duration::ZERO)
+            .await;
+        job_ledger
+            .requeue_collected(job, RequeueReason::InfraAutoRetry)
+            .await
+            .unwrap();
+        let baseline_journal = state
+            .load_jsonl::<model::RequeueRecord>(StateFile::Requeues)
+            .unwrap();
+
+        // Emission: the queued-watchdog verdict is computed... and the
+        // owner snapshot taken with it.
+        let owners = job_ledger.tracker().in_flight.lock().await.clone();
+        let verdict = vec![StallVerdict {
+            job: job.to_string(),
+            kind: StallKind::QueuedRequeue,
+            requeues_used: 1,
+        }];
+        // The window: a fresh batch commits the job (Queued → Active).
+        job_ledger.commit_batch(2, &[job.to_string()]).await;
+
+        apply_stall_actions(
+            &state,
+            &job_ledger,
+            &contexts,
+            &results,
+            &mut stall_retries,
+            &verdict,
+            &owners,
+            "leaf",
+            ScheduleMode::Timeless,
+            &Knobs::default(),
+            &mut test_probe(),
+            "c-staleq",
+        )
+        .await;
+
+        let journal: Vec<model::RequeueRecord> = state.load_jsonl(StateFile::Requeues).unwrap();
+        assert_eq!(
+            journal.len(),
+            baseline_journal.len(),
+            "a stale queued-requeue must journal nothing: {journal:?}"
+        );
+        assert_eq!(
+            wd.lock().await.phase_of(job),
+            Some(watchdog::JobPhase::Active),
+            "the fresh batch's Active clock is untouched"
+        );
+
+        // Legit direction: settle + re-queue again, verdict applied with
+        // the job still Queued — exactly one ladder step journals.
+        job_ledger
+            .tracker()
+            .release_after_settle(2, &[job.to_string()], std::time::Duration::ZERO)
+            .await;
+        job_ledger
+            .requeue_collected(job, RequeueReason::InfraAutoRetry)
+            .await
+            .unwrap();
+        let owners = job_ledger.tracker().in_flight.lock().await.clone();
+        apply_stall_actions(
+            &state,
+            &job_ledger,
+            &contexts,
+            &results,
+            &mut stall_retries,
+            &verdict,
+            &owners,
+            "leaf",
+            ScheduleMode::Timeless,
+            &Knobs::default(),
+            &mut test_probe(),
+            "c-staleq",
+        )
+        .await;
+        let journal: Vec<model::RequeueRecord> = state.load_jsonl(StateFile::Requeues).unwrap();
+        assert_eq!(
+            journal
+                .iter()
+                .filter(|r| r.source == model::REQUEUE_SOURCE_QUEUED)
+                .count(),
+            1,
+            "the live verdict journals exactly one ladder step: {journal:?}"
+        );
+    }
+
+    /// Stale QueuedEscalate verdict: the job was committed in the
+    /// emission-to-apply window. Applying would mint a spurious
+    /// stalled-queued InfraIndeterminate terminal (TripsRegression) for
+    /// a job the cluster just started running, strip the live batch's
+    /// reservation, and belt-drop its real result. The skip must leave
+    /// no record, the reservation, and the Active clock.
+    #[tokio::test]
+    async fn stale_queued_escalate_writes_no_terminal_after_a_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = "escalated.x86_64-linux";
+        let (state, tracker, wd, job_ledger, contexts) = stale_verdict_fixture(&dir, job);
+        let results = tokio::sync::Mutex::new(BTreeMap::new());
+        let mut stall_retries: HashMap<String, u32> = HashMap::new();
+
+        // Queued clock, budget exhausted (the escalate precondition).
+        job_ledger.commit_batch(1, &[job.to_string()]).await;
+        job_ledger
+            .tracker()
+            .release_after_settle(1, &[job.to_string()], std::time::Duration::ZERO)
+            .await;
+        job_ledger
+            .requeue_collected(job, RequeueReason::InfraAutoRetry)
+            .await
+            .unwrap();
+
+        // Emission, then the window: a fresh batch commits the job.
+        let owners = job_ledger.tracker().in_flight.lock().await.clone();
+        let verdict = vec![StallVerdict {
+            job: job.to_string(),
+            kind: StallKind::QueuedEscalate,
+            requeues_used: 2,
+        }];
+        job_ledger.commit_batch(7, &[job.to_string()]).await;
+
+        apply_stall_actions(
+            &state,
+            &job_ledger,
+            &contexts,
+            &results,
+            &mut stall_retries,
+            &verdict,
+            &owners,
+            "leaf",
+            ScheduleMode::Timeless,
+            &Knobs::default(),
+            &mut test_probe(),
+            "c-stalee",
+        )
+        .await;
+
+        assert!(
+            state
+                .load_jsonl::<JobRecord>(StateFile::Results)
+                .unwrap()
+                .is_empty(),
+            "no spurious stalled-queued terminal for a job the cluster is running"
+        );
+        assert_eq!(
+            tracker.in_flight.lock().await.get(job),
+            Some(&7),
+            "the live batch keeps its reservation"
+        );
+        assert_eq!(
+            wd.lock().await.phase_of(job),
+            Some(watchdog::JobPhase::Active),
+            "the live batch keeps its Active clock"
+        );
+    }
+
+    /// Stale ActiveStall verdict, both stale shapes: (a) the stuck batch
+    /// settled in the window with nothing re-committed (the moot
+    /// verdict — collect classifies the settle in-band; the auto-retry
+    /// would journal a phantom cluster-attempt, double-charge the
+    /// budget, and burn the single stall retry), and (b) settled AND a
+    /// successor committed (applying would additionally strip the
+    /// successor's reservation and flip its Active clock to Queued).
+    /// Neither may journal, count, strip, or observe anything.
+    #[tokio::test]
+    async fn stale_active_stall_is_skipped_when_the_owner_changed() {
+        for successor_commits in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let job = "overlap.x86_64-linux";
+            let (state, tracker, wd, job_ledger, contexts) = stale_verdict_fixture(&dir, job);
+            let results = tokio::sync::Mutex::new(BTreeMap::new());
+            let mut stall_retries: HashMap<String, u32> = HashMap::new();
+
+            // B1 owns the job at emission.
+            job_ledger.commit_batch(1, &[job.to_string()]).await;
+            let owners = job_ledger.tracker().in_flight.lock().await.clone();
+            let verdict = vec![StallVerdict {
+                job: job.to_string(),
+                kind: StallKind::ActiveStall,
+                requeues_used: 0,
+            }];
+            // The window: B1 settles; optionally B2 commits.
+            tracker
+                .release_after_settle(1, &[job.to_string()], std::time::Duration::ZERO)
+                .await;
+            if successor_commits {
+                job_ledger.commit_batch(2, &[job.to_string()]).await;
+            }
+
+            apply_stall_actions(
+                &state,
+                &job_ledger,
+                &contexts,
+                &results,
+                &mut stall_retries,
+                &verdict,
+                &owners,
+                "leaf",
+                ScheduleMode::Timeless,
+                &Knobs::default(),
+                &mut test_probe(),
+                "c-stalea",
+            )
+            .await;
+
+            let journal: Vec<model::RequeueRecord> = state.load_jsonl(StateFile::Requeues).unwrap();
+            assert!(
+                journal.is_empty(),
+                "successor_commits={successor_commits}: nothing journaled: {journal:?}"
+            );
+            assert_eq!(
+                tracker.resubmission_count(job).await,
+                0,
+                "successor_commits={successor_commits}: no phantom resubmission"
+            );
+            assert!(
+                stall_retries.is_empty(),
+                "successor_commits={successor_commits}: the single stall retry is not burned"
+            );
+            if successor_commits {
+                assert_eq!(
+                    tracker.in_flight.lock().await.get(job),
+                    Some(&2),
+                    "the successor keeps its reservation"
+                );
+                assert_eq!(
+                    wd.lock().await.phase_of(job),
+                    Some(watchdog::JobPhase::Active),
+                    "the successor keeps its Active clock"
+                );
+            } else {
+                assert!(
+                    !tracker.in_flight.lock().await.contains_key(job),
+                    "nothing re-reserves the settled job"
+                );
+            }
+        }
     }
 
     /// Timed-mode stall gating (design section 9.4): an active stall in a
@@ -8972,6 +9397,7 @@ mod tests {
         let apply = async |stalled: &[StallVerdict],
                            stall_retries: &mut HashMap<String, u32>,
                            probe: &mut StallProgressProbe| {
+            let owners = job_ledger.tracker().in_flight.lock().await.clone();
             apply_stall_actions(
                 &state,
                 &job_ledger,
@@ -8979,6 +9405,7 @@ mod tests {
                 &results,
                 stall_retries,
                 stalled,
+                &owners,
                 "leaf",
                 ScheduleMode::Timed,
                 &knobs,
@@ -9181,12 +9608,15 @@ mod tests {
         };
 
         // Drive the watchdog so ONE tick carries both verdicts: stuck is
-        // Active from t0 (6h threshold); starved is Queued with its
-        // re-enqueue budget spent by two QueuedRequeue crossings (2h, 4h),
-        // each applied through the production path (journal + confirm).
+        // Active from t0 (6h threshold), committed through the ledger so
+        // its reservation backs the stall verdicts (an ownerless
+        // ActiveStall is the stale shape and is skipped); starved is
+        // Queued with its re-enqueue budget spent by two QueuedRequeue
+        // crossings (2h, 4h), each applied through the production path
+        // (journal + confirm).
+        job_ledger.commit_batch(31, &[stuck.to_string()]).await;
         {
             let mut w = wd.lock().await;
-            w.observe_job(stuck, watchdog::JobPhase::Active);
             w.observe_job(starved, watchdog::JobPhase::Queued);
             w.on_tick(&tick_at(0));
         }
@@ -9200,6 +9630,7 @@ mod tests {
                 "{:?}",
                 crossing.stalled
             );
+            let owners = job_ledger.tracker().in_flight.lock().await.clone();
             apply_stall_actions(
                 &state,
                 &job_ledger,
@@ -9207,6 +9638,7 @@ mod tests {
                 &results,
                 &mut stall_retries,
                 &crossing.stalled,
+                &owners,
                 "leaf",
                 ScheduleMode::Timeless,
                 &Knobs::default(),
@@ -9234,6 +9666,7 @@ mod tests {
         let journal_aside = dir.path().join("requeues.jsonl.aside");
         std::fs::rename(&journal_path, &journal_aside).unwrap();
         std::fs::create_dir(&journal_path).unwrap();
+        let owners = job_ledger.tracker().in_flight.lock().await.clone();
         apply_stall_actions(
             &state,
             &job_ledger,
@@ -9241,6 +9674,7 @@ mod tests {
             &results,
             &mut stall_retries,
             &both.stalled,
+            &owners,
             "leaf",
             ScheduleMode::Timeless,
             &Knobs::default(),
@@ -9278,6 +9712,7 @@ mod tests {
         // exactly once, and the committed transition consumes the level.
         std::fs::remove_dir(&journal_path).unwrap();
         std::fs::rename(&journal_aside, &journal_path).unwrap();
+        let owners = job_ledger.tracker().in_flight.lock().await.clone();
         apply_stall_actions(
             &state,
             &job_ledger,
@@ -9285,6 +9720,7 @@ mod tests {
             &results,
             &mut stall_retries,
             &next.stalled,
+            &owners,
             "leaf",
             ScheduleMode::Timeless,
             &Knobs::default(),
