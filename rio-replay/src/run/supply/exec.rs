@@ -2372,8 +2372,7 @@ async fn pause_campaign(
 /// runs, and a path one arm could not provide can be delivered by a later
 /// arm or a top-up — so counting raw rows would double-count. The last
 /// settlement row per path is its settled disposition; bookkeeping rows
-/// (`unavailable`, `skipped` — see
-/// [`supply_outcome_is_settlement`](crate::run::model::supply_outcome_is_settlement))
+/// (`unavailable`, `skipped` — see [`supply_outcome_is_settlement`])
 /// count only for paths that never settled, because they assert nothing
 /// about delivery: a skip-held row appended after the claim holder's
 /// `delivered` row must leave the path counted delivered, and a breaker
@@ -3308,6 +3307,28 @@ mod tests {
         };
         refresh_outcome_counts(&mut untouched, &[]);
         assert_eq!(untouched.delivered, 3);
+    }
+
+    /// A supply-report.json artifact written before the `skipped` count
+    /// and the `upload_collapsed` flag existed still parses: both default
+    /// (0 / false — an old report never claims a collapse), and the
+    /// struct tolerates unknown keys so a rolled-back reader survives a
+    /// newer artifact too.
+    #[test]
+    fn supply_report_artifacts_from_before_the_skip_vocabulary_parse() {
+        let old = r#"{"plannedPrefetch":4,"prefetchMissing":1,"prefetchUnavailable":0,
+            "delivered":2,"delegated":1,"alreadyPresent":0,"refused":1,"unavailable":0,
+            "failed":1,"uploadedBytes":1024,"uploadSecs":2.0,"uploadMibPerS":null,
+            "probeErrors":{},"shortfallPct":25.0}"#;
+        let parsed: SupplyStageReport = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.skipped, 0);
+        assert!(!parsed.upload_collapsed);
+        assert_eq!(parsed.delivered, 2);
+        // Rollback direction: a NEWER artifact (unknown future key) is
+        // readable by this version — unknown keys are ignored.
+        let newer = r#"{"delivered":1,"someFutureKey":true}"#;
+        let parsed: SupplyStageReport = serde_json::from_str(newer).unwrap();
+        assert_eq!(parsed.delivered, 1);
     }
 
     /// Bookkeeping rows never displace settlements in the outcome fold —
