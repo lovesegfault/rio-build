@@ -890,15 +890,17 @@ pub(crate) fn validate_declared_hash_outputs(
         .strip_suffix(".drv")
         .unwrap_or_else(|| drv_sp.name());
 
-    let (recursive, algo_str) = match raw_algo.strip_prefix("r:") {
-        Some(rest) => (true, rest),
-        None => (false, raw_algo),
-    };
-    let algo: HashAlgo = algo_str.parse().map_err(|_| {
+    // Shared FodAlgo constructor — case-exact algo, one case-sensitive
+    // `r:` strip. Before this, the declared-hash gate folded case (lax
+    // FromStr) while `fod_algo_verifiable` below was exact — the
+    // merged_bug_048 disagreement shape INSIDE one component.
+    // r[impl nix.hash.algos+1]
+    let parsed = rio_nix::hash::OutputHashAlgo::parse(raw_algo).map_err(|_| {
         format!(
             "derivation {drv_path} output '{name}' declares unsupported outputHashAlgo '{raw_algo}'"
         )
     })?;
+    let (recursive, algo): (bool, HashAlgo) = (parsed.recursive, parsed.algo);
     // Length-discriminated decode (base16 / nixbase32 / base64) — CppNix
     // accepts all three encodings for outputHash, so the gate must too.
     // r[impl nix.hash.fod-decode+1]
@@ -922,16 +924,15 @@ pub(crate) fn validate_declared_hash_outputs(
 }
 
 /// True iff `algo` (`"sha256"`, `"r:sha512"`, …) is an outputHashAlgo
-/// the builder can verify/finalize. Mirrors rio-builder's
-/// `FodHashAlgo::from_nix_str` (FOD verification) and
-/// `FloatingCaSpec::from_outputs` (floating-CA finalization), which
-/// accept the same set — the three must stay in sync, which is cheap
-/// because Nix's supported set has been fixed for years.
+/// the builder can verify/finalize. Delegates to the system-wide
+/// FodAlgo constructor — the SAME parse rio-builder's verify pipeline
+/// and floating-CA finalizer run — so this screen cannot drift from
+/// what the worker enforces (it used to be a hand-mirrored set with a
+/// "must stay in sync" comment; merged_bug_048 was the sibling
+/// declared-hash gate disagreeing with it on case).
+// r[impl nix.hash.algos+1]
 pub(crate) fn fod_algo_verifiable(algo: &str) -> bool {
-    matches!(
-        algo.strip_prefix("r:").unwrap_or(algo),
-        "sha1" | "sha256" | "sha512"
-    )
+    rio_nix::hash::OutputHashAlgo::parse(algo).is_ok()
 }
 
 /// Clamp for tenant-controlled string attrs (`pname`/`version`/`name`)
@@ -2499,13 +2500,35 @@ mod tests {
         Ok(())
     }
 
+    /// merged_bug_048 pins: case variants are NOT verifiable — the
+    /// screen now delegates to the shared constructor, so these pins
+    /// hold for every other gate by construction (the oracle's
+    /// `parseHashAlgo`, hash.cc:468-490, rejects the same spellings).
+    // r[verify nix.hash.algos+1]
     #[test]
     fn fod_algo_verifiable_table() {
         for ok in ["sha1", "sha256", "sha512", "r:sha1", "r:sha256", "r:sha512"] {
             assert!(fod_algo_verifiable(ok), "{ok} must be verifiable");
         }
-        for bad in ["md5", "r:md5", "blake3", "sha3-256", ""] {
-            assert!(!fod_algo_verifiable(bad), "{bad} must not be verifiable");
+        for bad in [
+            "md5",
+            "r:md5",
+            "blake3",
+            "sha3-256",
+            "",
+            "SHA256",
+            "Sha256",
+            "sHa512",
+            "SHA1",
+            "r:SHA256",
+            "R:sha256",
+            "r:r:sha256",
+            "git:sha256",
+            "text:sha256",
+            " sha256",
+            "sha256 ",
+        ] {
+            assert!(!fod_algo_verifiable(bad), "{bad:?} must not be verifiable");
         }
     }
 
@@ -2592,6 +2615,26 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.to_string().contains("bad path ''"), "{err}");
+
+        // merged_bug_048 pin: a case-variant algo is UNVERIFIABLE — it
+        // routes to the offender flow (decided by realized-outputs
+        // exemption: no build can ever run for it), with the raw
+        // spelling preserved for diagnostics. Both gateway gates now
+        // agree by construction: the verifiability screen and the
+        // declared-hash binding parse with the same constructor —
+        // previously the binding's lax FromStr folded "SHA256" while
+        // the screen was exact, a latent disagreement shadowed only by
+        // the screen running first.
+        // r[verify nix.hash.algos+1]
+        let honest = StorePath::make_fixed_output("fetch", &nix_hash, false, &[]).unwrap();
+        for bad_algo in ["SHA256", "Sha256", "r:SHA256", "R:sha256"] {
+            let mut cache = HashMap::new();
+            cache.insert(key.clone(), fod_at(bad_algo, &hex_hash, honest.as_str()));
+            let offenders = validate_dag(std::slice::from_ref(&node), &cache)
+                .expect("classified as offender, not an immediate Err");
+            assert_eq!(offenders.len(), 1, "{bad_algo:?} must be an offender");
+            assert_eq!(offenders[0].algo, bad_algo, "raw spelling preserved");
+        }
     }
 
     /// CppNix's shape rule for fixed-output derivations, enforced at
