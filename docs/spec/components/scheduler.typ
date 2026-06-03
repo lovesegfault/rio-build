@@ -1046,11 +1046,15 @@ visibility share nodes: redundant from-source rebuilds of cached paths, and
 --- in the post-failover pruned-root shape --- a spurious fail-fast where the
 documented behaviour is the substitute lane. Minimum-UUID over the live
 tenant set is otherwise arbitrary but total, keys the store-side probe cache
-(`(tenant, path)`) to a stable tenant, and matches the `.min()` discipline of
-the bookkeeping attribution accessor (`attributed_tenant`), so the live
-policy pick and the bookkeeping attribution agree on which tenant represents
-a shared node. Liveness is the established round-1 constraint: a lingering
-terminal build must not authorize a new fetch it no longer wants.
+(`(tenant, path)`) to a stable tenant, and shares the `.min()` discipline of
+the bookkeeping attribution accessor (`attributed_tenant`) --- the same
+pure-function-of-the-tenant-set argument, but NOT the same pick: bookkeeping
+counts lingering terminal builds and answers per node, while the probe pick
+is live-only and batch-wide (one tenant authorizes the whole probe batch),
+so the two coincide only when every interested build is live and the node's
+minimum is the batch minimum. Liveness is the established round-1
+constraint: a lingering terminal build must not authorize a new fetch it no
+longer wants.
 
 #r("sched.substitute.eager-probe")[
   Every probeable node in a submission MUST receive a substitutability verdict

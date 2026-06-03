@@ -821,10 +821,16 @@ impl DagActor {
     ///   within a tenant — or the verdict re-rolls on identical state.
     ///   Smallest-UUID is otherwise arbitrary but total; preferring,
     ///   say, a tenant with configured upstreams would need store-side
-    ///   knowledge the scheduler doesn't have. Matches the
-    ///   `attributed_tenant` discipline so the live policy pick and
-    ///   the bookkeeping attribution agree on which tenant represents
-    ///   a shared node.
+    ///   knowledge the scheduler doesn't have. Same `.min()` discipline
+    ///   as the bookkeeping accessor (`attributed_tenant`), but NOT the
+    ///   same pick: bookkeeping counts lingering terminal builds and
+    ///   answers per node, while this pick is live-only and batch-wide
+    ///   (one tenant authorizes the whole probe batch, an accepted
+    ///   trade for one `FindMissingPaths` per batch instead of one per
+    ///   tenant group) — the two coincide only when every interested
+    ///   build is live and the node's minimum is the batch minimum.
+    ///   The liveness divergence is deliberate and test-pinned
+    ///   (`live_attributed_tenant_min_over_live_only`).
     // r[impl sched.dispatch.probe-tenant-stable]
     #[allow(clippy::extra_unused_lifetimes)] // 'a only in impl-Trait arg
     pub(super) fn probe_substitute_auth<'a>(
