@@ -200,7 +200,7 @@ fn disclose(reason: AbandonReason, unacked_lines: u64, last_acked_line: Option<u
 /// upload loop runs, defused on every normal exit; if the task unwinds
 /// (or is torn down without reaching its exit path), the guard's `Drop`
 /// reads the last published [`Progress`] and routes through
-/// [`disclose`] with [`AbandonReason::Panicked`]. This covers the
+/// `disclose` with [`AbandonReason::Panicked`]. This covers the
 /// `JoinError` path AND a post-detach panic — nobody has to await the
 /// handle for the loss to be counted.
 struct LossGuard {
@@ -253,7 +253,7 @@ pub enum DrainStatus {
     /// The upload ended with lines still un-acked. Whether that is loss
     /// — and whether the loss counter fired — is decided by `reason`
     /// (see `lost_lines`); the disclosure itself happened at the
-    /// task's single [`disclose`] site before this status was returned.
+    /// task's single `disclose` site before this status was returned.
     Abandoned {
         last_acked_line: Option<u64>,
         unacked_lines: u64,
@@ -772,7 +772,20 @@ impl UploadTask {
     fn trim(&mut self, durable_through_line: u64) -> usize {
         let mut popped = 0;
         while let Some(front) = self.buffer.front() {
-            let last_line = front.first_line_number + (front.lines.len() as u64 - 1);
+            // checked_add, not `+`: a frame whose line numbers overflow
+            // u64 is a protocol violation (LogBatcher numbers lines
+            // monotonically from 0), and the failure mode must be the
+            // same in every build profile — debug `+` panics on
+            // overflow but release WRAPS, which would silently corrupt
+            // the ack trim (and let the panic-disclosure test pass in
+            // dev while never firing under the release-built CI gate,
+            // which is exactly how this line was found). The panic is
+            // caught by the upload task's LossGuard and disclosed as
+            // reason=panic.
+            let last_line = front
+                .first_line_number
+                .checked_add(front.lines.len() as u64 - 1)
+                .expect("log frame line numbers overflow u64 (protocol violation)");
             if last_line > durable_through_line {
                 break;
             }
@@ -796,7 +809,7 @@ impl UploadTask {
     ///
     /// `reason` carries WHICH permanent class fired; whether the
     /// discarded lines count as loss is `lost_lines`'s decision at
-    /// the single [`disclose`] site (CompleteLog: no — the store
+    /// the single `disclose` site (CompleteLog: no — the store
     /// provably holds the finished log; Superseded/CapExhausted: yes).
     async fn reject_permanently(&mut self, reason: AbandonReason) -> DrainStatus {
         self.buffer.clear();
