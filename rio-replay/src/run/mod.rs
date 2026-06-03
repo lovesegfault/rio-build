@@ -3097,10 +3097,12 @@ pub async fn run_with_backends(
 }
 
 /// Read the persisted supply-stage report back and re-derive its per-path
-/// outcome counts from the supply journal (latest record per path wins, so
-/// a path recorded by both the coverage probe and the supply stage — or
-/// re-supplied by a later arm — is counted once, under its settled
-/// disposition). `None` when the campaign state has no supply report.
+/// outcome counts from the supply journal (latest SETTLEMENT record per
+/// path wins — see [`refresh_outcome_counts`] — so a path recorded by both
+/// the coverage probe and the supply stage, or re-supplied by a later arm,
+/// is counted once, under its settled disposition, and bookkeeping rows
+/// never displace one). `None` when the campaign state has no supply
+/// report.
 fn load_supply_summary(state: &StateDir) -> Result<Option<SupplyStageReport>> {
     let Some(mut report) = state.read_json::<SupplyStageReport>("supply-report.json")? else {
         return Ok(None);
