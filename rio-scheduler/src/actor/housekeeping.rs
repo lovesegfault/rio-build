@@ -166,7 +166,7 @@ impl DagActor {
         // store replica claims the work. Leader-gated like every
         // state gauge here (the handle_tick early-return above);
         // zeroed once by handle_leader_lost.
-        metrics::gauge!("rio_scheduler_substituting_derivations")
+        crate::observability::LeaderGauge::SubstitutingDerivations
             .set(f64::from(snapshot.substituting_derivations));
         // A2.4 (bug_217): the state gauges are single-sourced from the
         // SAME snapshot the proto fields serve — gauge and
@@ -175,10 +175,10 @@ impl DagActor {
         // nodes as builder-queue depth, the has_pending_unclaimed_job
         // omission). Leader-gated by the handle_tick early-return;
         // zeroed by handle_leader_lost.
-        metrics::gauge!("rio_scheduler_derivations_queued")
+        crate::observability::LeaderGauge::DerivationsQueued
             .set(f64::from(snapshot.queued_derivations));
-        metrics::gauge!("rio_scheduler_builds_active").set(f64::from(snapshot.active_builds));
-        metrics::gauge!("rio_scheduler_derivations_running")
+        crate::observability::LeaderGauge::BuildsActive.set(f64::from(snapshot.active_builds));
+        crate::observability::LeaderGauge::DerivationsRunning
             .set(f64::from(snapshot.running_derivations));
         self.snapshot_tx.send_replace(snapshot);
     }
@@ -740,8 +740,8 @@ impl DagActor {
         // ScaledObject contract). Store materialization claims get
         // their own series; counting them here inflated every consumer
         // sized off the builder fleet during substitution waves.
-        metrics::gauge!("rio_scheduler_open_attempts").set(opens.build.len() as f64);
-        metrics::gauge!("rio_scheduler_open_materialization_attempts")
+        crate::observability::LeaderGauge::OpenAttempts.set(opens.build.len() as f64);
+        crate::observability::LeaderGauge::OpenMaterializationAttempts
             .set(opens.materialization.len() as f64);
         // Skew tripwire (merged_bug_307 rider): a pending-unclaimed
         // view entry whose node is still Assigned/Running with NO open

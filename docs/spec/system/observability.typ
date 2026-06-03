@@ -198,22 +198,56 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   metrics MUST follow the `rio_scheduler_*` naming prefix.
 ]
 
-#r("obs.metric.scheduler-leader-gate+4")[
-  Scheduler state gauges (`_builds_active`, `_derivations_queued`,
-  `_derivations_running`, `_open_attempts`) are
-  published *only by the leader*. The standby's actor is warm (DAGs merge
-  for fast takeover per #rref("sched.lease.k8s-lease")), so its counts are
-  stale or zero; with `replicas>1`, publishing from both would create
-  duplicate Prometheus series with identical labels, and stat-panel
-  reducers pick one nondeterministically. Counters and histograms are
-  unaffected --- the standby's handlers no-op, so its counters stay at zero
-  naturally, and `sum(rate(...))` is the idiomatic query form anyway.
+#r("obs.metric.scheduler-leader-gate+5")[
+  Scheduler leader-state gauges form *one declared family* (the
+  `LeaderGauge` declaration in `rio-scheduler/src/observability.rs`): each
+  member carries its series name, its closed label axis (when labeled),
+  and its per-member reset value. Family members are published *only by
+  the leader*, are born at their declared reset on every replica at boot,
+  and are swept to their declared reset *exactly once on leadership loss,
+  driven from the single declaration* --- never from a hand-maintained
+  list. The standby's actor is warm (DAGs merge for fast takeover per
+  #rref("sched.lease.k8s-lease")), so its counts are stale or zero; with
+  `replicas>1`, publishing from both would create duplicate Prometheus
+  series with identical labels, and stat-panel reducers pick one
+  nondeterministically. Reset values are per-member because zero is wrong
+  for ratio gauges (`_sla_prior_divergence` resets to its in-band neutral
+  1.0 --- a 0.0 sweep would itself fire the clamp alert). Counters and
+  histograms are unaffected --- the standby's handlers no-op, so its
+  counters stay at zero naturally, and `sum(rate(...))` is the idiomatic
+  query form anyway.
 ]
 The stream-era `_workers_active` gauge (and its connection-state exception
 to the leader gate) is retired: it was deprecated and pinned to zero when
 the stream session was deleted, kept only as the deletion-gate recording
 series, and removed with the proto sweep once that role ended.
 `_open_attempts` is the busy-fleet gauge.
+
+#r("obs.metric.alert-counter-seeded")[
+  Every counter referenced by a PrometheusRule or ScaledObject `expr:`
+  MUST be born at zero on every replica at process boot (the per-crate
+  alert-seed table, applied from `describe_metrics()`), with every value
+  of its closed label set seeded individually. An alert expression over a
+  never-incremented counter otherwise evaluates an *absent* series --- not
+  zero --- so threshold and rate forms silently skip the first burst after
+  every fresh rollout.
+]
+Histograms are exempt by type (seeding one would fabricate an
+observation); gauges are governed by the leader-family rule above or by a
+recorded per-replica exemption. The parity tests
+(`rio-scheduler/tests/alert_metrics.rs`, `rio-store/tests/alert_metrics.rs`)
+enforce the rule against the live helm templates in CI.
+
+#r("obs.metric.store-gauge-ownership")[
+  Every `rio_store_*` gauge MUST be periodically self-published by the
+  store process that owns its data source (the store gauge tick); an RPC
+  handler MAY additionally publish on call as a freshness mirror, but
+  MUST NOT be a gauge's only writer.
+]
+The class this forecloses: a gauge whose only refresh rode an RPC that a
+since-retired caller used to invoke (`GetLoad` after the ComponentScaler
+CR removal) freezes at its last on-call value indefinitely --- the
+dashboard shows a stale constant, not an absence.
 
 #r("obs.metric.scheduler-substituting")[
   The scheduler MUST publish

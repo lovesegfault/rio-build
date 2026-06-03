@@ -3673,3 +3673,54 @@ async fn contract_first_pull_clears_ice_not_yet_ready_does_not() {
         "the armed entry is consumed by the clear, exactly like the registration edge"
     );
 }
+
+// r[verify obs.metric.scheduler-leader-gate+5]
+/// bug_310's structural pin: `handle_leader_lost` writes the
+/// cost-table edge-reload latch false through the LEADER_EDGES table.
+/// Pre-table, NO lose-side writer existed — `cost_was_leader` stayed
+/// true across an A→B→A lease flap inside one 600s housekeeping tick,
+/// so the prelude's `!was_leader` reload check
+/// (r[sched.sla.cost-leader-edge-reload], pinned by the prelude tests
+/// in sla/cost.rs) was skipped and the tick body persisted the deposed
+/// tenure's prices. Composed invariant: this lose-edge store + the
+/// prelude test = "the first leader tick after ANY acquire edge
+/// reloads before persist", wake-timing independent (a Notify-based
+/// lose signal would coalesce with the re-acquire nudge).
+#[tokio::test]
+async fn leader_lost_writes_cost_latch_false() {
+    use std::sync::atomic::Ordering;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor_hw(db.pool.clone());
+    actor.cost_was_leader.store(true, Ordering::Relaxed);
+
+    actor.handle_leader_lost();
+
+    assert!(
+        !actor.cost_was_leader.load(Ordering::Relaxed),
+        "handle_leader_lost must store cost_was_leader=false (the LEADER_EDGES \
+         lose cell) — without it a lose→re-acquire flap inside one housekeeping \
+         tick skips the cost-table edge reload and persists stale prices"
+    );
+}
+
+/// The paired-hook table is total: every edge has BOTH cells written
+/// (no-ops are explicit fn pointers, so this is a compile-time
+/// property), and the acquire cell of the cost latch actually nudges
+/// the housekeeping notify (permit-based — observable as an immediate
+/// `notified()` completion).
+#[tokio::test]
+async fn leader_edges_acquire_cells_fire() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let actor = bare_actor_hw(db.pool.clone());
+
+    for edge in crate::observability::LEADER_EDGES {
+        (edge.on_acquire)(&actor);
+    }
+    // The cost-latch acquire cell stored a notify permit.
+    assert!(
+        futures_util::FutureExt::now_or_never(actor.cost_reload_notify.notified()).is_some(),
+        "cost-table LEADER_EDGES acquire cell must notify_one() the \
+         housekeeping edge-reload"
+    );
+}

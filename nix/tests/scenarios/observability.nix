@@ -135,14 +135,25 @@ pkgs.testers.runNixOSTest {
             # it is present even at 0 — the same set-every-tick
             # registration mechanism as rio_scheduler_open_attempts.
             "rio_scheduler_materialization_stalled",
-            # T-6.2 lifecycle counters: pre-registered at 0 by the
-            # flag-on actor construction (the gc-collect .absolute(0)
-            # pattern) so alerts/dashboards have series from boot —
-            # present here even though this scenario's chain build is
-            # not substitutable and never increments them.
+            # Alert-seeded counters (C3 metric-ownership): born at 0
+            # by describe_metrics() via the ALERT_SEEDED_COUNTERS
+            # table (rio-scheduler/src/observability.rs — the T-6.2
+            # actor-construction seeds moved there), so alerts and
+            # dashboards have series from boot — present here even
+            # though this scenario's chain build is not substitutable
+            # and never increments any of them.
             "rio_scheduler_materialization_claims_total",
             "rio_scheduler_materialization_jobs_created_total",
             "rio_scheduler_materialization_jobs_resolved_total",
+            # bug_322: the establishment tripwire + fenced-write alert
+            # counters were the unseeded stragglers — their alerts
+            # evaluated an ABSENT series until the first
+            # establishment/fence event. RED pre-fix: absent from
+            # /metrics after the chain build (nothing establishes or
+            # fences in a healthy build); the seed table makes them
+            # present from boot.
+            "rio_scheduler_pull_establishments_total",
+            "rio_scheduler_evidence_write_fenced_total",
         ],
         (${gatewayHost}, 9092, "store"): [
             "rio_store_put_path_total",

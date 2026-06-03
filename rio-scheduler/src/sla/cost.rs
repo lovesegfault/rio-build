@@ -1080,8 +1080,16 @@ fn emit_stale_gauge(cost: &parking_lot::RwLock<CostTable>, now: f64) {
 
 /// Spot-only — `main.rs` spawns this only under `hw_cost_source =
 /// Spot`. λ refresh / sweep / persist / leader-edge reload live
-/// in [`interrupt_housekeeping`] (which runs unconditionally and is the
-/// SOLE owner of `was_leader` writes — see `poller_tick_prelude`).
+/// in [`interrupt_housekeeping`] (which runs unconditionally). TWO
+/// writers own `was_leader` (the two-writer contract): the prelude in
+/// `poller_tick_prelude` writes the steady-state edges (false on a
+/// standby tick, true after a successful leader reload), and the
+/// actor's `handle_leader_lost` writes false through
+/// `observability::LEADER_EDGES` so a lose→re-acquire flap INSIDE one
+/// 600s tick still presents a false→true edge to the prelude — without
+/// that lose-edge store, the flap left the latch true, the reload was
+/// skipped, and the tick body persisted the deposed tenure's prices
+/// (bug_310).
 /// This poller reads the shared `was_leader` and skips exactly one body
 /// on its own observed false→true edge so its first fold lands on the
 /// freshly-reloaded table, not the stale in-mem one (which the reload

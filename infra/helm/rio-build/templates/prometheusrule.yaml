@@ -465,9 +465,13 @@ spec:
         # evidence) — a dead or misconfigured upstream is the only thing
         # between its builds and progress. Builds WAIT (never fail) while
         # parked; this alert is the operator's cue to fix the upstream.
-        # The gauge is leader-published and pre-registered at 0 flag-on,
-        # so the expr has a series from boot; max() collapses the
-        # leader/old-leader series duplication across a failover.
+        # The gauge is a leader-gauge family member: every replica
+        # births it at its declared reset (0) at boot, the leader
+        # publishes ground truth each tick, and leadership loss sweeps
+        # it back to the reset from the family declaration — so the
+        # expr has a series from boot and a deposed leader's frozen
+        # backlog cannot keep this alert latched; max() collapses the
+        # brief leader/old-leader series overlap across a failover.
         # for: 15m — park backoffs start at 30 s with exponential
         # doubling; 15 minutes of sustained backlog means the re-claim
         # ladder keeps failing, not a transient upstream blip.

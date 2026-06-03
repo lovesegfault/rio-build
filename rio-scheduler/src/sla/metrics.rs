@@ -569,14 +569,26 @@ mod tests {
         }
         // Emit side: every SLA_METRICS name must appear as the first
         // arg of a counter!/gauge!/histogram! macro in a production
-        // source file (NOT this one).
+        // source file (NOT this one) — OR be a leader-gauge family
+        // member (C3 metric-ownership: family members carry no
+        // per-site literals; their single name literal lives in the
+        // `leader_gauges!` declaration and every production set goes
+        // through the typed accessors, e.g. `sla_prior_divergence` at
+        // prior.rs::clamp_field). The enum membership check is
+        // stronger than a text grep: the declaration IS the emit
+        // mechanism.
         for name in SLA_METRICS {
+            let family_member = crate::observability::LeaderGauge::ALL
+                .iter()
+                .any(|g| g.name() == *name);
             assert!(
-                SLA_FILES
-                    .iter()
-                    .any(|f| has_macro_call(f, name, &EMIT_MACROS)),
+                family_member
+                    || SLA_FILES
+                        .iter()
+                        .any(|f| has_macro_call(f, name, &EMIT_MACROS)),
                 "{name} registered but never emitted in production code \
-                 (no counter!/gauge!/histogram! call found in SLA_FILES)"
+                 (no counter!/gauge!/histogram! call found in SLA_FILES, \
+                 and not a LeaderGauge family member)"
             );
         }
         // Retired metrics must NOT appear at any emit site.

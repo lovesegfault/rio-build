@@ -5365,14 +5365,32 @@ async fn job_lifecycle_metrics_count_claims_and_resolutions() -> TestResult {
             1,
             "job 2 resolved cancelled (zero-interest closer); resolved map: {resolved:?}"
         );
-        // The pre-registration (flag-on actor construction) makes every
-        // outcome label present even at 0 — what gives the alerts and
-        // dashboards series to evaluate from boot.
+        // The pre-registration moved from actor construction to the
+        // boot path (describe_metrics → ALERT_SEEDED_COUNTERS, C3
+        // metric-ownership): every outcome label is born at 0 on the
+        // process scrape surface, not per-actor. Run the boot seed
+        // under this recorder and assert the full outcome product is
+        // present at its seeded floor (the two production increments
+        // above ride on top).
+        crate::describe_metrics();
+        let mut seeded: std::collections::BTreeMap<String, u64> = Default::default();
+        for (ck, _, _, v) in snap.snapshot().into_vec() {
+            let DebugValue::Counter(c) = v else { continue };
+            if ck.key().name() == "rio_scheduler_materialization_jobs_resolved_total" {
+                let outcome = ck
+                    .key()
+                    .labels()
+                    .find(|l| l.key() == "outcome")
+                    .map(|l| l.value().to_owned())
+                    .unwrap_or_default();
+                seeded.insert(outcome, c);
+            }
+        }
         for outcome in ["from_source", "unobtainable", "obsolete"] {
             assert_eq!(
-                resolved.get(outcome).copied().unwrap_or(u64::MAX),
+                seeded.get(outcome).copied().unwrap_or(u64::MAX),
                 0,
-                "outcome {outcome:?} is pre-registered at 0; resolved map: {resolved:?}"
+                "outcome {outcome:?} is boot-seeded at 0; seeded map: {seeded:?}"
             );
         }
     }

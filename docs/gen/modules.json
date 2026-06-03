@@ -1149,6 +1149,11 @@
       "doc": "rio-scheduler binary entry point."
     },
     {
+      "path": "observability.rs",
+      "depth": 0,
+      "doc": "Metric series ownership: declared registries replacing incidental"
+    },
+    {
       "path": "retry_policy.rs",
       "depth": 0,
       "doc": "The retry/poison decision surface, as the scheduler consumes it."

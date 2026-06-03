@@ -965,7 +965,7 @@ impl DagActor {
     /// `handle_tick` gate). Prometheus then sees two series per
     /// gauge until this pod restarts.
     // r[impl sched.lease.standby-tick-noop+2]
-    // r[impl obs.metric.scheduler-leader-gate+4]
+    // r[impl obs.metric.scheduler-leader-gate+5]
     pub(super) fn handle_leader_lost(&mut self) {
         // A same-count re-acquire's kept recovery may have re-stamped
         // the completion after `on_lose` cleared it (the same-epoch
@@ -988,29 +988,25 @@ impl DagActor {
         // any of the new tenure's writes run
         // (`sched.evidence.durability`).
         self.clear_persisted_state();
-        // (The stream-era workers_active gauge is gone; nothing
-        // registration-shaped needs zeroing here.)
+        // Lose-edge effects run from the SAME table the acquire
+        // handler iterates (observability::LEADER_EDGES) — an
+        // acquire-side effect cannot merge without its lose cell
+        // written. The gauge family member sweeps every declared
+        // gauge to its declared reset (merged_bug_025: the hand list
+        // this replaced omitted materialization_stalled, so a deposed
+        // leader's frozen parked-count fed the MD-D1 stalled alert —
+        // and sla_prior_divergence, whose neutral is 1.0, was never
+        // in scope at all). substituting_derivations/open_attempts
+        // rationale unchanged: leader-published series must collapse
+        // on loss or sum() consumers (the store ScaledObject
+        // triggers) double-count the fleet after every failover.
         // r[impl obs.metric.scheduler-substituting]
-        // substituting_derivations is in the list: it is published
-        // from the tick snapshot (leader-only), so a deposed leader
-        // would otherwise export its frozen backlog forever — exactly
-        // the duplicate-series hazard the leader gate exists for, and
-        // worse here because KEDA scales the store on this series.
-        //
-        // open_attempts too: the rule names it in the leader-gated
-        // family, and although its VALUE is durable-backed (the new
-        // leader republishes the same number from the same rows), the
-        // deposed pod's frozen series would persist until restart —
-        // sum() consumers (the store ScaledObject's builders trigger)
-        // would double-count the fleet after every failover.
-        for g in [
-            "rio_scheduler_derivations_queued",
-            "rio_scheduler_builds_active",
-            "rio_scheduler_derivations_running",
-            "rio_scheduler_substituting_derivations",
-            "rio_scheduler_open_attempts",
-        ] {
-            metrics::gauge!(g).set(0.0);
+        // The cost-table latch member writes cost_was_leader=false —
+        // THE lose-edge writer bug_310 was missing: without it an
+        // A→B→A flap inside one 600s housekeeping tick skipped the
+        // edge reload and persisted the deposed tenure's prices.
+        for edge in crate::observability::LEADER_EDGES {
+            (edge.on_lose)(self);
         }
     }
 
@@ -1050,16 +1046,19 @@ impl DagActor {
         // ordering).
         self.recovery_claim_stamped = false;
 
-        // Nudge `interrupt_housekeeping` so its lease-acquire
-        // edge-reload of `cost_table` (and the `cost_was_leader`
-        // false→true store) runs promptly. Without this, the gate on
-        // `handle_ack_spawned_intents`' `observe_instance_types` write
-        // stays closed for up to 600s (the housekeeping tick) and the
-        // controller's edge-detected instance-type observations during
-        // that window are dropped. `Notify::notified()` is
-        // permit-based, so this fire-and-forget won't be lost if
+        // Acquire-edge effects from the paired-hook table
+        // (observability::LEADER_EDGES — same table handle_leader_lost
+        // sweeps). The cost-table member nudges
+        // `interrupt_housekeeping` so its lease-acquire edge-reload of
+        // `cost_table` (and the `cost_was_leader` false→true store)
+        // runs promptly instead of up to 600s later; the gauge-family
+        // member is an explicit acquire no-op (the next leader tick
+        // republishes from ground truth). `Notify::notified()` is
+        // permit-based, so the fire-and-forget isn't lost if
         // housekeeping isn't yet at its select.
-        self.cost_reload_notify.notify_one();
+        for edge in crate::observability::LEADER_EDGES {
+            (edge.on_acquire)(self);
+        }
 
         // Snapshot the flap-detection signals BEFORE recovery. If the
         // lease flaps (lose→reacquire WITH a holder change in between)

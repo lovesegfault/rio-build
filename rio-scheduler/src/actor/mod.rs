@@ -383,7 +383,7 @@ pub struct DagActor {
     pub(crate) cost_was_leader: Arc<AtomicBool>,
     /// `interrupt_housekeeping` wake-up — see
     /// [`DagActorPlumbing::cost_reload_notify`].
-    cost_reload_notify: Arc<tokio::sync::Notify>,
+    pub(crate) cost_reload_notify: Arc<tokio::sync::Notify>,
     /// In-process insufficient-capacity mask. `handle_ack_spawned_intents`
     /// marks cells the controller reported `unfulfillable`; the
     /// per-dispatch read-time mask (`A \ masked`) is applied in
@@ -730,48 +730,6 @@ impl DagActor {
         // starts false until the first successful recovery's Ok arm.
         let dag_authoritative = plumbing.leader.recovery_complete();
 
-        // T-6.2 (Phase B): pre-register the materialization lifecycle
-        // counters at 0 when the flag is on (the rio-store gc-collect
-        // pattern) so (a) the PrometheusRule alerts have series to
-        // evaluate from boot instead of returning empty until the first
-        // job, and (b) the metrics-registered VM assertion sees them
-        // after a non-substitutable build.
-        {
-            metrics::counter!("rio_scheduler_materialization_claims_total").absolute(0);
-            for origin in ["pruned", "cache_opportunity", "stale_reset", "reprobe"] {
-                metrics::counter!(
-                    "rio_scheduler_materialization_jobs_created_total",
-                    "origin" => origin
-                )
-                .absolute(0);
-            }
-            for outcome in [
-                "success",
-                "from_source",
-                "unobtainable",
-                "cancelled",
-                "obsolete",
-            ] {
-                metrics::counter!(
-                    "rio_scheduler_materialization_jobs_resolved_total",
-                    "outcome" => outcome
-                )
-                .absolute(0);
-            }
-            // Item T: the PD-20 conversion counter — pre-registered per
-            // origin so the RioSchedulerMaterializationConversions
-            // alert has a series to evaluate from boot (a never-firing
-            // increase() over an absent series is indistinguishable
-            // from a broken scrape).
-            for origin in ["pruned", "cache_opportunity", "stale_reset", "reprobe"] {
-                metrics::counter!(
-                    "rio_scheduler_materialization_converted_total",
-                    "origin" => origin
-                )
-                .absolute(0);
-            }
-        }
-
         Self {
             dag,
             builds: HashMap::new(),
@@ -1060,8 +1018,12 @@ impl DagActor {
         //   independent.
         // - `cost_table`/`cost_was_leader`/`cost_reload_notify`:
         //   shared with `interrupt_housekeeping` (the edge-reload
-        //   owner). The actor is a passive reader/gated-writer; the
-        //   lease-transition reload is housekeeping's job.
+        //   owner). Correctly NOT in this wipe: the latch's lifecycle
+        //   is edge-owned — `handle_leader_lost` writes the false
+        //   store and `handle_leader_acquired` the reload nudge, both
+        //   through `observability::LEADER_EDGES` (the paired-hook
+        //   table; bug_310). This fn also serves recovery-start and
+        //   flap-discard, where a latch write would be wrong.
         // - `tick_count`: harmless counter.
     }
 

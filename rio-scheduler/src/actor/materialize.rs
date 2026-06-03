@@ -2108,7 +2108,7 @@ impl DagActor {
             }
         }
         // The stalled gauge: ground truth after the re-evaluation pass.
-        metrics::gauge!("rio_scheduler_materialization_stalled").set(still_parked as f64);
+        crate::observability::LeaderGauge::MaterializationStalled.set(still_parked as f64);
     }
 
     /// The PG-backed view backstop (merged_bug_246's sweep half +

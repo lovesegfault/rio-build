@@ -559,3 +559,318 @@ mod grep_tests {
         );
     }
 }
+
+// ===========================================================================
+// DescribedKinds — captures describe_*! names WITH their metric kind
+// ===========================================================================
+
+/// Metric kind as declared by the `describe_*!` macro family. Used by
+/// [`assert_alert_metrics_covered`] to classify alert-referenced names:
+/// counters must be boot-seeded, gauges must be leader-family-or-exempt,
+/// histograms are exempt by type (a `histogram_quantile` over an absent
+/// series is a rendering gap, not a verdict gap — and seeding one would
+/// fabricate an observation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetricKind {
+    Counter,
+    Gauge,
+    Histogram,
+}
+
+/// Recorder that captures `describe_*!` names keyed to their
+/// [`MetricKind`]. The kind-aware sibling of `DescribedNames`.
+#[derive(Default)]
+pub struct DescribedKinds(Arc<Mutex<HashMap<String, MetricKind>>>);
+
+impl DescribedKinds {
+    /// Snapshot of the name → kind map captured so far.
+    pub fn kinds(&self) -> HashMap<String, MetricKind> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl Recorder for DescribedKinds {
+    fn describe_counter(&self, key: KeyName, _: Option<Unit>, _: SharedString) {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(key.as_str().to_string(), MetricKind::Counter);
+    }
+    fn describe_gauge(&self, key: KeyName, _: Option<Unit>, _: SharedString) {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(key.as_str().to_string(), MetricKind::Gauge);
+    }
+    fn describe_histogram(&self, key: KeyName, _: Option<Unit>, _: SharedString) {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(key.as_str().to_string(), MetricKind::Histogram);
+    }
+    fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> Counter {
+        Counter::noop()
+    }
+    fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
+        Gauge::noop()
+    }
+    fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+        Histogram::noop()
+    }
+}
+
+// ===========================================================================
+// Alert-parity: every alert-referenced series exists from boot
+// ===========================================================================
+
+/// One boot-seeded counter family: the bare name, plus its closed
+/// label axis when the series is labeled. `None` = unlabeled (one
+/// series); `Some((label, values))` = one series per value, all
+/// seeded with `.absolute(0)` at boot.
+///
+/// Mirrors the per-crate `ALERT_SEEDED_COUNTERS` tables (the seed fns
+/// iterate the same shape) so the parity test and the seeder cannot
+/// drift: both consume the one declaration.
+pub struct SeededCounter {
+    pub name: &'static str,
+    pub label: Option<(&'static str, &'static [&'static str])>,
+}
+
+/// A gauge exempt from the leader-family requirement, with the reason
+/// recorded at the declaration site (surfaced verbatim in failures so
+/// the exemption table reads as documentation).
+pub struct GaugeExemption {
+    pub name: &'static str,
+    pub rationale: &'static str,
+}
+
+/// Extract every `rio_<prefix>…` metric token referenced inside an
+/// `expr:` block of the given YAML bodies (PrometheusRule /
+/// ScaledObject templates).
+///
+/// Line-state-machine, not a YAML parser: helm templating (`{{ … }}`)
+/// makes these files non-YAML before render. Two expr shapes:
+///
+/// - `expr: <inline>` — the rest of the line is the expression.
+/// - `expr: |` — every following line MORE indented than the `expr:`
+///   key belongs to the block; the first line at-or-left of the key's
+///   indent ends it.
+///
+/// ScaledObjects carry `query: "<promql>"` instead of `expr:` — the
+/// same inline shape, matched by the same key logic.
+///
+/// Histogram-suffixed tokens (`_bucket`/`_sum`/`_count`) are stripped
+/// to their base name; callers classify the base via the describe
+/// kinds. Annotation/comment references deliberately do NOT count —
+/// only expressions evaluate against absent series.
+pub fn extract_alert_metric_names(yaml_bodies: &[String], prefix: &str) -> BTreeSet<String> {
+    let token_re = regex::Regex::new(&format!(r"\b({}[a-z0-9_]+)", regex::escape(prefix))).unwrap();
+    let mut out = BTreeSet::new();
+    for body in yaml_bodies {
+        let mut block_indent: Option<usize> = None; // inside `expr: |` at this key indent
+        for line in body.lines() {
+            let indent = line.len() - line.trim_start().len();
+            let trimmed = line.trim_start();
+            if let Some(key_indent) = block_indent {
+                if !trimmed.is_empty() && indent <= key_indent {
+                    block_indent = None; // block ended; fall through to re-test this line
+                } else {
+                    collect_tokens(&token_re, trimmed, &mut out);
+                    continue;
+                }
+            }
+            for key in ["expr:", "query:"] {
+                if let Some(rest) = trimmed.strip_prefix(key) {
+                    let rest = rest.trim();
+                    if rest.is_empty() || rest == "|" || rest == "|-" || rest == ">" || rest == ">-"
+                    {
+                        block_indent = Some(indent);
+                    } else {
+                        collect_tokens(&token_re, rest, &mut out);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn collect_tokens(re: &regex::Regex, text: &str, out: &mut BTreeSet<String>) {
+    for cap in re.captures_iter(text) {
+        let mut name = cap[1].to_string();
+        for suffix in ["_bucket", "_sum", "_count"] {
+            if let Some(base) = name.strip_suffix(suffix) {
+                name = base.to_string();
+                break;
+            }
+        }
+        out.insert(name);
+    }
+}
+
+/// Extract exact-match label matchers (`label="value"`) per metric
+/// name from the same expr blocks. Regex matchers (`=~`) only require
+/// the AXIS to exist on the seeded entry — their value sets are open.
+fn extract_label_matchers(yaml_bodies: &[String], prefix: &str) -> Vec<(String, String, String)> {
+    let re = regex::Regex::new(&format!(
+        r#"\b({}[a-z0-9_]+)\{{([^}}]*)}}"#,
+        regex::escape(prefix)
+    ))
+    .unwrap();
+    let pair_re = regex::Regex::new(r#"([a-z0-9_]+)="([^"]*)""#).unwrap();
+    let mut out = Vec::new();
+    for body in yaml_bodies {
+        for cap in re.captures_iter(body) {
+            let name = cap[1].to_string();
+            for pair in pair_re.captures_iter(&cap[2]) {
+                // `=~` regex matchers also match this pattern's tail —
+                // exclude them by checking the char before `=`.
+                let full = pair.get(0).unwrap();
+                let before = &cap[2][..full.start() + pair[1].len()];
+                if before.ends_with('~') {
+                    continue;
+                }
+                out.push((name.clone(), pair[1].to_string(), pair[2].to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Assert every alert-referenced metric of `prefix` is covered: each
+/// counter appearing in a PrometheusRule/ScaledObject `expr:` is in
+/// the crate's boot-seed table (with any exact label matcher inside
+/// the seeded value set), each gauge is leader-family or exempt (with
+/// rationale), and each histogram is exempt by type. Names that the
+/// crate's `describe_metrics()` does not declare at all fail loudly —
+/// an alert over a never-described series is a typo or a stale rule.
+///
+/// `yaml_paths` are read relative to the test's CWD (the crate root
+/// under nextest) — pass `../infra/helm/...` paths and add the files
+/// to the nix test filesets, or the check passes locally and fails
+/// sandboxed.
+#[allow(clippy::too_many_arguments)]
+pub fn assert_alert_metrics_covered(
+    yaml_paths: &[&str],
+    prefix: &str,
+    describe_fn: fn(),
+    seeded: &[SeededCounter],
+    leader_family: &[&str],
+    gauge_exemptions: &[GaugeExemption],
+    crate_name: &str,
+) {
+    let bodies: Vec<String> = yaml_paths
+        .iter()
+        .map(|p| {
+            std::fs::read_to_string(p).unwrap_or_else(|e| {
+                panic!(
+                    "read {p}: {e}; alert-parity test needs the helm templates \
+                     in the nix fileset (nix/lib/nextest-args.nix) — without \
+                     them this check passes locally and fails sandboxed"
+                )
+            })
+        })
+        .collect();
+    let referenced = extract_alert_metric_names(&bodies, prefix);
+    assert!(
+        !referenced.is_empty(),
+        "{crate_name}: no {prefix} tokens found in any expr block of {yaml_paths:?} — \
+         extractor or fileset broke (vacuity guard)"
+    );
+
+    let recorder = DescribedKinds::default();
+    metrics::with_local_recorder(&recorder, describe_fn);
+    let kinds = recorder.kinds();
+
+    let mut failures: Vec<String> = Vec::new();
+    for name in &referenced {
+        match kinds.get(name) {
+            None => failures.push(format!(
+                "{name}: referenced in an alert expr but never described by \
+                 {crate_name}::describe_metrics() — typo or stale rule"
+            )),
+            Some(MetricKind::Histogram) => {} // exempt by type
+            Some(MetricKind::Counter) => {
+                if !seeded.iter().any(|s| s.name == *name) {
+                    failures.push(format!(
+                        "{name}: alert-referenced counter not in the boot-seed table — \
+                         the alert evaluates an absent series until the first increment \
+                         (the bug_322 birth-gap class); add it to ALERT_SEEDED_COUNTERS"
+                    ));
+                }
+            }
+            Some(MetricKind::Gauge) => {
+                let in_family = leader_family.contains(&name.as_str());
+                let exempt = gauge_exemptions.iter().any(|e| e.name == *name);
+                if !in_family && !exempt {
+                    failures.push(format!(
+                        "{name}: alert-referenced gauge neither in the leader-gauge \
+                         family nor exempted-with-rationale — a deposed replica's \
+                         frozen series (or a never-set boot gap) feeds this alert"
+                    ));
+                }
+            }
+        }
+    }
+
+    // Exact label matchers in exprs must be inside the seeded product.
+    for (name, label, value) in extract_label_matchers(&bodies, prefix) {
+        let Some(entry) = seeded.iter().find(|s| s.name == name) else {
+            continue; // counter-membership failure already recorded above (or a gauge)
+        };
+        match entry.label {
+            None => failures.push(format!(
+                "{name}: expr matches {{{label}=\"{value}\"}} but the seed entry is \
+                 unlabeled — seed the label product or the matcher never matches \
+                 the seeded series"
+            )),
+            Some((axis, values)) => {
+                if axis != label {
+                    failures.push(format!(
+                        "{name}: expr matches on label {label:?} but the seed axis \
+                         is {axis:?}"
+                    ));
+                } else if !values.contains(&value.as_str()) {
+                    failures.push(format!(
+                        "{name}: expr matches {{{label}=\"{value}\"}} but {value:?} \
+                         is not in the seeded value set {values:?}"
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{crate_name} alert-parity failures:\n  - {}",
+        failures.join("\n  - ")
+    );
+}
+
+/// Grep `<manifest_dir>/src/**.rs` for `metrics::gauge!("…")` literals
+/// only — the gauge-scoped sibling of [`grep_emitted_names`], for the
+/// single-ownership policy test: every RAW gauge emit must be an
+/// exempted per-replica/own-edge gauge; leader-family members carry no
+/// per-site literals at all (they publish through the typed
+/// `LeaderGauge` accessors, whose names live only in the one
+/// declaration), so a family name appearing here means someone
+/// bypassed the family.
+pub fn grep_emitted_gauge_names(manifest_dir: &str) -> Vec<String> {
+    let re = regex::Regex::new(r#"\bmetrics::gauge!\s*\(\s*"([a-z0-9_]+)""#).unwrap();
+    let mut names = BTreeSet::new();
+    fn walk(dir: &Path, re: &regex::Regex, out: &mut BTreeSet<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, re, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                for cap in re.captures_iter(&text) {
+                    out.insert(cap[1].to_string());
+                }
+            }
+        }
+    }
+    walk(&Path::new(manifest_dir).join("src"), &re, &mut names);
+    names.into_iter().collect()
+}

@@ -54,6 +54,14 @@ let
     "rio-migrations"
     "rio-test-support"
   ];
+  # Helm templates whose expr:/query: blocks the alert-parity tests
+  # (tests/alert_metrics.rs in rio-scheduler and rio-store) parse at
+  # test runtime.
+  alertTemplates = pkgs.lib.fileset.unions [
+    (unfilteredRoot + "/infra/helm/rio-build/templates/prometheusrule.yaml")
+    (unfilteredRoot + "/infra/helm/rio-build/templates/store-scaledobject.yaml")
+    (unfilteredRoot + "/infra/helm/rio-build/templates/gateway-scaledobject.yaml")
+  ];
 in
 {
   # Runtime inputs for test execution, keyed by member (null =
@@ -96,6 +104,7 @@ in
       workspaceFileset
       (unfilteredRoot + "/.config/nextest.toml")
       (unfilteredRoot + "/docs/gen/metrics.json")
+      alertTemplates
     ];
   };
   # Fileset for the shared cargo-metadata drv and the
@@ -121,6 +130,12 @@ in
       # fs::read_to_string). Lives outside any crate dir,
       # so the per-member overlay never supplies it.
       (unfilteredRoot + "/docs/gen/metrics.json")
+      # alert_metrics parity tests (rio-scheduler/rio-store)
+      # read the PrometheusRule/ScaledObject templates at
+      # runtime — without these in the sandbox fileset the
+      # check passes locally and fails sandboxed (or worse,
+      # the reverse).
+      alertTemplates
     ];
   };
   # Per-member full src/ for the runtime overlay (mkNextestRun

@@ -32,6 +32,7 @@ pub mod grpc;
 /// run_lease_loop}` paths keep working after the B1 extraction.
 pub use rio_lease as lease;
 pub mod lease_hooks;
+pub mod observability;
 // The Phase-0 reference fold over a derivation's failure history — the
 // executable specification the retryPolicy model's CountersRefineHistory
 // invariant compares the live RetryState counters against. Dead code by
@@ -542,4 +543,17 @@ pub fn describe_metrics() {
          emitting Log lines) — gateway can't drain fast enough (I-144)."
     );
     crate::sla::metrics::describe_all();
+
+    // Series birth (C3 metric-ownership): every alert-referenced
+    // counter and every leader-family gauge exists from the first
+    // scrape on every replica. Tail of describe_metrics() because
+    // rio_common::server::run installs the real exporter
+    // (init_metrics) immediately before calling this fn — the seeds
+    // bind to the exporter, not a pre-init noop recorder. NOT in
+    // DagActor::new: boot scrape-surface is a process property, and
+    // the standby gauge tests' touch-sets must stay actor-clean.
+    // r[impl obs.metric.alert-counter-seeded]
+    // r[impl obs.metric.scheduler-leader-gate+5]
+    crate::observability::seed_alert_counters();
+    crate::observability::seed_leader_gauges();
 }

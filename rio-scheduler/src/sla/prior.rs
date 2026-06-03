@@ -532,12 +532,14 @@ fn median_fitparams(v: &[&FitParams]) -> FitParams {
 /// divergence ratio is reported as `exp(fleet − op)` so the alert
 /// threshold (`> 2 ∨ < 0.5`) keeps its meaning across both domains.
 fn clamp_field(fleet: f64, op: f64, param: &'static str, log_domain: bool) -> f64 {
-    let g = ::metrics::gauge!("rio_scheduler_sla_prior_divergence", "param" => param);
+    // Leader-family member (set_with: the param axis is declared with
+    // the family; reset/seed = 1.0, the in-band neutral).
+    let g = |v: f64| crate::observability::LeaderGauge::SlaPriorDivergence.set_with(param, v);
     if op.abs() < f64::EPSILON {
         // Degenerate band (operator basis 0, e.g. q): pass fleet
         // through and report "in band" so a previously-set value for
         // this param doesn't stick.
-        g.set(1.0);
+        g(1.0);
         return fleet;
     }
     let (lo, hi, ratio) = if log_domain {
@@ -551,7 +553,7 @@ fn clamp_field(fleet: f64, op: f64, param: &'static str, log_domain: bool) -> f6
     // Unconditional: in-band → ratio ∈ [0.5, 2.0] and the alert
     // (`> 2 ∨ < 0.5`) auto-clears when fleet converges. Gating on
     // `clamped != fleet` left the last out-of-band ratio stale forever.
-    g.set(ratio);
+    g(ratio);
     fleet.clamp(lo, hi)
 }
 

@@ -79,7 +79,7 @@ fn spawn_actor_with_flags(
     (h, t)
 }
 
-// r[verify obs.metric.scheduler-leader-gate+4]
+// r[verify obs.metric.scheduler-leader-gate+5]
 // r[verify obs.metric.scheduler-substituting]
 /// When is_leader=false, handle_tick must NOT set state gauges.
 /// Standby actor is warm (DAGs merge for takeover) but its counts are
@@ -135,7 +135,7 @@ async fn test_not_leader_does_not_set_gauges() -> TestResult {
 }
 
 // r[verify sched.lease.standby-tick-noop+2]
-// r[verify obs.metric.scheduler-leader-gate+4]
+// r[verify obs.metric.scheduler-leader-gate+5]
 // r[verify obs.metric.scheduler-substituting]
 /// Was-leader → standby: `LeaderLost` clears in-memory state and zeros
 /// gauges; subsequent `Tick` early-returns so the orphan-watcher does
@@ -191,21 +191,31 @@ async fn test_ex_leader_housekeeping_is_noop_after_lose() -> TestResult {
             .is_none(),
         "LeaderLost should clear_persisted_state (DAG empty)"
     );
-    // LeaderLost zeroed the leader-state gauges (one-shot, not
-    // per-Tick). workers_active is NOT in this list — it's
-    // connection-state (executors map is retained on lose), maintained
-    // by inc/dec on standby.
-    for g in [
-        "rio_scheduler_derivations_queued",
-        "rio_scheduler_builds_active",
-        "rio_scheduler_derivations_running",
-        "rio_scheduler_substituting_derivations",
-    ] {
-        assert_eq!(
-            recorder.gauge_value(&format!("{g}{{}}")),
-            Some(0.0),
-            "LeaderLost should zero {g} so ex-leader's series collapses"
-        );
+    // LeaderLost swept the whole leader-gauge FAMILY to its declared
+    // resets (one-shot, not per-Tick) — family-driven, so a gauge
+    // added to the declaration is covered here automatically (the
+    // hand list this replaced omitted materialization_stalled and
+    // never knew about sla_prior_divergence's 1.0 neutral).
+    for g in crate::observability::LeaderGauge::ALL {
+        match g.label_axis() {
+            None => assert_eq!(
+                recorder.gauge_value(&format!("{}{{}}", g.name())),
+                Some(g.reset_value()),
+                "LeaderLost should sweep {} to its declared reset so the \
+                 ex-leader's series collapses",
+                g.name()
+            ),
+            Some((axis, values)) => {
+                for v in values {
+                    assert_eq!(
+                        recorder.gauge_value(&format!("{}{{{axis}={v}}}", g.name())),
+                        Some(g.reset_value()),
+                        "LeaderLost should sweep {}{{{axis}={v}}} to its declared reset",
+                        g.name()
+                    );
+                }
+            }
+        }
     }
 
     // Drop the watcher (orphan condition) and Tick ×3. cfg(test)
@@ -234,7 +244,7 @@ async fn test_ex_leader_housekeeping_is_noop_after_lose() -> TestResult {
     Ok(())
 }
 
-// r[verify obs.metric.scheduler-leader-gate+4]
+// r[verify obs.metric.scheduler-leader-gate+5]
 /// `LeaderLost` must zero `rio_scheduler_open_attempts` like the rest
 /// of the leader-state gauge family. Unlike the DAG gauges it is set
 /// from a durable view (the establishment sweep), so the new leader
@@ -276,11 +286,71 @@ async fn leader_lost_zeroes_open_attempts_gauge() -> TestResult {
     barrier(&handle).await;
     assert_eq!(
         recorder.gauge_value("rio_scheduler_open_attempts{}"),
-        Some(0.0),
-        "LeaderLost must zero open_attempts — a deposed leader's frozen \
-         series double-counts the fleet for sum() consumers (the KEDA \
-         builders trigger)"
+        Some(crate::observability::LeaderGauge::OpenAttempts.reset_value()),
+        "LeaderLost must sweep open_attempts to its declared family reset — \
+         a deposed leader's frozen series double-counts the fleet for sum() \
+         consumers (the KEDA builders trigger)"
     );
+    Ok(())
+}
+
+// r[verify obs.metric.scheduler-leader-gate+5]
+/// Family-driven loss sweep: EVERY declared member — including the
+/// labeled divergence gauge and members no tick has published — reads
+/// its declared reset after LeaderLost. Pre-family red (recorded in
+/// the introducing commit): the hand list missed
+/// `materialization_stalled` (a deposed leader's frozen parked-count
+/// kept feeding the MD-D1 stalled alert) and `sla_prior_divergence`
+/// (whose 0.0 would FIRE the clamp alert; its declared reset is the
+/// 1.0 neutral).
+#[tokio::test]
+async fn leader_lost_resets_every_leader_gauge() -> TestResult {
+    use crate::observability::LeaderGauge;
+
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task, leader) = spawn_actor_with_leader(db.pool.clone(), true, true);
+
+    // Sentinel-set every member through its typed accessor (7.0 is
+    // outside every declared reset) so the sweep is provably a write,
+    // not a leftover.
+    for g in LeaderGauge::ALL {
+        match g.label_axis() {
+            None => g.set(7.0),
+            Some((_, values)) => {
+                for v in values {
+                    g.set_with(v, 7.0);
+                }
+            }
+        }
+    }
+
+    leader.on_lose();
+    handle.send_unchecked(ActorCommand::LeaderLost).await?;
+    barrier(&handle).await;
+
+    for g in LeaderGauge::ALL {
+        match g.label_axis() {
+            None => assert_eq!(
+                recorder.gauge_value(&format!("{}{{}}", g.name())),
+                Some(g.reset_value()),
+                "{} must read its declared reset after LeaderLost",
+                g.name()
+            ),
+            Some((axis, values)) => {
+                for v in values {
+                    assert_eq!(
+                        recorder.gauge_value(&format!("{}{{{axis}={v}}}", g.name())),
+                        Some(g.reset_value()),
+                        "{}{{{axis}={v}}} must read its declared reset after LeaderLost",
+                        g.name()
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
