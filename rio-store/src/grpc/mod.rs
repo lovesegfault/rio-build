@@ -51,7 +51,7 @@ mod put_path_batch;
 mod queries;
 mod sign;
 
-pub use admin::{StoreAdminServiceImpl, spawn_pg_pool_gauge_tick};
+pub use admin::{StoreAdminServiceImpl, spawn_store_gauge_tick};
 pub use chunk::ChunkServiceImpl;
 
 /// Default cap on paths in a FindMissingPaths request (DoS guard).

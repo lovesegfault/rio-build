@@ -1207,6 +1207,11 @@ in
   #   admission gate — utilization observable at 1.0 on the 1-permit
   #   gate mid-cascade, and the serialized drain outlives the gauge
   #   tick.
+  # r[verify obs.metric.store-gauge-ownership]
+  #   cascade (4b): the admission gauge DECAYS to 0.0 within 45s of
+  #   the drain — the permit drop edge + the 30s store gauge tick own
+  #   the fall; pre-fix the acquire-only gauge froze at 1.0 forever
+  #   (bug_245), feeding KEDA a permanently-saturated replica.
   # r[verify sched.substitute.eager-probe]
   # r[verify sched.materialize.job+2]
   #   deep-chain: one merge burst classifies all 49 seeded links —

@@ -157,41 +157,45 @@ impl StoreAdminServiceImpl {
 /// Cadence of the in-process PG-pool gauge tick. Matches the old
 /// de-facto cadence ballpark (the ComponentScaler's GetLoad poll);
 /// the gauge is a slow-moving utilization ratio, so 30 s is plenty.
-const PG_POOL_GAUGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const STORE_GAUGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Publish `rio_store_pg_pool_utilization` once from the live pool
-/// counters (the same `(size − num_idle)/max_connections` formula
-/// GetLoad reports — see [`StoreAdminServiceImpl::pg_pool_utilization`]).
-fn publish_pg_pool_gauge(pool: &PgPool) {
+/// Publish every store-owned gauge once from its live data source:
+/// `rio_store_pg_pool_utilization` from the pool counters (the same
+/// `(size − num_idle)/max_connections` formula GetLoad reports — see
+/// [`StoreAdminServiceImpl::pg_pool_utilization`]) and
+/// `rio_store_substitute_admission_utilization` from the admission
+/// gate. ONE periodic publisher for the whole store gauge surface —
+/// a gauge whose only refresh rides an RPC freezes the moment the
+/// caller retires (the c9a9d163e ComponentScaler→KEDA orphan class:
+/// GetLoad's reconciler caller was deleted and the pool panel froze;
+/// bug_245 was the same class one gauge over). Edge publishers
+/// (acquire/drop on the gate) keep the instant signal; this tick is
+/// the steady-state floor and heals any concurrent-drop interleave.
+fn publish_store_gauges(pool: &PgPool, gate: &crate::admission::AdmissionGate) {
     let util = StoreAdminServiceImpl::pg_pool_utilization(pool);
     metrics::gauge!("rio_store_pg_pool_utilization").set(f64::from(util));
+    metrics::gauge!("rio_store_substitute_admission_utilization")
+        .set(f64::from(gate.utilization()));
 }
 
-/// Self-publish the PG-pool gauge on a 30 s in-process tick.
-///
-/// Historically the gauge was refreshed only as a `GetLoad`
-/// side-effect, and the store ComponentScaler reconciler was the only
-/// periodic caller — once that CR is removed (KEDA owns the store
-/// replica count) the gauge would freeze, blanking the store
-/// dashboard's PG-pool panel and `xtask k8s status`. The store now
-/// owns its gauge; `GetLoad` keeps publishing on call so the values
-/// the controller acts on (for any future CR target) stay mirrored.
+/// Self-publish every store-owned gauge on a 30 s in-process tick
+/// (the [`publish_store_gauges`] set). The store owns its gauges;
+/// `GetLoad` keeps publishing on call so the values a caller acts on
+/// stay mirrored, but no gauge's ONLY writer is an RPC handler.
 // r[impl obs.metric.store-pg-pool+2]
-pub fn spawn_pg_pool_gauge_tick(
+// r[impl obs.metric.store-gauge-ownership]
+pub fn spawn_store_gauge_tick(
     pool: PgPool,
+    gate: crate::admission::AdmissionGate,
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
-    rio_common::task::spawn_periodic(
-        "pg-pool-gauge",
-        PG_POOL_GAUGE_INTERVAL,
-        shutdown,
-        move || {
-            let pool = pool.clone();
-            async move {
-                publish_pg_pool_gauge(&pool);
-            }
-        },
-    )
+    rio_common::task::spawn_periodic("store-gauges", STORE_GAUGE_INTERVAL, shutdown, move || {
+        let pool = pool.clone();
+        let gate = gate.clone();
+        async move {
+            publish_store_gauges(&pool, &gate);
+        }
+    })
 }
 
 /// Cap on `TriggerGc.extra_roots`. Separate from
@@ -607,13 +611,17 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         Ok(Response::new(()))
     }
 
-    /// Per-replica load snapshot for the ComponentScaler reconciler.
+    /// Per-replica load snapshot (operator tooling / any future
+    /// controller target — the ComponentScaler CR is retired).
     ///
-    /// Side-effect: also publishes `rio_store_pg_pool_utilization` so
-    /// Prometheus sees the same value the controller acted on. The
-    /// gauge's steady cadence is the in-process 30 s tick
-    /// ([`spawn_pg_pool_gauge_tick`]) — this handler's publication
-    /// keeps the on-call mirror, it is no longer the only updater.
+    /// Side-effect: publishes both utilization gauges so Prometheus
+    /// sees the same values the caller acted on. MIRROR ONLY
+    /// (obs.metric.store-gauge-ownership): the steady cadence and the
+    /// ownership are the in-process 30 s tick
+    /// ([`spawn_store_gauge_tick`]) plus the admission gate's own
+    /// acquire/drop edges — this handler must never be a gauge's only
+    /// writer (that shape froze both panels when this RPC's periodic
+    /// caller was deleted).
     // r[impl store.admin.get-load+3]
     // r[impl obs.metric.store-pg-pool+2]
     #[instrument(skip(self, request), fields(rpc = "GetLoad"))]
@@ -734,23 +742,29 @@ mod tests {
         drop((c1, c2));
     }
 
-    /// The PG-pool gauge is self-published by the periodic in-process
-    /// tick — NOT only as a GetLoad side-effect. After the store
-    /// ComponentScaler CR removal nothing polls GetLoad periodically,
-    /// so without self-publication the gauge would freeze at its last
-    /// value (blanking the store dashboard's PG-pool panel and
-    /// `xtask k8s status`). The test never constructs the admin
-    /// service or calls GetLoad: the spawned tick alone must publish.
+    /// EVERY store-owned gauge is self-published by the periodic
+    /// in-process tick — NOT only as a GetLoad side-effect. After the
+    /// store ComponentScaler CR removal nothing polls GetLoad
+    /// periodically, so without self-publication a gauge freezes at
+    /// its last value (the PG-pool panel blanked then; bug_245's
+    /// admission gauge froze the same way one class over). The test
+    /// never constructs the admin service or calls GetLoad: the
+    /// spawned tick alone must publish BOTH gauges. Pre-fix red
+    /// (recorded in the introducing commit): the tick covered pg_pool
+    /// only — the admission gauge was never published without
+    /// GetLoad/acquire traffic.
     // r[verify obs.metric.store-pg-pool+2]
+    // r[verify obs.metric.store-gauge-ownership]
     #[tokio::test]
-    async fn pg_pool_gauge_tick_publishes_without_get_load() {
+    async fn store_gauge_tick_publishes_without_get_load() {
         let recorder = rio_test_support::metrics::CountingRecorder::default();
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         let shutdown = rio_common::signal::Token::new();
-        let _task = spawn_pg_pool_gauge_tick(db.pool.clone(), shutdown.clone());
+        let gate = AdmissionGate::new(4);
+        let _task = spawn_store_gauge_tick(db.pool.clone(), gate, shutdown.clone());
 
         // spawn_periodic fires its first interval tick immediately —
         // but the tick is a TIMER, and the current-thread runtime only
@@ -784,6 +798,15 @@ mod tests {
         assert!(
             (0.0..=1.0).contains(&v),
             "tick published an out-of-range utilization: {v}"
+        );
+        // The admission gauge rides the SAME tick (bug_245's steady-
+        // state floor): published without any acquire or GetLoad.
+        let adm = recorder.gauge_value("rio_store_substitute_admission_utilization{}");
+        assert_eq!(
+            adm,
+            Some(0.0),
+            "the periodic tick must publish the admission gauge from the gate \
+             (no permits held => 0.0) without any GetLoad/acquire traffic"
         );
         shutdown.cancel();
     }

@@ -564,6 +564,30 @@ pkgs.testers.runNixOSTest {
             f"or the store metrics forward died. samples={samples}"
         )
 
+        # ── (4b) ... and DECAYED to 0.0 after the cascade drained ────
+        # bug_245: pre-fix the gauge was acquire-edge-only — the last
+        # acquire froze 1.0 on the scrape surface forever (GetLoad's
+        # periodic caller retired with the ComponentScaler CR), so
+        # KEDA and the store-scaling dashboard saw a permanently
+        # saturated replica. Post-fix the permit's Drop republishes
+        # the fall AND the 30s store gauge tick is the steady-state
+        # floor. 45s budget = one 30s tick + scrape slack — a
+        # structural assert with a generous window, not a timing gate.
+        decayed = False
+        for _ in range(45):
+            ms = scrape_metrics(k3s_server, 19092)
+            val = metric_value(ms, "rio_store_substitute_admission_utilization")
+            if val == 0.0:
+                decayed = True
+                break
+            time.sleep(1)
+        assert decayed, (
+            "rio_store_substitute_admission_utilization never returned "
+            "to 0.0 within 45s of the cascade draining — the drop edge "
+            "or the 30s store gauge tick is not republishing (the "
+            "bug_245 frozen-gauge class)"
+        )
+
         # ── (5) zero builder pods spawned ────────────────────────────
         # Every leaf was substitutable → scheduler never emitted a
         # SpawnIntent → controller never created a Job. The DAG is

@@ -62,7 +62,7 @@ pub const SUBSTITUTE_ADMISSION_WAIT: Duration = Duration::from_secs(25);
 /// `GetLoad`). The inner `Arc` makes [`Clone`] cheap and the share
 /// observable: a permit acquired through one clone reduces
 /// `available_permits()` on every other.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AdmissionGate {
     sem: Arc<Semaphore>,
     capacity: usize,
@@ -91,11 +91,13 @@ impl AdmissionGate {
     /// Acquire one permit, queueing up to [`SUBSTITUTE_ADMISSION_WAIT`].
     ///
     /// `Ok(permit)` on success (permit released on drop — bind as
-    /// `let _permit = ...` so it lives to end-of-scope). On success
-    /// the `rio_store_substitute_admission_utilization` gauge is
-    /// updated — emitting here (not at the call site) keeps the gauge
-    /// coupled to wherever the acquire moves. After the wait expires,
-    /// returns [`AdmissionError::Saturated`] (maps to
+    /// `let _permit = ...` so it lives to end-of-scope). The returned
+    /// [`AdmissionPermit`] gives the gate BOTH gauge edges
+    /// (obs.metric.store-gauge-ownership): acquire publishes the rise
+    /// here, the permit's `Drop` releases and republishes the fall —
+    /// emitting in this module (not at call sites) keeps the gauge
+    /// coupled to wherever acquires and releases move. After the wait
+    /// expires, returns [`AdmissionError::Saturated`] (maps to
     /// `RESOURCE_EXHAUSTED` — transient per
     /// [`rio_common::grpc::is_transient`], so callers retry). The
     /// timeout-expiry path increments
@@ -104,14 +106,18 @@ impl AdmissionGate {
     /// saturated (the store ScaledObject's backlog/CPU triggers
     /// should already be scaling replicas out).
     // r[impl store.substitute.admission+2]
-    pub async fn acquire_bounded(&self) -> Result<OwnedSemaphorePermit, AdmissionError> {
+    // r[impl obs.metric.store-gauge-ownership]
+    pub async fn acquire_bounded(&self) -> Result<AdmissionPermit, AdmissionError> {
         match tokio::time::timeout(SUBSTITUTE_ADMISSION_WAIT, self.sem.clone().acquire_owned())
             .await
         {
             Ok(Ok(p)) => {
                 metrics::gauge!("rio_store_substitute_admission_utilization")
                     .set(f64::from(self.utilization()));
-                Ok(p)
+                Ok(AdmissionPermit {
+                    inner: Some(p),
+                    gate: self.clone(),
+                })
             }
             Ok(Err(_)) => Err(AdmissionError::Closed),
             Err(_) => {
@@ -132,5 +138,78 @@ impl AdmissionGate {
     /// Configured capacity (denominator of [`Self::utilization`]).
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+}
+
+/// A held substitution-admission permit. Releasing (Drop) returns the
+/// permit to the gate FIRST, then republishes
+/// `rio_store_substitute_admission_utilization` from the gate's
+/// post-release truth — the gate owns both edges of its gauge, so the
+/// series can never freeze at an acquire-time value (bug_245: the
+/// last acquire froze 1.0 on the scrape surface after the burst
+/// drained; GetLoad — whose retired ComponentScaler caller was the
+/// only periodic refresher — never corrected it).
+///
+/// Concurrent drops may interleave release/republish pairs and
+/// transiently overstate by one permit; the periodic store gauge tick
+/// (grpc::spawn_store_gauge_tick) heals any such race within 30s — do
+/// NOT add locking here.
+#[derive(Debug)]
+pub struct AdmissionPermit {
+    inner: Option<OwnedSemaphorePermit>,
+    gate: AdmissionGate,
+}
+
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        drop(self.inner.take());
+        metrics::gauge!("rio_store_substitute_admission_utilization")
+            .set(f64::from(self.gate.utilization()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rio_test_support::metrics::CountingRecorder;
+
+    const GAUGE: &str = "rio_store_substitute_admission_utilization{}";
+
+    /// bug_245's structural pin: the gauge follows the permit DOWN.
+    /// The gate owns BOTH edges — acquire publishes the rise,
+    /// [`AdmissionPermit`]'s Drop releases the permit and republishes
+    /// the fall. Pre-fix red (recorded in the introducing commit):
+    /// `acquire_bounded` returned a bare `OwnedSemaphorePermit`, so
+    /// the LAST acquire-time value froze on the scrape surface — a
+    /// cap-2 gate read 1.0 forever after its burst drained, and KEDA /
+    /// the store-scaling dashboard saw a permanently saturated
+    /// replica.
+    #[tokio::test]
+    async fn permit_drop_republishes_utilization() {
+        let recorder = CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let gate = AdmissionGate::new(2);
+        let p1 = gate.acquire_bounded().await.expect("permit 1");
+        let p2 = gate.acquire_bounded().await.expect("permit 2");
+        assert_eq!(
+            recorder.gauge_value(GAUGE),
+            Some(1.0),
+            "two of two permits held — acquire edge publishes 1.0"
+        );
+
+        drop(p1);
+        assert_eq!(
+            recorder.gauge_value(GAUGE),
+            Some(0.5),
+            "one permit released — the drop edge must republish 0.5 \
+             (pre-fix: frozen at the last acquire-time 1.0)"
+        );
+        drop(p2);
+        assert_eq!(
+            recorder.gauge_value(GAUGE),
+            Some(0.0),
+            "all permits released — the drop edge must republish 0.0"
+        );
     }
 }

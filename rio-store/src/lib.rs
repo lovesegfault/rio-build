@@ -628,19 +628,101 @@ pub fn describe_metrics() {
     metrics::gauge!("rio_store_gc_chunks_live").set(0.0);
     metrics::gauge!("rio_store_gc_chunks_would_collect").set(0.0);
     metrics::gauge!("rio_store_gc_collect_backlog_chunks").set(0.0);
-    // Chunk-collect counters: pre-register at 0 so the staleness alert
-    // (sum(increase(rio_store_gc_collect_cycles_total{outcome="ok"}[25h]))
-    // == 0, aggregated across replicas with for: 30m) and the
-    // parse-failure alert have a series to evaluate from boot instead
-    // of returning empty until the first cycle/failure. The error
-    // outcome is pre-registered for the same reason: a store whose
-    // every cycle fails against PostgreSQL surfaces immediately instead
-    // of staying invisible until the stalled alert's 25h window.
-    metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "ok").absolute(0);
-    metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "parse_failure")
-        .absolute(0);
-    metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "error").absolute(0);
-    metrics::counter!("rio_store_gc_collect_parse_failures_total").absolute(0);
-    metrics::counter!("rio_store_gc_collect_cycles_capped_total").absolute(0);
-    metrics::counter!("rio_store_gc_chunks_collected_total").absolute(0);
+    // Alert-seeded counters: the table below births every
+    // PrometheusRule-expr-referenced rio_store counter at 0 so the
+    // alerts have a series to evaluate from boot instead of returning
+    // empty until the first event (the bug_322 birth-gap class). The
+    // gc-collect entries were the original .absolute(0) precedent; the
+    // putpath/log entries are the previously-unseeded stragglers whose
+    // alerts (putpath retry-rate, chunk-write-failure, read-data-loss)
+    // silently skipped a fresh rollout's first burst.
+    // r[impl obs.metric.alert-counter-seeded]
+    seed_alert_counters();
+}
+
+/// One boot-seeded counter family (name + closed label axis). Mirrors
+/// `rio_test_support::metrics::SeededCounter` so the alert-parity test
+/// (tests/alert_metrics.rs) consumes this exact table.
+#[cfg(feature = "server")]
+pub struct SeededSeries {
+    pub name: &'static str,
+    pub label: Option<(&'static str, &'static [&'static str])>,
+}
+
+/// PutPath retriable-rejection reasons (grpc/mod.rs
+/// `putpath_metadata_status` + the concurrent-claim arm in
+/// grpc/put_path/common.rs — the closed production set).
+#[cfg(feature = "server")]
+pub const PUTPATH_RETRY_REASONS: &[&str] = &[
+    "serialization",
+    "deadlock",
+    "placeholder_missing",
+    "connection",
+    "resource_exhausted",
+    "concurrent_upload",
+];
+
+/// Log read-path data-loss reasons (logs/tail.rs `read_chunk`).
+#[cfg(feature = "server")]
+pub const LOG_READ_LOSS_REASONS: &[&str] = &["missing_object", "short_object", "overlong_object"];
+
+/// GC chunk-collect cycle outcomes.
+#[cfg(feature = "server")]
+pub const GC_COLLECT_OUTCOMES: &[&str] = &["ok", "parse_failure", "error"];
+
+/// Every alert-`expr:`-referenced rio_store counter, born at 0 at boot
+/// on every replica (the parity test fails when a PrometheusRule
+/// references a counter missing here).
+#[cfg(feature = "server")]
+pub const ALERT_SEEDED_COUNTERS: &[SeededSeries] = &[
+    SeededSeries {
+        name: "rio_store_putpath_retries_total",
+        label: Some(("reason", PUTPATH_RETRY_REASONS)),
+    },
+    SeededSeries {
+        name: "rio_store_log_chunk_write_failures_total",
+        label: None,
+    },
+    SeededSeries {
+        name: "rio_store_log_read_data_loss_total",
+        label: Some(("reason", LOG_READ_LOSS_REASONS)),
+    },
+    // The original .absolute(0) precedent (gc-collect): the staleness
+    // alert (sum(increase(...{outcome="ok"}[25h])) == 0) and the
+    // parse-failure alert need series from boot; the error outcome is
+    // seeded so a store whose every cycle fails against PostgreSQL
+    // surfaces immediately instead of hiding until the 25h window.
+    SeededSeries {
+        name: "rio_store_gc_collect_cycles_total",
+        label: Some(("outcome", GC_COLLECT_OUTCOMES)),
+    },
+    SeededSeries {
+        name: "rio_store_gc_collect_parse_failures_total",
+        label: None,
+    },
+    SeededSeries {
+        name: "rio_store_gc_collect_cycles_capped_total",
+        label: None,
+    },
+    SeededSeries {
+        name: "rio_store_gc_chunks_collected_total",
+        label: None,
+    },
+];
+
+/// Birth every [`ALERT_SEEDED_COUNTERS`] series at 0 (tail of
+/// [`describe_metrics`] — the exporter is installed immediately
+/// before, so the seeds land on the scrape surface).
+#[cfg(feature = "server")]
+fn seed_alert_counters() {
+    for s in ALERT_SEEDED_COUNTERS {
+        match s.label {
+            None => metrics::counter!(s.name).absolute(0),
+            Some((axis, values)) => {
+                for v in values {
+                    metrics::counter!(s.name, axis => *v).absolute(0);
+                }
+            }
+        }
+    }
 }
