@@ -729,6 +729,35 @@ influence nothing — running it would only add the store's own failure mode
 (an opcode-level abort) to replies the client is owed per path during a
 correlated outage.
 
+#r("gw.opcode.lost-terminal-relay")[
+  When a `wopBuildPathsWithResults` target with no recorded terminal of its
+  own under a *completed* DAG is reported `Substituted` on positive store
+  presence, the gateway MUST relay the lost-terminal marker line for that
+  target — the shared rio-nix producer formatter's output
+  (`rio: terminal lost for '<drv>'`), newline-terminated as its own
+  `STDERR_NEXT` payload, before the opcode's stderr loop closes — without
+  altering the in-band result (status `Substituted`, `timesBuilt = 0`, empty
+  `errorMsg`, the same positive-presence evidence floor), and MUST NOT relay
+  the marker for any other cell: not for a target with its own `Cached`
+  terminal (a recorded substitution event), and not for the blanket-failure
+  presence rescue (no terminal was lost; under fail-fast none was expected).
+]
+
+The marker exists because the wire vocabulary cannot carry the distinction:
+to a stock ssh-ng client, presence under a lost evidence channel and a
+genuine substitution terminal are the same word, and the in-band result must
+stay that word for compatibility. Measurement consumers (the replay engine's
+stderr capture — the same channel that captures the `rio: build <uuid>`
+announcement) parse the marker with the shared rio-nix detector and route a
+marked `Substituted` row to evidence-loss classification (auto-retry, then
+`infra-indeterminate`) instead of recording a substitution event — which
+force-build measurement tenants make definitionally impossible, so an
+unmarked lost-terminal mint would record a false policy violation and
+spuriously fail the zero-target-substituted smoke criterion. The exactness
+in the other direction is equally load-bearing: a marker on a genuine
+substitution cell would reroute real substitution events out of the
+measurable vocabulary and blind that same criterion.
+
 `wopBuildDerivation` (the build-hook path) is a single-target reply, so the
 batch-aggregation hazards above do not apply, but the client-crash one does:
 an unrealized floating-CA output reported as successful would carry an empty

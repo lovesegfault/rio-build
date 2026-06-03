@@ -742,6 +742,24 @@ async fn collect_stderr_frames_terminal(
     frames
 }
 
+/// Lost-terminal relay-marker drvs among captured stderr frames: every
+/// `STDERR_NEXT` payload line the shared rio-nix detector
+/// ([`BuildResult::lost_terminal_relay_drv`]) parses — the same parser
+/// the replay engine's capture applies, so what this helper sees is by
+/// construction what the measurement consumer would see.
+fn lost_terminal_marker_drvs(frames: &[StderrMessage]) -> Vec<String> {
+    frames
+        .iter()
+        .filter_map(|m| match m {
+            StderrMessage::Next(s) => Some(s),
+            _ => None,
+        })
+        .flat_map(|payload| payload.lines())
+        .filter_map(BuildResult::lost_terminal_relay_drv)
+        .map(str::to_string)
+        .collect()
+}
+
 /// Read stderr frames until the first non-preamble one. Used by the
 /// disconnect/shutdown tests, which read frames manually (not via
 /// [`collect_stderr_frames`]) because they need to drop the stream
@@ -2779,9 +2797,17 @@ async fn test_build_paths_with_results_failure_rescues_verified_target_as_substi
         u64: 0,
     );
 
-    drain_stderr_until_last(&mut h.stream).await?;
+    let frames = collect_stderr_frames(&mut h.stream).await;
     let count = wire::read_u64(&mut h.stream).await?;
     assert_eq!(count, 2);
+
+    // The rescue mints Substituted but lost NO terminal (under the
+    // fail-fast DAG failure none was ever expected for the unattempted
+    // root) — the lost-terminal marker must not ride it.
+    assert!(
+        lost_terminal_marker_drvs(&frames).is_empty(),
+        "the blanket-failure presence rescue is not a lost terminal: {frames:?}"
+    );
 
     let (_, result_a) = read_keyed_result(&mut h.stream).await?;
     assert_eq!(
@@ -2827,6 +2853,7 @@ const NOCHROOT_PRESENT_DRV: &str = "/nix/store/00000000000000000000000000000555-
 const NOCHROOT_PRESENT_ATERM: &str = r#"Derive([("out","/nix/store/cccccccccccccccccccccccccccccccc-nochroot-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("__noChroot","1"),("out","/nix/store/cccccccccccccccccccccccccccccccc-nochroot-out")])"#;
 
 // r[verify gw.opcode.build-results-honest+2]
+// r[verify gw.opcode.lost-terminal-relay]
 /// Event-loss shape, confirmed-present cell: the scheduler completes the
 /// DAG but THIS root's terminal event never arrives (state-channel
 /// Lagged, a leader-failover reconnect gap, dispatch-vs-completion
@@ -2840,6 +2867,15 @@ const NOCHROOT_PRESENT_ATERM: &str = r#"Derive([("out","/nix/store/ccccccccccccc
 /// Positive presence is the LOAD-BEARING trigger: the sibling tests pin
 /// the missing cell (demotion naming the DAG-level basis) and the
 /// unverifiable cell (the evidence-loss row, never a presence claim).
+///
+/// WIRE PIN, both channels: the in-band result is byte-for-byte a plain
+/// `Substituted` success — stock ssh-ng clients see exactly what a
+/// genuine substitution reports, nothing added or altered — and the
+/// disambiguation rides the stderr side channel as the lost-terminal
+/// relay marker line, exactly the shared formatter's output
+/// (newline-terminated, its own frame), parsed back here by the same
+/// shared detector the replay engine's capture applies. One marker, for
+/// exactly the lost root.
 #[tokio::test]
 async fn test_build_paths_with_results_eventless_completed_reports_substituted()
 -> anyhow::Result<()> {
@@ -2868,7 +2904,7 @@ async fn test_build_paths_with_results_eventless_completed_reports_substituted()
         u64: 0,
     );
 
-    drain_stderr_until_last(&mut h.stream).await?;
+    let frames = collect_stderr_frames(&mut h.stream).await;
     let count = wire::read_u64(&mut h.stream).await?;
     assert_eq!(count, 1);
 
@@ -2888,12 +2924,97 @@ async fn test_build_paths_with_results_eventless_completed_reports_substituted()
         result.status.is_success(),
         "Substituted stays a success to stock clients: {result:?}"
     );
+    assert!(
+        result.error_msg.is_empty(),
+        "stock-client pin: nothing rides the in-band message — the \
+         disambiguation is stderr-only: {result:?}"
+    );
     assert_eq!(
         result.built_outputs.len(),
         1,
         "presence-derived success still carries builtOutputs: {result:?}"
     );
     assert_eq!(result.built_outputs[0].out_path, HONEST_A_OUT);
+
+    // The lost-terminal relay marker: exactly one, for exactly the lost
+    // root, parsed by the shared rio-nix detector (what the replay
+    // engine's capture applies).
+    assert_eq!(
+        lost_terminal_marker_drvs(&frames),
+        vec![HONEST_A_DRV.to_string()],
+        "frames: {frames:?}"
+    );
+    // And the producing frame is byte-for-byte the shared formatter's
+    // line with the relay framing newline — its own STDERR_NEXT payload,
+    // never embedded in other text.
+    let expected_payload = format!("{}\n", BuildResult::lost_terminal_relay_line(HONEST_A_DRV));
+    assert!(
+        frames
+            .iter()
+            .any(|m| matches!(m, StderrMessage::Next(s) if *s == expected_payload)),
+        "marker payload must be the shared producer formatter's output: {frames:?}"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.lost-terminal-relay]
+/// The marker's must-NOT-emit direction for genuine substitution: a root
+/// WITH its own `Cached` terminal (the scheduler recorded a real
+/// substitution event) reports the same `Substituted`/`timesBuilt = 0`
+/// wire word — and NO lost-terminal marker. This is the cell that keeps
+/// genuine substitutions measurable: if the marker leaked here, every
+/// real substitution event would be rerouted to evidence-loss
+/// classification and the force-build policy-violation signal
+/// (`target-substituted` under a leaf tenant) would go structurally
+/// blind.
+#[tokio::test]
+async fn test_build_paths_with_results_own_cached_terminal_emits_no_marker() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        })),
+        // The root's OWN terminal: a recorded substitution event.
+        ev(build_event::Event::Derivation(
+            types::DerivationEvent::cached(HONEST_A_DRV.into(), vec![HONEST_A_OUT.into()]),
+        )),
+        ev(build_event::Event::Completed(types::BuildCompleted {
+            output_paths: vec![HONEST_A_OUT.into()],
+        })),
+    ]));
+
+    h.store
+        .seed_with_content(HONEST_A_DRV, HONEST_A_ATERM.as_bytes());
+    h.store.seed_with_content(HONEST_A_OUT, b"a-out");
+
+    let path_a = format!("{HONEST_A_DRV}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: std::slice::from_ref(&path_a),
+        u64: 0,
+    );
+
+    let frames = collect_stderr_frames(&mut h.stream).await;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+
+    let (echoed, result) = read_keyed_result(&mut h.stream).await?;
+    assert_eq!(echoed, path_a);
+    assert_eq!(
+        result.status,
+        BuildStatus::Substituted,
+        "an own Cached terminal reports the substitution it records: {result:?}"
+    );
+    assert_eq!(result.times_built, 0, "{result:?}");
+    assert!(
+        lost_terminal_marker_drvs(&frames).is_empty(),
+        "an own Cached terminal is a RECORDED substitution event — no terminal \
+         was lost, and a marker here would reroute genuine substitutions out of \
+         the measurable vocabulary: {frames:?}"
+    );
 
     h.finish().await;
     Ok(())
@@ -2932,9 +3053,17 @@ async fn test_build_paths_with_results_eventless_completed_missing_demotes_with_
         u64: 0,
     );
 
-    drain_stderr_until_last(&mut h.stream).await?;
+    let frames = collect_stderr_frames(&mut h.stream).await;
     let count = wire::read_u64(&mut h.stream).await?;
     assert_eq!(count, 1);
+
+    // The marker annotates Substituted presence mints only — a demoted
+    // failure carries its diagnosis in band and must not also claim the
+    // marker.
+    assert!(
+        lost_terminal_marker_drvs(&frames).is_empty(),
+        "the missing cell demotes; it does not mint a marked presence claim: {frames:?}"
+    );
 
     let (echoed, result) = read_keyed_result(&mut h.stream).await?;
     assert_eq!(echoed, path_b);
@@ -2999,9 +3128,18 @@ async fn test_build_paths_with_results_eventless_completed_unverifiable_reports_
         u64: 0,
     );
 
-    drain_stderr_until_last(&mut h.stream).await?;
+    let frames = collect_stderr_frames(&mut h.stream).await;
     let count = wire::read_u64(&mut h.stream).await?;
     assert_eq!(count, 1);
+
+    // The unverifiable cell disambiguates IN BAND (the evidence-loss
+    // row's message prefix); the relay marker belongs to the
+    // confirmed-present cell only.
+    assert!(
+        lost_terminal_marker_drvs(&frames).is_empty(),
+        "the unverifiable cell reports the in-band evidence-loss row, not a \
+         marked presence claim: {frames:?}"
+    );
 
     let (echoed, result) = read_keyed_result(&mut h.stream).await?;
     assert_eq!(echoed, derived_path);

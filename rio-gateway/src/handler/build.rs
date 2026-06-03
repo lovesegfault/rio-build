@@ -1064,6 +1064,18 @@ enum RootEvidence {
 ///   the DAG-level word was success (terminal lost) or failure (the
 ///   blanket rescue). `missing.is_empty()` is NOT presence evidence:
 ///   it includes the unverifiable state, where the store said nothing.
+/// - The lost-terminal presence mint additionally carries the
+///   `lost_terminal` marker bit ([`RootVerdict::Success`]): the wire
+///   word stays `Substituted` (the presence floor is unchanged — the
+///   marker adds a side channel, never a substitute for evidence), and
+///   the caller relays the marker line so measurement consumers can
+///   tell "presence under a lost evidence channel" from a recorded
+///   substitution event — which force-build measurement tenants make
+///   definitionally impossible, so an unmarked mint records a false
+///   policy violation downstream. The bit is exact: never set over an
+///   own `Cached` terminal, and never for the blanket rescue (no
+///   terminal was lost there — under a fail-fast DAG failure none was
+///   ever expected for the unattempted root).
 /// - A lost-terminal root under a completed DAG with NO presence
 ///   evidence reports the honest evidence-loss failure
 ///   ([`BuildResult::lost_terminal_unverified`]) — never a fabricated
@@ -1108,8 +1120,12 @@ fn per_root_verdict(
                 // Verified (or unverifiable — defer to the scheduler's
                 // own per-root terminal): success in the terminal's own
                 // shape (Built / Substituted), enriched with the wanted
-                // builtOutputs.
-                RootVerdict::Success(own)
+                // builtOutputs. An own Cached terminal is a RECORDED
+                // substitution event — no lost-terminal marker.
+                RootVerdict::Success {
+                    base: own,
+                    lost_terminal: false,
+                }
             } else {
                 // The wrong-success diagnosis names what the evidence
                 // actually claims: the relay records own success
@@ -1157,8 +1173,19 @@ fn per_root_verdict(
                     // Positive presence for every wanted output: report
                     // presence honestly — Substituted, timesBuilt = 0 —
                     // the same evidence floor as the blanket-failure
-                    // rescue below.
-                    RootVerdict::Success(BuildResult::substituted())
+                    // rescue below. The lost_terminal bit makes the
+                    // caller relay the marker line: on the wire alone
+                    // this Substituted is indistinguishable from a
+                    // genuine substitution terminal, but here it stands
+                    // on a lost evidence channel (the common event-loss
+                    // sub-case is an executed root whose outputs
+                    // uploaded before the loss), and measurement
+                    // consumers must classify it as evidence loss, not
+                    // record a substitution event.
+                    RootVerdict::Success {
+                        base: BuildResult::substituted(),
+                        lost_terminal: true,
+                    }
                 } else if !check.missing.is_empty() {
                     // The store positively reports wanted outputs absent
                     // under a completed DAG — wrong-success shape; the
@@ -1183,8 +1210,13 @@ fn per_root_verdict(
                 // timesBuilt = 0. Presence proves the outputs exist
                 // somehow (a concurrent batch, another tenant, an
                 // earlier substitution), not that this submission
-                // executed the build.
-                RootVerdict::Success(BuildResult::substituted())
+                // executed the build. No lost-terminal marker: nothing
+                // was lost — under the fail-fast DAG failure no terminal
+                // was ever expected for this unattempted root.
+                RootVerdict::Success {
+                    base: BuildResult::substituted(),
+                    lost_terminal: false,
+                }
             } else {
                 // Unverified blanket failure stands.
                 RootVerdict::Verbatim(dag)
@@ -1198,7 +1230,24 @@ fn per_root_verdict(
 enum RootVerdict {
     /// Report this success enriched with `builtOutputs` covering the
     /// wanted outputs (`result_with_wanted_outputs`).
-    Success(BuildResult),
+    Success {
+        base: BuildResult,
+        /// True for exactly one cell: the Completed-DAG lost-terminal
+        /// presence mint (`Substituted` off `confirmed_present` with no
+        /// own terminal). The wire result is unchanged — presence is
+        /// real and stock clients keep seeing a plain `Substituted` —
+        /// but on the wire alone that word is indistinguishable from a
+        /// genuine substitution terminal, so the caller relays the
+        /// lost-terminal marker line
+        /// ([`BuildResult::lost_terminal_relay_line`]) before writing
+        /// results: the side channel measurement consumers use to
+        /// classify the row as evidence loss instead of recording a
+        /// substitution event. Never set for an own `Cached` terminal
+        /// (a recorded substitution event) or for the blanket-failure
+        /// rescue (no terminal was lost; under fail-fast none was ever
+        /// expected).
+        lost_terminal: bool,
+    },
     /// Report this result verbatim (failures are never enriched).
     Verbatim(BuildResult),
 }
@@ -2423,13 +2472,38 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                 &check,
                 &demand.drv_path,
             ) {
-                RootVerdict::Success(base) => results.push(result_with_wanted_outputs(
+                RootVerdict::Success {
                     base,
-                    demand,
-                    &check,
-                    &ctx.drv_cache,
-                    &mut hash_cache,
-                )),
+                    lost_terminal,
+                } => {
+                    // r[impl gw.opcode.lost-terminal-relay]
+                    // The lost-terminal presence mint keeps Substituted
+                    // on the wire (stock-client compat; presence is
+                    // real) and relays the marker line on the stderr
+                    // side channel — formatted by the shared rio-nix
+                    // producer pair, the same vocabulary discipline as
+                    // the `rio: build <uuid>` announcement — so
+                    // measurement consumers can route the row to
+                    // evidence-loss classification instead of recording
+                    // a substitution event. Emitted before
+                    // `stderr.finish()` below, like every relay line of
+                    // this opcode.
+                    if lost_terminal {
+                        stderr
+                            .log(&format!(
+                                "{}\n",
+                                BuildResult::lost_terminal_relay_line(&demand.drv_path)
+                            ))
+                            .await?;
+                    }
+                    results.push(result_with_wanted_outputs(
+                        base,
+                        demand,
+                        &check,
+                        &ctx.drv_cache,
+                        &mut hash_cache,
+                    ));
+                }
                 RootVerdict::Verbatim(result) => results.push(result),
             }
         }
@@ -2509,7 +2583,19 @@ mod tests {
     ///     `confirmed_present`, the SAME minimum evidence in both
     ///     minting arms (lost-terminal and blanket rescue); and such a
     ///     mint is always `Substituted`/`timesBuilt = 0`, never an
-    ///     executed `Built`.
+    ///     executed `Built`;
+    ///  7. lost-terminal marker exactness — the relay-marker bit is set
+    ///     ONLY on a `Substituted` mint with positive presence, no own
+    ///     terminal, and an acknowledged batch (the value table pins it
+    ///     to exactly the Completed-DAG lost-terminal × confirmed cell:
+    ///     the own `Cached` terminal is a recorded substitution event
+    ///     and the blanket rescue lost no terminal, so neither may
+    ///     carry it — a marker there would reroute genuine
+    ///     substitution events out of the measurable vocabulary). The
+    ///     marker never changes the wire value: same status, same
+    ///     `timesBuilt`, same message, same floor (invariant 6 holds
+    ///     unchanged on the marked cell).
+    // r[verify gw.opcode.lost-terminal-relay]
     #[test]
     fn per_root_verdict_lattice_totality() {
         const CONFIRMED: usize = 0;
@@ -2572,6 +2658,10 @@ mod tests {
             status: BuildStatus,
             times_built: u64,
             msg: Msg,
+            /// The lost-terminal relay-marker bit: a decided column of
+            /// every cell. True for exactly one cell — the Completed-DAG
+            /// lost-terminal evidence under confirmed presence.
+            lost_terminal: bool,
         }
         fn exp(enriched: bool, status: BuildStatus, times_built: u64, msg: Msg) -> Expected {
             Expected {
@@ -2579,6 +2669,18 @@ mod tests {
                 status,
                 times_built,
                 msg,
+                lost_terminal: false,
+            }
+        }
+        /// The marked cell: same wire value as an `exp` row (the marker
+        /// changes nothing the client sees), plus the relay-marker bit.
+        fn exp_marked(status: BuildStatus, times_built: u64, msg: Msg) -> Expected {
+            Expected {
+                enriched: true,
+                status,
+                times_built,
+                msg,
+                lost_terminal: true,
             }
         }
 
@@ -2669,12 +2771,18 @@ mod tests {
                     submitted: true,
                 },
                 // THE round-introduced cells: presence claim only on
-                // positive presence; positive absence demotes naming the
-                // DAG-level basis (this root's execution is unknown); no
-                // evidence either way is an honest evidence-loss row,
-                // never a fabricated substitution.
+                // positive presence — and the confirmed cell is the ONE
+                // cell carrying the lost-terminal relay marker (the wire
+                // value is a plain Substituted, indistinguishable from a
+                // genuine substitution; the marker is the side channel
+                // that keeps measurement consumers from recording a
+                // substitution event off a lost evidence channel);
+                // positive absence demotes naming the DAG-level basis
+                // (this root's execution is unknown); no evidence either
+                // way is an honest evidence-loss row, never a fabricated
+                // substitution.
                 |state| match state {
-                    CONFIRMED => exp(true, BuildStatus::Substituted, 0, Msg::Empty),
+                    CONFIRMED => exp_marked(BuildStatus::Substituted, 0, Msg::Empty),
                     MISSING => exp(
                         false,
                         BuildStatus::MiscFailure,
@@ -2818,9 +2926,12 @@ mod tests {
             for state in [CONFIRMED, MISSING, UNVERIFIABLE] {
                 let chk = check(state);
                 let verdict = per_root_verdict(make(), &chk, "/nix/store/under-test.drv");
-                let (result, enriched) = match verdict {
-                    RootVerdict::Success(r) => (r, true),
-                    RootVerdict::Verbatim(r) => (r, false),
+                let (result, enriched, lost_terminal) = match verdict {
+                    RootVerdict::Success {
+                        base,
+                        lost_terminal,
+                    } => (base, true, lost_terminal),
+                    RootVerdict::Verbatim(r) => (r, false, false),
                 };
                 let ctx = format!(
                     "evidence: {}, store state: {}",
@@ -2834,6 +2945,12 @@ mod tests {
                 assert_eq!(
                     result.times_built, want.times_built,
                     "{ctx}: timesBuilt: {result:?}"
+                );
+                assert_eq!(
+                    lost_terminal, want.lost_terminal,
+                    "{ctx}: lost-terminal relay marker: a wrong-true reroutes a genuine \
+                     substitution event out of the measurable vocabulary; a wrong-false \
+                     re-opens the false force-build policy violation: {result:?}"
                 );
                 match want.msg {
                     Msg::Empty => {
@@ -2910,6 +3027,8 @@ mod tests {
                 //    without an own terminal requires confirmed_present —
                 //    the same minimum evidence in BOTH minting arms — and
                 //    is always a presence shape, never an executed Built.
+                //    The marker bit does not loosen this floor (it rides
+                //    cells that already pass it; see invariant 7).
                 if result.status.is_success() && !cell.own_success {
                     assert!(
                         chk.confirmed_present,
@@ -2922,6 +3041,33 @@ mod tests {
                         "{ctx}: evidence-less success must be a presence claim"
                     );
                     assert_eq!(result.times_built, 0, "{ctx}");
+                }
+                // 7. Lost-terminal marker exactness: the marker may ride
+                //    ONLY a Substituted presence mint with positive
+                //    presence, no own terminal, and an acknowledged
+                //    batch — it is a side-channel annotation on an
+                //    already-licensed mint, never a license of its own,
+                //    and never an alteration of the wire value.
+                if lost_terminal {
+                    assert_eq!(
+                        result.status,
+                        BuildStatus::Substituted,
+                        "{ctx}: the marker only annotates the presence word"
+                    );
+                    assert_eq!(result.times_built, 0, "{ctx}");
+                    assert!(
+                        chk.confirmed_present,
+                        "{ctx}: a marked mint still requires the presence floor"
+                    );
+                    assert!(
+                        !cell.own_success && cell.own_failure.is_none(),
+                        "{ctx}: an own terminal is never a lost terminal"
+                    );
+                    assert_eq!(
+                        cell.submitted,
+                        Some(true),
+                        "{ctx}: only an acknowledged batch can lose a terminal"
+                    );
                 }
                 outputs.push((enriched, result));
             }
