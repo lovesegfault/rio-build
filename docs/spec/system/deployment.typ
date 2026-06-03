@@ -135,7 +135,8 @@ Aurora `max_connections` (runtime-constant at the configured
 the model lives in `infra/eks/rds.tf`; `xtask deploy`'s pg preflight
 measures the live value, asserts it matches the model, and deploys the
 ceiling derived from the measurement); the trigger thresholds are
-seeded (600 backlog/replica,
+seeded (85 backlog jobs/replica --- the gauge counts derivations, not
+paths; render-time unit-checked via `files/metric-units.json` ---
 50 builders/replica, 70 % CPU) and re-derived from the post-wipe
 warm-phase capture. The
 no-KEDA profiles (`values/vmtest-full.yaml`, `values/dev.yaml`) set

@@ -288,12 +288,17 @@ store:
     maxReplicas: 173
     # Desired replicas (backlog trigger) =
     # ceil(sum(rio_scheduler_substituting_derivations) / this).
-    # Seeded 600: the reference incident's ~7.4k-path backlog asks for
-    # ~12 replicas at merge time. Re-derived from the post-wipe
-    # warm-phase capture (deployment checklist P10) — the landed gauge
-    # counts derivations (jobs), not paths, so the calibration run
-    # re-expresses the target in job units.
-    targetBacklogPathsPerReplica: 600
+    # IN JOB UNITS: the gauge counts derivations with unresolved
+    # materialization jobs, not store paths (bug_299 — the old
+    # paths-per-replica seed divided a jobs gauge, silently
+    # under-asking ~7×). Seeded 85 ≈ 600 paths / (~7 paths per job in
+    # the reference incident's backlog mix): the same ~7.4k-path
+    # (~1,050-job) wave asks for ~12 replicas. Deliberately
+    # overscale-biased (owner default Q7 2026-06-03) — more store pods
+    # minutes earlier on post-wipe waves — until the post-wipe
+    # warm-phase capture (deployment checklist P10) re-derives it.
+    # Render-time unit check: rio.promTrigger × files/metric-units.json.
+    targetBacklogJobsPerReplica: 85
     # Desired replicas (builder trigger) =
     # ceil(sum(rio_scheduler_open_attempts) / this). Seeded from the
     # ComponentScaler's seedRatio (50; its learned value converged

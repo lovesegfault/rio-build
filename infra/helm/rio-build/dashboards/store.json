@@ -651,7 +651,7 @@
    "id": 22,
    "type": "timeseries",
    "title": "Per-replica bytes: the three load classes",
-   "description": "Decision 5's load model side by side, per pod: substitution ingest (upstream->store, class 1), served read bytes (store->builder, class 2), PutPath ingest (builder->store, class 3). All three share the pod NIC/memory/PG pool - this panel shows which class is driving load and whether the one-per-node spread is keeping per-replica volume balanced. Calibrates targetBacklogPathsPerReplica / targetBuildersPerReplica from the warm-phase capture.",
+   "description": "Decision 5's load model side by side, per pod: substitution ingest (upstream->store, class 1), served read bytes (store->builder, class 2), PutPath ingest (builder->store, class 3). All three share the pod NIC/memory/PG pool - this panel shows which class is driving load and whether the one-per-node spread is keeping per-replica volume balanced. Calibrates targetBacklogJobsPerReplica (job units — see files/metric-units.json) / targetBuildersPerReplica from the warm-phase capture.",
    "gridPos": {
     "x": 12,
     "y": 37,

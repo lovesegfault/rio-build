@@ -306,3 +306,40 @@ spec:
       port: {{ .port }}
       targetPort: grpc
 {{- end -}}
+
+{{/*
+rio.promTrigger: emit one KEDA prometheus AverageValue trigger whose
+metric and threshold knob are unit-checked against
+files/metric-units.json (bug_299: a threshold seeded in PATH units once
+divided a DERIVATION-count gauge — silently overscaling-blind). Args
+(positional list): root, serverAddress, query, metric name, knob name,
+threshold value. A missing registry row or a unit mismatch fails the
+render (helm-lint + every VM test), so a future mismatched trigger
+cannot ship.
+*/}}
+{{- define "rio.promTrigger" -}}
+{{- $root := index . 0 -}}
+{{- $address := index . 1 -}}
+{{- $query := index . 2 -}}
+{{- $metric := index . 3 -}}
+{{- $knob := index . 4 -}}
+{{- $threshold := index . 5 -}}
+{{- $units := $root.Files.Get "files/metric-units.json" | fromJson -}}
+{{- $mu := index $units "metrics" $metric -}}
+{{- $ku := index $units "knobs" $knob -}}
+{{- if not $mu -}}
+{{- fail (printf "rio.promTrigger: metric %q has no unit in files/metric-units.json" $metric) -}}
+{{- end -}}
+{{- if not $ku -}}
+{{- fail (printf "rio.promTrigger: knob %q has no unit in files/metric-units.json" $knob) -}}
+{{- end -}}
+{{- if ne $mu $ku -}}
+{{- fail (printf "rio.promTrigger: unit mismatch — metric %s counts %q but knob %s is in %q" $metric $mu $knob $ku) -}}
+{{- end -}}
+- type: prometheus
+  metricType: AverageValue
+  metadata:
+    serverAddress: {{ $address | quote }}
+    query: {{ $query }}
+    threshold: {{ $threshold | quote }}
+{{- end -}}

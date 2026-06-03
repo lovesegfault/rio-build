@@ -91,29 +91,30 @@ spec:
   triggers:
     # Substitution backlog (leading, class 1). AverageValue: KEDA
     # divides the fleet-wide backlog by the current replica count, so
-    # desiredReplicas = ceil(sum(backlog) / targetBacklogPathsPerReplica).
+    # desiredReplicas = ceil(sum(backlog) / targetBacklogJobsPerReplica).
     # The gauge counts derivations with unresolved unclaimed
     # materialization jobs — durable PG-backed state published by the
     # scheduler leader each tick (sum() collapses the leader-gated
     # single series; a deposed leader's series is zeroed, not stale).
-    - type: prometheus
-      metricType: AverageValue
-      metadata:
-        serverAddress: {{ $a.prometheusAddress | quote }}
-        query: sum(rio_scheduler_substituting_derivations)
-        threshold: {{ $a.targetBacklogPathsPerReplica | quote }}
+    # Both prometheus triggers render through rio.promTrigger, which
+    # unit-checks metric vs knob against files/metric-units.json and
+    # fails the render on mismatch (bug_299).
+    {{- include "rio.promTrigger" (list $ $a.prometheusAddress
+          "sum(rio_scheduler_substituting_derivations)"
+          "rio_scheduler_substituting_derivations"
+          "targetBacklogJobsPerReplica"
+          $a.targetBacklogJobsPerReplica) | nindent 4 }}
     # Builder demand (leading, classes 2-3). rio_scheduler_open_attempts
     # is the busy-fleet gauge (one open pull-mode attempt per in-flight
     # derivation, one attempt per pod). Static ratio seeded from the
     # ComponentScaler's seedRatio era; the CPU trigger below is the
     # corrective term the learned ratio used to provide, and the
     # threshold is re-derived from the warm-phase capture (P10).
-    - type: prometheus
-      metricType: AverageValue
-      metadata:
-        serverAddress: {{ $a.prometheusAddress | quote }}
-        query: sum(rio_scheduler_open_attempts)
-        threshold: {{ $a.targetBuildersPerReplica | quote }}
+    {{- include "rio.promTrigger" (list $ $a.prometheusAddress
+          "sum(rio_scheduler_open_attempts)"
+          "rio_scheduler_open_attempts"
+          "targetBuildersPerReplica"
+          $a.targetBuildersPerReplica) | nindent 4 }}
     # Saturation (reactive, all classes): decompression, hashing,
     # chunking, and serve-path proto/TLS make CPU track all three load
     # classes well enough to act as the corrective term. If the

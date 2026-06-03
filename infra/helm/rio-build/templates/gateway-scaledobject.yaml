@@ -63,10 +63,9 @@ spec:
     # counts exec'd sessions, not SSH-level channels) by the current
     # replica count, so desiredReplicas =
     # ceil(sum(sessions) / targetSessionsPerPod).
-    - type: prometheus
-      metricType: AverageValue
-      metadata:
-        serverAddress: {{ $a.prometheusAddress | quote }}
-        query: sum(rio_gateway_channels_active)
-        threshold: {{ $a.targetSessionsPerPod | quote }}
+    {{- include "rio.promTrigger" (list $ $a.prometheusAddress
+          "sum(rio_gateway_channels_active)"
+          "rio_gateway_channels_active"
+          "targetSessionsPerPod"
+          $a.targetSessionsPerPod) | nindent 4 }}
 {{- end }}
