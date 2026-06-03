@@ -872,7 +872,7 @@ build that genuinely exits `137` (or is SIGKILLed by something else
 *inside* the kill scope) while an executor kill raced it is attributed
 to the executor's kill --- bit-identical at the wait level, the cost
 of the forwarding convention; bounded operationally by the canary
-metric `rio_builder_kill_verdict_outputs_present_total` (kill verdict
+metric #(refs.metric)("rio_builder_kill_verdict_outputs_present_total") (kill verdict
 + fully materialized declared outputs = the coincidence signature),
 and irreducible without kernel-level exit-reason attribution, which
 `waitid` does not expose. (2) A relay stuck past the escalation grace

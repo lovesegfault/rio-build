@@ -559,7 +559,7 @@ cycle reclamation). The work budget is two-dimensional: operation UNITS
 unit ledger alone would admit padded-`.drv` byte floods that retain
 GiBs while "within budget" (round-16 bug_079); exhaustion of either
 dimension is the same typed `RESOURCE_EXHAUSTED` monotone exit, and the
-`rio_store_ia_proof_arena_bytes` histogram makes byte-pressure approach
+#(refs.metric)("rio_store_ia_proof_arena_bytes") histogram makes byte-pressure approach
 visible. Cold walks are ADMITTED: a cache miss acquires one of
 `PROOF_WALK_CONCURRENCY = 4` shared permits — probe-before-admit keeps
 warm traffic permit-free — bounding the process aggregate of retained

@@ -922,7 +922,7 @@
       {
         "name": "rio_scheduler_merge_stripped_rejoin_total",
         "kind": "counter",
-        "help": "Settled rows REJOINED by a re-creating submission via the M_070 match bases the pre-strip-preservation matcher refused (sched.persist.settled-identity-freeze+2), labeled by basis: preserved_claim (byte-equal preserved stripped claim) or dual_anchor (byte-anchored row + same declared path, no contradicting evidence). Each increment is a rebuild that pre-fix terminated in a deterministic FAILED_PRECONDITION (merged_bug_038) — the wipe-deploy success signal."
+        "help": "Settled rows REJOINED by a re-creating submission via the M_070 match bases the pre-strip-preservation matcher refused (sched.persist.settled-identity-freeze+3), labeled by basis: preserved_claim (byte-equal preserved stripped claim) or dual_anchor (byte-anchored row + same declared path, no contradicting evidence). Each increment is a rebuild that pre-fix terminated in a deterministic FAILED_PRECONDITION (merged_bug_038) — the wipe-deploy success signal."
       },
       {
         "name": "rio_scheduler_orphan_builds_cancelled_total",

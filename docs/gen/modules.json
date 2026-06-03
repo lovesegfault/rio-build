@@ -1000,6 +1000,11 @@
       "doc": "State recovery on leader acquisition."
     },
     {
+      "path": "actor/settled.rs",
+      "depth": 1,
+      "doc": "Settled-row identity and displacement arbitration — the ONE owner"
+    },
+    {
       "path": "actor/snapshot.rs",
       "depth": 1,
       "doc": "Read-only snapshot/inspect handlers on [`DagActor`]. All methods"
