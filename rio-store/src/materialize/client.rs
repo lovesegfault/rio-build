@@ -705,7 +705,7 @@ mod tests {
             vec![Ok(deliver("exec-9", "/nix/store/zzz-bad.drv"))],
             vec![],
         );
-        let claimed = poll_and_claim(&mut t, "store-replica-0", 8).await;
+        let claimed = poll_and_claim(&mut t, "store-replica-0", 8, &token()).await;
         assert!(
             claimed.is_empty(),
             "a malformed job_id must refuse the claim (pre-fix RED: claimed with job_id=None)"
