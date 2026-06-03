@@ -550,9 +550,9 @@ pub struct UploadPlan {
 /// Relayed paths whose `nar_size` is at or above `large_nar_threshold_bytes`
 /// route to [`UploadPlan::large`] for individual streaming — after a
 /// plausibility screen on that peer-declared size: entries declaring more
-/// than [`MAX_RELAY_NAR_BYTES`] are skipped (same per-path degrade), so a
-/// fabricated `NarSize` can neither steer lane routing nor parameterize the
-/// streamed wire op.
+/// than `MAX_RELAY_NAR_BYTES` (crate-private, 64 GiB) are skipped (same
+/// per-path degrade), so a fabricated `NarSize` can neither steer lane
+/// routing nor parameterize the streamed wire op.
 ///
 /// Batch ordering: per node, inputSrcs → outputs → the `.drv` itself, nodes
 /// in children-first order, then settled in passes so every reference that
