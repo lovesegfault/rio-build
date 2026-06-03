@@ -53,6 +53,19 @@ impl DroppedInputs {
             .find(|p| path == p.as_str() || path.starts_with(&format!("{p}/")))
             .map(String::as_str)
     }
+
+    /// Human summary for verdict messages: count plus the members.
+    pub(crate) fn summary(&self) -> String {
+        format!(
+            "{} resolve-time residency gap(s): {}",
+            self.0.len(),
+            self.0
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
 }
 
 #[cfg(test)]

@@ -424,7 +424,7 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
 
     // ---- Classify + process outputs ---------------------------------------
     let is_fod = basic.is_fixed_output();
-    match classify_exit(outcome.exit, is_fod, false, false, None) {
+    match classify_exit(outcome.exit, is_fod, false, false, None, None) {
         ExitClassification::Failed { status, error_msg } => {
             report.classification = Some(status_name(status));
             report.error_msg = Some(error_msg);

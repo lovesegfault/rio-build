@@ -179,6 +179,7 @@ pub(crate) fn classify_exit(
     disk_full: bool,
     oom_killed: bool,
     log_cap_trip: Option<&crate::log_stream::LogCapTrip>,
+    dropped_summary: Option<&str>,
 ) -> ExitClassification {
     use ExitClassification::Failed;
 
@@ -228,6 +229,35 @@ pub(crate) fn classify_exit(
             error_msg: format!(
                 "builder was killed by signal {sig} and the worker's scratch space is nearly \
                  full (<8 MiB free) — attributing the failure to the worker, not the build"
+            ),
+        },
+        // Gap-dispatched build failed: with resolve-time residency
+        // gaps on record the failure cannot be distinguished from the
+        // gap (a missing transitive dep can fail a build through any
+        // exit code its build system chooses), so it attributes to
+        // infrastructure — re-dispatch re-resolves; bounded by the
+        // scheduler's infra retry caps (deliberately NOT cap-exempt:
+        // a build that keeps failing across re-resolves converges to
+        // poison through the capped path). Precedence: below
+        // OOM/disk-full (more-specific worker causes), above
+        // network-transient, and the kill-class variants matched
+        // before any of this — a cap/timeout verdict is never
+        // overridden by gap evidence.
+        // VerdictArm::ExitClassification consults dropped
+        ExitOutcome::Exited(code) if dropped_summary.is_some() => Failed {
+            status: BuildResultStatus::InfrastructureFailure,
+            error_msg: format!(
+                "builder exited with code {code} on a build dispatched with {} — \
+                 re-dispatch re-resolves the closure",
+                dropped_summary.unwrap_or_default()
+            ),
+        },
+        ExitOutcome::Signaled(sig) if dropped_summary.is_some() => Failed {
+            status: BuildResultStatus::InfrastructureFailure,
+            error_msg: format!(
+                "builder was killed by signal {sig} on a build dispatched with {} — \
+                 re-dispatch re-resolves the closure",
+                dropped_summary.unwrap_or_default()
             ),
         },
         ExitOutcome::Exited(code) if is_network_dependent => Failed {
@@ -778,7 +808,7 @@ mod tests {
     #[test]
     fn classify_success() {
         assert_eq!(
-            classify_exit(ExitOutcome::Exited(0), false, false, false, None),
+            classify_exit(ExitOutcome::Exited(0), false, false, false, None, None),
             ExitClassification::Success
         );
     }
@@ -798,6 +828,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None
             )),
             S::PermanentFailure
@@ -809,6 +840,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
                 None
             )),
             S::TransientFailure
@@ -820,6 +852,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
                 None
             )),
             S::TransientFailure
@@ -831,6 +864,7 @@ mod tests {
                 true,
                 true,
                 false,
+                None,
                 None
             )),
             S::InfrastructureFailure
@@ -842,6 +876,7 @@ mod tests {
                 true,
                 false,
                 true,
+                None,
                 None
             )),
             S::InfrastructureFailure
@@ -853,6 +888,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None
             )),
             S::PermanentFailure
@@ -864,12 +900,20 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None
             )),
             S::TimedOut
         );
         assert_eq!(
-            failed(classify_exit(ExitOutcome::Silent, true, true, true, None)),
+            failed(classify_exit(
+                ExitOutcome::Silent,
+                true,
+                true,
+                true,
+                None,
+                None
+            )),
             S::TimedOut
         );
         assert_eq!(
@@ -878,6 +922,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None
             )),
             S::LogLimitExceeded
@@ -895,6 +940,7 @@ mod tests {
             false,
             false,
             Some(&trip),
+            None,
         ) {
             ExitClassification::Failed { status, error_msg } => {
                 assert_eq!(status, S::LogLimitExceeded);
@@ -917,6 +963,7 @@ mod tests {
             false,
             false,
             Some(&lines),
+            None,
         ) {
             ExitClassification::Failed { error_msg, .. } => {
                 assert!(
@@ -927,6 +974,118 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// The dropped-evidence rung's precedence cells (round-17
+    /// merged_bug_054 c2): below OOM and disk-full, above
+    /// network-transient, never touching kill-class or success.
+    // r[verify builder.result.input-materialization-is-infra+5]
+    #[test]
+    fn dropped_rung_precedence() {
+        use BuildResultStatus as S;
+        use ExitClassification as EC;
+        let gaps = Some("2 resolve-time residency gap(s): /nix/store/a, /nix/store/b");
+        let status = |c: EC| match c {
+            EC::Failed { status, .. } => status,
+            EC::Success => panic!("expected failure"),
+        };
+        // Gap-dispatched failure → infrastructure, message names the gaps.
+        match classify_exit(ExitOutcome::Exited(2), false, false, false, None, gaps) {
+            EC::Failed { status, error_msg } => {
+                assert_eq!(status, S::InfrastructureFailure);
+                assert!(error_msg.contains("residency gap"), "{error_msg}");
+                assert!(error_msg.contains("/nix/store/a"), "{error_msg}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // Signaled likewise.
+        assert_eq!(
+            status(classify_exit(
+                ExitOutcome::Signaled(11),
+                false,
+                false,
+                false,
+                None,
+                gaps
+            )),
+            S::InfrastructureFailure
+        );
+        // OOM beats the gap rung (more specific worker cause).
+        let c = classify_exit(
+            ExitOutcome::Signaled(libc::SIGKILL),
+            false,
+            false,
+            true,
+            None,
+            gaps,
+        );
+        match c {
+            EC::Failed { status, error_msg } => {
+                assert_eq!(status, S::InfrastructureFailure);
+                assert!(
+                    error_msg.contains("OOM"),
+                    "OOM attribution wins: {error_msg}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // Disk-full beats the gap rung.
+        let c = classify_exit(ExitOutcome::Exited(1), false, true, false, None, gaps);
+        match c {
+            EC::Failed { error_msg, .. } => {
+                assert!(error_msg.contains("scratch space"), "{error_msg}")
+            }
+            other => panic!("{other:?}"),
+        }
+        // The gap rung beats network-transient (a FOD with gaps is
+        // still a gap dispatch).
+        match classify_exit(ExitOutcome::Exited(1), true, false, false, None, gaps) {
+            EC::Failed { status, error_msg } => {
+                assert_eq!(status, S::InfrastructureFailure);
+                assert!(error_msg.contains("residency gap"), "{error_msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Kill-class is never overridden by gap evidence.
+        assert_eq!(
+            status(classify_exit(
+                ExitOutcome::TimedOut,
+                false,
+                false,
+                false,
+                None,
+                gaps
+            )),
+            S::TimedOut
+        );
+        assert_eq!(
+            status(classify_exit(
+                ExitOutcome::LogLimitExceeded,
+                false,
+                false,
+                false,
+                None,
+                gaps
+            )),
+            S::LogLimitExceeded
+        );
+        // Success is never demoted by gap evidence.
+        assert_eq!(
+            classify_exit(ExitOutcome::Exited(0), false, false, false, None, gaps),
+            EC::Success
+        );
+        // No gaps → the old permanent classification, byte-compatible.
+        assert_eq!(
+            status(classify_exit(
+                ExitOutcome::Exited(2),
+                false,
+                false,
+                false,
+                None,
+                None
+            )),
+            S::PermanentFailure
+        );
     }
 
     /// The canary's producer set (the exhaustive [`canary_capable`]

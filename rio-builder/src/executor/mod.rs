@@ -1394,6 +1394,43 @@ async fn run_native_lifecycle(
                 "execution request rejected: {msg}"
             )))
         }
+        // execve ENOENT/ENOTDIR with resolve-time residency gaps on
+        // record: a missing STORE PATH manifests at exec exactly (and
+        // only) as those two errnos — the builder, or the `#!`
+        // interpreter it names, may be (under) a member the resolve
+        // dropped. With gaps present the failure cannot be
+        // distinguished from the gap, so it attributes to
+        // infrastructure (re-dispatch re-resolves the closure) —
+        // bounded by the scheduler's infra retry caps, deliberately
+        // not cap-exempt. ENOENT-only dominance: every OTHER
+        // derivation-caused exec errno (EACCES, ENOEXEC, E2BIG, …)
+        // requires the file to EXIST, which absence cannot produce —
+        // those stay permanent below even with gaps on record.
+        // r[impl builder.result.input-materialization-is-infra+5]
+        // VerdictArm::ExecErrno consults dropped
+        Err(rio_exec::ExecError::Setup(se))
+            if !oom_detected
+                && se.phase == rio_exec::SetupPhase::Exec
+                && matches!(
+                    nix::errno::Errno::from_raw(se.errno),
+                    nix::errno::Errno::ENOENT | nix::errno::Errno::ENOTDIR
+                )
+                && !dropped_inputs.is_empty() =>
+        {
+            let errno = nix::errno::Errno::from_raw(se.errno);
+            let attribution = dropped_inputs
+                .covering_member(basic_drv.builder())
+                .map(|m| format!("the builder path itself sits under the dropped member {m}"))
+                .unwrap_or_else(|| dropped_inputs.summary());
+            Ok(NativeBuild::Failed {
+                status: rio_proto::types::BuildResultStatus::InfrastructureFailure,
+                error_msg: format!(
+                    "cannot execute the builder '{}': {errno} — the build was dispatched \
+                     with {attribution}; re-dispatch re-resolves the closure",
+                    basic_drv.builder(),
+                ),
+            })
+        }
         // A failed execve of the builder itself (missing builder path,
         // missing `#!` interpreter, not executable, not a valid binary)
         // is a property of the derivation, not of this worker — CppNix
@@ -1457,12 +1494,14 @@ async fn run_native_lifecycle(
                      regression (sustained rate)"
                 );
             }
+            let dropped_summary = (!dropped_inputs.is_empty()).then(|| dropped_inputs.summary());
             match native_result::classify_exit(
                 exit,
                 is_fod,
                 disk_full,
                 oom_detected,
                 log_cap_trip.as_ref(),
+                dropped_summary.as_deref(),
             ) {
                 native_result::ExitClassification::Failed { status, error_msg } => {
                     if oom_detected
