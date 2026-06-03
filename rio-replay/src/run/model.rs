@@ -1087,6 +1087,11 @@ pub struct RequeueRecord {
     /// `attempts`/`flaky` stamped on records — an unrecognized string (a
     /// journal from a different engine version) counts, preserving the
     /// historical every-requeue semantics for foreign entries.
+    /// One load-bearing value beyond the measurement: the resume fold
+    /// counts collect-source entries whose why is
+    /// [`RequeueReason::EngineCancelled`]'s wire string into the
+    /// engine-cancel cycle budget (`max_engine_cancel_cycles`), so that
+    /// bound survives restarts.
     pub why: String,
     pub at: String,
 }

@@ -65,6 +65,19 @@ pub struct JobContext {
     pub fixed_output_drvs: std::sync::Arc<HashSet<String>>,
 }
 
+/// Consumed budgets a deciding member arrives with, read from the
+/// tracker's counters (live) or the journal fold (resume) at the
+/// chokepoint that calls [`decide`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PriorBudgets {
+    /// TOTAL engine resubmissions so far — every requeue reason counts
+    /// (see [`decide`]'s conservative-budget contract).
+    pub requeues: u32,
+    /// Engine-cancelled carve-out re-offers already granted (the
+    /// `RequeueReason::EngineCancelled` why-slice of the same journal).
+    pub cancel_cycles: u32,
+}
+
 /// Proof token that a requeue decision consulted its bound.
 ///
 /// [`CollectDecision::Requeue`] cannot be constructed without a
@@ -125,17 +138,18 @@ mod requeue_budget {
 
         /// The engine-cancelled carve-out: a batch the ENGINE itself
         /// cancelled (batch deadline, abort) re-offers its members without
-        /// consuming budget — the cancellation is the engine's own act,
-        /// not evidence about the job. The arm's bound is delegated to the
-        /// active-stall watchdog: each cycle holds the job `Active` for
-        /// the full batch timeout, so the stall clock fires mid-cycle
-        /// (one stall auto-retry, then a terminal stalled-active record).
-        /// That backstop requires `batch_timeout_hours >
-        /// active_stall_hours`, which spec validation asserts — do NOT
-        /// reach for this constructor from a new arm without naming an
-        /// equivalent backstop.
-        pub fn engine_cancelled_carveout() -> Self {
-            Self(Charge::Counted)
+        /// consuming the auto-retry budget — the cancellation is the
+        /// engine's own act, not evidence about the job. The carve-out
+        /// carries its OWN explicit bound: `prior_cancel_cycles <
+        /// max_engine_cancel_cycles`, each granted cycle journaled (the
+        /// `RequeueReason::EngineCancelled` why-slice) so the budget survives
+        /// restarts. Exhaustion terminalizes — a job whose batches the
+        /// engine keeps cancelling has consumed cycles x batch_timeout of
+        /// cluster time without producing a result, and another re-offer
+        /// cannot converge. Do NOT reach for this constructor from a new
+        /// arm without consulting the cycle budget.
+        pub fn engine_cancelled(prior_cancel_cycles: u32, knobs: &Knobs) -> Option<Self> {
+            (prior_cancel_cycles < knobs.max_engine_cancel_cycles).then_some(Self(Charge::Counted))
         }
 
         /// The canary-probe carve-out: an infra-shaped failure of a probe
@@ -405,24 +419,39 @@ pub fn decide(
     target: Option<&PathOutcome>,
     batch: &BatchView,
     poisoned: &HashMap<String, Vec<String>>,
-    prior_requeues: u32,
+    prior: PriorBudgets,
     knobs: &Knobs,
     log_tail: Option<&str>,
 ) -> CollectDecision {
+    let prior_requeues = prior.requeues;
     let relayed = batch.reasons.get(&ctx.drv_path).map(String::as_str);
     let Some(target) = target else {
         // No in-band result for this root. An engine-cancelled batch
-        // (deadline/abort: the channel was abandoned before results arrived)
-        // is always re-offered — the carve-out's bound is the active-stall
-        // watchdog (see [`RequeueBudget::engine_cancelled_carveout`]);
-        // otherwise a missing result is a transport defect — one
-        // auto-retry, then an infra failure. A canary probe's missing
-        // result (the very outage the probe was sent to test) is exempt
-        // from the budget: see [`RequeueBudget::probe_carveout`].
+        // (deadline/abort: the channel was abandoned before results
+        // arrived) re-offers within the explicit cycle budget — the
+        // cancellation is the engine's own act, but a job whose batches
+        // the engine keeps cancelling cannot converge by re-offering
+        // (see [`RequeueBudget::engine_cancelled`]); otherwise a missing
+        // result is a transport defect — one auto-retry, then an infra
+        // failure. A canary probe's missing result (the very outage the
+        // probe was sent to test) is exempt from the budget: see
+        // [`RequeueBudget::probe_carveout`].
         if batch.engine_cancelled {
-            return CollectDecision::Requeue {
-                why: RequeueReason::EngineCancelled,
-                budget: RequeueBudget::engine_cancelled_carveout(),
+            if let Some(budget) = RequeueBudget::engine_cancelled(prior.cancel_cycles, knobs) {
+                return CollectDecision::Requeue {
+                    why: RequeueReason::EngineCancelled,
+                    budget,
+                };
+            }
+            return CollectDecision::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::Infra,
+                },
+                evidence: Some(format!(
+                    "engine-cancel cycle budget exhausted after {} cycles (each granted the \
+                     full batch timeout)",
+                    prior.cancel_cycles
+                )),
             };
         }
         if batch.probe {
@@ -786,10 +815,10 @@ fn lossy_log_text(bytes: &[u8]) -> String {
 /// dispatcher, members with no job context, members already terminal — have
 /// no entry.
 ///
-/// `prior_requeues` carries each job's TOTAL engine resubmission count so
-/// far (every requeue reason counts, not just infra retries) — see
-/// [`decide`] for why any prior requeue consumes the infra auto-retry
-/// budget.
+/// `prior_budgets` carries each job's consumed budgets so far: the TOTAL
+/// engine resubmission count (every requeue reason counts, not just infra
+/// retries — see [`decide`]) and the engine-cancel cycles already granted
+/// through the carve-out.
 ///
 /// Duplicate-batch belt: `already_terminal` is the ledger's in-memory view
 /// of jobs whose latest record is terminal. The submit loop can re-submit a
@@ -808,7 +837,7 @@ pub async fn process_settled_batch(
     contexts: &HashMap<String, JobContext>,
     batch_jobs: &[String],
     batch: &BatchView,
-    prior_requeues: &HashMap<String, u32>,
+    prior_budgets: &HashMap<String, PriorBudgets>,
     knobs: &Knobs,
     mode: &str,
     campaign_id: &str,
@@ -892,7 +921,7 @@ pub async fn process_settled_batch(
                 decisions.insert(job.clone(), CollectDecision::AlreadyTerminal);
                 continue;
             }
-            let prior = prior_requeues.get(job).copied().unwrap_or(0);
+            let prior = prior_budgets.get(job).copied().unwrap_or_default();
             match decide(ctx, None, batch, &HashMap::new(), prior, knobs, None) {
                 // decide() never defers or belt-drops — those are
                 // membership decisions made here, not outcome decisions.
@@ -915,7 +944,7 @@ pub async fn process_settled_batch(
                 CollectDecision::Terminal { rio, .. } => {
                     tracing::info!(
                         job,
-                        prior_requeues = prior,
+                        prior_requeues = prior.requeues,
                         "engine-side submission failure with no retry budget left; recording an \
                          infrastructure failure"
                     );
@@ -1027,7 +1056,7 @@ pub async fn process_settled_batch(
                 "sanctioned confirmation retry succeeded; superseding the terminal record"
             );
         }
-        let prior = prior_requeues.get(job).copied().unwrap_or(0);
+        let prior = prior_budgets.get(job).copied().unwrap_or_default();
         // Evidence-age gate: when a failed root carries neither an in-band
         // error message nor a relayed reason (Signal 1) and has no
         // ListPoisoned entry (Signal 2 — the scheduler's poison rows decay
@@ -1277,6 +1306,14 @@ mod tests {
         }
     }
 
+    /// Consumed-budget fixture: `n` prior requeues, no cancel cycles.
+    fn prior(requeues: u32) -> PriorBudgets {
+        PriorBudgets {
+            requeues,
+            cancel_cycles: 0,
+        }
+    }
+
     const T: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-app.drv";
     const DEP: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep.drv";
     const OTHER: &str = "/nix/store/cccccccccccccccccccccccccccccccc-other.drv";
@@ -1449,7 +1486,7 @@ mod tests {
                 Some(&po(T, BuildStatus::Built, "")),
                 &batch,
                 &no_poison,
-                0,
+                prior(0),
                 &knobs,
                 None
             ),
@@ -1472,7 +1509,7 @@ mod tests {
                     Some(&po(T, status, "")),
                     &batch,
                     &no_poison,
-                    0,
+                    prior(0),
                     &knobs,
                     None
                 ),
@@ -1500,7 +1537,7 @@ mod tests {
                 Some(&infra),
                 &batch,
                 &poisoned_no_builders,
-                0,
+                prior(0),
                 &knobs,
                 None
             )
@@ -1513,7 +1550,7 @@ mod tests {
                 Some(&infra),
                 &batch,
                 &poisoned_no_builders,
-                1,
+                prior(1),
                 &knobs,
                 None
             ),
@@ -1534,7 +1571,7 @@ mod tests {
                 Some(&infra),
                 &batch,
                 &poisoned_with_builders,
-                0,
+                prior(0),
                 &knobs,
                 None
             ),
@@ -1557,7 +1594,7 @@ mod tests {
                 )),
                 &batch,
                 &no_poison,
-                0,
+                prior(0),
                 &knobs,
                 None
             ),
@@ -1580,7 +1617,7 @@ mod tests {
                 )),
                 &batch,
                 &no_poison,
-                0,
+                prior(0),
                 &knobs,
                 None
             ),
@@ -1598,29 +1635,86 @@ mod tests {
             status: "bogus-status".to_string(),
             ..PathOutcome::default()
         };
-        match decide(&c, Some(&bogus), &batch, &no_poison, 0, &knobs, None) {
+        match decide(&c, Some(&bogus), &batch, &no_poison, prior(0), &knobs, None) {
             CollectDecision::Terminal {
                 rio: RioOutcome::TargetFailed { .. },
                 evidence,
             } => assert!(evidence.unwrap().contains("bogus-status")),
             other => panic!("expected a terminal failure, got {other:?}"),
         }
-        // Missing in-band result: engine-cancelled wins regardless of the
-        // budget; otherwise one requeue, then terminal infra with the
-        // missing-result evidence.
+        // Missing in-band result: engine-cancelled re-offers within its
+        // OWN cycle budget — auto-retry exhaustion (prior requeues 5) does
+        // not block it, but consumed cancel cycles do: at
+        // max_engine_cancel_cycles the next cancellation terminalizes
+        // (each granted cycle cost the full batch timeout of cluster
+        // time, so re-offering cannot converge).
         let cancelled_batch = BatchView {
             engine_cancelled: true,
             ..BatchView::default()
         };
         assert_eq!(
-            decide(&c, None, &cancelled_batch, &no_poison, 5, &knobs, None).requeue_why(),
+            decide(
+                &c,
+                None,
+                &cancelled_batch,
+                &no_poison,
+                prior(5),
+                &knobs,
+                None
+            )
+            .requeue_why(),
             Some("engine-cancelled")
         );
+        let one_cycle_left = PriorBudgets {
+            requeues: 5,
+            cancel_cycles: knobs.max_engine_cancel_cycles - 1,
+        };
         assert_eq!(
-            decide(&c, None, &batch, &no_poison, 0, &knobs, None).requeue_why(),
+            decide(
+                &c,
+                None,
+                &cancelled_batch,
+                &no_poison,
+                one_cycle_left,
+                &knobs,
+                None
+            )
+            .requeue_why(),
+            Some("engine-cancelled"),
+            "the last budgeted cycle still re-offers"
+        );
+        let spent_cycles = PriorBudgets {
+            requeues: 5,
+            cancel_cycles: knobs.max_engine_cancel_cycles,
+        };
+        match decide(
+            &c,
+            None,
+            &cancelled_batch,
+            &no_poison,
+            spent_cycles,
+            &knobs,
+            None,
+        ) {
+            CollectDecision::Terminal {
+                rio:
+                    RioOutcome::TargetFailed {
+                        kind: FailureKind::Infra,
+                    },
+                evidence,
+            } => assert!(
+                evidence
+                    .unwrap()
+                    .contains("engine-cancel cycle budget exhausted"),
+                "the terminal evidence names the exhausted bound"
+            ),
+            other => panic!("expected terminal infra at the cycle bound, got {other:?}"),
+        }
+        assert_eq!(
+            decide(&c, None, &batch, &no_poison, prior(0), &knobs, None).requeue_why(),
             Some("no-inband-result")
         );
-        match decide(&c, None, &batch, &no_poison, 1, &knobs, None) {
+        match decide(&c, None, &batch, &no_poison, prior(1), &knobs, None) {
             CollectDecision::Terminal {
                 rio:
                     RioOutcome::TargetFailed {
@@ -1652,7 +1746,7 @@ mod tests {
 
         // Missing in-band result on a probe, budget exhausted (prior 5):
         // exempt requeue, not terminal infra.
-        match decide(&c, None, &probe_batch, &no_poison, 5, &knobs, None) {
+        match decide(&c, None, &probe_batch, &no_poison, prior(5), &knobs, None) {
             CollectDecision::Requeue { why, budget } => {
                 assert_eq!(why, RequeueReason::InfraProbe);
                 assert!(
@@ -1679,7 +1773,7 @@ mod tests {
             Some(&po(T, BuildStatus::TransientFailure, "")),
             &infra_probe,
             &empty_poison,
-            5,
+            prior(5),
             &knobs,
             None,
         ) {
@@ -1702,7 +1796,7 @@ mod tests {
                 )),
                 &probe_batch,
                 &no_poison,
-                0,
+                prior(0),
                 &knobs,
                 None
             ),
@@ -1721,7 +1815,7 @@ mod tests {
                 Some(&po(T, BuildStatus::Built, "")),
                 &probe_batch,
                 &no_poison,
-                0,
+                prior(0),
                 &knobs,
                 None
             ),
@@ -1736,7 +1830,7 @@ mod tests {
         // exemption is minted by the probe carve-out alone).
         let non_probe = BatchView::default();
         assert!(matches!(
-            decide(&c, None, &non_probe, &no_poison, 5, &knobs, None),
+            decide(&c, None, &non_probe, &no_poison, prior(5), &knobs, None),
             CollectDecision::Terminal {
                 rio: RioOutcome::TargetFailed {
                     kind: FailureKind::Infra
@@ -1745,7 +1839,7 @@ mod tests {
             }
         ));
         // And a within-budget non-probe requeue's witness is NOT exempt.
-        match decide(&c, None, &non_probe, &no_poison, 0, &knobs, None) {
+        match decide(&c, None, &non_probe, &no_poison, prior(0), &knobs, None) {
             CollectDecision::Requeue { budget, .. } => assert!(!budget.probe_exempt()),
             other => panic!("expected a charged requeue, got {other:?}"),
         }
@@ -1779,7 +1873,7 @@ mod tests {
             Some(&fetch_failure),
             &BatchView::default(),
             &no_poison,
-            0,
+            prior(0),
             &knobs,
             None,
         );
@@ -1853,7 +1947,7 @@ mod tests {
                 Some(&fetch_failure),
                 &BatchView::default(),
                 &no_poison,
-                0,
+                prior(0),
                 &knobs,
                 None
             ),
@@ -1889,7 +1983,15 @@ mod tests {
                  'https://example.com/dep.tar.gz'"
             ),
         );
-        match decide(&c, Some(&target), &batch, &HashMap::new(), 0, &knobs, None) {
+        match decide(
+            &c,
+            Some(&target),
+            &batch,
+            &HashMap::new(),
+            prior(0),
+            &knobs,
+            None,
+        ) {
             CollectDecision::Terminal {
                 rio: RioOutcome::DependencyFailed { root, failing_drv },
                 ..
@@ -1928,7 +2030,7 @@ mod tests {
                 )),
                 &batch,
                 &poisoned,
-                0,
+                prior(0),
                 &knobs,
                 None
             ),
@@ -1947,7 +2049,7 @@ mod tests {
                 Some(&po(T, BuildStatus::TransientFailure, "")),
                 &batch,
                 &poisoned,
-                0,
+                prior(0),
                 &knobs,
                 None
             )
@@ -1986,7 +2088,7 @@ mod tests {
             Some(&target),
             &batch,
             &poisoned_genuine,
-            0,
+            prior(0),
             &knobs,
             None,
         ) {
@@ -2025,7 +2127,7 @@ mod tests {
                 Some(&target_infra),
                 &batch_infra,
                 &poisoned_infra,
-                0,
+                prior(0),
                 &knobs,
                 None
             ),
@@ -2053,7 +2155,7 @@ mod tests {
                 Some(&po(T, BuildStatus::DependencyFailed, "")),
                 &batch_relayed,
                 &no_poison,
-                0,
+                prior(0),
                 &knobs,
                 None
             ),
@@ -2075,7 +2177,7 @@ mod tests {
                 Some(&mate),
                 &BatchView::default(),
                 &no_poison,
-                0,
+                prior(0),
                 &knobs,
                 None
             )
@@ -2092,7 +2194,7 @@ mod tests {
                 Some(&po(T, BuildStatus::DependencyFailed, "")),
                 &BatchView::default(),
                 &no_poison,
-                0,
+                prior(0),
                 &knobs,
                 None
             )
@@ -2138,7 +2240,7 @@ mod tests {
                     Some(target),
                     &BatchView::default(),
                     &no_poison,
-                    limit - 1,
+                    prior(limit - 1),
                     &knobs,
                     None
                 )
@@ -2155,7 +2257,7 @@ mod tests {
             Some(&mate),
             &BatchView::default(),
             &no_poison,
-            limit,
+            prior(limit),
             &knobs,
             None,
         ) {
@@ -2177,7 +2279,7 @@ mod tests {
             Some(&no_trigger),
             &BatchView::default(),
             &no_poison,
-            limit,
+            prior(limit),
             &knobs,
             None,
         ) {
@@ -2255,18 +2357,44 @@ mod tests {
         // First pass (no prior requeues): success terminal, infra auto-retry,
         // missing result requeued.
         assert_eq!(
-            decide(&job1, target_for(T), &batch, &poisoned, 0, &knobs, None),
+            decide(
+                &job1,
+                target_for(T),
+                &batch,
+                &poisoned,
+                prior(0),
+                &knobs,
+                None
+            ),
             CollectDecision::Terminal {
                 rio: RioOutcome::Built { executed: true },
                 evidence: None
             }
         );
         assert_eq!(
-            decide(&job2, target_for(DEP), &batch, &poisoned, 0, &knobs, None).requeue_why(),
+            decide(
+                &job2,
+                target_for(DEP),
+                &batch,
+                &poisoned,
+                prior(0),
+                &knobs,
+                None
+            )
+            .requeue_why(),
             Some("infra-auto-retry")
         );
         assert_eq!(
-            decide(&job3, target_for(OTHER), &batch, &poisoned, 0, &knobs, None).requeue_why(),
+            decide(
+                &job3,
+                target_for(OTHER),
+                &batch,
+                &poisoned,
+                prior(0),
+                &knobs,
+                None
+            )
+            .requeue_why(),
             Some("no-inband-result")
         );
 
@@ -2274,7 +2402,15 @@ mod tests {
         // terminal infra; the missing root carries the missing-result
         // evidence.
         assert!(matches!(
-            decide(&job2, target_for(DEP), &batch, &poisoned, 1, &knobs, None),
+            decide(
+                &job2,
+                target_for(DEP),
+                &batch,
+                &poisoned,
+                prior(1),
+                &knobs,
+                None
+            ),
             CollectDecision::Terminal {
                 rio: RioOutcome::TargetFailed {
                     kind: FailureKind::Infra
@@ -2282,7 +2418,15 @@ mod tests {
                 ..
             }
         ));
-        match decide(&job3, target_for(OTHER), &batch, &poisoned, 1, &knobs, None) {
+        match decide(
+            &job3,
+            target_for(OTHER),
+            &batch,
+            &poisoned,
+            prior(1),
+            &knobs,
+            None,
+        ) {
             CollectDecision::Terminal {
                 rio:
                     RioOutcome::TargetFailed {
@@ -2508,7 +2652,16 @@ mod tests {
             (ctx("b.x86_64-linux", DEP, &[], ExpectedOutcome::Built), 5),
         ] {
             assert_eq!(
-                decide(&job, None, &batch, &no_poison, prior_requeues, &knobs, None).requeue_why(),
+                decide(
+                    &job,
+                    None,
+                    &batch,
+                    &no_poison,
+                    prior(prior_requeues),
+                    &knobs,
+                    None
+                )
+                .requeue_why(),
                 Some("engine-cancelled"),
                 "prior_requeues = {prior_requeues}"
             );
@@ -2548,7 +2701,8 @@ mod tests {
         // on a real transport retry. The budget map drives the decision; the
         // journal is what the record's attempts derive from (production
         // keeps the two in lockstep via journal-then-increment).
-        let prior: HashMap<String, u32> = [("spent.x86_64-linux".to_string(), 1)].into();
+        let prior: HashMap<String, PriorBudgets> =
+            [("spent.x86_64-linux".to_string(), prior(1))].into();
         state
             .append_jsonl(
                 StateFile::Requeues,
@@ -2644,9 +2798,9 @@ mod tests {
         }
         // Both succeed on the next wave. The budget map mirrors the journal
         // (one prior requeue each) — and must NOT leak into the records.
-        let prior: HashMap<String, u32> = [
-            ("cut.x86_64-linux".to_string(), 1),
-            ("retried.x86_64-linux".to_string(), 1),
+        let prior: HashMap<String, PriorBudgets> = [
+            ("cut.x86_64-linux".to_string(), prior(1)),
+            ("retried.x86_64-linux".to_string(), prior(1)),
         ]
         .into();
         let batch = BatchView {
@@ -2729,7 +2883,8 @@ mod tests {
             results: vec![po(T, BuildStatus::PermanentFailure, "exit code 2")],
             ..BatchView::default()
         };
-        let prior: HashMap<String, u32> = [("ok.x86_64-linux".to_string(), 5)].into();
+        let prior: HashMap<String, PriorBudgets> =
+            [("ok.x86_64-linux".to_string(), prior(5))].into();
         // Mirror collect_pass_with's bookkeeping: extend the terminal view
         // with each batch's terminal decisions before the next batch.
         let mut already_terminal: HashSet<String> = HashSet::new();
@@ -3074,7 +3229,8 @@ mod tests {
             engine_cancelled: true,
             ..BatchView::default()
         };
-        let prior: HashMap<String, u32> = [("spent.x86_64-linux".to_string(), 5)].into();
+        let prior: HashMap<String, PriorBudgets> =
+            [("spent.x86_64-linux".to_string(), prior(5))].into();
         let decisions = process_settled_batch(
             &state,
             &LogAdmin::default(),
@@ -3323,7 +3479,8 @@ mod tests {
         };
         // Budget already consumed → terminal; with Signal 2 unavailable the
         // infra reason still resolves to infra.
-        let prior: HashMap<String, u32> = [("bad.x86_64-linux".to_string(), 1)].into();
+        let prior: HashMap<String, PriorBudgets> =
+            [("bad.x86_64-linux".to_string(), prior(1))].into();
         let decisions = process_settled_batch(
             &state,
             &admin,

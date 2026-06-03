@@ -153,6 +153,9 @@ pub const JOURNAL_BACKED_BOUNDS: &[&str] = &[
     "attempts-accounting",
     // `requeues >= max_queued_requeues` escalates the queued ladder.
     "queued-escalation-ladder",
+    // `cancel_cycles >= max_engine_cancel_cycles` terminalizes the
+    // engine-cancelled requeue loop.
+    "engine-cancel-cycle-bound",
 ];
 
 /// The non-tracker budget slices [`JobLedger::from_journals`] folds out
@@ -227,6 +230,7 @@ impl JobLedger {
     ) -> Result<(Self, RehydratedBudgets)> {
         let entries: Vec<RequeueRecord> = state.load_jsonl(StateFile::Requeues)?;
         let mut resubmissions: HashMap<String, u32> = HashMap::new();
+        let mut cancel_cycles: HashMap<String, u32> = HashMap::new();
         let mut stall_retries: HashMap<String, u32> = HashMap::new();
         let mut queued_requeues: HashMap<String, u32> = HashMap::new();
         for entry in &entries {
@@ -240,11 +244,19 @@ impl JobLedger {
                 }
                 _ => {
                     *resubmissions.entry(entry.job.clone()).or_default() += 1;
+                    // The engine-cancel cycle budget is the why-slice of
+                    // the collect source (the why is journal vocabulary,
+                    // written through the same typed reason decide()
+                    // mints — [`RequeueReason::EngineCancelled`]).
+                    if entry.why == RequeueReason::EngineCancelled.as_str() {
+                        *cancel_cycles.entry(entry.job.clone()).or_default() += 1;
+                    }
                 }
             }
         }
         let tracker = Arc::new(SubmitTracker {
             resubmissions: tokio::sync::Mutex::new(resubmissions),
+            cancel_cycles: tokio::sync::Mutex::new(cancel_cycles),
             ..SubmitTracker::default()
         });
         Ok((
@@ -327,6 +339,18 @@ impl JobLedger {
             .await
             .entry(job.to_string())
             .or_default() += 1;
+        // The engine-cancelled carve-out's granted cycles are tracked on
+        // their own counter (the why is the journal vocabulary the fold
+        // matches on), backing the explicit cycle bound.
+        if why == RequeueReason::EngineCancelled {
+            *self
+                .tracker
+                .cancel_cycles
+                .lock()
+                .await
+                .entry(job.to_string())
+                .or_default() += 1;
+        }
         self.watchdog
             .lock()
             .await
@@ -400,6 +424,18 @@ impl JobLedger {
             return;
         }
         self.watchdog.lock().await.remove_job(job);
+    }
+
+    /// Unsuspended seconds the job's clock has accrued in its current
+    /// phase — the stall terminal gate's floor input.
+    pub async fn stall_accrued_secs(&self, job: &str) -> Option<f64> {
+        self.watchdog.lock().await.accrued_secs(job)
+    }
+
+    /// The stall terminal gate observed progress: reset the clock for a
+    /// fresh accrual window (no phase change, no budget moves).
+    pub async fn grant_stall_grace(&self, job: &str) {
+        self.watchdog.lock().await.grant_stall_grace(job);
     }
 
     /// The job reached a terminal record (already appended by the caller):
@@ -823,6 +859,30 @@ mod tests {
                         budgets.stall_retries,
                         HashMap::from([("resub.x".to_string(), 1)]),
                         "{bound}: the stall slice rehydrates the auto-retry gate"
+                    );
+                }
+                "engine-cancel-cycle-bound" => {
+                    assert_eq!(
+                        *resumed
+                            .tracker()
+                            .cancel_cycles
+                            .lock()
+                            .await
+                            .get("resub.x")
+                            .unwrap_or(&0),
+                        1,
+                        "{bound}: the engine-cancelled why-slice rehydrates the cycle budget"
+                    );
+                    assert_eq!(
+                        *resumed
+                            .tracker()
+                            .cancel_cycles
+                            .lock()
+                            .await
+                            .get("starved.x")
+                            .unwrap_or(&0),
+                        0,
+                        "{bound}: non-cancel re-offers do not consume cycles"
                     );
                 }
                 "queued-escalation-ladder" => {

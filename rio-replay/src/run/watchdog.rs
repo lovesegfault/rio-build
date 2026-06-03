@@ -380,6 +380,26 @@ impl Watchdog {
         self.jobs.remove(job);
     }
 
+    /// Unsuspended seconds the job's clock has accrued in its current
+    /// phase (`None` = not tracked). Read by the stall terminal gate's
+    /// batch-timeout floor: a terminal stalled-active record may only be
+    /// considered once residence exceeds the budget the engine itself
+    /// granted the batch.
+    pub fn accrued_secs(&self, job: &str) -> Option<f64> {
+        self.jobs.get(job).map(|clock| clock.accrued_secs)
+    }
+
+    /// Reset the job's clock without a phase change: the stall terminal
+    /// gate observed PROGRESS (node-status transitions since the prior
+    /// probe), so the member earns a fresh accrual window instead of a
+    /// terminal record — a residence heuristic must yield to a positive
+    /// progress observation.
+    pub fn grant_stall_grace(&mut self, job: &str) {
+        if let Some(clock) = self.jobs.get_mut(job) {
+            clock.accrued_secs = 0.0;
+        }
+    }
+
     /// Seed the consumed queued-requeue budgets from the resume fold
     /// (the `REQUEUE_SOURCE_QUEUED` slice of requeues.jsonl). Called once
     /// at construction time on the production path; clocks created later

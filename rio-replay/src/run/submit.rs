@@ -59,6 +59,11 @@ pub struct SubmitTracker {
     /// (and by the stall watchdog when it requeues a stalled job); the
     /// submit loop only reads it.
     pub resubmissions: Mutex<HashMap<String, u32>>,
+    /// Job → engine-cancel carve-out cycles already granted (the
+    /// `RequeueReason::EngineCancelled` why-slice of the resubmissions): the
+    /// explicit bound on the cancel-and-requeue loop, rehydrated from the
+    /// same journal fold.
+    pub cancel_cycles: Mutex<HashMap<String, u32>>,
     /// Job → earliest instant it may be offered again after its batch
     /// settled (the post-settlement cool-down; see
     /// [`Self::release_after_settle`]).

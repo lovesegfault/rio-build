@@ -1114,6 +1114,95 @@ fn stall_record(
     }
 }
 
+/// Recent builds inspected per probe when locating the build that holds a
+/// stalled member's drv (most recent first — the stalled batch is by
+/// definition long-running, so it sits near the top of the listing).
+const STALL_PROBE_BUILD_WINDOW: u32 = 32;
+
+/// Progress probe for the stall ladder's terminal arm: a terminal record
+/// minted from absence of signal (pure residence) must first consult a
+/// positive observation. The probe locates the build currently holding
+/// the member's drv (AdminApi::list_builds — the same recovery fallback
+/// collect uses when the in-band build announcement was lost — then
+/// get_build_graph) and compares the graph's node statuses against the
+/// snapshot taken at the prior probe: any transition is progress. The drv
+/// appearing in a NEWER build than the snapshot's also reads as progress
+/// — assignment churn from cancel-and-requeue thrash looks exactly like
+/// that, which is why the engine-cancel requeue loop carries its own
+/// explicit cycle budget rather than delegating to this probe.
+struct StallProgressProbe {
+    admin: Arc<dyn AdminApi>,
+    tenant: String,
+    /// job → (build id, node statuses) at the prior probe.
+    snapshots: HashMap<String, (String, BTreeMap<String, String>)>,
+}
+
+impl StallProgressProbe {
+    fn new(admin: Arc<dyn AdminApi>, tenant: String) -> Self {
+        Self {
+            admin,
+            tenant,
+            snapshots: HashMap::new(),
+        }
+    }
+
+    /// `Some(true)` = node-status transitions since the prior probe;
+    /// `Some(false)` = the same build shows the same statuses (no
+    /// progress); `None` = no verdict — first observation (baseline
+    /// recorded) or evidence unavailable (RPC failure, no build holds the
+    /// drv). The terminal gate holds on `None`: a record that exists
+    /// because of missing signal must not be justified by more missing
+    /// signal.
+    async fn progressed_since_prior(&mut self, job: &str, drv: &str) -> Option<bool> {
+        let builds = match self
+            .admin
+            .list_builds(&self.tenant, STALL_PROBE_BUILD_WINDOW)
+            .await
+        {
+            Ok(builds) => builds,
+            Err(e) => {
+                tracing::warn!(job, error = %format!("{e:#}"), "stall progress probe: list_builds failed");
+                return None;
+            }
+        };
+        for (build_id, _submitted_at) in builds {
+            let graph = match self.admin.get_build_graph(&build_id).await {
+                Ok(graph) => graph,
+                Err(e) => {
+                    tracing::warn!(
+                        job,
+                        build_id,
+                        error = %format!("{e:#}"),
+                        "stall progress probe: get_build_graph failed; trying older builds"
+                    );
+                    continue;
+                }
+            };
+            if !graph.nodes.iter().any(|node| node.drv_path == drv) {
+                continue;
+            }
+            let statuses: BTreeMap<String, String> = graph
+                .nodes
+                .iter()
+                .map(|node| (node.drv_path.clone(), node.status.clone()))
+                .collect();
+            let verdict = match self.snapshots.get(job) {
+                Some((prior_id, prior)) if *prior_id == build_id => Some(*prior != statuses),
+                Some(_) => Some(true),
+                None => None,
+            };
+            self.snapshots.insert(job.to_string(), (build_id, statuses));
+            return verdict;
+        }
+        None
+    }
+
+    /// Drop the job's snapshot (terminal record written or job retired).
+    fn forget(&mut self, job: &str) {
+        self.snapshots.remove(job);
+    }
+}
+
 /// Apply watchdog stall verdicts. The first ActiveStall for a job triggers
 /// the single auto-retry, applied through the ledger's stall-requeue
 /// transition: the in-flight reservation is released, an engine
@@ -1147,6 +1236,8 @@ async fn apply_stall_actions(
     stalled: &[StallVerdict],
     mode: &str,
     schedule_mode: ScheduleMode,
+    knobs: &Knobs,
+    probe: &mut StallProgressProbe,
     campaign_id: &str,
 ) {
     for stall in stalled {
@@ -1221,32 +1312,95 @@ async fn apply_stall_actions(
                         }
                     }
                 } else {
-                    match write_terminal_stall(
-                        state,
-                        contexts,
-                        results,
-                        ledger,
-                        &stall.job,
-                        "stalled-active",
-                        // ActiveStall fires for a job in a committed batch:
-                        // the stalled attempt is a real submission.
-                        true,
-                        mode,
-                        campaign_id,
-                    )
-                    .await
-                    {
-                        Ok(()) => tracing::warn!(
+                    // Terminal candidate — but a stalled-active record is
+                    // minted from ABSENCE of signal (pure batch
+                    // residence), so it must clear two evidence gates
+                    // first. (1) The batch-timeout floor: the engine
+                    // itself granted the batch batch_timeout_hours, so
+                    // residence below that budget is the engine's own
+                    // contract being honored, not a wedge — at default
+                    // knobs this alone stops chromium/LLVM-class
+                    // cold-cache roots (and their co-batched siblings)
+                    // from being booked as rio infra failures. (2) A
+                    // no-progress observation: node-status transitions
+                    // since the prior probe mean the cluster is working —
+                    // the clock resets for a fresh window instead.
+                    // Probe-unavailable holds (the level-triggered verdict
+                    // re-fires and retries next tick); the genuinely
+                    // unsettled-wedge case converges once evidence
+                    // returns, and the batch's own settle (engine-cancel,
+                    // bounded by the explicit cycle budget) backstops a
+                    // probe that can never answer.
+                    let accrued = ledger.stall_accrued_secs(&stall.job).await.unwrap_or(0.0);
+                    let floor_secs = knobs.batch_timeout_hours * 3600.0;
+                    let drv = contexts.get(&stall.job).map(|ctx| ctx.drv_path.clone());
+                    if accrued < floor_secs {
+                        tracing::debug!(
                             job = %stall.job,
-                            "active stall after the single auto-retry: terminal \
-                             rio-infra-failure (stalled-active)"
-                        ),
-                        Err(e) => tracing::warn!(
-                            job = %stall.job,
-                            error = %format!("{e:#}"),
-                            "terminal stalled-active append failed; the verdict stays armed \
-                             and re-fires on the next poll"
-                        ),
+                            accrued_hours = accrued / 3600.0,
+                            floor_hours = knobs.batch_timeout_hours,
+                            "active stall held below the batch-timeout floor; the verdict \
+                             re-fires until residence exceeds the budget the batch was granted"
+                        );
+                        continue;
+                    }
+                    let progressed = match &drv {
+                        // No context: write_terminal_stall's no-context
+                        // arm retires the clock without a record; there is
+                        // no drv to probe.
+                        None => Some(false),
+                        Some(drv) => probe.progressed_since_prior(&stall.job, drv).await,
+                    };
+                    match progressed {
+                        Some(true) => {
+                            ledger.grant_stall_grace(&stall.job).await;
+                            tracing::info!(
+                                job = %stall.job,
+                                "stalled batch shows node-status progress; granting a fresh \
+                                 accrual window instead of a terminal record"
+                            );
+                        }
+                        None => {
+                            tracing::info!(
+                                job = %stall.job,
+                                "stall progress evidence unavailable; holding the terminal \
+                                 verdict (re-fires next tick)"
+                            );
+                        }
+                        Some(false) => {
+                            match write_terminal_stall(
+                                state,
+                                contexts,
+                                results,
+                                ledger,
+                                &stall.job,
+                                "stalled-active",
+                                // ActiveStall fires for a job in a
+                                // committed batch: the stalled attempt is
+                                // a real submission.
+                                true,
+                                mode,
+                                campaign_id,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    probe.forget(&stall.job);
+                                    tracing::warn!(
+                                        job = %stall.job,
+                                        "active stall past the batch-timeout floor with no \
+                                         observed progress: terminal rio-infra-failure \
+                                         (stalled-active)"
+                                    );
+                                }
+                                Err(e) => tracing::warn!(
+                                    job = %stall.job,
+                                    error = %format!("{e:#}"),
+                                    "terminal stalled-active append failed; the verdict stays \
+                                     armed and re-fires on the next poll"
+                                ),
+                            }
+                        }
                     }
                 }
             }
@@ -2199,6 +2353,8 @@ pub async fn run_with_backends(
         // the requeue journal so a pod restart cannot grant every stalled
         // job a second auto-retry.
         let mut stall_retries: HashMap<String, u32> = rehydrated_budgets.stall_retries;
+        let mut stall_probe =
+            StallProgressProbe::new(backends.admin.clone(), spec.tenants.build_tenant.clone());
         tokio::spawn(async move {
             let mut sync_tracker = SyncTracker::default();
             let mut probe_ladder = InfraProbeLadder::new();
@@ -2453,6 +2609,8 @@ pub async fn run_with_backends(
                         &outcome.stalled,
                         &mode,
                         schedule_mode,
+                        &knobs,
+                        &mut stall_probe,
                         &campaign_id,
                     )
                     .await;
@@ -2922,15 +3080,25 @@ async fn collect_pass_with(
             probe: batch.probe,
             confirmation_attempt: batch.confirmation_attempt,
         };
-        // prior_requeues carries each job's TOTAL engine resubmission count
-        // so far — any prior requeue consumes the single infra auto-retry
-        // budget (see `collect::decide`).
-        let prior_requeues: HashMap<String, u32> = {
+        // prior_budgets carries each job's consumed budgets so far: total
+        // engine resubmissions (any prior requeue consumes the single
+        // infra auto-retry budget — see `collect::decide`) and the
+        // engine-cancel cycles already granted through the carve-out.
+        let prior_budgets: HashMap<String, collect::PriorBudgets> = {
             let resubs = ledger.tracker().resubmissions.lock().await;
+            let cancels = ledger.tracker().cancel_cycles.lock().await;
             batch
                 .jobs
                 .iter()
-                .map(|j| (j.clone(), *resubs.get(j).unwrap_or(&0)))
+                .map(|j| {
+                    (
+                        j.clone(),
+                        collect::PriorBudgets {
+                            requeues: *resubs.get(j).unwrap_or(&0),
+                            cancel_cycles: *cancels.get(j).unwrap_or(&0),
+                        },
+                    )
+                })
                 .collect()
         };
         // first_active_at: approximation — the batch's started_at (the job
@@ -2954,7 +3122,7 @@ async fn collect_pass_with(
             contexts,
             &batch.jobs,
             &view,
-            &prior_requeues,
+            &prior_budgets,
             knobs,
             mode,
             campaign_id,
@@ -3124,6 +3292,41 @@ mod tests {
                 .get(&batch.root_drvs[0])
                 .cloned()
                 .unwrap_or_default())
+        }
+    }
+
+    /// Admin fake for the stall progress probe: scripted build listing and
+    /// per-build graphs, mutable between probes so tests can stage
+    /// progress / no-progress sequences.
+    #[derive(Default)]
+    struct ProbeAdmin {
+        builds: std::sync::Mutex<Vec<(String, Option<String>)>>,
+        graphs: std::sync::Mutex<HashMap<String, GraphSnapshot>>,
+    }
+
+    #[async_trait]
+    impl AdminApi for ProbeAdmin {
+        async fn get_build_graph(&self, build_id: &str) -> Result<GraphSnapshot> {
+            Ok(self
+                .graphs
+                .lock()
+                .unwrap()
+                .get(build_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+        async fn list_poisoned(&self) -> Result<Vec<PoisonedView>> {
+            Ok(vec![])
+        }
+        async fn log_tail(&self, _drv: &str, _exec: Option<&str>, _max: usize) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        async fn list_builds(
+            &self,
+            _tenant: &str,
+            _limit: u32,
+        ) -> Result<Vec<(String, Option<String>)>> {
+            Ok(self.builds.lock().unwrap().clone())
         }
     }
 
@@ -4371,6 +4574,13 @@ mod tests {
         );
     }
 
+    /// A progress probe over the no-builds admin fake: every probe answers
+    /// `None` (evidence unavailable) — tests that need a probe verdict
+    /// build one over a scripted admin instead.
+    fn test_probe() -> StallProgressProbe {
+        StallProgressProbe::new(Arc::new(NoLogsAdmin), "replay-leaf".to_string())
+    }
+
     /// Job context with an empty closure for the journal-fold tests.
     fn fold_ctx(job: &str, drv: &str) -> JobContext {
         JobContext {
@@ -4401,6 +4611,12 @@ mod tests {
         let folded_stalls = folded_budgets.stall_retries;
         let live_counts = live.tracker().resubmissions.lock().await.clone();
         let folded_counts = folded.tracker().resubmissions.lock().await.clone();
+        let live_cancels = live.tracker().cancel_cycles.lock().await.clone();
+        let folded_cancels = folded.tracker().cancel_cycles.lock().await.clone();
+        assert_eq!(
+            live_cancels, folded_cancels,
+            "live engine-cancel cycles must equal the journal fold at boundary: {boundary}"
+        );
         assert_eq!(
             folded_counts, live_counts,
             "fold(requeues.jsonl) must equal the live resubmission counters at boundary: \
@@ -4559,6 +4775,8 @@ mod tests {
             }],
             "leaf",
             ScheduleMode::Timeless,
+            &Knobs::default(),
+            &mut test_probe(),
             "c-fold",
         )
         .await;
@@ -6027,57 +6245,72 @@ mod tests {
         );
     }
 
-    /// Drives the watchdog with a fake clock (tick timestamps) through the
-    /// stall-action policy: first ActiveStall → single auto-retry (in-flight
-    /// reservation released, resubmission counted, no record); second
-    /// ActiveStall for the same job → terminal stalled-active;
-    /// QueuedEscalate → terminal stalled-queued.
+    /// The stall-action policy against its current contract: the first
+    /// ActiveStall grants the single auto-retry (reservation released,
+    /// resubmission counted, no record). After the retry is spent, a
+    /// terminal stalled-active record needs EVIDENCE, not residence alone:
+    /// it is held below the batch-timeout floor (the budget the engine
+    /// itself granted the batch — spec validation pins floor > threshold),
+    /// held while the progress probe has no verdict (first observation =
+    /// baseline), written only once the same build shows the same node
+    /// statuses across consecutive probes (no progress), and replaced by
+    /// a fresh accrual window when statuses DID transition (a healthy
+    /// long batch is never booked as a rio infra failure).
+    /// QueuedEscalate still terminalizes as stalled-queued directly — a
+    /// queued job is in no batch, so no budget or build applies.
     #[tokio::test]
-    async fn stall_actions_retry_then_terminal() {
+    async fn stall_actions_terminalize_only_wedged_batches_past_the_floor() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
         let tracker = Arc::new(SubmitTracker::default());
         let results = tokio::sync::Mutex::new(BTreeMap::new());
-        // Default knobs: active stall 6h, queued watchdog 2h.
-        let wd = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        // Default knobs: active stall 6h, batch timeout (the floor) 24h.
+        let knobs = Knobs::default();
+        let wd = Arc::new(tokio::sync::Mutex::new(Watchdog::new(knobs.clone())));
         let job_ledger = ledger::JobLedger::new(state.clone(), tracker.clone(), wd.clone());
         let mut stall_retries: HashMap<String, u32> = HashMap::new();
 
         let active_job = "appB.x86_64-linux";
         let queued_job = "libA.x86_64-linux";
-        let mk_ctx = |job: &str, drv: &str| JobContext {
-            job: job.to_string(),
-            system: "x86_64-linux".into(),
-            drv_path: drv.to_string(),
-            outputs: BTreeMap::new(),
-            dep_drvs: HashSet::new(),
-            expected_outcome: ExpectedOutcome::Built,
-            expected_outputs: BTreeMap::new(),
-            plan_not_attemptable: false,
-            plan_snapshot_valid: false,
-            fixed_output_drvs: Arc::new(HashSet::new()),
-        };
-        let mut contexts = HashMap::new();
-        contexts.insert(
-            active_job.to_string(),
-            mk_ctx(
-                active_job,
-                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-appB.drv",
+        let active_drv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-appB.drv";
+        let contexts: HashMap<String, JobContext> = [
+            (active_job.to_string(), fold_ctx(active_job, active_drv)),
+            (
+                queued_job.to_string(),
+                fold_ctx(
+                    queued_job,
+                    "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-libA.drv",
+                ),
             ),
-        );
-        contexts.insert(
-            queued_job.to_string(),
-            mk_ctx(
-                queued_job,
-                "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-libA.drv",
-            ),
-        );
-        // The active job sits in an in-flight batch.
-        tracker
-            .in_flight
+        ]
+        .into();
+
+        // Scripted admin: one build holding the active job's drv, graph
+        // mutable between probes.
+        let admin = Arc::new(ProbeAdmin::default());
+        admin
+            .builds
             .lock()
-            .await
-            .insert(active_job.to_string(), 1);
+            .unwrap()
+            .push(("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string(), None));
+        let set_graph = |status: &str| {
+            admin.graphs.lock().unwrap().insert(
+                "0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string(),
+                GraphSnapshot {
+                    nodes: vec![grpc::GraphNodeView {
+                        drv_path: active_drv.to_string(),
+                        status: status.to_string(),
+                        exec_id: String::new(),
+                        assigned_executor_id: String::new(),
+                    }],
+                    truncated: false,
+                    total_nodes: 1,
+                },
+            );
+        };
+        set_graph("created");
+        let mut probe =
+            StallProgressProbe::new(admin.clone() as Arc<dyn AdminApi>, "replay-leaf".into());
 
         let healthy = ClusterCounts {
             active_executors: 8,
@@ -6091,14 +6324,31 @@ mod tests {
             ice: IcePoll::NotPolled,
             engine_paused: false,
         };
+        let apply = async |stalled: &[StallVerdict],
+                           stall_retries: &mut HashMap<String, u32>,
+                           probe: &mut StallProgressProbe| {
+            apply_stall_actions(
+                &state,
+                &job_ledger,
+                &contexts,
+                &results,
+                stall_retries,
+                stalled,
+                "leaf",
+                ScheduleMode::Timeless,
+                &knobs,
+                probe,
+                "c-stall",
+            )
+            .await;
+        };
 
-        // Fake clock: baseline tick at t=0, then a tick 7h later (healthy,
-        // so the whole delta accrues) → first ActiveStall.
+        // ── Auto-retry leg (unchanged contract) ────────────────────────
+        job_ledger.commit_batch(1, &[active_job.to_string()]).await;
         let first = {
-            let mut wd = wd.lock().await;
-            wd.observe_job(active_job, watchdog::JobPhase::Active);
-            wd.on_tick(&tick_at(0));
-            wd.on_tick(&tick_at(7 * 3600))
+            let mut w = wd.lock().await;
+            w.on_tick(&tick_at(0));
+            w.on_tick(&tick_at(7 * 3600))
         };
         assert!(
             first
@@ -6106,63 +6356,93 @@ mod tests {
                 .iter()
                 .any(|s| s.job == active_job && s.kind == StallKind::ActiveStall)
         );
-        apply_stall_actions(
-            &state,
-            &job_ledger,
-            &contexts,
-            &results,
-            &mut stall_retries,
-            &first.stalled,
-            "leaf",
-            ScheduleMode::Timeless,
-            "c-stall",
-        )
-        .await;
-        // Auto-retry effects: reservation released, resubmission counted, no
-        // terminal record yet.
+        apply(&first.stalled, &mut stall_retries, &mut probe).await;
         assert!(!tracker.in_flight.lock().await.contains_key(active_job));
         assert_eq!(tracker.resubmission_count(active_job).await, 1);
         assert!(
             state
                 .load_jsonl::<JobRecord>(StateFile::Results)
                 .unwrap()
-                .is_empty()
+                .is_empty(),
+            "the auto-retry writes no record"
         );
 
-        // The retry goes back in flight; the fake clock advances another 7h
-        // of healthy time → second ActiveStall → terminal stalled-active.
-        tracker
-            .in_flight
-            .lock()
-            .await
-            .insert(active_job.to_string(), 1);
-        let second = {
-            let mut wd = wd.lock().await;
-            wd.observe_job(active_job, watchdog::JobPhase::Active);
-            wd.on_tick(&tick_at(14 * 3600))
-        };
+        // The retry goes back in flight (fresh batch).
+        job_ledger.commit_batch(2, &[active_job.to_string()]).await;
+
+        // ── Floor leg: 7h of fresh residence (over the 6h threshold,
+        // under the 24h floor) re-fires the verdict but must NOT
+        // terminalize — the engine granted the batch 24h. ──────────────
+        let below_floor = wd.lock().await.on_tick(&tick_at(14 * 3600));
         assert!(
-            second
+            below_floor
                 .stalled
                 .iter()
                 .any(|s| s.job == active_job && s.kind == StallKind::ActiveStall)
         );
-        apply_stall_actions(
-            &state,
-            &job_ledger,
-            &contexts,
-            &results,
-            &mut stall_retries,
-            &second.stalled,
-            "leaf",
-            ScheduleMode::Timeless,
-            "c-stall",
-        )
-        .await;
+        apply(&below_floor.stalled, &mut stall_retries, &mut probe).await;
+        assert!(
+            state
+                .load_jsonl::<JobRecord>(StateFile::Results)
+                .unwrap()
+                .is_empty(),
+            "no terminal record below the batch-timeout floor"
+        );
+        assert_eq!(
+            wd.lock().await.phase_of(active_job),
+            Some(watchdog::JobPhase::Active),
+            "the clock keeps running"
+        );
+
+        // ── Probe legs: 25h of residence clears the floor. ─────────────
+        let past_floor = wd.lock().await.on_tick(&tick_at((7 + 25) * 3600));
+        assert!(
+            past_floor
+                .stalled
+                .iter()
+                .any(|s| s.job == active_job && s.kind == StallKind::ActiveStall)
+        );
+        // First probe: baseline only — held, no record.
+        apply(&past_floor.stalled, &mut stall_retries, &mut probe).await;
+        assert!(
+            state
+                .load_jsonl::<JobRecord>(StateFile::Results)
+                .unwrap()
+                .is_empty(),
+            "first observation is a baseline, not a verdict"
+        );
+
+        // Progress between probes: the node transitioned — grace, not a
+        // record, and the clock restarts (no verdict on the next tick).
+        set_graph("running");
+        let refire = wd.lock().await.on_tick(&tick_at((7 + 25) * 3600 + 60));
+        assert!(!refire.stalled.is_empty());
+        apply(&refire.stalled, &mut stall_retries, &mut probe).await;
+        assert!(
+            state
+                .load_jsonl::<JobRecord>(StateFile::Results)
+                .unwrap()
+                .is_empty(),
+            "observed progress earns a fresh window, never a record"
+        );
+        let after_grace = wd.lock().await.on_tick(&tick_at((7 + 25) * 3600 + 120));
+        assert!(
+            after_grace.stalled.is_empty(),
+            "the grace reset the clock: {:?}",
+            after_grace.stalled
+        );
+
+        // The batch then truly wedges: another 26h of residence with the
+        // graph frozen at the snapshot the grace probe recorded — the
+        // probe now answers no-progress and the record is finally written.
+        let wedged = wd.lock().await.on_tick(&tick_at((7 + 25 + 26) * 3600));
+        assert!(!wedged.stalled.is_empty());
+        apply(&wedged.stalled, &mut stall_retries, &mut probe).await;
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
         assert_eq!(
             records[active_job].verdict.as_deref(),
-            Some("infra-indeterminate")
+            Some("infra-indeterminate"),
+            "no progress past the floor: the residence wedge is finally terminal"
         );
         assert_eq!(records[active_job].failure_cause.as_deref(), Some("infra"));
         assert_eq!(
@@ -6180,26 +6460,16 @@ mod tests {
             "in-memory results updated"
         );
         assert!(!tracker.in_flight.lock().await.contains_key(active_job));
+        assert_eq!(wd.lock().await.phase_of(active_job), None);
 
-        // QueuedEscalate goes terminal immediately with the stalled-queued
-        // signature.
+        // ── QueuedEscalate: terminal stalled-queued, no floor or probe
+        // (a queued job is in no batch). ────────────────────────────────
         let escalate = vec![StallVerdict {
             job: queued_job.to_string(),
             kind: StallKind::QueuedEscalate,
             requeues_used: 2,
         }];
-        apply_stall_actions(
-            &state,
-            &job_ledger,
-            &contexts,
-            &results,
-            &mut stall_retries,
-            &escalate,
-            "leaf",
-            ScheduleMode::Timeless,
-            "c-stall",
-        )
-        .await;
+        apply(&escalate, &mut stall_retries, &mut probe).await;
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
         assert_eq!(
             records[queued_job].verdict.as_deref(),
@@ -6306,6 +6576,8 @@ mod tests {
             &verdicts,
             "leaf",
             ScheduleMode::Timeless,
+            &Knobs::default(),
+            &mut test_probe(),
             "c-guard",
         )
         .await;
@@ -6337,49 +6609,100 @@ mod tests {
     }
 
     /// Timed-mode stall gating (design section 9.4): an active stall in a
-    /// timed campaign escalates directly to the terminal stalled-active
-    /// record — there is no pending pool, so the timeless auto-retry
-    /// requeue must not fire (no requeue journal entry, no resubmission,
-    /// no Queued observation for a ladder that does not apply).
+    /// timed campaign escalates to the terminal stalled-active record
+    /// without the timeless auto-retry — there is no pending pool, so no
+    /// requeue journal entry, no resubmission, no Queued observation. The
+    /// terminal arm's evidence gates apply in timed mode too: held below
+    /// the batch-timeout floor, then terminal once a wedged (no-progress)
+    /// probe confirms past it.
     #[tokio::test]
     async fn timed_active_stall_escalates_directly_without_a_requeue() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
         let tracker = Arc::new(SubmitTracker::default());
         let results = tokio::sync::Mutex::new(BTreeMap::new());
-        let wd = Arc::new(tokio::sync::Mutex::new(Watchdog::new(Knobs::default())));
+        let knobs = Knobs::default();
+        let wd = Arc::new(tokio::sync::Mutex::new(Watchdog::new(knobs.clone())));
         let job_ledger = ledger::JobLedger::new(state.clone(), tracker.clone(), wd.clone());
         let mut stall_retries: HashMap<String, u32> = HashMap::new();
         let job = "slowreq.x86_64-linux";
-        let contexts: HashMap<String, JobContext> = [(
-            job.to_string(),
-            fold_ctx(job, &format!("/nix/store/{}-slow.drv", "c".repeat(32))),
-        )]
-        .into();
+        let drv = format!("/nix/store/{}-slow.drv", "c".repeat(32));
+        let contexts: HashMap<String, JobContext> = [(job.to_string(), fold_ctx(job, &drv))].into();
         job_ledger.commit_batch(31, &[job.to_string()]).await;
 
-        apply_stall_actions(
-            &state,
-            &job_ledger,
-            &contexts,
-            &results,
-            &mut stall_retries,
-            &[StallVerdict {
-                job: job.to_string(),
-                kind: StallKind::ActiveStall,
-                requeues_used: 0,
-            }],
-            "leaf",
-            ScheduleMode::Timed,
-            "c-timedstall",
-        )
-        .await;
+        let admin = Arc::new(ProbeAdmin::default());
+        admin
+            .builds
+            .lock()
+            .unwrap()
+            .push(("0193e4a2-7c1b-7d20-9b3a-5f2e3d4c5b6e".to_string(), None));
+        admin.graphs.lock().unwrap().insert(
+            "0193e4a2-7c1b-7d20-9b3a-5f2e3d4c5b6e".to_string(),
+            GraphSnapshot {
+                nodes: vec![grpc::GraphNodeView {
+                    drv_path: drv.clone(),
+                    status: "assigned".to_string(),
+                    exec_id: String::new(),
+                    assigned_executor_id: String::new(),
+                }],
+                truncated: false,
+                total_nodes: 1,
+            },
+        );
+        let mut probe =
+            StallProgressProbe::new(admin.clone() as Arc<dyn AdminApi>, "replay-leaf".into());
+        let healthy = ClusterCounts {
+            active_executors: 8,
+            queued_derivations: 5,
+            running_derivations: 5,
+            substituting_derivations: 0,
+        };
+        let tick_at = |at: i64| PollTick {
+            at_unix: at,
+            cluster: watchdog::Polled::Fresh(healthy.clone()),
+            ice: IcePoll::NotPolled,
+            engine_paused: false,
+        };
+        // 25h of residence: past both the 6h threshold and the 24h floor.
+        wd.lock().await.on_tick(&tick_at(0));
+        let stalled = wd.lock().await.on_tick(&tick_at(25 * 3600));
+        assert!(!stalled.stalled.is_empty());
+
+        let apply = async |stalled: &[StallVerdict],
+                           stall_retries: &mut HashMap<String, u32>,
+                           probe: &mut StallProgressProbe| {
+            apply_stall_actions(
+                &state,
+                &job_ledger,
+                &contexts,
+                &results,
+                stall_retries,
+                stalled,
+                "leaf",
+                ScheduleMode::Timed,
+                &knobs,
+                probe,
+                "c-timedstall",
+            )
+            .await;
+        };
+        // Probe baseline first, then the unchanged graph confirms a wedge.
+        apply(&stalled.stalled, &mut stall_retries, &mut probe).await;
+        assert!(
+            state
+                .load_jsonl::<JobRecord>(StateFile::Results)
+                .unwrap()
+                .is_empty(),
+            "first probe is a baseline"
+        );
+        let stalled = wd.lock().await.on_tick(&tick_at(25 * 3600 + 60));
+        apply(&stalled.stalled, &mut stall_retries, &mut probe).await;
 
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
         assert_eq!(
             records[job].signature.as_deref(),
             Some("stalled-active"),
-            "a stalled timed request escalates to the terminal record directly"
+            "a wedged timed request escalates to the terminal record directly"
         );
         assert_eq!(
             tracker.resubmission_count(job).await,
@@ -6581,6 +6904,8 @@ mod tests {
                 &crossing.stalled,
                 "leaf",
                 ScheduleMode::Timeless,
+                &Knobs::default(),
+                &mut test_probe(),
                 "c-iso",
             )
             .await;
@@ -6613,6 +6938,8 @@ mod tests {
             &both.stalled,
             "leaf",
             ScheduleMode::Timeless,
+            &Knobs::default(),
+            &mut test_probe(),
             "c-iso",
         )
         .await;
@@ -6655,6 +6982,8 @@ mod tests {
             &next.stalled,
             "leaf",
             ScheduleMode::Timeless,
+            &Knobs::default(),
+            &mut test_probe(),
             "c-iso",
         )
         .await;

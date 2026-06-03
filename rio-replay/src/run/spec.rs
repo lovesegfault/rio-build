@@ -158,6 +158,14 @@ pub struct Knobs {
     pub queued_watchdog_hours: f64,
     pub max_queued_requeues: u32,
     pub max_auto_retries: u32,
+    /// Re-offers granted to a job through the engine-cancelled carve-out
+    /// (a batch the engine itself cancelled at its deadline or abort)
+    /// before the next cancellation terminalizes it. Each cycle can hold
+    /// the job for up to `batch_timeout_hours` of cluster time, so this
+    /// budget bounds the engine-cancel requeue loop explicitly — at
+    /// defaults (2 cycles x 24h) a deadline-cycling job is retired after
+    /// roughly two days instead of spinning.
+    pub max_engine_cancel_cycles: u32,
     pub failfast_singleton_after: u32,
     pub batch_timeout_hours: f64,
     pub log_tail_bytes: usize,
@@ -245,6 +253,7 @@ impl Default for Knobs {
             queued_watchdog_hours: 2.0,
             max_queued_requeues: 2,
             max_auto_retries: 1,
+            max_engine_cancel_cycles: 2,
             failfast_singleton_after: 3,
             batch_timeout_hours: 24.0,
             log_tail_bytes: 65536,
@@ -575,6 +584,13 @@ impl CampaignSpec {
             self.knobs.op_timeout_secs != 0,
             "campaign spec field knobs.op_timeout_secs must be nonzero"
         );
+        // Zero would terminalize a job on its FIRST engine cancellation —
+        // charging the engine's own deadline cut to the job with no
+        // re-offer at all.
+        anyhow::ensure!(
+            self.knobs.max_engine_cancel_cycles != 0,
+            "campaign spec field knobs.max_engine_cancel_cycles must be nonzero"
+        );
         // `None` means "derive from submit_concurrency"; an explicit zero
         // would leave the transport with no connections at all.
         anyhow::ensure!(
@@ -588,24 +604,25 @@ impl CampaignSpec {
             self.knobs.batch_timeout_hours.is_finite() && self.knobs.batch_timeout_hours > 0.0,
             "campaign spec field knobs.batch_timeout_hours must be a positive finite number of hours"
         );
-        // The engine-cancelled requeue arm is deliberately unbudgeted (an
-        // engine-cancelled batch re-offers its members regardless of spent
-        // retries) and delegates its bound to the active-stall watchdog:
-        // each cancel-and-requeue cycle holds the job Active for the full
-        // batch timeout, so the stall clock fires mid-cycle, granting the
-        // single stall auto-retry and then a terminal stalled-active
-        // record. That backstop only exists when the batch timeout EXCEEDS
-        // the stall threshold — inverted, every cancellation flips the
-        // job's phase (resetting the stall clock) before it can fire, and
-        // the requeue loop is unbounded.
+        // The engine-cancelled requeue arm is bounded by its own explicit
+        // cycle budget (max_engine_cancel_cycles, validated nonzero above)
+        // — the stall ladder is no longer that loop's bound. The ordering
+        // below still matters for the ladder's two remaining roles: the
+        // active-stall AUTO-RETRY can only fire mid-batch while a batch
+        // outlives the stall threshold (inverted, every settle flips the
+        // phase and resets the clock before the rescue can fire), and the
+        // terminal stalled-active arm's batch-timeout floor is only a
+        // meaningful tightening while the floor sits above the threshold
+        // (the engine must not retire a batch member on a residence the
+        // batch's own budget still permits).
         anyhow::ensure!(
             self.knobs.batch_timeout_hours > self.knobs.active_stall_hours,
             "campaign spec field knobs.batch_timeout_hours ({}) must exceed \
-             knobs.active_stall_hours ({}): the active-stall watchdog is the engine-cancelled \
-             requeue arm's only bound, and it can only fire while a batch outlives the stall \
-             threshold — with the inverted ordering (accepted by earlier engine versions, \
-             rejected now) an engine-cancelled batch resets the stall clock every cycle and is \
-             re-offered forever",
+             knobs.active_stall_hours ({}): the active-stall auto-retry can only fire while a \
+             batch outlives the stall threshold (with the inverted ordering — accepted by \
+             earlier engine versions, rejected now — every settle resets the clock first), and \
+             the terminal stall arm's batch-timeout floor must sit above the threshold to mean \
+             anything",
             self.knobs.batch_timeout_hours,
             self.knobs.active_stall_hours,
         );
@@ -1026,6 +1043,7 @@ mod tests {
         assert_eq!(k.narinfo_concurrency, 64);
         assert_eq!(k.max_queued_requeues, 2);
         assert_eq!(k.max_auto_retries, 1);
+        assert_eq!(k.max_engine_cancel_cycles, 2);
         assert_eq!(k.active_stall_hours, 6.0);
         assert_eq!(k.infra_low_confidence_pct, 5.0);
         assert_eq!(k.no_truth_threshold_pct, 5.0);
@@ -1225,19 +1243,27 @@ mod tests {
         assert!(err.to_string().contains("batch_timeout_hours"), "{err:#}");
     }
 
-    /// The engine-cancelled requeue arm's backstop ordering: the
-    /// active-stall watchdog can only bound the unbudgeted carve-out while
-    /// a batch outlives the stall threshold, so a spec whose batch timeout
-    /// is at or below active_stall_hours is rejected (such specs were
-    /// accepted by earlier engine versions — this is a deliberate
-    /// validation tightening, named in the error). The defaults (24h > 6h)
-    /// satisfy the ordering.
+    /// The stall ladder's ordering requirement, re-pointed at its current
+    /// contract: the engine-cancelled requeue loop is bounded by its OWN
+    /// explicit budget (max_engine_cancel_cycles — pinned below and in the
+    /// fold tests), so the ordering no longer carries that loop. It still
+    /// backs the ladder's two remaining roles: the active-stall AUTO-RETRY
+    /// can only fire mid-batch while a batch outlives the stall threshold,
+    /// and the terminal stall arm's batch-timeout floor must sit above the
+    /// threshold to be a tightening at all. A spec whose batch timeout is
+    /// at or below active_stall_hours is rejected (accepted by earlier
+    /// engine versions — a deliberate validation tightening, named in the
+    /// error). The defaults (24h > 6h) satisfy the ordering.
     #[test]
     fn batch_timeout_must_exceed_the_active_stall_threshold() {
         let defaults = Knobs::default();
         assert!(
             defaults.batch_timeout_hours > defaults.active_stall_hours,
-            "default knobs must satisfy the backstop ordering"
+            "default knobs must satisfy the ordering"
+        );
+        assert!(
+            defaults.max_engine_cancel_cycles > 0,
+            "the cancel loop's own bound exists — the ordering no longer carries it"
         );
 
         let mut inverted = valid_spec();
@@ -1247,8 +1273,8 @@ mod tests {
         assert!(err.contains("must exceed"), "{err}");
         assert!(err.contains("active_stall_hours"), "{err}");
         assert!(
-            err.contains("engine-cancelled"),
-            "the error must explain which bound depends on the ordering: {err}"
+            err.contains("auto-retry") && err.contains("floor"),
+            "the error must name the bounds that depend on the ordering: {err}"
         );
 
         // Equality is rejected too: the stall clock needs the batch to
@@ -1262,6 +1288,13 @@ mod tests {
         ordered.knobs.batch_timeout_hours = 7.0;
         ordered.knobs.active_stall_hours = 6.0;
         ordered.validate().unwrap();
+
+        // The cycle budget itself is validated nonzero: zero would charge
+        // the engine's own first deadline cut to the job.
+        let mut zero_cycles = valid_spec();
+        zero_cycles.knobs.max_engine_cancel_cycles = 0;
+        let err = zero_cycles.validate().unwrap_err().to_string();
+        assert!(err.contains("max_engine_cancel_cycles"), "{err}");
     }
 
     #[test]
