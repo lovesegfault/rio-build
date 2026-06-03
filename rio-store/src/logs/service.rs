@@ -249,11 +249,13 @@ impl LogServiceImpl {
     }
 
     pub fn with_byte_budget(mut self, bytes: u64) -> Self {
-        // Semaphore::MAX_PERMITS is usize::MAX >> 3; a multi-GiB budget
-        // fits on 64-bit. Clamp rather than panic on a pathological
-        // config (validate() already bounds it from below).
-        let permits = usize::try_from(bytes).unwrap_or(usize::MAX) & (usize::MAX >> 3);
-        self.byte_budget = Arc::new(tokio::sync::Semaphore::new(permits));
+        // Saturating conversion (validate() bounds the config from
+        // below AND above; this is the last-line guard for direct
+        // builder-style callers). The old `& (usize::MAX >> 3)` mask
+        // was a bitmask, not a clamp — bug_131.
+        self.byte_budget = Arc::new(tokio::sync::Semaphore::new(rio_common::semaphore_permits(
+            bytes,
+        )));
         self
     }
 

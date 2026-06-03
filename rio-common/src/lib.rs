@@ -36,3 +36,18 @@ pub mod wanted_outputs;
 pub fn default_addr(port: u16) -> std::net::SocketAddr {
     (std::net::Ipv6Addr::UNSPECIFIED, port).into()
 }
+
+/// Convert a byte/count budget (`u64`, the config-surface type) into a
+/// tokio semaphore permit count, saturating at BOTH boundaries:
+/// `usize` on 32-bit targets and [`tokio::sync::Semaphore::MAX_PERMITS`]
+/// everywhere (`Semaphore::new` PANICS above it). Use this instead of
+/// open-coded casts or bitmask "clamps" — a mask silently *changes*
+/// large budgets (`& (usize::MAX >> 3)` zeroes the high bits, so a
+/// pathological config could wrap to a tiny budget instead of
+/// saturating).
+// r[impl common.helpers]
+pub fn semaphore_permits(v: u64) -> usize {
+    usize::try_from(v)
+        .unwrap_or(usize::MAX)
+        .min(tokio::sync::Semaphore::MAX_PERMITS)
+}

@@ -174,7 +174,10 @@ pub struct Config {
     /// reserve is rejected with `RESOURCE_EXHAUSTED` and the builder
     /// retries against another replica. Deliberately separate from
     /// `nar_buffer_budget_bytes` so log ingest and NAR ingest cannot
-    /// starve each other. Default 1 GiB. Env: `RIO_LOG_BYTES_BUDGET`.
+    /// starve each other. Default 1 GiB; bounded above at 2^60 (a
+    /// budget beyond addressable memory is a typo, and semaphore
+    /// permit math saturates rather than panics under the bound).
+    /// Env: `RIO_LOG_BYTES_BUDGET`.
     pub log_bytes_budget: u64,
     /// Per-replica cap on concurrent `LogService.AppendLog` streams.
     /// The count twin of `log_bytes_budget` (whichever is exhausted
@@ -435,6 +438,12 @@ impl rio_common::config::ValidateConfig for Config {
              or no AppendLog stream can ever be admitted; set RIO_LOG_BYTES_BUDGET",
             self.log_bytes_budget,
             self.log_cut_threshold_bytes
+        );
+        anyhow::ensure!(
+            self.log_bytes_budget <= 1u64 << 60,
+            "log_bytes_budget ({}) exceeds 2^60 — beyond addressable memory, \
+             almost certainly a typo; set RIO_LOG_BYTES_BUDGET",
+            self.log_bytes_budget
         );
         // 0 → the periodic cut interval is zero → a busy-loop of empty
         // cuts; and the gray-failure staleness bound (2×) is zero → every

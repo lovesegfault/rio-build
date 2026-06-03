@@ -154,7 +154,7 @@
         "default": 180
       },
       "log_bytes_budget": {
-        "description": "Per-replica budget for resident build-log ingest buffer bytes\nacross all concurrent `LogService.AppendLog` streams. Each stream\nreserves `2 × log_cut_threshold_bytes` (its worst-case resident\nbuffer: one chunk mid-cut plus one refilling) at open and holds\nthe reservation for the stream's lifetime; a stream that cannot\nreserve is rejected with `RESOURCE_EXHAUSTED` and the builder\nretries against another replica. Deliberately separate from\n`nar_buffer_budget_bytes` so log ingest and NAR ingest cannot\nstarve each other. Default 1 GiB. Env: `RIO_LOG_BYTES_BUDGET`.",
+        "description": "Per-replica budget for resident build-log ingest buffer bytes\nacross all concurrent `LogService.AppendLog` streams. Each stream\nreserves `2 × log_cut_threshold_bytes` (its worst-case resident\nbuffer: one chunk mid-cut plus one refilling) at open and holds\nthe reservation for the stream's lifetime; a stream that cannot\nreserve is rejected with `RESOURCE_EXHAUSTED` and the builder\nretries against another replica. Deliberately separate from\n`nar_buffer_budget_bytes` so log ingest and NAR ingest cannot\nstarve each other. Default 1 GiB; bounded above at 2^60 (a\nbudget beyond addressable memory is a typo, and semaphore\npermit math saturates rather than panics under the bound).\nEnv: `RIO_LOG_BYTES_BUDGET`.",
         "type": "integer",
         "format": "uint64",
         "minimum": 0,

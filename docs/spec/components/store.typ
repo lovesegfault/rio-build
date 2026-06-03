@@ -1548,6 +1548,22 @@ closes the post-terminal injection hole without breaking the legitimate
 late-replay path (an *incomplete* terminal log keeps accepting the replay
 that completes it).
 
+#r("store.log.chunk-dirent-durable")[
+  A filesystem-backed log-chunk `put` MUST make the chunk's directory
+  entries durable before returning `Created`: the file is synced, then
+  every newly-created ancestor directory is fsynced child-to-root, then
+  the deepest pre-existing directory; the store root is fsynced at
+  construction.
+]
+
+`sync_all` on the file makes its content durable but the dirent naming it
+lives in the parent directory's data block — a crash between file-sync and
+dirent-sync loses a chunk whose manifest row commits afterwards, which
+reads back as a permanent `NotFound` for a line range the manifest says
+exists. The S3 backend gets the equivalent ordering for free from
+`PutObject` response semantics; the filesystem backend (standalone VM,
+single-node dev) must do it by hand.
+
 #r("store.log.chunk-immutable")[
   A committed log chunk MUST never be overwritten: chunk keys are unique per
   `(exec_id, session_id, chunk_seq)`, a chunk sequence number is consumed per

@@ -412,10 +412,16 @@ pub struct FilesystemLogChunkStore {
 }
 
 impl FilesystemLogChunkStore {
-    /// Create the root directory (and parents) if absent.
+    /// Create the root directory (and parents) if absent, and fsync it
+    /// so the dirent chain of every later [`durable_put`] ends at a
+    /// durable directory.
+    // r[impl store.log.chunk-dirent-durable]
     pub fn new(root: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
+        #[cfg(test)]
+        fsync_recorder::record(&root);
+        std::fs::File::open(&root)?.sync_all()?;
         Ok(Self { root })
     }
 
@@ -436,12 +442,71 @@ impl FilesystemLogChunkStore {
     }
 }
 
+/// fsync a DIRECTORY so the dirents created inside it are durable.
+/// POSIX: `sync_all` on the file makes its CONTENT durable, but the
+/// entry naming it lives in the parent directory's data — a crash
+/// between file-sync and dirent-sync resurfaces as a missing chunk
+/// whose manifest row exists. Called child-to-root over every ancestor
+/// `durable_put` newly created, ending at the deepest pre-existing
+/// directory.
+async fn fsync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    fsync_recorder::record(dir);
+    let f = tokio::fs::File::open(dir).await?;
+    f.sync_all().await
+}
+
+/// Test-only fsync_dir call recorder (sequence assertions).
+#[cfg(test)]
+pub(crate) mod fsync_recorder {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static LOG: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(crate) fn record(dir: &Path) {
+        LOG.lock().unwrap().push(dir.to_path_buf());
+    }
+
+    /// All recorded dir fsyncs under `root`, in call order.
+    pub(crate) fn under(root: &Path) -> Vec<PathBuf> {
+        LOG.lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with(root))
+            .cloned()
+            .collect()
+    }
+}
+
 #[async_trait::async_trait]
 impl LogChunkStore for FilesystemLogChunkStore {
     async fn put(&self, key: &str, body: Vec<u8>) -> Result<PutOutcome, LogChunkError> {
         let path = self.path_for(key)?;
         debug!(path = %path.display(), size = body.len(), "FilesystemLogChunkStore: storing chunk");
+        // r[impl store.log.chunk-dirent-durable]
+        // durable_put recipe: record which ancestors are NEW before
+        // creating them — after the file is written and synced, each
+        // new directory is fsynced child-to-root, then the deepest
+        // PRE-EXISTING directory (whose data block gained the dirent
+        // naming the topmost new one; the root itself was fsynced at
+        // construction). Without this, a crash between file-sync and
+        // dirent-sync loses a chunk whose manifest row exists.
+        let mut new_dirs: Vec<std::path::PathBuf> = Vec::new();
+        let mut preexisting = self.root.clone();
         if let Some(parent) = path.parent() {
+            let mut cursor = parent;
+            loop {
+                if cursor == self.root || cursor.exists() {
+                    preexisting = cursor.to_path_buf();
+                    break;
+                }
+                new_dirs.push(cursor.to_path_buf());
+                match cursor.parent() {
+                    Some(p) => cursor = p,
+                    None => break,
+                }
+            }
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| io_backend(e, "create_dir_all", key))?;
@@ -470,6 +535,14 @@ impl LogChunkStore for FilesystemLogChunkStore {
         file.sync_all()
             .await
             .map_err(|e| io_backend(e, "sync", key))?;
+        // Now the dirents: child-to-root over the new ancestors, then
+        // the pre-existing parent. (`new_dirs` was collected deepest
+        // first, so iteration order IS child-to-root.)
+        for dir in new_dirs.iter().chain(std::iter::once(&preexisting)) {
+            fsync_dir(dir)
+                .await
+                .map_err(|e| io_backend(e, "fsync_dir", key))?;
+        }
         Ok(PutOutcome::Created)
     }
 
@@ -579,6 +652,40 @@ impl LogChunkStore for MemoryLogChunkStore {
 
 #[cfg(test)]
 mod tests {
+    // r[verify store.log.chunk-dirent-durable]
+    #[tokio::test]
+    async fn filesystem_put_fsyncs_new_ancestors_child_to_root() {
+        use super::{LogChunkStore as _, fsync_recorder};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("chunks");
+        let store = super::FilesystemLogChunkStore::new(&root).unwrap();
+        // Construction fsyncs the root once — the dirent chain for
+        // every later put ends at a durable root.
+        assert_eq!(
+            fsync_recorder::under(&root),
+            vec![root.clone()],
+            "FilesystemLogChunkStore::new must fsync the root directory"
+        );
+        let key = "logs/ab/cd/chunk-000001";
+        let outcome = store.put(key, b"line".to_vec()).await.unwrap();
+        assert!(matches!(outcome, super::PutOutcome::Created));
+        let after = fsync_recorder::under(&root);
+        // After the put: the three newly-created ancestors child-to-
+        // root, then the deepest PRE-EXISTING dir (the root itself —
+        // its data block now names "logs/").
+        assert_eq!(
+            after[1..],
+            vec![
+                root.join("logs/ab/cd"),
+                root.join("logs/ab"),
+                root.join("logs"),
+                root.clone(),
+            ][..],
+            "put must fsync each new ancestor (child→root) and the \
+             pre-existing parent that gained a dirent"
+        );
+    }
+
     use super::*;
 
     /// The three storage-semantics tests, run against both the memory

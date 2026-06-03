@@ -1281,6 +1281,11 @@
       "doc": "Per-replica admission gate for `try_substitute_on_miss`."
     },
     {
+      "path": "authz.rs",
+      "depth": 0,
+      "doc": "Per-method credential-class table for every gRPC service bound on"
+    },
+    {
       "path": "backend.rs",
       "depth": 0,
       "doc": "Chunk storage backends."

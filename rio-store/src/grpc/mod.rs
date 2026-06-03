@@ -380,7 +380,9 @@ impl StoreServiceImpl {
     /// concurrent PutPath handlers). Builder-style. Tests use small values
     /// (e.g., `10 * 4096`) to exercise backpressure without 32 GiB of RAM.
     pub fn with_nar_budget(mut self, bytes: usize) -> Self {
-        self.nar_bytes_budget = Arc::new(tokio::sync::Semaphore::new(bytes));
+        self.nar_bytes_budget = Arc::new(tokio::sync::Semaphore::new(
+            rio_common::semaphore_permits(bytes as u64),
+        ));
         self
     }
 
