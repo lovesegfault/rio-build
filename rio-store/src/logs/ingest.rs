@@ -713,8 +713,17 @@ impl IngestSession {
             if shared.buffer.is_empty() {
                 return Ok(None);
             }
-            let run_len =
-                super::kernel::contiguous_prefix_len(shared.buffer.iter().map(|(n, _)| *n));
+            // Bounded in BOTH dimensions (store.log.write-read-bound):
+            // contiguity decides what one manifest row may describe,
+            // and the framed-payload bound keeps the chunk decodable by
+            // the read path. An over-bound contiguous run drains as
+            // multiple chunks across the level-triggered cut loops
+            // (`cut_while_due`, the final drain) — each call takes the
+            // next bounded slice.
+            let run_len = super::kernel::bounded_contiguous_prefix_len(
+                shared.buffer.iter().map(|(n, l)| (*n, l.len() as u64)),
+                super::kernel::MAX_CHUNK_PAYLOAD_BYTES,
+            );
             let rest = shared.buffer.split_off(run_len);
             shared.in_flight = std::mem::replace(&mut shared.buffer, rest);
             let drained_bytes: u64 = shared.in_flight.iter().map(|(_, l)| accounted_len(l)).sum();
@@ -1202,6 +1211,57 @@ mod tests {
         // Lines accepted after the cut wait for the next cut.
         session.accept(batch(30, 5)).unwrap();
         assert_eq!(buffered_line_count(&session), 5);
+    }
+
+    // r[verify store.log.write-read-bound]
+    /// bug_098 (red-first): a contiguous run whose framed payload
+    /// exceeds the read path's bound must split across multiple chunks,
+    /// each decodable. The recorded red: the unbounded cutter drained
+    /// the whole ~17 MiB run into ONE chunk whose framed payload the
+    /// read path refuses — `decompress_lines` failed with "chunk
+    /// decompresses past the 16777216-byte bound" on a chunk the write
+    /// path had just committed.
+    #[tokio::test]
+    async fn cut_splits_run_at_payload_bound() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let store = MemoryLogChunkStore::default();
+        let mut session = new_session(IngestConfig {
+            per_exec_byte_cap: 64 * 1024 * 1024,
+            ..test_config()
+        });
+
+        // 290 contiguous lines x 60 000 B ≈ 17.4 MiB content: past the
+        // 16 MiB shared write/read bound (lines stay under the 64 KiB
+        // line cap, so nothing here is truncated).
+        for i in 0..29u64 {
+            session.accept(sized_batch(i * 10, 10, 60_000)).unwrap();
+        }
+        let mut cuts = 0;
+        while session.cut(&store, &db.pool).await.unwrap().is_some() {
+            cuts += 1;
+            assert!(cuts < 100, "the cut loop must terminate");
+        }
+
+        assert!(
+            store.len() >= 2,
+            "an over-bound run must split into multiple chunks, got {}",
+            store.len()
+        );
+        for key in store.keys() {
+            let blob = store.get(&key).await.expect("stored chunk fetch");
+            let lines = decompress_lines(&blob).expect(
+                "every committed chunk must round-trip within the read \
+                 bound — the write path may never commit an unreadable \
+                 chunk",
+            );
+            assert!(!lines.is_empty());
+        }
+        let rows = manifest_rows(&db.pool, session.exec_id).await;
+        let total: i64 = rows.iter().map(|(_, n, _)| n).sum();
+        assert_eq!(
+            total, 290,
+            "every accepted line is durable across the split"
+        );
     }
 
     #[tokio::test]

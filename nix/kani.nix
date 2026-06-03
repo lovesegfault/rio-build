@@ -203,7 +203,8 @@ in
   kani-rio-log-kernel = mkKaniCheck {
     name = "rio-log-kernel";
     crate = crateBuildKani.members.rio-log-kernel;
-    expectedHarnesses = 5;
+    # 5 + check_bounded_prefix_contract (B2: store.log.write-read-bound).
+    expectedHarnesses = 6;
   };
 
   # rio-retry-kernel: the scheduler's retry/poison decision kernels

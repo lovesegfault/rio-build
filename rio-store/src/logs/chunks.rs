@@ -27,14 +27,24 @@ use uuid::Uuid;
 /// payloads.
 const LOG_CHUNK_ZSTD_LEVEL: i32 = 6;
 
-/// Upper bound on a single chunk's decompressed size.
-///
-/// 2x the ingest path's 8 MiB uncompressed cut threshold — a legitimate
-/// chunk can never approach this. Defense in depth against a corrupt or
-/// malicious zstd frame with a huge declared content size: the read
-/// path decompresses one chunk per concurrent reader, so an unbounded
-/// `read_to_end` would let one bad object OOM the replica.
-const MAX_DECOMPRESSED_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+/// Upper bound on a single chunk's framed payload, in BOTH directions —
+/// the kernel owns the constant ([`rio_log_kernel::MAX_CHUNK_PAYLOAD_BYTES`])
+/// so the cutter's prospective arithmetic and this module's
+/// compress/decompress refusals can never drift apart
+/// (`store.log.write-read-bound`). Defense in depth on the read side
+/// against a corrupt or malicious zstd frame with a huge declared
+/// content size: the read path decompresses one chunk per concurrent
+/// reader, so an unbounded `read_to_end` would let one bad object OOM
+/// the replica.
+pub(super) const MAX_DECOMPRESSED_CHUNK_BYTES: u64 = rio_log_kernel::MAX_CHUNK_PAYLOAD_BYTES;
+
+// A truncated line (64 KiB) plus its frame prefix always fits a chunk:
+// the kernel's ≥1-on-non-empty escape (a single line is always
+// cuttable) can never produce a chunk the read path refuses.
+const _: () = assert!(
+    super::ingest::MAX_LINE_LEN as u64 + rio_log_kernel::LINE_LEN_PREFIX_BYTES
+        <= rio_log_kernel::MAX_CHUNK_PAYLOAD_BYTES
+);
 
 // r[impl store.log.chunk-immutable]
 // r[impl obs.log.exec-keyed+2]
@@ -106,8 +116,9 @@ pub enum PutOutcome {
     Existed,
 }
 
-/// Width of the per-line length prefix in the chunk payload.
-const LINE_LEN_PREFIX_BYTES: usize = 4;
+/// Width of the per-line length prefix in the chunk payload (kernel-owned;
+/// see `store.log.write-read-bound`).
+const LINE_LEN_PREFIX_BYTES: usize = rio_log_kernel::LINE_LEN_PREFIX_BYTES as usize;
 
 /// zstd-compress log lines into a chunk blob.
 ///
@@ -132,6 +143,17 @@ const LINE_LEN_PREFIX_BYTES: usize = 4;
 pub fn compress_lines(lines: &[Vec<u8>]) -> Result<Vec<u8>, LogChunkError> {
     use std::io::Write as _;
     let payload_len: usize = lines.iter().map(|l| l.len() + LINE_LEN_PREFIX_BYTES).sum();
+    // r[impl store.log.write-read-bound]
+    // Defense in depth behind the cutter's bounded_contiguous_prefix_len:
+    // a chunk this function would frame past the shared payload bound is
+    // a chunk decompress_lines will refuse — refuse it HERE, before the
+    // PUT, so a committed chunk is decodable by construction.
+    if payload_len as u64 > MAX_DECOMPRESSED_CHUNK_BYTES {
+        return Err(LogChunkError::Codec(std::io::Error::other(format!(
+            "framed chunk payload of {payload_len} bytes exceeds the \
+             {MAX_DECOMPRESSED_CHUNK_BYTES}-byte shared write/read bound"
+        ))));
+    }
     let mut encoder =
         zstd::stream::Encoder::new(Vec::with_capacity(payload_len / 4), LOG_CHUNK_ZSTD_LEVEL)
             .map_err(LogChunkError::Codec)?;
@@ -756,8 +778,16 @@ mod tests {
     /// shape of a corrupt-or-malicious "small object, huge content" frame.
     #[test]
     fn codec_rejects_oversized_decompressed_payload() {
+        // Built with RAW zstd, not compress_lines: the writer now
+        // refuses over-bound payloads (store.log.write-read-bound), so
+        // an oversized frame can only arrive from outside the write
+        // path — a corrupt or attacker-crafted object — which is
+        // exactly what the read-side defense exists for.
         let huge_line = vec![0u8; (MAX_DECOMPRESSED_CHUNK_BYTES + 1024) as usize];
-        let blob = compress_lines(&[huge_line]).unwrap();
+        let mut payload = Vec::with_capacity(huge_line.len() + super::LINE_LEN_PREFIX_BYTES);
+        payload.extend_from_slice(&(huge_line.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&huge_line);
+        let blob = zstd::stream::encode_all(payload.as_slice(), 6).unwrap();
         assert!(
             blob.len() < 64 * 1024,
             "precondition: the bomb must be small compressed ({} bytes)",
@@ -767,6 +797,23 @@ mod tests {
             Err(LogChunkError::Codec(_)) => {}
             other => panic!("expected Codec error for oversized payload, got {other:?}"),
         }
+    }
+
+    // r[verify store.log.write-read-bound]
+    /// The write-side half of the shared bound: the codec refuses to
+    /// FRAME a payload the read path would refuse to decode.
+    #[test]
+    fn compress_refuses_over_bound_payload() {
+        let lines: Vec<Vec<u8>> = (0..280).map(|_| vec![b'x'; 64 * 1024 - 64]).collect(); // ~17.9 MiB framed
+        match compress_lines(&lines) {
+            Err(LogChunkError::Codec(e)) => {
+                assert!(e.to_string().contains("shared write/read bound"), "{e}");
+            }
+            other => panic!("expected Codec refusal, got {other:?}"),
+        }
+        // Polarity: just under the bound still compresses.
+        let ok: Vec<Vec<u8>> = (0..10).map(|_| vec![b'x'; 1024]).collect();
+        compress_lines(&ok).expect("an in-bound payload compresses");
     }
 
     /// The trailing-empty-line case: `["a", ""]` and `["a"]` must stay

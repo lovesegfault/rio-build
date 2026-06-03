@@ -22,8 +22,9 @@
 //! real `IngestSession::accept`/`read_chunk`/`LineCursor` store paths.
 //! Of the once-replayed PG-coupled contracts: the cutter replay is
 //! gone — `SessionHarness::cut` calls
-//! `rio_log_kernel::contiguous_prefix_len` for run discovery instead
-//! of reimplementing the loop — while the `(first_line, session_id)`
+//! `rio_log_kernel::bounded_contiguous_prefix_len` (the production
+//! cutter's contiguity + shared-payload-bound rule) for run discovery
+//! instead of reimplementing the loop — while the `(first_line, session_id)`
 //! sort below deliberately mirrors `read_manifest_range`'s `ORDER BY`,
 //! an SQL contract a hermetic harness must replay by construction.
 //! (The kernel targets share one corpus tree and lockfile with this
@@ -82,7 +83,7 @@ use std::time::Duration;
 use libfuzzer_sys::fuzz_target;
 use rio_proto::types::BuildLogBatch;
 use rio_store::logs::chunks::{
-    LogChunkStore, MemoryLogChunkStore, PutOutcome, compress_lines, log_chunk_key,
+    LogChunkStore, MemoryLogChunkStore, PutOutcome, compress_lines, decompress_lines, log_chunk_key,
 };
 use rio_store::logs::ingest::{AcceptOutcome, IngestConfig, IngestSession, MAX_LINE_LEN};
 use rio_store::logs::tail::{ChunkRef, LineCursor, read_chunk};
@@ -175,13 +176,24 @@ impl SessionHarness {
         let session_id = Uuid::from_u128(
             0x2000_0000_0000_0000_0000_0000_0000_0011 + (exec as u128) * 16 + sess as u128,
         );
+        // The GateOk a fresh execution's open produces: no committed
+        // chunks yet, no recorded end. The session is constructible
+        // ONLY from a gate verdict (store.log.caps-durable) — the
+        // harness models the post-gate world, so it mints the verdict
+        // a passing gate would have returned.
+        let gate_ok = rio_store::logs::gate::GateOk {
+            drv_hash: DRV_HASH.to_string(),
+            exec_id,
+            final_line_count: None,
+            prior_accounted_bytes: 0,
+            prior_chunks: 0,
+        };
         Self {
             exec,
             sess,
             session: IngestSession::new(
-                exec_id,
+                &gate_ok,
                 session_id,
-                DRV_HASH.to_string(),
                 IngestConfig {
                     per_exec_byte_cap: cap,
                     // Small enough that the size trigger actually flips
@@ -304,14 +316,33 @@ impl SessionHarness {
         let pending = &self.expected[self.chunked_to..];
         let mut run_start = 0;
         while run_start < pending.len() {
+            // Mirrors the production cutter's BOUNDED rule
+            // (store.log.write-read-bound): contiguity decides the run,
+            // the shared payload ceiling splits an over-bound run into
+            // multiple chunks.
             let run_end = run_start
-                + rio_log_kernel::contiguous_prefix_len(
-                    pending[run_start..].iter().map(|(n, _)| *n),
+                + rio_log_kernel::bounded_contiguous_prefix_len(
+                    pending[run_start..]
+                        .iter()
+                        .map(|(n, l)| (*n, l.len() as u64)),
+                    rio_log_kernel::MAX_CHUNK_PAYLOAD_BYTES,
                 );
             let run = &pending[run_start..run_end];
             let first_line = run[0].0;
             let lines: Vec<Vec<u8>> = run.iter().map(|(_, l)| l.clone()).collect();
-            let blob = compress_lines(&lines).expect("in-memory zstd encode cannot fail");
+            let blob = compress_lines(&lines).expect(
+                "the bounded cutter never hands the codec an over-bound \
+                 payload (store.log.write-read-bound)",
+            );
+            // Every committed chunk round-trips within the read bound,
+            // byte-identically — the byte-domain pin the qnt model
+            // cannot express.
+            let roundtrip = decompress_lines(&blob)
+                .expect("a committed chunk must decode within the read bound");
+            assert_eq!(
+                roundtrip, lines,
+                "committed chunk bytes must round-trip exactly"
+            );
             let key = log_chunk_key(DRV_HASH, &self.exec_id(), &self.session_id(), self.next_seq);
             self.next_seq += 1;
             assert_eq!(

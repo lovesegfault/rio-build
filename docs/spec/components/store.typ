@@ -1573,6 +1573,20 @@ a compromised builder holding a valid token could exhaust the replica's
 memory, and without the monotone gate it could corrupt the manifest's line
 arithmetic for its own execution.
 
+#r("store.log.write-read-bound")[
+  The chunk payload ceiling is ONE shared constant consumed by both halves
+  of the codec: the cutter MUST NOT drain a contiguous run whose framed
+  payload exceeds it (an over-bound run drains as multiple chunks), the
+  compressor MUST refuse to frame a payload past it, and the reader MUST
+  refuse to decompress past it. A committed chunk is therefore decodable by
+  construction; a single maximally-truncated line plus its frame prefix
+  always fits (compile-time asserted).
+]
+The write path used to bound a chunk only by line contiguity while the read
+path enforced a 16 MiB decompression ceiling --- a multi-MiB contiguous run
+committed a chunk the read path then refused, making the tail of that log
+unreadable while the manifest claimed coverage.
+
 #r("store.log.tail-reconnect")[
   A `follow`-mode `TailLog` stream ends when the ingest session it is
   attached to closes, which does not imply the execution is finished. A

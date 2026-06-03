@@ -381,6 +381,58 @@ pub fn contiguous_prefix_len(line_numbers: impl Iterator<Item = u64>) -> usize {
     len
 }
 
+/// Width of the per-line `u32` length prefix in a chunk payload frame.
+/// Owned here because BOTH halves of the codec bound depend on it: the
+/// cutter's prospective payload arithmetic
+/// ([`bounded_contiguous_prefix_len`]) and the store codec's framing.
+pub const LINE_LEN_PREFIX_BYTES: u64 = 4;
+
+/// The chunk payload ceiling shared by the write and read paths: the
+/// cutter never drains a run whose framed payload
+/// (`Σ content + LINE_LEN_PREFIX_BYTES per line`) exceeds this, and the
+/// reader refuses to decompress past it. One constant, one owner — the
+/// write/read bound asymmetry (a committed chunk the read path
+/// rejects) is unrepresentable while both sides consume this value.
+pub const MAX_CHUNK_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
+
+// r[impl store.log.write-read-bound]
+/// The bounded cutter decision: the longest contiguous prefix of
+/// `lines` (`(line_number, content_len)` pairs, contiguity on the
+/// numbers exactly as [`contiguous_prefix_len`]) whose framed payload —
+/// `Σ (content_len + LINE_LEN_PREFIX_BYTES)` — stays at or under
+/// `max_payload`.
+///
+/// Returns at least 1 on non-empty input even if the first line alone
+/// exceeds the bound: a single line is always cuttable (the ingest path
+/// truncates lines to 64 KiB ≪ the 16 MiB bound — the consuming crate
+/// const-asserts that relation), and refusing it would wedge the
+/// buffer. Saturating arithmetic keeps the running total defined at the
+/// `u64` edge (the prefix simply ends there).
+pub fn bounded_contiguous_prefix_len(
+    lines: impl Iterator<Item = (u64, u64)>,
+    max_payload: u64,
+) -> usize {
+    let mut iter = lines;
+    let Some((mut prev, first_len)) = iter.next() else {
+        return 0;
+    };
+    let mut framed: u64 = first_len.saturating_add(LINE_LEN_PREFIX_BYTES);
+    let mut len = 1;
+    for (n, content_len) in iter {
+        if prev.checked_add(1) != Some(n) {
+            break;
+        }
+        let next_framed = framed.saturating_add(content_len.saturating_add(LINE_LEN_PREFIX_BYTES));
+        if next_framed > max_payload {
+            break;
+        }
+        framed = next_framed;
+        len += 1;
+        prev = n;
+    }
+    len
+}
+
 #[cfg(kani)]
 mod proofs {
     use super::*;
@@ -567,6 +619,49 @@ mod proofs {
             assert!(chunks.iter().any(|&(f, n)| f <= x && x < f + n));
         }
     }
+
+    // r[verify store.log.write-read-bound]
+    /// [`bounded_contiguous_prefix_len`]'s contract over every input of
+    /// up to 4 lines with fully symbolic numbers, sizes, and bound:
+    /// (1) the result never exceeds the unbounded contiguous prefix;
+    /// (2) non-empty input yields ≥ 1, empty yields 0; (3) the framed
+    /// payload of the chosen prefix is within `max_payload` UNLESS the
+    /// prefix is the single always-cuttable first line; (4) the chosen
+    /// prefix is genuinely contiguous.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn check_bounded_prefix_contract() {
+        const MAX_LINES: usize = 4;
+        let all: [(u64, u64); MAX_LINES] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAX_LINES);
+        let lines = &all[..len];
+        let max_payload: u64 = kani::any();
+
+        let bounded = bounded_contiguous_prefix_len(lines.iter().copied(), max_payload);
+        let unbounded = contiguous_prefix_len(lines.iter().map(|&(n, _)| n));
+
+        // (1) Never longer than the contiguity alone allows.
+        assert!(bounded <= unbounded);
+        // (2) Total + non-wedging.
+        if len == 0 {
+            assert!(bounded == 0);
+        } else {
+            assert!(bounded >= 1);
+        }
+        // (3) Within budget, except the singleton escape.
+        if bounded > 1 {
+            let mut framed: u64 = 0;
+            for &(_, content) in &lines[..bounded] {
+                framed = framed.saturating_add(content.saturating_add(LINE_LEN_PREFIX_BYTES));
+            }
+            assert!(framed <= max_payload);
+        }
+        // (4) Contiguous on the line numbers.
+        for w in lines[..bounded].windows(2) {
+            assert!(w[0].0.checked_add(1) == Some(w[1].0));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -694,5 +789,28 @@ mod tests {
         // The u64::MAX edge: checked_add ends the run; no wrap to 0.
         assert_eq!(lens(&[u64::MAX, 0]), 1);
         assert_eq!(lens(&[u64::MAX - 1, u64::MAX]), 2);
+    }
+
+    // r[verify store.log.write-read-bound]
+    #[test]
+    fn bounded_prefix_len_table() {
+        let f = |v: &[(u64, u64)], cap: u64| bounded_contiguous_prefix_len(v.iter().copied(), cap);
+        // Empty: 0. Singleton over the cap: still 1 (always cuttable).
+        assert_eq!(f(&[], 100), 0);
+        assert_eq!(f(&[(0, 1000)], 100), 1);
+        // Under the cap end-to-end: equals the unbounded contiguity.
+        let run: Vec<(u64, u64)> = (0..5).map(|n| (n, 10)).collect();
+        assert_eq!(f(&run, 1000), 5);
+        assert_eq!(
+            f(&run, 1000),
+            contiguous_prefix_len(run.iter().map(|&(n, _)| n))
+        );
+        // The cap splits a contiguous run: 2 lines of framed 14 fit in
+        // 28; the third would make 42 > 28.
+        assert_eq!(f(&run, 28), 2);
+        // A number gap still ends the run before the cap does.
+        assert_eq!(f(&[(0, 1), (2, 1), (3, 1)], u64::MAX), 1);
+        // Exactly at the cap is in-budget.
+        assert_eq!(f(&[(0, 10), (1, 10)], 28), 2);
     }
 }
