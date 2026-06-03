@@ -73,8 +73,8 @@ use crate::run::transport::{DaemonChannel, GatewayPool, TransportError};
 use crate::substituter::Substituter;
 
 use super::{
-    ClaimOutcome, PathSource, UploadClaims, UploadItem, UploadPayload, UploadPlan, plan_uploads,
-    resolve_source, split_batches, topo_levels, walk_closure,
+    ClaimOutcome, Closure, PathSource, UploadClaims, UploadItem, UploadPayload, UploadPlan,
+    plan_uploads, resolve_source, split_batches, topo_levels, walk_closure,
 };
 
 /// Base deadline for individually streamed (large) uploads. Probes and
@@ -2246,23 +2246,39 @@ async fn probe_substituter_narinfos(
     hits
 }
 
-/// The archive-backed half of the supply stage: walk the workload union
-/// closure, extend target coverage with live substituter probes, resolve
-/// every needed path through the source ladder, and deliver the resulting
-/// upload plan (prewarm uploads, or an explicit deferral record under
-/// inline delivery). Folds its outcomes into `report` and returns the ladder
-/// context it built (admitted relay substituters, probed coverage, the
-/// validity set as of the last delivery) so the caller can keep it for
-/// per-request top-ups; `None` when the workload has no drvs to plan over.
-async fn run_upload_ladder(
-    state: &StateDir,
+/// What [`probe_ladder_context`] observed: the ladder context plus the
+/// closure-derived working sets the upload planner consumes after it.
+struct LadderProbe {
+    /// The ladder context (admitted relays, probed coverage, the live
+    /// validity set) — the part that outlives the stage as the
+    /// per-submission top-up's working state.
+    ctx: SupplyContext,
+    /// The workload union closure the probe walked.
+    closure: Closure,
+    /// Paths probed valid on the target during this pass.
+    valid: BTreeSet<String>,
+    /// Union of the closure nodes' input sources.
+    input_srcs: BTreeSet<String>,
+    /// Non-derivation closure members not already valid on the target —
+    /// what the ladder still has to place.
+    needed: Vec<String>,
+}
+
+/// The planning/probing core of the upload ladder, shared VERBATIM by the
+/// supply stage ([`run_upload_ladder`]) and the resume rebuild
+/// ([`rebuild_ladder_context`]) so the two can never diverge: walk the
+/// workload union closure, re-probe target validity, extend coverage with
+/// live substituter probes, and admit relay substituters. Pure
+/// observation — no journal rows, no uploads, no report-count mutation
+/// beyond the probe-error tallies the caller passes in. `None` when the
+/// workload has no drvs to plan over.
+async fn probe_ladder_context(
     transport: &dyn SupplyTransport,
     archive: &Arc<ReplayArchive>,
     inputs: &SupplyInputs,
     knobs: &Knobs,
-    report: &mut SupplyStageReport,
-    prefetch_unavailable: &mut BTreeSet<String>,
-) -> Result<Option<SupplyContext>> {
+    probe_errors: &mut BTreeMap<String, u64>,
+) -> Result<Option<LadderProbe>> {
     let roots: Vec<String> = inputs.workload_drvs.iter().cloned().collect();
     if roots.is_empty() {
         return Ok(None);
@@ -2346,7 +2362,7 @@ async fn run_upload_ladder(
             &target_refs,
             &unprobed,
             knobs.narinfo_concurrency,
-            &mut report.probe_errors,
+            probe_errors,
         )
         .await;
         ctx.target_coverage.extend(hits.into_keys());
@@ -2392,12 +2408,77 @@ async fn run_upload_ladder(
                 &relay_refs,
                 &relay_candidates,
                 knobs.narinfo_concurrency,
-                &mut report.probe_errors,
+                probe_errors,
             )
             .await
         };
         ctx.relay_narinfos = relay_hits;
     }
+
+    Ok(Some(LadderProbe {
+        ctx,
+        closure,
+        valid,
+        input_srcs,
+        needed,
+    }))
+}
+
+/// Rebuild the ladder context on a resume past a COMPLETED supply stage by
+/// re-running the stage's planning and probing — never its deliveries.
+/// Resume costs re-probing, never correctness: the rebuilt context is the
+/// same closure walk, validity probe, coverage probes, and relay admission
+/// the completed stage performed (via `probe_ladder_context`, the shared
+/// core), against the target's CURRENT validity — which already reflects
+/// everything the completed stage delivered. Nothing is journaled here:
+/// the completed stage's journal stays the durable record of what it did,
+/// and the rebuilt context's deliveries journal through the per-submission
+/// top-up exactly like the fresh process's would.
+///
+/// Fleet cost, named: one closure walk plus one validity-probe sweep plus
+/// the narinfo probes of still-missing paths, per resume — the same
+/// probing every fresh campaign start already pays inside the supply
+/// stage. Probe-error tallies are logged by the probe helpers and
+/// discarded; the persisted supply report belongs to the completed stage.
+pub async fn rebuild_ladder_context(
+    transport: &dyn SupplyTransport,
+    archive: &Arc<ReplayArchive>,
+    inputs: &SupplyInputs,
+    knobs: &Knobs,
+) -> Result<Option<SupplyContext>> {
+    let mut probe_errors = BTreeMap::new();
+    let probe = probe_ladder_context(transport, archive, inputs, knobs, &mut probe_errors).await?;
+    Ok(probe.map(|probe| probe.ctx))
+}
+
+/// The archive-backed half of the supply stage: walk the workload union
+/// closure, extend target coverage with live substituter probes
+/// ([`probe_ladder_context`], shared with the resume rebuild), resolve
+/// every needed path through the source ladder, and deliver the resulting
+/// upload plan (prewarm uploads, or an explicit deferral record under
+/// inline delivery). Folds its outcomes into `report` and returns the ladder
+/// context it built (admitted relay substituters, probed coverage, the
+/// validity set as of the last delivery) so the caller can keep it for
+/// per-request top-ups; `None` when the workload has no drvs to plan over.
+async fn run_upload_ladder(
+    state: &StateDir,
+    transport: &dyn SupplyTransport,
+    archive: &Arc<ReplayArchive>,
+    inputs: &SupplyInputs,
+    knobs: &Knobs,
+    report: &mut SupplyStageReport,
+    prefetch_unavailable: &mut BTreeSet<String>,
+) -> Result<Option<SupplyContext>> {
+    let Some(LadderProbe {
+        ctx,
+        closure,
+        valid,
+        input_srcs,
+        needed,
+    }) = probe_ladder_context(transport, archive, inputs, knobs, &mut report.probe_errors).await?
+    else {
+        return Ok(None);
+    };
 
     // Resolve every needed path through the source ladder. Paths the
     // resolution itself withholds or cannot place are recorded here, from
@@ -2848,6 +2929,10 @@ pub(crate) mod test_support {
         pub wire_error_uploads: AtomicBool,
         /// Total upload calls (batch + streamed), accepted or not.
         pub upload_calls: AtomicUsize,
+        /// Total `query_valid` probe calls — lets tests pin when probe
+        /// traffic happens at all (e.g. a report-only resume must not
+        /// re-probe a cluster it will never submit to).
+        pub probe_calls: AtomicUsize,
         /// Per-path upload attempts (batch + streamed), accepted or not.
         pub attempts: Mutex<HashMap<String, u32>>,
     }
@@ -2935,6 +3020,7 @@ pub(crate) mod test_support {
     #[async_trait]
     impl SupplyTransport for FakeSupplyTransport {
         async fn query_valid(&self, paths: &[String]) -> anyhow::Result<BTreeSet<String>> {
+            self.probe_calls.fetch_add(1, Ordering::SeqCst);
             let valid = self.valid.lock().unwrap();
             Ok(paths
                 .iter()

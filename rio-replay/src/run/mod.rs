@@ -425,6 +425,27 @@ fn require_mode_wiring(spec: &CampaignSpec) -> Result<ModeWiring> {
     })
 }
 
+/// Whether the wiring's top-up role, under the effective dependency
+/// policy, wires a per-submission supply hook at all — THE one predicate
+/// for both the fresh supply stage and the resume rebuild. The supply
+/// attempt floor reads the wired hook's presence (floor 2 wired / 1 not),
+/// and the floor gates PERMANENT exclusion records, so this decision is
+/// campaign-lifetime: it derives only from the spec — identical in every
+/// process over the same spec — never from process-local state, and a pod
+/// reschedule cannot change it.
+///
+/// Under inline delivery ([`TopupRole::Primary`]) the hook IS the delivery
+/// mechanism — wired regardless of the dependency policy (embedded input
+/// sources are deferred too). Under prewarm ([`TopupRole::MissFallback`])
+/// it only backstops prewarm misses, so dependencies-none campaigns —
+/// whose ladder delivers nothing per submission — run without it.
+fn topup_wired(topup: TopupRole, dependencies: SupplyDependencies) -> bool {
+    match topup {
+        TopupRole::Primary => true,
+        TopupRole::MissFallback => dependencies != SupplyDependencies::None,
+    }
+}
+
 /// In-scope attemptable jobs still awaiting their first DELIVERED
 /// submission: no terminal record and never part of a recorded batch
 /// whose pre-submission top-up succeeded (`topup_delivered`). On an
@@ -2454,21 +2475,27 @@ pub async fn run_with_backends(
     ));
     // Pre-submission supply hook for the execute stage (the timed
     // dispatcher's per-request call, the timeless submit loop's per-batch
-    // call): built below only when the supply stage runs in this process
-    // under a wiring that has something to top up; `None` keeps the execute
-    // stage running without one.
+    // call): built below whenever the wiring has something to top up — by
+    // the supply stage when it runs in this process, or by the probing-only
+    // context rebuild when resuming past a completed stage; `None` keeps
+    // the execute stage running without one.
     let mut supply_topup: Option<Arc<dyn PreSubmitSupply>> = None;
+    // Hook-wiring inputs shared by both arms below. All three derive from
+    // the spec and the pinned plan — identical in every process over the
+    // same campaign state — because the wired-hook decision feeds the
+    // supply attempt floor, which gates permanent exclusion records: a
+    // resume must reach exactly the decision a fresh process would.
+    let effective_dependencies = spec.supply.effective_dependencies(spec.mode);
+    let wire_topup = topup_wired(wiring.topup, effective_dependencies);
+    // Outputs (and drvs) of the units that remain attemptable: those
+    // outputs are what the campaign measures, so they are never
+    // supplied; everything else in their closures is fair game for the
+    // supply ladder. Shared with the offline dry-run, which calls the
+    // same helper with the archive-derivable subset of these
+    // exclusions.
+    let attempt_excluded: HashSet<&str> = plan_dispositions.keys().map(String::as_str).collect();
+    let protected = supply::protected_workload(&manifest, &in_scope, &attempt_excluded);
     if !state.marker_done("supply") {
-        let effective_dependencies = spec.supply.effective_dependencies(spec.mode);
-        // Outputs (and drvs) of the units that remain attemptable: those
-        // outputs are what the campaign measures, so they are never
-        // supplied; everything else in their closures is fair game for the
-        // supply ladder. Shared with the offline dry-run, which calls the
-        // same helper with the archive-derivable subset of these
-        // exclusions.
-        let attempt_excluded: HashSet<&str> =
-            plan_dispositions.keys().map(String::as_str).collect();
-        let protected = supply::protected_workload(&manifest, &in_scope, &attempt_excluded);
         // The prefetch arm only exists under the substituters policy; the
         // other policies deliver dependencies by client upload (or withhold
         // them entirely).
@@ -2550,32 +2577,9 @@ pub async fn run_with_backends(
         state.set_marker("supply")?;
         // The mode-wiring table decides whether the stage's transport and
         // ladder context outlive the stage as the pre-submission top-up
-        // hook. Under inline delivery the hook IS the delivery mechanism:
-        // the stage deferred every planned upload to it, whatever the
-        // dependency policy. Under prewarm it only backstops prewarm misses
-        // (a path the prewarm pass refused, failed, or skipped gets one
-        // more delivery attempt), so dependencies-none campaigns — whose
-        // ladder delivers nothing per submission — run without it. Either
-        // way the hook reuses the stage's admitted substituters and probe
-        // results instead of re-admitting or re-probing what is already
-        // known valid.
-        //
-        // TODO: rebuild the ladder context when resuming past a completed
-        // supply stage. A resumed campaign whose supply marker is already
-        // set ran the stage in an earlier process, so no context exists
-        // there and the execute stage runs without the hook: under prewarm
-        // that only loses the miss-fallback, while under inline the hook IS
-        // the delivery mechanism, so the resume path (the else branch
-        // below) refuses to start while the supply journal still owes
-        // inline-deferred uploads and any in-scope job awaits its first
-        // delivered submission, rather than fail those jobs on missing
-        // inputs. Re-running the stage's planning and probing on resume
-        // (resume costs re-probing, never correctness) would lift the
-        // refusal and restore the miss-fallback.
-        let wire_topup = match wiring.topup {
-            TopupRole::Primary => true,
-            TopupRole::MissFallback => effective_dependencies != SupplyDependencies::None,
-        };
+        // hook (`topup_wired` above). The hook reuses the stage's admitted
+        // substituters and probe results instead of re-admitting or
+        // re-probing what is already known valid.
         if wire_topup && let Some(ladder) = supply_output.ladder {
             let topup: Arc<dyn PreSubmitSupply> = Arc::new(LadderTopup::new(
                 transport,
@@ -2588,29 +2592,133 @@ pub async fn run_with_backends(
         }
     } else {
         // Resumed past a completed supply stage: the stage ran in an
-        // earlier process and took the ladder context the pre-submission
-        // top-up needs with it (see the TODO above). Whether that is safe
-        // depends on what the COMPLETED stage did, not on what the current
-        // spec's wiring would do — so this gate reads the durable supply
-        // journal instead of `wiring.topup`. A prewarm stage delivered its
-        // planned supply before setting the marker (resuming only loses
-        // the miss-fallback); an inline stage only PROMISED delivery, and
-        // the unredeemed promise is exactly the journal's outstanding
-        // deferral rows. A spec switched from inline to prewarm between
-        // processes changes the wiring, but never what the completed stage
-        // left undelivered.
+        // earlier process and took its in-memory ladder context with it.
+        // Rebuild that context by re-running the stage's planning and
+        // probing — never its deliveries (resume costs re-probing, never
+        // correctness): the hook's presence is a campaign-lifetime
+        // decision (it selects the supply attempt floor, which gates
+        // permanent exclusion records, and under inline delivery the hook
+        // IS the delivery mechanism), so a pod reschedule must wire
+        // exactly what a fresh process over the same spec would wire. The
+        // rebuild probes the target's CURRENT validity — which already
+        // reflects everything the completed stage delivered — and
+        // journals nothing; its top-up deliveries journal per submission
+        // exactly like the fresh process's.
+        //
+        // Scoped to resumes with submittable work left: with every
+        // in-scope job terminal the hook can never be invoked and the
+        // floor gates nothing (the rollup's retirements are masked by the
+        // existing records and the empty submit pool), so probing would
+        // buy no decision — and a report-only resume keeps working even
+        // when the cluster the campaign measured no longer exists. Any
+        // non-terminal in-scope job (including the deadline-partial
+        // not-attempted backfills a resume re-offers) keeps the rebuild
+        // on.
+        let work_remains = manifest.iter().any(|m| {
+            in_scope.contains(m.job.as_str())
+                && !existing_records.get(m.job.as_str()).is_some_and(|record| {
+                    model::is_terminal_class(&record.verdict, &record.disposition)
+                })
+        });
+        if wire_topup && work_remains && !protected.drvs.is_empty() {
+            let transport = match &backends.supply_transport {
+                Some(transport) => transport.clone(),
+                None => build_supply_transport(&spec)?,
+            };
+            // The fresh process seeds the ladder's target coverage from
+            // the warm-set upstream-coverage probe; the rebuilt context
+            // must see the SAME coverage, or paths the target can
+            // substitute from its own upstream would re-classify as
+            // unsourceable here — plan-skipped, so every post-resume
+            // batch's top-up outcome would carry undelivered paths and
+            // the fail-closed delivery proof could never be minted again
+            // (the wired-hook decision and its evidence must be exactly
+            // the fresh process's). Re-probing journals the same
+            // bookkeeping rows the fresh probe wrote — bookkeeping can
+            // neither retire units nor displace settled truth, and
+            // resume costs re-probing, never correctness.
+            let target_coverage: BTreeSet<String> =
+                if spec.mode == Mode::Leaf && !plan_output.warm_set.is_empty() {
+                    let narinfo = backends.narinfo.as_ref().context(
+                        "the warm-set upstream-coverage probe needs a public-HTTPS \
+                         substituter, but the archive's substituter lists (target, then \
+                         relay) contain no usable entry; a leaf-mode campaign with a \
+                         non-empty warm set cannot run against this archive",
+                    )?;
+                    truth::probe_warm_upstream_coverage(
+                        &state,
+                        narinfo.as_ref(),
+                        &plan_output.warm_set,
+                        spec.knobs.narinfo_concurrency,
+                        NARINFO_SWEEP_ATTEMPTS,
+                    )
+                    .await?
+                    .found
+                } else {
+                    BTreeSet::new()
+                };
+            // Same shape as the stage's inputs minus the delivery-only
+            // members: no prefetch set (the prefetch arm delegated or
+            // settled in the completed stage; the hook never prefetches)
+            // and no prior-valid seed (the rebuild re-probes the target's
+            // current validity itself — strictly more probing, the
+            // blessed resume cost).
+            let inputs = SupplyInputs {
+                workload_outputs: protected.outputs,
+                workload_drvs: protected.drvs,
+                prefetch_paths: BTreeMap::new(),
+                prior_valid: BTreeSet::new(),
+                target_coverage,
+                archive: Some(archive.clone()),
+                target_substituters: spec.supply.target_substituters.clone(),
+                relay_substituters: archive.manifest().substituters.relay.clone(),
+                dependencies: effective_dependencies,
+                delivery: spec.supply.delivery,
+            };
+            let rebuilt = supply::exec::rebuild_ladder_context(
+                transport.as_ref(),
+                &archive,
+                &inputs,
+                &spec.knobs,
+            )
+            .await?;
+            if let Some(ladder) = rebuilt {
+                tracing::info!(
+                    "rebuilt the supply ladder context on resume (planning and probing \
+                     re-run; deliveries settle per submission through the top-up)"
+                );
+                let topup: Arc<dyn PreSubmitSupply> = Arc::new(LadderTopup::new(
+                    transport,
+                    archive.clone(),
+                    ladder,
+                    spec.knobs.clone(),
+                    state.clone(),
+                ));
+                supply_topup = Some(topup);
+            }
+        }
+        // Residual inline-resume gate, for the one wiring with NO
+        // per-submission delivery path (prewarm with dependencies "none"):
+        // whether resuming is safe depends on what the COMPLETED stage
+        // did, not on what the current spec's wiring would do — so the
+        // gate reads the durable supply journal. A prewarm stage delivered
+        // its planned supply before setting the marker; an inline stage
+        // only PROMISED delivery, and the unredeemed promise is exactly
+        // the journal's outstanding deferral rows. A spec switched from
+        // inline to prewarm between processes changes the wiring, but
+        // never what the completed stage left undelivered — with a top-up
+        // wired the rebuilt hook redeems those deferrals per submission,
+        // without one nothing will, so jobs still awaiting their first
+        // delivered submission would fail on missing inputs and the
+        // resume refuses loudly instead.
         // supply-fold: outstanding_inline_deferrals — the gate's trigger
         // evidence is the owner's deferral projection: settlements redeem
         // a deferral, bookkeeping (a breaker-open `skipped` stamp) cannot
         // displace it, so an outage that skip-stamps the outstanding
-        // paths leaves the refusal armed (fail-closed). The residual
-        // conservatism is a path that became valid on the target through
-        // some other channel after the stage planned it (the live top-up
-        // skips valid paths without journaling); a resume then refuses
-        // until a supply re-run records it `already-present`.
+        // paths leaves the refusal armed (fail-closed).
         let supply_journal: Vec<SupplyEntry> = state.load_jsonl(StateFile::Supply)?;
         let deferred = model::SupplyFold::collapse(&supply_journal).outstanding_inline_deferrals();
-        if !deferred.is_empty() {
+        if supply_topup.is_none() && !deferred.is_empty() {
             // Jobs already covered by an earlier process are safe: a job in
             // a batch whose pre-submission top-up succeeded had its gap
             // delivery, and jobs with terminal records are never submitted
@@ -2650,7 +2758,7 @@ pub async fn run_with_backends(
                 // never correctness; s3:DeleteObject on the replay prefix
                 // is already provisioned in infra/eks/replay.tf). Deferred
                 // until the substrate-crossing resume e2e
-                // (`inline_resume_across_pod_reschedule_refuses_with_durable_remedy`)
+                // (`prewarm_none_resume_across_pod_reschedule_refuses_with_durable_remedy`)
                 // has soaked the manual remediation: an auto-delete on a
                 // spurious refusal would re-run supply fleet-wide with no
                 // operator in the loop, so the refusal predicate earns the
@@ -2677,14 +2785,17 @@ pub async fn run_with_backends(
                 bail!(
                     "campaign {campaign_id}: cannot resume past the completed supply stage: it \
                      deferred {deferred} planned upload(s) to the per-submission top-up \
-                     (supply.delivery \"inline\") and that delivery context cannot be rebuilt \
-                     on resume yet, so the {count} in-scope job(s) not yet submitted with a \
-                     delivered top-up (e.g. {sample}) would run without their deferred uploads \
-                     and fail on missing inputs; {marker_remedy} to re-run the supply stage on \
-                     the next start (resume costs re-probing, never correctness), either \
-                     keeping inline delivery or switching the spec to supply.delivery \
-                     \"prewarm\" to deliver supply before execution",
+                     (supply.delivery \"inline\") and the current spec's wiring (supply.delivery \
+                     \"{delivery}\" with effective dependencies \"{dependencies}\") tops up \
+                     nothing per submission, so the {count} in-scope job(s) not yet submitted \
+                     with a delivered top-up (e.g. {sample}) would run without their deferred \
+                     uploads and fail on missing inputs; {marker_remedy} to re-run the supply \
+                     stage on the next start (resume costs re-probing, never correctness) and \
+                     deliver the deferred supply under whichever delivery mode the spec then \
+                     names",
                     deferred = deferred.len(),
+                    delivery = spec.supply.delivery.as_str(),
+                    dependencies = effective_dependencies.as_str(),
                     count = undelivered.len(),
                 );
             }
@@ -4196,6 +4307,44 @@ mod tests {
         );
     }
 
+    /// Consumer enumeration for the wired-hook decision feeding the supply
+    /// attempt floor: `topup_wired` is consulted exactly once (the hoisted
+    /// decision both supply arms share), the hook is constructed at
+    /// exactly two sites (the fresh stage's wiring and the resume
+    /// rebuild's, both gated on that one decision), and `wiring.topup` has
+    /// no other production reader — so a new wiring arm cannot reach a
+    /// different floor than its siblings without failing these counts.
+    /// Domain: the production half (pre-`#[cfg(test)]`) of mod.rs.
+    #[test]
+    fn wired_hook_decision_consumers_are_enumerated() {
+        let src = include_str!("mod.rs");
+        let prod = src
+            .split_once("#[cfg(test)]")
+            .map(|(prod, _)| prod.to_string())
+            .unwrap_or_else(|| src.to_string());
+        // Built at runtime so this test's own strings cannot match.
+        let wired_calls = format!("{}{}", "topup_wired", "(");
+        assert_eq!(
+            prod.matches(&wired_calls).count(),
+            2,
+            "the definition plus its single hoisted call — a new topup_wired caller \
+             must share the hoisted decision, not re-derive it"
+        );
+        let hook_sites = format!("supply_topup = {}", "Some(");
+        assert_eq!(
+            prod.matches(&hook_sites).count(),
+            2,
+            "the fresh stage and the resume rebuild are the only hook constructors; \
+             a new one must be gated on the same wire_topup decision and join this count"
+        );
+        let role_reads = format!("wiring{}", ".topup");
+        assert_eq!(
+            prod.matches(&role_reads).count(),
+            1,
+            "the topup role reaches production code only through topup_wired"
+        );
+    }
+
     /// Consumer enumeration for the fresh `workload_set` derivation: the
     /// demotion decision is pinned at first plan and resolved through
     /// `resolve_demoted_impure`, so production code may consult the fresh
@@ -4536,6 +4685,59 @@ mod tests {
             evidence: None,
             updated_at: now_rfc3339(),
         }
+    }
+
+    /// The wired-hook decision over its FULL input lattice — every
+    /// [`TopupRole`] × every [`SupplyDependencies`], all six combinations,
+    /// not just the ones today's specs can produce. `topup_wired` selects
+    /// the supply attempt floor (2 wired / 1 not), and the floor gates
+    /// permanent exclusion records, so each row is a campaign-lifetime
+    /// policy commitment: inline (`Primary`) wires under every dependency
+    /// policy (the hook IS the delivery mechanism — input sources and drv
+    /// texts are deferred to it even under "none"), while prewarm
+    /// (`MissFallback`) wires exactly when the policy delivers anything
+    /// per submission. The exhaustive matches at the end make a NEW role
+    /// or dependency variant fail this test at compile time until its
+    /// rows join the lattice.
+    #[test]
+    fn topup_wired_covers_the_full_role_by_dependencies_lattice() {
+        let rows = [
+            (TopupRole::Primary, SupplyDependencies::Substituters, true),
+            (TopupRole::Primary, SupplyDependencies::EmbeddedOnly, true),
+            (TopupRole::Primary, SupplyDependencies::None, true),
+            (
+                TopupRole::MissFallback,
+                SupplyDependencies::Substituters,
+                true,
+            ),
+            (
+                TopupRole::MissFallback,
+                SupplyDependencies::EmbeddedOnly,
+                true,
+            ),
+            (TopupRole::MissFallback, SupplyDependencies::None, false),
+        ];
+        for (role, dependencies, expected) in rows {
+            assert_eq!(
+                topup_wired(role, dependencies),
+                expected,
+                "{role:?} × {dependencies:?}"
+            );
+            // Compile-time totality: adding a TopupRole or
+            // SupplyDependencies variant makes these matches
+            // non-exhaustive, forcing the new sibling's rows into the
+            // lattice above.
+            match role {
+                TopupRole::Primary | TopupRole::MissFallback => {}
+            }
+            match dependencies {
+                SupplyDependencies::Substituters
+                | SupplyDependencies::EmbeddedOnly
+                | SupplyDependencies::None => {}
+            }
+        }
+        // Six rows = the full 2 × 3 cross product, no combination skipped.
+        assert_eq!(rows.len(), 2 * 3);
     }
 
     /// The mode-wiring table is the single source for mode legality, hook
@@ -5076,23 +5278,19 @@ mod tests {
         outcomes.insert(app_b_drv.to_string(), outcome);
     }
 
-    /// Inline-delivery resume guard on the LOCAL-VOLUME substrate (no
-    /// artifact store — the `--no-s3` flow, where the state dir survives
-    /// process restarts): once the supply stage has completed in an
-    /// earlier process, the inline delivery context (the ladder the
-    /// pre-submission top-up replays) cannot be rebuilt, so resuming while
-    /// in-scope jobs still await their first delivered submission refuses
-    /// with the campaign id and both remedies — and the error's own advice
-    /// (here the pod-local marker delete: with no artifact store, the
-    /// local copy IS the copy that controls the next start) genuinely
-    /// lifts the refusal and lets the campaign run to completion. The
-    /// production substrate — fresh pod volume, marker re-materialized
-    /// from the artifact store before the check — is covered by
-    /// `inline_resume_across_pod_reschedule_refuses_with_durable_remedy`,
-    /// which performs the durable-key remediation the message prints
-    /// there.
+    /// Inline-delivery resume on the LOCAL-VOLUME substrate (no artifact
+    /// store — the `--no-s3` flow, where the state dir survives process
+    /// restarts): once the supply stage has completed in an earlier
+    /// process, the resume REBUILDS the delivery context by re-running the
+    /// stage's planning and probing (resume costs re-probing, never
+    /// correctness) — under inline delivery the rebuilt per-submission
+    /// top-up IS the delivery mechanism, so the deferred uploads are
+    /// redeemed at submission time and the campaign completes without any
+    /// operator remediation. The wiring with no per-submission delivery
+    /// path at all — the one case that still refuses — is covered by
+    /// `prewarm_none_resume_still_refuses_undelivered_inline_supply`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn inline_resume_refuses_while_unsubmitted_work_remains() {
+    async fn inline_resume_rebuilds_the_delivery_context_and_completes() {
         let (_archive_dir, archive, archive_id) = open_mini_archive();
         let manifest = load_units(&archive).unwrap();
         let app_a = manifest
@@ -5105,9 +5303,16 @@ mod tests {
             .find(|m| m.job == "appB.x86_64-linux")
             .unwrap()
             .clone();
+        // The whole of appB's closure is relayable: the per-batch
+        // delivery proof is the fail-closed collapse of the top-up's own
+        // per-path outcome, so an unsourceable closure path (correctly)
+        // withholds it — the happy-path fixture must make every closure
+        // path deliverable.
         let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let (_stdenv_drv, stdenv_out) = app_b_dep(&archive, "-stdenv-");
         let mut narinfos = HashMap::new();
         narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
+        narinfos.insert(stdenv_out.clone(), narinfo_text(&stdenv_out));
         let submitter = Arc::new(KeyedSubmitter::default());
         let supply_transport = Arc::new(FakeSupplyTransport::default());
         let state_dir = tempfile::tempdir().unwrap();
@@ -5145,50 +5350,15 @@ mod tests {
                 .is_empty(),
             "inline delivery deferred the planned uploads"
         );
-
-        // Process 2: the resume refuses loudly — both attemptable jobs were
-        // never submitted, so their deferred uploads can no longer be
-        // delivered — and the error names the campaign and the remedies.
-        let err = run_with_backends(
-            run_args(state_dir.path()),
-            inline_spec(),
-            StateDir::new(state_dir.path()).unwrap(),
-            archive.clone(),
-            resume_backends(&submitter, &supply_transport, &narinfos),
-        )
-        .await
-        .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("campaign c-e2e"), "{msg}");
-        assert!(msg.contains("supply.delivery \"inline\""), "{msg}");
-        assert!(msg.contains("2 in-scope job(s) not yet submitted"), "{msg}");
-        assert!(msg.contains("appA.x86_64-linux"), "{msg}");
-        // The remediation contract: the message names the marker copy that
-        // controls the next start. With no artifact store wired that is
-        // the pod-local path — and ONLY it: durable-key phrasing here
-        // would direct the operator at a store that does not exist.
         assert!(
-            msg.contains(
-                state
-                    .path("markers/supply.done")
-                    .display()
-                    .to_string()
-                    .as_str()
-            ),
-            "{msg}"
-        );
-        assert!(!msg.contains("artifact store"), "{msg}");
-        assert!(msg.contains("\"prewarm\""), "{msg}");
-        assert!(
-            submitter.submitted.lock().unwrap().is_empty(),
-            "the refusal precedes the execute stage"
+            supply_transport.uploaded_batches.lock().unwrap().is_empty(),
+            "an inline stage promises — it does not deliver"
         );
 
-        // The error's first remedy: deleting the supply marker re-runs the
-        // stage on the next start (resume costs re-probing, never
-        // correctness), which rebuilds the delivery context and lets the
-        // campaign finish.
-        std::fs::remove_file(state.path("markers/supply.done")).unwrap();
+        // Process 2: the resume rebuilds the ladder context past the
+        // completed stage and proceeds straight into the execute stage;
+        // the per-batch top-up delivers the deferred uploads before each
+        // submission, and the campaign completes.
         script_apps_built(&submitter, &app_a.drv_path, &app_b.drv_path);
         run_with_backends(
             run_args(state_dir.path()),
@@ -5199,12 +5369,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let records = latest_per_job(
-            StateDir::new(state_dir.path())
-                .unwrap()
-                .load_jsonl(StateFile::Results)
-                .unwrap(),
+        assert!(
+            !submitter.submitted.lock().unwrap().is_empty(),
+            "the resumed process submitted the pending work"
         );
+        assert!(
+            !supply_transport.uploaded_batches.lock().unwrap().is_empty(),
+            "the rebuilt top-up delivered the deferred uploads at submission time"
+        );
+        let state = StateDir::new(state_dir.path()).unwrap();
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
         assert_eq!(
             records["appA.x86_64-linux"].verdict.as_deref(),
             Some("match-built")
@@ -5213,20 +5387,48 @@ mod tests {
             records["appB.x86_64-linux"].verdict.as_deref(),
             Some("match-built")
         );
+        // Delivery proof per batch (the BatchIntent carrier), and the
+        // journal converges: every deferral row is superseded by the
+        // top-up's settlement.
+        let batches = state
+            .load_jsonl::<model::BatchRecord>(StateFile::Batches)
+            .unwrap();
+        assert!(
+            !batches.is_empty() && batches.iter().all(|b| b.topup_delivered),
+            "every batch of the resumed campaign carries its top-up delivery proof: {batches:?}"
+        );
+        let journal = state.load_jsonl::<SupplyEntry>(StateFile::Supply).unwrap();
+        assert!(
+            model::SupplyFold::collapse(&journal)
+                .outstanding_inline_deferrals()
+                .is_empty(),
+            "the rebuilt top-up redeemed every deferral"
+        );
     }
 
-    /// The guard is keyed on the durable journal, not the current spec's
-    /// wiring: relaunching the SAME campaign with the spec switched to
-    /// supply.delivery "prewarm" (the relaunch guard's documented escape
-    /// hatch) must still refuse while the inline stage's deferred uploads
-    /// remain unredeemed — the switch changes the topup role to
-    /// miss-fallback, but the completed stage still delivered nothing, so
-    /// proceeding would submit every job without its supply and mint false
-    /// regressions. The remedy is the same marker delete (the re-run stage
-    /// then delivers under whichever delivery mode the spec now names).
+    /// A resume with the spec switched to supply.delivery "prewarm" (the
+    /// relaunch guard's documented escape hatch) while the completed
+    /// inline stage's deferrals are still unredeemed: the switched wiring
+    /// is miss-fallback, which under a delivering dependency policy still
+    /// wires the per-submission top-up — and the rebuilt top-up redeems
+    /// the old stage's deferrals at submission time, so the resume
+    /// proceeds and completes instead of refusing. (The refusal remains
+    /// only where NOTHING tops up per submission: prewarm with
+    /// dependencies "none" — see the test below.)
     #[tokio::test(flavor = "multi_thread")]
-    async fn prewarm_switched_resume_still_refuses_undelivered_inline_supply() {
+    async fn prewarm_switched_resume_redeems_inline_deferrals_via_the_topup() {
         let (_archive_dir, archive, archive_id) = open_mini_archive();
+        let manifest = load_units(&archive).unwrap();
+        let app_a = manifest
+            .iter()
+            .find(|m| m.job == "appA.x86_64-linux")
+            .unwrap()
+            .clone();
+        let app_b = manifest
+            .iter()
+            .find(|m| m.job == "appB.x86_64-linux")
+            .unwrap()
+            .clone();
         let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
         let mut narinfos = HashMap::new();
         narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
@@ -5250,11 +5452,14 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(submitter.submitted.lock().unwrap().is_empty());
 
-        // Process 2: the operator switched the spec to prewarm. The wiring
-        // is now miss-fallback, but the journal still owes the deferrals —
-        // the resume must refuse, not run the workload undelivered.
-        let err = run_with_backends(
+        // Process 2: the operator switched the spec to prewarm
+        // (miss-fallback wiring under the leaf substituters policy). The
+        // rebuilt top-up backstops every submission, redeeming the old
+        // deferrals — no refusal, no marker surgery.
+        script_apps_built(&submitter, &app_a.drv_path, &app_b.drv_path);
+        run_with_backends(
             run_args(state_dir.path()),
             leaf_spec(&archive_id),
             StateDir::new(state_dir.path()).unwrap(),
@@ -5262,20 +5467,172 @@ mod tests {
             resume_backends(&submitter, &supply_transport, &narinfos),
         )
         .await
-        .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("supply.delivery \"inline\""), "{msg}");
-        assert!(msg.contains("markers/supply.done"), "{msg}");
+        .unwrap();
+        let state = StateDir::new(state_dir.path()).unwrap();
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(
+            records["appA.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+        assert_eq!(
+            records["appB.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+        let journal = state.load_jsonl::<SupplyEntry>(StateFile::Supply).unwrap();
         assert!(
-            submitter.submitted.lock().unwrap().is_empty(),
-            "a prewarm-switched resume must not submit undelivered work"
+            model::SupplyFold::collapse(&journal)
+                .outstanding_inline_deferrals()
+                .is_empty(),
+            "the rebuilt miss-fallback top-up redeemed the inline stage's deferrals"
         );
     }
 
-    /// The inline-resume guard never blocks a report-only resume: when every
-    /// in-scope job already reached a terminal record (and was submitted by
-    /// the process that ran the supply stage), resuming proceeds and submits
-    /// nothing new.
+    /// [`leaf_spec`] with the self-hosted measurement mode: the effective
+    /// dependency policy defaults to "none" (the target builds the entire
+    /// closure itself), which is the ONE wiring whose prewarm role tops up
+    /// nothing per submission. The build tenant follows the mode (the
+    /// plan-stage tenant check requires the mode's own tenant).
+    fn self_hosted_spec(archive_digest: &str) -> CampaignSpec {
+        let mut spec = leaf_spec(archive_digest);
+        spec.mode = Mode::SelfHosted;
+        spec.tenants.build_tenant = "replay-selfhosted".to_string();
+        spec
+    }
+
+    /// The residual resume refusal: a completed INLINE stage left
+    /// unredeemed deferrals (under self-hosted, the deferred input
+    /// sources and derivation texts), and the resumed spec's wiring —
+    /// prewarm with dependencies "none" — wires NO per-submission top-up,
+    /// so nothing can ever deliver them. The gate is keyed on the durable
+    /// journal, not the current spec's wiring: the switch changed the
+    /// topup role, but the completed stage still delivered nothing, so
+    /// proceeding would submit every job without its supply and mint
+    /// false regressions. The remedy is the marker delete (the re-run
+    /// stage then delivers under whichever delivery mode the spec now
+    /// names) — performed verbatim at the end, proving it lifts the
+    /// refusal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prewarm_none_resume_still_refuses_undelivered_inline_supply() {
+        let (_archive_dir, archive, archive_id) = open_mini_archive();
+        let manifest = load_units(&archive).unwrap();
+        let app_a = manifest
+            .iter()
+            .find(|m| m.job == "appA.x86_64-linux")
+            .unwrap()
+            .clone();
+        let app_b = manifest
+            .iter()
+            .find(|m| m.job == "appB.x86_64-linux")
+            .unwrap()
+            .clone();
+        let narinfos = HashMap::new();
+        let submitter = Arc::new(KeyedSubmitter::default());
+        let supply_transport = Arc::new(FakeSupplyTransport::default());
+        let state_dir = tempfile::tempdir().unwrap();
+
+        // Process 1: self-hosted inline delivery, deadline already past —
+        // the supply stage completes by deferring its planned uploads
+        // (drv texts at minimum), nothing is submitted.
+        let mut args = run_args(state_dir.path());
+        args.deadline = Some("2000-01-01T00:00:00Z".into());
+        let mut inline_spec = self_hosted_spec(&archive_id);
+        inline_spec.supply.delivery = SupplyDelivery::Inline;
+        run_with_backends(
+            args,
+            inline_spec,
+            StateDir::new(state_dir.path()).unwrap(),
+            archive.clone(),
+            resume_backends(&submitter, &supply_transport, &narinfos),
+        )
+        .await
+        .unwrap();
+        let state = StateDir::new(state_dir.path()).unwrap();
+        assert!(state.marker_done("supply"));
+        let journal = state.load_jsonl::<SupplyEntry>(StateFile::Supply).unwrap();
+        assert!(
+            !model::SupplyFold::collapse(&journal)
+                .outstanding_inline_deferrals()
+                .is_empty(),
+            "the self-hosted inline stage deferred its planned uploads"
+        );
+
+        // Process 2: the spec switched to prewarm. Under dependencies
+        // "none" the miss-fallback role wires no top-up — nothing will
+        // redeem the deferrals, so the resume refuses loudly, naming the
+        // campaign and the remedies.
+        let err = run_with_backends(
+            run_args(state_dir.path()),
+            self_hosted_spec(&archive_id),
+            StateDir::new(state_dir.path()).unwrap(),
+            archive.clone(),
+            resume_backends(&submitter, &supply_transport, &narinfos),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("campaign c-e2e"), "{msg}");
+        assert!(msg.contains("supply.delivery \"inline\""), "{msg}");
+        assert!(msg.contains("2 in-scope job(s) not yet submitted"), "{msg}");
+        assert!(msg.contains("appA.x86_64-linux"), "{msg}");
+        // The remediation contract: with no artifact store wired the
+        // message names the pod-local marker — and ONLY it.
+        assert!(
+            msg.contains(
+                state
+                    .path("markers/supply.done")
+                    .display()
+                    .to_string()
+                    .as_str()
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("artifact store"), "{msg}");
+        assert!(
+            submitter.submitted.lock().unwrap().is_empty(),
+            "the refusal precedes the execute stage"
+        );
+
+        // The remedy, performed verbatim: deleting the supply marker
+        // re-runs the stage on the next start; under prewarm it delivers
+        // the previously deferred uploads BEFORE execution, and the
+        // campaign completes without a top-up.
+        std::fs::remove_file(state.path("markers/supply.done")).unwrap();
+        script_apps_built(&submitter, &app_a.drv_path, &app_b.drv_path);
+        run_with_backends(
+            run_args(state_dir.path()),
+            self_hosted_spec(&archive_id),
+            StateDir::new(state_dir.path()).unwrap(),
+            archive.clone(),
+            resume_backends(&submitter, &supply_transport, &narinfos),
+        )
+        .await
+        .unwrap();
+        let state = StateDir::new(state_dir.path()).unwrap();
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(
+            records["appA.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+        assert_eq!(
+            records["appB.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+        let journal = state.load_jsonl::<SupplyEntry>(StateFile::Supply).unwrap();
+        assert!(
+            model::SupplyFold::collapse(&journal)
+                .outstanding_inline_deferrals()
+                .is_empty(),
+            "the re-run prewarm stage delivered every previously deferred upload"
+        );
+    }
+
+    /// A report-only resume needs no supply machinery: when every in-scope
+    /// job already reached a terminal record (and was submitted by the
+    /// process that ran the supply stage), resuming proceeds, submits
+    /// nothing new, and — because the hook could never be invoked and the
+    /// floor gates nothing — performs NO context-rebuild probing either,
+    /// so regenerating a finished campaign's report works even when the
+    /// measured cluster no longer exists.
     #[tokio::test(flavor = "multi_thread")]
     async fn inline_resume_with_all_work_terminal_proceeds() {
         let (_archive_dir, archive, archive_id) = open_mini_archive();
@@ -5318,8 +5675,10 @@ mod tests {
         let submitted_before = submitter.submitted.lock().unwrap().len();
         assert!(submitted_before > 0, "the first process submitted the work");
 
-        // Resume: everything terminal, so the guard lets the report-only
-        // resume through and nothing new is submitted.
+        // Resume: everything terminal, so the report-only resume proceeds,
+        // submits nothing new, and probes nothing — the context rebuild is
+        // scoped to resumes that still have submittable work.
+        let probes_before = supply_transport.probe_calls.load(Ordering::SeqCst);
         run_with_backends(
             run_args(state_dir.path()),
             inline_spec(),
@@ -5334,6 +5693,11 @@ mod tests {
             submitted_before,
             "the terminal-only resume submits nothing"
         );
+        assert_eq!(
+            supply_transport.probe_calls.load(Ordering::SeqCst),
+            probes_before,
+            "a report-only resume must not re-probe a cluster it will never submit to"
+        );
         let records = latest_per_job(
             StateDir::new(state_dir.path())
                 .unwrap()
@@ -5346,10 +5710,11 @@ mod tests {
         );
     }
 
-    /// Prewarm resume is unaffected by the inline-resume guard: a prewarm
-    /// campaign that stopped before submitting (deadline) resumes straight
-    /// into the execute stage — losing only the miss-fallback top-up — and
-    /// runs to completion.
+    /// Prewarm resume with pending work proceeds straight into the execute
+    /// stage — with the miss-fallback top-up rebuilt, not lost: the
+    /// resumed process re-probes and re-plans the ladder context, so a
+    /// prewarm miss still gets its one more delivery attempt after a
+    /// restart.
     #[tokio::test(flavor = "multi_thread")]
     async fn prewarm_resume_with_unsubmitted_work_proceeds() {
         let (_archive_dir, archive, archive_id) = open_mini_archive();
@@ -5416,6 +5781,215 @@ mod tests {
             records["appB.x86_64-linux"].verdict.as_deref(),
             Some("match-built")
         );
+    }
+
+    /// Resume==fresh equivalence for campaign-lifetime supply decisions —
+    /// the floor above all: a campaign resumed past a completed prewarm
+    /// stage must derive the SAME attempt floor and reach the SAME final
+    /// records as a process that never restarted over the same scripted
+    /// world. The scenario is the floor's own trigger: the prewarm pass's
+    /// drv-text batch is refused once (attempt + fresh-channel retry both
+    /// refused → ONE settled refused row per path), which at the wired
+    /// floor of 2 leaves every dependent attemptable for the top-up's
+    /// documented one-more-attempt. A deadline stops the first process
+    /// before submission; the resume must NOT retire those units (a
+    /// process-lifetime floor of 1 would permanently exclude them as
+    /// upload-rejected before anything could re-attempt) — it rebuilds
+    /// the ladder context, the miss-fallback top-up re-delivers at
+    /// submission time, and the campaign converges on exactly the control
+    /// run's records. The comparability block must converge identically:
+    /// the partial run's not-attempted count and any partial-denominator
+    /// flags clear on the resumed refresh (derived entries re-derive;
+    /// they never latch).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prewarm_resume_derives_the_same_floor_and_records_as_a_fresh_process() {
+        let (_archive_dir, archive, archive_id) = open_mini_archive();
+        let manifest = load_units(&archive).unwrap();
+        let app_a = manifest
+            .iter()
+            .find(|m| m.job == "appA.x86_64-linux")
+            .unwrap()
+            .clone();
+        let app_b = manifest
+            .iter()
+            .find(|m| m.job == "appB.x86_64-linux")
+            .unwrap()
+            .clone();
+        // The whole of appB's closure is relayable in BOTH worlds: the
+        // per-batch delivery proof is the fail-closed collapse of the
+        // top-up's own per-path outcome, so an unsourceable closure path
+        // (correctly) withholds it — and this test's equivalence claim
+        // includes the proof bit, so the fixture must make every closure
+        // path deliverable.
+        let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let (_stdenv_drv, stdenv_out) = app_b_dep(&archive, "-stdenv-");
+        let mut narinfos = HashMap::new();
+        narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
+        narinfos.insert(stdenv_out.clone(), narinfo_text(&stdenv_out));
+
+        // One scripted world, instantiated twice (control and restarted):
+        // the prewarm upload pass refuses appB's drv-text batch on both
+        // the attempt and the fresh-channel retry (count 2), settling one
+        // refused row per batched path; every later upload is accepted.
+        let scripted_world = |submitter: &Arc<KeyedSubmitter>| {
+            let transport = Arc::new(FakeSupplyTransport::default());
+            transport
+                .refusals
+                .lock()
+                .unwrap()
+                .insert(app_b.drv_path.clone(), 2);
+            script_apps_built(submitter, &app_a.drv_path, &app_b.drv_path);
+            transport
+        };
+
+        // CONTROL: one process, no restart — supply stage refused once,
+        // floor 2 keeps the units attemptable, the stage-built top-up
+        // re-delivers at submission, everything settles.
+        let control_submitter = Arc::new(KeyedSubmitter::default());
+        let control_transport = scripted_world(&control_submitter);
+        let control_dir = tempfile::tempdir().unwrap();
+        run_with_backends(
+            run_args(control_dir.path()),
+            leaf_spec(&archive_id),
+            StateDir::new(control_dir.path()).unwrap(),
+            archive.clone(),
+            resume_backends(&control_submitter, &control_transport, &narinfos),
+        )
+        .await
+        .unwrap();
+
+        // RESTARTED: process 1 runs the same world but the deadline is
+        // already past — the supply stage completes (with the settled
+        // refusals), the marker is set, nothing submits.
+        let submitter = Arc::new(KeyedSubmitter::default());
+        let supply_transport = scripted_world(&submitter);
+        let state_dir = tempfile::tempdir().unwrap();
+        let mut args = run_args(state_dir.path());
+        args.deadline = Some("2000-01-01T00:00:00Z".into());
+        run_with_backends(
+            args,
+            leaf_spec(&archive_id),
+            StateDir::new(state_dir.path()).unwrap(),
+            archive.clone(),
+            resume_backends(&submitter, &supply_transport, &narinfos),
+        )
+        .await
+        .unwrap();
+        assert!(submitter.submitted.lock().unwrap().is_empty());
+        let state = StateDir::new(state_dir.path()).unwrap();
+        let journal = state.load_jsonl::<SupplyEntry>(StateFile::Supply).unwrap();
+        assert!(
+            journal
+                .iter()
+                .any(|e| e.path == app_b.drv_path && e.outcome == model::SUPPLY_OUTCOME_REFUSED),
+            "the prewarm pass settled the scripted refusal"
+        );
+        // The FRESH process's floor decision over this state, pinned: one
+        // settled refusal per path stays below the wired floor of 2, so
+        // nothing is retired — the deadline-stopped process leaves no
+        // terminal supply records.
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        for (job, record) in &records {
+            assert!(
+                !matches!(
+                    record.disposition.as_deref(),
+                    Some("upload-rejected") | Some("supply-failed")
+                ),
+                "the fresh process keeps refused-once supply attemptable: {job} {record:?}"
+            );
+        }
+
+        // Process 2 resumes past the completed stage. Same floor, same
+        // outcome as the control: no retirement at start, the rebuilt
+        // miss-fallback top-up re-attempts the refused drv texts (the
+        // refusal script is exhausted), and the campaign completes.
+        run_with_backends(
+            run_args(state_dir.path()),
+            leaf_spec(&archive_id),
+            StateDir::new(state_dir.path()).unwrap(),
+            archive.clone(),
+            resume_backends(&submitter, &supply_transport, &narinfos),
+        )
+        .await
+        .unwrap();
+
+        // THE equivalence: per-job (verdict, disposition) of the restarted
+        // campaign equals the never-restarted control's, for EVERY job —
+        // the resume changed when work happened, never what was decided.
+        let final_of = |dir: &Path| -> BTreeMap<String, (Option<String>, Option<String>)> {
+            latest_per_job(
+                StateDir::new(dir)
+                    .unwrap()
+                    .load_jsonl(StateFile::Results)
+                    .unwrap(),
+            )
+            .into_iter()
+            .map(|(job, r)| (job, (r.verdict, r.disposition)))
+            .collect()
+        };
+        let control_final = final_of(control_dir.path());
+        let restarted_final = final_of(state_dir.path());
+        assert_eq!(
+            restarted_final, control_final,
+            "a pod restart must not change any job's recorded decision"
+        );
+        assert_eq!(
+            restarted_final["appB.x86_64-linux"],
+            (Some("match-built".to_string()), None),
+            "the refused-once unit converged through the top-up's re-attempt"
+        );
+        // The top-up actually delivered (delivery proof on the settled
+        // batches), and the journal's last word on the refused path is
+        // delivered — in BOTH worlds.
+        for dir in [control_dir.path(), state_dir.path()] {
+            let state = StateDir::new(dir).unwrap();
+            let batches = state
+                .load_jsonl::<model::BatchRecord>(StateFile::Batches)
+                .unwrap();
+            assert!(
+                !batches.is_empty() && batches.iter().all(|b| b.topup_delivered),
+                "every settling batch carries its top-up delivery proof: {batches:?}"
+            );
+            let journal = state.load_jsonl::<SupplyEntry>(StateFile::Supply).unwrap();
+            let last_settlement = journal
+                .iter()
+                .rfind(|e| {
+                    e.path == app_b.drv_path && model::supply_outcome_is_settlement(&e.outcome)
+                })
+                .expect("the drv text settled");
+            assert_eq!(last_settlement.outcome, model::SUPPLY_OUTCOME_DELIVERED);
+        }
+        // Comparability converges too: the partial run's not-attempted
+        // backfill count cleared on the resumed refresh (derived counts
+        // re-derive from current truth; they never latch), and the two
+        // worlds' excluded maps and confidence flags agree.
+        let campaign_of = |dir: &Path| -> CampaignRecord {
+            StateDir::new(dir)
+                .unwrap()
+                .read_json("campaign.json")
+                .unwrap()
+                .unwrap()
+        };
+        let control_campaign = campaign_of(control_dir.path());
+        let restarted_campaign = campaign_of(state_dir.path());
+        assert!(
+            !restarted_campaign
+                .comparability
+                .excluded
+                .contains_key("not-attempted"),
+            "the deadline-partial run's drained not-attempted count must not \
+             survive the resumed refresh: {:?}",
+            restarted_campaign.comparability.excluded
+        );
+        assert_eq!(
+            restarted_campaign.comparability.excluded,
+            control_campaign.comparability.excluded
+        );
+        assert_eq!(
+            restarted_campaign.comparability.low_confidence,
+            control_campaign.comparability.low_confidence
+        );
+        assert_eq!(restarted_campaign.comparability.completeness_pct, 100.0);
     }
 
     /// [`resume_backends`] with an artifact store wired: the production
@@ -5574,18 +6148,23 @@ mod tests {
         artifact::assert_state_dir_files_classified(&state_c);
     }
 
-    /// The inline crash-loop scenario on the production substrate, and its
-    /// printed remediation performed VERBATIM: an inline campaign's pod is
-    /// rescheduled mid-execute, every replacement pod re-materializes
-    /// markers/supply.done from the artifact store before the resume gate
-    /// runs, so the refusal must (a) fire on the replacement pod, (b) fire
-    /// regardless of a spec switched to prewarm, and (c) print the DURABLE
-    /// marker key — the only copy whose deletion lifts the refusal. The
-    /// test then deletes exactly the key the message names and proves the
-    /// next pod re-runs the supply stage and completes. (This soak is the
-    /// gate for the auto-invalidation follow-up at the bail site.)
+    /// The residual crash-loop scenario on the production substrate, and
+    /// its printed remediation performed VERBATIM: a self-hosted inline
+    /// campaign's pod is rescheduled mid-execute, the operator switches
+    /// the spec to prewarm (dependencies stay "none" — the one wiring
+    /// with no per-submission delivery path), and every replacement pod
+    /// re-materializes markers/supply.done from the artifact store before
+    /// the resume gate runs. The refusal must (a) fire on the replacement
+    /// pod and (b) print the DURABLE marker key — the only copy whose
+    /// deletion lifts it. The test then deletes exactly the key the
+    /// message names and proves the next pod re-runs the supply stage and
+    /// completes. (This soak is the gate for the auto-invalidation
+    /// follow-up at the bail site.) The wired-topup wirings no longer
+    /// refuse here at all: their resume rebuilds the delivery context —
+    /// see `inline_resume_rebuilds_the_delivery_context_and_completes`
+    /// and `campaign_completes_across_pod_reschedule_with_artifact_restore`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn inline_resume_across_pod_reschedule_refuses_with_durable_remedy() {
+    async fn prewarm_none_resume_across_pod_reschedule_refuses_with_durable_remedy() {
         let (_archive_dir, archive, archive_id) = open_mini_archive();
         let manifest = load_units(&archive).unwrap();
         let app_a = manifest
@@ -5614,15 +6193,16 @@ mod tests {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(artifact::LocalDirArtifactStore::new(store_dir.path()));
         let inline_spec = || {
-            let mut spec = leaf_spec(&archive_id);
+            let mut spec = self_hosted_spec(&archive_id);
             spec.supply.delivery = SupplyDelivery::Inline;
             spec
         };
 
-        // Pod 1: the supply stage completes by deferring every planned
-        // upload to the inline top-up; the deadline stops the run before
-        // anything is submitted, and the end-of-run sync pushes the state
-        // — deferral journal and supply marker included — to the store.
+        // Pod 1: the self-hosted inline stage completes by deferring every
+        // planned upload to the inline top-up; the deadline stops the run
+        // before anything is submitted, and the end-of-run sync pushes the
+        // state — deferral journal and supply marker included — to the
+        // store.
         let dir_a = tempfile::tempdir().unwrap();
         let mut args = run_args(dir_a.path());
         args.deadline = Some("2000-01-01T00:00:00Z".into());
@@ -5637,12 +6217,14 @@ mod tests {
         .unwrap();
         assert!(submitter.submitted.lock().unwrap().is_empty());
 
-        // Pod 2: FRESH state dir. The restore resurrects the marker before
-        // the gate runs — the refusal must fire and name the durable key.
+        // Pod 2: FRESH state dir, spec switched to prewarm (dependencies
+        // "none" → no top-up wired, nothing can redeem the deferrals).
+        // The restore resurrects the marker before the gate runs — the
+        // refusal must fire and name the durable key.
         let dir_b = tempfile::tempdir().unwrap();
         let err = run_with_backends(
             run_args(dir_b.path()),
-            inline_spec(),
+            self_hosted_spec(&archive_id),
             StateDir::new(dir_b.path()).unwrap(),
             archive.clone(),
             resume_backends_with_store(&submitter, &supply_transport, &narinfos, &store),
@@ -5654,27 +6236,10 @@ mod tests {
             StateDir::new(dir_b.path()).unwrap().marker_done("supply"),
             "the restore re-materialized the supply marker before the gate"
         );
+        assert!(msg.contains("supply.delivery \"inline\""), "{msg}");
         assert!(
             msg.contains("artifact store"),
             "with a store wired the remediation must target the durable copy: {msg}"
-        );
-        // Pod 2b: the operator switches the spec to prewarm and the Job is
-        // relaunched — yet another fresh pod. The restored marker and
-        // deferral journal must still refuse (the wiring changed; what the
-        // completed stage failed to deliver did not).
-        let dir_b2 = tempfile::tempdir().unwrap();
-        let err2 = run_with_backends(
-            run_args(dir_b2.path()),
-            leaf_spec(&archive_id),
-            StateDir::new(dir_b2.path()).unwrap(),
-            archive.clone(),
-            resume_backends_with_store(&submitter, &supply_transport, &narinfos, &store),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            format!("{err2:#}").contains("supply.delivery \"inline\""),
-            "{err2:#}"
         );
         assert!(
             submitter.submitted.lock().unwrap().is_empty(),
@@ -5693,14 +6258,14 @@ mod tests {
         std::fs::remove_file(store_dir.path().join(durable_key)).unwrap();
 
         // Pod 3: fresh dir again. No durable marker → the supply stage
-        // re-runs (resume costs re-probing, never correctness), rebuilds
-        // the delivery context, and the campaign completes — with every
-        // batch carrying its delivery proof.
+        // re-runs (resume costs re-probing, never correctness) under the
+        // prewarm spec, delivering the previously deferred uploads BEFORE
+        // execution, and the campaign completes without a top-up.
         script_apps_built(&submitter, &app_a.drv_path, &app_b.drv_path);
         let dir_c = tempfile::tempdir().unwrap();
         run_with_backends(
             run_args(dir_c.path()),
-            inline_spec(),
+            self_hosted_spec(&archive_id),
             StateDir::new(dir_c.path()).unwrap(),
             archive.clone(),
             resume_backends_with_store(&submitter, &supply_transport, &narinfos, &store),
@@ -5717,13 +6282,6 @@ mod tests {
             records["appB.x86_64-linux"].verdict.as_deref(),
             Some("match-built")
         );
-        let batches = state_c
-            .load_jsonl::<model::BatchRecord>(StateFile::Batches)
-            .unwrap();
-        assert!(
-            !batches.is_empty() && batches.iter().all(|b| b.topup_delivered),
-            "every batch of the re-run campaign carries its top-up delivery proof: {batches:?}"
-        );
         let journal = state_c
             .load_jsonl::<SupplyEntry>(StateFile::Supply)
             .unwrap();
@@ -5731,7 +6289,7 @@ mod tests {
             model::SupplyFold::collapse(&journal)
                 .outstanding_inline_deferrals()
                 .is_empty(),
-            "the re-run stage and its per-batch top-ups redeemed every deferral"
+            "the re-run prewarm stage delivered every previously deferred upload"
         );
         artifact::assert_state_dir_files_classified(&state_c);
     }
@@ -7467,10 +8025,12 @@ mod tests {
         );
         assert_eq!(
             prod.matches(liveness.as_str()).count(),
-            4,
+            5,
             "liveness consumers: the inline-resume gate, the submit loop's terminal set, \
-             the stall already-terminal guard, and the in-scope progress count; a new \
-             consumer must pick its projection deliberately and join this enumeration"
+             the stall already-terminal guard, the in-scope progress count, and the \
+             resume rebuild's work-remains scoping (all asking \"needs no more \
+             offers\"); a new consumer must pick its projection deliberately and join \
+             this enumeration"
         );
     }
 
