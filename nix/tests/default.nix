@@ -1225,6 +1225,13 @@ in
   #   fod-s3-origin subtest: an s3:// origin is skipped per-candidate
   #   and the build succeeds via the hashed mirror; a regression to the
   #   whole-fetch bail fails the build before the mirror is consulted.
+  # r[verify fetcher.mirrors.admission-accept-set]
+  #   mirror-admission-reject subtest: server-side dry-run against the
+  #   real apiserver (the real cel-go evaluator + cost budget) rejects
+  #   an s3:// mirror and an NBSP mirror with the accept-set message,
+  #   and accepts an in-set control. End-to-end witness that admission
+  #   enforces the single-source pattern — YAML drift is not
+  #   acceptance evidence (r16 CEL cost-budget lesson).
   vm-fetcher-split-k3s = fetcher-split {
     inherit pkgs common drvs;
     fixture = k3sFull {

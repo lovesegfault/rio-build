@@ -81,7 +81,7 @@ impl ExecutorKind {
 ///   inside the set every transport layer treats identically leaves
 ///   no rune/byte split-semantics gap to audit.
 ///
-/// The character class `[-!-+.-~]` is `-` ∪ `!`..`+` ∪ `.`..`~` =
+/// The character class (dash, then bang..plus, then dot..tilde) is
 /// printable ASCII minus comma. The pattern bytes contain no
 /// backslash and no quote, so the SAME bytes embed verbatim in a
 /// Rust literal, a CEL single-quoted string, and the generated YAML
@@ -762,7 +762,7 @@ mod tests {
             );
         }
 
-        // Class-boundary pins (the [-!-+.-~] union edges).
+        // Class-boundary pins (the union edges of the class).
         for (s, expect) in [
             ("https://x!y", true),       // 0x21 lower edge
             ("https://x+y", true),       // 0x2b upper edge of !-+

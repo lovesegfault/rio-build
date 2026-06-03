@@ -1343,4 +1343,52 @@ in
         [ "$fail" = 0 ] || exit 1
         touch $out
       '';
+
+  # r17 merged_bug_003 (RC17-14): the hashedMirrors admission pattern
+  # is single-sourced in rio-crds — the distinctive accept-set class
+  # bytes may appear ONLY in the defining file (exactly once: the
+  # macro body) and the generated CRD YAML. A copy anywhere else
+  # re-creates the three-spellings drift this check exists to kill;
+  # consumers import rio_crds::pool::{HASHED_MIRROR_URL_PATTERN,
+  # hashed_mirror_entry_admissible} instead. Fixed-string grep — the
+  # pattern bytes contain no quote or backslash by design, so -F
+  # needs no escaping at any quoting layer.
+  mirror-pattern-single-source =
+    pkgs.runCommand "rio-mirror-pattern-single-source"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../.;
+          fileset = pkgs.lib.fileset.unions [
+            workspaceFileset
+            ../docs/spec
+            ../nix
+            ../infra
+            ../.config
+          ];
+        };
+      }
+      ''
+        cd $src
+        # The needle is assembled from two halves so THIS file never
+        # contains the contiguous pattern bytes (the check would
+        # otherwise flag itself).
+        needle='[-!-+'
+        needle="$needle"'.-~]'
+        hits=$(grep -rlF -- "$needle" . | LC_ALL=C sort)
+        allowed=$(printf '%s\n' ./infra/helm/crds/pools.rio.build.yaml ./rio-crds/src/pool.rs)
+        if [ "$hits" != "$allowed" ]; then
+          echo "FAIL: hashedMirrors accept-set pattern bytes found outside the single source:" >&2
+          echo "$hits" >&2
+          echo "remediation: import rio_crds::pool::{HASHED_MIRROR_URL_PATTERN, hashed_mirror_entry_admissible}" >&2
+          echo "(allowlist lives in nix/misc-checks.nix mirror-pattern-single-source)" >&2
+          exit 1
+        fi
+        n=$(grep -cF -- "$needle" rio-crds/src/pool.rs)
+        if [ "$n" != "1" ]; then
+          echo "FAIL: expected exactly 1 pattern literal in rio-crds/src/pool.rs (the macro body), found $n" >&2
+          echo "build derived strings from hashed_mirror_url_pattern!/HASHED_MIRROR_URL_PATTERN, never a second literal" >&2
+          exit 1
+        fi
+        touch $out
+      '';
 }

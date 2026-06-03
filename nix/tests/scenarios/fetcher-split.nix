@@ -501,6 +501,61 @@ pkgs.testers.runNixOSTest {
         print("dispatch PASS: FOD→fetcher, consumer→builder")
 
     # ══════════════════════════════════════════════════════════════════
+    # mirror-admission-reject — the CEL accept-set at the apiserver
+    # ══════════════════════════════════════════════════════════════════
+    # r17 merged_bug_003: the hashedMirrors accept-set is single-sourced
+    # from the terminal fetch consumers. Out-of-set entries — a scheme
+    # the candidate loop skips (s3://) or bytes the env transports
+    # mangle (NBSP) — must die at the apiserver, not in fetch latency.
+    # Server-side dry-run = the real cel-go evaluator with the real
+    # cost budget (r16 lesson: YAML drift is not acceptance evidence —
+    # an over-budget rule rejects the whole CRD at apply). The accept
+    # control doubles as the cost-budget witness for THIS rule.
+    # NBSP enters via printf escapes only — never raw bytes in source.
+    with subtest("mirror-admission-reject: CEL rejects out-of-accept-set mirrors"):
+        head = (
+            "apiVersion: rio.build/v1alpha1\\nkind: Pool\\n"
+            "metadata: {name: mirror-admission-probe, namespace: ${nsFetchers}}\\n"
+            "spec: {kind: Builder, image: probe, systems: [x86_64-linux], "
+        )
+        # s3:// — scheme outside the candidate loop's set.
+        k3s_server.succeed(
+            f"printf '{head}hashedMirrors: [s3://bucket/prefix]}}\\n' "
+            "> /tmp/pool-s3.yaml"
+        )
+        out = k3s_server.fail(
+            "k3s kubectl apply --dry-run=server -f /tmp/pool-s3.yaml 2>&1"
+        )
+        assert "must be http(s) URLs of printable ASCII" in out, (
+            f"s3 mirror rejection missing the accept-set message: {out!r}"
+        )
+        # NBSP (U+00A0, bytes c2 a0) — outside printable ASCII; the r16
+        # CEL class admitted it and the reconciler then dropped it.
+        k3s_server.succeed(
+            "printf 'https://m.example/a\\xc2\\xa0b' > /tmp/nbsp-url"
+        )
+        k3s_server.succeed(
+            f"{{ printf '{head}hashedMirrors: [\"'; cat /tmp/nbsp-url; "
+            "printf '\"]}\\n'; } > /tmp/pool-nbsp.yaml"
+        )
+        out = k3s_server.fail(
+            "k3s kubectl apply --dry-run=server -f /tmp/pool-nbsp.yaml 2>&1"
+        )
+        assert "must be http(s) URLs of printable ASCII" in out, (
+            f"NBSP mirror rejection missing the accept-set message: {out!r}"
+        )
+        # Accept control: an in-set mirror list dry-runs clean (and
+        # witnesses the rule fits the apiserver's CEL cost budget).
+        k3s_server.succeed(
+            f"printf '{head}hashedMirrors: [https://tarballs.nixos.org/]}}\\n' "
+            "> /tmp/pool-ok.yaml"
+        )
+        k3s_server.succeed(
+            "k3s kubectl apply --dry-run=server -f /tmp/pool-ok.yaml"
+        )
+        print("mirror-admission-reject PASS: s3 + NBSP rejected, control accepted")
+
+    # ══════════════════════════════════════════════════════════════════
     # fod-dead-origin — hashed-mirrors fallback for flat-hash FODs
     # ══════════════════════════════════════════════════════════════════
     # Origin URL is a 404 path on upstream-v4; the ONLY way this build
