@@ -276,16 +276,32 @@ pub(crate) enum UploadOrder {
     Data,
     /// A file whose content vouches for other synced files (a stage
     /// done-marker; `collected.json`, the processed-batch index over
-    /// results.jsonl and requeues.jsonl): uploaded after EVERY data file
-    /// in the tick. A certifier visible in the store before its data
-    /// would let a crash mid-tick strand a restored campaign trusting a
-    /// claim whose evidence never reached the store — a marker without
-    /// its stage output, or a processed-batch set whose terminal records
-    /// and requeue-journal lines are missing (verdicts silently lost to
-    /// re-execution, consumed retry budgets re-granted by the short
-    /// journal fold). The reverse skew (data newer than the certifier) is
-    /// the tolerated conservative direction: at worst a settled batch is
-    /// re-processed from its own records.
+    /// results.jsonl and requeues.jsonl): its BYTES are snapshotted
+    /// before any data file is read, and the snapshot is uploaded after
+    /// EVERY data file in the tick. Both halves serve one invariant — a
+    /// certifier must never vouch, in the store, for data the store does
+    /// not hold:
+    ///
+    /// - PUT order (data first, certifier last) covers the crash-mid-
+    ///   tick direction: a marker without its stage output, or a
+    ///   processed-batch set whose terminal records and requeue-journal
+    ///   lines are missing (verdicts silently lost to re-execution,
+    ///   consumed retry budgets re-granted by the short journal fold).
+    /// - Capture order (certifier bytes first, data reads after) covers
+    ///   the concurrent-writer direction: collect appends journal rows
+    ///   first and rewrites collected.json last, so a commit landing
+    ///   between a read-at-PUT-time journal upload and the certifier
+    ///   upload would ship a certifier listing a batch whose rows the
+    ///   uploaded journals lack — the same inversion through capture
+    ///   timing instead of PUT order.
+    ///
+    /// The restore direction consumes the same column inverted:
+    /// [`download_state_if_missing`] fetches certifiers FIRST, so under
+    /// a concurrently-syncing writer (an unfenced replaced pod's zombie)
+    /// a restored certifier is never newer than the data fetched after
+    /// it. The tolerated skew is always data-newer-than-certifier, the
+    /// conservative direction: at worst a settled batch is re-processed
+    /// from its own records.
     Certifier,
 }
 
@@ -456,6 +472,10 @@ pub(crate) fn assert_state_dir_files_classified(state: &StateDir) {
     );
 }
 
+/// `(length, mtime)` change signature of one state file — see
+/// [`SyncTracker`].
+type FileSig = (u64, Option<std::time::SystemTime>);
+
 /// Tracks the last-synced `(length, mtime)` signature per file so
 /// unchanged files are not re-uploaded. The JSONL streams are
 /// append-only and the JSON documents are full rewrites, so a changed
@@ -465,7 +485,7 @@ pub(crate) fn assert_state_dir_files_classified(state: &StateDir) {
 /// moves either signal.
 #[derive(Debug, Default)]
 pub struct SyncTracker {
-    last_sig: HashMap<String, (u64, Option<std::time::SystemTime>)>,
+    last_sig: HashMap<String, FileSig>,
 }
 
 /// Upload changed state files to `<prefix>/<campaign-id>/<rel>`.
@@ -522,8 +542,36 @@ pub async fn sync_state(
         _ => 0u8,
     };
     rels.sort_by(|a, b| (upload_order(a), a).cmp(&(upload_order(b), b)));
+    // Certifier CONTENT is captured before any data file is read (and
+    // uploaded last): PUT order alone covers only the crash-mid-tick
+    // direction. The bytes used to be read at upload time, so a
+    // concurrent collect commit — journal rows appended first,
+    // collected.json rewritten last, exactly the protocol the manifest
+    // documents — landing between the journal PUTs and the certifier
+    // PUT shipped a certifier listing a batch whose rows the uploaded
+    // journals lack: resume then skips that batch over its missing
+    // records. Snapshotting first makes the uploaded certifier
+    // at-least-as-old as every uploaded data file's content (the
+    // [`UploadOrder::Certifier`] conservative direction). The
+    // SNAPSHOT's signature is what the tracker records, so a rewrite
+    // landing after the snapshot re-uploads on the next tick.
+    let mut certifier_snapshots: Vec<(String, FileSig, Vec<u8>)> = Vec::new();
+    for rel in rels.iter().filter(|rel| upload_order(rel) == 1) {
+        let path = state.path(rel);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let sig = (meta.len(), meta.modified().ok());
+        if tracker.last_sig.get(rel.as_str()) == Some(&sig) {
+            continue;
+        }
+        let bytes = tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("read {}", path.display()))?;
+        certifier_snapshots.push((rel.clone(), sig, bytes));
+    }
     let mut uploaded = 0;
-    for rel in &rels {
+    for rel in rels.iter().filter(|rel| upload_order(rel) == 0) {
         let path = state.path(rel);
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;
@@ -541,16 +589,25 @@ pub async fn sync_state(
         tracker.last_sig.insert(rel.clone(), sig);
         uploaded += 1;
     }
+    for (rel, sig, bytes) in certifier_snapshots {
+        store
+            .put_bytes(&format!("{prefix}/{campaign_id}/{rel}"), bytes)
+            .await?;
+        tracker.last_sig.insert(rel, sig);
+        uploaded += 1;
+    }
     Ok(uploaded)
 }
 
 /// Resume support: if the local state dir has no campaign.json but the
-/// store does, download the synced state files so resume can proceed
-/// after a pod reschedule wiped the local volume. Returns true when a
-/// campaign was restored from the store. The local campaign.json doubles
-/// as the restore-complete sentinel and is written last, so a restore
-/// that fails partway leaves no sentinel and is retried in full on the
-/// next start. `buckets/*.jsonl` and
+/// store does, download the synced state files — certifiers first, data
+/// after, per the [`UploadOrder`] column inverted (see the ordering
+/// comment in the body) — so resume can proceed after a pod reschedule
+/// wiped the local volume. Returns true when a campaign was restored
+/// from the store. The local campaign.json doubles as the
+/// restore-complete sentinel and is written last, so a restore that
+/// fails partway leaves no sentinel and is retried in full on the next
+/// start. `buckets/*.jsonl` and
 /// `logs/*.log.zst` are uploaded by [`sync_state`] but not restored here —
 /// the report stage regenerates the bucket files from results.jsonl, and
 /// the job records already carry their log keys (the local log copies are
@@ -570,7 +627,29 @@ pub async fn download_state_if_missing(
     else {
         return Ok(false);
     };
-    for rel in synced_files().filter(|r| *r != "campaign.json") {
+    // Certifiers are fetched FIRST — the [`UploadOrder`] column inverted
+    // (the upload side captures certifiers first and PUTs them last;
+    // both ends of the pipe consume the same table). Restore can race a
+    // concurrently-syncing writer (the unfenced k8s Job model: a
+    // partitioned node's zombie pod keeps syncing while its replacement
+    // restores), and each sync tick PUTs data before its certifier —
+    // so fetching a certifier first bounds its claims by some tick N,
+    // and every data file fetched after it is at-least tick N's (the
+    // certifier's evidence was durably PUT before the certifier was).
+    // Fetching certifiers last took the newest certifier over older
+    // data: a marker vouching for stage data the restored volume does
+    // not hold, or a processed-batch set whose journal rows are
+    // missing. The tolerated direction is data-newer-than-certifier:
+    // at worst a settled batch re-processes from its own records.
+    let restore_order = |rel: &str| match sync_policy(rel) {
+        Some(SyncPolicy::Synced {
+            order: UploadOrder::Certifier,
+        }) => 0u8,
+        _ => 1u8,
+    };
+    let mut rels: Vec<&'static str> = synced_files().filter(|r| *r != "campaign.json").collect();
+    rels.sort_by(|a, b| (restore_order(a), *a).cmp(&(restore_order(b), *b)));
+    for rel in rels {
         if let Some(bytes) = store
             .get_bytes(&format!("{prefix}/{campaign_id}/{rel}"))
             .await?
@@ -585,8 +664,10 @@ pub async fn download_state_if_missing(
     // are idempotent overwrites); a sentinel written first would make a
     // partial restore look complete, resume the campaign on near-empty state,
     // and let the periodic sync overwrite the durable store copies with that
-    // empty state. Mirrors the data-before-markers ordering [`sync_state`]
-    // enforces in the upload direction. The write itself is atomic (tmp +
+    // empty state. The campaign.json probe-first/sentinel-last special
+    // case sits outside the certifier-first loop above: its bytes are
+    // fetched before everything (the existence probe) and written after
+    // everything (the completion gate). The write itself is atomic (tmp +
     // fsync + rename, the state dir's JSON-document discipline): a torn
     // sentinel would exist-but-not-parse, skipping the retry that heals it
     // and crash-looping resume on an unreadable campaign.json instead.
@@ -810,10 +891,22 @@ mod tests {
         assert!(!missing_dest.exists());
     }
 
-    /// [`ArtifactStore`] wrapper that records the order of uploaded keys.
+    /// [`ArtifactStore`] wrapper that records the order of uploaded and
+    /// fetched keys.
     struct RecordingStore {
         inner: LocalDirArtifactStore,
         puts: std::sync::Mutex<Vec<String>>,
+        gets: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingStore {
+        fn new(root: &Path) -> Self {
+            Self {
+                inner: LocalDirArtifactStore::new(root),
+                puts: std::sync::Mutex::new(Vec::new()),
+                gets: std::sync::Mutex::new(Vec::new()),
+            }
+        }
     }
 
     #[async_trait]
@@ -824,6 +917,7 @@ mod tests {
         }
 
         async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.gets.lock().unwrap().push(key.to_string());
             self.inner.get_bytes(key).await
         }
 
@@ -854,10 +948,7 @@ mod tests {
         let sdir = tempfile::tempdir().unwrap();
         let adir = tempfile::tempdir().unwrap();
         let state = StateDir::new(sdir.path()).unwrap();
-        let store = RecordingStore {
-            inner: LocalDirArtifactStore::new(adir.path()),
-            puts: std::sync::Mutex::new(Vec::new()),
-        };
+        let store = RecordingStore::new(adir.path());
         let mut tracker = SyncTracker::default();
 
         // Every Synced manifest entry, written from the manifest iteration
@@ -927,6 +1018,254 @@ mod tests {
             assert!(
                 position(journal) < position("collected.json"),
                 "collected.json must upload after {journal}: {rels:?}"
+            );
+        }
+    }
+
+    /// [`ArtifactStore`] wrapper that plays the concurrent collector:
+    /// during the FIRST `results.jsonl` PUT it commits a batch the
+    /// production way (journal rows appended first, collected.json
+    /// rewritten last) into the live state dir. Models a collect pass
+    /// landing inside the sync tick's upload window.
+    struct CommitDuringSyncStore {
+        inner: LocalDirArtifactStore,
+        state_root: PathBuf,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl ArtifactStore for CommitDuringSyncStore {
+        async fn put_bytes(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
+            if key.ends_with("/results.jsonl")
+                && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                use std::io::Write as _;
+                // The collect protocol's write order: rows first ...
+                let mut results = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(self.state_root.join("results.jsonl"))
+                    .unwrap();
+                results.write_all(b"{\"job\":\"batch9-member\"}\n").unwrap();
+                let mut requeues = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(self.state_root.join("requeues.jsonl"))
+                    .unwrap();
+                requeues
+                    .write_all(b"{\"job\":\"batch9-member\",\"source\":\"collect\"}\n")
+                    .unwrap();
+                // ... the certifier last.
+                std::fs::write(self.state_root.join("collected.json"), b"[9]").unwrap();
+            }
+            self.inner.put_bytes(key, bytes).await
+        }
+
+        async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get_bytes(key).await
+        }
+
+        async fn get_to_file(&self, key: &str, dest: &Path) -> Result<Option<(String, u64)>> {
+            self.inner.get_to_file(key, dest).await
+        }
+
+        async fn exists(&self, key: &str) -> Result<bool> {
+            self.inner.exists(key).await
+        }
+    }
+
+    /// The capture-order half of the [`UploadOrder::Certifier`]
+    /// invariant, under a CONCURRENT collect commit (PUT order alone is
+    /// pinned by `sync_uploads_certifiers_after_every_data_file`; this
+    /// pins WHEN the bytes are read): a commit landing mid-tick — rows
+    /// appended, collected.json rewritten to claim batch 9 — must not
+    /// leak into the tick's uploaded certifier, because the uploaded
+    /// journals were read before the commit's rows. Pre-fix, certifier
+    /// bytes were read at PUT time (after the data PUTs the commit
+    /// interleaved with), so the store held collected.json=[9] next to
+    /// journals without batch 9's rows: restore seeds the processed set
+    /// from the certifier and permanently skips the batch over its
+    /// missing records. Second half: the post-snapshot rewrite is not
+    /// lost — the tracker recorded the SNAPSHOT's signature, so the
+    /// next tick re-uploads certifier and journals together and the
+    /// store converges to the committed state.
+    #[tokio::test]
+    async fn concurrent_commit_cannot_outrun_the_certifier_snapshot() {
+        let sdir = tempfile::tempdir().unwrap();
+        let adir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(sdir.path()).unwrap();
+        let store = CommitDuringSyncStore {
+            inner: LocalDirArtifactStore::new(adir.path()),
+            state_root: sdir.path().to_path_buf(),
+            fired: std::sync::atomic::AtomicBool::new(false),
+        };
+        let mut tracker = SyncTracker::default();
+
+        state
+            .write_json_atomic("campaign.json", &serde_json::json!({"campaignId": "c1"}))
+            .unwrap();
+        state
+            .write_bytes("results.jsonl", b"{\"job\":\"a\"}\n")
+            .unwrap();
+        state
+            .write_bytes(
+                "requeues.jsonl",
+                b"{\"job\":\"a\",\"source\":\"collect\"}\n",
+            )
+            .unwrap();
+        state.write_bytes("collected.json", b"[]").unwrap();
+
+        sync_state(&state, &store, "replay/campaigns", "c1", &mut tracker)
+            .await
+            .unwrap();
+        // The uploaded certifier must be the pre-commit snapshot: the
+        // uploaded journals lack batch 9's rows (read before the
+        // commit), so a certifier claiming batch 9 would be the
+        // forbidden inversion.
+        assert_eq!(
+            store
+                .inner
+                .get_bytes("replay/campaigns/c1/collected.json")
+                .await
+                .unwrap()
+                .unwrap(),
+            b"[]",
+            "the uploaded certifier must not list a batch whose rows the uploaded journals lack"
+        );
+        let uploaded_results = store
+            .inner
+            .get_bytes("replay/campaigns/c1/results.jsonl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !String::from_utf8(uploaded_results)
+                .unwrap()
+                .contains("batch9-member"),
+            "the journals were read before the commit's rows landed"
+        );
+
+        // Next tick (no further mutation): the snapshot signature is
+        // stale against the rewritten file, so certifier AND journals
+        // re-upload and the store converges on the committed state.
+        let n = sync_state(&state, &store, "replay/campaigns", "c1", &mut tracker)
+            .await
+            .unwrap();
+        assert!(
+            n >= 3,
+            "rewritten certifier and grown journals re-upload: {n}"
+        );
+        assert_eq!(
+            store
+                .inner
+                .get_bytes("replay/campaigns/c1/collected.json")
+                .await
+                .unwrap()
+                .unwrap(),
+            b"[9]"
+        );
+        let uploaded_results = store
+            .inner
+            .get_bytes("replay/campaigns/c1/results.jsonl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            String::from_utf8(uploaded_results)
+                .unwrap()
+                .contains("batch9-member"),
+            "the next tick ships the committed rows with their certifier"
+        );
+    }
+
+    /// Restore-direction ordering pin, derived from [`STATE_DIR_MANIFEST`]
+    /// like its upload twin (`sync_uploads_certifiers_after_every_data_file`):
+    /// every Synced manifest entry is seeded in the store, and the GET
+    /// order must fetch the campaign.json probe first, then every
+    /// certifier before every data file — the [`UploadOrder`] column
+    /// inverted. Under a concurrently-syncing zombie writer (which PUTs
+    /// data before certifiers each tick) certifier-first bounds every
+    /// restored certifier's claims by the data fetched after it; the
+    /// pre-fix manifest-order loop fetched markers LAST (newest), the
+    /// unsafe direction, while fetching collected.json before its
+    /// journals — internally inconsistent.
+    #[tokio::test]
+    async fn restore_fetches_certifiers_before_data() {
+        let adir = tempfile::tempdir().unwrap();
+        let store = RecordingStore::new(adir.path());
+        for rel in synced_files() {
+            store
+                .inner
+                .put_bytes(&format!("replay/campaigns/c1/{rel}"), b"x\n".to_vec())
+                .await
+                .unwrap();
+        }
+        store
+            .inner
+            .put_bytes(
+                "replay/campaigns/c1/campaign.json",
+                b"{\"campaignId\":\"c1\"}".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let sdir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(sdir.path()).unwrap();
+        let restored = download_state_if_missing(&state, &store, "replay/campaigns", "c1")
+            .await
+            .unwrap();
+        assert!(restored);
+
+        let rels: Vec<String> = store
+            .gets
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|k| {
+                k.strip_prefix("replay/campaigns/c1/")
+                    .expect("gets are keyed under the campaign prefix")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            rels.first().map(String::as_str),
+            Some("campaign.json"),
+            "the existence probe leads: {rels:?}"
+        );
+        let body = &rels[1..];
+        assert_eq!(
+            body.len(),
+            synced_files().count() - 1,
+            "every non-probe synced file is fetched exactly once: {rels:?}"
+        );
+        let is_certifier = |rel: &str| {
+            matches!(
+                sync_policy(rel),
+                Some(SyncPolicy::Synced {
+                    order: UploadOrder::Certifier
+                })
+            )
+        };
+        let last_certifier = body
+            .iter()
+            .rposition(|r| is_certifier(r))
+            .expect("the manifest declares certifiers");
+        let first_data = body
+            .iter()
+            .position(|r| !is_certifier(r))
+            .expect("the manifest declares data files");
+        assert!(
+            last_certifier < first_data,
+            "every certifier must be fetched before every data file: {rels:?}"
+        );
+        // The certification edges, mirrored from the upload pin.
+        let position = |rel: &str| {
+            body.iter()
+                .position(|r| r == rel)
+                .unwrap_or_else(|| panic!("{rel} was not fetched: {rels:?}"))
+        };
+        for journal in ["batches.jsonl", "requeues.jsonl", "results.jsonl"] {
+            assert!(
+                position("collected.json") < position(journal),
+                "collected.json must restore before {journal}: {rels:?}"
             );
         }
     }
