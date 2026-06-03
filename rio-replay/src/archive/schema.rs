@@ -455,7 +455,11 @@ pub struct OutcomeRecord {
 }
 
 /// Expected NAR identity of one output of a `built` outcome.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Ordering is digest bytes then size — content identity, arbitrary but
+/// total, for deterministic content-keyed tiebreaks (the truth-collapse
+/// within-rank pick); never a semantic judgment between two hashes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct OutputHash {
     /// SHA-256 of the uncompressed NAR. The wire field is `nar_hash_hex` and
     /// writers emit lowercase hex per the format specification; loading goes

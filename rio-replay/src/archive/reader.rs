@@ -20,7 +20,8 @@ use rio_nix::narinfo::NarInfo;
 use super::backend::{Backend, WalkEntry};
 use super::schema::{
     Capabilities, Capability, ClosureRecord, Counts, ExclusionRecord, ExpectedOutcome, ImpureEnv,
-    Manifest, MemberPresence, OutcomeRecord, RequestRecord, SessionKey, Substituters, UnitRecord,
+    Manifest, MemberPresence, OutcomeRecord, OutputHash, RequestRecord, SessionKey, Substituters,
+    UnitRecord,
 };
 use super::{
     CLOSURES_MEMBER, EXCLUSIONS_MEMBER, IMPURE_ENV_MEMBER, MANIFEST_MEMBER, METADATA_MEMBERS,
@@ -668,24 +669,30 @@ impl ReplayArchive {
     /// authority — it explicitly applies to any request of the unit);
     /// otherwise the scoped record of the highest informativeness rank
     /// (`informativeness_rank` below — the design doc's expected-outcome
-    /// vocabulary carries the same table), with the highest-numbered
-    /// session breaking ties WITHIN a rank class only.
+    /// vocabulary carries the same table), with ties WITHIN a rank class
+    /// resolved by record content (the [`consumed_truth`] ordering:
+    /// outcome, then recorded output hashes) and the highest-numbered
+    /// session deciding only between records whose consumed truth is
+    /// identical.
     ///
-    /// Session ids must never decide between rank classes: they are opaque
-    /// grouping keys whose allocation order carries no truth ordering (the
-    /// committed v0 production fixture allocates them out of capture
-    /// order), and for overlapping sessions even capture order says
-    /// nothing — the earlier session's build can complete after the later
-    /// session's disconnect. A `built` record discarded in favor of a
-    /// concurrent `disconnected` one would silently drop a truly-built
-    /// unit from the parity denominator, with the choice flipping under
-    /// session relabeling.
+    /// Session ids must never decide consumed truth — between rank
+    /// classes or within one: they are opaque grouping keys whose
+    /// allocation order carries no truth ordering (the committed v0
+    /// production fixture allocates them out of capture order), and for
+    /// overlapping sessions even capture order says nothing — the earlier
+    /// session's build can complete after the later session's disconnect.
+    /// A `built` record discarded in favor of a concurrent `disconnected`
+    /// one would silently drop a truly-built unit from the parity
+    /// denominator — and two `built` records with conflicting hashes
+    /// resolved by session id would flip the unit's NAR-comparison
+    /// baseline — with the choice flipping under session relabeling.
     ///
-    /// Scoped records that disagree with the chosen outcome are logged
-    /// here, and the per-unit conflict count is surfaced in the report's
-    /// comparability block ([`ReplayArchive::truth_collapse_conflicts`]) —
-    /// the collapse is losing information the timeless engine cannot
-    /// represent, and the operator must be able to see how much.
+    /// Scoped records whose consumed truth disagrees with the chosen
+    /// record's are logged here, and the per-unit conflict count is
+    /// surfaced in the report's comparability block
+    /// ([`ReplayArchive::truth_collapse_conflicts`]) — the collapse is
+    /// losing information the timeless engine cannot represent, and the
+    /// operator must be able to see how much.
     pub fn expected_outcome_across_sessions(&self, drv: &str) -> Option<&OutcomeRecord> {
         let by_session = self.outcomes.get(drv)?;
         if let Some(record) = by_session.get(&None) {
@@ -694,7 +701,7 @@ impl ReplayArchive {
         let record = collapse_scoped(by_session)?;
         let disagreeing: Vec<i64> = by_session
             .iter()
-            .filter(|(_, other)| other.outcome != record.outcome)
+            .filter(|(_, other)| consumed_truth(other) != consumed_truth(record))
             .filter_map(|(session, _)| *session)
             .collect();
         if !disagreeing.is_empty() {
@@ -703,20 +710,26 @@ impl ReplayArchive {
                 chosen_session = record.session.unwrap_or_default(),
                 chosen_outcome = record.outcome.as_str(),
                 ?disagreeing,
-                "collapsing session-scoped truth by informativeness rank over sessions that \
-                 recorded a different outcome; the unit counts as a truth-collapse conflict in \
-                 the comparability block"
+                "collapsing session-scoped truth over sessions whose records disagree on the \
+                 consumed truth (outcome or recorded output hashes); the unit counts as a \
+                 truth-collapse conflict in the comparability block"
             );
         }
         Some(record)
     }
 
     /// Workload units whose session-scoped truth records disagree on the
-    /// outcome, with no session-less record to supersede them — exactly
-    /// the units whose one truth slot the scoped collapse had to resolve
-    /// by rank, discarding recorded information. Surfaced in the report's
-    /// comparability block so collapse-resolved truth is visible next to
-    /// the headline it shapes, not only in engine logs.
+    /// CONSUMED truth — the outcome enum or the recorded output hashes
+    /// ([`consumed_truth`]) — with no session-less record to supersede
+    /// them: exactly the units whose one truth slot the scoped collapse
+    /// had to resolve by rank or content order, discarding recorded
+    /// information. Surfaced in the report's comparability block so
+    /// collapse-resolved truth is visible next to the headline it shapes,
+    /// not only in engine logs. Comparing the projection (not just the
+    /// outcome enum) is what makes a hash-conflicted pair of `built`
+    /// records count: those conflicts silently flip the unit's
+    /// NAR-comparison baseline, the one collapse axis a bare outcome
+    /// comparison cannot see.
     ///
     /// Gated on the `expected_outcomes` capability INSIDE the owner, like
     /// every other outcomes-as-truth consumer (`Capability::gates()`:
@@ -747,9 +760,9 @@ impl ReplayArchive {
                     if by_session.contains_key(&None) {
                         return false;
                     }
-                    let mut outcomes = by_session.values().map(|record| record.outcome);
-                    let first = outcomes.next();
-                    outcomes.any(|outcome| Some(outcome) != first)
+                    let mut truths = by_session.values().map(consumed_truth);
+                    let first = truths.next();
+                    truths.any(|truth| Some(truth) != first)
                 })
                 .count(),
         )
@@ -947,18 +960,71 @@ fn informativeness_rank(record: &OutcomeRecord) -> u8 {
     }
 }
 
-/// The scoped half of the collapse rule: the record of the highest
-/// [`informativeness_rank`], with the highest session breaking ties within
-/// a rank class (`BTreeMap` iterates sessions ascending and `max_by_key`
-/// keeps the LAST maximum). Callers resolve the session-less record first;
-/// this function only ever sees scoped disagreement.
+/// The consumed-truth projection of one outcome record: exactly the
+/// fields the timeless collapse's consumer reads off the chosen record
+/// (`run::truth::expected_outcomes_for_units` copies `outcome` and
+/// `outputs` into the comparison baseline; nothing else of a collapsed
+/// record is consumed). This projection is the ONE unit of equality for
+/// the collapse tiebreak, the disagreement warn, and the
+/// `truthCollapseConflicts` count, so the disclosure granularity
+/// structurally cannot lag the truth granularity again (round 3 added
+/// outcome-level disclosure while rank-4 hash payloads stayed
+/// session-decided and undisclosed).
 ///
-/// The choice of rank class is therefore invariant under any relabeling of
-/// the session axis — only the within-class tiebreak reads session ids.
+/// Every field is destructured, so a NEW `OutcomeRecord` field refuses
+/// to compile until it is classified truth-bearing (joins the
+/// projection) or not:
+/// - `session`: the relabeling axis itself — an opaque grouping label,
+///   never truth.
+/// - `drv`: the unit's identity, constant across one collapse input by
+///   construction (the outcomes map is keyed by it).
+/// - `detail`: free-form human-readable text, "Never interpreted" per
+///   the schema.
+/// - `duration_s` / `stop_offset_s`: per-attempt timing measurements,
+///   expected to vary across sessions; consumed only by the
+///   session-aware timed lookup (`expected_outcome` via `SessionKey`),
+///   never off a collapsed record.
+/// - `outcome` + `outputs`: the consumed truth.
+///
+/// The projection's `Ord` (outcome wire string, then the outputs map —
+/// `OutputHash` orders by digest bytes then size) is the within-rank
+/// tiebreak: arbitrary but total and derived from record CONTENT, so
+/// the pick cannot flip under session relabeling.
+fn consumed_truth(record: &OutcomeRecord) -> (&'static str, &BTreeMap<String, OutputHash>) {
+    let OutcomeRecord {
+        session: _,
+        drv: _,
+        outcome,
+        detail: _,
+        duration_s: _,
+        stop_offset_s: _,
+        outputs,
+    } = record;
+    (outcome.as_str(), outputs)
+}
+
+/// The scoped half of the collapse rule: the record of the highest
+/// [`informativeness_rank`]; ties within a rank class resolve by the
+/// records' consumed-truth content ([`consumed_truth`]'s ordering), and
+/// the highest session decides only between records whose consumed
+/// truth is identical (`BTreeMap` iterates sessions ascending and
+/// `max_by` keeps the LAST maximum). Callers resolve the session-less
+/// record first; this function only ever sees scoped disagreement.
+///
+/// The CONSUMED truth of the choice — not merely its rank class — is
+/// therefore invariant under any relabeling of the session axis:
+/// session ids only ever pick between records the consumer cannot tell
+/// apart. Two rank-4 `built` records with conflicting hashes resolve to
+/// the content-greater record under either labeling; content order is
+/// arbitrary-but-total tiebreak policy, not a truth judgment, so the
+/// conflict is never silent — it is disclosed through the warn above
+/// and counted by [`ReplayArchive::truth_collapse_conflicts`].
 fn collapse_scoped(by_session: &BTreeMap<Option<i64>, OutcomeRecord>) -> Option<&OutcomeRecord> {
-    by_session
-        .values()
-        .max_by_key(|record| informativeness_rank(record))
+    by_session.values().max_by(|a, b| {
+        informativeness_rank(a)
+            .cmp(&informativeness_rank(b))
+            .then_with(|| consumed_truth(a).cmp(&consumed_truth(b)))
+    })
 }
 
 /// Surface screen-rejected relay entries at open time, without judging
@@ -2342,9 +2408,178 @@ mod tests {
         }
     }
 
+    /// Within-rank-4 conflict at the archive level, in BOTH labelings:
+    /// two session-scoped `built` records carry CONFLICTING output
+    /// hashes — the unit's NAR-comparison baseline. The chosen consumed
+    /// truth (the hashes `expected_outcomes_for_units` copies into
+    /// `ExpectedSide`) must be identical whichever session id carries
+    /// which hash — content order decides, never session allocation —
+    /// and the conflict must be DISCLOSED: `truthCollapseConflicts`
+    /// counts the outputs axis even though the outcome enum agrees.
+    /// Pre-fix both failed: the higher session's hash won (the choice
+    /// flipped under relabeling) and the count compared only the
+    /// outcome enum (zero disclosed conflicts).
+    #[test]
+    fn conflicting_rank4_hashes_resolve_by_content_and_are_disclosed() {
+        let mut chosen_hashes = Vec::new();
+        for (low_payload_session, high_payload_session) in [(3i64, 9i64), (9, 3)] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (root, _) = staged_tiny_archive(dir.path());
+
+            let path = root.join(OUTCOMES_MEMBER);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let mut lines: Vec<String> = text
+                .lines()
+                .filter(|line| !line.contains(APP_DRV))
+                .map(String::from)
+                .collect();
+            lines.push(format!(
+                "{{\"session\":{low_payload_session},\"drv\":\"{APP_DRV}\",\"outcome\":\"built\",\
+                 \"outputs\":{{\"out\":{{\"nar_hash_hex\":\"{}\",\"nar_size\":7}}}}}}",
+                "2".repeat(64)
+            ));
+            lines.push(format!(
+                "{{\"session\":{high_payload_session},\"drv\":\"{APP_DRV}\",\"outcome\":\"built\",\
+                 \"outputs\":{{\"out\":{{\"nar_hash_hex\":\"{}\",\"nar_size\":7}}}}}}",
+                "7".repeat(64)
+            ));
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+            refresh_files_entry(&root, OUTCOMES_MEMBER);
+
+            let archive = ReplayArchive::open(&root).unwrap();
+            let collapsed = archive.expected_outcome_across_sessions(APP_DRV).unwrap();
+            assert_eq!(
+                collapsed.outcome,
+                crate::archive::schema::ExpectedOutcome::Built
+            );
+            chosen_hashes.push(collapsed.outputs.clone());
+            assert_eq!(
+                archive.truth_collapse_conflicts(),
+                Some(1),
+                "an outcome-equal hash conflict must be disclosed, not silently resolved"
+            );
+        }
+        chosen_hashes.dedup();
+        assert_eq!(
+            chosen_hashes.len(),
+            1,
+            "the NAR-comparison baseline must not flip under session relabeling: \
+             {chosen_hashes:?}"
+        );
+        assert_eq!(
+            chosen_hashes[0]["out"].nar_hash,
+            crate::narhash::NarHash::parse(&"7".repeat(64)).unwrap(),
+            "content order picks the greater digest under either labeling"
+        );
+    }
+
+    /// The conflict count's payload axis at the unit level, both
+    /// directions (counted vs not): records identical on the consumed
+    /// truth — including identical hashes recorded by different
+    /// sessions, and outcome-equal records where only non-truth fields
+    /// (detail, timing) differ — are NOT conflicts; records differing in
+    /// nar size alone ARE (size is part of the recorded NAR identity the
+    /// comparator consumes). A session-less record supersedes by
+    /// contract, so even a hash conflict under one stays uncounted.
+    #[test]
+    fn truth_collapse_conflicts_counts_the_consumed_truth_axes() {
+        let cases: &[(&str, Vec<String>, usize)] = &[
+            (
+                "identical hashes across sessions",
+                vec![
+                    outcome_line(3, "built", Some(("2", 7))),
+                    outcome_line(9, "built", Some(("2", 7))),
+                ],
+                0,
+            ),
+            (
+                "non-truth fields differ (detail/timing)",
+                vec![
+                    format!(
+                        "{{\"session\":3,\"drv\":\"{APP_DRV}\",\"outcome\":\"failed\",\
+                         \"detail\":\"exit 2\",\"duration_s\":10.0}}"
+                    ),
+                    format!(
+                        "{{\"session\":9,\"drv\":\"{APP_DRV}\",\"outcome\":\"failed\",\
+                         \"detail\":\"exit code 2 (rebuilt)\",\"duration_s\":99.5}}"
+                    ),
+                ],
+                0,
+            ),
+            (
+                "nar size differs, digest equal",
+                vec![
+                    outcome_line(3, "built", Some(("2", 7))),
+                    outcome_line(9, "built", Some(("2", 8))),
+                ],
+                1,
+            ),
+            (
+                "hash conflict under a session-less supersede",
+                vec![
+                    outcome_line(3, "built", Some(("2", 7))),
+                    outcome_line(9, "built", Some(("7", 7))),
+                    format!(
+                        "{{\"drv\":\"{APP_DRV}\",\"outcome\":\"built\",\
+                         \"outputs\":{{\"out\":{{\"nar_hash_hex\":\"{}\",\"nar_size\":7}}}}}}",
+                        "2".repeat(64)
+                    ),
+                ],
+                0,
+            ),
+        ];
+        for (label, extra_lines, want) in cases {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (root, _) = staged_tiny_archive(dir.path());
+            let path = root.join(OUTCOMES_MEMBER);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let mut lines: Vec<String> = text
+                .lines()
+                .filter(|line| !line.contains(APP_DRV))
+                .map(String::from)
+                .collect();
+            lines.extend(extra_lines.iter().cloned());
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+            refresh_files_entry(&root, OUTCOMES_MEMBER);
+
+            let archive = ReplayArchive::open(&root).unwrap();
+            assert_eq!(archive.truth_collapse_conflicts(), Some(*want), "{label}");
+        }
+    }
+
+    /// One scoped outcome line for `APP_DRV`; `outputs` from the
+    /// `(digest nibble, nar_size)` pair when present.
+    fn outcome_line(session: i64, outcome: &str, outputs: Option<(&str, u64)>) -> String {
+        match outputs {
+            None => {
+                format!("{{\"session\":{session},\"drv\":\"{APP_DRV}\",\"outcome\":\"{outcome}\"}}")
+            }
+            Some((nibble, nar_size)) => format!(
+                "{{\"session\":{session},\"drv\":\"{APP_DRV}\",\"outcome\":\"{outcome}\",\
+                 \"outputs\":{{\"out\":{{\"nar_hash_hex\":\"{}\",\"nar_size\":{nar_size}}}}}}}",
+                nibble.repeat(64)
+            ),
+        }
+    }
+
     /// One synthetic scoped record per (outcome, hashes) shape, for the
-    /// rank-policy tests below.
+    /// rank-policy tests below. Constant `'3'` payload — shapes that need
+    /// the within-rank payload axis use [`scoped_record_with_payload`].
     fn scoped_record(session: i64, outcome: ExpectedOutcome, with_hashes: bool) -> OutcomeRecord {
+        scoped_record_with_payload(session, outcome, with_hashes, '3')
+    }
+
+    /// [`scoped_record`] with the hash payload nibble chosen by the
+    /// caller: rank-4 records with DIFFERENT payloads are how the
+    /// within-rank conflict axis is exercised — a constant payload is
+    /// exactly what made the round-3 relabeling lattice structurally
+    /// blind to session-decided hash flips.
+    fn scoped_record_with_payload(
+        session: i64,
+        outcome: ExpectedOutcome,
+        with_hashes: bool,
+        payload: char,
+    ) -> OutcomeRecord {
         OutcomeRecord {
             session: Some(session),
             drv: "/nix/store/r-rank.drv".to_string(),
@@ -2356,7 +2591,8 @@ mod tests {
                 BTreeMap::from([(
                     "out".to_string(),
                     crate::archive::schema::OutputHash {
-                        nar_hash: crate::narhash::NarHash::parse(&"3".repeat(64)).unwrap(),
+                        nar_hash: crate::narhash::NarHash::parse(&payload.to_string().repeat(64))
+                            .unwrap(),
                         nar_size: 7,
                     },
                 )])
@@ -2420,70 +2656,98 @@ mod tests {
         }
     }
 
-    /// The per-rank-class invariance property over the full shape lattice:
-    /// for every pair of record shapes and BOTH assignments of the two
-    /// session ids, the collapse picks a record of the maximum rank — so
-    /// the chosen rank class is a pure function of the record contents,
-    /// never of the session labeling. When ranks differ the exact winning
-    /// content is labeling-invariant too; when they tie, the documented
-    /// within-class tiebreak (highest session) applies. A three-record
-    /// equal-rank multiset is checked under every permutation: reordering
-    /// equal-rank records across sessions never changes the chosen class.
+    /// The consumed-truth invariance property over the full shape
+    /// lattice, stated over what the consumer actually reads (the
+    /// (outcome, outputs) projection, [`consumed_truth`]) — not over the
+    /// classifier's internal rank class, which is the granularity error
+    /// that let rank-4 hash flips ride session ids undetected: for every
+    /// pair of record shapes × payload assignment and BOTH labelings of
+    /// the two session ids, the collapse picks the maximum rank, and the
+    /// chosen CONSUMED truth is a pure function of the record contents
+    /// (rank, then content order), never of the session labeling.
+    /// Session ids decide only between records whose consumed truth is
+    /// identical. The payload axis runs hash nibbles ('3','7') and
+    /// ('7','3') across the pair, so within-rank-4 conflicting-hash
+    /// cells are exercised in both content directions. A three-record
+    /// equal-rank multiset is checked under every permutation:
+    /// reordering equal-rank records across sessions never changes the
+    /// chosen consumed truth.
     #[test]
-    fn collapse_rank_class_is_invariant_under_session_relabeling() {
+    fn collapse_consumed_truth_is_invariant_under_session_relabeling() {
         let shapes = rank_table_shapes();
         for &(outcome_a, hashes_a) in &shapes {
             for &(outcome_b, hashes_b) in &shapes {
-                let rank_a = informativeness_rank(&scoped_record(0, outcome_a, hashes_a));
-                let rank_b = informativeness_rank(&scoped_record(0, outcome_b, hashes_b));
-                for (session_a, session_b) in [(3i64, 9i64), (9, 3)] {
-                    let by_session: BTreeMap<Option<i64>, OutcomeRecord> = BTreeMap::from([
-                        (
-                            Some(session_a),
-                            scoped_record(session_a, outcome_a, hashes_a),
-                        ),
-                        (
-                            Some(session_b),
-                            scoped_record(session_b, outcome_b, hashes_b),
-                        ),
-                    ]);
-                    let chosen = collapse_scoped(&by_session).unwrap();
-                    let chosen_rank = informativeness_rank(chosen);
-                    assert_eq!(
-                        chosen_rank,
-                        rank_a.max(rank_b),
-                        "{outcome_a:?}/{hashes_a} @{session_a} vs \
-                         {outcome_b:?}/{hashes_b} @{session_b}"
-                    );
-                    match rank_a.cmp(&rank_b) {
-                        std::cmp::Ordering::Greater => {
-                            assert_eq!(
-                                (chosen.outcome, !chosen.outputs.is_empty()),
-                                (outcome_a, hashes_a),
-                                "the higher-ranked content must win under either labeling"
-                            );
+                for (payload_a, payload_b) in [('3', '3'), ('3', '7'), ('7', '3')] {
+                    let rank_a = informativeness_rank(&scoped_record_with_payload(
+                        0, outcome_a, hashes_a, payload_a,
+                    ));
+                    let rank_b = informativeness_rank(&scoped_record_with_payload(
+                        0, outcome_b, hashes_b, payload_b,
+                    ));
+                    let mut chosen_truths = Vec::new();
+                    for (session_a, session_b) in [(3i64, 9i64), (9, 3)] {
+                        let by_session: BTreeMap<Option<i64>, OutcomeRecord> = BTreeMap::from([
+                            (
+                                Some(session_a),
+                                scoped_record_with_payload(
+                                    session_a, outcome_a, hashes_a, payload_a,
+                                ),
+                            ),
+                            (
+                                Some(session_b),
+                                scoped_record_with_payload(
+                                    session_b, outcome_b, hashes_b, payload_b,
+                                ),
+                            ),
+                        ]);
+                        let chosen = collapse_scoped(&by_session).unwrap();
+                        let label = format!(
+                            "{outcome_a:?}/{hashes_a}/{payload_a} @{session_a} vs \
+                             {outcome_b:?}/{hashes_b}/{payload_b} @{session_b}"
+                        );
+                        assert_eq!(informativeness_rank(chosen), rank_a.max(rank_b), "{label}");
+                        // The content-derived expectation: the max of the two
+                        // records under (rank, consumed-truth) order — a pure
+                        // function of contents, independent of the labeling.
+                        let record_a = &by_session[&Some(session_a)];
+                        let record_b = &by_session[&Some(session_b)];
+                        let want = if (rank_a, consumed_truth(record_a))
+                            >= (rank_b, consumed_truth(record_b))
+                        {
+                            consumed_truth(record_a)
+                        } else {
+                            consumed_truth(record_b)
+                        };
+                        assert_eq!(
+                            consumed_truth(chosen),
+                            want,
+                            "consumed truth must resolve by content, not labeling: {label}"
+                        );
+                        // Session ids decide only between records the
+                        // consumer cannot tell apart.
+                        if consumed_truth(record_a) == consumed_truth(record_b) {
+                            assert_eq!(chosen.session, Some(session_a.max(session_b)), "{label}");
                         }
-                        std::cmp::Ordering::Less => {
-                            assert_eq!(
-                                (chosen.outcome, !chosen.outputs.is_empty()),
-                                (outcome_b, hashes_b),
-                                "the higher-ranked content must win under either labeling"
-                            );
-                        }
-                        std::cmp::Ordering::Equal => {
-                            // Within a rank class the highest session wins —
-                            // the one place session ids may decide.
-                            assert_eq!(chosen.session, Some(session_a.max(session_b)));
-                        }
+                        chosen_truths
+                            .push((consumed_truth(chosen).0, consumed_truth(chosen).1.clone()));
                     }
+                    chosen_truths.dedup();
+                    assert_eq!(
+                        chosen_truths.len(),
+                        1,
+                        "one consumed truth across both labelings: \
+                         {outcome_a:?}/{hashes_a}/{payload_a} vs {outcome_b:?}/{hashes_b}/{payload_b}"
+                    );
                 }
             }
         }
 
         // Equal-rank multiset: failed / resource-exhausted (both rank 2)
         // plus a disconnected (rank 1), permuted over three sessions every
-        // way — the chosen class is always the shared maximum rank, and the
-        // winner is the highest session holding it.
+        // way — the chosen class is always the shared maximum rank, and
+        // the chosen consumed truth is the content-max of that class
+        // (resource-exhausted > failed in wire-string order), regardless
+        // of which session carries which record.
         let multiset = [
             (ExpectedOutcome::Failed, false),
             (ExpectedOutcome::ResourceExhausted, false),
@@ -2509,12 +2773,12 @@ mod tests {
                 .collect();
             let chosen = collapse_scoped(&by_session).unwrap();
             assert_eq!(informativeness_rank(chosen), 2, "{permutation:?}");
-            let highest_rank2_session = by_session
-                .iter()
-                .filter(|(_, record)| informativeness_rank(record) == 2)
-                .filter_map(|(session, _)| *session)
-                .max();
-            assert_eq!(chosen.session, highest_rank2_session, "{permutation:?}");
+            assert_eq!(
+                chosen.outcome,
+                ExpectedOutcome::ResourceExhausted,
+                "the content-max of the top rank class wins under every permutation: \
+                 {permutation:?}"
+            );
         }
     }
 

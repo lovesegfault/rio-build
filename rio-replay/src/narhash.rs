@@ -24,7 +24,11 @@ use anyhow::Context as _;
 /// the same hash compare equal. Serializes as bare lowercase hex (the archive
 /// and results.jsonl wire form); deserializes through [`NarHash::parse`], so
 /// every accepted spelling loads.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// Ordering is over the digest bytes — a content-identity order,
+/// arbitrary but total. Consumers use it for deterministic
+/// content-keyed tiebreaks (the truth-collapse within-rank pick), never
+/// as a semantic "newer/better" judgment.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NarHash([u8; 32]);
 
 impl NarHash {
