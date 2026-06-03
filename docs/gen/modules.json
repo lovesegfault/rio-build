@@ -297,7 +297,7 @@
     {
       "path": "keygen.rs",
       "depth": 0,
-      "doc": "`rio-cli keygen` — generate an ed25519 narinfo signing keypair."
+      "doc": "`rio-cli keygen` — ed25519 narinfo signing-key operations."
     },
     {
       "path": "logs.rs",

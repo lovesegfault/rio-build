@@ -1,25 +1,39 @@
-//! `rio-cli keygen` — generate an ed25519 narinfo signing keypair.
+//! `rio-cli keygen` — ed25519 narinfo signing-key operations.
 //!
-//! Replaces `nix-store --generate-binary-cache-key` in the bootstrap
-//! Job (`nix/bootstrap-job.sh`) so the bootstrap image doesn't carry
-//! the Nix closure. Output is byte-compatible with what `nix-store`
-//! emits and what `rio-store/src/signing.rs::Signer::parse` and
-//! `parse_trusted_key_entry` accept:
+//! Two subcommands, both purely local (no scheduler/store connection,
+//! no config):
 //!
-//! - secret: `{name}:{base64(seed ++ pubkey)}` — the 64-byte expanded
-//!   keypair encoding (32-byte seed, then the 32-byte public key),
-//!   standard RFC 4648 alphabet with padding, no trailing newline.
-//!   Written `0600`, never overwritten.
-//! - public: `{name}:{base64(pubkey)}` — 32 bytes; the
-//!   `trusted-public-keys` entry format.
+//! - `keygen new <name> <secret-file> <public-file>` — generate a
+//!   keypair. Replaces `nix-store --generate-binary-cache-key` in the
+//!   bootstrap Job (`nix/bootstrap-job.sh`) so the bootstrap image
+//!   doesn't carry the Nix closure. Output is byte-compatible with
+//!   what `nix-store` emits and what
+//!   `rio-store/src/signing.rs::Signer::parse` and
+//!   `parse_trusted_key_entry` accept:
+//!   - secret: `{name}:{base64(seed ++ pubkey)}` — the 64-byte
+//!     expanded keypair encoding, standard RFC 4648 alphabet with
+//!     padding, no trailing newline. Written `0600`, never
+//!     overwritten.
+//!   - public: `{name}:{base64(pubkey)}` — 32 bytes; the
+//!     `trusted-public-keys` entry format.
+//! - `keygen derive-pub` — read a SECRET entry on stdin, write the
+//!   derived PUBLIC entry to stdout (no trailing newline). The only
+//!   secret-to-public mapping the bootstrap plumbing is allowed to
+//!   use: the shell previously re-implemented this as
+//!   `base64 -d | tail -c 32 | base64 -w0`, which published the
+//!   private seed verbatim for 32-byte seed-only entries (round-16
+//!   bug_023). stdin (never argv) so the secret cannot land in
+//!   /proc/*/cmdline; output is the codec's canonical encoding so
+//!   `cmp`-based pair-consistency checks see keygen-identical bytes.
 //!
-//! Purely local: no scheduler/store connection, no config. The seed
-//! comes straight from the OS CSPRNG — the workspace deliberately
-//! leaves `ed25519-dalek`'s `rand_core` feature off (keys elsewhere
-//! are always built from supplied seed bytes), so the entropy read and
-//! the key derivation are two explicit steps here.
+//! All byte-format knowledge lives in `rio_common::signing_keyfmt`;
+//! this module is I/O glue. The seed comes straight from the OS
+//! CSPRNG — the workspace deliberately leaves `ed25519-dalek`'s
+//! `rand_core` feature off (keys elsewhere are always built from
+//! supplied seed bytes), so the entropy read and the key derivation
+//! are two explicit steps here.
 
-use std::io::Write as _;
+use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -30,6 +44,24 @@ use rio_common::signing_keyfmt::SecretEntry;
 
 #[derive(Args, Clone)]
 pub(crate) struct KeygenArgs {
+    #[command(subcommand)]
+    cmd: KeygenCmd,
+}
+
+#[derive(clap::Subcommand, Clone)]
+enum KeygenCmd {
+    /// Generate a new signing keypair (refuses to overwrite an
+    /// existing secret file — rotation must be explicit).
+    New(NewArgs),
+    /// Read a secret entry (`name:base64`) on stdin and print the
+    /// derived public entry (`name:base64(pubkey)`) to stdout with no
+    /// trailing newline. The only supported secret-to-public mapping;
+    /// refuses internally inconsistent or malformed entries.
+    DerivePub,
+}
+
+#[derive(Args, Clone)]
+struct NewArgs {
     /// Key name (e.g. `rio-<bucket>`). Embedded in every signature
     /// (`Sig: {name}:{b64sig}`) so clients know which
     /// `trusted-public-keys` entry to verify against.
@@ -45,6 +77,32 @@ pub(crate) struct KeygenArgs {
 
 /// Run the `keygen` subcommand. Sync — no RPC, no async I/O.
 pub(crate) fn run(args: KeygenArgs) -> anyhow::Result<()> {
+    match args.cmd {
+        KeygenCmd::New(a) => run_new(a),
+        KeygenCmd::DerivePub => run_derive_pub(&mut std::io::stdin(), &mut std::io::stdout()),
+    }
+}
+
+/// `keygen derive-pub`: secret entry on `input`, canonical public
+/// entry (no trailing newline) on `output`. Factored over generic
+/// streams so tests drive it without a real stdin.
+fn run_derive_pub(input: &mut impl Read, output: &mut impl Write) -> anyhow::Result<()> {
+    let mut entry = String::new();
+    input
+        .read_to_string(&mut entry)
+        .context("read secret entry from stdin")?;
+    // Transport stripping only (CLI `--output text` / editor trailing
+    // newlines); the codec itself is a pure byte contract.
+    let entry = entry.trim_ascii();
+    let secret = rio_common::signing_keyfmt::SecretEntry::parse(entry)
+        .context("parse secret entry from stdin")?;
+    output
+        .write_all(secret.derive_pub().encode().as_bytes())
+        .context("write public entry to stdout")?;
+    Ok(())
+}
+
+fn run_new(args: NewArgs) -> anyhow::Result<()> {
     if args.name.is_empty() {
         bail!("key name must not be empty");
     }
@@ -131,7 +189,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sec_path = dir.path().join("key.sec");
         let pub_path = dir.path().join("key.pub");
-        run(KeygenArgs {
+        run_new(NewArgs {
             name: "rio-test-1".into(),
             secret_key_file: sec_path.clone(),
             public_key_file: pub_path.clone(),
@@ -186,7 +244,7 @@ mod tests {
         let pub_path = dir.path().join("key.pub");
         std::fs::write(&sec_path, "existing").unwrap();
 
-        let err = run(KeygenArgs {
+        let err = run_new(NewArgs {
             name: "rio-test-1".into(),
             secret_key_file: sec_path.clone(),
             public_key_file: pub_path.clone(),
@@ -208,7 +266,7 @@ mod tests {
     #[test]
     fn rejects_colon_in_name() {
         let dir = tempfile::tempdir().unwrap();
-        let err = run(KeygenArgs {
+        let err = run_new(NewArgs {
             name: "bad:name".into(),
             secret_key_file: dir.path().join("k.sec"),
             public_key_file: dir.path().join("k.pub"),
@@ -223,7 +281,7 @@ mod tests {
     fn keys_are_random() {
         let dir = tempfile::tempdir().unwrap();
         for n in ["a", "b"] {
-            run(KeygenArgs {
+            run_new(NewArgs {
                 name: "k".into(),
                 secret_key_file: dir.path().join(format!("{n}.sec")),
                 public_key_file: dir.path().join(format!("{n}.pub")),
@@ -234,5 +292,75 @@ mod tests {
             std::fs::read_to_string(dir.path().join("a.sec")).unwrap(),
             std::fs::read_to_string(dir.path().join("b.sec")).unwrap(),
         );
+    }
+
+    /// `derive-pub` on a keygen-emitted secret reproduces the keygen
+    /// public file byte-for-byte (the bootstrap re-derive contract:
+    /// cmp-equal, no trailing newline).
+    #[test]
+    fn derive_pub_matches_keygen_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let sec_path = dir.path().join("key.sec");
+        let pub_path = dir.path().join("key.pub");
+        run_new(NewArgs {
+            name: "rio-test-1".into(),
+            secret_key_file: sec_path.clone(),
+            public_key_file: pub_path.clone(),
+        })
+        .unwrap();
+
+        // Transport fidelity: feed the secret with a trailing newline
+        // (what `aws --output text` emits) — output must still be the
+        // canonical newline-free entry.
+        let mut input = std::fs::read(&sec_path).unwrap();
+        input.push(b'\n');
+        let mut out = Vec::new();
+        run_derive_pub(&mut input.as_slice(), &mut out).unwrap();
+        assert_eq!(
+            out,
+            std::fs::read(&pub_path).unwrap(),
+            "derive-pub output is byte-identical to the keygen public file"
+        );
+        assert!(!out.ends_with(b"\n"));
+    }
+
+    /// bug_023 regression: a 32-byte seed-only secret entry derives the
+    /// PUBLIC key — the output never contains the seed in any window.
+    #[test]
+    fn derive_pub_seed_only_never_emits_seed() {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let seed = [0x5Au8; 32];
+        let seed_b64 = b64.encode(seed);
+        let entry = format!("rio-byo:{seed_b64}");
+
+        let mut out = Vec::new();
+        run_derive_pub(&mut entry.as_bytes(), &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+
+        let expected = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        assert_eq!(out, format!("rio-byo:{}", b64.encode(expected)));
+        assert!(
+            !out.contains(&seed_b64),
+            "published entry must not contain the seed's base64"
+        );
+    }
+
+    /// The 64-byte stale-tail arm: derive-pub refuses an internally
+    /// inconsistent expanded entry instead of publishing either side.
+    #[test]
+    fn derive_pub_refuses_stale_tail() {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let mut expanded = [0u8; 64];
+        expanded[..32].copy_from_slice(&[0x33u8; 32]);
+        expanded[32..].copy_from_slice(&[0x44u8; 32]); // not derive(seed)
+        let entry = format!("rio-t:{}", b64.encode(expanded));
+
+        let mut out = Vec::new();
+        let err = run_derive_pub(&mut entry.as_bytes(), &mut out).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("internally inconsistent"),
+            "error names the inconsistency: {err:#}"
+        );
+        assert!(out.is_empty(), "nothing published on refusal");
     }
 }
