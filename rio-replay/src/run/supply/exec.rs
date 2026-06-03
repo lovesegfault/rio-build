@@ -872,6 +872,19 @@ fn entry_source(item: &UploadItem) -> &'static str {
 ///   this invocation released its own, and bookkeeping rows can neither
 ///   retire dependents nor displace a settlement under the journal's
 ///   folds.
+///
+/// The asserts are HARD (`assert!`, live in every build profile): the CI
+/// test binaries and the production engine compile without
+/// debug-assertions, where a `debug_assert!` would be dead code — and a
+/// reordered call site is invisible to post-hoc state checks, because in
+/// a sequential run release-then-record produces the same observable end
+/// state (row present, claim released); the in-flight check at the append
+/// instant is the only profile-independent witness the ordering has. In
+/// production a violation means the engine was about to mint corrupt
+/// settled truth into a journal that outlives the process, so a loud
+/// abort of the campaign beats silently writing rows the rollup will
+/// trust. The cost is one claims-mutex lookup per settled row, dwarfed by
+/// the file append the same call performs.
 fn record_settlement(
     env: &UploadEnv<'_>,
     item: &UploadItem,
@@ -882,13 +895,13 @@ fn record_settlement(
     bytes: Option<u64>,
 ) -> Result<()> {
     match outcome {
-        SUPPLY_OUTCOME_REFUSED | SUPPLY_OUTCOME_FAILED => debug_assert!(
+        SUPPLY_OUTCOME_REFUSED | SUPPLY_OUTCOME_FAILED => assert!(
             env.claims.is_pending(&item.store_path),
             "settled {outcome} row for {} appended without its upload claim held: \
              release the claim only AFTER the row is recorded",
             item.store_path
         ),
-        SUPPLY_OUTCOME_DELIVERED => debug_assert!(
+        SUPPLY_OUTCOME_DELIVERED => assert!(
             env.claims.is_done(&item.store_path),
             "settled delivered row for {} appended before its claim completed",
             item.store_path
@@ -3240,10 +3253,15 @@ mod tests {
     ///
     /// Release-ordering axis: every settled refused/failed row is appended
     /// while its claim is still held — [`record_settlement`] asserts it at
-    /// the chokepoint, and every refused/failed cell here drives that
-    /// assert — and the claim is released afterwards (re-claimable below),
-    /// so there is no window in which a sibling can win the claim while
-    /// the failure is unrecorded, and no leaked claim either.
+    /// the chokepoint with a HARD `assert!` (live in every build profile,
+    /// including the release-profile CI test binaries and production;
+    /// this matters because release-then-record leaves the same
+    /// observable end state in a sequential run, so these cells witness
+    /// the ordering ONLY through that in-flight assert), and every
+    /// refused/failed cell here drives it — and the claim is released
+    /// afterwards (re-claimable below), so there is no window in which a
+    /// sibling can win the claim while the failure is unrecorded, and no
+    /// leaked claim either.
     #[tokio::test]
     async fn upload_arms_never_contradict_the_claims_table() {
         for arm in ["stream", "batch"] {
